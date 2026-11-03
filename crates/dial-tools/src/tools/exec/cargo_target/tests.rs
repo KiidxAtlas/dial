@@ -81,3 +81,37 @@ fn explicit_removal_is_not_replaced() {
         None,
     );
 }
+
+#[test]
+fn stale_session_targets_are_pruned_but_the_current_and_recent_ones_stay() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    for session in ["current", "recent", "old"] {
+        std::fs::create_dir_all(dir_for(root, session).join("debug")).unwrap();
+    }
+    mark_used(&dir_for(root, "recent"));
+    // A stray file and a non-session name are never touched.
+    let base = dir_for(root, "x").parent().unwrap().to_path_buf();
+    std::fs::write(base.join("notes.txt"), b"keep").unwrap();
+    std::fs::create_dir_all(base.join("not a session")).unwrap();
+
+    // Nothing is old enough under a one-hour threshold.
+    assert!(prune_stale(root, "current", Duration::from_secs(3600)).is_empty());
+
+    std::thread::sleep(Duration::from_millis(50));
+    mark_used(&dir_for(root, "recent"));
+    let removed = prune_stale(root, "current", Duration::from_millis(25));
+    assert_eq!(removed, vec![dir_for(root, "old")]);
+    assert!(dir_for(root, "current").is_dir());
+    assert!(dir_for(root, "recent").is_dir());
+    assert!(base.join("notes.txt").is_file());
+    assert!(base.join("not a session").is_dir());
+}
+
+#[test]
+fn marking_never_creates_a_missing_target_directory() {
+    let project = tempfile::tempdir().unwrap();
+    let dir = dir_for(project.path(), "unused");
+    mark_used(&dir);
+    assert!(!dir.exists());
+}

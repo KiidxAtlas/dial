@@ -396,6 +396,9 @@ pub struct Agent<'a> {
     enabled_tools: HashSet<String>,
     /// Task-scoped specialist selection; never durable pins or execution authority.
     tool_routing: run::tool_exposure::ToolRouting,
+    /// Retry floor left by an automatic compaction that could not shrink the request. It seeds the
+    /// next turn so a new user message does not rerun a method chain that just failed.
+    compaction_retry_carry: Option<u64>,
     lean_tools: bool,
     /// `[assistance.local]` escalation reached this session (see `local_profile`).
     local_escalation: model::local_profile::Escalation,

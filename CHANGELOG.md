@@ -35,6 +35,32 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   held-out cases the experiment never saw (sign test), and `promote`/`revert` switch the
   project's model only to a copy that passed. `/weights` and the `model_weights` tool gain the
   same operations; the tool cannot promote or revert.
+
+### Fixed
+
+- Tools that automatic routing offers for one turn stay offered on later turns (bounded, oldest
+  dropped first), so the system prompt and tool array no longer change between turns and a
+  provider's prompt cache, history included, is no longer invalidated by a routed turn
+  (`docs/agent-loop.md`).
+- Compaction no longer fails with an error when there is history but nothing can shrink it:
+  manual and RPC compaction report an unchanged result, summaries are not requested for under 512
+  tokens of replaceable history, Snapcompact is skipped for models without image-token pricing
+  (it was billed at one token per pixel, inflating a few short turns to about 185k tokens), and a
+  failed automatic attempt is not rerun at the start of every new turn. The `continued-session`
+  efficiency benchmark now has enough earlier history for its forced compaction to shrink.
+- Background job output no longer splits a multi-byte character across two reads.
+
+### Changed
+
+- The shell output minimizer also filters outputs longer than the inline head-and-tail view, using
+  the complete copy in the output artifact, and recognises `cd DIR && <command>` sequences,
+  `pip`/`uv` installs and `jest`/`vitest` runs (`docs/shell.md`).
+- Per-session Cargo target directories unused for seven days are deleted in the background when a
+  session starts (`docs/shell.md`).
+- Unhinted provider retry backoff doubles up to 60 seconds per attempt instead of up to
+  `retry.max_delay_secs`; server hints and quota waits keep the configured bound
+  (`docs/llm-transport.md`).
+
 ## [0.2.11] - 2026-11-03
 
 ### Security

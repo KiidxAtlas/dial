@@ -64,6 +64,9 @@ fn working_directory(
 const MAX_COMMAND: usize = 64 * 1024;
 const BASH_HEAD: usize = 6 * 1024;
 const BASH_TAIL: usize = 14 * 1024;
+/// Complete outputs up to this size are re-read from their artifact so the output filter can
+/// apply even when the inline view had to be cut to head and tail.
+const FULL_FILTER_MAX: u64 = 4 * 1024 * 1024;
 /// Diagnostic lines kept from the omitted middle (a compiler's first error is often there).
 const BASH_DIAGNOSTICS: usize = 3 * 1024;
 #[cfg(not(windows))]
@@ -277,7 +280,7 @@ impl Capture {
 }
 
 /// Length of `bytes` without an incomplete UTF-8 sequence at its end.
-fn complete_utf8_prefix(bytes: &[u8]) -> usize {
+pub(in crate::tools::exec) fn complete_utf8_prefix(bytes: &[u8]) -> usize {
     match std::str::from_utf8(bytes) {
         Err(error) if error.error_len().is_none() => error.valid_up_to(),
         _ => bytes.len(),
@@ -454,6 +457,7 @@ fn minimize_body(
     body_len: usize,
     text: &mut String,
     capture_complete: bool,
+    full: Option<&str>,
 ) -> bool {
     if !capture_complete
         || !ws.minimizing_output()
@@ -463,9 +467,15 @@ fn minimize_body(
     {
         return false;
     }
-    let Some(minimized) = super::minimizer::minimize(command, &text[..body_len]) else {
+    let Some(minimized) = super::minimizer::minimize(command, full.unwrap_or(&text[..body_len]))
+    else {
         return false;
     };
+    // A filtered complete output that still exceeds the inline view keeps the head/tail view and
+    // its middle diagnostics instead.
+    if full.is_some() && minimized.text.len() > BASH_HEAD + BASH_TAIL {
+        return false;
+    }
     let mut body = minimized.text;
     if !body.ends_with('\n') {
         body.push('\n');
@@ -1003,12 +1013,26 @@ fn run_bash(
         text.push_str("[sandbox: /tmp is outside the project and not writable; use $TMPDIR, a scratch directory inside the project]\n");
     }
     let artifact = append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
+    let complete_capture = eof && capture_error.is_none();
+    // A long output was cut to head and tail, so the inline text cannot be filtered faithfully.
+    // When the artifact holds all of it, filter the complete output instead.
+    let full = if complete_capture && original != inline_retained && elided == Some(0) {
+        artifact.as_deref().and_then(|uri| {
+            ws.artifacts()?
+                .read_text(uri, FULL_FILTER_MAX)
+                .ok()
+                .flatten()
+        })
+    } else {
+        None
+    };
     let minimized = minimize_body(
         ws,
         &command,
         body_len,
         &mut text,
-        eof && capture_error.is_none() && original == inline_retained,
+        complete_capture && (original == inline_retained || full.is_some()),
+        full.as_deref(),
     );
     // A failed build or test whose first error sits pages down gets those lines up front; the
     // full output still follows unchanged (and stays in the artifact).

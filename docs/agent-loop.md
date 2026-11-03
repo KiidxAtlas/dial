@@ -353,7 +353,10 @@ advance memory-authority revisions, and sync acknowledgements and input freshnes
 
 Session history is append-only; tree navigation selects an abandoned branch without deleting it, and branch summaries are optional context for navigation.
 
-Task-tool routing is local, deterministic and turn-scoped. The first request selects native specialists by workflow intent and MCP tools by indexed capabilities/domain relevance. Unique tool-name capabilities can also match explicit inspection requests without a server name; ambiguous and generic matches remain conservative. Complete single-target reads of `package.json`, `Cargo.toml` and `pyproject.toml` can add bounded dependency-domain signals; unsupported requirement forms are skipped. Successful MCP discovery can expose matching same-server consumers for the following model request, including one additional tool slot when the count budget is full. Both serial and parallel results feed the same observer. Selection never executes tools or changes permissions; pinned harnesses, child allowlists and ordinary approval policy remain authoritative. Automatic additions are monotonic within the turn, capped at six tools and 24 KiB of schemas (seven tools after a successful discovery). Lean and minimal local profiles route MCP tools and the native web pair, capped at two tools and 8 KiB (three tools after discovery). Clear web/research intent prioritizes eligible `web_search` and `web_fetch` ahead of incidental MCP matches; ordinary coding turns still omit them. The byte caps remain unchanged and overflow fallback disables automatic additions to preserve headroom. Explicit unloads suppress reactivation until the next external request. Selection introduces no extra inference or project reads.
+Task-tool routing is local and deterministic. Tools routed on one turn stay offered on later turns
+(up to twelve, oldest dropped first; four in lean and minimal local profiles) so the system prompt and
+tool array, and with them a provider's prompt cache, do not change back and forth between turns;
+a tool that stops being an eligible candidate, or that is explicitly unloaded, is dropped. The first request selects native specialists by workflow intent and MCP tools by indexed capabilities/domain relevance. Unique tool-name capabilities can also match explicit inspection requests without a server name; ambiguous and generic matches remain conservative. Complete single-target reads of `package.json`, `Cargo.toml` and `pyproject.toml` can add bounded dependency-domain signals; unsupported requirement forms are skipped. Successful MCP discovery can expose matching same-server consumers for the following model request, including one additional tool slot when the count budget is full. Both serial and parallel results feed the same observer. Selection never executes tools or changes permissions; pinned harnesses, child allowlists and ordinary approval policy remain authoritative. Automatic additions are monotonic within the turn, capped at six tools and 24 KiB of schemas (seven tools after a successful discovery). Lean and minimal local profiles route MCP tools and the native web pair, capped at two tools and 8 KiB (three tools after discovery). Clear web/research intent prioritizes eligible `web_search` and `web_fetch` ahead of incidental MCP matches; ordinary coding turns still omit them. The byte caps remain unchanged and overflow fallback disables automatic additions to preserve headroom. Explicit unloads suppress reactivation until the next external request. Selection introduces no extra inference or project reads.
 
 Intent rules read request prose, not the names it mentions: code spans and identifier-like tokens (`$request_method`, `server.py`, `/usr/bin`) do not count, while a URL still signals URL intent. Tool names that are ordinary words (`task`, `message`, `goal`, `monitor`, `data`, ...) route only when marked as tool names, so "Your task is to" does not offer `task`. A web server, app or page to build is not web-search intent, a page needs a visual term (not just "verify") before `browser` is added, and asking to keep a service running is not runtime watching for `monitor`. In the Terminal-Bench task instructions this keeps the nginx setup task from adding seven specialist schemas (48.0 KB of schemas per request down to 24.9 KB in the offline real-registry offer). Fewer billed tokens per live run are expected, not measured.
 
@@ -1271,6 +1274,12 @@ flags distinguish compaction from a committed notes-backed reset.
 With no per-call overrides or summary focus, an already-safe history entirely within the configured
 keep-recent budget is a successful no-op, even if adaptive small-window budgeting would retain less.
 No summary request is made and no compaction is counted.
+A manual compaction that has history to work with but where no method can make the next request
+smaller is also an unchanged result, with a notice naming each method's reason, rather than an
+error. Soft, Remote and Handoff skip the summary request when the history they would replace is
+under 512 estimated tokens, because a summary of that little text is not shorter than its source.
+Automatic compaction that fails this way keeps its retry floor into the next user turn, so a new
+message does not rerun the same failing method chain until the request has grown.
 CLI overrides include `--compaction-strategy`, `--compaction-threshold-tokens` and
 `--compaction-reserve-tokens`; the numeric flags accept positive integers or `auto` to clear
 an inherited value. Omission follows persisted configuration.
@@ -1408,7 +1417,9 @@ image_detail = "auto" # auto | high | original; high for older/unknown routes
 Native compaction requires an explicit compatible route declaration; protocol selection alone is
 not evidence that an endpoint supports it. A custom summary endpoint resolves credentials for its
 own URL. Image archives use actual bundled fonts, PNG dimensions and declared model billing;
-unknown billing uses a conservative pixel ceiling and may legitimately fail to fit. All 17 font/
+unknown billing uses a conservative pixel ceiling, which never comes out smaller than the text it
+replaces, so automatic method selection skips Snapcompact for a model without a
+`snapcompact_models` entry; `/compact snapcompact` or `strategy = "snapcompact"` still tries it. All 17 font/
 layout variants are selectable in settings. Characters a shape cannot draw (no bitmap or Silver ink,
 including Arabic in every bundled font, controls and bidi/format marks) are rendered as exact JSON
 `\uXXXX` escapes (surrogate pairs above U+FFFF), with literal backslashes doubled to distinguish

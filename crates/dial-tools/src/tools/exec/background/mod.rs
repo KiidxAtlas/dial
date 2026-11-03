@@ -819,17 +819,23 @@ fn minimize_complete(command: &str, ring: &Ring) -> Option<super::minimizer::Min
 /// A terminal's model-facing output is its rendered screen, a snapshot not a delta.
 fn take_unread(snap: &Snapshot) -> (String, u64) {
     let mut ring = lock(&snap.ring);
+    let mut cursor = ring.total;
     let fresh = match ring.screen_text() {
         Some(screen) => (screen, 0),
         None => {
             // Preserve a UTF-8 lookbehind before render_body applies its character-safe cap.
-            let (bytes, lost) = ring.recent_since(ring.cursor, MAX_OUTPUT + 3);
+            let (mut bytes, lost) = ring.recent_since(ring.cursor, MAX_OUTPUT + 3);
+            // A character still being written is left unread for the next call instead of
+            // becoming a replacement character at the end of this read and the start of the next.
+            let held = bytes.len() - super::shell::complete_utf8_prefix(&bytes);
+            bytes.truncate(bytes.len() - held);
+            cursor -= held as u64;
             let text = String::from_utf8(bytes)
                 .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
             (text, lost)
         }
     };
-    ring.cursor = ring.total;
+    ring.cursor = cursor;
     fresh
 }
 

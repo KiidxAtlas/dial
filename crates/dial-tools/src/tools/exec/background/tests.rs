@@ -1680,3 +1680,21 @@ fn adopted_cells_do_not_invent_shell_attachments() {
         );
     }
 }
+
+#[test]
+fn a_character_split_across_reads_is_delivered_whole() {
+    let snapshot = minimizer_snapshot();
+    {
+        let mut ring = lock(&snapshot.ring);
+        ring.cursor = ring.total;
+        // "é" is 0xC3 0xA9; only the first byte has been written so far.
+        ring.push(b"caf\xC3");
+    }
+    let (first, _) = take_unread(&snapshot);
+    assert_eq!(first, "caf");
+    lock(&snapshot.ring).push(b"\xA9 done");
+    let (second, _) = take_unread(&snapshot);
+    assert_eq!(second, "é done");
+    let ring = lock(&snapshot.ring);
+    assert_eq!(ring.cursor, ring.total);
+}

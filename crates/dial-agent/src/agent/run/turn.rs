@@ -438,7 +438,7 @@ impl Agent<'_> {
             overflow_retries: 0,
             compacted_without_reply: false,
             compaction_failed: false,
-            compaction_retry_floor: None,
+            compaction_retry_floor: self.compaction_retry_carry,
             unpriced_cap_noted: false,
             turn_cost_warn: cost_warn::Crossing::new(true),
             wrap_up_noted: false,

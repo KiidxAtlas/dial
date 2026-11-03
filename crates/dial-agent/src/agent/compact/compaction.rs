@@ -71,6 +71,25 @@ impl std::fmt::Display for NothingToCompact {
 }
 impl std::error::Error for NothingToCompact {}
 
+/// History exists, but no method could make the next request smaller (or a method was skipped
+/// because it could not). Callers treat this like [`NothingToCompact`]: history is unchanged.
+#[derive(Debug)]
+pub struct Unprofitable(pub String);
+impl std::fmt::Display for Unprofitable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Unprofitable {}
+
+/// Below this many tokens of replaceable history a summary (plus its frame) rarely comes out
+/// smaller than its source, so the summary model call is skipped.
+const MIN_SUMMARY_GAIN_TOKENS: u64 = 512;
+
+fn unprofitable(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Unprofitable(message.into()))
+}
+
 /// Runs on the controlling thread. None announces a logical remote request; Some reports accepted usage.
 pub type RemoteCompactionObserver<'a> = dyn FnMut(&Backend, Option<&llm::Reply>) -> Result<()> + 'a;
 #[derive(Debug)]
@@ -562,6 +581,7 @@ pub(in crate::agent) fn compact_history_with_execution(
         "no compaction method is enabled for this invocation"
     );
     let mut failures = Vec::new();
+    let mut all_unprofitable = true;
     for method in methods {
         interrupted(&interrupt)?;
         if !focus.is_empty()
@@ -573,6 +593,7 @@ pub(in crate::agent) fn compact_history_with_execution(
             failures.push(format!(
                 "{method:?} cannot apply summary focus instructions"
             ));
+            all_unprofitable = false;
             continue;
         }
         let result = (|| -> Result<PreparedCompaction> {
@@ -704,10 +725,30 @@ pub(in crate::agent) fn compact_history_with_execution(
                             .cloned()
                             .collect::<Vec<_>>(),
                     );
+                    let tail_tokens = request_tokens_with_policy(&tail, policy, context.identity);
                     ensure!(
-                        request_tokens_with_policy(&tail, policy, context.identity) < budget,
+                        tail_tokens < budget,
                         "newest complete history group and retained context leave no room for a summary; no summary was requested"
                     );
+                    let history_tokens = request_tokens_with_policy(
+                        &replacement_request(
+                            request,
+                            &request
+                                .messages
+                                .iter()
+                                .filter(|m| is_history(m))
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        ),
+                        policy,
+                        context.identity,
+                    );
+                    let replaceable = history_tokens.saturating_sub(tail_tokens);
+                    if replaceable < MIN_SUMMARY_GAIN_TOKENS {
+                        return Err(unprofitable(format!(
+                            "{method:?} would replace only {replaceable} history tokens, too few for a summary to shrink; no summary was requested"
+                        )));
+                    }
                     let live = if method == CompactionMethod::Handoff && execution.live_handoff {
                         let retained = request.messages[keep..]
                             .iter()
@@ -839,10 +880,11 @@ pub(in crate::agent) fn compact_history_with_execution(
                         ));
                         elided += 1;
                     }
-                    ensure!(
-                        elided > 0,
-                        "shake found no older recoverable archived evidence"
-                    );
+                    if elided == 0 {
+                        return Err(unprofitable(
+                            "shake found no older recoverable archived evidence",
+                        ));
+                    }
                     (
                         format!(
                             "Elided {elided} recoverable older tool results without deleting history."
@@ -853,10 +895,20 @@ pub(in crate::agent) fn compact_history_with_execution(
                     )
                 }
                 CompactionMethod::Snapcompact => {
-                    ensure!(
-                        backend.accepts_image_input(),
-                        "snapcompact requires a vision-capable model"
-                    );
+                    if !backend.accepts_image_input() {
+                        return Err(unprofitable("snapcompact requires a vision-capable model"));
+                    }
+                    // Unpriced images are billed at one token per pixel, which costs hundreds of
+                    // times the text they replace; only an explicit request still tries it.
+                    if options.method != Some(CompactionMethod::Snapcompact)
+                        && options.strategy.unwrap_or(policy.strategy)
+                            != CompactionStrategy::Snapcompact
+                        && match_selector(&policy.snapcompact_models, context.identity).is_none()
+                    {
+                        return Err(unprofitable(
+                            "snapcompact image tokens are unpriced for this model (no compaction.snapcompact_models entry); skipped",
+                        ));
+                    }
                     if policy.snapcompact.overlay
                         || crate::agent::compact::snapcompact::views::available(&request.messages)
                     {
@@ -962,10 +1014,11 @@ pub(in crate::agent) fn compact_history_with_execution(
                 after <= budget,
                 "{method:?} leaves {after} prompt tokens above safe next-request budget {budget}; no compaction was committed"
             );
-            ensure!(
-                after < before,
-                "{method:?} does not reduce the next request; no compaction was committed"
-            );
+            if after >= before {
+                return Err(unprofitable(format!(
+                    "{method:?} does not reduce the next request; no compaction was committed"
+                )));
+            }
             prepared.outcome.tokens_after = after;
             let threshold = policy.effective_threshold(context.identity, context.window)?;
             prepared.outcome.continue_allowed = after <= continue_band(threshold)
@@ -990,9 +1043,16 @@ pub(in crate::agent) fn compact_history_with_execution(
                         "{method:?} compaction failed; original history is unchanged"
                     )));
                 }
+                all_unprofitable &= error.is::<Unprofitable>() || error.is::<NothingToCompact>();
                 failures.push(format!("{method:?}: {error:#}"));
             }
         }
+    }
+    if all_unprofitable {
+        return Err(unprofitable(format!(
+            "no compaction method would shrink the next request; original history is unchanged: {}",
+            failures.join("; ")
+        )));
     }
     bail!(
         "no compaction method produced a safe smaller next request; original history is unchanged: {}",

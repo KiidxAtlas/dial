@@ -296,10 +296,15 @@ impl<'a> Agent<'a> {
     pub(in crate::agent) fn offered_with(&self, selection_only: bool) -> Vec<String> {
         let catalog = self.catalog();
         let discovery = self.tool_discovery();
-        let request_tools = if selection_only || self.lean_tools {
-            &[][..]
+        let request_tools: Vec<String> = if selection_only || self.lean_tools {
+            Vec::new()
         } else {
-            &self.tool_routing.selected[..]
+            self.tool_routing
+                .retained
+                .iter()
+                .chain(&self.tool_routing.selected)
+                .cloned()
+                .collect()
         };
         let discovered = self.discovered_tools();
         let loaded: std::collections::HashSet<String> = self

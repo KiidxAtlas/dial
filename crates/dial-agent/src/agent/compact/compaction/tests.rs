@@ -519,6 +519,59 @@ fn safe_manual_noop_does_not_reserve_context_that_will_not_be_regenerated() {
     assert!(result.err().unwrap().is::<NothingToCompact>());
 }
 
+/// A forced compaction of a few short turns cannot shrink anything. It must decline without a
+/// summary model call and report `Unprofitable`, which manual callers turn into "unchanged".
+#[test]
+fn forced_compaction_of_tiny_history_declines_without_a_summary_call() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let request = Chat {
+        messages: vec![
+            json!({"role":"system","content":"system"}),
+            json!({"role":"user","content":"Remember: the goal is ORCHID-739."}),
+            json!({"role":"assistant","content":"Understood."}),
+            json!({"role":"user","content":"Why does the distractor not replace it?"}),
+            json!({"role":"assistant","content":"It is archival data."}),
+            json!({"role":"user","content":"Complete the goal now."}),
+        ],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let result = compact_history(
+        &mut compaction_backend(),
+        HistoryCompaction {
+            request: &request,
+            policy: &CompactionConfig::default(),
+            context: CompactionContext {
+                identity: CompactionIdentity {
+                    provider: "endpoint",
+                    model: "summarizer",
+                    agent: None,
+                },
+                window: 32_768,
+                summary_window: 200_000,
+                summary_output_limit: Some(1_000),
+                timeout_secs: 5,
+                user_dir: user_dir.path(),
+                native_request: None,
+                retained_overhead_tokens: 0,
+                supplemental_context: None,
+            },
+            options: &CompactionOptions {
+                keep_recent_tokens: Some(0),
+                ..Default::default()
+            },
+        },
+        Arc::new(AtomicBool::new(false)),
+        &mut crate::agent::NullUi,
+        &mut |_, _, _| panic!("too little history to shrink must not request a summary"),
+        None,
+    );
+    let error = result.err().unwrap();
+    assert!(error.is::<Unprofitable>(), "{error:#}");
+}
+
 fn compaction_backend() -> Backend {
     Backend::new(
         crate::llm::provider::ProviderKind::Endpoint {
