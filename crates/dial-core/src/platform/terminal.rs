@@ -276,5 +276,41 @@ impl Drop for Signals {
     }
 }
 
+/// Wait up to `timeout` for a terminal descriptor to have input. `None` when it is not a terminal.
+/// A hung-up terminal is an error: its reads return end-of-file forever, so readers must stop.
+pub fn input_ready(input: &impl AsRawFd, timeout: std::time::Duration) -> io::Result<Option<bool>> {
+    let closed = || io::Error::new(io::ErrorKind::BrokenPipe, "terminal input closed");
+    let fd = input.as_raw_fd();
+    // SAFETY: isatty only inspects the descriptor.
+    if unsafe { libc::isatty(fd) } != 1 {
+        // Linux answers terminal ioctls on a hung-up terminal with EIO.
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::EIO) {
+            Err(closed())
+        } else {
+            Ok(None)
+        };
+    }
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: one valid pollfd, bounded timeout.
+    if unsafe { libc::poll(&mut pollfd, 1, millis) } == -1 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(Some(false))
+        } else {
+            Err(error)
+        };
+    }
+    if pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Err(closed());
+    }
+    Ok(Some(pollfd.revents & libc::POLLIN != 0))
+}
+
 #[cfg(test)]
 mod tests;

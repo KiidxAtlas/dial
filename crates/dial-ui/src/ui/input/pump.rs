@@ -23,6 +23,9 @@ use crossterm::event::{self, Event};
 pub const CAPACITY: usize = 1024;
 /// Longest one poll blocks before the reader checks for a stop request.
 const TICK: Duration = Duration::from_millis(20);
+/// Shortest crossterm poll: its terminal source reads input only while a poll has time left.
+#[cfg(unix)]
+const MIN_POLL: Duration = Duration::from_millis(1);
 
 /// Where events come from. The pump's reader thread owns one; `poll`/`read` fall back to one
 /// when the pump is stopped.
@@ -36,10 +39,22 @@ pub struct CrosstermEvents;
 
 impl EventSource for CrosstermEvents {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        // crossterm reads the terminal through level-triggered poll(2) (`use-dev-tty`), so a
+        // poll ends at its timeout even on a hung-up terminal, whose reads return end-of-file
+        // forever. Report the hang-up here so the reader ends instead of polling a dead terminal.
+        #[cfg(unix)]
+        {
+            crate::platform::terminal::input_ready(&io::stdin(), Duration::ZERO)?;
+            // That source never inspects input during a zero timeout.
+            event::poll(timeout.max(MIN_POLL))
+        }
+        #[cfg(not(unix))]
         event::poll(timeout)
     }
 
     fn read(&mut self) -> io::Result<Event> {
+        // Block through `poll` so a hang-up is reported rather than waited on forever.
+        while !self.poll(TICK)? {}
         event::read()
     }
 }

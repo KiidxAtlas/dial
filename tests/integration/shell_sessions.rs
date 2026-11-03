@@ -1,11 +1,18 @@
 //! Named `bash` sessions moved to a background job, run through the real embedded shell host.
 //! The host is the `dial` binary itself, so this behavior is only observable end to end.
+#[cfg(unix)]
 use dial::config::types::{Config, ShellBackend};
+#[cfg(unix)]
 use dial::tools::Workspace;
+#[cfg(unix)]
 use dial::tools::exec::background::AdoptedJob;
+#[cfg(unix)]
 use dial::tools::exec::shell::{ForegroundJob, bash_tool_streaming_with_adopter};
+#[cfg(unix)]
 use dial::tools::integrations::ext::ToolContext;
+#[cfg(unix)]
 use serde_json::json;
+#[cfg(unix)]
 use std::sync::atomic::AtomicBool;
 
 #[cfg(unix)]

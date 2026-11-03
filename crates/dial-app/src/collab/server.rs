@@ -175,6 +175,20 @@ impl Drop for Membership {
 fn would_block(error: &tungstenite::Error) -> bool {
     matches!(error, tungstenite::Error::Io(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted))
 }
+/// The peer is gone: a completed close, or a socket the other side dropped without one. Either way
+/// the connection has ended normally from the relay's view; membership cleanup still runs.
+fn peer_gone(error: &tungstenite::Error) -> bool {
+    match error {
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => true,
+        tungstenite::Error::Io(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+        ),
+        _ => false,
+    }
+}
 /// Handshake callback that records the requested room and role. A named `Callback` impl rather
 /// than a closure, because the trait fixes the large `ErrorResponse` error type.
 struct HandshakeRecorder {
@@ -317,7 +331,7 @@ fn peer(stream: TcpStream, rooms: Rooms, next_peer: Arc<AtomicU32>) -> Result<()
                 );
                 // Still read incoming control frames; do not enqueue more output until flushed.
             }
-            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
+            Err(error) if peer_gone(&error) => break,
             Err(error) => return Err(error.into()),
         }
         if blocked_since.is_none() && !closing {
@@ -337,9 +351,7 @@ fn peer(stream: TcpStream, rooms: Rooms, next_peer: Arc<AtomicU32>) -> Result<()
                         blocked_since.get_or_insert_with(Instant::now);
                         break;
                     }
-                    Err(
-                        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed,
-                    ) => return Ok(()),
+                    Err(error) if peer_gone(&error) => return Ok(()),
                     Err(error) => return Err(error.into()),
                 }
                 if closing {
@@ -404,7 +416,7 @@ fn peer(stream: TcpStream, rooms: Rooms, next_peer: Arc<AtomicU32>) -> Result<()
                 );
                 thread::sleep(POLL);
             }
-            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
+            Err(error) if peer_gone(&error) => break,
             Err(error) => return Err(error.into()),
         }
     }

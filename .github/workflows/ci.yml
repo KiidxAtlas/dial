@@ -254,7 +254,9 @@ jobs:
 
   linux-features:
     name: Linux feature powerset
-    runs-on: ubuntu-22.04
+    # libspa 0.9 needs PipeWire headers newer than Ubuntu 22.04's 0.3.48 (spa_video_info_raw.flags,
+    # u64 modifier); compile the PipeWire combinations against Ubuntu 24.04's PipeWire 1.0.
+    runs-on: ${{ matrix.wayland && 'ubuntu-24.04' || 'ubuntu-22.04' }}
     strategy:
       fail-fast: false
       matrix:

@@ -286,7 +286,9 @@ prompt resolves its weights; a missing default MLX runtime gets an installation 
 The release workflow runs on pushed `v*` tags and requires the tag to match
 `Cargo.toml`'s version. `scripts/release.sh <version>` prepares the release from a clean `main`.
 It first refuses unless `HEAD` matches `origin/main` and a `CI` run on that commit succeeded (it
-asks `gh`), so a tag is never placed on code CI has not passed. It then sets
+asks `gh`), so a tag is never placed on code CI has not passed; when it refuses, it lists every
+failed job of the latest run with its link, and the release workflow's gate does the same as
+annotations, so all blockers are visible in one pass. It then sets
 `[workspace.package] version`, refreshes `Cargo.lock` for workspace members only, moves the
 `## [Unreleased]` changelog entries under a dated version heading (refusing an empty section), runs
 `scripts/preflight.sh --quick` on the bumped tree (skip with `--no-check`), commits

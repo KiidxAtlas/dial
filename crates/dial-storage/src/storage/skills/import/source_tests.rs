@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(unix)]
 #[test]
 fn bulk_import_reports_invalid_skills_and_preserves_source_identity() {
     let project = tempfile::tempdir().unwrap();

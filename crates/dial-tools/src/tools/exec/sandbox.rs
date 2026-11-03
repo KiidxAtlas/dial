@@ -803,7 +803,7 @@ const DEV_DENIED_MACH: &[&str] = &[
 /// rule given via a symlinked or `..` path enforceable, since sandbox rules
 /// match resolved paths.
 pub(crate) fn resolve(path: &Path) -> Result<PathBuf, String> {
-    quote(path)?; // absolute, UTF-8, no quote/backslash/control characters
+    expressible(path)?;
     let mut existing = path.to_path_buf();
     let mut tail: Vec<OsString> = Vec::new();
     let mut base = loop {
@@ -821,8 +821,32 @@ pub(crate) fn resolve(path: &Path) -> Result<PathBuf, String> {
         }
     };
     base.extend(tail.iter().rev());
-    quote(&base)?;
+    expressible(&base)?;
     Ok(base)
+}
+
+/// Require a path that a sandbox rule can express: absolute and UTF-8 everywhere, and on platforms
+/// that generate a quoted profile, free of quote, backslash and control characters. Windows has no
+/// command-sandbox profile, and its native separator is a backslash, so only the portable checks
+/// apply there; Git metadata protection still resolves Windows paths through this function.
+fn expressible(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let text = path
+            .to_str()
+            .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))?;
+        if !path.is_absolute() {
+            return Err(format!("sandbox path must be absolute: {text}"));
+        }
+        if text.chars().any(|c| c == '"' || c.is_control()) {
+            return Err(format!(
+                "sandbox path contains a quote or control character: {text:?}"
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    quote(path).map(drop)
 }
 
 /// Generate the Dev sandbox profile. `workspace` must exist; `deny_read` and

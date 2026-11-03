@@ -247,3 +247,20 @@ fn termination_signals_are_scoped_and_restore_previous_handlers() {
         "signal child exited={exited}: {output:?}"
     );
 }
+
+#[test]
+fn input_ready_reports_terminal_input_and_refuses_a_hung_up_terminal() {
+    let not_terminal = File::open("/dev/null").unwrap();
+    assert_eq!(input_ready(&not_terminal, Duration::ZERO).unwrap(), None);
+
+    let (mut master, slave) = open(24, 80).unwrap();
+    assert_eq!(input_ready(&slave, Duration::ZERO).unwrap(), Some(false));
+    master.write_all(b"line\n").unwrap();
+    assert_eq!(
+        input_ready(&slave, Duration::from_secs(5)).unwrap(),
+        Some(true)
+    );
+    drop(master);
+    let error = input_ready(&slave, Duration::from_secs(5)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+}
