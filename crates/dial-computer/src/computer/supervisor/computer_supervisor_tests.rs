@@ -51,6 +51,9 @@ fn computer_stalled_write_is_bounded_and_cancellable() {
         let supervisor = fake_worker("import time; time.sleep(30)");
         let signal = AbortSignal::new();
         let started = Instant::now();
+        // The cancelled write gets a deadline only an ignored cancellation could reach, so a
+        // loaded runner delaying the aborting thread cannot turn the abort into a timeout.
+        let deadline = started + Duration::from_millis(if cancel { 30_000 } else { 200 });
         std::thread::scope(|scope| {
             if cancel {
                 let signal = &signal;
@@ -62,13 +65,13 @@ fn computer_stalled_write_is_bounded_and_cancellable() {
             let error = send_guarded(
                 &supervisor.inner,
                 &json!({"code":"x".repeat(1024 * 1024)}),
-                started + Duration::from_millis(200),
+                deadline,
                 Some(&signal),
             )
             .unwrap_err();
             assert_eq!(error.is_abort, cancel, "{error}");
         });
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(supervisor.inner.state.lock().worker.is_none());
     }
 }

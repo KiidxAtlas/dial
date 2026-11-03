@@ -416,13 +416,15 @@ fn codex_watchdog_retry(cancel: bool) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let server_finished = Arc::clone(&finished);
     let server = std::thread::spawn(move || {
         let (mut first, _) = listener.accept().unwrap();
         let original = read_http_request(&mut first);
         started_tx.send(()).unwrap();
-        // A silent upgrade, not a rejected upgrade: only the agent watchdog can recover it, and
-        // recovering it closes this connection. The close is awaited apart from the retry, with a
-        // bound well past the 1 s watchdog: a loaded parallel suite can delay it for seconds.
+        // A silent upgrade, not a rejected upgrade: only a timeout can recover it, and recovering
+        // it closes this connection. The close is awaited apart from the retry, with a bound well
+        // past the watchdog: a loaded parallel suite can delay it for seconds.
         let closed = std::thread::spawn(move || {
             first
                 .set_read_timeout(Some(Duration::from_secs(60)))
@@ -435,10 +437,11 @@ fn codex_watchdog_retry(cancel: bool) {
                 closed.join().unwrap().unwrap(),
                 "stalled upgrade was not closed"
             );
-            return (original, None);
+            return (original, Vec::new());
         }
-        let (mut second, _) = listener.accept().unwrap();
-        let retried = read_http_request(&mut second);
+        // On a remote route the watchdog limit equals the transport limit that also bounds the
+        // WebSocket setup, so either may expire first: the setup budget's HTTP fallback can itself
+        // be cancelled and retried by the watchdog. Serve every follow-up until the turn ends.
         let body = format!(
             "data: {}\n\n",
             json!({"type":"response.completed","response":{
@@ -446,12 +449,25 @@ fn codex_watchdog_retry(cancel: bool) {
                 "role":"assistant","content":[{"type":"output_text","text":"recovered"}]}]
             }})
         );
-        write!(second, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut retries = Vec::new();
+        loop {
+            let (mut next, _) = listener.accept().unwrap();
+            if server_finished.load(Ordering::SeqCst) {
+                break;
+            }
+            retries.push(read_http_request(&mut next));
+            // A follow-up the watchdog already cancelled may have closed its end.
+            let _ = write!(
+                next,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
         assert!(
             closed.join().unwrap().unwrap(),
             "stalled upgrade was not closed"
         );
-        (original, Some(retried))
+        (original, retries)
     });
     let dir = tempfile::tempdir().unwrap();
     llm::chatgpt::test_account(dir.path(), false);
@@ -498,7 +514,10 @@ fn codex_watchdog_retry(cancel: bool) {
             }
         },
     );
-    let (original, retried) = server.join().unwrap();
+    finished.store(true, Ordering::SeqCst);
+    // Wake the follow-up loop; after a cancelled turn the listener may already be gone.
+    let _ = std::net::TcpStream::connect(address);
+    let (original, retries) = server.join().unwrap();
     assert!(llm::fake::request_line(&original).starts_with("GET "));
     if cancel {
         assert!(
@@ -507,22 +526,24 @@ fn codex_watchdog_retry(cancel: bool) {
                 .downcast_ref::<llm::Interrupted>()
                 .is_some()
         );
-        assert!(retried.is_none(), "user cancellation must not retry");
+        assert!(retries.is_empty(), "user cancellation must not retry");
         assert!(
             backend.live_steering_key().is_some(),
             "user cancellation must not disable WebSocket"
         );
         return;
     }
-    let retried = retried.unwrap();
-    assert!(
-        llm::fake::request_line(&retried).starts_with("POST "),
-        "a watchdog retry must not repeat the stalled WebSocket upgrade"
-    );
-    assert_eq!(
-        llm::fake::body(&retried)["input"],
-        json!([{"role":"user","content":"resume this task"}])
-    );
+    assert!(!retries.is_empty(), "the stalled upgrade was never retried");
+    for retried in &retries {
+        assert!(
+            llm::fake::request_line(retried).starts_with("POST "),
+            "a watchdog retry must not repeat the stalled WebSocket upgrade"
+        );
+        assert_eq!(
+            llm::fake::body(retried)["input"],
+            json!([{"role":"user","content":"resume this task"}])
+        );
+    }
     assert_eq!(reply.unwrap().text, "recovered");
 }
 
