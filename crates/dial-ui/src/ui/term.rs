@@ -1081,6 +1081,8 @@ struct OverlayBackend<W: Write> {
 }
 
 impl<W: Write> Backend for OverlayBackend<W> {
+    type Error = io::Error;
+
     fn draw<'b, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'b Cell)>,

@@ -107,9 +107,7 @@ pub(super) fn xml(
             .map_err(|e| format!("malformed document XML: {e}"))?
         {
             Event::Start(start) => {
-                let name = std::str::from_utf8(start.local_name().as_ref())
-                    .map_err(|_| "non-UTF8 document element")?
-                    .to_string();
+                let name = start.local_name().as_ref().to_string();
                 if depth == 0 {
                     roots += 1;
                     if roots != 1 || name != root {
@@ -123,14 +121,9 @@ pub(super) fn xml(
                 let mut attributes = Vec::new();
                 for attr in start.attributes() {
                     let attr = attr.map_err(|e| format!("malformed document attribute: {e}"))?;
-                    let name = std::str::from_utf8(attr.key.as_ref())
-                        .map_err(|_| "non-UTF8 document attribute")?
-                        .to_string();
+                    let name = attr.key.as_ref().to_string();
                     let value = attr
-                        .decoded_and_normalized_value(
-                            quick_xml::XmlVersion::Implicit1_0,
-                            reader.decoder(),
-                        )
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map_err(|e| format!("invalid document attribute entity: {e}"))?
                         .into_owned();
                     attributes.push((name, value));
@@ -139,16 +132,11 @@ pub(super) fn xml(
             }
             Event::End(end) => {
                 depth = depth.checked_sub(1).ok_or("unbalanced document XML")?;
-                let name = std::str::from_utf8(end.local_name().as_ref())
-                    .map_err(|_| "non-UTF8 document element")?
-                    .to_string();
+                let name = end.local_name().as_ref().to_string();
                 visit(Xml::End(name))?;
             }
             Event::Text(value) => {
-                let decoded = value
-                    .decode()
-                    .map_err(|e| format!("invalid document text: {e}"))?;
-                let value = quick_xml::escape::unescape(&decoded)
+                let value = quick_xml::escape::unescape(&value)
                     .map_err(|e| format!("unsupported document entity: {e}"))?
                     .into_owned();
                 if depth == 0 && !value.trim().is_empty() {
@@ -160,27 +148,19 @@ pub(super) fn xml(
                 if depth == 0 {
                     return Err("document CDATA outside root".into());
                 }
-                visit(Xml::Text(
-                    value
-                        .decode()
-                        .map_err(|e| format!("invalid document CDATA: {e}"))?
-                        .into_owned(),
-                ))?;
+                visit(Xml::Text(value.into_inner().into_owned()))?;
             }
             Event::GeneralRef(value) => {
                 if depth == 0 {
                     return Err("document entity outside root".into());
                 }
-                let name = value
-                    .decode()
-                    .map_err(|e| format!("invalid document entity: {e}"))?;
-                let entity = format!("&{name};");
+                let entity = format!("&{};", &*value);
                 let decoded = quick_xml::escape::unescape(&entity)
                     .map_err(|e| format!("unsupported document entity: {e}"))?;
                 visit(Xml::Text(decoded.into_owned()))?;
             }
             Event::DocType(value) => {
-                if value.contains(&b'[') {
+                if value.contains('[') {
                     return Err("document DTDs and external entities are forbidden".into());
                 }
             }
