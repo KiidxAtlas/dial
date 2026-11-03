@@ -103,7 +103,9 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   Docker build-push v7 / login v4 actions.
 - CI's Linux feature-powerset jobs share one Rust cache per runner image instead of one per
   combination (32 entries, ~6.5 GB of the 10 GB quota), so the macOS test caches are no longer
-  evicted and the macos-15-intel job stops rebuilding every dependency from scratch.
+  evicted and the macos-15-intel job stops rebuilding every dependency from scratch. The Intel
+  job now runs format, build and the full test suite only; installed-binary smoke, terminal
+  lifecycle, slim build and runtime-overhead steps run on macos-15 and Ubuntu.
 
 ### Added
 

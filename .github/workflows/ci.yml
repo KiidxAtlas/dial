@@ -98,14 +98,21 @@ jobs:
         # fails a test still running after 5 minutes); `cargo test` ran the binaries one after
         # another. Doctests still run under `cargo test --doc`.
         run: make test-nextest TEST_PROFILE=ci
+      # The steps below exercise the installed binary, real terminals and runtime overhead. They
+      # are not architecture-sensitive and macos-15 runs them; skipping them on the slower Intel
+      # runner keeps it from being the CI long pole. Intel still builds and runs every test above,
+      # and the release workflow builds and smoke-tests the packaged x86_64-apple-darwin archive.
       - name: Check slim build
+        if: matrix.os != 'macos-15-intel'
         run: cargo check --locked --profile ci --no-default-features -p dial --bin dial
       - name: Install executable and verify artifact contracts
+        if: matrix.os != 'macos-15-intel'
         timeout-minutes: 10
         run: |
           cargo install --locked --path . --profile ci --root target/installed
           make test-smoke DIAL=target/installed/bin/dial
       - name: Real terminal and crash lifecycle
+        if: matrix.os != 'macos-15-intel'
         timeout-minutes: 10
         run: |
           python3 examples/benchmarks/interactive_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/main
@@ -113,16 +120,17 @@ jobs:
           python3 examples/benchmarks/session_contention_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/contention
           python3 examples/benchmarks/side_lifecycle_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/side-lifecycle
       - name: Record runtime overhead
+        if: matrix.os != 'macos-15-intel'
         continue-on-error: true
         run: cargo run --locked --profile ci --example runtime_baseline -- target/runtime-baseline.json
       - name: Preserve runtime baseline
-        if: always()
+        if: always() && matrix.os != 'macos-15-intel'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runtime-baseline-${{ matrix.os }}
           path: target/runtime-baseline.json
       - name: Preserve terminal failure evidence
-        if: failure()
+        if: failure() && matrix.os != 'macos-15-intel'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terminal-${{ matrix.os }}
