@@ -314,7 +314,13 @@ impl<'a> Agent<'a> {
         // Cargo build output is scoped per session so concurrent sessions do not share one target lock.
         let workspace = workspace.with_cargo_session(session.id());
         {
-            // Finished sessions' build output is removed in the background once it goes stale.
+            // A new session takes over an idle earlier session's build output (one rename) so its
+            // first build is incremental; output that has gone stale is removed in the background.
+            crate::tools::exec::cargo_target::adopt_idle(
+                workspace.root(),
+                session.id(),
+                crate::tools::exec::cargo_target::ADOPT_AFTER,
+            );
             let root = workspace.root().to_path_buf();
             let keep = session.id().to_owned();
             let _ = std::thread::Builder::new()

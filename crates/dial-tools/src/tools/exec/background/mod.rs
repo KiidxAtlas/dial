@@ -793,9 +793,37 @@ fn take_presented(
         ));
         return (body, 0, integrity);
     }
-    let (body, lost) = take_unread(snap);
+    let (mut body, lost) = take_unread(snap);
     let integrity = output_integrity(snap, &body, lost, tail);
+    if !body.is_empty()
+        && let Some(digest) = failed_job_digest(snap)
+        && !digest.lines().all(|line| body.contains(line))
+    {
+        // A capped read keeps only the newest output, so a failed build's first error may be gone
+        // from this view while the ring still holds it.
+        body.insert_str(
+            0,
+            &format!("[failure digest: first error lines; the newest output follows]\n{digest}[end of digest]\n"),
+        );
+    }
     (body, lost, integrity)
+}
+
+/// The first error lines of a pipe job that exited unsuccessfully, from everything the ring
+/// still retains; `None` while it runs, after success, or for unrecognized commands.
+fn failed_job_digest(snap: &Snapshot) -> Option<String> {
+    let State::Exited {
+        status: Some(status),
+        ..
+    } = &snap.state
+    else {
+        return None;
+    };
+    if snap.terminal || status.success() {
+        return None;
+    }
+    let (bytes, _) = lock(&snap.ring).since(0);
+    super::minimizer::failure_digest_of_unseen(&snap.command, &String::from_utf8_lossy(&bytes))
 }
 
 /// Shared by explicit reads and completion notices. Never classify a delta or reread an artifact;

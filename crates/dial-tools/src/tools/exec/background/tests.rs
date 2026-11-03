@@ -1698,3 +1698,37 @@ fn a_character_split_across_reads_is_delivered_whole() {
     let ring = lock(&snapshot.ring);
     assert_eq!(ring.cursor, ring.total);
 }
+
+#[test]
+fn a_failed_job_whose_first_error_scrolled_out_of_the_read_gets_a_digest() {
+    use std::os::unix::process::ExitStatusExt;
+    let (_dir, ws) = open_workspace();
+    let mut snap = minimizer_snapshot();
+    {
+        let mut ring = lock(&snap.ring);
+        *ring = Ring::new(MAX_BUFFER);
+        ring.push(b"error[E0425]: cannot find value `x` in this scope\n  --> src/lib.rs:3:5\n");
+        ring.push("   Compiling dependency v1.0.0\n".repeat(3000).as_bytes());
+        ring.push(b"error: could not compile `demo`\n");
+        ring.closed = true;
+        ring.reached_eof = true;
+    }
+    snap.state = State::Exited {
+        at: Instant::now(),
+        detail: "exit code 101".into(),
+        status: Some(std::process::ExitStatus::from_raw(101 << 8)),
+    };
+    let (body, _, _) = take_presented(&ws, &snap, None);
+    assert!(body.starts_with("[failure digest"), "{}", &body[..200]);
+    assert!(body.contains("error[E0425]: cannot find value `x`"));
+    assert!(body.contains("--> src/lib.rs:3:5"));
+    // Nothing new to read: no repeated digest.
+    let (again, _, _) = take_presented(&ws, &snap, None);
+    assert!(again.is_empty());
+
+    // A successful job never gets one.
+    let mut ok = minimizer_snapshot();
+    ok.command = "cargo build".into();
+    let (body, _, _) = take_presented(&ws, &ok, None);
+    assert!(!body.contains("[failure digest"));
+}

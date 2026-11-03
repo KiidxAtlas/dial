@@ -328,6 +328,10 @@ impl Agent<'_> {
         let is_pointer = duplicate
             .as_deref()
             .is_some_and(crate::agent::workflow::investigation::is_unchanged_read);
+        if is_pointer {
+            // An unchanged re-read is not an intervention, but it is still a repeated call.
+            self.record(step, "repeated_call", json!({"name":call.name}))?;
+        }
         if is_duplicate && !is_pointer {
             self.record(step, "investigation_gate", json!({"name":call.name}))?;
             ui.diagnostic(&format!("Recovery checkpoint: unchanged observation in this `{}` call; it is withheld while corrected arguments and narrower evidence remain available.", call.name));

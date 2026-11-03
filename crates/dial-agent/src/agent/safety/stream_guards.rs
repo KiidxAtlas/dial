@@ -250,6 +250,46 @@ pub(crate) fn render_tool_call_loop_escalation(
 }
 
 /// Renders the synthetic result of an identical repeat that was not executed.
+/// Advice for a model repeating one call or cycling through a few: an event line for the UI and
+/// the guidance text to send. A streak past [`TOOL_CALL_LOOP_THRESHOLD`] gets the stronger
+/// escalation. Shared by the main loop and child workers so both see the same redirect.
+pub(crate) fn repetition_guidance(messages: &[serde_json::Value]) -> Option<(String, String)> {
+    if let Some(repeat) = crate::agent::safety::guard::RepeatedToolCall::detect(
+        messages,
+        TOOL_CALL_LOOP_THRESHOLD,
+        TOOL_CALL_LOOP_EXEMPT_TOOLS,
+    ) {
+        let render = if repeat.count > TOOL_CALL_LOOP_THRESHOLD {
+            render_tool_call_loop_escalation
+        } else {
+            render_tool_call_loop_redirect
+        };
+        return Some((
+            format!(
+                "Repeated tool call {}x; redirecting the model",
+                repeat.count
+            ),
+            render(
+                &repeat.tool_name,
+                repeat.count,
+                &repeat.arguments_summary,
+                &repeat.result_summary,
+            ),
+        ));
+    }
+    crate::agent::safety::guard::CallCycle::detect(messages, TOOL_CALL_LOOP_EXEMPT_TOOLS).map(
+        |cycle| {
+            (
+                format!(
+                    "Tool calls cycling with period {}; redirecting the model",
+                    cycle.period
+                ),
+                cycle.guidance(),
+            )
+        },
+    )
+}
+
 pub(crate) fn render_duplicate_call_result(
     tool_name: &str,
     earlier_id: &str,

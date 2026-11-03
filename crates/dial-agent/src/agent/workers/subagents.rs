@@ -328,10 +328,12 @@ pub fn schema(config: &Config) -> Value {
             json!({"type":"array","maxItems":MAX_BATCH,"items":entry,"description":"Independent tasks instead of `task`; each needs task and solution_space."}),
         ),
     ]);
-    properties.insert(
-        "acceptance_checks".into(),
-        entry_properties["acceptance_checks"].clone(),
-    );
+    properties.insert("acceptance_checks".into(), {
+        // Same contract shape as the batch field; the full description is not repeated.
+        let mut single = entry_properties["acceptance_checks"].clone();
+        single["description"] = json!("Single task: as tasks[].acceptance_checks.");
+        single
+    });
     properties.insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session id prefix or worker id whose record is read; other agents reject it."}));
     properties.insert("model".into(), json!({"type":"string","description":"seance only: answering model (default the source session's, else the main model); other agents reject it."}));
     if config.experimental.work_packet_contracts {

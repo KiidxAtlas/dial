@@ -115,3 +115,34 @@ fn marking_never_creates_a_missing_target_directory() {
     mark_used(&dir);
     assert!(!dir.exists());
 }
+
+#[test]
+fn a_new_session_adopts_the_most_recent_idle_directory_but_not_a_busy_one() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    for session in ["older", "newer", "building"] {
+        std::fs::create_dir_all(dir_for(root, session).join("debug")).unwrap();
+        mark_used(&dir_for(root, session));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(dir_for(root, "newer").join("debug/artifact"), b"warm").unwrap();
+    // A Cargo build holds the lock in the most recently used directory.
+    let lock = std::fs::File::create(dir_for(root, "building").join("debug/.cargo-lock")).unwrap();
+    lock.lock().unwrap();
+
+    // Not idle long enough yet.
+    assert_eq!(adopt_idle(root, "fresh", Duration::from_secs(3600)), None);
+
+    let adopted = adopt_idle(root, "fresh", Duration::ZERO);
+    assert_eq!(adopted, Some(dir_for(root, "newer")));
+    assert!(dir_for(root, "fresh").join("debug/artifact").is_file());
+    assert!(!dir_for(root, "newer").exists());
+    assert!(dir_for(root, "building").is_dir());
+    assert!(dir_for(root, "older").is_dir());
+
+    // A session that already has a directory keeps it.
+    assert_eq!(adopt_idle(root, "fresh", Duration::ZERO), None);
+    // A busy directory is never pruned either.
+    assert!(!prune_stale(root, "fresh", Duration::ZERO).contains(&dir_for(root, "building")));
+    drop(lock);
+}

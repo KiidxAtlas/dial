@@ -493,6 +493,16 @@ pattern!(LOCATION, r"^\s*--> \S+:\d+(:\d+)?\s*$");
 /// whose first error sits far below the start. `None` for other commands, short outputs, an
 /// error already near the top, or no recognizable error line.
 pub fn failure_digest(command: &str, text: &str) -> Option<String> {
+    digest_from(command, text, DIGEST_VISIBLE_BYTES)
+}
+
+/// Like [`failure_digest`], for a reader that does not see the start of `text` (a capped tail
+/// view of a background job), so an error near the start still needs a digest.
+pub fn failure_digest_of_unseen(command: &str, text: &str) -> Option<String> {
+    digest_from(command, text, 0)
+}
+
+fn digest_from(command: &str, text: &str, visible: usize) -> Option<String> {
     if text.len() < DIGEST_MIN_BYTES {
         return None;
     }
@@ -521,7 +531,7 @@ pub fn failure_digest(command: &str, text: &str) -> Option<String> {
             break;
         }
     }
-    (first? >= DIGEST_VISIBLE_BYTES).then_some(digest)
+    (first? >= visible).then_some(digest)
 }
 
 /// The conventional meaning of a nonzero exit `code` that printed nothing, for simple commands

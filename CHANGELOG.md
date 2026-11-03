@@ -49,14 +49,21 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   failed automatic attempt is not rerun at the start of every new turn. The `continued-session`
   efficiency benchmark now has enough earlier history for its forced compaction to shrink.
 - Background job output no longer splits a multi-byte character across two reads.
+- A background job that fails shows a digest of its first error lines when its earliest output
+  has scrolled out of the capped read (`docs/shell.md`).
+- Child workers get the same repeated-call and call-cycle redirect as the main loop, and the
+  `repeated_calls` workflow metric now also counts unchanged re-reads and loop-guard short circuits.
 
 ### Changed
 
 - The shell output minimizer also filters outputs longer than the inline head-and-tail view, using
   the complete copy in the output artifact, and recognises `cd DIR && <command>` sequences,
   `pip`/`uv` installs and `jest`/`vitest` runs (`docs/shell.md`).
-- Per-session Cargo target directories unused for seven days are deleted in the background when a
-  session starts (`docs/shell.md`).
+- A new session takes over the most recently used Cargo target directory idle for 30 minutes, so
+  its first build is incremental, and directories unused for seven days are deleted in the
+  background; directories locked by a running Cargo build are left alone (`docs/shell.md`).
+- The single-task `acceptance_checks` description of the `task` tool no longer repeats the batch
+  description, trimming every request's tool schemas.
 - Unhinted provider retry backoff doubles up to 60 seconds per attempt instead of up to
   `retry.max_delay_secs`; server hints and quota waits keep the configured bound
   (`docs/llm-transport.md`).

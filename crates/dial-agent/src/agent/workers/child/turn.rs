@@ -524,6 +524,21 @@ impl<'a> ChildTurn<'a> {
         if let Some(guidance) = self.rule_catalog.guidance(rule_state, &self.rule_agent) {
             self.messages.push(guidance);
         }
+        // Workers get the same repeated-call and cycle redirect as the main loop. The note is
+        // replaced each step so a stale redirect does not outlive the repetition.
+        self.messages
+            .retain(|message| message["dial_repetition_guard"] != true);
+        if let Some((event, guidance)) =
+            crate::agent::safety::stream_guards::repetition_guidance(&self.messages)
+        {
+            approver.notice(&event);
+            let mut note = crate::agent::run::guidance::note(
+                crate::agent::run::guidance::Priority::Repetition,
+                guidance,
+            );
+            note["dial_repetition_guard"] = json!(true);
+            self.messages.push(note);
+        }
         // The last allowed request is a reserved summary step. Schemas may remain for provider
         // history compatibility, but the response must not dispatch tools (enforced below).
         let summary_step = self.budget != 0 && self.steps + 1 == self.budget;

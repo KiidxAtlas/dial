@@ -8,7 +8,8 @@
 //!
 //! Each export touches a marker in the directory. Directories of other sessions whose marker is
 //! older than [`STALE_AFTER`] are deleted by [`prune_stale`], so finished sessions do not leave
-//! build output behind indefinitely.
+//! build output behind indefinitely. A new session first adopts the most recently used idle
+//! directory ([`adopt_idle`]) so its first build is incremental instead of cold.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,9 @@ const MAX_SESSION_LEN: usize = 128;
 const USED_MARKER: &str = ".dial-last-used";
 /// Session target directories unused for this long are removed.
 pub const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Another session's directory unused for this long, with no Cargo build holding it, may be
+/// taken over by a new session.
+pub const ADOPT_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// Whether a session name is safe to use as one path component.
 pub(crate) fn valid_session(session: &str) -> bool {
@@ -75,9 +79,40 @@ pub(crate) fn mark_used(dir: &Path) {
     }
 }
 
-/// Deletes other sessions' target directories under `root` that have not been used for `stale`.
-/// Returns the removed directories. Errors are ignored: pruning is best effort.
-pub fn prune_stale(root: &Path, keep_session: &str, stale: Duration) -> Vec<PathBuf> {
+/// When `session` has no target directory yet, renames the most recently used directory of another
+/// session that has been idle for at least `idle` and is not locked by a running Cargo build, so
+/// the new session starts with a warm cache. Returns the directory that was adopted.
+pub fn adopt_idle(root: &Path, session: &str, idle: Duration) -> Option<PathBuf> {
+    if !valid_session(session) {
+        return None;
+    }
+    let own = dir_for(root, session);
+    if own.exists() {
+        return None;
+    }
+    let candidate = idle_directories(root, session, idle)
+        .into_iter()
+        .filter(|(path, _)| !cargo_build_running(path))
+        .max_by_key(|(_, used)| *used)?
+        .0;
+    std::fs::rename(&candidate, &own).ok()?;
+    mark_used(&own);
+    Some(candidate)
+}
+
+/// Whether Cargo holds the build lock of any profile directory in `dir`.
+fn cargo_build_running(dir: &Path) -> bool {
+    let Ok(profiles) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    profiles.flatten().any(|profile| {
+        let lock = profile.path().join(".cargo-lock");
+        std::fs::File::open(&lock).is_ok_and(|file| file.try_lock().is_err())
+    })
+}
+
+/// Other sessions' target directories unused for at least `idle`, with their last-use time.
+fn idle_directories(root: &Path, keep_session: &str, idle: Duration) -> Vec<(PathBuf, SystemTime)> {
     let base = root
         .join(crate::workspace_copy::SCRATCH_DIR)
         .join(TARGET_ROOT);
@@ -85,29 +120,38 @@ pub fn prune_stale(root: &Path, keep_session: &str, stale: Duration) -> Vec<Path
         return Vec::new();
     };
     let now = SystemTime::now();
-    let mut removed = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name == keep_session || !valid_session(name) {
-            continue;
-        }
-        let path = entry.path();
-        // Never follow a link out of the scratch directory.
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let used = std::fs::metadata(path.join(USED_MARKER))
-            .or_else(|_| std::fs::metadata(&path))
-            .and_then(|meta| meta.modified());
-        let Ok(used) = used else { continue };
-        if now.duration_since(used).is_ok_and(|age| age >= stale)
-            && std::fs::remove_dir_all(&path).is_ok()
-        {
-            removed.push(path);
-        }
-    }
-    removed
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            // Never follow a link out of the scratch directory.
+            if name == keep_session
+                || !valid_session(name)
+                || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                return None;
+            }
+            let path = entry.path();
+            let used = std::fs::metadata(path.join(USED_MARKER))
+                .or_else(|_| std::fs::metadata(&path))
+                .and_then(|meta| meta.modified())
+                .ok()?;
+            now.duration_since(used)
+                .is_ok_and(|age| age >= idle)
+                .then_some((path, used))
+        })
+        .collect()
+}
+
+/// Deletes other sessions' target directories under `root` that have not been used for `stale`.
+/// Returns the removed directories. Errors are ignored: pruning is best effort.
+pub fn prune_stale(root: &Path, keep_session: &str, stale: Duration) -> Vec<PathBuf> {
+    idle_directories(root, keep_session, stale)
+        .into_iter()
+        .filter(|(path, _)| !cargo_build_running(path) && std::fs::remove_dir_all(path).is_ok())
+        .map(|(path, _)| path)
+        .collect()
 }
 
 #[cfg(test)]
