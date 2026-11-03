@@ -1164,10 +1164,14 @@ def main():
             raise RequestError("request is not valid JSON") from None
         require(isinstance(request, dict), "request must be an object")
         from dial_steering import operation as steering_operation
+        from dial_weights import operation as weights_operation
         operations = {"steering_extract":steering_operation,"steering_evaluate":steering_operation,"steering_import":steering_operation,
                       "steering_bake":steering_operation,"capabilities": capabilities, "generate": generate,
                       "train": train, "sensitivity": sensitivity, "score": score, "adapter_combine": adapter_combine,
-                      "fuse": fuse}
+                      "fuse": fuse, "weights_map": weights_operation, "weights_stats": weights_operation,
+                      "weights_activations": weights_operation, "weights_trace": weights_operation,
+                      "weights_generate": weights_operation, "weights_direction": weights_operation,
+                      "weights_edit": weights_operation}
         operation = request.get("op")
         require(isinstance(operation, str) and operation in operations, "unsupported operation")
         phase = operation
@@ -1175,7 +1179,7 @@ def main():
             result = operations[operation](request)
         sys.stdout.write(json.dumps(result, allow_nan=False) + "\n")
     except Exception as error:
-        detail = str(error) if isinstance(error, RequestError) or type(error).__name__ == "SteeringError" else type(error).__name__
+        detail = str(error) if isinstance(error, RequestError) or type(error).__name__ in ("SteeringError", "WeightsError") else type(error).__name__
         print(f"dial-worker: {phase} failed: {detail}", file=sys.stderr)
         return 1
     return 0

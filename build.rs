@@ -15,6 +15,7 @@ const INPUTS: &[&str] = &[
     "python/dial_server.py",
     "python/dial_steering.py",
     "python/dial_tool_grammar.py",
+    "python/dial_weights.py",
     "python/dial_worker.py",
     "python/laya-requirements.txt",
     "python/pyproject.toml",

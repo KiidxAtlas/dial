@@ -563,6 +563,18 @@ def parse_tool(text, tokenizer):
     except (ValueError,TypeError):return None
 
 
+def contract(case):
+    """Validate a case's optional response checks (required/forbidden text, tool call, syntax)."""
+    require(isinstance(case.get('required',[]),list) and isinstance(case.get('forbidden',[]),list) and all(isinstance(x,str) and 0<len(x)<=1024 for x in case.get('required',[])+case.get('forbidden',[])),'invalid contract checks')
+    require(len(case.get('required',[]))+len(case.get('forbidden',[]))<=32, 'too many response checks')
+    require(type(case.get('python_ast',False))is bool,'invalid syntax check')
+    require(case.get('expected_tool') is None or isinstance(case['expected_tool'],str) and 0<len(case['expected_tool'])<=128,'invalid expected tool')
+    require(isinstance(case.get('required_arguments',[]),list) and len(case.get('required_arguments',[]))<=32 and all(isinstance(x,str) and 0<len(x)<=128 for x in case.get('required_arguments',[])), 'invalid tool argument contract')
+    require(isinstance(case.get('expected_arguments',{}),dict) and len(case.get('expected_arguments',{}))<=32,'invalid exact argument contract')
+    require(case.get('tools') is None or isinstance(case['tools'],list) and len(case['tools'])<=16 and all(isinstance(x,dict) for x in case['tools']), 'invalid evaluation tools')
+    return bool(case.get('required') or case.get('forbidden') or case.get('expected_tool') or case.get('python_ast'))
+
+
 def check_case(case,text,tokenizer):
     required=case.get('required',[]);forbidden=case.get('forbidden',[])
     passed=all(term in text for term in required) and all(term not in text for term in forbidden)
@@ -579,19 +591,31 @@ def check_case(case,text,tokenizer):
     return bool(passed),tool_ok
 
 
-def generate_case(model,tokenizer,case,limit):
+def generate_case(model,tokenizer,case,limit,tail=0):
+    """Greedy answer metrics; finish_reason is 'length' when the token limit cut the answer off.
+
+    tail>0 adds the answer's last tail characters (never the prompt).
+    """
     import mlx.core as mx
     from mlx_lm import stream_generate
     from mlx_lm.sample_utils import make_sampler
     tokens=prompt(tokenizer,case['messages'],tools=case.get('tools'));mx.random.seed(42)
-    begin=time.monotonic();first=None;text='';count=0;tool_complete=None
+    begin=time.monotonic();first=None;text='';count=0;tool_complete=None;finish=None
     for item in stream_generate(model,tokenizer,prompt=tokens,max_tokens=limit,sampler=make_sampler(temp=0.0)):
         if first is None:first=time.monotonic()-begin
-        text+=item.text;count+=1
+        text+=item.text;count+=1;finish=getattr(item,'finish_reason',None) or finish
         if case.get('expected_tool') and tool_complete is None and parse_tool(text,tokenizer):tool_complete=time.monotonic()-begin
     passed,tool_ok=check_case(case,text,tokenizer)
-    words=text.split();repeated=1-len(set(tuple(words[i:i+4]) for i in range(max(0,len(words)-3))))/max(1,len(words)-3) if len(words)>=4 else 0.0
-    return {'passed':passed,'tool_valid':tool_ok,'first_token_secs':first or time.monotonic()-begin,'tool_call_complete_secs':tool_complete,'seconds':time.monotonic()-begin,'tokens':count,'repeat_ratio':repeated}
+    repeated=repeat_ratio(text)
+    result={'passed':passed,'tool_valid':tool_ok,'first_token_secs':first or time.monotonic()-begin,'tool_call_complete_secs':tool_complete,'seconds':time.monotonic()-begin,'tokens':count,'repeat_ratio':repeated,'finish_reason':finish or 'stop'}
+    if tail:result['tail']=text[-tail:]
+    return result
+
+
+def repeat_ratio(text):
+    """Share of repeated word 4-grams: 0 for varied text, near 1 for a loop."""
+    words=text.split()
+    return 1-len(set(tuple(words[i:i+4]) for i in range(max(0,len(words)-3))))/max(1,len(words)-3) if len(words)>=4 else 0.0
 
 
 def evaluate(request):
@@ -602,13 +626,7 @@ def evaluate(request):
     for case in cases:
         msg=messages(case['messages']);require(msg[-1]['role']=='user','evaluation prompt must end with user')
         key=digest(msg);require(key not in bundle['training_prompts'] and key not in seen,'evaluation prompts must be held out and distinct');seen.add(key)
-        require(isinstance(case.get('required',[]),list) and isinstance(case.get('forbidden',[]),list) and all(isinstance(x,str) and 0<len(x)<=1024 for x in case.get('required',[])+case.get('forbidden',[])),'invalid contract checks')
-        require(len(case.get('required',[]))+len(case.get('forbidden',[]))<=32, 'too many response checks')
-        require(type(case.get('python_ast',False))is bool,'invalid syntax check')
-        require(case.get('expected_tool') is None or isinstance(case['expected_tool'],str) and 0<len(case['expected_tool'])<=128,'invalid expected tool')
-        require(isinstance(case.get('required_arguments',[]),list) and len(case.get('required_arguments',[]))<=32 and all(isinstance(x,str) and 0<len(x)<=128 for x in case.get('required_arguments',[])), 'invalid tool argument contract')
-        require(isinstance(case.get('expected_arguments',{}),dict) and len(case.get('expected_arguments',{}))<=32,'invalid exact argument contract')
-        require(case.get('tools') is None or isinstance(case['tools'],list) and len(case['tools'])<=16 and all(isinstance(x,dict) for x in case['tools']), 'invalid evaluation tools')
+        contract(case)
         require(bool(case.get('required')) or bool(case.get('expected_tool')),'each held-out case needs a positive response contract')
     limit=request.get('max_tokens',128);require(type(limit)is int and 1<=limit<=256,'evaluation token limit exceeds budget')
     fingerprint=digest([bundle['id'],cases,request['strength'],limit,bundle['model'],bundle['adapter']]);state=resume(request,fingerprint,{'phase':'evaluating','completed':0,'total':len(cases),'results':[]})

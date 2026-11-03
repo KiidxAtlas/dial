@@ -426,6 +426,98 @@ compute job, and `/improve stop <state_id>` to request cancellation. LoRA suppor
 training, evaluation, activation and confirmed adapter use are separate states. An available or
 verified adapter capability does not mean training has run or that inference used an adapter.
 
+## Weight and activation inspection
+
+Dial can show what is inside the configured local MLX model without changing it. Every surface
+runs the same worker operations and stores the latest result per operation under the project's
+state directory (`weights/`):
+
+| Operation | What it reports | Loads the model |
+|---|---|---|
+| `map` | architecture, tensors, parameters and bytes per layer and component (attention, MLP, norms, embeddings), dtypes and quantization | no (safetensors headers) |
+| `stats` | per-tensor norm, RMS, mean, std, absolute max and outlier ratio; per-layer norms (`--prefix` limits the tensors) | no (lazy reads, quantized weights dequantized in chunks) |
+| `activations` | per-layer contrast between 1–64 matched positive/negative conversations sharing a prompt, with a suggested steering layer | yes |
+| `trace` | answer-loss increase over 1–16 conversations with each layer skipped, or with each attention head of one layer removed (`--heads N`) | yes |
+
+```sh
+dial weights map
+dial weights stats --prefix model.layers.12
+dial weights activations --pairs pairs.json      # [{"positive":[...messages], "negative":[...]}]
+dial weights trace --cases cases.json --heads 12 # [{"messages":[..., {"role":"assistant",...}]}]
+dial weights status                              # stored results; --json for the raw values
+dial weights open                                # loopback dashboard
+```
+
+`dial weights` inspects the configured model; when the saved default is a hosted provider, select
+the local checkpoint with `--provider mlx --model <path or repo>`.
+
+In a session, `/weights` prints the stored results and opens the dashboard, `/weights status` only
+prints them, and `/weights map|stats|activations|trace …` runs the same command as a background job
+(model-loading forms wait for the current turn). The dashboard binds 127.0.0.1 only, refuses other
+`Host` names, shows per-layer heatmaps of parameters, weight RMS, activation contrast and
+sensitivity plus a grid of attention heads, and refreshes while a job runs. `/improve` has a Weights
+tab with the same per-layer bars. The agent can run the operations through the `model_weights` tool
+once it is listed in `integrations`; each call that reads the model needs approval.
+
+Results contain numbers and tensor names, never prompt or answer text. Inspections never write
+model files; [weight edits](#evaluation-gated-weight-edits) write a separate copy.
+Only Dial-owned MLX safetensors checkpoints are supported: GGUF files, hosted providers and external
+endpoints are refused. Head tracing needs a standard attention layer; linear-attention layers of
+hybrid models (for example some Qwen3.5 layers) report that they have no heads to remove. Stored
+tensor rows are capped at 4096; per-layer aggregates always cover the whole checkpoint.
+
+### Evaluation-gated weight edits
+
+Dial can make a weight edit that removes one behavior direction from selected MLP layers. This
+follows the "Sparks of Weight-Space Programming" recipe for a reasoning loop: measure the
+direction the MLPs write on looping answers, then project it out of the 64 `down_proj` output
+columns per layer that write it most. No gradients are used. Each edit is a new model copy, and it
+becomes the project's model only after it beats the base model on held-out cases.
+
+| Step | What it does | Model runs charged |
+|---|---|---|
+| `experiment NAME --budget N` | creates an experiment with a budget of 1–256 model runs; without `--budget`, shows the experiment | 0 |
+| `generate` | greedy answers (temperature 0, seed 42) to 1–32 cases ending in a user turn; reports tokens, token-limit hits, repetition ratio and optional `required`/`forbidden` checks per case; `--tail N` shows the last N ≤ 400 characters of each answer | 1 |
+| `direction NAME` | per-layer unit direction between `--negative` (unwanted) and `--positive` (wanted) answers at the MLP output (`--site mlp`, default) or residual stream, with gap and separation per layer and suggested layers | 1 |
+| `edit NAME` | new copy under `weights/edits/NAME` with the direction projected out of the top `--columns` (default 64) `down_proj` columns of each of `--layers` (1–16), scaled by `--alpha` (default 1) | 0 |
+| `evaluate EDIT --cases FILE` | runs the base and the edit on 8–32 held-out cases, compares them case by case, and records pass or fail | not charged |
+| `promote EDIT` / `revert` | sets the project's main model to the passing edit, or back to its base | — |
+
+```sh
+dial weights experiment loops --budget 6
+dial weights generate --experiment loops --cases probe.json --max-tokens 1024 --tail 200
+dial weights direction loop --experiment loops --negative looping.json --positive finished.json
+dial weights edit noloop --experiment loops --direction loop --layers 18,19,20
+dial weights evaluate noloop --cases held_out.json --max-tokens 1024
+dial weights promote noloop      # only after a passing evaluation
+dial weights revert              # back to the base model
+```
+
+**Budget.** The experiment's budget is enforced. Each `generate` or `direction` run is charged
+before the worker starts, and a run past the budget is refused. Each run records the SHA-256 of the
+prompts it showed the model, never the text.
+
+**Held-out evaluation.** An evaluation refuses any case whose prompt the experiment already saw.
+Once evaluated, those cases are held out: later runs of the experiment may not use them. A case is
+good when the answer stops before the token limit and passes its checks, if it has any. The edit
+wins a case when only its answer is good, and loses one when only the base's is. The edit passes
+when it has at least 8 cases, more wins than losses, and a one-sided sign-test p ≤ 0.1.
+
+**Copies.** The edit never changes the base model. Unchanged files are hard-linked into the copy, or
+copied when linking is not possible. Only the shards holding edited tensors are rewritten, and the
+copy carries a `weights-edit.json` provenance record. Quantized models are supported: edited groups
+are dequantized, edited and requantized, and each layer reports its requantization error. Untouched
+quantization groups stay byte-identical.
+
+**Promotion.** `promote` needs the edit's own passing evaluation, and the copy must be unchanged since
+then (names, sizes and modification times are rechecked). It writes `provider = "mlx"` and the copy's
+path as `model` to the project settings. `revert` restores the base the edit was made from.
+
+In a session, `/weights experiment|generate|direction|edit|evaluate …` runs the same command as a
+background job. `/weights promote EDIT` and `/weights revert` switch the session's model at once.
+The `model_weights` tool can run experiments, generation, directions, edits and evaluations, but it
+cannot promote or revert: only the user can change the model.
+
 ## Experimental MLX activation steering
 
 Dial can extract a unit-length behavior vector from matched positive/negative assistant responses,

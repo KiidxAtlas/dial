@@ -367,7 +367,11 @@ impl<'a> Agent<'a> {
             layout: Some(layout),
             session,
             workspace,
-            ext: Registry::standard(config, crate::computer::tools(config)),
+            ext: Registry::standard(config, {
+                let mut native = crate::computer::tools(config);
+                native.extend(crate::weights::tool::tools(config));
+                native
+            }),
             background_notices: Vec::new(),
             exit_bound_jobs_noticed: Default::default(),
             hook_context: Vec::new(),

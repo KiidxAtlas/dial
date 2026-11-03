@@ -82,4 +82,4 @@ impl<'de> Deserialize<'de> for ContextWindow {
 
 /// Default silence limit for remote model streams (Anthropic, ChatGPT, OpenAI-compatible hosts).
 /// A stalled connection fails and retries instead of waiting forever.
-pub const DEFAULT_REMOTE_IDLE_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_REMOTE_IDLE_TIMEOUT_SECS: u64 = 60;

@@ -11,3 +11,4 @@ pub(crate) mod sessions;
 pub(crate) mod skills;
 pub(crate) mod steering;
 pub mod update;
+pub(crate) mod weights;

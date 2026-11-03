@@ -400,18 +400,34 @@ impl EditStore {
         revision: Option<[u8; 32]>,
         ranges: &[(usize, usize)],
     ) -> Result<(), String> {
-        let snapshot=self.files.get(path).and_then(|snaps|snaps.iter().rev().find(|snap|snap.text.as_ref()==lf&&snap.raw_revision==revision))
-            .ok_or_else(||format!("{} has no current source/read witness (notebook metadata must match too); read its affected lines with a targeted read such as `{}:START-END`; for a hashline edit, retry with the fresh [path#TAG] header that read returns, otherwise retry the edit after the refreshed read",path.display(),path.display()))?;
-        for &(a, b) in ranges {
-            if let Some((first, last)) = snapshot.seen.first_unseen(a, b) {
-                return Err(format!(
-                    "{} lines {first}-{last} were not displayed in full; read `{}:{first}-{last}` first; for a hashline edit, retry with the fresh [path#TAG] header that read returns, otherwise retry the edit after the refreshed read",
+        let snapshots = self.files.get(path);
+        let snapshot = snapshots.and_then(|snaps| snaps.iter().rev().find(|snap| snap.text.as_ref() == lf && snap.raw_revision == revision));
+        match snapshot {
+            None => {
+                let hint = if snapshots.is_some() {
+                    "witness was dropped from memory pressure; re-read its affected lines with a targeted read such as `{}:START-END`"
+                } else {
+                    "read its affected lines with a targeted read such as `{}:START-END`"
+                };
+                Err(format!(
+                    "{} has no current source/read witness ({}); for a hashline edit, retry with the fresh [path#TAG] header that read returns",
                     path.display(),
-                    path.display()
-                ));
+                    hint
+                ))
+            }
+            Some(snapshot) => {
+                for &(a, b) in ranges {
+                    if let Some((first, last)) = snapshot.seen.first_unseen(a, b) {
+                        return Err(format!(
+                            "{} lines {first}-{last} were not displayed in full; read `{}:{first}-{last}` first; for a hashline edit, retry with the fresh [path#TAG] header that read returns",
+                            path.display(),
+                            path.display()
+                        ));
+                    }
+                }
+                Ok(())
             }
         }
-        Ok(())
     }
     pub(crate) fn witness_flags(&self, path: &Path, lf: &str) -> Vec<bool> {
         self.witness_flags_version(path, lf, None)

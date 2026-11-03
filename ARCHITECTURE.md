@@ -24,7 +24,7 @@ in this table (see Dependency boundaries).
 | 4 | `dial-storage` | `storage`: sessions, checkpoints, memory, project understanding, skills, settings outside the workspace |
 | 5 | `dial-tools` | `tools` (model-callable tools, grouped below), `setup`, `security`, `voice`, `embedded_shell`, `browser_relay` |
 | 6 | `dial-computer` | `computer`: desktop capture and input; `build.rs` sets the desktop cfg and builds the macOS capture helper |
-| 7 | `dial-agent` | `agent` (agent loop, grouped below), `learn`, `judgment`, `adaptive`, `steering`, `reliability`, `telemetry`, `stats`, `extensions`, `commit`, `pack` |
+| 7 | `dial-agent` | `agent` (agent loop, grouped below), `learn`, `judgment`, `adaptive`, `steering`, `weights`, `reliability`, `telemetry`, `stats`, `extensions`, `commit`, `pack` |
 | 8 | `dial-ui` | `ui` (terminal interface: composer, transcript, overlays, themes), `git_panel`; bundled palettes live in `crates/dial-ui/themes/` |
 | 9 | `dial-app` | `app` (application wiring, with private slash-command handlers in `app/commands/`), `cli` (subcommands, flags, plain-text tables), `benchmark`, `repl`, `rpc`, `acp`, `schedule`, `changelog`, `collab` |
 

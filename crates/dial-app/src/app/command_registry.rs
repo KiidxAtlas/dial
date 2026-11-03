@@ -358,6 +358,9 @@ pub(super) const RUNS_NOW_ARGS: &[&str] = &[
     "improve settings",
     "improve models",
     "image settings",
+    "weights",
+    "weights status",
+    "weights open",
 ];
 
 /// One scheduling decision for dispatch, help and palette annotations. Aliases are resolved before
