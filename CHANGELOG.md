@@ -96,6 +96,11 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   model role is assigned and its route passes the escalation privacy gate (local, or
   `escalation.allow_remote`). Explicit `true`/`false` keep their meaning; `strict_requirements`
   stays off (`docs/requirement-verification.md`).
+- Dependency updates: ratatui 0.30 (on crossterm 0.29, so one crossterm version is built),
+  quick-xml 0.42 (document XML is read as UTF-8 text; DTD refusal and entity rules unchanged),
+  ast-grep 0.51, fontdue 0.9.5, unicode-normalization 0.1.26, and the release workflow's
+  checkout v7, upload-artifact v7, download-artifact v8 (digest mismatches now fail), and
+  Docker build-push v7 / login v4 actions.
 
 ### Added
 
