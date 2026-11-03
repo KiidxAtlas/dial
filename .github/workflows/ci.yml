@@ -273,8 +273,11 @@ jobs:
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: features-${{ matrix.aws }}-${{ matrix.voice }}-${{ matrix.shell }}-${{ matrix.desktop }}-${{ matrix.wayland }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # One cache per runner image, saved only by the all-features job. A cache per
+          # combination (32 entries, ~6.5 GB) filled the 10 GB quota and evicted the macOS test
+          # caches, so those jobs (the CI long pole, macos-15-intel most of all) rebuilt cold.
+          shared-key: features-${{ matrix.wayland && 'ubuntu-24.04' || 'ubuntu-22.04' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.aws != '' && matrix.voice != '' && matrix.shell != '' && matrix.desktop != '' }}
       - name: Compile feature combination
         env:
           CHECK_FEATURES: ${{ format('{0} {1} {2} {3} {4}', matrix.aws, matrix.voice, matrix.shell, matrix.desktop, matrix.wayland) }}
