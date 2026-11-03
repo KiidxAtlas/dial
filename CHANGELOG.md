@@ -17,6 +17,25 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Added
+
+- Read-only weight and activation inspection for Dial-owned local MLX models (`docs/improvement.md`).
+  `dial weights map|stats|activations|trace` and `/weights` report per-layer parameter counts,
+  weight norms, activation contrast for matched response pairs, and answer-loss sensitivity to
+  skipping each layer or removing each attention head. `/weights open` serves a 127.0.0.1
+  dashboard with heatmaps and a head grid, and `/improve` gains a Weights tab. The approval-gated
+  `model_weights` agent tool (off unless listed in `integrations`) runs the same operations. Model
+  files are never written; GGUF and hosted models are refused.
+- Evaluation-gated weight edits for Dial-owned local MLX models (`docs/improvement.md`), following
+  the "Sparks of Weight-Space Programming" reasoning-loop fix. `dial weights experiment` sets a
+  forward-pass budget, which `generate` (token-limit hits, repetition and response checks) and
+  `direction` (per-layer unwanted-vs-wanted MLP direction) are charged against. `edit` writes a new
+  hard-linked model copy with that direction projected out of chosen layers' `down_proj` columns,
+  reporting requantization error on quantized models. `evaluate` compares base and edit on
+  held-out cases the experiment never saw (sign test), and `promote`/`revert` switch the
+  project's model only to a copy that passed. `/weights` and the `model_weights` tool gain the
+  same operations; the tool cannot promote or revert.
+
 ### Security
 
 - Refuse unquoted shell expansion in inspection exemptions, native writes into Git metadata,

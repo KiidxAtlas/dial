@@ -8,6 +8,10 @@
 //! - `/schedule list|add|remove|log` edits the project's schedules directly.
 //! - `/relay start|stop|status` runs a local collaboration relay for `/collab` in the background.
 //! - `/hooks` lists the configured lifecycle hooks.
+//! - `/weights` shows stored weight results and opens their loopback dashboard at once;
+//!   `/weights map|stats|activations|trace|experiment|generate|direction|edit|evaluate` runs
+//!   `dial weights` as a background job, and `/weights promote NAME|revert` switches this
+//!   project's model to an edited copy that passed its evaluation, or back to its base.
 use super::CommandSpec;
 use super::extensions::spawn_job_streaming;
 use crate::agent::Agent;
@@ -95,6 +99,26 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         args_hint: "",
         subcommands: &[],
     },
+    CommandSpec {
+        name: "weights",
+        description: "inspect local MLX model weights and run evaluation-gated weight edit experiments",
+        args_hint: "[status|open|map|stats|activations|trace|experiment NAME [--budget N]|generate|direction NAME|edit NAME|evaluate EDIT --cases FILE|promote EDIT|revert]",
+        subcommands: &[
+            "status",
+            "open",
+            "map",
+            "stats",
+            "activations",
+            "trace",
+            "experiment",
+            "generate",
+            "direction",
+            "edit",
+            "evaluate",
+            "promote",
+            "revert",
+        ],
+    },
 ];
 
 pub(super) fn run(
@@ -111,6 +135,10 @@ pub(super) fn run(
         "plan-yolo" => plan_yolo(shell, agent, args),
         "anonymize" => anonymize(shell, app, agent, args),
         "benchmark" => benchmark(shell, app, args),
+        "weights" if matches!(args.split_whitespace().next(), Some("promote" | "revert")) => {
+            return Some(weights_switch(shell, app, agent, args));
+        }
+        "weights" => weights_job(shell, app, args),
         _ => return None,
     };
     Some(result.map(|()| Step::Done))
@@ -133,6 +161,7 @@ pub(super) fn run_live(
         "update" => update(shell, app, args),
         "relay" => relay(shell, app, args),
         "hooks" => hooks(shell, app),
+        "weights" if matches!(args, "" | "status" | "open") => weights(shell, app, args),
         _ => return None,
     };
     Some(result.map(|()| Step::Done))
@@ -462,6 +491,77 @@ fn benchmark(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
     let mut argv = vec!["benchmark".to_owned()];
     argv.extend(split_args(args)?);
     spawn_dial(shell, app, "Benchmark", argv, None)
+}
+
+/// `/weights`, `/weights status` and `/weights open`: stored results only, never a model load.
+fn weights(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
+    if args != "status" {
+        let url = crate::weights::dashboard::url(&app.config)?;
+        let opened = crate::llm::oauth::util::open_browser(&url);
+        shell.note(
+            "Weights",
+            if opened {
+                format!("Dashboard: {url}")
+            } else {
+                format!("Dashboard: {url} (open it in a browser)")
+            },
+        );
+    }
+    if args != "open" {
+        let status = crate::weights::status(&app.config);
+        shell.note("Weights", crate::weights::render_status(&status));
+    }
+    Ok(())
+}
+
+/// `/weights map|stats|activations|trace|experiment|generate|direction|edit|evaluate ...`:
+/// `dial weights` for this session's model as a background job. It joins this session's
+/// foreground compute instead of competing with it.
+fn weights_job(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
+    let words = split_args(args)?;
+    let op = words.first().map(String::as_str).unwrap_or_default();
+    if !matches!(op, "experiment" | "evaluate") {
+        crate::weights::Operation::parse(op).context(
+            "usage: /weights [status|open|map|stats|activations|trace|experiment NAME [--budget N]|generate --experiment E --cases FILE|direction NAME --experiment E --positive FILE --negative FILE|edit NAME --experiment E --direction D --layers 10,11|evaluate EDIT --cases FILE|promote EDIT|revert]",
+        )?;
+    }
+    crate::weights::target(&app.config)?;
+    // `target` accepted only Dial-owned MLX, so the child is pinned to that route too: the saved
+    // configuration may name a hosted provider and endpoint for other sessions.
+    let mut argv = vec![
+        "--provider".to_owned(),
+        "mlx".to_owned(),
+        "--model".to_owned(),
+        app.config.model.clone(),
+        "weights".to_owned(),
+    ];
+    argv.extend(words);
+    spawn_dial(
+        shell,
+        app,
+        "Weights",
+        argv,
+        Some("Finished. /weights open shows the result in the dashboard."),
+    )
+}
+
+/// `/weights promote NAME` and `/weights revert`: save this project's main model as the edited
+/// copy (only after its evaluation passed) or its base, and adopt it in this session.
+fn weights_switch(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+    let words = split_args(args)?;
+    let switch = match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["promote", name] => crate::weights::promotion(&app.config, name)?,
+        ["revert"] => crate::weights::reversion(&app.config)?,
+        _ => bail!("usage: /weights promote EDIT or /weights revert"),
+    };
+    app.save_settings(
+        crate::config::settings_store::Scope::Project,
+        &switch.changes,
+        Some("main"),
+    )?;
+    let fresh = app.reload()?;
+    shell.note("Weights", switch.message);
+    Ok(shell.config_changed(app, agent, fresh))
 }
 
 /// Run `dial ARGS` from the project directory as a background job (see [`spawn_process`]).

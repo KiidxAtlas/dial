@@ -65,6 +65,8 @@ integrations! {
     ("security_scan", false, false),
     ("computer", false, false),
     ("glab_mr", false, false),
+    // Read-only local MLX weight and activation inspection; approval-gated.
+    ("model_weights", false, false),
     ("ida", false, false),
     ("image_gen", false, false),
     ("report_tool_issue", false, false),

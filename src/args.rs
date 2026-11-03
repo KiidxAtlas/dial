@@ -342,6 +342,147 @@ pub(crate) enum SteeringCommand {
     },
 }
 
+/// Weight inspection and evaluation-gated weight edits of the configured local MLX model.
+#[derive(Subcommand)]
+pub(crate) enum WeightsCommand {
+    /// Show the stored result of every inspection and any running job.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Checkpoint layout and parameter counts from safetensors headers (no model load).
+    Map {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Per-tensor and per-layer weight statistics (no forward pass).
+    Stats {
+        /// Measure only tensors whose name starts with this prefix.
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Per-layer activation contrast for matched response pairs.
+    Activations {
+        /// JSON array of {positive, negative} message lists sharing a prompt (1–64 pairs).
+        #[arg(long)]
+        pairs: PathBuf,
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Answer-loss change with each layer skipped, or each head of one layer removed.
+    Trace {
+        /// JSON array of {messages} ending in the assistant answer to score (1–16 cases).
+        #[arg(long)]
+        cases: PathBuf,
+        /// Remove each attention head of this zero-based layer instead of skipping layers.
+        #[arg(long)]
+        heads: Option<u64>,
+        /// Comma-separated zero-based layers to skip (default: all).
+        #[arg(long, value_delimiter = ',', conflicts_with = "heads")]
+        layers: Vec<u64>,
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create an experiment with a forward-pass budget, or show an existing one.
+    Experiment {
+        name: String,
+        /// Create the experiment with this many model runs (1–256).
+        #[arg(long)]
+        budget: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Greedy answers per case: tokens, token-limit hits, repetition and response checks.
+    Generate {
+        /// Experiment charged one model run.
+        #[arg(long)]
+        experiment: String,
+        /// JSON array of {messages, required?, forbidden?} ending in a user turn (1–32 cases).
+        #[arg(long)]
+        cases: PathBuf,
+        /// Token limit per answer (default 512).
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Show the last N characters of each answer (0–400).
+        #[arg(long)]
+        tail: Option<u64>,
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Measure and save a per-layer direction between unwanted and wanted answers.
+    Direction {
+        /// Name of the saved direction.
+        name: String,
+        /// Experiment charged one model run.
+        #[arg(long)]
+        experiment: String,
+        /// JSON array of {messages} ending in a wanted assistant answer.
+        #[arg(long)]
+        positive: PathBuf,
+        /// JSON array of {messages} ending in an unwanted assistant answer.
+        #[arg(long)]
+        negative: PathBuf,
+        /// Measure MLP outputs (`mlp`, default) or the residual stream (`residual`).
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a new model copy with a direction projected out of chosen layers' MLP outputs.
+    Edit {
+        /// Name of the edited copy.
+        name: String,
+        /// Experiment the direction was measured in.
+        #[arg(long)]
+        experiment: String,
+        /// Direction to project out.
+        #[arg(long)]
+        direction: String,
+        /// Comma-separated zero-based layers to edit (1–16).
+        #[arg(long, value_delimiter = ',', required = true)]
+        layers: Vec<u64>,
+        /// down_proj output columns edited per layer (default 64).
+        #[arg(long)]
+        columns: Option<u64>,
+        /// Fraction of the direction removed, in (0, 2] (default 1).
+        #[arg(long)]
+        alpha: Option<f64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare an edited copy with its base on held-out cases the experiment never saw.
+    Evaluate {
+        /// The edited copy.
+        edit: String,
+        /// JSON array of {messages, required?, forbidden?} ending in a user turn (8–32 cases).
+        #[arg(long)]
+        cases: PathBuf,
+        /// Token limit per answer (default 512).
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make an edited copy that passed its evaluation this project's model.
+    Promote { edit: String },
+    /// Restore the base model of the promoted edit.
+    Revert,
+    /// Serve the loopback dashboard and open it in the browser.
+    Open {
+        /// Port on 127.0.0.1 (default: an ephemeral port).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum ReliabilityCommand {
     /// Inspect saved capability results without inference.
@@ -538,6 +679,11 @@ pub(crate) enum Command {
     Steering {
         #[command(subcommand)]
         action: SteeringCommand,
+    },
+    /// Inspect the local MLX model's weights and activations (read-only), with a dashboard.
+    Weights {
+        #[command(subcommand)]
+        action: WeightsCommand,
     },
     /// Install, start or inspect Dial's independent Laya decision service.
     Laya {

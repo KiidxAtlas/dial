@@ -1,7 +1,7 @@
-//! `/improve`: one tabbed panel for self-improvement: status, jobs, versions and setup. The controller
-//! builds a [`View`] from the learning store and job files; this panel only lays it out and turns
-//! keys into events. Stop and rollback ask for Enter first, then run the matching `/improve` command,
-//! which keeps its own checks.
+//! `/improve`: one tabbed panel for self-improvement: status, jobs, versions, setup and weights.
+//! The controller builds a [`View`] from the learning store, job files and stored weight
+//! inspections; this panel only lays it out and turns keys into events. Stop and rollback ask for
+//! Enter first, then run the matching `/improve` command, which keeps its own checks.
 use super::{
     DrawCtx, OverlayEvent,
     compute::tab_line,
@@ -21,7 +21,7 @@ use ratatui::{
 };
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 4] = ["Status", "Jobs", "Versions", "Setup"];
+const TABS: [&str; 5] = ["Status", "Jobs", "Versions", "Setup", "Weights"];
 /// While a job runs, the controller re-reads the snapshot at this interval.
 pub const REFRESH: Duration = Duration::from_secs(2);
 /// Rows of the Setup tab: the panel name and what it changes.
@@ -49,6 +49,8 @@ pub struct View {
     pub last_cycle: Vec<String>,
     pub jobs: Vec<JobRow>,
     pub versions: Vec<VersionRow>,
+    /// Summary and per-layer bar lines of the stored weight inspections (`/weights`).
+    pub weights: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -232,6 +234,7 @@ impl ImproveOverlay {
                 };
                 return OverlayEvent::Action(target.into());
             }
+            4 => return OverlayEvent::Action("command:/weights open".into()),
             _ => {}
         }
         OverlayEvent::None
@@ -343,7 +346,7 @@ impl ImproveOverlay {
                     ));
                 }
             }
-            _ => {
+            3 => {
                 for (index, (name, detail)) in SETUP.iter().enumerate() {
                     let is_selected = index == self.cursor;
                     if is_selected {
@@ -353,6 +356,17 @@ impl ImproveOverlay {
                         format!(" {} {name} — {detail}", pointer(is_selected)),
                         if is_selected { Tok::Accent } else { Tok::Text },
                     ));
+                }
+            }
+            _ => {
+                if self.view.weights.is_empty() {
+                    rows.push((
+                        "No weight inspections yet. Run /weights map or /weights stats.".into(),
+                        Tok::Muted,
+                    ));
+                }
+                for line in &self.view.weights {
+                    rows.push((format!(" {line}"), Tok::Text));
                 }
             }
         }
@@ -430,6 +444,7 @@ impl ImproveOverlay {
                             1 => "stop",
                             2 => "roll back",
                             3 => "open",
+                            4 => "dashboard",
                             _ => "",
                         };
                         let mut hints = vec![

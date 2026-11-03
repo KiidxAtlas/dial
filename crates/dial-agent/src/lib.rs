@@ -9,6 +9,7 @@ pub mod reliability;
 pub mod stats;
 pub mod steering;
 pub mod telemetry;
+pub mod weights;
 
 pub(crate) use dial_computer::computer;
 pub(crate) use dial_core::{hex, platform, runtime, workspace_copy};

@@ -55,6 +55,7 @@ pub(super) fn improve_view(app: &App) -> crate::ui::overlay::improve::View {
             readiness: "the learning store is unavailable".into(),
             state: "unavailable".into(),
             needed,
+            weights: weights_lines(app),
             ..View::default()
         };
     };
@@ -157,7 +158,24 @@ pub(super) fn improve_view(app: &App) -> crate::ui::overlay::improve::View {
         last_cycle,
         jobs,
         versions,
+        weights: weights_lines(app),
     }
+}
+
+/// The Weights tab: the stored inspections' terminal summary, or nothing when none ran yet.
+fn weights_lines(app: &App) -> Vec<String> {
+    let status = crate::weights::status(&app.config);
+    if crate::weights::Operation::ALL
+        .iter()
+        .all(|op| status[op.name()].is_null())
+        && status["progress"].is_null()
+    {
+        return Vec::new();
+    }
+    crate::weights::render_status(&status)
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 pub(super) fn improve_summary(app: &App) -> String {

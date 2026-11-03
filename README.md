@@ -206,7 +206,7 @@ This README is an overview. Detailed documentation lives in [`docs/`](docs/), an
 **Memory, learning and measurement**
 
 - [Memory and background learning](docs/memory-and-learning.md): memory backends, saved codebase understanding (`/understanding`), architecture synthesis, experience reuse
-- [Optional learning and harness improvement](docs/improvement.md): `dial improve` cycles, LoRA and fast weight candidates, verified local-model workflows, repository exercises, activation steering, portable packs
+- [Optional learning and harness improvement](docs/improvement.md): `dial improve` cycles, LoRA and fast weight candidates, verified local-model workflows, repository exercises, activation steering, weight and activation inspection (`dial weights`, `/weights`), portable packs
 - [Benchmarks and measurement](docs/benchmarks.md): `dial bench`/`dial benchmark` suites, efficiency measurement, regression checks, configuration comparisons, assistance ablation
 - [Autoresearch and archive](docs/autoresearch-and-archive.md)
 

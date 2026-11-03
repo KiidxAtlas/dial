@@ -67,6 +67,9 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         Some(Command::Steering { action }) => {
             return cmd::steering::run(&cli, &layout, action);
         }
+        Some(Command::Weights { action }) => {
+            return cmd::weights::run(&cli, &layout, action);
+        }
         Some(Command::Experience { json }) => {
             let report = dial::storage::experience::Experience::open(&layout)?.inspect()?;
             if *json {

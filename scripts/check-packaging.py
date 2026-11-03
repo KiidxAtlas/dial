@@ -10,7 +10,10 @@ Exit status is non-zero and each problem is printed when a check fails.
 """
 import re
 import sys
-import tomllib
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent

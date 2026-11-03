@@ -221,7 +221,7 @@ impl Default for LocalAssistance {
             small_window: LOCAL_SMALL_WINDOW,
             edit_mode: LocalEditMode::default(),
             sampling: LocalSamplingSource::Model,
-            reasoning_share: 50,
+            reasoning_share: 10,
             escalate_after: 2,
             thinking: LocalThinking::Model,
             keep_loaded_secs: 0,

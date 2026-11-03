@@ -178,8 +178,9 @@ fn seven_zip_reads_member_content() {
 }
 
 fn seven_zip_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod};
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::COPY)]);
     for (name, data) in entries {
         writer
             .push_archive_entry(ArchiveEntry::new_file(name), Some(Cursor::new(*data)))

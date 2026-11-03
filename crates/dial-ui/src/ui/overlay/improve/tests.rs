@@ -60,7 +60,7 @@ fn tabs_cycle_and_escape_closes_the_panel() {
     assert_eq!(overlay.tab, 1);
     press(&mut overlay, KeyCode::Left);
     press(&mut overlay, KeyCode::Left);
-    assert_eq!(overlay.tab, 3);
+    assert_eq!(overlay.tab, 4, "Left from the first tab wraps to Weights");
     assert!(matches!(
         press(&mut overlay, KeyCode::Esc),
         OverlayEvent::Close
@@ -141,6 +141,42 @@ fn setup_rows_open_the_existing_settings_and_models_views() {
         panic!("models row opens a view");
     };
     assert_eq!(models, "open:improve-models");
+}
+
+#[test]
+fn weights_tab_lists_stored_results_and_opens_the_dashboard() {
+    let rig = Rig::new();
+    let mut overlay = ImproveOverlay::new(View {
+        weights: vec!["Weights stats · fixture".into(), "   0  ████ 2.0000".into()],
+        ..view()
+    });
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    for _ in 0..4 {
+        press(&mut overlay, KeyCode::Right);
+    }
+    let screen_text = screen(&render(100, 24, |frame| overlay.draw(frame, &ctx)));
+    assert!(
+        screen_text.contains("Weights stats · fixture"),
+        "{screen_text}"
+    );
+    assert!(screen_text.contains("████ 2.0000"), "{screen_text}");
+    let OverlayEvent::Action(action) = press(&mut overlay, KeyCode::Enter) else {
+        panic!("Enter opens the weights dashboard");
+    };
+    assert_eq!(action, "command:/weights open");
+
+    let empty = ImproveOverlay::new(view());
+    let mut empty = empty;
+    for _ in 0..4 {
+        press(&mut empty, KeyCode::Right);
+    }
+    let text = screen(&render(100, 24, |frame| empty.draw(frame, &ctx)));
+    assert!(text.contains("No weight inspections yet"), "{text}");
 }
 
 #[test]

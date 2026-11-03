@@ -17,14 +17,14 @@ use std::{
 
 const PAGE: &str = r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>Dial stats</title><style>body{font:16px system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem;background:#111;color:#ddd}pre{white-space:pre-wrap;background:#222;padding:1rem;border-radius:8px}</style><h1 id=title>Dial usage</h1><p id=sub>Local session and model usage</p><pre id=data>Loading…</pre><script>const hash=location.hash,trace=hash.indexOf('#/traces')===0;const session=new URLSearchParams(hash.split('?')[1]||'').get('s')||'';if(trace){title.textContent='Dial session trace';sub.textContent=session||'No session selected'}const url=trace?(session?'/api/trace?session='+encodeURIComponent(session):null):'/api/stats';if(!url){data.textContent='No session selected. Open a trace with /trace.'}else{fetch(url).then(r=>{if(!r.ok)return r.text().then(t=>{throw Error(r.status+' '+t)});return r.json()}).then(x=>data.textContent=JSON.stringify(x,null,2)).catch(e=>data.textContent='Unable to load: '+e)}</script>"#;
 
-const TEXT: &str = "text/plain; charset=utf-8";
-const HTML: &str = "text/html; charset=utf-8";
-const JSON: &str = "application/json";
+pub(crate) const TEXT: &str = "text/plain; charset=utf-8";
+pub(crate) const HTML: &str = "text/html; charset=utf-8";
+pub(crate) const JSON: &str = "application/json";
 
-/// Binds the dashboard listener on 127.0.0.1 (`port` 0 picks an ephemeral port).
+/// Binds a dashboard listener on 127.0.0.1 (`port` 0 picks an ephemeral port).
 pub fn bind_loopback(port: u16) -> Result<TcpListener> {
     TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
-        .with_context(|| format!("binding local stats dashboard on 127.0.0.1:{port}"))
+        .with_context(|| format!("binding local dashboard on 127.0.0.1:{port}"))
 }
 
 pub fn serve(user_dir: PathBuf, port: u16) -> Result<()> {
@@ -35,12 +35,24 @@ pub fn serve(user_dir: PathBuf, port: u16) -> Result<()> {
 
 /// Serves requests on `listener` until it fails. Connections are handled one at a time.
 pub fn serve_listener(listener: TcpListener, user_dir: PathBuf) -> Result<()> {
+    serve_routes(listener, "stats dashboard", move |target| {
+        route(&user_dir, target)
+    })
+}
+
+/// Serves `route` on a loopback `listener` until it fails, behind the [`loopback_host`] gate.
+/// `label` names the dashboard in diagnostics. Connections are handled one at a time.
+pub(crate) fn serve_routes(
+    listener: TcpListener,
+    label: &str,
+    route: impl Fn(&str) -> Response,
+) -> Result<()> {
     let port = listener.local_addr()?.port();
     for incoming in listener.incoming() {
         let mut stream = match incoming {
             Ok(stream) => stream,
             Err(error) => {
-                eprintln!("stats dashboard connection failed: {error}");
+                eprintln!("{label} connection failed: {error}");
                 continue;
             }
         };
@@ -64,14 +76,14 @@ pub fn serve_listener(listener: TcpListener, user_dir: PathBuf) -> Result<()> {
             continue;
         }
         let line = String::from_utf8_lossy(&request);
-        let (status, content_type, body) = respond(&user_dir, port, &line);
+        let (status, content_type, body) = answer(port, &line, &route);
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         let _ = stream.write_all(response.as_bytes());
     }
-    bail!("stats dashboard listener stopped")
+    bail!("{label} listener stopped")
 }
 
 /// Only loopback host names reach the routes: a page on another origin whose DNS name rebinds
@@ -98,10 +110,16 @@ fn loopback_host(request: &str, port: u16) -> bool {
         })
 }
 
-type Response = (&'static str, &'static str, String);
+pub(crate) type Response = (&'static str, &'static str, String);
 
 /// Answers one raw HTTP request: the `Host` gate first, then routing. `port` is the listener's.
+#[cfg(test)]
 fn respond(user_dir: &Path, port: u16, request: &str) -> Response {
+    answer(port, request, |target| route(user_dir, target))
+}
+
+/// Answers one raw HTTP request with `route` once the `Host` gate admits it.
+pub(crate) fn answer(port: u16, request: &str, route: impl Fn(&str) -> Response) -> Response {
     if !loopback_host(request, port) {
         return ("403 Forbidden", TEXT, "unexpected Host header\n".to_owned());
     }
@@ -110,7 +128,7 @@ fn respond(user_dir: &Path, port: u16, request: &str) -> Response {
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/");
-    route(user_dir, target)
+    route(target)
 }
 
 /// Maps a request target (`/path?query`) to `(status, content type, body)`.
@@ -154,7 +172,7 @@ fn bad_request(error: impl std::fmt::Display) -> Response {
 }
 
 /// Serializes `result` as JSON (500 with the error text when it failed).
-fn json_response<T: Serialize>(result: Result<T>) -> Response {
+pub(crate) fn json_response<T: Serialize>(result: Result<T>) -> Response {
     match result.and_then(|value| Ok(serde_json::to_string(&value)?)) {
         Ok(body) => ("200 OK", JSON, body),
         Err(error) => ("500 Internal Server Error", TEXT, format!("{error:#}")),
@@ -162,7 +180,7 @@ fn json_response<T: Serialize>(result: Result<T>) -> Response {
 }
 
 /// Like [`json_response`], but `Ok(None)` is a 404 with `missing` as its text.
-fn optional_json<T: Serialize>(result: Result<Option<T>>, missing: &str) -> Response {
+pub(crate) fn optional_json<T: Serialize>(result: Result<Option<T>>, missing: &str) -> Response {
     match result {
         Ok(Some(value)) => json_response(Ok(value)),
         Ok(None) => ("404 Not Found", TEXT, missing.to_owned()),

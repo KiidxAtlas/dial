@@ -175,8 +175,8 @@ pub fn category(name: &str) -> Category {
         "gc" | "anonymize" | "images" | "update" | "benchmark" | "schedule" | "stats" => {
             Category::Maintenance
         }
-        "improve" | "reliability" | "policy" | "steering" | "experience" | "understanding"
-        | "laya" | "outcome" | "autoresearch" => Category::Learning,
+        "improve" | "reliability" | "policy" | "steering" | "weights" | "experience"
+        | "understanding" | "laya" | "outcome" | "autoresearch" => Category::Learning,
         _ => Category::Settings,
     }
 }

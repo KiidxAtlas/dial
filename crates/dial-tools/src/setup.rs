@@ -15,6 +15,7 @@ use std::{
 
 const WORKER: &str = include_str!("../../../python/dial_worker.py");
 const STEERING: &str = include_str!("../../../python/dial_steering.py");
+const WEIGHTS: &str = include_str!("../../../python/dial_weights.py");
 const PYPROJECT: &str = include_str!("../../../python/pyproject.toml");
 
 /// Keep the managed worker aligned with the binary without reinstalling Python packages.
@@ -27,9 +28,11 @@ pub fn refresh_worker(config: &Config) -> Result<()> {
         settings_store::write_private(&managed, WORKER.as_bytes())?;
     }
     if config.worker == managed {
-        let path = config.user_dir.join("python/dial_steering.py");
-        if std::fs::read(&path).ok().as_deref() != Some(STEERING.as_bytes()) {
-            settings_store::write_private(&path, STEERING.as_bytes())?;
+        for (name, source) in [("dial_steering.py", STEERING), ("dial_weights.py", WEIGHTS)] {
+            let path = config.user_dir.join("python").join(name);
+            if std::fs::read(&path).ok().as_deref() != Some(source.as_bytes()) {
+                settings_store::write_private(&path, source.as_bytes())?;
+            }
         }
     }
     Ok(())
@@ -58,6 +61,7 @@ pub fn ensure_runtime_with(
     crate::platform::atomic::private_dir(&dir)?;
     settings_store::write_private(&dir.join("dial_worker.py"), WORKER.as_bytes())?;
     settings_store::write_private(&dir.join("dial_steering.py"), STEERING.as_bytes())?;
+    settings_store::write_private(&dir.join("dial_weights.py"), WEIGHTS.as_bytes())?;
     settings_store::write_private(&dir.join("pyproject.toml"), PYPROJECT.as_bytes())?;
     let mut command = std::process::Command::new("uv");
     command.args(["sync", "--project"]).arg(&dir);
