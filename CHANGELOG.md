@@ -17,6 +17,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-11-03
+
 ### Security
 
 - Refuse unquoted shell expansion in inspection exemptions, native writes into Git metadata,
