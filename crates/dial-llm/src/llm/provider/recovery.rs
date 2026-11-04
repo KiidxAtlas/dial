@@ -187,8 +187,9 @@ impl Backend {
             attempt_started,
             interrupt,
         } = failure;
+        let class = llm::errors::classify(&error);
         if !state.reasoning_stripped
-            && attempt < retry_policy.max_attempts
+            && attempt < retry_policy.attempts(&class)
             && llm::reasoning_memory::rejects_reasoning(&error)
             && state
                 .profile
@@ -205,7 +206,7 @@ impl Backend {
         }
         if self.oauth.is_some()
             && state.oauth_retry == OAuthRetry::NotRequested
-            && attempt < retry_policy.max_attempts
+            && attempt < retry_policy.attempts(&class)
             && error
                 .downcast_ref::<llm::HttpError>()
                 .is_some_and(|http| matches!(http.status, 401 | 403))
@@ -216,8 +217,7 @@ impl Backend {
             );
             return Ok(());
         }
-        let class = llm::errors::classify(&error);
-        if attempt < retry_policy.max_attempts
+        if attempt < retry_policy.attempts(&class)
             && let Some(cooldown) = llm::key_pool::cooldown(
                 &class,
                 error
@@ -244,7 +244,7 @@ impl Backend {
         // OAuth accounts: a rate limit, quota exhaustion, or rejected credential cools that
         // account down and moves this session to the next stored one. ChatGPT keeps its own
         // failover below, with its session-binding guards.
-        if attempt < retry_policy.max_attempts
+        if attempt < retry_policy.attempts(&class)
             && retry_policy.rotate_accounts
             && !matches!(self.kind, ProviderKind::ChatGpt { .. })
             && let Some(binding) = self.oauth.as_mut()
@@ -260,7 +260,7 @@ impl Backend {
             );
             return Ok(());
         }
-        if attempt < retry_policy.max_attempts
+        if attempt < retry_policy.attempts(&class)
             && retry_policy.rotate_accounts
             && matches!(
                 class,
@@ -295,7 +295,6 @@ impl Backend {
             };
             return Err(error.context(format!("provider authentication failed (HTTP {status}); check {key} or sign in through /providers")));
         }
-        let class = llm::errors::classify(&error);
         let hinted = error
             .downcast_ref::<llm::HttpError>()
             .and_then(|http| http.retry_after);

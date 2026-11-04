@@ -424,3 +424,97 @@ fn harness_peer_and_monitor_turns_never_replace_the_admitted_instruction() {
         }
     });
 }
+
+#[test]
+fn lossy_draft_is_rejected_before_review_or_main_inference() {
+    let server = llm::fake::serve(vec![reply("Fix the parser.")]);
+    with_agent(ON_NO_RETRY, |agent| {
+        agent.backend = Some(backend(&server.url));
+        let mut ui = DraftReview {
+            accept: true,
+            ..Default::default()
+        };
+        let error = agent
+            .turn("Fix `src/parser.rs`; keep the limit at 25.", &mut ui)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("verbatim"), "{error:#}");
+        assert!(ui.reviewed.is_empty());
+        assert!(user_messages(agent).is_empty());
+        assert!(agent.backend.is_some());
+    });
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn draft_fidelity_protects_explicit_material_without_claiming_semantic_equivalence() {
+    for (original, draft, expected) in [
+        ("Run `cargo test --locked`", "Run `cargo test`", false),
+        (
+            "Run `cargo test --locked`",
+            "Run cargo test --locked-all",
+            false,
+        ),
+        ("Keep `x`", "Keep text", false),
+        ("Keep `25`", "Keep 125", false),
+        (
+            "Run `cargo test --locked`",
+            "Run cargo test --locked.",
+            true,
+        ),
+        ("Keep 'can't open'", "Keep 'cannot open'", false),
+        ("For e.g. src/lib.rs", "For example src/lib.rs", true),
+        ("Use src/parser.rs", "Use src/other.rs", false),
+        ("Read @src/lib.rs", "Read src/lib.rs", false),
+        ("Keep 25 ms", "Keep 250 ms", false),
+        ("Set -2.5%", "Set 2.5%", false),
+        ("Error: \"file not found\"", "Error: file missing", false),
+        ("Keep ‘λ 🦀’", "Keep ‘λ’", false),
+        ("Run ```sh\necho ok\n```", "Run ```sh\necho bad\n```", false),
+        (
+            "Don't change the user's parser",
+            "Preserve the parser",
+            true,
+        ),
+        (
+            "Fix src/parser.rs.",
+            "Objective: fix `src/parser.rs`.",
+            true,
+        ),
+        ("Keep 25 ms", "The limit remains 25 ms.", true),
+        ("Use \"λ 🦀\"", "Preserve `λ 🦀` exactly", true),
+        ("Keep \"can't open\"", "Keep \"cannot open\"", false),
+        // Negation and scope require human review: verbatim presence is not a semantic proof.
+        ("Do not edit src/lib.rs", "Edit src/lib.rs", true),
+        (
+            "Actually use src/v2.rs, not src/v1.rs",
+            "Use src/v2.rs",
+            false,
+        ),
+    ] {
+        assert_eq!(
+            fidelity::preserves(original, draft),
+            expected,
+            "{original:?} -> {draft:?}"
+        );
+    }
+}
+
+#[test]
+fn fidelity_failure_drops_steering_queue_without_delivery() {
+    let server = llm::fake::serve(vec![reply("Use the other file.")]);
+    with_agent(ON_NO_RETRY, |agent| {
+        let mut ui = Applied::default();
+        agent
+            .accept_steering(vec!["Use src/v2.rs".into(), "then test".into()], &mut ui)
+            .unwrap();
+        assert!(
+            agent
+                .draft_deferred_steering(&mut backend(&server.url), &mut ui)
+                .is_err()
+        );
+        assert!(agent.undrafted_steering.is_empty());
+        assert!(ui.0.is_empty());
+        assert!(user_messages(agent).is_empty());
+    });
+    assert_eq!(server.requests().len(), 1);
+}

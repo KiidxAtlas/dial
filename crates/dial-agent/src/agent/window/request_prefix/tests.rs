@@ -149,3 +149,48 @@ fn empty_and_shortened_requests_have_bounded_prefix_measurements() {
     assert_eq!(empty.tool_schema_bytes, 2);
     assert_eq!(empty.tool_count, 0);
 }
+
+#[test]
+fn reusable_digest_buffer_preserves_exact_json_identity() {
+    let mut scratch = Vec::new();
+    for value in [
+        json!({"role":"tool","content":"large context".repeat(4096)}),
+        json!({"role":"user","content":"Unicode: λ 🦀; escaped: \" \\ \n"}),
+        json!([]),
+        json!({"content":[{"type":"text","text":"hook replacement"}]}),
+    ] {
+        let expected = serde_json::to_vec(&value).unwrap();
+        let (hash, bytes) = digest(&value, &mut scratch);
+        assert_eq!(bytes, expected.len());
+        assert_eq!(hash.as_slice(), Sha256::digest(&expected).as_slice());
+    }
+}
+
+/// Matched offline preparation microbenchmark; no provider or model inference.
+#[test]
+#[ignore = "manual request-prefix microbenchmark"]
+fn request_prefix_preparation_benchmark() {
+    let mut request = chat();
+    let text = "source context: \"quoted\" \\ path\n".repeat(1024);
+    for index in 0..128 {
+        request
+            .messages
+            .push(json!({"role":"tool","content":text,"tool_call_id":index.to_string()}));
+    }
+    let mut tracker = Tracker::default();
+    tracker.observe("model", &request);
+    let mut samples = Vec::new();
+    for _ in 0..31 {
+        let start = std::time::Instant::now();
+        std::hint::black_box(tracker.observe("model", std::hint::black_box(&request)));
+        samples.push(start.elapsed());
+    }
+    samples.sort();
+    eprintln!(
+        "request-prefix messages={} serialized_bytes={} median_us={} p95_us={}",
+        request.messages.len(),
+        serde_json::to_vec(&request.messages).unwrap().len(),
+        samples[15].as_micros(),
+        samples[29].as_micros()
+    );
+}

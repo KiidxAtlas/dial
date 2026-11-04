@@ -13,6 +13,8 @@ use crate::agent::*;
 use crate::llm::model_config::TURN_DRAFTER;
 use crate::storage::session::TURN_DRAFT_KEY;
 
+mod fidelity;
+
 /// Output budget for one drafted prompt: structured text and diagrams, not an answer.
 const DRAFT_MAX_TOKENS: u32 = 8192;
 /// Earlier assistant replies the drafter sees, so references such as "do that" resolve.
@@ -120,6 +122,10 @@ impl Agent<'_> {
         ensure!(
             !drafted.is_empty(),
             "turn drafter returned an empty prompt; your message was not sent to the main model"
+        );
+        ensure!(
+            fidelity::preserves(typed, drafted),
+            "turn draft did not preserve explicit verbatim material; your message was not sent to the main model"
         );
         ui.extension_panel("Turn drafter · proposed instruction", drafted);
         ensure!(

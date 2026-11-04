@@ -253,8 +253,12 @@ blocker, unverified check or safety-relevant gap requires disclosure. This is mo
 an enforced output guarantee; completion gates and inference labels remain unchanged.
 
 When a configured fallback is ready, failures it accepts (`retry.fallback_on`) get two attempts
-and at most a 10 s wait on the primary before failing over. A primary that cannot be rebuilt when
-the fallback's cooldown ends keeps the fallback and is retried 5 minutes later. With `retry.fallback_revert = "never"` the session does not return at cooldown end at all; see [model routing](model-routing.md).
+and at most a 10 s wait on the primary before failing over. Immediate reasoning-parameter recovery,
+OAuth refresh and credential/account rotation share that per-class attempt budget; rotation cannot
+extend it to the larger `retry.max_attempts` limit. Without an applicable fallback, the ordinary
+attempt budget remains in effect. A primary that cannot be rebuilt when the fallback's cooldown
+ends keeps the fallback and is retried 5 minutes later. With `retry.fallback_revert = "never"` the
+session does not return at cooldown end at all; see [model routing](model-routing.md).
 
 Different successful lookups also have a shared foreground/worker synthesis boundary. After twelve
 observation-bearing model rounds without a novel committed change or accepted task resolution,
@@ -1691,8 +1695,14 @@ main model in a separate request.
   inspect, implement and verify; questions and read-only reviews do not become edit requests.
   It must not manufacture permission gates or open questions for already actionable tasks.
 - It fails closed: if the drafter errors, is cancelled, hits its output limit, returns an empty
-  prompt, or the user cancels review, nothing is sent to the main model. For a steering message,
-  any steering still queued behind it is dropped too.
+  prompt, fails the verbatim-material check, or the user cancels review, nothing is sent to the
+  main model. For a steering message, any steering still queued behind it is dropped too.
+- Before review, a deterministic check requires explicit code/quoted spans, path-like tokens,
+  `@references` and numeric tokens from the typed message to remain in the draft. The check
+  does not echo missing text in errors, make another model request, or send raw text as a fallback.
+  It checks presence, not semantic equivalence: changed negation, reordered constraints and added
+  requirements still need human review. Unquoted commands and arbitrary identifiers are not
+  comprehensively recognized. This is a correctness guard, not evidence of improved model quality.
 - Steering is drafted at the next step boundary, because the main stream holds the model connection
   while it generates. Codex live mid-stream steering is therefore not used while the optimizer is
   on, and steering takes the local replan path. Steering left over from an interrupted turn is
@@ -1701,3 +1711,17 @@ main model in a separate request.
   evaluation agents are not drafted.
 
 Each draft is an extra model request per user message, so it adds latency and cost.
+
+## Request preparation and tool concurrency
+
+`task.max_concurrency` remains the worker-branch admission budget (1..=64). It also sets the
+parallel read window for ordinary and streamed tool calls; dependency-aware native-call waves
+retain their separate ceiling of 32. These are tool-call windows, not additional worker pools.
+The policy is centralized in `TaskConfig::parallel_read_limit` and `dependency_wave_limit`;
+validated configurations retain their previous scheduling limits.
+
+Request-prefix telemetry hashes the final provider-neutral request after hooks. Serialization
+uses request-local reusable scratch space and fixed-size hashes; the tracker retains no message
+contents. Historical messages are measured afresh because projection, compaction and hooks can
+rewrite them. The ignored `request_prefix_preparation_benchmark` provides an offline long-context
+microbenchmark; it is not a provider-cache or end-to-end latency benchmark.

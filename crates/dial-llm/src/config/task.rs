@@ -3,6 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Most worker branches one `[task]` may request; also the parallel read window ceiling.
+pub const MAX_CONCURRENCY: usize = 64;
+/// Hard ceiling on native calls in one dependency wave, whatever `max_concurrency` says.
+pub const DEPENDENCY_WAVE_CEILING: usize = 32;
+
 /// `[task]`: subagent orchestration limits.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -13,7 +18,9 @@ pub struct TaskConfig {
     /// How many levels deep subagents may start their own subagents: -1 unlimited, 0 none.
     /// The main agent's children are depth 1; with 2 they may spawn one more level.
     pub max_recursion_depth: i32,
-    /// Most active worker branches per project in this process (1..=64).
+    /// Worker-branch budget for subagent admission (1..=64). The same value also sets one
+    /// reply's parallel read window (`parallel_read_limit`); dependency waves use the lower
+    /// `dependency_wave_limit`. The read window is a tool-call window, not a second worker pool.
     pub max_concurrency: usize,
     pub isolation_dependencies: bool,
     pub isolation_git: bool,
@@ -78,8 +85,8 @@ impl TaskConfig {
             "task.max_recursion_depth must be -1 (unlimited) or 0..16"
         );
         anyhow::ensure!(
-            (1..=64).contains(&self.max_concurrency),
-            "task.max_concurrency must be 1..64"
+            (1..=MAX_CONCURRENCY).contains(&self.max_concurrency),
+            "task.max_concurrency must be 1..{MAX_CONCURRENCY}"
         );
         anyhow::ensure!(
             self.max_schema_retries <= 10,
@@ -106,4 +113,21 @@ impl TaskConfig {
     pub fn can_spawn_at(&self, depth: u32) -> bool {
         self.max_recursion_depth < 0 || i64::from(depth) < i64::from(self.max_recursion_depth)
     }
+
+    /// Read window for one reply: how many admitted read-only calls may run together, from
+    /// ordinary parallel groups and streamed early reads alike. This is the validated
+    /// `max_concurrency`, clamped to 1..=64 defensively; it is a tool-call window, not worker
+    /// admission (`task_slots` and the live pool apply their own limits).
+    pub fn parallel_read_limit(&self) -> usize {
+        self.max_concurrency.clamp(1, MAX_CONCURRENCY)
+    }
+
+    /// Native calls one dependency wave may admit: `parallel_read_limit` capped at
+    /// `DEPENDENCY_WAVE_CEILING` (32), so a larger `max_concurrency` never widens mutation waves.
+    pub fn dependency_wave_limit(&self) -> usize {
+        self.parallel_read_limit().min(DEPENDENCY_WAVE_CEILING)
+    }
 }
+
+#[cfg(test)]
+mod tests;

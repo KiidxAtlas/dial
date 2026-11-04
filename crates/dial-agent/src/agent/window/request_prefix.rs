@@ -8,9 +8,9 @@ use sha2::{Digest, Sha256};
 pub(in crate::agent) struct Tracker {
     /// Model of the previous request; `None` until the first one is observed.
     model: Option<String>,
-    system: Vec<u8>,
-    tools: Vec<u8>,
-    messages: Vec<(Vec<u8>, usize)>,
+    system: [u8; 32],
+    tools: [u8; 32],
+    messages: Vec<([u8; 32], usize)>,
 }
 
 /// Why the request prefix could not be reused, by the first differing part in prefix order. The
@@ -65,18 +65,25 @@ pub(in crate::agent) struct Observation {
     pub request_message_bytes: usize,
 }
 
-/// Digest and serialized length of one value, from a single serialization.
-fn digest(value: &impl Serialize) -> (Vec<u8>, usize) {
+/// Digest and serialized length using request-local scratch space. The buffer is never retained
+/// by the tracker: projected/hook-rewritten messages are measured afresh at every boundary.
+fn digest(value: &impl Serialize, scratch: &mut Vec<u8>) -> ([u8; 32], usize) {
+    scratch.clear();
     // Only JSON values (string-keyed maps) are digested; serializing them cannot fail.
-    let bytes = serde_json::to_vec(value).expect("JSON value serialization cannot fail");
-    (Sha256::digest(&bytes).to_vec(), bytes.len())
+    serde_json::to_writer(&mut *scratch, value).expect("JSON value serialization cannot fail");
+    (Sha256::digest(&*scratch).into(), scratch.len())
 }
 
 impl Tracker {
-    /// Runs once per request on the whole history, so each message is serialized once: the
-    /// system identity is derived from the system messages' own digests.
+    /// Runs once per request on the whole history. Reuse serialization capacity across values,
+    /// not fingerprints across requests: projection and hooks may change any historical message.
     pub fn observe(&mut self, model: &str, request: &Chat) -> Observation {
-        let messages: Vec<_> = request.messages.iter().map(digest).collect();
+        let mut scratch = Vec::new();
+        let messages: Vec<_> = request
+            .messages
+            .iter()
+            .map(|value| digest(value, &mut scratch))
+            .collect();
         let mut system = Sha256::new();
         let mut system_bytes = 0;
         for (message, (hash, bytes)) in request.messages.iter().zip(&messages) {
@@ -85,8 +92,8 @@ impl Tracker {
                 system_bytes += bytes;
             }
         }
-        let system = system.finalize().to_vec();
-        let (tools, tool_schema_bytes) = digest(&request.tools);
+        let system = system.finalize().into();
+        let (tools, tool_schema_bytes) = digest(&request.tools, &mut scratch);
         let common = self
             .messages
             .iter()

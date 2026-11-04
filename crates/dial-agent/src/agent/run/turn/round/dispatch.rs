@@ -210,7 +210,7 @@ impl Agent<'_> {
             {
                 let count = reply.tool_calls[index..]
                     .iter()
-                    .take(self.config.task.max_concurrency)
+                    .take(self.config.task.parallel_read_limit())
                     .take_while(|c| {
                         !crate::agent::safety::hooks::wanted_for_tool(
                             self.tool_hooks(),

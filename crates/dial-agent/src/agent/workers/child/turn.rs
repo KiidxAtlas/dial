@@ -1993,7 +1993,7 @@ impl<'a> ChildTurn<'a> {
             {
                 let count = reply.tool_calls[index..]
                     .iter()
-                    .take(env.config.task.max_concurrency)
+                    .take(env.config.task.parallel_read_limit())
                     .take_while(|call| {
                         approval::parallel_read(env.ext, &call.name, &call.arguments)
                             && call_form_error(call, &self.schemas, &self.names).is_none()

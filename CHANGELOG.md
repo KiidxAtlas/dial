@@ -17,6 +17,22 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Request execution and fidelity
+
+- Immediate credential rotation, OAuth refresh and reasoning-parameter recovery now honor the
+  same per-error-class attempt budget as provider retries, so rotation cannot bypass a ready
+  fallback's short retry limit. Ordinary no-fallback retry limits are unchanged.
+- The experimental turn optimizer rejects drafts that omit explicit verbatim code/quoted spans,
+  path-like tokens, references or numeric tokens before review or main inference. Rejection
+  retains fail-closed delivery; semantic equivalence and negation still require human review.
+  No live-model quality improvement is claimed (`docs/agent-loop.md`).
+- Named tool-concurrency policy preserves existing valid worker/read limits (1..=64) and the
+  dependency-wave ceiling (32), without new settings or wider mutation concurrency.
+- Request-prefix tracking reuses request-local serialization capacity and stores fixed-size
+  hashes, without retaining message text or caching potentially stale projected fingerprints.
+  A matched offline 4.7 MB debug-build microbenchmark showed no meaningful latency improvement
+  (median approximately 82 ms before and after); provider latency and model outcomes are unmeasured.
+
 ### Added
 
 - Opt-in named task contracts persist bounded workflow intent and dependency bindings, require

@@ -3433,6 +3433,77 @@ fn a_pool_with_every_other_key_unavailable_surfaces_the_ordinary_retry() {
     );
 }
 
+#[test]
+fn credential_rotation_honors_the_fallback_attempt_budget() {
+    let keys = [
+        "DIAL_TEST_BUDGET_KEY_A",
+        "DIAL_TEST_BUDGET_KEY_B",
+        "DIAL_TEST_BUDGET_KEY_C",
+    ];
+    if key_pool_subprocess(
+        "credential_rotation_honors_the_fallback_attempt_budget",
+        &[
+            (keys[0], Some("budget-key-a")),
+            (keys[1], Some("budget-key-b")),
+            (keys[2], Some("budget-key-c")),
+        ],
+    ) {
+        return;
+    }
+    let throttled = || Script::HttpHeaders {
+        status: 429,
+        headers: vec![("Retry-After", "0".into())],
+        body: b"{\"error\":\"slow down\"}".to_vec(),
+    };
+    // With a ready fallback, rotation cannot spend more than the two attempts the fallback
+    // budget allows. Without one, every configured key is tried before the request gives up.
+    let cases = [
+        (
+            Some(crate::config::types::FallbackOn::Any),
+            vec![throttled(), throttled()],
+            2,
+        ),
+        (
+            None,
+            vec![throttled(), throttled(), throttled(), ok("third key")],
+            4,
+        ),
+    ];
+    for (failover, scripts, primary_requests) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let server = fake::serve(scripts);
+        let base = format!("{}/v1", server.url);
+        let mut remote = backend(endpoint(&base))
+            .with_credential_source(dir.path(), &base, Some(keys[0]))
+            .with_key_pool(keys.map(str::to_owned));
+        remote.retry_backoff = Duration::from_millis(1);
+        remote.next_request_failover(failover);
+        let result = remote.chat(None, &request(), 5, None);
+        let seen = server.requests();
+        assert_eq!(seen.len(), primary_requests, "failover {failover:?}");
+        match failover {
+            Some(_) => {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("moving to the configured fallback model"),
+                    "{error:#}"
+                );
+            }
+            None => assert_eq!(result.unwrap().text, "third key"),
+        }
+        assert_eq!(
+            header(&seen[0], "authorization").as_deref(),
+            Some("Bearer budget-key-a")
+        );
+        assert_eq!(
+            header(&seen[1], "authorization").as_deref(),
+            Some("Bearer budget-key-b")
+        );
+    }
+}
+
 /// A masking backend sends placeholders, never the secret, and the tool call that comes back
 /// carries the real value again. A local route is never masked.
 #[test]

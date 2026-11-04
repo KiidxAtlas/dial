@@ -71,7 +71,7 @@ impl StreamingDispatch {
         interrupt: Arc<AtomicBool>,
         admission: Admission,
     ) -> Self {
-        let limit = config.task.max_concurrency.max(1);
+        let limit = config.task.parallel_read_limit();
         Self {
             runner: Arc::new(Runner {
                 workspace,

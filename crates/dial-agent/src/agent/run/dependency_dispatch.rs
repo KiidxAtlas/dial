@@ -175,12 +175,12 @@ impl BatchPrerequisites {
 }
 
 impl Agent<'_> {
-    /// A maximal independent prefix, bounded by the controller's configured concurrency. A
-    /// conflicting resource or unknown effect closes the wave; nothing jumps a serial barrier.
+    /// A maximal independent prefix, bounded by `TaskConfig::dependency_wave_limit` (at most 32).
+    /// A conflicting resource or unknown effect closes the wave; nothing jumps a serial barrier.
     pub(in crate::agent) fn dependency_wave(&mut self, calls: &[ToolCall]) -> Vec<ToolCall> {
         let mut admitted = Vec::new();
         let mut footprints = Vec::new();
-        for call in calls.iter().take(self.config.task.max_concurrency.min(32)) {
+        for call in calls.iter().take(self.config.task.dependency_wave_limit()) {
             if ["pre_tool_use", "post_tool_use"].iter().any(|event| {
                 crate::agent::safety::hooks::wanted_for_tool(self.tool_hooks(), event, &call.name)
             }) || self.repro_first_fires(call, crate::config::types::ReproFirst::Gate)
