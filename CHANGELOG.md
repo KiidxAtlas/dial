@@ -19,6 +19,33 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Added
 
+- Opt-in named task contracts persist bounded workflow intent and dependency bindings, require
+  current controller-observed acceptance before successful completion, and recover without
+  replaying workers or trusting saved verdicts (`docs/subagents.md`). Ordinary tasks are unchanged.
+- A compact work panel above the composer on terminals 90 or more columns wide: one rounded card,
+  at most 100 columns wide and as tall as its content, with the plan's steps and the `plan`,
+  `evidence` and `approvals` tabs (`Ctrl+F`; `Alt+W` and `F12` remain aliases; `app.work.tab`).
+  The launch input is a rounded box, the default status line leads with a colored approval dot
+  (`● ask`), in-progress steps use the warning color, and active tabs are drawn as filled pills
+  (`docs/terminal-interface.md`).
+- Delegated results distinguish candidate completion from controller acceptance in synchronous and
+  live task metadata. Built-in handoffs ask for observable criteria, configured checks when
+  available and explicit uncovered requirements (`docs/subagents.md`).
+- `/todo progress` exposes persisted deliverable claims alongside current linked-check status,
+  acceptance, unverified references and worker outcomes. Existing input witnesses are revalidated
+  when opened idle; busy views report unavailable rather than stale-as-current evidence
+  (`docs/terminal-interface.md`).
+- Explicit improvement cycles retain bounded, deduplicated recurring-failure lesson proposals with
+  trajectory references, displayed in `/improve status` for review. Proposals never automatically
+  activate rules or write project instructions, and require no extra inference (`docs/improvement.md`).
+- Per-role thinking levels: `model_roles.<role>.thinking` (`off`, `minimal`..`max`) applies to
+  every request of that role, including subagents. Set it with `/effort <role> <level>` and clear
+  it with `/effort <role> default` (`docs/model-routing.md`).
+- The stats ledger records each request's time to first streamed output (`first_output_ms`) and
+  requested reasoning effort (`effort`) (`docs/llm-transport.md`).
+- The stats ledger's `requests.changed_part` names the request section (`system`, `tools`,
+  `messages`, ...) where a `prompt_changed` request first differed from the previous one, so
+  prompt-cache breaks can be attributed (`docs/llm-transport.md`).
 - Read-only weight and activation inspection for Dial-owned local MLX models (`docs/improvement.md`).
   `dial weights map|stats|activations|trace` and `/weights` report per-layer parameter counts,
   weight norms, activation contrast for matched response pairs, and answer-loss sensitivity to
@@ -26,6 +53,33 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   dashboard with heatmaps and a head grid, and `/improve` gains a Weights tab. The approval-gated
   `model_weights` agent tool (off unless listed in `integrations`) runs the same operations. Model
   files are never written; GGUF and hosted models are refused.
+- `model_weights` `edit` accepts `method = "scale"` (`dial weights edit --changes FILE`): the model
+  names exact tensors, factors and optional rows or columns, so it can edit weights directly
+  instead of through a measured direction. The copy, evaluation gate and user-only promotion are
+  unchanged.
+- Weight edits are easier to get right. `attribute` ranks attention heads and MLP neurons by estimated
+  support for given answers (optionally against `wanted` answers), `try` scores an edit in memory at
+  several strengths with neutral-answer drift and writes no files, scale changes can name a layer's
+  `heads` or `neurons`, selectors are validated against tensor shapes, worker contract errors reach
+  the caller instead of being withheld, quantized edits whose requantization error exceeds half the edit
+  are refused unless `allow_noisy`, and `status` lists earlier edits with their parameters.
+- `/weights improve GOAL` (or a plain request, with `model_weights` enabled) has the model run the
+  whole weight-edit loop for a goal in your words; approvals and user-only promotion are unchanged.
+  It edits the current model's weights but can be driven by another model: a picker over the
+  configured chat models, or `/weights improve --with MODEL GOAL`, for that request only.
+  `attribute` gained `focus: repeats`, `neutral` answers (components generally important rank low),
+  per-component `agreement`, neuron promote/suppress tokens and head induction attention.
+- `dial weights analyze` probes the local model with built-in text and records what its parts do:
+  layer importance, attention-head roles (induction, previous-token, attention sink) and the
+  busiest MLP neurons with the tokens they promote. `dial weights improve GOAL` starts a session
+  with the goal and the weight-editing playbook and enables `model_weights` for it; the playbook now
+  runs `analyze` first. Approvals and user-only promotion are unchanged.
+- `dial weights`, `/weights` and `model_weights` no longer fail with "improvement stopped by operator"
+  when background improvement was stopped for the model: that switch pauses automatic work, not
+  weight inspection you ask for.
+- `[weights] model` names the local MLX model that weight inspection and edits act on, so a hosted
+  frontier main model can drive `model_weights` edits to a different local model. Promotion and
+  revert then change that setting, not the main model.
 - Evaluation-gated weight edits for Dial-owned local MLX models (`docs/improvement.md`), following
   the "Sparks of Weight-Space Programming" reasoning-loop fix. `dial weights experiment` sets a
   forward-pass budget, which `generate` (token-limit hits, repetition and response checks) and
@@ -35,6 +89,46 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   held-out cases the experiment never saw (sign test), and `promote`/`revert` switch the
   project's model only to a copy that passed. `/weights` and the `model_weights` tool gain the
   same operations; the tool cannot promote or revert.
+- `dial weights` grew into a fuller workflow (`docs/improvement.md`). Qwen3.5/3.6 hybrid
+  mixture-of-experts models are supported: `analyze` classifies gated full-attention heads and
+  reports expert routing and linear-attention output, `attribute` ranks routed and shared experts,
+  and scale changes may select `experts` or `shared_expert`. Every run is kept with a `run_id`
+  (`history`, `show`, `compare` of two `analyze` runs, `prune`) and linked from its experiment.
+  Evaluations keep per-case rows per edit and refuse edits that raise loss on general probe text by
+  more than 5%. New edits: steering bundles folded into weights (`edit --bundle`) and `combine` of
+  2–4 edits. `cases --session` builds cases from a past session, `next` suggests the next step,
+  `improve` accepts presets (`loops`, `concise`, `rambling`, `format`), and the dashboard shows
+  edits, evaluations, dose curves, rankings, head grid, routing, experiments and recent runs.
+
+### Fixed
+
+- Skill tool cards show the bundled reference-file path as well as the skill name, distinguishing
+  chapter reads from repeated core-skill loads (`docs/terminal-interface.md`).
+
+- Local subagents now share the parent's generation-silence watchdog and bounded same-request
+  recovery, rather than waiting without it. Remote stalls are handled only by transport retries,
+  avoiding a competing watchdog that could cancel recovery (`docs/llm-transport.md`, `docs/subagents.md`).
+- `check` rejects an empty named selection instead of reporting verification success and a
+  matched pass prediction when no checks ran. Explicit reproduction registration still runs
+  its initial attempt (`docs/agent-loop.md`).
+- Automatic verification repair stops early when the same confirmed diagnosis recurs without
+  changed declared inputs; no-op/reverted edits cannot reset that bound when complete input
+  contracts are available. Undeclared checks retain an effect-revision fallback. Failed checks
+  and infrastructure blockers remain visible (`docs/agent-loop.md`).
+- Streaming answers reuse cached markdown rows when validating stable text for scrollback, avoiding
+  repeated full-prefix parsing while retaining exact timestamp and styled-row checks
+  (`docs/tui-rendering.md`).
+- Rejected `check` selections no longer register or replace reproductions and erase their prior
+  failure evidence. `repro` with `failed_only` is refused before registration, with instructions
+  to register/run first and rerun afterwards (`docs/agent-loop.md`).
+- Anthropic prompt-cache misses after a new user turn: tools routed in by an earlier request of
+  the session stay offered, so the tool list in the cached prefix no longer shrinks and rewrites
+  the cache when the next message matches different tools.
+- The terminal stays responsive while the main agent waits on subagents, side questions or
+  background work: those waits now hand the UI a heartbeat every 80 ms instead of every 250 ms.
+- `dial weights analyze` no longer fails with "subprocess failed (exit status: 1)" on models whose
+  forward pass reads attention attributes, such as mlx-vlm Qwen3.5/3.6: the attention recorder now
+  forwards attribute reads to the module it wraps.
 
 ### Fixed
 
@@ -91,6 +185,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- Local image generation no longer times out before slow diffusion models finish: `image.timeout_secs` now defaults to 900 (was 180; MLX-Serve's MOSS-Image takes about five minutes per 1024x1024 image, and Dial hung up first, so the server cancelled the job). A timeout error now names the limit and the setting to raise, and a transport timeout caused by that limit is reported as such instead of a bare transport error.
 - `scripts/release.sh` and the release workflow's CI gate list every failed job of the latest `CI` run (with links) when they refuse to release, instead of only reporting that no successful run exists.
 - Windows native edits no longer fail Git-metadata protection on `\\?\C:\…` paths (the macOS profile's backslash refusal now applies only where a quoted sandbox profile is generated), the collaboration relay treats a peer that drops its socket (broken pipe or reset) as a normal disconnect rather than a relay error, and CI compiles the Wayland/PipeWire feature combinations on Ubuntu 24.04, whose PipeWire headers match `libspa` 0.9.
 - Closing the terminal Dial runs in (a killed tmux server, a closed SSH session) no longer leaves Dial spinning at full CPU: the input reader treats a hung-up terminal as closed and exits instead of retrying its end-of-file forever.

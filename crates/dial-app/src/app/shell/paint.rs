@@ -251,6 +251,7 @@ impl Shell {
             title,
             tab_scope,
             todo,
+            work_tab,
             home,
             ..
         } = self;
@@ -343,13 +344,36 @@ impl Shell {
                     let room = available.saturating_sub(bottom.len());
                     bottom.extend(side_rows(thread, streamed, cols as usize, theme, room));
                 }
-                bottom.extend(tasks::rows(
+                let room = available.saturating_sub(bottom.len());
+                let tab_key = keys.label(Action::WorkTab);
+                let cycle_key = keys.label(Action::ApprovalCycle);
+                // Wide terminals show the plan as two cards beside each other (the work panel);
+                // narrower ones keep the compact focus summary.
+                let panel = crate::ui::work_panel::rows(
                     todo,
+                    &crate::ui::work_panel::Facts {
+                        approval: &status.approval,
+                        sandbox: &status.sandbox,
+                        tab_key: &tab_key,
+                        cycle_key: &cycle_key,
+                    },
+                    *work_tab,
                     cols as usize,
+                    room.min((rows as usize / 2).min(14)),
                     theme,
                     spinner,
-                    cap.min(available.saturating_sub(bottom.len())),
-                ));
+                );
+                if panel.is_empty() {
+                    bottom.extend(tasks::rows(
+                        todo,
+                        cols as usize,
+                        theme,
+                        spinner,
+                        cap.min(room),
+                    ));
+                } else {
+                    bottom.extend(panel);
+                }
                 if let Some(home) = home {
                     let frame = home.frame(cols, rows.saturating_sub(1), theme, view, bottom);
                     (frame.rows, Some(frame.cursor))

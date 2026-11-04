@@ -941,8 +941,13 @@ fn request_image(
         }
         None => builder.send_json(body),
     };
-    let mut response = sent
-        .map_err(|error| headers.redact(anyhow!(error).context("requesting image generation")))?;
+    let mut response = sent.map_err(|error| {
+        headers.redact(
+            client
+                .transport(error)
+                .context("requesting image generation"),
+        )
+    })?;
     let status = response.status().as_u16();
     let raw = response
         .body_mut()

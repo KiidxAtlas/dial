@@ -1407,3 +1407,35 @@ fn retained_routing_is_bounded_and_drops_the_oldest_first() {
         assert_eq!(retained[0], "mcp__srv3__inspect-widget3");
     });
 }
+
+/// A routed tool sits in the cached prompt prefix (tool list and system prompt). Once the session
+/// has history, a later request that does not match it keeps it offered instead of re-sending the
+/// whole conversation uncached.
+#[test]
+fn routed_tools_stay_offered_across_requests_once_the_session_has_history() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        nuxt(agent);
+        agent
+            .push(json!({"role":"user","content":"Fix Nuxt routing and rendering"}))
+            .unwrap();
+        agent.begin_tool_routing("Fix Nuxt routing and rendering");
+        assert!(selected(agent, "mcp__nuxt__list-documentation-pages"));
+        let offer = agent.offered();
+        agent.rebuild_system();
+        let system = agent.system_messages();
+        agent.begin_tool_routing("Fix a Rust compiler error");
+        assert_eq!(agent.offered(), offer);
+        agent.rebuild_system();
+        assert_eq!(agent.system_messages(), system);
+        // An explicit unload is honoured and is not re-added by the kept selection.
+        agent
+            .tool_routing
+            .unload(&["mcp__nuxt__list-documentation-pages".into()]);
+        agent.begin_tool_routing("Fix a Rust compiler error");
+        assert!(
+            !agent
+                .offered()
+                .contains(&"mcp__nuxt__list-documentation-pages".into())
+        );
+    });
+}

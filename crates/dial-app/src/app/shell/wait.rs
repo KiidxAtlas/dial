@@ -238,6 +238,10 @@ impl Shell {
                 self.ui.show_thinking = !self.ui.show_thinking;
                 WaitFlow::Continue
             }
+            ComposerEvent::Action(Action::WorkTab) => {
+                self.work_tab = self.work_tab.next();
+                WaitFlow::Continue
+            }
             ComposerEvent::Action(Action::DisplayReset) => {
                 self.display_reset();
                 WaitFlow::Continue

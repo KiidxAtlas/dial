@@ -24,11 +24,11 @@ impl Default for ReasoningGuardConfig {
     }
 }
 
-/// Operator-owned recovery for a silent inference attempt, not a task/step limit.
+/// Operator-owned recovery for a silent local inference attempt, not a task/step limit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestRecoveryConfig {
-    /// Seconds without meaningful inference progress before cancelling just that attempt; 0 disables it.
+    /// Local generation silence before cancelling just that attempt; 0 disables it.
     pub silence_secs: u64,
     /// Retry the same request once automatically; subsequent recovery needs user direction.
     pub retry_once: bool,

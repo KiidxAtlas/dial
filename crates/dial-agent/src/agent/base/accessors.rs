@@ -116,6 +116,17 @@ impl<'a> Agent<'a> {
     pub fn restore_todo(&mut self, snapshot: &Value) -> Result<()> {
         self.todo.restore(snapshot).map_err(anyhow::Error::msg)
     }
+    /// Progress for `/todo`: revalidates existing observations, then joins deliverables with
+    /// controller-current check status and live worker acceptance. It never runs checks. Owners
+    /// are not recorded, so none is reported. `jobs` is `Null` when the registry cannot be read.
+    pub fn progress_view(&mut self) -> serde_json::Value {
+        self.refresh_check_inputs();
+        let state = self.session.control_state();
+        serde_json::json!({
+            "reconciliation": self.deliverable_reconciliation(&state["working_state"]),
+            "jobs": self.live_tasks.status(None).unwrap_or(serde_json::Value::Null),
+        })
+    }
     pub fn checkpoints(&self) -> Option<&Arc<Checkpoints>> {
         self.checkpoints.as_ref()
     }
@@ -421,6 +432,7 @@ impl<'a> Agent<'a> {
     }
     pub(in crate::agent) fn restore_control(&mut self) -> Result<()> {
         let mut state = self.session.control_state();
+        self.workflow_contracts = workers::contracts::Ledger::restore(&state["workflow_jobs"]);
         self.workspace.reset_file_handles();
         if let Some(snapshot) = state.get("file_handles") {
             let snapshot = serde_json::from_value(snapshot.clone())

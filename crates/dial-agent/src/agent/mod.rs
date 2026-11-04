@@ -425,6 +425,7 @@ pub struct Agent<'a> {
     task_packet: workers::task_packet::PacketCache,
     reasoning_recovery: workflow::reasoning::Recovery,
     live_tasks: workers::live_tasks::LiveTasks,
+    workflow_contracts: workers::contracts::Ledger,
     side_questions: workers::side_questions::Questions,
     superseded: workflow::evidence::Supersession,
     legacy_memory_migrated: bool,

@@ -1027,6 +1027,7 @@ fn parse_models(value: &Value, probe: &Probe) -> Result<Vec<ModelEntry>> {
                 headers: probe.spec.headers.clone(),
                 account_id: None,
                 context_window: context(row),
+                thinking: None,
             };
             selection.context_window = selection
                 .context_window

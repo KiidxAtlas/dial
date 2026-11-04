@@ -2,6 +2,7 @@
 
 pub(in crate::agent) mod child;
 pub mod child_transcript;
+pub(in crate::agent) mod contracts;
 pub(in crate::agent) mod delegation;
 pub(in crate::agent) mod development_copy;
 pub(crate) mod isolation;

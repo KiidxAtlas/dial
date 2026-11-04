@@ -1054,6 +1054,7 @@ fn app_shortcuts_come_from_the_keymap_and_remapping_is_honored() {
             KeyCode::Char('g'),
             KeyModifiers::CONTROL,
         ),
+        (Action::WorkTab, KeyCode::Char('f'), KeyModifiers::CONTROL),
     ];
     for (action, code, mods) in cases {
         assert_eq!(
@@ -3475,13 +3476,35 @@ fn placeholders_shorten_to_a_whole_phrase_instead_of_being_cut() {
     env.ui.composer_shape = ComposerShape::Band;
     let c = composer();
     for width in [12u16, 20, 30, 36, 60] {
-        let rows = lines(&c.home_view(width, &env.ctx()).rows).join("\n");
+        let home = lines(&c.home_view(width, &env.ctx()).rows).join("\n");
+        assert!(
+            LANDING_PLACEHOLDERS.iter().any(|p| home.contains(p)) || width < 16,
+            "{width}: {home}"
+        );
+        let rows = lines(&c.view(width, &env.ctx()).rows).join("\n");
         assert!(
             PLACEHOLDERS.iter().any(|p| rows.contains(p)) || width < 16,
             "{width}: {rows}"
         );
         assert!(!rows.contains("describe what to\n"), "{width}: {rows}");
     }
+}
+
+#[test]
+fn the_launch_input_is_a_rounded_pill_without_status_or_shortcuts() {
+    let env = Env::new();
+    let c = composer();
+    let rows = lines(&c.home_view(60, &env.ctx()).rows);
+    assert!(
+        rows[0].starts_with('╭') && rows[0].ends_with('╮'),
+        "{rows:?}"
+    );
+    assert!(rows.last().unwrap().starts_with('╰'), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("What are we building?")));
+    assert!(
+        rows[0].chars().all(|c| "╭╮─".contains(c)),
+        "no status line in the launch pill: {rows:?}"
+    );
 }
 
 #[test]

@@ -966,4 +966,13 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Derive the pre-action time limit from the model's measured speed when reasoning_guard.max_pre_action_secs is 0, and show an estimated time left in the status line.",
         Kind::Bool,
     ),
+    field!(
+        "weights.model",
+        weights.model,
+        IM,
+        "Weights",
+        "Weight edit target",
+        "Local MLX model (id or path) that `dial weights`, /weights and the model_weights tool inspect and edit. Empty uses the main model, which must then be local MLX. Set it to let a hosted frontier main model drive edits to a different local model; promoting an edit then replaces this setting, not the main model.",
+        Kind::Text,
+    ),
 ];

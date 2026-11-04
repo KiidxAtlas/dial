@@ -421,4 +421,6 @@ fn failure_cause(error: &anyhow::Error) -> String {
 }
 
 #[cfg(test)]
+mod repair_progress_tests;
+#[cfg(test)]
 mod turn_steps_tests;

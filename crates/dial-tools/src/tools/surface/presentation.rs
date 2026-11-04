@@ -68,6 +68,15 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
             }),
         "todo" => one_line(field("op")),
         "message" => one_line(field("to")),
+        "skill" => {
+            let name = one_line(field("name"));
+            let file = one_line(field("file"));
+            if file.is_empty() {
+                name
+            } else {
+                format!("{name} · {file}")
+            }
+        }
         // The question the user is asked, not the call's JSON.
         "ask" => {
             let questions = args["questions"].as_array().map_or(&[][..], Vec::as_slice);

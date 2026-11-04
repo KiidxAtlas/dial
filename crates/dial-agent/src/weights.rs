@@ -19,9 +19,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use edits::{
-    MAX_BUDGET, MIN_EVALUATION_CASES, ModelSwitch, create_experiment, evaluate, experiment,
-    promotion, reversion,
+    MAX_BUDGET, MIN_EVALUATION_CASES, ModelSwitch, combine, create_experiment, evaluate,
+    experiment, promotion, reversion,
 };
+pub use guide::{PRESETS, cases_from_messages, expand_goal, next_steps};
+pub use history::{MAX_RUNS, compare_analyses, history, prune, show_run};
 
 /// Mirrors the worker's limits so callers learn about a bad request before a model loads.
 const MAX_PAIRS: usize = 64;
@@ -33,6 +35,12 @@ const MAX_NEW_TOKENS: u64 = 4096;
 const MAX_TAIL: u64 = 400;
 const MAX_EDIT_LAYERS: usize = 16;
 const MAX_EDIT_COLUMNS: u64 = 4096;
+const MAX_EDIT_CHANGES: usize = 32;
+const MAX_EDIT_INDICES: usize = 4096;
+const MAX_EDIT_SCALE: f64 = 4.0;
+const MAX_DOSES: usize = 5;
+const MAX_ATTRIBUTION_ROWS: usize = 100;
+const MAX_NEUTRAL_CASES: usize = 8;
 /// Stored and returned tensor rows; per-layer aggregates always cover the whole checkpoint.
 const MAX_TENSOR_ROWS: usize = 4096;
 
@@ -52,10 +60,17 @@ pub enum Operation {
     Direction,
     /// A new model copy with a saved direction projected out of chosen layers' MLP outputs.
     Edit,
+    /// Score an edit in memory at one or more strengths (answer loss and drift on neutral
+    /// answers) without writing a model copy.
+    Try,
+    /// Rank attention heads and MLP neurons by how strongly they support given answers.
+    Attribute,
+    /// An atlas of what each layer, attention head and neuron does, from built-in probe text.
+    Analyze,
 }
 
 impl Operation {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::Map,
         Self::Stats,
         Self::Activations,
@@ -63,6 +78,9 @@ impl Operation {
         Self::Generate,
         Self::Direction,
         Self::Edit,
+        Self::Try,
+        Self::Attribute,
+        Self::Analyze,
     ];
 
     pub fn name(self) -> &'static str {
@@ -74,6 +92,9 @@ impl Operation {
             Self::Generate => "generate",
             Self::Direction => "direction",
             Self::Edit => "edit",
+            Self::Try => "try",
+            Self::Attribute => "attribute",
+            Self::Analyze => "analyze",
         }
     }
 
@@ -83,7 +104,7 @@ impl Operation {
             .find(|op| op.name() == name)
             .with_context(|| {
                 format!(
-                    "unknown weights operation {name:?}; expected map, stats, activations, trace, generate, direction or edit"
+                    "unknown weights operation {name:?}; expected map, stats, analyze, activations, trace, generate, direction, edit, try or attribute"
                 )
             })
     }
@@ -92,23 +113,45 @@ impl Operation {
     pub fn loads_model(self) -> bool {
         matches!(
             self,
-            Self::Activations | Self::Trace | Self::Generate | Self::Direction
+            Self::Activations
+                | Self::Trace
+                | Self::Generate
+                | Self::Direction
+                | Self::Try
+                | Self::Attribute
+                | Self::Analyze
         )
     }
 
     /// Whether the operation belongs to an experiment, whose budget it is charged against.
     pub fn budgeted(self) -> bool {
-        matches!(self, Self::Generate | Self::Direction | Self::Edit)
+        matches!(
+            self,
+            Self::Generate | Self::Direction | Self::Edit | Self::Try | Self::Attribute
+        )
     }
 }
 
-/// The local MLX checkpoint directory for the configured model, or why it cannot be inspected.
+/// The model weight work acts on: `[weights] model` when set (so a hosted main model can drive
+/// edits to a different local model), otherwise the main model.
+pub fn target_name(config: &Config) -> &str {
+    if config.weights.model.is_empty() {
+        &config.model
+    } else {
+        &config.weights.model
+    }
+}
+
+/// The local MLX checkpoint directory for the target model, or why it cannot be inspected.
 pub fn target(config: &Config) -> Result<PathBuf> {
     ensure!(
-        config.endpoint.is_none() && config.provider.as_deref().is_none_or(|p| p == "mlx"),
-        "weight inspection needs a Dial-owned local MLX model; hosted and external endpoints expose no weights"
+        !config.weights.model.is_empty()
+            || (config.endpoint.is_none() && config.provider.as_deref().is_none_or(|p| p == "mlx")),
+        "the main model is hosted or external and exposes no weights; set `weights.model` to a Dial-owned local MLX model to edit it from this session"
     );
-    let resolved = PathBuf::from(crate::llm::catalog::resolve_local_model(&config.model)?);
+    let resolved = PathBuf::from(crate::llm::catalog::resolve_local_model(target_name(
+        config,
+    ))?);
     if local_format::gguf_file(&resolved).is_some() {
         bail!(
             "GGUF models are not supported yet; weight inspection reads MLX safetensors checkpoints"
@@ -182,7 +225,7 @@ pub fn arguments(op: Operation, input: &Value) -> Result<Value> {
     let field = |key: &str| input.get(key).filter(|value| !value.is_null());
     let mut out = json!({});
     match op {
-        Operation::Map => {}
+        Operation::Map | Operation::Analyze => {}
         Operation::Stats => {
             if let Some(prefix) = field("prefix") {
                 let prefix = prefix.as_str().context("prefix must be a string")?;
@@ -291,42 +334,248 @@ pub fn arguments(op: Operation, input: &Value) -> Result<Value> {
             out["name"] = json!(name(field("name"), "direction")?);
         }
         Operation::Edit => {
-            out["method"] = json!("project_out");
             out["name"] = json!(name(field("name"), "edit")?);
-            out["direction"] = json!(name(field("direction"), "direction")?);
-            let layers = field("layers")
-                .and_then(Value::as_array)
-                .map(|layers| {
-                    layers
-                        .iter()
-                        .map(|layer| layer.as_u64().filter(|&n| n < MAX_LAYER))
-                        .collect::<Option<Vec<_>>>()
-                })
-                .context("edit needs `layers`: zero-based layer indices")?
-                .context("layers must be zero-based indices")?;
-            ensure!(
-                (1..=MAX_EDIT_LAYERS).contains(&layers.len())
-                    && layers.iter().collect::<BTreeSet<_>>().len() == layers.len(),
-                "edit needs 1–{MAX_EDIT_LAYERS} distinct layers"
-            );
-            out["layers"] = json!(layers);
-            if let Some(columns) = field("columns") {
-                let columns = columns
+            edit_fields(input, &mut out)?;
+        }
+        Operation::Attribute => {
+            out["cases"] = json!(conversations(
+                field("cases"),
+                "cases",
+                MAX_CASES,
+                "assistant"
+            )?);
+            if let Some(wanted) = field("wanted") {
+                out["wanted"] = json!(conversations(
+                    Some(wanted),
+                    "wanted",
+                    MAX_CASES,
+                    "assistant"
+                )?);
+            }
+            if let Some(neutral) = field("neutral") {
+                out["neutral"] = json!(conversations(
+                    Some(neutral),
+                    "neutral",
+                    MAX_NEUTRAL_CASES,
+                    "assistant"
+                )?);
+            }
+            if let Some(focus) = field("focus") {
+                let focus = focus
+                    .as_str()
+                    .filter(|focus| matches!(*focus, "answer" | "repeats"))
+                    .context("focus must be answer or repeats")?;
+                out["focus"] = json!(focus);
+            }
+            if let Some(explain) = field("explain") {
+                out["explain"] = json!(explain.as_bool().context("explain must be true or false")?);
+            }
+            if let Some(top) = field("top") {
+                let top = top
                     .as_u64()
-                    .filter(|n| (1..=MAX_EDIT_COLUMNS).contains(n))
-                    .with_context(|| format!("columns must be 1–{MAX_EDIT_COLUMNS}"))?;
-                out["columns"] = json!(columns);
+                    .filter(|n| (1..=MAX_ATTRIBUTION_ROWS as u64).contains(n))
+                    .with_context(|| format!("top must be 1–{MAX_ATTRIBUTION_ROWS}"))?;
+                out["top"] = json!(top);
             }
-            if let Some(alpha) = field("alpha") {
-                let alpha = alpha
-                    .as_f64()
-                    .filter(|a| a.is_finite() && *a > 0.0 && *a <= 2.0)
-                    .context("alpha must be in (0, 2]")?;
-                out["alpha"] = json!(alpha);
+        }
+        Operation::Try => {
+            out["cases"] = json!(conversations(
+                field("cases"),
+                "cases",
+                MAX_CASES,
+                "assistant"
+            )?);
+            if let Some(neutral) = field("neutral") {
+                out["neutral"] = json!(conversations(
+                    Some(neutral),
+                    "neutral",
+                    MAX_NEUTRAL_CASES,
+                    "assistant"
+                )?);
             }
+            if let Some(doses) = field("doses") {
+                let doses = doses
+                    .as_array()
+                    .filter(|doses| {
+                        (1..=MAX_DOSES).contains(&doses.len())
+                            && doses
+                                .iter()
+                                .all(|d| d.as_f64().is_some_and(|d| d > 0.0 && d <= 2.0))
+                    })
+                    .with_context(|| {
+                        format!("doses must be 1–{MAX_DOSES} numbers in (0, 2]; 1 is the edit as specified")
+                    })?;
+                out["doses"] = json!(doses);
+            }
+            edit_fields(input, &mut out)?;
         }
     }
     Ok(out)
+}
+
+/// The fields that describe an edit, shared by `edit` and `try`: its method and either the
+/// direction, layers, columns and alpha of a projection or the `changes` of a direct scaling.
+fn edit_fields(input: &Value, out: &mut Value) -> Result<()> {
+    let field = |key: &str| input.get(key).filter(|value| !value.is_null());
+    if let Some(allow) = field("allow_noisy") {
+        out["allow_noisy"] = json!(
+            allow
+                .as_bool()
+                .context("allow_noisy must be true or false")?
+        );
+    }
+    match field("method").map_or(Some("project_out"), Value::as_str) {
+        Some("project_out") => {}
+        Some("scale") => {
+            out["method"] = json!("scale");
+            out["changes"] = scale_changes(field("changes"))?;
+            return Ok(());
+        }
+        Some("steering") => return steering_fields(input, out),
+        _ => bail!("method must be project_out, scale or steering"),
+    }
+    out["method"] = json!("project_out");
+    out["direction"] = json!(name(field("direction"), "direction")?);
+    let layers = field("layers")
+        .and_then(Value::as_array)
+        .map(|layers| {
+            layers
+                .iter()
+                .map(|layer| layer.as_u64().filter(|&n| n < MAX_LAYER))
+                .collect::<Option<Vec<_>>>()
+        })
+        .context("edit needs `layers`: zero-based layer indices")?
+        .context("layers must be zero-based indices")?;
+    ensure!(
+        (1..=MAX_EDIT_LAYERS).contains(&layers.len())
+            && layers.iter().collect::<BTreeSet<_>>().len() == layers.len(),
+        "edit needs 1–{MAX_EDIT_LAYERS} distinct layers"
+    );
+    out["layers"] = json!(layers);
+    if let Some(columns) = field("columns") {
+        let columns = columns
+            .as_u64()
+            .filter(|n| (1..=MAX_EDIT_COLUMNS).contains(n))
+            .with_context(|| format!("columns must be 1–{MAX_EDIT_COLUMNS}"))?;
+        out["columns"] = json!(columns);
+    }
+    if let Some(alpha) = field("alpha") {
+        let alpha = alpha
+            .as_f64()
+            .filter(|a| a.is_finite() && *a > 0.0 && *a <= 2.0)
+            .context("alpha must be in (0, 2]")?;
+        out["alpha"] = json!(alpha);
+    }
+    Ok(())
+}
+
+/// Optional row or column indices of a `scale` change: 1–[`MAX_EDIT_INDICES`] non-negative integers.
+fn indices(change: &Value, key: &str, tensor: &str) -> Result<Option<Value>> {
+    let Some(list) = change.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let list = list
+        .as_array()
+        .filter(|list| {
+            (1..=MAX_EDIT_INDICES).contains(&list.len()) && list.iter().all(Value::is_u64)
+        })
+        .with_context(|| {
+            format!("{tensor}: `{key}` must be 1–{MAX_EDIT_INDICES} non-negative integers")
+        })?;
+    Ok(Some(json!(list)))
+}
+
+/// Validate the `changes` of a direct `scale` edit: distinct exact tensor names, each multiplied
+/// by a finite factor, optionally on chosen rows or columns only. The worker checks the names and
+/// indices against the model's own tensors.
+fn scale_changes(value: Option<&Value>) -> Result<Value> {
+    let list = value.and_then(Value::as_array).with_context(|| {
+        "a scale edit needs `changes`: [{tensor, scale, rows?, columns?}] with exact tensor names"
+    })?;
+    ensure!(
+        (1..=MAX_EDIT_CHANGES).contains(&list.len()),
+        "a scale edit needs 1–{MAX_EDIT_CHANGES} changes"
+    );
+    let mut seen = BTreeSet::new();
+    let mut changes = Vec::new();
+    for change in list {
+        let scale_of = |label: &str| {
+            change["scale"]
+                .as_f64()
+                .filter(|scale| scale.is_finite() && scale.abs() <= MAX_EDIT_SCALE)
+                .with_context(|| {
+                    format!(
+                        "{label}: `scale` must be a number in [-{MAX_EDIT_SCALE}, {MAX_EDIT_SCALE}]"
+                    )
+                })
+        };
+        if change.get("tensor").is_none_or(Value::is_null) {
+            // A semantic selector: one layer's attention heads or MLP neurons, as `attribute` reports them.
+            let layer = change["layer"]
+                .as_u64()
+                .filter(|&n| n < MAX_LAYER)
+                .context(
+                    "a change needs an exact `tensor` name, or a `layer` with `heads`, `neurons`, `experts` or `shared_expert`",
+                )?;
+            let label = format!("layer {layer}");
+            // Exactly one selector: attention heads or MLP neurons (dense layers), MoE experts
+            // (routed expert down_proj entries), or the layer's shared expert.
+            let key = match (
+                change.get("heads"),
+                change.get("neurons"),
+                change.get("experts"),
+                change.get("shared_expert"),
+            ) {
+                (Some(_), None, None, None) => "heads",
+                (None, Some(_), None, None) => "neurons",
+                (None, None, Some(_), None) => "experts",
+                (None, None, None, Some(Value::Bool(true))) => "shared_expert",
+                _ => bail!(
+                    "{label}: give exactly one of `heads`, `neurons`, `experts` or `shared_expert: true`"
+                ),
+            };
+            ensure!(
+                seen.insert(format!("{layer}/{key}")),
+                "{label} {key} appear in more than one change"
+            );
+            ensure!(
+                change.get("rows").is_none() && change.get("columns").is_none(),
+                "{label}: `rows` and `columns` belong to a change with a `tensor`"
+            );
+            if key == "shared_expert" {
+                changes.push(
+                    json!({"layer": layer, "shared_expert": true, "scale": scale_of(&label)?}),
+                );
+                continue;
+            }
+            let list = change[key]
+                .as_array()
+                .filter(|list| {
+                    (1..=MAX_EDIT_INDICES).contains(&list.len()) && list.iter().all(Value::is_u64)
+                })
+                .with_context(|| {
+                    format!("{label}: `{key}` must be 1–{MAX_EDIT_INDICES} non-negative integers")
+                })?;
+            changes.push(json!({"layer": layer, key: list, "scale": scale_of(&label)?}));
+            continue;
+        }
+        let tensor = change["tensor"]
+            .as_str()
+            .filter(|name| !name.is_empty() && name.chars().count() <= MAX_PREFIX)
+            .context("every change needs an exact `tensor` name")?;
+        ensure!(
+            seen.insert(tensor.to_owned()),
+            "{tensor} appears in more than one change"
+        );
+        let mut entry = json!({"tensor": tensor, "scale": scale_of(tensor)?});
+        for key in ["rows", "columns"] {
+            if let Some(list) = indices(change, key, tensor)? {
+                entry[key] = list;
+            }
+        }
+        changes.push(entry);
+    }
+    Ok(json!(changes))
 }
 
 /// Where results, progress and the job lock live.
@@ -379,6 +628,18 @@ fn call_worker(
     config: &Config,
     model: &Path,
     op: Operation,
+    request: Value,
+    adapter: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    call_worker_named(config, model, op.name(), request, adapter, cancel)
+}
+
+/// [`call_worker`] for a worker operation `weights_<name>` that is not an [`Operation`].
+fn call_worker_named(
+    config: &Config,
+    model: &Path,
+    name: &str,
     mut request: Value,
     adapter: Option<&Path>,
     cancel: &AtomicBool,
@@ -386,17 +647,49 @@ fn call_worker(
     let progress = progress_path(config);
     write_private(
         &progress,
-        json!({"phase": "starting", "op": op.name()})
+        json!({"phase": "starting", "op": name})
             .to_string()
             .as_bytes(),
     )?;
-    request["op"] = json!(format!("weights_{}", op.name()));
+    request["op"] = json!(format!("weights_{name}"));
     request["model"] = json!(model);
     request["progress"] = json!(progress);
     if let Some(adapter) = adapter {
         request["adapter"] = json!(adapter);
     }
-    worker::call_controlled(config, &request, Some(cancel))
+    let response = worker::call_user_requested(config, &request, Some(cancel))?;
+    if let Some(message) = response["error"].as_str() {
+        bail!("{name}: {message}");
+    }
+    Ok(response)
+}
+
+/// The fields of a `steering` edit: a steering bundle and the records it was measured on (absolute
+/// paths), the strength to fold in and an optional ridge for the rank-1 solve.
+fn steering_fields(input: &Value, out: &mut Value) -> Result<()> {
+    let field = |key: &str| input.get(key).filter(|value| !value.is_null());
+    out["method"] = json!("steering");
+    for key in ["bundle", "data"] {
+        let path = field(key)
+            .and_then(Value::as_str)
+            .map(Path::new)
+            .filter(|path| path.is_absolute())
+            .with_context(|| format!("a steering edit needs `{key}`: an absolute path"))?;
+        out[key] = json!(path);
+    }
+    let strength = field("strength")
+        .and_then(Value::as_f64)
+        .filter(|s| s.is_finite() && *s > 0.0 && *s <= 10000.0)
+        .context("strength must be in (0, 10000]")?;
+    out["strength"] = json!(strength);
+    if let Some(ridge) = field("ridge") {
+        let ridge = ridge
+            .as_f64()
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .context("ridge must be a positive number")?;
+        out["ridge"] = json!(ridge);
+    }
+    Ok(())
 }
 
 /// Run one operation and store it as the latest result for its operation.
@@ -444,7 +737,11 @@ pub fn run(
             value["experiment"] = charged;
         }
         if let (Some(created), Some(experiment)) = (created, experiment.as_deref()) {
-            edits::record(config, created, experiment, &model)?;
+            edits::record(config, created, experiment, &model, &value)?;
+        }
+        let id = history::keep(config, &mut value)?;
+        if let Some(experiment) = experiment.as_deref().filter(|_| op.budgeted()) {
+            edits::link_run(config, experiment, op, &id)?;
         }
         write_private(&result_path(config, op), value.to_string().as_bytes())?;
         Ok(value)
@@ -483,7 +780,7 @@ pub fn latest(config: &Config, op: Operation) -> Result<Option<Value>> {
 /// The latest result of each operation and evaluation (null when absent), the edited copies and
 /// any running job's progress.
 pub fn status(config: &Config) -> Value {
-    let mut out = json!({"model": config.model});
+    let mut out = json!({"model": target_name(config)});
     out["target"] = match target(config) {
         Ok(path) => json!({"path": path}),
         Err(error) => json!({"unsupported": format!("{error:#}")}),
@@ -496,6 +793,8 @@ pub fn status(config: &Config) -> Value {
         .flatten()
         .unwrap_or(Value::Null);
     out["edits"] = json!(edits::summaries(config));
+    out["experiments"] = json!(edits::experiments(config));
+    out["runs"] = json!(history::recent(config));
     out["progress"] = stored(&progress_path(config))
         .ok()
         .flatten()
@@ -619,12 +918,27 @@ pub fn render(value: &Value) -> String {
             out.push("Separation per layer (gap in pooled standard deviations):".into());
             out.extend(bars(&rows("layers"), "layer", "separation", 24));
         }
-        "edit" => {
+        "edit" | "combine" => {
+            let how = match value["method"].as_str() {
+                Some("scale") => "scaled tensors".to_owned(),
+                Some("steering") => format!(
+                    "steering folded into {} at strength {}",
+                    value["steering"]["module"].as_str().unwrap_or("?"),
+                    value["steering"]["strength"]
+                ),
+                Some("combine") => format!(
+                    "sum of {} edits",
+                    value["sources"].as_array().map_or(0, Vec::len)
+                ),
+                _ => format!(
+                    "{} columns per layer · alpha {}",
+                    value["columns"], value["alpha"]
+                ),
+            };
             out.push(format!(
-                "{} · {} columns per layer · alpha {} · {} parameters edited, {} rewritten ({} of the model){}",
+                "{} · {} · {} parameters edited, {} rewritten ({} of the model){}",
                 value["output"].as_str().unwrap_or("?"),
-                value["columns"],
-                value["alpha"],
+                how,
                 value["edited_params"],
                 value["rewritten_params"],
                 value["fraction_changed"],
@@ -634,11 +948,124 @@ pub fn render(value: &Value) -> String {
                     ""
                 }
             ));
-            out.push("Edit norm per layer:".into());
-            out.extend(bars(&rows("layers"), "layer", "edit_norm", 24));
-            if value["quantized"] == true {
-                out.push("Requantization error per layer:".into());
-                out.extend(bars(&rows("layers"), "layer", "requantization_error", 24));
+            if value["method"] == "scale" {
+                out.push("Scaled tensors (edit norm, requantization error relative to it):".into());
+                for change in rows("changes") {
+                    out.push(format!(
+                        "  {} ×{} · rows {} · columns {} · edit norm {} · requantization {}",
+                        change["tensor"].as_str().unwrap_or("?"),
+                        change["scale"],
+                        change["rows"],
+                        change["columns"],
+                        change["edit_norm"],
+                        change["requantization_error"]
+                    ));
+                }
+            } else {
+                out.push("Edit norm per layer:".into());
+                out.extend(bars(&rows("layers"), "layer", "edit_norm", 24));
+                if value["quantized"] == true {
+                    out.push("Requantization error per layer:".into());
+                    out.extend(bars(&rows("layers"), "layer", "requantization_error", 24));
+                }
+            }
+        }
+        "analyze" => {
+            let summary = &value["summary"];
+            out.push(format!(
+                "{} layers · {} probe texts · baseline loss {} · most important layers {} · least important {}",
+                value["layer_count"],
+                value["probes"],
+                value["baseline_loss"],
+                summary["most_important_layers"],
+                summary["least_important_layers"]
+            ));
+            out.push(format!("Heads by role: {}", summary["heads_by_role"]));
+            for head in summary["induction_heads"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(5)
+            {
+                out.push(format!(
+                    "  induction head: layer {} head {} · copy attention {:.2}",
+                    head["layer"],
+                    head["head"],
+                    head["induction"].as_f64().unwrap_or(f64::NAN)
+                ));
+            }
+            out.push("Loss increase when the layer is skipped:".into());
+            out.extend(bars(&rows("layers"), "layer", "importance", 24));
+            for note in value["notes"].as_array().into_iter().flatten() {
+                out.push(format!("Note: {}", note.as_str().unwrap_or("")));
+            }
+        }
+        "attribute" => {
+            let key = value["ranked_by"].as_str().unwrap_or("support");
+            out.push(format!(
+                "{} cases · {} wanted · {} neutral · focus {} · ranked by {key} (estimated loss rise if removed)",
+                value["cases"],
+                value["wanted"],
+                value["neutral"],
+                value["focus"].as_str().unwrap_or("answer")
+            ));
+            for (title, list, field) in [
+                ("Attention heads", "heads", "head"),
+                ("MLP neurons", "neurons", "neuron"),
+            ] {
+                out.push(format!("{title}:"));
+                for row in rows(list).iter().take(10) {
+                    let mut line = format!(
+                        "  layer {} {field} {} · {key} {:.4} · agreement {:.2}",
+                        row["layer"],
+                        row[field],
+                        row[key].as_f64().unwrap_or(f64::NAN),
+                        row["agreement"].as_f64().unwrap_or(f64::NAN)
+                    );
+                    if let Some(induction) = row["induction"].as_f64() {
+                        line.push_str(&format!(" · induction attention {induction:.2}"));
+                    }
+                    for (label, tokens) in [("promotes", "promotes"), ("suppresses", "suppresses")]
+                    {
+                        if let Some(words) = row[tokens].as_array() {
+                            let words: Vec<String> = words
+                                .iter()
+                                .map(|w| format!("{:?}", w.as_str().unwrap_or("")))
+                                .collect();
+                            line.push_str(&format!(" · {label} {}", words.join(" ")));
+                        }
+                    }
+                    out.push(line);
+                }
+            }
+            for note in value["notes"].as_array().into_iter().flatten() {
+                out.push(format!("Note: {}", note.as_str().unwrap_or("")));
+            }
+            out.push("Per layer:".into());
+            out.extend(bars(&rows("layers"), "layer", key, 24));
+        }
+        "try" => {
+            out.push(format!(
+                "{} · {} answer tokens · baseline loss {} · {} neutral cases",
+                value["method"].as_str().unwrap_or("?"),
+                value["answer_tokens"],
+                value["baseline_loss"],
+                value["neutral_cases"]
+            ));
+            out.push("Per dose (loss change on the cases, drift from the intact model on neutral answers):".into());
+            for dose in rows("doses") {
+                out.push(format!(
+                    "  dose {} · loss {:+} · neutral drift {} · requantization {}{}",
+                    dose["dose"],
+                    dose["delta"].as_f64().unwrap_or(f64::NAN),
+                    dose["neutral_kl"],
+                    dose["max_requantization_error"],
+                    if dose["noisy"] == true {
+                        " · noisy"
+                    } else {
+                        ""
+                    }
+                ));
             }
         }
         "evaluate" => {
@@ -667,9 +1094,63 @@ pub fn render(value: &Value) -> String {
                     summary["checked"]
                 ));
             }
+            let quality = &value["quality"];
+            if let Some(change) = quality["relative_change"].as_f64() {
+                out.push(format!(
+                    "General probe-text loss: base {} → edit {} ({:+.1}%)",
+                    quality["base_probe_loss"],
+                    quality["edited_probe_loss"],
+                    change * 100.0
+                ));
+            }
+            let rows = rows("rows");
+            if !rows.is_empty() {
+                out.push("Case  outcome  base tokens/limit  edit tokens/limit".into());
+                for row in rows {
+                    let side = |side: &Value| {
+                        format!(
+                            "{}{}{}",
+                            side["tokens"],
+                            if side["hit_limit"] == true {
+                                " limit"
+                            } else {
+                                ""
+                            },
+                            if side["passed"] == false {
+                                " failed"
+                            } else {
+                                ""
+                            }
+                        )
+                    };
+                    out.push(format!(
+                        "{:>4}  {:<7}  {:<17}  {}",
+                        row["case"],
+                        row["outcome"].as_str().unwrap_or("?"),
+                        side(&row["base"]),
+                        side(&row["edited"])
+                    ));
+                }
+            }
             if let Some(reason) = value["reason"].as_str() {
                 out.push(format!("Not admitted: {reason}"));
             }
+        }
+        "compare" => {
+            out[0] = format!(
+                "Weights compare · {} → {}",
+                value["before"].as_str().unwrap_or("?"),
+                value["after"].as_str().unwrap_or("?")
+            );
+            out.push(format!(
+                "Baseline loss {} → {} · heads by role {} → {}",
+                value["baseline_loss"]["before"],
+                value["baseline_loss"]["after"],
+                value["heads_by_role"]["before"],
+                value["heads_by_role"]["after"]
+            ));
+            out.push("Importance change per layer:".into());
+            out.extend(bars(&rows("layers"), "layer", "importance", 24));
         }
         "experiment" => out.push(format!(
             "Experiment {}: {} of {} model runs used · {} prompts seen over {} runs",
@@ -681,9 +1162,8 @@ pub fn render(value: &Value) -> String {
         )),
         _ => out.push(value.to_string()),
     }
-    if let Some(experiment) = value["experiment"].as_object()
-        && op != "evaluate"
-    {
+    let experiment = &value["experiment"];
+    if experiment.is_object() && op != "evaluate" {
         out.push(format!(
             "Experiment {}: {} of {} model runs used",
             experiment["name"].as_str().unwrap_or("?"),
@@ -692,6 +1172,71 @@ pub fn render(value: &Value) -> String {
         ));
     }
     out.join("\n")
+}
+
+/// One line of what an edit changed, for the edited-copies list.
+fn describe(details: &Value) -> String {
+    let noise = details["max_requantization_error"]
+        .as_f64()
+        .filter(|noise| *noise > 0.0)
+        .map_or_else(String::new, |noise| format!(" · requantization {noise:.2}"));
+    match details["method"].as_str() {
+        Some("scale") => format!(
+            " · scaled {} · {} params{noise}",
+            details["tensors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| format!("{} ×{}", t["tensor"].as_str().unwrap_or("?"), t["scale"]))
+                .collect::<Vec<_>>()
+                .join(", "),
+            details["edited_params"]
+        ),
+        Some("steering") => format!(
+            " · steering into {} at strength {} · {} params{noise}",
+            details["module"].as_str().unwrap_or("?"),
+            details["strength"],
+            details["edited_params"]
+        ),
+        Some("combine") => format!(
+            " · sum of {} · {} params{noise}",
+            details["sources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" + "),
+            details["edited_params"]
+        ),
+        Some(_) => format!(
+            " · project_out layers {} · {} columns · alpha {} · {} params{noise}",
+            details["layers"], details["columns"], details["alpha"], details["edited_params"]
+        ),
+        None => String::new(),
+    }
+}
+
+/// Terminal list of kept runs ([`history`]): id, operation, experiment and the result's summary.
+pub fn render_history(rows: &Value) -> String {
+    let rows = rows.as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        return "No kept weights runs yet.".into();
+    }
+    rows.iter()
+        .map(|row| {
+            let experiment = row["experiment"]
+                .as_str()
+                .map_or_else(String::new, |name| format!(" · experiment {name}"));
+            format!(
+                "{} · {}{experiment} · {}",
+                row["id"].as_str().unwrap_or("?"),
+                row["op"].as_str().unwrap_or("?"),
+                row["summary"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Terminal summary of [`status`]: the target, any running job, every stored result and the
@@ -735,9 +1280,10 @@ pub fn render_status(status: &Value) -> String {
                 None => "not evaluated",
             };
             out.push(format!(
-                "  {} · experiment {} · {state}",
+                "  {} · experiment {} · {state}{}",
                 edit["name"].as_str().unwrap_or("?"),
-                edit["experiment"].as_str().unwrap_or("?")
+                edit["experiment"].as_str().unwrap_or("?"),
+                describe(&edit["details"])
             ));
         }
     }
@@ -747,8 +1293,17 @@ pub fn render_status(status: &Value) -> String {
     out.join("\n")
 }
 
+/// The instruction a model turn receives for `/weights improve GOAL`: the user's goal in their own
+/// words plus the stages of the `model_weights` loop. It grants nothing; every operation still
+/// needs approval and only the user can promote an edit.
+pub fn improvement_prompt(goal: &str) -> String {
+    include_str!("weights/playbook.md").replace("{goal}", &expand_goal(goal))
+}
+
 pub mod dashboard;
 mod edits;
+mod guide;
+mod history;
 pub mod tool;
 
 #[cfg(test)]

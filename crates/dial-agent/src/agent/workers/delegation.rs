@@ -1,6 +1,9 @@
 //! Subagent, reviewer and solve delegation from the main agent.
 
+use super::live_tasks;
 use crate::agent::*;
+
+mod contracts;
 
 /// Idle terminal sleep cap while live workers may message the parent.
 const WORKER_MESSAGE_POLL: Duration = Duration::from_millis(250);
@@ -28,6 +31,11 @@ impl<'a> Agent<'a> {
             &mut self.session_cost,
             ui,
         );
+        if let Err(error) = self.sync_contracts() {
+            ui.diagnostic(&format!(
+                "contracted workflow remains incomplete: {error:#}"
+            ));
+        }
         // Finished results stay queued until a request persists them: see `deliver_worker_results`.
         for letter in self.live_tasks.take_parent_messages() {
             ui.notice(&format!(
@@ -140,6 +148,18 @@ impl<'a> Agent<'a> {
     }
 
     pub fn start_subagents(&mut self, args: &Value, ui: &mut dyn Ui) -> Result<Value> {
+        if args.get("contract").is_some() {
+            return self.contract_task(args, ui);
+        }
+        self.start_live_subagents(args, ui, false)
+    }
+
+    fn start_live_subagents(
+        &mut self,
+        args: &Value,
+        ui: &mut dyn Ui,
+        strict: bool,
+    ) -> Result<Value> {
         self.gate_subagent_spawn(args, ui)
             .map_err(anyhow::Error::msg)?;
         if let Some(backend) = &self.backend {
@@ -155,7 +175,13 @@ impl<'a> Agent<'a> {
         };
         self.authorize_call(&call, ui)
             .map_err(|e| anyhow::anyhow!(e.message()))?;
-        let harness = self.child_harness();
+        let mut harness = self.child_harness();
+        if strict {
+            // A bounded workflow node cannot hide unlimited descendants inside one request.
+            harness
+                .tools
+                .retain(|name| name != "task" && name != "side_request");
+        }
         let result = self
             .live_tasks
             .start(
@@ -218,6 +244,12 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
     ) -> ToolOutput {
         self.pump_subagents(ui);
+        if args.get("contract").is_some() {
+            return match self.contract_task(args, ui) {
+                Ok(value) => live_tasks::output(Ok(value)),
+                Err(error) => ToolOutput::err(format!("{error:#}")),
+            };
+        }
         let spawns = matches!(
             args["action"].as_str().unwrap_or("run"),
             "run" | "start" | "resume" | "create" | "push"

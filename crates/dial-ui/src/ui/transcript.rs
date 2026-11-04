@@ -399,11 +399,30 @@ impl Block {
         if kind == Prose::Thinking && !ctx.ui.show_thinking {
             return None;
         }
+        let markdown = self.markdown.borrow();
+        let mut header = Vec::new();
+        self.timestamp_rows(&mut header, w, ctx);
         for &cut in stable_cuts(&text, self.spill.src).iter().rev().take(4) {
-            let mut prefix = prose_rows(kind, &text[..cut], w, ctx);
-            self.timestamp_rows(&mut prefix, w, ctx);
-            let p = prefix.len();
-            if p > skip && p <= full.len() && full[..p] == prefix[..] {
+            // Rendering already froze this source prefix. Reuse its rows rather than parsing the
+            // growing answer again whenever another paragraph can move into scrollback.
+            let cached = kind == Prose::Assistant
+                && markdown.cut == cut
+                && markdown
+                    .key
+                    .as_ref()
+                    .is_some_and(|(width, theme)| *width == w && theme == ctx.theme)
+                && text.starts_with(&markdown.head);
+            let prefix = if cached {
+                std::borrow::Cow::Borrowed(markdown.prefix.as_ref())
+            } else {
+                std::borrow::Cow::Owned(prose_rows(kind, &text[..cut], w, ctx))
+            };
+            let p = header.len() + prefix.len();
+            if p > skip
+                && p <= full.len()
+                && full[..header.len()] == header[..]
+                && full[header.len()..p] == prefix[..]
+            {
                 return Some((cut, p));
             }
         }

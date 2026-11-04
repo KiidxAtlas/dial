@@ -12,6 +12,16 @@ impl Agent<'_> {
         storage_before: crate::storage::session::SessionIoMetrics,
         ui: &mut dyn Ui,
     ) -> Result<TurnReport> {
+        // Contracted nodes are fail-closed even after late hooks, user edits and persistence errors.
+        self.sync_contracts()?;
+        if let Ok(report) = &mut result
+            && report.outcome == TurnOutcome::Completed
+            && let Some(reason) = self.workflow_contracts.blocker()
+        {
+            report.outcome = TurnOutcome::Incomplete;
+            report.text = unsettled_report(&report.text, &reason);
+            ui.notice(&reason);
+        }
         // Hooks and late verification may invalidate an earlier accepted candidate. Strict
         // requirements are checked again at final settlement without launching extra processes.
         if let Ok(report) = &mut result

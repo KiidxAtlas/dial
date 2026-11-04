@@ -1,4 +1,4 @@
-use crate::args::{Cli, Command};
+use crate::args::{Cli, Command, WeightsCommand};
 use crate::chat::chat;
 use crate::cmd;
 use crate::exit_with;
@@ -67,7 +67,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         Some(Command::Steering { action }) => {
             return cmd::steering::run(&cli, &layout, action);
         }
-        Some(Command::Weights { action }) => {
+        Some(Command::Weights { action }) if !matches!(action, WeightsCommand::Improve { .. }) => {
             return cmd::weights::run(&cli, &layout, action);
         }
         Some(Command::Experience { json }) => {
@@ -209,7 +209,34 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         }
         _ => {}
     }
+    let improving = match &cli.command {
+        Some(Command::Weights {
+            action: WeightsCommand::Improve { goal },
+        }) => Some(dial::weights::improvement_prompt(&goal.join(" "))),
+        _ => None,
+    };
+    if let Some(prompt) = &improving {
+        // The goal becomes the opening message of an ordinary session, so approvals, sessions and
+        // the model choice behave as they do everywhere else.
+        cli.prompt = vec![prompt.clone()];
+        cli.command = None;
+    }
     let mut table = overlay(&cli)?;
+    if improving.is_some() {
+        let config = dial::cli::model_flags::apply(
+            Config::load(&layout, Some(table.clone()))?,
+            &cli.model_flags,
+        )?;
+        dial::weights::target(&config)?;
+        let mut integrations = config.integrations.clone();
+        if !integrations.iter().any(|name| name == "model_weights") {
+            integrations.push("model_weights".into());
+        }
+        table.insert(
+            "integrations".into(),
+            toml::Value::Array(integrations.into_iter().map(Into::into).collect()),
+        );
+    }
     let mode = dial::cli::mode_flags::resolve(
         &cli.mode_args,
         dial::cli::mode_flags::LaunchContext {

@@ -398,6 +398,10 @@ pub struct ModelSelection {
     pub account_id: Option<String>,
     #[serde(deserialize_with = "context_override")]
     pub context_window: Option<u32>,
+    /// Role thinking level (`off`, `minimal`..`max`, `on`); `None` keeps the model default. Only
+    /// meaningful on `model_roles` entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 impl ModelSelection {
     /// A selection with only provider and model set; every optional field takes its default.
@@ -412,6 +416,7 @@ impl ModelSelection {
             headers: None,
             account_id: None,
             context_window: None,
+            thinking: None,
         }
     }
 }
@@ -444,6 +449,7 @@ impl Default for ModelSelection {
             headers: None,
             account_id: None,
             context_window: None,
+            thinking: None,
         }
     }
 }

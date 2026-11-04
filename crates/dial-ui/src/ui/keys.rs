@@ -48,6 +48,7 @@ pub enum Action {
     ThinkingToggle,
     ApprovalCycle,
     SubagentsHub,
+    WorkTab,
     SubagentsRecent,
     RateGood,
     RateBad,
@@ -107,6 +108,7 @@ impl Action {
         Action::ThinkingToggle,
         Action::ApprovalCycle,
         Action::SubagentsHub,
+        Action::WorkTab,
         Action::SubagentsRecent,
         Action::RateGood,
         Action::RateBad,
@@ -188,6 +190,7 @@ impl Action {
             Action::ThinkingToggle => "app.thinking.toggle",
             Action::ApprovalCycle => "app.approval.cycle",
             Action::SubagentsHub => "app.subagents.hub",
+            Action::WorkTab => "app.work.tab",
             Action::SubagentsRecent => "app.subagents.recent",
             Action::RateGood => "app.turn.rateGood",
             Action::RateBad => "app.turn.rateBad",
@@ -257,6 +260,7 @@ impl Action {
             Action::SubagentsRecent => {
                 "Open the most recent running worker's transcript; press again to cycle"
             }
+            Action::WorkTab => "Switch the work panel tab (plan, evidence, approvals)",
             Action::RateGood => "Mark the last turn good (Teach this model)",
             Action::RateBad => "Mark the last turn bad (Teach this model)",
             Action::SelectUp => "Move up in lists",
@@ -320,6 +324,7 @@ impl Action {
             Action::ToolsExpand
             | Action::ToolsToggle
             | Action::ThinkingToggle
+            | Action::WorkTab
             | Action::DisplayReset => "Display",
             Action::EditorLeft
             | Action::EditorRight
@@ -371,6 +376,8 @@ impl Action {
             Action::ApprovalCycle => &["Shift+Tab"],
             Action::SubagentsHub => &["Alt+A", "F6"],
             Action::SubagentsRecent => &["Alt+Shift+A", "F7"],
+            // Option+letter chords type glyphs on macOS, so the primary default is a Ctrl chord.
+            Action::WorkTab => &["Ctrl+F", "Alt+W", "F12"],
             Action::RateGood => &["Alt+Up"],
             Action::RateBad => &["Alt+Down"],
             Action::SelectUp => &["Up", "Ctrl+P"],

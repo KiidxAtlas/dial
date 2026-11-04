@@ -33,8 +33,10 @@ task = ["openrouter/anthropic/claude-sonnet-4-5"]
 
 [model_roles]
 small = { provider = "openai", model = "gpt-4o-mini" }
-task = { provider = "anthropic", model = "claude-sonnet-4-5" }
+task = { provider = "anthropic", model = "claude-sonnet-4-5", thinking = "medium" }
 ```
+
+Each assigned role may set its own `thinking` level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` (`on` is not accepted; `auto` applies only to the main model). The level is applied to every request made by that role, including subagents that use it, through the role model's catalog reasoning metadata or its `[model_profiles]` entry. Without `thinking`, the role uses the model's default effort. Set it from the TUI with `/effort <role> <level>`, and clear it with `/effort <role> default`; the role must be assigned in `/roles` first. A level the role model does not support is rejected when you set it. If a hand-edited level cannot be applied, the role keeps the model default. A `@role:level` suffix on a subagent route still overrides the role level for that one worker.
 
 ### Context promotion
 

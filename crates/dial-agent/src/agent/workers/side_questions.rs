@@ -190,7 +190,7 @@ impl Questions {
                     Some(
                         deadline
                             .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(250)),
+                            .min(crate::agent::ui::chat::HEARTBEAT),
                     ),
                 )?;
             }

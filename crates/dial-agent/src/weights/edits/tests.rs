@@ -52,6 +52,13 @@ elif op=='weights_edit':
     (out/'model.safetensors').write_text('x')
     (out/'weights-edit.json').write_text(json.dumps({'base':r['model'],'base_id':'base'}))
     print(json.dumps({'op':'edit','model':r['model'],'output':str(out),'layers':[]}))
+elif op=='weights_combine':
+    out=Path(r['output']); out.mkdir()
+    (out/'config.json').write_text('{"model_type":"llama"}')
+    (out/'model.safetensors').write_text('x')
+    (out/'weights-edit.json').write_text(json.dumps({'method':'combine','base_id':'base'}))
+    print(json.dumps({'op':'combine','model':r['model'],'method':'combine','output':str(out),
+                      'sources':r['edits'],'changes':[],'edited_params':3}))
 "#,
     )
     .unwrap();
@@ -134,6 +141,87 @@ fn comparison_admits_only_significant_wins_over_enough_cases() {
     assert!(compare(&result(&[true]), &result(&[true, true])).is_err());
 }
 
+#[test]
+fn probe_loss_rise_blocks_an_otherwise_significant_edit() {
+    let result = |hit: bool, loss: Option<f64>| {
+        let mut value = json!({"cases": vec![json!({"hit_limit": hit, "passed": null}); 8],
+                               "summary": {}});
+        if let Some(loss) = loss {
+            value["probe_loss"] = json!(loss);
+        }
+        value
+    };
+    // (base probe loss, edited probe loss, passed)
+    let table = [
+        (Some(2.0), Some(2.05), true),
+        (Some(2.0), Some(2.2), false),
+        (Some(2.0), Some(1.5), true),
+        (None, Some(9.0), true),
+    ];
+    for (before, after, passed) in table {
+        let value = admit_for_tests(&result(true, before), &result(false, after));
+        assert_eq!(value["passed"], passed, "{value}");
+        if !passed {
+            assert!(value["reason"].as_str().unwrap().contains("probe text"));
+        }
+        assert_eq!(value["quality"].is_null(), before.is_none(), "{value}");
+    }
+}
+
+#[test]
+fn records_written_before_history_still_load() {
+    let ledger: Ledger = serde_json::from_value(json!({"name": "old", "budget": 2, "used": 1,
+        "created_at": 1, "runs": [{"op": "generate", "at": 1, "cost": 1, "prompts": []}]}))
+    .unwrap();
+    assert!(ledger.runs[0].result.is_none());
+    let record: EditRecord = serde_json::from_value(json!({"name": "e", "experiment": "x",
+        "direction": "d", "base_model": "m", "base": "/b", "output": "/o", "created_at": 1,
+        "evaluation": {"passed": true, "wins": 8, "fingerprint": "f"}}))
+    .unwrap();
+    assert!(record.evaluation.unwrap()["rows"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn combine_sums_edits_of_one_experiment_into_a_new_unevaluated_copy() {
+    let root = tempfile::tempdir().unwrap();
+    let config = fixture(root.path());
+    let cancel = AtomicBool::new(false);
+    create_experiment(&config, "mix", 4).unwrap();
+    for name in ["a", "b"] {
+        let input = json!({"experiment": "mix", "name": name, "method": "scale",
+                           "changes": [{"tensor": "t", "scale": 0.5}]});
+        run(&config, None, Operation::Edit, &input, None, &cancel).unwrap();
+    }
+    let combine_with = |input: Value| combine(&config, None, &input, &cancel);
+    assert!(combine_with(json!({"name": "ab", "edits": ["a"]})).is_err());
+    assert!(combine_with(json!({"name": "ab", "edits": ["a", "a"]})).is_err());
+    assert!(combine_with(json!({"name": "ab", "edits": ["a", "missing"]})).is_err());
+    let value = combine_with(json!({"name": "ab", "edits": ["a", "b"]})).unwrap();
+    assert_eq!(value["op"], "combine");
+    assert!(value["run_id"].is_string());
+    let state = status(&config);
+    let made = &state["edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edit| edit["name"] == "ab")
+        .unwrap()
+        .clone();
+    assert_eq!(made["experiment"], "mix");
+    assert_eq!(made["details"]["method"], "combine");
+    assert_eq!(made["details"]["sources"], json!(["a", "b"]));
+    assert!(
+        made["passed"].is_null(),
+        "a combination needs its own evaluation"
+    );
+    let again = format!(
+        "{:#}",
+        combine_with(json!({"name": "ab", "edits": ["a", "b"]})).unwrap_err()
+    );
+    assert!(again.contains("already exists"), "{again}");
+}
+
 #[cfg(unix)]
 #[test]
 fn experiment_budget_edit_evaluation_promotion_and_revert() {
@@ -210,6 +298,27 @@ fn experiment_budget_edit_evaluation_promotion_and_revert() {
     assert_eq!(value["passed"], true, "{value}");
     assert_eq!(value["wins"], 8);
     assert_eq!(status(&config)["evaluate"]["edit"], "e1");
+    // The evaluation is kept per edit with its rows, and every run is in the history.
+    let state = status(&config);
+    let kept = &state["edits"][0]["evaluation"];
+    assert_eq!(kept["rows"].as_array().map(Vec::len), Some(8), "{kept}");
+    assert!(
+        kept.get("fingerprint").is_none(),
+        "fingerprint stays internal"
+    );
+    assert_eq!(state["runs"][0]["op"], "evaluate");
+    assert_eq!(state["runs"][0]["id"], value["run_id"]);
+    let charged = &state["experiments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["experiment"] == "loops")
+        .unwrap()["runs"];
+    let linked = charged[0]["result"].as_str().unwrap();
+    assert_eq!(
+        crate::weights::show_run(&config, linked).unwrap()["op"],
+        "generate"
+    );
     // Held-out cases stay out of the experiment afterwards.
     create_experiment(&config, "more", 1).unwrap();
     let ledger_error = {

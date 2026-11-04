@@ -234,6 +234,35 @@ impl Agent<'_> {
         }
         Ok(())
     }
+
+    /// Runs later turns on `driver` while the `model_weights` tool keeps acting on `target`, the
+    /// checkpoint of the model in force before. Returns the override to hand back to
+    /// [`Self::restore_model_override`] when the request ends. Session-only: neither the config on
+    /// disk nor the saved `/switch` selection changes. Refused while a turn holds the backend.
+    pub fn drive_weights_with(
+        &mut self,
+        driver: &ModelSelection,
+        target: &std::path::Path,
+    ) -> Result<Option<Config>> {
+        ensure!(
+            self.backend.is_some(),
+            "a turn is in progress; choose the driver model between turns"
+        );
+        let mut config = switched_config(self.effective_config(), driver, None)?;
+        config.weights.model = target.to_string_lossy().into_owned();
+        let prior = self.model_override.clone();
+        self.install_model_override(Some(config))?;
+        Ok(prior)
+    }
+
+    /// Reinstalls the override [`Self::drive_weights_with`] returned (`None`: the configured model).
+    pub fn restore_model_override(&mut self, prior: Option<Config>) -> Result<()> {
+        ensure!(
+            self.backend.is_some(),
+            "a turn is in progress; the session model is restored between turns"
+        );
+        self.install_model_override(prior)
+    }
 }
 
 /// Whether `selection` names a model Dial can offer without a network round trip: a bundled catalog

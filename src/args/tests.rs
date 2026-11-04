@@ -178,3 +178,24 @@ fn rules_cli_samples_are_exclusive_and_do_not_clash_with_global_flags() {
         )
     ));
 }
+
+#[test]
+fn weights_analyze_and_improve_parse_without_extra_flags() {
+    let cli = Cli::try_parse_from(["dial", "weights", "analyze", "--json"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Weights {
+            action: WeightsCommand::Analyze { json: true }
+        })
+    ));
+    let cli =
+        Cli::try_parse_from(["dial", "weights", "improve", "stop", "endless", "loops"]).unwrap();
+    let Some(Command::Weights {
+        action: WeightsCommand::Improve { goal },
+    }) = cli.command
+    else {
+        panic!("expected weights improve");
+    };
+    assert_eq!(goal.join(" "), "stop endless loops");
+    assert!(Cli::try_parse_from(["dial", "weights", "improve"]).is_err());
+}

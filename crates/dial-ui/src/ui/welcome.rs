@@ -110,7 +110,7 @@ fn row(margin: usize, spans: Vec<Span<'static>>, width: usize, ellipsis: &str) -
 }
 
 /// What an approval mode means, in a few words.
-fn approval_meaning(mode: &str) -> &'static str {
+pub(super) fn approval_meaning(mode: &str) -> &'static str {
     match mode {
         "write" => "edits and safe commands run; risky ones ask",
         "ask" => "asks before every edit and command",

@@ -56,6 +56,23 @@ Run `dial improve status` to inspect learning, `dial improve cycle` for an expli
 
 Existing verified trajectories remain available to the explicit learning pipeline. New ordinary coding chats and their bounded request observations stay in the session journal for resume, review and explicit cross-model session teaching, without becoming approved training examples. To evaluate task/model performance, run the explicit benchmark and improvement tools.
 
+### Review-only lessons from recurring failures
+
+An explicit improvement cycle also records lesson proposals when the same closed failure category
+recurs across at least two distinct recorded trajectories. Current categories cover semantic
+validation, configuration precedence and negative search. These are suggestions inferred from
+recorded events, not verified diagnoses or evidence that a new rule will improve performance.
+`/improve status` and the Status panel show the proposed lesson with its trajectory references.
+The cycle report records the proposal step. Storage reuses the learning database, deduplicates by
+category, and bounds candidates and references; proposal records contain fixed summaries and IDs,
+not copied prompts or code. It adds no inference request.
+
+Proposals remain **review required**, never active guidance. Review the linked trajectories before
+manually adopting a project rule or proposing a harness change through the existing evaluation and
+admission pipeline. Dial does not automatically edit `AGENTS.md` or `CLAUDE.md`, activate these
+lessons, or create a separate `progress.md` ledger. Ordinary sessions without recorded learning
+trajectories do not silently become training data to supply these proposals.
+
 ## What a cycle does
 
 `/improve jobs` shows each model's worker status and log alongside the shared compute lock.
@@ -435,18 +452,31 @@ state directory (`weights/`):
 | Operation | What it reports | Loads the model |
 |---|---|---|
 | `map` | architecture, tensors, parameters and bytes per layer and component (attention, MLP, norms, embeddings), dtypes and quantization | no (safetensors headers) |
+| `analyze` | an atlas from built-in probe text: per-layer importance (loss rise when the layer is skipped), each attention head's role (induction/copy, previous-token, attention sink, mixed) and the busiest MLP neurons with the tokens they promote; takes no input and costs no experiment run | yes |
 | `stats` | per-tensor norm, RMS, mean, std, absolute max and outlier ratio; per-layer norms (`--prefix` limits the tensors) | no (lazy reads, quantized weights dequantized in chunks) |
 | `activations` | per-layer contrast between 1–64 matched positive/negative conversations sharing a prompt, with a suggested steering layer | yes |
 | `trace` | answer-loss increase over 1–16 conversations with each layer skipped, or with each attention head of one layer removed (`--heads N`) | yes |
 
 ```sh
 dial weights map
+dial weights analyze                              # what the layers, heads and neurons do
+dial weights improve stop endless repetition in long lists   # the model runs the whole edit loop
 dial weights stats --prefix model.layers.12
 dial weights activations --pairs pairs.json      # [{"positive":[...messages], "negative":[...]}]
 dial weights trace --cases cases.json --heads 12 # [{"messages":[..., {"role":"assistant",...}]}]
 dial weights status                              # stored results; --json for the raw values
 dial weights open                                # loopback dashboard
 ```
+
+The short path is three commands. `dial weights map` shows the layout, `dial weights analyze` probes
+the model and records what its parts do (the model sees the same atlas through `model_weights`), and
+`dial weights improve GOAL` opens an ordinary session whose first message is the goal plus the
+weight-editing playbook, with the `model_weights` tool enabled for that run. The model measures the
+problem, picks components using the atlas and `attribute`, tests them with `try`, writes a copy with
+`edit` and judges it with `evaluate`. Every call still asks for approval, and only you can adopt an
+edit (`dial weights promote NAME`). The head roles are attention-pattern heuristics measured on six
+short texts: leads for the model to check, not proof of function. Mixture-of-experts and
+linear-attention layers have no per-head or dense-neuron entries and the result says so.
 
 `dial weights` inspects the configured model; when the saved default is a hosted provider, select
 the local checkpoint with `--provider mlx --model <path or repo>`.
@@ -479,6 +509,8 @@ becomes the project's model only after it beats the base model on held-out cases
 | `experiment NAME --budget N` | creates an experiment with a budget of 1–256 model runs; without `--budget`, shows the experiment | 0 |
 | `generate` | greedy answers (temperature 0, seed 42) to 1–32 cases ending in a user turn; reports tokens, token-limit hits, repetition ratio and optional `required`/`forbidden` checks per case; `--tail N` shows the last N ≤ 400 characters of each answer | 1 |
 | `direction NAME` | per-layer unit direction between `--negative` (unwanted) and `--positive` (wanted) answers at the MLP output (`--site mlp`, default) or residual stream, with gap and separation per layer and suggested layers | 1 |
+| `attribute` | ranks attention heads and MLP neurons by the estimated rise in answer loss if each were removed (one backward pass over 1–16 `--cases` ending in the unwanted answer); with `--wanted` answers it ranks by the difference, so components that drive the unwanted answer without being needed for the wanted one come first | 1 |
+| `try` | scores an edit in memory at each of `--doses` (up to 5) and discards it: loss change on `--cases` and KL drift from the intact model on up to 8 `--neutral` answers; writes no model files | 1 |
 | `edit NAME` | new copy under `weights/edits/NAME` with the direction projected out of the top `--columns` (default 64) `down_proj` columns of each of `--layers` (1–16), scaled by `--alpha` (default 1) | 0 |
 | `evaluate EDIT --cases FILE` | runs the base and the edit on 8–32 held-out cases, compares them case by case, and records pass or fail | not charged |
 | `promote EDIT` / `revert` | sets the project's main model to the passing edit, or back to its base | — |
@@ -497,7 +529,81 @@ dial weights revert              # back to the base model
 before the worker starts, and a run past the budget is refused. Each run records the SHA-256 of the
 prompts it showed the model, never the text.
 
-**Held-out evaluation.** An evaluation refuses any case whose prompt the experiment already saw.
+**Direct scaling.** `edit` also takes `method = "scale"` (CLI: `--changes FILE`), where the caller
+chooses the weights instead of a measured direction: `changes` is a list of `{tensor, scale, rows?,
+columns?}` with exact tensor names from `map`/`stats`, a factor in [-4, 4], and optional first-axis
+`rows` and last-axis `columns` (default: the whole tensor). Only the selected elements change.
+It costs no model runs, needs no direction, and goes through the same copy, record, held-out
+evaluation and user-only promotion as a projection edit. Quantized tensors are requantized only in
+the groups holding a selected element, and the result reports the requantization error against the
+edit size. An edit whose requantization error exceeds half the edit itself is mostly rounding noise and
+is refused unless `allow_noisy` (`--allow-noisy` on `try`) is set; edit an 8-bit or full-precision
+copy instead.
+
+A change may name `{layer, heads}` (that layer's attention `o_proj` columns for those heads) or
+`{layer, neurons}` (its `down_proj` columns) instead of a tensor, using the indices `attribute`
+reports. Rows, columns and layers are checked against the model's tensor shapes before any shard
+loads, and worker contract errors are returned to the caller with the limit that was exceeded.
+
+**Understanding before editing.** `attribute` shortlists components, `try` measures a candidate at
+several strengths against both the target behaviour and neutral drift, and only a candidate that
+lowers loss on the cases while neutral drift stays near zero is worth writing with `edit`.
+`attribute` is a first-order estimate: confirm it with `try` or `trace --heads`. `status` lists every
+earlier edit with its parameters and requantization error so failed attempts are not repeated.
+
+**Mixture-of-experts and hybrid models.** On Qwen3.5/3.6-style models `analyze` classifies the heads
+of the full-attention layers (the gated `q_proj` is split so only the query half is scored), reports
+per-layer expert routing (top experts by share and routing entropy) and the output RMS of
+linear-attention layers. `attribute` also ranks routed experts and shared experts, and a scale change
+may name `{layer, experts: [...]}` (those experts' `down_proj` slices) or `{layer, shared_expert: true}`.
+
+**Steering and combined edits.** `dial weights edit NAME --experiment E --bundle B --data D
+--strength S` folds a steering bundle from `dial steering` into the weights of a new copy (the rank-1
+delta is solved as for a baked adapter, then added to the placed projection; no adapter is left).
+`dial weights combine NAME --edits a,b` sums 2–4 edits of one experiment on one base into a new copy.
+Both are ordinary edits: they need their own passing evaluation before `promote`.
+
+**History and comparison.** Every successful run and evaluation is also kept under
+`weights/runs/` (newest 200) with a `run_id`; experiment ledgers link each charged run to its result.
+`dial weights history [--op analyze]` lists them, `dial weights show ID` prints one,
+`dial weights compare BEFORE AFTER` compares two `analyze` runs layer by layer (importance, routing
+entropy, head roles, baseline loss), for example of a base and its edited copy, and
+`dial weights prune --keep N` removes older ones. The dashboard shows recent runs, an experiment
+timeline, the edited copies with their per-case evaluation rows, `try` dose curves and `attribute`
+rankings.
+
+**Getting started.** `dial weights next` suggests the next step from what has been run.
+`dial weights cases --session ID --output cases.json` turns a past session's user turns into
+generation cases (add `required`/`forbidden` checks by hand). `dial weights improve loops` (also
+`concise`, `rambling`, `format`) expands a preset goal.
+
+**Telling the model what you want.** Say the goal in plain words, either as an ordinary message
+(with `model_weights` in `integrations`) or as `/weights improve GOAL`, for example
+`/weights improve stop endless repetition in long lists`. The model reproduces the problem with
+`generate`, shortlists components with `attribute`, tests them with `try`, writes the best with
+`edit`, judges it with `evaluate` and reports what it measured. `/weights improve` adds a fixed
+playbook to the request; it grants nothing: every `model_weights` call except `status` still asks
+for approval, and only you can adopt a passing edit with `/weights promote NAME`.
+
+**Choosing the model that runs the loop.** The weights edited are always those of the model in
+force when you run `/weights improve` (or `[weights] model` when set). The model that drives the
+loop can be a different one: when other chat models are configured (model roles or favorites),
+`/weights improve GOAL` opens a picker with the current model first; `/weights improve --with
+MODEL GOAL` chooses directly (`provider/model`, a unique model id, `@role`, or `@main` for the
+current model). So you can `/switch` to a local MLX model, run `/weights improve`, and pick a
+frontier model to fix that local model's weights. The driver applies to that request only and is
+session-only; the session model returns afterwards and no settings are written.
+
+`attribute` options: `focus: repeats` scores only tokens that repeat an earlier 3-token sequence,
+`neutral` answers are subtracted so generally important components rank low (`specific`), and each
+row reports `agreement` (share of cases it supports). Top neurons list the tokens they
+promote/suppress (read from the `down_proj` column through the output embedding, a logit lens) and
+top heads their induction attention; `explain: false` skips these.
+
+**Held-out evaluation.** An evaluation also scores both models on built-in general probe text: an
+edit that raises that loss by more than 5% is not admitted even when it wins its cases, and the
+result shows the change. Each edit keeps its last evaluation with the per-case rows.
+An evaluation refuses any case whose prompt the experiment already saw.
 Once evaluated, those cases are held out: later runs of the experiment may not use them. A case is
 good when the answer stops before the token limit and passes its checks, if it has any. The edit
 wins a case when only its answer is good, and loses one when only the base's is. The edit passes
@@ -512,6 +618,12 @@ quantization groups stay byte-identical.
 **Promotion.** `promote` needs the edit's own passing evaluation, and the copy must be unchanged since
 then (names, sizes and modification times are rechecked). It writes `provider = "mlx"` and the copy's
 path as `model` to the project settings. `revert` restores the base the edit was made from.
+
+**Editing a different model from a frontier session.** Weight work acts on the main model by
+default, which must then be local MLX. Set `[weights] model = "mlx-community/…"` (or a path) to
+point it at a local model instead: the main model can stay a hosted frontier model that drives the
+`model_weights` tool while the weights of the other model are inspected and edited. With that
+setting, `promote` and `revert` change `weights.model` and never the main model.
 
 In a session, `/weights experiment|generate|direction|edit|evaluate …` runs the same command as a
 background job. `/weights promote EDIT` and `/weights revert` switch the session's model at once.

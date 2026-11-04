@@ -44,7 +44,8 @@ pub struct ImageConfig {
     /// Environment variable holding the API key. Unset uses the provider's standard variable
     /// (`OPENAI_API_KEY` for api.openai.com) or a key saved through `/providers`.
     pub api_key_env: Option<String>,
-    /// Per request timeout in seconds. Zero disables the timeout.
+    /// Per request timeout in seconds. Zero disables the timeout. The default leaves room for
+    /// local diffusion models, which can take several minutes per image.
     pub timeout_secs: u64,
     /// Offer `image_gen` without an `integrations` entry whenever a shared image route resolves
     /// with its required credentials, independently of the main chat model's vision capability.
@@ -64,7 +65,7 @@ impl Default for ImageConfig {
             model: "gpt-image-1.5".into(),
             api: None,
             api_key_env: None,
-            timeout_secs: 180,
+            timeout_secs: 900,
             auto: true,
             allow_weight_edits: false,
             models: BTreeMap::new(),

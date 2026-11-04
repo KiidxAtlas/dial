@@ -312,6 +312,12 @@ pub struct Reply {
     /// How the backend that produced this reply bills it; `None` for replies that did not come
     /// from a provider request (fixtures, synthesized replies).
     pub billing: Option<usage::Billing>,
+    /// Wall time from the final attempt's dispatch to its first streamed output (text, reasoning
+    /// or tool arguments). `None` when the reply was not streamed through callbacks.
+    pub first_output: Option<Duration>,
+    /// Reasoning effort the request asked for (`off` when thinking was disabled); `None` leaves
+    /// the provider default in place.
+    pub requested_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

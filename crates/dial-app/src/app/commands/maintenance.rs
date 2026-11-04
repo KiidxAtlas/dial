@@ -9,6 +9,8 @@
 //! - `/relay start|stop|status` runs a local collaboration relay for `/collab` in the background.
 //! - `/hooks` lists the configured lifecycle hooks.
 //! - `/weights` shows stored weight results and opens their loopback dashboard at once;
+//!   `/weights improve [--with MODEL] GOAL` has a model (picked when others are configured) run
+//!   the whole edit loop on the current model's weights for a goal in plain words;
 //!   `/weights map|stats|activations|trace|experiment|generate|direction|edit|evaluate` runs
 //!   `dial weights` as a background job, and `/weights promote NAME|revert` switches this
 //!   project's model to an edited copy that passed its evaluation, or back to its base.
@@ -16,6 +18,7 @@ use super::CommandSpec;
 use super::extensions::spawn_job_streaming;
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step};
+use crate::ui::overlay::palette::{ChoiceItem, ChoiceSpec};
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
@@ -102,11 +105,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "weights",
         description: "inspect local MLX model weights and run evaluation-gated weight edit experiments",
-        args_hint: "[status|open|map|stats|activations|trace|experiment NAME [--budget N]|generate|direction NAME|edit NAME|evaluate EDIT --cases FILE|promote EDIT|revert]",
+        args_hint: "[status|open|next|map|analyze|stats|activations|trace|experiment NAME [--budget N]|generate|direction NAME|edit NAME|combine NAME --edits a,b|evaluate EDIT --cases FILE|history|show ID|compare A B|prune|cases --session ID|improve [--with MODEL] GOAL|promote EDIT|revert]",
         subcommands: &[
             "status",
             "open",
             "map",
+            "analyze",
             "stats",
             "activations",
             "trace",
@@ -115,6 +119,14 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
             "direction",
             "edit",
             "evaluate",
+            "combine",
+            "history",
+            "show",
+            "compare",
+            "prune",
+            "cases",
+            "next",
+            "improve",
             "promote",
             "revert",
         ],
@@ -137,6 +149,9 @@ pub(super) fn run(
         "benchmark" => benchmark(shell, app, args),
         "weights" if matches!(args.split_whitespace().next(), Some("promote" | "revert")) => {
             return Some(weights_switch(shell, app, agent, args));
+        }
+        "weights" if args.split_whitespace().next() == Some("improve") => {
+            return Some(weights_improve(shell, app, agent, args));
         }
         "weights" => weights_job(shell, app, args),
         _ => return None,
@@ -520,21 +535,31 @@ fn weights(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
 fn weights_job(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
     let words = split_args(args)?;
     let op = words.first().map(String::as_str).unwrap_or_default();
-    if !matches!(op, "experiment" | "evaluate") {
+    if !matches!(
+        op,
+        "experiment"
+            | "evaluate"
+            | "combine"
+            | "history"
+            | "show"
+            | "compare"
+            | "prune"
+            | "cases"
+            | "next"
+    ) {
         crate::weights::Operation::parse(op).context(
             "usage: /weights [status|open|map|stats|activations|trace|experiment NAME [--budget N]|generate --experiment E --cases FILE|direction NAME --experiment E --positive FILE --negative FILE|edit NAME --experiment E --direction D --layers 10,11|evaluate EDIT --cases FILE|promote EDIT|revert]",
         )?;
     }
     crate::weights::target(&app.config)?;
-    // `target` accepted only Dial-owned MLX, so the child is pinned to that route too: the saved
-    // configuration may name a hosted provider and endpoint for other sessions.
-    let mut argv = vec![
-        "--provider".to_owned(),
-        "mlx".to_owned(),
-        "--model".to_owned(),
-        app.config.model.clone(),
-        "weights".to_owned(),
-    ];
+    // `target` accepted only Dial-owned MLX. Without `weights.model` the main model is that
+    // target, so the child is pinned to it: the saved configuration may name a hosted provider
+    // and endpoint for other sessions. With `weights.model` the child resolves the same setting.
+    let mut argv = Vec::new();
+    if app.config.weights.model.is_empty() {
+        argv.extend(["--provider", "mlx", "--model", app.config.model.as_str()].map(str::to_owned));
+    }
+    argv.push("weights".to_owned());
     argv.extend(words);
     spawn_dial(
         shell,
@@ -543,6 +568,142 @@ fn weights_job(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
         argv,
         Some("Finished. /weights open shows the result in the dashboard."),
     )
+}
+
+/// `/weights improve [--with MODEL] GOAL`: hand the user's goal to a model with the weight-editing
+/// playbook, so it runs the `model_weights` loop itself. The weights edited are those of the model
+/// in force now (or `weights.model`); the model that drives the loop may be another one, chosen
+/// with `--with` (`@main` keeps the current one) or from a picker when other chat models are
+/// configured. The driver is session-only and is put back when the request ends. Every operation
+/// still asks for approval and promotion stays with `/weights promote`.
+fn weights_improve(
+    shell: &mut Shell,
+    app: &App,
+    agent: &mut Agent<'_>,
+    args: &str,
+) -> Result<Step> {
+    let rest = args
+        .trim()
+        .strip_prefix("improve")
+        .unwrap_or_default()
+        .trim();
+    let (driver, goal) = match rest.strip_prefix("--with") {
+        Some(rest) => {
+            let rest = rest.trim_start();
+            let (selector, goal) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            (Some(selector), goal.trim())
+        }
+        None => (None, rest),
+    };
+    if goal.is_empty() || driver == Some("") {
+        bail!(
+            "usage: /weights improve [--with MODEL] GOAL, for example /weights improve stop endless repetition in long lists"
+        );
+    }
+    let config = agent.effective_config();
+    let target = crate::weights::target(config)?;
+    if !config
+        .integrations
+        .iter()
+        .any(|name| name == "model_weights")
+    {
+        bail!(
+            "the model_weights tool is off. Add \"model_weights\" to `integrations` in /settings (Tools), then run this again"
+        );
+    }
+    let prompt = crate::weights::improvement_prompt(goal);
+    let driver = match driver {
+        Some(selector) => crate::agent::modes::switch::resolve(config, selector)?,
+        None => {
+            let choices = driver_choices(config, goal);
+            if choices.items.len() > 1 {
+                return shell.open(
+                    app,
+                    agent,
+                    crate::app::overlay::Which::Choice(Box::new(choices)),
+                );
+            }
+            return shell.run_turn(app, agent, &prompt);
+        }
+    };
+    let current = config.selection();
+    if driver.provider == current.provider && driver.model == current.model {
+        return shell.run_turn(app, agent, &prompt);
+    }
+    if !shell.wait_compute(app)? {
+        return Ok(Step::Done);
+    }
+    let prior = agent.drive_weights_with(&driver, &target)?;
+    shell.note(
+        "Weights",
+        format!(
+            "{} drives this request; it edits {}. The session model returns afterwards.",
+            driver.display_name(),
+            target.display()
+        ),
+    );
+    let step = shell.run_turn(app, agent, &prompt);
+    if let Err(error) = agent.restore_model_override(prior) {
+        shell.note(
+            "Weights",
+            format!("could not restore the session model: {error:#}"),
+        );
+    }
+    step
+}
+
+/// Roles that never answer chat, so they cannot drive the weight-editing loop.
+const NON_CHAT_ROLES: &[&str] = &[
+    "embedding",
+    "grounding",
+    "image",
+    "image_embedding",
+    "memory",
+];
+
+/// The picker for `/weights improve GOAL`: the current model first, then every other configured
+/// chat model (roles and favorites). Each row runs `/weights improve --with MODEL GOAL`.
+fn driver_choices(config: &crate::config::types::Config, goal: &str) -> ChoiceSpec {
+    let current = config.selection();
+    let mut seen = std::collections::BTreeSet::new();
+    seen.insert(format!("{}/{}", current.provider, current.model));
+    let mut items = vec![ChoiceItem {
+        value: format!("--with @main {goal}"),
+        label: format!("{} (current model)", current.display_name()),
+        detail: "The model whose weights are edited also runs the loop.".into(),
+        current: true,
+    }];
+    let roles = config
+        .model_roles
+        .iter()
+        .filter(|(role, _)| !NON_CHAT_ROLES.contains(&role.as_str()))
+        .map(|(role, selection)| (format!("role {role}"), selection));
+    let favorites = config
+        .model_favorites
+        .iter()
+        .map(|selection| ("favorite".to_owned(), selection));
+    for (source, selection) in roles.chain(favorites) {
+        let key = format!("{}/{}", selection.provider, selection.model);
+        if selection.model.is_empty() || !seen.insert(key.clone()) {
+            continue;
+        }
+        items.push(ChoiceItem {
+            value: format!("--with {key} {goal}"),
+            label: selection.display_name(),
+            detail: format!("{key} · {source}: drives the loop for this request only"),
+            current: false,
+        });
+    }
+    ChoiceSpec {
+        title: "Weights · choose the model that runs the edit loop".into(),
+        command: "weights".into(),
+        verb: "improve",
+        items,
+        prompt: "Filter models:".into(),
+        summary: "The edited weights stay those of the current model (or weights.model).".into(),
+        current_tag: Some("edited".into()),
+        ..Default::default()
+    }
 }
 
 /// `/weights promote NAME` and `/weights revert`: save this project's main model as the edited
@@ -557,7 +718,7 @@ fn weights_switch(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
     app.save_settings(
         crate::config::settings_store::Scope::Project,
         &switch.changes,
-        Some("main"),
+        switch.role,
     )?;
     let fresh = app.reload()?;
     shell.note("Weights", switch.message);

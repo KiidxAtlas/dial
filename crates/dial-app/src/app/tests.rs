@@ -751,6 +751,50 @@ fn chatgpt_reasoning_controls_create_and_persist_an_exact_model_profile() {
 }
 
 #[test]
+fn role_thinking_is_saved_per_role_and_applied_only_to_that_role() {
+    use crate::app::selection::role_thinking_changes;
+    use crate::llm::profiles::ReasoningEffort;
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let set = |path: &str, value: &str| Change::Set {
+        path: path.into(),
+        value: value.into(),
+    };
+    let config = settings_store::save_config(
+        &layout,
+        Scope::Global,
+        &[
+            set("provider", "anthropic"),
+            set("model", "claude-opus-5-5"),
+            set("model_roles.task.provider", "anthropic"),
+            set("model_roles.task.model", "claude-haiku-5-5"),
+        ],
+    )
+    .unwrap();
+    assert!(role_thinking_changes(&config, "main", "high").is_err());
+    assert!(
+        role_thinking_changes(&config, "coach", "high").is_err(),
+        "unassigned role"
+    );
+    assert!(role_thinking_changes(&config, "task", "auto").is_err());
+    let changes = role_thinking_changes(&config, "task", "medium").unwrap();
+    let saved = settings_store::save_config(&layout, Scope::Project, &changes).unwrap();
+    assert_eq!(
+        saved
+            .for_role("task")
+            .active_model_profile()
+            .unwrap()
+            .reasoning_effort,
+        Some(ReasoningEffort::Medium)
+    );
+    assert!(saved.active_model_profile().is_none());
+    let changes = role_thinking_changes(&saved, "task", "default").unwrap();
+    let cleared = settings_store::save_config(&layout, Scope::Project, &changes).unwrap();
+    assert!(cleared.for_role("task").active_model_profile().is_none());
+}
+
+#[test]
 fn thinking_status_distinguishes_toggle_default_and_unsupported() {
     use crate::llm::profiles::{ModelCapabilities, ModelProfile, ReasoningApi, ReasoningEffort};
     let mut profile = ModelProfile {

@@ -221,3 +221,85 @@ fn plan_picker_summarizes_the_plan_and_does_not_repeat_the_status() {
     // The standalone step view keeps the status, since it has no label beside it.
     assert!(step_detail(&todo.tasks()[1]).contains("Status: Working"));
 }
+
+#[test]
+fn recorded_findings_and_references_are_labelled_unverified_in_the_inspector() {
+    let mut todo = list(json!([{"content":"read"}, {"content":"fix"}]));
+    todo.call(&json!({"op":"done", "finding":"Cause identified", "evidence":["src/main.rs:42"]}));
+    todo.call(&json!({"op":"done"}));
+    let detail = step_detail(&todo.tasks()[0]);
+    assert!(detail.contains("Agent finding (observation, not verified): Cause identified"));
+    assert!(
+        detail.contains("Evidence references (agent observations, not verified):\nsrc/main.rs:42")
+    );
+    assert!(!detail.contains("Unverified: no evidence"));
+    let bare = step_detail(&todo.tasks()[1]);
+    assert!(bare.contains("Unverified: no evidence recorded for this completed step"));
+    assert!(!bare.contains("Evidence references"));
+}
+
+#[test]
+fn progress_view_distinguishes_passing_stale_unknown_and_unverified_evidence() {
+    let progress = json!({
+        "reconciliation": {
+            "deliverables": [
+                {"id":"pass","description":"fix","claimed_status":"satisfied","evidence_status":"linked_checks_passed",
+                 "acceptance":{"status":"observed"},
+                 "checks":[{"name":"unit","status":"passed"}],"unverified_refs":["src/a.rs:1"]},
+                {"id":"stale","description":"verify","claimed_status":"satisfied","evidence_status":"linked_checks_unresolved",
+                 "acceptance":{"status":"needs_verification"},
+                 "checks":[{"name":"lint","status":"stale"}],"unverified_refs":[]},
+                {"id":"unknown","description":"ship","claimed_status":"satisfied","evidence_status":"linked_checks_unresolved",
+                 "acceptance":{"status":"unassessed"},
+                 "checks":[{"name":"ghost","status":"unknown_check"}],"unverified_refs":[]},
+                {"id":"claim","description":"doc","claimed_status":"satisfied","evidence_status":"claim_only",
+                 "acceptance":{"status":"unassessed"},"checks":[],"unverified_refs":["notes"]}
+            ],
+            "omitted_deliverables": 0
+        },
+        "jobs": [{"id":"task-1","status":"done",
+            "acceptance":{"state":"needs_verification","reason":"configured check owner not run"},
+            "candidate":{"check_owner":"controller"}}]
+    });
+    let text = progress_text(Some(&progress));
+    assert!(text.contains("check unit: passed"), "{text}");
+    assert!(text.contains("check lint: stale"), "{text}");
+    assert!(text.contains("check ghost: unknown_check"), "{text}");
+    assert!(
+        text.contains("checks: none linked by check: references"),
+        "{text}"
+    );
+    assert!(
+        text.contains("unverified refs (not checked): src/a.rs:1"),
+        "{text}"
+    );
+    assert!(text.contains("owner unknown (not recorded)"), "{text}");
+    assert!(
+        text.contains("task-1 done: acceptance needs_verification"),
+        "{text}"
+    );
+    assert!(
+        text.contains("configured check owner: controller"),
+        "{text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .filter(|line| line.contains("configured check owner"))
+            .any(|line| line.contains("checked")),
+        "owner must never read as checked: {text}"
+    );
+}
+
+#[test]
+fn progress_view_is_explicitly_unavailable_while_busy_and_when_state_is_unreadable() {
+    assert!(progress_text(None).contains("unavailable while a turn is running"));
+    let broken = json!({"reconciliation": {}, "jobs": null});
+    let text = progress_text(Some(&broken));
+    assert!(text.contains("Deliverables: unavailable"), "{text}");
+    assert!(text.contains("Workers: status unavailable"), "{text}");
+    let empty = json!({"reconciliation": {"deliverables": []}, "jobs": []});
+    let text = progress_text(Some(&empty));
+    assert!(text.contains("Deliverables: none recorded"), "{text}");
+    assert!(text.contains("Workers: none"), "{text}");
+}

@@ -54,14 +54,6 @@ fn hero(width: usize, budget: usize, theme: &Theme, sweep: f32, idle: u64) -> Ro
             theme,
         )],
     };
-    if budget > rows.len() + 2 {
-        rows.push(Line::default());
-        rows.push(centered(
-            vec![Span::styled("What are we building?", theme.fg(Tok::Muted))],
-            width,
-            theme,
-        ));
-    }
     rows.push(Line::default());
     rows
 }

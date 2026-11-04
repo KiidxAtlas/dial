@@ -361,6 +361,42 @@ fn streaming_render_vec_delta_measurement() {
     eprintln!("20KB / Vec<String> 40-byte deltas: {:?}", before.elapsed());
 }
 
+/// Production live path: `assistant_delta` then `live` for every 40-byte delta, with spilled rows
+/// kept as the scrollback consumer would. Times the loop only; correctness is checked after it.
+#[test]
+#[ignore = "manual live transcript spill measurement"]
+fn live_spill_delta_measurement() {
+    let paragraph = "A streamed answer with **styled words**, a number 42, and ordinary prose that wraps across terminal rows.\n\n";
+    let source = paragraph.repeat(200);
+    let answer = &source[..20_000];
+    let env = Env::new();
+    let ctx = env.ctx();
+    let mut t = Transcript::new();
+    let mut delivered: Rows = Vec::new();
+    let before = std::time::Instant::now();
+    for end in (40..=answer.len()).step_by(40) {
+        t.assistant_delta(&answer[end - 40..end]);
+        let (spilled, live) = t.live(100, &ctx, 20);
+        std::hint::black_box(&live);
+        delivered.extend(spilled);
+    }
+    let elapsed = before.elapsed();
+    let spilled_rows = delivered.len();
+    assert!(
+        spilled_rows > 0,
+        "the live path must spill on a 20KB answer"
+    );
+    t.finish_turn();
+    delivered.extend(t.take_settled(100, &ctx));
+    let mut canonical = Transcript::new();
+    canonical.assistant_delta(answer);
+    canonical.finish_turn();
+    assert_eq!(delivered, canonical.all_rows(100, &ctx));
+    eprintln!(
+        "20KB live assistant_delta+live, 40-byte deltas, width 100, max_rows 20: {elapsed:?}, spilled rows {spilled_rows}"
+    );
+}
+
 struct Env {
     theme: Theme,
     ui: UiConfig,
@@ -2166,6 +2202,35 @@ fn timestamped_stream_spills_without_repeating_header_or_text() {
     transcript.finish_turn();
     delivered.extend(transcript.take_settled(40, &env.ctx()));
     assert_eq!(plain(&delivered), expected);
+}
+
+#[test]
+fn timestamped_stream_spills_live_without_repeating_header_or_text() {
+    let env = Env::new();
+    let ctx = env.ctx();
+    let mut t = Transcript::new();
+    let body = long_markdown(12).concat() + "tail";
+    let stamp = "2026-10-01T10:01:00.000Z";
+    let mut delivered: Rows = Vec::new();
+    for piece in body.as_bytes().chunks(11) {
+        t.assistant_delta_at(std::str::from_utf8(piece).unwrap(), stamp);
+        let (spilled, live) = t.live(40, &ctx, 5);
+        assert!(live.len() <= 5);
+        delivered.extend(spilled);
+    }
+    assert!(!delivered.is_empty(), "something must spill");
+    t.finish_turn();
+    delivered.extend(t.take_settled(40, &ctx));
+    let shown = text_of(&delivered);
+    assert_eq!(
+        shown.matches("Assistant · 2026-10-01 10:01:00 UTC").count(),
+        1,
+        "the header is delivered once: {shown}"
+    );
+    let mut canonical = Transcript::new();
+    canonical.assistant_delta_at(&body, stamp);
+    canonical.finish_turn();
+    assert_eq!(delivered, canonical.all_rows(40, &ctx));
 }
 
 #[test]

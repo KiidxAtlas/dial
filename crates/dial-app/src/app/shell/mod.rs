@@ -113,6 +113,8 @@ pub(super) struct Shell {
     pub(super) commands: Vec<context::CommandDef>,
     pub(super) scope: Scope,
     pub(super) tools_expanded: bool,
+    /// The work panel's right-card view, switched with `app.work.tab`.
+    pub(super) work_tab: crate::ui::work_panel::Tab,
     /// The live home screen, shown above the composer until the conversation starts.
     pub(super) home: Option<welcome::Home>,
     /// The transcript's block count when the user first submitted input on the home screen. Output

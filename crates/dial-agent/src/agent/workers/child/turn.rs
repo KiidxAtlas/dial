@@ -970,7 +970,7 @@ impl<'a> ChildTurn<'a> {
                 render_text: !research_step,
                 context_tokens: None,
                 policy: Some(&env.config.reasoning_guard),
-                recovery: None,
+                recovery: Some(&config.request_recovery),
             },
             generation_cancel.clone(),
             crate::agent::ChatSinks {

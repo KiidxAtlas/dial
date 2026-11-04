@@ -6,6 +6,13 @@ Assistant prose freezes complete top-level markdown blocks and reparses only the
 
 Streaming content may spill stable rows to scrollback while keeping the live tail visible. Resizing replays committed transcript content at the new width; terminal frame diffing reuses unchanged rows. Ctrl+O expands or collapses tool evidence and repaints existing scrollback, including successful reads, searches and checks. Compact diffs honor `ui.tool_output_lines`; expanded cards reveal complete stored output and clipped targets. Worker cards use typed results and show a short finding when collapsed and the full report when expanded. Themes are embedded JSON palettes and selectable by name.
 
+Spill validation reuses the markdown cache's frozen prefix when its source cut, width and theme
+match, instead of reparsing that growing prefix for each spill. The timestamp and styled rows must
+still exactly match the current displayed head; other cuts retain the full-render validation path.
+The ignored `live_spill_delta_measurement` test measures `assistant_delta` plus `live` over a 20 KB
+answer in 40-byte chunks and checks that scrollback plus the settled remainder equals the document.
+This measures local transcript work, not provider latency or a terminal emulator's drawing cost.
+
 One input pump reads the terminal into a bounded queue independently of model requests and painting. One output worker serializes real-terminal frames and control sequences. Frame admission is nonblocking: a full output queue defers painting without advancing transcript or diff cursors, and idle ticks retry even when no further model output arrives. The queue includes in-flight bytes, normally admits at most 8 MiB, and permits one oversized frame only when empty (16 MiB maximum). Terminal handoffs drain output before changing ownership; failures remain errors rather than successful draws.
 
 Frame pacing adapts between 40 and 200 ms using the preceding paint cost. Scrollback retirement is limited per frame to 32 blocks, 256 rows and a 4 ms between-block deadline; a single render is not preempted. A partially retired block retains one wrapping until its remaining rows have been handed off. Native-image blocks remain indivisible with their graphics separator. Live-tail rendering starts at the newest visible blocks instead of formatting the entire waiting history. `/debug performance` reports observed input, refresh and paint stalls; `/debug terminal` includes output backlog and retirement/reveal state.

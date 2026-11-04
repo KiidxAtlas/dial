@@ -33,8 +33,8 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     },
     super::CommandSpec {
         name: "effort",
-        description: "Show or set the thinking effort for the current model",
-        args_hint: "[level|auto]",
+        description: "Show or set the thinking effort for the current model or a model role",
+        args_hint: "[level|auto] | <role> <level|default>",
         subcommands: &[],
     },
     super::CommandSpec {
@@ -222,6 +222,28 @@ pub(super) fn completions(config: &Config) -> Vec<String> {
 
 fn effort(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) -> Result<Step> {
     let args = args.trim();
+    if let Some((role, level)) = args.split_once(char::is_whitespace) {
+        let (role, level) = (role.trim(), level.trim());
+        match crate::app::selection::role_thinking_changes(
+            &shell.settings_config(app).clone(),
+            role,
+            level,
+        )
+        .and_then(|changes| shell.save(app, agent, &changes, Scope::Project))
+        {
+            Ok(step) => {
+                shell.note(
+                    "Thinking",
+                    format!("Thinking for role {role} set to {level}."),
+                );
+                return Ok(step);
+            }
+            Err(error) => {
+                shell.note("Thinking", format!("not changed: {error:#}"));
+                return Ok(Step::Done);
+            }
+        }
+    }
     let config = shell.settings_config(app).clone();
     if args.is_empty() {
         if config.thinking_auto {

@@ -42,9 +42,13 @@ pub(in crate::agent) fn blocking_with_heartbeat<T: Send>(
     })
 }
 
+/// How often a blocked controller loop hands the UI a heartbeat (input, paint). Loops that wait
+/// on workers or background work use it as their longest sleep, so typing stays responsive.
+pub(in crate::agent) const HEARTBEAT: Duration = Duration::from_millis(80);
+
 pub(in crate::agent) fn receive_with_heartbeat<T>(rx: &Receiver<T>, ui: &mut dyn Ui) -> Result<T> {
     loop {
-        match rx.recv_timeout(Duration::from_millis(80)) {
+        match rx.recv_timeout(HEARTBEAT) {
             Ok(event) => return Ok(event),
             Err(RecvTimeoutError::Timeout) => ui.heartbeat(),
             Err(RecvTimeoutError::Disconnected) => {
@@ -71,31 +75,19 @@ impl std::fmt::Display for SilentRequest {
 }
 impl std::error::Error for SilentRequest {}
 
-/// Whether the generation-silence watchdog may cancel a request. Remote streams are always
-/// watched. A local engine's model load and prompt prefill are long, silent, and bounded only by
-/// the transport timeout, so only observed generation (text, reasoning, tool deltas, or a
-/// `Generating` progress report) arms it. Any retry disarms it until generation resumes.
+/// Whether observed progress arms a silence clock. Remote first-event deadlines
+/// live in the transport; `silence_limit_secs` disables their UI-side clock. A local
+/// engine's model load/prefill may be long and silent, so only generation arms its
+/// watchdog. Any retry disarms it until generation resumes.
 pub(in crate::agent) fn silence_watch_armed(local_model: bool, generating: bool) -> bool {
     !local_model || generating
 }
 
-/// The watchdog's effective limit in seconds (`0` disables it). Hosted reasoning models can stay
-/// silent for minutes before their first or next streamed event, and remote transports already
-/// retry genuine stalls by semantic progress (`transport_secs`). A remote request is therefore
-/// never cancelled sooner than its transport stall limit, and not at all when that limit is
-/// unlimited. Local routes keep the configured limit.
-pub(in crate::agent) fn silence_limit_secs(
-    configured_secs: u64,
-    local_model: bool,
-    transport_secs: u64,
-) -> u64 {
-    if local_model || configured_secs == 0 {
-        configured_secs
-    } else if transport_secs == 0 {
-        0
-    } else {
-        configured_secs.max(transport_secs)
-    }
+/// The local generation watchdog's limit (`0` disables it). Remote transports own
+/// semantic-progress deadlines and bounded retries. A second watchdog must not cancel
+/// their request scope at the same deadline, turning a recoverable stall into interruption.
+pub(in crate::agent) fn silence_limit_secs(configured_secs: u64, local_model: bool) -> u64 {
+    if local_model { configured_secs } else { 0 }
 }
 
 /// Whether generation silence has lasted past its limit. Provider backoff is an explicit wait, not
@@ -359,11 +351,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
     let cancel_request = interrupt.clone();
     let local_model = backend.local_inference();
     let silence_limit = recovery.map_or(0, |policy| {
-        silence_limit_secs(
-            policy.silence_secs,
-            local_model,
-            backend.response_timeout(timeout),
-        )
+        silence_limit_secs(policy.silence_secs, local_model)
     });
     let mut context =
         context_tokens.map(crate::agent::window::context_meter::StreamingContext::new);

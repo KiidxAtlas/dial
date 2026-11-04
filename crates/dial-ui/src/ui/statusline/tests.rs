@@ -267,6 +267,7 @@ fn presets_map_to_their_segment_lists_and_custom_uses_the_configured_ones() {
         (
             names(&[
                 "spinner",
+                "approval",
                 "model",
                 "mode",
                 "thinking",

@@ -140,14 +140,27 @@ fn publish_settings(
 
 fn job_status(job: &ControlJob) -> Value {
     let mut value = body_status(&job.body);
-    if let Some(receipt) = job
+    let acceptance = job
         .acceptance
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_ref()
-    {
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(receipt) = acceptance.as_ref() {
         value["acceptance"] = json!(receipt);
     }
+    let checks: Vec<String> = value["assignment"]["acceptance_checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|check| check.as_str().map(str::to_owned))
+        .collect();
+    value["candidate"] = subagents::candidate_status(
+        value["status"].as_str().unwrap_or("unknown"),
+        acceptance
+            .as_ref()
+            .map(|receipt| receipt.state)
+            .unwrap_or_default(),
+        &checks,
+    );
     value
 }
 
@@ -805,6 +818,21 @@ impl LiveTasks {
                 receipt.revalidate(&control.workspace, config);
             }
         }
+    }
+
+    /// Typed controller receipt, never reconstructed from the worker's serialized report.
+    pub(in crate::agent) fn acceptance_receipt(
+        &self,
+        id: &str,
+    ) -> Option<crate::agent::verify::worker_acceptance::Acceptance> {
+        self.jobs
+            .get(id)?
+            .control
+            .as_ref()?
+            .acceptance
+            .lock()
+            .ok()?
+            .clone()
     }
 
     fn refresh_acceptance_report(&self, report: &mut Value) {
@@ -1815,7 +1843,7 @@ impl LiveTasks {
                     Some(
                         until
                             .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(250)),
+                            .min(crate::agent::ui::chat::HEARTBEAT),
                     ),
                 )
                 .map_err(|e| e.to_string())?;

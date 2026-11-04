@@ -45,10 +45,13 @@ fn legacy_request_table_gains_wire_columns_and_records_them() {
     db.record_request(&RequestRecord {
         wire: Some(WireRecord {
             transport: "http".into(),
-            invalidation: "none".into(),
+            invalidation: "prompt_changed".into(),
             common_prompt_bytes: 900,
             prompt_bytes: 1000,
+            changed_part: Some("tools".into()),
         }),
+        first_output_ms: Some(420),
+        effort: Some("medium".into()),
         ..request(2, "m", 1000, 10, 0, None, 5)
     })
     .unwrap();
@@ -58,25 +61,33 @@ fn legacy_request_table_gains_wire_columns_and_records_them() {
         Option<String>,
         Option<i64>,
         Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
     );
     let rows: Vec<WireRow> = db
         .conn
-        .prepare("SELECT session, transport, invalidation, common_prompt_bytes, prompt_bytes FROM requests ORDER BY id")
+        .prepare("SELECT session, transport, invalidation, common_prompt_bytes, prompt_bytes, first_output_ms, effort, changed_part FROM requests ORDER BY id")
         .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
+        })
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(
         rows,
         vec![
-            ("old".into(), None, None, None, None),
+            ("old".into(), None, None, None, None, None, None, None),
             (
                 "s1".into(),
                 Some("http".into()),
-                Some("none".into()),
+                Some("prompt_changed".into()),
                 Some(900),
-                Some(1000)
+                Some(1000),
+                Some(420),
+                Some("medium".into()),
+                Some("tools".into())
             ),
         ]
     );

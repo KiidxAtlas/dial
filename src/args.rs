@@ -355,6 +355,17 @@ pub(crate) enum WeightsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Probe the model with built-in text and record what each layer, attention head and neuron does.
+    Analyze {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Give the model a goal in plain words; it runs the whole weight-editing loop itself.
+    Improve {
+        /// What to change, e.g. "stop endless repetition in long lists".
+        #[arg(required = true, num_args = 1..)]
+        goal: Vec<String>,
+    },
     /// Per-tensor and per-layer weight statistics (no forward pass).
     Stats {
         /// Measure only tensors whose name starts with this prefix.
@@ -436,19 +447,87 @@ pub(crate) enum WeightsCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Write a new model copy with a direction projected out of chosen layers' MLP outputs.
+    /// Score an edit in memory at one or more strengths, without writing a model copy.
+    Try {
+        /// Experiment charged one model run.
+        #[arg(long)]
+        experiment: String,
+        /// JSON array of {messages} ending in the assistant answer the edit should change.
+        #[arg(long)]
+        cases: PathBuf,
+        /// JSON array of ordinary {messages} answers the edit must not disturb (up to 8).
+        #[arg(long)]
+        neutral: Option<PathBuf>,
+        /// Comma-separated edit strengths in (0, 2] (up to 5; default 1).
+        #[arg(long, value_delimiter = ',')]
+        doses: Vec<f64>,
+        /// Direction to project out.
+        #[arg(long, required_unless_present = "changes", conflicts_with = "changes")]
+        direction: Option<String>,
+        /// Comma-separated zero-based layers to edit (1–16).
+        #[arg(long, value_delimiter = ',', required_unless_present = "changes")]
+        layers: Vec<u64>,
+        /// Scale tensors, heads or neurons directly: JSON array of changes.
+        #[arg(long)]
+        changes: Option<PathBuf>,
+        #[arg(long)]
+        columns: Option<u64>,
+        #[arg(long)]
+        alpha: Option<f64>,
+        /// Accept a quantized edit whose requantization error exceeds half the edit.
+        #[arg(long)]
+        allow_noisy: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rank attention heads and MLP neurons by how strongly they support the given answers.
+    Attribute {
+        /// Experiment charged one model run.
+        #[arg(long)]
+        experiment: String,
+        /// JSON array of {messages} ending in the (unwanted) assistant answer to explain.
+        #[arg(long)]
+        cases: PathBuf,
+        /// JSON array of {messages} ending in the wanted answer; ranks components by the difference.
+        #[arg(long)]
+        wanted: Option<PathBuf>,
+        /// JSON array of {messages} ending in ordinary answers the components should not matter for.
+        #[arg(long)]
+        neutral: Option<PathBuf>,
+        /// Score every answer token (`answer`, default) or only tokens that repeat an earlier 3-token sequence (`repeats`).
+        #[arg(long)]
+        focus: Option<String>,
+        /// Components listed per kind (1–100, default 20).
+        #[arg(long)]
+        top: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a new model copy with a direction projected out of chosen layers' MLP outputs, or with exact tensors scaled.
     Edit {
         /// Name of the edited copy.
         name: String,
-        /// Experiment the direction was measured in.
+        /// Experiment the edit belongs to (the direction's, when one is used).
         #[arg(long)]
         experiment: String,
         /// Direction to project out.
-        #[arg(long)]
-        direction: String,
+        #[arg(long, required_unless_present_any = ["changes", "bundle"], conflicts_with_all = ["changes", "bundle"])]
+        direction: Option<String>,
         /// Comma-separated zero-based layers to edit (1–16).
-        #[arg(long, value_delimiter = ',', required = true)]
+        #[arg(long, value_delimiter = ',', required_unless_present_any = ["changes", "bundle"])]
         layers: Vec<u64>,
+        /// Fold a steering bundle (from `dial steering`) into the weights instead: its path.
+        #[arg(long, conflicts_with = "changes", requires_all = ["data", "strength"])]
+        bundle: Option<PathBuf>,
+        /// Steering: the records the bundle was measured on.
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// Steering: strength to fold in.
+        #[arg(long)]
+        strength: Option<f64>,
+        /// Scale exact tensors directly: JSON array of {tensor, scale, rows?, columns?}.
+        #[arg(long)]
+        changes: Option<PathBuf>,
         /// down_proj output columns edited per layer (default 64).
         #[arg(long)]
         columns: Option<u64>,
@@ -481,6 +560,64 @@ pub(crate) enum WeightsCommand {
         #[arg(long, default_value_t = 0)]
         port: u16,
     },
+    /// List kept weights runs, newest first.
+    History {
+        /// Only runs of this operation (for example `analyze` or `evaluate`).
+        #[arg(long)]
+        op: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the full result of a kept run.
+    Show {
+        /// Run id from `dial weights history`.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare two kept `analyze` runs layer by layer (for example base and edited copy).
+    Compare {
+        before: String,
+        after: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove all but the newest kept runs.
+    Prune {
+        /// Runs to keep.
+        #[arg(long, default_value_t = 50)]
+        keep: usize,
+    },
+    /// Sum 2–4 edited copies of one experiment into a new edited copy (evaluate it before promoting).
+    Combine {
+        /// Name of the combined copy.
+        name: String,
+        /// Comma-separated edits to sum.
+        #[arg(long, value_delimiter = ',', required = true)]
+        edits: Vec<String>,
+        /// Accept a combination whose requantization error exceeds half the summed edits.
+        #[arg(long)]
+        allow_noisy: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build generation cases from a past session's user turns (for generate or evaluate).
+    Cases {
+        /// Session id or unique prefix (`dial sessions`).
+        #[arg(long)]
+        session: String,
+        /// Newest user turns kept (1–32).
+        #[arg(long, default_value_t = 16)]
+        limit: usize,
+        /// Earlier messages kept before each turn.
+        #[arg(long, default_value_t = 4)]
+        context: usize,
+        /// Write the cases here instead of printing them.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Suggest the next step of the weight-editing loop from what has been run so far.
+    Next,
 }
 
 #[derive(Subcommand)]

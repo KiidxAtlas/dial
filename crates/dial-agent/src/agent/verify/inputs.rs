@@ -58,6 +58,12 @@ impl IdentityKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::agent) struct Snapshot([u8; 32]);
 
+impl Snapshot {
+    pub(in crate::agent) fn digest(&self) -> String {
+        crate::hex(&self.0)
+    }
+}
+
 struct Capture<'a> {
     workspace: &'a Workspace,
     digest: Sha256,

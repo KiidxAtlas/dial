@@ -33,7 +33,7 @@ const MAX_INPUT_ROWS: usize = 10;
 const MIN_BOX_WIDTH: usize = 8;
 const MAX_NAME_COLUMN: usize = 24;
 /// App-level shortcuts the composer reports instead of handling.
-const APP_ACTIONS: [Action; 17] = [
+const APP_ACTIONS: [Action; 18] = [
     Action::CommandPalette,
     Action::ModelSelect,
     Action::ModelRoles,
@@ -43,6 +43,7 @@ const APP_ACTIONS: [Action; 17] = [
     Action::ToolsExpand,
     Action::ToolsToggle,
     Action::ThinkingToggle,
+    Action::WorkTab,
     Action::ApprovalCycle,
     Action::DisplayReset,
     Action::EditExternal,
@@ -277,6 +278,9 @@ const PLACEHOLDERS: [&str; 3] = [
     "Ask or describe a task",
     "Ask anything",
 ];
+
+/// The launch input asks the home screen's question itself, so the hero carries no second copy.
+const LANDING_PLACEHOLDERS: [&str; 2] = ["What are we building?", "Ask anything"];
 
 /// Offered for a non-empty draft while busy. Automatic routing is the default.
 const DRAFT_CHOICES: &[BusyChoice] = &[
@@ -1805,8 +1809,10 @@ impl Composer {
             return view;
         }
 
-        let banded = landing || ctx.ui.composer_shape == ComposerShape::Band;
-        let boxed = !landing && ctx.ui.composer_shape == ComposerShape::Box;
+        // The launch input is the concept's wide rounded pill; in a conversation the configured
+        // shape applies.
+        let banded = !landing && ctx.ui.composer_shape == ComposerShape::Band;
+        let boxed = landing || ctx.ui.composer_shape == ComposerShape::Box;
         let inner = if boxed {
             w - 4
         } else if banded {
@@ -1873,6 +1879,12 @@ impl Composer {
         let edge = || Span::styled(theme.sym(Sym::Quote).to_owned(), edge_style);
         if banded {
             rows.push(band(vec![edge()]));
+        } else if landing {
+            // The home keeps its status out of the input; the top edge is a plain rounded rule.
+            rows.push(Line::from(Span::styled(
+                format!("{top_l}{}{top_r}", bar.repeat(w.saturating_sub(2))),
+                border,
+            )));
         } else {
             rows.push(statusline::border_line_with(
                 header_ui,
@@ -1901,6 +1913,8 @@ impl Composer {
                     &["Edit the queued message", "Edit queued message"]
                 } else if self.busy {
                     &["Add direction while Dial works", "Add direction"]
+                } else if landing {
+                    &LANDING_PLACEHOLDERS
                 } else {
                     &PLACEHOLDERS
                 };
@@ -1982,8 +1996,14 @@ impl Composer {
                 ));
             }
         } else {
+            // The launch pill carries no shortcut catalog unless a recording needs its stop key.
+            let shown: &[Hint] = if landing && self.recording.is_none() {
+                &[]
+            } else {
+                &hints
+            };
             rows.push(bottom_border(
-                w, &hints, bottom_l, bottom_r, bar, border, theme,
+                w, shown, bottom_l, bottom_r, bar, border, theme,
             ));
         }
 

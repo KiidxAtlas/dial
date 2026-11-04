@@ -37,7 +37,7 @@ impl Shell {
             return false;
         }
         if name == "todo" {
-            if let Some(spec) = self.work_plan(args)
+            if let Some(spec) = self.work_plan(args, None)
                 && let Err(error) = self.start_busy_overlay(app, Which::Choice(Box::new(spec)))
             {
                 self.note("Work plan", format!("{error:#}"));

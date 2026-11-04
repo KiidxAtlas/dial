@@ -143,3 +143,76 @@ pub fn apply_thinking(mut config: Config, level: CliThinking) -> Result<Config> 
     // (such as a saved Anthropic effort) without mutating the operator's named profile.
     install_thinking_profile(config, profile)
 }
+
+/// The reasoning profile for the selected model: the active model profile, a ChatGPT account
+/// profile, or one built from the bundled catalog's thinking metadata. `None` when nothing
+/// declares the model's reasoning controls.
+pub fn reasoning_profile(config: &Config) -> Result<Option<ModelProfile>> {
+    if let Some(profile) = config.active_model_profile() {
+        return Ok(Some(profile.clone()));
+    }
+    if config.provider.as_deref() == Some(crate::llm::chatgpt::PROVIDER)
+        && let Some(profile) = crate::llm::chatgpt::model_profile(&config.user_dir, &config.model)?
+    {
+        return Ok(Some(profile));
+    }
+    let selection = config.selection();
+    let identity = format!("{}/{}", selection.provider, selection.model);
+    let Some(model) = crate::llm::catalog::model_capabilities(&identity) else {
+        return Ok(None);
+    };
+    let Some(mode) = model.thinking else {
+        return Ok(None);
+    };
+    use crate::llm::catalog::ThinkingMode;
+    let reasoning = match mode {
+        ThinkingMode::Effort => {
+            if selection.protocol == Some(crate::llm::model_config::ApiProtocol::Responses) {
+                ReasoningApi::OpenaiResponses
+            } else {
+                ReasoningApi::OpenaiEffort
+            }
+        }
+        ThinkingMode::Budget => match selection.provider.as_str() {
+            "anthropic" => ReasoningApi::AnthropicBudget,
+            "gemini" => ReasoningApi::GeminiBudget,
+            _ => ReasoningApi::OpenaiEffort,
+        },
+        ThinkingMode::AnthropicAdaptive => ReasoningApi::AnthropicAdaptive,
+        ThinkingMode::AnthropicBudgetEffort => ReasoningApi::AnthropicBudget,
+        ThinkingMode::GoogleLevel => ReasoningApi::GeminiLevel,
+    };
+    Ok(Some(ModelProfile {
+        provider: selection.provider,
+        model: selection.model,
+        capabilities: crate::llm::profiles::ModelCapabilities {
+            reasoning,
+            reasoning_efforts: model.thinking_efforts,
+            reasoning_effort_wire: model.effort_wire,
+            ..Default::default()
+        },
+        reasoning_effort: model.default_effort,
+        thinking: Some(true),
+        ..Default::default()
+    }))
+}
+
+/// Applies a model role's saved `thinking` level (`model_roles.<role>.thinking`) to the role's
+/// resolved configuration. Unlike `--thinking`, the catalog's reasoning metadata is enough: a role
+/// model needs no hand-written profile. `auto` is judged per user turn and is not a role level.
+pub fn apply_role_thinking(mut config: Config, level: &str) -> Result<Config> {
+    let level = parse_thinking(level)
+        .map_err(|error| anyhow!(error.replace("--thinking", "role thinking")))?;
+    anyhow::ensure!(
+        level != CliThinking::Auto,
+        "role thinking must be a fixed level; auto applies only to the main model"
+    );
+    if config.active_model_profile().is_none()
+        && let Some(profile) = reasoning_profile(&config)?
+    {
+        config = install_thinking_profile(config, profile)?;
+    }
+    let mut config = apply_thinking(config, level)?;
+    config.thinking_auto = false;
+    Ok(config)
+}

@@ -214,6 +214,16 @@ answer again. Explicitly blocked tasks or deliverables produce a blocked outcome
 automation. Plain final replies and explicit `finish` use the same classification; candidate prose
 does not earn completed status or success-learning credit.
 
+Automatic focused-check repairs keep their existing turn-wide allowance (three by default), but
+can stop earlier for no progress: after a repair, the same outstanding confirmed code-failure
+diagnosis with unchanged complete declared check-input snapshots records `repair_no_progress`
+and leaves the turn failed with its diagnostics, without rerunning an unchanged failure. A no-op or reverted edit cannot buy another
+round merely by advancing a mutation counter. If a check lacks a complete input witness, the
+fallback compares effect revisions; unknown dependencies are not certified unchanged. This is
+an early-stop safeguard, not proof that a changed input is a useful repair. Infrastructure,
+permission, cancellation, timeout and unverified problems never become automatic code repairs;
+their existing failure obligations remain visible. No extra reviewer-model request is added.
+
 When `[verification].automatic_checks` is off and the turn edited files without any passing focused
 or shell check, the first final answer makes the completion gate run the applicable focused checks
 itself, through the same approval and freshness path as the `check` tool. If they pass, the answer
@@ -813,6 +823,13 @@ denial) is reported `not_shown_to_reproduce` and earns no behavioral credit, tho
 counts as an ordinary current passing check. A pass with no effect since the failure earns nothing.
 A failing or stale reproduction withholds all behavioral credit, as a failing configured behavioral
 check does. Completion evidence lists each reproduction's state under `checks.reproductions`.
+Registration validates every requested check name before changing reproduction state. A rejected
+selection preserves the previous reproduction, its observations and retained failure obligations.
+An empty `names` array without an explicit `repro` is rejected: it cannot establish a passing
+result or prediction. Omit `names` to select all applicable checks, or name a nonempty subset.
+Do not combine `repro` with `failed_only`: registration must run the initial attempt, whereas
+`failed_only` selects previously observed code failures. Register first, then rerun with `names`
+or `failed_only`. Unknown names are errors even when no focused checks currently apply.
 Executable repair records use that same classified, typed execution evidence, not printed exit
 markers. Unverified runs invalidate a matching failure baseline rather than pairing an old failure
 with a later pass. Related-test planning reuses JS package/runner metadata and Go directory scans

@@ -1403,6 +1403,58 @@ impl Backend {
             scope.begin(billing)?;
         }
         let transport = llm::usage::Transport::enter(scope.clone());
+        let requested_effort = self
+            .next_profile
+            .as_ref()
+            .or(self.profile.as_ref())
+            .and_then(|profile| {
+                if profile.thinking == Some(false) {
+                    Some("off".to_owned())
+                } else {
+                    profile
+                        .reasoning_effort
+                        .map(|effort| effort.as_str().to_owned())
+                }
+            });
+        // Time to first output, restarted with each fresh attempt so backoff is not counted.
+        let attempt_start = std::cell::Cell::new(std::time::Instant::now());
+        let first_output = std::cell::Cell::new(None::<std::time::Duration>);
+        let mark = || {
+            if first_output.get().is_none() {
+                first_output.set(Some(attempt_start.get().elapsed()));
+            }
+        };
+        let mut timed_text;
+        let on_text: Option<&mut dyn FnMut(&str) -> bool> = match on_text {
+            Some(inner) => {
+                timed_text = |text: &str| {
+                    if !text.is_empty() {
+                        mark();
+                    }
+                    inner(text)
+                };
+                Some(&mut timed_text)
+            }
+            None => None,
+        };
+        let mut timed_event = |event: &llm::StreamEvent| {
+            match event {
+                llm::StreamEvent::Retry { .. } => {
+                    attempt_start.set(std::time::Instant::now());
+                    first_output.set(None);
+                }
+                llm::StreamEvent::Reasoning(text) | llm::StreamEvent::HiddenText(text)
+                    if !text.is_empty() =>
+                {
+                    mark()
+                }
+                llm::StreamEvent::ToolArguments { .. }
+                | llm::StreamEvent::ToolCallComplete { .. } => mark(),
+                _ => {}
+            }
+            on_event(event)
+        };
+        let on_event: &mut dyn FnMut(&llm::StreamEvent) -> bool = &mut timed_event;
         let mut result = match self.secrets.clone() {
             Some(masker) => {
                 let (masked, restorer) = masker.mask_chat(req);
@@ -1418,6 +1470,8 @@ impl Backend {
         if let Ok(reply) = &mut result {
             reply.wire = self.wire.lock().latest();
             reply.billing = Some(billing);
+            reply.first_output = first_output.get();
+            reply.requested_effort = requested_effort;
         }
         transport.settle(result.is_ok())?;
         if let Some(scope) = scope {

@@ -120,56 +120,37 @@ pub(super) fn clear_role_changes(role: &str, scope: Scope) -> Result<Vec<Change>
     Ok(changes)
 }
 
+/// Set or clear (`default`) the saved thinking level of an assigned model role. The level is
+/// checked against the role model's reasoning metadata before anything is saved.
+pub(super) fn role_thinking_changes(
+    config: &Config,
+    role: &str,
+    level: &str,
+) -> Result<Vec<Change>> {
+    ensure!(
+        ROLES.iter().any(|(name, _)| *name == role) && role != "main",
+        "unknown model role {role}; use /effort <level> for the main model"
+    );
+    let selection = config.role_selection(role).ok_or_else(|| {
+        anyhow::anyhow!("role {role} follows the main model; assign it a model in /roles first")
+    })?;
+    let path = format!("model_roles.{role}.thinking");
+    if level == "default" {
+        return Ok(vec![Change::Remove { path }]);
+    }
+    let mut plain = selection.clone();
+    plain.thinking = None;
+    crate::config::thinking::apply_role_thinking(config.with_selection(&plain), level)?;
+    Ok(vec![Change::Set {
+        path,
+        value: level.into(),
+    }])
+}
+
 pub(super) fn reasoning_profile(
     config: &Config,
 ) -> Result<Option<crate::llm::profiles::ModelProfile>> {
-    if let Some(profile) = config.active_model_profile() {
-        return Ok(Some(profile.clone()));
-    }
-    if config.provider.as_deref() == Some(crate::llm::chatgpt::PROVIDER)
-        && let Some(profile) = crate::llm::chatgpt::model_profile(&config.user_dir, &config.model)?
-    {
-        return Ok(Some(profile));
-    }
-    let selection = config.selection();
-    let identity = format!("{}/{}", selection.provider, selection.model);
-    let Some(model) = crate::llm::catalog::model_capabilities(&identity) else {
-        return Ok(None);
-    };
-    let Some(mode) = model.thinking else {
-        return Ok(None);
-    };
-    use crate::llm::profiles::{ModelCapabilities, ModelProfile, ReasoningApi};
-    let reasoning = match mode {
-        crate::llm::catalog::ThinkingMode::Effort => {
-            if selection.protocol == Some(crate::llm::model_config::ApiProtocol::Responses) {
-                ReasoningApi::OpenaiResponses
-            } else {
-                ReasoningApi::OpenaiEffort
-            }
-        }
-        crate::llm::catalog::ThinkingMode::Budget => match selection.provider.as_str() {
-            "anthropic" => ReasoningApi::AnthropicBudget,
-            "gemini" => ReasoningApi::GeminiBudget,
-            _ => ReasoningApi::OpenaiEffort,
-        },
-        crate::llm::catalog::ThinkingMode::AnthropicAdaptive => ReasoningApi::AnthropicAdaptive,
-        crate::llm::catalog::ThinkingMode::AnthropicBudgetEffort => ReasoningApi::AnthropicBudget,
-        crate::llm::catalog::ThinkingMode::GoogleLevel => ReasoningApi::GeminiLevel,
-    };
-    Ok(Some(ModelProfile {
-        provider: selection.provider,
-        model: selection.model,
-        capabilities: ModelCapabilities {
-            reasoning,
-            reasoning_efforts: model.thinking_efforts,
-            reasoning_effort_wire: model.effort_wire,
-            ..Default::default()
-        },
-        reasoning_effort: model.default_effort,
-        thinking: Some(true),
-        ..Default::default()
-    }))
+    crate::config::thinking::reasoning_profile(config)
 }
 
 pub(super) fn thinking_label(profile: &crate::llm::profiles::ModelProfile) -> String {

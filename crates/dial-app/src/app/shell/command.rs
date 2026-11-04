@@ -120,7 +120,8 @@ impl Shell {
         let name = canonical_command(name);
         if name == "todo" {
             self.todo = agent.todo().clone();
-            return match self.work_plan(args) {
+            let progress = agent.progress_view();
+            return match self.work_plan(args, Some(&progress)) {
                 Some(spec) => self.open(app, agent, Which::Choice(Box::new(spec))),
                 None => Ok(Step::Done),
             };

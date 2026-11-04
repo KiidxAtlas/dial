@@ -17,13 +17,16 @@ pub struct Observation {
     pub common_prompt_bytes: usize,
     pub prompt_bytes: usize,
     pub invalidation: &'static str,
+    /// On `prompt_changed`, the request section holding the first differing part: `system`,
+    /// `tools`, `messages` (or the provider's equivalent key). Earlier sections cost more cache.
+    pub changed_part: Option<&'static str>,
 }
 
 #[derive(Default)]
 pub(crate) struct Tracker {
     model: Value,
     transport: Option<&'static str>,
-    parts: Vec<([u8; 32], usize)>,
+    parts: Vec<(&'static str, [u8; 32], usize)>,
     latest: Option<Observation>,
 }
 pub(crate) type Shared = Arc<Mutex<Tracker>>;
@@ -85,7 +88,7 @@ impl Tracker {
                 if key == "system" {
                     reset_attestation(&mut encoded);
                 }
-                parts.push((Sha256::digest(&encoded).into(), encoded.len()));
+                parts.push((key, Sha256::digest(&encoded).into(), encoded.len()));
             }
         }
         // Transport does not change the prompt; a switch is reported only when the prompt held.
@@ -99,25 +102,29 @@ impl Tracker {
         } else {
             0
         };
+        let invalidation = if self.transport.is_none() {
+            "initial"
+        } else if !same_model {
+            "model_changed"
+        } else if common < self.parts.len() {
+            "prompt_changed"
+        } else if self.transport != Some(transport) {
+            "transport_changed"
+        } else {
+            "none"
+        };
         self.latest = Some(Observation {
             boundary: "final_provider_wire",
             transport,
             chained,
             payload_bytes: bytes.len(),
             payload_sha256: format!("{:x}", Sha256::digest(bytes)),
-            common_prompt_bytes: parts[..common].iter().map(|p| p.1).sum(),
-            prompt_bytes: parts.iter().map(|p| p.1).sum(),
-            invalidation: if self.transport.is_none() {
-                "initial"
-            } else if !same_model {
-                "model_changed"
-            } else if common < self.parts.len() {
-                "prompt_changed"
-            } else if self.transport != Some(transport) {
-                "transport_changed"
-            } else {
-                "none"
-            },
+            common_prompt_bytes: parts[..common].iter().map(|p| p.2).sum(),
+            prompt_bytes: parts.iter().map(|p| p.2).sum(),
+            invalidation,
+            changed_part: (invalidation == "prompt_changed")
+                .then(|| parts.get(common).or(self.parts.get(common)).map(|p| p.0))
+                .flatten(),
         });
         self.model = body["model"].clone();
         self.transport = Some(transport);

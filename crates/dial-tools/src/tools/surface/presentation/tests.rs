@@ -60,3 +60,28 @@ fn edit_results_with_new_language_server_errors_show_the_count_as_a_fact() {
     );
     assert!(clean.facts.iter().all(|fact| !fact.contains("error")));
 }
+
+#[test]
+fn skill_reference_reads_are_distinct_from_loading_the_core_skill() {
+    for (file, target) in [
+        (None, "rust-best-practices"),
+        (
+            Some("references/handbook-11.md"),
+            "rust-best-practices · references/handbook-11.md",
+        ),
+        (
+            Some("references/handbook-04.md"),
+            "rust-best-practices · references/handbook-04.md",
+        ),
+        (Some(""), "rust-best-practices"),
+    ] {
+        let mut args = serde_json::json!({"name": "rust-best-practices"});
+        if let Some(file) = file {
+            args["file"] = file.into();
+        }
+        let view = render_call("skill", &args);
+        assert_eq!(view.label, "Skill");
+        assert_eq!(view.target, target);
+        assert_eq!(view.body, BodyStyle::Quiet);
+    }
+}

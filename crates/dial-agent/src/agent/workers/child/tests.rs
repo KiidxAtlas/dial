@@ -626,6 +626,39 @@ fn scripted_reply(text: &str, call: Option<(&str, Value)>) -> llm::fake::Script 
     llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
 }
 
+#[test]
+fn silent_worker_generation_retries_without_dispatching_partial_tools() {
+    let partial = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"partial","type":"function","function":{"name":"fixture_lookup","arguments":"{}"}}]}}]});
+    let (outcome, requests, calls, started) = scripted_worker_with_config(
+        &["fixture_lookup"],
+        vec![
+            llm::fake::Script::StallAfter {
+                first: format!("data: {partial}\n\n"),
+                silence: std::time::Duration::from_millis(1800),
+            },
+            scripted_reply("Inspection complete; no tools or tests run.", None),
+        ],
+        3,
+        vec![],
+        |config| {
+            config.worker_timeout_secs = 0;
+            config.retry.max_attempts = 1;
+            config.request_recovery.silence_secs = 1;
+            config.request_recovery.retry_once = true;
+        },
+    );
+    assert_eq!(
+        outcome.status.phase,
+        crate::runtime::Phase::Completed,
+        "{}",
+        outcome.status.text
+    );
+    assert_eq!(requests.len(), 2, "retry only the silent model request");
+    assert_eq!(requests[0], requests[1], "keep the same request context");
+    assert_eq!(calls, 0, "a partial reply must never dispatch tools");
+    assert!(started.is_empty());
+}
+
 /// Exercise the real child loop, provider projection and admission boundary, not a guard-only
 /// mock. Count actual extension dispatch and all tool starts (including native inline edits).
 fn scripted_worker(
@@ -761,7 +794,8 @@ fn scripted_worker_with_config(
         },
         std::path::PathBuf::new(),
         5,
-    );
+    )
+    .with_steering(&config);
     backend
         .bind_session(&config, &mut children.journal.borrow_mut().session)
         .unwrap();

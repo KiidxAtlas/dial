@@ -27,6 +27,7 @@ fn operations_round_trip_and_unknown_names_are_refused() {
     }
     assert!(Operation::parse("train").is_err());
     assert!(!Operation::Map.loads_model() && !Operation::Stats.loads_model());
+    assert!(Operation::Analyze.loads_model() && !Operation::Analyze.budgeted());
     assert!(Operation::Activations.loads_model() && Operation::Trace.loads_model());
     assert!(Operation::Generate.loads_model() && Operation::Direction.loads_model());
     // An edit rewrites tensors without a forward pass: it belongs to an experiment but is free.
@@ -42,6 +43,11 @@ fn arguments_keep_only_validated_worker_fields() {
         json!({"messages":[{"role":"user","content":"q"},{"role":"assistant","content":"a"}]});
     let cases: &[(Operation, Value, Result<Value, &str>)] = &[
         (Operation::Map, json!({"model":"/elsewhere"}), Ok(json!({}))),
+        (
+            Operation::Analyze,
+            json!({"model":"/elsewhere"}),
+            Ok(json!({})),
+        ),
         (Operation::Map, json!([1]), Err("JSON object")),
         (
             Operation::Stats,
@@ -151,6 +157,136 @@ fn arguments_keep_only_validated_worker_fields() {
             json!({"name":"e1","direction":"loop","layers":[3],"alpha":3.0}),
             Err("alpha"),
         ),
+        (
+            Operation::Edit,
+            json!({"name":"s1","method":"scale","changes":[
+                {"tensor":"model.layers.3.mlp.down_proj.weight","scale":0.5,"rows":[0,2],"columns":null}]}),
+            Ok(json!({"name":"s1","method":"scale","changes":[
+                {"tensor":"model.layers.3.mlp.down_proj.weight","scale":0.5,"rows":[0,2]}]})),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s1","method":"scale","changes":[
+                {"tensor":"a","scale":1.0},{"tensor":"a","scale":2.0}]}),
+            Err("more than one change"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s1","method":"scale","changes":[{"tensor":"a","scale":9.0}]}),
+            Err("scale"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s1","method":"scale","changes":[{"tensor":"a","scale":1.0,"rows":[-1]}]}),
+            Err("non-negative"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s1","method":"scale"}),
+            Err("changes"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s1","method":"rewrite","changes":[]}),
+            Err("method must be"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s2","method":"scale","changes":[
+                {"layer":14,"heads":[1,3],"scale":0.0},{"layer":14,"neurons":[5],"scale":0.5}]}),
+            Ok(json!({"name":"s2","method":"scale","changes":[
+                {"layer":14,"heads":[1,3],"scale":0.0},{"layer":14,"neurons":[5],"scale":0.5}]})),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s2","method":"scale","changes":[{"layer":14,"heads":[1],"neurons":[2],"scale":0.0}]}),
+            Err("exactly one of"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"m1","method":"scale","changes":[
+                {"layer":3,"experts":[7,151],"scale":0.5},{"layer":3,"shared_expert":true,"scale":0.0}]}),
+            Ok(json!({"name":"m1","method":"scale","changes":[
+                {"layer":3,"experts":[7,151],"scale":0.5},{"layer":3,"shared_expert":true,"scale":0.0}]})),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"m1","method":"scale","changes":[{"layer":3,"experts":[1],"shared_expert":true,"scale":0.0}]}),
+            Err("exactly one of"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"m1","method":"scale","changes":[{"layer":3,"shared_expert":false,"scale":0.0}]}),
+            Err("shared_expert: true"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"m1","method":"scale","changes":[{"layer":3,"experts":[],"scale":0.0}]}),
+            Err("experts"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s3","method":"steering","bundle":"/b.json","data":"/d.jsonl","strength":2.0}),
+            Ok(
+                json!({"name":"s3","method":"steering","bundle":"/b.json","data":"/d.jsonl","strength":2.0}),
+            ),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s3","method":"steering","bundle":"b.json","data":"/d.jsonl","strength":2.0}),
+            Err("absolute"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s3","method":"steering","bundle":"/b.json","data":"/d.jsonl","strength":0.0}),
+            Err("strength"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"s2","method":"scale","allow_noisy":"yes","changes":[{"tensor":"a","scale":1.0}]}),
+            Err("allow_noisy"),
+        ),
+        (
+            Operation::Try,
+            json!({"cases":[case.clone()],"neutral":[case.clone()],"doses":[0.5,1.0],
+                   "method":"scale","changes":[{"tensor":"a","scale":0.0}],"experiment":"x"}),
+            Ok(
+                json!({"cases":[case.clone()],"neutral":[case.clone()],"doses":[0.5,1.0],
+                   "method":"scale","changes":[{"tensor":"a","scale":0.0}]}),
+            ),
+        ),
+        (
+            Operation::Try,
+            json!({"cases":[case.clone()],"doses":[3.0],"method":"scale","changes":[{"tensor":"a","scale":0.0}]}),
+            Err("doses"),
+        ),
+        (
+            Operation::Try,
+            json!({"cases":[{"messages":[{"role":"user","content":"q"}]}],"method":"scale","changes":[{"tensor":"a","scale":0.0}]}),
+            Err("assistant"),
+        ),
+        (
+            Operation::Attribute,
+            json!({"cases":[case.clone()],"wanted":[case.clone()],"top":5,"experiment":"x"}),
+            Ok(json!({"cases":[case.clone()],"wanted":[case.clone()],"top":5})),
+        ),
+        (
+            Operation::Attribute,
+            json!({"cases":[case.clone()],"neutral":[case.clone()],"focus":"repeats","explain":false}),
+            Ok(
+                json!({"cases":[case.clone()],"neutral":[case.clone()],"focus":"repeats","explain":false}),
+            ),
+        ),
+        (
+            Operation::Attribute,
+            json!({"cases":[case.clone()],"focus":"loops"}),
+            Err("focus"),
+        ),
+        (
+            Operation::Attribute,
+            json!({"cases":[case.clone()],"top":500}),
+            Err("top"),
+        ),
     ];
     for (op, input, expected) in cases {
         let actual = arguments(*op, input);
@@ -187,6 +323,28 @@ fn target_refuses_hosted_and_non_mlx_models() {
         error.contains("GGUF") || error.contains("no complete downloaded weights"),
         "{error}"
     );
+}
+
+#[test]
+fn weights_model_lets_a_hosted_main_model_target_a_local_one() {
+    let root = tempfile::tempdir().unwrap();
+    let model = mlx_checkpoint(root.path());
+    let mut config = config_for(root.path(), &model);
+    config.model = "claude-opus-4-5".into();
+    config.provider = Some("anthropic".into());
+    assert!(format!("{:#}", target(&config).unwrap_err()).contains("weights.model"));
+
+    config.weights.model = model.to_string_lossy().into_owned();
+    assert_eq!(
+        target(&config).unwrap(),
+        std::fs::canonicalize(&model).unwrap()
+    );
+    assert_eq!(status(&config)["model"], json!(config.weights.model));
+
+    // Promotion then replaces the weight target and leaves the hosted main model alone.
+    let switch = edits::switch_for_tests(&config, "/edited");
+    assert_eq!(switch.role, None);
+    assert_eq!(switch.changes.len(), 1);
 }
 
 #[test]
@@ -242,6 +400,14 @@ fn render_summarises_each_operation() {
         (
             json!({"op":"trace","model_id":"m","mode":"heads","layer":4,"heads":[{"head":0,"delta":0.3}]}),
             "Layer 4 heads",
+        ),
+        (
+            json!({"op":"analyze","model_id":"m","layer_count":1,"probes":6,"baseline_loss":2.0,
+                   "summary":{"most_important_layers":[0],"least_important_layers":[0],
+                              "heads_by_role":{"induction":1},
+                              "induction_heads":[{"layer":0,"head":1,"induction":0.7}]},
+                   "layers":[{"layer":0,"importance":1.5}]}),
+            "induction head: layer 0 head 1",
         ),
     ];
     for (value, expected) in cases {
@@ -413,4 +579,19 @@ fn render_status_reports_target_progress_and_results() {
         none.contains("Unsupported model: GGUF") && none.contains("No results yet"),
         "{none}"
     );
+}
+
+#[test]
+fn improvement_prompt_carries_the_goal_and_keeps_promotion_with_the_user() {
+    let prompt = improvement_prompt("  stop endless repetition in long lists ");
+    assert!(prompt.contains("stop endless repetition in long lists"));
+    assert!(!prompt.contains("{goal}"));
+    for step in [
+        "`attribute`",
+        "`try`",
+        "`evaluate`",
+        "/weights promote NAME",
+    ] {
+        assert!(prompt.contains(step), "playbook lacks {step}");
+    }
 }

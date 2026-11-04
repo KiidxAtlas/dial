@@ -244,6 +244,9 @@ impl Bridge<'_> {
                         ComposerEvent::Action(Action::ThinkingToggle) => {
                             shell.ui.show_thinking = !shell.ui.show_thinking
                         }
+                        ComposerEvent::Action(Action::WorkTab) => {
+                            shell.work_tab = shell.work_tab.next();
+                        }
                         ComposerEvent::Action(Action::SubagentsHub) => {
                             shell.route_busy_command(self.app, "/agents".into());
                         }

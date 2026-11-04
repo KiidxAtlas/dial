@@ -314,6 +314,21 @@ pub(super) fn improve_summary(app: &App) -> String {
     if let Ok(profiles) = crate::learn::profiles::summary(store) {
         summary.push_str(&format!("\n{profiles}"));
     }
+    match crate::learn::improve::lesson_proposals(store) {
+        Ok(Value::Array(candidates)) if !candidates.is_empty() => {
+            summary.push_str("\nLesson proposals (review required; not active rules):");
+            for candidate in candidates {
+                summary.push_str(&format!(
+                    "\n- {}: {} Evidence: trajectories {}. Review the evidence before authoring a rule or evaluated harness change.",
+                    candidate["category"].as_str().unwrap_or("unknown"),
+                    candidate["summary"].as_str().unwrap_or(""),
+                    candidate["trajectories"],
+                ));
+            }
+        }
+        Ok(_) => {}
+        Err(error) => summary.push_str(&format!("\nLesson proposals unavailable: {error:#}")),
+    }
     match auto::jobs_summary(&app.layout) {
         Ok(jobs) => summary.push_str(&format!("\n{jobs}")),
         Err(error) => summary.push_str(&format!("\nShared compute status unavailable: {error:#}")),

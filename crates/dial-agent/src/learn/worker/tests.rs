@@ -508,3 +508,31 @@ time.sleep(30)
             .unwrap();
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn user_requested_calls_ignore_the_background_improvement_stop() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        state_dir: root.path().join("state"),
+        user_dir: root.path().join("user"),
+        python: PathBuf::from("/usr/bin/python3"),
+        worker: root.path().join("worker.py"),
+        worker_timeout_secs: 30,
+        ..Config::default()
+    };
+    std::fs::create_dir_all(&config.state_dir).unwrap();
+    std::fs::write(
+        &config.worker,
+        "import json\nprint(json.dumps({'ok': True}))\n",
+    )
+    .unwrap();
+    std::fs::write(config.state_dir.join("improvement.stop"), "stop").unwrap();
+    let refused = call(&config, &json!({"op": "generate"})).unwrap_err();
+    assert!(
+        refused.to_string().contains("stopped by operator"),
+        "{refused:#}"
+    );
+    let answer = call_user_requested(&config, &json!({"op": "weights_map"}), None).unwrap();
+    assert_eq!(answer["ok"], true);
+}

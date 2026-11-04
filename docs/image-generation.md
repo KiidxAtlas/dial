@@ -61,7 +61,7 @@ api = "gemini"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
 model = "gemini-2.5-flash-image"
 api_key_env = "GEMINI_API_KEY"
-timeout_secs = 180
+timeout_secs = 900
 ```
 
 `api` is optional for existing configurations: omitting it preserves OpenAI/xAI host inference.

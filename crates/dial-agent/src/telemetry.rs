@@ -47,6 +47,10 @@ pub struct Request {
     pub wire: Option<crate::llm::wire::Observation>,
     /// How the reply was billed; subscription requests have no cost by design, not by omission.
     pub billing: Option<crate::llm::usage::Billing>,
+    /// Time from the final attempt's dispatch to its first streamed output.
+    pub first_output: Option<Duration>,
+    /// Reasoning effort the request asked for; `None` keeps the provider default.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +161,8 @@ pub fn request(
             end: SystemTime::now(),
             wire: reply.wire.clone(),
             billing: reply.billing,
+            first_output: reply.first_output,
+            effort: reply.requested_effort.clone(),
         })),
     );
 }
@@ -193,6 +199,8 @@ pub fn request_failed(
             end: SystemTime::now(),
             wire: None,
             billing: None,
+            first_output: None,
+            effort: None,
         })),
     );
 }
@@ -537,8 +545,11 @@ fn record_stats(db: &mut crate::stats::Db, event: &Event) -> Result<()> {
                 invalidation: w.invalidation.into(),
                 common_prompt_bytes: w.common_prompt_bytes as u64,
                 prompt_bytes: w.prompt_bytes as u64,
+                changed_part: w.changed_part.map(str::to_owned),
             }),
             billing: r.billing.map(|billing| billing.label().to_owned()),
+            first_output_ms: r.first_output.map(|d| d.as_millis() as u64),
+            effort: r.effort.clone(),
         }),
         Event::Tool(t) => db.record_tool(&crate::stats::ToolRecord {
             facts: t.facts.clone(),

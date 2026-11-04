@@ -199,3 +199,131 @@ fn contracted_promotion_revalidates_parent_dependencies_inside_rollback_boundary
         }
     }
 }
+
+#[test]
+fn contracts_restore_requires_matching_fresh_checks_and_invalidates_downstream() {
+    use crate::agent::workers::contracts::{Contract, Ledger};
+    let (dir, workspace, config) = fixture();
+    let artifacts = tempfile::tempdir().unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(artifacts.path()).unwrap();
+    let output = store.retain("immutable candidate").unwrap();
+    let workspace = workspace.with_artifacts(store);
+    let receipt = || {
+        evaluate_with(
+            &workspace,
+            &config,
+            &["behavior".into()],
+            |_| observed(0),
+            || false,
+        )
+    };
+    let mut ledger = Ledger::default();
+    for (id, dependencies) in [
+        ("root", vec![]),
+        ("child", vec!["root".into()]),
+        ("leaf", vec!["child".into()]),
+    ] {
+        ledger
+            .begin(
+                &Contract {
+                    id: id.into(),
+                    depends_on: dependencies,
+                },
+                json!({"task":id, "acceptance_checks":["behavior"]}),
+            )
+            .unwrap();
+        ledger.attach(id, &format!("task-{id}")).unwrap();
+        ledger
+            .settle(id, "done", receipt(), Some(output.clone()))
+            .unwrap();
+    }
+    ledger.refresh(&workspace, &config);
+    assert!(ledger.blocker().is_none());
+    let snapshot = ledger.snapshot();
+    let mut restored = Ledger::restore(&snapshot);
+    assert!(restored.blocker().is_some());
+    assert!(restored.running().is_empty());
+    assert!(
+        restored.checks("child").is_err(),
+        "verify in dependency order"
+    );
+    for id in ["root", "child", "leaf"] {
+        restored.checks(id).unwrap();
+        restored.rechecked(id, receipt()).unwrap();
+    }
+    restored.refresh(&workspace, &config);
+    assert!(restored.blocker().is_none());
+    assert_eq!(restored.node("root").unwrap()["output"], output);
+    fs::write(dir.path().join("source.txt"), "changed input").unwrap();
+    restored.refresh(&workspace, &config);
+    for id in ["root", "child", "leaf"] {
+        assert_eq!(restored.node(id).unwrap()["state"], "needs_verification");
+    }
+    // A fresh pass for different inputs does not certify the old retained candidate.
+    restored.rechecked("root", receipt()).unwrap();
+    assert!(restored.blocker().is_some());
+    assert_eq!(
+        restored.node("root").unwrap()["state"],
+        "needs_verification"
+    );
+    fs::write(dir.path().join("source.txt"), "candidate").unwrap();
+    restored.refresh(&workspace, &config);
+    assert!(
+        restored.blocker().is_some(),
+        "restored bytes do not revive evidence"
+    );
+    restored.rechecked("root", receipt()).unwrap();
+    assert_eq!(
+        restored.node("child").unwrap()["state"],
+        "needs_verification"
+    );
+    restored.rechecked("child", receipt()).unwrap();
+    restored.rechecked("leaf", receipt()).unwrap();
+    assert!(restored.blocker().is_none());
+}
+
+#[test]
+fn contracts_lost_output_and_unknown_effects_never_count_as_acceptance() {
+    use crate::agent::workers::contracts::{Contract, Ledger};
+    let (_dir, workspace, config) = fixture();
+    let mut ledger = Ledger::default();
+    ledger
+        .begin(
+            &Contract {
+                id: "root".into(),
+                depends_on: vec![],
+            },
+            json!({"acceptance_checks":["behavior"]}),
+        )
+        .unwrap();
+    ledger.attach("root", "task-1").unwrap();
+    let receipt = evaluate_with(
+        &workspace,
+        &config,
+        &["behavior".into()],
+        |_| observed(0),
+        || false,
+    );
+    ledger
+        .settle(
+            "root",
+            "done",
+            receipt,
+            Some(format!("artifact://{}", "0".repeat(64))),
+        )
+        .unwrap();
+    ledger.refresh(&workspace, &config);
+    assert_eq!(ledger.node("root").unwrap()["state"], "needs_verification");
+    assert!(ledger.blocker().is_some());
+    let node = Contract {
+        id: "unknown".into(),
+        depends_on: vec![],
+    };
+    let request = json!({"acceptance_checks":["behavior"]});
+    ledger.begin(&node, request.clone()).unwrap();
+    ledger.attach("unknown", "task-2").unwrap();
+    let mut receipt = Acceptance::unverified("check failed after unknown effects");
+    receipt.reject("failed");
+    ledger.settle("unknown", "lost", receipt, None).unwrap();
+    assert!(ledger.begin(&node, request).is_err());
+}

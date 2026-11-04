@@ -34,6 +34,10 @@ pub const MAX_BUDGET: u64 = 256;
 /// Fewest held-out cases an evaluation may admit an edit on.
 pub const MIN_EVALUATION_CASES: usize = 8;
 const MAX_P_VALUE: f64 = 0.1;
+/// Largest relative rise of the loss on general probe text an admitted edit may cause.
+const MAX_PROBE_LOSS_RISE: f64 = 0.05;
+/// Experiments listed in the status.
+const MAX_LISTED_EXPERIMENTS: usize = 32;
 /// Provenance the worker writes into every edited copy.
 const EDIT_RECORD: &str = "weights-edit.json";
 const MAX_EDIT_RECORD: u64 = 4 << 20;
@@ -58,6 +62,9 @@ struct Run {
     at: u64,
     cost: u64,
     prompts: Vec<String>,
+    /// The kept run (`dial weights show ID`) this charge produced, once it succeeded.
+    #[serde(default)]
+    result: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -78,6 +85,9 @@ struct EditRecord {
     base: PathBuf,
     output: PathBuf,
     created_at: u64,
+    /// What the edit did, so a later session sees what was already tried.
+    #[serde(default)]
+    details: Value,
     #[serde(default)]
     evaluation: Option<Value>,
 }
@@ -97,6 +107,9 @@ pub(super) enum Created {
 /// The settings writes that switch the project's main model, with a message for the user.
 pub struct ModelSwitch {
     pub changes: Vec<Change>,
+    /// The model role the changes replace (`Some("main")`), or `None` when they only set
+    /// `weights.model` and leave the main model alone.
+    pub role: Option<&'static str>,
     pub model: PathBuf,
     pub message: String,
 }
@@ -178,14 +191,16 @@ fn prompts(op: Operation, request: &Value) -> Vec<String> {
             .flatten()
             .map(|case| prompt_hash(&messages(case)))
             .collect(),
-        Operation::Direction => ["positive", "negative"]
-            .into_iter()
-            .flat_map(|key| request[key].as_array().cloned().unwrap_or_default())
-            .map(|item| {
-                let all = messages(&item);
-                prompt_hash(all.split_last().map_or(&[][..], |(_, prompt)| prompt))
-            })
-            .collect(),
+        Operation::Direction | Operation::Try | Operation::Attribute => {
+            ["positive", "negative", "cases", "neutral", "wanted"]
+                .into_iter()
+                .flat_map(|key| request[key].as_array().cloned().unwrap_or_default())
+                .map(|item| {
+                    let all = messages(&item);
+                    prompt_hash(all.split_last().map_or(&[][..], |(_, prompt)| prompt))
+                })
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -242,6 +257,11 @@ pub(super) fn prepare(
     request: &mut Value,
     experiment: Option<&str>,
 ) -> Result<Option<Created>> {
+    // A direct scale or steering edit has no direction; the record names the method instead.
+    let method = request["method"]
+        .as_str()
+        .unwrap_or("project_out")
+        .to_owned();
     let mut take = |key: &str| {
         request
             .as_object_mut()
@@ -263,18 +283,24 @@ pub(super) fn prepare(
         }
         Operation::Edit => {
             let name = take("name")?;
-            let direction = take("direction")?;
-            let measured: DirectionRecord = load(&direction_record_path(config, &direction))?
-                .with_context(|| {
-                    format!("no direction named {direction}; measure one with the direction operation first")
-                })?;
-            ensure!(
-                Some(measured.experiment.as_str()) == experiment,
-                "direction {direction} belongs to experiment {}; an edit must use a direction from its own experiment",
-                measured.experiment
-            );
-            let source = direction_path(config, &direction);
-            ensure!(source.is_file(), "direction {direction} has no saved file");
+            let direction = if method == "scale" || method == "steering" {
+                method.clone()
+            } else {
+                let direction = take("direction")?;
+                let measured: DirectionRecord = load(&direction_record_path(config, &direction))?
+                    .with_context(|| {
+                        format!("no direction named {direction}; measure one with the direction operation first")
+                    })?;
+                ensure!(
+                    Some(measured.experiment.as_str()) == experiment,
+                    "direction {direction} belongs to experiment {}; an edit must use a direction from its own experiment",
+                    measured.experiment
+                );
+                let source = direction_path(config, &direction);
+                ensure!(source.is_file(), "direction {direction} has no saved file");
+                request["direction"] = json!(source);
+                direction
+            };
             let dir = edits_dir(config);
             private_dir(&dir)?;
             let output = dir.join(&name);
@@ -282,7 +308,6 @@ pub(super) fn prepare(
                 !output.exists() && !record_path(config, &name).exists(),
                 "an edit named {name} already exists; choose another name"
             );
-            request["direction"] = json!(source);
             request["output"] = json!(output);
             Ok(Some(Created::Edit {
                 name,
@@ -319,9 +344,57 @@ pub(super) fn charge(config: &Config, name: &str, op: Operation, request: &Value
         at: now(),
         cost,
         prompts,
+        result: None,
     });
     save(&path, &ledger)?;
     Ok(json!({"name": name, "budget": ledger.budget, "used": ledger.used, "cost": cost}))
+}
+
+/// Link the newest unlinked charge of `op` in experiment `name` to kept run `id`; the caller
+/// holds the job lock it charged under.
+pub(super) fn link_run(config: &Config, name: &str, op: Operation, id: &str) -> Result<()> {
+    let path = experiment_path(config, name);
+    let mut ledger = ledger(config, name)?;
+    if let Some(run) = ledger
+        .runs
+        .iter_mut()
+        .rev()
+        .find(|run| run.op == op.name() && run.result.is_none())
+    {
+        run.result = Some(id.to_owned());
+        save(&path, &ledger)?;
+    }
+    Ok(())
+}
+
+/// The experiments, newest first, with each charged run and the kept result it produced.
+pub(super) fn experiments(config: &Config) -> Vec<Value> {
+    let Ok(entries) = std::fs::read_dir(directory(config).join("experiments")) else {
+        return Vec::new();
+    };
+    let mut ledgers: Vec<Ledger> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| load(&path).ok().flatten())
+        .collect();
+    ledgers.sort_by_key(|ledger| std::cmp::Reverse(ledger.created_at));
+    ledgers
+        .into_iter()
+        .take(MAX_LISTED_EXPERIMENTS)
+        .map(|ledger| {
+            json!({
+                "experiment": ledger.name,
+                "budget": ledger.budget,
+                "used": ledger.used,
+                "created_at": ledger.created_at,
+                "held_out": ledger.held_out.len(),
+                "runs": ledger.runs.iter().map(|run| json!({
+                    "op": run.op, "at": run.at, "cost": run.cost, "result": run.result,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 /// Record what a successful run created; the caller holds the job lock.
@@ -330,6 +403,7 @@ pub(super) fn record(
     created: Created,
     experiment: &str,
     base: &Path,
+    result: &Value,
 ) -> Result<()> {
     match created {
         Created::Direction { name } => save(
@@ -350,13 +424,68 @@ pub(super) fn record(
                 name: name.clone(),
                 experiment: experiment.into(),
                 direction,
-                base_model: config.model.clone(),
+                base_model: super::target_name(config).to_owned(),
                 base: base.to_owned(),
                 output,
                 created_at: now(),
+                details: details(result),
                 evaluation: None,
             },
         ),
+    }
+}
+
+/// The parameters and measured side effects of an edit result worth remembering: the method, what
+/// was changed, how much, and how noisy the requantization was.
+fn details(result: &Value) -> Value {
+    let noise = |rows: &[Value]| {
+        rows.iter()
+            .filter_map(|row| row["requantization_error"].as_f64())
+            .fold(0.0, f64::max)
+    };
+    match result["method"].as_str() {
+        Some("scale") => {
+            let changes = result["changes"].as_array().cloned().unwrap_or_default();
+            json!({
+                "method": "scale",
+                "tensors": changes.iter().map(|c| json!({"tensor": c["tensor"], "scale": c["scale"]})).collect::<Vec<_>>(),
+                "edited_params": result["edited_params"],
+                "max_requantization_error": noise(&changes),
+            })
+        }
+        Some("steering") => {
+            let changes = result["changes"].as_array().cloned().unwrap_or_default();
+            let steering = &result["steering"];
+            json!({
+                "method": "steering",
+                "module": steering["module"],
+                "layer": steering["layer"],
+                "strength": steering["strength"],
+                "relative_error": steering["relative_error"],
+                "edited_params": result["edited_params"],
+                "max_requantization_error": noise(&changes),
+            })
+        }
+        Some("combine") => {
+            let changes = result["changes"].as_array().cloned().unwrap_or_default();
+            json!({
+                "method": "combine",
+                "sources": result["combined"],
+                "edited_params": result["edited_params"],
+                "max_requantization_error": noise(&changes),
+            })
+        }
+        _ => {
+            let layers = result["layers"].as_array().cloned().unwrap_or_default();
+            json!({
+            "method": "project_out",
+            "layers": layers.iter().map(|l| l["layer"].clone()).collect::<Vec<_>>(),
+            "columns": result["columns"],
+            "alpha": result["alpha"],
+            "edited_params": result["edited_params"],
+            "max_requantization_error": noise(&layers),
+            })
+        }
     }
 }
 
@@ -376,12 +505,20 @@ pub(super) fn summaries(config: &Config) -> Vec<Value> {
         .into_iter()
         .take(MAX_LISTED_EDITS)
         .map(|record| {
+            let evaluation = record.evaluation.map(|mut evaluation| {
+                if let Some(fields) = evaluation.as_object_mut() {
+                    fields.remove("fingerprint");
+                }
+                evaluation
+            });
             json!({
                 "name": record.name,
                 "experiment": record.experiment,
                 "direction": record.direction,
                 "output": record.output,
-                "passed": record.evaluation.as_ref().map_or(Value::Null, |e| e["passed"].clone()),
+                "details": record.details,
+                "passed": evaluation.as_ref().map_or(Value::Null, |e| e["passed"].clone()),
+                "evaluation": evaluation,
                 "created_at": record.created_at,
             })
         })
@@ -500,6 +637,47 @@ fn compare(base: &Value, edited: &Value) -> Result<Value> {
     }))
 }
 
+/// The relative change of the loss on general probe text from `base` to `edited` (generations
+/// asked for `probe_loss`), and whether it rose too much to admit the edit.
+fn quality(base: &Value, edited: &Value) -> (Value, Option<String>) {
+    match (base["probe_loss"].as_f64(), edited["probe_loss"].as_f64()) {
+        (Some(before), Some(after)) if before > 0.0 => {
+            let change = (after - before) / before;
+            let reason = (change > MAX_PROBE_LOSS_RISE).then(|| {
+                format!(
+                    "the edit raises loss on general probe text by more than {}%",
+                    MAX_PROBE_LOSS_RISE * 100.0
+                )
+            });
+            (
+                json!({"base_probe_loss": before, "edited_probe_loss": after, "relative_change": change}),
+                reason,
+            )
+        }
+        _ => (Value::Null, None),
+    }
+}
+
+/// [`compare`] plus the probe-loss quality gate: a significant win that damages general text is
+/// still not admitted.
+fn admit(base: &Value, edited: &Value) -> Result<Value> {
+    let mut value = compare(base, edited)?;
+    let (quality, reason) = quality(base, edited);
+    if value["passed"] == true
+        && let Some(reason) = reason
+    {
+        value["passed"] = json!(false);
+        value["reason"] = json!(reason);
+    }
+    value["quality"] = quality;
+    Ok(value)
+}
+
+#[cfg(test)]
+pub(super) fn admit_for_tests(base: &Value, edited: &Value) -> Value {
+    admit(base, edited).unwrap()
+}
+
 /// Evaluate edit `input.edit` against its base on held-out `input.cases` (generation cases, with
 /// optional `max_tokens`). Not charged to the experiment; the cases become held out for it.
 pub fn evaluate(
@@ -513,6 +691,8 @@ pub fn evaluate(
     if let Some(fields) = request.as_object_mut() {
         // Evaluation reports outcomes only, never answer text.
         fields.remove("tail");
+        // Both generations also score general probe text: the quality gate.
+        fields.insert("probe_loss".into(), json!(true));
     }
     let count = request["cases"].as_array().map_or(0, Vec::len);
     ensure!(
@@ -567,19 +747,21 @@ pub fn evaluate(
             None,
             cancel,
         )?;
-        let mut value = compare(&base, &edited)?;
+        let mut value = admit(&base, &edited)?;
         let fingerprint = fingerprint(&record.output)?;
         record.evaluation = Some(json!({
             "passed": value["passed"],
+            "reason": value["reason"],
             "wins": value["wins"],
             "losses": value["losses"],
             "ties": value["ties"],
             "cases": value["cases"],
             "p_value": value["p_value"],
+            "quality": value["quality"],
+            "rows": value["rows"],
             "fingerprint": fingerprint,
             "at": now(),
         }));
-        save(&path, &record)?;
         value["op"] = json!("evaluate");
         value["edit"] = json!(name);
         value["experiment"] = json!(record.experiment);
@@ -587,16 +769,117 @@ pub fn evaluate(
         value["model_id"] = edited["model_id"].clone();
         value["base_model"] = json!(record.base);
         value["created_at"] = json!(now());
+        let id = super::history::keep(config, &mut value)?;
+        if let Some(evaluation) = record.evaluation.as_mut() {
+            evaluation["run_id"] = json!(id);
+        }
+        save(&path, &record)?;
         write_private(&evaluation_path(config), value.to_string().as_bytes())?;
         Ok(value)
     })
 }
 
+/// Sum 2–4 edited copies of the same base into a new edited copy `input.name` (`input.edits`
+/// names them; `allow_noisy` as for an edit). The combination belongs to the sources' experiment
+/// and needs its own evaluation before it can be promoted. Not charged: no forward pass.
+pub fn combine(
+    config: &Config,
+    layout: Option<&Layout>,
+    input: &Value,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    let name = super::name(input.get("name"), "edit")?;
+    let sources = input["edits"]
+        .as_array()
+        .filter(|list| (2..=4).contains(&list.len()))
+        .context("combine needs `edits`: 2-4 edited copies to sum")?
+        .iter()
+        .map(|value| super::name(Some(value), "edit"))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        sources.iter().collect::<BTreeSet<_>>().len() == sources.len(),
+        "combine needs distinct edits"
+    );
+    let allow_noisy = match input.get("allow_noisy").filter(|v| !v.is_null()) {
+        Some(value) => value
+            .as_bool()
+            .context("allow_noisy must be true or false")?,
+        None => false,
+    };
+    job(config, layout, cancel, || {
+        let records = sources
+            .iter()
+            .map(|source| {
+                load::<EditRecord>(&record_path(config, source))?
+                    .with_context(|| format!("no edit named {source}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let first = &records[0];
+        for record in &records[1..] {
+            ensure!(
+                record.base == first.base && record.experiment == first.experiment,
+                "edits {} and {} have different bases or experiments; combine only sums edits of one experiment on one base",
+                first.name,
+                record.name
+            );
+        }
+        let output = edits_dir(config).join(&name);
+        ensure!(
+            !output.exists() && !record_path(config, &name).exists(),
+            "an edit named {name} already exists; choose another name"
+        );
+        let request = json!({
+            "edits": records.iter().map(|record| &record.output).collect::<Vec<_>>(),
+            "output": output,
+            "allow_noisy": allow_noisy,
+        });
+        let mut value =
+            super::call_worker_named(config, &first.base, "combine", request, None, cancel)?;
+        value["op"] = json!("combine");
+        value["edit"] = json!(name);
+        value["combined"] = json!(sources);
+        value["experiment"] = json!(first.experiment);
+        value["created_at"] = json!(now());
+        save(
+            &record_path(config, &name),
+            &EditRecord {
+                name: name.clone(),
+                experiment: first.experiment.clone(),
+                direction: "combine".into(),
+                base_model: first.base_model.clone(),
+                base: first.base.clone(),
+                output,
+                created_at: now(),
+                details: details(&value),
+                evaluation: None,
+            },
+        )?;
+        super::history::keep(config, &mut value)?;
+        Ok(value)
+    })
+}
+
+#[cfg(test)]
+pub(super) fn switch_for_tests(config: &Config, model: &str) -> ModelSwitch {
+    switch(config, model, String::new()).unwrap()
+}
+
 fn switch(config: &Config, model: &str, message: String) -> Result<ModelSwitch> {
-    let changes =
-        crate::config::selection::changes(config, &ModelSelection::new("mlx", model), "main")?;
+    let (changes, role) = if config.weights.model.is_empty() {
+        let changes =
+            crate::config::selection::changes(config, &ModelSelection::new("mlx", model), "main")?;
+        (changes, Some("main"))
+    } else {
+        // A separate edit target: the main model (often hosted) stays as it is.
+        let set = Change::Set {
+            path: "weights.model".into(),
+            value: model.to_owned().into(),
+        };
+        (vec![set], None)
+    };
     Ok(ModelSwitch {
         changes,
+        role,
         model: PathBuf::from(model),
         message,
     })
@@ -627,7 +910,12 @@ pub fn promotion(config: &Config, name: &str) -> Result<ModelSwitch> {
         config,
         model,
         format!(
-            "Promoted edit {name} to this project's model ({model}); `dial weights revert` restores {}.",
+            "Promoted edit {name} to this project's {} ({model}); `dial weights revert` restores {}.",
+            if config.weights.model.is_empty() {
+                "model"
+            } else {
+                "weight target (the main model is unchanged)"
+            },
             record.base_model
         ),
     )

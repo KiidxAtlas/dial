@@ -140,9 +140,45 @@ impl Agent<'_> {
             Some(Ok(check)) => Some(check),
             None => None,
         };
+        if repro.is_some() && failed_only {
+            return ToolOutput::err(
+                "repro cannot be combined with failed_only: register and run it first without failed_only, then use names or failed_only to rerun it",
+            );
+        }
         let mut candidates = self.current_focused_checks();
         self.step_checks
             .include_failed_checks(self.workspace.root(), &mut candidates);
+        let listed = |checks: &[FocusedCheck]| {
+            checks
+                .iter()
+                .map(|check| check.name.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        // Selection errors must not replace a reproduction or clear its failed evidence.
+        // Registration adds only its own name; replacing a name keeps that name selectable.
+        if let Some(names) = &names {
+            if names.is_empty() && repro.is_none() {
+                return ToolOutput::err(
+                    "names must select at least one check; omit names to run all applicable checks, or provide exact check names",
+                );
+            }
+            let unknown: Vec<&str> = names
+                .iter()
+                .filter(|name| {
+                    !candidates.iter().any(|check| &check.name == *name)
+                        && !repro.as_ref().is_some_and(|check| &check.name == *name)
+                })
+                .map(String::as_str)
+                .collect();
+            if !unknown.is_empty() {
+                return ToolOutput::err(format!(
+                    "unknown check name(s): {}. Available: {}",
+                    unknown.join("; "),
+                    listed(&candidates)
+                ));
+            }
+        }
         let mut registered = None;
         if let Some(check) = repro {
             if let Err(error) = self.register_repro(&check, &mut candidates) {
@@ -153,13 +189,6 @@ impl Agent<'_> {
         }
         let changed =
             self.step_checks.mutations > 0 || self.step_checks.has_uncheckpointed_operations();
-        let listed = |checks: &[FocusedCheck]| {
-            checks
-                .iter()
-                .map(|check| check.name.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        };
         let note = |text: String| ToolOutput {
             execution: Default::default(),
             data: None,
@@ -175,18 +204,6 @@ impl Agent<'_> {
         }
         let mut selected = candidates.clone();
         if let Some(names) = &names {
-            let unknown: Vec<&str> = names
-                .iter()
-                .filter(|name| !candidates.iter().any(|check| &check.name == *name))
-                .map(String::as_str)
-                .collect();
-            if !unknown.is_empty() {
-                return ToolOutput::err(format!(
-                    "unknown check name(s): {}. Available: {}",
-                    unknown.join("; "),
-                    listed(&candidates)
-                ));
-            }
             selected.retain(|check| names.contains(&check.name));
         }
         if failed_only {

@@ -37,6 +37,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
             "model",
             "isolation_backend",
             "acceptance_checks",
+            "contract",
         ],
     ),
     ("find", &["related"]),
@@ -134,6 +135,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
 /// schema is the current one with exactly these values removed.
 const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
     ("eval", "language", &["py"]),
+    ("task", "action", &["verify"]),
     ("lsp", "action", &["request"]),
     (
         "data",

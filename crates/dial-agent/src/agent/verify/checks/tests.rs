@@ -630,7 +630,8 @@ fn external_changes_and_disappearance_invalidate_passes_without_local_counter_ch
         } else {
             std::fs::write(root.path().join("input"), "after").unwrap();
         }
-        agent.refresh_check_inputs();
+        // Opening progress must revalidate external changes, not present an old pass as current.
+        agent.progress_view();
         assert_eq!(agent.step_checks.revision(), revision);
         assert_eq!(
             agent

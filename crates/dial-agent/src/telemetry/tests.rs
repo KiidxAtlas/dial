@@ -30,6 +30,8 @@ fn request_event(session: &str, error: bool) -> Event {
         end: SystemTime::now(),
         wire: None,
         billing: None,
+        first_output: Some(Duration::from_millis(420)),
+        effort: Some("medium".into()),
     }))
 }
 

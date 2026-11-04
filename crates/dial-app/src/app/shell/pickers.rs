@@ -222,9 +222,25 @@ impl Shell {
 
     /// A read-only plan browser shared by idle commands and the live-turn command route.
     /// Detail panels return to the plan; cancelling either layer never alters the agent's tasks.
-    pub(super) fn work_plan(&mut self, args: &str) -> Option<ChoiceSpec> {
+    pub(super) fn work_plan(
+        &mut self,
+        args: &str,
+        progress: Option<&serde_json::Value>,
+    ) -> Option<ChoiceSpec> {
         if args == "list" {
-            self.note("Work plan", self.todo.render());
+            let body = format!(
+                "{}\n\n{}",
+                self.todo.render(),
+                crate::ui::tasks::progress_text(progress)
+            );
+            self.note("Work plan", body.trim_start());
+            return None;
+        }
+        if args == "progress" {
+            self.note(
+                "Deliverables and checks",
+                crate::ui::tasks::progress_text(progress),
+            );
             return None;
         }
         let mut selected = None;
@@ -234,7 +250,7 @@ impl Shell {
                 .and_then(|number| number.trim().parse::<usize>().ok())
                 .and_then(|number| number.checked_sub(1));
             let Some(task) = index.and_then(|index| self.todo.tasks().get(index)) else {
-                self.note("Work plan", "Use /todo to browse, /todo list for text, or /todo show <number>. No task state changed.");
+                self.note("Work plan", "Use /todo to browse, /todo list for text, /todo progress for deliverables and checks, or /todo show <number>. No task state changed.");
                 return None;
             };
             let detail = crate::ui::tasks::step_detail(task);

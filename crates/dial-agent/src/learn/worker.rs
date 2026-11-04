@@ -371,6 +371,27 @@ pub fn call_controlled(
     request: &Value,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Value> {
+    call_worker(config, request, cancel, true)
+}
+
+/// A worker call the user asked for directly (`dial weights`, `/weights`, `model_weights`). The
+/// persistent `improvement.stop` switch pauses background self-improvement for a model; it does
+/// not forbid inspecting or editing that model's weights, so this call ignores it. Cancellation
+/// and the compute-yield rules still apply.
+pub fn call_user_requested(
+    config: &Config,
+    request: &Value,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Value> {
+    call_worker(config, request, cancel, false)
+}
+
+fn call_worker(
+    config: &Config,
+    request: &Value,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    honour_stop: bool,
+) -> Result<Value> {
     crate::setup::refresh_worker(config)?;
     ensure!(
         config.python.is_absolute() && config.worker.is_absolute(),
@@ -378,6 +399,7 @@ pub fn call_controlled(
     );
     let input = serde_json::to_string(request).context("serializing worker request")?;
     let worker = config.worker.to_str().context("worker path is not UTF-8")?;
+    let stop_file = config.state_dir.join("improvement.stop");
     let output = loop {
         let result = run_command_handoff(
             &config.python,
@@ -386,11 +408,13 @@ pub fn call_controlled(
             ProcessControl {
                 timeout_secs: config.worker_timeout_secs,
                 cancel,
-                stop: Some(&config.state_dir.join("improvement.stop")),
+                stop: honour_stop.then_some(stop_file.as_path()),
                 tracking: Some(config),
             },
             &mut || {
-                super::auto::check_stop(config)?;
+                if honour_stop {
+                    super::auto::check_stop(config)?;
+                }
                 if super::compute::background_active()
                     && (super::compute::paused(&config.user_dir)
                         || (config.compute_locks

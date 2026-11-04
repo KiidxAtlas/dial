@@ -145,6 +145,7 @@ impl Config {
 
     fn validate_feature_bounds(&self) -> Result<()> {
         self.steering.validate()?;
+        self.weights.validate()?;
         self.adaptive.validate()?;
         self.reliability.validate()?;
         self.image.validate()?;
@@ -399,6 +400,13 @@ impl Config {
                 "a Laya judge uses the decision role's checkpoint; set model_roles.judge.model = {:?} and choose the checkpoint with the decision role",
                 crate::config::laya::JUDGE_MODEL
             );
+            if let Some(level) = selection.thinking.as_deref() {
+                let parsed = crate::config::thinking::parse_thinking(level);
+                ensure!(
+                    parsed.is_ok_and(|l| l != crate::config::thinking::CliThinking::Auto),
+                    "model_roles.{role}.thinking must be one of off, minimal, low, medium, high, xhigh, max"
+                );
+            }
             if selection.provider == crate::llm::chatgpt::PROVIDER {
                 ensure!(
                     selection

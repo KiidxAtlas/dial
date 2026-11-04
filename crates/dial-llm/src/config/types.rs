@@ -97,6 +97,8 @@ pub struct Config {
     pub assistance: AssistanceConfig,
     pub efficiency: EfficiencyConfig,
     pub steering: config::steering::Config,
+    /// `[weights]`: the local model weight inspection and edits act on.
+    pub weights: config::weights::Config,
     /// `[message_routing]`: how a message typed during a running turn is routed.
     pub message_routing: config::message_routing::Config,
     pub local_runtime: crate::llm::local_runtime::LocalRuntime,
@@ -257,6 +259,7 @@ impl Default for Config {
             assistance: AssistanceConfig::default(),
             efficiency: EfficiencyConfig::default(),
             steering: config::steering::Config::default(),
+            weights: config::weights::Config::default(),
             message_routing: config::message_routing::Config::default(),
             local_runtime: Default::default(),
             adaptive: config::adaptive::Config::default(),

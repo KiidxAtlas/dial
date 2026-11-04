@@ -18,6 +18,12 @@ fn wire_changes_include_images_tools_and_signed_bytes_without_retaining_content(
     tracker.observe(&serde_json::to_vec(&body).unwrap(), None, false, "http");
     let changed = tracker.latest().unwrap();
     assert_eq!(changed.invalidation, "prompt_changed");
+    assert_eq!(changed.changed_part, Some("messages"));
+    body["tools"] = json!([{"name":"added"}]);
+    tracker.observe(&serde_json::to_vec(&body).unwrap(), None, false, "http");
+    assert_eq!(tracker.latest().unwrap().changed_part, Some("tools"));
+    tracker.observe(&serde_json::to_vec(&body).unwrap(), None, false, "http");
+    assert_eq!(tracker.latest().unwrap().changed_part, None);
     assert!(changed.common_prompt_bytes > 0 && changed.common_prompt_bytes < changed.prompt_bytes);
     assert!(!serde_json::to_string(&changed).unwrap().contains("BBBB"));
 }

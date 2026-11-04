@@ -203,6 +203,10 @@ impl Shell {
                 );
                 Ok(Step::Done)
             }
+            Action::WorkTab => {
+                self.work_tab = self.work_tab.next();
+                Ok(Step::Done)
+            }
             Action::ApprovalCycle => {
                 self.cycle_approval(agent);
                 Ok(Step::Done)

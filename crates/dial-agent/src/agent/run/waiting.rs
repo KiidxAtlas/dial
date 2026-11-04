@@ -2,8 +2,9 @@
 use crate::agent::*;
 
 // Legacy hosts may queue input without signalling the platform wake channel. Keep their input,
-// runtime projection and budget checks responsive, but never ask the model to poll on this tick.
-const HOST_TICK: Duration = Duration::from_millis(250);
+// paint, runtime projection and budget checks responsive at the UI heartbeat, but never ask the
+// model to poll on this tick.
+const HOST_TICK: Duration = crate::agent::ui::chat::HEARTBEAT;
 
 impl Agent<'_> {
     /// Returns true when a continuation is needed, including user steering, peer mail or a stop

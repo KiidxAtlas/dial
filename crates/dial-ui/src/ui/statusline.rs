@@ -35,6 +35,7 @@ pub fn segments(cfg: &UiConfig) -> (Vec<String>, Vec<String>) {
         StatusPreset::Default | StatusPreset::Nerd | StatusPreset::Ascii => (
             names(&[
                 "spinner",
+                "approval",
                 "model",
                 "mode",
                 "thinking",
@@ -594,18 +595,28 @@ impl Env<'_> {
                     ],
                 )
             }
+            // `● ask`: a status dot in the mode's safety color, then the mode, as in the concept's
+            // footer. Without icons the word label stands in for the dot.
             "approval" => {
                 let value = text::one_line(&data.approval);
-                if value.trim().is_empty() {
+                let value = value.trim();
+                if value.is_empty() {
                     return None;
                 }
+                let dot = match value {
+                    "ask" | "readonly" => Tok::Success,
+                    "auto" => Tok::Warning,
+                    _ => Tok::StatusApproval,
+                };
+                let mark = if self.theme.ascii() {
+                    Some(self.part("approval ", Tok::StatusApproval))
+                } else {
+                    Some(self.part(format!("{} ", self.theme.sym(Sym::Bullet)), dot))
+                };
                 self.seg(
                     name,
                     importance,
-                    vec![
-                        self.icon(Sym::IconApproval, Tok::StatusApproval, "approval"),
-                        Some(self.part(value.trim(), Tok::StatusApproval)),
-                    ],
+                    vec![mark, Some(self.part(value, Tok::StatusApproval))],
                 )
             }
             "sandbox" => {

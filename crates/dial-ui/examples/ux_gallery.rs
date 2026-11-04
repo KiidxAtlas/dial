@@ -31,6 +31,7 @@ use dial_ui::ui::{
     theme::{Glyphs, Theme},
     transcript::{Transcript, TranscriptCtx},
     welcome::{self, View, WelcomeInfo},
+    work_panel::{self, Facts, Tab},
     worker_pins::WorkerBoard,
 };
 use ratatui::{
@@ -172,6 +173,13 @@ fn main() -> anyhow::Result<()> {
             Theme::builtin("dial-dark").unwrap(),
             false,
             "Tall · 120 × 40",
+        ),
+        (
+            200,
+            40,
+            Theme::builtin("dial-dark").unwrap(),
+            false,
+            "Wide · 200 × 40",
         ),
         (
             100,
@@ -529,6 +537,18 @@ fn main() -> anyhow::Result<()> {
             r#"{"name":"rust-best-practices"}"#,
         );
         lifecycle.tool_end("skill", "Skill instructions loaded", false, 0.01);
+        for (id, file) in [
+            ("skill-11", "references/handbook-11.md"),
+            ("skill-04", "references/handbook-04.md"),
+        ] {
+            lifecycle.tool_start(
+                id,
+                "skill",
+                "rust-best-practices",
+                &format!(r#"{{"name":"rust-best-practices","file":"{file}"}}"#),
+            );
+            lifecycle.tool_end(id, "Skill reference loaded", false, 0.01);
+        }
         lifecycle.tool_start("workers", "task", "3 workers", r#"{"action":"start"}"#);
         lifecycle.tool_end("workers", "Workers started", false, 0.1);
         lifecycle.tool_data("workers", &serde_json::json!([
@@ -553,6 +573,41 @@ fn main() -> anyhow::Result<()> {
             &rows_buffer(rows, width, 48),
             light,
         );
+        if width as usize >= work_panel::MIN_WIDTH {
+            let tab_key = keys.label(dial_ui::ui::keys::Action::WorkTab);
+            let facts = Facts {
+                approval: "ask",
+                sandbox: "workspace",
+                tab_key: &tab_key,
+                cycle_key: "Shift+Tab",
+            };
+            let mut panel_plan = TodoList::new();
+            panel_plan.call(&serde_json::json!({"op": "set", "tasks": [
+                {"content": "Map the renderer"},
+                {"content": "Draw the cards"},
+                {"content": "Write the docs"},
+            ]}));
+            panel_plan.call(&serde_json::json!({"op": "done", "finding": "Paint owns the live region", "evidence": ["src/paint.rs:195"]}));
+            for tab in Tab::ALL {
+                let panel =
+                    work_panel::rows(&panel_plan, &facts, tab, width as usize, 14, &theme, None);
+                screen(
+                    &mut out,
+                    &format!("Work panel {} / {name}", tab.label()),
+                    &rows_buffer(panel, width, 14),
+                    light,
+                );
+            }
+            let mut one = TodoList::new();
+            one.call(&serde_json::json!({"op": "set", "tasks": [{"content": "Write the docs"}]}));
+            let short = work_panel::rows(&one, &facts, Tab::Plan, width as usize, 6, &theme, None);
+            screen(
+                &mut out,
+                &format!("Work panel short, one pending / {name}"),
+                &rows_buffer(short, width, 6),
+                light,
+            );
+        }
         let request = QuestionRequest {
             question_id: "review".into(),
             generation: 0,
@@ -989,6 +1044,39 @@ fn main() -> anyhow::Result<()> {
             &mut out,
             &format!("Answer formatting / {name}"),
             &rows_buffer(rows, width, 24),
+            light,
+        );
+        // Exercise the actual streaming/spill path, not only a settled markdown render.
+        let mut streaming = Transcript::new();
+        let expand_key = keys.label(dial_ui::ui::keys::Action::ToolsExpand);
+        let streaming_ctx = TranscriptCtx {
+            theme: &theme,
+            ui: &ui,
+            tick: 0,
+            tools_expanded: false,
+            expand_key: &expand_key,
+        };
+        let mut history = Vec::new();
+        let mut tail = Vec::new();
+        for paragraph in 1..=12 {
+            streaming.assistant_delta_at(
+                &format!("Paragraph {paragraph}: streaming **styled text** into scrollback while the live tail stays visible.\n\n"),
+                "2026-10-01T10:01:00.000Z",
+            );
+            let (spilled, live) = streaming.live(width, &streaming_ctx, 8);
+            history.extend(spilled);
+            tail = live;
+        }
+        screen(
+            &mut out,
+            &format!("Streaming / {name} / scrollback"),
+            &rows_buffer(history, width, 24),
+            light,
+        );
+        screen(
+            &mut out,
+            &format!("Streaming / {name} / live tail"),
+            &rows_buffer(tail, width, 8),
             light,
         );
         let mut diagram_transcript = Transcript::new();

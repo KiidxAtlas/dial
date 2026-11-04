@@ -195,6 +195,52 @@ fn before_any_change_it_lists_checks_and_runs_only_a_named_baseline() {
 }
 
 #[test]
+fn empty_check_selection_cannot_report_a_pass_or_a_prediction() {
+    for mutations in [0, 1] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.experimental.check_predictions = true;
+        let mut agent = hermetic_agent(&config, root.path());
+        agent.step_checks.mutations = mutations;
+        let before = agent
+            .step_checks
+            .evidence
+            .snapshot(agent.step_checks.revision());
+        let out = agent.check_tool(&json!({"names":[], "expect":"pass"}), &mut NullUi);
+        assert!(
+            out.is_error,
+            "an empty selection is not verification: {}",
+            out.text
+        );
+        assert!(out.text.contains("omit names"), "{}", out.text);
+        assert!(out.data.is_none(), "no execution or prediction occurred");
+        assert_eq!(
+            agent
+                .step_checks
+                .evidence
+                .snapshot(agent.step_checks.revision()),
+            before
+        );
+    }
+}
+
+#[test]
+fn empty_check_selection_still_runs_an_explicit_reproduction() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    let mut args = repro_args("bug", REPRO);
+    args["names"] = json!([]);
+    let out = agent.check_tool(&args, &mut NullUi);
+    let results = out.data.as_ref().unwrap()["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["command"], REPRO);
+    assert_eq!(results[0]["status"], "code_failed");
+    assert_eq!(results[0]["ran"], true);
+    assert!(agent.step_checks.failed);
+}
+
+#[test]
 fn predictions_are_offered_only_under_the_flag_and_mismatches_are_reported() {
     assert!(
         schema(false)
@@ -395,6 +441,125 @@ fn a_reproduction_that_passes_before_any_change_is_refused_and_not_rerun_by_the_
         corrected.text
     );
     assert_eq!(agent.step_checks.evidence.repros().len(), 1);
+}
+
+#[test]
+fn invalid_reproduction_selection_preserves_registration_and_failed_evidence() {
+    for replace_existing in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let mut agent = hermetic_agent(&config, root.path());
+        if replace_existing {
+            let first = agent.check_tool(&repro_args("bug", REPRO), &mut NullUi);
+            assert!(first.is_error, "{}", first.text);
+            assert!(agent.step_checks.failed);
+        }
+        let before = agent
+            .step_checks
+            .evidence
+            .snapshot(agent.step_checks.revision());
+        let failures = agent.step_checks.failed_checks.clone();
+        let mut args = repro_args("bug", "touch unexpected");
+        args["names"] = json!(["missing"]);
+        let refused = agent.check_tool(&args, &mut NullUi);
+        assert!(refused.is_error, "{}", refused.text);
+        assert!(
+            refused.text.contains("unknown check name"),
+            "{}",
+            refused.text
+        );
+        assert_eq!(
+            agent
+                .step_checks
+                .evidence
+                .snapshot(agent.step_checks.revision()),
+            before,
+            "invalid selection must not register or replace a reproduction"
+        );
+        assert_eq!(agent.step_checks.failed_checks, failures);
+        assert_eq!(agent.step_checks.failed, replace_existing);
+        assert!(!root.path().join("unexpected").exists());
+        assert_eq!(
+            agent
+                .current_focused_checks()
+                .iter()
+                .any(|check| check.command == REPRO),
+            replace_existing,
+            "the final gate must retain the original failed reproduction"
+        );
+    }
+}
+
+#[test]
+fn failed_only_reproduction_registration_is_refused_without_changing_evidence() {
+    for replace_existing in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let mut agent = hermetic_agent(&config, root.path());
+        if replace_existing {
+            let first = agent.check_tool(&repro_args("bug", REPRO), &mut NullUi);
+            assert!(first.is_error, "{}", first.text);
+        }
+        let before = agent
+            .step_checks
+            .evidence
+            .snapshot(agent.step_checks.revision());
+        let failures = agent.step_checks.failed_checks.clone();
+        let mut args = repro_args("bug", "touch unexpected");
+        args["failed_only"] = json!(true);
+        let refused = agent.check_tool(&args, &mut NullUi);
+        assert!(refused.is_error, "{}", refused.text);
+        assert!(refused.text.contains("failed_only"), "{}", refused.text);
+        assert_eq!(
+            agent
+                .step_checks
+                .evidence
+                .snapshot(agent.step_checks.revision()),
+            before
+        );
+        assert_eq!(agent.step_checks.failed_checks, failures);
+        assert_eq!(agent.step_checks.failed, replace_existing);
+        assert!(!root.path().join("unexpected").exists());
+    }
+}
+
+#[test]
+fn explicit_selection_runs_a_replacement_and_other_named_checks() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config();
+    config
+        .verification
+        .commands
+        .retain(|check| check.name == "unit");
+    let mut agent = hermetic_agent(&config, root.path());
+    let first = agent.check_tool(&repro_args("bug", REPRO), &mut NullUi);
+    assert!(first.is_error, "{}", first.text);
+    let replacement = "echo 'replacement.rs:1: error: bug remains'; exit 1";
+    let mut args = repro_args("bug", replacement);
+    args["names"] = json!(["unit", "repro: bug"]);
+    let result = agent.check_tool(&args, &mut NullUi);
+    let results = result.data.as_ref().unwrap()["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "{}", result.text);
+    assert!(
+        results
+            .iter()
+            .any(|check| check["command"] == UNIT && check["status"] == "passed")
+    );
+    assert!(
+        results
+            .iter()
+            .any(|check| check["command"] == replacement && check["status"] == "code_failed")
+    );
+    assert_eq!(agent.step_checks.evidence.latest_status(REPRO), None);
+    assert!(agent.step_checks.failed);
+    assert_eq!(agent.step_checks.failed_checks.len(), 1);
+    assert_eq!(agent.step_checks.failed_checks[0].command, replacement);
+    assert!(
+        !agent
+            .current_focused_checks()
+            .iter()
+            .any(|check| check.command == REPRO)
+    );
 }
 
 #[test]

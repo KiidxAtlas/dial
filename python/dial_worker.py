@@ -1171,7 +1171,8 @@ def main():
                       "fuse": fuse, "weights_map": weights_operation, "weights_stats": weights_operation,
                       "weights_activations": weights_operation, "weights_trace": weights_operation,
                       "weights_generate": weights_operation, "weights_direction": weights_operation,
-                      "weights_edit": weights_operation}
+                      "weights_edit": weights_operation, "weights_try": weights_operation, "weights_attribute": weights_operation,
+                      "weights_analyze": weights_operation, "weights_combine": weights_operation}
         operation = request.get("op")
         require(isinstance(operation, str) and operation in operations, "unsupported operation")
         phase = operation
@@ -1179,6 +1180,11 @@ def main():
             result = operations[operation](request)
         sys.stdout.write(json.dumps(result, allow_nan=False) + "\n")
     except Exception as error:
+        if phase.startswith("weights_") and type(error).__name__ == "WeightsError":
+            # Weights contract failures name fields and indices, never content; the caller needs
+            # them to repair its request, and the harness withholds stderr.
+            sys.stdout.write(json.dumps({"error": str(error)}) + "\n")
+            return 0
         detail = str(error) if isinstance(error, RequestError) or type(error).__name__ in ("SteeringError", "WeightsError") else type(error).__name__
         print(f"dial-worker: {phase} failed: {detail}", file=sys.stderr)
         return 1

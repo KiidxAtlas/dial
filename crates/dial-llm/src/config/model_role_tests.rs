@@ -169,6 +169,34 @@ fn validation_accepts_only_assignable_roles() {
 }
 
 #[test]
+fn role_thinking_level_applies_to_the_role_and_is_validated() {
+    let config = resolve(
+        "model='claude-opus-5-5'\nprovider='anthropic'\n\
+         [model_roles.task]\nprovider='anthropic'\nmodel='claude-haiku-5-5'\nthinking='medium'\n",
+    )
+    .unwrap();
+    config.validate().unwrap();
+    let task = config.for_role("task");
+    let profile = task.active_model_profile().expect("role thinking profile");
+    assert_eq!(profile.model, "claude-haiku-5-5");
+    assert_eq!(
+        profile.reasoning_effort,
+        Some(crate::llm::profiles::ReasoningEffort::Medium)
+    );
+    assert!(
+        config.active_model_profile().is_none(),
+        "the main model keeps its own thinking"
+    );
+    for level in ["auto", "loud"] {
+        let result = resolve(&format!(
+            "model='local'\nprovider='mlx'\n[model_roles.task]\nprovider='mlx'\nmodel='m'\nthinking='{level}'\n"
+        ))
+        .and_then(|config| config.validate());
+        assert!(result.is_err(), "accepted role thinking {level}");
+    }
+}
+
+#[test]
 fn removed_settings_migrate_and_the_rest_still_loads() {
     let mut table: toml::Table = toml::from_str(
         "[memory]\nenabled=true\nbackend='mnemopi'\n[memory.mnemopi]\nendpoint='x'\n\

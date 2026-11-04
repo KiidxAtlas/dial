@@ -68,13 +68,15 @@ pub fn step_detail(task: &Task) -> String {
 /// Reason, finding, phase and evidence: what a step records beyond its text and status. The
 /// step-specific facts lead, so a plan row shows why a step is blocked before its (often
 /// shared) phase.
-fn recorded(task: &Task) -> Vec<String> {
+pub(super) fn recorded(task: &Task) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(reason) = &task.note {
         lines.push(format!("Reason: {reason}"));
     }
     if let Some(finding) = &task.finding {
-        lines.push(format!("Recorded finding: {finding}"));
+        lines.push(format!(
+            "Agent finding (observation, not verified): {finding}"
+        ));
     }
     if let Some(phase) = &task.phase {
         lines.push(format!("Phase: {phase}"));
@@ -82,8 +84,15 @@ fn recorded(task: &Task) -> Vec<String> {
     if task.investigation {
         lines.push("Investigation: a question to resolve before implementation".into());
     }
-    if !task.evidence.is_empty() {
-        lines.push(format!("Recorded evidence:\n{}", task.evidence.join("\n")));
+    if task.evidence.is_empty() {
+        if task.status == Status::Completed {
+            lines.push("Unverified: no evidence recorded for this completed step".into());
+        }
+    } else {
+        lines.push(format!(
+            "Evidence references (agent observations, not verified):\n{}",
+            task.evidence.join("\n")
+        ));
     }
     lines
 }
@@ -177,7 +186,7 @@ fn header(todo: &TodoList, theme: &Theme) -> Vec<Span<'static>> {
 }
 
 /// One task row. `changed` marks a row the latest todo call moved; closed steps are struck through.
-fn task_spans(
+pub(super) fn task_spans(
     task: &Task,
     indent: &str,
     theme: &Theme,
@@ -220,9 +229,10 @@ fn task_spans(
                 (Some(frame), false) => frame.to_owned(),
                 (None, false) => theme.sym(Sym::Working).to_owned(),
             };
+            // The active step is the warm dot of the plan: done is green, pending a hollow ring.
             (
                 glyph,
-                theme.fg(Tok::Accent),
+                theme.fg(Tok::Warning),
                 theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
             )
         }
@@ -334,6 +344,113 @@ pub fn changes(old: &TodoList, new: &TodoList) -> Vec<(Task, bool)> {
             (task.clone(), changed)
         })
         .collect()
+}
+
+/// Deliverables with their controller-current check status, plus worker acceptance, as plain text
+/// for `/todo progress`. Every value comes from `Agent::progress_view`; nothing is inferred here.
+/// `None` means the agent is busy and its state is not readable, so the view says so instead of
+/// showing an earlier snapshot as current.
+pub fn progress_text(progress: Option<&serde_json::Value>) -> String {
+    let Some(progress) = progress else {
+        return "Deliverables and workers: unavailable while a turn is running. Use /todo progress when idle.".into();
+    };
+    let reconciliation = &progress["reconciliation"];
+    let mut out = Vec::new();
+    match reconciliation["deliverables"].as_array() {
+        None => out.push("Deliverables: unavailable".to_owned()),
+        Some(items) if items.is_empty() => out.push("Deliverables: none recorded".to_owned()),
+        Some(items) => {
+            out.push("Deliverables (model claims; evidence is shown separately):".to_owned());
+            for item in items {
+                out.extend(deliverable_lines(item));
+            }
+        }
+    }
+    if let Some(more) = reconciliation["omitted_deliverables"]
+        .as_u64()
+        .filter(|more| *more > 0)
+    {
+        out.push(format!("  … {more} more not shown"));
+    }
+    out.push("Undeclared requirements: unassessed (not independently verified)".to_owned());
+    out.push(String::new());
+    out.extend(worker_lines(&progress["jobs"]));
+    out.join("\n")
+}
+
+/// One deliverable: its claim, controller-current check statuses for explicit `check:` refs, the
+/// acceptance contract verdict, and the references that remain unverified.
+fn deliverable_lines(item: &serde_json::Value) -> Vec<String> {
+    let text =
+        |value: &serde_json::Value, fallback: &str| value.as_str().unwrap_or(fallback).to_owned();
+    let mut lines = vec![format!(
+        "  {}: {}",
+        text(&item["id"], "<unnamed>"),
+        text(&item["description"], "")
+    )];
+    lines.push(format!(
+        "    claimed {} · evidence {} · acceptance {} · owner unknown (not recorded)",
+        text(&item["claimed_status"], "unknown"),
+        text(&item["evidence_status"], "unknown"),
+        text(&item["acceptance"]["status"], "unassessed"),
+    ));
+    match item["checks"]
+        .as_array()
+        .filter(|checks| !checks.is_empty())
+    {
+        None => lines.push("    checks: none linked by check: references".to_owned()),
+        Some(checks) => {
+            for check in checks {
+                lines.push(format!(
+                    "    check {}: {}",
+                    text(&check["name"], "?"),
+                    text(&check["status"], "unknown")
+                ));
+            }
+        }
+    }
+    let refs: Vec<String> = item["unverified_refs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|reference| reference.as_str().map(str::to_owned))
+        .collect();
+    if !refs.is_empty() {
+        lines.push(format!(
+            "    unverified refs (not checked): {}",
+            refs.join("; ")
+        ));
+    }
+    lines
+}
+
+/// Worker status from the existing work view. Acceptance is the controller's receipt; the
+/// configured check owner is named but never presented as having run the checks.
+fn worker_lines(jobs: &serde_json::Value) -> Vec<String> {
+    let Some(jobs) = jobs.as_array() else {
+        return vec!["Workers: status unavailable".to_owned()];
+    };
+    if jobs.is_empty() {
+        return vec!["Workers: none".to_owned()];
+    }
+    let mut lines = vec!["Workers:".to_owned()];
+    for job in jobs {
+        let id = job["id"].as_str().or(job["name"].as_str()).unwrap_or("?");
+        let status = job["status"].as_str().unwrap_or("unknown");
+        let acceptance = job["acceptance"]["state"].as_str().unwrap_or("none");
+        let mut line = format!("  {id} {status}: acceptance {acceptance}");
+        if let Some(reason) = job["acceptance"]["reason"]
+            .as_str()
+            .filter(|r| !r.is_empty())
+        {
+            line.push_str(&format!(" ({reason})"));
+        }
+        if let Some(owner) = job["candidate"]["check_owner"].as_str() {
+            line.push_str(&format!(" · configured check owner: {owner}"));
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 #[cfg(test)]

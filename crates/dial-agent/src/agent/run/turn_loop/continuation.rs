@@ -3,6 +3,8 @@
 use super::{AdmittedTurn, TurnSteps, unsettled_report};
 use crate::agent::run::{engine::Engine, turn::TurnState};
 use crate::agent::*;
+mod repair_progress;
+use repair_progress::Fingerprint;
 
 const DEFAULT_REPAIR_ROUNDS: u64 = 3;
 const STOP_HOOK_ROUNDS: u32 = 3;
@@ -136,6 +138,7 @@ impl Agent<'_> {
             self.step_checks.record_checked();
             let mut check_run = self.run_checks(&checks, ui);
             // Zero selects a bounded default; hooks cannot reset the repair allowance.
+            let mut stalled = false;
             let repair_outcome = (|| -> Result<()> {
                 while run.repair_attempts < run.repair_limit {
                     // Only confirmed code failures are repaired; infrastructure, permission, cancellation,
@@ -146,6 +149,12 @@ impl Agent<'_> {
                     let Some(repair_steps) = run.steps.remaining() else {
                         break;
                     };
+                    let repair_checks = checks.clone();
+                    let round_start = Fingerprint::new(
+                        &check_run.diagnoses,
+                        self.step_checks.revision(),
+                        self.check_input_snapshots(&checks),
+                    );
                     self.metrics.repair_attempts += 1;
                     self.record(0, "repair_round", json!({"attempt":run.repair_attempts+1}))?;
                     self.push(json!({"role":"user","content":format!(
@@ -168,7 +177,13 @@ impl Agent<'_> {
                     self.flush_accepted_live_steering(ui)?;
                     let (mut repaired, consumed) = repaired?;
                     repaired.steps = run.steps.charge(repaired.steps, consumed);
-                    if repaired.outcome != TurnOutcome::Completed {
+                    // Failed check obligations can make an otherwise finished repair incomplete.
+                    // Still compare progress and verify changed inputs; this never promotes an
+                    // incomplete candidate or retries blocked/interrupted work.
+                    if !matches!(
+                        repaired.outcome,
+                        TurnOutcome::Completed | TurnOutcome::Incomplete
+                    ) {
                         repaired.text = unsettled_report(&run.candidate_summary, &repaired.text);
                         run.result = Ok(repaired);
                         break;
@@ -177,6 +192,8 @@ impl Agent<'_> {
                         run.candidate_summary.clone_from(&repaired.text);
                     }
                     run.result = Ok(repaired);
+                    // Same confirmed diagnosis and no progress: another rerun would repeat it. The
+                    // effect epoch and declared inputs are read before the rerun, so its probes do not count.
                     if self.step_checks.clean() {
                         check_run.actionable.clear();
                         check_run.failures.clear();
@@ -185,7 +202,35 @@ impl Agent<'_> {
                         self.step_checks
                             .include_failed_checks(self.workspace.root(), &mut checks);
                         self.step_checks.record_checked();
-                        check_run = self.run_checks(&checks, ui);
+                        let revision = self.step_checks.revision();
+                        let inputs = self.check_input_snapshots(&checks);
+                        // Do not rerun a known failure merely because the model changed a todo or
+                        // claimed completion. Complete input witnesses also catch reverted edits.
+                        let unchanged = checks == repair_checks
+                            && round_start.repeats(&Fingerprint::new(
+                                &check_run.diagnoses,
+                                revision,
+                                inputs.clone(),
+                            ));
+                        if !unchanged {
+                            check_run = self.run_checks(&checks, ui);
+                        }
+                        if unchanged
+                            || (!check_run.actionable.is_empty()
+                                && round_start.repeats(&Fingerprint::new(
+                                    &check_run.diagnoses,
+                                    revision,
+                                    inputs,
+                                )))
+                        {
+                            self.record(
+                                0,
+                                "repair_no_progress",
+                                json!({"diagnosis":round_start.key(),"attempt":run.repair_attempts}),
+                            )?;
+                            stalled = true;
+                            break;
+                        }
                     }
                 }
                 Ok(())
@@ -220,7 +265,11 @@ impl Agent<'_> {
                 })
             {
                 let problems = check_run.failures.join("; ");
-                let diagnostic = if run.repair_attempts > 0 {
+                let diagnostic = if stalled {
+                    format!(
+                        "Focused verification still has the same confirmed diagnosis and its inputs did not change, so automatic repair stopped: {problems}"
+                    )
+                } else if run.repair_attempts > 0 {
                     format!("Focused verification still fails after bounded repair: {problems}")
                 } else if !check_run.actionable.is_empty() {
                     format!(

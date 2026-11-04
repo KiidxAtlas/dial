@@ -70,9 +70,18 @@ impl<'a> Client<'a> {
         ensure!(
             self.config.image.timeout_secs == 0
                 || self.started.elapsed() < Duration::from_secs(self.config.image.timeout_secs),
-            "image generation timed out; a submitted remote job may still be running"
+            "image generation timed out after {}s; a submitted remote job may still be running. Slow models can need a larger image.timeout_secs (0 disables the deadline)",
+            self.config.image.timeout_secs
         );
         Ok(())
+    }
+
+    /// A transport error, reported as the interruption or deadline when that is what ended it.
+    pub(super) fn transport(&self, error: ureq::Error) -> anyhow::Error {
+        match (&error, self.check()) {
+            (ureq::Error::Timeout(_), Err(reason)) => reason,
+            _ => anyhow!(error),
+        }
     }
 
     pub(super) fn pause(&self) -> Result<()> {
@@ -149,7 +158,8 @@ impl<'a> Client<'a> {
             }
             builder.call()
         };
-        let mut response = sent.map_err(|error| self.redact(headers.redact(anyhow!(error))))?;
+        let mut response =
+            sent.map_err(|error| self.redact(headers.redact(self.transport(error))))?;
         let status = response.status().as_u16();
         let raw = response
             .body_mut()

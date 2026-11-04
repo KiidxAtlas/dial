@@ -37,6 +37,7 @@ pub mod tools;
 pub mod types;
 mod validate;
 pub mod voice;
+pub mod weights;
 
 use crate::config::{
     paths::Layout,
@@ -1036,6 +1037,7 @@ impl Config {
             headers: self.endpoint.as_ref().and_then(|e| e.headers.clone()),
             account_id: self.endpoint.as_ref().and_then(|e| e.account_id.clone()),
             context_window: Some(self.context_window),
+            thinking: None,
         }
     }
 
@@ -1278,7 +1280,14 @@ impl Config {
                 {
                     endpoint.account_id = self.endpoint.as_ref().and_then(|e| e.account_id.clone());
                 }
-                resolved
+                // Validation rejects unknown levels on load; a level the model cannot honour
+                // keeps the model default rather than failing every request for the role.
+                match selection.thinking.as_deref() {
+                    Some(level) => {
+                        thinking::apply_role_thinking(resolved.clone(), level).unwrap_or(resolved)
+                    }
+                    None => resolved,
+                }
             }
             None => self.clone(),
         };

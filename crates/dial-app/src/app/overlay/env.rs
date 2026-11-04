@@ -82,6 +82,7 @@ pub(in crate::app) fn favorite_routes(
                     headers: endpoint.headers,
                     account_id: endpoint.account_id,
                     context_window: selection.context_window,
+                    thinking: selection.thinking.clone(),
                 },
                 None => selection.clone(),
             };

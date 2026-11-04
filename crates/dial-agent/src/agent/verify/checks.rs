@@ -7,6 +7,8 @@ use crate::agent::*;
 pub(in crate::agent) struct CheckRun {
     pub(in crate::agent) failures: Vec<String>,
     pub(in crate::agent) actionable: Vec<String>,
+    /// Confirmed diagnoses only: excludes changing prompt context such as the file-change header.
+    pub(in crate::agent) diagnoses: Vec<String>,
 }
 
 /// One bounded verification process, owned until its actual result is settled.
@@ -133,6 +135,18 @@ impl<'a> Agent<'a> {
         self.capture_check_inputs(check).ok().flatten()
     }
 
+    /// Declared input identities for `checks`, one per check in order; `None` when a check has no
+    /// complete contract. Repair progress compares these rather than a bare effect epoch.
+    pub(in crate::agent) fn check_input_snapshots(
+        &self,
+        checks: &[verify::verification::FocusedCheck],
+    ) -> Vec<Option<verify::inputs::Snapshot>> {
+        checks
+            .iter()
+            .map(|check| self.check_inputs(check))
+            .collect()
+    }
+
     pub(in crate::agent) fn reuse_check(
         &mut self,
         check: &verify::verification::FocusedCheck,
@@ -169,6 +183,10 @@ impl<'a> Agent<'a> {
         let started = Instant::now();
         self.live_tasks
             .revalidate_acceptance(&self.config.verification);
+        if let Err(error) = self.sync_contracts() {
+            self.workflow_contracts
+                .fail(format!("workflow evidence could not settle: {error:#}"));
+        }
         let mut runtime = None;
         for check in self.step_checks.evidence.input_checks() {
             let inputs = self
@@ -860,6 +878,7 @@ impl<'a> Agent<'a> {
         self.drain_background_check(ui, true);
         let mut failures = Vec::new();
         let mut actionable = Vec::new();
+        let mut diagnoses = Vec::new();
         let mut results = Vec::new();
         let mut outcomes = Vec::new();
         let receipts = self.config.experimental.verification_receipts && !self.hermetic;
@@ -990,6 +1009,7 @@ impl<'a> Agent<'a> {
                 // An unexplained failure, infrastructure, permission, cancellation, timeout or
                 // unverified problem is reported without sending the model into source repair.
                 if status.repairable() && !unchanged {
+                    diagnoses.push(message.clone());
                     actionable.push(message.clone());
                 }
                 failures.push(message);
@@ -1073,6 +1093,7 @@ impl<'a> Agent<'a> {
         CheckRun {
             failures,
             actionable,
+            diagnoses,
         }
     }
 
@@ -1180,6 +1201,9 @@ impl<'a> Agent<'a> {
             && (!self.config.verification.enabled || !unchecked_effects)
         {
             return Err("Cannot complete: focused checks failed and no new edits are awaiting a fresh check. Repair, rerun the failed check, or report a blocker.".into());
+        }
+        if let Some(reason) = self.workflow_contracts.blocker() {
+            return Err(reason);
         }
         if let Some(reason) = crate::agent::verify::requirements::strict_blocker(
             &self.config.verification,
@@ -1372,6 +1396,7 @@ impl<'a> Agent<'a> {
             "visual_evidence": visual,
             "checks": checks,
             "requirements": requirements,
+            "workflow_jobs": self.workflow_contracts.snapshot(),
             "uncheckpointed_effects": self.step_checks.has_uncheckpointed_operations(),
             "caller_obligations": self.caller_obligations(),
             "requested_targets": self.step_checks.targets.evidence(&self.workspace, self.step_checks.effect_epoch()),

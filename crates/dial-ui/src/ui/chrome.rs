@@ -132,13 +132,16 @@ pub fn key_hint_spans(theme: &Theme, hints: &[(&str, &str)]) -> Vec<Span<'static
     spans
 }
 
-/// Style of one tab in any panel's tab strip: the active tab is accent, bold and underlined, the
-/// others muted words. No fills, so a tab strip reads the same in every panel and theme.
+/// Style of one tab in any panel's tab strip: the active tab is a soft pill (the panel inset fill)
+/// with an accent, bold and underlined label; the others are muted words. Themes without an inset
+/// fill keep the plain accent label, so a tab strip reads the same in every panel.
 pub fn tab_style(theme: &Theme, active: bool) -> Style {
     if active {
-        theme
-            .fg(Tok::Accent)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        surface(theme).patch(
+            theme
+                .fg(Tok::Accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )
     } else {
         theme.fg(Tok::Muted)
     }

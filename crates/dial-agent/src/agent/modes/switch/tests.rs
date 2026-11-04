@@ -57,6 +57,73 @@ fn switch_applies_to_later_turns_and_leaves_the_config_untouched() {
 }
 
 #[test]
+fn a_weights_driver_runs_the_turn_but_keeps_the_previous_model_as_the_edit_target() {
+    let config = Config::default();
+    let server = crate::llm::fake::serve(vec![reply("driven")]);
+    let base_url = format!("{}/v1", server.url);
+    let backend = Backend::new(
+        ProviderKind::Endpoint {
+            base_url: base_url.clone(),
+            model: "local-main".into(),
+            api_key: None,
+        },
+        PathBuf::new(),
+        5,
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let version = Version {
+        id: 0,
+        parent: None,
+        kind: "config".into(),
+        harness: config.harness.clone(),
+        adapter: None,
+        status: "active".into(),
+    };
+    let mut agent =
+        Agent::hermetic(&config, backend, &version, workspace.path(), None, None).unwrap();
+    let local = ModelSelection {
+        provider: "switch-test".into(),
+        model: "local-main".into(),
+        base_url: Some(base_url.clone()),
+        protocol: Some(ApiProtocol::ChatCompletions),
+        ..Default::default()
+    };
+    agent.switch_model(&local, None).unwrap();
+    let driver = ModelSelection {
+        provider: "switch-test".into(),
+        model: "frontier".into(),
+        base_url: Some(base_url),
+        protocol: Some(ApiProtocol::ChatCompletions),
+        ..Default::default()
+    };
+    let target = workspace.path().join("checkpoint");
+
+    let prior = agent.drive_weights_with(&driver, &target).unwrap();
+    assert_eq!(prior.as_ref().unwrap().selection().model, "local-main");
+    assert_eq!(agent.effective_config().selection().model, "frontier");
+    assert_eq!(
+        agent.effective_config().weights.model,
+        target.to_string_lossy()
+    );
+    agent.turn("improve", &mut NullUi).unwrap();
+    assert_eq!(
+        crate::llm::fake::body(&server.requests()[0])["model"],
+        "frontier"
+    );
+
+    agent.restore_model_override(prior).unwrap();
+    assert_eq!(agent.effective_config().selection().model, "local-main");
+    assert!(agent.effective_config().weights.model.is_empty());
+    let saved = agent
+        .modes
+        .switch
+        .as_ref()
+        .expect("the /switch choice is kept");
+    assert_eq!(saved.selection.model, "local-main");
+    assert_eq!(config.selection(), Config::default().selection());
+}
+
+#[test]
 fn parse_target_splits_only_known_effort_levels() {
     assert_eq!(
         parse_target("anthropic/claude:high"),

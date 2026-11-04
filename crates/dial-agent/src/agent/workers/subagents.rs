@@ -265,7 +265,7 @@ pub fn schema(config: &Config) -> Value {
     let mut properties = serde_json::Map::from_iter([
         (
             "action".into(),
-            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close"],"description":"run (default) waits for every task; start returns live ids for status/wait/message/cancel; resume continues a stopped worker with message; create/push/peek/close manage a worker pool."}),
+            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close","verify"],"description":"run (default) waits for every task; start returns live ids; resume continues a stopped worker; status/wait/cancel manage jobs; create/push/peek/close manage pools. With contract, start launches one durable bounded node, status inspects it, and verify reruns only its configured acceptance checks without replaying the worker."}),
         ),
         (
             "id".into(),
@@ -334,6 +334,15 @@ pub fn schema(config: &Config) -> Value {
         single["description"] = json!("Single task: as tasks[].acceptance_checks.");
         single
     });
+    properties.insert("contract".into(), json!({
+        "type":"object",
+        "description":"Opt-in strict workflow node, main agent only; requires start with acceptance_checks and a persistent session. Stable id binds the assignment and up to 16 already accepted dependencies. Missing/stale evidence blocks completion. Accepted outputs are retained, retries are bounded, and unknown effects are never replayed. Use status or verify with this id after restart.",
+        "properties":{
+            "id":{"type":"string","minLength":1,"maxLength":64},
+            "depends_on":{"type":"array","maxItems":16,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}
+        },
+        "required":["id"],"additionalProperties":false
+    }));
     properties.insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session id prefix or worker id whose record is read; other agents reject it."}));
     properties.insert("model".into(), json!({"type":"string","description":"seance only: answering model (default the source session's, else the main model); other agents reject it."}));
     if config.experimental.work_packet_contracts {
@@ -782,6 +791,12 @@ impl Job<'_> {
                 out.push_str("The output_schema remains authoritative for the final answer; do not add fields it forbids. Acceptance coverage absent from that payload remains not_verified in the parent projection.\n");
             }
         }
+        if !self.acceptance_checks.is_empty() {
+            out.push_str(&format!(
+                "\nCONTROLLER ACCEPTANCE\nThe controller runs these configured checks on your candidate after completion: {}. Your report is not acceptance and cannot substitute for them. Run a check yourself only as evidence, and never claim a controller check passed.\n",
+                self.acceptance_checks.join(", ")
+            ));
+        }
         if tools.iter().any(|name| name == "codebase_memory") {
             out.push_str("Use saved codebase context to locate the affected area without rediscovering the whole repository. Reuse current source evidence; inspect only missing or stale context. Use codebase_memory to recall; do not save findings with remember: the parent records reusable findings after it integrates your result, so report them in your answer instead.\n");
             out.push_str("Before proposing or making nontrivial changes, identify the owning module, relevant architecture documents, and existing helpers or analogous implementations to reuse. Cite source locations; justify any new abstraction. Review changes for duplicated logic and boundary violations. Distinguish documented intent from observed code and surface conflicts. Keep investigation task-local.\n");
@@ -812,6 +827,11 @@ pub(in crate::agent) struct Request<'c> {
 /// Turn raw `task` arguments into validated jobs, or say precisely what is wrong. Nothing runs
 /// unless every task in the call is valid.
 pub(in crate::agent) fn parse<'c>(args: &Value, config: &'c Config) -> Result<Request<'c>, String> {
+    if args.get("contract").is_some() {
+        return Err(
+            "contracted workflow nodes require the main agent's explicit start path".into(),
+        );
+    }
     let model_profile = optional_str(args, "model_profile")?.map(str::to_owned);
     if let Some(name) = &model_profile {
         if !config.experimental.profile_matching {
@@ -859,6 +879,9 @@ pub(in crate::agent) fn parse<'c>(args: &Value, config: &'c Config) -> Result<Re
         .iter()
         .enumerate()
         .map(|(index, entry)| {
+            if entry.get("contract").is_some() {
+                return Err("contract is a main-agent single-task property, not a batch or nested task property".into());
+            }
             let place = if batch {
                 format!("tasks[{index}]")
             } else {
@@ -1479,6 +1502,25 @@ pub(in crate::agent) trait Approver {
     }
 }
 
+/// Recheck a retained candidate through the same approval and isolated execution path as workers.
+pub(in crate::agent) fn recheck_acceptance(
+    env: Env<'_>,
+    ids: &[String],
+    gate: super::live_tasks::ApprovalGate<'_>,
+    ui: &mut dyn Ui,
+) -> crate::agent::verify::worker_acceptance::Acceptance {
+    let mut direct = Direct {
+        approval: gate.approval,
+        always: gate.rules,
+        root: gate.root,
+        extra_roots: gate.extra_roots,
+        layout: gate.layout,
+        plan_mode: gate.read_only,
+        cost: gate.cost,
+        ui,
+    };
+    crate::agent::verify::worker_acceptance::evaluate(env, ids, &mut direct)
+}
 /// Approves on the calling thread, straight through the parent's policy and UI.
 struct Direct<'a> {
     approval: Approval,
@@ -2110,7 +2152,7 @@ pub(in crate::agent) fn nested_schema(config: &Config) -> Value {
         .as_object_mut()
         .expect("task properties");
     props.insert("action".into(), json!({"type":"string","enum":["run"],"description":"Nested tasks run synchronously within this worker's spawn policy and depth limit."}));
-    for name in ["id", "message", "timeout"] {
+    for name in ["id", "message", "timeout", "contract"] {
         props.remove(name);
     }
     schema
@@ -3241,6 +3283,22 @@ pub(in crate::agent) fn structured_result_note(output: &ToolOutput) -> Option<Va
     handoff::structured_note(output)
 }
 
+/// Completion (execution lifecycle) and controller acceptance are reported separately. Neither
+/// implies that the work packet's acceptance conditions were met.
+pub(super) fn candidate_status(
+    completion: &str,
+    acceptance: crate::agent::verify::worker_acceptance::State,
+    checks: &[String],
+) -> Value {
+    json!({
+        "completion": completion,
+        "acceptance": acceptance,
+        "check_owner": if checks.is_empty() { "none" } else { "controller" },
+        "acceptance_checks": checks,
+        "note": "completion is the worker's lifecycle; acceptance covers only the controller-run configured checks on stable inputs",
+    })
+}
+
 /// A lone `prompt` returns just the answer; a batch returns one labelled section per task, in input order.
 fn render(
     request: &Request,
@@ -3259,6 +3317,7 @@ fn render(
         let mut result = json!({"name":job.label,"agent":job.kind,"status":status,"steps":outcome.steps,"result":outcome.data.clone().unwrap_or_else(|| json!(text))});
         result["inspections"] = json!(outcome.inspections);
         result["acceptance"] = json!(outcome.acceptance);
+        result["candidate"] = candidate_status(status, outcome.acceptance.state, &job.acceptance_checks);
         result["projection"] = result_projection(text, outcome.data.as_ref(), job.work_packet.as_ref().map(|p| p.acceptance.as_slice()).unwrap_or_default(), workspace);
         result["role"] = json!(job.role);
         result["model"] = json!(models.get(&job.index));

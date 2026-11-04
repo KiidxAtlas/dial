@@ -30,8 +30,8 @@ fn framed_lines_have_one_width_and_keep_the_title() {
 }
 
 #[test]
-fn every_tab_strip_marks_the_active_tab_without_a_fill() {
-    let theme = Theme::dark();
+fn every_tab_strip_marks_the_active_tab_as_a_pill_on_the_panel_fill() {
+    let theme = Theme::builtin("dial-dark").unwrap();
     let active = tab_style(&theme, true);
     let idle = tab_style(&theme, false);
     assert_eq!(active.fg, theme.fg(Tok::Accent).fg);
@@ -40,8 +40,9 @@ fn every_tab_strip_marks_the_active_tab_without_a_fill() {
             .add_modifier
             .contains(Modifier::UNDERLINED | Modifier::BOLD)
     );
+    assert_eq!(active.bg, surface(&theme).bg);
     assert_eq!(idle.fg, theme.fg(Tok::Muted).fg);
-    assert!(active.bg.is_none() && idle.bg.is_none());
+    assert!(idle.bg.is_none());
 }
 
 #[test]

@@ -96,6 +96,7 @@ impl Shell {
             commands,
             scope: Scope::Global,
             tools_expanded: false,
+            work_tab: Default::default(),
             home: None,
             home_mark: None,
             started: Instant::now(),

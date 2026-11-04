@@ -55,6 +55,22 @@ failures (including checkpoint failures) are not reset by this recovery.
   menu, so `Enter` sends it as typed, and while busy it queues like any other message.
 - A configurable status line shows model, role, path, Git state, context, token usage/rate, approval,
   sandbox and session state. Settings let you choose presets or define left/right segments. Learning diagnostics are available in the explicit improvement views.
+- The default status line leads with the approval mode as a colored dot and word (`● ask`): green
+  for `ask` and `readonly`, orange for `auto`.
+- **Work panel.** While a plan has open steps on a terminal at least 90 columns wide, one compact
+  rounded card sits above the composer. It is as tall as its content and at most 100 columns wide.
+  Its tab strip shows `plan`, `evidence` and `approvals`, switched with `Ctrl+F` (or `Alt+W` or
+  `F12`; rebind `app.work.tab`). The plan tab lists the steps with status dots (a green check for
+  done, an orange dot for the step in progress, a hollow ring for pending) and the focused step's
+  recorded reason or finding; when the card is short it keeps the focused step and drops reason
+  lines first. Evidence lists references recorded so far, labelled as agent observations, not
+  verification. Approvals shows the approval mode and sandbox. Narrower terminals keep the one-line
+  focus summary. The panel only reads the plan; it never changes it.
+- The launch input is a rounded box that asks "What are we building?". It shows no status line
+  or shortcut catalog. An active tab in any panel's tab strip is drawn as a filled pill.
+- Skill tool lines include the bundled reference-file path when one is read, for example
+  `rust-best-practices · references/handbook-11.md`, so separate reference reads do not look like
+  repeated loads of the core skill.
 - The `cost` segment shows the observed API cost of the running turn and the session, such as
   `$0.0412 turn · $1.20 session`. Amounts use the `$` form of `/cost` (four decimals below a
   dollar, cents above). While a turn runs, the segment counts spend observed since the turn
@@ -105,7 +121,14 @@ failures (including checkpoint failures) are not reset by this recovery.
   repeating the whole checklist. `/todo` opens a searchable inspector, ordered by current work,
   blockers, upcoming steps and closed history. Select a step for its full recorded reason,
   finding and evidence; Back returns to the plan. Browsing never changes task state.
-  `/todo list` retains plain-text output; `/todo show <number>` opens a recorded step directly.
+  `/todo list` retains plain-text output and appends the progress view; `/todo show <number>` opens
+  a recorded step directly. `/todo progress` shows persisted deliverables with their claimed status,
+  explicit linked-check verdicts (including stale or unknown evidence), configured acceptance,
+  unverified references and worker acceptance. Opening it while idle revalidates existing input
+  witnesses without running checks. Unrecorded ownership stays unknown; passing checks do not
+  imply complete semantic coverage. While a turn runs, the new progress section reports unavailable
+  instead of presenting an old snapshot as current; the existing todo browser remains available.
+  Todo findings and references are labelled as agent observations, not verification.
 - A frameless default look (`dial-dark`/`dial`): shaded bands for your messages and the composer,
   a shared icon gutter for answers and tool calls, and inset panels and menus with a filled
   selection. Dark, light, monochrome, Gruvbox, Nord and Paper themes; custom JSON themes, symbol

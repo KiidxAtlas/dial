@@ -44,6 +44,22 @@ pub(in crate::agent) struct Acceptance {
 }
 
 impl Acceptance {
+    /// A historical binding for retained output, not a deserializable verification receipt.
+    /// Recovery must execute fresh checks and compare this binding before reusing that output.
+    pub(in crate::agent) fn binding(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        if self.state != State::Accepted || self.checks.is_empty() {
+            return None;
+        }
+        let checks: Vec<_> = self
+            .checks
+            .iter()
+            .map(|check| json!([check.check, check.identity, check.snapshot.digest()]))
+            .collect();
+        Some(crate::hex(&Sha256::digest(
+            json!(checks).to_string().as_bytes(),
+        )))
+    }
     pub fn unverified(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),

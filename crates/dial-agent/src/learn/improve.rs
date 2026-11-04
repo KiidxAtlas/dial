@@ -31,6 +31,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod lessons;
+
+/// Review-only lesson candidates from recurring recorded failures. This reads existing metadata;
+/// it never runs inference, changes the active harness, or writes project instructions.
+///
+/// # Errors
+/// Returns an error if proposal metadata cannot be read or is malformed or oversized.
+pub fn lesson_proposals(store: &Store) -> Result<Value> {
+    Ok(Value::Array(lessons::load(store)?))
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -651,6 +662,8 @@ pub struct Signals {
     pub tool_errors: BTreeMap<String, usize>,
     /// Closed taxonomy only: per-trajectory counts, never source code, prompts or gate results.
     pub recurring_failures: BTreeMap<String, usize>,
+    /// Distinct trajectory IDs per category (newest last), the evidence references for lessons.
+    pub recurring_trajectories: BTreeMap<String, Vec<i64>>,
     pub live_failures: usize,
     pub risky: Vec<(i64, f64)>,
 }
@@ -717,6 +730,13 @@ pub fn collect_signals(
                 .recurring_failures
                 .entry(category.to_owned())
                 .or_default() += 1;
+            if let Some(id) = row["id"].as_i64() {
+                signals
+                    .recurring_trajectories
+                    .entry(category.to_owned())
+                    .or_default()
+                    .push(id);
+            }
         }
         if failed
             && !row["domain"]
@@ -2177,6 +2197,8 @@ pub fn run_cycle(
         "diagnosis",
         json!({"selfplay_rates":signals.selfplay_rates,"failure_kinds":signals.failure_kinds,"tool_errors":signals.tool_errors,"recurring_failures":signals.recurring_failures,"live_failures":signals.live_failures}),
     );
+    let lesson_proposals = lessons::record(store, &signals)?;
+    note(&mut steps, "lesson_proposals", lesson_proposals);
     if !force
         && total_sp >= 8
         && passed_sp == total_sp
@@ -2601,3 +2623,6 @@ mod attempt_tests;
 
 #[cfg(test)]
 mod monitor_tests;
+
+#[cfg(test)]
+mod lessons_tests;

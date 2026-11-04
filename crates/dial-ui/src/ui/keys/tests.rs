@@ -602,3 +602,16 @@ fn mac_option_v_text_fallback_respects_platform_modifiers_and_remaps() {
         ));
     }
 }
+
+#[test]
+fn work_tab_defaults_lead_with_a_non_option_chord() {
+    let map = Keymap::defaults();
+    assert_eq!(map.label(Action::WorkTab), "Ctrl+F");
+    assert!(map.matches(
+        Action::WorkTab,
+        &key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+    ));
+    // The earlier Option and function-key defaults keep working as aliases.
+    assert!(map.matches(Action::WorkTab, &key(KeyCode::Char('w'), KeyModifiers::ALT)));
+    assert!(map.matches(Action::WorkTab, &key(KeyCode::F(12), KeyModifiers::NONE)));
+}

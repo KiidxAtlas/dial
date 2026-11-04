@@ -938,17 +938,22 @@ impl Agent<'_> {
         self.add_task_tools(matches, false)
     }
 
+    /// Tool and schema caps for the routed selection on this profile.
+    fn routing_limits(&self) -> (usize, usize) {
+        if self.lean_local() || self.minimal_tools() {
+            (LEAN_TOOL_LIMIT, LEAN_SCHEMA_BYTES)
+        } else {
+            (TOOL_LIMIT, SCHEMA_BYTES)
+        }
+    }
+
     fn add_task_tools(&mut self, mut matches: Vec<String>, followup: bool) -> bool {
         let small = self.lean_local() || self.minimal_tools();
         if small {
             matches.sort_by_key(|name| !WEB_TOOLS.contains(&name.as_str()));
         }
         let before = self.tool_routing.selected.len();
-        let (tool_limit, schema_limit) = if small {
-            (LEAN_TOOL_LIMIT, LEAN_SCHEMA_BYTES)
-        } else {
-            (TOOL_LIMIT, SCHEMA_BYTES)
-        };
+        let (tool_limit, schema_limit) = self.routing_limits();
         // One follow-up can use an additional slot, but not additional schema bytes.
         let tool_limit = tool_limit + usize::from(followup);
         let mut bytes = self

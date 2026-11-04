@@ -43,6 +43,7 @@ pub mod transcript;
 pub mod tree_picker;
 pub mod welcome;
 pub mod word_complete;
+pub mod work_panel;
 pub mod worker_pins;
 
 /// Styled terminal rows, one `Line` per physical row (already wrapped to the target width).

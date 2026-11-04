@@ -333,6 +333,27 @@ fn synchronous_structured_results_remain_intact() {
     assert_eq!(output.data.unwrap()["jobs"][0]["result"], value);
 }
 
+#[test]
+fn completed_candidate_without_controller_observations_remains_unverified() {
+    let config = config(&[]);
+    let request = parse(
+        &json!({"task":"implement parser", "agent":"worker", "solution_space":"parser only"}),
+        &config,
+    )
+    .unwrap();
+    let mut outcome = Outcome::failed(2, "");
+    outcome.status = Status::done("All checks passed, according to the worker".into());
+    let output = render(&request, vec![Some(outcome)], &BTreeMap::new(), None);
+    let data = output.data.unwrap();
+    assert_eq!(data["jobs"][0]["candidate"]["completion"], "done");
+    assert_eq!(
+        data["jobs"][0]["candidate"]["acceptance"],
+        "needs_verification"
+    );
+    assert_eq!(data["jobs"][0]["candidate"]["check_owner"], "none");
+    assert_eq!(data["jobs"][0]["acceptance"]["state"], "needs_verification");
+}
+
 fn config(presets: &[(&str, &str)]) -> Config {
     Config {
         subagents: presets
@@ -1282,6 +1303,16 @@ fn acceptance_contract_only_resolves_configured_checks_and_isolates_mutating_job
         let request = parse(&json!({"agent":agent,"task":"work","solution_space":"s","acceptance_checks":["behavior"]}), &config).unwrap();
         assert_eq!(request.jobs[0].isolated, agent == "worker");
         assert_eq!(request.jobs[0].acceptance_checks, ["behavior"]);
+        let prompt = request.jobs[0].system(Path::new("/repo"), &[]);
+        assert!(prompt.contains("CONTROLLER ACCEPTANCE") && prompt.contains("behavior"));
+        let candidate = candidate_status(
+            "failed",
+            Default::default(),
+            &request.jobs[0].acceptance_checks,
+        );
+        assert_eq!(candidate["acceptance"], "needs_verification");
+        assert_eq!(candidate["check_owner"], "controller");
+        assert_eq!(candidate["acceptance_checks"], json!(["behavior"]));
     }
     for checks in [
         json!([]),

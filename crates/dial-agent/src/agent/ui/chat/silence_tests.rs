@@ -120,25 +120,22 @@ fn provider_backoff_is_not_a_silent_stall() {
 }
 
 #[test]
-fn remote_watchdog_never_undercuts_the_transport_stall_limit() {
-    // (configured, local, transport) -> effective
-    for (configured, local, transport, effective) in [
-        // Hosted reasoning may be silent up to the transport's semantic-progress limit.
-        (30, false, 300, 300),
-        (600, false, 300, 600),
-        // An unlimited remote transport leaves no remote silence limit either.
-        (30, false, 0, 0),
+fn remote_silence_is_owned_by_transport_retries() {
+    // Remote streams already have a semantic-progress deadline and bounded retries.
+    // A second cancellation clock must not preempt that recovery at the same deadline.
+    for (configured, local, effective) in [
+        (30, false, 0),
+        (600, false, 0),
         // Local routes keep the configured generation-silence limit.
-        (30, true, 300, 30),
-        (30, true, 0, 30),
+        (30, true, 30),
         // Disabled stays disabled.
-        (0, false, 300, 0),
-        (0, true, 300, 0),
+        (0, false, 0),
+        (0, true, 0),
     ] {
         assert_eq!(
-            silence_limit_secs(configured, local, transport),
+            silence_limit_secs(configured, local),
             effective,
-            "configured={configured} local={local} transport={transport}"
+            "configured={configured} local={local}"
         );
     }
 }
@@ -402,15 +399,15 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
     request
 }
 
-fn codex_watchdog_retry(cancel: bool) {
+fn codex_upgrade_timeout_recovery(cancel: bool) {
     use std::io::{Read, Write};
     struct Retry;
     impl Ui for Retry {
         fn interactive_input(&self) -> bool {
             true
         }
-        fn ask_user(&mut self, _: &str, _: &str, options: &[String]) -> Option<String> {
-            Some(options[0].clone())
+        fn ask_user(&mut self, _: &str, _: &str, _: &[String]) -> Option<String> {
+            panic!("remote setup timeout must recover through the transport, not a watchdog popup");
         }
     }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -424,7 +421,7 @@ fn codex_watchdog_retry(cancel: bool) {
         started_tx.send(()).unwrap();
         // A silent upgrade, not a rejected upgrade: only a timeout can recover it, and recovering
         // it closes this connection. The close is awaited apart from the retry, with a bound well
-        // past the watchdog: a loaded parallel suite can delay it for seconds.
+        // past the setup budget: a loaded parallel suite can delay it for seconds.
         let closed = std::thread::spawn(move || {
             first
                 .set_read_timeout(Some(Duration::from_secs(60)))
@@ -439,9 +436,8 @@ fn codex_watchdog_retry(cancel: bool) {
             );
             return (original, Vec::new());
         }
-        // On a remote route the watchdog limit equals the transport limit that also bounds the
-        // WebSocket setup, so either may expire first: the setup budget's HTTP fallback can itself
-        // be cancelled and retried by the watchdog. Serve every follow-up until the turn ends.
+        // Transport setup expiry selects HTTP without the UI watchdog cancelling its fallback.
+        // Keep serving follow-ups until the request settles, and assert none repeat the upgrade.
         let body = format!(
             "data: {}\n\n",
             json!({"type":"response.completed","response":{
@@ -548,13 +544,13 @@ fn codex_watchdog_retry(cancel: bool) {
 }
 
 #[test]
-fn popup_retry_after_watchdog_uses_http_instead_of_another_silent_upgrade() {
-    codex_watchdog_retry(false);
+fn remote_upgrade_timeout_uses_http_without_watchdog_intervention() {
+    codex_upgrade_timeout_recovery(false);
 }
 
 #[test]
 fn user_cancellation_does_not_retry_or_disable_codex_websocket() {
-    codex_watchdog_retry(true);
+    codex_upgrade_timeout_recovery(true);
 }
 
 #[test]

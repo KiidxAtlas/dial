@@ -1276,6 +1276,26 @@ fn endpoint_streams_when_a_callback_is_given() {
     assert_eq!(reply.text, "ab");
     assert_eq!(seen, "ab");
     assert_eq!(fake::body(&server.requests()[0])["stream"], true);
+    assert!(
+        reply.first_output.is_some(),
+        "streamed text stamps first output"
+    );
+    assert_eq!(
+        reply.requested_effort, None,
+        "no profile keeps the provider default"
+    );
+    let server = fake::serve(vec![ok("whole")]);
+    let mut profile = llm::profiles::ModelProfile::minimal("lm-studio", "gpt-x");
+    profile.capabilities.reasoning = llm::profiles::ReasoningApi::OpenaiEffort;
+    profile.capabilities.reasoning_efforts = vec![llm::profiles::ReasoningEffort::Medium];
+    profile.reasoning_effort = Some(llm::profiles::ReasoningEffort::Medium);
+    let mut remote = backend(endpoint(&format!("{}/v1", server.url))).with_profile(profile);
+    let reply = remote.chat(None, &request(), 5, None).unwrap();
+    assert_eq!(
+        reply.first_output, None,
+        "an unstreamed reply has no first-output time"
+    );
+    assert_eq!(reply.requested_effort.as_deref(), Some("medium"));
 }
 
 #[test]

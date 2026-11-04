@@ -167,6 +167,55 @@ acceptance. Worker narratives, JSON Schema validity and artifact references cann
 controller receipts. Passing the declared checks does not establish full task correctness or
 live-service behavior.
 
+For substantial implementation, built-in delegation guidance asks for a `work_packet` with
+observable outcomes, owned scope and interfaces, configured `acceptance_checks` when available,
+and an explicit account of criteria those checks cannot cover. This is selective guidance, not
+a mandatory ceremony for small or read-only work, and it does not create a verification command
+or grant execution permission. A contracted child is told which checks the controller owns;
+its report cannot substitute for those observations.
+
+Task result metadata includes `candidate.completion` separately from `candidate.acceptance`,
+with `candidate.check_owner` and the configured `candidate.acceptance_checks`. The owner field
+identifies responsibility, not proof that a check ran. A finished worker supplies a candidate;
+only controller observations can establish the scoped acceptance result. The integrated-parent
+revalidation described above remains authoritative; no extra verifier-model call is required.
+
+### Strict named workflows (opt-in)
+
+A main-agent single-task `start` can add `contract: {"id":"build", "depends_on":[]}`
+alongside `acceptance_checks`. This opts the session into fail-closed completion for that node;
+ordinary chat and tasks without `contract` retain their existing behavior. Checks must be
+operator-configured with complete input declarations. Contracted tasks require persistent
+session, worker and artifact storage; they cannot run in plan mode or through nested workers,
+batches or pools. Mutating workers use the existing isolated promotion and approval paths.
+
+```json
+{"action":"start","agent":"worker","task":"Implement the parser change",
+ "solution_space":"Change the parser and its owning tests only",
+ "acceptance_checks":["parser"],"max_steps":32,
+ "contract":{"id":"parser","depends_on":[]}}
+```
+
+Dependencies must already be accepted and are bound to retained immutable output references.
+Missing, failed, interrupted or stale nodes prevent a successful turn, including a plain final
+answer and `finish completed`. Input or check-definition changes invalidate acceptance and
+dependent results; restoring the old bytes does not silently restore it. Each node has a bounded
+attempt budget, and every worker has a nonzero step limit (at most 64). Retrying is explicit and
+must retain the original assignment and dependencies, not change the goal to make a check pass.
+
+Use `{"action":"status","contract":{"id":"parser"}}` to inspect a node. After a restart,
+saved acceptance is historical only: no worker or external effect is replayed automatically.
+For a previously accepted output, `{"action":"verify","contract":{"id":"parser"}}` runs
+the configured checks through the existing approval path; only a matching current binding can
+revalidate retained output. Interrupted work or unknown effects require inspection, not an
+automatic retry. A storage/journal failure blocks completion rather than dropping the obligation.
+
+Contracts do not grant permissions, make filesystem integration crash-atomic, prove that input
+declarations cover every real dependency, or certify untested external services. External effects
+still depend on the operator's configured tool permissions and approval policy. Existing reviewed
+learning proposals remain proposals: workflow failures do not activate rules, grant access or
+weaken checks.
+
 ### Isolation backends
 
 Set the backend with `[isolation] backend`, or in Settings under Subagents, "Isolation backend":
@@ -220,6 +269,12 @@ Use `action: "start"` to start a live task, then `status`, `wait`, or `cancel` w
 ### Slow and stalled workers
 
 A running worker's `status` includes `running_secs`, `idle_secs` (time since its last progress or tool start, or since launch if it has not progressed) and `health`. `health` is `stalled` once `idle_secs` reaches `[task].stall_secs` (default 300, matching the remote model idle timeout; 0 disables monitoring), `slow` once the worker has run three times that long while still progressing, and `active` otherwise. Settled workers carry none of these. A newly stalled worker raises one background notice and ends a parent `task` `wait` early (nothing is cancelled); decide to keep waiting, `message` it, `peek`/`status` it, or `cancel` it and tell the user. A worker that resumes and stalls again is reported again. A long model call or tool counts as silence, so raise `stall_secs` for workloads with slow single steps.
+
+Local worker inference uses the same `request_recovery` policy as the parent: after generation
+begins, `silence_secs` bounds silence and `retry_once` allows one same-context retry. Partial
+tool calls are discarded, and completed tools are not replayed. Loading/prefill and provider-slot
+queues are not generation stalls. Remote stream stalls remain under the transport's idle limit
+and bounded `[retry]` attempts; the parent's watchdog cannot cancel those retries at their deadline.
 
 Worker messages to `parent` are not held back by the parent's own waiting. While workers are running, the idle terminal pumps at least every quarter second, so the message notice appears promptly. A parent `task` `wait` stops early when a worker message arrives: nothing is cancelled, the workers keep running, the result says why the wait ended, and the message arrives with the parent's next request.
 

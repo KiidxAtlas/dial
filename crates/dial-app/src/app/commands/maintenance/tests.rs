@@ -56,3 +56,43 @@ fn relay_readiness_requires_successful_bind_in_the_launched_child() {
         }
     }
 }
+
+#[test]
+fn the_weights_driver_picker_offers_the_current_model_then_other_chat_models() {
+    use crate::llm::model_config::ModelSelection;
+    let selection = |provider: &str, model: &str| ModelSelection {
+        provider: provider.into(),
+        model: model.into(),
+        ..Default::default()
+    };
+    let mut config = crate::config::types::Config {
+        model: "local-qwen".into(),
+        provider: Some("mlx".into()),
+        ..Default::default()
+    };
+    config
+        .model_roles
+        .insert("coach".into(), selection("anthropic", "claude-opus"));
+    config
+        .model_roles
+        .insert("embedding".into(), selection("ollama", "nomic-embed"));
+    config.model_favorites = vec![
+        selection("anthropic", "claude-opus"),
+        selection("mlx", "local-qwen"),
+        selection("openai", "gpt-5"),
+    ];
+
+    let spec = driver_choices(&config, "write cleaner code");
+    let values: Vec<&str> = spec.items.iter().map(|item| item.value.as_str()).collect();
+    assert_eq!(
+        values,
+        [
+            "--with @main write cleaner code",
+            "--with anthropic/claude-opus write cleaner code",
+            "--with openai/gpt-5 write cleaner code",
+        ],
+        "current first, duplicates and non-chat roles left out"
+    );
+    assert!(spec.items[0].current && !spec.items[1].current);
+    assert_eq!((spec.command.as_str(), spec.verb), ("weights", "improve"));
+}
