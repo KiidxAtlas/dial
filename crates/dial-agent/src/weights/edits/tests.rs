@@ -1,12 +1,17 @@
 use super::*;
+#[cfg(unix)]
 use crate::config::settings_store::Change;
-use crate::weights::{Operation, run, status};
+use crate::weights::Operation;
+#[cfg(unix)]
+use crate::weights::{run, status};
+#[cfg(unix)]
 use std::sync::atomic::AtomicBool;
 
 fn user(text: &str) -> Value {
     json!({"messages": [{"role": "user", "content": text}]})
 }
 
+#[cfg(unix)]
 fn cases(prefix: &str, count: usize) -> Value {
     json!(
         (0..count)
@@ -15,6 +20,7 @@ fn cases(prefix: &str, count: usize) -> Value {
     )
 }
 
+#[cfg(unix)]
 /// A base checkpoint and a config whose fake worker answers every weights operation: the base
 /// always hits the token limit, an edited copy never does.
 fn fixture(root: &Path) -> Config {
@@ -65,6 +71,7 @@ elif op=='weights_combine':
     config
 }
 
+#[cfg(unix)]
 fn set_model(changes: &[Change]) -> Option<String> {
     changes.iter().find_map(|change| match change {
         Change::Set { path, value } if path == "model" => value.as_str().map(str::to_owned),
@@ -72,6 +79,7 @@ fn set_model(changes: &[Change]) -> Option<String> {
     })
 }
 
+#[cfg(unix)]
 /// The error of a refused model switch (`ModelSwitch` holds settings changes, which have no Debug).
 fn refused(result: Result<ModelSwitch>) -> String {
     match result {

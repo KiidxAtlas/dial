@@ -201,9 +201,10 @@ offline dependencies:
 - `cargo check --locked --profile ci --no-default-features -p dial --bin dial`.
 
 These are compile/lint checks, not native runtime tests or linked release-archive builds.
-Warnings remain unsuppressed: host `rust-objcopy` cannot load `@rpath/libLLVM.dylib`, musl
-checks report deprecated `libc::time_t` uses, and Windows test compilation reports unused
-Unix-only weights-test helpers/imports. The earlier macOS unwind-section warning also remains.
+Warnings in that run were unsuppressed: host `rust-objcopy` could not load `@rpath/libLLVM.dylib`,
+musl checks reported deprecated `libc::time_t` uses, and Windows test compilation reported
+unused Unix-only weights-test helpers/imports (corrected in the release-path follow-up below).
+The earlier macOS unwind-section warning also remains.
 Cross-target evidence: `artifact://87f4e2c1b46a64e98c42c96204ed5b0683079b50e597abd1fc931c5a4c58867a`.
 
 With explicit project-local-only approval, PowerShell **7.6.6** was downloaded from its
@@ -232,3 +233,37 @@ isolated rerun and later full app suite passed historically. The no-default inte
 missing embedded-shell fixture is not the default-feature result above. Unrelated staged and
 unstaged work remains preserved; accidental source backup copies were archived before removal,
 not silently discarded. These targeted checks are not a review of every shared 0.3.0 change.
+
+### Release-path follow-up
+
+A fresh `make release-check RELEASE_TAG=v0.3.0` exposed a no-build gate bug: the workspace
+`crates/*` glob treated regular files such as Finder's `.DS_Store` as crate directories.
+Member discovery now considers directories only; matched directories without manifests still
+fail closed. The regression failed first, then `make release-check RELEASE_TAG=v0.3.0
+test-release-policy test-build test-packaging` passed: **15 release-policy, 19 build and
+14 packaging tests**. Evidence:
+`artifact://60fd78d33ae644c749e5654e9577417a80b6aa70ebe57125680627e6b38d08fa`.
+
+The Windows warnings above were reproduced as errors with Clippy's actual `-D warnings`
+policy. Unix-only helper imports/functions now use the same `cfg(unix)` boundary as their
+owning tests; all portable tests remain enabled. The full Windows GNU cross-target workspace
+Clippy run passed with `--all-targets -- -D warnings`, and all **6** owning weights-edit
+tests passed on macOS. This does not replace native Windows MSVC CI. Evidence:
+`artifact://2d329fa9740782ff29544d5ee5d754dbc5ff4e7eefc9a7c661845db90d9ce4a1`.
+
+Read-only GitHub API inspection for `KiidxAtlas/dial` found both public signing-key variables
+valid and matching, and `DIAL_RELEASE_SIGNING_KEY` present at repository scope. Secret values
+were neither retrieved nor printed; private/public agreement still requires the hosted
+signing-readiness job. `release-signing` had no environment-specific secrets, reviewer rules
+or deployment-branch policy. `main` reported `protected: false`, and the repository ruleset
+list was empty. Those hosted protection gaps require owner configuration, not weakened
+workflow checks. The optional organization-secret listing returned HTTP 422; the repository
+secret's observed presence suffices for the presence finding, not private-key validation.
+
+At inspection, push CI for `c85487ea98befe626c7d3ca722905ffb215edf48` was incomplete:
+https://github.com/KiidxAtlas/dial/actions/runs/41932056055.
+These follow-up fixes are uncommitted and therefore not covered by that run. Before tagging,
+the reviewed final tree must be committed and pushed separately with authorization, and CI
+must pass for that exact SHA. Release-profile linking, all eight native release archives,
+hosted signing and publication are not established by these local tests. No commit, staging,
+tag, push, publication or hosted-setting change was performed in this follow-up.

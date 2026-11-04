@@ -100,6 +100,15 @@ class ReleaseReadinessTests(unittest.TestCase):
         with mock.patch("subprocess.run", side_effect=AssertionError("no child commands")):
             self.assertEqual(policy.release_problems(self.root, "v0.3.0"), [])
 
+    def test_workspace_glob_ignores_files_but_refuses_directories_without_manifests(self):
+        (self.root / "crates/.DS_Store").write_bytes(b"Finder metadata")
+        (self.root / "crates/README.md").write_text("Not a workspace package")
+        self.assertEqual(policy.release_problems(self.root, "v0.3.0"), [])
+        (self.root / "crates/broken").mkdir()
+        problems = policy.release_problems(self.root, "v0.3.0")
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("crates/broken/Cargo.toml", problems[0])
+
     def test_static_gate_aggregates_independent_errors(self):
         (self.root / "crates/helper/Cargo.toml").write_text('[package]\nname = "helper"\nversion = "0.2.0"\n')
         (self.root / "Cargo.lock").write_text('[[package]]\nname = "dial"\nversion = "0.2.0"\n')

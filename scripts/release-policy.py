@@ -75,7 +75,7 @@ def release_problems(root, tag=None):
             problems.append(f"tag {tag} must match Cargo.toml version v{version}")
     members = {root / "Cargo.toml"}
     for pattern in workspace["members"]:
-        matches = [root] if pattern == "." else list(root.glob(pattern))
+        matches = [root] if pattern == "." else [path for path in root.glob(pattern) if path.is_dir()]
         if not matches:
             problems.append(f"workspace member pattern has no matches: {pattern}")
         members.update(path / "Cargo.toml" for path in matches)

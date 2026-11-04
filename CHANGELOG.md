@@ -51,6 +51,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - Remove accidental source backup copies, exclude patch/editor recovery files from Git and
   container build contexts, and replace temporary release-preparation status notes with durable
   platform, verification and maintainer guidance.
+- Ignore non-directory matches when expanding Cargo workspace members in the no-build release
+  gate, while still refusing matched crate directories with missing or invalid manifests.
+- Compile Unix-only weights-test helpers only where their owning tests run, keeping Windows
+  Clippy's warnings-as-errors gate intact without suppressions or dropping portable tests.
 
 ## [0.3.0] - 2026-11-04
 
