@@ -85,6 +85,8 @@ impl Metrics {
                 self.repeated_calls += 1;
                 self.interventions += 1;
             }
+            // Re-reads answered with a pointer and calls short-circuited by the loop guard.
+            "repeated_call" => self.repeated_calls += 1,
             "reasoning_gate" => self.interventions += 1,
             "tool_form_failure" => self.protocol_errors += 1,
             _ => {}

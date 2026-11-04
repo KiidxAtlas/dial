@@ -793,9 +793,37 @@ fn take_presented(
         ));
         return (body, 0, integrity);
     }
-    let (body, lost) = take_unread(snap);
+    let (mut body, lost) = take_unread(snap);
     let integrity = output_integrity(snap, &body, lost, tail);
+    if !body.is_empty()
+        && let Some(digest) = failed_job_digest(snap)
+        && !digest.lines().all(|line| body.contains(line))
+    {
+        // A capped read keeps only the newest output, so a failed build's first error may be gone
+        // from this view while the ring still holds it.
+        body.insert_str(
+            0,
+            &format!("[failure digest: first error lines; the newest output follows]\n{digest}[end of digest]\n"),
+        );
+    }
     (body, lost, integrity)
+}
+
+/// The first error lines of a pipe job that exited unsuccessfully, from everything the ring
+/// still retains; `None` while it runs, after success, or for unrecognized commands.
+fn failed_job_digest(snap: &Snapshot) -> Option<String> {
+    let State::Exited {
+        status: Some(status),
+        ..
+    } = &snap.state
+    else {
+        return None;
+    };
+    if snap.terminal || status.success() {
+        return None;
+    }
+    let (bytes, _) = lock(&snap.ring).since(0);
+    super::minimizer::failure_digest_of_unseen(&snap.command, &String::from_utf8_lossy(&bytes))
 }
 
 /// Shared by explicit reads and completion notices. Never classify a delta or reread an artifact;
@@ -819,17 +847,23 @@ fn minimize_complete(command: &str, ring: &Ring) -> Option<super::minimizer::Min
 /// A terminal's model-facing output is its rendered screen, a snapshot not a delta.
 fn take_unread(snap: &Snapshot) -> (String, u64) {
     let mut ring = lock(&snap.ring);
+    let mut cursor = ring.total;
     let fresh = match ring.screen_text() {
         Some(screen) => (screen, 0),
         None => {
             // Preserve a UTF-8 lookbehind before render_body applies its character-safe cap.
-            let (bytes, lost) = ring.recent_since(ring.cursor, MAX_OUTPUT + 3);
+            let (mut bytes, lost) = ring.recent_since(ring.cursor, MAX_OUTPUT + 3);
+            // A character still being written is left unread for the next call instead of
+            // becoming a replacement character at the end of this read and the start of the next.
+            let held = bytes.len() - super::shell::complete_utf8_prefix(&bytes);
+            bytes.truncate(bytes.len() - held);
+            cursor -= held as u64;
             let text = String::from_utf8(bytes)
                 .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
             (text, lost)
         }
     };
-    ring.cursor = ring.total;
+    ring.cursor = cursor;
     fresh
 }
 

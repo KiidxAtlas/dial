@@ -1042,7 +1042,8 @@ fn minimization_requires_a_complete_unclipped_capture() {
         "cargo clippy",
         body.len(),
         &mut text,
-        false
+        false,
+        None
     ));
     assert_eq!(text, original);
     assert!(minimize_body(
@@ -1050,10 +1051,56 @@ fn minimization_requires_a_complete_unclipped_capture() {
         "cargo clippy",
         body.len(),
         &mut text,
-        true
+        true,
+        None
     ));
     assert!(text.contains("[exit code: 101]"));
     assert!(!text.contains("Checking"));
+}
+
+#[test]
+fn a_clipped_view_is_filtered_from_the_complete_artifact_output() {
+    let (_dir, ws, _artifacts) = with_artifacts(true);
+    let full = format!(
+        "{}warning: unused import\ntest result: ok. 900 passed; 0 failed\n",
+        (0..900)
+            .map(|i| format!("test module::case_{i} ... ok\n"))
+            .collect::<String>()
+    );
+    // The inline view is a head/tail cut of `full`; filtering it alone would hide the cut.
+    let clipped = format!(
+        "{}[... clipped ...]\n{}",
+        &full[..2048],
+        &full[full.len() - 2048..]
+    );
+    let mut text = format!("{clipped}[exit code: 0]\n[complete output: artifact://raw]\n");
+    assert!(minimize_body(
+        &ws,
+        "cargo test",
+        clipped.len(),
+        &mut text,
+        true,
+        Some(&full)
+    ));
+    assert!(!text.contains("[... clipped ...]"));
+    assert!(text.contains("[900 passing lines omitted"));
+    assert!(text.contains("warning: unused import"));
+    assert!(text.contains("test result: ok. 900 passed"));
+    assert!(text.contains("[exit code: 0]"));
+
+    // A filtered output still larger than the inline view keeps the head/tail view.
+    let noisy = "warning: keep me\n".repeat(3000);
+    let mut text = format!("{clipped}[exit code: 0]\n[complete output: artifact://raw]\n");
+    let before = text.clone();
+    assert!(!minimize_body(
+        &ws,
+        "cargo test",
+        clipped.len(),
+        &mut text,
+        true,
+        Some(&format!("{noisy}{full}"))
+    ));
+    assert_eq!(text, before);
 }
 
 #[test]

@@ -58,7 +58,9 @@ Limits of the built-in shell:
 
 ## Per-session Cargo build output
 
-Commands Dial runs (`bash`, the built-in shell and background shell jobs) set `CARGO_TARGET_DIR` to a directory unique to the session: `<workspace>/.tmp/cargo-target/<session id>`. Concurrent sessions therefore stop contending for one `target/` build lock. The directory is fixed per session, not per command, so builds reuse their cache and the number of directories stays bounded by the sessions you run. It lives in the workspace scratch directory, which the sandbox already allows Dial to write.
+Commands Dial runs (`bash`, the built-in shell and background shell jobs) set `CARGO_TARGET_DIR` to a directory unique to the session: `<workspace>/.tmp/cargo-target/<session id>`. Concurrent sessions therefore stop contending for one `target/` build lock. The directory is fixed per session, not per command, so builds reuse their cache. It lives in the workspace scratch directory, which the sandbox already allows Dial to write.
+
+- Each command Dial runs refreshes a `.dial-last-used` marker in an existing session directory. A new session that has no directory yet takes over (renames) the most recently used directory of another session idle for at least 30 minutes, so its first build is incremental rather than cold. When a session starts, other sessions' directories unused for seven days are deleted in the background, so finished sessions do not keep gigabytes of build output indefinitely. A directory whose profile `.cargo-lock` is held by a running Cargo build is never adopted or deleted. Resuming a session keeps its directory and its warm cache.
 
 - An explicit `CARGO_TARGET_DIR` in Dial's inherited environment or named-shell state is kept as is.
 - A `--target-dir` flag on a Cargo command still wins, because Cargo applies it after the environment.
@@ -90,7 +92,7 @@ state budget. Previously retained session changes remain available on later comm
 
 ## Output minimizer
 
-With `shell.minimize_output = true` (default), foreground `bash` output of a recognised noisy command is shrunk before the model reads it. A filter applies only when the command is one simple command (optionally with leading `NAME=value` assignments or `2>&1`); compound commands (`a && b`, `a; b`), pipelines, redirections and substitutions are never filtered.
+With `shell.minimize_output = true` (default), foreground `bash` output of a recognised noisy command is shrunk before the model reads it. A filter applies when the command is one simple command (optionally with leading `NAME=value` assignments or `2>&1`), or a sequence (`a && b`, `a; b`) whose segments are `cd` or recognised commands that all select the same filter, such as `cd web && npm install` or `cargo check && cargo test`. Mixed sequences, pipelines, redirections and substitutions are never filtered.
 
 | Command | Dropped | Collapsed |
 |---|---|---|
@@ -101,10 +103,12 @@ With `shell.minimize_output = true` (default), foreground `bash` output of a rec
 | `npm`/`pnpm` install-like, `yarn` install | notices, funding and audit lines, progress | |
 | `pytest`, `python -m pytest` | session header, progress dots | `PASSED` lines |
 | `go test` | `=== RUN` / `PAUSE` / `CONT` | `--- PASS`, `ok pkg` |
+| `pip install`, `python -m pip install`, `uv pip install`, `uv sync`, `uv add` | `Collecting`, `Downloading`, `Using cached`, `Requirement already satisfied`, wheel-build and progress-bar lines | |
+| `jest`, `vitest`, `npx`/`bunx jest`/`vitest` | | `PASS` / `✓` lines |
 
 For every command, ANSI escape sequences are stripped and carriage-return progress redraws are reduced to their last frame.
 
-Guarantees: a line mentioning error, warning, panic, fail, traceback, exception or fatal is never dropped or collapsed (a frame overwritten by a carriage return that carries one is kept on its own line); the exit status and the `[exit code: N]` line are untouched; the result is used only if it saves at least 256 bytes and a tenth of the output. The text gains a line `[output filtered (cargo): 41230 -> 3810 bytes; ...]` and the `[complete output: artifact://...]` link still holds the raw output, readable with `artifact_read`. Without an artifact store (so the raw output could not be recovered), or after a capture or artifact error, nothing is filtered. Background (`bg`) output is not minimized.
+Guarantees: a line mentioning error, warning, panic, fail, traceback, exception or fatal is never dropped or collapsed (a frame overwritten by a carriage return that carries one is kept on its own line); the exit status and the `[exit code: N]` line are untouched; the result is used only if it saves at least 256 bytes and a tenth of the output. The text gains a line `[output filtered (cargo): 41230 -> 3810 bytes; ...]` and the `[complete output: artifact://...]` link still holds the raw output, readable with `artifact_read`. Output longer than the inline head-and-tail view (about 20 KB) is filtered from the complete copy in its artifact (up to 4 MiB) when nothing was elided, and the filtered text is used only if it fits the inline view; otherwise the head-and-tail view, with its middle diagnostics, is shown as before. Without an artifact store (so the raw output could not be recovered), or after a capture or artifact error, nothing is filtered. Background (`bg`) output is minimized only when a finished job's complete output is read at once. When a failed recognised command's first error lines are no longer in the capped read, they are shown first as a failure digest.
 
 ## Git guard
 

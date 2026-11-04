@@ -239,6 +239,8 @@ impl Agent<'_> {
                 continue;
             }
             if let Some(results) = duplicates.as_ref() {
+                // The loop guard answered this call from the earlier identical round.
+                self.record(step, "repeated_call", json!({"name":call.name}))?;
                 let output = ToolOutput::ok(results[index].clone());
                 ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                 ui.tool_result_with_id(&call.id, &call.name, &output);

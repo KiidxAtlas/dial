@@ -358,9 +358,14 @@ impl<'a> Agent<'a> {
         let prepared = match prepared {
             Err(error)
                 if options.reason == crate::config::compaction::CompactionReason::Manual
-                    && error.is::<crate::agent::compact::compaction::NothingToCompact>() =>
+                    && (error.is::<crate::agent::compact::compaction::NothingToCompact>()
+                        || error.is::<crate::agent::compact::compaction::Unprofitable>()) =>
             {
-                ui.notice("nothing to compact yet: history is already within the keep budget");
+                if error.is::<crate::agent::compact::compaction::NothingToCompact>() {
+                    ui.notice("nothing to compact yet: history is already within the keep budget");
+                } else {
+                    ui.notice(&format!("history left unchanged: {error}"));
+                }
                 return Ok(crate::agent::compact::compaction::CompactionOutcome {
                     kind: crate::agent::compact::compaction::CompactionOutcomeKind::Unchanged,
                     method: None,
@@ -393,6 +398,7 @@ impl<'a> Agent<'a> {
         template: Option<&Chat>,
         mut live_backend: Option<&mut Backend>,
     ) -> Result<crate::agent::compact::compaction::CompactionOutcome> {
+        self.compaction_retry_carry = None;
         ensure!(
             self.session.id() == snapshot.session_id
                 && self.auth_config.selection() == snapshot.model_selection

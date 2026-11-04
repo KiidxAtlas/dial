@@ -199,6 +199,21 @@ impl ArtifactStore {
             }
         })
     }
+    /// The whole artifact as text when it is at most `max_bytes`; `None` when it is larger.
+    pub fn read_text(&self, uri: &str, max_bytes: u64) -> Result<Option<String>> {
+        let file = self.open(uri)?;
+        let meta = file.metadata()?;
+        ensure!(meta.is_file(), "artifact must be a regular file");
+        if meta.len() > max_bytes {
+            return Ok(None);
+        }
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max_bytes {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
     pub fn retrieve_bytes(&self, uri: &str, offset: u64, count: usize) -> Result<String> {
         use std::io::{Seek, SeekFrom};
         ensure!((1..=16384).contains(&count), "bytes must be 1..16384");

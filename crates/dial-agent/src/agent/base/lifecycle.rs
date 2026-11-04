@@ -313,6 +313,26 @@ impl<'a> Agent<'a> {
         )?);
         // Cargo build output is scoped per session so concurrent sessions do not share one target lock.
         let workspace = workspace.with_cargo_session(session.id());
+        {
+            // A new session takes over an idle earlier session's build output (one rename) so its
+            // first build is incremental; output that has gone stale is removed in the background.
+            crate::tools::exec::cargo_target::adopt_idle(
+                workspace.root(),
+                session.id(),
+                crate::tools::exec::cargo_target::ADOPT_AFTER,
+            );
+            let root = workspace.root().to_path_buf();
+            let keep = session.id().to_owned();
+            let _ = std::thread::Builder::new()
+                .name("dial-cargo-target-prune".into())
+                .spawn(move || {
+                    crate::tools::exec::cargo_target::prune_stale(
+                        &root,
+                        &keep,
+                        crate::tools::exec::cargo_target::STALE_AFTER,
+                    )
+                });
+        }
         let skills = skills::discover(&layout);
         let parts = PromptParts {
             soul: crate::agent::window::context::soul(&layout),
@@ -429,6 +449,7 @@ impl<'a> Agent<'a> {
             route: Default::default(),
             enabled_tools: HashSet::new(),
             tool_routing: Default::default(),
+            compaction_retry_carry: None,
             lean_tools: false,
             local_escalation: Default::default(),
             local_session: Default::default(),
@@ -605,6 +626,7 @@ impl<'a> Agent<'a> {
             route: Default::default(),
             enabled_tools: HashSet::new(),
             tool_routing: Default::default(),
+            compaction_retry_carry: None,
             lean_tools: false,
             local_escalation: Default::default(),
             local_session: Default::default(),

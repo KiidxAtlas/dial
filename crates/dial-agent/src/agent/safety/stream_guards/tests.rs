@@ -118,3 +118,26 @@ fn recovery_rendering_does_not_expand_placeholders_inside_quoted_evidence() {
     assert!(text.contains(id));
     assert!(text.contains(result));
 }
+
+#[test]
+fn shared_repetition_guidance_redirects_then_escalates() {
+    let turn = |n: usize| {
+        let id = format!("c{n}");
+        vec![
+            serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]}),
+            serde_json::json!({"role":"tool","tool_call_id":id,"content":"same result"}),
+        ]
+    };
+    let mut messages: Vec<serde_json::Value> = (0..4).flat_map(turn).collect();
+    assert!(repetition_guidance(&messages).is_none());
+    messages.extend(turn(4));
+    let (event, redirect) = repetition_guidance(&messages).expect("five identical calls");
+    assert!(event.contains("5x"), "{event}");
+    assert_eq!(
+        redirect,
+        render_tool_call_loop_redirect("read", 5, "{\"path\":\"a\"}", "same result")
+    );
+    messages.extend(turn(5));
+    let (_, escalation) = repetition_guidance(&messages).expect("six identical calls");
+    assert_ne!(escalation, redirect);
+}

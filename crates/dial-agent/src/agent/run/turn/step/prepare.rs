@@ -457,12 +457,18 @@ impl Agent<'_> {
                     // Re-check at the next request boundary; compaction may be needed again
                     // after subsequent tool results in this same autonomous turn.
                     turn.compaction_succeeded();
+                    self.compaction_retry_carry = None;
                     turn.context_rewritten(engine);
                     turn.budget.give_back();
                     return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
                 }
                 Err(error) => {
                     turn.compaction_failed_at(request_context);
+                    if error.is::<crate::agent::compact::compaction::Unprofitable>()
+                        || error.is::<crate::agent::compact::compaction::NothingToCompact>()
+                    {
+                        self.compaction_retry_carry = turn.compaction_retry_floor;
+                    }
                     ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                         crate::agent::ui::ui_event::EventKind::Recovery,
                         format!("context compaction could not make enough room ({error:#})"),

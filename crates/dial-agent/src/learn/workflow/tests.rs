@@ -68,6 +68,11 @@ fn timing_and_repetition_are_observed_not_inferred_from_token_counts() {
     assert_eq!(metrics.first_useful_ms, Some(70));
     assert_eq!(metrics.elapsed_ms, 90);
     assert_eq!((metrics.tool_errors, metrics.repeated_calls), (1, 1));
+    // Pointer re-reads and loop-guard short circuits are repeats but not interventions.
+    let interventions = metrics.interventions;
+    metrics.observe("repeated_call", &json!({"name":"read","wall_ms":95}));
+    assert_eq!(metrics.repeated_calls, 2);
+    assert_eq!(metrics.interventions, interventions);
 }
 
 fn evidence() -> Evidence {

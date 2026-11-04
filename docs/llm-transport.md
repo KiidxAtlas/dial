@@ -3,8 +3,8 @@
 The shared LLM layer provides bounded streaming, provider-aware error classification, retries, and request budgeting. Context-overflow classifications are kept attached to errors before any header redaction so compaction remains reliable. HTTP 413 is classified as a payload failure unless the body identifies a token/context limit; it must not trigger token compaction merely because its status is 413. oMLX's "prefill memory guard rejected this prompt" refusal (prefill would exceed the server's memory ceiling) is classified as context overflow, as an HTTP body or a stream error, so the turn compacts and retries a smaller prompt instead of failing.
 
 `[retry]` settings bound attempts and delays. Unhinted retries use bounded exponential backoff
-starting at no more than two seconds, with up to 25% positive jitter; every wait is capped by
-`retry.max_delay_secs`. Explicit `retry-after`, `retry-after-ms`, and `x-ratelimit-reset[-ms]`
+starting at no more than two seconds, with up to 25% positive jitter; the doubling stops at 60
+seconds per attempt, and every wait is capped by `retry.max_delay_secs`. Explicit `retry-after`, `retry-after-ms`, and `x-ratelimit-reset[-ms]`
 delays replace the automatic interval instead of being inflated to five minutes. A hint beyond
 the configured cap stops the request rather than silently retrying earlier than requested.
 Window-reset headers remain quota information, not mandatory waits. A throttle (including HTTP
@@ -302,7 +302,7 @@ Devin also requires its successful completion trailer and complete framing befor
 **API-key pools.** A provider can name several keys: `api_key_env` plus `api_key_envs = ["KEY_B", "KEY_C"]` on `[providers.<id>]`. When the active key is rate limited or out of quota, that key is blocked until the Retry-After or quota reset time (60 seconds when the provider gives none, at most one hour) and the same request is retried at once with the next key whose variable is set. This consumes one attempt. The key that works keeps serving later requests, and blocks are shared by every session in the process. If no other key is available the ordinary backoff applies. Pool state is process-local and never persisted; only variable names are tracked, so key values are never logged. Each variable must belong to the provider's origin, as for `api_key_env`. A pool needs a key-authenticated endpoint; OAuth and subscription routes do not use one.
 
 Transient provider errors use fixed retry waits with server retry hints and visible notices (up to `[retry].max_attempts`
-attempts, default 10; ordinary waits are 300 seconds, bounded by `[retry].max_delay_secs`, default 300, and longer server hints stop the request; the first retry after a connection-level failure waits 2 seconds). This includes macOS socket `Invalid argument (os error 22)` and
+attempts, default 10; unhinted waits double from 2 seconds up to 60 seconds, every wait is bounded by `[retry].max_delay_secs`, default 300, and longer server hints stop the request). This includes macOS socket `Invalid argument (os error 22)` and
 TLS `BadRecordMac` alerts before a response arrives. Each retry opens a fresh connection; TLS certificate
 verification remains enabled. Disconnected or prematurely closed ChatGPT, compatible chat, and
 Anthropic streams also retry within that bound, discarding the failed attempt's partial reply and tool

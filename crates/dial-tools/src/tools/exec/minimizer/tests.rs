@@ -303,3 +303,38 @@ fn homogeneous_cargo_sequences_compact_without_losing_summary_or_coverage() {
         assert!(minimize(command, &text).is_none(), "{command}");
     }
 }
+
+#[test]
+fn pip_install_and_js_test_noise_is_filtered_behind_a_cd() {
+    let mut pip = big((0..40).map(|i| format!("Collecting package{i}>=1.0")));
+    pip.push_str(&big((0..40).map(|i| {
+        format!("  Using cached package{i}-1.0-py3-none-any.whl (12 kB)")
+    })));
+    pip.push_str(
+        "ERROR: pip's dependency resolver found a conflict\nSuccessfully installed package0-1.0\n",
+    );
+    for command in [
+        "pip install -r requirements.txt",
+        "python3 -m pip install .",
+        "uv pip install -e .",
+        "cd backend && pip install -r requirements.txt",
+    ] {
+        let out = minimize(command, &pip).expect(command);
+        assert_eq!(out.filter, "pip install", "{command}");
+        assert!(!out.text.contains("Collecting"), "{command}");
+        assert!(out.text.contains("ERROR: pip's dependency resolver"));
+        assert!(out.text.contains("Successfully installed"));
+    }
+
+    let mut jest = big((0..60).map(|i| format!("PASS src/module{i}.test.ts")));
+    jest.push_str("FAIL src/broken.test.ts\nTests: 1 failed, 60 passed, 61 total\n");
+    for command in ["npx jest", "cd web && npx vitest run", "vitest run"] {
+        let out = minimize(command, &jest).expect(command);
+        assert_eq!(out.filter, "js test", "{command}");
+        assert!(out.text.contains("[60 passing lines omitted"), "{command}");
+        assert!(out.text.contains("FAIL src/broken.test.ts"));
+        assert!(out.text.contains("Tests: 1 failed"));
+    }
+    // Different recognized tools in one compound command keep their raw output.
+    assert!(minimize("pip install x && npx jest", &jest).is_none());
+}

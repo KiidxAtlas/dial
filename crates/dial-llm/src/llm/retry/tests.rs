@@ -197,6 +197,14 @@ fn automatic_retries_back_off_with_bounded_jitter_and_honor_short_hints() {
             Decision::Retry { delay, .. } if delay >= base && delay <= base.mul_f64(1.25)
         ));
     }
+    // Unhinted doubling stops at the backoff cap even though max_delay allows 300 seconds.
+    for attempt in 7..=9 {
+        assert!(matches!(
+            decide(&ErrorClass::Transient, None, attempt, false, &policy),
+            Decision::Retry { delay, .. }
+                if delay >= BACKOFF_CAP && delay <= BACKOFF_CAP.mul_f64(1.25)
+        ));
+    }
     for seconds in [1, 30, 300] {
         assert!(matches!(
             decide(&ErrorClass::Transient, Some(Duration::from_secs(seconds)), 1, false, &policy),

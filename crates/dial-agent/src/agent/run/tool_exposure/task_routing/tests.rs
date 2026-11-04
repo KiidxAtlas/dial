@@ -729,14 +729,17 @@ fn request_domain_selects_relevant_tools_from_small_servers_instead_of_loading_e
                 .iter()
                 .any(|name| name.starts_with("mcp__"))
         );
+        assert!(
+            serde_json::to_vec(&agent.schemas(&offer).unwrap())
+                .unwrap()
+                .len()
+                > baseline
+        );
+        // An unrelated later turn routes nothing new and keeps the earlier offer, so the cached
+        // request prefix is not rewritten.
         agent.begin_tool_routing("Fix a Rust compiler error");
         assert!(agent.tool_routing.selected.is_empty());
-        assert_eq!(
-            serde_json::to_vec(&agent.schemas(&agent.offered()).unwrap())
-                .unwrap()
-                .len(),
-            baseline
-        );
+        assert_eq!(agent.offered(), offer);
     });
 }
 
@@ -924,16 +927,25 @@ fn lean_research_protects_the_web_pair_from_incidental_mcp_matches() {
             "list web search results for Gemma 4 E4B",
         ] {
             agent.begin_tool_routing(query);
-            assert!(selected(agent, "web_search"), "{query}");
-            assert!(selected(agent, "web_fetch"), "{query}");
-            assert!(
-                !agent
-                    .tool_routing
+            // Routed on the first query, then retained on later turns.
+            let routing = &agent.tool_routing;
+            let routed = |name: &str| {
+                routing
                     .selected
                     .iter()
+                    .chain(&routing.retained)
+                    .any(|tool| tool == name)
+            };
+            assert!(routed("web_search"), "{query}");
+            assert!(routed("web_fetch"), "{query}");
+            assert!(
+                !routing
+                    .selected
+                    .iter()
+                    .chain(&routing.retained)
                     .any(|name| name.starts_with("mcp__nuxt__")),
                 "{query}: {:?}",
-                agent.tool_routing.selected
+                routing.selected
             );
             let offer = agent.offered();
             assert!(offer.iter().any(|name| name == "web_search"), "{query}");
@@ -1344,5 +1356,54 @@ fn task_routes_ready_before_unknown_and_keeps_blocked_tools_explicitly_loadable(
         assert!(!selected(agent, "mcp__docs__c_missing"));
         load(agent, json!({"names":["mcp__docs__c_missing"]}));
         assert!(agent.offered().contains(&"mcp__docs__c_missing".into()));
+    });
+}
+
+#[test]
+fn routed_tools_stay_offered_on_later_turns_so_the_prefix_is_stable() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        library_docs(agent);
+        agent.begin_tool_routing("How do I configure the Tokio library API?");
+        assert!(selected(agent, "mcp__manuals__query-docs"));
+        let routed = agent.offered();
+        agent.begin_tool_routing("Fix the arithmetic bug in calc.py");
+        assert!(agent.tool_routing.selected.is_empty());
+        assert_eq!(
+            agent.offered(),
+            routed,
+            "a routed tool was dropped next turn"
+        );
+        assert!(
+            !agent
+                .automatic_candidates()
+                .iter()
+                .any(|(name, _)| name == "mcp__manuals__query-docs"),
+            "a retained tool must not take a new routing slot"
+        );
+        agent
+            .tool_routing
+            .unload(&["mcp__manuals__query-docs".to_owned()]);
+        agent.begin_tool_routing("Fix the arithmetic bug in calc.py");
+        assert!(
+            !agent
+                .offered()
+                .iter()
+                .any(|name| name == "mcp__manuals__query-docs")
+        );
+    });
+}
+
+#[test]
+fn retained_routing_is_bounded_and_drops_the_oldest_first() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        for index in 0..RETAINED_LIMIT + 3 {
+            let name = format!("mcp__srv{index}__inspect-widget{index}");
+            register(agent, &name, &format!("Inspect widget{index} records"));
+            agent.tool_routing.selected = vec![name];
+            agent.begin_tool_routing("");
+        }
+        let retained = &agent.tool_routing.retained;
+        assert_eq!(retained.len(), RETAINED_LIMIT);
+        assert_eq!(retained[0], "mcp__srv3__inspect-widget3");
     });
 }

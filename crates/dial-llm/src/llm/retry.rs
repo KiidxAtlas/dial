@@ -85,6 +85,9 @@ pub(crate) const FAILOVER_MAX_WAIT: Duration = Duration::from_secs(10);
 const FAILOVER_INTERVAL: Duration = Duration::from_secs(1);
 /// Base automatic retry interval; subsequent retries grow exponentially with bounded jitter.
 pub(crate) const CONNECTION_RETRY: Duration = Duration::from_secs(2);
+/// Unhinted exponential backoff never waits longer than this per attempt. `retry.max_delay_secs`
+/// still bounds server hints and quota waits, which can legitimately be longer.
+pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// Server timing hints from one non-2xx response.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -346,6 +349,7 @@ pub(crate) fn decide(
             .backoff
             .min(CONNECTION_RETRY)
             .saturating_mul(1u32 << attempt.saturating_sub(1).min(10))
+            .min(BACKOFF_CAP)
     }
     .min(policy.max_delay);
     // Explicit hints replace the automatic interval, rather than being inflated by it.

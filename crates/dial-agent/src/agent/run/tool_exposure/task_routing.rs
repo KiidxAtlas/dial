@@ -8,12 +8,20 @@ const SCHEMA_BYTES: usize = 24 * 1024;
 const LEAN_TOOL_LIMIT: usize = 2;
 const LEAN_SCHEMA_BYTES: usize = 8 * 1024;
 const CONTEXT_LIMIT: usize = 24;
+/// Tools routed on earlier turns stay offered so the cached request prefix survives the next turn.
+/// The cap bounds how many accumulate; past it the oldest are dropped (one cache break).
+const RETAINED_LIMIT: usize = 2 * TOOL_LIMIT;
+const LEAN_RETAINED_LIMIT: usize = 2 * LEAN_TOOL_LIMIT;
 /// Native web pair offered together for research intent. Small profiles keep it ahead of MCP matches.
 const WEB_TOOLS: [&str; 2] = ["web_search", "web_fetch"];
 
 #[derive(Default)]
 pub(in crate::agent) struct ToolRouting {
+    /// Tools routed for the current user turn.
     pub(in crate::agent) selected: Vec<String>,
+    /// Tools routed on earlier turns, oldest first. They remain offered so the system prompt and
+    /// tool array do not change back and forth between turns.
+    pub(in crate::agent) retained: Vec<String>,
     query: String,
     context: BTreeSet<String>,
     suppressed: BTreeSet<String>,
@@ -22,6 +30,7 @@ pub(in crate::agent) struct ToolRouting {
 impl ToolRouting {
     pub(in crate::agent) fn unload(&mut self, names: &[String]) {
         self.selected.retain(|name| !names.contains(name));
+        self.retained.retain(|name| !names.contains(name));
         self.suppressed.extend(names.iter().cloned());
     }
     /// Whether the user explicitly unloaded `name`; such a tool is not re-offered by gap routing.
@@ -828,11 +837,47 @@ fn followups(
 
 impl Agent<'_> {
     pub(in crate::agent) fn begin_tool_routing(&mut self, query: &str) {
+        let previous = std::mem::take(&mut self.tool_routing);
         self.tool_routing = ToolRouting {
             query: crate::agent::window::prompt::truncate_chars(query, 4096),
+            retained: self.carried_task_tools(previous),
             ..Default::default()
         };
         self.refresh_task_tools();
+    }
+
+    /// Earlier routed tools that are still automatic candidates, oldest first and capped.
+    /// Dropping them at each turn boundary rewrote the system prompt and tool array, so a provider
+    /// prompt cache was invalidated (history included) whenever one turn routed a tool.
+    fn carried_task_tools(&self, previous: ToolRouting) -> Vec<String> {
+        if !self.automatic_tool_routing() {
+            return Vec::new();
+        }
+        let small = self.lean_local() || self.minimal_tools();
+        let eligible: BTreeSet<String> = self
+            .eligible_candidates()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .filter(|name| {
+                self.tool_readiness(name).automatic_candidate()
+                    && (!small || parts(name).is_some() || WEB_TOOLS.contains(&name.as_str()))
+            })
+            .collect();
+        let mut seen = BTreeSet::new();
+        let mut carried: Vec<String> = previous
+            .retained
+            .into_iter()
+            .chain(previous.selected)
+            .filter(|name| eligible.contains(name) && seen.insert(name.clone()))
+            .collect();
+        let limit = if small {
+            LEAN_RETAINED_LIMIT
+        } else {
+            RETAINED_LIMIT
+        };
+        let excess = carried.len().saturating_sub(limit);
+        carried.drain(..excess);
+        carried
     }
 
     pub(in crate::agent) fn observe_tool_routing(&mut self, call: &ToolCall, output: &ToolOutput) {

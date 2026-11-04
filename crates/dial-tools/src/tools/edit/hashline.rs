@@ -401,7 +401,12 @@ impl EditStore {
         ranges: &[(usize, usize)],
     ) -> Result<(), String> {
         let snapshots = self.files.get(path);
-        let snapshot = snapshots.and_then(|snaps| snaps.iter().rev().find(|snap| snap.text.as_ref() == lf && snap.raw_revision == revision));
+        let snapshot = snapshots.and_then(|snaps| {
+            snaps
+                .iter()
+                .rev()
+                .find(|snap| snap.text.as_ref() == lf && snap.raw_revision == revision)
+        });
         match snapshot {
             None => {
                 let hint = if snapshots.is_some() {

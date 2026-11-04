@@ -37,6 +37,7 @@ fn environment(scratch: &Path, cargo_target: Option<&Path>) -> Vec<(String, Stri
     if std::env::var_os("CARGO_TARGET_DIR").is_none()
         && let Some(target) = cargo_target
     {
+        crate::tools::exec::cargo_target::mark_used(target);
         set("CARGO_TARGET_DIR", &target.to_string_lossy());
     }
     env
@@ -152,6 +153,7 @@ pub(super) fn run(
         body_len,
         &mut text,
         eof && capture_error.is_none() && original == inline_retained,
+        None,
     );
     let integrity = output_integrity(
         original,

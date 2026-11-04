@@ -299,7 +299,8 @@ impl Backend {
         let hinted = error
             .downcast_ref::<llm::HttpError>()
             .and_then(|http| http.retry_after);
-        // A failure before any response (reset, refused, broken pipe) retries promptly once.
+        // A failure before any response (reset, refused, broken pipe) is transient and uses the
+        // ordinary backoff; `decide` keeps the flag only for caller compatibility.
         let connection = error.chain().any(|cause| {
             cause
                 .downcast_ref::<llm::TransportError>()

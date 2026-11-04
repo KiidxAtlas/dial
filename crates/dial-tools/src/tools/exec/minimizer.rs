@@ -1,7 +1,8 @@
 //! Output minimizer: shrinks the progress noise of recognised commands before the model reads it.
 //!
 //! The filter is chosen from the command alone. Simple recognized commands qualify; compound
-//! commands qualify only when every output-producing segment is a recognized Cargo check command.
+//! commands qualify only when every output-producing segment is `cd` or a recognized command that
+//! selects the same filter (for example `cd web && npm install`).
 //! Arbitrary program stdout and pipelines never select a Cargo filter. Filters are deterministic
 //! line classifiers (drop, keep, or passing results that collapse in runs). Three rules hold:
 //!
@@ -214,21 +215,22 @@ fn filter_for(command: &str) -> Option<&'static Filter> {
         if commands.len() < 2 {
             return None;
         }
-        let mut cargo = false;
+        let mut chosen: Option<&'static Filter> = None;
         for segment in commands {
             if segment.starts_with("cd ") || segment.starts_with("cd\t") {
-                // `cd` can print directory names (CDPATH); it cannot emit Cargo progress.
+                // `cd` can print directory names (CDPATH); it cannot emit tool progress.
                 if segment.contains(['<', '>', '`', '$']) {
                     return None;
                 }
                 continue;
             }
-            if filter_for(&segment).is_none_or(|filter| !std::ptr::eq(filter, &CARGO)) {
+            let filter = filter_for(&segment)?;
+            if chosen.is_some_and(|chosen| !std::ptr::eq(chosen, filter)) {
                 return None;
             }
-            cargo = true;
+            chosen = Some(filter);
         }
-        return cargo.then_some(&CARGO);
+        return chosen;
     };
     if sole.contains(['<', '>', '`']) || sole.contains("$(") {
         return None;
@@ -268,6 +270,20 @@ fn filter_for(command: &str) -> Option<&'static Filter> {
         "pytest" | "py.test" => Some(&PYTEST),
         "python" | "python3" => match args.as_slice() {
             ["-m", "pytest", ..] => Some(&PYTEST),
+            ["-m", "pip", "install", ..] => Some(&PIP_INSTALL),
+            _ => None,
+        },
+        "pip" | "pip3" => match args.first() {
+            Some(&"install") => Some(&PIP_INSTALL),
+            _ => None,
+        },
+        "uv" => match args.as_slice() {
+            ["pip", "install", ..] | ["sync", ..] | ["add", ..] => Some(&PIP_INSTALL),
+            _ => None,
+        },
+        "jest" | "vitest" => Some(&JS_TEST),
+        "npx" | "bunx" => match args.iter().find(|arg| !arg.starts_with('-')) {
+            Some(&("jest" | "vitest")) => Some(&JS_TEST),
             _ => None,
         },
         "go" => match *args.iter().find(|arg| !arg.starts_with('-'))? {
@@ -322,6 +338,14 @@ static PYTEST: Filter = Filter {
 static GO_TEST: Filter = Filter {
     name: "go test",
     classify: classify_go_test,
+};
+static PIP_INSTALL: Filter = Filter {
+    name: "pip install",
+    classify: classify_pip_install,
+};
+static JS_TEST: Filter = Filter {
+    name: "js test",
+    classify: classify_js_test,
 };
 
 macro_rules! pattern {
@@ -426,6 +450,29 @@ fn classify_go_test(line: &str) -> Class {
     }
 }
 
+pattern!(
+    PIP_NOISE,
+    r"^\s*(Collecting|Downloading|Using cached|Requirement already satisfied|Obtaining|Preparing metadata|Installing build dependencies|Getting requirements to build|Building wheels? for|Created wheel for|Stored in directory|Resolved \d+ packages?|Prepared \d+ packages?|Audited \d+ packages?|Downloaded \S)|^\s*[\u{2500}-\u{257f}\u{2588}]+\s+[\d.]+/[\d.]+\s"
+);
+
+fn classify_pip_install(line: &str) -> Class {
+    if PIP_NOISE.is_match(line) {
+        Class::Drop
+    } else {
+        Class::Keep
+    }
+}
+
+pattern!(JS_TEST_PASS, r"^\s*(PASS|✓|√)\s+\S");
+
+fn classify_js_test(line: &str) -> Class {
+    if JS_TEST_PASS.is_match(line) {
+        Class::Passed
+    } else {
+        Class::Keep
+    }
+}
+
 // -------------------------------------------------------------------------------- failure digest
 
 /// Outputs shorter than this already show their first error near the top.
@@ -446,6 +493,16 @@ pattern!(LOCATION, r"^\s*--> \S+:\d+(:\d+)?\s*$");
 /// whose first error sits far below the start. `None` for other commands, short outputs, an
 /// error already near the top, or no recognizable error line.
 pub fn failure_digest(command: &str, text: &str) -> Option<String> {
+    digest_from(command, text, DIGEST_VISIBLE_BYTES)
+}
+
+/// Like [`failure_digest`], for a reader that does not see the start of `text` (a capped tail
+/// view of a background job), so an error near the start still needs a digest.
+pub fn failure_digest_of_unseen(command: &str, text: &str) -> Option<String> {
+    digest_from(command, text, 0)
+}
+
+fn digest_from(command: &str, text: &str, visible: usize) -> Option<String> {
     if text.len() < DIGEST_MIN_BYTES {
         return None;
     }
@@ -474,7 +531,7 @@ pub fn failure_digest(command: &str, text: &str) -> Option<String> {
             break;
         }
     }
-    (first? >= DIGEST_VISIBLE_BYTES).then_some(digest)
+    (first? >= visible).then_some(digest)
 }
 
 /// The conventional meaning of a nonzero exit `code` that printed nothing, for simple commands
