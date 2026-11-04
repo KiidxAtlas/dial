@@ -1,0 +1,4 @@
+# Settings evidence is independent of the command declaration.
+[ui]
+smooth_reveal = true
+page_size = 24

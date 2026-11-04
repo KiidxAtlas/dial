@@ -132,7 +132,7 @@ pub(super) fn drive(
             session_cost = agent.session_cost();
             (step, agent.layout().cloned())
         };
-        shell.session_id = session.id().to_owned();
+        shell.set_session_id(session.id());
         match step? {
             Step::Quit | Step::Done => break,
             Step::Rebuild(config) => {

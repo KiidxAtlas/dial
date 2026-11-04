@@ -119,6 +119,19 @@ fn observe_primes_then_notifies_once_per_worker_and_outcome() {
 }
 
 #[test]
+fn interrupted_worker_notice_is_not_cancellation_or_success() {
+    let mut board = board(vec![agent("w", AgentStatus::Running)]);
+    board.observe(&board.snapshot.clone());
+    let snap = HubSnapshot {
+        agents: vec![agent("w", AgentStatus::Interrupted)],
+        ..Default::default()
+    };
+    board.observe(&snap);
+    board.observe(&snap);
+    assert_eq!(board.take_notices("Alt+A"), ["w interrupted — Alt+A"]);
+}
+
+#[test]
 fn observe_notices_failures_and_skips_cancellations() {
     let mut board = board(vec![agent("p", AgentStatus::Running)]);
     board.observe(&board.snapshot.clone());

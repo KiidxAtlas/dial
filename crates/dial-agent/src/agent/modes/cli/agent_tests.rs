@@ -141,7 +141,9 @@ fn registered_deferred_tools_are_allowed_without_bypassing_approval() {
         // RPC swaps writers; ACP also forks/replaces the tool session. Both retain launch restrictions.
         let next_tools = agent.fresh_session_tools();
         agent.replace_session_tools(next_tools);
-        agent.swap_session(crate::storage::session::Session::ephemeral());
+        agent
+            .swap_session(crate::storage::session::Session::ephemeral())
+            .unwrap();
         assert!(agent.tool_eligible("mcp__demo__FetchItem"));
         assert!(!agent.offered().contains(&"bash".into()));
     });
@@ -156,7 +158,9 @@ fn no_tools_survives_protocol_session_switches() {
                 ..Default::default()
             })
             .unwrap();
-        agent.swap_session(crate::storage::session::Session::ephemeral());
+        agent
+            .swap_session(crate::storage::session::Session::ephemeral())
+            .unwrap();
         assert!(!agent.offered().contains(&"read".into()));
         assert!(!agent.offered().contains(&"bash".into()));
         assert!(agent.modes.launch.deferred_tools.is_empty());

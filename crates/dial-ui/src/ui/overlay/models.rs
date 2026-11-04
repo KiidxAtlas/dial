@@ -6,7 +6,8 @@
 //! `model_download`). The Memory group lists models for the `memory` role with the memory backend's
 //! status. It only reports what the user chose; the controller saves it and answers with
 //! [`ModelOverlay::set_roles`].
-use super::model_download::{ModelDownloads, Step};
+use super::model_download::Step;
+pub use super::model_download::{DownloadFailure, ModelDownloads, SharedModelDownloads};
 use super::{
     DrawCtx, OverlayEvent,
     settings::{
@@ -18,7 +19,7 @@ use crate::{
     config::paths::Layout,
     config::settings_store::Scope,
     llm::catalog::{Discovery, ModelEntry, ModelKind, ProviderStatus},
-    llm::model_config::{ModelSelection, ROLES, RoleSource, RoleStatus, TURN_DRAFTER},
+    llm::model_config::{ModelSelection, ROLES, RoleSource, RoleStatus, TURN_DRAFTER, role_label},
     setup::embeddings,
     stats::{ModelUsage, local_models::Settings},
     ui::{
@@ -29,7 +30,7 @@ use crate::{
         theme::{Sym, Theme, Tok},
     },
 };
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     style::{Modifier, Style},
@@ -183,10 +184,13 @@ struct Chooser {
     cursor: usize,
 }
 
-/// Typed-id prompt for the roles that take a checkpoint path or Hugging Face repo id.
-struct Prompt {
-    role: &'static str,
-    text: String,
+struct AssignmentReview {
+    transaction: crate::config::settings_store::ModelConfigReview,
+    event: Option<OverlayEvent>,
+    title: String,
+    notes: Vec<String>,
+    scroll: usize,
+    confirmed: bool,
 }
 
 /// Saved declarations and their resolved HTTP route are separate so inheritance
@@ -212,6 +216,7 @@ pub struct ModelOverlay {
     favorite_entries: Vec<FavoriteEntry>,
     scope: Scope,
     group: Group,
+    project_name: String,
     focus: Focus,
     kind: KindFilter,
     show: ShowFilter,
@@ -223,7 +228,7 @@ pub struct ModelOverlay {
     /// Picking a model for this role (started from the Roles view).
     target_role: Option<String>,
     chooser: Option<Chooser>,
-    prompt: Option<Prompt>,
+    review: Option<AssignmentReview>,
     headers_editor: Option<(String, ModelSelection, super::headers::HeaderEditor)>,
     /// The groups column is hidden at this width (set while drawing), so it cannot take focus.
     narrow: bool,
@@ -232,12 +237,10 @@ pub struct ModelOverlay {
     /// LoRA state of the current main model, which the catalog alone cannot know (admitted adapters).
     main_lora: Lora,
     learning: bool,
-    /// The judge role's Laya entry, offered only while choosing the judge model (see `laya_judge_entry`).
-    laya_judge: ModelEntry,
-    /// Installed or explicitly assigned checkpoint, never the judge's `decision` alias.
+    /// The typed-decision alias, available only with a configured or installed Laya checkpoint.
     laya_decision: ModelEntry,
     /// The Get models group: installed local models, downloads and the embedding models.
-    downloads: ModelDownloads,
+    downloads: SharedModelDownloads,
     /// Recorded requests, cost and decode speed per stats model name (see `usage_of`).
     usage: BTreeMap<String, ModelUsage>,
     /// The user directory the usage was read from; F5 reads it again.
@@ -253,25 +256,11 @@ fn is_embedding(entry: &ModelEntry) -> bool {
 /// Laya checkpoints are only for typed decisions; chat and embedding models stay separate.
 fn role_accepts(role: &str, entry: &ModelEntry) -> bool {
     if entry.selection.provider == crate::config::laya::PROVIDER {
-        return matches!(role, "judge" | "decision");
+        return role == "decision";
     }
     match role {
-        "decision" => false,
         "embedding" => is_embedding(entry),
         "image" => entry.accepts_image_role(),
-        // Grounding reads screenshots: a chat model that does not declare itself text-only.
-        "grounding" => entry.supports_chat() && entry.metadata.vision != Some(false),
-        // Multimodal embedders are VLM checkpoints (Qwen3-VL-Embedding) that catalogs list as
-        // chat models; a text-only embedder (nomic-embed) cannot embed images.
-        "image_embedding" => {
-            let model = entry.selection.model.to_ascii_lowercase();
-            is_image_embedder(entry)
-                || (model.contains("embed")
-                    && (entry.metadata.vision == Some(true)
-                        || ["-vl", "vl-", "clip", "siglip", "multimodal"]
-                            .iter()
-                            .any(|marker| model.contains(marker))))
-        }
         _ => entry.supports_chat() && !is_image_embedder(entry),
     }
 }
@@ -317,41 +306,11 @@ pub fn embedding_candidates(discovery: &Discovery) -> Vec<(ModelEntry, bool)> {
     out
 }
 
-/// The Laya decision engine as a judge model. It shares the decision role's checkpoint (assigned or
-/// installed), so it is selectable only once the decision role has one.
-fn laya_judge_entry(roles: &[RoleStatus]) -> ModelEntry {
-    let checkpoint = roles
-        .iter()
-        .find(|status| status.role == "decision")
-        .and_then(|status| status.effective.clone());
+/// Checkpoint readiness is supplied separately from role assignments by the application.
+fn laya_decision_entry(checkpoint: Option<String>) -> ModelEntry {
     ModelEntry {
-        selection: ModelSelection::new(
-            crate::config::laya::PROVIDER,
-            crate::config::laya::JUDGE_MODEL,
-        ),
-        label: "decision checkpoint".into(),
-        source: match &checkpoint {
-            Some(checkpoint) => format!("Laya typed choices · decision role: {checkpoint}"),
-            None => "Laya typed choices · no decision checkpoint".into(),
-        },
-        available: checkpoint.is_some(),
-        metadata: Default::default(),
-    }
-}
-
-fn laya_decision_entry(roles: &[RoleStatus]) -> ModelEntry {
-    let checkpoint = roles
-        .iter()
-        .find(|status| status.role == "decision")
-        .and_then(|status| status.assigned.as_ref())
-        .map(|selection| selection.model.clone())
-        .or_else(|| crate::config::laya::expected_checkpoint(&Default::default()));
-    ModelEntry {
-        selection: ModelSelection::new(
-            crate::config::laya::PROVIDER,
-            checkpoint.as_deref().unwrap_or(""),
-        ),
-        label: "Laya checkpoint".into(),
+        selection: ModelSelection::new(crate::config::laya::PROVIDER, "decision"),
+        label: "Laya typed decisions".into(),
         source: checkpoint
             .clone()
             .unwrap_or_else(|| "No installed Laya checkpoint".into()),
@@ -366,7 +325,6 @@ fn source_label(source: RoleSource) -> &'static str {
         RoleSource::Main => "session model",
         RoleSource::FollowsMain => "follows main",
         RoleSource::FollowsSmall => "follows small",
-        RoleSource::LayaInstalled => "installed Laya checkpoint",
         RoleSource::NotSet => "not set",
     }
 }
@@ -515,7 +473,7 @@ fn tool_warning(entry: &ModelEntry) -> Option<&'static str> {
 /// Why a model cannot be selected.
 fn refusal(entry: &ModelEntry) -> String {
     if entry.selection.provider == crate::config::laya::PROVIDER {
-        return "no Laya checkpoint; run `dial laya install --checkpoint PATH` or assign the decision role"
+        return "no Laya checkpoint; run `dial laya install --checkpoint PATH` or set laya.checkpoint"
             .to_owned();
     }
     let source = entry.source.to_lowercase();
@@ -772,8 +730,7 @@ impl ModelOverlay {
         ModelOverlay {
             memory_required: false,
             memory_optional: false,
-            laya_judge: laya_judge_entry(&roles),
-            laya_decision: laya_decision_entry(&roles),
+            laya_decision: laya_decision_entry(None),
             discovery,
             roles,
             favorites: Vec::new(),
@@ -789,25 +746,33 @@ impl ModelOverlay {
             scroll: 0,
             page: 8,
             target_role: None,
+            project_name: "this project".into(),
             chooser: None,
-            prompt: None,
+            review: None,
             headers_editor: None,
             narrow: false,
             message: None,
             main_lora: Lora::Unknown,
             learning: false,
-            downloads: ModelDownloads::idle(),
+            downloads: ModelDownloads::idle().into_shared(),
             usage: BTreeMap::new(),
             usage_dir: None,
             memory_backend: None,
         }
         .with_discovered_embeddings()
     }
+    /// Names the save destination without reading project configuration in the UI.
+    pub fn with_project_name(mut self, name: &str) -> Self {
+        self.project_name = text::one_line(name);
+        self
+    }
 
     /// Hands the discovered embedding models to the Get models Embedding shelf.
-    fn with_discovered_embeddings(mut self) -> Self {
+    fn with_discovered_embeddings(self) -> Self {
         if let Some(discovery) = &self.discovery {
-            self.downloads.set_embedding_models(&discovery.models);
+            self.downloads
+                .borrow_mut()
+                .set_embedding_models(&discovery.models);
         }
         self
     }
@@ -933,13 +898,8 @@ impl ModelOverlay {
     }
 
     fn all_entries(&self) -> impl Iterator<Item = &ModelEntry> {
-        let judging = self.target_role.as_deref() == Some("judge");
-        std::iter::once(&self.laya_judge)
-            .filter(move |_| judging)
-            .chain(
-                std::iter::once(&self.laya_decision)
-                    .filter(move |_| self.target_role.as_deref() == Some("decision")),
-            )
+        std::iter::once(&self.laya_decision)
+            .filter(move |_| self.target_role.as_deref() == Some("decision"))
             .chain(
                 self.discovery
                     .iter()
@@ -992,11 +952,14 @@ impl ModelOverlay {
     /// Reads the installed local models and enables downloads in the Get models group. Without it the
     /// group lists nothing installed and downloads report unavailable.
     pub fn with_downloads(mut self, layout: &Layout, settings: Settings, python: PathBuf) -> Self {
-        self.downloads = ModelDownloads::open(layout, settings, python);
-        if let Some(discovery) = &self.discovery {
-            self.downloads.set_embedding_models(&discovery.models);
-        }
-        self
+        self.downloads = ModelDownloads::open(layout, settings, python).into_shared();
+        self.with_discovered_embeddings()
+    }
+
+    /// Attach the session's existing manager without replacing active work or its browse position.
+    pub fn with_shared_downloads(mut self, downloads: SharedModelDownloads) -> Self {
+        self.downloads = downloads;
+        self.with_discovered_embeddings()
     }
 
     /// Reads every model's recorded requests, cost and speed from the stats database under
@@ -1080,6 +1043,25 @@ impl ModelOverlay {
         self.scroll = 0;
     }
 
+    /// Open the existing role picker, preserving its capability filters and cancel destination.
+    /// Unknown/hidden roles and active review/editor transactions are never replaced.
+    pub fn show_role(&mut self, role: &str) -> bool {
+        if self.review.is_some() || self.headers_editor.is_some() || self.chooser.is_some() {
+            return false;
+        }
+        let Some(cursor) = self
+            .visible_roles()
+            .iter()
+            .position(|(name, _)| *name == role)
+        else {
+            return false;
+        };
+        self.show_roles();
+        self.cursor = cursor;
+        let _ = self.confirm();
+        true
+    }
+
     /// Open on the Get models group (`/models local`).
     pub fn show_downloads(&mut self) {
         self.group = Group::Download;
@@ -1100,18 +1082,18 @@ impl ModelOverlay {
     /// Get models on its Memory shelf: small local models to download for the memory role.
     fn show_memory_downloads(&mut self) {
         self.show_downloads();
-        self.downloads.show_memory();
+        self.downloads.borrow_mut().show_memory();
     }
 
     /// Whether a finished download asks for a rescan; the controller takes the request once per frame.
     pub fn take_refresh(&mut self) -> bool {
-        self.downloads.take_rescan()
+        self.downloads.borrow_mut().take_rescan()
     }
 
     /// Discovery arrives asynchronously: the search, filters and the highlighted model survive.
     pub fn set_discovery(&mut self, d: Discovery) {
         let anchor = self.highlighted().map(|e| e.selection.clone());
-        self.downloads.set_embedding_models(&d.models);
+        self.downloads.borrow_mut().set_embedding_models(&d.models);
         self.discovery = Some(d);
         self.rebuild_favorite_entries();
         if let Group::Provider(id) = &self.group
@@ -1153,10 +1135,18 @@ impl ModelOverlay {
         self.memory_backend = Some(backend);
     }
 
+    /// Supply the effective configured or installed checkpoint, without inventing a model role.
+    pub fn set_laya_checkpoint(&mut self, checkpoint: Option<String>) {
+        self.laya_decision = laya_decision_entry(checkpoint);
+    }
+
+    pub fn with_laya_checkpoint(mut self, checkpoint: Option<String>) -> Self {
+        self.set_laya_checkpoint(checkpoint);
+        self
+    }
+
     pub fn set_roles(&mut self, roles: Vec<RoleStatus>) {
         let anchor = self.highlighted().map(|e| e.selection.clone());
-        self.laya_judge = laya_judge_entry(&roles);
-        self.laya_decision = laya_decision_entry(&roles);
         self.roles = roles;
         if self.group != Group::Roles {
             let rows = self.rows();
@@ -1220,7 +1210,7 @@ impl ModelOverlay {
                 .all_entries()
                 .filter(|entry| entry.accepts_image_role())
                 .count(),
-            Group::Download => self.downloads.installed_count(),
+            Group::Download => self.downloads.borrow().installed_count(),
             Group::Provider(id) => self
                 .all_entries()
                 .filter(|entry| &entry.selection.provider == id)
@@ -1282,7 +1272,7 @@ impl ModelOverlay {
                     None => continue,
                 }
             };
-            // The Laya engine leads the judge list: it is not a catalog model and is easy to miss.
+            // Laya leads the decision list: it is not a catalog model and is easy to miss.
             let rank = if lead.is_some_and(|m| same_model(m, &entry.selection))
                 || entry.selection.provider == crate::config::laya::PROVIDER
             {
@@ -1384,12 +1374,6 @@ impl ModelOverlay {
                 }
                 OverlayEvent::None
             }
-            Event::Paste(text) if self.prompt.is_some() => {
-                if let Some(prompt) = &mut self.prompt {
-                    prompt.text.push_str(&text::one_line(text));
-                }
-                OverlayEvent::None
-            }
             Event::Paste(text) if self.chooser.is_none() => {
                 self.type_text(&text::one_line(text));
                 OverlayEvent::None
@@ -1401,7 +1385,7 @@ impl ModelOverlay {
     fn type_text(&mut self, text: &str) {
         if self.group == Group::Download {
             self.focus = Focus::List;
-            self.downloads.paste(text);
+            self.downloads.borrow_mut().paste(text);
             return;
         }
         if self.group == Group::Roles {
@@ -1419,8 +1403,82 @@ impl ModelOverlay {
         self.message = Some((message, !is_error));
     }
 
+    /// The controller prepares this through the canonical model transaction owner.
+    pub fn review_assignment(
+        &mut self,
+        transaction: crate::config::settings_store::ModelConfigReview,
+        event: OverlayEvent,
+        title: String,
+        mut notes: Vec<String>,
+    ) {
+        if let OverlayEvent::AssignModel { selection, .. } = &event {
+            if let Some(entry) = self
+                .all_entries()
+                .find(|entry| same_model(&entry.selection, selection))
+            {
+                notes.push(
+                    capabilities(entry)
+                        .into_iter()
+                        .map(|(_, name, supported)| {
+                            format!(
+                                "{name}: {}",
+                                match supported {
+                                    Some(true) => "supported",
+                                    Some(false) => "unsupported",
+                                    None => "unknown (not reported)",
+                                }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                );
+            } else {
+                notes.push(
+                    "Capabilities unknown (no catalog metadata); unknown does not mean supported."
+                        .into(),
+                );
+            }
+        }
+        self.review = Some(AssignmentReview {
+            transaction,
+            event: Some(event),
+            title,
+            notes,
+            scroll: 0,
+            confirmed: false,
+        });
+    }
+
+    /// Only a deliberate confirmation releases the frozen transaction to the controller.
+    pub fn take_confirmed_assignment(
+        &mut self,
+    ) -> Option<crate::config::settings_store::ModelConfigReview> {
+        if self.review.as_ref().is_some_and(|review| review.confirmed) {
+            self.review.take().map(|review| review.transaction)
+        } else {
+            None
+        }
+    }
+
     fn key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
         self.message = None;
+        if let Some(review) = &mut self.review {
+            if keys.matches(Action::SelectCancel, key) {
+                self.review = None;
+                self.set_status(
+                    "Model selection cancelled; no settings saved.".into(),
+                    false,
+                );
+            } else if keys.matches(Action::SelectConfirm, key) {
+                review.confirmed = true;
+                return review.event.take().unwrap_or(OverlayEvent::None);
+            } else if keys.matches(Action::SelectDown, key) {
+                review.scroll = review.scroll.saturating_add(1);
+            } else if keys.matches(Action::SelectUp, key) {
+                review.scroll = review.scroll.saturating_sub(1);
+            }
+            return OverlayEvent::None;
+        }
         if let Some((role, selection, editor)) = &mut self.headers_editor {
             match editor.key(key, keys) {
                 super::headers::Outcome::Pending => return OverlayEvent::None,
@@ -1440,15 +1498,12 @@ impl ModelOverlay {
                 }
             }
         }
-        if self.prompt.is_some() {
-            return self.prompt_key(key, keys);
-        }
         if self.chooser.is_some() {
             return self.chooser_key(key, keys);
         }
         if self.group == Group::Download
             && self.focus == Focus::List
-            && !self.downloads.has_picker()
+            && !self.downloads.borrow().has_picker()
             && (keys.matches(Action::TabPrev, key)
                 || (key.code == KeyCode::Left
                     && key.modifiers == crossterm::event::KeyModifiers::CONTROL))
@@ -1464,7 +1519,7 @@ impl ModelOverlay {
                 || key.code == KeyCode::Backspace)
         {
             self.focus = Focus::List;
-            match self.downloads.key(key, keys) {
+            match self.downloads.borrow_mut().key(key, keys) {
                 Step::Ignored => {}
                 Step::Handled => return OverlayEvent::None,
                 Step::Back => {
@@ -1509,23 +1564,12 @@ impl ModelOverlay {
                 }
             }
         }
-        if key.code == KeyCode::F(2)
-            && self.focus == Focus::List
-            && (self.target_role.as_deref() == Some("decision")
-                || (self.group == Group::Roles
-                    && self
-                        .visible_roles()
-                        .get(self.cursor)
-                        .is_some_and(|(role, _)| *role == "decision")))
-        {
-            self.open_prompt("decision");
-            return OverlayEvent::None;
-        }
-        if key.code == KeyCode::F(8) {
+        if local_function_key(key, keys, 8, Action::ModelFavoriteNext) {
             // Headers belong to a role's assignment; outside Roles only a role being picked for has one.
             if self.group != Group::Roles && self.target_role.is_none() {
                 self.set_status(
-                    "Choose a role first: Roles → Enter, then F8 sets that role's headers".into(),
+                    "Choose a role first: Roles → Enter, then Shift+F8 sets that role's headers"
+                        .into(),
                     true,
                 );
                 return OverlayEvent::None;
@@ -1567,7 +1611,26 @@ impl ModelOverlay {
             return OverlayEvent::None;
         }
         if key.code == KeyCode::F(7) {
-            return OverlayEvent::Action("open:model-settings".into());
+            let selection = if self.focus != Focus::List {
+                None
+            } else if self.group == Group::Roles {
+                self.visible_roles()
+                    .get(self.cursor)
+                    .and_then(|(role, _)| self.role_selection(role))
+            } else {
+                self.highlighted().map(|entry| &entry.selection)
+            };
+            if let Some(selection) = selection {
+                return OverlayEvent::Action(format!(
+                    "open:model-settings:{}",
+                    serde_json::to_string(selection).expect("model selection serializes")
+                ));
+            }
+            self.set_status(
+                "Highlight a model or an explicitly assigned role to tune it.".into(),
+                true,
+            );
+            return OverlayEvent::None;
         }
         if is_ctrl(key, 'f') {
             return self.toggle_favorite();
@@ -1577,14 +1640,14 @@ impl ModelOverlay {
             return OverlayEvent::None;
         }
         let list_view = !matches!(self.group, Group::Roles | Group::Download);
-        if key.code == KeyCode::F(2) && list_view {
+        if local_function_key(key, keys, 2, Action::ModelSelect) && list_view {
             self.show = cycle(ShowFilter::ALL, self.show);
             self.focus = Focus::List;
             self.cursor = 0;
             self.scroll = 0;
             return OverlayEvent::None;
         }
-        if key.code == KeyCode::F(3) && list_view {
+        if local_function_key(key, keys, 3, Action::ModelRoles) && list_view {
             let anchor = self.highlighted().map(|entry| entry.selection.clone());
             self.sort = cycle(SortOrder::ALL, self.sort);
             self.focus = Focus::List;
@@ -1604,7 +1667,7 @@ impl ModelOverlay {
         }
         if key.code == KeyCode::F(5) || is_ctrl(key, 'r') {
             if self.group == Group::Download {
-                self.downloads.reload();
+                self.downloads.borrow_mut().reload();
             }
             if let Some(dir) = &self.usage_dir {
                 self.usage = crate::stats::read_model_usage(dir);
@@ -1921,45 +1984,6 @@ impl ModelOverlay {
         OverlayEvent::None
     }
 
-    fn open_prompt(&mut self, role: &'static str) {
-        let text = self
-            .role_selection(role)
-            .map(|selection| selection.model.clone())
-            .unwrap_or_default();
-        self.prompt = Some(Prompt { role, text });
-    }
-
-    fn prompt_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
-        let Some(prompt) = &mut self.prompt else {
-            return OverlayEvent::None;
-        };
-        if keys.matches(Action::SelectCancel, key) {
-            self.prompt = None;
-        } else if keys.matches(Action::SelectConfirm, key) {
-            let role = prompt.role;
-            let text = prompt.text.trim().to_owned();
-            self.prompt = None;
-            if text.is_empty() {
-                self.message = Some((
-                    "Type a checkpoint path or Hugging Face repo id first".to_owned(),
-                    false,
-                ));
-                return OverlayEvent::None;
-            }
-            let provider = crate::config::laya::PROVIDER;
-            return OverlayEvent::AssignModel {
-                role: role.to_owned(),
-                selection: ModelSelection::new(provider, &text),
-                scope: self.scope,
-            };
-        } else if key.code == KeyCode::Backspace {
-            prompt.text.pop();
-        } else if let Some(c) = typed_char(key) {
-            prompt.text.push(c);
-        }
-        OverlayEvent::None
-    }
-
     fn clear_role(&mut self) -> OverlayEvent {
         if self.group != Group::Roles || self.focus != Focus::List {
             return OverlayEvent::None;
@@ -1985,10 +2009,10 @@ impl ModelOverlay {
     // ---- drawing --------------------------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        let extra = format!(
-            "{} scope: {}",
-            ctx.theme.sym(Sym::Dot),
-            scope_name(self.scope)
+        let extra = super::settings::scope_caption(
+            self.scope,
+            &self.project_name,
+            usize::from(frame.area().width.saturating_sub(11)),
         );
         panel(frame, ctx.theme, Section::Dial, "Models", &extra, |w, h| {
             self.compose(w, h, ctx)
@@ -1997,9 +2021,48 @@ impl ModelOverlay {
 
     fn compose(&mut self, w: u16, h: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
         let (w, h) = (usize::from(w), usize::from(h));
-        self.downloads.poll();
+        if let Some(review) = &mut self.review {
+            let mut rows = vec![format!("Review model change: {}", review.title)];
+            rows.extend(review.notes.clone());
+            rows.push("Exact saved effects (values hidden; no credentials shown):".into());
+            rows.extend(
+                review
+                    .transaction
+                    .effects()
+                    .iter()
+                    .map(|(scope, path, removed)| {
+                        format!(
+                            "{} {}: {path}",
+                            scope_name(*scope),
+                            if *removed { "REMOVE" } else { "SAVE" }
+                        )
+                    }),
+            );
+            if review.transaction.effects().is_empty() {
+                rows.push("No saved keys change.".into());
+            }
+            let rows: Vec<_> = rows
+                .into_iter()
+                .flat_map(|row| text::wrap_words(&row, w.max(1)))
+                .collect();
+            let body = h.saturating_sub(1);
+            review.scroll = review.scroll.min(rows.len().saturating_sub(body));
+            let mut lines: Vec<_> = rows
+                .into_iter()
+                .skip(review.scroll)
+                .take(body)
+                .map(Line::from)
+                .collect();
+            lines.push(Line::from(format!(
+                "{} · {} · ↑/↓ scroll",
+                hint(ctx.keys, Action::SelectConfirm, "save"),
+                hint(ctx.keys, Action::SelectCancel, "cancel (no save)")
+            )));
+            return lines;
+        }
+        self.downloads.borrow_mut().poll();
         if self.group == Group::Download {
-            self.downloads.load_visible();
+            self.downloads.borrow_mut().load_visible();
         }
         let theme = ctx.theme;
         if let Some((_, _, editor)) = &self.headers_editor {
@@ -2019,6 +2082,8 @@ impl ModelOverlay {
                 false
             }
         };
+        let show_active = grant(!download_view);
+        let show_effect = grant(!download_view);
         let (show_footer, show_kind, show_search, show_detail, show_header, show_used) = (
             grant(true),
             grant(!download_view),
@@ -2030,6 +2095,8 @@ impl ModelOverlay {
         // Price and recorded usage of the highlighted model: the first line to give way.
         let show_numbers = grant(!download_view && !roles_view);
         let flags = [
+            show_active,
+            show_effect,
             show_footer,
             show_kind,
             show_search,
@@ -2064,7 +2131,7 @@ impl ModelOverlay {
         self.scroll = self.scroll.min(len.saturating_sub(body_rows));
         let rows = self.rows();
         let download_lines = if download_view {
-            self.downloads.body(right_w, body_rows, theme)
+            self.downloads.borrow().body(right_w, body_rows, theme)
         } else {
             Vec::new()
         };
@@ -2073,6 +2140,28 @@ impl ModelOverlay {
 
         // Right pane lines before the list.
         let mut right_top: Vec<Line<'static>> = Vec::new();
+        if show_active {
+            let active = self
+                .roles
+                .iter()
+                .find(|status| status.role == "main")
+                .and_then(|status| status.effective.as_deref())
+                .unwrap_or("not configured");
+            right_top.push(Line::from(fit(
+                vec![chrome::label(
+                    theme,
+                    &format!(" Active session: {}", text::one_line(active)),
+                )],
+                right_w,
+            )));
+        }
+        if show_effect {
+            let effect = self.assignment_effect();
+            right_top.push(Line::from(fit(
+                vec![Span::styled(format!(" {effect}"), theme.fg(Tok::Muted))],
+                right_w,
+            )));
+        }
         if show_header {
             right_top.push(self.header_line(theme, right_w));
         }
@@ -2199,7 +2288,7 @@ impl ModelOverlay {
                     .to_owned()
             }
             Some(_) if self.show != ShowFilter::Any && self.search.is_empty() => format!(
-                " No models match the \"{}\" filter. F2 shows another set; Esc clears it.",
+                " No models match the \"{}\" filter. Shift+F2 shows another set; Esc clears it.",
                 self.show.label()
             ),
             Some(_) if self.kind == KindFilter::Embedding && self.search.is_empty() => {
@@ -2455,7 +2544,7 @@ impl ModelOverlay {
             line(
                 &Group::Download,
                 "Get models".to_owned(),
-                nonzero(self.downloads.installed_count()),
+                nonzero(self.downloads.borrow().installed_count()),
                 None,
                 self,
             ),
@@ -2655,7 +2744,7 @@ impl ModelOverlay {
                     .find(|entry| same_model(selection, &entry.selection))
             });
         let caps_w = if entry.is_some() && w >= 40 { 8 } else { 0 };
-        let rest = w.saturating_sub(text::width(pointer) + 1 + 12 + caps_w);
+        let rest = w.saturating_sub(text::width(pointer) + 1 + 17 + caps_w);
         let value_w = rest * 2 / 5;
         let desc_w = rest.saturating_sub(value_w + 2);
         let value = text::ellipsize(&value, value_w, theme.ascii());
@@ -2665,7 +2754,7 @@ impl ModelOverlay {
             vec![
                 Span::styled(format!("{pointer} "), theme.fg(Tok::Accent).patch(fill)),
                 Span::styled(
-                    text::pad(role, 12),
+                    text::pad(role_label(role), 17),
                     theme
                         .fg(Tok::Text)
                         .add_modifier(if selected {
@@ -2753,7 +2842,10 @@ impl ModelOverlay {
             theme,
             vec![
                 Span::styled(format!("   {radio} "), theme.fg(Tok::Accent).patch(fill)),
-                Span::styled(text::pad(role, 12), theme.fg(Tok::Text).patch(fill)),
+                Span::styled(
+                    text::pad(role_label(role), 17),
+                    theme.fg(Tok::Text).patch(fill),
+                ),
                 Span::styled(description.to_owned(), theme.fg(Tok::Muted).patch(fill)),
             ],
             w,
@@ -2766,17 +2858,6 @@ impl ModelOverlay {
         theme: &Theme,
         entry: Option<&ModelEntry>,
     ) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
-        if let Some(prompt) = &self.prompt {
-            let first = vec![Span::styled(
-                format!(" {}: {}_", prompt.role, prompt.text),
-                theme.fg(Tok::Accent),
-            )];
-            let second = vec![Span::styled(
-                " Enter assigns this Laya checkpoint (path or Hugging Face repo id); Esc cancels",
-                theme.fg(Tok::Dim),
-            )];
-            return (first, second);
-        }
         if let Some((message, ok)) = &self.message {
             let (glyph, tok) = if *ok {
                 (Sym::Check, Tok::Success)
@@ -2792,24 +2873,45 @@ impl ModelOverlay {
             );
         }
         if self.group == Group::Download {
-            return self.downloads.detail(theme);
+            return self.downloads.borrow().detail(theme);
         }
         if self.group == Group::Roles {
             let roles = self.visible_roles();
             let (role, description) = roles[self.cursor.min(roles.len() - 1)];
+            let status = self.roles.iter().find(|status| status.role == role);
+            let selection = status.and_then(|status| status.assigned.as_ref());
+            let reasoning = selection
+                .and_then(|selection| selection.thinking.as_deref())
+                .unwrap_or(
+                    if status.is_some_and(|status| status.source == RoleSource::FollowsMain) {
+                        "inherits main"
+                    } else {
+                        "model/provider default"
+                    },
+                );
+            let headers = match selection.and_then(|selection| selection.headers.as_ref()) {
+                None if selection.is_none() => "inherits main".into(),
+                None => "inherited from provider".into(),
+                Some(headers) if headers.is_empty() => "cleared (no inherited headers)".into(),
+                Some(headers) => format!("{} masked row(s)", headers.len()),
+            };
             return (
                 vec![Span::styled(
-                    format!(" {role}: {description}"),
+                    format!(
+                        " {} ({role}): {} · reasoning: {reasoning} · {}",
+                        role_label(role),
+                        status
+                            .and_then(|status| status.effective.as_deref())
+                            .unwrap_or("not configured"),
+                        status
+                            .map(|status| source_label(status.source))
+                            .unwrap_or("unassigned")
+                    ),
                     theme.fg(Tok::Muted),
                 )],
                 vec![Span::styled(
                     format!(
-                        " {}",
-                        if role == "main" {
-                            "Enter changes the model; the main model cannot be cleared"
-                        } else {
-                            "Enter picks a model; x or Delete makes it follow the main model again"
-                        }
+                        " Connection overrides → Headers: {headers} · Shift+F8 edit · Composer reasoning is main-only. {description}"
                     ),
                     theme.fg(Tok::Dim),
                 )],
@@ -2819,22 +2921,28 @@ impl ModelOverlay {
             return (Vec::new(), Vec::new());
         };
         let mut first = vec![Span::styled(
-            format!(" {}", display_name(entry)),
+            format!(" Selected: {}", display_name(entry)),
             theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
         )];
         first.push(Span::styled(
             format!("  {}", capability_detail(theme, entry)),
             theme.fg(Tok::Muted),
         ));
-        // Unknown values are left out rather than spelled as "unknown".
-        let context = entry
-            .selection
-            .context_window
-            .map(|c| format!("context {}", fmt_context(c)));
-        let max_output = entry
-            .metadata
-            .max_output_tokens
-            .map(|tokens| format!("max output {}", fmt_context(tokens)));
+        // Missing catalog facts are not evidence that a capability is unsupported.
+        let context = Some(
+            entry
+                .selection
+                .context_window
+                .map(|c| format!("context {}", fmt_context(c)))
+                .unwrap_or_else(|| "context unknown".into()),
+        );
+        let max_output = Some(
+            entry
+                .metadata
+                .max_output_tokens
+                .map(|tokens| format!("max output {}", fmt_context(tokens)))
+                .unwrap_or_else(|| "max output unknown".into()),
+        );
         let facts = context
             .into_iter()
             .chain(max_output)
@@ -2864,9 +2972,15 @@ impl ModelOverlay {
         }
         let used = self.roles_using(&entry.selection);
         let used_text = if used.is_empty() {
-            "not used by any role".to_owned()
+            "no explicit role assignment".to_owned()
         } else {
-            format!("used by: {}", used.join(", "))
+            format!(
+                "assigned to: {}",
+                used.iter()
+                    .map(|role| format!("{} ({role})", role_label(role)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         };
         let mut second = vec![Span::styled(format!(" {used_text}"), theme.fg(Tok::Muted))];
         if let Some(favorite) = self
@@ -2907,7 +3021,7 @@ impl ModelOverlay {
     /// The third detail line: the provider's price per 1M tokens and the model's recorded use (median
     /// speed with its trend, requests, average cost and latency). Unknown values show as `-`.
     fn numbers_line(&self, theme: &Theme, entry: Option<&ModelEntry>) -> Vec<Span<'static>> {
-        if self.prompt.is_some() || self.message.is_some() {
+        if self.message.is_some() {
             return Vec::new();
         }
         let Some(entry) = entry else {
@@ -2962,13 +3076,39 @@ impl ModelOverlay {
         ]
     }
 
-    fn footer(&self, keys: &Keymap) -> Vec<String> {
-        if self.prompt.is_some() {
-            return vec![
-                hint(keys, Action::SelectConfirm, "assign"),
-                hint(keys, Action::SelectCancel, "cancel"),
-            ];
+    fn assignment_effect(&self) -> String {
+        let role = if self.group == Group::Roles {
+            self.visible_roles().get(self.cursor).map(|(role, _)| *role)
+        } else {
+            self.target_role.as_deref().or_else(|| {
+                self.highlighted().map(|entry| {
+                    if self.group == Group::Memory {
+                        "memory"
+                    } else if entry.is_embedding() {
+                        "embedding"
+                    } else if self.group == Group::Images || entry.metadata.kind == ModelKind::Image
+                    {
+                        "image"
+                    } else {
+                        "main"
+                    }
+                })
+            })
         }
+        .unwrap_or("main");
+        let scope = match self.scope {
+            Scope::Global => {
+                "user default; clears this project's overrides for this role after review"
+            }
+            Scope::Project => "project override",
+        };
+        format!(
+            "Assign {} ({role}): this session + {scope}; other sessions unchanged · Ctrl+S scope",
+            role_label(role)
+        )
+    }
+
+    fn footer(&self, keys: &Keymap) -> Vec<String> {
         if self.chooser.is_some() {
             return vec![
                 format!(
@@ -3006,32 +3146,24 @@ impl ModelOverlay {
                     pair_label(keys, Action::SelectUp, Action::SelectDown)
                 ),
                 "x clear".to_owned(),
-                "F2 custom decision checkpoint".to_owned(),
                 if self.learning {
                     "F6 verify LoRA".to_owned()
                 } else {
                     String::new()
                 },
-                "F7 main model settings".to_owned(),
-                "F8 HTTP headers".to_owned(),
+                "F7 tune selected".to_owned(),
+                "Shift+F8 Connection overrides (HTTP headers)".to_owned(),
                 self.groups_hint(keys),
                 hint(keys, Action::SelectCancel, "close"),
             ];
         }
         if self.group == Group::Download {
-            let mut hints = self.downloads.footer(keys);
-            if !self.narrow && !self.downloads.has_picker() {
+            let mut hints = self.downloads.borrow().footer(keys);
+            if !self.narrow && !self.downloads.borrow().has_picker() {
                 hints.push(self.groups_hint(keys));
             }
             hints.push("F5 rescan".to_owned());
             return hints;
-        }
-        if self.target_role.as_deref() == Some("decision") {
-            return vec![
-                hint(keys, Action::SelectConfirm, "assign checkpoint"),
-                "F2 custom checkpoint".into(),
-                hint(keys, Action::SelectCancel, "back"),
-            ];
         }
         if self.nothing_discovered() {
             return vec![
@@ -3080,10 +3212,12 @@ impl ModelOverlay {
             } else {
                 String::new()
             },
-            "F2 filter".to_owned(),
-            "F3 sort".to_owned(),
+            "F7 tune selected".to_owned(),
             "Ctrl+F favorite".to_owned(),
             self.groups_hint(keys),
+            "Shift+F8 Connection overrides".to_owned(),
+            "Shift+F2 filter".to_owned(),
+            "Shift+F3 sort".to_owned(),
             format!(
                 "{} models",
                 pair_label(keys, Action::SelectUp, Action::SelectDown)
@@ -3102,7 +3236,7 @@ impl ModelOverlay {
                 String::new()
             },
             if self.target_role.is_some() {
-                "F8 HTTP headers".to_owned()
+                "Shift+F8 Connection overrides (HTTP headers)".to_owned()
             } else {
                 String::new()
             },
@@ -3130,6 +3264,13 @@ impl ModelOverlay {
             hint(keys, Action::SectionPrev, "groups")
         }
     }
+}
+
+/// Keep the old panel key when it is not claimed by the effective global shortcut.
+fn local_function_key(key: &KeyEvent, keys: &Keymap, number: u8, global: Action) -> bool {
+    key.code == KeyCode::F(number)
+        && (key.modifiers == KeyModifiers::SHIFT
+            || (key.modifiers.is_empty() && !keys.triggers(global, key)))
 }
 
 #[cfg(test)]

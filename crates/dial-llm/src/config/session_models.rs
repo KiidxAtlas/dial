@@ -16,6 +16,8 @@ const MAIN_KEYS: &[&str] = &[
 ];
 /// Helper-role assignments, pinned per role.
 const ROLES: &str = "model_roles";
+/// Explicit vision feature selections, pinned independently of chat roles.
+const VISION: &str = "vision";
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SessionModels(toml::Table);
@@ -27,6 +29,7 @@ impl SessionModels {
         for key in pinned_keys() {
             copy(&mut models.0, merged, key);
         }
+        copy_field(&mut models.0, merged, "laya", "checkpoint");
         models
     }
 
@@ -35,6 +38,7 @@ impl SessionModels {
         for key in pinned_keys() {
             copy(merged, &self.0, key);
         }
+        copy_field(merged, &self.0, "laya", "checkpoint");
     }
 
     /// Adopt the merged values at settings paths this session wrote itself, so its own choices
@@ -49,7 +53,12 @@ impl SessionModels {
             match (parts.next(), parts.next()) {
                 (Some(key), _) if MAIN_KEYS.contains(&key) => copy(&mut self.0, merged, key),
                 (Some(ROLES), None) => copy(&mut self.0, merged, ROLES),
-                (Some(ROLES), Some(role)) => self.adopt_helper_role(merged, role),
+                (Some(ROLES), Some(role)) => copy_field(&mut self.0, merged, ROLES, role),
+                (Some(VISION), None) => copy(&mut self.0, merged, VISION),
+                (Some(VISION), Some(feature)) => copy_field(&mut self.0, merged, VISION, feature),
+                (Some("laya"), None | Some("checkpoint")) => {
+                    copy_field(&mut self.0, merged, "laya", "checkpoint");
+                }
                 _ => {}
             }
         }
@@ -63,36 +72,13 @@ impl SessionModels {
                 copy(&mut self.0, merged, key);
             }
         } else {
-            self.adopt_helper_role(merged, role);
-        }
-    }
-
-    fn adopt_helper_role(&mut self, merged: &toml::Table, role: &str) {
-        let value = merged
-            .get(ROLES)
-            .and_then(toml::Value::as_table)
-            .and_then(|roles| roles.get(role))
-            .cloned();
-        let mut roles = match self.0.remove(ROLES) {
-            Some(toml::Value::Table(roles)) => roles,
-            _ => toml::Table::new(),
-        };
-        match value {
-            Some(value) => {
-                roles.insert(role.to_owned(), value);
-            }
-            None => {
-                roles.remove(role);
-            }
-        }
-        if !roles.is_empty() {
-            self.0.insert(ROLES.to_owned(), toml::Value::Table(roles));
+            copy_field(&mut self.0, merged, ROLES, role);
         }
     }
 }
 
 fn pinned_keys() -> impl Iterator<Item = &'static str> {
-    MAIN_KEYS.iter().copied().chain([ROLES])
+    MAIN_KEYS.iter().copied().chain([ROLES, VISION])
 }
 
 /// Make `target[key]` equal `source[key]`, removing it when the source has none.
@@ -104,6 +90,29 @@ fn copy(target: &mut toml::Table, source: &toml::Table, key: &str) {
         None => {
             target.remove(key);
         }
+    }
+}
+
+/// Replace one complete selection without adopting unrelated fields from another session.
+fn copy_field(target: &mut toml::Table, source: &toml::Table, section: &str, key: &str) {
+    let value = source
+        .get(section)
+        .and_then(|value| value.get(key))
+        .cloned();
+    let mut fields = match target.remove(section) {
+        Some(toml::Value::Table(fields)) => fields,
+        _ => toml::Table::new(),
+    };
+    match value {
+        Some(value) => {
+            fields.insert(key.to_owned(), value);
+        }
+        None => {
+            fields.remove(key);
+        }
+    }
+    if !fields.is_empty() {
+        target.insert(section.to_owned(), toml::Value::Table(fields));
     }
 }
 

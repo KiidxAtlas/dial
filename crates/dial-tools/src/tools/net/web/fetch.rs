@@ -12,10 +12,11 @@ use crate::config::types::DEFAULT_WEB_TIMEOUT_SECS;
 use dial_llm::url::MAX_URL_LEN;
 use dial_llm::url::has_scheme;
 pub use dial_llm::url::parse_url;
+use std::collections::HashSet;
 use std::io::Read;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use ureq::Error;
@@ -40,8 +41,20 @@ pub struct Response {
     pub media_type: Option<String>,
     pub charset: Option<String>,
     pub body: Vec<u8>,
-    /// The body was longer than [`MAX_BODY_BYTES`] and has been cut.
+    /// The body was cut at the per-response or shared discovery byte cap.
     pub truncated: bool,
+}
+
+/// One budget shared by all optional HTML discovery, including redirects and network readers.
+struct Discovery {
+    deadline: Instant,
+    remaining: Mutex<DiscoveryRemaining>,
+}
+
+struct DiscoveryRemaining {
+    requests: usize,
+    bytes: usize,
+    seen: HashSet<(String, String)>,
 }
 
 pub struct Client {
@@ -49,6 +62,7 @@ pub struct Client {
     interrupt: Arc<AtomicBool>,
     /// Total seconds one request may take, set from `web.timeout_secs` at each tool call.
     timeout_secs: AtomicU64,
+    discovery: Option<Arc<Discovery>>,
 }
 
 impl Client {
@@ -72,6 +86,7 @@ impl Client {
             agent: ureq::Agent::with_parts(config, DefaultConnector::new(), resolver),
             interrupt: Arc::new(AtomicBool::new(false)),
             timeout_secs: AtomicU64::new(DEFAULT_WEB_TIMEOUT_SECS),
+            discovery: None,
         }
     }
 
@@ -92,6 +107,33 @@ impl Client {
 
     pub fn is_interrupted(&self) -> bool {
         self.interrupt.load(Ordering::Acquire)
+    }
+
+    /// A scoped client for optional discovery; ordinary fetches and document downloads keep their
+    /// independent limits. Every consumer of this clone shares the same ten-second (or configured
+    /// shorter) deadline, twelve HTTP hops and four MiB body budget.
+    pub(super) fn for_discovery(&self) -> Self {
+        let timeout = self.remaining_timeout().min(Duration::from_secs(10));
+        Self {
+            agent: self.agent.clone(),
+            interrupt: self.interrupt.clone(),
+            timeout_secs: AtomicU64::new(self.timeout_secs.load(Ordering::Acquire)),
+            discovery: Some(Arc::new(Discovery {
+                deadline: Instant::now() + timeout,
+                remaining: Mutex::new(DiscoveryRemaining {
+                    requests: 12,
+                    bytes: 4 * 1024 * 1024,
+                    seen: HashSet::new(),
+                }),
+            })),
+        }
+    }
+
+    pub(super) fn remaining_timeout(&self) -> Duration {
+        let configured = Duration::from_secs(self.timeout_secs.load(Ordering::Acquire));
+        self.discovery.as_ref().map_or(configured, |budget| {
+            configured.min(budget.deadline.saturating_duration_since(Instant::now()))
+        })
     }
 
     /// GET `url`. `bearer` is attached only to requests to the origin of `url`.
@@ -145,7 +187,17 @@ impl Client {
         cancel: &AtomicBool,
     ) -> Result<Response, String> {
         let agent = self.agent.clone();
-        let timeout = Duration::from_secs(self.timeout_secs.load(Ordering::Acquire));
+        let timeout = self.remaining_timeout();
+        if cancel.load(Ordering::Acquire) || self.is_interrupted() {
+            return Err("web request cancelled".into());
+        }
+        if timeout.is_zero() {
+            return Err("discovery deadline exhausted".into());
+        }
+        let discovery = self.discovery.clone();
+        let deadline = discovery
+            .as_ref()
+            .map_or(Instant::now() + timeout, |budget| budget.deadline);
         let url = url.to_owned();
         let accept = accept.to_owned();
         let headers: Vec<(String, String)> = headers
@@ -163,14 +215,24 @@ impl Client {
                 .as_ref()
                 .map(|(content_type, body)| (content_type.as_str(), body.as_slice()));
             let _ = tx.send(Self::send_hops(
-                &agent, &url, &accept, &headers, post, limit, timeout,
+                &agent,
+                &url,
+                &accept,
+                &headers,
+                post,
+                limit,
+                (timeout, discovery.as_deref()),
             ));
         });
         loop {
-            match rx.recv_timeout(INTERRUPT_POLL) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("request timed out".into());
+            }
+            match rx.recv_timeout(INTERRUPT_POLL.min(remaining)) {
                 Ok(result) => return result,
                 Err(RecvTimeoutError::Timeout) => {
-                    if cancel.load(Ordering::Acquire) {
+                    if cancel.load(Ordering::Acquire) || self.is_interrupted() {
                         return Err("web request cancelled".into());
                     }
                 }
@@ -186,15 +248,29 @@ impl Client {
         headers: &[(&str, &str)],
         mut post: Option<(&str, &[u8])>,
         limit: usize,
-        timeout: Duration,
+        bounds: (Duration, Option<&Discovery>),
     ) -> Result<Response, String> {
-        let deadline = Instant::now() + timeout;
+        let (timeout, discovery) = bounds;
+        let deadline = discovery.map_or(Instant::now() + timeout, |budget| budget.deadline);
         let first = parse_url(url)?;
         let mut current = first.clone();
         for _ in 0..=MAX_REDIRECTS {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err("request timed out".into());
+            }
+            if let Some(budget) = discovery {
+                let mut left = budget
+                    .remaining
+                    .lock()
+                    .expect("discovery budget lock poisoned");
+                if left.requests == 0 || left.bytes == 0 {
+                    return Err("discovery budget exhausted".into());
+                }
+                if !left.seen.insert((current.to_string(), accept.to_owned())) {
+                    return Err("duplicate discovery request".into());
+                }
+                left.requests -= 1;
             }
             let same_origin = origin(&current) == origin(&first);
             let sent = match post {
@@ -246,14 +322,36 @@ impl Client {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned);
             let (media_type, charset) = split_content_type(content_type.as_deref());
+            // Reserve before reading so failures and abandoned workers cannot escape the aggregate
+            // cap. Successful short reads refund unused capacity; failed reads spend the reservation.
+            let wanted = limit.saturating_add(1);
+            let allowance = discovery.map_or(wanted, |budget| {
+                let mut left = budget
+                    .remaining
+                    .lock()
+                    .expect("discovery budget lock poisoned");
+                let allowance = wanted.min(left.bytes);
+                left.bytes -= allowance;
+                allowance
+            });
+            if allowance == 0 {
+                return Err("discovery byte budget exhausted".into());
+            }
             let mut body = Vec::new();
             response
                 .body_mut()
                 .as_reader()
-                .take(limit as u64 + 1)
+                .take(allowance as u64)
                 .read_to_end(&mut body)
                 .map_err(|error| format!("reading response body: {}", io_message(&error)))?;
-            let truncated = body.len() > limit;
+            if let Some(budget) = discovery {
+                budget
+                    .remaining
+                    .lock()
+                    .expect("discovery budget lock poisoned")
+                    .bytes += allowance - body.len();
+            }
+            let truncated = body.len() > limit || (allowance < wanted && body.len() == allowance);
             body.truncate(limit);
             return Ok(Response {
                 url: current.to_string(),

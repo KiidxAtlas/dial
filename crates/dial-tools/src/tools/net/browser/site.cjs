@@ -123,10 +123,50 @@ async function emulate(request, host) {
   return { applied, context_wide: contextWide };
 }
 
-async function clipboardGrant(host, page) {
-  const origin = httpOrigin(page, 'clipboard access');
-  await host.context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin });
-  await page.bringToFront();
+// Never grant clipboard access to an untrusted page. A controller-only, script-free document
+// gets the one permission needed, in a disposable context; closing it revokes all its grants.
+const clipboardContexts = new Set();
+let clipboardStopping = false;
+async function closeClipboardContext(context) {
+  try { await context.clearPermissions(); }
+  finally {
+    await context.close();
+    clipboardContexts.delete(context);
+  }
+}
+async function closeClipboardContexts() {
+  clipboardStopping = true;
+  await Promise.all([...clipboardContexts].map(closeClipboardContext));
+}
+
+async function clipboard(request, host) {
+  const tab = host.tabFor(request);
+  await tab.ready;
+  httpOrigin(tab.page, 'clipboard access');
+  const browser = host.context.browser();
+  if (!browser) throw new Error('clipboard access needs a browser-owned context');
+  const context = await browser.newContext({ serviceWorkers: 'block' });
+  clipboardContexts.add(context);
+  try {
+    if (clipboardStopping) throw new Error('browser is stopping');
+    const origin = 'https://dial-clipboard.invalid';
+    const page = await context.newPage();
+    await page.route('**/*', route => route.fulfill({
+      status: 200, contentType: 'text/html',
+      headers: { 'content-security-policy': "default-src 'none'; script-src 'none'" },
+      body: '<!doctype html><title>Dial clipboard controller</title>',
+    }));
+    await page.goto(origin);
+    const read = request.action === 'clipboard_read';
+    await context.grantPermissions([read ? 'clipboard-read' : 'clipboard-write'], { origin });
+    await page.bringToFront();
+    if (read) return { text: await page.evaluate(() => navigator.clipboard.readText()) };
+    await page.evaluate(text => navigator.clipboard.writeText(text), request.text);
+    return { chars: request.text.length };
+  } finally {
+    // Do not swallow cleanup failures or report clipboard success while a grant may remain.
+    await closeClipboardContext(context);
+  }
 }
 
 async function loadState(request, host) {
@@ -188,19 +228,9 @@ async function run(request, host) {
       const result = await tab.page.evaluate(STORAGE_PAGE, request.storage);
       return { area: request.storage.area, operation: request.storage.operation, ...result };
     }
-    case 'clipboard_read': {
-      const tab = host.tabFor(request);
-      await tab.ready;
-      await clipboardGrant(host, tab.page);
-      return { text: await tab.page.evaluate(() => navigator.clipboard.readText()) };
-    }
-    case 'clipboard_write': {
-      const tab = host.tabFor(request);
-      await tab.ready;
-      await clipboardGrant(host, tab.page);
-      await tab.page.evaluate(text => navigator.clipboard.writeText(text), request.text);
-      return { chars: request.text.length };
-    }
+    case 'clipboard_read':
+    case 'clipboard_write':
+      return clipboard(request, host);
     case 'clipboard_copy':
     case 'clipboard_paste': {
       const tab = host.tabFor(request);
@@ -215,4 +245,4 @@ async function run(request, host) {
   }
 }
 
-module.exports = { ACTIONS, run, applyTabEmulation };
+module.exports = { ACTIONS, run, applyTabEmulation, closeClipboardContexts };

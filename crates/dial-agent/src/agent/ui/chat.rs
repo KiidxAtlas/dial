@@ -2,6 +2,8 @@
 
 use crate::agent::*;
 
+mod delivery;
+
 pub(in crate::agent) enum ChatEvent {
     Retry {
         waiting: bool,
@@ -358,7 +360,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
     if let Some(tokens) = context_tokens {
         ui.context_usage(tokens, true);
     }
-    let (tx, rx) = mpsc::channel();
+    let (tx, mut rx) = delivery::channel();
     let mut progress = backend
         .local_inference()
         .then(crate::agent::workflow::progress::RequestProgress::new);
@@ -478,6 +480,14 @@ pub(in crate::agent) fn chat_attempt_with_ui(
         let mut stalled = None;
         let mut partial_text = String::new();
         let result = loop {
+            // Cancellation is checked for every delivery, not only the timed heartbeat:
+            // fast providers can leave many late text/reasoning/tool events queued.
+            if external_interrupt.load(Ordering::SeqCst) {
+                cancel_request.store(true, Ordering::SeqCst);
+            }
+            if cancel_request.load(Ordering::SeqCst) {
+                rx.cancel();
+            }
             if let Some(error) = ui.execution_error() {
                 cancel_request.store(true, Ordering::SeqCst);
                 break Err(anyhow::Error::msg(error));
@@ -487,6 +497,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                 .filter(|m| m.hit.is_some() || m.failure.is_some())
             {
                 cancel_request.store(true, Ordering::SeqCst);
+                rx.cancel();
                 match rx.recv_timeout(Duration::from_millis(80)) {
                     Ok(ChatEvent::Finished(_)) | Err(RecvTimeoutError::Disconnected) => {
                         if let Some(failure) = &monitor.failure {
@@ -501,6 +512,15 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                 }
             }
             match rx.recv_timeout(Duration::from_millis(80)) {
+                Ok(event)
+                    if !matches!(event, ChatEvent::Finished(_))
+                        && (cancel_request.load(Ordering::SeqCst)
+                            || external_interrupt.load(Ordering::SeqCst)) =>
+                {
+                    cancel_request.store(true, Ordering::SeqCst);
+                    rx.cancel();
+                    continue;
+                }
                 Ok(ChatEvent::Finished(_)) if stalled.is_some() => {
                     break Err(anyhow::Error::new(SilentRequest {
                         silence_secs: stalled.unwrap(),
@@ -612,6 +632,9 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                             cancel_request.store(true, Ordering::SeqCst);
                         }
                     }
+                    if cancel_request.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     if !text.is_empty() {
                         generating = true;
                         ui.request_phase(RequestPhase::Generating);
@@ -651,6 +674,9 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     {
                         header_runaway = Some(count);
                         cancel_request.store(true, Ordering::SeqCst);
+                    }
+                    if cancel_request.load(Ordering::SeqCst) {
+                        continue;
                     }
                     if !text.is_empty() {
                         generating = true;
@@ -821,6 +847,10 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                 last_tick = Instant::now();
             }
         };
+        // A UI/journal failure can exit without consuming Finished. Disconnect the
+        // byte-bounded payload queue before joining so a blocked callback wakes.
+        cancel_request.store(true, Ordering::SeqCst);
+        rx.cancel();
         if worker.join().is_err() {
             return Err(anyhow::anyhow!("model worker panicked"));
         }
@@ -848,3 +878,6 @@ mod silence_tests;
 
 #[cfg(test)]
 mod streaming_safety_tests;
+
+#[cfg(test)]
+mod delivery_tests;

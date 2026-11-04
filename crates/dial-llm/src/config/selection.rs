@@ -19,7 +19,7 @@ pub fn protocol(
         .unwrap_or_else(|| crate::llm::model_config::ApiProtocol::builtin(&selection.provider))
 }
 
-/// Provider name that marks the `judge` role as TypeSafe System One; it is a hosted judgment API with no weights.
+/// Provider name selecting hosted TypeSafe System One for unified typed decisions (no weights).
 pub const TYPESAFE_JUDGE_PROVIDER: &str = "typesafe";
 
 /// Whether selection must acquire chat/embedding weights before publishing settings.

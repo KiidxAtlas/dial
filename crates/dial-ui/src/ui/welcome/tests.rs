@@ -1,5 +1,24 @@
 use super::*;
 
+#[test]
+fn first_run_tour_dismissal_and_sending_persist_outside_the_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("tour-seen");
+    let mut home = Home::new(WelcomeInfo::default(), vec![], false).with_tour(marker.clone());
+    assert!(home.info.tour);
+    assert!(home.dismiss_tour());
+    assert!(
+        !Home::new(WelcomeInfo::default(), vec![], false)
+            .with_tour(marker.clone())
+            .info
+            .tour
+    );
+    std::fs::remove_file(&marker).unwrap();
+    let home = Home::new(WelcomeInfo::default(), vec![], false).with_tour(marker.clone());
+    home.summary(80, &Theme::dark());
+    assert!(marker.exists());
+}
+
 fn info() -> WelcomeInfo {
     WelcomeInfo {
         version: "0.3.1".into(),
@@ -20,6 +39,8 @@ fn info() -> WelcomeInfo {
         branch: String::new(),
         approval: "ask".into(),
         sandbox: "dev".into(),
+        doctor_issues: 0,
+        tour: false,
     }
 }
 
@@ -260,6 +281,8 @@ fn long_and_hostile_fields_are_sanitized_and_ellipsized() {
         branch: String::new(),
         approval: String::new(),
         sandbox: String::new(),
+        doctor_issues: 0,
+        tour: false,
     };
     for width in [10u16, 30, 69, 70, 120] {
         let rows = rows(&hostile, width, &Theme::dark());

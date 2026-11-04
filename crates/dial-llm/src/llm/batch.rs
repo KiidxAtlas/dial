@@ -13,6 +13,11 @@ use std::{
 
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ITEMS: usize = 1000;
+// Admission safety assumptions, not provider-enforced limits: arbitrary future
+// tokenizers/metadata may exceed these reserves. The download cap remains enforced.
+const RESULT_BYTES_PER_TOKEN: u64 = 256 * 6; // UTF-8 bytes/token times JSON escaping.
+const RESULT_ENVELOPE_BYTES: u64 = 16 * 1024; // Metadata, errors and row framing.
+const MULTIPART_BOUNDARY: &str = "dial-batch-0000000000000000";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
@@ -75,6 +80,51 @@ impl Plan {
             "batch input exceeds byte bound"
         );
         Ok(())
+    }
+    /// Validate new paid work against both collection and native upload bounds.
+    /// Legacy ledger reads deliberately use only `validate`.
+    pub fn validate_submission(&self) -> Result<()> {
+        self.validate()?;
+        let result_bytes = self.items.len() as u64
+            * (RESULT_ENVELOPE_BYTES + u64::from(self.max_tokens) * RESULT_BYTES_PER_TOKEN)
+            + 2;
+        ensure!(
+            result_bytes <= MAX_BYTES as u64,
+            "batch output envelope exceeds collection bound; reduce max_tokens or split the plan"
+        );
+        self.submission_body()?;
+        Ok(())
+    }
+    fn submission_body(&self) -> Result<(String, Vec<u8>)> {
+        let (content_type, body) = match self.provider {
+            Provider::Anthropic => (
+                "application/json".to_owned(),
+                serde_json::to_vec(&json!({"requests": self.items.iter().map(|i|
+                    json!({"custom_id": i.custom_id, "params": self.params(i)}))
+                    .collect::<Vec<_>>()}))?,
+            ),
+            Provider::Openai => {
+                let mut lines = String::new();
+                for item in &self.items {
+                    lines.push_str(&serde_json::to_string(&json!({"custom_id":item.custom_id,"method":"POST","url":"/v1/chat/completions","body":self.params(item)}))?);
+                    lines.push('\n');
+                }
+                // Prompts are JSON-escaped: no literal CRLF can collide with this boundary.
+                let boundary = MULTIPART_BOUNDARY;
+                let body = format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"batch.jsonl\"\r\nContent-Type: application/jsonl\r\n\r\n{lines}\r\n--{boundary}--\r\n"
+                );
+                (
+                    format!("multipart/form-data; boundary={boundary}"),
+                    body.into_bytes(),
+                )
+            }
+        };
+        ensure!(
+            body.len() <= MAX_BYTES,
+            "batch wire payload exceeds byte bound"
+        );
+        Ok((content_type, body))
     }
     fn params(&self, item: &Item) -> Value {
         json!({"model": self.model, "max_tokens": self.max_tokens, "messages": [{"role":"user", "content":item.prompt}]})
@@ -185,27 +235,17 @@ impl Client {
         serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid batch provider JSON"))
     }
     pub fn submit(&self, plan: &Plan) -> Result<String> {
-        plan.validate()?;
+        plan.validate_submission()?;
         ensure!(self.provider == plan.provider, "batch provider mismatch");
+        let (content_type, body) = plan.submission_body()?;
         let payload = match self.provider {
-            Provider::Anthropic => {
-                json!({"requests":plan.items.iter().map(|i| json!({"custom_id": i.custom_id, "params":plan.params(i)})).collect::<Vec<_>>()})
-            }
+            Provider::Anthropic => serde_json::from_slice(&body)?,
             Provider::Openai => {
-                let mut lines = String::new();
-                for item in &plan.items {
-                    lines.push_str(&serde_json::to_string(&json!({"custom_id":item.custom_id,"method":"POST","url":"/v1/chat/completions","body":plan.params(item)}))?);
-                    lines.push('\n');
-                }
-                let boundary = format!("dial-batch-{:016x}", rand::random::<u64>());
-                let body = format!(
-                    "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"batch.jsonl\"\r\nContent-Type: application/jsonl\r\n\r\n{lines}\r\n--{boundary}--\r\n"
-                );
                 let uploaded: Value = serde_json::from_slice(&self.request(
                     "POST",
                     "/files",
-                    &format!("multipart/form-data; boundary={boundary}"),
-                    body.as_bytes(),
+                    &content_type,
+                    &body,
                 )?)
                 .map_err(|_| anyhow::anyhow!("invalid batch upload receipt"))?;
                 let file = uploaded["id"].as_str().context("missing batch file id")?;
@@ -296,9 +336,7 @@ impl Client {
         }
         let mut results = parse_results(self.provider, &bytes, plan)?;
         for outcome in results.values_mut() {
-            if let Outcome::Succeeded(text) = outcome {
-                *text = text.replace(self.key.as_str(), "[REDACTED:ApiKey]");
-            }
+            outcome.redact(|text| text.replace(self.key.as_str(), "[REDACTED:ApiKey]"));
         }
         Ok(results)
     }
@@ -307,10 +345,25 @@ impl Client {
 #[serde(tag = "state", content = "text", rename_all = "snake_case")]
 pub enum Outcome {
     Succeeded(String),
+    Incomplete { output: String, reason: String },
+    Refused { output: String, reason: String },
     Errored,
     Canceled,
     Expired,
     Missing,
+}
+impl Outcome {
+    /// Redact every retained provider text field, including refusal and stop reasons.
+    pub fn redact(&mut self, mut redact: impl FnMut(&str) -> String) {
+        match self {
+            Self::Succeeded(text) => *text = redact(text),
+            Self::Incomplete { output, reason } | Self::Refused { output, reason } => {
+                *output = redact(output);
+                *reason = redact(reason);
+            }
+            Self::Errored | Self::Canceled | Self::Expired | Self::Missing => {}
+        }
+    }
 }
 fn parse_results(
     provider: Provider,
@@ -338,10 +391,35 @@ fn parse_results(
         );
         let outcome = match provider {
             Provider::Openai if value["response"]["status_code"] == 200 => {
-                value["response"]["body"]["choices"][0]["message"]["content"]
+                let choice = &value["response"]["body"]["choices"][0];
+                let output = choice["message"]["content"]
                     .as_str()
-                    .map(|s| Outcome::Succeeded(s.to_owned()))
-                    .unwrap_or(Outcome::Errored)
+                    .unwrap_or_default()
+                    .to_owned();
+                let reason = choice["finish_reason"]
+                    .as_str()
+                    .unwrap_or("missing_finish_reason");
+                if let Some(refusal) = choice["message"]["refusal"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                {
+                    Outcome::Refused {
+                        output,
+                        reason: refusal.to_owned(),
+                    }
+                } else if reason == "content_filter" {
+                    Outcome::Refused {
+                        output,
+                        reason: reason.to_owned(),
+                    }
+                } else if reason == "stop" && choice["message"]["content"].is_string() {
+                    Outcome::Succeeded(output)
+                } else {
+                    Outcome::Incomplete {
+                        output,
+                        reason: reason.to_owned(),
+                    }
+                }
             }
             Provider::Openai => Outcome::Errored,
             Provider::Anthropic => match value["result"]["type"].as_str() {
@@ -353,7 +431,20 @@ fn parse_results(
                         .filter_map(|v| v["text"].as_str())
                         .collect::<Vec<_>>()
                         .join("\n");
-                    Outcome::Succeeded(text)
+                    let reason = value["result"]["message"]["stop_reason"]
+                        .as_str()
+                        .unwrap_or("missing_stop_reason");
+                    match reason {
+                        "end_turn" | "stop_sequence" => Outcome::Succeeded(text),
+                        "refusal" => Outcome::Refused {
+                            output: text,
+                            reason: reason.to_owned(),
+                        },
+                        _ => Outcome::Incomplete {
+                            output: text,
+                            reason: reason.to_owned(),
+                        },
+                    }
                 }
                 Some("canceled") => Outcome::Canceled,
                 Some("expired") => Outcome::Expired,

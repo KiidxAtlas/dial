@@ -271,3 +271,60 @@ fn note_enter_saves_without_advancing_or_submitting() {
     assert!(matches!(dialog.mode, Mode::Choices));
     assert_eq!(dialog.answers[0].note.as_deref(), Some("context"));
 }
+
+#[test]
+fn inspection_pauses_and_resumes_exact_remaining_question_time_without_sleeping() {
+    let request = request(1, None);
+    let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+    let start = Instant::now();
+    let remaining = Duration::new(52, 123_456_789);
+    let paused = start + Duration::from_secs(7);
+    dialog.deadline = Some(paused + remaining);
+    let before = serde_json::to_value(&dialog.answers).unwrap();
+    dialog.pause_timeout(paused);
+    dialog.pause_timeout(paused + Duration::from_secs(1)); // idempotent, not reset
+    assert_eq!(dialog.paused_timeout, Some(remaining));
+    assert!(
+        dialog
+            .expired_at(start + Duration::from_secs(10_000))
+            .is_none()
+    );
+    assert_eq!(serde_json::to_value(&dialog.answers).unwrap(), before);
+    let returned = start + Duration::from_secs(10_000);
+    dialog.resume_timeout(returned).unwrap();
+    assert_eq!(dialog.deadline, Some(returned + remaining));
+    dialog
+        .resume_timeout(returned + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(dialog.deadline, Some(returned + remaining));
+    assert!(
+        dialog
+            .expired_at(returned + remaining - Duration::from_nanos(1))
+            .is_none()
+    );
+    assert!(dialog.expired_at(returned + remaining).is_some());
+}
+
+#[test]
+fn inspecting_untimed_questions_keeps_them_untimed_and_preserves_custom_input() {
+    let mut request = request(1, None);
+    request.timeout_seconds = 0;
+    let mut dialog = Dialog::new(&request, Path::new("/tmp"));
+    dialog.presented().unwrap();
+    let keys = Keymap::defaults();
+    dialog.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &keys);
+    dialog.paste("unfinished answer");
+    let before = dialog.rows(100, 30);
+    let now = Instant::now();
+    dialog.pause_timeout(now);
+    dialog
+        .resume_timeout(now + Duration::from_secs(10_000))
+        .unwrap();
+    assert!(dialog.deadline.is_none());
+    assert!(
+        dialog
+            .expired_at(now + Duration::from_secs(20_000))
+            .is_none()
+    );
+    assert_eq!(dialog.rows(100, 30), before);
+}

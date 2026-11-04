@@ -188,7 +188,7 @@ struct RunSettings<'a> {
     coordinate_safe: bool,
     read_only: bool,
     timeout: Option<f64>,
-    /// Config for `win.locate`, present only while the `grounding` role is assigned.
+    /// Config for `win.locate`, present only while a grounding model is configured.
     grounding: Option<&'a Config>,
 }
 
@@ -232,7 +232,7 @@ impl ComputerHost for ToolHost {
         }
         let Some(config) = &self.grounding else {
             return Err(ComputerError::tool(
-                "locate needs a grounding model: run `/setup grounding` or assign one to the `grounding` role in Alt+M",
+                "locate needs a grounding model: run `/setup grounding` or set `vision.grounding`",
             ));
         };
         locate_screenshot(config, &args, signal)

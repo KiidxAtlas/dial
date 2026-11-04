@@ -1182,7 +1182,7 @@ fn unsandboxed_backends() -> Vec<(&'static str, ShellBackend)> {
 }
 
 #[test]
-fn launch_zero_exit_after_terminal_diagnostic_stays_successful_with_launch_facts() {
+fn launch_zero_exit_after_terminal_diagnostic_preserves_exit_and_launch_facts() {
     // A curses program needs a real terminal on stdin and stdout, finds stdin at EOF, prints why
     // it cannot run, and exits 0. Each precondition fails with its own status, so a wrong launch
     // mode cannot hide behind the success exit.
@@ -1203,7 +1203,11 @@ fn launch_zero_exit_after_terminal_diagnostic_stays_successful_with_launch_facts
             }
             let label = format!("{name} interceptor={interceptor}");
             let out = launch(&ws, &command, &cancel);
-            assert!(!out.is_error, "{label}: {}", out.text);
+            if backend == ShellBackend::InProcess {
+                inprocess_tests::assert_zero_exit_with_cleanup_accounted_for(&out);
+            } else {
+                assert!(!out.is_error, "{label}: {}", out.text);
+            }
             assert!(
                 out.text.contains(TERMINAL_DIAGNOSTIC),
                 "{label}: {}",

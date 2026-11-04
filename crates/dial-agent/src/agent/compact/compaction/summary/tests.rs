@@ -748,15 +748,16 @@ fn turn_prefix_overlaps_the_history_fold_and_matches_the_serial_summary() {
     let (main_started, turn_waits_for_main) = mpsc::sync_channel::<()>(1);
     let (turn_started, main_waits_for_turn) = mpsc::sync_channel::<()>(1);
     let mut main_waits_for_turn = Some(main_waits_for_turn);
-    let mut main = |_: &mut Backend, request: &Chat, _: &mut dyn Ui| -> Result<String> {
-        if let Some(waiting) = main_waits_for_turn.take() {
-            main_started.send(()).unwrap();
-            waiting
-                .recv_timeout(HANDSHAKE_TIMEOUT)
-                .context("the turn-prefix fold never ran beside the history fold")?;
-        }
-        digest(request)
-    };
+    let mut main =
+        |_: &mut Backend, request: &Chat, _: &mut dyn Ui, _: Arc<AtomicBool>| -> Result<String> {
+            if let Some(waiting) = main_waits_for_turn.take() {
+                main_started.send(()).unwrap();
+                waiting
+                    .recv_timeout(HANDSHAKE_TIMEOUT)
+                    .context("the turn-prefix fold never ran beside the history fold")?;
+            }
+            digest(request)
+        };
     let worker_calls = Arc::new(AtomicUsize::new(0));
     let cancel_shared = Arc::new(AtomicBool::new(false));
     let (counted, shared, parent) = (
@@ -804,8 +805,8 @@ fn turn_prefix_overlaps_the_history_fold_and_matches_the_serial_summary() {
     assert_eq!(parallel, serial, "the overlap must not change the summary");
     assert_eq!(worker_calls.load(Ordering::SeqCst), 1);
     assert!(
-        cancel_shared.load(Ordering::SeqCst),
-        "the worker shares the parent cancel flag"
+        !cancel_shared.load(Ordering::SeqCst),
+        "split cancellation must be independent of the parent stop flag"
     );
     assert_eq!(
         ui.0.iter()
@@ -818,80 +819,114 @@ fn turn_prefix_overlaps_the_history_fold_and_matches_the_serial_summary() {
 }
 
 #[test]
-fn a_failed_history_fold_still_joins_the_turn_worker_and_keeps_the_parent_interrupt_clear() {
-    let user_dir = std::env::temp_dir();
-    let context = summary_context(&user_dir);
-    let messages = split_turn();
-    let interrupt = Arc::new(AtomicBool::new(false));
-    let finished = Arc::new(AtomicBool::new(false));
-    let done = Arc::clone(&finished);
-    let mut worker = Some(SummaryWorker {
-        backend: remote_backend(),
-        complete: Box::new(
-            move |_: &mut Backend,
-                  request: &Chat,
-                  _: &mut dyn Ui,
-                  _: Arc<AtomicBool>|
-                  -> Result<String> {
-                done.store(true, Ordering::SeqCst);
-                digest(request)
-            },
-        ),
-    });
-    let error = summarize_prefix_with_worker(
-        &mut remote_backend(),
-        &messages,
-        6,
-        &CompactionConfig::default(),
-        &context,
-        CompactionMethod::Soft,
-        "",
-        &interrupt,
-        &mut crate::agent::NullUi,
-        &mut |_, _, _| Err(anyhow::anyhow!("history fold rejected")),
-        &mut None,
-        &mut worker,
-    )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("history fold rejected"));
-    assert!(
-        finished.load(Ordering::SeqCst),
-        "the worker is joined before the error returns"
-    );
-    assert!(!interrupt.load(Ordering::SeqCst));
-}
-
-#[test]
-fn a_failed_turn_worker_fails_the_summary_without_setting_the_parent_interrupt() {
-    let user_dir = std::env::temp_dir();
-    let context = summary_context(&user_dir);
-    let messages = split_turn();
-    let interrupt = Arc::new(AtomicBool::new(false));
-    let mut worker = Some(SummaryWorker {
-        backend: remote_backend(),
-        complete: Box::new(
-            |_: &mut Backend, _: &Chat, _: &mut dyn Ui, _: Arc<AtomicBool>| -> Result<String> {
-                Err(anyhow::anyhow!("turn worker rejected"))
-            },
-        ),
-    });
-    let error = summarize_prefix_with_worker(
-        &mut remote_backend(),
-        &messages,
-        6,
-        &CompactionConfig::default(),
-        &context,
-        CompactionMethod::Soft,
-        "",
-        &interrupt,
-        &mut crate::agent::NullUi,
-        &mut |_, request, _| digest(request),
-        &mut None,
-        &mut worker,
-    )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("turn worker rejected"));
-    assert!(!interrupt.load(Ordering::SeqCst));
+fn split_failures_cancel_and_join_the_waiting_sibling_without_interrupting_the_parent() {
+    for (fail_history, user_stop) in [(true, false), (false, false), (true, true), (false, true)] {
+        let user_dir = std::env::temp_dir();
+        let context = summary_context(&user_dir);
+        let messages = split_turn();
+        let original = messages.clone();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(AtomicBool::new(false));
+        let (started, waiting) = mpsc::sync_channel(1);
+        let finish = joined.clone();
+        let main_wait = move |cancel: Arc<AtomicBool>| -> Result<String> {
+            started.send(()).unwrap();
+            let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+            while !cancel.load(Ordering::SeqCst) {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "sibling was not cancelled"
+                );
+                std::thread::yield_now();
+            }
+            finish.store(true, Ordering::SeqCst);
+            Err(crate::llm::Interrupted.into())
+        };
+        let parent_stop = interrupt.clone();
+        let reject = move |cancel: Arc<AtomicBool>| -> Result<String> {
+            waiting
+                .recv_timeout(HANDSHAKE_TIMEOUT)
+                .context("waiting sibling never started")?;
+            if user_stop {
+                parent_stop.store(true, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+                while !cancel.load(Ordering::SeqCst) {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "parent stop was not propagated"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+            Err(anyhow::anyhow!("original split failure"))
+        };
+        // Each callback is used once; channels make failure wait until the other half is active.
+        let (mut main, worker_complete): (
+            Box<super::super::execution::Completion>,
+            Box<super::super::execution::Completion>,
+        ) = if fail_history {
+            (
+                Box::new(move |_, _, _, cancel| reject(cancel)),
+                Box::new(move |_, _, _, cancel| main_wait(cancel)),
+            )
+        } else {
+            (
+                Box::new(move |_, _, _, cancel| main_wait(cancel)),
+                Box::new(move |_, _, _, cancel| reject(cancel)),
+            )
+        };
+        let mut worker = Some(SummaryWorker {
+            backend: remote_backend(),
+            complete: worker_complete,
+        });
+        let error = summarize_prefix_with_worker(
+            &mut remote_backend(),
+            &messages,
+            6,
+            &CompactionConfig::default(),
+            &context,
+            CompactionMethod::Soft,
+            "",
+            &interrupt,
+            &mut crate::agent::NullUi,
+            &mut main,
+            &mut None,
+            &mut worker,
+        )
+        .unwrap_err();
+        if user_stop {
+            assert!(error.is::<crate::llm::Interrupted>(), "{error:#}");
+        } else {
+            assert!(
+                format!("{error:#}").contains("original split failure"),
+                "{error:#}"
+            );
+            // A subsequent fallback still runs under the same untouched parent owner.
+            summarize_prefix(
+                &mut remote_backend(),
+                &messages,
+                6,
+                &CompactionConfig::default(),
+                &context,
+                CompactionMethod::Soft,
+                "",
+                &interrupt,
+                &mut crate::agent::NullUi,
+                &mut |_, request, _| digest(request),
+                &mut None,
+            )
+            .expect("split failure must not poison sequential fallback");
+        }
+        assert!(
+            joined.load(Ordering::SeqCst),
+            "waiting sibling must settle before return"
+        );
+        assert_eq!(interrupt.load(Ordering::SeqCst), user_stop);
+        assert_eq!(
+            messages, original,
+            "preparation never mutates original history"
+        );
+    }
 }
 
 #[test]
@@ -965,7 +1000,7 @@ fn the_turn_worker_forks_only_for_two_independent_remote_routes_and_a_nonempty_s
             "",
             &interrupt,
             &mut crate::agent::NullUi,
-            &mut |_, request, _| digest(request),
+            &mut |_, request, _, _| digest(request),
             &mut None,
             &mut worker,
         )

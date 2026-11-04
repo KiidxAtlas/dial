@@ -32,7 +32,7 @@ const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessio
 
 /// Credential file protected independently from other subscription-store data.
 pub fn credential_path(dir: &Path) -> std::path::PathBuf {
-    dir.join(FILE)
+    super::credential_store::subscription_path(dir, FILE)
 }
 const MAX_JSON: u64 = 64 * 1024;
 
@@ -81,13 +81,13 @@ fn cancelled(cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 fn load(dir: &Path) -> Result<State> {
-    let Some(bytes) = crate::platform::atomic::read_private(&dir.join(FILE))? else {
+    let Some(bytes) = crate::platform::atomic::read_private(&credential_path(dir))? else {
         return Ok(State::default());
     };
     serde_json::from_slice(&bytes).context("Anthropic subscription credentials are invalid")
 }
 fn save(dir: &Path, state: &State) -> Result<()> {
-    write_private(&dir.join(FILE), &serde_json::to_vec(state)?)
+    write_private(&credential_path(dir), &serde_json::to_vec(state)?)
 }
 pub fn signed_in(dir: &Path) -> bool {
     signed_in_checked(dir).unwrap_or(false)
@@ -319,7 +319,7 @@ pub fn login(dir: &Path, cancel: Arc<AtomicBool>) -> Result<String> {
         cancel,
     )?;
     let tokens = tokens(&value, None)?;
-    let _lock = locked(&dir.join(FILE))?;
+    let _lock = locked(&credential_path(dir))?;
     save(
         dir,
         &State {
@@ -334,7 +334,7 @@ pub fn access_token(dir: &Path, cancel: Arc<AtomicBool>) -> Result<SecretToken> 
     )
 }
 fn access_token_at(dir: &Path, token_url: &str, cancel: Arc<AtomicBool>) -> Result<SecretToken> {
-    let _lock = locked_cancellable(&dir.join(FILE), &cancel)?;
+    let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
     let mut state = load(dir)?;
     let previous = state
         .tokens
@@ -353,7 +353,7 @@ fn access_token_at(dir: &Path, token_url: &str, cancel: Arc<AtomicBool>) -> Resu
     Ok(SecretToken::new(token))
 }
 pub fn sign_out(dir: &Path) -> Result<String> {
-    let _lock = locked_for(&dir.join(FILE), None, Duration::from_secs(2))?;
+    let _lock = locked_for(&credential_path(dir), None, Duration::from_secs(2))?;
     let mut state = load(dir)?;
     state.tokens = None;
     save(dir, &state)?;

@@ -41,6 +41,9 @@ pub(in crate::agent) struct Acceptance {
     pub state: State,
     pub reason: String,
     checks: Vec<Observation>,
+    /// Controller-owned uncertainty is sticky and cannot be supplied by a worker payload.
+    #[serde(skip)]
+    effects_unknown: bool,
 }
 
 impl Acceptance {
@@ -70,6 +73,27 @@ impl Acceptance {
     pub fn reject(&mut self, reason: impl Into<String>) {
         self.state = State::Rejected;
         self.reason = reason.into();
+    }
+
+    pub(in crate::agent) fn integration_failed(
+        &mut self,
+        merge: &crate::agent::workers::isolation::Merge,
+    ) {
+        if !merge.applied.is_empty()
+            || merge.recovery_backup.is_some()
+            || merge.errors.iter().any(|error| error.stage == "rollback")
+        {
+            self.mark_effects_unknown();
+        }
+        self.reject("candidate was not coherently integrated");
+    }
+
+    pub(in crate::agent) fn mark_effects_unknown(&mut self) {
+        self.effects_unknown = true;
+    }
+
+    pub(in crate::agent) fn retry_safe(&self) -> bool {
+        !self.effects_unknown
     }
 
     /// Invalidity is sticky. Restoring old bytes does not silently reinstate acceptance.

@@ -177,3 +177,42 @@ fn missing_null_or_zero_timing_adds_no_line() {
         assert!(text.contains("Changed: 1 file(s): a.rs"), "{text}");
     }
 }
+
+#[test]
+fn next_steps_follow_turn_outcome_without_suggesting_unavailable_undo() {
+    for (summary, expected) in [
+        (
+            json!({"outcome":"completed", "changed_files":["a.rs"]}),
+            "Next: /review · /undo",
+        ),
+        (
+            json!({"outcome":"failed", "changed_files":["a.rs"]}),
+            "Next: continue · /undo",
+        ),
+        (
+            json!({"outcome":"failed", "changed_files":[]}),
+            "Next: continue",
+        ),
+    ] {
+        let report = render(&summary, &no_timing()).unwrap();
+        assert_eq!(
+            report.lines().find(|line| line.starts_with("Next:")),
+            Some(expected)
+        );
+        assert!(report.contains("Summary:"));
+    }
+}
+
+#[test]
+fn check_actions_disclose_missing_logs_and_reused_evidence() {
+    let summary = json!({"outcome":"completed", "changed_files":["a.rs"],
+    "checks_current":true, "recorded_checks":[
+        {"name":"test", "status":"passed", "reused":true, "evidence_ref":"artifact://exact"},
+        {"name":"lint", "status":"passed"}
+    ]});
+    let report = render(&summary, &no_timing()).unwrap();
+    assert!(report.contains("test passed (reused, not rerun)"));
+    assert!(report.contains("live freshness unknown"));
+    assert!(report.contains("/evidence check test — inspect exact retained evidence"));
+    assert!(report.contains("/evidence check lint — exact retained log unavailable"));
+}

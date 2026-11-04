@@ -17,6 +17,15 @@ symlink confinement and protected Dial storage exclusions are unchanged. This is
 not an approval to execute arbitrary tools. Roots are saved with the session in
 the same way as `/add-dir` roots.
 
+RPC and ACP session activation replaces the outgoing session's attached roots with
+the incoming session's saved, still-existing directories; new sessions start with
+no session-only roots. Checkpoints are rebound to that session and its restored
+roots before execution resumes. A parked ACP session does not lend its grants to
+another session. Explicit launch access remains distinct from session grants.
+Terminal session changes retain directories explicitly supplied with `--add-dir` for the launch,
+but replace additional roots granted only to the outgoing session. Sensitive grants are revoked
+even when a normal launch root remains available.
+
 Directory capability requests always require an actual interactive decision,
 including in auto approval modes. There is no “always allow” or “allow project”
 option. Denial, cancellation, or a directory changing during the popup leaves the
@@ -48,10 +57,10 @@ ChatGPT accounts, or Anthropic subscription credentials, cannot receive a sensit
 Session subdirectories can receive grants; native grants do not remove credential exclusions
 or scrubbed command environments.
 
-Sensitive grants are process-local, not restored from the session on resume.
+Sensitive grants are process-local and session-bound, not restored from the session on resume.
 The attached root may be restored, but its protected contents are locked again.
-Removing the root or moving the workspace revokes its sensitive grant. A denied
-second popup does not leave behind a normal root. Filesystem path checking is not
+Removing the root, moving the workspace, or switching sessions revokes its sensitive grant.
+A denied second popup does not leave behind a normal root. Filesystem path checking is not
 atomic with later file operations; the existing symlink-swap/hard-link residual
 limits described in `dial-tools` still apply.
 

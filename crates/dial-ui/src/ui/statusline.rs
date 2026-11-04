@@ -27,6 +27,47 @@ const LAST_RESORT_FLOOR: usize = 2;
 const CONTEXT_BAR_CELLS: usize = 6;
 const CONTEXT_HOT: f64 = 0.70;
 
+/// Compact active session controls; focus opens the existing keyboard-navigable editors.
+pub fn controls_row(
+    data: &StatusData,
+    keys: &super::keys::Keymap,
+    theme: &Theme,
+    width: u16,
+) -> Line<'static> {
+    let on = |value| match value {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "unknown",
+    };
+    let reasoning = if data.thinking.is_empty() {
+        "provider default"
+    } else {
+        &data.thinking
+    };
+    let label = format!(
+        "{} Controls · Planning {} · Approval {} · Reasoning(main) {} · Assistance {}",
+        keys.label(super::keys::Action::StatusFocus),
+        on(data.planning),
+        super::status::approval_label(&data.approval),
+        reasoning,
+        on(data.assistance),
+    );
+    let label = if data.controls_pending {
+        format!("Saved changes after turn (not active) · {label}")
+    } else {
+        label
+    };
+    let label = if theme.ascii() {
+        label.replace('·', "-")
+    } else {
+        label
+    };
+    Line::from(Span::styled(
+        text::ellipsize(&label, width as usize, theme.ascii()),
+        theme.fg(Tok::Muted),
+    ))
+}
+
 /// Segment names for the configured preset: `(left, right)`. `custom` uses `ui.status_left/right`
 /// verbatim (unknown names are skipped when rendering).
 pub fn segments(cfg: &UiConfig) -> (Vec<String>, Vec<String>) {
@@ -43,7 +84,7 @@ pub fn segments(cfg: &UiConfig) -> (Vec<String>, Vec<String>) {
                 "path",
                 "git",
             ]),
-            names(&["workers", "cost", "context"]),
+            names(&["inbox", "workers", "cost", "context"]),
         ),
         StatusPreset::Minimal => (
             names(&["model", "thinking", "inference"]),
@@ -155,49 +196,79 @@ pub fn activity_row(
     }
     let w = usize::from(width);
     let waiting = data.stopping() || data.phase == super::status::Phase::WaitingCompute;
-    let stale = data.model_progress.is_some() && data.model_silence_secs >= 15;
-    let tone = if waiting || stale {
-        Tok::Warning
-    } else {
-        Tok::Text
-    };
-    let marker = if waiting || stale {
+    let marker = if waiting {
         "!"
     } else {
         theme.spinner(data.tick)
     };
-    let prefix = text::clip(&format!(" {marker} "), w);
-    let mut spans = vec![Span::styled(prefix.clone(), theme.fg(tone))];
-    let clock = if w >= 40 && data.elapsed_secs.is_finite() && data.elapsed_secs >= 0.0 {
-        format!("  turn {} ", elapsed(data.elapsed_secs))
+    let tone = if waiting { Tok::Warning } else { Tok::Text };
+    let mut label = if data.stopping() {
+        data.activity_label()
+    } else if data.phase == super::status::Phase::Compacting {
+        "Compacting".into()
+    } else if data.phase == super::status::Phase::WaitingCompute {
+        "Waiting · local compute".into()
+    } else if let Some(progress) = &data.model_progress {
+        use crate::llm::InferencePhase;
+        match progress.phase {
+            InferencePhase::Loading => "Loading".into(),
+            InferencePhase::Processing => match (progress.processed_tokens, progress.prompt_tokens)
+            {
+                (Some(done), Some(total)) if total > 0 => format!(
+                    "Processing · {}/{} tok",
+                    human(done.min(total)),
+                    human(total)
+                ),
+                (_, Some(total)) => format!("Processing · {} tok", human(total)),
+                _ => "Processing".into(),
+            },
+            InferencePhase::Generating => {
+                let prefix = if progress.estimated { "~" } else { "" };
+                let mut label = "Generating".to_owned();
+                if let Some(tokens) = progress.output_tokens {
+                    label.push_str(&format!(" · {prefix}{} tok", human(tokens)));
+                }
+                if let Some(rate) = progress
+                    .tokens_per_second
+                    .filter(|n| n.is_finite() && *n > 0.0)
+                {
+                    label.push_str(&format!(" · {prefix}{rate:.1} tok/s"));
+                }
+                label
+            }
+        }
+    } else {
+        format!("Working · {}", data.activity_label())
+    };
+    if data.elapsed_secs.is_finite() && data.elapsed_secs >= 0.0 {
+        let (phase, detail) = label.split_once(" · ").unwrap_or((&label, ""));
+        label = format!(
+            "{phase} {}{}",
+            elapsed(data.elapsed_secs),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" · {detail}")
+            }
+        );
+    }
+    let silence = if data.model_progress.is_some() && data.model_silence_secs >= 15 && !waiting {
+        format!(" · no progress for {}s", data.model_silence_secs)
     } else {
         String::new()
     };
-    // The silence warning is more useful than an animated track during a stalled request.
-    let track = w >= 72 && !waiting && !stale;
-    let reserved = text::width(&prefix) + text::width(&clock) + if track { 10 } else { 0 };
-    let label = text::ellipsize(
-        &data.activity_label(),
-        w.saturating_sub(reserved),
-        theme.ascii(),
-    );
-    spans.push(Span::styled(
-        label.clone(),
-        theme.fg(tone).add_modifier(ratatui::style::Modifier::BOLD),
-    ));
-    spans.push(Span::raw(
-        " ".repeat(w.saturating_sub(reserved + text::width(&label))),
-    ));
-    if track {
-        spans.push(Span::raw("  "));
-        spans.extend(super::fx::activity_track(
-            theme,
-            data.tick,
-            data.prompt_fraction(),
-        ));
-    }
-    spans.push(Span::styled(clock, theme.fg(Tok::Muted)));
-    Some(Line::from(spans))
+    let prefix = text::clip(&format!(" {marker} "), w);
+    let suffix = text::clip(&silence, w.saturating_sub(text::width(&prefix) + 8));
+    let available = w.saturating_sub(text::width(&prefix) + text::width(&suffix));
+    let label = text::ellipsize(&text::one_line(&label), available, theme.ascii());
+    Some(Line::from(vec![
+        Span::styled(prefix.clone(), theme.fg(tone)),
+        Span::styled(label.clone(), theme.fg(tone)),
+        Span::styled(suffix.clone(), theme.fg(Tok::Muted)),
+        Span::raw(" ".repeat(
+            w.saturating_sub(text::width(&prefix) + text::width(&label) + text::width(&suffix)),
+        )),
+    ]))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -294,6 +365,7 @@ fn canonical(name: &str) -> Option<(&'static str, u8)> {
         "session" => ("session", 20),
         "time" => ("time", 20),
         "workers" => ("workers", 70),
+        "inbox" => ("inbox", 15),
         _ => return None,
     })
 }
@@ -551,6 +623,19 @@ impl Env<'_> {
                 ),
                 super::status::InputMode::Normal => None,
             },
+            "inbox" => {
+                if data.inbox_unread == 0 {
+                    return None;
+                }
+                self.seg(
+                    name,
+                    importance,
+                    vec![Some(self.part(
+                        format!("{} unread · /inbox", data.inbox_unread),
+                        Tok::Accent,
+                    ))],
+                )
+            }
             "context" => Some(self.context(importance)),
             "tokens" => {
                 let (tokens, estimated) = data.live_output_tokens();
@@ -616,7 +701,10 @@ impl Env<'_> {
                 self.seg(
                     name,
                     importance,
-                    vec![mark, Some(self.part(value, Tok::StatusApproval))],
+                    vec![
+                        mark,
+                        Some(self.part(super::status::approval_label(value), Tok::StatusApproval)),
+                    ],
                 )
             }
             "sandbox" => {
@@ -1072,6 +1160,36 @@ fn compose(
         home: std::env::var("HOME").ok(),
     };
     let (left_names, right_names) = segments(cfg);
+    // Progress has one dedicated row, rather than competing with metadata in the border.
+    let (left_names, right_names) = if cfg.status == StatusPreset::Default {
+        let names = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect();
+        if data.status_expanded {
+            let full = UiConfig {
+                status: StatusPreset::Full,
+                ..cfg.clone()
+            };
+            segments(&full)
+        } else if width < 80 {
+            (names(&["model", "approval"]), names(&["context"]))
+        } else if width < 120 {
+            (
+                names(&["model", "approval", "git"]),
+                names(&["cost", "context"]),
+            )
+        } else {
+            (left_names, right_names)
+        }
+    } else {
+        (left_names, right_names)
+    };
+    let left_names: Vec<_> = left_names
+        .into_iter()
+        .filter(|name| name != "spinner")
+        .collect();
+    let right_names: Vec<_> = right_names
+        .into_iter()
+        .filter(|name| name != "spinner")
+        .collect();
     let build = |names: &[String]| {
         names
             .iter()

@@ -26,7 +26,6 @@ pub const DEFAULT_LIMIT: usize = 20;
 pub const MAX_LIMIT: usize = 100;
 const MAX_PAGES: usize = 3;
 const KEY_ENV: &str = "SMITHERY_API_KEY";
-const KEY_FILE: &str = "smithery.json";
 
 /// Registry or auth failure. `status` is the HTTP status, or 0 for transport failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -902,7 +901,7 @@ pub fn key_file(user_dir: &Path) -> Result<PathBuf> {
     if user_dir.as_os_str().is_empty() {
         bail!("Smithery API key storage needs a Dial home directory.");
     }
-    Ok(user_dir.join(KEY_FILE))
+    Ok(crate::config::paths::smithery_key_file(user_dir))
 }
 
 pub fn read_key(path: &Path) -> Result<Option<String>> {

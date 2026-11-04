@@ -108,10 +108,10 @@ pub(super) fn settings_fingerprint(layout: &Layout) -> Result<u64> {
 /// Files hashed by `resources_fingerprint` and watched by `resource_events`.
 fn resource_files(layout: &Layout) -> [std::path::PathBuf; 10] {
     [
-        layout.user_dir.join("keybindings.toml"),
-        layout.user_dir.join("skills.json"),
+        crate::config::paths::keybindings_file(&layout.user_dir),
+        crate::config::paths::skills_file(&layout.user_dir),
         layout.state_dir.join("skills.json"),
-        layout.user_dir.join("SOUL.md"),
+        crate::config::paths::soul_file(&layout.user_dir),
         layout.project_dir.join("SYSTEM.md"),
         layout.project_dir.join("APPEND_SYSTEM.md"),
         layout.project_dir.join("AGENTS.md"),
@@ -125,10 +125,10 @@ fn resource_files(layout: &Layout) -> [std::path::PathBuf; 10] {
 fn resource_dirs(layout: &Layout) -> [(std::path::PathBuf, bool); 5] {
     [
         (layout.project_dir.join("commands"), false),
-        (layout.user_dir.join("commands"), false),
-        (layout.user_dir.join("themes"), false),
+        (crate::config::paths::commands_dir(&layout.user_dir), false),
+        (crate::config::paths::themes_dir(&layout.user_dir), false),
         (layout.project_dir.join("skills"), true),
-        (layout.user_dir.join("skills"), true),
+        (crate::config::paths::skills_dir(&layout.user_dir), true),
     ]
 }
 

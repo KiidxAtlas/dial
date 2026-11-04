@@ -109,6 +109,13 @@ fn failed_reroot_restores_the_original_writer_and_workspace() {
         app.layout.project_root
     );
     assert!(original.exists());
+    // Release the live writer first: a held writer makes any reopen look contended, not moved.
+    drop(agent);
+    // The rolled-back ledger entry must not make the original look moved: it reopens in place.
+    assert!(matches!(
+        Session::open_or_fork(&app.layout, &original).unwrap(),
+        crate::storage::session::Resumed::Owned(_)
+    ));
     assert!(Session::list(&target, 10).unwrap_or_default().is_empty());
 }
 
@@ -134,4 +141,53 @@ fn rejected_destination_validation_leaves_the_session_untouched() {
     assert_eq!(agent.session().path().unwrap(), original);
     assert_eq!(agent.workspace().root(), app.layout.project_root);
     assert!(original.exists());
+}
+
+#[test]
+fn terminal_switch_preserves_launch_roots_but_replaces_session_only_grants() {
+    let (_home, _project, mut app) = fixture();
+    let launch = tempfile::tempdir().unwrap();
+    let outgoing = tempfile::tempdir().unwrap();
+    let incoming = tempfile::tempdir().unwrap();
+    app.add_dirs = vec![launch.path().canonicalize().unwrap()];
+    let session = Session::create(
+        &app.layout,
+        SessionMeta {
+            model: app.config.model.clone(),
+        },
+    )
+    .unwrap();
+    let mut agent = app.make_agent(session).unwrap();
+    agent
+        .add_workspace_roots(&[outgoing.path().to_owned()])
+        .unwrap();
+    agent.persist_workspace_roots().unwrap();
+    let mut next = Session::create(
+        &app.layout,
+        SessionMeta {
+            model: app.config.model.clone(),
+        },
+    )
+    .unwrap();
+    next.set_additional_dirs(&[incoming.path().to_owned()])
+        .unwrap();
+    let old = app.swap_agent_session(&mut agent, next).unwrap();
+    let roots = agent.workspace().additional_roots();
+    assert!(roots.contains(&launch.path().canonicalize().unwrap()));
+    assert!(roots.contains(&incoming.path().canonicalize().unwrap()));
+    assert!(!roots.contains(&outgoing.path().canonicalize().unwrap()));
+    let previous = app.swap_agent_session(&mut agent, old).unwrap();
+    assert!(
+        agent
+            .workspace()
+            .additional_roots()
+            .contains(&outgoing.path().canonicalize().unwrap())
+    );
+    assert!(
+        !agent
+            .workspace()
+            .additional_roots()
+            .contains(&incoming.path().canonicalize().unwrap())
+    );
+    drop(previous);
 }

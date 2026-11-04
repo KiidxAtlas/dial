@@ -34,6 +34,41 @@ fn directory_listing_is_by_name_and_does_not_expand_generated_directories() {
         "{out}"
     );
 }
+
+#[test]
+fn directory_read_identity_tracks_only_the_visible_listing() {
+    use sha2::{Digest, Sha256};
+
+    let (dir, ws) = workspace();
+    fs::create_dir_all(dir.path().join("src/nested/deeper/bottom")).unwrap();
+    fs::create_dir_all(dir.path().join("src/target")).unwrap();
+    let identity = ws
+        .read_identity("src")
+        .expect("directory observation identity");
+    let listing = run(&ws, "read", json!({"path":"src"}));
+    assert!(!listing.is_error);
+    assert_eq!(
+        identity,
+        <[u8; 32]>::from(Sha256::digest(listing.text.as_bytes()))
+    );
+    assert!(ws.file_identity(&dir.path().join("src")).is_none());
+    for invisible in [
+        "unrelated.txt",
+        "src/target/generated.rs",
+        "src/nested/deeper/bottom/hidden.rs",
+    ] {
+        fs::write(dir.path().join(invisible), "not listed").unwrap();
+        assert_eq!(ws.read_identity("src"), Some(identity), "{invisible}");
+    }
+    let visible = dir.path().join("src/nested/visible.rs");
+    fs::write(&visible, "source").unwrap();
+    assert_ne!(ws.read_identity("src"), Some(identity));
+    fs::remove_file(visible).unwrap();
+    assert_eq!(ws.read_identity("src"), Some(identity));
+    assert!(ws.read_identity("missing").is_none());
+    let outside = tempfile::tempdir().unwrap();
+    assert!(ws.read_identity(outside.path().to_str().unwrap()).is_none());
+}
 #[test]
 fn read_numbers_lines_and_pages() {
     let (dir, ws) = workspace();

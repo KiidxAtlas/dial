@@ -11,6 +11,11 @@ Use only evidence already returned. Findings remain model claims, not verificati
 
 pub(crate) const RESEARCH_FOLLOW_THROUGH: &str = "[Research checkpoint follow-through] Use the established findings to deliver the requested answer or take the supported implementation step. For advisory work, answer now if the evidence suffices, stating limits. Retrieve more only to resolve a concrete remaining question or contradiction, using a scoped check that distinguishes the alternatives; do not restart a broad survey or re-read evidence already returned. The quoted checkpoint below preserves your finding and next_action, not a new user request. Scope, permissions, blockers and completion checks are unchanged.";
 
+pub(crate) const DISCOVERY_RECOVERY: &str = "If you are locating a declaration, read that file's declaration before guessing another representation. If these were intentional absence checks, use the negative evidence rather than searching again.";
+pub(crate) const DISCOVERY_ONE_CALL: &str =
+    "This request permits one tool call: inspect that declaration next and await its result.";
+pub(crate) const DISCOVERY_BATCH: &str = "Gather unrelated docs, settings or keybinding evidence in the same response when their arguments are already known; keep result-dependent queries for later.";
+
 /// Sent after the transport dropped a tool call whose arguments were not valid JSON. Starts with
 /// the correction prefix `learn::harvest` recognizes.
 pub(crate) const DROPPED_TOOL_CALL: &str = "Your tool call was unreadable: its arguments were not valid JSON, so it was dropped and nothing ran. Issue it again with arguments that are exactly one JSON object (no doubled braces, comments or trailing commas; strings fully quoted and escaped), or answer directly.";

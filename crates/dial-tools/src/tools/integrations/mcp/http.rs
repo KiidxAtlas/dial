@@ -37,6 +37,8 @@ const CANCEL_POLL: Duration = Duration::from_millis(50);
 const MAX_EVENT_LINE: u64 = 16 * 1024 * 1024;
 /// Most data one event may carry, counted across its `data:` lines as they arrive.
 const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+/// Replay cursors are untrusted header values, not event bodies.
+const MAX_EVENT_ID_BYTES: usize = 1024;
 /// How long a streamable-HTTP GET stream runs before it is reopened on the same session.
 const STREAMABLE_LISTEN_LIFETIME: Duration = Duration::from_secs(600);
 /// How long a legacy SSE stream runs; it carries every reply, so its end closes the session.
@@ -139,6 +141,15 @@ pub(super) struct Auth {
 }
 
 impl Auth {
+    /// Fixed credentials take precedence over every stored OAuth grant.
+    pub(super) fn has_fixed_credentials(config: &McpServerConfig) -> bool {
+        config.bearer_env.is_some()
+            || config
+                .headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("authorization"))
+    }
+
     pub(super) fn new(
         server: &str,
         config: &McpServerConfig,
@@ -154,9 +165,7 @@ impl Auth {
                 .map_err(|_| anyhow!("environment variable {var} (bearer_env) is not set"))?;
             headers.push(("Authorization".into(), format!("Bearer {}", token.trim())));
         }
-        let fixed = headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+        let fixed = Self::has_fixed_credentials(config);
         Ok(Auth {
             server: server.to_owned(),
             headers,
@@ -240,6 +249,7 @@ pub struct Http {
     listener: Mutex<Option<std::thread::JoinHandle<()>>>,
     sse: bool,
     endpoint: Mutex<Option<String>>,
+    last_event_id: Mutex<Option<String>>,
     /// How long one GET event stream may run before Dial closes it (see `read_stream`).
     stream_lifetime: Duration,
 }
@@ -263,6 +273,7 @@ impl Http {
             listener: Mutex::new(None),
             sse: config.transport == Some(McpTransport::Sse),
             endpoint: Mutex::default(),
+            last_event_id: Mutex::default(),
             stream_lifetime: if config.transport == Some(McpTransport::Sse) {
                 LEGACY_LISTEN_LIFETIME
             } else {
@@ -490,6 +501,15 @@ impl Http {
             if let Some(id) = self.session() {
                 request = request.header("Mcp-Session-Id", id.as_str());
             }
+            if !self.sse
+                && let Some(id) = self
+                    .last_event_id
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+            {
+                request = request.header("Last-Event-ID", id.as_str());
+            }
             if let Some(version) = self.protocol() {
                 request = request.header("MCP-Protocol-Version", version.as_str());
             }
@@ -544,7 +564,7 @@ impl Http {
         // that elapses, so a server that stalls cannot hold this thread and its socket forever.
         // Cancellation is polled below TLS even while the stream is silent; shutdown joins it.
         let reader = BufReader::new(response.body_mut().with_config().limit(u64::MAX).reader());
-        read_events(
+        read_events_with_id(
             reader,
             &|| !self.stop.load(Ordering::Relaxed),
             &mut |event, data| {
@@ -569,6 +589,12 @@ impl Http {
                     }
                 }
                 true
+            },
+            &mut |id| {
+                if !self.sse {
+                    *self.last_event_id.lock().unwrap_or_else(|e| e.into_inner()) =
+                        replay_cursor(id);
+                }
             },
         )
         .map_err(|e| {
@@ -778,10 +804,27 @@ pub(super) fn flatten(value: Value) -> Vec<Value> {
 /// Comments and fields other than `event`/`data` are ignored. The data of one event may not exceed
 /// [`MAX_EVENT_BYTES`]; that is counted as the lines arrive, so an event that never ends is refused.
 pub(super) fn read_events(
-    mut reader: impl BufRead,
+    reader: impl BufRead,
     keep_going: &dyn Fn() -> bool,
     on_event: &mut dyn FnMut(&str, &str) -> bool,
 ) -> std::io::Result<()> {
+    read_events_with_id(reader, keep_going, on_event, &mut |_| {})
+}
+
+fn replay_cursor(id: &str) -> Option<String> {
+    (!id.is_empty()
+        && id.len() <= MAX_EVENT_ID_BYTES
+        && ureq::http::HeaderValue::from_str(id).is_ok())
+    .then(|| id.to_owned())
+}
+
+fn read_events_with_id(
+    mut reader: impl BufRead,
+    keep_going: &dyn Fn() -> bool,
+    on_event: &mut dyn FnMut(&str, &str) -> bool,
+    on_id: &mut dyn FnMut(&str),
+) -> std::io::Result<()> {
+    let mut id: Option<String> = None;
     let mut event = String::new();
     let mut data: Vec<String> = Vec::new();
     let mut data_bytes = 0usize;
@@ -801,22 +844,27 @@ pub(super) fn read_events(
                 "server-sent event line is too long",
             ));
         }
+        // EOF is not an SSE dispatch boundary. A partial event (including its id) must
+        // be replayable, even when its last data line happened to be complete JSON.
+        if read == 0 {
+            return Ok(());
+        }
         let line = std::str::from_utf8(&raw)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let text = line.trim_end_matches(['\r', '\n']);
-        if read == 0 || text.is_empty() {
+        if text.is_empty() {
             if !data.is_empty() {
                 let name = if event.is_empty() { "message" } else { &event };
                 if !on_event(name, &data.join("\n")) {
                     return Ok(());
                 }
             }
+            if let Some(id) = id.take() {
+                on_id(&id);
+            }
             data.clear();
             data_bytes = 0;
             event.clear();
-            if read == 0 {
-                return Ok(());
-            }
         } else if let Some(rest) = text.strip_prefix("data:") {
             let rest = rest.strip_prefix(' ').unwrap_or(rest);
             // The joined event gets one newline between lines; count it as it is added.
@@ -829,6 +877,19 @@ pub(super) fn read_events(
             }
             data_bytes += added;
             data.push(rest.to_owned());
+        } else if text == "id" {
+            id = Some(String::new());
+        } else if let Some(rest) = text.strip_prefix("id:") {
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            // NUL ids are ignored by SSE. Unusable/oversized ids reset resumability rather
+            // than replaying from an earlier cursor and silently skipping invalidations.
+            if !rest.contains('\0') {
+                id = Some(if replay_cursor(rest).is_some() {
+                    rest.to_owned()
+                } else {
+                    String::new()
+                });
+            }
         } else if let Some(rest) = text.strip_prefix("event:") {
             event = rest.trim().to_owned();
         }

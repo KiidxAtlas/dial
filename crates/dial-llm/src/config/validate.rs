@@ -20,6 +20,7 @@ impl Config {
         self.validate_runtimes()?;
         self.validate_model_profiles()?;
         self.validate_model_roles()?;
+        self.validate_vision()?;
         self.validate_fallback_chains()?;
         self.validate_providers()?;
         self.validate_improve()?;
@@ -74,6 +75,9 @@ impl Config {
         for selection in std::iter::once(self.selection())
             .chain(self.model_roles.values().cloned())
             .chain(self.model_favorites.iter().cloned())
+            .chain(self.vision.grounding.iter().cloned())
+            .chain(self.vision.image_embedding.iter().cloned())
+            .chain(self.plan_model.iter().cloned())
         {
             crate::llm::model_config::validate_headers(
                 selection.headers.as_deref().unwrap_or_default(),
@@ -390,14 +394,10 @@ impl Config {
                 "model role {role} has no model"
             );
             ensure!(
-                role != "decision" || selection.provider == crate::config::laya::PROVIDER,
-                "the decision role is the Laya checkpoint; assign it with /roles or with dial laya install --checkpoint"
-            );
-            ensure!(
-                role != "judge"
+                role != "decision"
                     || selection.provider != crate::config::laya::PROVIDER
                     || selection.model == crate::config::laya::JUDGE_MODEL,
-                "a Laya judge uses the decision role's checkpoint; set model_roles.judge.model = {:?} and choose the checkpoint with the decision role",
+                "a Laya decision uses laya.checkpoint; set model_roles.decision.model = {:?} and configure laya.checkpoint separately",
                 crate::config::laya::JUDGE_MODEL
             );
             if let Some(level) = selection.thinking.as_deref() {

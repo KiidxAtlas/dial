@@ -264,7 +264,7 @@ fn long_prompts_are_bounded_on_a_char_boundary() {
 }
 
 #[test]
-fn judge_config_prefers_judge_then_small_then_main() {
+fn judge_config_prefers_decision_then_small_then_main() {
     use crate::llm::model_config::ModelSelection;
     let selection = |model: &str| ModelSelection {
         provider: "openai".into(),
@@ -282,8 +282,8 @@ fn judge_config_prefers_judge_then_small_then_main() {
     assert_eq!(judge_config(&config).model, "small-model");
     config
         .model_roles
-        .insert("judge".into(), selection("judge-model"));
-    assert_eq!(judge_config(&config).model, "judge-model");
+        .insert("decision".into(), selection("decision-model"));
+    assert_eq!(judge_config(&config).model, "decision-model");
 }
 
 #[test]
@@ -341,18 +341,69 @@ fn laya_judge_asks_one_typed_choice_and_caches_by_checkpoint() {
 }
 
 #[test]
-fn judge_role_assigned_to_laya_is_recognised() {
+fn decision_role_assigned_to_laya_is_recognised() {
     use crate::llm::model_config::ModelSelection;
     let mut config = Config::default();
     assert!(!judge_uses_laya(&config));
     config.model_roles.insert(
-        "judge".into(),
-        ModelSelection::new(
-            crate::config::laya::PROVIDER,
-            crate::config::laya::JUDGE_MODEL,
-        ),
+        "decision".into(),
+        ModelSelection::new(crate::config::laya::PROVIDER, "decision"),
     );
     assert!(judge_uses_laya(&config));
+}
+
+#[test]
+fn decision_laya_uses_persistent_checkpoint_without_chat_fallback() {
+    use crate::llm::{fake, model_config::ModelSelection};
+    for valid in [true, false] {
+        let health = json!({"service":"dial-laya","protocol":1,"status":"ok","busy":false,"checkpoint":"/persistent-ckpt","device":"cpu"});
+        let answer = if valid { "medium" } else { "not-a-choice" };
+        let mut script = Vec::new();
+        for _ in 0..if valid { 1 } else { MAX_ATTEMPTS } {
+            script.push(fake::json(200, &health));
+            script.push(fake::json(
+                200,
+                &json!({"answers":{"choice":{"choice":answer,"confidence":0.8}}}),
+            ));
+        }
+        let laya = fake::serve(script);
+        let main = fake::serve(vec![]);
+        let home = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            provider: Some("endpoint".into()),
+            endpoint: Some(crate::config::types::EndpointConfig {
+                base_url: format!("{}/v1", main.url),
+                headers: None,
+                api_key_env: None,
+                allow_insecure: false,
+                protocol: None,
+                account_id: None,
+            }),
+            ..Default::default()
+        };
+        config.laya.endpoint = laya.url.clone();
+        config.laya.checkpoint = Some("/persistent-ckpt".into());
+        config
+            .model_roles
+            .insert("decision".into(), ModelSelection::new("laya", "decision"));
+        let result = judge_turn_thinking(
+            &config,
+            home.path(),
+            "fix the parser",
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        if valid {
+            assert_eq!(result.unwrap().choice, "medium");
+            assert_eq!(laya.requests().len(), 2);
+        } else {
+            assert!(result.is_err(), "invalid typed choice must fail closed");
+        }
+        assert!(
+            main.requests().is_empty(),
+            "typed decisions never fall back to chat"
+        );
+    }
 }
 
 #[test]

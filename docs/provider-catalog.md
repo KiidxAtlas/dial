@@ -112,9 +112,22 @@ are served by dial's own MLX server (so LoRA training applies), and running LM S
 servers on their usual loopback ports, plus Docker Model Runner (`docker-model-runner`, `http://127.0.0.1:12434/engines/v1`, override with `DOCKER_MODEL_RUNNER_BASE_URL`; see [docker.md](docker.md)). It also discovers OpenAI-compatible endpoints and Anthropic's
 Messages API. OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, Mistral and DeepSeek have setup presets.
 
+Interactive refreshes keep one active discovery scan and coalesce pending refreshes to the latest
+configuration. Superseded scans cannot publish over newer requests. Gemini and Anthropic model
+lists follow opaque continuation tokens on the original authenticated endpoint, within one shared
+listing deadline (one second for local endpoints, five seconds remote), 16 pages, 512 raw model rows
+and 2 MiB of response bytes. Repeated/invalid cursors or incomplete listings fail without replacing
+the saved catalog with a partial first page.
+
+Ollama `/api/show` capability enrichment is optional: at most 16 requests, eight concurrently, share
+a one-second budget. Remaining models stay listed with unknown capabilities. Single-model metadata
+and context-window lookups share an immutable parsed catalog snapshot instead of copying unrelated
+rows; file-version invalidation is unchanged. These bounds and allocation changes are not measured
+latency or live-provider compatibility results.
+
 SambaNova (`SAMBANOVA_API_KEY`, `https://api.sambanova.ai/v1`) and Inception (`INCEPTION_API_KEY`, `https://api.inceptionlabs.ai/v1`) are OpenAI-compatible chat-completions providers with bundled model cards (SambaNova `gpt-oss-120b`; Inception `mercury-2`, `mercury-2.5`, `mercury-3`). Inception's `minimal` reasoning rung is sent on the wire as `instant` (declared per model by the catalog's `m` effort-wire map); `low`, `medium` and `high` send their own names.
 
-TypeSafe System One is a judgment-only backend, not a chat provider. Assign it to the `judge` role (`provider = "typesafe"`, `model = "jev-latest"` by default) and set `TYPESAFE_API_KEY`; `TYPESAFE_BASE_URL` overrides `https://api.typesafe.ai`. Thinking judgments then POST `{base}/v1/systemone` with a typed `choice` question. A missing key is reported when a judgment runs; it is never silently replaced by another model.
+TypeSafe System One is a judgment-only backend, not a chat provider. Assign it to the `decision` role (`provider = "typesafe"`, `model = "jev-latest"` by default) and set `TYPESAFE_API_KEY`; `TYPESAFE_BASE_URL` overrides `https://api.typesafe.ai`. Thinking judgments then POST `{base}/v1/systemone` with a typed `choice` question. A missing key is reported when a judgment runs; it is never silently replaced by another model.
 
 **GitLab Duo Agent** (`gitlab-duo-agent`, protocol `gitlab-duo-agent`, `https://gitlab.com`) runs GitLab's Duo Agent Platform workflows over a WebSocket. Authenticate with `GITLAB_TOKEN` (personal access token with `api` scope) or the `gitlab-duo-agent` OAuth sign-in. Set `GITLAB_DUO_PROJECT` to a full project path (`group/subgroup/project`) to choose the project; when unset, Dial uses the first project where the user has Developer or higher access. Nested projects resolve their root group from the namespace's full path. Dial creates a workflow for the conversation and streams the agent's checkpoint text as it arrives. Server-side `runMCPTool` actions become ordinary Dial tool calls, so approvals, sandbox confinement and tool output apply unchanged; results return to the same workflow. Workflow approval statuses that carry a tool action surface as that tool call through the normal approval gate, and a denial is sent back as the tool result. An approval status with no tool action still fails the turn. Workflows are reused across turns of one session. Resetting, cancelling or forgetting a session sends a best-effort REST stop (5-second cap) before closing the socket. Step-limit and transient "Duo Agent Platform" errors restart the workflow with the transcript (at most four step-limit restarts and one transient retry); text already streamed in the turn is not repeated after a restart.
 
@@ -201,7 +214,7 @@ concurrently with sessions too, without acquiring or waiting for the lock. This 
 policy: other sessions and already-running workers retain their own settings; restart background
 workers to apply a change. Concurrent work can exhaust RAM/GPU memory. Explicit background pause,
 stop and cancellation controls remain active; data-integrity locks are not disabled.
-Laya decision and judge roles never make a session acquire the shared compute lock.
+Laya typed decisions never make a session acquire the shared compute lock.
 
 Idle chats keep resident main and role models loaded between turns, so the next turn starts
 without reloading the weights. Once the turn and its child agents finish, they unload them only

@@ -8,7 +8,7 @@
 //! `repro` registers a model-written reproduction for this turn only. It joins the gate's
 //! selection, is approved like a `bash` call, and earns behavioral credit only after a code
 //! failure at an earlier effect revision and a pass at the final one (`evidence::ReproState`).
-use crate::agent::verify::evidence::MAX_REPROS;
+use crate::agent::verify::evidence::{MAX_REPROS, ReproState};
 use crate::agent::verify::verification::{CheckStatus, FocusedCheck};
 use crate::agent::*;
 
@@ -280,7 +280,7 @@ impl Agent<'_> {
                     text.push(diagnostics(&output.text));
                 }
             }
-            let mut result = json!({"name":check.name,"command":check.command,"status":name,"reused":reused,"ran":output.is_some()});
+            let mut result = json!({"name":check.name,"command":check.command,"status":name,"reused":reused,"ran":output.is_some(),"evidence_ref":self.step_checks.evidence.evidence_ref(&check.command)});
             if reused {
                 result["observed_revision"] =
                     json!(self.step_checks.evidence.observed_revision(&check.command));
@@ -306,6 +306,9 @@ impl Agent<'_> {
                         .repro_state(&check.command, self.step_checks.revision());
                     text.push(format!("  reproduction: {}", state.describe()));
                     result["reproduction"] = json!(state.as_str());
+                    if status == CheckStatus::Passed && state == ReproState::NotShownToReproduce {
+                        text.push("  Post-fix check passed; pre-fix failure was not observed. Rereads or unchanged reruns cannot recover that history. Do not undo the fix to manufacture credit. Report the gap if fail-then-pass proof is required; otherwise finish once remaining acceptance checks pass.".into());
+                    }
                 }
             }
             results.push(result);

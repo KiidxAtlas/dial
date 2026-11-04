@@ -234,22 +234,40 @@ fn require(id: &str) -> Result<&'static Flow> {
 }
 
 fn path(user_dir: &Path, id: &str) -> PathBuf {
-    user_dir.join(format!("oauth-{id}.json"))
+    super::credential_store::oauth_path(user_dir, id)
 }
 
 type Grants = Store<Credentials>;
 
 /// Every account stored for a provider. A missing file holds none; a legacy single-grant file
 /// loads as one account (see [`accounts::parse`]).
+fn current_path(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return path.to_owned();
+    };
+    if parent.file_name().is_some_and(|name| name == "auth") {
+        return path.to_owned();
+    }
+    let Some(name) = path.file_name() else {
+        return path.to_owned();
+    };
+    let migrated = parent.join("auth").join(name);
+    if migrated.exists() {
+        migrated
+    } else {
+        path.to_owned()
+    }
+}
+
 fn load(path: &Path) -> Result<Grants> {
-    match crate::platform::atomic::read_private(path)? {
+    match crate::platform::atomic::read_private(&current_path(path))? {
         Some(bytes) => accounts::parse(&bytes),
         None => Ok(Grants::default()),
     }
 }
 
 fn save(path: &Path, grants: &Grants) -> Result<()> {
-    write_private(path, &serde_json::to_vec(grants)?)
+    write_private(&current_path(path), &serde_json::to_vec(grants)?)
 }
 
 pub fn signed_in(user_dir: &Path, id: &str) -> bool {
@@ -350,13 +368,12 @@ pub fn sign_out(user_dir: &Path, id: &str) -> Result<String> {
     let path = path(user_dir, id);
     let _lock = locked_for(&path, None, std::time::Duration::from_secs(2))?;
     advance_sign_out_generation(flow.id);
-    if path.exists() {
-        std::fs::remove_file(&path).context("could not remove the stored OAuth grant")?;
-    }
+    // Keep an empty document: deleting it would resurrect the retained legacy grant.
+    save(&path, &Grants::default())?;
     Ok(format!("Signed out of {}", flow.name))
 }
 
-/// Remove one stored account. The grant file is deleted together with its last account.
+/// Remove one stored account. An empty store prevents legacy grants being resurrected.
 pub fn sign_out_account(user_dir: &Path, id: &str, key: &str) -> Result<String> {
     let flow = require(id)?;
     let path = path(user_dir, id);
@@ -365,13 +382,7 @@ pub fn sign_out_account(user_dir: &Path, id: &str, key: &str) -> Result<String> 
     let removed = grants
         .remove(key)
         .with_context(|| format!("no stored {} account to remove", flow.name))?;
-    if grants.is_empty() {
-        if path.exists() {
-            std::fs::remove_file(&path).context("could not remove the stored OAuth grant")?;
-        }
-    } else {
-        save(&path, &grants)?;
-    }
+    save(&path, &grants)?;
     let who = label(&removed).unwrap_or_else(|| key.to_owned());
     Ok(format!("Removed {} account {who}", flow.name))
 }

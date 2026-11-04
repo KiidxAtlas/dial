@@ -9,24 +9,32 @@ use std::collections::BTreeMap;
 pub enum Tab {
     Mcp,
     Skills,
+    Tools,
+    Hooks,
 }
 
 /// Number of tabs; sizes the per-tab arrays in [`Browser`].
-const TABS: usize = 2;
+const TABS: usize = 4;
 const _: () = assert!(Tab::ALL.len() == TABS);
 
 impl Tab {
-    pub const ALL: [Tab; TABS] = [Tab::Mcp, Tab::Skills];
+    pub const ALL: [Tab; TABS] = [Tab::Mcp, Tab::Skills, Tab::Tools, Tab::Hooks];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Mcp => "MCP servers",
             Tab::Skills => "Skills",
+            Tab::Tools => "Tool groups",
+            Tab::Hooks => "Hooks",
         }
     }
 
     fn index(self) -> usize {
         Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+
+    pub fn has_catalog(self) -> bool {
+        matches!(self, Self::Mcp | Self::Skills)
     }
 }
 
@@ -426,6 +434,11 @@ impl Browser {
 
     pub fn tab(&self) -> Tab {
         self.tab
+    }
+
+    pub fn select_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.details_open = false;
     }
 
     pub fn query(&self) -> &str {

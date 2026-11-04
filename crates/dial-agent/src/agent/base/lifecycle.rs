@@ -312,7 +312,7 @@ impl<'a> Agent<'a> {
             &layout.state_dir.join("artifacts"),
         )?);
         // Cargo build output is scoped per session so concurrent sessions do not share one target lock.
-        let workspace = workspace.with_cargo_session(session.id());
+        let workspace = workspace.with_cargo_session(session.id())?;
         {
             // A new session takes over an idle earlier session's build output (one rename) so its
             // first build is incremental; output that has gone stale is removed in the background.
@@ -508,6 +508,7 @@ impl<'a> Agent<'a> {
                 .register(crate::tools::knowledge::history::tool(history.clone()));
         }
         agent.restore_control()?;
+        agent.record_main_model_route("Main backend initialized for this process from the supplied session selection; earlier launch-selection provenance unavailable (not recorded)");
         agent.initialize_coordination();
         agent.rebuild_system();
         Ok(agent)

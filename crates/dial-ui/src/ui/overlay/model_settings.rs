@@ -1,4 +1,4 @@
-//! `/model settings`: a profile editor for the current main model.
+//! A profile editor for the explicitly targeted model; browsing never changes the active model.
 //!
 //! Values are grouped into sections. Toggles and choices cycle with Left/Right, numbers step the same
 //! way (Enter types an exact value), text rows take plain typed text, and anything else is a TOML
@@ -400,6 +400,9 @@ pub struct ModelSettingsOverlay {
     /// Page-key step from the most recently drawn list height.
     page: usize,
     scope: Scope,
+    project_name: String,
+    /// Main-model tuning may activate its profile; selected-model tuning must not switch main.
+    activate_profile: bool,
     editor: Option<Editor>,
     pending: Option<(ModelProfile, String)>,
     message: Option<(String, bool)>,
@@ -425,6 +428,8 @@ impl ModelSettingsOverlay {
             scroll: 0,
             page: 6,
             scope: Scope::Project,
+            project_name: "this project".into(),
+            activate_profile: true,
             editor: None,
             pending: None,
             message: None,
@@ -433,6 +438,27 @@ impl ModelSettingsOverlay {
         }
     }
 
+    /// Edit a selected model without changing the main model or its explicit profile pin.
+    pub fn for_selected_model(mut self) -> Self {
+        self.activate_profile = false;
+        self
+    }
+
+    /// Whether the controller should also pin this profile as the main model's profile.
+    pub fn activates_profile(&self) -> bool {
+        self.activate_profile
+    }
+
+    /// Use the same visible storage destination as the enclosing model picker.
+    pub fn with_scope(mut self, scope: Scope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub fn with_project_name(mut self, name: &str) -> Self {
+        self.project_name = text::one_line(name);
+        self
+    }
     /// Supplies Dial's effective grammar with this profile's pin cleared. Kept separately so resetting
     /// or cycling back to inheritance never persists the resolved fallback as a model pin.
     pub fn with_inherited_edit_mode(mut self, mode: String) -> Self {
@@ -833,7 +859,12 @@ impl ModelSettingsOverlay {
             Ok(()) => {
                 if let Some((profile, what)) = self.pending.take() {
                     self.profile = profile;
-                    self.message = Some((format!("{what} · applies to the next request"), false));
+                    let timing = if self.activate_profile {
+                        "saved main profile · next request after active turn"
+                    } else {
+                        "saved selected-model profile · main selection unchanged"
+                    };
+                    self.message = Some((format!("{what} · {timing}"), false));
                 }
                 if let Some(index) = self.staged_suggestion.take()
                     && index < self.suggestions.len()
@@ -1069,7 +1100,12 @@ impl ModelSettingsOverlay {
                     self.message = Some(("Already using the default".into(), false));
                     return OverlayEvent::None;
                 }
-                KeyCode::Char('s') => {
+                KeyCode::Char('s') | KeyCode::Char('S')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                        || key.code == KeyCode::Char('s') =>
+                {
                     self.scope = other_scope(self.scope);
                     self.message = Some((
                         format!("Changes now save to {} settings", scope_name(self.scope)),
@@ -1077,6 +1113,7 @@ impl ModelSettingsOverlay {
                     ));
                     return OverlayEvent::None;
                 }
+                KeyCode::Char('c') => return OverlayEvent::Action("open:providers".into()),
                 KeyCode::Char('d') => return OverlayEvent::Action("open:context-defaults".into()),
                 KeyCode::Char('g') => return OverlayEvent::Action("open:settings".into()),
                 _ => {}
@@ -1096,6 +1133,14 @@ impl ModelSettingsOverlay {
             .next()
             .unwrap_or(&self.profile.model)
             .to_owned();
+        let budget = usize::from(frame.area().width.saturating_sub(19));
+        let caption = super::settings::scope_caption(self.scope, &self.project_name, budget);
+        let named = format!("{name} · {caption}");
+        let name = if crate::ui::text::width(&named) <= budget {
+            named
+        } else {
+            caption
+        };
         panel(
             frame,
             ctx.theme,
@@ -1183,10 +1228,11 @@ impl ModelSettingsOverlay {
         out.push(Line::from(fit(
             vec![Span::styled(
                 format!(
-                    " {} {} saves to {} settings {} {}/{}",
+                    " {} {} saves to {} settings · project: {} {} {}/{}",
                     summary,
                     theme.sym(Sym::Dot),
                     scope_name(self.scope),
+                    self.project_name,
                     theme.sym(Sym::Dot),
                     self.cursor + 1,
                     self.len()
@@ -1433,6 +1479,7 @@ impl ModelSettingsOverlay {
                 "r reset".to_owned(),
                 format!("s save to {}", scope_name(other_scope(self.scope))),
                 "d context defaults".to_owned(),
+                "c connections / provider Headers".to_owned(),
                 "g all settings".to_owned(),
                 hint(keys, Action::SelectCancel, "close"),
             ];

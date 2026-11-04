@@ -1,4 +1,4 @@
-//! The `grounding` role: given a screenshot and an element description, a GUI grounding model
+//! The `grounding` feature: given a screenshot and an element description, a GUI grounding model
 //! (UI-Venus, UI-TARS, ShowUI or any vision chat model) answers with one click point.
 //!
 //! Models answer in different coordinate spaces, so the reply is mapped back to the pixels of the
@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-pub const ROLE: &str = "grounding";
+pub const FEATURE: &str = "grounding";
 /// Longest screenshot edge sent to the grounding model; larger captures are scaled down first.
 const MAX_EDGE: u32 = 1920;
 const MAX_REPLY_TOKENS: u32 = 64;
@@ -73,9 +73,9 @@ impl Located {
     }
 }
 
-/// Whether the `grounding` role is assigned.
+/// Whether an explicit grounding model is configured.
 pub fn configured(config: &Config) -> bool {
-    config.role_selection(ROLE).is_some()
+    config.vision_selection(FEATURE).is_some()
 }
 
 /// The coordinate space from a model's identity: its local `config.json` when there is one,
@@ -216,7 +216,7 @@ pub fn parse_point(
     Ok((x.min(w - 1.0).max(0.0), y.min(h - 1.0).max(0.0)))
 }
 
-/// The grounding backend stays loaded between calls; a changed role selection replaces it.
+/// The grounding backend stays loaded between calls; a changed feature selection replaces it.
 struct Resident {
     key: String,
     backend: Backend,
@@ -239,7 +239,7 @@ fn resident_key(resolved: &Config) -> String {
 }
 
 fn build(resolved: &Config) -> Result<Resident> {
-    let route = super::route(ROLE, resolved)?;
+    let route = super::route(FEATURE, resolved)?;
     let (kind, local_dir, allow_insecure) = match &route {
         Route::Local => {
             let dir = crate::llm::download::ensure_local_model(&resolved.python, &resolved.model)?;
@@ -286,7 +286,7 @@ fn build(resolved: &Config) -> Result<Resident> {
     })
 }
 
-/// Find `description` in `screenshot` (PNG, JPEG, GIF or WebP bytes) with the `grounding` role.
+/// Find `description` in `screenshot` (PNG, JPEG, GIF or WebP bytes) with the grounding model.
 /// The point is in the screenshot's own pixels; nothing is clicked.
 pub fn locate(
     config: &Config,
@@ -296,7 +296,7 @@ pub fn locate(
 ) -> Result<Located> {
     ensure!(
         configured(config),
-        "no grounding model is configured; run `/setup grounding` or assign one to the `grounding` role in Alt+M"
+        "no grounding model is configured; run `/setup grounding` or set `vision.grounding`"
     );
     let description = description.trim();
     ensure!(!description.is_empty(), "describe the element to locate");
@@ -308,7 +308,7 @@ pub fn locate(
     let mime = super::image_mime(screenshot)?;
     let (sent, sent_mime) = fit(screenshot, mime, width, height)?;
     let (sent_width, sent_height) = crate::llm::images::dimensions(&sent)?;
-    let resolved = config.for_role(ROLE);
+    let resolved = config.for_vision(FEATURE);
     let mut slot = RESIDENT.lock();
     if slot
         .as_ref()

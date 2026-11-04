@@ -27,6 +27,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install check dependencies
+        run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
+      - name: Validate metadata, notes and public keys before builds
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
+        run: |
+          make release-check RELEASE_TAG="$RELEASE_TAG"
+          python3 scripts/release-policy.py keys
       - name: Require main ancestry
         id: identity
         run: |
@@ -60,9 +76,32 @@ jobs:
             waited=$((waited + 30))
           done
 
+  signing-ready:
+    name: Validate protected signing inputs before builds
+    needs: gate
+    runs-on: ubuntu-22.04
+    environment: release-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install check dependencies
+        run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
+      - name: Check signing key presence, type and public-key agreement
+        env:
+          DIAL_RELEASE_SIGNING_KEY: ${{ secrets.DIAL_RELEASE_SIGNING_KEY }}
+          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
+        run: python3 scripts/release-policy.py keys --private
+
   build:
     name: Package ${{ matrix.target }}
-    needs: gate
+    needs: [gate, signing-ready]
     env:
       SOURCE_DATE_EPOCH: ${{ needs.gate.outputs.epoch }}
     strategy:
@@ -101,7 +140,7 @@ jobs:
           rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
       - name: Install installer test dependencies
-        run: python3 -m pip install --disable-pip-version-check -r scripts/requirements-ci.txt
+        run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
       - name: Select musl C compiler
         if: contains(matrix.target, '-musl')
         env:
@@ -110,21 +149,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
-      - name: Validate release tag
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          cargo metadata --no-deps --format-version 1 --locked > release-metadata.json
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          metadata = json.loads(Path('release-metadata.json').read_text())
-          version = next(p['version'] for p in metadata['packages'] if p['name'] == 'dial')
-          tag = os.environ['RELEASE_TAG']
-          if tag != f'v{version}':
-              raise SystemExit(f'Tag {tag} must match Cargo.toml version v{version}')
-          PY
+          cache-on-failure: true
       - name: Test terminal installer
         run: bash scripts/test-install.sh
       - name: Build release binary
@@ -159,7 +184,7 @@ jobs:
 
   windows-build:
     name: Build and package ${{ matrix.target }}
-    needs: gate
+    needs: [gate, signing-ready]
     env:
       SOURCE_DATE_EPOCH: ${{ needs.gate.outputs.epoch }}
     strategy:
@@ -180,14 +205,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
-      - name: Validate release tag
-        shell: pwsh
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
-          $version = ($metadata.packages | Where-Object { $_.name -eq 'dial' } | Select-Object -First 1).version
-          if ($env:RELEASE_TAG -ne "v$version") { throw "Tag $env:RELEASE_TAG must match Cargo.toml version v$version" }
+          cache-on-failure: true
       - name: Build release binary
         env:
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
@@ -444,6 +462,8 @@ jobs:
           push: true
           tags: ${{ steps.docker-meta.outputs.tags }}
           labels: ${{ steps.docker-meta.outputs.labels }}
+          cache-from: type=gha,scope=docker-release
+          cache-to: type=gha,scope=docker-release,mode=max
       - name: Install pinned Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2; verifies pinned bootstrap checksum
         with:

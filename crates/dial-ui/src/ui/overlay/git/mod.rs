@@ -34,10 +34,38 @@ use std::{
     time::Instant,
 };
 use tree::Entry;
+/// Focused work areas share one repository snapshot and the existing bounded read workers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitTab {
+    Status,
+    Diff,
+    Commit,
+    Log,
+}
+
+impl GitTab {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "status" => Some(Self::Status),
+            "diff" => Some(Self::Diff),
+            "commit" => Some(Self::Commit),
+            "log" => Some(Self::Log),
+            _ => None,
+        }
+    }
+
+    /// Only explicit two-word forms select tabs; single words remain revisions.
+    pub fn from_args(args: &str) -> Option<Self> {
+        args.strip_prefix("tab ").and_then(Self::parse)
+    }
+}
 
 pub struct GitOverlay {
     repo: Repo,
     commit: Option<Commit>,
+    log_open: bool,
+    recent: Result<Vec<(String, String)>, String>,
+    log_cursor: usize,
     branch: Option<String>,
     /// Short sha and subject of HEAD.
     head: Option<(String, String)>,
@@ -90,11 +118,37 @@ pub struct GitOverlay {
 }
 
 impl GitOverlay {
+    pub fn select_tab(&mut self, tab: GitTab) {
+        self.log_open = tab == GitTab::Log;
+        self.editing = tab == GitTab::Commit && self.revision.is_none();
+        self.focus = if tab == GitTab::Diff {
+            Focus::Diff
+        } else {
+            Focus::Sidebar
+        };
+    }
+
+    fn tab(&self) -> GitTab {
+        if self.log_open {
+            return GitTab::Log;
+        }
+        if self.editing {
+            GitTab::Commit
+        } else if self.focus == Focus::Diff {
+            GitTab::Diff
+        } else {
+            GitTab::Status
+        }
+    }
+
     /// Opens the panel on the working tree, or on `revision` (read-only) when one is given.
     pub fn open(repo: Repo, revision: Option<&str>) -> Result<Self, String> {
         let mut overlay = Self {
             repo,
             commit: None,
+            log_open: false,
+            recent: Ok(Vec::new()),
+            log_cursor: 0,
             branch: None,
             head: None,
             changes: Vec::new(),
@@ -268,11 +322,56 @@ impl GitOverlay {
             Some(commit) => format!("commit {}", commit.short),
             None => self.branch.clone().unwrap_or_else(|| "detached".to_owned()),
         };
+        let extra = if self.revision.is_some() {
+            format!("{extra} · Status / Diff · Tab")
+        } else {
+            let tabs = [GitTab::Status, GitTab::Diff, GitTab::Commit, GitTab::Log]
+                .map(|tab| {
+                    let label = match tab {
+                        GitTab::Status => "Status",
+                        GitTab::Diff => "Diff",
+                        GitTab::Commit => "Commit",
+                        GitTab::Log => "Log",
+                    };
+                    if tab == self.tab() {
+                        format!("[{label}]")
+                    } else {
+                        label.to_owned()
+                    }
+                })
+                .join(" / ");
+            format!("{extra} · {tabs} · Tab")
+        };
         let block = chrome::panel_block_titled(ctx.theme, Section::Tools, "Git", &extra);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.area
             .set((usize::from(inner.width), usize::from(inner.height)));
+        if self.log_open {
+            let lines: Vec<ratatui::text::Line<'static>> = match &self.recent {
+                Ok(entries) if entries.is_empty() => vec!["No commits yet.".into()],
+                Ok(entries) => entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, label))| {
+                        format!(
+                            "{} {}",
+                            if index == self.log_cursor { "›" } else { " " },
+                            text::one_line(label)
+                        )
+                        .into()
+                    })
+                    .collect(),
+                Err(error) => {
+                    vec![format!("Could not read recent commits: {}", text::one_line(error)).into()]
+                }
+            };
+            let top = self
+                .log_cursor
+                .saturating_sub(usize::from(inner.height).saturating_sub(1));
+            frame.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), inner);
+            return;
+        }
         let lines = self.compose(inner.width, inner.height, ctx);
         frame.render_widget(Paragraph::new(lines), inner);
     }
@@ -298,11 +397,50 @@ impl GitOverlay {
             }
             return OverlayEvent::None;
         }
+        if self.ai_prompt.is_none() {
+            let previous = super::panel_keys::matches(keys, Action::TabPrev, key);
+            if previous || super::panel_keys::matches(keys, Action::TabNext, key) {
+                let tab = if self.revision.is_some() {
+                    if self.focus == Focus::Sidebar {
+                        GitTab::Diff
+                    } else {
+                        GitTab::Status
+                    }
+                } else {
+                    let tabs = [GitTab::Status, GitTab::Diff, GitTab::Commit, GitTab::Log];
+                    let index = tabs.iter().position(|tab| *tab == self.tab()).unwrap_or(0);
+                    tabs[(index + if previous { 3 } else { 1 }) % tabs.len()]
+                };
+                self.select_tab(tab);
+                return OverlayEvent::None;
+            }
+        }
         if self.editing {
             return self.edit_key(key, keys);
         }
         if self.ai_prompt.is_some() {
             return self.ai_prompt_key(key, keys);
+        }
+        if self.log_open {
+            let count = self.recent.as_ref().map_or(0, Vec::len);
+            if super::panel_keys::matches(keys, Action::SelectCancel, key) {
+                return OverlayEvent::Close;
+            }
+            if keys.matches(Action::SelectUp, key) {
+                self.log_cursor = self.log_cursor.saturating_sub(1);
+            } else if keys.matches(Action::SelectDown, key) {
+                self.log_cursor = (self.log_cursor + 1).min(count.saturating_sub(1));
+            } else if super::panel_keys::matches(keys, Action::SelectConfirm, key)
+                && let Ok(entries) = &self.recent
+                && let Some((sha, _)) = entries.get(self.log_cursor)
+            {
+                return OverlayEvent::Action(format!("command:/git {sha}"));
+            } else if plain_char(key) == Some('r') {
+                self.sync();
+            } else if plain_char(key) == Some('?') {
+                self.help = true;
+            }
+            return OverlayEvent::None;
         }
         let pending = self.confirm.take();
         if key.code == KeyCode::Delete {
@@ -325,10 +463,6 @@ impl GitOverlay {
                 KeyCode::Down => self.jump_hunk(1),
                 _ => {}
             }
-            return OverlayEvent::None;
-        }
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.toggle_focus();
             return OverlayEvent::None;
         }
         match ch {
@@ -492,13 +626,6 @@ impl GitOverlay {
     fn flash(&mut self, message: impl Into<String>, error: bool) {
         let message: String = message.into();
         self.status = Some((text::one_line(&message), error, Instant::now()));
-    }
-
-    fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Diff => Focus::Sidebar,
-            Focus::Sidebar => Focus::Diff,
-        };
     }
 
     /// Request status off-thread. Repeated refreshes coalesce while a read is running.

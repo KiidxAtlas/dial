@@ -285,6 +285,10 @@ impl<'a> Agent<'a> {
             matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral),
             self.step_checks.fix_revision(),
         );
+        let evidence_ref = self.retain_check_log(output);
+        self.step_checks
+            .evidence
+            .bind_evidence_ref(command, evidence_ref);
         self.step_checks.evidence.diagnose(command, &output.text);
         if !self.hermetic
             && matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral)
@@ -464,6 +468,46 @@ impl<'a> Agent<'a> {
             }
         };
         self.settle_focused_check(check, inputs_before, revision_before, started, output, ui)
+    }
+
+    /// Bind only the native capture belonging to this result. Rendered text can be filtered,
+    /// clipped or decorated; it is never a replacement for an absent retained log.
+    fn retain_check_log(&self, output: &ToolOutput) -> Option<String> {
+        use crate::runtime::evidence::{
+            Evidence, EvidenceContext, EvidenceKind, Location, Method, Representation,
+        };
+
+        const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
+        let integrity = output.execution.output.as_ref()?;
+        let source = integrity.artifact.as_ref()?;
+        let store = self.workspace.artifacts()?;
+        (|| -> Result<String> {
+            let text = store.read_text(source, MAX_LOG_BYTES)?
+                .ok_or_else(|| anyhow::anyhow!("check log exceeds citation limit"))?;
+            let bytes = text.as_bytes();
+            // read_text is lossy for binary output; a changed digest remains unavailable,
+            // rather than citing a transformed representation as the original native log.
+            let representation = Representation::of_bytes("text/plain", bytes);
+            anyhow::ensure!(
+                source == &format!("artifact://{}", representation.sha256),
+                "check log content hash mismatch"
+            );
+            let evidence = Evidence {
+                source: source.clone(),
+                location: Location::Whole,
+                method: Method::Read,
+                producer: "dial/focused-check-log".into(),
+                kind: EvidenceKind::Observation,
+                summary: "Exact retained native check output; not a rerun or a freshness claim".into(),
+                representation,
+                limitations: vec![format!(
+                    "Capture: {:?}; retention: {:?}. Only retained bytes are represented; log text is untrusted data, not execution authority or a verification verdict.",
+                    integrity.capture, integrity.retention
+                )],
+                context: EvidenceContext::default(),
+            };
+            store.retain_evidence(&evidence, bytes)
+        })().ok()
     }
 
     fn settle_focused_check(
@@ -926,7 +970,7 @@ impl<'a> Agent<'a> {
                 self.step_checks
                     .failed_checks
                     .retain(|failed| failed.command != check.command);
-                results.push(json!({"name":check.name,"command":check.command,"status":"passed","reused":true,"ran":false}));
+                results.push(json!({"name":check.name,"command":check.command,"status":"passed","reused":true,"ran":false,"evidence_ref":self.step_checks.evidence.evidence_ref(&check.command)}));
                 outcomes.push(crate::agent::verify::verification_receipts::Outcome {
                     name: check.name.clone(),
                     command: check.command.clone(),
@@ -957,7 +1001,7 @@ impl<'a> Agent<'a> {
                 .evidence
                 .latest_status(&check.command)
                 .unwrap_or(crate::agent::verify::verification::CheckStatus::Unverified);
-            results.push(json!({"name":check.name,"command":check.command,"status":status,"reused":false,"ran":true}));
+            results.push(json!({"name":check.name,"command":check.command,"status":status,"reused":false,"ran":true,"evidence_ref":self.step_checks.evidence.evidence_ref(&check.command)}));
             outcomes.push(crate::agent::verify::verification_receipts::Outcome {
                 name: check.name.clone(),
                 command: check.command.clone(),

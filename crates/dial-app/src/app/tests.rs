@@ -369,7 +369,7 @@ fn action_palette_uses_registered_commands_and_real_turn_policies() {
     let find = |name: &str| entries.iter().find(|e| e.command.name == name).unwrap();
     assert!(find("undo").during_turn.starts_with("Stops"));
     assert!(find("model").during_turn.starts_with("Opens now"));
-    assert!(find("workers").during_turn.starts_with("Opens now"));
+    assert!(find("activity").during_turn.starts_with("Runs now"));
     for name in ["message", "cancel", "search", "help", "context"] {
         assert!(find(name).during_turn.starts_with("Runs now"), "{name}");
     }
@@ -446,7 +446,7 @@ fn undo_and_rollback_take_an_optional_positive_turn_count() {
         .iter()
         .find(|(name, _, _)| *name == "undo")
         .unwrap();
-    assert_eq!(undo.1, "[n]");
+    assert_eq!(undo.1, "[n|files [n]]");
     assert!(Shell::stops_turn("/undo 3"));
 }
 
@@ -965,7 +965,7 @@ fn coding_model_catalog_ignores_learning_records_and_never_starts_python() {
     let unverified = project.path().join("unverified-role-model");
     std::fs::create_dir_all(&unverified).unwrap();
     config.model_roles.insert(
-        "planner".into(),
+        "task".into(),
         ModelSelection {
             model: unverified.to_string_lossy().into_owned(),
             ..Default::default()
@@ -1541,11 +1541,10 @@ fn selecting_a_local_model_clears_the_remote_endpoint_and_a_new_remote_adds_its_
 fn model_assignment_takes_effect_in_both_scopes_without_touching_other_roles() {
     for scope in [Scope::Global, Scope::Project] {
         for role in [
-            "main", "small", "coach", "tester", "planner", "memory", "decision",
+            "main", "small", "coach", "tester", "task", "memory", "decision",
         ] {
             let (_home, _project, layout, base) = config();
-            let old =
-                ModelSelection::new(if role == "decision" { "laya" } else { "mlx" }, "old-model");
+            let old = ModelSelection::new("mlx", "old-model");
             settings_store::save_config(
                 &layout,
                 Scope::Global,
@@ -1558,11 +1557,7 @@ fn model_assignment_takes_effect_in_both_scopes_without_touching_other_roles() {
                 &selection_changes(&base, &old, role).unwrap(),
             )
             .unwrap();
-            let other_role = if role == "tester" {
-                "planner"
-            } else {
-                "tester"
-            };
+            let other_role = if role == "tester" { "task" } else { "tester" };
             let other = ModelSelection::new("mlx", "keep-other-model");
             settings_store::save_config(
                 &layout,
@@ -1581,10 +1576,7 @@ fn model_assignment_takes_effect_in_both_scopes_without_touching_other_roles() {
             .unwrap();
             let global_before = std::fs::read(&layout.config_files()[0]).unwrap();
             let fresh = Config::load(&layout, None).unwrap();
-            let new = ModelSelection::new(
-                if role == "decision" { "laya" } else { "openai" },
-                "new-model",
-            );
+            let new = ModelSelection::new("openai", "new-model");
             settings_store::save_model_config(
                 &layout,
                 scope,
@@ -1743,7 +1735,7 @@ fn a_global_role_with_a_project_inherit_marker_resolves_to_the_main_model() {
 
 #[test]
 fn clearing_chatgpt_roles_in_project_discards_inherited_account_bindings() {
-    for role in ["small", "coach", "tester", "planner", "memory"] {
+    for role in ["small", "coach", "tester", "task", "memory", "decision"] {
         let (_home, _project, layout, config) = config();
         let selection = ModelSelection {
             account_id: Some("test-account".into()),
@@ -1780,7 +1772,7 @@ fn clearing_decision_in_project_does_not_migrate_the_marker_to_memory() {
         Scope::Global,
         &selection_changes(
             &config,
-            &ModelSelection::new("laya", "test/checkpoint"),
+            &ModelSelection::new("laya", "decision"),
             "decision",
         )
         .unwrap(),
@@ -1856,7 +1848,14 @@ fn command_menu_lists_builtins_then_custom_then_skills_and_builtins_win() {
     );
     assert_eq!(names.iter().filter(|name| **name == "review").count(), 1);
     assert!(matches!(entries[at("review")].kind, CommandKind::Builtin));
-    assert_eq!(entries[at("resume")].args_hint.as_deref(), Some("[id]"));
+    assert!(
+        !names.contains(&"resume"),
+        "/resume is a hidden alias of /sessions"
+    );
+    assert_eq!(
+        entries[at("sessions")].args_hint.as_deref(),
+        Some("[id|this|branch [n]|label [text]|fork]")
+    );
 }
 
 #[test]
@@ -2315,7 +2314,8 @@ fn effective_config_serializes_for_the_settings_overlay() {
 }
 
 #[test]
-fn initial_discovery_publishes_and_a_stale_refresh_cannot_replace_the_newest() {
+fn discovery_refreshes_keep_one_worker_and_only_the_latest_pending_scan() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     fn result(id: &str) -> catalog::Discovery {
         catalog::Discovery {
             models: vec![],
@@ -2333,16 +2333,31 @@ fn initial_discovery_publishes_and_a_stale_refresh_cannot_replace_the_newest() {
     catalog.launch(|| result("first"));
     catalog.worker.take().unwrap().join().unwrap();
     assert_eq!(catalog.get().unwrap().providers[0].id, "first");
+
     let (release, wait) = std::sync::mpsc::channel();
     catalog.launch(move || {
         wait.recv().unwrap();
         result("stale")
     });
-    let stale = catalog.worker.take().unwrap();
+    let active = catalog.worker.as_ref().unwrap().thread().id();
+    let superseded_runs = Arc::new(AtomicUsize::new(0));
+    for _ in 0..100 {
+        let runs = superseded_runs.clone();
+        catalog.launch(move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            result("superseded")
+        });
+    }
     catalog.launch(|| result("newest"));
-    catalog.worker.take().unwrap().join().unwrap();
+    let retained = catalog.worker.as_ref().unwrap().thread().id();
+    // Always release the first worker, including when the assertions expose a regression.
     release.send(()).unwrap();
-    stale.join().unwrap();
+    catalog.worker.take().unwrap().join().unwrap();
+    assert_eq!(retained, active, "refresh must not detach an active probe");
+    assert_eq!(superseded_runs.load(Ordering::SeqCst), 0);
+    assert_eq!(catalog.get().unwrap().providers[0].id, "first");
+    catalog.collect();
+    catalog.worker.take().unwrap().join().unwrap();
     assert_eq!(catalog.get().unwrap().providers[0].id, "newest");
 }
 #[test]

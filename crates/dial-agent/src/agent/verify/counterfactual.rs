@@ -1,8 +1,8 @@
 //! Counterfactual focused-check runs in isolated project copies.
 //!
-//! - `experimental.fault_witness`: after a behavioral focused check passes on a turn with edits,
-//!   rerun it once per evidence revision in a copy with the turn's checkpointed changes reverted.
-//!   Failing there shows the check exercises the change; passing shows it does not.
+//! - `experimental.fault_witness`: opt-in comparison of an explicitly declared behavioral check
+//!   against the turn-start files. At most one attempt per turn, with a 60-second command deadline.
+//!   A passing comparison does not invalidate normal verification or demand more tests.
 //! - `experimental.edit_bisection_runs`: when a check that passed earlier this turn fails after
 //!   edits to two or more files, revert halves of those files (to their content at the last
 //!   pass) in copies to find which file's change broke it, within the configured run budget.
@@ -20,13 +20,15 @@ use std::collections::BTreeMap;
 const SNAPSHOT_BYTES: usize = 16 << 20;
 /// Changed files a bisection considers.
 const MAX_BISECT_FILES: usize = 64;
+/// A cold-build comparison must not consume an unbounded normal-check deadline.
+const WITNESS_TIMEOUT_SECS: u64 = 60;
 
 /// Project-relative path to content (`None`: absent) to install in a copy.
 pub(in crate::agent) type Overrides = BTreeMap<String, Option<Vec<u8>>>;
 
 #[derive(Default)]
 pub(in crate::agent) struct State {
-    /// Check name to fault-witness verdict (with the revision it was taken at).
+    /// Check name to diagnostic verdict and the revision compared; at most one entry per turn.
     witnesses: BTreeMap<String, Value>,
     /// Check command to the turn-changed file contents at its latest pass.
     passing: BTreeMap<String, Overrides>,
@@ -47,15 +49,14 @@ impl State {
     }
 }
 
-/// Generated syntax/type checks pass without the turn's changes by design; only configured
-/// commands and related tests are behavioral enough to witness a fault.
+/// Only operator-declared behavioral commands are eligible, never inferred related suites.
 fn behavioral(config: &Config, check: &FocusedCheck) -> bool {
-    check.name.starts_with("related ")
-        || config
+    config.verification.behavioral_checks.contains(&check.name)
+        && config
             .verification
             .commands
             .iter()
-            .any(|configured| configured.command == check.command)
+            .any(|configured| configured.name == check.name && configured.command == check.command)
 }
 
 /// Files whose current content differs from `passing`, with the content to restore. A file
@@ -202,12 +203,9 @@ impl Agent<'_> {
         ui: &mut dyn Ui,
     ) -> Option<String> {
         let revision = self.step_checks.revision();
-        if self
-            .step_checks
-            .counterfactual
-            .witnesses
-            .get(&check.name)
-            .is_some_and(|witness| witness["revision"] == json!(revision))
+        if !self.config.experimental.fault_witness
+            || !behavioral(self.config, check)
+            || !self.step_checks.counterfactual.witnesses.is_empty()
         {
             return None;
         }
@@ -219,22 +217,25 @@ impl Agent<'_> {
         if reverted.is_empty() {
             return None;
         }
-        ui.notice(&format!(
-            "Fault witness: rerunning {} without this turn's edits",
-            check.name
-        ));
-        let (verdict, line) = match self.counterfactual_run(check, &reverted, ui) {
+        let bounded = FocusedCheck {
+            timeout_secs: match check.timeout_secs {
+                0 => WITNESS_TIMEOUT_SECS,
+                seconds => seconds.min(WITNESS_TIMEOUT_SECS),
+            },
+            ..check.clone()
+        };
+        let (verdict, line) = match self.counterfactual_run(&bounded, &reverted, ui) {
             Ok(CheckStatus::CodeFailed) => (
                 "fails_without_turn_changes",
                 format!(
-                    "[fault witness: {} fails with this turn's edits reverted, so it exercises the change]",
+                    "[fault witness: {} fails with this turn's edits reverted; diagnostic comparison only, not an observed pre-fix reproduction]",
                     check.name
                 ),
             ),
             Ok(CheckStatus::Passed) => (
                 "passes_without_turn_changes",
                 format!(
-                    "[fault witness: {} also passes with this turn's edits reverted, so it does not show the change works; add or run a check that fails without it]",
+                    "[fault witness: {} also passes with this turn's edits reverted; this comparison shows no change sensitivity, but normal verification remains valid]",
                     check.name
                 ),
             ),
@@ -253,7 +254,7 @@ impl Agent<'_> {
         };
         self.step_checks.counterfactual.witnesses.insert(
             check.name.clone(),
-            json!({"verdict":verdict,"revision":revision,"reverted_files":reverted.keys().collect::<Vec<_>>()}),
+            json!({"verdict":verdict,"revision":revision,"timeout_secs":bounded.timeout_secs,"reverted_files":reverted.keys().collect::<Vec<_>>()}),
         );
         Some(line)
     }

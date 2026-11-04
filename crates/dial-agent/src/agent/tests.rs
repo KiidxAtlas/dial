@@ -1450,61 +1450,164 @@ fn silence_watch_is_armed_for_remote_streams_and_only_generating_local_ones() {
 
 #[test]
 fn plan_model_serves_plan_turns_and_the_default_model_resumes_after() {
-    let server = crate::llm::fake::serve(vec![sse_reply("planned"), sse_reply("executed")]);
-    let base_url = format!("{}/v1", server.url);
-    let mut config = Config {
-        model: "default-model".into(),
-        ..Config::default()
-    };
-    config.endpoint = Some(crate::config::types::EndpointConfig {
-        headers: None,
-        base_url: base_url.clone(),
-        api_key_env: None,
-        allow_insecure: false,
-        protocol: None,
-        account_id: None,
-    });
-    config.model_roles.insert(
-        "planner".into(),
-        crate::llm::model_config::ModelSelection {
+    for (explicit, coach, expected) in [
+        (false, false, "default-model"),
+        (false, true, "coach-model"),
+        (true, true, "plan-model"),
+        (true, false, "plan-model"),
+    ] {
+        let server = crate::llm::fake::serve(vec![sse_reply("planned"), sse_reply("executed")]);
+        let base_url = format!("{}/v1", server.url);
+        let mut config = Config {
+            model: "default-model".into(),
+            ..Config::default()
+        };
+        config.endpoint = Some(crate::config::types::EndpointConfig {
+            headers: None,
+            base_url: base_url.clone(),
+            api_key_env: None,
+            allow_insecure: false,
+            protocol: None,
+            account_id: None,
+        });
+        let selection = |model: &str| crate::llm::model_config::ModelSelection {
             provider: "endpoint".into(),
-            model: "plan-model".into(),
+            model: model.into(),
             base_url: Some(base_url.clone()),
             ..Default::default()
-        },
-    );
-    let backend = Backend::new(
-        ProviderKind::Endpoint {
-            base_url,
-            model: "default-model".into(),
-            api_key: None,
-        },
-        PathBuf::new(),
-        5,
-    );
-    let workspace = tempfile::tempdir().unwrap();
-    let version = Version {
-        id: 0,
-        parent: None,
-        kind: "config".into(),
-        harness: config.harness.clone(),
-        adapter: None,
-        status: "active".into(),
-    };
-    let mut agent =
-        Agent::hermetic(&config, backend, &version, workspace.path(), None, None).unwrap();
-    agent.plan_mode = true;
-    agent.turn("plan it", &mut NullUi).unwrap();
-    agent.plan_mode = false;
-    agent.turn("do it", &mut NullUi).unwrap();
-    drop(agent);
-    let requests = server.requests();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(crate::llm::fake::body(&requests[0])["model"], "plan-model");
-    assert_eq!(
-        crate::llm::fake::body(&requests[1])["model"],
-        "default-model"
-    );
+        };
+        if coach {
+            config
+                .model_roles
+                .insert("coach".into(), selection("coach-model"));
+        }
+        if explicit {
+            config.plan_model = Some(selection("plan-model"));
+        }
+        let backend = Backend::new(
+            ProviderKind::Endpoint {
+                base_url,
+                model: "default-model".into(),
+                api_key: None,
+            },
+            PathBuf::new(),
+            5,
+        );
+        let workspace = tempfile::tempdir().unwrap();
+        let version = Version {
+            id: 0,
+            parent: None,
+            kind: "config".into(),
+            harness: config.harness.clone(),
+            adapter: None,
+            status: "active".into(),
+        };
+        let mut agent =
+            Agent::hermetic(&config, backend, &version, workspace.path(), None, None).unwrap();
+        agent.plan_mode = true;
+        agent.turn("plan it", &mut NullUi).unwrap();
+        agent.plan_mode = false;
+        agent.turn("do it", &mut NullUi).unwrap();
+        drop(agent);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(crate::llm::fake::body(&requests[0])["model"], expected);
+        assert_eq!(
+            crate::llm::fake::body(&requests[1])["model"],
+            "default-model"
+        );
+    }
+}
+
+#[test]
+fn plan_model_preserves_same_named_endpoint_and_thinking_override() {
+    use crate::llm::{model_config::ModelSelection, profiles::*};
+    for separate_endpoint in [false, true] {
+        let main = crate::llm::fake::serve(if separate_endpoint {
+            vec![sse_reply("main")]
+        } else {
+            vec![sse_reply("plan"), sse_reply("main")]
+        });
+        let plan = crate::llm::fake::serve(vec![sse_reply("plan")]);
+        let mut config = Config {
+            provider: Some("endpoint".into()),
+            model: "shared-model".into(),
+            model_profile: Some("reasoning".into()),
+            ..Config::default()
+        };
+        config.endpoint = Some(crate::config::types::EndpointConfig {
+            headers: None,
+            base_url: format!("{}/v1", main.url),
+            api_key_env: None,
+            allow_insecure: false,
+            protocol: None,
+            account_id: None,
+        });
+        config.model_profiles.insert(
+            "reasoning".into(),
+            ModelProfile {
+                provider: "endpoint".into(),
+                model: "shared-model".into(),
+                reasoning_effort: Some(ReasoningEffort::Low),
+                capabilities: ModelCapabilities {
+                    reasoning: ReasoningApi::OpenaiEffort,
+                    reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.plan_model = Some(ModelSelection {
+            base_url: Some(format!(
+                "{}/v1",
+                if separate_endpoint {
+                    &plan.url
+                } else {
+                    &main.url
+                }
+            )),
+            thinking: Some("high".into()),
+            ..ModelSelection::new("endpoint", "shared-model")
+        });
+        let backend = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: format!("{}/v1", main.url),
+                model: "shared-model".into(),
+                api_key: None,
+            },
+            PathBuf::new(),
+            5,
+        );
+        let workspace = tempfile::tempdir().unwrap();
+        let version = Version {
+            id: 0,
+            parent: None,
+            kind: "config".into(),
+            harness: config.harness.clone(),
+            adapter: None,
+            status: "active".into(),
+        };
+        let mut agent =
+            Agent::hermetic(&config, backend, &version, workspace.path(), None, None).unwrap();
+        agent.plan_mode = true;
+        agent.turn("plan", &mut NullUi).unwrap();
+        agent.plan_mode = false;
+        agent.turn("execute", &mut NullUi).unwrap();
+        let requests = if separate_endpoint {
+            plan.requests()
+        } else {
+            main.requests()
+        };
+        assert_eq!(
+            crate::llm::fake::body(&requests[0])["reasoning_effort"],
+            "high"
+        );
+        assert_eq!(requests.len(), if separate_endpoint { 1 } else { 2 });
+        assert_eq!(
+            crate::llm::fake::body(main.requests().last().unwrap())["reasoning_effort"],
+            "low"
+        );
+    }
 }
 
 #[test]

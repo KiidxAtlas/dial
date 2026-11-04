@@ -160,3 +160,48 @@ fn batched_read_feedback_expires_when_any_target_changes_or_disappears() {
         assert!(checkpoint.rejection_at(&ws, &read).is_none());
     }
 }
+
+#[test]
+fn directory_feedback_tracks_visible_changes_for_single_and_batched_reads() {
+    for batched in [false, true] {
+        for remove in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let ws = crate::tools::Workspace::new(dir.path()).unwrap();
+            std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+            std::fs::write(dir.path().join("stable.txt"), "stable").unwrap();
+            let changed = dir.path().join("src/nested/visible.rs");
+            if remove {
+                std::fs::write(&changed, "source").unwrap();
+            }
+            let mut read = call("read");
+            read.arguments = if batched {
+                json!({"paths":["stable.txt", "src"]})
+            } else {
+                json!({"path":"src"})
+            };
+            let mut checkpoint = RecoveryCheckpoint::default();
+            let mut investigation =
+                crate::agent::workflow::investigation::InvestigationGuard::default();
+            let mut repeats = crate::agent::safety::guard::RepeatGuard::default();
+            checkpoint.arm(&read, "unchanged listing");
+            checkpoint.arm(&call("bash"), "unrelated failed command");
+            checkpoint.observe_at(
+                &ws,
+                &read,
+                &crate::runtime::tool_output::ToolOutput::ok("directory listing".into()),
+                &mut investigation,
+                &mut repeats,
+            );
+            assert!(checkpoint.rejection_at(&ws, &read).is_some());
+            std::fs::write(dir.path().join("unrelated.txt"), "other").unwrap();
+            assert!(checkpoint.rejection_at(&ws, &read).is_some());
+            if remove {
+                std::fs::remove_file(changed).unwrap();
+            } else {
+                std::fs::write(changed, "source").unwrap();
+            }
+            assert!(checkpoint.rejection_at(&ws, &read).is_none());
+            assert!(checkpoint.rejection_at(&ws, &call("bash")).is_some());
+        }
+    }
+}

@@ -120,24 +120,32 @@ pub(super) fn run_call(
     deliver: impl FnOnce(&str) -> bool,
     gone: impl Fn() -> bool,
 ) -> ToolOutput {
+    if interrupt.load(Ordering::SeqCst) {
+        return ToolOutput::err(format!("{label} was cancelled before delivery"))
+            .with_effects(crate::runtime::execution::Effects::None);
+    }
     let (call_id, answers) = match bridge.open_call() {
         Ok(opened) => opened,
-        Err(error) => return ToolOutput::err(format!("{error:#}")),
+        Err(error) => {
+            return ToolOutput::err(format!("{error:#}"))
+                .with_effects(crate::runtime::execution::Effects::None);
+        }
     };
     if !deliver(&call_id) {
         bridge.close_call(&call_id);
         return ToolOutput::err(format!(
             "{label} could not be delivered: no client is attached"
-        ));
+        ))
+        .with_effects(crate::runtime::execution::Effects::None);
     }
     let deadline = Instant::now() + timeout;
     let outcome = loop {
         if interrupt.load(Ordering::SeqCst) || gone() {
-            break Err(format!("{label} was cancelled"));
+            break Err(format!("{label} (request {call_id}) was cancelled"));
         }
         if Instant::now() >= deadline {
             break Err(format!(
-                "{label} timed out after {} ms",
+                "{label} (request {call_id}) timed out after {} ms",
                 timeout.as_millis()
             ));
         }
@@ -145,15 +153,20 @@ pub(super) fn run_call(
             Ok(result) => break Ok(result),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break Err(format!("{label} was cancelled"));
+                break Err(format!("{label} (request {call_id}) was cancelled"));
             }
         }
     };
     bridge.close_call(&call_id);
     match outcome {
-        Ok(result) if result.is_error => ToolOutput::err(result.text),
+        Ok(result) if result.is_error => {
+            ToolOutput::err(format!("{} ({label}, request {call_id})", result.text))
+                .with_effects(crate::runtime::execution::Effects::Unknown)
+        }
         Ok(result) => ToolOutput::ok(result.text),
-        Err(message) => ToolOutput::err(message),
+        Err(message) => {
+            ToolOutput::err(message).with_effects(crate::runtime::execution::Effects::Unknown)
+        }
     }
 }
 

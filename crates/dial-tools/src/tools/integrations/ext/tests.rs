@@ -21,11 +21,11 @@ fn legacy_integration_lists_keep_always_registered_tools() {
         integrations: Vec::new(),
         ..Config::default()
     };
-    // `image_search` is always registered, but only while its model role is assigned.
-    config.model_roles.insert(
-        crate::tools::vision::embedding::ROLE.into(),
-        crate::llm::model_config::ModelSelection::new("mlx", "test/embedder"),
-    );
+    // `image_search` is always registered, but only with an explicit feature model.
+    config.vision.image_embedding = Some(crate::llm::model_config::ModelSelection::new(
+        "mlx",
+        "test/embedder",
+    ));
     let registry = Registry::standard(&config, Vec::new());
     for entry in crate::config::tools::integrations::INTEGRATIONS {
         if entry.always_registered {

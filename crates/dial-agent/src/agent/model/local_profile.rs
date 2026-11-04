@@ -894,7 +894,7 @@ impl Agent<'_> {
             return;
         }
         self.probe_local_server();
-        let profile = backend.model_profile().cloned();
+        let profile = backend.compaction_profile().cloned();
         backend.set_local_hints(self.local_base_hints(profile.as_ref()));
         let llama = self.local_session.server == Some(LocalServer::LlamaCpp);
         backend.next_local_hints(LocalHints {

@@ -443,3 +443,6 @@ pub struct Agent<'a> {
 
 #[cfg(test)]
 mod subscription_tests;
+
+#[cfg(test)]
+mod extension_sdk_tests;

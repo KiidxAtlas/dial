@@ -13,6 +13,7 @@ struct Editor {
     read: bool,
     write: bool,
     fail: bool,
+    fail_after_write: bool,
     buffer: Mutex<String>,
     written: Mutex<Vec<(PathBuf, String)>>,
 }
@@ -36,7 +37,23 @@ impl ClientFileIo for Editor {
             .unwrap()
             .push((path.to_path_buf(), content.to_owned()));
         *self.buffer.lock().unwrap() = content.to_owned();
+        if self.fail_after_write {
+            return Err("editor applied the buffer but its acknowledgement was lost".into());
+        }
         Ok(())
+    }
+    fn write_text_confirmed(
+        &self,
+        path: &Path,
+        content: &str,
+    ) -> Result<(), crate::tools::ClientWriteError> {
+        if self.fail {
+            return Err(crate::tools::ClientWriteError::NotWritten(
+                "editor refused the write before delivery".into(),
+            ));
+        }
+        self.write_text(path, content)
+            .map_err(crate::tools::ClientWriteError::Unknown)
     }
 }
 
@@ -136,7 +153,17 @@ fn client_write_error_is_a_tool_error_and_no_local_write_follows() {
     });
     let (_dir, ws, path) = project(Some(editor.clone()));
     let change = Change::load(&ws, path.clone(), Some("new\n".into())).unwrap();
-    let error = commit(&ws, &[change]).unwrap_err();
+    let output =
+        crate::tools::exec::execution::run(&std::sync::atomic::AtomicBool::new(false), || {
+            crate::runtime::tool_output::ToolOutput::err(commit(&ws, &[change]).unwrap_err())
+        });
+    assert_eq!(
+        output.execution.effects,
+        crate::runtime::execution::Effects::Known
+    );
+    assert!(output.execution.changed_paths.is_empty());
+    assert!(output.text.contains("was not written"), "{}", output.text);
+    let error = output.text;
     assert!(
         error.contains("editor refused the write") && error.contains("no local write"),
         "{error}"
@@ -231,4 +258,28 @@ fn already_applied_buffer_edit_never_notifies_the_observer_or_editor_writer() {
     assert!(observed.0.lock().unwrap().is_empty());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk\n");
     assert_eq!(*editor.buffer.lock().unwrap(), "buffer\n");
+}
+
+#[test]
+fn applied_client_write_with_lost_acknowledgement_has_unknown_effects() {
+    let editor = Arc::new(Editor {
+        read: true,
+        write: true,
+        fail_after_write: true,
+        buffer: Mutex::new("buffer\n".into()),
+        ..Default::default()
+    });
+    let (_dir, ws, path) = project(Some(editor.clone()));
+    let change = Change::load(&ws, path, Some("new\n".into())).unwrap();
+    let output =
+        crate::tools::exec::execution::run(&std::sync::atomic::AtomicBool::new(false), || {
+            crate::tools::ToolOutput::err(commit(&ws, &[change]).unwrap_err())
+        });
+    assert_eq!(*editor.buffer.lock().unwrap(), "new\n");
+    assert_eq!(
+        output.execution.effects,
+        crate::runtime::execution::Effects::Unknown
+    );
+    assert!(!output.text.contains("was not written"), "{}", output.text);
+    assert!(output.text.contains("not confirmed"), "{}", output.text);
 }

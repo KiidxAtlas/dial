@@ -214,6 +214,9 @@ impl Bridge<'_> {
                                 return;
                             }
                         }
+                        ComposerEvent::Action(Action::StatusFocus) => {
+                            shell.route_busy_command(self.app, "/controls".into());
+                        }
                         ComposerEvent::Interrupt | ComposerEvent::Exit => {
                             self.interrupt.store(true, Ordering::SeqCst);
                             self.show_stopping();
@@ -243,6 +246,9 @@ impl Bridge<'_> {
                         }
                         ComposerEvent::Action(Action::ThinkingToggle) => {
                             shell.ui.show_thinking = !shell.ui.show_thinking
+                        }
+                        ComposerEvent::Action(Action::StatusExpand) => {
+                            shell.status.toggle_status_expanded();
                         }
                         ComposerEvent::Action(Action::WorkTab) => {
                             shell.work_tab = shell.work_tab.next();

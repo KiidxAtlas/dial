@@ -118,7 +118,7 @@ Repository files are never read as configuration. Settings come from the user's 
 
 ## Plan mode
 
-Plans are stored locally under Dial's state directory and exposed as `local://` artifacts. Plan mode uses the configured `planner` model role when one is defined, and restores the model in force before plan mode when leaving it. An approved plan is supplied as context when handing work to subagents.
+Plans are stored locally under Dial's state directory and exposed as `local://` artifacts. Plan mode uses the launch-only `--plan <model>` override, otherwise an explicitly assigned `coach` model, otherwise main, and restores the model in force before plan mode when leaving it. An approved plan is supplied as context when handing work to subagents.
 
 ## Durable tool contracts
 
@@ -190,9 +190,30 @@ see [Writing and evaluating skills](skills.md). Skills are procedures, not execu
 ## Rust embedding SDK
 
 The Rust SDK exposes `extensions::{Extension, ExtensionHost, Command}` and versioned
-`tools::ext::Tool` with atomic tool registration. Operator-trusted extensions can register tools and
-prompt commands; executions still pass the agent's normal validation/approval boundaries. It is a Rust
-embedding API, not a loader for arbitrary workspace programs.
+`tools::integrations::ext::Tool` with atomic registration. Operator-trusted extensions can register
+tools and prompt commands; executions still pass the agent's normal validation/approval boundaries.
+It is a Rust embedding API, not a loader for arbitrary workspace programs.
+
+Implement `Extension::name` with a nonempty, unique name and install through
+`ExtensionHost::install` before starting a turn. `Extension::api_version` defaults to
+`extensions::SDK_VERSION`; each tool's `extension_api_version` defaults to
+`tools::integrations::ext::EXTENSION_API_VERSION`. These are separate API versions, not the tool's
+semantic `contract_revision`. Version mismatch diagnostics identify the extension (and tool when
+applicable) and report expected and actual versions.
+
+Each tool must provide a function schema whose name matches `Tool::name`, with object parameters
+and a positive semantic revision. Tool names contain 1–128 ASCII letters, digits, underscores or
+hyphens and cannot replace existing tools. Command names use the same characters and must be
+nonempty and unique within the host; command handlers return prompt text, not direct tool execution.
+An invalid tool, command or collision rejects the entire installation: no sibling tools or commands
+are registered and the extension name remains available for a corrected retry. Native extension
+code itself is operator-trusted; registration does not sandbox arbitrary Rust code.
+
+`Agent::swap_session` returns `Result<Session>`: workspace/checkpoint preparation failures leave
+the current session untouched and must be handled before updating controller state. Controllers
+with explicit launch-wide directory access can prepare through
+`prepare_session_workspace_with_roots` and publish through `swap_session_prepared`; session-only
+grants always come from the incoming session, not the outgoing workspace.
 
 ## Lifecycle hooks, path permissions, isolated workers and schedules
 
@@ -247,6 +268,17 @@ and reports the resulting access policy when saving. `/schedule run` runs due en
 background job; `dial schedule run` remains the persistent foreground scheduler unless `--once`
 is supplied. Neither confirmation nor a named allow list grants approval to unlisted write tools.
 
+Failed child starts preserve the pending watch trigger and interval timestamp; retries use a
+separate exponential backoff from 2 seconds up to 60 seconds. Filesystem notifications are bounded
+and coalesced; overflow or incomplete watcher coverage requests a conservative full rescan.
+Directory create/remove and rename notifications also request a full rescan: a directory path
+need not match a watched file glob, and some backends emit no descendant notifications.
+Watch fingerprints include file content, so same-size edits with restored mtimes are detected.
+Verification streams at most 16 MiB per file and 64 MiB across a shared batch of overlapping watch
+sets; an unreadable, changing or over-budget file reports incomplete coverage rather than unchanged
+content. This adds bounded disk I/O, not a measured scheduler speedup. Older metadata-only baselines
+remain readable and conservatively cause one change observation.
+
 ## Git tools, budgets, custom agents and HTTP MCP
 
 **`git` tool** (an integration, on by default). Structured `status`, `diff`, `log`, `show`, `branches`
@@ -284,6 +316,27 @@ requests are POSTed (it must stay on the server's origin), and replies arrive on
 HTTP redirects are refused: configure the final endpoint URL so credentials and session IDs are
 never forwarded to an unvalidated destination. OAuth refresh retries apply to HTTP 401 only;
 HTTP 403 retains its status instead of being reported as an expired token.
+Stored OAuth grants are bound to the exact validated server URL, not just its configured name:
+changing the URL (including its path or query) requires `/mcp login <name>` again. Older grants
+without a resource binding also require sign-in again. Discovered OAuth metadata, authorization,
+token and registration endpoints must use HTTPS, except for localhost/loopback HTTP; private LAN
+addresses and `.local` names do not qualify for that exception. Stored token endpoints are checked
+again before refresh. These rules do not change other providers' OAuth endpoint policies.
+
+Lifecycle signals coalesce in bounded storage rather than accumulating an unbounded queue.
+Closure takes priority; notification degradation still invalidates cached definitions. A stale
+tool catalog can retry validation when a caller needs the server, under a bounded catalog deadline,
+cancellable lock/request waits and a one-second retry cooldown. Calls using stale or changed
+definitions remain refused until validation succeeds; concurrent invalidation is not erased by
+an older successful listing.
+
+Startup and refresh share the same tool-list policy: at most 256 parsed tools and 50 pages per
+server, with explicit cutoff notices for a bounded prefix. Streamable-HTTP notification reconnects
+send `Last-Event-ID` when the server supplied a usable SSE cursor (at most 1,024 bytes). Empty or
+unusable IDs clear resumability; NUL-containing IDs are ignored. Legacy SSE remains cursorless.
+Replay depends on server support and does not remove conservative notification-health degradation
+or guarantee duplicate-free delivery. These contracts are locally fixture-tested, not verified
+against live external servers.
 
 **MCP discovery and install.** `/extensions` (MCP tab) immediately shows the curated list and loads
 the first page from the official MCP registry, Smithery, npm and GitHub in the background (read

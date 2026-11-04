@@ -1042,9 +1042,13 @@ fn local_sampling_sends_greedy_for_do_sample_false_unless_pinned() {
 #[test]
 fn local_reasoning_cap_follows_the_lean_tiers() {
     let cap = |overlay: &str| with_agent(overlay, |agent| agent.local_reasoning_cap());
-    assert_eq!(cap("context_window=16384"), Some(16384 * 4 / 2));
-    assert_eq!(cap("context_window=32768"), Some(32768 * 4 / 2));
-    assert_eq!(cap("context_window=65536"), Some(65536 * 4 / 2));
+    for (window, bytes) in [(16384, 6553), (32768, 13107), (65536, 26214)] {
+        assert_eq!(cap(&format!("context_window={window}")), Some(bytes));
+    }
+    assert_eq!(
+        cap("context_window=16384\n[assistance.local]\nreasoning_share=50"),
+        Some(32768)
+    );
     assert_eq!(
         cap("context_window=65536\n[assistance]\nlean_local='auto'"),
         None

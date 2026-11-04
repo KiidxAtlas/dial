@@ -3,6 +3,7 @@ use crate::tools::testkit::*;
 use serde_json::json;
 use std::sync::atomic::AtomicBool;
 
+#[cfg(feature = "embedded-shell")]
 fn unsandboxed() -> (tempfile::TempDir, Workspace) {
     let (dir, ws) = workspace();
     (
@@ -19,6 +20,39 @@ fn run_with(
     cancel: &AtomicBool,
 ) -> Result<ToolOutput, String> {
     bash_tool_streaming(ws, &args, timeout, &|_| {}, cancel)
+}
+
+/// Script success and bounded cleanup are independent. Real discovery can legitimately exhaust
+/// its deadline under parallel test load; accept that only with the complete uncertainty contract.
+pub(super) fn assert_zero_exit_with_cleanup_accounted_for(out: &ToolOutput) {
+    use crate::tools::surface::outcome::Effects;
+    let process = out
+        .execution
+        .process
+        .as_ref()
+        .expect("missing process facts");
+    assert!(process.started, "{}", out.text);
+    assert_eq!(process.exit_code, Some(0), "{}", out.text);
+    assert!(!process.cancelled && !process.timed_out, "{}", out.text);
+    assert!(process.output_complete, "{}", out.text);
+    if out.execution.effects == Effects::Unknown {
+        assert!(out.is_error, "{}", out.text);
+        assert!(
+            out.text
+                .contains("[external-command cleanup could not be established:")
+                && out.text.contains("processes may still be running]"),
+            "{}",
+            out.text
+        );
+    } else {
+        assert_eq!(out.execution.effects, Effects::Known, "{}", out.text);
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            !out.text.contains("cleanup could not be established"),
+            "{}",
+            out.text
+        );
+    }
 }
 
 #[cfg(feature = "embedded-shell")]
@@ -44,7 +78,7 @@ fn runs_in_process_when_sandbox_is_off() {
 #[test]
 fn cargo_session_directory_is_exported_without_overriding_shell_assignments() {
     let (_dir, ws) = unsandboxed();
-    let ws = ws.with_cargo_session("session-1");
+    let ws = ws.with_cargo_session("session-1").unwrap();
     let inherited = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| ws.cargo_target_dir().unwrap());
@@ -55,7 +89,7 @@ fn cargo_session_directory_is_exported_without_overriding_shell_assignments() {
         &AtomicBool::new(false),
     )
     .unwrap();
-    assert!(!out.is_error, "{}", out.text);
+    assert_zero_exit_with_cleanup_accounted_for(&out);
     assert!(
         out.text
             .starts_with(&inherited.to_string_lossy().to_string()),
@@ -69,7 +103,7 @@ fn cargo_session_directory_is_exported_without_overriding_shell_assignments() {
         &AtomicBool::new(false),
     )
     .unwrap();
-    assert!(!out.is_error, "{}", out.text);
+    assert_zero_exit_with_cleanup_accounted_for(&out);
     assert!(out.text.starts_with("explicit"), "{}", out.text);
 }
 
@@ -95,8 +129,12 @@ fn refuses_every_sandbox_mode_other_than_off_and_runs_nothing() {
             &AtomicBool::new(false),
         )
         .unwrap_err();
-        assert!(err.contains("sandbox.mode"), "{err}");
-        assert!(err.contains("inprocess"), "{err}");
+        if cfg!(feature = "embedded-shell") {
+            assert!(err.contains("sandbox.mode"), "{err}");
+            assert!(err.contains("inprocess"), "{err}");
+        } else {
+            assert!(err.contains("embedded-shell feature is disabled"), "{err}");
+        }
         assert!(!dir.path().join("should-not-exist").exists());
     }
 }
@@ -168,5 +206,88 @@ fn environment_drops_secrets_and_cwd_is_honoured() {
         "{}",
         out.text
     );
-    assert!(!out.is_error, "{}", out.text);
+    assert_zero_exit_with_cleanup_accounted_for(&out);
+}
+
+#[test]
+fn stop_facts_and_diagnostics_distinguish_abandonment_and_cleanup_failure() {
+    use crate::embedded_shell::inprocess::Termination;
+    use crate::tools::surface::outcome::Effects;
+    for (shell_stopped, cleanup_error, cancelled, timed_out, expected) in [
+        (false, None, false, true, Effects::Unknown),
+        (
+            true,
+            Some("discovery failed".to_owned()),
+            false,
+            true,
+            Effects::Unknown,
+        ),
+        (false, None, true, false, Effects::Unknown),
+        (true, None, true, false, Effects::Unknown),
+        (true, None, false, true, Effects::Known),
+    ] {
+        let termination = Termination {
+            shell_stopped,
+            cleanup_error,
+        };
+        let output = inprocess::finish_stop(
+            ToolOutput {
+                execution: Default::default(),
+                data: None,
+                text: String::new(),
+                is_error: true,
+            },
+            cancelled,
+            timed_out,
+            &termination,
+        );
+        assert_eq!(output.execution.effects, expected, "{termination:?}");
+        let mut notes = String::new();
+        inprocess::append_stop_notes(&mut notes, cancelled, timed_out, 1, &termination);
+        assert_eq!(notes.contains("shell stopped]"), shell_stopped, "{notes}");
+        assert_eq!(notes.contains("was abandoned"), !shell_stopped, "{notes}");
+        assert_eq!(
+            notes.contains("processes may still be running"),
+            termination.cleanup_error.is_some(),
+            "{notes}"
+        );
+    }
+}
+
+#[test]
+fn completed_script_keeps_exit_facts_when_cleanup_is_uncertain() {
+    use crate::embedded_shell::inprocess::Termination;
+    use crate::runtime::execution::ProcessOutcome;
+    for cleanup_error in [
+        None,
+        Some("external-command cleanup deadline exceeded".to_owned()),
+    ] {
+        let termination = Termination {
+            shell_stopped: true,
+            cleanup_error,
+        };
+        let mut text = "script output\n".to_owned();
+        inprocess::append_stop_notes(&mut text, false, false, 1, &termination);
+        let output = inprocess::finish_stop(
+            ToolOutput {
+                execution: Default::default(),
+                data: None,
+                text,
+                is_error: termination.uncertain(),
+            }
+            .with_process(ProcessOutcome {
+                started: true,
+                exit_code: Some(0),
+                signal: None,
+                timed_out: false,
+                cancelled: false,
+                output_complete: true,
+            }),
+            false,
+            false,
+            &termination,
+        );
+        assert_zero_exit_with_cleanup_accounted_for(&output);
+        assert_eq!(output.is_error, termination.uncertain());
+    }
 }

@@ -343,3 +343,27 @@ fn backend_timings_are_inclusive_aggregate_and_saturating() {
         u64::MAX
     );
 }
+
+#[test]
+fn prefix_timing_uses_the_existing_operation_ledger() {
+    let mut metrics = Metrics::default();
+    let mut tracker = crate::agent::window::request_prefix::Tracker::default();
+    let chat = crate::llm::Chat {
+        messages: vec![serde_json::json!({"role":"user","content":"hello"})],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 16,
+        seed: None,
+    };
+    let mut observation = tracker.observe("model", &chat);
+    observation.elapsed_us = 7;
+    metrics.prefix(&observation);
+    observation.elapsed_us = 11;
+    metrics.prefix(&observation);
+    let report = serde_json::to_value(&metrics).unwrap();
+    assert_eq!(report["backend_operations"]["request_prefix"]["calls"], 2);
+    assert_eq!(
+        report["backend_operations"]["request_prefix"]["elapsed_us"],
+        18
+    );
+}

@@ -211,3 +211,31 @@ fn a_failed_refresh_keeps_the_previous_tools_and_reports_a_notice() {
     let names = catalog_names(&session);
     assert!(names.contains(&"echo".to_owned()), "{names:?}");
 }
+
+#[test]
+fn startup_and_refresh_share_tool_and_page_cutoffs_and_diagnostics() {
+    for (flags, expected) in [("many-tools", 256), ("endless-pages", 0)] {
+        let loaded = load(&config_with(vec![("fake", fake_config(flags, 30))]));
+        assert_eq!(loaded.sessions.len(), 1, "{flags}: {:?}", loaded.notices);
+        let session = &loaded.sessions[0];
+        let before = session.catalog_snapshot().1;
+        assert_eq!(before.len(), expected, "{flags}");
+        let cutoff = loaded
+            .notices
+            .iter()
+            .find(|notice| notice.contains("cut off"))
+            .unwrap();
+        session.refresh_tools();
+        assert_eq!(session.catalog_snapshot().1, before, "{flags}");
+        assert!(
+            session.catalog_current(),
+            "a bounded prefix is usable at startup and refresh"
+        );
+        let notices = session.drain_notices();
+        assert_eq!(
+            notices,
+            vec![cutoff.clone()],
+            "same partial-coverage diagnostic for {flags}"
+        );
+    }
+}

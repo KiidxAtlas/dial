@@ -38,6 +38,8 @@ pub(in crate::agent) struct ActiveRoute {
     /// Bumped whenever a route is installed, so a turn can resize its output budget for a model
     /// swapped in by a mode hook.
     generation: u64,
+    /// Last bounded selection receipt in this process; never restored from current defaults.
+    receipt: Option<Value>,
 }
 
 impl ActiveRoute {
@@ -73,6 +75,29 @@ impl ActiveRoute {
 }
 
 impl Agent<'_> {
+    /// The installed main route, which can differ from the configured primary during fallback.
+    pub fn active_model_config(&self) -> &Config {
+        &self.auth_config
+    }
+
+    /// Current-process recorded cause only. Legacy history is not reconstructed on load.
+    pub fn main_model_explanation(&self) -> Option<&str> {
+        self.route.receipt.as_ref()?.get("explanation")?.as_str()
+    }
+
+    /// A projection on the existing branch-aware control record, not a second routing ledger.
+    /// A receipt publication failure must not change provider selection; it leaves evidence unavailable.
+    pub(in crate::agent) fn record_main_model_route(&mut self, reason: &str) {
+        let model = self.auth_config.selection().display_name();
+        // Leave one character for the preview helper's truncation ellipsis.
+        let explanation =
+            crate::agent::window::prompt::truncate_chars(&format!("{model}: {reason}"), 767);
+        let receipt = json!({"version":1,"model":model,"explanation":explanation});
+        let mut state = self.session.control_state();
+        state["main_model_route"] = receipt.clone();
+        self.route.receipt = self.session.set_control_state(state).ok().map(|()| receipt);
+    }
+
     /// Installs `config` as the live route in one step. The backend is built and bound to this
     /// session and to the turn's usage scope before anything is replaced, so a failed construction
     /// leaves the previous route untouched. The resolved configuration, loaded-window cap and
@@ -110,6 +135,7 @@ impl Agent<'_> {
         self.role_backends.clear();
         self.subagent_backend = None;
         self.route.generation = self.route.generation.wrapping_add(1);
+        self.route.receipt = None;
         Ok(previous)
     }
 
@@ -145,6 +171,7 @@ impl Agent<'_> {
         }
         self.route.fallback = None;
         self.route.tried = 0;
+        self.record_main_model_route("Primary restored after provider-error fallback cooldown; not a worker missing-assignment default");
         self.request_phase
             .recover("fallback cooldown elapsed; returning to the primary model");
         ui.event(&crate::agent::ui::ui_event::UiEvent::new(
@@ -223,6 +250,10 @@ impl Agent<'_> {
             self.route.promoted = Some(Promoted {
                 config: next_config,
             });
+            self.record_main_model_route(&format!(
+                "Context promotion from {}/{}: request about {request_tokens} tokens, larger window {window} (previous {current}); not provider-error fallback",
+                live.provider, live.model
+            ));
             self.compaction_runtime.cancel();
             self.request_phase
                 .recover("switching to a larger-window model");
@@ -279,6 +310,10 @@ impl Agent<'_> {
                 primary_cap,
                 served: false,
             });
+            self.record_main_model_route(&format!(
+                "Provider-error fallback from {}; configured main fallback candidate {} selected; not a worker missing-assignment default",
+                selected.display_name(), self.route.tried
+            ));
             self.request_phase
                 .recover("switching to a configured fallback model");
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(

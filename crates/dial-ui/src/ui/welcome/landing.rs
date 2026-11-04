@@ -74,9 +74,14 @@ pub fn frame(
     let inner = content_width(width as u16) as usize;
     let inset = (width - inner) / 2;
     let remaining = height.saturating_sub(composer.rows.len() + auxiliary.len());
-    // Only exceptional setup/safety context is visible at rest. Session choices are revealed
-    // by the existing Down-key navigation instead of competing with the input.
+    // Safety context is reserved first; recent sessions use only spare space below it.
     let mut notices = Vec::new();
+    if info.doctor_issues > 0 {
+        notices.push(vec![Span::styled(
+            format!("{} issues · /doctor", info.doctor_issues),
+            theme.fg(Tok::Warning),
+        )]);
+    }
     if info.model.trim().is_empty() {
         let hint = text::one_line(&info.setup_hint);
         notices.push(vec![Span::styled(
@@ -88,7 +93,7 @@ pub fn frame(
         notices.push(vec![Span::styled(
             format!(
                 "approval {} · sandbox {}",
-                text::one_line(&info.approval),
+                text::one_line(crate::ui::status::approval_label(&info.approval)),
                 text::one_line(&info.sandbox)
             )
             .replace('·', if theme.ascii() { ":" } else { "·" }),
@@ -130,7 +135,7 @@ pub fn frame(
         context.push(centered(spans, inner, theme));
     }
     let limit = budget.saturating_sub(context.len());
-    if view.selected.is_some() {
+    if view.selected.is_some() || (!info.recent.is_empty() && limit >= 4) {
         context.extend(
             list_lines(info, theme, &view, inner, limit)
                 .into_iter()
@@ -154,6 +159,22 @@ pub fn frame(
             inner,
             theme,
         ));
+    }
+    if info.tour && view.selected.is_none() && budget.saturating_sub(context.len()) >= 4 {
+        for hint in [
+            "1  Type a request in your own words",
+            "2  Enter sends · Ctrl+P opens actions",
+            "3  /models picks a model · Esc dismisses",
+        ] {
+            context.push(centered(
+                vec![Span::styled(
+                    hint.replace('·', theme.sym(Sym::Dot)),
+                    theme.fg(Tok::Muted),
+                )],
+                inner,
+                theme,
+            ));
+        }
     }
     rows.extend(context.into_iter().map(indent));
     rows.extend(auxiliary);

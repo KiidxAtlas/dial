@@ -2,10 +2,122 @@
 
 #[cfg(test)]
 use crate::app::command_registry::{DuringTurn, during_turn};
-use crate::app::command_registry::{RUNS_NOW, RUNS_NOW_ARGS, STOPS_TURN, command_entries};
+use crate::app::command_registry::{command_entries, turn_help};
 use crate::app::shell::Shell;
 use crate::ui::composer::{CommandEntry, CommandKind};
 use crate::ui::keys::Action;
+
+/// One owner for topic names, documentation destinations and the introduction shown in chat.
+const HELP_TOPICS: &[(&str, &str, &str)] = &[
+    (
+        "composer",
+        "docs/terminal-composer.md#composer-and-transcript",
+        "Write, paste and edit drafts without losing your place; understand the launch screen, transcript and status line.",
+    ),
+    (
+        "command-reference",
+        "docs/terminal-commands.md#commands-and-help",
+        "Find actions through the goal-first palette, slash completion and command help.",
+    ),
+    (
+        "shortcuts",
+        "docs/terminal-shortcuts.md#keyboard-shortcuts",
+        "Find the active keys, edit bindings and handle terminal-specific keyboard differences.",
+    ),
+    (
+        "sessions",
+        "docs/terminal-sessions.md#sessions-and-history",
+        "Resume, search, branch, share and move conversations while preserving their recorded history.",
+    ),
+    (
+        "models",
+        "docs/terminal-models.md#models-and-roles",
+        "Keep model selection, roles, favorites, downloads and per-model tuning together in the Models panel.",
+    ),
+    (
+        "settings",
+        "docs/terminal-settings.md#settings",
+        "Search configuration, choose storage scope and review setup presets before saving.",
+    ),
+    (
+        "turns",
+        "docs/terminal-turns.md#turns-steering-and-review",
+        "Steer running work, queue follow-ups and review recorded outcomes without confusing history with fresh verification.",
+    ),
+    (
+        "terminal",
+        "docs/terminal-integration.md#terminal-integration",
+        "Use terminal links, titles, progress signals and the optional live side pane.",
+    ),
+    (
+        "stop-scopes",
+        "docs/terminal-turns.md#turns-steering-and-review",
+        "Stop scope — reading this page stops nothing.\n\nCurrent answer: use the Interrupt key shown in /hotkeys. It requests a stop at the next safe point, not rollback. The agent also requests cancellation of its live workers and side questions when it observes that interruption; do not use it to stop only one worker. An admitted file mutation may finish.\n\nIndividual worker: open /workers, inspect the worker, then use its cancellation control (or /cancel <id>). Cancellation is requested for that worker; the main answer and other workers continue. Already completed edits and external effects remain.\n\nSession-owned shell jobs: open /processes to inspect jobs and output before explicitly killing a selected job. Interrupting an answer or a bg wait does not kill these background processes. They remain managed by bg until explicitly killed, finished, or their owning tool/session ends. Stopping one job does not stop the answer or other jobs.\n\nPersistent jobs: Unix bg jobs started with persist=true survive session exit/restarts until completion, explicit persistent kill, or their lifetime expires. Use bg list/output with persist=true to inspect them, and bg kill with persist=true and the exact name to stop one; ordinary session-job controls are not the persistent-job owner. Scheduled/learning work has separate controls in /activity and /learn; stopping an answer does not disable future scheduling.\n\nStopping is cooperative, not proof that every effect ceased immediately. Inspect results before retrying; no stop action promises to undo files, network requests or other external effects.",
+    ),
+    (
+        "undo-meanings",
+        "docs/terminal-turns.md#turns-steering-and-review",
+        "Undo meanings — reading this page changes nothing.\n\nReview files first: /review files opens the checkpoint review owner. Inspect recorded changes and choose any revert there; existing overlap warnings and confirmations still apply.\n\nFiles only: /undo files [n] (also /rollback [n]) restores recorded file checkpoints from the latest n checkpoint turns, default 1. It keeps conversation history. These commands execute a restore, not a preview.\n\nFiles and conversation: /undo [n] restores the checkpoints linked to the selected conversation turns, then rewinds history. It keeps the conversation when restoration reports incomplete work; files may already be partly restored.\n\nConversation only: /branch (alias /rewind) opens the message picker; confirm the selected rewind there. It changes the active conversation path, retaining the abandoned branch, but does not restore files or reverse completed tool effects.\n\nSettings inheritance: open /settings and inspect the selected scope and source. Removing an override removes that scope's saved value so the lower-precedence value is inherited (or the built-in default is used). This is not file rollback or conversation rewind, and is not necessarily a reset to the built-in value. Higher-precedence overrides may still win. Saving and adopting agent settings can happen at different boundaries.\n\nCheckpoint limits: only captured file writes are recoverable, within checkpoint workspace roots. Arbitrary shell writes and external effects are not guaranteed to be captured. Missing checkpoints, changed files, overlapping writers and partial restore warnings require inspection. None of these actions promises to undo network requests, processes, commits, remote services or other external side effects. Stop conflicting work and review the owner's warnings before restoring.",
+    ),
+    (
+        "everyday",
+        "docs/everyday.md",
+        "Start, steer, review, undo and resume everyday work in Dial.",
+    ),
+    (
+        "tools",
+        "docs/tools.md",
+        "Browse tools, safety boundaries and context sources.",
+    ),
+    (
+        "setup",
+        "docs/setup.md",
+        "Configure optional capabilities and inspect missing dependencies.",
+    ),
+];
+
+/// Project the canonical topic metadata into the optional palette mode.
+pub(super) fn palette_topics() -> Vec<crate::ui::overlay::palette::UnifiedEntry> {
+    use crate::ui::overlay::palette::{UnifiedEntry, UnifiedKind};
+    HELP_TOPICS
+        .iter()
+        .map(|(name, path, introduction)| UnifiedEntry {
+            kind: UnifiedKind::Help,
+            label: (*name).into(),
+            description: format!(
+                "{} · {path}",
+                introduction.lines().next().unwrap_or_default()
+            ),
+            command: format!("help {name}"),
+            session: None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests;
+
+/// Topic help is plain text: no editor, model request or runtime dependency on a source checkout.
+pub(super) fn topic_help(topic: &str) -> Option<String> {
+    HELP_TOPICS.iter().find_map(|(name, path, introduction)| {
+        topic
+            .eq_ignore_ascii_case(name)
+            .then(|| format!("{path}\n\n{introduction}"))
+    })
+}
+
+/// Exact command help wins over topic introductions; aliases resolve through the registry.
+pub(super) fn command_help(name: &str) -> Option<String> {
+    let spec = crate::ui::command_surface::command_spec(name.trim().trim_start_matches('/'))?;
+    let mut text = format!("/{} {}\n\n{}", spec.name, spec.usage, spec.description);
+    if let Some(cli) = spec.cli {
+        text.push_str(&format!("\n\nalso: dial {cli}"));
+    }
+    if let Some(note) = spec.note {
+        text.push_str(&format!("\n\n{note}"));
+    }
+    Some(text)
+}
 
 impl Shell {
     pub(super) const SEARCH_USAGE: &str = "Search past sessions in this project.\nUsage: /search <words>\nExample: /search parser error";
@@ -49,7 +161,7 @@ impl Shell {
             Action::Interrupt,
             Action::Exit,
         ] {
-            lines.push(row(&self.keys.labels(action), action.describe()));
+            lines.push(row(&self.keys.label(action), action.describe()));
         }
         lines.push(row("/hotkeys", "view and rebind every shortcut"));
         lines.push(String::new());
@@ -59,7 +171,7 @@ impl Shell {
             "choose: add direction now or queue for later",
         ));
         lines.push(row(
-            &self.keys.labels(Action::FollowUp),
+            &self.keys.label(Action::FollowUp),
             "queue a follow-up for when the turn ends",
         ));
         lines.push(row(
@@ -68,7 +180,7 @@ impl Shell {
         ));
         lines.push(row(
             "Stops the turn",
-            &STOPS_TURN
+            &turn_help(true)
                 .iter()
                 .map(|name| format!("/{name}"))
                 .collect::<Vec<_>>()
@@ -76,9 +188,8 @@ impl Shell {
         ));
         lines.push(row(
             "Runs at once",
-            &RUNS_NOW
+            &turn_help(false)
                 .iter()
-                .chain(RUNS_NOW_ARGS)
                 .map(|name| format!("/{name}"))
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -97,16 +208,22 @@ impl Shell {
         let entries = command_entries(&self.commands, &self.skills);
         let command_row = |entry: &CommandEntry| -> String {
             let name = format!("/{}", entry.name);
+            let description = crate::ui::command_surface::command_spec(&entry.name)
+                .and_then(|spec| spec.cli)
+                .map_or_else(
+                    || entry.description.clone(),
+                    |cli| format!("{} · also: dial {cli}", entry.description),
+                );
             match &entry.args_hint {
                 Some(hint) if name.len() + 1 + hint.len() <= LEFT => {
-                    row(&format!("{name} {hint}"), &entry.description)
+                    row(&format!("{name} {hint}"), &description)
                 }
                 Some(hint) => format!(
                     "{}\n{}",
-                    row(&name, &entry.description),
+                    row(&name, &description),
                     row("", &format!("usage: {name} {hint}"))
                 ),
-                None => row(&name, &entry.description),
+                None => row(&name, &description),
             }
         };
         let mut folded = Vec::new();
@@ -146,6 +263,10 @@ impl Shell {
             ));
         }
         lines.push(String::new());
+        lines.push("/help <topic>: composer, command-reference, shortcuts, sessions, models, settings, turns, terminal, everyday, tools, setup.".into());
+        lines.push("/sessions browses all sessions; Ctrl+T opens this session's branches and labels. /sessions branch rewinds; /sessions label bookmarks a message; /sessions fork copies the conversation.".into());
+        lines.push("/review offers AI review or keep/revert files; /review files opens checkpoint review directly. /undo files restores files without removing conversation turns.".into());
+        lines.push("/todo inspects Plan and Progress tabs. /btw browses side threads. /help commands lists custom commands.".into());
         lines.push(
             "/reload re-reads settings, commands, skills and themes from disk (files are also checked every two seconds; invalid edits keep the last good settings).".into(),
         );

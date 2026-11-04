@@ -238,24 +238,13 @@ fn no_op_edits_and_todo_polling_do_not_erase_version_check_loops() {
 fn unchanged_read_gets_pointer_only_while_earlier_result_is_full() {
     let mut returned = ReturnedReads::default();
     let read = call("read", json!({"path":"src/lib.rs"}));
+    let body = "1: fn a() {}\n".repeat(32);
+    assert!(returned.pointer(&read, &body, false, |_| true).is_none());
+    assert!(returned.pointer(&read, &body, false, |_| false).is_none());
+    assert!(returned.pointer(&read, &body, false, |_| true).is_some());
     assert!(
         returned
-            .pointer(&read, "1: fn a() {}", false, |_| true)
-            .is_none()
-    );
-    assert!(
-        returned
-            .pointer(&read, "1: fn a() {}", false, |_| false)
-            .is_none()
-    );
-    assert!(
-        returned
-            .pointer(&read, "1: fn a() {}", false, |_| true)
-            .is_some()
-    );
-    assert!(
-        returned
-            .pointer(&read, "1: fn b() {}", false, |_| true)
+            .pointer(&read, &"1: fn b() {}\n".repeat(32), false, |_| true)
             .is_none()
     );
 }
@@ -364,4 +353,126 @@ fn adjacent_visible_reads_jointly_cover_a_later_range_without_hiding_gaps() {
             assert!(pointer.contains("left") && pointer.contains("right"));
         }
     }
+}
+
+#[test]
+fn visible_edit_and_discovery_rows_cover_rereads_but_not_unseen_or_stale_lines() {
+    for name in ["edit", "write", "glob", "find"] {
+        let mut returned = ReturnedReads::default();
+        let source = ToolCall {
+            id: "source-result".into(),
+            ..call(name, json!({}))
+        };
+        let text = rows("AAAA", 5..=12);
+        assert!(returned.pointer(&source, &text, false, |_| true).is_none());
+        let pointer = returned.pointer(
+            &read_call("again", "src/lib.rs:6-11"),
+            &rows("AAAA", 6..=11),
+            false,
+            |_| true,
+        );
+        assert!(
+            pointer.is_some_and(|text| text.contains("source-result")),
+            "{name}"
+        );
+        for (tag, range, visible) in [
+            ("AAAA", 4..=8, true),
+            ("BBBB", 6..=7, true),
+            ("AAAA", 6..=7, false),
+        ] {
+            assert!(
+                returned
+                    .pointer(
+                        &read_call("fresh", "src/lib.rs"),
+                        &rows(tag, range),
+                        false,
+                        |_| visible
+                    )
+                    .is_none(),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn errors_shell_output_and_truncated_rows_do_not_seed_read_reuse() {
+    for (name, error, text) in [
+        ("edit", true, rows("AAAA", 1..=2)),
+        ("bash", false, rows("AAAA", 1..=2)),
+        (
+            "glob",
+            false,
+            "[src/lib.rs#AAAA]\n1:partial …[truncated]\n".into(),
+        ),
+    ] {
+        let mut returned = ReturnedReads::default();
+        returned.pointer(&call(name, json!({})), &text, error, |_| true);
+        assert!(
+            returned
+                .pointer(
+                    &read_call("fresh", "src/lib.rs"),
+                    &rows("AAAA", 1..=1).replace("code 1", &"source".repeat(100)),
+                    false,
+                    |_| true
+                )
+                .is_none(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn source_reuse_pointer_is_smaller_and_does_not_replace_tiny_ranges() {
+    let mut returned = ReturnedReads::default();
+    returned.pointer(
+        &call("edit", json!({})),
+        &rows("AAAA", 1..=20),
+        false,
+        |_| true,
+    );
+    let full = rows("AAAA", 5..=15);
+    let pointer = returned
+        .pointer(&read_call("part", "src/lib.rs:5-15"), &full, false, |_| {
+            true
+        })
+        .unwrap();
+    assert!(pointer.len() < full.len());
+    assert!(
+        returned
+            .pointer(
+                &read_call("tiny", "src/lib.rs:1"),
+                &rows("AAAA", 1..=1),
+                false,
+                |_| true
+            )
+            .is_none()
+    );
+}
+
+#[test]
+fn identical_reads_never_expand_tiny_or_equal_sized_results() {
+    let read = read_call("first", "src/lib.rs");
+    let expected = "[Unchanged read] Fresh read succeeded; same rows in still-visible tool call first. Reuse them.";
+    for text in ["x".into(), rows("AAAA", 1..=1), "x".repeat(expected.len())] {
+        let mut returned = ReturnedReads::default();
+        for _ in 0..3 {
+            assert!(returned.pointer(&read, &text, false, |_| true).is_none());
+        }
+    }
+}
+
+#[test]
+fn identical_reads_use_the_compact_pointer_only_when_it_saves_bytes() {
+    let read = read_call("first", "src/lib.rs");
+    let mut returned = ReturnedReads::default();
+    let text = rows("AAAA", 1..=20);
+    assert!(returned.pointer(&read, &text, false, |_| true).is_none());
+    let pointer = returned.pointer(&read, &text, false, |_| true).unwrap();
+    assert!(pointer.len() < text.len());
+    assert_eq!(
+        pointer,
+        "[Unchanged read] Fresh read succeeded; same rows in still-visible tool call first. Reuse them."
+    );
+    assert!(returned.pointer(&read, &text, false, |_| false).is_none());
 }

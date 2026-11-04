@@ -134,7 +134,7 @@ pub struct Store {
 impl Store {
     pub fn open(user_dir: &Path) -> Result<Self> {
         crate::platform::atomic::private_dir(user_dir)?;
-        let path = user_dir.join(DB_FILE);
+        let path = crate::config::paths::gc_db_file(user_dir);
         let mut options = fs::OpenOptions::new();
         options.create(true).read(true).write(true);
         platform_fs::open_owner_only(&options, &path).context("open gc database file")?;

@@ -15,16 +15,21 @@ use crate::llm::model_config::ModelSelection;
 use crate::ui::keys::Keymap;
 use crate::ui::status::StatusData;
 use crate::ui::theme::ThemeManager;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 pub(in crate::app) struct OverlayEnv<'a> {
     pub(in crate::app) runtime: &'a crate::runtime::Tree,
+    pub(in crate::app) todo: &'a crate::agent::workflow::todo::TodoList,
+    pub(in crate::app) model_downloads:
+        Option<&'a crate::ui::overlay::models::SharedModelDownloads>,
     pub(in crate::app) compute_monitor: Option<ComputeMonitor>,
     pub(in crate::app) live_tasks: Option<&'a crate::agent::LiveTaskControl>,
     pub(in crate::app) verify_lora: Option<ModelSelection>,
     pub(in crate::app) auth_job: &'a mut Option<AuthJob>,
+    pub(in crate::app) last_setup_failure: &'a mut Option<super::auth::SetupFailure>,
     pub(in crate::app) extensions_pending:
         &'a mut Option<crate::app::commands::extensions_browser::Pending>,
     pub(in crate::app) extensions_job:
@@ -41,6 +46,8 @@ pub(in crate::app) struct OverlayEnv<'a> {
     pub(in crate::app) dark: Option<bool>,
     pub(in crate::app) latest: Option<Config>,
     pub(in crate::app) next: Option<String>,
+    /// The shell's existing navigation stack; direct model reviews must retain their editor too.
+    pub(in crate::app) history: &'a mut Vec<ActiveOverlay>,
     pub(in crate::app) seen_generation: u64,
     /// Unloads resident models before a compute action starts training. Absent in busy panels,
     /// where the chat loop's compute handoff runs while the panel is open.
@@ -56,12 +63,85 @@ pub(in crate::app) fn settings_tables(
     effective: &Config,
 ) -> Result<(toml::Table, toml::Table, toml::Table)> {
     Ok((
-        toml::Table::try_from(effective).context("serializing effective settings")?,
+        effective
+            .settings_values()
+            .context("serializing effective settings")?,
         settings_store::load_layer(&app.layout, Scope::Global)
             .context("reading global settings")?,
         settings_store::load_layer(&app.layout, Scope::Project)
             .context("reading project settings")?,
     ))
+}
+
+/// The App snapshot belongs to the active turn; disk reloads may already contain staged saves.
+pub(in crate::app) fn refresh_settings_application(
+    settings: &mut crate::ui::overlay::settings::SettingsOverlay,
+    app: &App,
+    saved: &Config,
+    busy: bool,
+) {
+    if let (Ok(active), Ok(projected)) = (
+        app.config.settings_values(),
+        saved.clone().for_coding().settings_values(),
+    ) {
+        settings.set_projected_application_state(&active, Some(&projected), busy);
+    }
+}
+
+/// Re-enter retained configuration pages with fresh values, not fresh navigation/editor state.
+pub(in crate::app) fn refresh_navigation(
+    app: &App,
+    catalog: &Catalog,
+    overlay: &mut ActiveOverlay,
+    busy: bool,
+) {
+    let overlay = overlay.content_mut();
+    if !matches!(
+        overlay,
+        ActiveOverlay::Settings(_) | ActiveOverlay::Models(_) | ActiveOverlay::Providers(_)
+    ) {
+        return;
+    }
+    let result = (|| -> Result<()> {
+        let config = app.reload()?;
+        match overlay {
+            ActiveOverlay::Settings(settings) => {
+                let (values, global, project) = settings_tables(app, &config)?;
+                settings.refresh_values(values, project, global, config.setting_sources.clone());
+                refresh_settings_application(settings, app, &config, busy);
+                apply_settings_hints(settings, &config);
+                settings.set_setup_offers(setting_setup_offers(&app.layout.user_dir, &config));
+                settings.set_value_choices(settings_value_choices(
+                    &config,
+                    catalog.get().as_ref(),
+                    &app.layout.user_dir,
+                ));
+            }
+            ActiveOverlay::Models(models) => {
+                models.set_roles(config.role_statuses());
+                models.set_favorites(favorite_routes(&config));
+                models.set_laya_checkpoint(crate::config::laya::expected_checkpoint(&config.laya));
+                models.set_memory_required(crate::config::memory_backend::requires_memory_role(
+                    &config.memory,
+                ));
+                models.set_memory_optional(
+                    crate::config::memory_backend::auto_retain_uses_memory_role(&config.memory),
+                );
+                models.set_memory_backend(
+                    crate::config::memory_backend::active_backend(&config.memory).as_str(),
+                );
+            }
+            ActiveOverlay::Providers(providers) => providers.set_configured(config.providers),
+            _ => {}
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        overlay.banner(
+            format!("Could not refresh settings; showing last good values: {error:#}"),
+            true,
+        );
+    }
 }
 
 pub(in crate::app) fn favorite_routes(
@@ -92,6 +172,53 @@ pub(in crate::app) fn favorite_routes(
             }
         })
         .collect()
+}
+
+/// Validate the frozen review and remove all its exact paths in one canonical transaction.
+/// The comparison runs under the settings store's layer locks, not before acquiring them.
+fn save_reviewed_reset(
+    app: &App,
+    paths: &[String],
+    scope: Scope,
+    expected: &BTreeMap<String, toml::Value>,
+) -> Result<()> {
+    let selected: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
+    ensure!(
+        !selected.is_empty()
+            && selected.len() == paths.len()
+            && selected.len() == expected.len()
+            && selected.iter().all(|path| expected.contains_key(*path)),
+        "Reset paths do not match the reviewed overrides; review again."
+    );
+    ensure!(
+        selected
+            .iter()
+            .all(|path| crate::ui::overlay::settings::resettable_path(path)),
+        "Reset includes a setting that cannot be removed in bulk; review again."
+    );
+    let changes: Vec<_> = paths
+        .iter()
+        .map(|path| Change::Remove { path: path.clone() })
+        .collect();
+    app.save_settings_checked(scope, &changes, |_| {
+        let layer = settings_store::load_layer(&app.layout, scope)?;
+        for (path, value) in expected {
+            ensure!(
+                crate::config::schema::get(&layer, path) == Some(value),
+                "Reviewed override {path} changed; review again before resetting."
+            );
+            // Single-key reset clears embedding pairs. Bulk reset must review every stored half,
+            // never silently expand a preview to remove an unreviewed partner.
+            if let Some(partner) = crate::ui::overlay::settings::pair_partner(path) {
+                ensure!(
+                    crate::config::schema::get(&layer, partner).is_none()
+                        || expected.contains_key(partner),
+                    "Embedding override partner {partner} was not reviewed; review again."
+                );
+            }
+        }
+        Ok(())
+    })
 }
 
 impl OverlayEnv<'_> {
@@ -141,7 +268,7 @@ impl OverlayEnv<'_> {
         for (_, line) in AuthJob::drain_lines(self.auth_job) {
             overlay.banner(line, false);
         }
-        let result = AuthJob::collect(self.auth_job, self.app);
+        let result = AuthJob::collect_retained(self.auth_job, self.app, self.last_setup_failure);
         if let Some((provider, result)) = result {
             if let ActiveOverlay::Providers(providers) = overlay {
                 providers.set_chatgpt_pending(false);
@@ -196,6 +323,14 @@ impl OverlayEnv<'_> {
                 }
                 other => other,
             };
+            if provider == "Model"
+                && result.is_ok()
+                && self.next.is_none()
+                && matches!(overlay, ActiveOverlay::Models(_))
+                && matches!(self.history.last(), Some(ActiveOverlay::Settings(_)))
+            {
+                self.next = Some("navigate:back".into());
+            }
             self.refresh_roles(overlay);
             self.report(overlay, result);
             self.catalog.refresh(self.app);
@@ -277,6 +412,62 @@ impl OverlayEnv<'_> {
         }
     }
 
+    pub(super) fn unset_many(
+        &mut self,
+        overlay: &mut ActiveOverlay,
+        paths: &[String],
+        scope: Scope,
+    ) {
+        let ActiveOverlay::Settings(settings) = overlay else {
+            self.report(
+                overlay,
+                Err(anyhow::anyhow!("Bulk reset requires a settings review.")),
+            );
+            return;
+        };
+        let outcome = (|| -> Result<_> {
+            ensure!(
+                settings.batch_pending(),
+                "Bulk reset has not been confirmed; review again."
+            );
+            ensure!(
+                settings.batch_scope() == Some(scope),
+                "Reset scope does not match the review; review again."
+            );
+            let expected = settings
+                .batch_expected()
+                .context("Bulk reset requires a settings review.")?;
+            ensure!(
+                self.auth_job.is_none() && !settings.setup_pending(),
+                "A setup or authentication operation is still running; wait or cancel it before resetting."
+            );
+            save_reviewed_reset(self.app, paths, scope, expected)?;
+            let fresh = self.reload_saved()?;
+            let (values, global, project) = settings_tables(self.app, &fresh)?;
+            Ok((fresh, (values, project, global)))
+        })();
+        match outcome {
+            Ok((fresh, tables)) => {
+                *self.scope = scope;
+                settings.batch_settled(Ok(tables));
+                refresh_settings_application(
+                    settings,
+                    self.app,
+                    &fresh,
+                    self.status.phase != crate::ui::status::Phase::Idle,
+                );
+                apply_settings_hints(settings, &fresh);
+                settings.set_setup_offers(setting_setup_offers(&self.app.layout.user_dir, &fresh));
+                settings.set_value_choices(settings_value_choices(
+                    &fresh,
+                    self.catalog.get().as_ref(),
+                    &self.app.layout.user_dir,
+                ));
+            }
+            Err(error) => settings.batch_settled(Err(format!("{error:#}"))),
+        }
+    }
+
     pub(super) fn setting(
         &mut self,
         overlay: &mut ActiveOverlay,
@@ -286,10 +477,12 @@ impl OverlayEnv<'_> {
     ) {
         if let ActiveOverlay::ModelSettings(settings) = overlay {
             let mut updates = changes.to_vec();
-            updates.push(Change::Set {
-                path: "model_profile".into(),
-                value: toml::Value::String(settings.name.clone()),
-            });
+            if settings.activates_profile() {
+                updates.push(Change::Set {
+                    path: "model_profile".into(),
+                    value: toml::Value::String(settings.name.clone()),
+                });
+            }
             let result = self
                 .save(&updates, scope)
                 .map(|_| ())
@@ -337,6 +530,12 @@ impl OverlayEnv<'_> {
                 }
                 settings.settled(path, Ok(Self::effective_value(&fresh, path)));
                 settings.replace_values(values, project, global);
+                refresh_settings_application(
+                    settings,
+                    self.app,
+                    &fresh,
+                    self.status.phase != crate::ui::status::Phase::Idle,
+                );
                 apply_settings_hints(settings, &fresh);
                 settings.set_setup_offers(setting_setup_offers(&self.app.layout.user_dir, &fresh));
                 settings.set_value_choices(settings_value_choices(
@@ -397,9 +596,10 @@ impl OverlayEnv<'_> {
         }
     }
 
-    pub(super) fn refresh_roles(&mut self, overlay: &mut ActiveOverlay) {
+    pub(in crate::app) fn refresh_roles(&mut self, overlay: &mut ActiveOverlay) {
         if let (ActiveOverlay::Models(models), Some(config)) = (overlay, &self.latest) {
             models.set_roles(config.role_statuses());
+            models.set_laya_checkpoint(crate::config::laya::expected_checkpoint(&config.laya));
             models.set_memory_required(crate::config::memory_backend::requires_memory_role(
                 &config.memory,
             ));
@@ -413,3 +613,6 @@ impl OverlayEnv<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

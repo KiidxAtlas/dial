@@ -524,7 +524,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         TO,
         "Portable rules",
         "Judge question rules",
-        "Ask judged `question` rules about each completed main-agent reply. Auto: only when the judge role is assigned. On: the judge role, falling back to small and then the main model. Off: never. Judging never interrupts a reply.",
+        "Ask judged `question` rules about each completed main-agent reply. Auto: only when the decision role is assigned. On: the decision role, falling back to small and then the main model. Off: never. Judging never interrupts a reply.",
         Kind::Enum(RULE_JUDGE),
         true
     ),

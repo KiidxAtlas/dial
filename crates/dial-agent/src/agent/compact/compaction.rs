@@ -26,6 +26,7 @@ use crate::{
     storage::session::Session,
 };
 use anyhow::{Context, Result, bail, ensure};
+use execution::RequestCompletion;
 pub(in crate::agent) use execution::{SummaryExecution, SummaryWorker};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -482,7 +483,7 @@ pub fn compact_history(
         input,
         interrupt,
         ui,
-        complete,
+        &mut |backend, request, ui, _| complete(backend, request, ui),
         remote_observer,
         &mut SummaryExecution::default(),
     )
@@ -494,7 +495,7 @@ pub(in crate::agent) fn compact_history_with_execution(
     input: HistoryCompaction<'_>,
     interrupt: Arc<AtomicBool>,
     ui: &mut dyn Ui,
-    complete: &mut dyn FnMut(&mut Backend, &Chat, &mut dyn Ui) -> Result<String>,
+    complete: &mut RequestCompletion<'_>,
     mut remote_observer: Option<&mut RemoteCompactionObserver<'_>>,
     execution: &mut SummaryExecution,
 ) -> Result<PreparedCompaction> {
@@ -764,7 +765,9 @@ pub(in crate::agent) fn compact_history_with_execution(
                             &live_focus,
                             &interrupt,
                             ui,
-                            complete,
+                            &mut |backend, request, ui| {
+                                complete(backend, request, ui, interrupt.clone())
+                            },
                         )?
                     } else {
                         None
@@ -838,7 +841,9 @@ pub(in crate::agent) fn compact_history_with_execution(
                                 &focus,
                                 &interrupt,
                                 ui,
-                                complete,
+                                &mut |backend, request, ui| {
+                                    complete(backend, request, ui, interrupt.clone())
+                                },
                                 &mut remote_observer,
                             )?;
                             prefix = vec![Session::compaction_message(&summary)];

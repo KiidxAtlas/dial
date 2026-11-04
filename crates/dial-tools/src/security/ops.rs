@@ -205,7 +205,7 @@ fn make_plan(env: &Env, args: &Value) -> Result<Plan> {
                 env.project_root.join(path)
             }
         }
-        None => env.user_dir.join("security").join("outputs"),
+        None => crate::config::paths::security_dir(&env.user_dir).join("outputs"),
     };
     let model = ModelRef {
         provider: env.provider.clone(),

@@ -56,7 +56,7 @@ pub fn compute_lock_cancellable(
     cancelled: impl Fn() -> bool,
 ) -> Result<Option<File>> {
     let _request = super::compute::Request::foreground(&layout.user_dir)?;
-    let file = lock_file(&layout.user_dir.join("compute.lock"))?;
+    let file = lock_file(&crate::config::paths::compute_lock_file(&layout.user_dir))?;
     loop {
         if cancelled() {
             return Ok(None);
@@ -205,7 +205,7 @@ pub fn jobs(layout: &Layout) -> Result<Value> {
     }
     entries.sort_by_key(|entry| entry["state_id"].as_str().unwrap_or_default().to_owned());
     Ok(
-        json!({"shared_compute_busy":busy(&layout.user_dir.join("compute.lock"))?,"project_jobs":entries}),
+        json!({"shared_compute_busy":busy(&crate::config::paths::compute_lock_file(&layout.user_dir))?,"project_jobs":entries}),
     )
 }
 

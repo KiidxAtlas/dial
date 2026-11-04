@@ -253,13 +253,19 @@ fn input_ready_reports_terminal_input_and_refuses_a_hung_up_terminal() {
     let not_terminal = File::open("/dev/null").unwrap();
     assert_eq!(input_ready(&not_terminal, Duration::ZERO).unwrap(), None);
 
-    let (mut master, slave) = open(24, 80).unwrap();
+    let (mut master, mut slave) = open(24, 80).unwrap();
     assert_eq!(input_ready(&slave, Duration::ZERO).unwrap(), Some(false));
     master.write_all(b"line\n").unwrap();
     assert_eq!(
         input_ready(&slave, Duration::from_secs(5)).unwrap(),
         Some(true)
     );
+    // A concurrent fork can briefly retain the master until exec closes its CLOEXEC copy.
+    // Consume the readiness fixture so that queued input cannot win the hang-up wait.
+    let mut line = [0; 5];
+    slave.read_exact(&mut line).unwrap();
+    assert_eq!(&line, b"line\n");
+    assert_eq!(input_ready(&slave, Duration::ZERO).unwrap(), Some(false));
     drop(master);
     let error = input_ready(&slave, Duration::from_secs(5)).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);

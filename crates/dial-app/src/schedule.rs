@@ -38,6 +38,11 @@ const MIN_INTERVAL_SECS: u64 = 30;
 const MAX_ENTRIES: usize = 64;
 const MAX_PROMPT: usize = 16 * 1024;
 const MAX_WATCHED_FILES: usize = 20_000;
+const MAX_FINGERPRINT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_FINGERPRINT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_EVENT_PATHS: usize = 1024;
+const START_RETRY_SECS: u64 = 2;
+const MAX_START_RETRY_SECS: u64 = 60;
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const DEBOUNCE_SECS: u64 = 3;
 const CAPTURE_HEAD: usize = 128 * 1024;
@@ -214,8 +219,8 @@ fn watch_set(patterns: &[String]) -> Result<globset::GlobSet> {
     Ok(builder.build()?)
 }
 
-/// A digest of path, size and modification time of every watched, non-ignored regular file.
-/// Refuse incomplete coverage, including traversal/metadata errors and more than 20,000 matches.
+/// A digest of path, size, modification time and content of every watched, non-ignored file.
+/// Refuse incomplete coverage, including traversal/read errors and bounded file/byte limits.
 pub fn fingerprint(root: &Path, patterns: &[String]) -> Result<[u8; 32]> {
     let set = watch_set(patterns)?;
     fingerprints(root, &[&set]).pop().expect("one watch set")
@@ -233,6 +238,26 @@ fn fingerprints_with_walk(
     sets: &[&globset::GlobSet],
     limit: usize,
     walk: impl FnOnce() -> ignore::Walk,
+) -> Vec<Result<[u8; 32]>> {
+    fingerprints_with_reader(
+        root,
+        sets,
+        limit,
+        MAX_FINGERPRINT_FILE_BYTES,
+        MAX_FINGERPRINT_BYTES,
+        walk,
+        content_digest,
+    )
+}
+
+fn fingerprints_with_reader(
+    root: &Path,
+    sets: &[&globset::GlobSet],
+    limit: usize,
+    file_bytes: u64,
+    mut remaining: u64,
+    walk: impl FnOnce() -> ignore::Walk,
+    mut read: impl FnMut(&Path, &fs::Metadata) -> Result<[u8; 32]>,
 ) -> Vec<Result<[u8; 32]>> {
     let mut files: Vec<Result<Vec<_>>> = sets.iter().map(|_| Ok(Vec::new())).collect();
     if sets.is_empty() {
@@ -282,7 +307,26 @@ fn fingerprints_with_walk(
                     .duration_since(UNIX_EPOCH)
                     .context("watch coverage incomplete: modification time predates Unix epoch")?
                     .as_nanos();
-                Ok((relative.to_path_buf(), meta.len(), modified))
+                ensure!(
+                    meta.len() <= file_bytes,
+                    "watch coverage incomplete: {} exceeds {file_bytes} content bytes; narrow --watch",
+                    entry.path().display()
+                );
+                // Charge once per distinct file, not per matching set. Include a sentinel byte
+                // so growth during a read can be detected without exceeding the shared budget.
+                let charged = meta.len().saturating_add(1);
+                ensure!(
+                    charged <= remaining,
+                    "watch coverage incomplete: shared content byte budget exhausted; narrow --watch"
+                );
+                remaining -= charged;
+                let content = read(entry.path(), &meta).with_context(|| {
+                    format!(
+                        "watch coverage incomplete: reading content of {}",
+                        entry.path().display()
+                    )
+                })?;
+                Ok((relative.to_path_buf(), meta.len(), modified, content))
             })();
             for index in matching {
                 let matched = files[index].as_mut().expect("active watch set");
@@ -313,15 +357,48 @@ fn fingerprints_with_walk(
         .collect()
 }
 
-fn hash_files(mut files: Vec<(PathBuf, u64, u128)>) -> [u8; 32] {
+fn content_digest(path: &Path, expected: &fs::Metadata) -> Result<[u8; 32]> {
+    let file =
+        crate::platform::fs::open_nofollow_nonblocking(fs::OpenOptions::new().read(true), path)?;
+    let opened = file.metadata()?;
+    ensure!(
+        opened.is_file()
+            && opened.len() == expected.len()
+            && opened.modified()? == expected.modified()?,
+        "file changed before content verification"
+    );
+    let mut reader = (&file).take(expected.len().saturating_add(1));
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    let mut total = 0;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        hash.update(&buffer[..count]);
+    }
+    let after = file.metadata()?;
+    ensure!(
+        total == expected.len()
+            && after.len() == expected.len()
+            && after.modified()? == expected.modified()?,
+        "file changed during content verification"
+    );
+    Ok(hash.finalize().into())
+}
+
+fn hash_files(mut files: Vec<(PathBuf, u64, u128, [u8; 32])>) -> [u8; 32] {
     files.sort();
     let mut hash = Sha256::new();
-    for (path, len, modified) in files {
+    for (path, len, modified, content) in files {
         let path = path.to_string_lossy();
         hash.update((path.len() as u64).to_le_bytes());
         hash.update(path.as_bytes());
         hash.update(len.to_le_bytes());
         hash.update(modified.to_le_bytes());
+        hash.update(content);
     }
     hash.finalize().into()
 }
@@ -606,6 +683,7 @@ pub struct Scheduler {
     pub last_run: HashMap<String, u64>,
     watches: HashMap<String, Watch>,
     definitions: HashMap<String, Entry>,
+    start_retries: HashMap<String, (u64, u64)>,
 }
 
 impl Scheduler {
@@ -617,6 +695,11 @@ impl Scheduler {
         });
         self.last_run
             .retain(|id, _| fresh.iter().any(|entry| entry.id == *id));
+        self.start_retries.retain(|id, _| {
+            fresh.iter().any(|entry| {
+                entry.id == *id && self.definitions.get(id).is_none_or(|old| old == entry)
+            })
+        });
         self.definitions = fresh
             .iter()
             .map(|entry| (entry.id.clone(), entry.clone()))
@@ -629,6 +712,13 @@ impl Scheduler {
         now: u64,
         fingerprint: impl FnOnce() -> Option<[u8; 32]>,
     ) -> Option<Reason> {
+        if self
+            .start_retries
+            .get(&entry.id)
+            .is_some_and(|(retry_at, _)| now < *retry_at)
+        {
+            return None;
+        }
         if let Some(every) = entry.every_secs {
             let since = self
                 .last_run
@@ -666,8 +756,21 @@ impl Scheduler {
         }
     }
 
+    /// A launch failure is not a completion: preserve the pending change and interval timestamp.
+    fn start_failed(&mut self, entry: &Entry, now: u64) {
+        let delay = self
+            .start_retries
+            .get(&entry.id)
+            .map_or(START_RETRY_SECS, |(_, delay)| {
+                delay.saturating_mul(2).min(MAX_START_RETRY_SECS)
+            });
+        self.start_retries
+            .insert(entry.id.clone(), (now.saturating_add(delay), delay));
+    }
+
     /// Record a finished run. The new fingerprint becomes the baseline, so the run's own edits do not retrigger it.
     pub fn ran(&mut self, entry: &Entry, now: u64, fingerprint: Option<[u8; 32]>) {
+        self.start_retries.remove(&entry.id);
         self.last_run.insert(entry.id.clone(), now);
         if !entry.watch.is_empty() {
             self.watches.insert(
@@ -1495,10 +1598,7 @@ fn run_entry(
 /// "a run's own edits are the new baseline" are unchanged. Without a working watcher (or after
 /// an overflow/rescan event) every watched entry is re-fingerprinted.
 struct FsEvents {
-    rx: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
-    /// Events received by `wait`, consumed by the next `drain`.
-    early: std::cell::RefCell<Vec<notify::Result<notify::Event>>>,
-    roots: Vec<PathBuf>,
+    inbox: EventInbox,
     _watcher: notify::RecommendedWatcher,
 }
 
@@ -1507,42 +1607,94 @@ enum Changes {
     Everything,
 }
 
-impl FsEvents {
-    fn start(root: &Path) -> Result<Self> {
-        use notify::Watcher;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = tx.send(event);
-        })
-        .context("creating filesystem watcher")?;
-        watcher
-            .watch(root, notify::RecursiveMode::Recursive)
-            .with_context(|| format!("watching {}", root.display()))?;
-        // Event paths may arrive canonicalized (macOS /var → /private/var) or as given.
-        let mut roots = vec![root.to_path_buf()];
-        if let Ok(canonical) = root.canonicalize()
-            && canonical != root
-        {
-            roots.push(canonical);
+/// Keep backend callbacks nonblocking even while a child run owns the scheduler thread.
+struct EventSink {
+    tx: std::sync::mpsc::SyncSender<PathBuf>,
+    overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl EventSink {
+    fn push(&self, event: notify::Result<notify::Event>) {
+        use std::sync::atomic::Ordering;
+        let Ok(event) = event else {
+            self.overflow.store(true, Ordering::Release);
+            return;
+        };
+        if event.need_rescan() {
+            self.overflow.store(true, Ordering::Release);
+            return;
         }
-        Ok(Self {
-            rx,
-            early: Default::default(),
-            roots,
-            _watcher: watcher,
-        })
+        // Content verification itself emits access/open/close-read notifications on some
+        // backends. They must neither enqueue paths nor exhaust the queue.
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            return;
+        }
+        // Directory changes need not emit notifications for their descendants. A directory path
+        // also need not match a file glob; structural/ambiguous notifications require a rescan.
+        if matches!(
+            event.kind,
+            notify::EventKind::Create(
+                notify::event::CreateKind::Folder | notify::event::CreateKind::Any
+            ) | notify::EventKind::Remove(
+                notify::event::RemoveKind::Folder | notify::event::RemoveKind::Any
+            ) | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+        ) {
+            self.overflow.store(true, Ordering::Release);
+            return;
+        }
+        for (index, path) in event.paths.into_iter().enumerate() {
+            if index >= MAX_EVENT_PATHS || self.tx.try_send(path).is_err() {
+                self.overflow.store(true, Ordering::Release);
+                break;
+            }
+        }
+    }
+}
+
+struct EventInbox {
+    rx: std::sync::mpsc::Receiver<PathBuf>,
+    early: std::cell::RefCell<HashSet<PathBuf>>,
+    overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    roots: Vec<PathBuf>,
+}
+
+impl EventInbox {
+    fn new(roots: Vec<PathBuf>) -> (EventSink, Self) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(MAX_EVENT_PATHS);
+        let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            EventSink {
+                tx,
+                overflow: overflow.clone(),
+            },
+            Self {
+                rx,
+                early: Default::default(),
+                overflow,
+                roots,
+            },
+        )
     }
 
-    /// Wait until the deadline or `stop`; an event shortens the wait to a 250 ms batch window so
-    /// a burst (save-all, build output) wakes the scheduler once.
+    /// Bound both consumed notifications and retained distinct paths during the batch window.
     fn wait(&self, mut deadline: Instant, stop: &std::sync::atomic::AtomicBool) {
-        while Instant::now() < deadline && !stop.load(std::sync::atomic::Ordering::Acquire) {
+        use std::sync::atomic::Ordering;
+        let mut received = 0;
+        while Instant::now() < deadline && !stop.load(Ordering::Acquire) {
+            if self.overflow.load(Ordering::Acquire) {
+                return;
+            }
             let slice = deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(100));
             match self.rx.recv_timeout(slice) {
-                Ok(event) => {
-                    self.early.borrow_mut().push(event);
+                Ok(path) => {
+                    self.early.borrow_mut().insert(path);
+                    received += 1;
+                    if received >= MAX_EVENT_PATHS {
+                        self.overflow.store(true, Ordering::Release);
+                        return;
+                    }
                     deadline = deadline.min(Instant::now() + Duration::from_millis(250));
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -1551,34 +1703,60 @@ impl FsEvents {
         }
     }
 
-    /// Relative paths changed since the last drain, or `Everything` when the watcher lost track.
     fn drain(&self) -> Changes {
-        let mut events = std::mem::take(&mut *self.early.borrow_mut());
-        events.extend(self.rx.try_iter());
-        let mut paths = Vec::new();
-        for event in events {
-            let Ok(event) = event else {
-                return Changes::Everything;
-            };
-            if event.need_rescan() {
-                return Changes::Everything;
-            }
-            if matches!(event.kind, notify::EventKind::Access(_)) {
-                continue;
-            }
-            for path in event.paths {
-                match self
-                    .roots
+        use std::sync::atomic::Ordering;
+        let mut full_scan = self.overflow.swap(false, Ordering::AcqRel);
+        let mut paths = std::mem::take(&mut *self.early.borrow_mut());
+        // Never chase a producer indefinitely. Reaching the drain cap is conservative overflow.
+        for (index, path) in self.rx.try_iter().take(MAX_EVENT_PATHS).enumerate() {
+            paths.insert(path);
+            full_scan |= index + 1 == MAX_EVENT_PATHS || paths.len() > MAX_EVENT_PATHS;
+        }
+        full_scan |= self.overflow.swap(false, Ordering::AcqRel);
+        if full_scan {
+            return Changes::Everything;
+        }
+        let relative: Option<Vec<_>> = paths
+            .into_iter()
+            .map(|path| {
+                self.roots
                     .iter()
                     .find_map(|root| path.strip_prefix(root).ok())
-                {
-                    Some(relative) => paths.push(relative.to_path_buf()),
-                    // A path we cannot place (renamed root, foreign mount): be conservative.
-                    None => return Changes::Everything,
-                }
-            }
+                    .map(Path::to_path_buf)
+            })
+            .collect();
+        relative.map_or(Changes::Everything, Changes::Paths)
+    }
+}
+
+impl FsEvents {
+    fn start(root: &Path) -> Result<Self> {
+        use notify::Watcher;
+        // Event paths may arrive canonicalized (macOS /var → /private/var) or as given.
+        let mut roots = vec![root.to_path_buf()];
+        if let Ok(canonical) = root.canonicalize()
+            && canonical != root
+        {
+            roots.push(canonical);
         }
-        Changes::Paths(paths)
+        let (sink, inbox) = EventInbox::new(roots);
+        let mut watcher = notify::recommended_watcher(move |event| sink.push(event))
+            .context("creating filesystem watcher")?;
+        watcher
+            .watch(root, notify::RecursiveMode::Recursive)
+            .with_context(|| format!("watching {}", root.display()))?;
+        Ok(Self {
+            inbox,
+            _watcher: watcher,
+        })
+    }
+
+    fn wait(&self, deadline: Instant, stop: &std::sync::atomic::AtomicBool) {
+        self.inbox.wait(deadline, stop);
+    }
+
+    fn drain(&self) -> Changes {
+        self.inbox.drain()
     }
 }
 
@@ -1833,6 +2011,8 @@ pub fn run(
                     ) {
                         eprintln!("dial schedule: {} log unavailable: {log_error:#}", entry.id);
                     }
+                    scheduler.start_failed(entry, now());
+                    continue;
                 }
                 Err(RunFailure::Active(error)) => {
                     // Do not launch another entry when process ownership or completion is uncertain.

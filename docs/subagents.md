@@ -147,6 +147,8 @@ is not completed integration: parent conflicts make the task `incomplete`, and m
 it `failed`. The candidate structured result remains intact, with applied paths, conflicts, errors
 and recovery locations reported separately in isolation metadata. Inspect that metadata before
 relying on a worker's edits; a rollback or cleanup failure is not a clean merge.
+Controller-owned rollback uncertainty also blocks strict-contract replay: retained applied paths,
+recovery backups or rollback errors cannot be turned into retry permission by a worker report.
 
 Optional `acceptance_checks` on a task or `tasks[]` item names 1–16 unique configured
 `verification.commands` IDs, never model-supplied shell commands. Mutating workers with this
@@ -188,6 +190,9 @@ ordinary chat and tasks without `contract` retain their existing behavior. Check
 operator-configured with complete input declarations. Contracted tasks require persistent
 session, worker and artifact storage; they cannot run in plan mode or through nested workers,
 batches or pools. Mutating workers use the existing isolated promotion and approval paths.
+Strict contracts require an isolated mutating worker (for example `agent: "worker"`). Scout/reviewer
+and other nonisolated advisory contracts are refused before durable intent is recorded; ordinary
+read-only tasks remain available without a strict contract.
 
 ```json
 {"action":"start","agent":"worker","task":"Implement the parser change",
@@ -202,6 +207,9 @@ answer and `finish completed`. Input or check-definition changes invalidate acce
 dependent results; restoring the old bytes does not silently restore it. Each node has a bounded
 attempt budget, and every worker has a nonzero step limit (at most 64). Retrying is explicit and
 must retain the original assignment and dependencies, not change the goal to make a check pass.
+Running dependents revalidate live dependency bindings inside the workspace promotion transaction,
+holding controller authority through validation and commit/rollback. Stale upstream acceptance
+retains the candidate instead of landing a patch and merely invalidating completion afterward.
 
 Use `{"action":"status","contract":{"id":"parser"}}` to inspect a node. After a restart,
 saved acceptance is historical only: no worker or external effect is replayed automatically.
@@ -266,6 +274,11 @@ Synchronous task results retain the complete typed job report before creating te
 
 Use `action: "start"` to start a live task, then `status`, `wait`, or `cancel` with its id. Live workers and the parent talk through the `message` tool, offered whenever `task` is (it reports an empty roster or an unknown recipient when no worker is live): `to` takes a live job id or label, `parent` (from a worker), or `all` (a broadcast to the other live workers); omit `to` to list reachable recipients. Each message is at most 32 KiB. A recipient's mailbox holds at most `[task].inbox_limit` undelivered messages (default 256); a full mailbox refuses the message explicitly, and a broadcast reports each refusal. Messages are plain text with no authority: they never approve actions or widen a worker's tools. A recipient receives a message, labelled with its sender, at its next model request. The `message` result is a receipt per recipient: `{"receipts":[{"to":"task-1","status":"queued"}]}`. `queued` means the recipient's mailbox accepted the message and it will be read at the recipient's next model step (the sender cannot know that synchronously, so `delivered` is never claimed); `refused` carries a `reason` (only a broadcast reports a full mailbox this way, since a single full mailbox fails the send). A message to a finished or unknown worker fails the call with that reason; Dial never revives a finished worker, and messages still unread when a worker finishes are discarded. A worker's message to `parent` follows the same policy as worker completion notices and background-job completions: it never starts an unrequested turn. While the parent is idle (for example waiting for your input in the TUI), the controller's regular pump (about every two seconds when nothing else is animating) shows `Message from <worker> to parent: <first line>` in the transcript and queues the full text, marked as peer text rather than instructions, for the parent's next request; while a turn runs it surfaces at the next model step. `task_message` remains the RPC form of the same send. Completed task records and transcripts may be retained in the state directory according to `[task].persist`; do not put secrets in task prompts or messages.
 
+The worker inspector's **Settings** section shows live configuration revision/state, last applied
+revision, active model, requested model/thinking and any application error. Queued/applying values
+remain requests, not the active model; a failed application is labelled **failed (not applied)**.
+This is a projection of runtime receipts, not a second control path or a persisted transcript claim.
+
 ### Slow and stalled workers
 
 A running worker's `status` includes `running_secs`, `idle_secs` (time since its last progress or tool start, or since launch if it has not progressed) and `health`. `health` is `stalled` once `idle_secs` reaches `[task].stall_secs` (default 300, matching the remote model idle timeout; 0 disables monitoring), `slow` once the worker has run three times that long while still progressing, and `active` otherwise. Settled workers carry none of these. A newly stalled worker raises one background notice and ends a parent `task` `wait` early (nothing is cancelled); decide to keep waiting, `message` it, `peek`/`status` it, or `cancel` it and tell the user. A worker that resumes and stalls again is reported again. A long model call or tool counts as silence, so raise `stall_secs` for workloads with slow single steps.
@@ -283,7 +296,7 @@ Worker outcome payloads carry the shared `runtime::Phase` rather than a separate
 Busy-input routing acknowledges independent work only after confirming worker startup. If startup fails before a worker launches, explicitly independent input is deferred until after the active turn; automatically split input falls back to steering. A worker that actually started is never replayed through that fallback.
 
 Automatic busy-input decisions run at the next safe model-request/tool boundary, not concurrently
-with an unfinished foreground inference. They use the `judge` role when assigned (including typed
+with an unfinished foreground inference. They use the `decision` role when assigned (including typed
 Laya decisions), otherwise `small` or the current model. Classification has a three-second total
 budget (or the shorter worker timeout), including retries. A busy provider slot, timeout, malformed
 answer or unavailable decision service falls back to steering with the exact user message; it does
@@ -356,9 +369,9 @@ Runtime telemetry records `ok`, `error`, `blocked`, `skipped`, `timeout`, and `a
 
 ## Model roles
 
-Subagents use the effective project and global model-role assignments. Scouts prefer `small`, reviewers and test runners prefer `tester`, planners prefer `planner`, and implementation workers prefer `task`. TOML custom agents inherit the role of their declared `base`. File definitions use `small` for read-only agents and `task` for writers unless a model selector names another role. Both foreground and background launches load file definitions.
+Subagents use the effective project and global model-role assignments. Scouts prefer `small`, reviewers and test runners prefer `tester`, planners prefer `coach`, and implementation workers prefer `task`. TOML custom agents inherit the role of their declared `base`. File definitions use `small` for read-only agents and `task` for writers unless a model selector names another role. Both foreground and background launches load file definitions.
 
-When the preferred role is unassigned, delegation chooses the first configured role in these chains, then the conversation model (`main`): worker `task → coach → small → main`; scout `small → task → main`; reviewer/test-runner `tester → coach → task → small → main`; planner `planner → coach → task → small → main`. These are delegation-only defaults, not provider-error retries or general chat-role fallback rules. An explicit model selector overrides these defaults; an architecture-only setting does not change ordinary scout routing.
+When the preferred role is unassigned, delegation chooses the first configured role in these chains, then the conversation model (`main`): worker `task → coach → small → main`; scout `small → task → main`; reviewer/test-runner `tester → coach → task → small → main`; planner `coach → task → small → main`. These are delegation-only defaults, not provider-error retries or general chat-role fallback rules. An explicit model selector overrides these defaults; an architecture-only setting does not change ordinary scout routing.
 
 A custom definition can override its model with `model: ["@tester"]`, a qualified `provider/model`, or a model name on its default role's provider. An explicit task `model_profile` overrides the definition's model list. `thinking_level` (or a model's `:level` suffix) reaches the selected model's request controls; the explicit definition setting takes precedence over a suffix. `off` and `none` disable thinking. Enabled efforts require exact-model support declared by the selected profile; unsupported controls fail before workers start.
 

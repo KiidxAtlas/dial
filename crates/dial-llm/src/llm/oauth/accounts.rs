@@ -162,7 +162,7 @@ pub(crate) fn refresh_lock_path(user_dir: &Path, id: &str, key: &str) -> PathBuf
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    user_dir.join(format!("oauth-{id}.{hex}.refresh"))
+    crate::config::paths::oauth_refresh_lock_file(user_dir, id, &hex)
 }
 
 #[cfg(test)]

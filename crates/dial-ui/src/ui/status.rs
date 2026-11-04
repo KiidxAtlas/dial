@@ -10,6 +10,16 @@ fn push_eta(label: &mut String, eta: Option<f64>) {
     }
 }
 
+/// Friendly UI names; stored configuration and command arguments retain their raw values.
+pub fn approval_label(value: &str) -> &str {
+    match value {
+        "ask" => "Ask first",
+        "write" => "Edit freely",
+        "auto" => "Full auto",
+        "readonly" => "Read-only",
+        other => other,
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Phase {
     #[default]
@@ -96,7 +106,13 @@ impl Lora {
 #[derive(Clone, Debug, Default)]
 pub struct StatusData {
     pub provider: String,
+    /// Unread session notifications; zero hides the inbox segment.
+    pub inbox_unread: usize,
+    /// Transient expansion of the adaptive default; never persisted in configuration.
+    pub status_expanded: bool,
     pub model: String,
+    /// Recorded main selection cause; absent means unavailable, never inferred from saved defaults.
+    pub main_model_explanation: Option<String>,
     /// Configured reasoning level, toggle or provider default; empty if metadata is unavailable.
     pub thinking: String,
     /// Last main local request's overrides; empty before a request or after a model switch.
@@ -113,9 +129,19 @@ pub struct StatusData {
     pub prompt_tokens: Option<u64>,
     pub context_estimated: bool,
     pub context_window: u32,
+    /// Observed loaded-server ceiling, absent when it has not been reported.
+    pub loaded_context_window: Option<u32>,
+    /// Active policy's compaction reserve; saved changes do not replace this snapshot.
+    pub compaction_reserve: Option<u32>,
     pub output_tokens: u64,
     pub tokens_per_second: Option<f64>,
     pub approval: String,
+    /// Active session planning mode, captured before the agent is lent to a turn.
+    pub planning: Option<bool>,
+    /// Active assistance configuration, not a saved change waiting for adoption.
+    pub assistance: Option<bool>,
+    /// A saved configuration is staged for adoption at the next safe turn boundary.
+    pub controls_pending: bool,
     pub sandbox: String,
     /// Admitted version id of the learning loop, if it is active.
     pub version: Option<i64>,
@@ -145,6 +171,10 @@ pub struct StatusData {
 }
 
 impl StatusData {
+    /// Toggle the transient full segment set for the adaptive default layout.
+    pub fn toggle_status_expanded(&mut self) {
+        self.status_expanded = !self.status_expanded;
+    }
     /// Prefer lifecycle state over stale model telemetry, especially while stopping.
     pub fn activity_label(&self) -> String {
         let activity = crate::ui::text::one_line(&self.activity);

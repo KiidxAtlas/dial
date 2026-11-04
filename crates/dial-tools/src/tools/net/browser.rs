@@ -329,7 +329,7 @@ impl BrowserTool {
         capture::validate(action, args)?;
         if action == "locate" && !crate::tools::vision::grounding::configured(ctx.config) {
             return Err(
-                "locate needs a grounding model: run `/setup grounding` or assign one to the `grounding` role in Alt+M"
+                "locate needs a grounding model: run `/setup grounding` or set `vision.grounding`"
                     .into(),
             );
         }

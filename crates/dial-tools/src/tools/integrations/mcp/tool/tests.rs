@@ -124,3 +124,60 @@ fn protocol_capture_retention_and_text_presentation_are_independent() {
         Completeness::Complete
     );
 }
+
+#[test]
+fn catalog_publication_at_admission_refuses_the_previously_approved_definition() {
+    use super::super::tests::{config_with, fake_config};
+    use crate::tools::testkit;
+    let loaded = super::super::load(&config_with(vec![("fake", fake_config("", 30))]));
+    let session = &loaded.sessions[0];
+    let definitions = session.catalog_snapshot().1;
+    let remote = definitions
+        .iter()
+        .find(|tool| tool.name == "echo")
+        .unwrap()
+        .clone();
+    let tool = McpTool::with_lifecycle_hooks(
+        "mcp__fake__echo".into(),
+        "fake",
+        remote,
+        session.clone(),
+        Duration::from_secs(2),
+        vec![],
+    );
+    let first = std::cell::Cell::new(true);
+    let (_dir, workspace) = testkit::workspace();
+    let config = crate::config::types::Config::default();
+    let output = tool.call_request(
+        &ToolContext {
+            workspace: &workspace,
+            config: &config,
+            mutation_authorizer: None,
+            confirm: None,
+        },
+        &json!({}),
+        &|| {
+            if first.replace(false) {
+                // A deterministic publication at the cancellation/admission boundary. Previously
+                // this callback ran in request_with, after two independent catalog checks passed.
+                let mut changed = definitions.clone();
+                let echo = changed.iter_mut().find(|tool| tool.name == "echo").unwrap();
+                echo.input_schema = json!({"type":"object", "required":["new_required_argument"]});
+                echo.read_only_hint = !echo.read_only_hint;
+                session.apply_catalog(changed);
+            }
+            false
+        },
+        &|_| {},
+    );
+    assert!(output.is_error, "{}", output.text);
+    assert!(
+        output.text.contains("definition changed"),
+        "{}",
+        output.text
+    );
+    let facts = output.execution.integration.unwrap();
+    assert_eq!(facts.dispatch, DispatchState::NotDispatched);
+    assert_eq!(facts.failure, Some(IntegrationFailure::Admission));
+    assert_eq!(output.execution.effects, Effects::None);
+}

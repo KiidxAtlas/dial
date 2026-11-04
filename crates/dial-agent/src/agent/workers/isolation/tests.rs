@@ -403,6 +403,32 @@ fn installation_failure_rolls_back_the_whole_patch_and_preserves_concurrent_edit
         );
         assert!(merged.errors.iter().any(|error| error.stage == "install"));
         assert_eq!(merged.recovery_backup.is_some(), concurrent_edit);
+        // Exercise the controller receipt -> durable workflow boundary with the real rollback
+        // outcome. Concurrent edits must not turn a rejected integration into replay permission.
+        use crate::agent::{
+            verify::worker_acceptance::Acceptance,
+            workers::contracts::{Contract, Ledger},
+        };
+        let mut receipt = Acceptance::unverified("candidate");
+        receipt.integration_failed(&merged);
+        let mut ledger = Ledger::default();
+        let contract = Contract {
+            id: "rollback".into(),
+            depends_on: vec![],
+        };
+        let request = serde_json::json!({"acceptance_checks":["behavior"]});
+        ledger.begin(&contract, request.clone()).unwrap();
+        ledger.attach("rollback", "task-1").unwrap();
+        ledger.settle("rollback", "failed", receipt, None).unwrap();
+        assert_eq!(
+            ledger.node("rollback").unwrap()["state"],
+            if concurrent_edit {
+                "interrupted"
+            } else {
+                "retryable"
+            }
+        );
+        assert_eq!(ledger.begin(&contract, request).is_err(), concurrent_edit);
         if !concurrent_edit {
             assert!(merged.applied.is_empty());
             assert_eq!(merged.rolled_back, [PathBuf::from("a.txt")]);

@@ -71,3 +71,54 @@ fn archive_consumer_prepares_immutable_redacted_snapshots_without_application() 
     let redacted = ledger.prepare(secret_plan).unwrap();
     assert!(!redacted.plan.items[0].prompt.contains(&"x".repeat(40)));
 }
+
+#[test]
+fn legacy_successful_large_job_remains_readable_but_not_newly_admitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(temp.path()).unwrap();
+    let job = ledger.prepare(plan()).unwrap();
+    // Persist the original version-1 outcome shape, without using the new enum serializer.
+    let mut legacy = serde_json::to_value(&job).unwrap();
+    legacy["state"] = serde_json::json!("results_ready");
+    legacy["plan"]["max_tokens"] = serde_json::json!(16384);
+    legacy["results"] = serde_json::json!({"one":{"state":"succeeded","text":"old summary"}});
+    write_private(
+        &ledger.path(&job.id).unwrap(),
+        &serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    drop(ledger);
+    let ledger = Ledger::open(temp.path()).unwrap();
+    let reopened = ledger.load(&job.id).unwrap();
+    assert_eq!(reopened.state, State::ResultsReady);
+    assert_eq!(
+        reopened.results.unwrap()["one"],
+        Outcome::Succeeded("old summary".into())
+    );
+    assert!(ledger.prepare(reopened.plan).is_err());
+}
+
+#[test]
+fn incomplete_and_refused_results_survive_private_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(temp.path()).unwrap();
+    for outcome in [
+        Outcome::Incomplete {
+            output: "partial".into(),
+            reason: "max_tokens".into(),
+        },
+        Outcome::Refused {
+            output: "partial".into(),
+            reason: "refusal".into(),
+        },
+    ] {
+        let mut job = ledger.prepare(plan()).unwrap();
+        job.state = State::ResultsReady;
+        job.results = Some(BTreeMap::from([("one".into(), outcome.clone())]));
+        ledger.save(&job).unwrap();
+        assert_eq!(
+            ledger.load(&job.id).unwrap().results.unwrap()["one"],
+            outcome
+        );
+    }
+}

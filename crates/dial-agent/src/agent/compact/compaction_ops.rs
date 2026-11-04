@@ -295,7 +295,7 @@ impl<'a> Agent<'a> {
             },
             cancel,
             ui,
-            &mut |backend, request, ui| {
+            &mut |backend, request, ui, inference_cancel: Arc<AtomicBool>| {
                 if request
                     .messages
                     .iter()
@@ -312,7 +312,7 @@ impl<'a> Agent<'a> {
                         backend,
                         request,
                         ui,
-                        self.interrupt.clone(),
+                        inference_cancel.clone(),
                         remaining.as_secs().max(1),
                     );
                     backend.set_usage_scope(old_scope);
@@ -326,7 +326,7 @@ impl<'a> Agent<'a> {
                     let _slot = crate::agent::model::provider_slots::acquire_checked(
                         config,
                         || -> Result<()> {
-                            if self.interrupt.load(Ordering::SeqCst) {
+                            if inference_cancel.load(Ordering::SeqCst) {
                                 return Err(llm::Interrupted.into());
                             }
                             ensure!(
@@ -339,13 +339,13 @@ impl<'a> Agent<'a> {
                     )?;
                     let remaining = summary_expires.saturating_duration_since(Instant::now());
                     ensure!(!remaining.is_zero(), "summary deadline expired");
-                    self.bounded_role_chat(
+                    self.bounded_role_chat_with_cancel(
                         backend,
                         "small",
                         llm::usage::Purpose::Compaction,
                         request,
                         ui,
-                        remaining.as_secs().max(1),
+                        (remaining.as_secs().max(1), inference_cancel),
                     )
                 }
             },

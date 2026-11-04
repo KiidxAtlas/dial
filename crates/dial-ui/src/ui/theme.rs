@@ -1228,7 +1228,7 @@ impl ThemeManager {
         env: EnvFn,
     ) -> ThemeManager {
         let mut manager = ThemeManager {
-            dir: user_dir.join("themes"),
+            dir: crate::config::paths::themes_dir(user_dir),
             env,
             cfg: cfg.clone(),
             terminal_dark,

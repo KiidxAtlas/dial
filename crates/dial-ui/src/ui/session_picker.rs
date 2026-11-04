@@ -23,6 +23,8 @@ const PREVIEW_TURNS: usize = 2;
 pub enum Action {
     None,
     Cancel,
+    /// Browse messages, branches and labels of the active session.
+    ThisSession,
     Resume(usize),
     Pin(usize),
     /// Index of the session and its new title.
@@ -202,23 +204,7 @@ impl Picker {
             {
                 continue;
             }
-            let title = text::one_line(&session.title).to_lowercase();
-            let hay = &self.searchable[index];
-            let rank = if tokens.is_empty() || title == query {
-                0
-            } else if tokens.iter().all(|token| title.contains(token)) {
-                1
-            } else if tokens.iter().all(|token| hay.contains(token)) {
-                2
-            }
-            // Fuzzy matching is restricted to the title: scattered letters across a long
-            // transcript or filesystem path must not make nearly every session a hit.
-            else if tokens
-                .iter()
-                .all(|token| text::fuzzy(token, &title).is_some())
-            {
-                3
-            } else {
+            let Some(rank) = search_rank(&query, &session.title, &self.searchable[index]) else {
                 continue;
             };
             ranked.push((index, rank));
@@ -333,6 +319,7 @@ impl Picker {
                         self.refilter_keeping_selection();
                     }
                     KeyCode::Char('c') if ctrl => return Action::Cancel,
+                    KeyCode::Char('t') if ctrl => return Action::ThisSession,
                     KeyCode::Char('p') if ctrl => {
                         if let Some(index) = self.gated(selected, Need::Pin) {
                             return Action::Pin(index);
@@ -566,11 +553,11 @@ impl Picker {
         };
         if height >= 7 && !nothing_listed {
             let status = if self.show_empty {
-                format!("All sessions · {scope}")
+                format!("All sessions · {scope} · Ctrl+T this session")
             } else if empty > 0 {
-                format!("Conversations · {scope} · Tab shows {empty} empty")
+                format!("Conversations · {scope} · Tab shows {empty} empty · Ctrl+T this session")
             } else {
-                format!("Conversations · {scope}")
+                format!("Conversations · {scope} · Ctrl+T this session")
             };
             body.push(line(status, Tok::Muted));
         }
@@ -1109,12 +1096,39 @@ fn now_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-fn search_text(s: &SessionInfo) -> String {
+/// Canonical summary search text, shared with the optional palette projection. Never reads a journal.
+pub fn search_text(s: &SessionInfo) -> String {
     text::one_line(&format!(
         "{} {} {} {} {} {}",
         s.title, s.first_message, s.last_message, s.last_answer, s.model, s.id
     ))
     .to_lowercase()
+}
+
+/// Session matching rank: exact title, title words, summary words, then title-only fuzzy.
+/// `hay` is the cached lowercase text returned by [`search_text`]. Paths never enter matching.
+pub fn search_rank(query: &str, title: &str, hay: &str) -> Option<usize> {
+    let query = query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let tokens: Vec<_> = query.split_whitespace().collect();
+    let title = text::one_line(title).to_lowercase();
+    if tokens.is_empty() || title == query {
+        Some(0)
+    } else if tokens.iter().all(|token| title.contains(token)) {
+        Some(1)
+    } else if tokens.iter().all(|token| hay.contains(token)) {
+        Some(2)
+    } else if tokens
+        .iter()
+        .all(|token| text::fuzzy(token, &title).is_some())
+    {
+        Some(3)
+    } else {
+        None
+    }
 }
 
 fn label(s: &SessionInfo) -> String {

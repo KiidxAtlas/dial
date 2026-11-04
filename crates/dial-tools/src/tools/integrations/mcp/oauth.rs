@@ -47,7 +47,7 @@ pub struct TokenSource {
 }
 
 fn grant_path(user_dir: &Path, server: &str) -> PathBuf {
-    user_dir.join(format!("mcp-oauth-{}.json", util::encode(server)))
+    crate::config::paths::mcp_oauth_file(user_dir, &util::encode(server))
 }
 
 /// Deletes the stored grant of `server` (`/mcp logout`). `Ok(false)` when no grant was stored.
@@ -75,9 +75,11 @@ impl TokenSource {
         }
     }
 
-    /// The grant stored for `server`, or none when it never signed in. Without a user directory
-    /// nothing can be stored, so the source stays empty.
-    pub fn load(user_dir: &Path, server: &str) -> Result<Self> {
+    /// The grant stored for `server`, bound to the exact effective resource URL. Missing or
+    /// mismatched bindings require sign-in again; no credential is exposed from such a grant.
+    /// Without a user directory nothing can be stored, so the source stays empty.
+    pub fn load(user_dir: &Path, server: &str, resource: &str) -> Result<Self> {
+        validate_endpoint(resource)?;
         if user_dir.as_os_str().is_empty() {
             return Ok(Self::empty(PathBuf::new()));
         }
@@ -88,6 +90,12 @@ impl TokenSource {
             })?),
             None => None,
         };
+        if let Some(grant) = &grant {
+            ensure!(
+                validate_endpoint(&grant.resource).is_ok() && grant.resource == resource,
+                "stored OAuth grant for MCP server `{server}` belongs to a different or unknown resource; sign in again"
+            );
+        }
         Ok(Self {
             path,
             grant: Mutex::new(grant),
@@ -132,7 +140,7 @@ impl TokenSource {
         if grant.access != stale {
             return true;
         }
-        if grant.refresh.is_empty() {
+        if grant.refresh.is_empty() || validate_endpoint(&grant.token_endpoint).is_err() {
             return false;
         }
         let secret = grant
@@ -208,12 +216,9 @@ pub fn login(
     let Some(url) = server.url.as_deref() else {
         bail!("MCP server `{name}` is a local program; only remote servers sign in with OAuth")
     };
+    validate_endpoint(url)?;
     ensure!(
-        server.bearer_env.is_none()
-            && !server
-                .headers
-                .keys()
-                .any(|key| key.eq_ignore_ascii_case("authorization")),
+        !super::http::Auth::has_fixed_credentials(server),
         "MCP server `{name}` uses a fixed credential (bearer_env or an Authorization header); remove it to sign in with OAuth"
     );
     let Some(challenge) = probe(url, &cancel)? else {
@@ -243,6 +248,14 @@ pub fn login(
     };
     let authorize = field("authorization_endpoint")?;
     let token_endpoint = field("token_endpoint")?;
+    validate_endpoint(&authorize)?;
+    validate_endpoint(&token_endpoint)?;
+    if let Some(endpoint) = metadata
+        .get("registration_endpoint")
+        .and_then(Value::as_str)
+    {
+        validate_endpoint(endpoint)?;
+    }
     if let Some(methods) = metadata
         .get("code_challenge_methods_supported")
         .and_then(Value::as_array)
@@ -383,7 +396,16 @@ fn probe(url: &str, cancel: &Arc<AtomicBool>) -> Result<Option<String>> {
     ))
 }
 
+/// Apply the MCP URL policy, not shared provider OAuth's broader local-network exceptions.
+/// Do not echo discovered URLs: they can contain credentials or other provider-controlled data.
+fn validate_endpoint(url: &str) -> Result<()> {
+    crate::config::tools::mcp::validate_url(url).map_err(|_| {
+        anyhow::anyhow!("MCP OAuth endpoints must use https (http is allowed only for localhost)")
+    })
+}
+
 fn get_json(url: &str, cancel: &Arc<AtomicBool>) -> Result<Value> {
+    validate_endpoint(url)?;
     let response = util::request(
         "GET",
         url,
@@ -401,6 +423,7 @@ fn get_json(url: &str, cancel: &Arc<AtomicBool>) -> Result<Value> {
 
 /// Authorization-server metadata: RFC 8414 first, then the OpenID configuration document.
 fn authorization_metadata(issuer: &str, cancel: &Arc<AtomicBool>) -> Result<Value> {
+    validate_endpoint(issuer)?;
     let issuer = issuer.trim_end_matches('/');
     let candidates = [
         well_known(issuer, "oauth-authorization-server")?,
@@ -433,6 +456,7 @@ fn register(
     let endpoint = endpoint
         .and_then(Value::as_str)
         .context("the server has no client registration endpoint; set oauth.client_id")?;
+    validate_endpoint(endpoint)?;
     let body = json!({
         "client_name": format!("dial ({name})"),
         "redirect_uris": [redirect],

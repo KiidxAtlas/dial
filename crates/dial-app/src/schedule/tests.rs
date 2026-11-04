@@ -277,3 +277,122 @@ fn legacy_fingerprint_state_survives_initial_definition_load_and_migrates() {
         matches!(store.load_baselines().get(&e.id), Some(SavedBaseline::Bound { definition, .. }) if definition == &e)
     );
 }
+
+#[test]
+fn failed_starts_preserve_watch_and_interval_triggers_with_capped_backoff() {
+    for every in [None, Some(100)] {
+        let e = entry(every, &["*.rs"]);
+        let mut scheduler = Scheduler::default();
+        scheduler.ran(&e, 1000, Some([1; 32]));
+        scheduler.due(&e, 1001, || Some([2; 32]));
+        let mut at = 1100;
+        assert!(scheduler.due(&e, at, || Some([2; 32])).is_some());
+        for attempt in 0..10 {
+            scheduler.start_failed(&e, at);
+            assert_eq!(
+                scheduler.last_run[&e.id], 1000,
+                "a failed start is not a run"
+            );
+            assert_eq!(scheduler.watches[&e.id].baseline, Some([1; 32]));
+            let delay = (START_RETRY_SECS << attempt).min(MAX_START_RETRY_SECS);
+            assert_eq!(scheduler.due(&e, at + delay - 1, || Some([2; 32])), None);
+            at += delay;
+            assert!(scheduler.due(&e, at, || Some([2; 32])).is_some());
+        }
+        scheduler.ran(&e, at, Some([2; 32]));
+        assert_eq!(scheduler.due(&e, at + 1, || Some([2; 32])), None);
+        scheduler.start_failed(&e, at + 2);
+        assert_eq!(
+            scheduler.start_retries[&e.id].1, START_RETRY_SECS,
+            "completion resets launch backoff"
+        );
+    }
+}
+
+#[test]
+fn event_bursts_never_block_the_callback_and_overflow_requests_full_scan() {
+    let root = PathBuf::from("/project");
+    let (sink, inbox) = EventInbox::new(vec![root.clone()]);
+    let (done, completed) = std::sync::mpsc::channel();
+    let producer = std::thread::spawn(move || {
+        for i in 0..MAX_EVENT_PATHS * 10 {
+            sink.push(Ok(
+                notify::Event::new(notify::EventKind::Any).add_path(root.join(format!("{i}.rs")))
+            ));
+        }
+        done.send(()).unwrap();
+    });
+    completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("callback must not wait for drain");
+    producer.join().unwrap();
+    assert!(matches!(inbox.drain(), Changes::Everything));
+    assert!(matches!(inbox.drain(), Changes::Paths(paths) if paths.is_empty()));
+}
+
+#[test]
+fn event_inbox_coalesces_paths_ignores_reads_and_preserves_coverage_signals() {
+    let root = PathBuf::from("/project");
+    let canonical = PathBuf::from("/canonical/project");
+    let (sink, inbox) = EventInbox::new(vec![root.clone(), canonical.clone()]);
+    for _ in 0..MAX_EVENT_PATHS * 2 {
+        sink.push(Ok(notify::Event::new(notify::EventKind::Access(
+            notify::event::AccessKind::Read,
+        ))
+        .add_path(root.join("a.rs"))));
+    }
+    for path in [root.join("a.rs"), root.join("a.rs"), canonical.join("b.rs")] {
+        sink.push(Ok(notify::Event::new(notify::EventKind::Any).add_path(path)));
+    }
+    let Changes::Paths(paths) = inbox.drain() else {
+        panic!("read access is not overflow");
+    };
+    assert_eq!(
+        paths.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([PathBuf::from("a.rs"), PathBuf::from("b.rs")])
+    );
+    for event in [
+        Ok(notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)),
+        Err(notify::Error::generic("watch failed")),
+        Ok(notify::Event::new(notify::EventKind::Any).add_path(PathBuf::from("/foreign/file"))),
+    ] {
+        sink.push(event);
+        assert!(matches!(inbox.drain(), Changes::Everything));
+    }
+}
+
+#[test]
+fn one_large_event_and_wait_batches_have_bounded_retention() {
+    let root = PathBuf::from("/project");
+    let (sink, inbox) = EventInbox::new(vec![root.clone()]);
+    let mut event = notify::Event::new(notify::EventKind::Any);
+    event.paths = (0..MAX_EVENT_PATHS * 2)
+        .map(|i| root.join(i.to_string()))
+        .collect();
+    sink.push(Ok(event));
+    inbox.wait(
+        Instant::now() + Duration::from_secs(2),
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    assert!(inbox.early.borrow().len() <= MAX_EVENT_PATHS);
+    assert!(matches!(inbox.drain(), Changes::Everything));
+}
+
+#[test]
+fn structural_events_rescan_file_globs_even_without_descendant_notifications() {
+    use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+    let root = PathBuf::from("/workspace");
+    let (sink, inbox) = EventInbox::new(vec![root.clone()]);
+    let set = watch_set(&["src/**/*.rs".into()]).unwrap();
+    assert!(!set.is_match("src/generated"));
+    for kind in [
+        notify::EventKind::Create(CreateKind::Folder),
+        notify::EventKind::Remove(RemoveKind::Folder),
+        notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+    ] {
+        sink.push(Ok(
+            notify::Event::new(kind).add_path(root.join("src/generated"))
+        ));
+        assert!(matches!(inbox.drain(), Changes::Everything), "{kind:?}");
+    }
+}

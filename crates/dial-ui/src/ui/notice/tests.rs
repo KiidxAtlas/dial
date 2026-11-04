@@ -212,3 +212,18 @@ fn received_messages_use_the_irc_lane_without_inventing_a_peer_body() {
             .any(|r| r.contains("Message from an unknown source"))
     );
 }
+
+#[test]
+fn turn_report_is_compact_until_tools_are_expanded() {
+    let env = Env::new();
+    let body = "Outcome: completed\nChanged: 1 file(s): a.rs\nNext: /review · /undo\nSummary: 1 files changed · checks current · /undo available";
+    let compact = plain(&rows("Turn report", body, 100, &env.ctx()));
+    assert_eq!(compact.len(), 2);
+    assert!(compact[0].contains("checks current"));
+    assert!(compact[1].contains("Next: /review"));
+    let mut ctx = env.ctx();
+    ctx.tools_expanded = true;
+    let full = plain(&rows("Turn report", body, 100, &ctx)).join("\n");
+    assert!(full.contains("a.rs") && full.contains("Outcome:"));
+    assert!(!full.contains("Summary:"));
+}

@@ -338,7 +338,10 @@ fn directories(config: &Config) -> Vec<(PathBuf, Source)> {
         out.extend(claude);
     }
     if config.user_dir.is_absolute() {
-        out.push((config.user_dir.join("agents"), Source::User));
+        out.push((
+            crate::config::paths::agents_dir(&config.user_dir),
+            Source::User,
+        ));
         if config.task.claude_agents
             && let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty())
         {

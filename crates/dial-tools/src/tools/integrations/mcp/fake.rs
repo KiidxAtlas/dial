@@ -127,6 +127,16 @@ fn list(id: &Value, cursor: Option<&str>, flags: &str, lists: usize) -> Value {
     if has("bad-list") || (has("list-fails-after-first") && lists > 1) {
         return json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "list exploded"}});
     }
+    if has("list-fails-once") && lists == 2 {
+        return json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32000,"message":"temporary list failure"}});
+    }
+    if has("many-tools") {
+        let tools: Vec<_> = (0..300).map(|n| tool(&format!("tool-{n}"), None)).collect();
+        return json!({"jsonrpc":"2.0", "id":id, "result":{"tools":tools,"nextCursor":"more"}});
+    }
+    if has("endless-pages") {
+        return json!({"jsonrpc":"2.0", "id":id, "result":{"tools":[],"nextCursor":"more"}});
+    }
     if has("no-tools") {
         return json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}});
     }

@@ -713,7 +713,10 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     }
   });
 });
-async function stop() { if (browser && !attached) await browser.close().catch(() => {}); process.exit(0); }
+async function stop() {
+  try { await siteModule.closeClipboardContexts(); }
+  finally { if (browser && !attached) await browser.close().catch(() => {}); process.exit(0); }
+}
 process.on('SIGTERM', stop);
 process.on('SIGINT', stop);
 process.stdin.on('end', stop);

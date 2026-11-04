@@ -1,0 +1,24 @@
+# Use cross_agent.py for joint accuracy AND ordered-trace grading (see README below).
+# `dial benchmark` can run these portable outcome checks but cannot grade call order.
+version = 1
+name = "registry-discovery-v1"
+
+[[cases]]
+id = "tuple-registry-batch"
+project = "examples/benchmarks/registry-discovery-fixture"
+categories = ["registry_discovery_batch"]
+prompt = "Inspect this repository, without modifying its evidence files. Discover the actual command declaration representation; do not assume named fields. Cross-check the independent docs, settings and keybindings. Write answer.json with exactly these keys: commands (sorted list of slash-command names), count (integer), tree_up (keybinding string), smooth_reveal (boolean), page_size (integer), documented_tree (boolean). Reply DONE. Batching is permitted: group independent read-only inspections in a request or a multi-path read; do not serialize independent evidence collection. Inspect the declaration before retrying a search that assumes a representation."
+checks = [
+  {kind="command", command='''python3 -c 'import json; assert json.load(open("answer.json")) == {"commands":["/compact","/help","/label","/settings","/tree"],"count":5,"tree_up":"Ctrl+Up","smooth_reveal":True,"page_size":24,"documented_tree":True}' '''},
+  {kind="response_equals", content="DONE"},
+]
+
+[[cases]]
+id = "tuple-registry-one-call"
+project = "examples/benchmarks/registry-discovery-fixture"
+categories = ["registry_discovery_one_call"]
+prompt = "Inspect this repository, without modifying its evidence files. Discover the actual command declaration representation; do not assume named fields. Cross-check the independent docs, settings and keybindings. Write answer.json with exactly these keys: commands (sorted list of slash-command names), count (integer), tree_up (keybinding string), smooth_reveal (boolean), page_size (integer), documented_tree (boolean). Reply DONE. Explicit one-call mode: emit at most ONE native tool call per assistant response. A single read with multiple paths is allowed. Inspect the declaration before retrying a search that assumes a representation."
+checks = [
+  {kind="command", command='''python3 -c 'import json; assert json.load(open("answer.json")) == {"commands":["/compact","/help","/label","/settings","/tree"],"count":5,"tree_up":"Ctrl+Up","smooth_reveal":True,"page_size":24,"documented_tree":True}' '''},
+  {kind="response_equals", content="DONE"},
+]

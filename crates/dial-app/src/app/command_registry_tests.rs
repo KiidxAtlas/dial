@@ -1,7 +1,7 @@
 use super::*;
 use crate::app::command_registry::{
-    BUILTIN_COMMANDS, COMMAND_ALIASES, DuringTurn, RUNS_NOW, RUNS_NOW_ARGS, STOPS_TURN,
-    canonical_command, command_entries, command_panel, during_turn, during_turn_note,
+    BUILTIN_COMMANDS, COMMANDS, DuringTurn, Surface, canonical_command, command_entries,
+    command_panel, command_spec, during_turn, during_turn_note, turn_help,
 };
 use crate::app::core::App;
 use crate::app::overlay::auth::{AuthJob, PreparedModel};
@@ -14,6 +14,33 @@ use crate::ui::command_surface::{EVERYDAY, START_HERE, STARTERS};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+// Phase-B intentional menu changes: these names remain executable compatibility deep links.
+// The integrator applies this explicit exclusion to the frozen discovery contract.
+const GIT_ACTIVITY_MENU_CHANGES: &[&str] = &[
+    "workers",
+    "processes",
+    "compute",
+    "schedule",
+    "queue",
+    "commit",
+    "git",
+    "activity",
+];
+
+#[test]
+fn git_and_activity_centralize_discovery_without_removing_legacy_handlers() {
+    let entries = command_entries(&[], &[]);
+    for name in GIT_ACTIVITY_MENU_CHANGES {
+        assert!(command_spec(name).is_some(), "/{name} remains registered");
+        assert_eq!(
+            entries.iter().any(|entry| entry.name == *name),
+            matches!(*name, "git" | "activity"),
+            "/{name} discovery visibility"
+        );
+    }
+    assert_eq!(during_turn("activity", "queue"), DuringTurn::Now);
+    assert_eq!(during_turn("commit", "--dry-run"), DuringTurn::AfterTurn);
+}
 /// A name a user can type that dispatches to a real command, not counting aliases.
 fn registered(name: &str) -> bool {
     BUILTIN_COMMANDS
@@ -25,7 +52,11 @@ fn registered(name: &str) -> bool {
 #[test]
 fn every_alias_resolves_to_a_registered_command_and_is_not_listed() {
     let listed = command_entries(&[], &[]);
-    for (alias, target) in COMMAND_ALIASES {
+    for (alias, target) in COMMANDS.iter().flat_map(|spec| {
+        spec.aliases
+            .iter()
+            .map(move |alias| (alias.name, spec.name))
+    }) {
         assert!(
             registered(target),
             "/{alias} points at unregistered /{target}"
@@ -34,13 +65,40 @@ fn every_alias_resolves_to_a_registered_command_and_is_not_listed() {
             !registered(alias),
             "/{alias} is listed as a command and an alias"
         );
-        assert_eq!(canonical_command(alias), *target);
+        assert_eq!(canonical_command(alias), target);
         assert!(
-            listed.iter().all(|entry| entry.name != *alias),
+            listed.iter().all(|entry| entry.name != alias),
             "/{alias} must stay out of menus, palette and help"
         );
     }
     assert_eq!(canonical_command("exit"), "exit");
+}
+
+#[test]
+fn consolidated_commands_hide_compatibility_names_without_changing_turn_policy() {
+    let listed = command_entries(&[], &[]);
+    for name in [
+        "clear",
+        "resume",
+        "palette",
+        "commands",
+        "tree",
+        "branch",
+        "rollback",
+        "review-file",
+    ] {
+        assert!(listed.iter().all(|entry| entry.name != name), "/{name}");
+    }
+    for (alias, target) in [
+        ("clear", "new"),
+        ("resume", "sessions"),
+        ("palette", "help"),
+    ] {
+        assert_eq!(canonical_command(alias), target);
+        assert_eq!(during_turn(alias, ""), during_turn(target, ""));
+    }
+    assert_eq!(during_turn("rollback", "2"), DuringTurn::Stop);
+    assert_eq!(during_turn("review-file", ""), DuringTurn::AfterTurn);
 }
 
 #[test]
@@ -58,7 +116,7 @@ fn starters_and_everyday_commands_are_registered() {
 
 #[test]
 fn descriptions_are_short_and_plain_and_syntax_lives_in_usage() {
-    for (name, usage, description) in BUILTIN_COMMANDS {
+    for (name, usage, description) in BUILTIN_COMMANDS.iter() {
         assert!(
             description.chars().count() <= 64,
             "/{name} description is {} characters",
@@ -79,7 +137,7 @@ fn descriptions_are_short_and_plain_and_syntax_lives_in_usage() {
         );
         if !spec.subcommands.is_empty() {
             assert!(
-                !spec.args_hint.is_empty(),
+                !spec.usage.is_empty(),
                 "/{} takes subcommands but shows no usage",
                 spec.name
             );
@@ -89,7 +147,11 @@ fn descriptions_are_short_and_plain_and_syntax_lives_in_usage() {
 
 #[test]
 fn turn_lists_drive_stops_turn_and_the_palette_notes_alike() {
-    for name in STOPS_TURN {
+    for name in COMMANDS
+        .iter()
+        .filter(|spec| spec.during_turn == DuringTurn::Stop)
+        .map(|spec| spec.name)
+    {
         assert!(
             registered(name),
             "/{name} stops the turn but is not registered"
@@ -100,7 +162,11 @@ fn turn_lists_drive_stops_turn_and_the_palette_notes_alike() {
             "Stops the current turn before running."
         );
     }
-    for name in RUNS_NOW {
+    for name in COMMANDS
+        .iter()
+        .filter(|spec| spec.during_turn == DuringTurn::Now)
+        .map(|spec| spec.name)
+    {
         assert!(!Shell::stops_turn(&format!("/{name}")), "/{name} runs now");
         let note = during_turn_note(name);
         assert!(
@@ -110,7 +176,11 @@ fn turn_lists_drive_stops_turn_and_the_palette_notes_alike() {
             "/{name}: {note}"
         );
     }
-    for line in RUNS_NOW_ARGS {
+    for line in COMMANDS.iter().flat_map(|spec| {
+        spec.live_forms
+            .iter()
+            .map(move |form| format!("{} {}", spec.name, form.args))
+    }) {
         assert!(!Shell::stops_turn(&format!("/{line}")), "/{line} runs now");
     }
     // Aliases follow their target, so /quit stops a turn exactly like /exit.
@@ -192,6 +262,28 @@ fn navigation_panels_have_the_same_destinations_while_busy() {
 }
 
 #[test]
+fn settings_controls_and_reviewed_recovery_share_registry_routes() {
+    use crate::app::overlay::Which;
+    assert!(matches!(
+        command_panel("controls", ""),
+        Some(Which::Controls)
+    ));
+    assert_eq!(during_turn("controls", ""), DuringTurn::Now);
+    assert_eq!(during_turn("activity", "resume"), DuringTurn::AfterTurn);
+    assert!(command_panel("activity", "resume").is_none());
+    assert!(
+        matches!(command_panel("settings", "ui.notify"), Some(Which::SettingsAt(path)) if path == "ui.notify")
+    );
+    assert!(command_panel("settings", "not.a.setting").is_none());
+    let actions = crate::app::command_registry::palette_entries(&[], &[]);
+    assert!(
+        actions
+            .iter()
+            .any(|entry| entry.command.name == "settings ui.notify")
+    );
+}
+
+#[test]
 fn model_preparation_only_publishes_successful_uncancelled_results() {
     let (_home, _project, layout, config) = super::tests::config();
     let app = App::new(
@@ -216,6 +308,7 @@ fn model_preparation_only_publishes_successful_uncancelled_results() {
                 role: Some("main".into()),
                 scope: Scope::Global,
                 voice: None,
+                review: None,
             }),
         });
         assert!(AuthJob::collect(&mut job, &app).is_none());
@@ -253,4 +346,214 @@ fn settings_panel_rejects_unreadable_layers_instead_of_empty_defaults() {
     settings_store::write_private(&layout.config_files()[1], b"invalid = [").unwrap();
     let error = settings_tables(&app, &config).unwrap_err();
     assert!(format!("{error:#}").contains("reading project settings"));
+}
+
+/// The frozen contract predates consolidation. Explicit menu-only changes are excluded below;
+/// legacy execution identities, arguments and scheduling remain covered in full.
+#[test]
+fn one_table_preserves_the_legacy_command_contract() {
+    use serde_json::{Value, json};
+    let baseline: Value =
+        serde_json::from_str(include_str!("command_registry/legacy_contract.json")).unwrap();
+    let added = ["set", "inbox", "doctor", "controls"];
+    // Phase B hubs intentionally replace these discovery rows, not their execution behavior.
+    const HUB_MENU_CHANGES: &[&str] = &[
+        "mode",
+        "learn",
+        "dirs",
+        "collab",
+        "share",
+        "export",
+        "copy",
+        "dump",
+        "improve",
+        "join",
+        "leave",
+        "add-dir",
+        "remove-dir",
+        "vibe",
+        "skillful",
+    ];
+    // Extensions gains tab arguments; /hooks becomes a hidden shortcut to its tab.
+    const EXTENSIONS_STATS_MENU_CHANGES: &[&str] = &["extensions", "hooks"];
+    let excluded = |name: &str| {
+        HUB_MENU_CHANGES.contains(&name)
+            || EXTENSIONS_STATS_MENU_CHANGES.contains(&name)
+            || GIT_ACTIVITY_MENU_CHANGES.contains(&name)
+    };
+    let unchanged_hub_row = |row: &&Value| !excluded(row[0].as_str().unwrap());
+    let entries: Vec<_> = command_entries(&[], &[])
+        .into_iter()
+        .filter(|entry| !added.contains(&entry.name.as_str()))
+        .filter(|entry| !excluded(entry.name.as_str()))
+        .map(|entry| {
+            json!([
+                entry.name,
+                entry.args_hint.unwrap_or_default(),
+                entry.description
+            ])
+        })
+        .collect();
+    let expected_entries: Vec<_> = baseline["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(unchanged_hub_row)
+        .cloned()
+        .collect();
+    assert_eq!(json!(entries), json!(expected_entries));
+    assert_eq!(
+        json!(super::command_registry::builtin_commands()),
+        baseline["rpc"]
+    );
+    assert_eq!(json!(turn_help(true)), baseline["stop"]);
+    // Hidden compatibility spellings stay executable, but their top-level help rows are hidden.
+    let expected_now: Vec<_> = baseline["now"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|name| {
+            let name = name.as_str().unwrap();
+            !matches!(name, "leave" | "hooks") && !GIT_ACTIVITY_MENU_CHANGES.contains(&name)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(json!(turn_help(false)), json!(expected_now));
+    let args = baseline["args"].as_array().unwrap();
+    for row in baseline["policies"].as_array().unwrap() {
+        let name = row[0].as_str().unwrap();
+        // /doctor is intentionally promoted from an alias to a diagnostic command in phase A.
+        if name == "doctor" {
+            continue;
+        }
+        assert_eq!(canonical_command(name), row[1].as_str().unwrap(), "{name}");
+        assert_eq!(
+            format!("{:?}", crate::ui::command_surface::category(name)),
+            row[2].as_str().unwrap(),
+            "{name}"
+        );
+        assert_eq!(during_turn_note(name), row[3].as_str().unwrap(), "{name}");
+        for (arg, expected) in args.iter().zip(row[4].as_array().unwrap()) {
+            let arg = arg.as_str().unwrap();
+            assert_eq!(
+                format!("{:?}", during_turn(name, arg)),
+                expected.as_str().unwrap(),
+                "/{name} {arg}"
+            );
+        }
+    }
+    for name in baseline["hidden"].as_array().unwrap() {
+        let name = name.as_str().unwrap();
+        assert!(command_spec(name).is_some_and(|spec| spec.name != name || !spec.visible));
+    }
+}
+
+#[test]
+fn command_records_and_aliases_are_unique_and_phase_a_additions_have_expected_policy() {
+    let mut names = std::collections::HashSet::new();
+    let mut aliases = std::collections::HashSet::new();
+    for spec in COMMANDS {
+        assert!(names.insert(spec.name), "duplicate /{}", spec.name);
+        for alias in spec.aliases {
+            assert!(
+                aliases.insert(alias.name),
+                "duplicate alias /{}",
+                alias.name
+            );
+        }
+    }
+    assert!(names.is_disjoint(&aliases));
+    for (name, expected) in [
+        ("set", DuringTurn::Now),
+        ("inbox", DuringTurn::AfterTurn),
+        ("doctor", DuringTurn::AfterTurn),
+    ] {
+        let spec = command_spec(name).unwrap();
+        assert!(spec.visible && spec.surface == Surface::Group);
+        assert_eq!(spec.name, name);
+        assert_eq!(during_turn(name, ""), expected);
+    }
+}
+
+#[test]
+fn extension_tabs_and_statistics_have_shared_idle_and_busy_destinations() {
+    use crate::app::overlay::Which;
+    use crate::ui::overlay::extensions::model::Tab;
+    for (args, expected) in [
+        ("mcp", Tab::Mcp),
+        ("skills", Tab::Skills),
+        ("tools", Tab::Tools),
+        ("hooks", Tab::Hooks),
+    ] {
+        assert!(
+            matches!(command_panel("extensions", args), Some(Which::ExtensionsTab(tab)) if tab == expected)
+        );
+        assert_eq!(during_turn("extensions", args), DuringTurn::Now);
+    }
+    assert!(matches!(
+        command_panel("hooks", ""),
+        Some(Which::ExtensionsTab(Tab::Hooks))
+    ));
+    assert!(matches!(command_panel("stats", ""), Some(Which::Stats(_))));
+    assert!(command_panel("stats", "--port 9000").is_none());
+    assert!(command_panel("stats", "7d").is_none());
+    assert!(!command_spec("hooks").unwrap().visible);
+    for name in ["cost", "usage", "stats", "skills", "tools"] {
+        assert!(
+            command_spec(name).unwrap().visible,
+            "/{name} has distinct data or actions"
+        );
+    }
+}
+
+#[test]
+fn unified_palette_sessions_are_local_conversations_and_use_normal_resume_dispatch() {
+    use crate::app::command_registry::palette_sessions;
+    use crate::storage::session::{Session, SessionMeta};
+    let (_home, _project, layout, _config) = crate::app::tests::config();
+    let make = |layout: &crate::config::paths::Layout, request: Option<&str>| {
+        let mut session = Session::create(
+            layout,
+            SessionMeta {
+                model: "test-model".into(),
+            },
+        )
+        .unwrap();
+        if let Some(request) = request {
+            session
+                .append(serde_json::json!({ "role": "user", "content": request }))
+                .unwrap();
+        }
+        session
+    };
+    let current = make(&layout, Some("Current conversation"));
+    let empty = make(&layout, None);
+    let saved = make(&layout, Some("Callback retry"));
+    let elsewhere = tempfile::tempdir().unwrap();
+    let foreign_layout =
+        crate::config::paths::Layout::with_user_dir(elsewhere.path(), layout.user_dir.clone())
+            .unwrap();
+    let foreign = make(&foreign_layout, Some("Not in this project"));
+    let projected = palette_sessions(&layout, current.id()).unwrap();
+    assert_eq!(projected.len(), 1);
+    let result = &projected[0];
+    assert_eq!(result.command, format!("resume {}", saved.id()));
+    assert_eq!(
+        result.kind,
+        crate::ui::overlay::palette::UnifiedKind::Session
+    );
+    assert_eq!(result.session.as_ref().unwrap().id, saved.id());
+    assert!(result.description.contains("Callback retry"));
+    for excluded in [current.id(), empty.id(), foreign.id()] {
+        assert!(
+            projected
+                .iter()
+                .all(|entry| entry.session.as_ref().unwrap().id != excluded)
+        );
+    }
+    assert_eq!(canonical_command("resume"), "sessions");
+    assert_eq!(
+        during_turn("resume", saved.id()),
+        during_turn("sessions", saved.id())
+    );
 }

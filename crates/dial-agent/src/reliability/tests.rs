@@ -338,3 +338,32 @@ fn only_a_failed_or_text_lifted_non_batch_case_is_a_native_failure() {
         "text-lifted calls are not native parsing"
     );
 }
+
+#[test]
+fn request_call_policy_explains_measured_constraints_and_rendering() {
+    let mut config = AppConfig::default();
+    config.reliability.enabled = true;
+    config.reliability.measured_interfaces = true;
+    let mut stats = Stats::default();
+    let passed = json!({"batch_passed":true,"passed":2,"total":2});
+    let failed = json!({"batch_passed":false});
+    assert!(single_call_reasons(&config, Some(&passed), &stats).is_empty());
+    assert_eq!(
+        single_call_reasons(&config, Some(&failed), &stats),
+        ["saved_reliability_record"]
+    );
+    stats.consecutive_contract_failures = 2;
+    assert_eq!(
+        single_call_reasons(&config, Some(&failed), &stats),
+        ["contract_recovery", "saved_reliability_record"]
+    );
+    config.reliability.enabled = false;
+    assert!(single_call_reasons(&config, Some(&failed), &stats).is_empty());
+    let rendered = render(
+        &json!({"session":{"call_policy":{"mode":"one_call","reasons":["contract_recovery"]}}}),
+    );
+    assert!(
+        rendered.contains("Request call policy: one_call · reasons: contract_recovery"),
+        "{rendered}"
+    );
+}

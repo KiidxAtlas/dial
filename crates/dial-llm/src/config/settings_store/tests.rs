@@ -111,6 +111,87 @@ fn model_assignment_rejects_invalid_project_without_changing_global() {
 }
 
 #[test]
+fn malformed_project_hooks_reject_save_without_changing_files() {
+    let (_home, _project, layout) = fixture();
+    save_config(&layout, Scope::Global, &[]).unwrap();
+    save_config(&layout, Scope::Project, &[]).unwrap();
+    let files = layout.config_files();
+    let original = files.each_ref().map(|path| fs::read(path).unwrap());
+    let result = save_config(
+        &layout,
+        Scope::Project,
+        &[Change::Set {
+            path: "hooks".into(),
+            value: "invalid".into(),
+        }],
+    );
+    assert!(result.is_err(), "malformed hooks must reject the save");
+    assert_eq!(
+        files.each_ref().map(|path| fs::read(path).unwrap()),
+        original
+    );
+}
+
+#[test]
+fn project_override_cannot_mask_invalid_global_save_or_preview() {
+    let (_home, _project, layout) = fixture();
+    save_config(&layout, Scope::Global, &[]).unwrap();
+    save_config(
+        &layout,
+        Scope::Project,
+        &[Change::Set {
+            path: "preparation.lsp_paths".into(),
+            value: toml::Value::Array(vec![]),
+        }],
+    )
+    .unwrap();
+    let files = layout.config_files();
+    let original = files.each_ref().map(|path| fs::read(path).unwrap());
+    let changes = [Change::Set {
+        path: "preparation.lsp_paths".into(),
+        value: toml::Value::Array(vec!["../outside.rs".into()]),
+    }];
+    let preview = preview_config(&layout, Scope::Global, &changes, &toml::Table::new());
+    let save = save_config(&layout, Scope::Global, &changes);
+    assert!(
+        preview.is_err() && save.is_err(),
+        "invalid global paths must reject both preview and save: preview rejected={}, save rejected={}",
+        preview.is_err(),
+        save.is_err()
+    );
+    assert_eq!(
+        files.each_ref().map(|path| fs::read(path).unwrap()),
+        original
+    );
+}
+
+#[test]
+fn valid_global_save_preserves_project_override() {
+    let (_home, _project, layout) = fixture();
+    save_config(
+        &layout,
+        Scope::Project,
+        &[Change::Set {
+            path: "preparation.lsp_paths".into(),
+            value: toml::Value::Array(vec![]),
+        }],
+    )
+    .unwrap();
+    let changes = [Change::Set {
+        path: "preparation.lsp_paths".into(),
+        value: toml::Value::Array(vec!["src/lib.rs".into()]),
+    }];
+    let preview = preview_config(&layout, Scope::Global, &changes, &toml::Table::new()).unwrap();
+    let saved = save_config(&layout, Scope::Global, &changes).unwrap();
+    assert!(preview.preparation.lsp_paths.is_empty());
+    assert!(saved.preparation.lsp_paths.is_empty());
+    assert_eq!(
+        load_layer(&layout, Scope::Global).unwrap()["preparation"]["lsp_paths"],
+        toml::Value::Array(vec!["src/lib.rs".into()])
+    );
+}
+
+#[test]
 fn another_sessions_model_write_does_not_retarget_a_pinned_session() {
     let (_home, _project, layout) = fixture();
     let set = |path: &str, value: &str| Change::Set {
@@ -407,4 +488,179 @@ fn record_locks_interoperate_with_native_flock_and_preserve_contention_errors() 
         try_locked(&path).is_ok(),
         "explicit unlock releases ownership"
     );
+}
+
+#[test]
+fn effective_sources_follow_layers_even_when_values_equal_defaults() {
+    let (_home, _project, layout) = fixture();
+    let global: toml::Table = "[ui]\ntips = true\n".parse().unwrap();
+    let project: toml::Table = "[ui]\ntips = true\n".parse().unwrap();
+    let empty = toml::Table::new();
+    for (global, project, overlay, source) in [
+        (&empty, &empty, &empty, "default"),
+        (&global, &empty, &empty, "global"),
+        (&global, &project, &empty, "project"),
+        (&global, &project, &global, "CLI flag"),
+    ] {
+        let config =
+            crate::config::types::Config::from_layers(&layout, global, project, overlay).unwrap();
+        assert_eq!(config.setting_sources["ui.tips"], source);
+    }
+}
+
+#[test]
+fn model_review_reports_only_actual_project_removals_and_does_not_save() {
+    let (_home, _project, layout) = fixture();
+    save_config(
+        &layout,
+        Scope::Project,
+        &[
+            Change::Set {
+                path: "model".into(),
+                value: "old".into(),
+            },
+            Change::Set {
+                path: "provider".into(),
+                value: "local".into(),
+            },
+            Change::Set {
+                path: "endpoint.base_url".into(),
+                value: "http://127.0.0.1:9999/v1".into(),
+            },
+            Change::Set {
+                path: "model_profile".into(),
+                value: "".into(),
+            },
+            Change::Set {
+                path: "context_window".into(),
+                value: 4096.into(),
+            },
+            Change::Set {
+                path: "task.prefer_subagents".into(),
+                value: true.into(),
+            },
+        ],
+    )
+    .unwrap();
+    let before = [
+        load_layer(&layout, Scope::Global).unwrap(),
+        load_layer(&layout, Scope::Project).unwrap(),
+    ];
+    let config = load_config(&layout, &toml::Table::new()).unwrap();
+    let selection = crate::llm::model_config::ModelSelection::new("local", "new");
+    let changes = crate::config::selection::changes(&config, &selection, "main").unwrap();
+    let review = review_model_config(&layout, Scope::Global, &changes, Some("main")).unwrap();
+    let removed: Vec<_> = review
+        .effects()
+        .iter()
+        .filter(|(scope, _, removed)| *scope == Scope::Project && *removed)
+        .map(|(_, path, _)| path.as_str())
+        .collect();
+    assert_eq!(
+        removed,
+        [
+            "context_window",
+            "endpoint",
+            "model",
+            "model_profile",
+            "provider"
+        ]
+    );
+    assert_eq!(load_layer(&layout, Scope::Global).unwrap(), before[0]);
+    assert_eq!(load_layer(&layout, Scope::Project).unwrap(), before[1]);
+    save_reviewed_model_config(&layout, &review).unwrap();
+    let project = load_layer(&layout, Scope::Project).unwrap();
+    assert!(project.get("model").is_none());
+    assert!(project.get("context_window").is_none());
+    assert_eq!(project["task"]["prefer_subagents"].as_bool(), Some(true));
+    assert_eq!(
+        load_config(&layout, &toml::Table::new()).unwrap().model,
+        "new"
+    );
+    let second_review =
+        review_model_config(&layout, Scope::Global, &changes, Some("main")).unwrap();
+    assert!(
+        second_review
+            .effects()
+            .iter()
+            .all(|(scope, _, _)| *scope != Scope::Project),
+        "absent project overrides must not be advertised as removals"
+    );
+}
+
+#[test]
+fn stale_model_reviews_refuse_both_layers_without_writes() {
+    for changed_scope in [Scope::Global, Scope::Project] {
+        let (_home, _project, layout) = fixture();
+        let config = load_config(&layout, &toml::Table::new()).unwrap();
+        let selection = crate::llm::model_config::ModelSelection::new("local", "reviewed");
+        let changes = crate::config::selection::changes(&config, &selection, "main").unwrap();
+        let review = review_model_config(&layout, Scope::Global, &changes, Some("main")).unwrap();
+        save_config(
+            &layout,
+            changed_scope,
+            &[Change::Set {
+                path: "model".into(),
+                value: "concurrent".into(),
+            }],
+        )
+        .unwrap();
+        let before = layout.config_files().map(|path| std::fs::read(path).ok());
+        assert!(
+            save_reviewed_model_config(&layout, &review)
+                .unwrap_err()
+                .to_string()
+                .contains("changed since review")
+        );
+        assert_eq!(
+            layout.config_files().map(|path| std::fs::read(path).ok()),
+            before
+        );
+    }
+}
+
+#[test]
+fn model_review_does_not_advertise_or_publish_unselected_layer_migrations() {
+    for (scope, role) in [(Scope::Project, Some("main")), (Scope::Global, None)] {
+        let (_home, _project, layout) = fixture();
+        let config = load_config(&layout, &toml::Table::new()).unwrap();
+        let unselected = usize::from(scope == Scope::Global);
+        save(
+            &layout,
+            if unselected == 0 {
+                Scope::Global
+            } else {
+                Scope::Project
+            },
+            &[],
+        )
+        .unwrap();
+        let legacy = b"[model_roles.smol]\nprovider='mlx'\nmodel='legacy-small'\n";
+        write_private(&layout.config_files()[unselected], legacy).unwrap();
+        let changes = if role.is_some() {
+            crate::config::selection::changes(
+                &config,
+                &crate::llm::model_config::ModelSelection::new("local", "new"),
+                "main",
+            )
+            .unwrap()
+        } else {
+            vec![Change::Remove {
+                path: "model_roles.coach".into(),
+            }]
+        };
+        let review = review_model_config(&layout, scope, &changes, role).unwrap();
+        assert!(
+            review
+                .effects()
+                .iter()
+                .all(|(effect_scope, _, _)| *effect_scope == scope),
+            "unpublished migrations must not appear as saved effects"
+        );
+        save_reviewed_model_config(&layout, &review).unwrap();
+        assert_eq!(
+            std::fs::read(&layout.config_files()[unselected]).unwrap(),
+            legacy
+        );
+    }
 }

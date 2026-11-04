@@ -465,6 +465,25 @@ impl Repo {
         (branch, head)
     }
 
+    /// Bounded recent history for the existing status worker, never called by the input thread.
+    pub(crate) fn recent_commits(&self) -> Result<Vec<(String, String)>, String> {
+        let (_, output) = run_git_bounded(
+            &self.root,
+            &["log", "--max-count=50", "--format=%H%x1f%h %s"],
+            None,
+        )?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let (sha, label) = line.split_once('\u{1f}')?;
+                Some((sha.to_owned(), label.to_owned()))
+            })
+            .collect())
+    }
+
     pub(crate) fn untracked_doc(&self, path: &str) -> Result<Doc, String> {
         untracked_doc(&self.root, path)
     }

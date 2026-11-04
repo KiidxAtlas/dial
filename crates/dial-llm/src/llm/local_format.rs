@@ -185,7 +185,9 @@ pub fn llama_server() -> Option<PathBuf> {
     };
     let user_dir = crate::config::types::default_user_dir();
     if !user_dir.as_os_str().is_empty() {
-        let managed = user_dir.join("tools").join("llama-cpp").join(name);
+        let managed = crate::config::paths::tools_dir(&user_dir)
+            .join("llama-cpp")
+            .join(name);
         if managed.is_file() {
             return Some(managed);
         }

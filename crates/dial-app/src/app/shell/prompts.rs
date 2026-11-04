@@ -30,8 +30,156 @@ pub(in crate::app) enum DraftStep {
     Cancel,
 }
 
+pub(in crate::app) const ATTENTION_HINT: &str =
+    "F6: read-only Attention (keeps this prompt pending)";
+
+pub(in crate::app) fn attention_key(key: &KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release && key.code == KeyCode::F(6) && key.modifiers.is_empty()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::app) enum AttentionExit {
+    Returned,
+    Cancelled,
+    Disconnected,
+}
+
+/// This reducer has no command, answer or draft channel. All inspector input is consumed.
+#[derive(Default)]
+struct AttentionView {
+    offset: usize,
+}
+
+impl AttentionView {
+    fn event(
+        &mut self,
+        event: &Event,
+        keys: &crate::ui::keys::Keymap,
+        lines: usize,
+        visible: usize,
+    ) -> Option<AttentionExit> {
+        let Event::Key(key) = event else {
+            return None;
+        };
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        if attention_key(key) || key.code == KeyCode::Esc {
+            return Some(AttentionExit::Returned);
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Some(AttentionExit::Cancelled);
+        }
+        let down = keys.matches(Action::SelectPageDown, key);
+        if down || keys.matches(Action::SelectPageUp, key) {
+            self.offset = panel_scroll(self.offset, lines, visible, down);
+        }
+        None
+    }
+}
+
 impl Shell {
     // ----- asking the user ------------------------------------------------------------------
+
+    /// Frozen observed data, not another Activity controller. Action values are deliberately
+    /// discarded; this view can only return to its still-owned prompt or cancel it.
+    fn modal_attention_text(&self, title: &str, body: &str) -> String {
+        let workers = crate::ui::subagent_model::HubSnapshot {
+            agents: self.workers.agents().to_vec(),
+            ..Default::default()
+        };
+        let jobs = self
+            .background_control
+            .as_ref()
+            .and_then(|control| control.jobs_view(None))
+            .map(|view| {
+                view.jobs
+                    .into_iter()
+                    .map(|job| crate::ui::overlay::jobs::JobRow {
+                        name: job.name,
+                        command: job.command,
+                        status: job.status,
+                        process_outcome: job.process_outcome,
+                        running: job.running,
+                        terminal: job.terminal,
+                        mode: "session".into(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let failure = self
+            .model_downloads
+            .as_ref()
+            .and_then(|downloads| downloads.borrow().last_failure().cloned());
+        let projection = crate::app::overlay::activity::attention_choices_with_context(
+            &workers,
+            &jobs,
+            Some(&self.status),
+            Some(&self.todo),
+            failure.as_ref(),
+            self.last_setup_failure.as_ref(),
+        );
+        let mut text = format!(
+            "F6 / Esc: Return to original prompt · Ctrl+C: cancel original prompt\nRead-only frozen snapshot. Enter, approval letters and paste do nothing.\n\nMain prompt · waiting for you\n{title}\n{body}"
+        );
+        for item in projection.items {
+            text.push_str(&format!("\n\n{}\n{}", item.label, item.detail));
+        }
+        text.push_str("\n\nWorker data is last observed, not refreshed here. Missing snapshots are not an all-clear. Return to the original prompt before operating any owner.");
+        text
+    }
+
+    pub(in crate::app) fn inspect_modal_attention(
+        &mut self,
+        title: &str,
+        body: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> AttentionExit {
+        let body = self.modal_attention_text(title, body);
+        let mut view = AttentionView::default();
+        loop {
+            if cancelled() {
+                return AttentionExit::Cancelled;
+            }
+            let (cols, height) = self.term.size();
+            let available = height.saturating_sub(6) as usize;
+            let rows = panel_rows_window(
+                self.themes.current(),
+                cols,
+                available,
+                PanelView {
+                    title: "Attention · read-only · F6/Esc returns to prompt",
+                    body: &body,
+                    options: &[],
+                    selected: 0,
+                    offset: view.offset,
+                },
+            );
+            if self.paint(Some(rows)).is_err() {
+                return AttentionExit::Disconnected;
+            }
+            match poll(TICK) {
+                Ok(false) => continue,
+                Err(_) => return AttentionExit::Disconnected,
+                Ok(true) => {}
+            }
+            let event = match read() {
+                Ok(event) => event,
+                Err(_) => return AttentionExit::Disconnected,
+            };
+            if cancelled() {
+                return AttentionExit::Cancelled;
+            }
+            if matches!(event, Event::Resize(..)) {
+                self.term.on_resize();
+            }
+            let lines = text::wrap_words(&text::sanitize(&body), panel_inner(cols)).len();
+            let visible = panel_body_limit(0, available);
+            if let Some(exit) = view.event(&event, &self.keys, lines, visible) {
+                return exit;
+            }
+        }
+    }
 
     /// Keep draft-only consent across bridges and turns, but not across app launches.
     pub(in crate::app) fn review_turn_draft(
@@ -146,6 +294,7 @@ impl Shell {
             } else {
                 body.to_owned()
             };
+            shown = format!("{ATTENTION_HINT}\n\n{shown}");
             let draft = self.composer.draft();
             if let Some(note) = self.draft_note(focus) {
                 shown = format!("{shown}\n\n{note}");
@@ -171,6 +320,15 @@ impl Shell {
             }
             match read() {
                 Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                    if attention_key(&key) {
+                        match self.inspect_modal_attention(title, &shown, || {
+                            cancel
+                                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                        }) {
+                            AttentionExit::Returned => continue,
+                            AttentionExit::Cancelled | AttentionExit::Disconnected => return None,
+                        }
+                    }
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     if !panel_has_room(cols, height.saturating_sub(6) as usize) {
                         // A tiny viewport cannot show what a confirmation would authorize. Keep

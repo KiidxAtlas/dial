@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering;
 impl OverlayEnv<'_> {
     /// Returns true when the overlay should close.
     pub(super) fn apply(&mut self, event: OverlayEvent, overlay: &mut ActiveOverlay) -> bool {
+        let overlay = overlay.content_mut();
         match event {
             OverlayEvent::Close => {
                 if self
@@ -86,6 +87,9 @@ impl OverlayEnv<'_> {
                 }
                 self.setting(overlay, &path, &changes, scope);
             }
+            OverlayEvent::UnsetMany { paths, scope } => {
+                self.unset_many(overlay, &paths, scope);
+            }
             OverlayEvent::AssignModel {
                 role,
                 selection,
@@ -97,9 +101,91 @@ impl OverlayEnv<'_> {
                     .clone()
                     .unwrap_or_else(|| self.app.config.clone());
                 let embedding_role = role == "embedding";
+                let mut saved = false;
                 let outcome = (|| -> Result<String> {
-                    let changes = selection_changes(&config, &selection, &role)?;
-                    settings_store::preview_model_config(&self.app.layout, scope, &changes, &role)?;
+                    let review = if let ActiveOverlay::Models(models) = &mut *overlay {
+                        models.take_confirmed_assignment()
+                    } else {
+                        None
+                    };
+                    let review = if let Some(review) = review {
+                        review
+                    } else {
+                        let changes = selection_changes(&config, &selection, &role)?;
+                        let review = settings_store::review_model_config(
+                            &self.app.layout,
+                            scope,
+                            &changes,
+                            Some(&role),
+                        )?;
+                        let mut notes = vec![
+                            format!("This session: {role} → {}", selection.display_name()),
+                            format!("Saved: {scope:?}; other running sessions unchanged."),
+                            "Cancel leaves both saved settings and this session unchanged.".into(),
+                        ];
+                        if role == "main" {
+                            let follows = config
+                                .role_statuses()
+                                .into_iter()
+                                .filter(|status| {
+                                    status.source
+                                        == crate::llm::model_config::RoleSource::FollowsMain
+                                })
+                                .map(|status| status.role)
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            notes.push(format!("Roles following main also change: {follows}. Assigned roles unchanged."));
+                        } else {
+                            notes.push(
+                                "Main model and all other role assignments unchanged.".into(),
+                            );
+                        }
+                        if crate::config::selection::requires_local_preparation(&config, &selection)
+                        {
+                            notes.push("Installation: confirmation starts local model preparation; settings save only after success. Review itself downloads nothing.".into());
+                        } else {
+                            notes.push("Installation: none; no download from this review.".into());
+                        }
+                        if !matches!(overlay, ActiveOverlay::Models(_)) {
+                            let previous = std::mem::replace(
+                                overlay,
+                                ActiveOverlay::Models(Box::new(
+                                    crate::ui::overlay::models::ModelOverlay::new(
+                                        None,
+                                        config.role_statuses(),
+                                        scope,
+                                    )
+                                    .with_project_name(
+                                        &self
+                                            .app
+                                            .layout
+                                            .project_root
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy(),
+                                    ),
+                                )),
+                            );
+                            if self.history.len() == 16 {
+                                self.history.remove(0);
+                            }
+                            self.history.push(previous);
+                        }
+                        if let ActiveOverlay::Models(models) = &mut *overlay {
+                            models.review_assignment(
+                                review,
+                                OverlayEvent::AssignModel {
+                                    role: role.clone(),
+                                    selection: selection.clone(),
+                                    scope,
+                                },
+                                format!("{role} → {}", selection.display_name()),
+                                notes,
+                            );
+                        }
+                        return Ok("Review the exact model changes; confirm to save, or cancel without saving.".into());
+                    };
+                    let changes = review.changes().to_vec();
                     let message = if role == "main" {
                         format!("switched to {}", selection.display_name())
                     } else {
@@ -134,6 +220,7 @@ impl OverlayEnv<'_> {
                             role: Some(role),
                             scope,
                             voice: None,
+                            review: Some(review),
                         });
                         Ok("Preparing model in the background; settings save only on success. Esc closes this panel and cancels preparation.".into())
                     } else {
@@ -144,13 +231,13 @@ impl OverlayEnv<'_> {
                                 .is_some_and(|job| job.model.is_some()),
                             "Cancel the pending model selection first (Esc)."
                         );
-                        self.app.save_settings(scope, &changes, Some(&role))?;
+                        self.app.save_reviewed_model_settings(&review)?;
                         self.reload_saved()?;
+                        saved = true;
                         Ok(message)
                     }
                 })();
-                let assigned =
-                    outcome.is_ok() && self.auth_job.as_ref().is_none_or(|job| job.model.is_none());
+                let assigned = outcome.is_ok() && saved;
                 let outcome = match outcome {
                     Ok(message) if assigned && embedding_role => {
                         Ok(match self.queue_semantic_offer() {
@@ -170,6 +257,13 @@ impl OverlayEnv<'_> {
                 {
                     settings.replace_values(values, project, global);
                     settings.roles_changed();
+                }
+                if assigned
+                    && self.next.is_none()
+                    && matches!(self.history.last(), Some(ActiveOverlay::Settings(_)))
+                {
+                    self.next = Some("navigate:back".into());
+                    return true;
                 }
             }
             OverlayEvent::DownloadSetting { path, value, scope } => {
@@ -215,6 +309,7 @@ impl OverlayEnv<'_> {
                         role: None,
                         scope,
                         voice: None,
+                        review: None,
                     });
                     Ok(format!(
                         "Downloading {value} in the background; {path} saves only on success. Esc closes this panel and cancels the download."
@@ -268,6 +363,7 @@ impl OverlayEnv<'_> {
                         changes,
                         role: None,
                         scope,
+                        review: None,
                         voice: Some(PreparedVoice {
                             original: original_voice,
                             changes: prepared_rx,
@@ -284,18 +380,37 @@ impl OverlayEnv<'_> {
             }
             OverlayEvent::ClearRole { role, scope } => {
                 *self.scope = scope;
-                let outcome =
-                    clear_role_changes(&role, scope).and_then(|changes| self.save(&changes, scope));
-                self.report(
-                    overlay,
-                    outcome.map(|config| {
-                        if config.role_selection(&role).is_some() {
-                            format!("{role}: {scope:?} assignment removed, but another scope still assigns a model; Ctrl+S switches scope")
+                let outcome = (|| -> Result<String> {
+                    let review = if let ActiveOverlay::Models(models) = &mut *overlay {
+                        models.take_confirmed_assignment()
+                    } else {
+                        None
+                    };
+                    if let Some(review) = review {
+                        self.app.save_reviewed_model_settings(&review)?;
+                        let config = self.reload_saved()?;
+                        return Ok(if config.role_selection(&role).is_some() {
+                            format!(
+                                "{role}: {scope:?} assignment removed, but another scope still assigns a model; Ctrl+S switches scope"
+                            )
                         } else {
                             format!("{role} assignment cleared")
-                        }
-                    }),
-                );
+                        });
+                    }
+                    let changes = clear_role_changes(&role, scope)?;
+                    // Clearing a role retains its existing scope semantics, unlike explicit assignment.
+                    let review = settings_store::review_model_config(
+                        &self.app.layout,
+                        scope,
+                        &changes,
+                        None,
+                    )?;
+                    if let ActiveOverlay::Models(models) = &mut *overlay {
+                        models.review_assignment(review, OverlayEvent::ClearRole { role: role.clone(), scope }, format!("clear {role}"), vec![format!("This session + saved {scope:?} {role} assignment removed."), "Lower-scope assignment may become effective; otherwise this role follows main.".into(), "Main and other running sessions unchanged. Cancel saves nothing.".into()]);
+                    }
+                    Ok("Review role removal; confirm to save or cancel without saving.".into())
+                })();
+                self.report(overlay, outcome);
                 self.refresh_roles(overlay);
             }
             OverlayEvent::AddProvider { id, spec, scope } => {

@@ -163,18 +163,20 @@ impl TurnState<'_> {
     /// Before the next request: the previous reply was kept when an assistant message reached
     /// history after it arrived. Kept, its notes are done; discarded, they are queued again ahead
     /// of new ones and the advisory note it carried is retracted so it is not filtered as a repeat.
-    fn settle_delivered(&mut self, assistants_since: impl FnOnce(usize) -> usize) {
+    /// Return kept notes so their owning recovery trackers can acknowledge selected delivery.
+    fn settle_delivered(&mut self, assistants_since: impl FnOnce(usize) -> usize) -> Vec<Value> {
         let Some(mark) = self.reply_mark.take() else {
-            return;
+            return Vec::new();
         };
         if assistants_since(mark) > 0 {
-            self.delivered_nudges.clear();
             self.emissions.confirm();
+            std::mem::take(&mut self.delivered_nudges)
         } else {
             let mut again = std::mem::take(&mut self.delivered_nudges);
             again.append(&mut self.pending_nudges);
             self.pending_nudges = again;
             self.emissions.retract();
+            Vec::new()
         }
     }
 

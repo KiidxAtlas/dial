@@ -192,3 +192,35 @@ paths = ["source.txt"]
         assert!(agent.workflow_contracts.blocker().is_some());
     });
 }
+
+#[test]
+fn strict_read_only_contract_is_rejected_before_durable_intent() {
+    with_agent(
+        r#"
+[task]
+persist = true
+[[verification.commands]]
+name = "behavior"
+command = "printf '1 test passed\\n'"
+timeout_secs = 5
+[verification.inputs.behavior]
+paths = ["source.txt"]
+"#,
+        |agent| {
+            std::fs::write(agent.workspace.root().join("source.txt"), "input").unwrap();
+            for kind in ["scout", "reviewer"] {
+                let args = json!({"action":"start", "agent":kind, "task":"inspect", "solution_space":"findings", "acceptance_checks":["behavior"], "contract":{"id":kind}});
+                let error = agent.start_subagents(&args, &mut NullUi).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("strict contracts require an isolated worker"),
+                    "{error:#}"
+                );
+                assert!(agent.workflow_contracts.snapshot().is_null());
+                assert!(agent.session.control_state()["workflow_jobs"].is_null());
+                assert!(agent.live_tasks.running_ids().is_empty());
+            }
+        },
+    );
+}

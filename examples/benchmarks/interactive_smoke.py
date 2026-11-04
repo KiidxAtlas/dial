@@ -7,6 +7,7 @@ Delayed SSE covers queue management, refused restart and help during a live turn
 Run after building: python3 examples/benchmarks/interactive_smoke.py --dial target/debug/dial
 """
 import argparse
+from contextlib import ExitStack
 import base64
 import http.server
 import json
@@ -611,7 +612,8 @@ def side_thread_case(server, binary, captures):
             assert len(files) == 1, "side question was displayed before being saved"
             pending = json.loads(files[0].read_text())["pending"]
             assert "SIDE-PREFIX" in pending["answer"], "displayed side prefix was not durable"
-            terminal.key("Escape")
+            # Escape dismisses composer UI; Ctrl+C is the configured running-turn interrupt.
+            terminal.key("C-c")
             terminal.wait("interrupted")
             server.side_advance.set()
             terminal.wait("SIDE-SURVIVED-MAIN-CANCEL")
@@ -660,10 +662,11 @@ def main():
     thread.start()
     terminal = None
     try:
-        with tempfile.TemporaryDirectory(prefix="dial-pty-regression-") as directory:
+        with tempfile.TemporaryDirectory(prefix="dial-pty-regression-") as directory, ExitStack() as cleanup:
             root = pathlib.Path(directory)
             project, home = fixture(root, server.server_port)
             terminal = Terminal(binary, project, home, args.captures)
+            cleanup.callback(lambda: terminal.close() if terminal else None)
             terminal.wait("mock-main")
             server.discovery.armed.set()
             terminal.capture("baseline")
@@ -708,12 +711,19 @@ def main():
             terminal.capture("selective-review-dialog")
             terminal.key("r")
             terminal.wait("Restored only the selected file")
+            terminal.wait("checkpoint for /undo files.")
             assert (project / "a.txt").read_text() == "original-a"
             assert (project / "b.txt").read_text() == "edited-b"
             terminal.capture("selective-revert")
             terminal.command("/undo")
-            terminal.wait("restored 1 file(s), removed 0")
+            terminal.wait("unrelated newer file checkpoint blocks undo; conversation kept")
+            assert (project / "a.txt").read_text() == "original-a"
+            assert (project / "b.txt").read_text() == "edited-b"
+            terminal.capture("conversation-undo-preserves-selective-revert")
+            terminal.command("/undo files")
+            terminal.wait('restored ["a.txt"], removed []')
             assert (project / "a.txt").read_text() == "edited-a"
+            assert (project / "b.txt").read_text() == "edited-b"
             terminal.capture("selective-revert-undone")
             terminal.command("PTY-STREAM")
             terminal.wait("SSE-PREFIX-MARKER")
@@ -722,15 +732,21 @@ def main():
             terminal.command("/queue remove 1")
             terminal.wait("Removed only the selected queued message")
             terminal.command("/queue")
-            terminal.wait("No queued messages")
+            terminal.wait("[queue]")
+            terminal.wait("No choices to pick from.")
+            terminal.capture("streaming-queue-empty")
+            terminal.key("Escape")
+            terminal.wait_panel(False)
             server.stream_gates[0].set()
             terminal.wait("SSE-AFTER-QUEUE")
             terminal.command("/model restart")
-            terminal.wait("No server was stopped")
+            terminal.wait("needs an idle session; finish or cancel the current turn")
             server.stream_gates[1].set()
             terminal.wait("SSE-AFTER-RESTART")
             terminal.command("/help")
             terminal.wait_panel()
+            terminal.wait("Actions", history=False)
+            terminal.wait("Start or continue work", history=False)
             terminal.capture("streaming-help-live")
             terminal.key("Escape")
             terminal.wait_panel(False)
@@ -782,10 +798,11 @@ def main():
         pool_case(server, binary, args.captures)
         draft_focus_case(server, binary, args.captures)
         side_thread_case(server, binary, args.captures)
-        with tempfile.TemporaryDirectory(prefix="dial-pty-cancel-") as directory:
+        with tempfile.TemporaryDirectory(prefix="dial-pty-cancel-") as directory, ExitStack() as cleanup:
             project, home = fixture(pathlib.Path(directory), server.server_port)
             server.discovery = DiscoveryGate()
             terminal = Terminal(binary, project, home, args.captures)
+            cleanup.callback(lambda: terminal.close() if terminal else None)
             terminal.wait("mock-main")
             server.discovery.armed.set()
             terminal.command("/model next")

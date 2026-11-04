@@ -26,7 +26,7 @@ use server::Shared;
 
 /// Where the relay token lives under the Dial user directory.
 pub fn token_path(user_dir: &Path) -> PathBuf {
-    user_dir.join("browser-relay").join("token")
+    crate::config::paths::browser_relay_dir(user_dir).join("token")
 }
 
 /// Returns the relay token, creating it on first use. Every relay and the extension share it.

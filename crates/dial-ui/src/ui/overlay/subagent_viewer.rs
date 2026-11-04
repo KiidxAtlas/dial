@@ -75,6 +75,11 @@ pub struct Conversation {
     /// A capped read left complete records unread; they are replayed on the next poll.
     behind: bool,
     revision: u64,
+    /// Inspector facts from records already consumed by this same incremental follower.
+    prompt: Option<String>,
+    observed_tools: BTreeMap<String, u64>,
+    recorded_thinking: Option<String>,
+    contract_tools: Option<Vec<String>>,
 }
 
 /// Leading bytes compared on every poll to detect a rewrite that kept the same inode and size.
@@ -193,9 +198,44 @@ impl Conversation {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             return;
         };
+        match value["type"].as_str() {
+            Some("worker_settings") => {
+                self.recorded_thinking = value["thinking"].as_str().map(str::to_owned);
+            }
+            Some("execution_contract") => {
+                self.contract_tools = value["tools"].as_array().map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                });
+            }
+            _ => {}
+        }
         // Older archives may contain delta records. Do not display their raw
         // fragments: only authoritative messages and cumulative safe snapshots.
         if let Some("message") = value["type"].as_str() {
+            let message = &value["message"];
+            if self.prompt.is_none() && message["role"] == "user" {
+                self.prompt = message["content"].as_str().map(str::to_owned);
+            }
+            if message["role"] == "assistant" {
+                if let Some(calls) = message["tool_calls"].as_array() {
+                    for call in calls {
+                        if let Some(name) = call["function"]["name"].as_str() {
+                            *self.observed_tools.entry(name.to_owned()).or_default() += 1;
+                        }
+                    }
+                }
+                if let Some(parts) = message["content"].as_array() {
+                    for part in parts.iter().filter(|part| part["type"] == "tool_use") {
+                        if let Some(name) = part["name"].as_str() {
+                            *self.observed_tools.entry(name.to_owned()).or_default() += 1;
+                        }
+                    }
+                }
+            }
             if value["message"]["role"] == "assistant" {
                 self.streaming = Transcript::new();
             }
@@ -315,6 +355,9 @@ pub fn route(agent: Option<&AgentEntry>) -> Route {
     }
     match agent.status {
         AgentStatus::Cancelled => Route::Unavailable("Cancelled workers cannot continue"),
+        AgentStatus::Interrupted => {
+            Route::Unavailable("No saved continuation is available for this interrupted worker")
+        }
         AgentStatus::Running | AgentStatus::Waiting => {
             Route::Unavailable("This worker cannot take a message right now")
         }
@@ -360,6 +403,10 @@ pub struct SubagentViewer {
     /// Persistent hub projection for this worker's model refresh; never rereads unchanged transcripts.
     model_cache: HubCache,
     scroll: Scroll,
+    inspector: bool,
+    inspector_scroll: Scroll,
+    transcript_geometry: (usize, usize),
+    inspector_geometry: (usize, usize),
     /// Message entry to scroll to once it has been replayed.
     pending_entry: Option<usize>,
     expanded: bool,
@@ -401,6 +448,13 @@ impl SubagentViewer {
             next_tail: now,
             model_cache: HubCache::default(),
             scroll: Scroll::default(),
+            inspector: false,
+            inspector_scroll: Scroll {
+                top: 0,
+                follow: false,
+            },
+            transcript_geometry: (0, 0),
+            inspector_geometry: (0, 0),
             pending_entry: entry,
             expanded: false,
             draft: Editor::default(),
@@ -513,7 +567,11 @@ impl SubagentViewer {
 
     fn scroll_by(&mut self, delta: isize) {
         let (total, view) = self.geometry;
-        self.scroll.by(delta, total, view);
+        if self.inspector {
+            self.inspector_scroll.by(delta, total, view);
+        } else {
+            self.scroll.by(delta, total, view);
+        }
     }
 
     fn page(&self) -> isize {
@@ -548,6 +606,17 @@ impl SubagentViewer {
                 "Press Ctrl+C again within {} s to cancel this worker",
                 CANCEL_CONFIRM.as_secs()
             ));
+            return OverlayEvent::None;
+        }
+        // Right/Left belong to the draft and hub gesture. Reuse the focus-section
+        // bindings instead, including with a nonempty draft; no editor is replaced.
+        if keys.matches(Action::SectionNext, key) || keys.matches(Action::SectionPrev, key) {
+            self.inspector = !self.inspector;
+            self.geometry = if self.inspector {
+                self.inspector_geometry
+            } else {
+                self.transcript_geometry
+            };
             return OverlayEvent::None;
         }
         if keys.matches(Action::Submit, key) {
@@ -626,10 +695,15 @@ impl SubagentViewer {
         }
         // Home/End jump only while there is no draft; with text they move the editor cursor.
         if empty && key.modifiers.is_empty() && matches!(key.code, KeyCode::Home | KeyCode::End) {
-            if key.code == KeyCode::Home {
-                self.scroll.to_top();
+            let scroll = if self.inspector {
+                &mut self.inspector_scroll
             } else {
-                self.scroll.to_bottom();
+                &mut self.scroll
+            };
+            if key.code == KeyCode::Home {
+                scroll.to_top();
+            } else {
+                scroll.to_bottom();
             }
             return OverlayEvent::None;
         }
@@ -676,8 +750,37 @@ impl SubagentViewer {
     fn compose(&mut self, width: usize, height: usize, ctx: &DrawCtx) -> Vec<Line<'static>> {
         let theme = ctx.theme;
         let footer = self.footer(width, ctx);
-        let mut lines = vec![self.header(width, ctx), self.task(width, theme)];
+        let tabs = if self.inspector {
+            "Transcript | [Inspector]"
+        } else {
+            "[Transcript] | Inspector"
+        };
+        let mut lines = vec![
+            self.header(width, ctx),
+            self.task(width, theme),
+            filled(
+                vec![Span::styled(tabs, theme.fg(Tok::Accent))],
+                width,
+                Style::default(),
+            ),
+        ];
         let body_h = height.saturating_sub(lines.len() + footer.len());
+        if self.inspector {
+            let rows = self.inspector_rows(width, theme);
+            self.inspector_scroll.clamp(rows.len(), body_h);
+            self.geometry = (rows.len(), body_h);
+            self.inspector_geometry = self.geometry;
+            lines.extend(
+                rows.into_iter()
+                    .skip(self.inspector_scroll.top)
+                    .take(body_h),
+            );
+            while lines.len() < height.saturating_sub(footer.len()) {
+                lines.push(Line::default());
+            }
+            lines.extend(footer);
+            return lines.into_iter().take(height).collect();
+        }
 
         let key_width = width.min(u16::MAX as usize) as u16;
         self.ensure_rows(key_width, ctx);
@@ -697,6 +800,7 @@ impl SubagentViewer {
         }
         self.scroll.clamp(total, body_h);
         self.geometry = (total, body_h);
+        self.transcript_geometry = self.geometry;
 
         let body = match &self.cache {
             Some(cache) if total > 0 => {
@@ -719,6 +823,181 @@ impl SubagentViewer {
         }
         lines.extend(footer);
         lines
+    }
+
+    /// A read-only projection, not a second worker configuration store. Missing
+    /// runtime receipts stay unknown; configured roles never stand in for routing.
+    fn inspector_rows(&self, width: usize, theme: &Theme) -> Rows {
+        let known = |value: &str| {
+            if value.is_empty() {
+                "unknown".to_owned()
+            } else {
+                value.to_owned()
+            }
+        };
+        let mut facts = vec![format!("Worker: {}", self.id)];
+        if let Some(agent) = &self.agent {
+            facts.extend([
+                format!("Task: {}", known(&agent.task)),
+                format!("Recorded model: {}", known(&agent.model)),
+                format!("Routing source: {}", known(&agent.model_source)),
+                format!(
+                    "Why this model (recorded launch/provider route): {}",
+                    agent
+                        .model_explanation
+                        .as_deref()
+                        .unwrap_or("unavailable (not recorded)")
+                ),
+                "Context promotion: separate request event, not inferred from launch routing"
+                    .into(),
+                format!("Role label (not routing): {}", known(&agent.role)),
+                format!(
+                    "Context used/window: {}",
+                    agent.context.map_or_else(
+                        || "unknown".into(),
+                        |(used, window)| format!("{used}/{window}")
+                    )
+                ),
+                "Budget limits: unknown (not exposed)".into(),
+                format!(
+                    "Tokens in/out: {}/{}",
+                    agent
+                        .tokens_in
+                        .map_or_else(|| "unknown".into(), |n| n.to_string()),
+                    agent
+                        .tokens_out
+                        .map_or_else(|| "unknown".into(), |n| n.to_string())
+                ),
+                format!(
+                    "Cost: {}",
+                    agent
+                        .cost_usd
+                        .map_or_else(|| "unknown".into(), |cost| format!("${cost:.4}"))
+                ),
+                format!(
+                    "Reported steps/requests/tool calls: {}/{}/{}",
+                    agent.steps, agent.requests, agent.tool_calls
+                ),
+                format!(
+                    "Current activity: {}",
+                    agent.current.as_deref().map_or("unknown".into(), known)
+                ),
+                format!(
+                    "Isolation: {}",
+                    agent.isolation.as_deref().map_or("unknown".into(), known)
+                ),
+            ]);
+            if let Some(config) = &agent.config {
+                facts.extend([
+                    format!("Config state: {}", known(&config.state)),
+                    format!(
+                        "Config revision requested/applied: {}/{}",
+                        config.revision, config.applied_revision
+                    ),
+                    format!(
+                        "Requested model (not active): {}",
+                        config
+                            .requested_model
+                            .as_deref()
+                            .map_or("unknown".into(), known)
+                    ),
+                    format!(
+                        "Requested thinking: {}",
+                        config
+                            .requested_thinking
+                            .as_deref()
+                            .map_or("unknown".into(), known)
+                    ),
+                    format!(
+                        "Config refusal/failure: {}",
+                        config
+                            .failure
+                            .as_deref()
+                            .map_or("none recorded".into(), known)
+                    ),
+                ]);
+            } else {
+                facts.push("Config lifecycle: unknown (no receipt)".into());
+            }
+            facts.push(format!(
+                "Transcript: {}",
+                agent
+                    .transcript
+                    .as_ref()
+                    .map_or_else(|| "unknown".into(), |path| path.display().to_string())
+            ));
+            if agent.artifacts.is_empty() {
+                facts.push("Artifacts: none recorded".into());
+            } else {
+                for (label, uri) in &agent.artifacts {
+                    facts.push(format!("Artifact {label}: {uri}"));
+                }
+            }
+        } else {
+            facts.push("Worker metadata: unknown (loading)".into());
+        }
+        facts.push("Allowed tools: unknown; observed use is not permission".into());
+        facts.push(format!(
+            "Recorded applied thinking: {}",
+            self.conversation
+                .recorded_thinking
+                .as_deref()
+                .unwrap_or("unknown (no receipt)")
+        ));
+        facts.push(format!(
+            "Recorded tool contract (not current permission): {}",
+            self.conversation.contract_tools.as_ref().map_or_else(
+                || "unknown (no receipt)".into(),
+                |tools| if tools.is_empty() {
+                    "empty".into()
+                } else {
+                    tools.join(", ")
+                }
+            )
+        ));
+        if self.conversation.observed_tools.is_empty() {
+            facts.push("Observed tools: none in replayed records".into());
+        } else {
+            for (name, count) in &self.conversation.observed_tools {
+                facts.push(format!("Observed tool: {name} ({count} calls)"));
+            }
+        }
+        for tool in &self.conversation.live {
+            facts.push(format!(
+                "Live tool: {} ({})",
+                tool.name,
+                if tool.running { "running" } else { "finished" }
+            ));
+        }
+        facts.push(if self.conversation.is_behind() {
+            "Transcript replay: partial; more records pending".into()
+        } else {
+            "Transcript replay: caught up to complete records".into()
+        });
+        facts.push(format!(
+            "First recorded user prompt: {}",
+            self.conversation
+                .prompt
+                .as_deref()
+                .unwrap_or("unknown (not recorded or not replayed)")
+        ));
+        // Shared terminal-safe wrapping retains long prompts and artifact paths on
+        // narrow terminals without leaking control sequences or clipping facts away.
+        facts
+            .into_iter()
+            .flat_map(|fact| {
+                text::wrap_words(&text::sanitize(&fact), width.max(1))
+                    .into_iter()
+                    .map(|row| {
+                        filled(
+                            vec![Span::styled(row, theme.fg(Tok::Muted))],
+                            width,
+                            Style::default(),
+                        )
+                    })
+                    .collect::<Rows>()
+            })
+            .collect()
     }
 
     fn empty_body_text(&self) -> String {
@@ -786,7 +1065,9 @@ impl SubagentViewer {
                 fx::pulse(theme, ctx.status.tick),
             ),
             // A worker blocked on the operator must not look busy.
-            AgentStatus::Waiting => (theme.sym(Sym::Warn).to_owned(), theme.fg(Tok::Warning)),
+            AgentStatus::Waiting | AgentStatus::Interrupted => {
+                (theme.sym(Sym::Warn).to_owned(), theme.fg(Tok::Warning))
+            }
             AgentStatus::Done => (theme.sym(Sym::Check).to_owned(), theme.fg(Tok::Success)),
             AgentStatus::Failed => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Error)),
             AgentStatus::Cancelled => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Muted)),
@@ -886,6 +1167,15 @@ impl SubagentViewer {
             "main · draft kept"
         };
         let mut segments = Vec::new();
+        segments.push(hint(
+            ctx.keys,
+            Action::SectionNext,
+            if self.inspector {
+                "transcript"
+            } else {
+                "inspector"
+            },
+        ));
         // Scroll keys type into the draft once it has text, so they are offered only without one.
         if self.draft.text.is_empty() {
             segments.push(format!(

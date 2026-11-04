@@ -177,3 +177,92 @@ fn busy_settings_lookup_sees_new_entries_without_changing_the_running_config() {
     );
     assert!(pending.is_none());
 }
+
+#[test]
+fn set_values_use_schema_ranges_types_and_unknown_key_suggestions() {
+    for (key, raw, valid) in [
+        ("ui.tips", "true", true),
+        ("ui.tips", "not-a-bool", false),
+        ("harness.max_steps", "-1", false),
+        ("harness.max_steps", "64", true),
+    ] {
+        assert_eq!(setting_value(key, raw).is_ok(), valid, "{key} {raw}");
+    }
+    let error = setting_value("ui.tip", "false").unwrap_err().to_string();
+    assert!(error.contains("Did you mean \"ui.tips\""), "{error}");
+}
+
+#[test]
+fn working_setup_capture_roundtrips_without_models_secrets_or_paths() {
+    let mut config = Config {
+        fast_mode: true,
+        ..Default::default()
+    };
+    config.model_roles.insert(
+        "coach".into(),
+        crate::llm::model_config::ModelSelection::new("mlx", "/private/model"),
+    );
+    config.laya.checkpoint = Some("/private/checkpoint".into());
+    let preset = capture_setup(&config);
+    let encoded = toml::to_string(&preset).unwrap();
+    assert!(!encoded.contains("/private"));
+    assert!(preset.roles.is_empty());
+    assert!(preset.vision.is_none());
+    assert!(preset.laya_checkpoint.is_none());
+    let loaded: ModelPreset = toml::from_str(&encoded).unwrap();
+    let changes = preset_changes(&config, &loaded).unwrap();
+    let (_home, _project, layout, _) = crate::app::tests::config();
+    let before = settings_store::load_layer(&layout, Scope::Global).unwrap();
+    let future =
+        settings_store::preview_config(&layout, Scope::Global, &changes, &toml::Table::new())
+            .unwrap();
+    assert!(future.fast_mode);
+    assert_eq!(
+        before,
+        settings_store::load_layer(&layout, Scope::Global).unwrap(),
+        "preview must not publish"
+    );
+    settings_store::save_config(&layout, Scope::Global, &changes).unwrap();
+    let saved = Config::load(&layout, None).unwrap();
+    assert_eq!(capture_setup(&saved).setup, loaded.setup);
+    assert!(!written(&changes).contains(&"model_roles".into()));
+}
+
+#[test]
+fn setup_rejects_unsafe_unknown_nested_and_colliding_keys() {
+    for text in [
+        "[setup]\nendpoint = true",
+        "[setup]\n\"endpoint.headers\" = true",
+        "[setup]\n\"memory.path\" = true",
+        "[setup.memory]\nenabled = true",
+        "[setup]\nfast_mode = '/private/path'",
+        "[setup]\nfast_mode = true\nfast_mode = false",
+        "[setup]\n\"memory.enabled\" = true\nmemory = true",
+    ] {
+        assert!(toml::from_str::<ModelPreset>(text).is_err(), "{text}");
+    }
+    let mut preset = ModelPreset::default();
+    preset.setup.insert("endpoint.headers".into(), true.into());
+    assert!(preset_changes(&Config::default(), &preset).is_err());
+}
+
+#[test]
+fn legacy_model_presets_keep_the_same_change_plan_and_redact_review_auth() {
+    let preset: ModelPreset =
+        toml::from_str("laya_checkpoint = '/local/checkpoint'\n[roles]").unwrap();
+    let changes = preset_changes(&Config::default(), &preset).unwrap();
+    assert_eq!(written(&changes), ["model_roles", "laya.checkpoint"]);
+    let empty: ModelPreset = toml::from_str("").unwrap();
+    assert_eq!(
+        written(&preset_changes(&Config::default(), &empty).unwrap()),
+        ["model_roles"]
+    );
+    let review = changes_preview(&[Change::Set {
+        path: "model_roles".into(),
+        value: toml::toml! { [coach] model = "reviewed-model" headers = { Authorization = "secret-value" } }.into(),
+    }, Change::Remove { path: "roles.task".into() }]);
+    assert!(review.contains("reviewed-model"));
+    assert!(review.contains("roles.task"));
+    assert!(review.contains("[redacted]"));
+    assert!(!review.contains("secret-value"));
+}

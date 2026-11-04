@@ -417,11 +417,13 @@ impl Agent<'_> {
     /// Target file for a rule named `name`: `<project>/.dial/rules` or the user rules directory.
     pub fn rule_target(&self, name: &str, global: bool) -> Result<PathBuf> {
         let dir = if global {
-            self.layout
-                .as_ref()
-                .context("no user directory is configured for global rules")?
-                .user_dir
-                .join("rules")
+            crate::config::paths::rules_dir(
+                &self
+                    .layout
+                    .as_ref()
+                    .context("no user directory is configured for global rules")?
+                    .user_dir,
+            )
         } else {
             self.workspace.root().join(".dial").join("rules")
         };

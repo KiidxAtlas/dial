@@ -1,45 +1,46 @@
-# Vision model roles: grounding and image embeddings
+# Vision features: grounding and image embeddings
 
-Two optional model roles give tools their own vision models. Each role does nothing until it is assigned.
+Two optional feature selections give tools their own vision models. Neither falls back to the main
+model, and neither appears in the model-role picker. An absent selection leaves its feature off.
 
-| Role | Used by | Unassigned |
+| Feature | Used by | Unconfigured |
 | --- | --- | --- |
 | `grounding` | `computer` `target.locate(description)` and `browser` `action=locate`: find a described UI element in a screenshot | Both calls fail with a message that names `/setup grounding` |
 | `image_embedding` | The read-only `image_search` tool, and a prompt-similarity line after `image_gen` writes an image | `image_search` is not offered and no similarity line is added |
 
-Both roles run on Dial's local MLX model server on Apple Silicon (the pinned `mlx-vlm` runtime) or
+Both features run on Dial's local MLX model server on Apple Silicon (the pinned `mlx-vlm` runtime) or
 on any OpenAI-compatible endpoint (`chat-completions` protocol). Other protocols, such as Anthropic,
 Responses or native Gemini, are refused with that message.
 
 ## Easy install
 
 `/setup grounding` and `/setup image-embeddings` list the curated models. The guided `/setup` menu
-has a row for each. `/setup <id>:<repo>` previews the download size, cache state and the role it
+has a row for each. `/setup <id>:<repo>` previews the download size, cache state and feature it
 will set. `/setup grounding yes` (or `/setup grounding:<repo> yes`) runs the setup in the
 background:
 
 1. It installs Dial's MLX runtime first if `python/.venv` is missing (macOS arm64; uv is needed).
 2. It downloads the Hugging Face checkpoint into the shared model cache. A cached checkpoint is
    reused.
-3. It assigns the role globally (`model_roles.grounding` or `model_roles.image_embedding`, with
-   `provider = "mlx"`) and reloads the running session, so the tools appear without a restart.
+3. It saves the feature globally (`vision.grounding` or `vision.image_embedding`, with
+   `provider = "mlx"`), replacing stale endpoint data in that layer, and reloads the running session.
 
-A project-scoped role assignment still overrides the new global one, and the summary says so.
-Any model can also be assigned to either role in Alt+M (/roles), or in configuration:
+A project-scoped feature selection still overrides the new global one, and the summary says so.
+Configure either feature directly in configuration (including an OpenAI-compatible `base_url`):
 
 ```toml
-[model_roles.grounding]
+[vision.grounding]
 provider = "mlx"
 model = "mlx-community/UI-Venus-1.5-2B-6bit"
 
-[model_roles.image_embedding]
+[vision.image_embedding]
 provider = "mlx"
 model = "mlx-community/Qwen3-VL-Embedding-2B-8bit"
 ```
 
 Curated models (sizes rounded):
 
-| Role | Model | Download | Notes |
+| Feature | Model | Download | Notes |
 | --- | --- | --- | --- |
 | grounding | `mlx-community/UI-Venus-1.5-2B-6bit` | 2.5 GB | Default. Qwen3-VL based; answers in 0–1000 coordinates |
 | grounding | `mlx-community/UI-TARS-1.5-7B-4bit` | 4.9 GB | Larger and slower. Qwen2.5-VL based; answers in resized-image pixels |
@@ -88,7 +89,7 @@ Vectors are cached by image content (SHA-256) and model identity in
 `~/.dial/projects/<project>/image_embeddings.sqlite3`, outside the workspace. Each call embeds at
 most 256 new images; repeat the call to include the rest.
 
-After `image_gen` writes an image while the role is assigned, its result gains a line such as
+After `image_gen` writes an image while image embeddings are configured, its result gains a line such as
 `Prompt similarity 0.312 (…)`. If embedding fails, the line reports the error and the generated
 image is kept.
 

@@ -54,7 +54,7 @@ impl Shell {
         let _ = self.term.clear_screen();
         self.transcript = Transcript::new();
         replay_session(&mut self.transcript, session);
-        self.session_id = session.id().to_owned();
+        self.set_session_id(session.id());
         self.set_scope(&session.title());
     }
 
@@ -147,6 +147,9 @@ impl Shell {
             }
             match picker.handle(&event, height as usize) {
                 Pick::Cancel => return Ok(None),
+                Pick::ThisSession => {
+                    crate::app::commands::session::tree(self, agent)?;
+                }
                 Pick::Resume(index) => {
                     let session = &picker.sessions[index];
                     let (id, path) = (session.id.clone(), session.path.clone());

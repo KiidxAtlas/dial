@@ -217,13 +217,18 @@ impl Agent<'_> {
                 self.step_checks.visited_paths.extend(targets);
             }
             let revision = self.step_checks.revision();
-            self.step_checks.empty_searches.observe(
-                &call.name,
-                &call.arguments,
-                &output.text,
-                output.is_error,
-                revision,
-            )
+            let mut effective = call.clone();
+            if crate::agent::window::file_handles::expand(&self.workspace, &mut effective).is_ok() {
+                self.step_checks.empty_searches.observe(
+                    &effective.name,
+                    &effective.arguments,
+                    &output.text,
+                    output.is_error,
+                    revision,
+                )
+            } else {
+                None
+            }
         };
         self.step_checks
             .evidence

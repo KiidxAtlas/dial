@@ -49,6 +49,65 @@ pub(crate) fn interrupted_workers(layout: &Layout, parent_session: &str) -> Vec<
         .collect()
 }
 
+/// Review only existing interrupted workers; cancellation never invokes the resume path.
+pub(crate) fn reviewed_restore(
+    app: &App,
+    shell: &mut Shell,
+    agent: &mut Agent<'_>,
+) -> Result<Report> {
+    let ids = interrupted_workers(&app.layout, agent.session().id());
+    if ids.is_empty() {
+        shell.note("Resume interrupted workers", "No interrupted workers in this session. Completed, failed and cancelled workers are not eligible.");
+        return Ok(Report::default());
+    }
+    let todos = agent
+        .todo()
+        .tasks()
+        .iter()
+        .enumerate()
+        .map(|(index, task)| format!("{:?}: {}", task.status, task.label(index + 1)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let state = agent.session().control_state();
+    let body = format!(
+        "Candidate worker IDs: {}\n\nRetained todos:\n{}\n\nRecorded checks:\n{}\n\nResume revalidates each worker's saved contract, workspace, history and lease; candidates may be rejected. No completed-tool replay is requested. External effects and incomplete history remain uncertain: inspect before repeating work. The main prompt is never submitted.\n\nFile undo (/undo) restores checkpointed files; conversation rewind changes conversation context, not external effects. Settings are changed in /settings; this is not a settings-history restore.",
+        ids.join(", "),
+        if todos.is_empty() { "None" } else { &todos },
+        crate::app::commands::evidence::check_list(&state["turn_summary"]),
+    );
+    let body = crate::storage::redact::redact_text(&body).into_owned();
+    let choice = shell.ask(
+        "Resume interrupted workers",
+        &body,
+        &[
+            ("Cancel", 'c'),
+            ("Resume eligible interrupted workers", 'r'),
+        ],
+    );
+    reviewed_action(choice, || {
+        let eligible: HashSet<_> = interrupted_workers(&app.layout, agent.session().id())
+            .into_iter()
+            .collect();
+        restore_ids(
+            app,
+            shell,
+            agent,
+            ids.into_iter().filter(|id| eligible.contains(id)).collect(),
+        )
+    })
+}
+
+fn reviewed_action(
+    choice: Option<usize>,
+    resume: impl FnOnce() -> Result<Report>,
+) -> Result<Report> {
+    if choice == Some(1) {
+        resume()
+    } else {
+        Ok(Report::default())
+    }
+}
+
 /// Rebinds each interrupted worker of the agent's session through `start(action: "resume")`.
 /// Rejections keep the worker interrupted and carry the reason the resume path gave.
 pub(super) fn restore_interrupted(
@@ -56,9 +115,18 @@ pub(super) fn restore_interrupted(
     shell: &mut Shell,
     agent: &mut Agent<'_>,
 ) -> Result<Report> {
-    let parent = agent.session().id().to_owned();
+    let ids = interrupted_workers(&app.layout, agent.session().id());
+    restore_ids(app, shell, agent, ids)
+}
+
+fn restore_ids(
+    app: &App,
+    shell: &mut Shell,
+    agent: &mut Agent<'_>,
+    ids: Vec<String>,
+) -> Result<Report> {
     let mut report = Report::default();
-    for id in interrupted_workers(&app.layout, &parent) {
+    for id in ids {
         let args = json!({"action": "resume", "id": id, "message": CONTINUE});
         let (result, failed) = {
             let mut bridge = Bridge {

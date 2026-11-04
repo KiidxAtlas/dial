@@ -2,13 +2,12 @@
 
 use crate::app::command_registry::{DuringTurn, canonical_command, command_panel, during_turn};
 use crate::app::core::App;
-use crate::app::display::{app_home_hint, short};
+use crate::app::display::app_home_hint;
 use crate::app::drive::Step;
 use crate::app::improve_view::{improve_jobs_text, improve_stop_text};
 use crate::app::overlay::Which;
 use crate::app::overlay::auth::AuthJob;
 use crate::app::shell::Shell;
-use crate::storage::session::Session;
 use std::path::Path;
 
 impl Shell {
@@ -26,8 +25,37 @@ impl Shell {
         let (name, args) = rest
             .split_once(char::is_whitespace)
             .map_or((rest, ""), |(name, args)| (name, args.trim()));
+        if let Some(draft) = crate::app::command_registry::hubs::draft(name, args) {
+            if self.composer.draft().trim().is_empty() {
+                self.composer.set_draft(draft);
+            } else {
+                self.note(
+                    "Command",
+                    format!("Your draft is kept. Enter {draft}<value> to continue."),
+                );
+            }
+            return false;
+        }
+        let (name, args) = crate::app::command_registry::hubs::expand(name, args);
         let name = canonical_command(name);
+        let context = crate::ui::command_surface::AvailabilityContext {
+            busy: true,
+            ..self.command_context()
+        };
+        if let Some(reason) = crate::ui::command_surface::unavailable_reason(name, args, context) {
+            self.note(&format!("/{name}"), reason);
+            return false;
+        }
         let policy = during_turn(name, args);
+        if name == "worker" {
+            if !self.composer.request_worker(args) {
+                self.note(
+                    "Worker",
+                    "Usage: /worker <message> (up to 256 KiB; wait if 16 requests are pending).",
+                );
+            }
+            return false;
+        }
         if name == "reload" {
             if args.is_empty() {
                 self.refresh_resources(app, true, true);
@@ -44,7 +72,7 @@ impl Shell {
             }
             return false;
         }
-        if name == "queue" {
+        if name == "queue" && !args.is_empty() {
             self.queue_command(&text);
             return false;
         }
@@ -90,6 +118,7 @@ impl Shell {
         let (name, args) = rest
             .split_once(char::is_whitespace)
             .map_or((rest, ""), |(name, args)| (name, args.trim()));
+        let (name, args) = crate::app::command_registry::hubs::expand(name, args);
         let name = canonical_command(name);
         match (name, args) {
             ("model", args) => {
@@ -114,8 +143,10 @@ impl Shell {
                     )),
                 );
             }
-            ("help" | "?", _) => {
-                let text = self.help_text(args.trim() == "all");
+            ("help" | "?", args) if args != "commands" => {
+                let text = super::help::command_help(args.trim())
+                    .or_else(|| super::help::topic_help(args.trim()))
+                    .unwrap_or_else(|| self.help_text(args.trim() == "all"));
                 self.note("Help", text);
             }
             ("hotkeys", "") => {
@@ -124,28 +155,27 @@ impl Shell {
             }
             ("search", "") => self.note("Search", Self::SEARCH_USAGE),
             ("btw", args) => {
+                if args.is_empty() {
+                    let spec = self.side_thread_picker();
+                    if let Err(error) = self.start_busy_overlay(app, Which::Choice(Box::new(spec)))
+                    {
+                        self.note("BTW", format!("{error:#}"));
+                    }
+                    return true;
+                }
+                let Some(args) = self.side_thread_action(args) else {
+                    return true;
+                };
+                if args.starts_with("promote ") {
+                    self.deferred.push_back(format!("/btw {args}"));
+                    self.note("BTW", "Promotion will run when the current turn finishes.");
+                    return true;
+                }
                 let snapshot = self.side.busy_snapshot();
-                let text = self.side.command(args, snapshot.as_deref());
+                let text = self.side.command(&args, snapshot.as_deref());
                 self.note("BTW", text);
             }
-            ("search", query) if !query.is_empty() => {
-                match Session::search(&app.layout, query, 8) {
-                    Ok(hits) if hits.is_empty() => {
-                        self.note("Search", format!("No past messages match \"{query}\"."))
-                    }
-                    Ok(hits) => {
-                        let text = hits
-                            .iter()
-                            .map(|hit| {
-                                format!("{} [{}] {}", short(&hit.session_id), hit.role, hit.snippet)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        self.note("Search", text);
-                    }
-                    Err(error) => self.note("Search", format!("error: {error:#}")),
-                }
-            }
+            ("search", query) if !query.is_empty() => self.start_search(&app.layout, query),
             ("improve", "status") => {
                 let text = self.improve_status_text(app);
                 self.note("Improvement", text);
@@ -212,7 +242,7 @@ impl Shell {
             ("skills", "") => {
                 self.note("Skills", self.skills_listing.clone());
             }
-            ("commands", "") => {
+            ("commands", "") | ("help", "commands") => {
                 let text = if self.commands.is_empty() {
                     "no custom commands (add .dial/commands/<name>.md)".to_owned()
                 } else {
@@ -284,6 +314,7 @@ impl Shell {
         for (label, line) in AuthJob::drain_lines(&mut self.auth_job) {
             self.job_line(app, label, &line);
         }
+        self.poll_search(&app.layout);
         self.sync_live_pane(app, None);
         if self
             .auth_job
@@ -292,7 +323,9 @@ impl Shell {
         {
             return;
         }
-        if let Some((label, result)) = AuthJob::collect(&mut self.auth_job, app) {
+        if let Some((label, result)) =
+            AuthJob::collect_retained(&mut self.auth_job, app, &mut self.last_setup_failure)
+        {
             self.job_ended(label, &result);
             self.report_job_result(label, result);
             self.transcript.settle_job_notices();

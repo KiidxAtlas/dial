@@ -684,7 +684,7 @@ fn role_follows_the_agent_type() {
     let builtin_role = |name: &str| role_for_agent(builtin(name).unwrap());
     assert_eq!(builtin_role("scout"), "small");
     assert_eq!(builtin_role("reviewer"), "tester");
-    assert_eq!(builtin_role("planner"), "planner");
+    assert_eq!(builtin_role("planner"), "coach");
     assert_eq!(builtin_role("worker"), "task");
     assert_eq!(builtin_role("test-runner"), "tester");
 }
@@ -716,14 +716,14 @@ fn task_defaults_do_not_override_assigned_specialists_or_explicit_routes() {
             .iter()
             .all(|job| job.role == "task" && job.model_routes[0].config.model == "task-model")
     );
-    for role in ["small", "tester", "planner"] {
+    for role in ["small", "tester", "coach"] {
         config
             .model_roles
             .insert(role.into(), selection(&format!("{role}-model")));
     }
     let request = parse(&args, &config).unwrap();
     let roles: Vec<_> = request.jobs.iter().map(|job| job.role).collect();
-    assert_eq!(roles, ["task", "small", "tester", "planner", "tester"]);
+    assert_eq!(roles, ["task", "small", "tester", "coach", "tester"]);
     for job in &request.jobs {
         assert_eq!(
             job.model_routes[0].config.model,
@@ -754,6 +754,16 @@ fn task_defaults_do_not_override_assigned_specialists_or_explicit_routes() {
         "explicit-model"
     );
     assert_eq!(request.jobs[0].model_routes[0].source, "profile");
+    assert!(
+        request.jobs[0].model_routes[0]
+            .explanation
+            .contains("Explicit model profile explicit selected")
+    );
+    assert!(
+        !request.jobs[0].model_routes[0]
+            .explanation
+            .contains("unassigned")
+    );
     config.model_roles.clear();
     assert_eq!(
         parse(&args, &config).unwrap().jobs[0].model_routes[0]
@@ -766,13 +776,13 @@ fn task_defaults_do_not_override_assigned_specialists_or_explicit_routes() {
 #[test]
 fn task_defaults_use_configured_helper_chains_before_main() {
     use crate::llm::model_config::ModelSelection;
-    let helpers = ["task", "small", "coach", "tester", "planner"];
+    let helpers = ["task", "small", "coach", "tester"];
     let cases = [
         ("worker", &["task", "coach", "small"][..]),
         ("scout", &["small", "task"][..]),
         ("reviewer", &["tester", "coach", "task", "small"][..]),
         ("test-runner", &["tester", "coach", "task", "small"][..]),
-        ("planner", &["planner", "coach", "task", "small"][..]),
+        ("planner", &["coach", "task", "small"][..]),
     ];
     // Exercise every assignment combination, including no helpers and all specialists.
     for mask in 0..(1 << helpers.len()) {
@@ -817,6 +827,16 @@ fn task_defaults_use_configured_helper_chains_before_main() {
     let request = parse(&args, &config).unwrap();
     assert_eq!(request.jobs[0].model_routes[0].config.model, "main-model");
     assert_eq!(request.jobs[0].model_routes[0].source, "definition");
+    assert!(
+        request.jobs[0].model_routes[0]
+            .explanation
+            .contains("Agent definition model selector @main selected")
+    );
+    assert!(
+        !request.jobs[0].model_routes[0]
+            .explanation
+            .contains("unassigned")
+    );
 }
 
 #[test]
@@ -836,6 +856,13 @@ fn worker_routes_append_the_configured_fallback_chain_for_their_role() {
     let models: Vec<_> = routes.iter().map(|r| r.config.model.as_str()).collect();
     assert_eq!(models, ["task-model", "backup-model"]);
     assert_eq!(routes[1].source, "fallback");
+    let explanation = routes[1].metadata()["model_explanation"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(explanation.contains("task assigned, selected"));
+    assert!(explanation.contains("provider-error fallback selected:"));
+    assert!(!explanation.contains("missing-assignment default"));
     assert_eq!(routes[1].role, "task");
     // An exact provider/model chain and a provider wildcard apply when no role chain does.
     config.retry.fallback_chains.clear();
@@ -849,6 +876,44 @@ fn worker_routes_append_the_configured_fallback_chain_for_their_role() {
     // No chain, no extra routes.
     config.retry.fallback_chains.clear();
     assert_eq!(parse(&args, &config).unwrap().jobs[0].model_routes.len(), 1);
+}
+
+#[test]
+fn recorded_worker_explanation_retains_only_evaluated_missing_assignments() {
+    use crate::llm::model_config::ModelSelection;
+    let mut config = config(&[]);
+    config.model = "main-model".into();
+    let args = json!({"agent":"reviewer","task":"review","solution_space":"s"});
+    for (assignments, expected) in [
+        (
+            vec![],
+            "tester unassigned -> coach unassigned -> task unassigned -> small unassigned -> main selected (missing-assignment default)",
+        ),
+        (
+            vec!["coach", "task"],
+            "tester unassigned -> coach assigned, selected",
+        ),
+        (vec!["tester", "coach"], "tester assigned, selected"),
+    ] {
+        config.model_roles.clear();
+        for role in assignments {
+            config.model_roles.insert(
+                role.into(),
+                ModelSelection::new("openai", &format!("{role}-model")),
+            );
+        }
+        let request = parse(&args, &config).unwrap();
+        let route = &request.jobs[0].model_routes[0];
+        assert_eq!(
+            route.metadata()["model_explanation"],
+            format!(
+                "reviewer: {expected}; route {}",
+                route.config.selection().display_name()
+            )
+        );
+        assert!(!route.explanation.contains("provider-error"));
+        assert!(!route.explanation.contains("promotion"));
+    }
 }
 
 #[test]

@@ -56,9 +56,130 @@ struct Node {
 }
 
 #[derive(Debug, Default)]
-pub(in crate::agent) struct Ledger {
+pub(in crate::agent) struct LedgerState {
     nodes: BTreeMap<String, Node>,
     fault: Option<String>,
+}
+
+/// The controller and promotion transaction share one authority, not a cached dependency view.
+#[derive(Debug, Default)]
+pub(in crate::agent) struct Ledger(std::sync::Arc<std::sync::Mutex<LedgerState>>);
+
+#[derive(Clone, Debug)]
+pub(in crate::agent) struct Promotion {
+    ledger: std::sync::Arc<std::sync::Mutex<LedgerState>>,
+    id: String,
+}
+
+fn lock_state(state: &std::sync::Mutex<LedgerState>) -> std::sync::MutexGuard<'_, LedgerState> {
+    state.lock().unwrap_or_else(|error| {
+        let mut state = error.into_inner();
+        state.fail("workflow authority was interrupted while locked; inspect retained work".into());
+        state
+    })
+}
+
+impl Drop for Ledger {
+    fn drop(&mut self) {
+        // Replacing session control state revokes old workers' authority, even if their
+        // cancellation has not reached the promotion boundary yet.
+        self.lock()
+            .fail("workflow controller was replaced or closed".into());
+    }
+}
+
+impl Ledger {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+        lock_state(&self.0)
+    }
+
+    pub(in crate::agent) fn restore(value: &Value) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(
+            LedgerState::restore(value),
+        )))
+    }
+    pub(in crate::agent) fn fail(&mut self, reason: String) {
+        self.lock().fail(reason);
+    }
+    pub(in crate::agent) fn snapshot(&self) -> Value {
+        self.lock().snapshot()
+    }
+    pub(in crate::agent) fn blocker(&self) -> Option<String> {
+        self.lock().blocker()
+    }
+    pub(in crate::agent) fn begin(
+        &mut self,
+        contract: &Contract,
+        request: Value,
+    ) -> Result<(), String> {
+        self.lock().begin(contract, request)
+    }
+    pub(in crate::agent) fn attach(&mut self, id: &str, worker: &str) -> Result<(), String> {
+        self.lock().attach(id, worker)
+    }
+    pub(in crate::agent) fn running(&self) -> Vec<(String, String)> {
+        self.lock().running()
+    }
+    pub(in crate::agent) fn settle(
+        &mut self,
+        id: &str,
+        status: &str,
+        receipt: Acceptance,
+        output: Option<String>,
+    ) -> Result<(), String> {
+        self.lock().settle(id, status, receipt, output)
+    }
+    pub(in crate::agent) fn refresh(&mut self, workspace: &Workspace, config: &VerificationConfig) {
+        self.lock().refresh(workspace, config);
+    }
+    pub(in crate::agent) fn node(&self, id: &str) -> Option<Value> {
+        self.lock().node(id)
+    }
+    pub(in crate::agent) fn checks(&self, id: &str) -> Result<Vec<String>, String> {
+        self.lock().checks(id)
+    }
+    pub(in crate::agent) fn rechecked(
+        &mut self,
+        id: &str,
+        receipt: Acceptance,
+    ) -> Result<(), String> {
+        self.lock().rechecked(id, receipt)
+    }
+    pub(in crate::agent) fn promotion(&self, id: &str) -> Promotion {
+        Promotion {
+            ledger: self.0.clone(),
+            id: id.into(),
+        }
+    }
+}
+
+impl Promotion {
+    /// Lock order is workspace transaction, then ledger; controller ledger operations never
+    /// acquire the workspace transaction lock. Keep this guard until commit or rollback ends.
+    pub(in crate::agent) fn lock(
+        &self,
+    ) -> impl FnMut(&Workspace, &VerificationConfig) -> anyhow::Result<()> + '_ {
+        let mut ledger = lock_state(&self.ledger);
+        move |workspace, config| {
+            ledger.refresh(workspace, config);
+            anyhow::ensure!(ledger.fault.is_none(), "workflow authority is unavailable");
+            let node = ledger
+                .nodes
+                .get(&self.id)
+                .ok_or_else(|| anyhow::anyhow!("workflow node missing"))?;
+            anyhow::ensure!(
+                matches!(node.state, State::Starting | State::Running),
+                "workflow node is no longer running"
+            );
+            let ids: Vec<_> = node.depends_on.keys().cloned().collect();
+            let current = ledger.dependencies(&ids).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                current == node.depends_on,
+                "workflow dependency binding changed"
+            );
+            Ok(())
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -77,7 +198,7 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
 }
 
-impl Ledger {
+impl LedgerState {
     pub(in crate::agent) fn restore(value: &Value) -> Self {
         if value.is_null() {
             return Self::default();
@@ -273,6 +394,10 @@ impl Ledger {
             return Err("workflow node cannot settle twice".into());
         }
         match status {
+            _ if !receipt.retry_safe() => {
+                node.state = State::Interrupted;
+                node.reason = "controller observed unreconciled effects; inspect retained work before new work".into();
+            }
             "done"
                 if receipt.state == AcceptanceState::Accepted
                     && output

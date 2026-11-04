@@ -139,13 +139,7 @@ pub(crate) fn write_url(
         config: ssh.clone(),
     };
     let shell = transfer_shell(&target, &settings, cancel)?;
-    let path = url.path.shell_word();
-    // Stage to a sibling temp file so a failed transfer leaves `dest` untouched. An existing
-    // destination (file or symlink) is then overwritten in place, keeping its mode, owner and
-    // symlink; `mv` would replace the link itself and reset the mode to the 0600 of the temp file.
-    let script = format!(
-        "dest={path}; tmp=\"${{dest}}.dial-tmp-$$\"; umask 077; trap 'rm -f -- \"$tmp\"' EXIT HUP INT TERM; cat > \"$tmp\" && if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then cat \"$tmp\" > \"$dest\"; else mv -f -- \"$tmp\" \"$dest\"; fi"
-    );
+    let script = write_script(&url.path.shell_word());
     let command = shell.wrap(&script);
     let args = connection::remote_args(&target, &settings, &command, true)?;
     let done = process::run(
@@ -160,6 +154,14 @@ pub(crate) fn write_url(
         return Err(done.failure(&format!("writing {input}"), Duration::from_secs(30)));
     }
     Ok(())
+}
+
+fn write_script(path: &str) -> String {
+    // A private, exclusively created sibling directory prevents preplanted staging symlinks.
+    // Retain overwrite-in-place semantics for existing files/links (including mode and owner).
+    format!(
+        "dest={path}; umask 077; stage=$(mktemp -d \"${{dest}}.dial-stage-XXXXXXXXXX\") || exit 1; trap 'rm -rf -- \"$stage\"' EXIT; trap 'exit 1' HUP INT TERM; tmp=\"$stage/payload\"; (set -C; cat > \"$tmp\") && if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then cat \"$tmp\" > \"$dest\"; else mv -f -- \"$tmp\" \"$dest\"; fi"
+    )
 }
 
 /// Verified connection plus the POSIX shell that runs transfer snippets. A host without one
@@ -344,3 +346,6 @@ impl Tool for SshTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,4 +1,4 @@
-//! The `image_embedding` role: one vector space for text and images (Qwen3-VL-Embedding or any
+//! The `image_embedding` feature: one vector space for text and images (Qwen3-VL-Embedding or any
 //! OpenAI-compatible `/embeddings` endpoint that accepts `image_url` items).
 
 use super::Route;
@@ -14,7 +14,7 @@ use std::io::Read as _;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-pub const ROLE: &str = "image_embedding";
+pub const FEATURE: &str = "image_embedding";
 /// Inputs per HTTP request; the local server embeds them one at a time.
 const BATCH: usize = 8;
 /// Longest image edge sent for embedding; the model's own processor resizes further.
@@ -28,14 +28,14 @@ pub enum Input<'a> {
     Image(&'a [u8]),
 }
 
-/// Whether the `image_embedding` role is assigned.
+/// Whether an explicit image embedding model is configured.
 pub fn configured(config: &Config) -> bool {
-    config.role_selection(ROLE).is_some()
+    config.vision_selection(FEATURE).is_some()
 }
 
 /// The model identity that keys cached vectors: provider, endpoint and model.
 pub fn model_key(config: &Config) -> String {
-    let resolved = config.for_role(ROLE);
+    let resolved = config.for_vision(FEATURE);
     format!(
         "{}|{}|{}",
         resolved.provider.as_deref().unwrap_or("mlx"),
@@ -47,7 +47,7 @@ pub fn model_key(config: &Config) -> String {
     )
 }
 
-/// The local embedding server, kept loaded between calls and replaced when the role changes.
+/// The local embedding server, kept loaded between calls and replaced when the selection changes.
 static SERVER: Mutex<Option<(String, ModelServer)>> = Mutex::new(None);
 
 /// Unit-length vectors for `inputs`, in order.
@@ -58,9 +58,9 @@ pub fn embed(
 ) -> Result<Vec<Vec<f32>>> {
     ensure!(
         configured(config),
-        "no image embedding model is configured; run `/setup image-embeddings` or assign one to the `image_embedding` role in Alt+M"
+        "no image embedding model is configured; run `/setup image-embeddings` or set `vision.image_embedding`"
     );
-    let resolved = config.for_role(ROLE);
+    let resolved = config.for_vision(FEATURE);
     let items = inputs
         .iter()
         .map(|input| match input {
@@ -69,7 +69,7 @@ pub fn embed(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut vectors = Vec::with_capacity(items.len());
-    match super::route(ROLE, &resolved)? {
+    match super::route(FEATURE, &resolved)? {
         Route::Local => {
             let dir = crate::llm::download::ensure_local_model(&resolved.python, &resolved.model)?;
             let mut slot = SERVER.lock();

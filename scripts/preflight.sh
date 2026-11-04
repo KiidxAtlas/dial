@@ -3,8 +3,8 @@
 #
 #   scripts/preflight.sh               # check HEAD (a clean snapshot, not the working tree)
 #   scripts/preflight.sh <rev>         # check another commit
-#   scripts/preflight.sh --in-place    # check the working tree as it is (release.sh uses this)
-#   scripts/preflight.sh --quick ...   # compile/lint gates only: fmt, clippy, cross-target checks
+#   scripts/preflight.sh --in-place    # check the working tree as it is
+#   scripts/preflight.sh --quick ...   # cheap readiness gate, then compile/lint gates
 #   scripts/preflight.sh --force ...   # re-run even if this tree already passed
 #
 # The snapshot is a detached worktree in .tmp/preflight/wt with a persistent target directory, so
@@ -165,13 +165,52 @@ main() {
   fi
   installed_targets="$(rustup target list --installed)"
 
+  # CI runs every Python step on 3.12 with these packages installed; use the same in a throwaway
+  # uv environment rather than whatever python3 this host has.
+  local py=() requirements="$dir/scripts/requirements-ci.lock"
+  # Older selected commits predate the lock and the shared Make targets below.
+  [[ -f "$requirements" ]] || requirements="$dir/scripts/requirements-ci.txt"
+  if command -v uv >/dev/null 2>&1; then
+    py=(uv run --quiet --no-project --python 3.12 --with-requirements "$requirements")
+  else
+    skip python-env "install uv to run Python steps on CI's 3.12 with its packages; using python3"
+  fi
+  pyrun() { ${py[@]+"${py[@]}"} "$@"; }
+  local keep_going="${PREFLIGHT_KEEP_GOING:-0}"
+  export PREFLIGHT_KEEP_GOING=1
+  if [[ -f "$dir/scripts/release-policy.py" ]] && grep -q '^release-check:' Makefile; then
+    step release-check pyrun make release-check
+    ((${#failed[@]} == 0)) || finish
+  fi
   step fmt cargo fmt --check
+  if [[ "$quick" == 0 ]]; then
+    step test-drivers pyrun make test-drivers
+    if [[ -f "$dir/scripts/requirements-ci.lock" ]]; then
+      step test-install pyrun make test-install
+      step test-build pyrun make test-build PYTHON=python3
+      step test-windows-contract pyrun make test-windows-contract PYTHON=python3
+      step packaging pyrun make test-packaging PYTHON=python3
+      step release-policy pyrun make test-release-policy PYTHON=python3
+    else
+      # Preserve REV=<commit> for snapshots whose Makefile has no shared check targets.
+      step test-install pyrun bash scripts/test-install.sh
+      step test-build pyrun python3 scripts/test-build.py
+      step test-windows-contract pyrun python3 scripts/test-windows-contract.py
+      step packaging pyrun sh -c 'python3 scripts/test-packaging.py && python3 scripts/check-packaging.py'
+      step release-policy pyrun python3 scripts/test-release-policy.py
+    fi
+    step test-python pyrun make test-python PYTHON=python3
+    step test-bench-offline pyrun make test-bench-offline PYTHON=python3
+  fi
+  export PREFLIGHT_KEEP_GOING="$keep_going"
+  # Collect cheap blockers together, but never begin expensive work after they fail.
+  ((${#failed[@]} == 0)) || finish
+
   # CI's lint job runs on Linux, where cfg(target_os = "linux") code is linted too.
   cross x86_64-unknown-linux-gnu clippy-linux clippy --locked --workspace --all-targets -- -D warnings
   step clippy-host cargo clippy --locked --workspace --all-targets -- -D warnings
   cross x86_64-unknown-linux-musl musl-x86_64 check --locked --profile ci -p dial
   cross aarch64-unknown-linux-musl musl-aarch64 check --locked --profile ci -p dial
-  # CI builds Windows with MSVC; the GNU target type-checks the same cfg(windows) code.
   cross x86_64-pc-windows-gnu windows-check check --locked --profile ci --workspace --all-targets
   step slim-check cargo check --locked --profile ci --no-default-features -p dial --bin dial
   if command -v cargo-deny >/dev/null 2>&1; then
@@ -180,25 +219,6 @@ main() {
     skip cargo-deny "cargo install cargo-deny"
   fi
   [[ "$quick" == 0 ]] || finish
-
-  # CI runs every Python step on 3.12 with these packages installed; use the same in a throwaway
-  # uv environment rather than whatever python3 this host has.
-  local py=()
-  if command -v uv >/dev/null 2>&1; then
-    py=(uv run --quiet --no-project --python 3.12 --with-requirements "$root/scripts/requirements-ci.txt")
-  else
-    skip python-env "install uv to run Python steps on CI's 3.12 with its packages; using python3"
-  fi
-  pyrun() { ${py[@]+"${py[@]}"} "$@"; }
-
-  step test-drivers pyrun make test-drivers
-  step test-install pyrun bash scripts/test-install.sh
-  step test-build pyrun python3 scripts/test-build.py
-  step test-windows-contract pyrun python3 scripts/test-windows-contract.py
-  step packaging pyrun sh -c 'python3 scripts/test-packaging.py && python3 scripts/check-packaging.py'
-  step release-policy pyrun python3 scripts/test-release-policy.py
-  step test-python pyrun make test-python PYTHON=python3
-  step test-bench-offline pyrun make test-bench-offline PYTHON=python3
 
   # macOS runners resolve the temp directory through /var -> /private/var; use it as CI does.
   local tmp

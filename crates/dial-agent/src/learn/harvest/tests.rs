@@ -182,7 +182,7 @@ fn request_snapshots_preserve_context_and_never_relabel_previous_turns() {
         100.0,
         vec![system(), user("placeholder"), say("legacy")],
     );
-    let messages = vec![
+    let mut messages = vec![
         system(),
         user("original constraints"),
         say("old answer"),
@@ -191,6 +191,8 @@ fn request_snapshots_preserve_context_and_never_relabel_previous_turns() {
         answer("1", "actual evidence"),
         say("new answer"),
     ];
+    messages[1]["dial_checkpoint"] = json!({"session":"session-id","turn":1});
+    messages[3]["dial_checkpoint"] = json!({"session":"session-id","turn":2});
     f.store
         .save_messages(
             id,
@@ -200,6 +202,13 @@ fn request_snapshots_preserve_context_and_never_relabel_previous_turns() {
     assert_eq!(f.run().from_successes, 1);
     let records = f.records();
     assert_eq!(records.len(), 1);
+    assert!(
+        records[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("dial_checkpoint").is_none())
+    );
     assert_eq!(records[0]["messages"][2]["content"], "old answer");
     assert_eq!(records[0]["messages"][6]["content"], "new answer");
     assert_eq!(

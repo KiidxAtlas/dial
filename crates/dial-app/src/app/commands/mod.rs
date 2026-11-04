@@ -3,7 +3,7 @@
 //! so a group can add commands or extend existing ones without touching the dispatcher.
 //!
 //! A group module exposes:
-//! - `COMMANDS`: specs for commands it adds (never names already listed in app.rs `BUILTIN_COMMANDS`).
+//! - Command metadata lives once in `ui::command_surface::COMMANDS`.
 //! - `run`: returns `None` when the name is not handled by the group, otherwise the handler result.
 //! - `run_live` (optional): the commands and subcommands that need only the shell and app, never
 //!   the agent. They run at once even while a turn runs; `run` tries them first.
@@ -22,7 +22,7 @@ mod collab;
 pub(crate) mod commit;
 mod config_cmds;
 pub(crate) use config_cmds::UsageStatus;
-mod evidence;
+pub(super) mod evidence;
 pub(crate) mod extensions;
 pub(crate) mod extensions_browser;
 mod graphify;
@@ -31,37 +31,16 @@ pub(crate) mod maintenance;
 mod modes;
 pub(in crate::app) mod peers;
 mod security;
-mod session;
+pub(in crate::app) mod session;
 mod setup;
 pub(super) mod smithery;
 mod workspace;
 
-/// Name, one-line description, argument hint (empty for none) and static subcommands.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct CommandSpec {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub args_hint: &'static str,
-    pub subcommands: &'static [&'static str],
-}
-
-/// Every group's commands in display order.
-pub(super) fn specs() -> impl Iterator<Item = &'static CommandSpec> {
-    collab::COMMANDS
+/// Group metadata and static completions are projections of the one command table.
+pub(super) fn specs() -> impl Iterator<Item = &'static super::command_registry::CommandSpec> {
+    super::command_registry::COMMANDS
         .iter()
-        .chain(advanced::COMMANDS)
-        .chain(extensions::COMMANDS)
-        .chain(graphify::COMMANDS)
-        .chain(image::COMMANDS)
-        .chain(evidence::COMMANDS)
-        .chain(config_cmds::COMMANDS)
-        .chain(setup::COMMANDS)
-        .chain(commit::COMMANDS)
-        .chain(workspace::COMMANDS)
-        .chain(peers::COMMANDS)
-        .chain(session::COMMANDS)
-        .chain(modes::COMMANDS)
-        .chain(maintenance::COMMANDS)
+        .filter(|spec| spec.surface == super::command_registry::Surface::Group)
 }
 
 /// Routes `name` to the first group that handles it.
@@ -169,6 +148,7 @@ pub(super) fn run_settings(
 /// group's dynamic candidates (sessions, servers).
 pub(super) fn completions(config: &Config) -> Vec<String> {
     let mut candidates: Vec<String> = specs()
+        .filter(|spec| spec.visible)
         .flat_map(|spec| {
             spec.subcommands
                 .iter()

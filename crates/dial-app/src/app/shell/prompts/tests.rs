@@ -77,3 +77,78 @@ fn draft_focus_cannot_submit_or_approve_and_handoff_preserves_the_text() {
     assert!(shell.draft_step(key(KeyCode::Esc)) == DraftStep::Choices);
     assert_eq!(shell.composer.draft(), "keepy\n");
 }
+
+#[test]
+fn attention_inspector_consumes_answers_paste_and_navigation_until_explicit_return() {
+    let keys = crate::ui::keys::Keymap::defaults();
+    let mut view = AttentionView::default();
+    for event in [
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        Event::Paste("yes /approval auto".into()),
+        Event::Resize(1, 1),
+    ] {
+        assert_eq!(view.event(&event, &keys, 100, 10), None);
+    }
+    assert_eq!(
+        view.event(
+            &Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            &keys,
+            100,
+            10
+        ),
+        None
+    );
+    assert!(view.offset > 0);
+    for code in [KeyCode::F(6), KeyCode::Esc] {
+        assert_eq!(
+            view.event(
+                &Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                &keys,
+                100,
+                10
+            ),
+            Some(AttentionExit::Returned)
+        );
+    }
+    assert_eq!(
+        view.event(
+            &Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            &keys,
+            100,
+            10
+        ),
+        Some(AttentionExit::Cancelled)
+    );
+    let mut release = KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE);
+    release.kind = KeyEventKind::Release;
+    assert_eq!(view.event(&Event::Key(release), &keys, 100, 10), None);
+}
+
+#[test]
+fn modal_attention_projects_pending_prompt_without_dispatch_or_draft_changes() {
+    let (_home, _project, _app, mut shell) = shell();
+    shell.composer.set_draft("keep my draft");
+    shell.awaiting_user = true;
+    let before = shell.composer.draft();
+    let text = shell.modal_attention_text("Allow bash?", "Pending approval for a command");
+    assert!(text.contains("Main prompt · waiting for you"));
+    assert!(text.contains("Allow bash?"));
+    assert!(text.contains("Pending approval for a command"));
+    assert!(text.contains("Return to original prompt"));
+    assert!(!text.contains("command:/"));
+    assert_eq!(shell.composer.draft(), before);
+    assert!(shell.awaiting_user);
+    assert!(!shell.accept_all_turn_drafts);
+    assert!(attention_key(&KeyEvent::new(
+        KeyCode::F(6),
+        KeyModifiers::NONE
+    )));
+    assert!(!attention_key(&KeyEvent::new(
+        KeyCode::Char('y'),
+        KeyModifiers::NONE
+    )));
+}

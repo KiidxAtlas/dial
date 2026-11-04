@@ -19,6 +19,8 @@ pub fn canonicalize(message: &mut Value) {
         object.remove("dial_file_handles");
         object.remove("dial_transient");
         object.remove("dial_generated_user");
+        // Durable undo links stay in the session journal, not inference or training messages.
+        object.remove("dial_checkpoint");
         object.remove("dial_context_request");
         object.remove("dial_prompt_band");
         // Request-tail markers: task context/latest-user notes and advisory-note priority.

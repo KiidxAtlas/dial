@@ -71,51 +71,6 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-pub(super) const COMMANDS: &[super::CommandSpec] = &[
-    super::CommandSpec {
-        name: "fast",
-        description: "priority service tier: on, ultra (OpenAI ultrafast), off, status",
-        args_hint: "[on|ultra|off|status]",
-        subcommands: &["on", "ultra", "off", "status"],
-    },
-    super::CommandSpec {
-        name: "slow",
-        description: "flex service tier for lower cost: on, off, status",
-        args_hint: "[on|off|status]",
-        subcommands: &["on", "off", "status"],
-    },
-    super::CommandSpec {
-        name: "extended-context",
-        description: "request the extended context window: on, off, status",
-        args_hint: "[on|off|status]",
-        subcommands: &["on", "off", "status"],
-    },
-    super::CommandSpec {
-        name: "modelpreset",
-        description: "manage model presets: list, save, switch, delete",
-        args_hint: "[list|save <name>|switch <name>|delete <name>]",
-        subcommands: &["list", "save", "switch", "delete"],
-    },
-    super::CommandSpec {
-        name: "usage",
-        description: "show provider usage limits for signed-in providers",
-        args_hint: "[show|reset [anthropic|openai-codex] [confirm]]",
-        subcommands: &["show", "reset"],
-    },
-    super::CommandSpec {
-        name: "ssh",
-        description: "manage SSH hosts: list, add, remove, help",
-        args_hint: "[list|add|remove|help]",
-        subcommands: &["list", "add", "remove", "help"],
-    },
-    super::CommandSpec {
-        name: "checks",
-        description: "list the checks Dial runs after edits; add or remove project checks",
-        args_hint: "[list|add <name> [--ext rs,py] [--timeout secs] -- <command>|remove <name>|help]",
-        subcommands: &["list", "add", "remove", "help"],
-    },
-];
-
 /// Every form of these commands, including the ones that save settings. `agent` is `None` during
 /// a turn: the write lands at once and the agent adopts it when the turn finishes.
 pub(super) fn run_settings(
@@ -126,6 +81,7 @@ pub(super) fn run_settings(
     args: &str,
 ) -> Option<Result<Step>> {
     let result = match name {
+        "set" => set(shell, app, agent, args),
         "fast" => fast(shell, app, agent, args),
         "slow" => slow(shell, app, agent, args),
         "extended-context" => extended_context(shell, app, agent, args),
@@ -135,6 +91,99 @@ pub(super) fn run_settings(
         _ => return None,
     };
     Some(result)
+}
+
+fn setting_distance(left: &str, right: &str) -> usize {
+    let mut row: Vec<_> = (0..=right.chars().count()).collect();
+    for (i, a) in left.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, b) in right.chars().enumerate() {
+            let old = row[j + 1];
+            row[j + 1] = (row[j] + 1)
+                .min(old + 1)
+                .min(diagonal + usize::from(a != b));
+            diagonal = old;
+        }
+    }
+    row.last().copied().unwrap_or(0)
+}
+
+fn setting_value(key: &str, raw: &str) -> Result<toml::Value> {
+    let defs = crate::config::schema::registry();
+    if !defs.iter().any(|def| def.path == key) {
+        let suggestion = defs
+            .iter()
+            .min_by_key(|def| setting_distance(def.path, key))
+            .map(|def| def.path)
+            .unwrap_or("ui.theme");
+        bail!(
+            "Unknown setting {key:?}. Did you mean {suggestion:?}? Open /settings to browse keys."
+        );
+    }
+    let value = crate::cli::config_models::parse_value(raw);
+    crate::config::schema::check_value(key, &value).map_err(anyhow::Error::msg)?;
+    Ok(value)
+}
+
+fn set(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) -> Result<Step> {
+    let args = args.trim();
+    let (scope, args) = if let Some(args) = args.strip_prefix("--project ") {
+        (Scope::Project, args.trim())
+    } else if let Some(args) = args.strip_suffix(" --project") {
+        (Scope::Project, args.trim())
+    } else {
+        (Scope::Global, args)
+    };
+    let (key, raw) = args
+        .split_once(char::is_whitespace)
+        .map_or((args, ""), |(key, raw)| (key, raw.trim()));
+    if key.is_empty() {
+        bail!("Usage: /set <key> [value] [--project]");
+    }
+    // Check the key even for a query, so unknown paths never silently display a default.
+    if !crate::config::schema::registry()
+        .iter()
+        .any(|def| def.path == key)
+    {
+        setting_value(key, "")?;
+    }
+    if raw.is_empty() {
+        let config = shell.settings_config(app);
+        let values = config.settings_values()?;
+        let sensitive = crate::config::schema::registry()
+            .iter()
+            .find(|def| def.path == key)
+            .is_some_and(|def| def.sensitive());
+        let value = if sensitive {
+            "[redacted]".into()
+        } else {
+            crate::config::schema::get(&values, key)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unset".into())
+        };
+        let source = config
+            .setting_sources
+            .get(key)
+            .copied()
+            .unwrap_or("default");
+        shell.note("Setting", format!("{key} = {value} ({source})"));
+        return Ok(Step::Done);
+    }
+    let value = setting_value(key, raw)?;
+    let step = shell.save(app, agent, &[set_value(key, value)], scope)?;
+    shell.note(
+        "Setting",
+        format!(
+            "Saved {key} to {} settings.",
+            if scope == Scope::Project {
+                "project"
+            } else {
+                "global"
+            }
+        ),
+    );
+    Ok(step)
 }
 
 /// The status, list and help forms, plus `/usage`: they only read settings or start a background
@@ -167,10 +216,10 @@ pub(super) fn run_live(
         ("modelpreset", "" | "list") => {
             let presets = &config.model_presets;
             let text = if presets.is_empty() {
-                "No model presets saved. Use /modelpreset save <name> to create one.".to_owned()
+                "No presets saved. /modelpreset capture <name> saves safe working controls (no credentials or paths); /modelpreset save <name> saves legacy model selections.".to_owned()
             } else {
                 format!(
-                    "Model presets: {}",
+                    "Presets: {}\nUse /modelpreset preview <name> to review every write; /modelpreset switch <name> confirms before applying. Capture safe controls with /modelpreset capture <name>.",
                     presets.keys().cloned().collect::<Vec<_>>().join(", ")
                 )
             };
@@ -421,6 +470,120 @@ fn valid_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+fn capture_setup(config: &Config) -> ModelPreset {
+    let values = [
+        config.fast_mode,
+        config.slow_mode,
+        config.extended_context,
+        config.ui.tips,
+        config.memory.enabled,
+        config.laya.enabled,
+        config.assistance.teacher_enabled,
+        config.improve.distill,
+        config.escalation.enabled,
+        config.escalation.allow_remote,
+    ];
+    ModelPreset {
+        setup: ModelPreset::SETUP_KEYS
+            .iter()
+            .zip(values)
+            .map(|(key, value)| ((*key).into(), value.into()))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+// Every write is visible, including selection-owner clears. Never print auth material.
+pub(super) fn changes_preview(changes: &[Change]) -> String {
+    fn sensitive_path(path: &str) -> bool {
+        ["headers", "api_key", "token", "secret", "password"]
+            .iter()
+            .any(|part| path.to_ascii_lowercase().contains(part))
+    }
+    fn redact(value: &toml::Value) -> toml::Value {
+        match value {
+            toml::Value::Table(table) => toml::Value::Table(
+                table
+                    .iter()
+                    .map(|(key, value)| {
+                        let sensitive = sensitive_path(key);
+                        (
+                            key.clone(),
+                            if sensitive {
+                                "[redacted]".into()
+                            } else {
+                                redact(value)
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            toml::Value::Array(values) => toml::Value::Array(values.iter().map(redact).collect()),
+            _ => value.clone(),
+        }
+    }
+    changes
+        .iter()
+        .map(|change| match change {
+            Change::Set { path, value } | Change::Insert { path, value } => {
+                let value = if sensitive_path(path) {
+                    "[redacted]".into()
+                } else {
+                    redact(value)
+                };
+                format!("• {path} = {value}")
+            }
+            Change::Remove { path } => {
+                format!("• Remove {path} from this scope (inherited values may remain)")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn preset_changes(config: &Config, preset: &ModelPreset) -> Result<Vec<Change>> {
+    preset.validate_setup()?;
+    let mut changes = Vec::new();
+    // Safe captures contain no model fields. Legacy presets still restore their roles.
+    if preset.setup.is_empty() || !preset.roles.is_empty() {
+        changes.push(Change::Set {
+            path: "model_roles".into(),
+            value: toml::Value::try_from(&preset.roles)?,
+        });
+    }
+    if let Some(vision) = &preset.vision {
+        changes.push(Change::Set {
+            path: "vision".into(),
+            value: toml::Value::try_from(vision)?,
+        });
+    }
+    if let Some(checkpoint) = &preset.laya_checkpoint {
+        changes.push(Change::Set {
+            path: "laya.checkpoint".into(),
+            value: checkpoint.clone().into(),
+        });
+    }
+    if let Some(effort) = preset.thinking
+        && let Some(active) = config.active_model_profile()
+    {
+        let name = config
+            .model_profiles
+            .iter()
+            .find(|(_, profile)| std::ptr::eq(*profile, active))
+            .map(|(name, _)| name)
+            .ok_or_else(|| anyhow!("active model profile is not in model_profiles"))?;
+        changes.push(Change::Set {
+            path: format!("model_profiles.{name}.reasoning_effort"),
+            value: toml::Value::try_from(effort)?,
+        });
+    }
+    changes.extend(preset.setup.iter().map(|(path, value)| Change::Set {
+        path: path.clone(),
+        value: value.clone(),
+    }));
+    Ok(changes)
+}
+
 fn modelpreset(
     shell: &mut Shell,
     app: &App,
@@ -435,6 +598,37 @@ fn modelpreset(
         None => (trimmed, ""),
     };
     match sub {
+        "capture" => {
+            if !valid_name(rest) {
+                bail!("Usage: /modelpreset capture <name>");
+            }
+            let preset = capture_setup(config);
+            preset.validate_setup()?;
+            let preview = format!(
+                "Save safe working setup \"{rest}\" (global). Included controls:\n{}\n\nExcluded: all model assignments, endpoints, credentials, headers, paths, vision and checkpoints. Existing names in either scope are refused to avoid inherited model fields. Apply later with /modelpreset switch {rest}.",
+                changes_preview(&preset_changes(config, &preset)?)
+            );
+            shell.note(TITLE, &preview);
+            if shell.ask(
+                "Capture working setup",
+                &preview,
+                &[("Cancel", 'c'), ("Save named setup", 's')],
+            ) != Some(1)
+            {
+                return Ok(Step::Done);
+            }
+            let step = shell.save(
+                app,
+                agent,
+                &[Change::Insert {
+                    path: format!("model_presets.{rest}"),
+                    value: toml::Value::try_from(preset)?,
+                }],
+                Scope::Global,
+            )?;
+            shell.note(TITLE, format!("Saved safe working setup \"{rest}\"."));
+            Ok(step)
+        }
         "save" => {
             if !valid_name(rest) {
                 bail!(
@@ -446,6 +640,9 @@ fn modelpreset(
                 thinking: config
                     .active_model_profile()
                     .and_then(|profile| profile.reasoning_effort),
+                vision: Some(config.vision.clone()),
+                laya_checkpoint: config.laya.checkpoint.clone(),
+                setup: Default::default(),
             };
             let change = Change::Set {
                 path: format!("model_presets.{rest}"),
@@ -455,31 +652,32 @@ fn modelpreset(
             shell.note(TITLE, format!("Saved model preset \"{rest}\"."));
             Ok(step)
         }
-        "switch" => {
+        "switch" | "preview" => {
             let Some(preset) = config.model_presets.get(rest) else {
                 shell.note(TITLE, format!("Preset not found: {rest}"));
                 return Ok(Step::Done);
             };
-            let mut changes = vec![Change::Set {
-                path: "model_roles".into(),
-                value: toml::Value::try_from(&preset.roles)?,
-            }];
-            if let Some(effort) = preset.thinking
-                && let Some(active) = config.active_model_profile()
+            let changes = preset_changes(config, preset)?;
+            settings_store::preview_config(&app.layout, Scope::Global, &changes, &app.overlay)?;
+            let preview = format!(
+                "Preset \"{rest}\" · Global defaults\n{}\n\nAll writes above are one validated transaction. Project and command-line overrides remain in effect. No downloads or provider calls. No settings have changed yet.",
+                changes_preview(&changes)
+            );
+            shell.note(TITLE, &preview);
+            if sub == "preview"
+                || shell.ask(
+                    "Apply model/setup preset",
+                    &preview,
+                    &[
+                        ("Cancel — change nothing", 'c'),
+                        ("Save reviewed settings", 's'),
+                    ],
+                ) != Some(1)
             {
-                let profile_name = config
-                    .model_profiles
-                    .iter()
-                    .find(|(_, profile)| std::ptr::eq(*profile, active))
-                    .map(|(name, _)| name.clone())
-                    .ok_or_else(|| anyhow!("active model profile is not in model_profiles"))?;
-                changes.push(Change::Set {
-                    path: format!("model_profiles.{profile_name}.reasoning_effort"),
-                    value: toml::Value::try_from(effort)?,
-                });
+                return Ok(Step::Done);
             }
             let step = shell.save(app, agent, &changes, Scope::Global)?;
-            shell.note(TITLE, format!("Switched to model preset \"{rest}\"."));
+            shell.note(TITLE, format!("Switched to preset \"{rest}\". Checklist: settings saved; model routes not probed; run /doctor to review readiness."));
             Ok(step)
         }
         "delete" | "remove" => {
@@ -507,7 +705,7 @@ fn modelpreset(
             Ok(step)
         }
         other => bail!(
-            "Unknown /modelpreset subcommand: {other}. Usage: /modelpreset [list|save <name>|switch <name>|delete <name>]"
+            "Unknown /modelpreset subcommand: {other}. Usage: /modelpreset [list|save <name>|capture <name>|preview <name>|switch <name>|delete <name>]"
         ),
     }
 }

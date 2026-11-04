@@ -17,6 +17,278 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Reliability corrections
+
+- Exclude durable undo/checkpoint links from canonical inference and training messages while
+  retaining them in session storage. Accepted request snapshots can be harvested without
+  weakening strict message validation or losing earlier conversation context.
+- Enforce benchmark RPC case deadlines before dispatch and before accepting queued replies;
+  preserve operation/request-ID diagnostics without exposing request parameters.
+- Point review-revert recovery to `/undo files`, keeping bare `/undo` conversation-rewind
+  safety checks intact. Exercise refusal and file-only recovery in the real-terminal fixture.
+- Clear inline terminal rows without a display-wide erase, preventing tmux's default
+  `scroll-on-clear` behavior from copying a live streaming viewport into scrollback twice.
+- Align delegation integration fixtures with the existing planner-agent-to-coach model routing.
+- Select the actual binary target for related Rust tests when library and binary roots share
+  a source directory. Parse top-level external module declarations, exclude path-remapped
+  declarations from conventional ownership, and report unowned modules as coverage gaps.
+- Interpolate missing-witness recovery paths and retain refreshed-read retry guidance in
+  targeted edit refusals without weakening witness validation.
+
+### Bounded duplicate-read output
+
+- Use the same compact, size-checked pointer for identical reads and covered source ranges.
+  Compare model-visible sizes after file-handle projection and omit redundant file labels on pointers.
+  Keep tiny successful read results inline instead of expanding them into duplicate coaching;
+  preserve raw evidence, freshness checks, duplicate accounting and retry barriers.
+
+### Release preparation
+
+- Separate metadata preparation from explicit CI-gated tagging; preparation no longer builds,
+  stages, commits or publishes. Add `make release-check` to report cheap metadata, packaging,
+  shell and tooling failures together before compilation. Gate CI builds and release signing
+  readiness early, retain exact-commit publication checks, and preserve failed release build caches.
+- Remove accidental source backup copies, exclude patch/editor recovery files from Git and
+  container build contexts, and replace temporary release-preparation status notes with durable
+  platform, verification and maintainer guidance.
+
+## [0.3.0] - 2026-11-04
+
+### Bounded discovery and evidence reuse
+
+- Prefer one conventionally named test in opt-in glob previews without increasing the existing
+  three-file, forty-line or 6 KiB limits, changing sorted path pages, or adding prompt/schema text.
+- Reuse still-visible complete source rows from successful edits and discovery previews when a
+  fresh read returns the same snapshot and range. Keep raw evidence, freshness checks, missing-line
+  recovery and verification gates intact; compact range pointers only when smaller than the source.
+
+### Centralized configuration and session controls
+
+- Regroup Settings by purpose with horizontal category tabs and a stable scope/search header,
+  explicit F4 Appearance preview instead of expanding samples while browsing, named scope, effective-source
+  explanations, goal synonyms, Changed-only filtering and confirmed exact bulk override removal.
+  Preserve canonical validation, stale-review checks, credential masking and embedding-pair review.
+- Add safe named setup capture and an outcome-oriented local-model checklist using existing
+  explicitly reviewed installers, model selection and provider tests. Show known prerequisite
+  readiness beside memory/voice controls without inventing running-service or hardware health.
+- Separate active versus selected model tuning and review assignment effects, including actual
+  project clears. Record main and worker model-route reasons without reconstructing historical
+  decisions from current defaults. Add typed masked collection creation/editing with Advanced TOML
+  retained, and a Memory landing page with direct role-picker detours and retained return navigation.
+- Add a rebindable F10 session-control doorway and compact composer controls; distinguish active
+  facts from saved defaults awaiting adoption. Group Context/history settings with recorded limits.
+- Retain linked-panel navigation while refreshing configuration values, keep downloads owned by
+  the session rather than a browser view, and expose existing worker inspection/recovery owners
+  through Activity. Add optional grouped action/settings/session/help palette search.
+- Make role Headers and reasoning/inheritance discoverable in details, retain permanent named
+  scope in Models/Providers/tuning, and offer per-notice preference destinations without marking
+  notifications read. Retain typed historical download failure evidence for Attention inspection.
+- Add read-only modal Attention inspection without answering the pending approval/question;
+  pause timed question deadlines during inspection. Let small-terminal Appearance switch between
+  its retained editor and a scrollable, unsaved representative preview.
+- Track the forty-item scope and remaining acceptance evidence in
+  [the control-surface ledger](docs/control-surface-acceptance.md); sample rendering and local
+  tests do not certify live services or complete interactive-terminal behavior.
+
+### Model role consolidation
+
+- Remove separate planner, grounding and image-embedding role rows without removing their features.
+  Plan mode and planner agents use coach/main or their explicit launch routes; vision tools retain
+  explicit models in `vision.grounding` and `vision.image_embedding`, including setup support.
+- Consolidate judge into `decision` for typed judgments through chat models or Laya. Store Laya
+  checkpoints in `laya.checkpoint`, separately from the selected decision backend. Migrate former
+  role assignments, references and fallback-chain keys, preserving explicit destination settings.
+
+### Harness effectiveness and recovery
+
+- Make fault witnessing opt-in and limit it to explicitly declared behavioral commands, not
+  automatically discovered related suites. Permit one attempt per user turn with a 60-second
+  command cap, remove per-suite notices, and keep comparisons diagnostic: passing without the
+  edits neither invalidates normal verification nor demands more tests. Normal verification,
+  registered fail-then-pass reproductions and edit bisection retain their existing behavior.
+
+- Cross-agent reports add failure-inclusive time/tokens per verified success, nearest-rank p95
+  latency, and explicit installed/controlled setup declarations. Unknown usage stays unknown;
+  configuration notes do not certify matched setups or establish a live-model quality win.
+- Add opt-in private cross-agent session traces (`--capture-traces`) with bounded isolated-home
+  lookup, per-turn availability and separate export timing, retaining native calls/results for
+  diagnosing repeated interactions without changing independent outcome scores.
+- Target verification guidance at the changed entry point instead of unrelated suites, while
+  retaining broader checks for affected interfaces, uncertainty, requests and required gates.
+- Clarify that unchanged rereads succeeded and can reuse visible source; distinguish passing
+  post-fix checks from missing pre-fix reproduction without changing evidence credit or gates.
+- Recommend opt-in source previews only for code inspection when `glob` is offered, and compress
+  equivalent policy prose to meet the unchanged 9,000-byte compact-prompt budget.
+- Remove the duplicate callable-tool name inventory from efficiency-mode built-in environment
+  metadata; retain all schemas, deferred discovery, operator-owned prompts and verification gates.
+- Attribute request-prefix serialization/hash preparation in microseconds through the existing
+  request journal and operation ledger, without caching away hook-driven history changes.
+- Release repeated directory-read recovery feedback when the existing visible listing changes,
+  including nested additions/removals, without treating directory hashes as edit witnesses.
+- Show worker settings revisions and queued/applied/failed receipts in the inspector, keeping
+  requested models separate from the active model.
+- Identify extension/tool/command registration errors with SDK version and ownership context;
+  keep rejected registrations atomic and permit corrected same-name installation.
+
+### Discovery source previews
+
+- Add opt-in `glob` source previews (`preview=true`) using the existing confined, secret-screened
+  navigation reader. Returned rows can support edits without a separate read; ordinary path listings,
+  pagination and verification requirements are unchanged. Historical tool contracts remain compatible.
+
+### Highlights
+
+- **Everyday workflow:** a simpler command surface, model/settings discovery, recent sessions,
+  compact turn reports and clearer steer-versus-queue choices. Existing command aliases remain available.
+- **Safer recovery:** tighter credential bindings, session-switch permission boundaries, durable undo
+  and explicit uncertainty when remote writes or worker integration cannot be confirmed.
+- **More dependable execution:** bounded streaming, discovery and background processing; verification
+  failures remain visible rather than becoming successful completion claims.
+- **Local model tools:** optional inspection and evaluation-gated weight editing, with user-controlled
+  promotion. These capabilities do not establish a general model-quality improvement.
+- **Cleaner source distribution:** remove obsolete reports, clarify documentation and benchmark
+  entry points, and keep local state out of release inputs.
+
+The detailed changes below retain compatibility notes, measurement limitations and technical context.
+Historical release sections remain unchanged.
+
+### Repository hygiene
+
+- Remove historical audit/review reports and generated benchmark output from the release source
+  scaffold. Keep benchmark fixtures, runtime assets, release tooling and unfinished plans;
+  exclude disposable reports, experiments and local tooling from Git or Docker build contexts.
+  Release readiness remains subject to the checklist in `docs/release-and-install.md`.
+- Point the root README at the grouped documentation index and add examples/benchmark navigation
+  without moving consumed fixtures. Share packaging, installer and build-check Make targets between
+  CI and preflight; `make preflight-worktree` checks uncommitted work without creating a commit.
+- Pin portable CI tooling transitively with a generated hashed lock and pin nixpkgs to an immutable
+  commit. Native Nix locking/builds, hosted protection configuration and release signing remain
+  explicit acceptance gaps; no new live-model quality or performance improvement is claimed.
+
+### Audit hardening: credentials, sessions and request fidelity
+
+- Bind stored MCP OAuth grants to the exact effective resource URL; require sign-in again for
+  missing or changed bindings. MCP-discovered credential endpoints and refresh URLs require
+  HTTPS except genuine loopback HTTP (`docs/extensibility.md`).
+- Gate implicit ACP session activation before teardown and prepare incoming session directory,
+  checkpoint and Cargo bindings before publishing it. Outgoing directory and sensitive grants
+  do not carry over (`docs/directory-access.md`, `docs/rpc-and-acp.md`).
+- Preserve configured endpoints and URL templates for cross-provider fallback/promotion; apply
+  role thinking even when an auxiliary request reuses the main backend (`docs/model-routing.md`).
+- Protect Cargo cache adoption/pruning with session leases and held native/cross-target profile
+  locks; conservatively rescan scheduled watches after structural directory events
+  (`docs/shell.md`, `docs/extensibility.md`).
+- Preserve incomplete/refused native batch output and reasons instead of reporting success;
+  reject new paid batches whose conservative output envelope exceeds bounded collection capacity
+  before upload. Legacy saved jobs remain readable (`docs/provider-batches.md`).
+
+### Simpler terminal UX
+
+- Commands: `/new`, `/sessions`, `/undo`, `/review` and `/help` absorb overlapping commands; `/clear`,
+  `/resume`, `/palette`, `/commands`, `/tree`, `/branch`, `/rollback` and `/review-file` still work but
+  are hidden from menus. New subactions: `/help commands`, `/undo files`, `/review files`,
+  `/sessions this|branch|label|fork`; `Ctrl+T` in `/sessions` opens the current session tree.
+- Bare `/review` offers AI review or keep/revert files; bare `/btw` opens a side-thread picker;
+  `/todo` has Plan and Progress tabs.
+- The busy chooser offers **Steer** or **After this turn**; `r` hard-redirects, `w` (or `/worker <message>`)
+  starts an independent worker.
+- Keys: work-panel tab defaults to `Ctrl+X` (`Alt+W`, `F12` kept); `/models` filter, sort and header
+  editor move to `Shift+F2`/`Shift+F3`/`Shift+F8`; hints show one primary shortcut; Esc closes, Ctrl+C
+  stops (Esc no longer cancels compute waits); Enter runs a slash suggestion only after you navigate to it;
+  `Alt+S`/`F11` expands the adaptive status line.
+- Home shows recent sessions inline and a dismissible first-run tour; turn reports are one compact line
+  with a next-step hint (`Ctrl+O` expands); new [Everyday Dial](docs/everyday.md) guide.
+- Plain approval labels (Ask first, Edit freely, Full auto, Read-only; config values unchanged), settings
+  grouped under Common/Model/Safety/Appearance/Keys/Advanced, a plan card at 60–89 columns, and a single
+  progress row.
+- One shared command registry holds descriptions, aliases, categories and turn scheduling. `/help
+  <command>` shows the matching `dial …` CLI command, and commands that need Git or a session stay
+  listed but dimmed with the reason.
+- Settings show where each value comes from (default, global, project, environment, CLI);
+  `/set <key> [value] [--project]` shows or saves a validated value. Shortcut overrides live in
+  `config.toml [keys]`, with `keybindings.toml` kept as a per-binding fallback.
+- `/accounts` lists every saved login without credentials; small auth, state and cache records are
+  copied lazily into `auth/`, `state/` and `cache/`, keeping the originals as fallback.
+- Panels share `?` key help; `/inbox` collects session notifications with unread status; `/doctor`
+  lists diagnostics and reviews a fix before applying it.
+- New hubs `/mode`, `/dirs`, `/collab`, `/learn`, `/share`; tabbed `/git` (Status/Diff/Commit/Log)
+  and `/activity` (Workers/Processes/Compute/Schedule/Queue); `/extensions` gains Tool groups and
+  Hooks tabs; bare `/stats` opens Usage/cost, Tokens, Sessions and Tools tabs. Older spellings
+  still run ([Commands and help](docs/terminal-commands.md#hubs-and-panels)).
+- Docs have a three-tier [index](docs/README.md) and focused terminal topic pages; `/help <topic>`
+  points to them.
+
+### Discovery efficiency and request diagnostics
+
+- Record each foreground request's batching/one-call policy and reasons in workflow events and
+  session request-policy history; `/reliability` exposes the active constraint.
+- Reuse empty-search memory to offer one policy-aware declaration-read correction after distinct
+  unsuccessful probes against one file. Intentional absence checks remain valid; ambiguous shell
+  scripts are not guessed. Remove policy-blind batching advice from shell trimming hints.
+- Add a tuple-registry discovery regression evaluation with independent documentation, settings
+  and keybinding evidence, batch and one-call scenarios, and offline trace/round-trip grading.
+  See `docs/agent-loop.md`; live-model performance improvement requires a separate measurement.
+
+### Recovery, permission scope and source fidelity
+
+- Strict worker contracts retain controller-owned integration uncertainty instead of allowing
+  retries after incomplete rollback. Nonisolated advisory contracts are rejected before durable
+  intent, and dependency authority is revalidated inside promotion before a candidate can land
+  (`docs/subagents.md`).
+- `/undo` selects durable conversation-linked checkpoints, including read-only turns, instead of
+  counting file-changing turns. Partial restoration reports warnings and keeps the conversation;
+  durable restoration progress permits an inspected retry. Branch gates run before restoration.
+  Standalone `/rollback` keeps its file-changing-turn semantics (`docs/tools.md`).
+- ACP editor writes distinguish definite pre-delivery refusal from unconfirmed completion,
+  retain request identity and unknown effects, and require acknowledgement followed by a fresh
+  read before retrying an uncertain write on the same connection (`docs/rpc-and-acp.md`).
+- Browser clipboard access uses a disposable, script-free controller context with only the
+  requested permission, never grants clipboard access to the page, and revokes/closes the context
+  on exit. SSH writes use an exclusively created private sibling staging directory rather than a
+  predictable symlink-following temporary file (`docs/execution-and-web.md`, `docs/ssh.md`).
+- Alternate Markdown reports the actual final resource URL and its relationship to the original
+  page. Optional HTML discovery shares a deadline, request and aggregate download budget, with
+  bounded deduplicated candidates (`docs/execution-and-web.md`).
+
+### Bounded execution and discovery
+
+- Model streaming uses a byte-bounded delivery queue with backpressure, discards cancelled
+  payloads, and releases blocked producers before joining; terminal replies remain separately owned.
+- Model discovery coalesces superseded refreshes, bounds optional Ollama capability enrichment,
+  follows bounded Gemini/Anthropic pagination without caching partial listings, and shares immutable
+  parsed-cache snapshots for targeted metadata lookups (`docs/provider-catalog.md`).
+- MCP lifecycle notifications coalesce in bounded storage; stale catalogs can retry validation
+  with cancellation and cooldown while old definitions remain refused. Startup and refresh share
+  bounded tool listing, and supporting streamable-HTTP servers receive bounded SSE replay cursors
+  on reconnect (`docs/extensibility.md`).
+- Failure in either parallel split-summary fold cancels only its sibling inference and joins both
+  folds, retaining user-stop and fallback behavior (`docs/agent-loop.md`).
+- In-process shell results distinguish stopped, abandoned and uncertain descendant cleanup;
+  discovery shares a deadline/output budget. Readiness observes new output with explicit loss and
+  observation-limit diagnostics while preserving bounded contiguous regex input (`docs/shell.md`,
+  `docs/execution-and-web.md`).
+- Configuration rejects malformed hook overlays and validates standalone global settings before
+  saves/previews. Grep reuses anchored traversal prefixes and reports the actual continuation cap;
+  directory attachments bound discovery and report errors/interruption (`docs/configuration.md`,
+  `docs/tools.md`).
+- Scheduler launch failures retain pending triggers with capped retry backoff; filesystem events
+  use bounded coalescing with conservative overflow rescans, and content fingerprints detect
+  same-size edits with restored timestamps (`docs/extensibility.md`).
+- Failed stream-journal copies settle the writer and clean up their own destination, including
+  snapshot refusal; cleanup failure preserves both diagnostics and uncertainty.
+
+### Session recovery and search
+
+- Session moves settle copied journals and transfer-ledger state with the workspace switch, and
+  report uncertain publication or cleanup without claiming rollback.
+- Workspace-root header replacement syncs the parent directory on Unix and retains the replacement
+  writer and roots when a post-rename durability acknowledgement fails.
+- Interactive history search runs index maintenance and SQLite waits on a background worker,
+  coalesces pending queries, and discards superseded or previous-session/workspace results.
+- The full-text search index detects in-place journal rewrites, including changed prefixes before
+  appended content, and rebuilds affected messages transactionally (`docs/terminal-interface.md`).
+  No measured search-latency improvement or power-loss test result is claimed.
+
 ### Request execution and fidelity
 
 - Immediate credential rotation, OAuth refresh and reasoning-parameter recovery now honor the
@@ -146,8 +418,6 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   forward pass reads attention attributes, such as mlx-vlm Qwen3.5/3.6: the attention recorder now
   forwards attribute reads to the module it wraps.
 
-### Fixed
-
 - Tools that automatic routing offers for one turn stay offered on later turns (bounded, oldest
   dropped first), so the system prompt and tool array no longer change between turns and a
   provider's prompt cache, history included, is no longer invalidated by a routed turn
@@ -251,11 +521,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - Isolate release signing behind a protected environment, require exact-SHA push-to-main CI,
   publish curated version-specific changelog notes, and broaden platform lint/feature coverage.
   Container digest signing uses pinned Cosign with GitHub OIDC. Repository-owner protection
-  settings and outstanding verification/platform limits are tracked in
-  `docs/audit-2026-11-01-follow-up.md`.
+  settings and release verification limits are documented in `docs/release-and-install.md`.
 - Replace direct `fs2` locking with standard file locks, consolidate filesystem/HTTP/OAuth
   and UTF-8 boundary owners, extract orchestration phases, and enforce documented unsafe
-  invariants through the workspace Clippy lint. See the audit follow-up for item dispositions.
+  invariants through the workspace Clippy lint.
 - `verification.review.enabled` is now unset by default: completion review runs when a `coach`
   model role is assigned and its route passes the escalation privacy gate (local, or
   `escalation.allow_remote`). Explicit `true`/`false` keep their meaning; `strict_requirements`

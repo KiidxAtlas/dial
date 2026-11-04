@@ -1,6 +1,7 @@
 use super::super::settings::testkit::*;
 use super::*;
 
+use crossterm::event::KeyModifiers;
 #[test]
 fn a_local_server_that_is_not_running_is_expected_but_real_failures_stay_red() {
     let entry = |base: &str, state: &str, detail: &str, configured: bool| Entry {
@@ -623,6 +624,30 @@ fn menu_offers_actions_that_fit_the_provider() {
 }
 
 #[test]
+fn endpoint_configuration_opens_the_canonical_settings_collection() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    for id in ["lm-studio", "openai", "work"] {
+        select(&mut o, id);
+        let cursor = o.cursor;
+        send(&mut o, &rig, key(KeyCode::Enter));
+        let label = "Edit configuration / endpoint → Settings providers";
+        let shown = draw(&mut o, &rig, 120, 30);
+        assert!(shown.contains(label), "{id}: {shown}");
+        assert!(shown.contains("Test connection"), "{id}: {shown}");
+        assert!(shown.contains("API key"), "{id}: {shown}");
+        assert!(shown.contains("Headers"), "{id}: {shown}");
+        pick(&mut o, label);
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Enter)),
+            OverlayEvent::Action(action) if action == "open:settings:providers"
+        ));
+        assert!(matches!(o.mode, Mode::List));
+        assert_eq!(o.cursor, cursor, "provider navigation is retained");
+    }
+}
+
+#[test]
 fn removing_a_configured_provider_needs_confirmation() {
     let rig = Rig::new();
     let mut o = overlay();
@@ -1021,7 +1046,10 @@ fn anthropic_api_key_removal_is_independent_and_api_headers_remain_editable() {
     select(&mut o, "anthropic");
     o.open_menu();
     assert!(draw(&mut o, &rig, 150, 32).contains("auth: API key"));
-    pick(&mut o, "Edit HTTP header rows");
+    pick(
+        &mut o,
+        "Connection overrides → Headers (masked; inherit or clear)",
+    );
     send(&mut o, &rig, key(KeyCode::Enter));
     assert!(matches!(o.mode, Mode::Headers { .. }));
     send(&mut o, &rig, key(KeyCode::Esc));
@@ -1228,4 +1256,78 @@ fn key_entry_without_a_base_url_says_why_it_cannot_save() {
         ),
         _ => panic!("the key stays in the prompt with the reason"),
     }
+}
+
+#[test]
+fn narrow_scope_caption_does_not_overwrite_the_provider_title() {
+    let rig = Rig::new();
+    for (width, project) in [(60, "example-project"), (38, "長いプロジェクト名が続く")]
+    {
+        let mut panel = overlay().with_project_name(project);
+        for scope in [Scope::Global, Scope::Project] {
+            panel.scope = scope;
+            let shown = draw(&mut panel, &rig, width, 16);
+            let title = shown.lines().next().unwrap();
+            assert!(title.contains("Providers"), "{shown}");
+            assert!(
+                title.contains(&format!("scope: {}", scope_name(scope))),
+                "{shown}"
+            );
+            if width == 60 {
+                assert!(title.contains(project), "{shown}");
+            }
+        }
+    }
+}
+
+#[test]
+fn named_scope_and_connection_actions_separate_endpoint_credentials_and_status() {
+    let rig = Rig::new();
+    let mut o = overlay().with_project_name("example-project");
+    select(&mut o, "work");
+    o.set_credential_sources(BTreeMap::from([(
+        "https://llm.example.com/v1".into(),
+        CredentialSource {
+            env: Some(EnvCredential {
+                name: "WORK_KEY".into(),
+                set: false,
+            }),
+            saved: false,
+        },
+    )]));
+    let shown = draw(&mut o, &rig, 120, 30);
+    for expected in [
+        "scope: global",
+        "project (example-project)",
+        "Endpoint:",
+        "Status:",
+        "Credential:",
+        "WORK_KEY",
+    ] {
+        assert!(shown.contains(expected), "missing {expected}: {shown}");
+    }
+    assert!(matches!(
+        send(
+            &mut o,
+            &rig,
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        ),
+        OverlayEvent::None
+    ));
+    assert!(draw(&mut o, &rig, 120, 30).contains("scope: project (example-project)"));
+    o.open_menu();
+    let Mode::Menu(menu) = &o.mode else {
+        panic!("provider actions");
+    };
+    assert!(
+        menu.items
+            .iter()
+            .any(|(action, _)| matches!(action, ProviderAction::TestConnection))
+    );
+    assert!(
+        menu.items
+            .iter()
+            .any(|(action, label)| matches!(action, ProviderAction::Headers)
+                && label.contains("masked; inherit or clear"))
+    );
 }

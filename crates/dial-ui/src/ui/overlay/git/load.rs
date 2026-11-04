@@ -31,6 +31,7 @@ struct Status {
     changes: Vec<Change>,
     branch: Option<String>,
     head: Option<(String, String)>,
+    recent: Result<Vec<(String, String)>, String>,
     watch: Option<Watch>,
     watch_error: Option<String>,
 }
@@ -122,6 +123,7 @@ fn status(repo: Repo, revision: Option<String>, watch: bool) -> Result<Status, S
     } else {
         (None, None)
     };
+    let recent = repo.recent_commits();
     let (watch, watch_error) = if watch && commit.is_none() {
         match repo.watch() {
             Ok(watch) => (Some(watch), None),
@@ -136,6 +138,7 @@ fn status(repo: Repo, revision: Option<String>, watch: bool) -> Result<Status, S
         changes,
         branch,
         head,
+        recent,
         watch,
         watch_error,
     })
@@ -262,6 +265,10 @@ impl GitOverlay {
         self.commit = next.commit;
         self.branch = next.branch;
         self.head = next.head;
+        self.recent = next.recent;
+        self.log_cursor = self
+            .log_cursor
+            .min(self.recent.as_ref().map_or(0, Vec::len).saturating_sub(1));
         self.changes = next.changes;
         if self.watch.is_none() {
             self.watch = next.watch;

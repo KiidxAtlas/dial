@@ -8,6 +8,22 @@ fn empty_env(root: &std::path::Path) -> Env {
 }
 
 #[test]
+fn doctor_diagnostics_only_offer_review_and_never_create_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = empty_env(temp.path());
+    let spec = doctor_choices(&env, &Config::default());
+    assert_eq!(spec.command, "setup");
+    assert_eq!(spec.verb, "choose");
+    assert_eq!(spec.items.len(), deps::RECIPES.len());
+    assert!(
+        spec.items
+            .iter()
+            .all(|item| !item.value.contains(char::is_whitespace))
+    );
+    assert!(!env.user_dir.exists());
+}
+
+#[test]
 fn runtime_updates_require_the_exact_explicit_yes_action() {
     assert_eq!(update_action(&["updates"]), Some(UpdateAction::Check));
     assert_eq!(
@@ -38,8 +54,9 @@ fn choices_only_dispatch_review_and_cover_every_capability() {
     assert_eq!(spec.command, "setup");
     assert_eq!(spec.verb, "choose");
     assert!(spec.remove.is_none());
-    assert_eq!(spec.items.len(), deps::RECIPES.len() + 6);
+    assert_eq!(spec.items.len(), deps::RECIPES.len() + 7);
     for id in [
+        "local-model",
         "presets",
         "providers",
         "memory",
@@ -58,6 +75,55 @@ fn choices_only_dispatch_review_and_cover_every_capability() {
             .all(|item| !item.value.contains(char::is_whitespace))
     );
     assert!(!temp.path().join("user").exists());
+}
+
+#[test]
+fn local_model_checklist_uses_existing_review_and_navigation_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = empty_env(temp.path());
+    let spec = local_model_choices(&env, &Config::default(), None);
+    assert_eq!((spec.command.as_str(), spec.verb), ("setup", "choose"));
+    assert_eq!(
+        spec.items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>(),
+        ["ollama", "llama-cpp", "mlx-runtime", "models", "providers"]
+    );
+    assert!(
+        spec.items[..3]
+            .iter()
+            .all(|item| item.detail.starts_with("Needs setup"))
+    );
+    assert!(spec.items[4].detail.starts_with("Unknown"));
+    assert!(!env.user_dir.exists());
+    // An installed artifact changes only runtime prerequisites, never connection health.
+    let runtime = recipe("llama-cpp").unwrap();
+    let install = deps::install_dir(&env.user_dir, runtime.id);
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::write(install.join(runtime.artifact), b"fixture").unwrap();
+    let updated = local_model_choices(&env, &Config::default(), None);
+    assert!(updated.items[1].detail.starts_with("Ready"));
+    assert!(updated.items[4].detail.starts_with("Unknown"));
+    let config = Config::default();
+    let discovery = crate::llm::catalog::Discovery {
+        providers: vec![crate::llm::catalog::ProviderStatus {
+            id: config.selection().provider,
+            label: "fixture".into(),
+            base_url: None,
+            state: "offline".into(),
+            detail: "fixture connection refused".into(),
+            models: 0,
+        }],
+        ..Default::default()
+    };
+    let checked = local_model_choices(&env, &config, Some(&discovery));
+    assert!(checked.items[4].detail.contains("offline"));
+    assert!(
+        checked.items[4]
+            .detail
+            .contains("fixture connection refused")
+    );
 }
 
 #[test]

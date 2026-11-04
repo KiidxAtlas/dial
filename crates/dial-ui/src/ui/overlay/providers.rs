@@ -137,6 +137,7 @@ impl Wizard {
 enum ProviderAction {
     ChooseModel,
     TestConnection,
+    EditConfiguration,
     Headers,
     SetKey,
     OpenRouterLogin,
@@ -252,6 +253,7 @@ pub struct ProviderOverlay {
     configured: BTreeMap<String, ProviderSpec>,
     has_key: Box<dyn Fn(&str) -> bool>,
     scope: Scope,
+    project_name: String,
     cursor: usize,
     scroll: usize,
     page: usize,
@@ -322,6 +324,7 @@ impl ProviderOverlay {
             configured,
             has_key,
             scope,
+            project_name: "this project".into(),
             cursor: 0,
             scroll: 0,
             page: 8,
@@ -330,6 +333,11 @@ impl ProviderOverlay {
             saving: false,
             credential_sources: BTreeMap::new(),
         }
+    }
+
+    pub fn with_project_name(mut self, name: &str) -> Self {
+        self.project_name = text::one_line(name);
+        self
     }
 
     pub fn set_chatgpt_accounts(&mut self, accounts: Vec<crate::llm::chatgpt::AccountInfo>) {
@@ -684,8 +692,15 @@ impl ProviderOverlay {
                     .as_ref()
                     .is_some_and(|spec| spec.auth == AuthMethod::ApiKey)
             {
-                items.push((ProviderAction::Headers, "Edit HTTP header rows".into()));
+                items.push((
+                    ProviderAction::Headers,
+                    "Connection overrides → Headers (masked; inherit or clear)".into(),
+                ));
             }
+            items.push((
+                ProviderAction::EditConfiguration,
+                "Edit configuration / endpoint → Settings providers".into(),
+            ));
         }
         if entry.spec.is_some() {
             items.push((ProviderAction::Remove, "Remove provider".to_owned()));
@@ -774,6 +789,10 @@ impl ProviderOverlay {
         }
         let entry = menu.entry.clone();
         let action = match &menu.items[menu.cursor].0 {
+            ProviderAction::EditConfiguration => {
+                self.mode = Mode::List;
+                return OverlayEvent::Action("open:settings:providers".into());
+            }
             ProviderAction::UseAuth(auth) => {
                 let mut spec = entry.spec.clone().unwrap_or_else(|| ProviderSpec {
                     label: entry.label.clone(),
@@ -1181,10 +1200,10 @@ impl ProviderOverlay {
     // ---- drawing --------------------------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        let extra = format!(
-            "{} scope: {}",
-            ctx.theme.sym(Sym::Dot),
-            scope_name(self.scope)
+        let extra = super::settings::scope_caption(
+            self.scope,
+            &self.project_name,
+            usize::from(frame.area().width.saturating_sub(14)),
         );
         let area = frame.area();
         if area.width < 5 || area.height < 5 {
@@ -1216,10 +1235,17 @@ impl ProviderOverlay {
         };
         let (show_footer, show_detail, show_message, show_header) =
             (grant(), grant(), grant(), grant());
-        let body_rows = h - [show_footer, show_detail, show_message, show_header]
-            .iter()
-            .filter(|b| **b)
-            .count();
+        let extra_detail = if show_detail && matches!(self.mode, Mode::List) && h >= 12 {
+            spare.min(2)
+        } else {
+            0
+        };
+        let body_rows = h
+            - [show_footer, show_detail, show_message, show_header]
+                .iter()
+                .filter(|b| **b)
+                .count()
+            - extra_detail;
         let mut out: Vec<Line<'static>> = Vec::with_capacity(h);
         if show_header {
             let header = match &self.mode {
@@ -1276,7 +1302,10 @@ impl ProviderOverlay {
             });
         }
         if show_detail {
-            out.push(Line::from(fit(self.detail(theme, &entries), w)));
+            let details = text::wrap(vec![Line::from(self.detail(theme, &entries))], w.max(1));
+            out.extend(
+                (0..=extra_detail).map(|index| details.get(index).cloned().unwrap_or_default()),
+            );
         }
         if show_footer {
             out.push(key_footer(theme, &self.footer(ctx.keys), w));
@@ -1716,9 +1745,9 @@ impl ProviderOverlay {
         }
         match entries.get(self.cursor) {
             Some(entry) => {
-                let summary = self.key_source_sentence(entry).unwrap_or_else(|| text::one_line(&entry.detail));
-                let mut spans = vec![Span::styled(format!(" {summary}"), theme.fg(Tok::Muted))];
-                if let Some(url) = &entry.base_url { spans.push(Span::styled(format!("  {} {}", theme.sym(Sym::Dot), text::one_line(url)), theme.fg(Tok::Dim))); }
+                let summary = self.key_source_sentence(entry).unwrap_or_else(|| "source not reported".into());
+                let mut spans = vec![Span::styled(format!(" Endpoint: {} · Status: {} ({}) · Credential: {}", entry.base_url.as_deref().map(text::one_line).unwrap_or_else(|| "not HTTP / provider-managed".into()), text::one_line(&entry.state), text::one_line(&entry.detail), summary), theme.fg(Tok::Muted))];
+                spans.push(Span::styled(" · Enter: connection actions / explicit test where supported", theme.fg(Tok::Dim)));
                 spans
             }
             None => vec![Span::styled(" Add an OpenAI-compatible endpoint: id, name, base URL and an optional key variable.".to_owned(), theme.fg(Tok::Muted))],

@@ -128,7 +128,7 @@ fn plan_flag_enables_plan_mode() {
 }
 
 #[test]
-fn plan_model_resolves_aliases_into_the_planner_role() {
+fn plan_model_resolves_aliases_without_changing_shared_roles() {
     let mut config = crate::config::types::Config::default();
     config.model_roles.insert(
         "small".to_owned(),
@@ -138,17 +138,19 @@ fn plan_model_resolves_aliases_into_the_planner_role() {
             ..Default::default()
         },
     );
+    config.model_roles.insert(
+        "coach".to_owned(),
+        crate::llm::model_config::ModelSelection::new("openai", "coach-model"),
+    );
     let aliased = resolve(&parse(&["--plan", "@small"]), interactive()).unwrap();
     assert!(aliased.plan_mode);
     assert_eq!(aliased.plan_model.as_deref(), Some("@small"));
     let applied = aliased.apply_plan_model(config.clone()).unwrap();
-    assert_eq!(applied.model_roles["planner"].model, "gpt-small");
+    assert_eq!(applied.plan_model.as_ref().unwrap().model, "gpt-small");
+    assert_eq!(applied.model_roles, config.model_roles);
     let bare = resolve(&parse(&["--plan"]), interactive()).unwrap();
     assert_eq!(
-        bare.apply_plan_model(config.clone())
-            .unwrap()
-            .model_roles
-            .get("planner"),
+        bare.apply_plan_model(config.clone()).unwrap().plan_model,
         None
     );
     let err = resolve(&parse(&["--plan", "no-such-model"]), interactive())

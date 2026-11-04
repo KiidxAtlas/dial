@@ -3,7 +3,6 @@
 //! agent's (`Agent::generate_image`); the output is a new file named from the prompt (in the
 //! workspace root, or beside the edited source), never an existing one, and an edited source is
 //! only read.
-use super::CommandSpec;
 use crate::agent::Agent;
 use crate::app::{App, Bridge, PAINT_EVERY, Shell, Step};
 use crate::storage::redact::redact_text;
@@ -19,13 +18,6 @@ const USAGE: &str =
 /// Prompt words used in the output file name, and that name's maximum slug length.
 const SLUG_WORDS: usize = 6;
 const SLUG_CHARS: usize = 48;
-
-pub(super) const COMMANDS: &[CommandSpec] = &[CommandSpec {
-    name: "image",
-    description: "generate or edit an image with image_gen (asks for approval) or tune the model",
-    args_hint: "generate <prompt> | edit <file> <prompt> | settings",
-    subcommands: &["generate", "edit", "settings"],
-}];
 
 pub(super) fn run(
     shell: &mut Shell,

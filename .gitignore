@@ -32,3 +32,15 @@
 .env.*
 !.env.example
 !.env.sample
+
+# Disposable experiments and benchmark output (fixtures remain tracked).
+/scratch/
+/*-report.json
+/*-report-*.json
+
+# Patch/editor recovery files are local backups, not source inputs.
+*.orig
+*.rej
+*~
+*.swp
+*.swo

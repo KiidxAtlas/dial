@@ -8,10 +8,11 @@
 use super::client::Client;
 use super::names::Namer;
 use super::tool::{McpSurface, McpTool, RemoteTool, SurfaceKind};
-use super::{MAX_TOOLS_PER_SERVER, Session, list_all};
+use super::{CATALOG_RETRY_INTERVAL, MAX_PAGES, MAX_TOOLS_PER_SERVER, Session, remaining};
 use crate::runtime::integration::CatalogFreshness;
 use crate::tools::integrations::ext::Tool;
-use anyhow::Result;
+use anyhow::{Result, bail, ensure};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -80,7 +81,7 @@ impl Session {
     /// Lists the server's tools as the registry offers them: parsed, truncated, trust-filtered,
     /// sorted by name. A resource- or prompt-only server does not declare `tools`, and probing
     /// `tools/list` would fail it.
-    fn fetch_tools(
+    pub(super) fn fetch_tools(
         &self,
         client: &Client,
         deadline: Option<Instant>,
@@ -88,13 +89,49 @@ impl Session {
     ) -> Result<Vec<RemoteTool>> {
         let serves_tools = client.has_capability("tools")
             || !(client.has_capability("resources") || client.has_capability("prompts"));
-        let entries = if serves_tools {
-            list_all(client, "tools/list", "tools", deadline, cancel)?
-        } else {
-            Vec::new()
-        };
-        let mut tools: Vec<RemoteTool> = entries.iter().filter_map(RemoteTool::parse).collect();
-        tools.truncate(MAX_TOOLS_PER_SERVER);
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        if serves_tools {
+            for page_index in 0..MAX_PAGES {
+                ensure!(!cancel(), "MCP tools/list cancelled");
+                ensure!(
+                    deadline.is_none_or(|end| Instant::now() < end),
+                    "MCP tools/list exceeded its operation deadline"
+                );
+                let params = cursor
+                    .as_ref()
+                    .map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
+                let page =
+                    client.request_with("tools/list", params, remaining(deadline), cancel, None)?;
+                let Some(entries) = page.get("tools").and_then(Value::as_array) else {
+                    bail!("`tools/list` returned no `tools` array");
+                };
+                let mut parsed = entries.iter().filter_map(RemoteTool::parse);
+                tools.extend(parsed.by_ref().take(MAX_TOOLS_PER_SERVER - tools.len()));
+                let extra = parsed.next().is_some();
+                cursor = page
+                    .get("nextCursor")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_owned);
+                if extra
+                    || (cursor.is_some()
+                        && (tools.len() == MAX_TOOLS_PER_SERVER || page_index + 1 == MAX_PAGES))
+                {
+                    self.push_notice(format!(
+                        "mcp `{}`: tool list cut off after {} tools (limit: {} tools / {} pages)",
+                        self.name,
+                        tools.len(),
+                        MAX_TOOLS_PER_SERVER,
+                        MAX_PAGES
+                    ));
+                    break;
+                }
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
         for tool in &mut tools {
             tool.read_only_hint &= self.server.trust_read_only_hint;
         }
@@ -122,8 +159,20 @@ impl Session {
         deadline: Option<Instant>,
         cancel: &dyn Fn() -> bool,
     ) -> Result<CatalogDiff> {
+        let revision = client.signal_revision();
+        let transitions = self.health.lock().transitions;
         let tools = self.fetch_tools(client, deadline, cancel)?;
         let diff = self.apply_catalog(tools);
+        self.catalog_signal_revision
+            .store(revision, std::sync::atomic::Ordering::Release);
+        self.update_health(|health| {
+            health.catalog =
+                if revision == client.signal_revision() && health.transitions == transitions {
+                    CatalogFreshness::Fresh
+                } else {
+                    CatalogFreshness::Stale
+                };
+        });
         if !diff.is_empty() {
             self.push_notice(format!(
                 "mcp `{}`: tools updated (+{} -{} ~{})",
@@ -146,9 +195,10 @@ impl Session {
             // Recovery re-syncs the catalog when the transport returns.
             return;
         }
-        let deadline = crate::tools::exec::kernel::execution_deadline(self.timeout());
+        let deadline = Some(Instant::now() + self.catalog_timeout());
+        *self.catalog_retry.lock() = Some(Instant::now() + CATALOG_RETRY_INTERVAL);
         match self.sync_catalog(&client, deadline, &|| false) {
-            Ok(_) => self.update_health(|health| health.catalog = CatalogFreshness::Fresh),
+            Ok(_) => {}
             Err(error) => {
                 let error = format!("{error:#}");
                 self.update_health(|health| health.catalog = CatalogFreshness::Stale);
@@ -170,7 +220,33 @@ impl Session {
         (catalog.revision, catalog.tools.clone())
     }
 
+    /// Linearizes definition and freshness admission against catalog publication. The guard is
+    /// released before request I/O or callbacks, so refresh and cancellation cannot deadlock it.
+    pub(super) fn admit_tool(
+        &self,
+        client: &Client,
+        tool: &RemoteTool,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        let catalog = loop {
+            ensure!(!cancel(), "MCP tool admission cancelled");
+            if let Some(catalog) = self.catalog.try_lock_for(super::CANCEL_POLL) {
+                break catalog;
+            }
+        };
+        ensure!(
+            catalog.tools.iter().any(|live| live == tool),
+            "MCP tool was removed or its definition changed on the server; the next request offers the current definition"
+        );
+        ensure!(
+            std::ptr::eq(self.current().as_ref(), client) && self.catalog_current(),
+            "MCP tool catalog is stale or unverified; retry after catalog revalidation before using this registered definition"
+        );
+        Ok(())
+    }
+
     /// Whether the live catalog still offers exactly this definition.
+    #[cfg(test)]
     pub(super) fn offers(&self, tool: &RemoteTool) -> bool {
         self.catalog.lock().tools.iter().any(|live| live == tool)
     }

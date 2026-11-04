@@ -77,6 +77,15 @@ pub fn remove(session: &Path) -> std::io::Result<()> {
 /// reserves the destination, so reopening the session cannot adopt an unrelated stream journal.
 /// Failure removes only a destination this call created.
 pub fn copy(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    copy_with_snapshot(source, destination, Journal::snapshot)
+}
+
+// Keep snapshot refusal injectable without constructing a replay-limit-sized test fixture.
+fn copy_with_snapshot(
+    source: &Path,
+    destination: &Path,
+    mut snapshot: impl FnMut(&Journal, &Node) -> bool,
+) -> anyhow::Result<()> {
     let (nodes, complete) = scan(source)?;
     anyhow::ensure!(
         complete,
@@ -89,23 +98,30 @@ pub fn copy(source: &Path, destination: &Path) -> anyhow::Result<()> {
             path(destination).display()
         )
     })?;
-    for node in &nodes {
-        anyhow::ensure!(
-            journal.snapshot(node),
-            "stream journal {} node {} exceeds the replay row limit; source preserved, not copied",
-            path(source).display(),
-            node.id
-        );
-    }
-    let durable = journal
-        .check()
-        .map_err(anyhow::Error::msg)
-        .and_then(|()| journal.sync().map_err(anyhow::Error::from));
+    let copied = (|| -> anyhow::Result<()> {
+        for node in &nodes {
+            anyhow::ensure!(
+                snapshot(&journal, node),
+                "stream journal {} node {} exceeds the replay row limit; source preserved, not copied",
+                path(source).display(),
+                node.id
+            );
+        }
+        journal.check().map_err(anyhow::Error::msg)?;
+        journal.sync()?;
+        Ok(())
+    })();
     drop(journal);
-    if let Err(error) = durable {
+    if let Err(error) = copied {
+        // Settle the writer before cleanup, including a refused snapshot's early error.
         // This call created the file, so it is the only owner entitled to remove it.
-        let _ = remove(destination);
-        return Err(error);
+        return match remove(destination) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "removing failed stream journal copy {} failed: {cleanup}; destination may remain",
+                path(destination).display()
+            ))),
+        };
     }
     Ok(())
 }

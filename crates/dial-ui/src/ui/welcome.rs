@@ -47,6 +47,10 @@ pub struct WelcomeInfo {
     pub approval: String,
     /// Sandbox mode (`dev`, `strict`, `off`).
     pub sandbox: String,
+    /// Cheap, already-known startup diagnostics; never runs a probe while drawing.
+    pub doctor_issues: usize,
+    /// First-run guidance, dismissed persistently by the application.
+    pub tour: bool,
 }
 
 /// Starter requests shown to a project with no history, so the first message is never a blank page.
@@ -164,6 +168,15 @@ fn facts(
         if !hint.is_empty() {
             out.push(("next", vec![Span::styled(hint, theme.fg(Tok::Accent))]));
         }
+    }
+    if info.doctor_issues > 0 {
+        out.push((
+            "health",
+            vec![Span::styled(
+                format!("{} issues · /doctor", info.doctor_issues),
+                theme.fg(Tok::Warning),
+            )],
+        ));
     }
 
     let project = text::one_line(info.project.trim());
@@ -675,6 +688,7 @@ pub struct Home {
     settled: bool,
     /// When the sweep finished; the ambient clock counts from here.
     settled_at: Option<Instant>,
+    tour_marker: Option<std::path::PathBuf>,
 }
 
 impl Home {
@@ -687,9 +701,29 @@ impl Home {
             started: None,
             settled: !motion,
             settled_at: None,
+            tour_marker: None,
         }
     }
 
+    /// Enable the tour only when no previous conversation or dismissal exists.
+    pub fn with_tour(mut self, marker: std::path::PathBuf) -> Self {
+        self.info.tour = self.info.recent.is_empty() && !marker.exists();
+        self.tour_marker = Some(marker);
+        self
+    }
+
+    pub fn dismiss_tour(&mut self) -> bool {
+        let visible = self.info.tour;
+        self.info.tour = false;
+        self.save_tour_dismissal();
+        visible
+    }
+
+    fn save_tour_dismissal(&self) {
+        if let Some(marker) = &self.tour_marker {
+            let _ = crate::platform::atomic::write_private(marker, b"seen\n");
+        }
+    }
     pub fn selected(&self) -> Option<usize> {
         self.selected
     }
@@ -814,6 +848,7 @@ impl Home {
     }
 
     pub fn summary(&self, width: u16, theme: &Theme) -> Rows {
+        self.save_tour_dismissal();
         summary(&self.info, width, theme)
     }
 }

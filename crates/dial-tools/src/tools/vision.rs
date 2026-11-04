@@ -1,8 +1,8 @@
-//! Vision model roles used by tools: `grounding` (find a described element in a screenshot) and
+//! Vision feature models used by tools: `grounding` (find a described element in a screenshot) and
 //! `image_embedding` (multimodal vectors for the `image_search` tool).
 //!
 //! Both run on Dial's local MLX-VLM server (Apple Silicon) or on any OpenAI-compatible endpoint.
-//! A role that is unassigned leaves its tool surface off.
+//! An absent feature selection leaves its tool surface off.
 
 pub mod embedding;
 pub mod grounding;
@@ -12,7 +12,7 @@ use crate::config::types::Config;
 use crate::llm::model_config::ApiProtocol;
 use anyhow::{Result, ensure};
 
-/// Where a vision role's model runs.
+/// Where a vision feature's model runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Route {
     /// Dial launches the MLX checkpoint (local directory or Hugging Face repository id).
@@ -25,14 +25,14 @@ pub(crate) enum Route {
     },
 }
 
-/// The route of `role` from its resolved config. Other protocols (Anthropic, Responses, Gemini
+/// The route of a feature from its resolved config. Other protocols (Anthropic, Responses, Gemini
 /// native, subscriptions) are refused with the supported alternatives.
-pub(crate) fn route(role: &str, resolved: &Config) -> Result<Route> {
+pub(crate) fn route(feature: &str, resolved: &Config) -> Result<Route> {
     match &resolved.endpoint {
         None => {
             ensure!(
                 resolved.provider.as_deref().is_none_or(|p| p == "mlx"),
-                "the {role} role needs a local MLX model or an OpenAI-compatible endpoint; {} cannot serve it",
+                "the {feature} feature needs a local MLX model or an OpenAI-compatible endpoint; {} cannot serve it",
                 resolved.provider.as_deref().unwrap_or("this provider")
             );
             Ok(Route::Local)
@@ -43,7 +43,7 @@ pub(crate) fn route(role: &str, resolved: &Config) -> Result<Route> {
                 .or_else(|| resolved.provider.as_deref().map(ApiProtocol::builtin));
             ensure!(
                 protocol.is_none_or(|p| p == ApiProtocol::ChatCompletions),
-                "the {role} role needs an OpenAI-compatible endpoint; {} uses the {} API",
+                "the {feature} feature needs an OpenAI-compatible endpoint; {} uses the {} API",
                 endpoint.base_url,
                 protocol.map_or("unknown", |p| p.as_str())
             );

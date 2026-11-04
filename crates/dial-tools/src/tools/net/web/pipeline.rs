@@ -77,31 +77,36 @@ pub fn render(
     }
 
     let markup = content::decode(&page.body, page.charset.as_deref(), Kind::Html);
-    let served_as_markdown = |text: String, truncated: bool| Rendered {
+    let discovery = client.for_discovery();
+    let client = &discovery;
+    let served_as_markdown = |text: String, response: Response, source: &str| Rendered {
         text,
-        url: final_url.clone(),
-        status,
-        media: format!("{media}, markdown"),
-        truncated,
+        url: response.url,
+        status: response.status,
+        media: format!(
+            "{}, {source} for {final_url}",
+            response.media_type.as_deref().unwrap_or("unknown type")
+        ),
+        truncated: response.truncated,
     };
 
     for link in alternates::markdown_alternates(&markup, &final_url) {
-        if let Some((text, cut)) = probe(client, &link) {
-            return Ok(served_as_markdown(text, cut));
+        if let Some((text, response)) = probe(client, &link) {
+            return Ok(served_as_markdown(text, response, "alternate"));
         }
     }
     if let Some(link) = alternates::md_candidate(&final_url)
-        && let Some((text, cut)) = probe(client, &link)
+        && let Some((text, response)) = probe(client, &link)
     {
-        return Ok(served_as_markdown(text, cut));
+        return Ok(served_as_markdown(text, response, "markdown sibling"));
     }
     let negotiated = client
         .send(&final_url, MARKDOWN_ACCEPT, &[], None)
         .ok()
         .filter(|response| (200..300).contains(&response.status))
-        .and_then(|response| probe_response(&response));
-    if let Some((text, cut)) = negotiated {
-        return Ok(served_as_markdown(text, cut));
+        .and_then(|response| probe_response(&response).map(|text| (text, response)));
+    if let Some((text, response)) = negotiated {
+        return Ok(served_as_markdown(text, response, "negotiated markdown"));
     }
 
     if let Some(text) = reader::convert(client, config, workspace.root(), &final_url, &markup)? {
@@ -115,17 +120,14 @@ pub fn render(
     }
 
     for link in alternates::llms_candidates(&final_url) {
-        if let Some((text, cut)) = probe(client, &link) {
-            return Ok(Rendered {
-                text,
-                url: link,
-                status: 200,
-                media: "llms.txt".to_owned(),
-                truncated: cut,
-            });
+        if let Some((text, response)) = probe(client, &link) {
+            return Ok(served_as_markdown(text, response, "llms.txt"));
         }
     }
 
+    if client.is_interrupted() {
+        return Err("web request cancelled".into());
+    }
     let text = content::render(&page, false)?;
     Ok(Rendered {
         text,
@@ -138,17 +140,17 @@ pub fn render(
 
 /// Fetch a discovery candidate. `None` on any failure or unusable body; discovery never fails the
 /// fetch.
-fn probe(client: &Client, url: &str) -> Option<(String, bool)> {
+fn probe(client: &Client, url: &str) -> Option<(String, Response)> {
     let response = client.get(url, MARKDOWN_ACCEPT, None).ok()?;
     if !(200..300).contains(&response.status) {
         return None;
     }
-    probe_response(&response)
+    probe_response(&response).map(|text| (text, response))
 }
 
 /// The markdown body of `response`, when it is one (see [`alternates::accepts`]).
-fn probe_response(response: &Response) -> Option<(String, bool)> {
+fn probe_response(response: &Response) -> Option<String> {
     let text = content::decode(&response.body, response.charset.as_deref(), Kind::Text);
     let text = text.trim().to_owned();
-    alternates::accepts(response.media_type.as_deref(), &text).then_some((text, response.truncated))
+    alternates::accepts(response.media_type.as_deref(), &text).then_some(text)
 }

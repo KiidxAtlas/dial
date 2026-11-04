@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 pub(in crate::app) mod busy;
 mod checkpoint_review;
 pub(in crate::app) mod command;
+mod controls;
 mod file_discovery;
 pub(in crate::app) mod frame_pacing;
 pub(in crate::app) mod help;
@@ -47,6 +48,7 @@ pub(in crate::app) mod prompts;
 mod release_notice;
 pub(in crate::app) mod run;
 mod runtime_updates;
+mod search;
 pub(in crate::app) mod sessions;
 pub(in crate::app) mod submit;
 pub(in crate::app) mod teach;
@@ -56,6 +58,18 @@ pub(in crate::app) mod turn;
 pub(in crate::app) mod turn_report;
 pub(in crate::app) mod voice;
 pub(in crate::app) mod wait;
+
+impl Shell {
+    pub(in crate::app) fn command_context(
+        &self,
+    ) -> crate::ui::command_surface::AvailabilityContext {
+        crate::ui::command_surface::AvailabilityContext {
+            git: self.git.repository.value,
+            busy: self.status.busy(),
+            session: !self.session_id.is_empty(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod testkit;
@@ -73,6 +87,7 @@ pub(super) struct Shell {
     files: file_discovery::Files,
     runtime_updates: runtime_updates::RuntimeUpdates,
     release_notice: release_notice::ReleaseNotice,
+    pub(in crate::app) inbox: crate::ui::overlay::inbox::Inbox,
     pub(in crate::app) side: crate::app::side::SideThreadState,
     /// Publisher and request handler for the `/watch` side pane.
     pub(in crate::app) live_pane: live_pane::LivePane,
@@ -81,6 +96,9 @@ pub(super) struct Shell {
     pub(super) pending_result: Option<crate::runtime::Body>,
     pub(super) shared_prose: bool,
     pub(super) auth_job: Option<AuthJob>,
+    pub(in crate::app) last_setup_failure: Option<crate::app::overlay::auth::SetupFailure>,
+    /// Session owner: closing Models releases only its view handle, not active downloads.
+    pub(in crate::app) model_downloads: Option<crate::ui::overlay::models::SharedModelDownloads>,
     /// `/extensions` intent waiting for the main loop to start it.
     pub(crate) extensions_pending: Option<crate::app::commands::extensions_browser::Pending>,
     /// The running `/extensions` install, if any.
@@ -93,6 +111,8 @@ pub(super) struct Shell {
     pub(super) retry_control: Option<crate::llm::provider::RetryControl>,
     pub(super) smithery_resume: Option<crate::app::commands::smithery::Resume>,
     pub(super) commit_job: Option<crate::app::commands::commit::CommitJob>,
+    /// Latest-request background `/search` state; see `search.rs`.
+    search: search::Search,
     pub(super) busy_overlay: Option<BusyOverlay>,
     pub(super) worker_editors: crate::ui::overlay::subagent_viewer::WorkerEditors,
     pub(super) term: InlineTerminal,

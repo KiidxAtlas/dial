@@ -785,7 +785,11 @@ const SOURCE_LINES: usize = 40;
 
 /// Fuse navigation with the next bounded read, using the ordinary reader's confinement,
 /// formatting, truncation and witness recording. Never grant authority from ranked snippets.
-fn source_section(ws: &Workspace, hits: &[(&str, usize, usize, &str)], budget: usize) -> String {
+pub(in crate::tools) fn source_section(
+    ws: &Workspace,
+    hits: &[(&str, usize, usize, &str)],
+    budget: usize,
+) -> String {
     let mut out = String::new();
     let budget = budget.min(SOURCE_BYTES);
     let mut visited = BTreeSet::new();
@@ -827,10 +831,19 @@ fn source_section(ws: &Workspace, hits: &[(&str, usize, usize, &str)], budget: u
 /// Source-excerpt files in an authentic retained find result, bounded to the original search
 /// scope. The hashline rehydrator still verifies the raw digest, tag and every numbered row.
 pub(crate) fn source_targets(ws: &Workspace, args: &Value, text: &str) -> Vec<String> {
-    let Some((_, excerpts)) = text.split_once(SOURCE_SECTION) else {
+    let Ok(scope) = ws.resolve(args["path"].as_str().unwrap_or(".")) else {
         return Vec::new();
     };
-    let Ok(scope) = ws.resolve(args["path"].as_str().unwrap_or(".")) else {
+    source_paths(ws, text)
+        .into_iter()
+        .filter(|path| ws.resolve(path).is_ok_and(|path| path.starts_with(&scope)))
+        .collect()
+}
+
+/// Confined local code paths named by the shared source-excerpt renderer.
+/// Callers must additionally enforce their own original discovery scope.
+pub(in crate::tools) fn source_paths(ws: &Workspace, text: &str) -> Vec<String> {
+    let Some((_, excerpts)) = text.split_once(SOURCE_SECTION) else {
         return Vec::new();
     };
     excerpts
@@ -842,10 +855,8 @@ pub(crate) fn source_targets(ws: &Workspace, args: &Value, text: &str) -> Vec<St
                 .rsplit_once('#')?;
             let path = serde_json::from_str::<String>(path).unwrap_or_else(|_| path.to_owned());
             let resolved = ws.resolve(&path).ok()?;
-            (resolved.starts_with(&scope)
-                && !related::sensitive_path(&path)
-                && SupportLang::from_path(&resolved).is_some())
-            .then_some(path)
+            (!related::sensitive_path(&path) && SupportLang::from_path(&resolved).is_some())
+                .then_some(path)
         })
         .take(SOURCE_FILES)
         .collect()

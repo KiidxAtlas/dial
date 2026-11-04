@@ -27,6 +27,8 @@ struct Observation {
     input_check: Option<FocusedCheck>,
     behavioral: bool,
     diagnostic: Option<String>,
+    /// Canonical immutable manifest for this observation's native captured log, if retained.
+    evidence_ref: Option<String>,
 }
 
 impl Observation {
@@ -133,8 +135,19 @@ impl Ledger {
                 input_check: None,
                 behavioral,
                 diagnostic: None,
+                evidence_ref: None,
             },
         );
+    }
+
+    pub(super) fn bind_evidence_ref(&mut self, command: &str, reference: Option<String>) {
+        if let Some(observation) = self.latest.get_mut(command) {
+            observation.evidence_ref = reference;
+        }
+    }
+
+    pub(super) fn evidence_ref(&self, command: &str) -> Option<&str> {
+        self.latest.get(command)?.evidence_ref.as_deref()
     }
 
     pub(super) fn bind_inputs(&mut self, check: &FocusedCheck, inputs: super::inputs::Snapshot) {

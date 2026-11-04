@@ -1,7 +1,7 @@
 //! `/extensions`: one browser for MCP servers and skills.
 //!
-//! The overlay only shows rows and emits [`Intent`]s as `extensions:<json>` actions. Detection,
-//! installs and config writes happen in `commands::extensions_browser`.
+//! The overlay shows rows and emits [`Intent`]s as `extensions:<json>` actions, or opens the
+//! canonical MCP settings editor. Installs and config writes stay with the app controller.
 pub mod model;
 
 use super::{
@@ -40,6 +40,7 @@ pub struct ExtensionsOverlay {
     needs_refresh: bool,
     /// When the search text last changed and has not been sent to the MCP catalogs yet.
     query_edited: Option<Instant>,
+    panel_keys: super::panel_keys::PanelKeys,
 }
 
 impl Default for ExtensionsOverlay {
@@ -57,6 +58,7 @@ impl ExtensionsOverlay {
             catalog_job: false,
             needs_refresh: false,
             query_edited: None,
+            panel_keys: super::panel_keys::PanelKeys::default(),
         }
     }
 
@@ -165,6 +167,13 @@ impl ExtensionsOverlay {
 
     /// Route one key. Returns an action for the app or the controller to run.
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if self.panel_keys.handle(
+            event,
+            self.browser.searching() || self.browser.form.is_some(),
+            false,
+        ) {
+            return OverlayEvent::None;
+        }
         if let Event::Paste(text) = event {
             // Single-line fields accept literal text only; pasted control characters never
             // navigate, submit, or become terminal control sequences.
@@ -193,7 +202,7 @@ impl ExtensionsOverlay {
         }
 
         if b.confirm.is_some() {
-            if keys.matches(Action::SelectConfirm, key) {
+            if super::panel_keys::matches(keys, Action::SelectConfirm, key) {
                 return match b.accept() {
                     Some(intent) => action(&intent),
                     None => OverlayEvent::None,
@@ -214,8 +223,8 @@ impl ExtensionsOverlay {
                 || keys.matches(Action::SelectDown, key)
                 || keys.matches(Action::SelectPageUp, key)
                 || keys.matches(Action::SelectPageDown, key)
-                || keys.matches(Action::TabNext, key)
-                || keys.matches(Action::TabPrev, key)
+                || super::panel_keys::matches(keys, Action::TabNext, key)
+                || super::panel_keys::matches(keys, Action::TabPrev, key)
                 || matches!(
                     key.code,
                     crossterm::event::KeyCode::Home | crossterm::event::KeyCode::End
@@ -225,13 +234,14 @@ impl ExtensionsOverlay {
         }
 
         if b.searching() {
-            if keys.matches(Action::SelectCancel, key) {
+            if super::panel_keys::matches(keys, Action::SelectCancel, key) {
                 b.clear_search();
-            } else if keys.matches(Action::SelectConfirm, key) {
+            } else if super::panel_keys::matches(keys, Action::SelectConfirm, key) {
                 b.end_search();
                 let tab = b.tab();
                 let catalog = b.catalog(tab);
-                if !catalog.loading
+                if tab.has_catalog()
+                    && !catalog.loading
                     && (catalog.page == 0 || catalog.query.trim() != b.query().trim())
                 {
                     let query = b.query().to_owned();
@@ -247,7 +257,7 @@ impl ExtensionsOverlay {
             return OverlayEvent::None;
         }
 
-        if keys.matches(Action::SelectCancel, key) {
+        if super::panel_keys::matches(keys, Action::SelectCancel, key) {
             if b.details_open {
                 b.toggle_details();
                 return OverlayEvent::None;
@@ -258,11 +268,11 @@ impl ExtensionsOverlay {
             }
             return OverlayEvent::Close;
         }
-        if keys.matches(Action::TabNext, key) {
+        if super::panel_keys::matches(keys, Action::TabNext, key) {
             b.next_tab();
             return OverlayEvent::None;
         }
-        if keys.matches(Action::TabPrev, key) {
+        if super::panel_keys::matches(keys, Action::TabPrev, key) {
             b.prev_tab();
             return OverlayEvent::None;
         }
@@ -290,7 +300,7 @@ impl ExtensionsOverlay {
             b.move_cursor(isize::MAX / 2);
             return self.load_more_near_end();
         }
-        if keys.matches(Action::SelectConfirm, key) {
+        if super::panel_keys::matches(keys, Action::SelectConfirm, key) {
             if let Some(intent) = enter_install(b) {
                 return match b.request(intent) {
                     Some(now) => action(&now),
@@ -309,10 +319,21 @@ impl ExtensionsOverlay {
                 b.start_search();
                 OverlayEvent::None
             }
+            Some('a') if b.tab() == Tab::Mcp => OverlayEvent::Action("open:settings:mcp".into()),
+            Some('d')
+                if b.tab() == Tab::Mcp
+                    && b.selected()
+                        .is_some_and(|row| row.origin == Origin::Installed) =>
+            {
+                OverlayEvent::Action("open:settings:mcp".into())
+            }
             Some('r') | Some('n') => {
                 let tab = b.tab();
                 let state = b.catalog(tab);
-                if state.loading || (typed_char(key) == Some('n') && !state.more) {
+                if !tab.has_catalog()
+                    || state.loading
+                    || (typed_char(key) == Some('n') && !state.more)
+                {
                     return OverlayEvent::None;
                 }
                 if typed_char(key) == Some('n') {
@@ -390,6 +411,9 @@ impl ExtensionsOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        if self.panel_keys.draw(frame, ctx, "Extensions", "Enter shows details or requests an install. Destructive actions always ask for confirmation.\nMCP: a add custom · d edit configuration (installed) — opens Settings\nr refresh catalog · v details · t test · e enable/disable · x remove", true, true) {
+            return;
+        }
         let browser = &self.browser;
         let body = |width: u16, height: u16| {
             let w = usize::from(width);
@@ -469,6 +493,12 @@ impl ExtensionsOverlay {
                         }
                     }
                 } else if rows.is_empty() {
+                    if browser.tab() == Tab::Mcp {
+                        lines.push(Line::from(Span::styled(
+                            " a add custom server in Settings",
+                            ctx.theme.fg(Tok::Accent),
+                        )));
+                    }
                     let empty = if catalog.loading {
                         "Loading the catalog…".to_owned()
                     } else if browser.catalog_search_pending() {
@@ -534,6 +564,15 @@ impl ExtensionsOverlay {
                 // Most useful first; the footer drops hints before the last (the way out) when
                 // space runs short. Row actions appear only when they apply to the selection.
                 let mut items = Vec::new();
+                if browser.tab() == Tab::Mcp {
+                    items.push(("a".to_owned(), "add custom".to_owned()));
+                    if browser
+                        .selected()
+                        .is_some_and(|row| row.origin == Origin::Installed)
+                    {
+                        items.push(("d".to_owned(), "edit configuration".to_owned()));
+                    }
+                }
                 items.push((
                     pair_label(ctx.keys, Action::SelectUp, Action::SelectDown),
                     "select".to_owned(),
@@ -576,8 +615,12 @@ impl ExtensionsOverlay {
             frame.render_widget(Paragraph::new(lines), area);
             return;
         }
-        let block =
-            chrome::panel_block_titled(ctx.theme, Section::Connect, "Extensions", "MCP · skills");
+        let block = chrome::panel_block_titled(
+            ctx.theme,
+            Section::Connect,
+            "Extensions",
+            "MCP · skills · tools · hooks",
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let lines = body(inner.width, inner.height);

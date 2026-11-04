@@ -461,6 +461,80 @@ fn file_and_dir_references_append_blocks() {
 }
 
 #[test]
+fn interrupted_references_preserve_typed_text_without_attachments() {
+    let (_t, base) = project();
+    let root = base.join("proj");
+    write(root.join("src/a.txt"), "must not attach");
+    let text = "please inspect @src/ and @src/a.txt";
+    let (out, warnings) = expand_references(&root, text, &AtomicBool::new(true));
+    assert_eq!(out, text);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("interrupted"))
+    );
+}
+
+#[test]
+fn directory_listing_requires_complete_bounded_enumeration() {
+    let interrupt = AtomicBool::new(false);
+    let mut consumed = 0;
+    let oversized = std::iter::repeat_with(|| {
+        consumed += 1;
+        Ok((std::ffi::OsString::from("entry"), false))
+    });
+    assert_eq!(
+        directory_listing(oversized, &interrupt),
+        Err("directory entry limit exceeded")
+    );
+    assert_eq!(consumed, DIR_LISTING_CAP + 1);
+
+    let entries = (0..DIR_LISTING_CAP)
+        .map(|index| Ok((std::ffi::OsString::from(format!("{index:03}")), false)));
+    let listing = directory_listing(entries, &interrupt).unwrap();
+    assert_eq!(listing.lines().count(), DIR_LISTING_CAP);
+    assert!(listing.starts_with("000\n001\n"));
+
+    for names in [
+        vec!["x".repeat(DIR_LISTING_BYTES)],
+        vec!["x".repeat(DIR_LISTING_BYTES / 2); 2],
+        vec!["🦀".repeat(DIR_LISTING_BYTES / 4)],
+    ] {
+        let entries = names.into_iter().map(|name| Ok((name.into(), false)));
+        assert_eq!(
+            directory_listing(entries, &interrupt),
+            Err("directory listing byte limit exceeded")
+        );
+    }
+}
+
+#[test]
+fn directory_listing_errors_and_interruptions_never_look_complete() {
+    let interrupt = AtomicBool::new(false);
+    let entries = [
+        Ok(("visible".into(), false)),
+        Err(std::io::Error::other("injected entry/type failure")),
+    ];
+    assert_eq!(
+        directory_listing(entries.into_iter(), &interrupt),
+        Err("unreadable directory entry or entry type")
+    );
+    let missing = tempfile::tempdir().unwrap();
+    assert_eq!(
+        dir_listing(&missing.path().join("missing"), &interrupt),
+        Err("unreadable directory")
+    );
+    let mut consumed = 0;
+    let entries = std::iter::repeat_with(|| {
+        consumed += 1;
+        interrupt.store(true, Ordering::Relaxed);
+        Ok(("first".into(), false))
+    });
+    assert_eq!(directory_listing(entries, &interrupt), Err("interrupted"));
+    assert_eq!(consumed, 1);
+}
+
+#[test]
 fn references_cannot_escape_the_project() {
     let (_t, base) = project();
     let root = base.join("proj");

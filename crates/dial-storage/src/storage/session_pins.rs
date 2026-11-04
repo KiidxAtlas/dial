@@ -13,7 +13,7 @@ use crate::platform::fs as platform_fs;
 static LOCK: Mutex<()> = Mutex::new(());
 
 fn file(user_dir: &Path) -> PathBuf {
-    user_dir.join("session-pins.json")
+    crate::config::paths::session_pins_file(user_dir)
 }
 
 /// Pinned session ids in stored order. A missing file means nothing is pinned.
@@ -65,11 +65,10 @@ pub fn unpin(user_dir: &Path, session_id: &str) -> Result<()> {
 fn write(user_dir: &Path, ids: &[String]) -> Result<()> {
     fs::create_dir_all(user_dir).with_context(|| format!("creating {}", user_dir.display()))?;
     let path = file(user_dir);
-    let tmp = user_dir.join(format!(
-        ".session-pins.{}.{}.tmp",
-        std::process::id(),
-        crate::storage::session::random_hex(4)
-    ));
+    let tmp = crate::config::paths::session_pins_temp_file(
+        user_dir,
+        &crate::storage::session::random_hex(4),
+    );
     let body = serde_json::to_vec_pretty(ids)?;
     let mut out =
         platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), &tmp)

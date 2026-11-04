@@ -819,8 +819,9 @@ fn credentials_are_url_scoped_private_and_preserve_other_entries() {
         assert!(save_credential(dir.path(), url, "ok").is_err());
     }
     assert_eq!(
-        crate::platform::fs::mode(&fs::metadata(dir.path().join("credentials.json")).unwrap())
-            & 0o777,
+        crate::platform::fs::mode(
+            &fs::metadata(super::super::credential_store::api_key_path(dir.path())).unwrap()
+        ) & 0o777,
         0o600
     );
     let uri = "https://unrelated.test/v1".parse().unwrap();
@@ -1243,7 +1244,7 @@ fn old_claude_cache_recovers_context_without_network_or_rewriting_saved_metadata
             available: false,
             metadata: Default::default(),
         };
-        let path = home.path().join("model-catalog.json");
+        let path = crate::config::paths::model_catalog_file(home.path());
         let bytes = serde_json::to_vec(&BTreeMap::from([(
             super::super::anthropic::BASE_URL,
             vec![row.clone()],
@@ -1341,10 +1342,11 @@ fn old_gemini_cache_recovers_documented_image_output_without_rewriting_it() {
         row("gemini-2.5-flash", &base_url, None),
         row("gemini-3.1-flash-image", "https://proxy.example/v1", None),
     ];
-    let path = home.path().join("model-catalog.json");
+    let path = crate::config::paths::model_catalog_file(home.path());
     let bytes = serde_json::to_vec(&BTreeMap::from([("saved", rows.clone())])).unwrap();
     write_private(&path, &bytes).unwrap();
-    let loaded: Vec<_> = cached(home.path()).into_values().flatten().collect();
+    let saved = cached(home.path());
+    let loaded: Vec<_> = saved.values().flatten().collect();
     let image = |model: &str, url: &str| {
         loaded
             .iter()
@@ -1928,4 +1930,173 @@ fn supports_images_lets_explicit_disabled_veto_image_kind() {
     assert!(entries[2].supports_images());
     assert!(!entries[3].supports_images());
     assert!(entries[3].supports_chat());
+}
+
+fn listing_pages(bodies: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let job = std::thread::spawn(move || {
+        bodies.into_iter().map(|body| {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() { break; }
+                request.push_str(&line);
+            }
+            let length = request.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+            }).unwrap_or(0);
+            let mut body_bytes = vec![0; length];
+            reader.read_exact(&mut body_bytes).unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            request
+        }).collect()
+    });
+    (format!("http://{address}/v1"), job)
+}
+
+#[test]
+fn provider_listing_follows_native_continuations_and_keeps_auth() {
+    for (protocol, first, second, query, auth) in [
+        (
+            ApiProtocol::Gemini,
+            r#"{"models":[{"name":"models/one","supportedGenerationMethods":["generateContent"]}],"nextPageToken":"a/b?c&d"}"#,
+            r#"{"models":[{"name":"models/two","supportedGenerationMethods":["generateContent"]}]}"#,
+            "pageToken=a%2Fb%3Fc%26d",
+            "x-goog-api-key: fixture-key",
+        ),
+        (
+            ApiProtocol::Anthropic,
+            r#"{"data":[{"id":"one"}],"has_more":true,"last_id":"a/b?c&d"}"#,
+            r#"{"data":[{"id":"two"}],"has_more":false}"#,
+            "after_id=a%2Fb%3Fc%26d",
+            "x-api-key: fixture-key",
+        ),
+    ] {
+        let (url, job) = listing_pages(vec![first.into(), second.into()]);
+        let mut probe = test_probe(url, "custom");
+        probe.spec.protocol = Some(protocol);
+        probe.token = Some("fixture-key".into());
+        let (state, models) = probe_models(&probe);
+        assert_eq!(state.state, "reachable", "{state:?}");
+        assert_eq!(
+            models
+                .iter()
+                .map(|m| m.selection.model.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        let requests = job.join().unwrap();
+        assert!(
+            requests[0].starts_with("GET /v1/models "),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[1].starts_with(&format!("GET /v1/models?{query} ")),
+            "{}",
+            requests[1]
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.to_ascii_lowercase().contains(auth))
+        );
+    }
+}
+
+#[test]
+fn incomplete_listing_never_returns_partial_models() {
+    for bodies in [
+        vec![r#"{"data":[{"id":"one"}],"has_more":true,"last_id":"one"}"#.into(), "invalid".into()],
+        vec![r#"{"data":[{"id":"one"}],"has_more":true,"last_id":"one"}"#.into(); 2],
+        vec![r#"{"data":[],"has_more":true}"#.into()],
+        vec![r#"{"data":[],"has_more":true,"last_id":7}"#.into()],
+        (0..MAX_PAGES).map(|i| serde_json::json!({"data":[],"has_more":true,"last_id":format!("cursor-{i}")}).to_string()).collect(),
+        vec![serde_json::json!({"data":(0..MAX_MODELS + 1).map(|i| serde_json::json!({"id":format!("m-{i}")})).collect::<Vec<_>>()}).to_string()],
+        vec![serde_json::json!({"data":[],"padding":"x".repeat(MAX_RESPONSE as usize / 2),"has_more":true,"last_id":"one"}).to_string(); 2],
+    ] {
+        let (url, job) = listing_pages(bodies);
+        let mut probe = test_probe(url, "custom");
+        probe.spec.protocol = Some(ApiProtocol::Anthropic);
+        let (state, models) = probe_models(&probe);
+        assert_eq!(state.state, "unavailable", "{state:?}");
+        assert!(state.detail.contains("incomplete"), "{state:?}");
+        assert!(models.is_empty(), "Partial listing must never be cacheable");
+        job.join().unwrap();
+    }
+}
+
+#[test]
+fn ollama_enrichment_has_a_request_cap_and_keeps_the_basic_listing() {
+    let models = (0..40)
+        .map(|i| serde_json::json!({"name":format!("m-{i}")}))
+        .collect::<Vec<_>>();
+    let mut responses = vec![serde_json::json!({"models":models}).to_string()];
+    responses.extend(vec![
+        r#"{"capabilities":["completion"]}"#.into();
+        MAX_ENRICHMENTS
+    ]);
+    let (url, job) = listing_pages(responses);
+    let (state, models) = probe_models(&test_probe(url, "ollama"));
+    assert_eq!(state.state, "reachable");
+    assert_eq!(models.len(), 40);
+    assert_eq!(
+        models
+            .iter()
+            .filter(|m| m.metadata.kind == ModelKind::Chat)
+            .count(),
+        MAX_ENRICHMENTS
+    );
+    assert_eq!(job.join().unwrap().len(), MAX_ENRICHMENTS + 1);
+    let agent = super::super::agent_with(1, false, None, None);
+    let headers = super::super::model_config::resolve_validated_headers(&[]).unwrap();
+    assert!(
+        ollama_show(
+            &agent,
+            "http://127.0.0.1:1",
+            "model",
+            None,
+            &headers,
+            Instant::now()
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn immutable_catalog_lookup_invalidates_file_stamp_without_changing_old_snapshot() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let probe = test_probe("https://catalog.example/v1".into(), "custom");
+    let save = |window| {
+        let models = parse_models(
+            &serde_json::json!({"data":[{"id":"one","context_length":window},{"id":"two"}]}),
+            &probe,
+        )
+        .unwrap();
+        persist_cache(
+            home.path(),
+            BTreeMap::from([(probe_cache_key(&probe), models)]),
+        )
+        .unwrap();
+    };
+    save(1234);
+    let old = cached(home.path());
+    let mut selection = old[&probe_cache_key(&probe)][0].selection.clone();
+    selection.context_window = None;
+    assert_eq!(model_context_window(home.path(), &selection), Some(1234));
+    assert_eq!(model_metadata(&layout, &selection).kind, ModelKind::Unknown);
+    save(56789);
+    assert_eq!(model_context_window(home.path(), &selection), Some(56789));
+    assert_eq!(
+        old[&probe_cache_key(&probe)][0].selection.context_window,
+        Some(1234)
+    );
 }

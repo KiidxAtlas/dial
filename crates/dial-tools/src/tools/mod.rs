@@ -142,6 +142,20 @@ pub trait ClientFileIo: Send + Sync {
     fn writes(&self) -> bool;
     fn read_text(&self, path: &Path) -> Result<String, String>;
     fn write_text(&self, path: &Path, content: &str) -> Result<(), String>;
+    /// Typed write certainty. Older clients conservatively treat errors as unknown effects.
+    fn write_text_confirmed(&self, path: &Path, content: &str) -> Result<(), ClientWriteError> {
+        self.write_text(path, content)
+            .map_err(ClientWriteError::Unknown)
+    }
+}
+
+/// A client refusal before delivery differs from a lost acknowledgement after delivery.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientWriteError {
+    #[error("{0}")]
+    NotWritten(String),
+    #[error("{0}")]
+    Unknown(String),
 }
 
 /// Installed client bridge; `None` keeps every file operation local.
@@ -231,6 +245,8 @@ pub struct Workspace {
     artifacts: Option<artifact::ArtifactStore>,
     /// Session name scoping Cargo build output (see [`exec::cargo_target`]); `None` leaves it unset.
     cargo_session: Option<String>,
+    /// Shared ownership prevents maintenance while this workspace or its jobs can use the target.
+    cargo_lease: Option<Arc<std::fs::File>>,
     operations: Arc<Mutex<()>>,
     shell_sessions: Arc<Mutex<BTreeMap<String, crate::embedded_shell::state::State>>>,
     /// Named sessions a background shell job holds, or settled since their last use.
@@ -286,6 +302,7 @@ impl Workspace {
             staged_rewrites: Arc::default(),
             artifacts: None,
             cargo_session: None,
+            cargo_lease: None,
             operations: Arc::default(),
             shell_sessions: Arc::default(),
             shell_busy: Arc::default(),
@@ -311,11 +328,16 @@ impl Workspace {
     pub fn artifacts(&self) -> Option<&artifact::ArtifactStore> {
         self.artifacts.as_ref()
     }
-    /// Scopes Cargo build output to one session under the workspace scratch dir. An invalid
-    /// name leaves isolation off rather than building a path from unchecked text.
-    pub fn with_cargo_session(mut self, session: &str) -> Self {
+    /// Scopes Cargo output and leases its directory for this workspace and its clones.
+    /// Invalid names leave isolation off; an unavailable lease refuses setup before export.
+    pub fn with_cargo_session(mut self, session: &str) -> Result<Self> {
         self.cargo_session = exec::cargo_target::valid_session(session).then(|| session.to_owned());
-        self
+        self.cargo_lease = self
+            .cargo_session
+            .as_deref()
+            .map(|name| exec::cargo_target::session_lease(&self.root, name))
+            .transpose()?;
+        Ok(self)
     }
     /// Cargo target directory for commands run in this workspace, or `None` without a session scope.
     pub fn cargo_target_dir(&self) -> Option<PathBuf> {
@@ -651,7 +673,9 @@ impl Workspace {
         copy.ssh = self.ssh.clone();
         copy.ssh_hosts = Arc::clone(&self.ssh_hosts);
         copy.artifacts = self.artifacts.clone();
-        copy.cargo_session = self.cargo_session.clone();
+        if let Some(session) = &self.cargo_session {
+            copy = copy.with_cargo_session(session)?;
+        }
         Ok(copy)
     }
 
@@ -669,6 +693,9 @@ impl Workspace {
         ));
         next.additional_roots.clear();
         next.sensitive_roots.clear();
+        if let Some(session) = &self.cargo_session {
+            next = next.with_cargo_session(session)?;
+        }
         Ok(next)
     }
 
@@ -1174,10 +1201,17 @@ impl Workspace {
     }
 
     /// Bounded, workspace-confined identity for a read observation, including selectors.
-    /// Used only to expire recovery feedback; this is not verification evidence.
+    /// Directories hash the same visible listing as `read`, not metadata or hidden descendants.
+    /// Used only to expire recovery feedback; this is not access, a witness or verification evidence.
     pub fn read_identity(&self, input: &str) -> Option<[u8; 32]> {
-        self.file_identity(&self.resolve_read_target(input).ok()?)
-            .map(|(_, digest)| digest)
+        use sha2::{Digest, Sha256};
+        let path = self.resolve_read_target(input).ok()?;
+        if path.is_dir() {
+            return fs::files::list_dir(self, &path)
+                .ok()
+                .map(|listing| Sha256::digest(listing.as_bytes()).into());
+        }
+        self.file_identity(&path).map(|(_, digest)| digest)
     }
 
     /// Canonical workspace path and SHA-256 of an exact file path (never a read selector, since
@@ -1297,13 +1331,16 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
             "glob",
             "List workspace paths matching a glob (`*`, `?`, `[a-z]`, `{a,b}`, `**`; a bare pattern \
              matches names at any depth), sorted, at most 500 per page. The footer reports coverage and \
-             next_cursor/remaining_skip to continue. .git, scratch and symlinks are never listed.",
+             next_cursor/remaining_skip to continue. .git, scratch and symlinks are never listed. \
+             Use preview=true when you need source contents next: adds bounded, screened code \
+             excerpts with editable numbered rows, avoiding a separate read for those rows.",
             json!({
                 "pattern": {"type": "string", "description": "Glob such as `src/**/*.rs` or `*.py`, relative to the workspace root."},
                 "path": {"type": "string", "description": "Scope: file, directory or semicolon-separated scopes (default workspace root). Scopes inside .git or the workspace scratch directory are refused."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},
                 "gitignore": {"type": "boolean", "description": "Honor ignore rules and skip dependency/build directories (default true)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Paths per page (default 500)."},
+                "preview": {"type": "boolean", "description": "Include source previews for up to 3 code files among the first 16 listed paths (40 lines each, 6 KiB total). Default false: paths only. Sensitive, non-code and credential-bearing files are not previewed; only returned rows are edit witnesses."},
                 "skip": {"type": "integer", "minimum": 0, "description": "Paths to skip; resume with remaining_skip."},
                 "cursor": {"type": "object", "properties": {"path": {"type": "string"}, "match": {"type": "integer", "minimum": 0, "maximum": 0}}, "required": ["path", "match"], "additionalProperties": false, "description": "next_cursor from the previous page, unchanged."},
             }),

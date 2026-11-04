@@ -36,6 +36,7 @@ pub mod thinking;
 pub mod tools;
 pub mod types;
 mod validate;
+pub mod vision;
 pub mod voice;
 pub mod weights;
 
@@ -110,8 +111,8 @@ pub fn merge_overlay(base: &mut toml::Table, mut over: toml::Table) {
     }
     let hooks = over.remove("hooks");
     merge(base, over);
-    if let Some(toml::Value::Array(added)) = hooks {
-        match base.get_mut("hooks") {
+    match hooks {
+        Some(toml::Value::Array(added)) => match base.get_mut("hooks") {
             Some(toml::Value::Array(existing)) => {
                 for hook in added {
                     if !existing.contains(&hook) {
@@ -122,7 +123,12 @@ pub fn merge_overlay(base: &mut toml::Table, mut over: toml::Table) {
             _ => {
                 base.insert("hooks".into(), toml::Value::Array(added));
             }
+        },
+        Some(value) => {
+            // Preserve malformed values so typed configuration validation rejects them.
+            base.insert("hooks".into(), value);
         }
+        None => {}
     }
 }
 
@@ -337,9 +343,8 @@ fn drop_semantic_key(table: &mut toml::Table, key: &str) -> bool {
         .is_some_and(|semantic| semantic.remove(key).is_some())
 }
 
-/// Current roles that a legacy `default` role fills when they are not otherwise assigned. `decision` is the
-/// Laya checkpoint, so it is not filled.
-const DEFAULT_FILLS: &[&str] = &["task", "small", "coach", "tester", "planner", "memory"];
+/// Current helper roles filled by a legacy `default`; typed decisions remain opt-in.
+const DEFAULT_FILLS: &[&str] = &["task", "small", "coach", "tester", "memory"];
 
 /// The current role a legacy role name maps to, if it is one.
 fn legacy_role_target(name: &str) -> Option<&'static str> {
@@ -357,12 +362,18 @@ fn rewrite_legacy_role_refs(table: &mut toml::Table) -> bool {
             toml::Value::Table(child) => changed |= rewrite_legacy_role_refs(child),
             toml::Value::Array(items) => {
                 for item in items.iter_mut() {
-                    let Some(role) = item.as_str().and_then(|text| text.strip_prefix('@')) else {
+                    let Some(text) = item.as_str().and_then(|text| text.strip_prefix('@')) else {
                         continue;
                     };
+                    let (role, suffix) = text
+                        .split_once(':')
+                        .map_or((text, None), |(role, suffix)| (role, Some(suffix)));
                     if let Some(target) = legacy_role_target(role).filter(|target| *target != role)
                     {
-                        *item = toml::Value::String(format!("@{target}"));
+                        *item = toml::Value::String(match suffix {
+                            Some(suffix) => format!("@{target}:{suffix}"),
+                            None => format!("@{target}"),
+                        });
                         changed = true;
                     }
                 }
@@ -391,13 +402,10 @@ fn rewrite_memory_role_fields(table: &mut toml::Table) -> bool {
         else {
             continue;
         };
-        let target = match value.as_str() {
-            // `decision` is the Laya checkpoint now; a Sharpshooter model role named `decision` meant memory.
-            Some("decision") => Some("memory"),
-            Some(text) => legacy_role_target(text),
-            None => None,
-        }
-        .filter(|target| value.as_str() != Some(*target));
+        let target = value
+            .as_str()
+            .and_then(legacy_role_target)
+            .filter(|target| value.as_str() != Some(*target));
         if let Some(target) = target {
             *value = toml::Value::String(target.to_owned());
             changed = true;
@@ -406,66 +414,149 @@ fn rewrite_memory_role_fields(table: &mut toml::Table) -> bool {
     changed
 }
 
-/// Migrates legacy `model_roles` keys to the current roles (see `LEGACY_ROLE_MIGRATIONS`).
-/// Precedence: an explicit current key wins; among legacy keys for one role the first in
-/// `LEGACY_ROLE_MIGRATIONS` wins; `default` fills unassigned roles in `DEFAULT_FILLS`; `vision` is
-/// dropped. Also removes the retired `escalation.role` (escalation always uses coach) and rewrites
-/// `@legacy` references. Unknown keys are left for validation to report. Returns whether anything changed.
+/// Migrate retired roles without losing feature selections. Explicit destination settings win.
+/// `decision` now selects the typed-choice backend; old Laya checkpoint values move to `laya`.
+/// This runs on each source layer before merging, preserving project/global precedence.
 pub fn migrate_model_role_table(table: &mut toml::Table) -> bool {
-    let mut changed = rewrite_legacy_role_refs(table) | rewrite_memory_role_fields(table);
+    let before = table.clone();
+    rewrite_legacy_role_refs(table);
+    rewrite_memory_role_fields(table);
+    for path in [["retry", "fallback_chains"], ["compaction", "promotion"]] {
+        if let Some(section) = table
+            .get_mut(path[0])
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|parent| parent.get_mut(path[1]))
+            .and_then(toml::Value::as_table_mut)
+        {
+            let keys = if path[0] == "compaction" {
+                section
+                    .get_mut("targets")
+                    .and_then(toml::Value::as_table_mut)
+            } else {
+                Some(section)
+            };
+            if let Some(keys) = keys {
+                for (old, new) in crate::llm::model_config::LEGACY_ROLE_MIGRATIONS {
+                    if old != new
+                        && let Some(value) = keys.remove(*old)
+                    {
+                        keys.entry((*new).to_owned()).or_insert(value);
+                    }
+                }
+            }
+        }
+    }
     if let Some(escalation) = table
         .get_mut("escalation")
         .and_then(toml::Value::as_table_mut)
     {
-        changed |= escalation.remove("role").is_some();
+        escalation.remove("role");
     }
-    let Some(roles) = table
-        .get_mut("model_roles")
-        .and_then(toml::Value::as_table_mut)
-    else {
-        return changed;
-    };
-    // `decision` is the Laya checkpoint (provider `laya`). Any other `decision` value was the old Sharpshooter
-    // chat model, which now belongs to `memory`.
-    if let Some(value) = roles.get("decision").cloned()
-        && !matches!(
-            value
-                .as_table()
-                .and_then(|table| table.get("provider"))
-                .and_then(toml::Value::as_str),
-            Some(crate::config::laya::PROVIDER | "inherit")
-        )
+    if let Some(mut roles) = table
+        .get("model_roles")
+        .and_then(toml::Value::as_table)
+        .cloned()
     {
-        roles.remove("decision");
-        roles.entry("memory".to_owned()).or_insert(value);
-    }
-    let before = roles.clone();
-    let mut migrated = toml::Table::new();
-    for (legacy, target) in crate::llm::model_config::LEGACY_ROLE_MIGRATIONS {
-        // Current-role identities are not migrations: preserve them in place, including
-        // explicit selections that must win over legacy aliases for the same role.
-        if legacy == target {
-            continue;
+        // Only the former checkpoint-shaped Laya assignment is moved. Current chat decisions
+        // and the `laya/decision` alias must survive repeated loads unchanged.
+        if let Some(value) = roles.get("decision")
+            && value.get("provider").and_then(toml::Value::as_str) == Some(laya::PROVIDER)
+            && let Some(checkpoint) = value.get("model").and_then(toml::Value::as_str)
+            && checkpoint != laya::JUDGE_MODEL
+        {
+            let checkpoint = checkpoint.to_owned();
+            let laya = table
+                .entry("laya".to_owned())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let Some(laya) = laya.as_table_mut() {
+                laya.entry("checkpoint".to_owned())
+                    .or_insert(checkpoint.into());
+                roles.remove("decision");
+            }
         }
-        if let Some(value) = roles.remove(*legacy) {
-            migrated.entry((*target).to_owned()).or_insert(value);
+        for feature in ["grounding", "image_embedding"] {
+            if let Some(selection) = roles.get(feature).cloned() {
+                let vision = table
+                    .entry("vision".to_owned())
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let Some(vision) = vision.as_table_mut() {
+                    vision.entry(feature.to_owned()).or_insert(selection);
+                    roles.remove(feature);
+                }
+            }
+        }
+        let mut migrated = toml::Table::new();
+        for (legacy, target) in crate::llm::model_config::LEGACY_ROLE_MIGRATIONS {
+            if legacy != target
+                && let Some(value) = roles.remove(*legacy)
+            {
+                migrated.entry((*target).to_owned()).or_insert(value);
+            }
+        }
+        roles.remove("vision");
+        if let Some(default) = roles.remove("default") {
+            for role in DEFAULT_FILLS {
+                migrated
+                    .entry((*role).to_owned())
+                    .or_insert_with(|| default.clone());
+            }
+        }
+        for (role, value) in migrated {
+            roles.entry(role).or_insert(value);
+        }
+        table.insert("model_roles".to_owned(), toml::Value::Table(roles));
+    }
+    // Saved presets used the same role map. Reuse the root migration so switching an old
+    // preset cannot resurrect removed roles or silently discard its feature models.
+    if let Some(presets) = table
+        .get_mut("model_presets")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for preset in presets
+            .iter_mut()
+            .filter_map(|(_, preset)| preset.as_table_mut())
+        {
+            let mut selections = toml::Table::new();
+            if let Some(roles) = preset.remove("roles") {
+                selections.insert("model_roles".into(), roles);
+            }
+            if let Some(vision) = preset.remove("vision") {
+                selections.insert("vision".into(), vision);
+            }
+            if let Some(checkpoint) = preset.remove("laya_checkpoint") {
+                selections.insert(
+                    "laya".into(),
+                    toml::Value::Table(toml::Table::from_iter([("checkpoint".into(), checkpoint)])),
+                );
+            }
+            migrate_model_role_table(&mut selections);
+            if let Some(roles) = selections.remove("model_roles") {
+                preset.insert("roles".into(), roles);
+            }
+            if let Some(vision) = selections.remove("vision") {
+                preset.insert("vision".into(), vision);
+            }
+            if let Some(checkpoint) = selections
+                .get("laya")
+                .and_then(|laya| laya.get("checkpoint"))
+            {
+                preset.insert("laya_checkpoint".into(), checkpoint.clone());
+            }
         }
     }
-    roles.remove("vision");
-    if let Some(default) = roles.remove("default") {
-        for role in DEFAULT_FILLS {
-            migrated
-                .entry((*role).to_owned())
-                .or_insert_with(|| default.clone());
-        }
-    }
-    for (role, value) in migrated {
-        roles.entry(role).or_insert(value);
-    }
-    changed | (*roles != before)
+    *table != before
 }
 
 impl Config {
+    /// Values for the settings UI and queries, including process-only edit-mode pins.
+    pub fn settings_values(&self) -> Result<toml::Table> {
+        let mut values = toml::Table::try_from(self)?;
+        if let Some(mode) = self.edit_mode_override {
+            schema::set(&mut values, "edit.mode", toml::Value::try_from(mode)?);
+        }
+        Ok(values)
+    }
+
     /// Coding has no implicit learning lifecycle, even with preferences saved by older releases.
     /// The one opt-in is "Teach this model" ([`Self::teaching`]): verified turns of a local model
     /// are recorded and the latest admitted version serves. Background cycles stay off either way.
@@ -605,6 +696,22 @@ impl Config {
             models.apply(&mut table);
         }
         let mut config = Self::from_table_with_policy(layout, table, global)?;
+        for def in schema::registry() {
+            let source = if config.setting_sources.get(def.path) == Some(&"env")
+                && !(def.path == "edit.mode" && schema::get(overlay, def.path).is_some())
+            {
+                "env"
+            } else if schema::get(overlay, def.path).is_some() {
+                "CLI flag"
+            } else if schema::get(project, def.path).is_some() {
+                "project"
+            } else if schema::get(global, def.path).is_some() {
+                "global"
+            } else {
+                "default"
+            };
+            config.setting_sources.insert(def.path.to_owned(), source);
+        }
         if let Some(mode) = overlay
             .get("edit")
             .and_then(toml::Value::as_table)
@@ -702,12 +809,17 @@ impl Config {
                         .try_into()
                         .context("invalid DIAL_EDIT_VARIANT")?,
                 );
+                config.setting_sources.insert("edit.mode".into(), "env");
             }
         }
         if let Ok(value) = std::env::var("DIAL_EDIT_FUZZY") {
             match value.as_str() {
-                "1" | "true" => config.edit.fuzzy_match = true,
-                "0" | "false" => config.edit.fuzzy_match = false,
+                "1" | "true" | "0" | "false" => {
+                    config.edit.fuzzy_match = matches!(value.as_str(), "1" | "true");
+                    config
+                        .setting_sources
+                        .insert("edit.fuzzy_match".into(), "env");
+                }
                 _ => {}
             }
         }
@@ -717,6 +829,9 @@ impl Config {
                 .map_err(|_| anyhow::anyhow!("DIAL_EDIT_FUZZY_THRESHOLD must be UTF-8"))?;
             config.edit.fuzzy_threshold =
                 value.parse().context("invalid DIAL_EDIT_FUZZY_THRESHOLD")?;
+            config
+                .setting_sources
+                .insert("edit.fuzzy_threshold".into(), "env");
         }
         config.chatgpt_allowed_accounts = allowed;
         config.chatgpt_pinned_accounts = pins;
@@ -833,7 +948,25 @@ impl Config {
         config
             .model_roles
             .retain(|_, selection| selection.provider != "inherit");
-        for selection in config.model_roles.values_mut() {
+        for feature in [
+            &mut config.vision.grounding,
+            &mut config.vision.image_embedding,
+        ] {
+            if feature
+                .as_ref()
+                .is_some_and(|selection| selection.provider == "inherit")
+            {
+                *feature = None;
+            }
+        }
+        for selection in config.model_roles.values_mut().chain(
+            [
+                &mut config.vision.grounding,
+                &mut config.vision.image_embedding,
+            ]
+            .into_iter()
+            .filter_map(Option::as_mut),
+        ) {
             if selection.provider == "mlx" || selection.provider == crate::llm::apple::PROVIDER {
                 selection.base_url = None;
                 selection.api_key_env = None;
@@ -902,7 +1035,7 @@ impl Config {
         let mut selection = config.selection();
         selection.context_window = config.context_limit.tokens();
         config.context_window = config.resolve_context_window(&selection);
-        let python = layout.user_dir.join("python");
+        let python = crate::config::paths::python_dir(&layout.user_dir);
         if config.python.as_os_str().is_empty() {
             config.python = python.join(".venv/bin/python");
         }
@@ -1303,13 +1436,9 @@ impl Config {
         self.model_roles.get(role)
     }
 
-    /// Laya service settings: the assigned `decision` role supplies the checkpoint the service loads.
+    /// Laya service configuration, including its persisted checkpoint selection.
     pub fn laya_service(&self) -> crate::config::laya::Config {
-        let mut laya = self.laya.clone();
-        laya.checkpoint = self
-            .role_selection("decision")
-            .map(|selection| selection.model.clone());
-        laya
+        self.laya.clone()
     }
 
     /// Alt+M Roles rows in `ROLES` order: the model each role uses now and where that model comes from.
@@ -1329,22 +1458,11 @@ impl Config {
                 let (effective, source) = match (role, &assigned) {
                     ("main", _) => (Some(main.clone()), RoleSource::Main),
                     (_, Some(selection)) => (Some(selection.display_name()), RoleSource::Assigned),
-                    ("decision", None) => {
-                        match crate::config::laya::expected_checkpoint(&self.laya) {
-                            Some(checkpoint) => (
-                                Some(format!("Laya · {checkpoint}")),
-                                RoleSource::LayaInstalled,
-                            ),
-                            None => (None, RoleSource::NotSet),
-                        }
-                    }
-                    ("judge", None) => match self.model_roles.get("small") {
+                    ("decision", None) => match self.model_roles.get("small") {
                         Some(small) => (Some(small.display_name()), RoleSource::FollowsSmall),
                         None => (Some(main.clone()), RoleSource::FollowsMain),
                     },
-                    ("embedding" | "grounding" | "image_embedding", None) => {
-                        (None, RoleSource::NotSet)
-                    }
+                    ("embedding", None) => (None, RoleSource::NotSet),
                     // The memory role never falls back to main: local and sharpshooter stay inactive
                     // and semantic pauses automatic fact saving until it is assigned.
                     ("memory", None) => (None, RoleSource::NotSet),

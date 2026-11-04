@@ -2,20 +2,17 @@ use super::testkit::*;
 use super::*;
 use std::cell::RefCell;
 #[test]
-fn coherent_runtime_learning_preferences_have_a_separate_view() {
-    let mut coding = overlay().coding_only();
-    assert!(!coding.tabs.iter().any(|(tab, _)| *tab == "Improvement"));
-    for query in [
-        "laya",
+fn settings_includes_learning_preferences_and_learning_view_remains_a_subset() {
+    let mut all = overlay().coding_only();
+    for path in [
+        "laya.enabled",
         "improve.enabled",
         "training.rank",
         "memory.autolearn",
     ] {
-        coding.search = query.into();
-        assert!(coding.visible().iter().all(|row| !matches!(row, Row::Setting(i) if SettingsOverlay::learning_setting(&crate::config::schema::registry()[*i]))));
+        assert!(all.focus_path(path), "unknown {path}");
+        assert_eq!(path_at_cursor(&all), path);
     }
-    coding.search = "teach this model".into();
-    assert!(coding.visible().iter().any(|row| matches!(row, Row::Setting(i) if crate::config::schema::registry()[*i].path == "improve.teach")));
     let mut learning = overlay().learning_only();
     learning.search = "laya".into();
     assert!(learning.visible().iter().any(|row| matches!(row, Row::Setting(i) if crate::config::schema::registry()[*i].path == "laya.enabled")));
@@ -125,7 +122,7 @@ fn voice_tab_shows_dictation_without_search_or_advanced_and_allows_enabling_it()
         } else {
             overlay()
         };
-        o.tab = o.tabs.iter().position(|(tab, _)| *tab == "Voice").unwrap();
+        goto(&mut o, &rig.keys, "voice.stt.enabled");
         for path in [
             "voice.stt.enabled",
             "voice.stt.backend",
@@ -138,6 +135,7 @@ fn voice_tab_shows_dictation_without_search_or_advanced_and_allows_enabling_it()
                 "{path} missing (coding_only={coding_only})"
             );
         }
+        goto(&mut o, &rig.keys, "voice.stt.backend");
         let screen = draw(&mut o, &rig, 100, 30);
         assert!(screen.contains("Dictation"), "{screen}");
         assert!(screen.contains("Recognition program"), "{screen}");
@@ -189,17 +187,17 @@ fn hints_and_optional_offers_read_as_information_not_errors() {
 
 #[test]
 fn only_the_selected_memory_backend_shows_its_options() {
-    let on_learning = |mut o: SettingsOverlay| {
+    let on_memory = |mut o: SettingsOverlay| {
         o.tab = o.tabs.iter().position(|(t, _)| *t == "Memory").unwrap();
         o
     };
     // Default provenance: no backend sections at all.
-    let o = on_learning(overlay());
+    let o = on_memory(overlay());
     assert!(shows(&o, "memory.backend") && shows(&o, "memory.autolearn"));
     for path in ["memory.hindsight.endpoint", "memory.local.extraction_role"] {
         assert!(!shows(&o, path), "{path} is noise for provenance");
     }
-    let mut local = on_learning(SettingsOverlay::new(
+    let mut local = on_memory(SettingsOverlay::new(
         table("[memory]\nbackend = \"local\"\n"),
         Table::new(),
         table("[memory]\nbackend = \"local\"\n"),
@@ -213,7 +211,7 @@ fn only_the_selected_memory_backend_shows_its_options() {
         shows(&local, "memory.hindsight.endpoint"),
         "search still finds everything"
     );
-    let off = on_learning(SettingsOverlay::new(
+    let off = on_memory(SettingsOverlay::new(
         table("[memory]\nbackend = \"off\"\n"),
         Table::new(),
         Table::new(),
@@ -347,17 +345,17 @@ fn choose_next(o: &mut SettingsOverlay, keys: &Keymap) -> OverlayEvent {
 fn renders_title_tabs_sections_rows_and_footer() {
     let rig = Rig::new();
     let mut o = overlay();
+    goto(&mut o, &rig.keys, "ui.status_separator");
     let screen = draw(&mut o, &rig, 130, 30);
     for needle in [
         " Settings",
         "Save to: All projects",
         "Appearance",
-        "Interaction",
+        "Safety",
         "Setup",
-        "Status Line",
+        "STATUS LINE",
         "Separator",
         "Powerline thin",
-        "Preview: PREVIEW",
         "Search: ",
         "Esc close",
         "Ctrl+S scope",
@@ -371,35 +369,23 @@ fn renders_title_tabs_sections_rows_and_footer() {
 }
 
 #[test]
-fn section_list_counts_overridden_settings_so_customised_sections_stand_out() {
+fn category_tabs_count_saved_overrides_in_the_editing_scope() {
     let rig = Rig::new();
     let mut o = SettingsOverlay::new(
         table("[ui]\ntips = false\nmotion = false\nstatus_separator = \"pipe\"\n"),
-        Table::new(),
-        table("[ui]\ntips = false\nmotion = false\nstatus_separator = \"pipe\"\n"),
+        table("[ui]\nstatus_separator = \"pipe\"\n"),
+        table("[ui]\nstatus_separator = \"pipe\"\ntheme_dark = \"dark\"\n"),
         Scope::Global,
         vec![],
     );
-    let screen = draw(&mut o, &rig, 130, 40);
-    let section = |name: &str| {
-        screen
-            .lines()
-            .map(|line| line.split('│').next().unwrap_or_default().trim())
-            .find(|left| left.starts_with(name))
-            .unwrap_or_else(|| panic!("no {name} section\n{screen}"))
-            .to_owned()
-    };
-    assert!(section("Display").ends_with('2'), "{}", section("Display"));
-    assert!(
-        section("Status Line").ends_with('1'),
-        "{}",
-        section("Status Line")
-    );
-    assert_eq!(
-        section("Theme"),
-        "Theme",
-        "untouched sections carry no count"
-    );
+    goto(&mut o, &rig.keys, "ui.status_separator");
+    for (scope, count) in [(Scope::Global, 2), (Scope::Project, 1)] {
+        o.scope = scope;
+        let shown = draw(&mut o, &rig, 130, 40);
+        let category = o.tabs[o.tab].0;
+        let tabs = shown.lines().nth(1).unwrap();
+        assert!(tabs.contains(&format!("{category} {count}")), "{shown}");
+    }
 }
 
 #[test]
@@ -412,6 +398,7 @@ fn row_shows_modified_marker_and_source_per_layer() {
         Scope::Project,
         vec![],
     );
+    goto(&mut o, &rig.keys, "ui.status_separator");
     let screen = draw(&mut o, &rig, 120, 40);
     let line = |needle: &str| {
         screen
@@ -563,6 +550,11 @@ fn bool_toggles_and_enum_choices_require_confirmation() {
     let rig = Rig::new();
     let mut o = overlay();
     goto(&mut o, &rig.keys, "ui.tips");
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    send(&mut o, &rig.keys, key(KeyCode::Down));
     let (path, value, scope) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
     assert_eq!(
         (path.as_str(), value, scope),
@@ -575,7 +567,12 @@ fn bool_toggles_and_enum_choices_require_confirmation() {
         Some(&Value::Boolean(false)),
         "source layer updated"
     );
-    let (_, value, _) = expect_set(send(&mut o, &rig.keys, ch(' ')));
+    assert!(matches!(
+        send(&mut o, &rig.keys, ch(' ')),
+        OverlayEvent::None
+    ));
+    send(&mut o, &rig.keys, key(KeyCode::Down));
+    let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
     assert_eq!(value, Value::Boolean(true));
 
     goto(&mut o, &rig.keys, "ui.composer_shape");
@@ -838,7 +835,7 @@ fn search_filters_across_tabs_shows_location_and_escape_clears_before_closing() 
         "{shown}"
     );
     assert!(
-        shown.contains("Tools/Sandbox"),
+        shown.contains("Safety/Sandbox"),
         "each hit names its tab and section\n{shown}"
     );
     assert!(
@@ -846,14 +843,19 @@ fn search_filters_across_tabs_shows_location_and_escape_clears_before_closing() 
         "non-matching rows are hidden"
     );
     assert!(shown.contains("Esc clear search"));
-    // Hits come from other tabs than the current (Appearance) one.
+    // Hits come from other tabs than the initial Common section.
     assert!(matches!(
         send(&mut o, &rig.keys, key(KeyCode::Esc)),
         OverlayEvent::None
     ));
     assert!(o.search.is_empty());
-    // Appearance's Display rows sit below the fold at 30 rows with the framed chrome.
-    assert!(draw(&mut o, &rig, 120, 40).contains("Welcome banner"));
+    let restored = draw(&mut o, &rig, 120, 40);
+    assert_eq!(o.tabs[o.tab].0, "Common");
+    assert!(restored.contains("Theme"), "{restored}");
+    assert!(!shows(&o, "approval"));
+    goto(&mut o, &rig.keys, "approval");
+    assert_eq!(o.tabs[o.tab].0, "Safety");
+    assert!(draw(&mut o, &rig, 120, 40).contains("Approval mode"));
     assert!(matches!(
         send(&mut o, &rig.keys, key(KeyCode::Esc)),
         OverlayEvent::Close
@@ -936,7 +938,7 @@ fn search_never_changes_scope_and_ctrl_s_preserves_the_query() {
     assert_eq!(o.search, "status");
     assert!(draw(&mut o, &rig, 100, 24).contains("Save to: This project"));
     goto(&mut o, &rig.keys, "ui.tips");
-    let (_, _, scope) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+    let (_, _, scope) = expect_set(choose_next(&mut o, &rig.keys));
     assert_eq!(scope, Scope::Project, "later events carry the new scope");
     send(&mut o, &rig.keys, ctrl('s'));
     assert_eq!(o.scope, Scope::Global);
@@ -998,7 +1000,7 @@ fn saved_scope_feedback_survives_controller_refresh_but_not_navigation() {
         vec![],
     );
     goto(&mut o, &rig.keys, "ui.tips");
-    expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+    expect_set(choose_next(&mut o, &rig.keys));
     assert!(!draw(&mut o, &rig, 100, 24).contains("Saved globally"));
     o.settled("ui.tips", Ok(Value::Boolean(true)));
     o.replace_values(o.effective.clone(), o.project.clone(), o.global.clone());
@@ -1061,7 +1063,10 @@ fn preview_row_receives_the_pending_config() {
             status: &rig.status,
             preview_status: &preview,
         };
-        screen(&render(120, 30, |f| o.draw(f, &ctx)))
+        send(o, &rig.keys, key(KeyCode::F(4)));
+        let shown = screen(&render(120, 30, |f| o.draw(f, &ctx)));
+        send(o, &rig.keys, key(KeyCode::F(4)));
+        shown
     };
     assert!(paint(&mut o).contains("sep=PowerlineThin"));
     goto(&mut o, &rig.keys, "ui.status_separator");
@@ -1073,7 +1078,7 @@ fn preview_row_receives_the_pending_config() {
     );
     let shown = paint(&mut o);
     assert!(
-        shown.contains("Preview: sep=Slash"),
+        shown.contains("Preview status line: sep=Slash"),
         "pending value is previewed before the controller answers\n{shown}"
     );
     o.settled("ui.status_separator", Err("nope".into()));
@@ -1105,6 +1110,7 @@ fn invalid_ui_table_falls_back_to_default_preview() {
         status: &rig.status,
         preview_status: &preview,
     };
+    send(&mut o, &rig.keys, key(KeyCode::F(4)));
     let _ = render(100, 24, |f| o.draw(f, &ctx));
     assert_eq!(
         seen.borrow().as_ref().unwrap().status_separator,
@@ -1181,13 +1187,14 @@ fn tabs_and_sections_follow_the_keymap_including_remapped_keys() {
     let tab_name =
         |o: &SettingsOverlay| o.tabs.get(o.tab).map(|(t, _)| *t).unwrap_or(PROVIDERS_TAB);
     send(&mut o, &rig.keys, key(KeyCode::Right));
-    assert_eq!(tab_name(&o), "Interaction");
+    assert_eq!(tab_name(&o), o.tabs[1].0);
     send(&mut o, &rig.keys, key(KeyCode::Left));
     send(&mut o, &rig.keys, key(KeyCode::Left));
     assert_eq!(tab_name(&o), PROVIDERS_TAB, "wraps to the last tab");
     send(&mut o, &rig.keys, key(KeyCode::Right));
-    assert_eq!(tab_name(&o), "Appearance");
+    assert_eq!(tab_name(&o), "Common");
 
+    goto(&mut o, &rig.keys, "ui.theme_dark");
     // Tab / Shift+Tab jump between sections of the tab.
     let section = |o: &SettingsOverlay| SettingsOverlay::section_of(o.current_row().unwrap());
     assert_eq!(section(&o), "Theme");
@@ -1201,7 +1208,7 @@ fn tabs_and_sections_follow_the_keymap_including_remapped_keys() {
         Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
     );
     assert_eq!(section(&o), "Symbols");
-    for _ in 0..5 {
+    for _ in 0..o.tabs[o.tab].1.len() {
         send(&mut o, &rig.keys, key(KeyCode::Tab));
     }
     assert_eq!(section(&o), "Symbols", "wraps around the sections");
@@ -1220,15 +1227,16 @@ fn tabs_and_sections_follow_the_keymap_including_remapped_keys() {
     }
     let mut o = overlay();
     send(&mut o, &remapped, key(KeyCode::Right));
-    assert_eq!(tab_name(&o), "Appearance", "default chord no longer bound");
+    assert_eq!(tab_name(&o), "Common", "default chord no longer bound");
     send(&mut o, &remapped, ctrl('l'));
-    assert_eq!(tab_name(&o), "Interaction");
+    assert_eq!(tab_name(&o), o.tabs[1].0);
     send(&mut o, &remapped, ctrl('h'));
-    assert_eq!(tab_name(&o), "Appearance");
+    assert_eq!(tab_name(&o), "Common");
+    goto(&mut o, &remapped, "ui.theme_dark");
     send(&mut o, &remapped, ctrl('j'));
-    assert_eq!(o.cursor, 1);
+    assert_eq!(path_at_cursor(&o), "ui.theme_light");
     send(&mut o, &remapped, ctrl('k'));
-    assert_eq!(o.cursor, 0);
+    assert_eq!(path_at_cursor(&o), "ui.theme_dark");
     send(&mut o, &remapped, ctrl('n'));
     assert_eq!(section(&o), "Symbols");
     let hints = draw(
@@ -1313,8 +1321,10 @@ fn long_lists_scroll_to_keep_the_cursor_visible_and_show_a_scrollbar() {
         Scope::Global,
         vec![],
     );
-    o.tab = o.tabs.iter().position(|(t, _)| *t == "Memory").unwrap();
+    goto(&mut o, &rig.keys, "memory.backend");
+    assert_eq!(o.tabs[o.tab].0, "Memory");
     o.advanced_open.insert(("Memory", "Rollout memory"));
+    assert!(o.visible().len() > 21, "fixture must exercise a long list");
     let shown = draw(&mut o, &rig, 120, 16);
     assert!(shown.contains(rig.theme.sym(Sym::ScrollThumb)), "{shown}");
     for _ in 0..20 {
@@ -1340,7 +1350,7 @@ fn replace_values_drops_pending_state() {
     let rig = Rig::new();
     let mut o = overlay();
     goto(&mut o, &rig.keys, "ui.tips");
-    send(&mut o, &rig.keys, key(KeyCode::Enter));
+    expect_set(choose_next(&mut o, &rig.keys));
     o.settled("ui.tips", Err("x".into()));
     o.replace_values(table("[ui]\ntips = false\n"), Table::new(), Table::new());
     assert!(o.pending.is_empty() && o.notes.is_empty());
@@ -1403,21 +1413,30 @@ fn wide_and_hostile_text_is_kept_inside_the_frame() {
 fn experimental_tab_renders_each_new_toggle_off_by_default() {
     let rig = Rig::new();
     let mut o = overlay();
-    goto(&mut o, &rig.keys, "experimental.work_packet_contracts");
-    let shown = draw(&mut o, &rig, 120, 32);
-    for label in [
-        "Work packet contracts",
-        "Verification receipts",
-        "Overlap deduplication",
-        "Profile matching",
+    for (path, label) in [
+        (
+            "experimental.work_packet_contracts",
+            "Work packet contracts",
+        ),
+        (
+            "experimental.verification_receipts",
+            "Verification receipts",
+        ),
+        (
+            "experimental.context_overlap_dedup",
+            "Overlap deduplication",
+        ),
+        ("experimental.profile_matching", "Profile matching"),
     ] {
-        assert!(shown.contains(label), "missing {label} in:\n{shown}");
+        goto(&mut o, &rig.keys, path);
+        let shown = draw(&mut o, &rig, 120, 32);
+        let line = shown
+            .lines()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("missing {label} in {shown}"));
+        assert!(line.contains("off"), "{line}");
+        assert!(shown.contains("Advanced"));
     }
-    assert!(shown.contains("Experimental"));
-    assert!(
-        shown.contains("off"),
-        "toggles should render disabled:\n{shown}"
-    );
 }
 
 #[test]
@@ -1489,7 +1508,7 @@ fn picker_value(o: &SettingsOverlay) -> &str {
 }
 
 #[test]
-fn picker_filter_narrows_previews_the_match_and_esc_clears_before_closing() {
+fn appearance_picker_filter_previews_the_match_and_esc_discards() {
     let rig = Rig::new();
     let mut o = theme_overlay(&["dark", "light", "mono"]);
     open_theme_picker(&mut o, &rig.keys);
@@ -1501,15 +1520,6 @@ fn picker_filter_narrows_previews_the_match_and_esc_clears_before_closing() {
     assert_eq!(picker_value(&o), "mono");
     let shown = draw(&mut o, &rig, 100, 30);
     assert!(shown.contains("1 of 4"), "{shown}");
-    // Esc clears the filter first and keeps the picker open on the same value.
-    assert!(matches!(
-        send(&mut o, &rig.keys, key(KeyCode::Esc)),
-        OverlayEvent::None
-    ));
-    assert!(matches!(o.mode, Mode::Pick { .. }));
-    assert_eq!(filter_text(&o), "");
-    assert_eq!(picker_value(&o), "mono");
-    // Only a bare Esc closes it, restoring the saved theme preview.
     assert!(matches!(
         send(&mut o, &rig.keys, key(KeyCode::Esc)),
         OverlayEvent::PreviewTheme(None)
@@ -1562,7 +1572,7 @@ fn picker_filter_with_no_matches_saves_nothing_and_says_how_to_recover() {
     send_all(&mut o, &rig.keys, typed("zzz"));
     let shown = draw(&mut o, &rig, 100, 30);
     assert!(shown.contains("No option matches \"zzz\""), "{shown}");
-    assert!(shown.contains("clear filter"), "{shown}");
+    assert!(shown.contains("Esc discard"), "{shown}");
     assert!(matches!(
         send(&mut o, &rig.keys, key(KeyCode::Enter)),
         OverlayEvent::None
@@ -1582,8 +1592,7 @@ fn long_pickers_offer_a_filter_and_each_new_picker_starts_unfiltered() {
     assert!(shown.contains("Type filter"), "{shown}");
     send_all(&mut o, &rig.keys, typed("o"));
     assert!(draw(&mut o, &rig, 100, 30).contains(" of 10"));
-    // Esc clears the filter, a second Esc closes the picker, and reopening starts unfiltered.
-    send(&mut o, &rig.keys, key(KeyCode::Esc));
+    // Appearance Esc discards immediately, even with a filter.
     send(&mut o, &rig.keys, key(KeyCode::Esc));
     assert!(matches!(o.mode, Mode::Browse));
     open_theme_picker(&mut o, &rig.keys);
@@ -1622,13 +1631,29 @@ fn only_the_selected_row_carries_the_selection_marker() {
 }
 
 #[test]
-fn appearance_rows_hide_the_preview_line_when_there_is_nothing_to_preview() {
+fn appearance_preview_is_explicit_and_return_restores_the_controls() {
     let rig = Rig::new();
     let mut o = overlay();
     goto(&mut o, &rig.keys, "ui.theme");
-    let empty = |_: &UiConfig, _: u16| Line::default();
-    assert!(!draw_with(&mut o, &rig, 100, 24, &empty).contains("Preview:"));
-    assert!(draw(&mut o, &rig, 100, 24).contains("Preview: PREVIEW"));
+    let calls = std::cell::Cell::new(0);
+    let preview = |_: &UiConfig, _: u16| {
+        calls.set(calls.get() + 1);
+        Line::from("EXPLICIT PREVIEW")
+    };
+    let controls = draw_with(&mut o, &rig, 100, 24, &preview);
+    assert_eq!(
+        calls.get(),
+        0,
+        "browsing settings must not render a preview"
+    );
+    send(&mut o, &rig.keys, key(KeyCode::F(4)));
+    assert!(
+        draw_with(&mut o, &rig, 100, 24, &preview)
+            .contains("Preview status line: EXPLICIT PREVIEW")
+    );
+    assert_eq!(calls.get(), 1);
+    send(&mut o, &rig.keys, key(KeyCode::F(4)));
+    assert_eq!(draw_with(&mut o, &rig, 100, 24, &preview), controls);
 }
 
 #[test]
@@ -1649,28 +1674,60 @@ fn narrow_title_sheds_the_scope_label_without_touching_the_title() {
 }
 
 #[test]
-fn clipped_tab_strip_marks_hidden_tabs_and_keeps_the_active_one_whole() {
-    let theme = crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
-    let rig = Rig::with_theme(theme);
+fn horizontal_categories_keep_the_header_and_list_position_stable() {
+    let rig = Rig::new();
     let mut o = overlay();
-    let names: Vec<&str> = o.tabs.iter().map(|(t, _)| *t).collect();
-    let first = draw(&mut o, &rig, 38, 16);
-    let strip = first.lines().nth(1).unwrap();
-    assert!(strip.trim_end().ends_with("..."), "{strip}");
-    // Every name on the strip is whole: no tab is clipped mid-word.
-    for word in strip.split_whitespace().filter(|w| *w != "...") {
+    for width in [60, 130] {
+        goto(&mut o, &rig.keys, "ui.theme");
+        let before = draw(&mut o, &rig, width, 30);
+        let search_row = before
+            .lines()
+            .position(|line| line.contains("Search:"))
+            .unwrap();
+        let first_setting_row = before
+            .lines()
+            .position(|line| line.contains("Theme") && line.contains(rig.theme.sym(Sym::Pointer)))
+            .unwrap();
         assert!(
-            names.contains(&word) || word == PROVIDERS_TAB,
-            "clipped {word:?} in {strip}"
+            before.lines().nth(1).unwrap().contains("Common"),
+            "{before}"
         );
-    }
-    for _ in 0..names.len() {
+        assert!(
+            before.lines().nth(1).unwrap().contains("Appearance"),
+            "{before}"
+        );
+        assert!(
+            !before.contains("Preview theme:") && !before.contains("Preview: PREVIEW"),
+            "preview must be explicitly opened:\n{before}"
+        );
+        send(&mut o, &rig.keys, key(KeyCode::Down));
+        let after = draw(&mut o, &rig, width, 30);
+        assert_eq!(
+            before.lines().take(search_row + 1).collect::<Vec<_>>(),
+            after.lines().take(search_row + 1).collect::<Vec<_>>(),
+            "header changed while moving down:\n{after}"
+        );
+        assert_eq!(
+            after
+                .lines()
+                .position(
+                    |line| line.contains("Theme") && !line.contains(rig.theme.sym(Sym::Pointer))
+                )
+                .unwrap(),
+            first_setting_row,
+            "list jumped while moving down:\n{after}"
+        );
+        let tab = o.tab;
         send(&mut o, &rig.keys, key(KeyCode::Right));
+        assert_eq!(o.tab, (tab + 1) % (o.tabs.len() + 1));
+        let next = draw(&mut o, &rig, width, 30);
+        assert_eq!(
+            next.lines().position(|line| line.contains("Search:")),
+            Some(search_row)
+        );
+        send(&mut o, &rig.keys, key(KeyCode::Left));
+        assert_eq!(o.tab, tab);
     }
-    let last = draw(&mut o, &rig, 38, 16);
-    let strip = last.lines().nth(1).unwrap();
-    assert!(strip.trim_start().starts_with("..."), "{strip}");
-    assert!(strip.contains(PROVIDERS_TAB), "{strip}");
 }
 
 #[test]
@@ -1802,6 +1859,11 @@ fn credential_settings_are_masked_until_deliberately_revealed() {
         assert!(!draw(&mut o, &rig, 180, 40).contains("sentinel-private-secret"));
         send(&mut o, &rig.keys, key(KeyCode::Enter));
         assert!(!draw(&mut o, &rig, 180, 40).contains("sentinel-private-secret"));
+        // Structured collections open safely first; Ctrl+E retains the masked raw escape hatch.
+        if matches!(o.mode, Mode::Entries { .. }) {
+            send(&mut o, &rig.keys, ctrl('e'));
+            assert!(!draw(&mut o, &rig, 180, 40).contains("sentinel-private-secret"));
+        }
         send(&mut o, &rig.keys, ctrl('r'));
         assert!(o.reveal_sensitive);
         assert!(draw(&mut o, &rig, 220, 40).contains("sentinel-private-secret"));
@@ -1993,12 +2055,12 @@ fn known_value_lists_check_values_instead_of_typing_them() {
 fn collections_open_a_per_entry_editor_that_saves_the_whole_value() {
     let rig = Rig::new();
     let mut o = overlay();
-    // Collections that can hold credentials (hooks, MCP, providers…) keep the masked text editor.
+    // Credential-bearing collections also offer the focused, masked entry editor.
     goto(&mut o, &rig.keys, "hooks");
     send(&mut o, &rig.keys, key(KeyCode::Enter));
     assert!(
-        matches!(o.mode, Mode::Edit { .. }),
-        "sensitive stays masked"
+        matches!(o.mode, Mode::Entries { .. }),
+        "sensitive collection offers focused fields"
     );
     send(&mut o, &rig.keys, key(KeyCode::Esc));
 
@@ -2010,6 +2072,8 @@ fn collections_open_a_per_entry_editor_that_saves_the_whole_value() {
     );
     // An empty table shows the add row first; Enter opens its input.
     send(&mut o, &rig.keys, key(KeyCode::Enter));
+    // Advanced TOML remains available from the ordinary typed Add flow.
+    send(&mut o, &rig.keys, ctrl('e'));
     send_all(
         &mut o,
         &rig.keys,
@@ -2017,7 +2081,7 @@ fn collections_open_a_per_entry_editor_that_saves_the_whole_value() {
     );
     send(&mut o, &rig.keys, key(KeyCode::Enter));
     let screen = draw(&mut o, &rig, 120, 40);
-    assert!(screen.contains("cargo check"), "{screen}");
+    assert!(screen.contains("commands = 1 items"), "{screen}");
     assert!(screen.contains("Save changes"), "{screen}");
     // Down past the add row reaches Save.
     send(&mut o, &rig.keys, key(KeyCode::Down));
@@ -2246,3 +2310,19 @@ fn reasoning_strategy_picker_browses_cancels_and_confirms_raw_values_including_d
         "global selection must not alter project settings"
     );
 }
+
+#[test]
+fn settings_runtime_sources_win_over_saved_layers() {
+    let mut panel = overlay().with_sources(BTreeMap::from([
+        ("ui.tips".into(), "CLI flag"),
+        ("edit.fuzzy_match".into(), "env"),
+    ]));
+    panel.project = table("[ui]\ntips = true\n[edit]\nfuzzy_match = false");
+    assert_eq!(panel.source("ui.tips"), "CLI flag");
+    assert_eq!(panel.source("edit.fuzzy_match"), "env");
+    assert_eq!(panel.source("ui.theme"), "default");
+}
+
+mod application;
+mod bulk;
+mod redesign;

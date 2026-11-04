@@ -175,7 +175,7 @@ fn switching_sessions_retires_the_old_peer_identity() {
         )
         .unwrap();
         let next_session_id = session.id().to_owned();
-        let _old_journal = agent.swap_session(session);
+        let _old_journal = agent.swap_session(session).unwrap();
         let peers = observer.peers().unwrap();
         assert_eq!(peers.len(), 1);
         assert_ne!(peers[0].id, old);

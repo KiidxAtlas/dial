@@ -37,8 +37,16 @@ fn capture_diagnostics(mut stream: impl Read, captured: &Mutex<Vec<u8>>) {
         }
     }
 }
+fn check_deadline(deadline: Option<Instant>) -> Result<()> {
+    ensure!(
+        deadline.is_none_or(|deadline| Instant::now() < deadline),
+        "benchmark RPC timed out"
+    );
+    Ok(())
+}
 fn receive(rx: &mpsc::Receiver<Result<Value>>, deadline: Option<Instant>) -> Result<Value> {
-    match deadline {
+    check_deadline(deadline)?;
+    let event = match deadline {
         Some(deadline) => match rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
         {
             Ok(event) => event,
@@ -48,7 +56,9 @@ fn receive(rx: &mpsc::Receiver<Result<Value>>, deadline: Option<Instant>) -> Res
             }
         },
         None => rx.recv().context("benchmark RPC closed")?,
-    }
+    }?;
+    check_deadline(deadline)?;
+    Ok(event)
 }
 fn request(
     input: &mut impl Write,
@@ -59,6 +69,8 @@ fn request(
     deadline: Option<Instant>,
     metrics: &mut RunMetrics,
 ) -> Result<Value> {
+    check_deadline(deadline)
+        .with_context(|| format!("waiting for benchmark RPC {method} (request {id})"))?;
     serde_json::to_writer(
         &mut *input,
         &json!({"id":id,"method":method,"params":params}),

@@ -8,6 +8,70 @@ use crate::config::types::Approval;
 use crate::ui::overlay::palette::{ChoiceItem, ChoiceSpec};
 
 impl Shell {
+    pub(in crate::app) fn side_thread_picker(&self) -> ChoiceSpec {
+        let mut items: Vec<_> = self
+            .side
+            .threads()
+            .iter()
+            .map(|thread| ChoiceItem {
+                value: format!("threads actions {}", thread.id),
+                label: thread.title.clone(),
+                detail: format!("{} · {} exchange(s)", thread.id, thread.exchanges.len()),
+                current: false,
+            })
+            .collect();
+        items.push(ChoiceItem {
+            value: "threads new".into(),
+            label: "New side question".into(),
+            detail: "Write a question in the composer without changing the main conversation."
+                .into(),
+            current: false,
+        });
+        ChoiceSpec {
+            title: "Side threads".into(),
+            command: "btw".into(),
+            items,
+            summary: "Choose a thread to open, copy, cancel or promote; or start a new question."
+                .into(),
+            ..Default::default()
+        }
+    }
+
+    /// Picker-only actions resolve to the existing commands; no thread semantics change.
+    pub(in crate::app) fn side_thread_action(&mut self, args: &str) -> Option<String> {
+        if args == "threads new" {
+            if self.composer.draft().trim().is_empty() {
+                self.composer.set_draft("/btw new ");
+            } else {
+                self.note(
+                    "BTW",
+                    "Your draft is kept. Send /btw new <question> to start a new side thread.",
+                );
+            }
+            return None;
+        }
+        let Some(id) = args.strip_prefix("threads actions ") else {
+            return Some(args.to_owned());
+        };
+        let choice = self.ask("Side thread", "Opening or copying leaves the main conversation unchanged. Promotion creates an independent full session.", &[("Open", 'o'), ("Copy answer", 'c'), ("Cancel streaming answer", 'x'), ("Promote to session", 'p'), ("New question", 'n')])?;
+        match choice {
+            0 => Some(format!("open {id}")),
+            1 => {
+                let text = self.side.command(&format!("open {id}"), None);
+                if text.starts_with("error:") {
+                    self.note("BTW", text);
+                    return None;
+                }
+                Some("copy".into())
+            }
+            2 => Some("cancel".into()),
+            3 => Some(format!("promote {id}")),
+            _ => {
+                self.side_thread_action("threads new");
+                None
+            }
+        }
+    }
     /// The value picker a bare command opens in the TUI: `/approval`, `/effort`, `/profile`,
     /// `/theme`, `/queue` and `/permissions remove`. `None` keeps the command's text output.
     pub(super) fn picker(
@@ -47,7 +111,11 @@ impl Shell {
                     .map(|value| {
                         let mode: Approval = serde_json::from_value(serde_json::json!(value))
                             .expect("approval metadata");
-                        pick(value, mode.description(), *value == current)
+                        ChoiceItem {
+                            label: crate::ui::status::approval_label(value).to_owned(),
+                            detail: format!("{value} · {}", mode.description()),
+                            ..pick(value, mode.description(), *value == current)
+                        }
                     })
                     .collect();
                 Some(picker(
@@ -58,7 +126,10 @@ impl Shell {
                     items,
                     (
                         "Filter modes:",
-                        format!("When Dial asks before acting; now {current}"),
+                        format!(
+                            "When Dial asks before acting; now {}",
+                            crate::ui::status::approval_label(&current)
+                        ),
                     ),
                 ))
             }
@@ -257,7 +328,23 @@ impl Shell {
             self.ask("Step details", &detail, &[("Back to work plan", 'b')])?;
             selected = index;
         }
-        let mut plan = crate::ui::tasks::plan_picker(&self.todo);
+        let mut plan = Some(
+            crate::ui::tasks::plan_picker(&self.todo).unwrap_or_else(|| ChoiceSpec {
+                title: "Work plan".into(),
+                command: "todo".into(),
+                verb: "show",
+                summary: "No plan recorded yet.".into(),
+                ..Default::default()
+            }),
+        );
+        if let Some(plan) = &mut plan {
+            plan.items.push(ChoiceItem {
+                value: "__progress".into(),
+                label: "Progress".into(),
+                detail: crate::ui::tasks::progress_text(progress),
+                current: false,
+            });
+        }
         if let (Some(plan), Some(index)) = (&mut plan, selected) {
             for item in &mut plan.items {
                 item.current = item.value == (index + 1).to_string();

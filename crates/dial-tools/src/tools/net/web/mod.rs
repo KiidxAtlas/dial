@@ -107,10 +107,9 @@ impl WebFetch {
             pipeline::render(&self.client, &config.web, workspace, url, raw, HTML_ACCEPT)?;
         let mut text = content::truncate_chars(rendered.text, max_chars);
         if rendered.truncated {
-            text.push_str(&format!(
-                "\n[the response exceeded {} bytes; the rest was not downloaded]",
-                fetch::MAX_BODY_BYTES
-            ));
+            text.push_str(
+                "\n[response download stopped at the per-response or shared discovery byte limit; remaining content was not downloaded]",
+            );
         }
         let requested = fetch::parse_url(url)?.to_string();
         let mut source = format!(
@@ -118,7 +117,7 @@ impl WebFetch {
             rendered.url, rendered.status, rendered.media
         );
         if rendered.url != requested {
-            source.push_str(&format!(", redirected from {requested}"));
+            source.push_str(&format!(", requested URL {requested}"));
         }
         Ok(untrusted(&source, &text))
     }

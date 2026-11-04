@@ -13,6 +13,8 @@ Ollama) or hosted providers, with approvals, sandboxing and checkpoints included
 
 [Install](#install) · [Quick start](#quick-start) · [Screenshots](#a-look-around) · [Configuration](#configuration-essentials) · [Docs](#documentation)
 
+[Everyday Dial: start, steer, review, undo and resume](docs/everyday.md)
+
 <img src="docs/images/home.png" alt="Dial's home screen: the dial wordmark, a centered composer asking what are we building, and the active model, project and branch" width="640">
 
 </div>
@@ -170,45 +172,18 @@ defaults; [docs/model-routing.md](docs/model-routing.md) covers model roles and 
 
 ## Documentation
 
-This README is an overview. Detailed documentation lives in [`docs/`](docs/), and
-[`ARCHITECTURE.md`](ARCHITECTURE.md) describes the module layout, dependency boundaries and invariants.
+Start with [Everyday Dial](docs/everyday.md), then use the
+[documentation index](docs/README.md) for focused Everyday, Configure and Internals guides.
 
-**Getting started and everyday use**
+- [Install or release](docs/release-and-install.md), including [Docker](docs/docker.md) and [Windows](docs/windows.md).
+- [Configure providers and settings](docs/configuration.md), [choose models](docs/provider-catalog.md), or [assign roles](docs/model-routing.md).
+- [Use the terminal](docs/terminal-interface.md), [tools](docs/tools.md), and [subagents](docs/subagents.md).
+- [Extend Dial](docs/extensibility.md) or [integrate an editor through RPC/ACP](docs/rpc-and-acp.md).
+- [Measure outcomes](docs/benchmarks.md) and explore [optional improvement](docs/improvement.md).
 
-- [Release and installation](docs/release-and-install.md): installers, manual platform setup, signing, building from source, publishing releases
-- [Docker](docs/docker.md): run Dial in a container (`docker run`, Compose), sandbox options, Docker Model Runner
-- [Optional dependencies and one-key setup](docs/setup.md): `/settings` Ctrl+L, `/setup`, `dial doctor --fix`, verified runtime downloads
-- [Configuration](docs/configuration.md): layers, unlimited execution defaults, annotated example
-- [Terminal interface](docs/terminal-interface.md): composer, slash commands, steering and queueing, shortcuts, `/settings`, model settings, themes, image previews
-- [Composer and editor](docs/composer.md), [TUI rendering](docs/tui-rendering.md), [Voice](docs/voice.md), [Windows](docs/windows.md)
-
-**Models and providers**
-
-- [Provider and model catalog](docs/provider-catalog.md): discovery, local MLX/LM Studio/Ollama/llama.cpp, API keys, Claude and ChatGPT/Codex subscriptions, `/compute`, cost accounting
-- [Model routing](docs/model-routing.md): model roles, picker role assignment, retries and fallback chains
-- [LLM transport](docs/llm-transport.md): model profiles, protocols, prompt caching, request headers, retries, image input
-
-**The agent and its tools**
-
-- [Agent loop and context maintenance](docs/agent-loop.md): coding workflow, verification and completion, shared context economy, human questions and checkpoints, compaction policies, live phase policy
-- [Tools, safety and context](docs/tools.md): tool roster and integrations, approvals and sandbox, context sources, [editing grammars](docs/tools.md#editing-grammars-and-safety), tool reliability
-- [Execution and web tools](docs/execution-and-web.md): kernels, browser, web access, DAP
-- [Shell tool](docs/shell.md), [Terminal shell](docs/terminal-shell.md), [SSH](docs/ssh.md)
-- [Subagents](docs/subagents.md): delegation, typed roles, isolation, live tasks, worker panel
-
-**Extending and automating**
-
-- [Extensions and project context](docs/extensibility.md): skills import and toggles, custom tools, Rust SDK, [hooks, path permissions and schedules](docs/extensibility.md#lifecycle-hooks-path-permissions-isolated-workers-and-schedules), [git tool, budgets, custom agents and HTTP MCP](docs/extensibility.md#git-tools-budgets-custom-agents-and-http-mcp)
-- [Stream rules](docs/stream-rules.md): portable rules that interrupt or remind the model as it streams, judged `question` rules, `/rule` and `dial rules list|test`
-- [RPC and ACP](docs/rpc-and-acp.md): print mode JSON output, session CLI, persistent RPC, ACP
-- [Background services](docs/background-services.md), [Encrypted collaboration](docs/collab.md), [Sharing, statistics and telemetry](docs/share-stats-telemetry.md)
-
-**Memory, learning and measurement**
-
-- [Memory and background learning](docs/memory-and-learning.md): memory backends, saved codebase understanding (`/understanding`), architecture synthesis, experience reuse
-- [Optional learning and harness improvement](docs/improvement.md): `dial improve` cycles, LoRA and fast weight candidates, verified local-model workflows, repository exercises, activation steering, weight and activation inspection (`dial weights`, `/weights`), portable packs
-- [Benchmarks and measurement](docs/benchmarks.md): `dial bench`/`dial benchmark` suites, efficiency measurement, regression checks, configuration comparisons, assistance ablation
-- [Autoresearch and archive](docs/autoresearch-and-archive.md)
+Contributors: start with [CONTRIBUTING.md](CONTRIBUTING.md).
+[ARCHITECTURE.md](ARCHITECTURE.md) owns crate boundaries and invariants;
+[AGENTS.md](AGENTS.md) records repository conventions.
 
 ## Known limits
 

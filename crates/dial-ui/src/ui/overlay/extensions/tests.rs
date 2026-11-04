@@ -344,6 +344,7 @@ fn empty_tabs_wrap_their_way_forward_and_hints_skip_unavailable_actions() {
     let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
     // The whole empty message is readable, never clipped at the edge.
     assert!(flat.contains("search the catalog."), "{screen}");
+    assert!(flat.contains("a add custom"), "{screen}");
     // Nothing is selected and no next page is pending: no row actions or paging are offered.
     for absent in [
         "t test",
@@ -370,6 +371,8 @@ fn empty_tabs_wrap_their_way_forward_and_hints_skip_unavailable_actions() {
         screen.contains("t test") && screen.contains("e disable") && screen.contains("x remove"),
         "{screen}"
     );
+    assert!(screen.contains("a add custom"), "{screen}");
+    assert!(screen.contains("d edit configuration"), "{screen}");
 }
 
 #[test]
@@ -601,4 +604,94 @@ fn errors_from_the_controller_show_as_a_failed_job_and_notices_stay_neutral() {
     overlay.banner("Applying", false);
     assert!(matches!(overlay.browser.job, Job::Idle));
     assert_eq!(overlay.browser.message, "Applying");
+}
+
+#[test]
+fn local_tabs_support_shared_keys_without_remote_requests_or_mutations() {
+    use crate::ui::overlay::settings::testkit::{Rig, key, render, screen, status_preview};
+    use crossterm::event::KeyCode;
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    for tab in [Tab::Tools, Tab::Hooks] {
+        let mut panel = ExtensionsOverlay::new();
+        panel.browser.set_rows(
+            tab,
+            vec![row("local-fixture", Origin::Installed, State::Enabled)],
+        );
+        panel.browser.select_tab(tab);
+        assert!(matches!(
+            panel.handle(&key(KeyCode::Char('r')), &rig.keys),
+            OverlayEvent::None
+        ));
+        assert!(matches!(
+            panel.handle(&key(KeyCode::Enter), &rig.keys),
+            OverlayEvent::None
+        ));
+        assert!(panel.browser.details_open);
+        panel.handle(&key(KeyCode::Esc), &rig.keys);
+        panel.handle(&key(KeyCode::Char('?')), &rig.keys);
+        assert!(screen(&render(100, 30, |f| panel.draw(f, &ctx))).contains("Extensions · keys"));
+        panel.handle(&key(KeyCode::Esc), &rig.keys);
+        panel.handle(&key(KeyCode::Char('/')), &rig.keys);
+        panel.handle(&key(KeyCode::Char('?')), &rig.keys);
+        assert_eq!(panel.browser.query(), "?");
+        assert!(matches!(
+            panel.handle(&key(KeyCode::Enter), &rig.keys),
+            OverlayEvent::None
+        ));
+    }
+}
+
+#[test]
+fn mcp_configuration_doorways_open_settings_without_starting_work() {
+    use crate::ui::overlay::settings::testkit::{Rig, key};
+    use crossterm::event::KeyCode;
+
+    let rig = Rig::new();
+    for (entry, shortcut, opens) in [
+        (None, 'a', true),
+        (None, 'd', false),
+        (Some((Origin::Installed, State::Enabled)), 'a', true),
+        (Some((Origin::Installed, State::Enabled)), 'd', true),
+        (Some((Origin::Installed, State::Disabled)), 'd', true),
+        (Some((Origin::Curated, State::Available)), 'a', true),
+        (Some((Origin::Curated, State::Available)), 'd', false),
+    ] {
+        let mut overlay = ExtensionsOverlay::new();
+        if let Some((origin, state)) = entry {
+            overlay
+                .browser
+                .set_rows(Tab::Mcp, vec![row("fixture", origin, state)]);
+        }
+        let event = overlay.handle(&key(KeyCode::Char(shortcut)), &rig.keys);
+        if opens {
+            assert!(matches!(event, OverlayEvent::Action(action) if action == "open:settings:mcp"));
+        } else {
+            assert!(matches!(event, OverlayEvent::None));
+        }
+        assert!(matches!(overlay.browser.job, Job::Idle));
+        assert!(overlay.browser.confirm.is_none());
+        assert!(overlay.browser.form.is_none());
+        assert!(!overlay.browser.catalog(Tab::Mcp).loading);
+        assert!(!overlay.take_refresh());
+    }
+
+    for tab in [Tab::Skills, Tab::Tools, Tab::Hooks] {
+        let mut overlay = ExtensionsOverlay::new();
+        overlay.browser.select_tab(tab);
+        overlay
+            .browser
+            .set_rows(tab, vec![row("fixture", Origin::Installed, State::Enabled)]);
+        for shortcut in ['a', 'd'] {
+            assert!(matches!(
+                overlay.handle(&key(KeyCode::Char(shortcut)), &rig.keys),
+                OverlayEvent::None
+            ));
+        }
+    }
 }

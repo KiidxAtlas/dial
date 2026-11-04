@@ -56,3 +56,300 @@ fn normal_actor_failure_emits_fatal_without_duplicate_request_reply() {
         .is_ok()
     );
 }
+
+fn with_runtime(configure: impl FnOnce(&mut Config), f: impl FnOnce(&mut ActorRuntime<'_>)) {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    let mut config = Config {
+        state_dir: layout.state_dir.clone(),
+        compute_locks: false,
+        ..Config::default()
+    };
+    config.codebase.enabled = false;
+    config.memory.backend = crate::config::memory_backend::MemoryBackendId::Off;
+    configure(&mut config);
+    let backend = crate::llm::provider::Backend::new(
+        crate::llm::provider::ProviderKind::Endpoint {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            model: "test".into(),
+            api_key: None,
+        },
+        std::path::PathBuf::new(),
+        5,
+    );
+    let flag = Arc::new(AtomicBool::new(false));
+    let agent = Agent::interactive(
+        &config,
+        backend,
+        layout.clone(),
+        Session::create(
+            &layout,
+            SessionMeta {
+                model: "test".into(),
+            },
+        )
+        .unwrap(),
+        None,
+        None,
+        flag.clone(),
+    )
+    .unwrap();
+    let out = Sender {
+        output: Arc::new(Mutex::new(Output {
+            acp: None,
+            protocol: DEFAULT_PROTOCOL_VERSION,
+        })),
+        writer: crate::output::StdoutWriter::new().unwrap(),
+        failed: Arc::new(AtomicBool::new(false)),
+        failure: Arc::new(OnceLock::new()),
+    };
+    let (_, approvals) = mpsc::channel();
+    let (_, questions) = mpsc::channel();
+    let (_, rx) = mpsc::channel();
+    let ui = RpcUi {
+        out: out.clone(),
+        approvals,
+        pending_approval: Arc::new(Mutex::new(None)),
+        question_answers: questions,
+        pending_question: Arc::new(Mutex::new(None)),
+        interrupt: flag.clone(),
+        input_disconnected: Arc::new(AtomicBool::new(false)),
+        steering: Arc::new(Mutex::new(Vec::new())),
+        prompt_queued: Arc::new(AtomicBool::new(false)),
+        next: 0,
+        node_cursors: Default::default(),
+        node_revisions: Default::default(),
+        node_meta: Default::default(),
+        projection_dirty: false,
+        tree: None,
+    };
+    let mut runtime = ActorRuntime {
+        parked: Default::default(),
+        ui,
+        agent,
+        compute: None,
+        layout: &layout,
+        config: &config,
+        acp: true,
+        rx,
+        worker_out: &out,
+        flag,
+        active: Arc::new(AtomicBool::new(false)),
+        worker_closing: Arc::new(AtomicBool::new(false)),
+        worker_prompt_queued: Arc::new(AtomicBool::new(false)),
+        worker_host: Default::default(),
+        worker_uris: Default::default(),
+        worker_query_cache: Default::default(),
+        worker_live: Default::default(),
+        projected_messages: 0,
+        projected_at: Instant::now(),
+        current: true,
+    };
+    f(&mut runtime);
+}
+
+#[cfg(unix)]
+#[test]
+fn implicit_parked_activation_obeys_switch_veto_without_teardown() {
+    with_runtime(
+        |config| {
+            config.hooks.push(crate::config::types::HookConfig {
+                event: "session_before_switch".into(),
+                matcher: None,
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf '{\"decision\":\"block\",\"reason\":\"stay here\"}'".into(),
+                ],
+                timeout_secs: 5,
+                fail_closed: None,
+            });
+        },
+        |runtime| {
+            let current = runtime.agent.session().id().to_owned();
+            let next = Session::create(
+                runtime.layout,
+                SessionMeta {
+                    model: "test".into(),
+                },
+            )
+            .unwrap();
+            let wanted = next.id().to_owned();
+            runtime
+                .parked
+                .insert(wanted.clone(), ParkedSession::fresh(&runtime.agent, next));
+            runtime.agent.set_plan_mode(true);
+            let background = runtime.agent.background_control().unwrap();
+            runtime.worker_uris.declare(vec!["ticket".into()]);
+            let error = runtime
+                .handle_request(
+                    &json!({"method":"plan","params":{"session_id":wanted,"enabled":false}}),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("stay here"), "{error:#}");
+            assert_eq!(runtime.agent.session().id(), current);
+            assert!(runtime.agent.plan_mode());
+            assert!(runtime.parked.contains_key(&wanted));
+            assert!(Arc::ptr_eq(
+                &background,
+                &runtime.agent.background_control().unwrap()
+            ));
+            assert!(
+                crate::tools::integrations::host_uri::HostUriResolver::serves(
+                    &host_uris::Resolver::new(
+                        runtime.worker_uris.clone(),
+                        runtime.worker_out.clone()
+                    ),
+                    "ticket"
+                )
+            );
+        },
+    );
+}
+
+#[test]
+fn session_activation_replaces_roots_and_restores_saved_incoming_roots() {
+    for acp in [false, true] {
+        with_runtime(
+            |_| {},
+            |runtime| {
+                runtime.acp = acp;
+                let a_dir = tempfile::tempdir().unwrap();
+                let b_dir = tempfile::tempdir().unwrap();
+                let a_root = a_dir.path().canonicalize().unwrap();
+                let b_root = b_dir.path().canonicalize().unwrap();
+                runtime.agent.workspace_mut().add_root(&a_root).unwrap();
+                runtime.agent.persist_workspace_roots().unwrap();
+                let a_id = runtime.agent.session().id().to_owned();
+                let mut b = Session::create(
+                    runtime.layout,
+                    SessionMeta {
+                        model: "test".into(),
+                    },
+                )
+                .unwrap();
+                b.set_additional_dirs(std::slice::from_ref(&b_root))
+                    .unwrap();
+                let b_id = b.id().to_owned();
+                drop(b);
+                runtime.resume(&json!({"session_id":b_id})).unwrap();
+                assert_eq!(
+                    runtime.agent.workspace().additional_roots(),
+                    std::slice::from_ref(&b_root),
+                    "acp={acp}"
+                );
+                assert!(
+                    runtime
+                        .agent
+                        .workspace()
+                        .resolve(a_root.to_str().unwrap())
+                        .is_err()
+                );
+                let b_file = b_root.join("checkpoint.txt");
+                std::fs::write(&b_file, "before").unwrap();
+                let checkpoints = runtime.agent.checkpoints().unwrap().clone();
+                checkpoints.begin_turn("incoming edit").unwrap();
+                runtime.agent.workspace().observe_write(&b_file).unwrap();
+                std::fs::write(&b_file, "after").unwrap();
+                assert_eq!(
+                    checkpoints.list()[0].files,
+                    1,
+                    "incoming root must be checkpointed"
+                );
+                checkpoints.rollback(1).unwrap();
+                assert_eq!(std::fs::read_to_string(&b_file).unwrap(), "before");
+                runtime.new_session().unwrap();
+                assert!(
+                    runtime.agent.workspace().additional_roots().is_empty(),
+                    "acp={acp}"
+                );
+                runtime.resume(&json!({"session_id":a_id})).unwrap();
+                assert_eq!(
+                    runtime.agent.workspace().additional_roots(),
+                    [a_root],
+                    "acp={acp}"
+                );
+                runtime.resume(&json!({"session_id":b_id})).unwrap();
+                assert_eq!(
+                    runtime.agent.workspace().additional_roots(),
+                    [b_root],
+                    "acp={acp}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn invalid_parked_checkpoint_setup_preserves_active_session_and_writer() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            let current = runtime.agent.session().id().to_owned();
+            let next = Session::create(
+                runtime.layout,
+                SessionMeta {
+                    model: "test".into(),
+                },
+            )
+            .unwrap();
+            let wanted = next.id().to_owned();
+            runtime
+                .parked
+                .insert(wanted.clone(), ParkedSession::fresh(&runtime.agent, next));
+            std::fs::write(
+                runtime.layout.checkpoints_dir().join(&wanted),
+                "not a directory",
+            )
+            .unwrap();
+            let background = runtime.agent.background_control().unwrap();
+            assert!(runtime.activate_parked(&wanted).is_err());
+            assert_eq!(runtime.agent.session().id(), current);
+            assert!(runtime.parked.contains_key(&wanted));
+            assert!(Arc::ptr_eq(
+                &background,
+                &runtime.agent.background_control().unwrap()
+            ));
+        },
+    );
+}
+
+#[test]
+fn returning_to_parked_session_does_not_restore_sensitive_grants() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            let a_id = runtime.agent.session().id().to_owned();
+            let sensitive = runtime.layout.user_dir.join("sensitive-test");
+            std::fs::create_dir_all(&sensitive).unwrap();
+            let sensitive = sensitive.canonicalize().unwrap();
+            let file = sensitive.join("note");
+            std::fs::write(&file, "private").unwrap();
+            runtime.agent.workspace_mut().add_root(&sensitive).unwrap();
+            runtime
+                .agent
+                .workspace_mut()
+                .grant_sensitive_directory(&sensitive)
+                .unwrap();
+            runtime.agent.persist_workspace_roots().unwrap();
+            assert!(
+                runtime
+                    .agent
+                    .workspace()
+                    .resolve(file.to_str().unwrap())
+                    .is_ok()
+            );
+            runtime.new_session().unwrap();
+            runtime.activate_parked(&a_id).unwrap();
+            assert_eq!(runtime.agent.workspace().additional_roots(), [sensitive]);
+            assert!(
+                runtime
+                    .agent
+                    .workspace()
+                    .resolve(file.to_str().unwrap())
+                    .is_err()
+            );
+        },
+    );
+}

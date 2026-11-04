@@ -223,7 +223,7 @@ pub fn install(
     checkpoint: Option<&std::path::Path>,
 ) -> Result<Option<std::path::PathBuf>> {
     use crate::{config::settings_store, learn::worker};
-    let directory = layout.user_dir.join("laya");
+    let directory = crate::config::paths::laya_dir(&layout.user_dir);
     crate::platform::atomic::private_dir(&directory)?;
     settings_store::write_private(&directory.join("dial_laya_server.py"), SERVER.as_bytes())?;
     settings_store::write_private(&directory.join("requirements.txt"), REQUIREMENTS.as_bytes())?;

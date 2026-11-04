@@ -30,9 +30,8 @@ impl Default for CommitConfig {
 }
 
 /// Experimental agent workflow features. Every feature is disabled unless explicitly enabled,
-/// except the two check-before-change aids: `fault_witness` and `repro_first = advise` are on by
-/// default.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// except `repro_first = advise`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExperimentalConfig {
     /// Offer bounded, approved video frame investigations; image tokens can be expensive.
@@ -46,9 +45,9 @@ pub struct ExperimentalConfig {
     pub turn_optimizer: bool,
     /// Optional prompt guidance, independent of provider thinking controls and permissions.
     pub reasoning_strategy: ReasoningStrategy,
-    /// After a focused check passes on a turn with edits, rerun it once in an isolated copy with
-    /// the turn's changed files restored to their turn-start content: a failure there witnesses
-    /// that the change mattered; a pass there marks the check vacuous for this change.
+    /// Opt in to a diagnostic comparison of an operator-declared behavioral check against
+    /// turn-start files. At most one attempt per turn, with a command deadline capped at 60s.
+    /// Related suites and registered reproductions are not automatically rerun.
     pub fault_witness: bool,
     /// On debugging tasks whose request asks for verification, the first edit to a non-test
     /// source file before any reproduction has failed gets advice (`advise`) or is refused once
@@ -72,30 +71,6 @@ pub struct ExperimentalConfig {
     /// Offer `check.expect` (pass/fail prediction); a mismatch is reported as a fact and the next
     /// request asks the model to account for it before editing again.
     pub check_predictions: bool,
-}
-
-impl Default for ExperimentalConfig {
-    fn default() -> Self {
-        Self {
-            video_analysis: false,
-            work_packet_contracts: false,
-            verification_receipts: false,
-            context_overlap_dedup: false,
-            profile_matching: false,
-            tool_speculation: false,
-            turn_optimizer: false,
-            reasoning_strategy: ReasoningStrategy::default(),
-            fault_witness: true,
-            repro_first: ReproFirst::default(),
-            edit_bisection_runs: 0,
-            outcome_gradient_rounds: 0,
-            streaming_dispatch: false,
-            batch_approvals: false,
-            dependency_dispatch: false,
-            background_checks: false,
-            check_predictions: false,
-        }
-    }
 }
 
 /// `experimental.repro_first`: how debugging tasks are steered toward a failing reproduction

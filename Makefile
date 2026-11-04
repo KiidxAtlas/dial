@@ -21,6 +21,8 @@ DIAL ?= $(BUILD_DIR)/dial
 
 .DEFAULT_GOAL := help
 .PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline test-smoke test-mlx preflight preflight-quick hooks
+.PHONY: test-install test-build test-windows-contract test-packaging test-release-policy preflight-worktree
+.PHONY: release-check
 
 help:
 	@printf '%s\n' \
@@ -38,10 +40,17 @@ help:
 		'make test-drivers  Run browser, JavaScript eval and Python kernel transport contracts (Node 22+, Python 3)' \
 		'make test-python  Run Python contracts; report unavailable optional MLX checks' \
 		'make test-bench-offline  Run benchmark grader/reporting tests, no model or binary needed' \
+		'make test-packaging  Check distribution metadata and packaging contracts' \
+		'make test-release-policy  Check publication authorization and version ordering' \
+		'make release-check  No-build source, packaging, shell and tooling checks (RELEASE_TAG=v0.3.0 optional)' \
+		'make test-build  Test local build/install commands without replacing your installed binary' \
+		'make test-install  Test the Unix release installer (Python cryptography required)' \
+		'make test-windows-contract  Test the focused Windows contract runner' \
 		'make test-smoke DIAL=target/local/dial  Check an already-built binary and scripted recovery' \
 		'make test-mlx  Run optional local MLX checks; explicitly skip unsupported hosts, never download' \
 		'make preflight  Run every CI check locally on a clean snapshot of HEAD (REV=<commit> for another)' \
-		'make preflight-quick  Only the compile and lint gates: fmt, clippy (host + Linux), musl, Windows, slim' \
+		'make preflight-quick  Cheap readiness and fmt, then clippy (host + Linux), musl, Windows, slim compilation' \
+		'make preflight-worktree  Run preflight on current staged/unstaged files without committing' \
 		'make hooks    Run make preflight automatically before every git push (pre-push hook)'
 
 update:
@@ -102,6 +111,33 @@ test-python:
 test-bench-offline:
 	$(PYTHON) -m unittest discover -s examples/benchmarks -p 'test_*.py'
 
+test-install:
+	bash scripts/test-install.sh
+
+test-build:
+	$(PYTHON) scripts/test-build.py
+
+test-windows-contract:
+	$(PYTHON) scripts/test-windows-contract.py
+
+test-packaging:
+	$(PYTHON) scripts/test-packaging.py
+	$(PYTHON) scripts/check-packaging.py
+
+test-release-policy:
+	$(PYTHON) scripts/test-release-policy.py
+
+# No compilation, dependency installation, network, staging or publication. Aggregate cheap
+# failures so callers see all prerequisites before deciding to run an expensive tier.
+RELEASE_TAG ?=
+release-check:
+	@status=0; \
+	$(PYTHON) scripts/release-policy.py check $(if $(RELEASE_TAG),"$(RELEASE_TAG)") || status=1; \
+	$(PYTHON) scripts/check-packaging.py || status=1; \
+	$(PYTHON) scripts/release-policy.py tools || status=1; \
+	for script in scripts/release.sh scripts/preflight.sh; do bash -n "$$script" || status=1; done; \
+	exit $$status
+
 # Deliberately no build prerequisite: test exactly the artifact selected by DIAL.
 test-smoke:
 	$(PYTHON) scripts/check-artifact.py --dial "$(DIAL)"
@@ -118,6 +154,9 @@ preflight:
 
 preflight-quick:
 	scripts/preflight.sh --quick "$(REV)"
+
+preflight-worktree:
+	scripts/preflight.sh --in-place
 
 hooks:
 	git config core.hooksPath .githooks

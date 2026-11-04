@@ -28,16 +28,29 @@ fn incremental_config(command: &str) -> Config {
 #[test]
 fn complete_inputs_reuse_across_unrelated_edits_in_check_and_gate_without_fabricating_runs() {
     let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("inputs")).unwrap();
     std::fs::write(root.path().join("inputs/value"), "good").unwrap();
-    let command = "test \"$(cat inputs/value)\" = good";
+    let command = "cat inputs/value; test \"$(cat inputs/value)\" = good";
     let config = incremental_config(command);
     let mut agent = hermetic_agent(&config, root.path());
+    agent.workspace = agent
+        .workspace
+        .clone()
+        .with_artifacts(crate::storage::artifact::ArtifactStore::new(state.path()).unwrap());
     agent.step_checks.mutations = 1;
     let first = agent.check_tool(&json!({}), &mut NullUi);
     assert!(!first.is_error, "{}", first.text);
     assert_eq!(first.data.as_ref().unwrap()["results"][0]["ran"], true);
     assert_eq!(agent.verifications.len(), 1);
+    let first_ref = first.data.as_ref().unwrap()["results"][0]["evidence_ref"]
+        .as_str()
+        .expect("native check log citation")
+        .to_owned();
+    let store = agent.workspace.artifacts().unwrap();
+    let record = store.evidence_record(&first_ref).unwrap();
+    assert_eq!(store.evidence_bytes(&record, 4096).unwrap(), b"good");
+    assert_eq!(record.evidence.source, record.representation_uri);
 
     std::fs::write(root.path().join("README.md"), "unrelated").unwrap();
     agent.step_checks.mutations += 1;
@@ -46,6 +59,10 @@ fn complete_inputs_reuse_across_unrelated_edits_in_check_and_gate_without_fabric
     assert_eq!(reused.data.as_ref().unwrap()["results"][0]["reused"], true);
     assert_eq!(reused.data.as_ref().unwrap()["results"][0]["ran"], false);
     assert_eq!(agent.verifications.len(), 1);
+    assert_eq!(
+        reused.data.as_ref().unwrap()["results"][0]["evidence_ref"],
+        first_ref
+    );
     let evidence = agent.completion_evidence(TurnOutcome::Completed);
     assert_eq!(
         evidence["checks"]["latest"][command]["revision"],
@@ -65,12 +82,38 @@ fn complete_inputs_reuse_across_unrelated_edits_in_check_and_gate_without_fabric
         1,
         "the completion gate uses the same witness"
     );
+    assert_eq!(
+        agent.step_checks.evidence.evidence_ref(command),
+        Some(first_ref.as_str())
+    );
+    // A changed declared input forces a new execution whose log must not inherit the old ref.
+    std::fs::write(root.path().join("inputs/value"), "good\n").unwrap();
     let explicit = agent.check_tool(&json!({"names":["contract"]}), &mut NullUi);
     assert!(!explicit.is_error, "{}", explicit.text);
     assert_eq!(
         agent.verifications.len(),
         2,
         "explicit requests force real execution"
+    );
+    let explicit_data = explicit.data.as_ref().unwrap();
+    assert_eq!(explicit_data["results"][0]["ran"], true);
+    assert_eq!(explicit_data["results"][0]["reused"], false);
+    let new_ref = explicit_data["results"][0]["evidence_ref"]
+        .as_str()
+        .unwrap();
+    assert_ne!(new_ref, first_ref);
+    let store = agent.workspace.artifacts().unwrap();
+    let record = store.evidence_record(new_ref).unwrap();
+    assert_eq!(store.evidence_bytes(&record, 4096).unwrap(), b"good\n");
+    let inspected = crate::tools::knowledge::workbench::run(
+        &agent.workspace,
+        &json!({"action":"inspect","references":[new_ref]}),
+    )
+    .unwrap();
+    assert!(
+        inspected.text.contains("authenticated"),
+        "{}",
+        inspected.text
     );
 }
 

@@ -14,6 +14,8 @@ pub(super) struct Catalog {
     pub(super) slot: Arc<Mutex<(u64, Option<catalog::Discovery>)>>,
     pub(super) request: u64,
     pub(super) worker: Option<JoinHandle<()>>,
+    /// Only the newest refresh survives while the active scan finishes.
+    pending: Option<Box<dyn FnOnce() -> catalog::Discovery + Send>>,
     pub(super) generation: u64,
 }
 
@@ -38,6 +40,7 @@ impl Catalog {
             slot: Arc::new(Mutex::new((0, None))),
             request: 0,
             worker: None,
+            pending: None,
             generation: 0,
         }
     }
@@ -46,13 +49,20 @@ impl Catalog {
         shared(&self.slot).1.clone()
     }
 
-    /// Reap a finished scan so a new request can start; bumps `generation` when one completed.
+    /// Reap a finished scan and start at most one coalesced refresh.
     pub(super) fn collect(&mut self) {
-        if !self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            return;
+        if let Some(worker) = self.worker.as_ref() {
+            if !worker.is_finished() {
+                return;
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            self.generation = self.generation.wrapping_add(1);
         }
-        self.worker = None;
-        self.generation = self.generation.wrapping_add(1);
+        if let Some(discover) = self.pending.take() {
+            self.spawn(discover);
+        }
     }
 
     pub(super) fn start(&mut self, app: &App) {
@@ -93,9 +103,14 @@ impl Catalog {
         &mut self,
         discover: impl FnOnce() -> catalog::Discovery + Send + 'static,
     ) {
-        self.request += 1;
+        self.request = self.request.wrapping_add(1);
+        shared(&self.slot).0 = self.request;
+        self.pending = Some(Box::new(discover));
+        self.collect();
+    }
+
+    fn spawn(&mut self, discover: Box<dyn FnOnce() -> catalog::Discovery + Send>) {
         let request = self.request;
-        shared(&self.slot).0 = request;
         let slot = self.slot.clone();
         self.worker = Some(std::thread::spawn(move || {
             let found = discover();

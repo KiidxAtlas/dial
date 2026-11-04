@@ -136,6 +136,10 @@ fn shown_runs(text: &str) -> Vec<(&str, Vec<Run>)> {
             sections.push((header, Vec::new()));
             continue;
         }
+        // Clipped source rows cannot cover a later complete read of the same line.
+        if line.ends_with("…[truncated]") || line.ends_with("…[line truncated]") {
+            continue;
+        }
         let Some(number) = line
             .split_once(':')
             .and_then(|(digits, _)| digits.parse::<u32>().ok())
@@ -164,8 +168,8 @@ pub(in crate::agent) fn is_unchanged_read(body: &str) -> bool {
     body.starts_with(UNCHANGED_READ)
 }
 
-/// Turn-local record of each read target's last full result. An identical re-read whose earlier result is still
-/// shown in full gets a short pointer instead of the same text again.
+/// Turn-local source rows returned by reads, edits and opt-in discovery previews.
+/// Fresh rereads reuse only unchanged ranges whose earlier result remains visible in full.
 #[derive(Default)]
 pub(in crate::agent) struct ReturnedReads {
     seen: std::collections::HashMap<String, (u64, String)>,
@@ -187,43 +191,58 @@ impl ReturnedReads {
         is_error: bool,
         still_full: impl Fn(&str) -> bool,
     ) -> Option<String> {
-        if call.name != "read" || is_error {
+        if is_error {
+            return None;
+        }
+        if matches!(call.name.as_str(), "edit" | "write" | "glob" | "find") {
+            self.remember(shown_runs(text), &call.id);
+            return None;
+        }
+        if call.name != "read" {
             return None;
         }
         let target = ["path", "paths", "offset", "limit"]
             .map(|name| call.arguments[name].to_string())
             .join("\0");
         let key = observation_key(call, text);
-        if let Some((previous, id)) = self.seen.get(&target)
+        let sections = shown_runs(text);
+        let ids = if let Some((previous, id)) = self.seen.get(&target)
             && *previous == key
             && still_full(id)
         {
-            return Some(format!(
-                "{UNCHANGED_READ} This read of the same range returned identical content in tool call {id}, which is still shown above. Reuse that text; reread only after a change or if it is no longer visible."
-            ));
-        }
-        let sections = shown_runs(text);
-        if let Some(ids) = self.covering(&sections, &still_full) {
-            return Some(format!(
-                "{UNCHANGED_READ} Every line of this read was already returned unchanged in tool call {}, which is still shown above. Reuse that text; reread only after a change or if it is no longer visible.",
+            Some(vec![id.clone()])
+        } else {
+            self.covering(&sections, &still_full)
+        };
+        if let Some(ids) = ids {
+            let pointer = format!(
+                "{UNCHANGED_READ} Fresh read succeeded; same rows in still-visible tool call {}. Reuse them.",
                 ids.join(", ")
-            ));
+            );
+            // Reusing a tiny range must not cost more bytes than returning that range.
+            if pointer.len() < text.len() {
+                return Some(pointer);
+            }
         }
         if self.seen.len() >= 256 {
             self.seen.clear();
         }
         self.seen.insert(target, (key, call.id.clone()));
+        self.remember(sections, &call.id);
+        None
+    }
+
+    fn remember(&mut self, sections: Vec<(&str, Vec<Run>)>, id: &str) {
         for (header, runs) in sections {
             if self.shown.len() >= Self::MAX_FILES && !self.shown.contains_key(header) {
                 self.shown.clear();
             }
             let known = self.shown.entry(header.to_owned()).or_default();
-            known.extend(runs.into_iter().map(|run| (run, call.id.clone())));
+            known.extend(runs.into_iter().map(|run| (run, id.to_owned())));
             if known.len() > Self::MAX_RUNS_PER_FILE {
                 known.drain(..known.len() - Self::MAX_RUNS_PER_FILE);
             }
         }
-        None
     }
 
     /// Calls whose still-visible results together contain every line of `sections`.

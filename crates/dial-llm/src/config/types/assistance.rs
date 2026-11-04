@@ -10,7 +10,7 @@ pub struct PortableRulesConfig {
     pub max_regenerations: u32,
     /// User turns after which a fired stream rule may fire again; 0 keeps it quiet for the session.
     pub repeat_after_turns: u32,
-    /// When judged `question` rules are asked of the `judge` role.
+    /// When judged `question` rules are asked of the `decision` role.
     pub judge: RuleJudge,
 }
 impl Default for PortableRulesConfig {
@@ -24,9 +24,9 @@ impl Default for PortableRulesConfig {
     }
 }
 
-/// `portable_rules.judge`. `auto` judges `question` rules only when the `judge` role is explicitly
-/// assigned, so no main-model calls are spent silently; `on` uses the judge role with its `small`
-/// and main-model fallbacks; `off` never judges.
+/// `portable_rules.judge`. `auto` asks `question` rules only when `decision` is explicitly
+/// assigned, so no main-model calls are spent silently; `on` uses decision with small/main
+/// fallbacks; `off` never judges.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleJudge {

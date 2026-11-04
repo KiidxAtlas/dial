@@ -709,6 +709,75 @@ fn main() -> anyhow::Result<()> {
             terminal.backend().buffer(),
             light,
         );
+        if label == "after" {
+            let values: toml::Table = toml::from_str(
+                "[memory]\nbackend = 'semantic'\n[model_roles.memory]\nprovider = 'openai'\nmodel = 'extractor'\n[model_roles.embedding]\nprovider = 'ollama'\nmodel = 'embedder'\n",
+            )?;
+            let mut memory = SettingsOverlay::new(
+                values.clone(),
+                toml::Table::new(),
+                values,
+                Scope::Project,
+                vec![],
+            )
+            .with_project_name("dial-example");
+            memory.set_hint(
+                "memory.backend",
+                "Needs setup · fixture prerequisite; no live service test".into(),
+            );
+            memory.focus_path("memory.backend");
+            terminal.draw(|f| memory.draw(f, &ctx))?;
+            screen(
+                &mut out,
+                &format!("Memory landing / {name}"),
+                terminal.backend().buffer(),
+                light,
+            );
+            let mut context = SettingsOverlay::new(
+                toml::Table::new(),
+                toml::Table::new(),
+                toml::Table::new(),
+                Scope::Global,
+                vec![],
+            )
+            .context_defaults();
+            terminal.draw(|f| context.draw(f, &ctx))?;
+            screen(
+                &mut out,
+                &format!("Context and history / {name}"),
+                terminal.backend().buffer(),
+                light,
+            );
+            let mut appearance = SettingsOverlay::new(
+                toml::Table::new(),
+                toml::Table::new(),
+                toml::Table::new(),
+                Scope::Global,
+                vec!["dial-dark".into(), "dial".into()],
+            );
+            appearance.focus_path("ui.motion");
+            appearance.handle(
+                &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                &keys,
+            );
+            appearance.handle(
+                &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::F(4),
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                &keys,
+            );
+            terminal.draw(|f| appearance.draw(f, &ctx))?;
+            screen(
+                &mut out,
+                &format!("Appearance preview / {name}"),
+                terminal.backend().buffer(),
+                light,
+            );
+        }
         settings.handle(&crossterm::event::Event::Paste("ui.theme".into()), &keys);
         settings.handle(
             &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
@@ -998,6 +1067,37 @@ fn main() -> anyhow::Result<()> {
         screen(
             &mut out,
             &format!("Models / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
+        models.show_roles();
+        terminal.draw(|f| models.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Model roles / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
+        models.set_laya_checkpoint(Some("/synthetic/laya-checkpoint".into()));
+        let decision = dial_llm::llm::model_config::ROLES
+            .iter()
+            .position(|(role, _)| *role == "decision")
+            .expect("decision role");
+        for code in std::iter::repeat_n(crossterm::event::KeyCode::Down, decision)
+            .chain(std::iter::once(crossterm::event::KeyCode::Enter))
+        {
+            models.handle(
+                &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                    code,
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                ctx.keys,
+            );
+        }
+        terminal.draw(|f| models.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Decision engines / {name}"),
             terminal.backend().buffer(),
             light,
         );

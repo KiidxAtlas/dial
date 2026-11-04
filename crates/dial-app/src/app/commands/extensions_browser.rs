@@ -72,6 +72,32 @@ pub(crate) fn refresh(panel: &mut ExtensionsOverlay, layout: &Layout, config: &C
         .cloned();
     rows.mcp.extend(found);
     panel.set_snapshot(rows.mcp, rows.skills);
+    panel.browser.set_rows(Tab::Tools, config.integrations.iter().map(|name| Row {
+        id: name.clone(), title: name.clone(), summary: "Configured tool group".into(),
+        tags: vec!["configured".into()], origin: Origin::Installed, state: State::Enabled,
+        details: vec!["Configured tool group. /tools shows which tools the current agent actually offers; /settings manages integrations.".into()],
+    }).collect());
+    let hooks = super::maintenance::hooks_text(config);
+    panel.browser.set_rows(
+        Tab::Hooks,
+        hooks
+            .lines()
+            .enumerate()
+            .map(|(index, text)| Row {
+                id: format!("hook-{index}"),
+                title: config
+                    .hooks
+                    .get(index)
+                    .map_or("Lifecycle hooks", |hook| hook.event.as_str())
+                    .into(),
+                summary: text.into(),
+                tags: vec![],
+                origin: Origin::Installed,
+                state: State::Enabled,
+                details: vec![text.into()],
+            })
+            .collect(),
+    );
     // Listings are fetched in the background; the rows above already show what is cached.
     for tab in [Tab::Mcp, Tab::Skills] {
         fetch_catalog(panel, layout, config, tab, String::new());
@@ -271,7 +297,7 @@ pub(super) fn server_command(server: &McpServerConfig) -> String {
 }
 
 fn mcp_cache_dir(user_dir: &Path) -> PathBuf {
-    user_dir.join("mcp")
+    crate::config::paths::mcp_dir(user_dir)
 }
 
 /// Result of an intent. `changes` are saved by [`poll`] only when `ok` is true.
@@ -627,6 +653,11 @@ fn catalog_update(
             }
             (rows, false, message)
         }
+        Tab::Tools | Tab::Hooks => (
+            Vec::new(),
+            false,
+            "Local configuration; no remote catalog.".into(),
+        ),
     };
     CatalogUpdate {
         tab,

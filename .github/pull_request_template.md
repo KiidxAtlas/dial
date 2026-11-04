@@ -18,4 +18,4 @@
 - [ ] Docs updated (`docs/*.md`) for user-visible behaviour
 - [ ] `CHANGELOG.md` entry under `## [Unreleased]`
 - [ ] New built-in tool properties registered in `ADDITIVE_PROPERTIES` when they are optional and additive
-- [ ] Prompt wording or tuning thresholds changed: before/after `dial benchmark` evidence attached, or the PR states that no outcome change is claimed ([rule](../CONTRIBUTING.md#prompt-wording-thresholds-and-recovery-limits))
+- [ ] Prompt wording or tuning thresholds changed: before/after `dial benchmark` evidence attached, or the PR states that no outcome change is claimed ([rule](https://github.com/KiidxAtlas/dial/blob/main/CONTRIBUTING.md#prompt-wording-thresholds-and-recovery-limits))

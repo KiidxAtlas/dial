@@ -32,7 +32,6 @@ const PREFIX: &str = "$$SECRET_";
 const SUFFIX: &str = "$$";
 const DIGEST_HEX: usize = 12;
 const PLACEHOLDER_LEN: usize = PREFIX.len() + DIGEST_HEX + SUFFIX.len();
-const KEY_FILE: &str = "secret-mask.key";
 const KEY_BYTES: usize = 32;
 /// Strings larger than this are never parsed as nested JSON.
 const NESTED_JSON_LIMIT: usize = 4 * 1024 * 1024;
@@ -342,7 +341,7 @@ fn could_become_placeholder(partial: &str) -> bool {
 }
 
 fn key_path(user_dir: &Path) -> PathBuf {
-    user_dir.join(KEY_FILE)
+    crate::config::paths::secret_mask_key_file(user_dir)
 }
 
 /// The install key, created owner-only on first use. Concurrent processes agree on one key.

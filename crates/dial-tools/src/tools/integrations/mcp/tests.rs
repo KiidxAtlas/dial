@@ -740,6 +740,7 @@ fn temporary_http_connection_uses_oauth_grant_from_custom_user_directory() {
         serde_json::to_vec(&json!({
             "access": "custom-user-grant",
             "expires_at_ms": u64::MAX,
+            "resource": url,
         }))
         .unwrap()
         .as_slice(),
@@ -793,9 +794,13 @@ fn health_check_tells_an_oauth_challenge_apart_from_a_broken_server() {
     // A completed `/mcp login` stores a grant; the same entry then connects and lists its tools.
     crate::config::settings_store::write_private(
         &user.path().join("mcp-oauth-remote.json"),
-        serde_json::to_vec(&json!({"access": "granted", "expires_at_ms": u64::MAX}))
-            .unwrap()
-            .as_slice(),
+        serde_json::to_vec(&json!({
+            "access": "granted",
+            "expires_at_ms": u64::MAX,
+            "resource": server.url.as_deref().unwrap(),
+        }))
+        .unwrap()
+        .as_slice(),
     )
     .unwrap();
     assert_eq!(catalog::check(&config, "remote", &server).unwrap(), 1);

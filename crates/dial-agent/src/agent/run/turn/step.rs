@@ -282,14 +282,14 @@ impl Agent<'_> {
     }
 
     /// Whether judged `question` rules are asked: `portable_rules.judge`, where `auto` requires
-    /// an explicitly assigned `judge` role.
+    /// an explicitly assigned `decision` role.
     fn judges_rules(&self) -> bool {
         use crate::config::types::RuleJudge;
         !self.hermetic
             && match self.config.portable_rules.judge {
                 RuleJudge::Off => false,
                 RuleJudge::On => true,
-                RuleJudge::Auto => self.auth_config.role_selection("judge").is_some(),
+                RuleJudge::Auto => self.auth_config.role_selection("decision").is_some(),
             }
     }
 

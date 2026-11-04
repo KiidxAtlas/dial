@@ -101,6 +101,11 @@ impl Shell {
                 dirty = true;
             }
             crate::app::commands::commit::poll(self);
+            if let Some(layout) = agent.layout()
+                && self.poll_search(layout)
+            {
+                dirty = true;
+            }
             self.poll_improve_watch();
             if crate::app::commands::extensions_browser::poll(self, app, agent) {
                 dirty = true;
@@ -120,7 +125,9 @@ impl Shell {
             if self.auth_job.is_none() {
                 self.transcript.settle_job_notices();
             }
-            if let Some((provider, result)) = AuthJob::collect(&mut self.auth_job, app) {
+            if let Some((provider, result)) =
+                AuthJob::collect_retained(&mut self.auth_job, app, &mut self.last_setup_failure)
+            {
                 self.job_ended(provider, &result);
                 let vision_ready = provider == "Setup"
                     && result.as_ref().is_ok_and(|message| {
@@ -311,6 +318,7 @@ impl Shell {
             let status_pending = self.git.cache.worker.is_some()
                 || self.learning.cache.worker.is_some()
                 || self.auth_job.is_some()
+                || self.search.is_pending()
                 || self.commit_job.is_some()
                 || self.catalog.worker.is_some()
                 || self.pending_favorite.is_some()

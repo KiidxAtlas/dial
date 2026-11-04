@@ -160,6 +160,23 @@ fn changed_schema_refuses_continuation_but_legacy_and_documentation_remain_reada
     validate_history(&history, &[], &registry).unwrap();
 }
 #[test]
+fn glob_history_before_previews_remains_compatible() {
+    let registry = Registry::new();
+    let current = crate::tools::schema("glob", crate::config::types::EditMode::Hashline).unwrap();
+    let mut before = current.clone();
+    before["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("preview");
+    let identity = identities(&[before], &registry)["glob"].clone();
+    let history = vec![json!({"role":"assistant", "dial_tool_contracts":{"call":identity}})];
+    validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
+    let mut changed = current;
+    changed["function"]["parameters"]["properties"]["pattern"]["type"] = json!("integer");
+    assert!(validate_history(&history, &[changed], &registry).is_err());
+}
+
+#[test]
 fn history_recorded_before_an_additive_builtin_property_stays_valid() {
     let registry = Registry::new();
     let current = crate::tools::schema("grep", crate::config::types::EditMode::Replace).unwrap();

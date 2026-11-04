@@ -237,7 +237,7 @@ fn installed_dirs(user_dir: &Path) -> Vec<PathBuf> {
     if user_dir.as_os_str().is_empty() {
         return Vec::new();
     }
-    let Ok(entries) = std::fs::read_dir(user_dir.join("tools")) else {
+    let Ok(entries) = std::fs::read_dir(crate::config::paths::tools_dir(user_dir)) else {
         return Vec::new();
     };
     let mut tools: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();

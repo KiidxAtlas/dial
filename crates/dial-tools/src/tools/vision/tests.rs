@@ -59,3 +59,35 @@ fn image_mime_comes_from_magic_bytes() {
     assert_eq!(image_mime(&png).unwrap(), "image/png");
     assert!(image_mime(b"not an image").is_err());
 }
+
+#[test]
+fn explicit_features_resolve_without_activating_unconfigured_tools() {
+    let mut config = Config {
+        model: "main-model".into(),
+        provider: Some("openai".into()),
+        endpoint: endpoint(serde_json::json!({"base_url": "https://main.example/v1"})),
+        ..Config::default()
+    };
+    assert!(!grounding::configured(&config));
+    assert!(!embedding::configured(&config));
+    assert!(config.vision_selection("unknown").is_none());
+    config.vision.grounding = Some(crate::llm::model_config::ModelSelection::new(
+        "mlx",
+        "local/grounding",
+    ));
+    let resolved = config.for_vision(grounding::FEATURE);
+    assert_eq!(resolved.model, "local/grounding");
+    assert_eq!(route(grounding::FEATURE, &resolved).unwrap(), Route::Local);
+    assert!(!embedding::configured(&config));
+    let mut selected = crate::llm::model_config::ModelSelection::new("custom", "image-vectors");
+    selected.base_url = Some("https://images.example/v1".into());
+    selected.protocol = Some(crate::llm::model_config::ApiProtocol::ChatCompletions);
+    config.vision.image_embedding = Some(selected);
+    let resolved = config.for_vision(embedding::FEATURE);
+    assert_eq!(resolved.model, "image-vectors");
+    assert!(
+        matches!(route(embedding::FEATURE, &resolved).unwrap(), Route::Endpoint { base_url, .. } if base_url == "https://images.example/v1")
+    );
+    assert_eq!(config.model, "main-model");
+    assert!(toml::from_str::<Config>("[vision]\nunknown = true").is_err());
+}

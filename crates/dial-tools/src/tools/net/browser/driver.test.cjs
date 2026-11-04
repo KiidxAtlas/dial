@@ -234,3 +234,66 @@ test('native screenshot returns its exact URL and actual captured image, includi
   assert.equal(unchanged.changed, false);
   assert.equal(unchanged.artifact, undefined);
 });
+
+function clipboardHarness(failure) {
+  const site = require('./site.cjs');
+  const grants = [], closed = [], revoked = [];
+  const scratchPage = {
+    async route(pattern, handler) { await handler({fulfill: async () => {}}); },
+    async goto() { if (failure === 'navigate') throw new Error('navigate failed'); },
+    async bringToFront() { if (failure === 'focus') throw new Error('focus failed'); },
+    async evaluate(fn, text) { if (failure === 'evaluate') throw new Error('evaluate failed'); return text === undefined ? 'fixture clipboard' : undefined; },
+  };
+  const scratch = {
+    async grantPermissions(permissions, options) { grants.push({permissions, options}); if (failure === 'grant') throw new Error('grant failed'); },
+    async clearPermissions() { revoked.push(true); if (failure === 'revoke') throw new Error('revoke failed'); },
+    async newPage() { return scratchPage; },
+    async close() { assert(revoked.length > 0, 'revoke before closing'); closed.push(true); if (failure === 'close') throw new Error('close failed'); },
+  };
+  const context = {
+    browser() { return {async newContext() { return scratch; }}; },
+    async grantPermissions() { throw new Error('must not mutate user context permissions'); },
+  };
+  const host = {context, tabFor() { return {ready:Promise.resolve(), page:{url:()=>'https://user.example/'}}; }};
+  return {site, host, grants, closed, revoked};
+}
+
+test('clipboard uses isolated permissions and closes its controller context on every settled exit', async () => {
+  for (const action of ['clipboard_read', 'clipboard_write']) {
+    for (const failure of [undefined, 'navigate', 'grant', 'focus', 'evaluate', 'revoke', 'close']) {
+      const h = clipboardHarness(failure);
+      const operation = h.site.run({action, text:'hello'}, h.host);
+      if (failure) await assert.rejects(operation, new RegExp(`${failure} failed`));
+      else assert.deepEqual(await operation, action === 'clipboard_read' ? {text:'fixture clipboard'} : {chars:5});
+      assert.equal(h.closed.length, 1, `${action}: ${failure}`);
+      assert.equal(h.revoked.length, 1, `${action}: ${failure} revokes before close`);
+      for (const grant of h.grants) {
+        assert.deepEqual(grant.permissions, [action === 'clipboard_read' ? 'clipboard-read' : 'clipboard-write']);
+        assert.equal(grant.options.origin, 'https://dial-clipboard.invalid');
+      }
+    }
+  }
+});
+
+test('clipboard cancellation closes the isolated grant without changing user permissions', async () => {
+  // Use a fresh module because shutdown is terminal for a driver process.
+  delete require.cache[require.resolve('./site.cjs')];
+  const h = clipboardHarness();
+  let started, rejectEvaluation;
+  const evaluating = new Promise(resolve => { started = resolve; });
+  const originalBrowser = h.host.context.browser();
+  const scratch = await originalBrowser.newContext();
+  const page = await scratch.newPage();
+  page.evaluate = () => new Promise((resolve, reject) => { rejectEvaluation = reject; started(); });
+  const close = scratch.close;
+  scratch.close = async () => { await close(); rejectEvaluation?.(new Error('controller context closed')); };
+  h.host.context.browser = () => ({newContext: async () => scratch});
+  const operation = h.site.run({action:'clipboard_read'}, h.host);
+  const failed = assert.rejects(operation, /controller context closed/);
+  await evaluating;
+  await h.site.closeClipboardContexts();
+  await failed;
+  assert(h.closed.length >= 1);
+  assert(h.revoked.length >= 1);
+  assert.deepEqual(h.grants.map(grant=>grant.permissions), [['clipboard-read']]);
+});

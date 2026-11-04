@@ -122,15 +122,15 @@ fn readiness_tracks_config_without_probing_or_claiming_registry_absence() {
         readiness("computer", &config, &registry),
         Readiness::Unknown
     );
-    config.model_roles.insert(
-        "grounding".into(),
-        crate::llm::model_config::ModelSelection::new("openai", "unreachable-test-model"),
-    );
+    config.vision.grounding = Some(crate::llm::model_config::ModelSelection::new(
+        "openai",
+        "unreachable-test-model",
+    ));
     assert_eq!(
         operation_readiness("computer", &config)["locate"],
         Readiness::Unknown
     );
-    config.model_roles.remove("grounding");
+    config.vision.grounding = None;
     assert!(matches!(
         operation_readiness("computer", &config)["locate"],
         Readiness::MissingPrerequisite { .. }

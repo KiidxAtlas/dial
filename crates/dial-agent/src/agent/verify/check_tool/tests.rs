@@ -396,6 +396,11 @@ fn a_reproduction_that_never_failed_is_reported_and_earns_no_behavioral_credit()
     assert!(!out.is_error, "{}", out.text);
     assert!(out.text.contains("passed: repro: bug"), "{}", out.text);
     assert!(out.text.contains("not shown to reproduce"), "{}", out.text);
+    assert!(out.text.contains("Post-fix check passed"), "{}", out.text);
+    let result = &out.data.as_ref().unwrap()["results"][0];
+    assert_eq!(result["status"], "passed");
+    assert_eq!(result["ran"], true);
+    assert_eq!(result["reproduction"], "not_shown_to_reproduce");
     let revision = agent.step_checks.revision();
     assert_eq!(agent.step_checks.evidence.passing_behavioral(revision), 0);
     let evidence = agent.completion_evidence(TurnOutcome::Completed);

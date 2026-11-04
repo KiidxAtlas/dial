@@ -46,10 +46,10 @@ fn rig() -> Rig {
         state_dir: dir.path().join("state"),
         ..Config::default()
     };
-    config.model_roles.insert(
-        embedding::ROLE.into(),
-        crate::llm::model_config::ModelSelection::new("mlx", "test/embedder"),
-    );
+    config.vision.image_embedding = Some(crate::llm::model_config::ModelSelection::new(
+        "mlx",
+        "test/embedder",
+    ));
     let index = Index::open(&config.state_dir.join("image_embeddings.sqlite3")).unwrap();
     Rig {
         ws: Workspace::new(&root).unwrap(),
@@ -181,7 +181,7 @@ fn invalid_requests_and_paths_outside_the_workspace_are_refused() {
 }
 
 #[test]
-fn the_tool_is_offered_only_while_the_role_is_assigned() {
+fn the_tool_is_offered_only_while_the_feature_is_configured() {
     let rig = rig();
     assert_eq!(tools(&rig.config).len(), 1);
     assert!(tools(&Config::default()).is_empty());
@@ -209,7 +209,7 @@ fn cached_vectors_are_keyed_by_content_and_model() {
 }
 
 #[test]
-fn image_gen_similarity_line_is_absent_until_the_role_is_assigned() {
+fn image_gen_similarity_line_is_absent_until_the_feature_is_configured() {
     let rig = rig();
     let image = rig.ws.root().join("assets/red.png");
     assert_eq!(
@@ -243,13 +243,10 @@ fn real_model_finds_the_described_image() {
         python: PathBuf::from(env("HOME")).join(".dial/python/.venv/bin/python"),
         ..Config::default()
     };
-    config.model_roles.insert(
-        embedding::ROLE.into(),
-        crate::llm::model_config::ModelSelection::new(
-            "mlx",
-            &env("DIAL_TEST_IMAGE_EMBEDDING_MODEL"),
-        ),
-    );
+    config.vision.image_embedding = Some(crate::llm::model_config::ModelSelection::new(
+        "mlx",
+        &env("DIAL_TEST_IMAGE_EMBEDDING_MODEL"),
+    ));
     let ws = Workspace::new(&root).unwrap();
     let index = Index::open(&config.state_dir.join("image_embeddings.sqlite3")).unwrap();
     let embedder = Embedder::Model(Arc::new(AtomicBool::new(false)));

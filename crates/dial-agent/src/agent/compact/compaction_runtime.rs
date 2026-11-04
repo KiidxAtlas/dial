@@ -1126,32 +1126,30 @@ impl CompactionRuntime {
                     progress: progress_tx,
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut callback = |backend: &mut Backend, request: &Chat, ui: &mut dyn Ui| {
-                        if worker_cancel.load(Ordering::SeqCst) {
-                            return Err(llm::Interrupted.into());
-                        }
-                        let remaining = deadline.at.saturating_duration_since(Instant::now());
-                        ensure!(
-                            !remaining.is_zero(),
-                            "background compaction deadline expired"
-                        );
-                        let target = if request
-                            .messages
-                            .iter()
-                            .any(|m| m["dial_compaction_handoff"] == true)
-                        {
-                            backend
-                        } else {
-                            backends.summary.as_mut().unwrap_or(backend)
+                    let mut callback =
+                        |backend: &mut Backend,
+                         request: &Chat,
+                         ui: &mut dyn Ui,
+                         cancel: Arc<AtomicBool>| {
+                            if worker_cancel.load(Ordering::SeqCst) {
+                                return Err(llm::Interrupted.into());
+                            }
+                            let remaining = deadline.at.saturating_duration_since(Instant::now());
+                            ensure!(
+                                !remaining.is_zero(),
+                                "background compaction deadline expired"
+                            );
+                            let target = if request
+                                .messages
+                                .iter()
+                                .any(|m| m["dial_compaction_handoff"] == true)
+                            {
+                                backend
+                            } else {
+                                backends.summary.as_mut().unwrap_or(backend)
+                            };
+                            complete(target, request, ui, cancel, remaining.as_secs().max(1))
                         };
-                        complete(
-                            target,
-                            request,
-                            ui,
-                            worker_cancel.clone(),
-                            remaining.as_secs().max(1),
-                        )
-                    };
                     compaction::compact_history_with_execution(
                         &mut backends.main,
                         compaction::HistoryCompaction {

@@ -308,7 +308,7 @@ fn invalid_run_error(layout: &Layout, reasons: &[String]) -> anyhow::Error {
             || reason.contains("subscription sign-in")
     }) && UNCOPIED_SIGN_INS
         .iter()
-        .any(|file| layout.user_dir.join(file).is_file())
+        .any(|file| dial::config::paths::auth_file(&layout.user_dir, file).is_file())
     {
         message.push_str(
             "\nhint: benchmark agents use an isolated DIAL_HOME. Pass --share-auth to use existing subscription sign-ins and their original refresh locks without copying tokens; API-key credentials remain supported.",
@@ -690,8 +690,8 @@ fn write_benchmark_home(layout: &Layout, isolated: &Config, user_home: &TempDir)
     let contents = toml::to_string(isolated).context("serializing benchmark config")?;
     write_private(&user_home.path().join("config.toml"), contents.as_bytes())?;
     copy_private_if_present(
-        &layout.user_dir.join("credentials.json"),
-        &user_home.path().join("credentials.json"),
+        &dial::llm::credential_store::api_key_path(&layout.user_dir),
+        &dial::llm::credential_store::api_key_path(user_home.path()),
     )?;
     Ok(())
 }

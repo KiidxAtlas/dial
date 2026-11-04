@@ -200,14 +200,33 @@ pub fn native_failure(record: &Value) -> bool {
             .any(|c| c["tool"] != "batch" && (c["passed"] == false || c["text_lifted"] == true))
     })
 }
+/// Why measured reliability constrains this request. Order is stable for diagnostics.
+pub fn single_call_reasons(
+    config: &AppConfig,
+    profile: Option<&Value>,
+    stats: &Stats,
+) -> Vec<&'static str> {
+    if !config.reliability.enabled || !config.reliability.measured_interfaces {
+        return Vec::new();
+    }
+    let mut reasons = Vec::new();
+    if config
+        .active_model_profile()
+        .is_some_and(|p| p.capabilities.parallel_tool_calls == Some(false))
+    {
+        reasons.push("model_capability");
+    }
+    if stats.consecutive_contract_failures >= 2 {
+        reasons.push("contract_recovery");
+    }
+    if profile.is_some_and(|p| !batch_permitted(p)) {
+        reasons.push("saved_reliability_record");
+    }
+    reasons
+}
+
 pub fn single_call(config: &AppConfig, profile: Option<&Value>, stats: &Stats) -> bool {
-    config.reliability.enabled
-        && config.reliability.measured_interfaces
-        && (config
-            .active_model_profile()
-            .is_some_and(|p| p.capabilities.parallel_tool_calls == Some(false))
-            || stats.consecutive_contract_failures >= 2
-            || profile.is_some_and(|p| !batch_permitted(p)))
+    !single_call_reasons(config, profile, stats).is_empty()
 }
 /// Route facts for the CLI report (`dial reliability`). Only this path may probe a local server or
 /// read the saved record; the live session never calls it.
@@ -364,6 +383,21 @@ pub fn render(value: &Value) -> String {
     }
     let session = &value["session"];
     if session.is_object() {
+        if session["call_policy"].is_object() {
+            out.push_str(&format!(
+                "\nRequest call policy: {} · reasons: {}",
+                session["call_policy"]["mode"].as_str().unwrap_or("unknown"),
+                session["call_policy"]["reasons"]
+                    .as_array()
+                    .map(|reasons| reasons
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "))
+                    .filter(|reasons| !reasons.is_empty())
+                    .unwrap_or_else(|| "no one-call constraint".into()),
+            ));
+        }
         let s = &session["stats"];
         let first_action = s["first_useful_action_ms"]
             .as_u64()

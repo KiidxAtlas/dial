@@ -9,7 +9,6 @@ pub const EVERYDAY: &[&str] = &[
     "workers",
     "processes",
     "sessions",
-    "resume",
     "rename",
     "fork",
     "new",
@@ -38,7 +37,7 @@ pub const START_HERE: &[&str] = &[
     "providers",
     "extensions",
     "setup",
-    "resume",
+    "sessions",
     "compact",
     "review",
     "changes",
@@ -146,39 +145,20 @@ impl Category {
     }
 }
 
-/// The category of a built-in command. Every registered command is listed; anything unknown
-/// (a command added without updating this map) lands in Settings so it is still reachable.
+mod commands;
+pub use commands::{
+    ArgumentPolicy, Availability, AvailabilityContext, COMMANDS, CommandAlias, CommandSpec,
+    DuringTurn, LiveForm, Surface, command_spec, unavailable_reason,
+};
+
+/// Category lookup is a thin projection of the shared command table.
 pub fn category(name: &str) -> Category {
-    match name {
-        "new" | "clear" | "sessions" | "resume" | "fork" | "rename" | "export" | "tree"
-        | "archive" | "copy" | "search" | "exit" | "restart" | "share" | "branch" | "delete"
-        | "move" | "pin" | "session" | "dump" | "retry" => Category::Session,
-        "model" | "providers" | "profile" | "reasoning" | "thinking" | "effort" | "fast"
-        | "slow" | "extended-context" | "modelpreset" | "switch" | "cost" | "usage" => {
-            Category::Model
-        }
-        "review" | "review-file" | "changes" | "undo" | "rollback" | "commit" | "checks"
-        | "code-history" | "plan-review" | "changelog" => Category::Review,
-        "workers" | "processes" | "bg" | "jobs" | "agents" | "message" | "cancel" | "queue"
-        | "todo" | "goal" | "guided-goal" | "contract" | "loop" | "btw" | "tan" | "compute" => {
-            Category::Work
-        }
-        "plan" | "plan-yolo" | "advisor" | "external-thinking" | "vibe" | "skillful"
-        | "prewalk" | "ratchet" | "rule" | "debug" | "fresh" | "handoff" | "shake" | "cleanse" => {
-            Category::Modes
-        }
-        "context" | "compact" | "memory" | "skills" | "commands" | "add-dir" | "remove-dir"
-        | "dirs" | "trace" => Category::Context,
-        "extensions" | "mcp" | "tools" | "computer" | "ssh" | "git" | "wt" | "security"
-        | "collab" | "join" | "leave" | "hub" | "relay" | "hooks" | "login" | "logout"
-        | "graphify" | "image" => Category::Integrations,
-        "gc" | "anonymize" | "images" | "update" | "benchmark" | "schedule" | "stats" => {
-            Category::Maintenance
-        }
-        "improve" | "reliability" | "policy" | "steering" | "weights" | "experience"
-        | "understanding" | "laya" | "outcome" | "autoresearch" => Category::Learning,
-        _ => Category::Settings,
-    }
+    command_spec(name).map_or(Category::Settings, |spec| {
+        spec.aliases
+            .iter()
+            .find(|alias| alias.name == name)
+            .map_or(spec.category, |alias| alias.category)
+    })
 }
 
 #[cfg(test)]

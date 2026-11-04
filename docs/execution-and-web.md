@@ -34,6 +34,14 @@ output condition, use the existing `bg wait` `until` regex or approved readiness
 ending a wait never establishes that the command passed. See
 [event-driven continuation](agent-loop.md#event-driven-continuation).
 
+Log readiness observes new bytes with a wait-local cursor, separate from display and notification
+readers. It preserves split UTF-8, terminal escapes and multiline regexes within a contiguous
+256 KiB observation. If the display ring has already discarded unobserved bytes, or that observation
+budget is exhausted, the wait reports incomplete readiness explicitly rather than silently missing
+a banner or changing regex anchors by dropping its prefix. Narrow startup output or use approved
+port readiness when more output is expected. Arbitrary regex matching still scans its bounded
+observation on growth; this is not a measured matching-speed improvement.
+
 ## Persistent kernels and evaluation
 
 The `eval` tool runs persistent cells in two languages selected by `language`: `js` (the default) and `py`. Each language keeps its own namespace between successful cells. Recorded `kernel` calls from earlier sessions replay as `eval` Python cells. Interrupting a running Python cell first sends SIGINT; an interrupt that does not unwind within five seconds escalates to terminating the kernel. Failed transport, cancellation and timeout paths discard the namespace. Effects already performed remain; loss of the final cell result is recorded as uncertain. Python interpreters may be selected from the project virtual environment (`.venv`/`VIRTUAL_ENV`) or conda environment when configured/approved, but execution remains subject to the mandatory process-creation fence. The cell deadline pauses while a tool callback requested by the cell is running, so callback time is not charged to the cell.
@@ -127,6 +135,15 @@ Supported platforms are macOS, Linux, and Windows with Chrome or Chromium that s
 the download cap was not retrieved.
 
 Fetch handles supported binary documents (including PDF and Office formats) with the document converter. For HTML, it probes declared Markdown alternate links and `.md` siblings, tries Markdown content negotiation, then configured readers with a quality gate, then `llms.txt` candidates, before using built-in HTML conversion. Optional external readers are configured through `web.reader_chain`; they receive HTML on standard input. Common GitHub, npm, crates.io, PyPI, and Stack Overflow URLs use public APIs when available, with ordinary fetching as fallback.
+
+Optional HTML discovery shares at most ten seconds (or the shorter configured web timeout), twelve
+HTTP requests including redirects, and 4 MiB of aggregate response-body reads. Declared alternate
+links and `llms.txt` candidate collections are capped at twelve; duplicate requests are skipped.
+Network readers share that budget and external reader processes use its remaining deadline.
+Exhausted optional discovery falls back to the already-fetched HTML. A selected Markdown alternate,
+sibling, negotiated representation or `llms.txt` response reports its actual final URL, status and
+download truncation, with the original page named as the discovery source rather than falsely
+attributing the alternate text to that page.
 
 Search uses `web.search_provider` or a per-call provider selection. Supported backends include Brave, Tavily, Exa, Serper, SearXNG, Kagi, Perplexity, Jina, Google Custom Search, Bing, Firecrawl (`FIRECRAWL_API_KEY`), Parallel (`PARALLEL_API_KEY`), Z.AI (`ZAI_API_KEY`), xAI (`XAI_API_KEY`), TinyFish (`TINYFISH_API_KEY`), DeepSeek (`DEEPSEEK_API_KEY`), Kimi (`KIMI_SEARCH_API_KEY`), Synthetic (`SYNTHETIC_API_KEY`), Ollama Cloud (`OLLAMA_API_KEY`), and the keyless DuckDuckGo, Startpage, Mojeek and Ecosia HTML scrapers. `auto` tries configured keyed providers first and the keyless ones last; a scraper that meets a captcha, firewall or proof-of-work wall fails with an error so `auto` moves on. `public` is explicit only: it queries Startpage, DuckDuckGo, Ecosia and Mojeek in turn, ranks a result several engines return ahead of others, and fails only when all four fail. Kimi, Synthetic, Ollama and `public` cannot enforce the recency window; the answer says so. Grounded answer providers run the provider's own web search and return its answer with the sources it cited: OpenAI (`openai`, Responses `web_search`, `OPENAI_API_KEY`), Anthropic (`anthropic`, server `web_search` tool, `ANTHROPIC_API_KEY`), Gemini (`gemini`, `google_search` grounding, `GEMINI_API_KEY`), OpenRouter (`openrouter`, web plugin, `OPENROUTER_API_KEY`) and Codex (`codex`, Responses `web_search` on the active ChatGPT subscription session, no API key). They are explicit only, so `auto` never selects them. Each API provider reads its key from the environment or a key saved for that provider. Codex uses the signed-in ChatGPT account from `/providers`, is refused when none is signed in, and its turn is streamed through the same Responses parser as the chat path; its model id is a default that a future release may change. Their native search has no hard date filter, so the recency window is an instruction in the prompt and the answer says so; `domains` and `exclude_domains` are applied to the returned sources. Gemini's grounding redirect links (`vertexaisearch.cloud.google.com/grounding-api-redirect/…`) are resolved to the final page through the guarded fetch client: at most four resolve at once, each within 5 seconds, and a link that fails keeps its redirect URL. A reply that did not run a search, or that carries no sources, is an error, not a result. Provider credentials are supplied through their documented environment variables; no key is embedded in configuration or sent to a different origin. A custom `web.search_url` template remains supported and must contain `{query}`.
 
@@ -263,10 +280,13 @@ browser session launches: set it on the first `open`, or run `shutdown` before r
 different value. It cannot be used with an attached browser (`DIAL_CDP_URL`), whose TLS settings the
 operator owns.
 
-Clipboard actions use the page's `navigator.clipboard` with granted read and write permissions.
 `clipboard_write` sets text (up to 64 KiB); `clipboard_read` returns it, truncated with a flag when
-larger. `clipboard_copy` and `clipboard_paste` send the platform copy and paste shortcut to the focused
-element. No clipboard shim is installed, so the result depends on the browser's clipboard support.
+larger. These actions use `navigator.clipboard` in a disposable, script-free controller document,
+granting only the requested permission there. They never add clipboard permissions to the user's
+page/context or clear its existing grants. The controller revokes its grants and closes its context
+in `finally`; cleanup failures are reported rather than hidden. `clipboard_copy` and
+`clipboard_paste` still send the platform shortcut to the focused element. No clipboard shim is
+installed; actual clipboard support remains browser/platform-dependent.
 
 `save_state` stores cookies and origin storage under `name` in the Dial state directory
 (`browser/states/<name>.json`). `load_state` restores those cookies and the current origin's

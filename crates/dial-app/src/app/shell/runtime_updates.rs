@@ -68,7 +68,7 @@ impl RuntimeUpdates {
                 Err(TryRecvError::Empty) => return None,
             }
         }
-        let stamp = user_dir.join("runtime-update-check");
+        let stamp = crate::config::paths::runtime_update_check_file(user_dir);
         if !self.loaded {
             self.loaded = true;
             self.last_attempt = std::fs::read_to_string(&stamp)

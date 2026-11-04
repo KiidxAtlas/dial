@@ -32,10 +32,10 @@ fn legacy_role_keys_map_to_current_roles() {
              [escalation]\nenabled=true\nrole='stronger'\n",
     );
     let roles = role_table(&table);
-    assert_eq!(roles.len(), 4);
+    assert_eq!(roles.len(), 3);
     assert_eq!(roles["small"]["model"].as_str(), Some("small-a"));
     assert_eq!(roles["coach"]["model"].as_str(), Some("coach-c"));
-    assert_eq!(roles["planner"]["model"].as_str(), Some("plan-e"));
+    assert!(!roles.contains_key("planner"));
     assert_eq!(roles["memory"]["model"].as_str(), Some("mem-f"));
     assert!(!table["escalation"].as_table().unwrap().contains_key("role"));
 }
@@ -73,8 +73,8 @@ fn default_fills_unassigned_roles_and_vision_is_dropped() {
     let roles = role_table(&table);
     assert!(!roles.contains_key("default"));
     assert!(!roles.contains_key("vision"));
-    assert_eq!(roles["planner"]["model"].as_str(), Some("plan"));
-    for role in ["task", "small", "coach", "tester", "memory"] {
+    assert_eq!(roles["coach"]["model"].as_str(), Some("plan"));
+    for role in ["task", "small", "tester", "memory"] {
         assert_eq!(roles[role]["model"].as_str(), Some("base"), "{role}");
     }
     assert!(!roles.contains_key("decision"));
@@ -146,7 +146,7 @@ fn validation_accepts_only_assignable_roles() {
         "small",
         "coach",
         "tester",
-        "planner",
+        "decision",
         "memory",
         "embedding",
     ] {
@@ -158,7 +158,16 @@ fn validation_accepts_only_assignable_roles() {
         .unwrap();
     }
     for role in [
-        "main", "default", "stronger", "feedback", "vision", "subagent",
+        "main",
+        "default",
+        "stronger",
+        "feedback",
+        "vision",
+        "subagent",
+        "planner",
+        "judge",
+        "grounding",
+        "image_embedding",
     ] {
         let result = resolve(&format!(
             "model='local'\nprovider='mlx'\n[model_roles.{role}]\nprovider='mlx'\nmodel='m'\n"
@@ -441,7 +450,7 @@ fn unassigned_roles_resolve_to_the_main_selection() {
     )
     .unwrap();
     assert_eq!(config.for_role("coach").selection(), config.selection());
-    assert_eq!(config.for_role("planner").selection(), config.selection());
+    assert_eq!(config.for_role("tester").selection(), config.selection());
     assert_eq!(config.for_role("small").model, "account-small");
 }
 
@@ -458,11 +467,10 @@ fn unassigned_decision_is_not_filled() {
 }
 
 #[test]
-fn decision_role_must_be_a_laya_checkpoint() {
+fn decision_role_accepts_chat_or_laya_with_separate_checkpoint() {
     let laya = resolve(
-        "model='local'\nprovider='mlx'\n[model_roles.decision]\nprovider='laya'\nmodel='/models/laya'\n",
-    )
-    .unwrap();
+        "model='local'\nprovider='mlx'\n[model_roles.decision]\nprovider='laya'\nmodel='decision'\n[laya]\ncheckpoint='/models/laya'\n",
+    ).unwrap();
     laya.validate().unwrap();
     assert_eq!(
         laya.laya_service().checkpoint.as_deref(),
@@ -470,17 +478,155 @@ fn decision_role_must_be_a_laya_checkpoint() {
     );
     let chat = resolve(
         "model='local'\nprovider='mlx'\n[model_roles.decision]\nprovider='mlx'\nmodel='m'\n",
+    )
+    .unwrap();
+    assert_eq!(chat.for_role("decision").model, "m");
+    assert!(chat.laya_service().checkpoint.is_none());
+    let row = chat
+        .role_statuses()
+        .into_iter()
+        .find(|row| row.role == "decision")
+        .unwrap();
+    assert_eq!(row.source, crate::llm::model_config::RoleSource::Assigned);
+}
+
+#[test]
+fn current_chat_decision_role_is_migration_safe() {
+    let mut table = migrated("[model_roles.decision]\nprovider='mlx'\nmodel='chat'\n");
+    assert_eq!(
+        role_table(&table)["decision"]["model"].as_str(),
+        Some("chat")
+    );
+    assert!(!migrate_model_role_table(&mut table));
+}
+
+#[test]
+fn consolidated_roles_migrate_without_losing_feature_routes() {
+    let mut table = migrated(
+        "[model_roles.planner]\nprovider='mlx'\nmodel='planning'\n\
+         [model_roles.judge]\nprovider='openai'\nmodel='typed-choice'\n\
+         [model_roles.decision]\nprovider='laya'\nmodel='/models/checkpoint'\n\
+         [model_roles.grounding]\nprovider='endpoint'\nmodel='ui-model'\nbase_url='http://127.0.0.1:9000/v1'\n\
+         [model_roles.image_embedding]\nprovider='mlx'\nmodel='vectors'\n\
+         [agents.custom]\nmodel=['@planner:high','@judge']\n\
+         [retry.fallback_chains]\njudge=['@judge']\nplanner=['@planner']\n",
+    );
+    let roles = role_table(&table);
+    assert_eq!(roles["coach"]["model"].as_str(), Some("planning"));
+    assert_eq!(roles["decision"]["model"].as_str(), Some("typed-choice"));
+    for removed in ["planner", "judge", "grounding", "image_embedding"] {
+        assert!(!roles.contains_key(removed), "{removed}");
+    }
+    assert_eq!(
+        table["laya"]["checkpoint"].as_str(),
+        Some("/models/checkpoint")
+    );
+    assert_eq!(
+        table["vision"]["grounding"]["model"].as_str(),
+        Some("ui-model")
+    );
+    assert_eq!(
+        table["vision"]["grounding"]["base_url"].as_str(),
+        Some("http://127.0.0.1:9000/v1")
+    );
+    assert_eq!(
+        table["vision"]["image_embedding"]["model"].as_str(),
+        Some("vectors")
+    );
+    assert_eq!(
+        table["agents"]["custom"]["model"][0].as_str(),
+        Some("@coach:high")
+    );
+    assert_eq!(
+        table["agents"]["custom"]["model"][1].as_str(),
+        Some("@decision")
+    );
+    assert_eq!(
+        table["retry"]["fallback_chains"]["decision"][0].as_str(),
+        Some("@decision")
+    );
+    assert_eq!(
+        table["retry"]["fallback_chains"]["coach"][0].as_str(),
+        Some("@coach")
     );
     assert!(
-        chat.is_err(),
-        "invalid decision roles are rejected during resolution"
+        !migrate_model_role_table(&mut table),
+        "migration must be idempotent"
     );
 }
 
 #[test]
-fn migration_moves_a_chat_decision_role_to_memory() {
-    let table = migrated("[model_roles.decision]\nprovider='mlx'\nmodel='chat'\n");
-    let roles = role_table(&table);
-    assert!(!roles.contains_key("decision"));
-    assert_eq!(roles["memory"]["model"].as_str(), Some("chat"));
+fn consolidated_role_migration_preserves_explicit_new_settings() {
+    let mut table = migrated(
+        "[model_roles.coach]\nprovider='mlx'\nmodel='coach'\n\
+         [model_roles.planner]\nprovider='mlx'\nmodel='old-plan'\n\
+         [model_roles.decision]\nprovider='openai'\nmodel='new-decision'\n\
+         [model_roles.judge]\nprovider='openai'\nmodel='old-judge'\n\
+         [model_roles.grounding]\nprovider='mlx'\nmodel='old-grounding'\n\
+         [vision.grounding]\nprovider='mlx'\nmodel='new-grounding'\n",
+    );
+    assert_eq!(
+        table["model_roles"]["coach"]["model"].as_str(),
+        Some("coach")
+    );
+    assert_eq!(
+        table["model_roles"]["decision"]["model"].as_str(),
+        Some("new-decision")
+    );
+    assert_eq!(
+        table["vision"]["grounding"]["model"].as_str(),
+        Some("new-grounding")
+    );
+    assert!(!migrate_model_role_table(&mut table));
+}
+
+#[test]
+fn saved_presets_migrate_removed_roles_and_keep_feature_selections() {
+    let mut table = migrated(
+        "[model_presets.work.roles.planner]\nprovider='mlx'\nmodel='plan'\n\
+         [model_presets.work.roles.judge]\nprovider='openai'\nmodel='judge-chat'\n\
+         [model_presets.work.roles.decision]\nprovider='laya'\nmodel='/checkpoint'\n\
+         [model_presets.work.roles.grounding]\nprovider='mlx'\nmodel='locate'\n\
+         [model_presets.work.roles.image_embedding]\nprovider='mlx'\nmodel='vectors'\n",
+    );
+    let config: Config = table.clone().try_into().unwrap();
+    let preset = &config.model_presets["work"];
+    assert_eq!(preset.roles["coach"].model, "plan");
+    assert_eq!(preset.roles["decision"].model, "judge-chat");
+    assert_eq!(preset.roles.len(), 2);
+    assert_eq!(preset.laya_checkpoint.as_deref(), Some("/checkpoint"));
+    let vision = preset.vision.as_ref().unwrap();
+    assert_eq!(vision.grounding.as_ref().unwrap().model, "locate");
+    assert_eq!(vision.image_embedding.as_ref().unwrap().model, "vectors");
+    assert!(!migrate_model_role_table(&mut table));
+}
+
+#[test]
+fn migrated_local_vision_override_does_not_inherit_the_global_endpoint() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    for feature in ["grounding", "image_embedding"] {
+        let global = migrated(&format!(
+            "provider='mlx'\nmodel='main'\n[model_roles.{feature}]\n\
+             provider='endpoint'\nmodel='remote'\nbase_url='http://127.0.0.1:9000/v1'\napi_key_env='OLD_KEY'\n",
+        ));
+        let project = migrated(&format!(
+            "[model_roles.{feature}]\nprovider='mlx'\nmodel='local'\n",
+        ));
+        let config = Config::from_layers(&layout, &global, &project, &toml::Table::new()).unwrap();
+        let resolved = config.for_vision(feature);
+        assert_eq!(resolved.model, "local");
+        assert!(
+            resolved.endpoint.is_none(),
+            "{feature} retained the global endpoint"
+        );
+        assert!(
+            config
+                .vision_selection(feature)
+                .unwrap()
+                .api_key_env
+                .is_none()
+        );
+    }
 }

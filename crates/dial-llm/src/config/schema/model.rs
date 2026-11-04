@@ -331,6 +331,14 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         },
         true
     ),
+    def!(
+        "laya.checkpoint",
+        MO,
+        "Laya",
+        "Decision checkpoint",
+        "Optional local path or Hugging Face repository for the Laya service. Delete uses the installed checkpoint; the decision role selects Laya or a chat backend independently.",
+        Kind::Text
+    ),
     field!(
         "codebase.synthesize_architecture",
         codebase.synthesize_architecture,

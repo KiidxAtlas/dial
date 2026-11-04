@@ -10,7 +10,6 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
 const SCHEMA_VERSION: i64 = 1;
-const DEFAULT_RELATIVE_PATH: &str = "cache/judgment.db";
 const PATH_ENV: &str = "DIAL_JUDGE_CACHE_DB";
 
 /// SQLite-backed judgment cache. Times are unix seconds, passed in so tests control the clock.
@@ -114,7 +113,7 @@ fn resolve_path(override_path: Option<OsString>, user_dir: &Path) -> Option<Path
     match override_path {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
         _ if user_dir.as_os_str().is_empty() => None,
-        _ => Some(user_dir.join(DEFAULT_RELATIVE_PATH)),
+        _ => Some(crate::config::paths::judgment_cache_file(user_dir)),
     }
 }
 

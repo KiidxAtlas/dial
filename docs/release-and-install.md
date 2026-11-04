@@ -1,5 +1,60 @@
 # Release and installation
 
+## Release-readiness checklist
+
+- Review and commit the intended source changes before running `make preflight`: it validates
+  a clean snapshot of the selected commit, not uncommitted work. Do not discard unrelated work
+  to obtain a clean status. Review version-specific release notes before tagging.
+- Keep the source scaffold separate from local state. `src/`, `crates/`, `python/`, `runtimes/`
+  and `assets/` contain implementation and bundled resources; `tests/` and `examples/` contain
+  regression coverage and runnable examples; `scripts/`, `.github/` and `Formula/` own release
+  and check tooling. The root manifests, lockfile, licenses and platform packaging are required.
+- Benchmark reports and `scratch/` experiments are disposable local output, not release inputs.
+  Git and Docker exclusions keep them out of new source changes and container build contexts.
+  A local cleanup must preserve installed environments, build caches, private Dial state,
+  unfinished plans and unrelated work unless their removal is separately approved.
+- Confirm required main/tag protections, signing-environment reviewers and secret scoping in
+  GitHub. Local workflow files cannot establish repository settings or successful publication.
+- Run applicable native-platform and optional integration tiers explicitly. Host tests and
+  cross-compilation do not verify Linux confinement, Windows runtime behavior, native desktop
+  capture/input, live providers, remote SSH or collaboration interoperability.
+- Verify the published archive signatures and container digest signature/provenance/SBOM.
+  Hosted signing/publication and bit-for-bit reproducibility require independent acceptance;
+  standalone archives do not yet have equivalent provenance/SBOM attestations. CI Python tools
+  use the transitive, hashed `scripts/requirements-ci.lock`. The Nix input is pinned to an immutable
+  revision, but still needs a genuine resolver-generated `flake.lock` and native Nix acceptance.
+
+### Known platform limits
+
+Portable Unix process-group signalling remains best-effort against PID reuse. General storage
+retention policy and native accessibility/terminal compatibility require separate owner checks;
+historical report pass counts do not establish current release readiness.
+
+### Dependency reproducibility
+
+`scripts/requirements-ci.txt` owns direct portable test dependencies. CI installs the generated
+`scripts/requirements-ci.lock` with `pip --require-hashes`; local preflight consumes the same lock.
+Regenerate intentionally with:
+
+```sh
+uv pip compile scripts/requirements-ci.txt --python-version 3.12 --generate-hashes --universal --output-file scripts/requirements-ci.lock
+```
+
+Review the lock diff and run the Python, installer and benchmark contracts after updates.
+This lock covers CI tooling, not the optional MLX worker (`python/pyproject.toml`), Laya or
+operator-installed extensions. Their separate environments must not be called fully reproducible.
+
+`flake.nix` pins nixpkgs to an immutable commit rather than a moving branch. On a Nix-enabled host,
+run `nix flake lock`, review and stage `flake.lock`, then run `nix flake check` and `nix build`.
+Do not fabricate a NAR hash or treat source inspection as native Nix acceptance.
+
+### Hosted settings acceptance
+
+A repository owner must configure and verify `main` and release-tag protections, repository
+rulesets, and reviewer/deployment-branch restrictions for the `release-signing` environment
+before publication. Missing required protections are release blockers; workflow files alone
+cannot establish the current hosted settings. See [Release signing inputs](#release-signing-inputs).
+
 ## Install a release
 
 The supported release installer is the asset `install.sh` on macOS and Linux:
@@ -103,7 +158,7 @@ so the container binary retains its source identity and trusted update key.
 
 ## Build from source
 
-Install the pinned Rust toolchain from `rust-toolchain.toml` and run `cargo build --release --locked -p dial` for shipping optimization. `make build` and `make update` default to the optimized `local` profile (incremental compilation, no LTO); pass `PROFILE=release` for shipping-equivalent builds (thin LTO). `make update` rebuilds from the checkout, backs up existing binaries, and retains only the three newest backups at each managed location. `make check`, `make test-lib`, and `make test-module MOD=module::path` provide narrower development checks; `make test` retains the full Rust suite. CI builds and tests with the `ci` profile (unoptimized, no debug info) and caches Rust dependencies separately for test, lint, and release jobs. Release builds start as soon as a tag is pushed and run alongside CI; the publish job waits for CI to pass on the tagged commit before signing and publishing anything. Python tests run under pytest in CI; optional model/runtime dependencies are separate from the Rust executable.
+Install the pinned Rust toolchain from `rust-toolchain.toml` and run `cargo build --release --locked -p dial` for shipping optimization. `make build` and `make update` default to the optimized `local` profile (incremental compilation, no LTO); pass `PROFILE=release` for shipping-equivalent builds (thin LTO). `make update` rebuilds from the checkout, backs up existing binaries, and retains only the three newest backups at each managed location. `make check`, `make test-lib`, and `make test-module MOD=module::path` provide narrower development checks; `make test` retains the full Rust suite. CI builds and tests with the `ci` profile (unoptimized, no debug info) and caches Rust dependencies separately for test, lint, and release jobs. Release jobs require a completed successful push-to-main CI run for the exact tagged commit before building, signing or publishing. Python tests run under pytest in CI; optional model/runtime dependencies are separate from the Rust executable.
 
 Unix subprocess creation shares one pipe/fork guard for ordinary, detached and process-group
 children. This prevents concurrent core spawns from retaining unrelated output-pipe writers on
@@ -112,10 +167,11 @@ group and bounds output draining; output is marked incomplete if EOF cannot be o
 
 ## Platform installation details
 
-Release targets are **macOS 13+ on Apple Silicon (arm64) or Intel (x86-64)**, **Linux x86-64 (Ubuntu
-22.04 or newer)**, and **native Windows x86-64** (`dial-<tag>-x86_64-pc-windows-msvc.zip`, installed
-with `scripts/install.ps1` in PowerShell). Linux x86-64 builds also run under WSL2 Ubuntu. No Rust compiler or source
-checkout is needed for prebuilt releases. Download the archive for your platform
+Release targets are **macOS 13+ on Apple Silicon (arm64) or Intel (x86-64)**, **Linux x86-64
+and arm64 (glibc or musl; Ubuntu 22.04 or newer)**, and **native Windows x86-64 and arm64**
+(`dial-<tag>-<target>.zip`, installed with the release's `install.ps1` in PowerShell). Linux builds
+also run under WSL2 on the matching architecture. No Rust compiler or source checkout is needed
+for prebuilt releases. Download the archive for your platform
 and the release's `SHA256SUMS` and `SHA256SUMS.sig` files from
 [GitHub Releases](https://github.com/KiidxAtlas/dial/releases).
 
@@ -151,7 +207,8 @@ dial --version
 Stop if checksum verification fails. Add `export PATH="$HOME/.local/bin:$PATH"`
 to your shell configuration (usually `~/.zshrc`) to keep Dial on your PATH.
 To update, repeat with a newer release and restart any running Dial sessions.
-The archives are not signed or notarized; if macOS blocks execution, review your
+The macOS executable is not Apple Developer ID code-signed or notarized; the signed Ed25519
+manifest authenticates archive digests separately. If macOS blocks execution, review your
 system's security prompt rather than disabling Gatekeeper globally.
 
 Hosted providers need an account/API key configured through first-run setup, but
@@ -283,22 +340,50 @@ prompt resolves its weights; a missing default MLX runtime gets an installation 
 
 ### Publishing a release (maintainers)
 
-The release workflow runs on pushed `v*` tags and requires the tag to match
-`Cargo.toml`'s version. `scripts/release.sh <version>` prepares the release from a clean `main`.
-It first refuses unless `HEAD` matches `origin/main` and a `CI` run on that commit succeeded (it
-asks `gh`), so a tag is never placed on code CI has not passed; when it refuses, it lists every
-failed job of the latest run with its link, and the release workflow's gate does the same as
-annotations, so all blockers are visible in one pass. It then sets
-`[workspace.package] version`, refreshes `Cargo.lock` for workspace members only, moves the
-`## [Unreleased]` changelog entries under a dated version heading (refusing an empty section), runs
-`scripts/preflight.sh --quick` on the bumped tree (skip with `--no-check`), commits
-`release: v<version>` and creates an annotated tag. It pushes only with `--push`:
+Release preparation, verification and publication are separate:
 
 ```sh
-scripts/release.sh 0.1.23          # commit + tag locally
-git push origin main
-git push origin v0.1.23
+scripts/release.sh 0.3.0          # metadata only; no build, stage, commit or tag
+make release-check              # aggregate cheap source/tooling errors; no compilation
+# Review, then commit and push main separately, only when authorized.
+# Run the applicable expensive checks and wait for successful push-to-main CI.
+scripts/release.sh 0.3.0 --tag    # explicit annotated tag of the already-tested commit
+# Push only when publication is authorized:
+git push origin v0.3.0
 ```
+
+Preparation accepts a dirty checkout, sets the inherited workspace version, rolls nonempty
+Unreleased notes into the dated version section, and refreshes only workspace lock entries
+with offline Cargo resolution. It never compiles or silently downloads dependencies. An offline
+resolution failure leaves the metadata edits available for inspection and retry; it does not
+certify a prepared tree. An already-bumped version is checked rather than rolled a second time.
+
+`make release-check RELEASE_TAG=v0.3.0` checks stable tag/version agreement, inherited member
+versions, local lock entries, exact nonempty release notes, packaging consistency, both release
+shell scripts and required local commands/Python imports. It reports independent blockers in
+one pass. It does not validate Cargo's complete dependency graph or Rust types and is not a
+replacement for compilation, Clippy, native tests, artifact smoke checks or hosted acceptance.
+Use Python 3.12 with the pinned check dependencies, for example:
+
+```sh
+uv run --no-project --python 3.12 --with-requirements scripts/requirements-ci.lock make release-check
+```
+
+`--tag` requires clean `main`, matching `origin/main`, passing no-build checks and a completed
+successful **push-to-main CI run for that exact commit**, checked with `gh`. It does not bump,
+commit, compile or push main. `--tag --push` additionally pushes the tag; bare `--push` and the
+old `--no-check` bypass are refused. The workflow independently repeats exact-commit admission.
+
+CI's shared no-build readiness/format job gates every compiling matrix and the container build.
+The release gate checks version/notes/public keys before any platform build; an isolated
+`release-signing` environment job also validates private/public Ed25519 key agreement first.
+Build jobs never receive the private key. The final signing job still validates its inputs and
+requires its own environment approval if configured: early approval does not waive final signing
+protection. These jobs cannot establish repository protections from workflow source alone.
+
+Release Rust caches are saved even after failure, and the container workflow explicitly exports
+and restores its release-layer cache. Cache availability and speedups are not guaranteed;
+Docker cache mounts are not themselves persisted by the layer-cache exporter.
 
 #### Checking a commit locally before pushing
 
@@ -324,9 +409,11 @@ and a tree that passed is recorded and not checked again. It covers, in CI's ter
 Cross targets compile their C dependencies with `zig` (`scripts/zig-cc`); install it
 (`brew install zig`) and the rustup targets, or those steps are reported as not covered.
 Tests run only on the host, so Linux-only tests (sandbox enforcement) and the native Windows suite
-still run only in CI; they are compile-checked locally. `make preflight-quick` runs only the compile
-and lint gates (about four minutes warm). A run stops at the first failing step and prints the end
-of its log; `PREFLIGHT_KEEP_GOING=1` reports every failing step. Logs are in `.tmp/preflight/logs/`.
+still run only in CI; they are compile-checked locally. `make preflight-quick` first runs cheap
+readiness and formatting, then the compile/lint gates. Full preflight also runs portable contracts
+before expensive workspace compilation. Cheap failures are collected together and stop the run
+before compile/lint work, even with `PREFLIGHT_KEEP_GOING=1`; that flag otherwise keeps collecting
+failures in the expensive phase. Logs are in `.tmp/preflight/logs/`.
 
 `make hooks` points `core.hooksPath` at `.githooks`, whose `pre-push` hook runs `make preflight`
 on every commit pushed to a branch and refuses the push if it fails. `DIAL_PREFLIGHT=quick git

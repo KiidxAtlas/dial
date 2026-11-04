@@ -26,7 +26,7 @@ pub struct HostRecord {
 }
 
 pub fn dir(user_dir: &Path) -> PathBuf {
-    user_dir.join("run").join("collab-hosts")
+    crate::config::paths::run_dir(user_dir).join("collab-hosts")
 }
 
 /// Write `record` atomically (private temp file, then rename). Returns the record's path.

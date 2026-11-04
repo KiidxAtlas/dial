@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// `<unix seconds of the last attempt>\n<latest tag, empty when unknown>`.
+#[cfg(test)]
 const STAMP: &str = "dial-release-check";
 
 #[derive(Default)]
@@ -78,7 +79,7 @@ impl ReleaseNotice {
         query: impl FnOnce() -> anyhow::Result<String> + Send + 'static,
     ) -> bool {
         let before = self.message.clone();
-        let stamp = user_dir.join(STAMP);
+        let stamp = crate::config::paths::release_check_file(user_dir);
         if !self.loaded {
             self.loaded = true;
             (self.checked_at, self.latest) = read_stamp(&stamp);

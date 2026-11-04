@@ -10,25 +10,11 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &LayaCommand) -> Result<()
         LayaCommand::Install { checkpoint } => {
             eprintln!("Installing Dial-owned Laya runtime and checkpoint…");
             if let Some(model) = laya::install(layout, checkpoint.as_deref())? {
-                use dial::config::settings_store::{self, Change, Scope};
-                settings_store::save(
-                    layout,
-                    Scope::Global,
-                    &[
-                        Change::Set {
-                            path: "model_roles.decision.provider".into(),
-                            value: dial::config::laya::PROVIDER.into(),
-                        },
-                        Change::Set {
-                            path: "model_roles.decision.model".into(),
-                            value: model.display().to_string().into(),
-                        },
-                    ],
-                )?;
+                save_checkpoint(layout, &model)?;
             }
             println!(
                 "Dial Laya installed in {}. Run dial laya start, then /laya on inside Dial.",
-                layout.user_dir.join("laya").display()
+                dial::config::paths::laya_dir(&layout.user_dir).display()
             );
         }
         LayaCommand::Start | LayaCommand::Status => {
@@ -44,3 +30,20 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &LayaCommand) -> Result<()
     }
     Ok(())
 }
+
+/// Persist only service state; installing weights must not change the selected decision engine.
+fn save_checkpoint(layout: &Layout, model: &std::path::Path) -> Result<()> {
+    use dial::config::settings_store::{self, Change, Scope};
+    settings_store::save(
+        layout,
+        Scope::Global,
+        &[Change::Set {
+            path: "laya.checkpoint".into(),
+            value: model.display().to_string().into(),
+        }],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

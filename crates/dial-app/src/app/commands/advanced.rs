@@ -3,29 +3,12 @@
 //! same way `/mcp enable` persists server state. `/security` forwards to the security command
 //! parser in `commands::security`.
 
-use super::CommandSpec;
 use super::security;
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step};
 use crate::computer;
 use crate::config::settings_store::{Change, Scope};
-use crate::security::command::SUBCOMMANDS as SECURITY_SUBCOMMANDS;
 use anyhow::{Result, bail};
-
-pub(super) const COMMANDS: &[CommandSpec] = &[
-    CommandSpec {
-        name: "computer",
-        description: "control the desktop: screenshots and input",
-        args_hint: "on|off|status",
-        subcommands: &["on", "off", "status"],
-    },
-    CommandSpec {
-        name: "security",
-        description: "security review: plan, scans, import, export, compare, cloud",
-        args_hint: "<subcommand>",
-        subcommands: SECURITY_SUBCOMMANDS,
-    },
-];
 
 pub(super) fn run(
     shell: &mut Shell,

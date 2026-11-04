@@ -14,7 +14,6 @@
 //!   `/weights map|stats|activations|trace|experiment|generate|direction|edit|evaluate` runs
 //!   `dial weights` as a background job, and `/weights promote NAME|revert` switches this
 //!   project's model to an edited copy that passed its evaluation, or back to its base.
-use super::CommandSpec;
 use super::extensions::spawn_job_streaming;
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step};
@@ -28,110 +27,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 mod watch_launch;
-
-pub(super) const COMMANDS: &[CommandSpec] = &[
-    CommandSpec {
-        name: "watch",
-        description: "open live edits, errors and screenshots in a separate terminal pane",
-        args_hint: "",
-        subcommands: &[],
-    },
-    CommandSpec {
-        name: "advisor",
-        description: "coach reviews each tool round and the final reply (on, completion, off, status)",
-        args_hint: "on|completion|off|status",
-        subcommands: &["on", "completion", "off", "status"],
-    },
-    CommandSpec {
-        name: "external-thinking",
-        description: "private scratchpad reasoning hidden from the transcript (on, off, status)",
-        args_hint: "on|off|status",
-        subcommands: &["on", "off", "status"],
-    },
-    CommandSpec {
-        name: "plan-yolo",
-        description: "plan mode whose next plan is auto-approved and handed to MODEL (default @small)",
-        args_hint: "[MODEL|off|status]",
-        subcommands: &["off", "status"],
-    },
-    CommandSpec {
-        name: "schedule",
-        description: "recurring or file-triggered prompt runs for this project",
-        args_hint: "list|add|remove|log|run",
-        subcommands: &["list", "add", "remove", "log", "run"],
-    },
-    CommandSpec {
-        name: "gc",
-        description: "sweep stale blobs, archives and WAL state (dry run unless `apply`)",
-        args_hint: "[apply] [--blobs|--archive|--wal|--stale]",
-        subcommands: &["apply"],
-    },
-    CommandSpec {
-        name: "anonymize",
-        description: "write an anonymized copy of a session (default: this one)",
-        args_hint: "[SESSION] [-o PATH]",
-        subcommands: &[],
-    },
-    CommandSpec {
-        name: "images",
-        description: "image cache: status, doctor, probe, purge [--apply] [--all]",
-        args_hint: "[status|doctor|probe|purge]",
-        subcommands: &["status", "doctor", "probe", "purge"],
-    },
-    CommandSpec {
-        name: "update",
-        description: "verify and install the latest signed release (then /restart)",
-        args_hint: "[VERSION]",
-        subcommands: &[],
-    },
-    CommandSpec {
-        name: "benchmark",
-        description: "run a coding benchmark suite in the background (same flags as `dial benchmark`)",
-        args_hint: "[flags]",
-        subcommands: &[],
-    },
-    CommandSpec {
-        name: "relay",
-        description: "local collaboration relay for /collab (start [ADDR], stop, status)",
-        args_hint: "start [ADDR]|stop|status",
-        subcommands: &["start", "stop", "status"],
-    },
-    CommandSpec {
-        name: "hooks",
-        description: "list configured lifecycle hooks",
-        args_hint: "",
-        subcommands: &[],
-    },
-    CommandSpec {
-        name: "weights",
-        description: "inspect local MLX model weights and run evaluation-gated weight edit experiments",
-        args_hint: "[status|open|next|map|analyze|stats|activations|trace|experiment NAME [--budget N]|generate|direction NAME|edit NAME|combine NAME --edits a,b|evaluate EDIT --cases FILE|history|show ID|compare A B|prune|cases --session ID|improve [--with MODEL] GOAL|promote EDIT|revert]",
-        subcommands: &[
-            "status",
-            "open",
-            "map",
-            "analyze",
-            "stats",
-            "activations",
-            "trace",
-            "experiment",
-            "generate",
-            "direction",
-            "edit",
-            "evaluate",
-            "combine",
-            "history",
-            "show",
-            "compare",
-            "prune",
-            "cases",
-            "next",
-            "improve",
-            "promote",
-            "revert",
-        ],
-    },
-];
 
 pub(super) fn run(
     shell: &mut Shell,
@@ -956,8 +851,13 @@ fn await_relay_ready(child: &mut Child) -> Result<()> {
 }
 
 fn hooks(shell: &mut Shell, app: &App) -> Result<()> {
-    let hooks = &app.config.hooks;
-    let text = if hooks.is_empty() {
+    shell.note("Hooks", hooks_text(&app.config));
+    Ok(())
+}
+
+pub(super) fn hooks_text(config: &crate::config::Config) -> String {
+    let hooks = &config.hooks;
+    if hooks.is_empty() {
         "No lifecycle hooks are configured. Add `[[hooks]]` entries (event, matcher, command) in the user config; see README → Hooks.".to_owned()
     } else {
         hooks
@@ -986,9 +886,7 @@ fn hooks(shell: &mut Shell, app: &App) -> Result<()> {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    };
-    shell.note("Hooks", text);
-    Ok(())
+    }
 }
 
 #[cfg(test)]

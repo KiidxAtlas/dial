@@ -63,6 +63,8 @@ pub(in crate::agent) struct Observation {
     pub tool_schema_bytes: usize,
     pub tool_count: usize,
     pub request_message_bytes: usize,
+    /// Inclusive CPU/wall work of this observation, excluding journal publication and inference.
+    pub elapsed_us: u64,
 }
 
 /// Digest and serialized length using request-local scratch space. The buffer is never retained
@@ -78,6 +80,7 @@ impl Tracker {
     /// Runs once per request on the whole history. Reuse serialization capacity across values,
     /// not fingerprints across requests: projection and hooks may change any historical message.
     pub fn observe(&mut self, model: &str, request: &Chat) -> Observation {
+        let started = std::time::Instant::now();
         let mut scratch = Vec::new();
         let messages: Vec<_> = request
             .messages
@@ -114,7 +117,7 @@ impl Tracker {
             0
         };
         let request_message_bytes = messages.iter().map(|m| m.1).sum::<usize>();
-        let observation = Observation {
+        let mut observation = Observation {
             boundary: "provider_neutral_after_hooks",
             invalidation,
             stable_message_bytes: stable,
@@ -128,11 +131,13 @@ impl Tracker {
             system_bytes,
             tool_schema_bytes,
             tool_count: request.tools.len(),
+            elapsed_us: 0,
         };
         self.model = Some(model.to_owned());
         self.system = system;
         self.tools = tools;
         self.messages = messages;
+        observation.elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         observation
     }
 }

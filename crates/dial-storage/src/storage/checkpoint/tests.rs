@@ -747,3 +747,135 @@ mod changed_review {
         );
     }
 }
+
+#[test]
+fn conversation_rollback_is_exact_and_readonly_links_survive_restart() {
+    let fx = Fixture::new();
+    fx.write("a", "original");
+    let cp = fx.open();
+    let edit = cp.begin_conversation_turn("edit", "session").unwrap();
+    modify(&cp, &fx, "a", "edited");
+    let readonly = cp.begin_conversation_turn("read", "session").unwrap();
+    drop(cp);
+    let cp = fx.open();
+    assert!(
+        cp.rollback_conversation("session", &[readonly])
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
+    assert_eq!(fx.read("a").as_deref(), Some("edited"));
+    assert!(
+        cp.rollback_conversation("session", &[edit])
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
+    assert_eq!(fx.read("a").as_deref(), Some("original"));
+    drop(cp);
+    let cp = fx.open();
+    assert!(
+        cp.begin_conversation_turn("replacement", "session")
+            .unwrap()
+            > readonly
+    );
+}
+
+#[test]
+fn conversation_rollback_rejects_legacy_foreign_missing_and_intervening_links() {
+    let fx = Fixture::new();
+    fx.write("a", "original");
+    let cp = fx.open();
+    let legacy = cp.begin_turn("legacy").unwrap();
+    modify(&cp, &fx, "a", "legacy");
+    let linked = cp.begin_conversation_turn("edit", "session").unwrap();
+    modify(&cp, &fx, "a", "linked");
+    let unrelated = cp.begin_turn("selective revert").unwrap();
+    modify(&cp, &fx, "a", "unrelated");
+    for (session, turns) in [
+        ("session", vec![legacy]),
+        ("fork", vec![linked]),
+        ("session", vec![999]),
+        ("session", vec![linked]),
+    ] {
+        assert!(
+            cp.rollback_conversation(session, &turns).is_err(),
+            "{session}: {turns:?}"
+        );
+        assert_eq!(fx.read("a").as_deref(), Some("unrelated"));
+    }
+    cp.rollback(1).unwrap();
+    assert!(!cp.list().iter().any(|info| info.turn == unrelated));
+    cp.rollback_conversation("session", &[linked]).unwrap();
+    assert_eq!(fx.read("a").as_deref(), Some("legacy"));
+    cp.rollback(1).unwrap();
+    assert_eq!(fx.read("a").as_deref(), Some("original"));
+}
+
+#[test]
+fn conversation_range_restores_newest_first_and_retains_incomplete_checkpoint() {
+    let fx = Fixture::new();
+    fx.write("a", "original");
+    let cp = fx.open();
+    let first = cp.begin_conversation_turn("first", "session").unwrap();
+    modify(&cp, &fx, "a", "first");
+    let second = cp.begin_conversation_turn("second", "session").unwrap();
+    modify(&cp, &fx, "a", "second");
+    assert!(
+        cp.rollback_conversation("session", &[first, second])
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
+    assert_eq!(fx.read("a").as_deref(), Some("original"));
+    let partial = cp.begin_conversation_turn("partial", "session").unwrap();
+    modify(&cp, &fx, "a", "partial");
+    let large = fs::File::create(fx.path("large")).unwrap();
+    large.set_len(MAX_FILE_BYTES + 1).unwrap();
+    cp.before_write(&fx.path("large")).unwrap();
+    let report = cp.rollback_conversation("session", &[partial]).unwrap();
+    assert_eq!(report.restored, ["a"]);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not restored"))
+    );
+    assert!(cp.list().iter().any(|info| info.turn == partial));
+}
+
+#[test]
+fn conversation_rollback_retry_does_not_replay_completed_newer_turn() {
+    let fx = Fixture::new();
+    let cp = fx.open();
+    fx.write("older", "original older");
+    fx.write("newer", "original newer");
+    let older = cp.begin_conversation_turn("older", "session").unwrap();
+    modify(&cp, &fx, "older", "changed older");
+    let newer = cp.begin_conversation_turn("newer", "session").unwrap();
+    modify(&cp, &fx, "newer", "changed newer");
+    fs::remove_file(fx.path("older")).unwrap();
+    fs::create_dir(fx.path("older")).unwrap();
+    let report = cp
+        .rollback_conversation("session", &[older, newer])
+        .unwrap();
+    assert!(!report.warnings.is_empty());
+    assert_eq!(fx.read("newer").as_deref(), Some("original newer"));
+    // Reopen to require durable progress rather than an in-memory skip list.
+    drop(cp);
+    let cp = fx.open();
+    fs::remove_dir(fx.path("older")).unwrap();
+    fx.write("newer", "after completed restore");
+    let report = cp
+        .rollback_conversation("session", &[older, newer])
+        .unwrap();
+    assert!(report.warnings.is_empty(), "{report:?}");
+    assert_eq!(fx.read("older").as_deref(), Some("original older"));
+    assert_eq!(fx.read("newer").as_deref(), Some("after completed restore"));
+    cp.finalize_conversation_rollback("session", &[older, newer])
+        .unwrap();
+    assert!(
+        cp.rollback_conversation("session", &[older, newer])
+            .is_err()
+    );
+}

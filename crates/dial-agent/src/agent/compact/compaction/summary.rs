@@ -2,6 +2,7 @@
 //! rather than re-summarized, a split turn keeps its own prefix summary, read/modified file lists
 //! carry across compactions, and summarizer input is planned in message-boundary windows that fit
 //! the compaction model (halving and re-planning when the provider rejects a window as too long).
+use super::execution::RequestCompletion;
 use crate::agent::Ui;
 use crate::agent::compact::compaction::{
     CompactionContext, CompactionControlDenied, MAX_SUMMARY_TOKENS, RemoteCompactionObserver,
@@ -523,7 +524,7 @@ pub(super) fn summarize_prefix(
         focus,
         interrupt,
         ui,
-        complete,
+        &mut |backend, request, ui, _| complete(backend, request, ui),
         remote_observer,
         &mut None,
     )
@@ -571,7 +572,7 @@ pub(super) fn summarize_prefix_with_worker(
     focus: &str,
     interrupt: &Arc<AtomicBool>,
     ui: &mut dyn Ui,
-    complete: &mut dyn FnMut(&mut Backend, &Chat, &mut dyn Ui) -> Result<String>,
+    complete: &mut RequestCompletion<'_>,
     remote_observer: &mut Option<&mut RemoteCompactionObserver<'_>>,
     worker: &mut Option<SummaryWorker>,
 ) -> Result<String> {
@@ -632,58 +633,124 @@ pub(super) fn summarize_prefix_with_worker(
             None
         };
         let (earlier, turn) = if let Some(worker) = fork {
-            std::thread::scope(|scope| -> Result<(String, String)> {
-                let (mut worker_ui, replay) =
-                    crate::agent::compact::compaction_runtime::buffer_progress();
-                let child_interrupt = interrupt.clone();
-                let child = std::thread::Builder::new()
-                    .name("dial-summary-turn-prefix".into())
-                    .spawn_scoped(scope, move || {
-                        let SummaryWorker {
-                            mut backend,
-                            mut complete,
-                        } = worker;
-                        let result = fold(
-                            &mut backend,
-                            &prefix,
-                            None,
-                            Prompt::TurnPrefix,
-                            policy,
-                            context,
-                            method,
-                            focus,
-                            &child_interrupt,
-                            &mut worker_ui,
-                            &mut |backend, request, ui| {
-                                complete(backend, request, ui, child_interrupt.clone())
-                            },
-                            &mut None,
-                        );
-                        (result, replay)
-                    })
-                    .context("start independent split-summary worker")?;
-                // Store errors until after join: no return can detach a sibling request.
-                let earlier = fold(
-                    backend,
-                    &history,
-                    previous,
-                    Prompt::Main,
-                    policy,
-                    context,
-                    method,
-                    focus,
-                    interrupt,
-                    ui,
-                    complete,
-                    remote_observer,
-                );
-                let (turn, replay) = child.join().map_err(|_| {
-                    anyhow::anyhow!("split-summary worker panicked; no summary was committed")
-                })?;
-                replay(ui);
-                interrupted(interrupt)?;
-                Ok((earlier?, turn?))
-            })?
+            // The deadline helper links user stop to a request-local flag without ever setting
+            // the user's flag when one fold fails. Preserve the original failure after settling.
+            let mut outcome = None;
+            let linked = crate::agent::model::roles::with_request_deadline(
+                interrupt.clone(),
+                std::time::Duration::from_secs(
+                    crate::agent::compact::compaction_runtime::maintenance_timeout(
+                        context.timeout_secs,
+                    ),
+                ),
+                |cancel| {
+                    let failure = std::sync::Mutex::new(None);
+                    let settle = |result: Result<String>| match result {
+                        Ok(text) => Some(text),
+                        Err(error) => {
+                            let mut first = failure.lock().unwrap_or_else(|e| e.into_inner());
+                            if first.is_none() {
+                                *first = Some(error);
+                            }
+                            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                            None
+                        }
+                    };
+                    outcome = Some(std::thread::scope(|scope| -> Result<(String, String)> {
+                        let (mut worker_ui, replay) =
+                            crate::agent::compact::compaction_runtime::buffer_progress();
+                        let child_cancel = cancel.clone();
+                        let settle_child = &settle;
+                        let child = std::thread::Builder::new()
+                            .name("dial-summary-turn-prefix".into())
+                            .spawn_scoped(scope, move || {
+                                let SummaryWorker {
+                                    mut backend,
+                                    mut complete,
+                                } = worker;
+                                let result = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| {
+                                        fold(
+                                            &mut backend,
+                                            &prefix,
+                                            None,
+                                            Prompt::TurnPrefix,
+                                            policy,
+                                            context,
+                                            method,
+                                            focus,
+                                            &child_cancel,
+                                            &mut worker_ui,
+                                            &mut |backend, request, ui| {
+                                                complete(backend, request, ui, child_cancel.clone())
+                                            },
+                                            &mut None,
+                                        )
+                                    }),
+                                )
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!(
+                                        "split-summary worker panicked; no summary was committed"
+                                    ))
+                                });
+                                (settle_child(result), replay)
+                            })
+                            .context("start independent split-summary worker")?;
+                        let earlier =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                fold(
+                                    backend,
+                                    &history,
+                                    previous,
+                                    Prompt::Main,
+                                    policy,
+                                    context,
+                                    method,
+                                    focus,
+                                    &cancel,
+                                    ui,
+                                    &mut |backend, request, ui| {
+                                        complete(backend, request, ui, cancel.clone())
+                                    },
+                                    remote_observer,
+                                )
+                            }))
+                            .unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!(
+                                    "split-summary history fold panicked; no summary was committed"
+                                ))
+                            });
+                        let earlier = settle(earlier);
+                        // Every path joins: neither failure nor user interruption detaches inference.
+                        let (turn, replay) = child
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("split-summary worker panicked"))?;
+                        replay(ui);
+                        if let Some(error) =
+                            failure.lock().unwrap_or_else(|e| e.into_inner()).take()
+                        {
+                            return Err(error);
+                        }
+                        Ok((
+                            earlier.context("history summary missing")?,
+                            turn.context("turn summary missing")?,
+                        ))
+                    }));
+                    Ok(())
+                },
+            );
+            interrupted(interrupt)?;
+            match outcome {
+                Some(Err(error)) => return Err(error),
+                Some(Ok(summary)) => {
+                    linked?;
+                    summary
+                }
+                None => {
+                    linked?;
+                    anyhow::bail!("split summary did not run")
+                }
+            }
         } else {
             let earlier = if history.is_empty() {
                 previous.map_or_else(|| "No prior history.".to_owned(), str::to_owned)
@@ -699,7 +766,7 @@ pub(super) fn summarize_prefix_with_worker(
                     focus,
                     interrupt,
                     ui,
-                    complete,
+                    &mut |backend, request, ui| complete(backend, request, ui, interrupt.clone()),
                     remote_observer,
                 )?
             };
@@ -714,7 +781,7 @@ pub(super) fn summarize_prefix_with_worker(
                 focus,
                 interrupt,
                 ui,
-                complete,
+                &mut |backend, request, ui| complete(backend, request, ui, interrupt.clone()),
                 remote_observer,
             )?;
             (earlier, turn)
@@ -732,7 +799,7 @@ pub(super) fn summarize_prefix_with_worker(
             focus,
             interrupt,
             ui,
-            complete,
+            &mut |backend, request, ui| complete(backend, request, ui, interrupt.clone()),
             remote_observer,
         )?
     };

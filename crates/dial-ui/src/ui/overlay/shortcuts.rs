@@ -21,6 +21,7 @@ use ratatui::{
 };
 
 pub struct ShortcutOverlay {
+    panel_keys: super::panel_keys::PanelKeys,
     search: Editor,
     cursor: usize,
     scroll: usize,
@@ -41,6 +42,7 @@ fn chords(keys: &Keymap, action: Action) -> String {
 impl ShortcutOverlay {
     pub fn new() -> Self {
         Self {
+            panel_keys: Default::default(),
             search: Editor::default(),
             cursor: 0,
             scroll: 0,
@@ -90,6 +92,9 @@ impl ShortcutOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if self.panel_keys.handle(event, true, true) {
+            return OverlayEvent::None;
+        }
         if let Event::Paste(value) = event {
             self.message = None;
             let value = text::one_line(value);
@@ -108,7 +113,7 @@ impl ShortcutOverlay {
         if !pressed(key) {
             return OverlayEvent::None;
         }
-        if keys.matches(Action::SelectCancel, key) {
+        if super::panel_keys::matches(keys, Action::SelectCancel, key) {
             self.message = None;
             if self.edit.take().is_some() {
                 return OverlayEvent::None;
@@ -180,6 +185,16 @@ impl ShortcutOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        if self.panel_keys.draw(
+            frame,
+            ctx,
+            "Keyboard shortcuts",
+            "Type to filter · Enter edits a binding · save validates the chord before applying",
+            false,
+            true,
+        ) {
+            return;
+        }
         panel(
             frame,
             ctx.theme,

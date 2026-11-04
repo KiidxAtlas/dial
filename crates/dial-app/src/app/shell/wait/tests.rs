@@ -4,7 +4,7 @@ use crate::app::shell::testkit::shell;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[test]
-fn escape_dismisses_completion_before_cancelling_compute_wait() {
+fn escape_dismisses_completion_but_only_interrupt_cancels_compute_wait() {
     let (_home, _project, app, mut shell) = shell();
     shell.composer.set_busy(true);
     shell.composer.set_draft("/mod");
@@ -13,7 +13,16 @@ fn escape_dismisses_completion_before_cancelling_compute_wait() {
     assert_eq!(shell.wait_key(&app, escape).unwrap(), WaitFlow::Continue);
     assert!(!shell.composer.menu_open());
     assert_eq!(shell.composer.draft(), "/mod");
-    assert_eq!(shell.wait_key(&app, escape).unwrap(), WaitFlow::Cancel);
+    assert_eq!(shell.wait_key(&app, escape).unwrap(), WaitFlow::Continue);
+    assert_eq!(
+        shell
+            .wait_key(
+                &app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            )
+            .unwrap(),
+        WaitFlow::Cancel
+    );
     assert!(shell.startup.is_none());
 }
 
@@ -73,6 +82,7 @@ fn wait_display_controls_work_now_without_discarding_draft() {
     let controls = [
         Action::ToolsToggle,
         Action::ThinkingToggle,
+        Action::StatusExpand,
         Action::ToolsExpand,
         Action::DisplayReset,
     ];
@@ -105,7 +115,7 @@ fn wait_display_controls_work_now_without_discarding_draft() {
 }
 
 #[test]
-fn maintenance_wait_dismisses_history_search_then_cancels_when_idle() {
+fn maintenance_wait_dismisses_history_search_but_escape_never_cancels() {
     let (_home, _project, app, mut shell) = shell();
     shell.keys.rebind(Action::HistorySearch, &["F6"]).unwrap();
     assert_eq!(
@@ -116,5 +126,14 @@ fn maintenance_wait_dismisses_history_search_then_cancels_when_idle() {
     );
     let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(shell.wait_key(&app, escape).unwrap(), WaitFlow::Continue);
-    assert_eq!(shell.wait_key(&app, escape).unwrap(), WaitFlow::Cancel);
+    assert_eq!(shell.wait_key(&app, escape).unwrap(), WaitFlow::Continue);
+    assert_eq!(
+        shell
+            .wait_key(
+                &app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            )
+            .unwrap(),
+        WaitFlow::Cancel
+    );
 }

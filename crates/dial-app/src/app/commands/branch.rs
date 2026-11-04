@@ -25,12 +25,34 @@ pub(in crate::app) fn rewind(
     agent: &mut Agent<'_>,
     user_turns: usize,
 ) -> Result<Rewound> {
+    let approval = preflight_rewind(agent, user_turns)?;
+    rewind_approved(app, agent, approval)
+}
+
+/// One-shot gate admission, obtained before undo can restore files.
+pub(in crate::app) struct RewindApproval {
+    user_turns: usize,
+}
+
+pub(in crate::app) fn preflight_rewind(
+    agent: &Agent<'_>,
+    user_turns: usize,
+) -> Result<RewindApproval> {
     agent
         .gate_session_change(
             "session_before_branch",
             serde_json::json!({"reason":"branch","user_turns":user_turns}),
         )
         .map_err(anyhow::Error::msg)?;
+    Ok(RewindApproval { user_turns })
+}
+
+pub(in crate::app) fn rewind_approved(
+    app: &App,
+    agent: &mut Agent<'_>,
+    approval: RewindApproval,
+) -> Result<Rewound> {
+    let user_turns = approval.user_turns;
     let rewound = rewind_branch(app, agent, user_turns);
     crate::collab::room::sync_host(agent.session());
     rewound

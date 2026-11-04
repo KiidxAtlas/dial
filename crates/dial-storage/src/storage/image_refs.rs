@@ -22,7 +22,6 @@ use std::{
 /// Serving window measured from the last registration (default 72 hours).
 pub const IMAGE_TTL_HOURS: u64 = 72;
 const IMAGE_TTL_SECS: u64 = IMAGE_TTL_HOURS * 3600;
-const STORE_DIR: &str = "images";
 const INDEX_FILE: &str = "index.json";
 const LOCK_FILE: &str = ".lock";
 /// Subdirectory of a sessions directory holding transcripts moved out by `dial gc` (still on disk).
@@ -80,7 +79,7 @@ pub struct VerifyReport {
 
 /// Directory holding blobs and the index.
 pub fn store_dir(user_dir: &Path) -> PathBuf {
-    user_dir.join(STORE_DIR)
+    crate::config::paths::images_dir(user_dir)
 }
 
 /// Whether `sha` is a canonical SHA-256 hex digest (64 lowercase hex characters).
@@ -187,7 +186,7 @@ pub fn scan_all_sessions(user_dir: &Path) -> Result<usize> {
 
 /// Every `projects/<project>/sessions` directory that exists under `user_dir`, sorted.
 pub fn session_dirs(user_dir: &Path) -> Result<Vec<PathBuf>> {
-    let projects = user_dir.join("projects");
+    let projects = crate::config::paths::projects_dir(user_dir);
     let read = match fs::read_dir(&projects) {
         Ok(read) => read,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),

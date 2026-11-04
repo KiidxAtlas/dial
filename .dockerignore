@@ -25,3 +25,28 @@ crates/dial-tools/browser
 .env.*
 !.env.example
 !.env.sample
+
+# Local-only tooling, experiments and reports are not container build inputs.
+.DS_Store
+**/.DS_Store
+.agents
+graphify-out
+scratch
+docs/audits
+docs/FILE_STRUCTURE_REFACTOR_PLAN.md
+stalled-session.md
+compute-owner.json
+compute.lock
+ideas.md
+skills-lock.json
+python3
+/*-report.json
+/*-report-*.json
+**/*.log
+
+# Do not ship patch/editor recovery copies in container build contexts.
+**/*.orig
+**/*.rej
+**/*~
+**/*.swp
+**/*.swo

@@ -32,6 +32,20 @@ pub(in crate::app) fn stage_settings(
 
 impl Shell {
     pub(in crate::app) fn note(&mut self, title: &str, text: impl AsRef<str>) {
+        if matches!(
+            title,
+            "Workers"
+                | "Background"
+                | "Notice"
+                | "Collab"
+                | "Project peers"
+                | "Setup"
+                | "Key bindings"
+                | "Theme"
+        ) {
+            self.inbox.push(title, text.as_ref());
+            self.status.inbox_unread = self.inbox.unread();
+        }
         self.transcript.notice(title, text.as_ref());
     }
 

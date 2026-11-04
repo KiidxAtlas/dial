@@ -961,13 +961,31 @@ impl LiveTasks {
     pub fn start(&mut self, ctx: StartContext<'_>, args: &Value) -> Result<Value, String> {
         self.start_inner(ctx, args, None)
     }
+    pub(in crate::agent) fn start_with_promotion(
+        &mut self,
+        ctx: StartContext<'_>,
+        args: &Value,
+        promotion: Option<super::contracts::Promotion>,
+    ) -> Result<Value, String> {
+        self.start_inner_with_promotion(ctx, args, None, promotion)
+    }
     /// Starts a worker, routing it onto a pool slot when `route` is set so the slot's backend and
     /// carried conversation are reused.
     fn start_inner(
         &mut self,
         ctx: StartContext<'_>,
         args: &Value,
+        route: Option<SlotRoute>,
+    ) -> Result<Value, String> {
+        self.start_inner_with_promotion(ctx, args, route, None)
+    }
+
+    fn start_inner_with_promotion(
+        &mut self,
+        ctx: StartContext<'_>,
+        args: &Value,
         mut route: Option<SlotRoute>,
+        promotion: Option<super::contracts::Promotion>,
     ) -> Result<Value, String> {
         let StartContext {
             config,
@@ -1094,6 +1112,7 @@ impl LiveTasks {
         let mut result = Vec::new();
         // All job contracts were validated above; runtime setup failures settle only that job.
         for (job, (role, harness)) in request.jobs.iter().zip(roles) {
+            let promotion = promotion.clone();
             let mut harness = harness;
             let resume_messages = resume
                 .as_ref()
@@ -1178,7 +1197,7 @@ impl LiveTasks {
             }
             let resume_contract = json!({"version":1,"workspace":workspace_identity,"task":task,"original_task":original_task,"model":role.selection().display_name(),"definition":config.agents.get(job.kind)});
             let started_ms = epoch_ms();
-            let status = json!({"id":id,"runtime_node":body.read(|node| node.id.clone()),"status":"running","name":job.label,"agent":job.kind,"model":role.selection().display_name(),"role":job.role,"model_source":job.model_routes[0].source,"phase":"starting","steps":0,"started_ms":started_ms,
+            let status = json!({"id":id,"runtime_node":body.read(|node| node.id.clone()),"status":"running","name":job.label,"agent":job.kind,"model":role.selection().display_name(),"role":job.role,"model_source":job.model_routes[0].source,"model_explanation":job.model_routes[0].explanation,"phase":"starting","steps":0,"started_ms":started_ms,
                 "assignment":assignment, "task":original_task, "instruction":job.prompt});
             body.settle(
                 String::new(),
@@ -1325,6 +1344,7 @@ impl LiveTasks {
                     };
                     request.jobs[0].resume_messages = messages;
                     request.jobs[0].resume_tools = tools;
+                    request.jobs[0].promotion = promotion;
                     if let Err(why) = subagents::seance::attach(
                         &mut request.jobs,
                         layout.as_ref(),
@@ -1406,7 +1426,7 @@ impl LiveTasks {
                 let route = bridge
                     .body
                     .read(|node| node.result.data.clone().unwrap_or(json!({})));
-                for key in ["role", "model", "model_source"] {
+                for key in ["role", "model", "model_source", "model_explanation"] {
                     value[key] = route[key].clone();
                 }
                 if let Some(data) = outcome.data {
@@ -1454,7 +1474,7 @@ impl LiveTasks {
                     let artifacts = value["artifact"]
                         .as_str()
                         .map_or_else(|| json!([]), |uri| json!([["result", uri]]));
-                    if let Err(error) = sink.finish(json!({"status":value["status"],"steps":outcome.steps,"finished":agent_timestamp(),"finished_ms":finished_ms,"elapsed_ms":finished_ms.saturating_sub(started_ms),"artifacts":artifacts,"isolation":value.get("isolation_label").cloned(),"role":value["role"],"model":value["model"],"model_source":value["model_source"]})) {
+                    if let Err(error) = sink.finish(json!({"status":value["status"],"steps":outcome.steps,"finished":agent_timestamp(),"finished_ms":finished_ms,"elapsed_ms":finished_ms.saturating_sub(started_ms),"artifacts":artifacts,"isolation":value.get("isolation_label").cloned(),"role":value["role"],"model":value["model"],"model_source":value["model_source"],"model_explanation":value["model_explanation"]})) {
                             value["status"] = json!("failed");
                             value["transcript_error"] = json!(format!("{error:#}"));
                         }

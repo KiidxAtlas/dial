@@ -50,7 +50,7 @@ fn render(tab: Tab, width: usize, max_rows: usize) -> Rows {
 #[test]
 fn narrow_short_or_finished_plans_yield_to_the_summary() {
     let theme = Theme::dark();
-    assert!(render(Tab::Plan, MIN_WIDTH - 1, 20).is_empty());
+    assert!(render(Tab::Plan, COLLAPSED_MIN_WIDTH - 1, 20).is_empty());
     assert!(render(Tab::Plan, 120, MIN_ROWS - 1).is_empty());
     assert!(rows(&TodoList::new(), &facts(), Tab::Plan, 120, 20, &theme, None).is_empty());
 }
@@ -118,7 +118,7 @@ fn tabs_show_the_focused_step_evidence_and_approval_mode() {
 
     let approvals = plain(&render(Tab::Approvals, 120, 12)).join("\n");
     assert!(
-        approvals.contains("● ask")
+        approvals.contains("● Ask first")
             && approvals.contains("sandbox workspace")
             && approvals.contains("Shift+Tab cycles the mode"),
         "{approvals}"
@@ -142,5 +142,19 @@ fn the_focused_step_stays_visible_at_every_card_height() {
         let text = plain(&view);
         assert!(view.len() <= max_rows, "{max_rows}: {text:?}");
         assert!(text.join("\n").contains("step 15"), "{max_rows}: {text:?}");
+    }
+}
+
+#[test]
+fn medium_width_card_only_shows_current_and_next_steps() {
+    for width in [60, 75, 89] {
+        for tab in Tab::ALL {
+            let view = render(tab, width, 12);
+            let joined = plain(&view).join("\n");
+            assert!(joined.contains("Draw the cards") && joined.contains("Write the docs"));
+            assert!(!joined.contains("Map the renderer") && !joined.contains("evidence"));
+            assert!(!joined.contains("next tab"));
+            assert!(view.iter().all(|row| text::line_width(row) == width));
+        }
     }
 }

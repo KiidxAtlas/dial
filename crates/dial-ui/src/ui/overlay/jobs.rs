@@ -25,6 +25,8 @@ pub struct JobRow {
     pub name: String,
     pub command: String,
     pub status: String,
+    /// Native owner evidence, independent of the legacy machine-status diagnostic.
+    pub process_outcome: Option<crate::runtime::execution::ProcessOutcome>,
     pub running: bool,
     /// Runs on a pseudo-terminal, so full-screen programs and line editing work.
     pub terminal: bool,
@@ -32,8 +34,29 @@ pub struct JobRow {
     pub mode: String,
 }
 
+impl JobRow {
+    /// Shared lifecycle wording from owner evidence only; no status-string interpretation.
+    pub fn lifecycle_label(&self) -> &'static str {
+        if self.running {
+            return "Running";
+        }
+        match self.process_outcome.as_ref() {
+            Some(outcome) if outcome.cancelled => "Cancelled",
+            Some(outcome) if outcome.timed_out => "Failed",
+            Some(outcome) if outcome.exit_code == Some(0) => "Completed",
+            Some(outcome) if outcome.exit_code.is_some() || outcome.signal.is_some() => "Failed",
+            _ => "Unknown",
+        }
+    }
+
+    pub fn needs_attention(&self) -> bool {
+        !self.running && self.lifecycle_label() == "Failed"
+    }
+}
+
 #[derive(Default)]
 pub struct JobsOverlay {
+    panel_keys: super::panel_keys::PanelKeys,
     jobs: Vec<JobRow>,
     cursor: usize,
     attached: Option<String>,
@@ -99,6 +122,9 @@ impl JobsOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if self.attached.is_none() && self.panel_keys.handle(event, false, false) {
+            return OverlayEvent::None;
+        }
         if let Some(name) = self.attached.clone() {
             let interactive = self
                 .jobs
@@ -178,7 +204,12 @@ impl JobsOverlay {
             self.output_scroll = 0;
             self.message = (!job.running).then(|| {
                 (
-                    format!("{} has exited; showing its last output", job.name),
+                    format!(
+                        "{} · {} · {}; showing its last output",
+                        job.lifecycle_label(),
+                        job.name,
+                        job.status
+                    ),
                     false,
                 )
             });
@@ -211,7 +242,12 @@ impl JobsOverlay {
             self.output_scroll = 0;
             self.message = (!job.running).then(|| {
                 (
-                    format!("{} has exited; showing its last output", job.name),
+                    format!(
+                        "{} · {} · {}; showing its last output",
+                        job.lifecycle_label(),
+                        job.name,
+                        job.status
+                    ),
                     false,
                 )
             });
@@ -222,6 +258,9 @@ impl JobsOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        if self.panel_keys.draw(frame, ctx, "Processes", "Enter attaches or views output · Ctrl+] detaches without stopping the process · while attached, Ctrl+C goes only to that process terminal (the program decides how to respond). Other processes and workers continue.", false, false) {
+            return;
+        }
         let extra = match &self.attached {
             Some(name) => format!("viewing {name}"),
             None => {
@@ -230,8 +269,11 @@ impl JobsOverlay {
                 match (running, exited) {
                     (0, 0) => "none yet".to_owned(),
                     (r, 0) => format!("{r} running"),
-                    (0, e) => format!("{e} exited"),
-                    (r, e) => format!("{r} running {} {e} exited", ctx.theme.sym(Sym::Dot)),
+                    (0, e) => format!("{e} finished (see outcomes)"),
+                    (r, e) => format!(
+                        "{r} running {} {e} finished (see outcomes)",
+                        ctx.theme.sym(Sym::Dot)
+                    ),
                 }
             }
         };
@@ -276,7 +318,8 @@ impl JobsOverlay {
                         vec![Span::styled(
                             text::ellipsize(
                                 &format!(
-                                    " {} {dot} {} {dot} {}",
+                                    " {} {dot} {} {dot} {} {dot} {}",
+                                    job.lifecycle_label(),
                                     job.mode,
                                     text::one_line(&job.status),
                                     text::one_line(&job.command)
@@ -317,13 +360,13 @@ impl JobsOverlay {
             }
             let segments = [
                 if interactive {
-                    "Ctrl+] detach"
+                    "Ctrl+] detach (keeps running)"
                 } else {
                     "Esc back"
                 }
                 .to_owned(),
                 if interactive {
-                    "keys go to the process".to_owned()
+                    "Ctrl+C signals this terminal only".to_owned()
                 } else if terminal {
                     "process exited; read-only".to_owned()
                 } else {
@@ -375,7 +418,7 @@ impl JobsOverlay {
             if mode_w > 0 {
                 meta.push_str(&pad(&job.mode, mode_w, ascii));
             }
-            meta.push_str(&pad(&text::one_line(&job.status), status_w, ascii));
+            meta.push_str(&pad(job.lifecycle_label(), status_w, ascii));
             if job.terminal && w >= 60 {
                 meta.push_str("pty ");
             }

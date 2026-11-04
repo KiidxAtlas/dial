@@ -12,87 +12,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-pub(super) const COMMANDS: &[super::CommandSpec] = &[
-    super::CommandSpec {
-        name: "branch",
-        description: "Pick a user message to rewind to, after confirming (keeps the old path as a branch; alias: rewind)",
-        args_hint: "[n]",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "label",
-        description: "Label the latest message so it is easy to find in /tree (no text clears the label)",
-        args_hint: "[text]",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "delete",
-        description: "Delete the current session after confirming, and start a new one",
-        args_hint: "",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "pin",
-        description: "Pin or unpin a session at the top of the resume list",
-        args_hint: "",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "move",
-        description: "Move the current session to a different directory",
-        args_hint: "<dir>",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "pack",
-        description: "Write this session as a portable archive with its side history, workers and artifacts",
-        args_hint: "[path]",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "restart",
-        description: "Restart dial with the same launch flags, resuming this session",
-        args_hint: "",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "retry",
-        description: "Skip a live provider retry wait; when idle, retry the last failed turn",
-        args_hint: "",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "stats",
-        description: "Show local usage statistics; --port starts the loopback dashboard",
-        args_hint: "[range] [--port <port>]",
-        subcommands: &["--port"],
-    },
-    super::CommandSpec {
-        name: "login",
-        description: "Sign in to an OAuth provider (no argument lists providers)",
-        args_hint: "[provider]",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "logout",
-        description: "Sign out of an OAuth provider (no argument lists signed-in providers)",
-        args_hint: "[provider]",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "session",
-        description: "Show the current session, or manage it (info, delete, pin)",
-        args_hint: "[info|delete|pin]",
-        subcommands: &["info", "delete", "pin"],
-    },
-    super::CommandSpec {
-        name: "changelog",
-        description: "Show the Dial changelog: `full`, or `last [N]` (default 1)",
-        args_hint: "[full|last [N]]",
-        subcommands: &["full", "last"],
-    },
-];
-
 pub(super) fn run(
     shell: &mut Shell,
     app: &App,
@@ -102,6 +21,18 @@ pub(super) fn run(
 ) -> Option<Result<Step>> {
     let args = args.trim();
     let result = match name {
+        "sessions" if args == "this" => tree(shell, agent),
+        "sessions" if args == "branch" || args.starts_with("branch ") => branch(
+            shell,
+            app,
+            agent,
+            args.strip_prefix("branch").unwrap_or("").trim(),
+        ),
+        "sessions" if args == "label" || args.starts_with("label ") => label(
+            shell,
+            agent,
+            args.strip_prefix("label").unwrap_or("").trim(),
+        ),
         "branch" | "rewind" => branch(shell, app, agent, args),
         "label" => label(shell, agent, args),
         // `/tree forks` stays the cross-session fork browser, handled by the dispatcher.
@@ -211,10 +142,10 @@ fn delete_current(shell: &mut Shell, app: &App, agent: &mut Agent<'_>) -> Result
         },
     )?;
     let fresh_id = fresh.id().to_owned();
-    let old = agent.swap_session(fresh);
+    let old = app.swap_agent_session(agent, fresh)?;
     agent.set_plan_mode(false);
     shell.stop_loop_for_session_change();
-    shell.session_id = fresh_id.clone();
+    shell.set_session_id(&fresh_id);
     // The pin is dropped only once the file is gone; a failed removal keeps both the file and pin.
     if let Err(error) = old.remove_file() {
         shell.note(
@@ -505,11 +436,16 @@ fn move_session_checked(
     agent.cancel_background_compaction();
     let old = std::mem::replace(agent.session_mut(), moved);
     if let Err(error) = agent.reroot_workspace(&target) {
+        // The source is the authoritative writer until the reroot publishes. Roll back the ledger
+        // entry before the copied journal is deleted, so the original path is not treated as moved.
         let failed = std::mem::replace(agent.session_mut(), old);
-        let cleanup = failed.remove_file();
-        return Err(match cleanup {
+        let destination = failed.path().map(ToOwned::to_owned);
+        return Err(match failed.rollback_relocation(&target, agent.session()) {
             Ok(()) => error.context("session not moved; original workspace retained"),
-            Err(cleanup) => error.context(format!("session not moved; original retained, but copied journal cleanup failed: {cleanup:#}")),
+            Err(rollback) => error.context(format!(
+                "session not moved; original retained, but transfer rollback or copied journal cleanup could not be fully acknowledged at {}: {rollback:#}",
+                destination.map_or_else(|| "an unknown path".to_owned(), |p| p.display().to_string()),
+            )),
         });
     }
     // The new journal and workspace are authoritative now. A source cleanup failure is
@@ -634,7 +570,7 @@ fn label(shell: &mut Shell, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
 
 /// `/tree`: pick any user message or labeled entry of this session, including abandoned branches,
 /// and continue from there. Nothing is deleted: the move appends a branch marker.
-fn tree(shell: &mut Shell, agent: &mut Agent<'_>) -> Result<Step> {
+pub(in crate::app) fn tree(shell: &mut Shell, agent: &mut Agent<'_>) -> Result<Step> {
     let Some(id) = shell.pick_tree_node(agent.session())? else {
         return Ok(Step::Done);
     };
@@ -883,5 +819,55 @@ fn stats_command(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
     Ok(Step::Done)
 }
 
+/// The same persisted report as `/stats <range>`; no provider requests or runtime counters.
+pub(in crate::app) fn stats_overlay(
+    app: &App,
+    range: &str,
+) -> Result<crate::ui::overlay::stats::StatsOverlay> {
+    let since = stats::parse_range(range)?;
+    let mut db = Db::open_default(&app.layout.user_dir)?;
+    db.sync_sessions(&app.layout.user_dir)?;
+    let report = db.report(since, stats::now_ms())?;
+    Ok(crate::ui::overlay::stats::StatsOverlay::new(stats_tabs(
+        &report,
+    )))
+}
+
+fn stats_tabs(report: &stats::Report) -> Vec<(&'static str, String)> {
+    let o = &report.overall;
+    let s = &report.sessions;
+    let tokens = format!(
+        "Recorded cross-session tokens\nInput: {}\nOutput: {}\nCache read: {}\nCache write: {}\nReasoning: {}\nRequests with complete usage: {} / {}\nCounts reflect recorded provider reports, not quota limits.",
+        o.input, o.output, o.cache_read, o.cache_write, o.reasoning, o.reported, o.requests,
+    );
+    let sessions = format!(
+        "Synced session transcripts\nSessions: {}\nProjects: {}\nUser messages: {}\nAssistant messages: {}\nTool calls: {}\nActive time: {} ms\nActive time is the first-to-last entry span, not model latency.",
+        s.sessions, s.projects, s.user_messages, s.assistant_messages, s.tool_calls, s.active_ms,
+    );
+    let mut tools = String::from("Tools timed at runtime\n");
+    for tool in &report.by_tool {
+        tools.push_str(&format!(
+            "{}: {} calls · {} errors · {} ms total\n",
+            tool.tool, tool.calls, tool.errors, tool.duration_ms
+        ));
+    }
+    if report.by_tool.is_empty() {
+        tools.push_str("No timed tool calls recorded.\n");
+    }
+    tools.push_str("\nTool calls in synced transcripts (includes older history)\n");
+    for tool in &report.transcript_tools {
+        tools.push_str(&format!("{}: {}\n", tool.name, tool.count));
+    }
+    vec![
+        ("Usage / cost", stats::render_text(report)),
+        ("Tokens", tokens),
+        ("Sessions", sessions),
+        ("Tools", tools),
+    ]
+}
+
 #[cfg(test)]
 mod relocation_tests;
+
+#[cfg(test)]
+mod stats_tests;

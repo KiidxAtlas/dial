@@ -154,6 +154,7 @@ fn every_path_is_a_real_key_with_the_real_default() {
                     | "cloudflare_gateway_id"
                     | "image.api"
                     | "image.api_key_env"
+                    | "laya.checkpoint"
             );
             let unset = default == Value::String(String::new())
                 || default == Value::String("auto".into())
@@ -401,16 +402,16 @@ fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
         assert_eq!(setting(path).tab, "Experimental");
         assert_eq!(setting(path).default_value(), Some(Value::Integer(0)));
     }
-    // Check-before-change aids ship enabled; the rest stay opt-in.
+    // Reproduce-first advice stays enabled; expensive counterfactual runs are opt-in.
     let witness = setting("experimental.fault_witness");
     assert_eq!(witness.tab, "Experimental");
     assert_eq!(witness.kind, Kind::Bool);
-    assert_eq!(witness.default_value(), Some(Value::Boolean(true)));
+    assert_eq!(witness.default_value(), Some(Value::Boolean(false)));
     let repro = setting("experimental.repro_first");
     assert_eq!(repro.tab, "Experimental");
     assert_eq!(repro.default_value(), Some(Value::String("advise".into())));
     let unset: Config = toml::from_str("").unwrap();
-    assert!(unset.experimental.fault_witness);
+    assert!(!unset.experimental.fault_witness);
     assert_eq!(
         unset.experimental.repro_first,
         crate::config::types::ReproFirst::Advise
@@ -433,6 +434,8 @@ fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
         crate::config::types::ReproFirst::Gate
     );
     assert_eq!(config.experimental.edit_bisection_runs, 4);
+    let opted_in: Config = toml::from_str("[experimental]\nfault_witness = true").unwrap();
+    assert!(opted_in.experimental.fault_witness);
     let mut out_of_range = Config::default();
     out_of_range.experimental.outcome_gradient_rounds = 11;
     assert!(out_of_range.validate().is_err());
@@ -618,7 +621,7 @@ fn known_list_values_are_accepted_by_their_settings() {
 
 #[test]
 fn layout_lists_every_registered_section_exactly_once() {
-    for def in registry() {
+    for def in REGISTRY.iter().chain(management::DECLARATIONS) {
         let sections = LAYOUT
             .iter()
             .find(|(tab, _)| *tab == def.tab)
@@ -637,8 +640,9 @@ fn layout_lists_every_registered_section_exactly_once() {
         assert_eq!(unique.len(), sections.len(), "{tab} repeats a section");
         for section in *sections {
             assert!(
-                registry()
+                REGISTRY
                     .iter()
+                    .chain(management::DECLARATIONS)
                     .any(|def| def.tab == *tab && def.section == *section),
                 "LAYOUT lists {tab}/{section}, which holds no setting"
             );
@@ -650,15 +654,97 @@ fn layout_lists_every_registered_section_exactly_once() {
 fn tabs_follow_the_layout_table_not_declaration_order() {
     let tabs = tabs();
     let names: Vec<_> = tabs.iter().map(|(tab, _)| *tab).collect();
-    let expected: Vec<_> = LAYOUT.iter().map(|(tab, _)| *tab).collect();
+    let expected = vec![
+        "Common",
+        "Appearance",
+        "Keys",
+        "Model",
+        "Connections",
+        "Safety",
+        "Tools",
+        "Memory",
+        "Learning",
+        "Experimental",
+        "Advanced",
+    ];
     assert_eq!(names, expected);
-    for ((tab, sections), (_, listed)) in tabs.iter().zip(LAYOUT) {
-        assert_eq!(
-            sections.as_slice(),
-            *listed,
-            "{tab} sections are out of order"
+    let common = tabs.first().unwrap();
+    assert_eq!(common.1, vec!["Common"]);
+    for path in COMMON_SETTINGS {
+        assert!(
+            registry()
+                .iter()
+                .any(|def| def.path == *path && def.tab == "Common"),
+            "{path}"
         );
     }
+}
+
+#[test]
+fn presentation_groups_keep_canonical_contracts_and_original_locations() {
+    for original in REGISTRY.iter().chain(management::DECLARATIONS) {
+        let presented = registry()
+            .iter()
+            .find(|def| def.path == original.path)
+            .unwrap();
+        assert_eq!(
+            presented.search_location(),
+            (original.tab, original.section)
+        );
+        assert_eq!(presented.kind, original.kind, "{}", original.path);
+        assert_eq!(
+            presented.default_value(),
+            original.default_value(),
+            "{}",
+            original.path
+        );
+        assert_eq!(presented.restart, original.restart, "{}", original.path);
+        if original.path.starts_with("memory.") {
+            assert_eq!(presented.tab, "Memory", "{}", original.path);
+        }
+        if original.tab == "Improvement" {
+            assert_eq!(presented.tab, "Learning", "{}", original.path);
+        }
+    }
+    for (path, group) in [
+        ("providers", "Connections"),
+        ("endpoint", "Connections"),
+        ("mcp", "Connections"),
+        ("approval", "Safety"),
+        ("sandbox.mode", "Safety"),
+        ("sandbox.extra_write", "Safety"),
+        ("sandbox.network_allow", "Safety"),
+        ("isolation.backend", "Safety"),
+        ("secrets.values", "Safety"),
+        ("shell.backend", "Tools"),
+        ("keys", "Keys"),
+    ] {
+        let def = registry().iter().find(|def| def.path == path).unwrap();
+        assert_eq!(def.tab, group, "{path}");
+    }
+}
+
+#[test]
+fn goal_search_terms_find_settings_without_reading_configured_values() {
+    for (goal, path) in [
+        ("stay offline", "sandbox.allow_network"),
+        ("spend less", "budget"),
+        ("stop asking", "approval"),
+        ("notifications", "ui.notify_errors"),
+        ("remember", "memory.backend"),
+        ("learning", "improve.enabled"),
+        ("connect", "providers"),
+        ("hotkeys", "keys"),
+    ] {
+        let def = registry().iter().find(|def| def.path == path).unwrap();
+        assert!(def.search_terms().contains(goal), "{goal}: {path}");
+    }
+    let providers = registry()
+        .iter()
+        .find(|def| def.path == "providers")
+        .unwrap();
+    assert!(providers.sensitive());
+    assert!(!providers.search_terms().is_empty());
 }
 
 #[test]

@@ -159,7 +159,7 @@ pub struct PromptHistory {
 
 impl PromptHistory {
     pub fn path(user_dir: &Path) -> PathBuf {
-        user_dir.join(HISTORY_DB)
+        crate::config::paths::history_db_file(user_dir)
     }
 
     /// Open (creating) the user's history database.
@@ -821,7 +821,7 @@ impl Archive {
     }
 
     fn projects_root(&self) -> PathBuf {
-        self.user_dir.join("projects")
+        crate::config::paths::projects_dir(&self.user_dir)
     }
 
     fn history(&self) -> Result<Option<PromptHistory>> {

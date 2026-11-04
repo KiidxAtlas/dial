@@ -113,3 +113,84 @@ fn selection_keeps_clean_entries_cached_but_checks_dirty_pending_and_missing_bas
         "failed after-run baseline must be retried"
     );
 }
+
+#[test]
+fn content_rewrite_with_restored_mtime_changes_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    fs::write(&path, "before").unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let before = fingerprint(dir.path(), &["*.rs".into()]).unwrap();
+    fs::write(&path, "after!").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+    assert_ne!(fingerprint(dir.path(), &["*.rs".into()]).unwrap(), before);
+}
+
+#[test]
+fn matching_sets_share_content_reads_and_byte_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.rs"), "content").unwrap();
+    let broad = set(&["*.rs"]);
+    let narrow = set(&["a.rs"]);
+    let reads = Cell::new(0);
+    let results = fingerprints_with_reader(
+        dir.path(),
+        &[&broad, &narrow],
+        10,
+        7,
+        8,
+        || ignore::WalkBuilder::new(dir.path()).build(),
+        |path, metadata| {
+            reads.set(reads.get() + 1);
+            content_digest(path, metadata)
+        },
+    );
+    assert_eq!(reads.get(), 1);
+    for result in results {
+        assert_eq!(
+            result.unwrap(),
+            fingerprint(dir.path(), &["*.rs".into()]).unwrap()
+        );
+    }
+}
+
+#[test]
+fn content_coverage_limits_and_read_errors_are_explicit_and_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.rs"), "content").unwrap();
+    let rust = set(&["*.rs"]);
+    let absent = set(&["*.txt"]);
+    for (file_bytes, total_bytes, read_error, expected) in [
+        (6, 8, false, "exceeds 6 content bytes"),
+        (7, 7, false, "shared content byte budget exhausted"),
+        (7, 8, true, "injected read failure"),
+    ] {
+        let mut results = fingerprints_with_reader(
+            dir.path(),
+            &[&rust, &absent],
+            10,
+            file_bytes,
+            total_bytes,
+            || ignore::WalkBuilder::new(dir.path()).build(),
+            |path, metadata| {
+                if read_error {
+                    bail!("injected read failure");
+                }
+                content_digest(path, metadata)
+            },
+        )
+        .into_iter();
+        let error = format!("{:#}", results.next().unwrap().unwrap_err());
+        assert!(
+            error.contains("watch coverage incomplete") && error.contains(expected),
+            "{error}"
+        );
+        assert_eq!(results.next().unwrap().unwrap(), hash_files(vec![]));
+    }
+}

@@ -175,6 +175,10 @@ impl Metrics {
         self.history_bytes += overhead.history_bytes as u64;
     }
     pub fn prefix(&mut self, prefix: &crate::agent::window::request_prefix::Observation) {
+        self.backend_operation(
+            "request_prefix",
+            std::time::Duration::from_micros(prefix.elapsed_us),
+        );
         *self
             .prefix_invalidations
             .entry(prefix.invalidation.as_str().to_owned())

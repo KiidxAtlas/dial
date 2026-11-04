@@ -152,7 +152,7 @@ pub fn probe(user_dir: &Path) -> Snapshot {
 }
 
 fn marker(user_dir: &Path) -> std::path::PathBuf {
-    user_dir.join("foreground-last")
+    crate::config::paths::foreground_last_file(user_dir)
 }
 
 /// Called whenever a coding turn asks for compute.
@@ -171,7 +171,7 @@ pub fn idle_secs(user_dir: &Path) -> Option<u64> {
 }
 
 fn usage_path(user_dir: &Path) -> std::path::PathBuf {
-    user_dir.join("compute-usage.json")
+    crate::config::paths::compute_usage_file(user_dir)
 }
 
 fn day(at: u64) -> u64 {

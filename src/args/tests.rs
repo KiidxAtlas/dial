@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn slash_cli_hints_resolve_through_the_real_clap_tree() {
+    use clap::CommandFactory;
+    let root = Cli::command();
+    for spec in dial::ui::command_surface::COMMANDS {
+        let Some(cli) = spec.cli else { continue };
+        let mut command = &root;
+        for word in cli.split_whitespace() {
+            command = command
+                .get_subcommands()
+                .find(|sub| {
+                    sub.get_name() == word || sub.get_all_aliases().any(|alias| alias == word)
+                })
+                .unwrap_or_else(|| panic!("/{} CLI hint has no subcommand: {cli}", spec.name));
+        }
+        assert_ne!(command.get_name(), root.get_name());
+    }
+}
+
+#[test]
 fn approval_choices_and_aliases_are_accepted_by_the_cli() {
     for &policy in dial::config::types::Approval::NAMES {
         let cli = Cli::try_parse_from(["dial", "--approval", policy]).unwrap();

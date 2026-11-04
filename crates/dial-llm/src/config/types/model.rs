@@ -1,13 +1,63 @@
 //! Model access: presets, OpenAI-compatible endpoints, the context budget and stream timeouts.
 use super::*;
 
-/// A named model preset (`/modelpreset`): role model assignments plus the thinking level.
+/// A named model preset: role assignments, optional vision/checkpoint selections and thinking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelPreset {
     pub roles: BTreeMap<String, crate::llm::model_config::ModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<crate::llm::profiles::ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<crate::config::vision::Config>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub laya_checkpoint: Option<String>,
+    /// Portable scalar controls only; never model routes, credentials or machine paths.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_setup",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub setup: BTreeMap<String, toml::Value>,
+}
+
+impl ModelPreset {
+    /// The explicit portable setup allowlist. All entries are boolean controls.
+    pub const SETUP_KEYS: &[&str] = &[
+        "fast_mode",
+        "slow_mode",
+        "extended_context",
+        "ui.tips",
+        "memory.enabled",
+        "laya.enabled",
+        "assistance.teacher_enabled",
+        "improve.distill",
+        "escalation.enabled",
+        "escalation.allow_remote",
+    ];
+
+    /// Validate on application too, since callers can construct presets in memory.
+    pub fn validate_setup(&self) -> anyhow::Result<()> {
+        for (key, value) in &self.setup {
+            anyhow::ensure!(
+                Self::SETUP_KEYS.contains(&key.as_str()) && value.is_bool(),
+                "unsafe or unknown setup setting: {key}; only allowlisted boolean controls are supported"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_setup<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, toml::Value>, D::Error> {
+    let setup = BTreeMap::<String, toml::Value>::deserialize(deserializer)?;
+    let preset = ModelPreset {
+        setup,
+        ..Default::default()
+    };
+    preset.validate_setup().map_err(serde::de::Error::custom)?;
+    Ok(preset.setup)
 }
 
 /// Use an OpenAI-compatible server (LM Studio, Ollama, llama.cpp, a hosted API) instead of the

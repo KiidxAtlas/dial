@@ -33,7 +33,7 @@ const MAX_INPUT_ROWS: usize = 10;
 const MIN_BOX_WIDTH: usize = 8;
 const MAX_NAME_COLUMN: usize = 24;
 /// App-level shortcuts the composer reports instead of handling.
-const APP_ACTIONS: [Action; 18] = [
+const APP_ACTIONS: [Action; 20] = [
     Action::CommandPalette,
     Action::ModelSelect,
     Action::ModelRoles,
@@ -43,6 +43,8 @@ const APP_ACTIONS: [Action; 18] = [
     Action::ToolsExpand,
     Action::ToolsToggle,
     Action::ThinkingToggle,
+    Action::StatusExpand,
+    Action::StatusFocus,
     Action::WorkTab,
     Action::ApprovalCycle,
     Action::DisplayReset,
@@ -140,6 +142,8 @@ struct Menu {
     arguments: Option<Vec<CommandEntry>>,
     matches: Vec<Match>,
     selected: usize,
+    /// Enter accepts a command suggestion only after deliberate list navigation.
+    navigated: bool,
     scroll: usize,
     /// `true` while a background ranking for `query` is still running.
     pending: bool,
@@ -170,10 +174,6 @@ enum BusyChoice {
     KeepWorking,
     /// Stop the running turn and send the oldest queued message.
     StopAndSend,
-    /// Redirect this task now: the stale model reply is cancelled, running tools finish.
-    SteerNow,
-    /// Start separate work in a worker while this task continues.
-    Independent,
 }
 
 /// Where an explicit message is in its journey. Only states the agent actually reported are shown.
@@ -204,12 +204,10 @@ struct Explicit {
 impl BusyChoice {
     fn label(self) -> &'static str {
         match self {
-            BusyChoice::Auto => "Send now",
-            BusyChoice::AfterTurn => "Send after this turn",
+            BusyChoice::Auto => "Steer",
+            BusyChoice::AfterTurn => "After this turn",
             BusyChoice::KeepWorking => "Keep working",
             BusyChoice::StopAndSend => "Stop and send oldest",
-            BusyChoice::SteerNow => "Steer now",
-            BusyChoice::Independent => "Independent worker",
         }
     }
 
@@ -219,8 +217,6 @@ impl BusyChoice {
             BusyChoice::AfterTurn => "waits until Dial finishes",
             BusyChoice::KeepWorking => "the queue waits for this turn",
             BusyChoice::StopAndSend => "ends this turn now",
-            BusyChoice::SteerNow => "cancels the stale reply; running tools finish",
-            BusyChoice::Independent => "separate task; this one keeps going",
         }
     }
 }
@@ -283,12 +279,7 @@ const PLACEHOLDERS: [&str; 3] = [
 const LANDING_PLACEHOLDERS: [&str; 2] = ["What are we building?", "Ask anything"];
 
 /// Offered for a non-empty draft while busy. Automatic routing is the default.
-const DRAFT_CHOICES: &[BusyChoice] = &[
-    BusyChoice::Auto,
-    BusyChoice::AfterTurn,
-    BusyChoice::SteerNow,
-    BusyChoice::Independent,
-];
+const DRAFT_CHOICES: &[BusyChoice] = &[BusyChoice::Auto, BusyChoice::AfterTurn];
 /// Offered for an empty Enter with queued work. Stopping the turn is never the default.
 const QUEUE_CHOICES: &[BusyChoice] = &[BusyChoice::KeepWorking, BusyChoice::StopAndSend];
 
@@ -335,6 +326,7 @@ pub struct Composer {
     history_index: Option<usize>,
     saved_draft: Option<Editor>,
     commands: Vec<CommandEntry>,
+    command_context: crate::ui::command_surface::AvailabilityContext,
     /// Push-to-talk is capturing: `Some(hold)` while recording (`hold` means release ends it).
     recording: Option<bool>,
     argument_completions: Vec<String>,
@@ -397,6 +389,7 @@ impl Composer {
             history_index: None,
             saved_draft: None,
             commands: Vec::new(),
+            command_context: Default::default(),
             menu: None,
             dismissed: None,
             search: None,
@@ -567,6 +560,14 @@ impl Composer {
         self.menu = None;
         self.refresh();
         self.restore_selection(selection);
+    }
+
+    /// The controller publishes cheap cached state; rendering never probes the workspace.
+    pub fn set_command_context(
+        &mut self,
+        context: crate::ui::command_surface::AvailabilityContext,
+    ) {
+        self.command_context = context;
     }
 
     fn menu_selection(&self) -> Option<(String, usize, usize)> {
@@ -764,6 +765,19 @@ impl Composer {
         }
     }
 
+    /// Admit a slash-command worker request without replacing an unrelated editor draft.
+    pub fn request_worker(&mut self, text: &str) -> bool {
+        if text.trim().is_empty() || text.len() > 256 * 1024 || self.explicit.len() >= 16 {
+            return false;
+        }
+        self.explicit.push(Explicit {
+            text: text.to_owned(),
+            kind: SteerKind::Independent,
+            stage: SteerStage::Pending,
+            untaken: true,
+        });
+        true
+    }
     fn send_explicit(&mut self, kind: SteerKind) -> ComposerEvent {
         if self.editor.text.trim().is_empty() {
             return ComposerEvent::None;
@@ -912,6 +926,15 @@ impl Composer {
         // A held Enter repeats: while busy, a repeat must not open, confirm or flush a choice by itself.
         if self.busy && key.kind == KeyEventKind::Repeat && ctx.keys.matches(Action::Submit, &key) {
             return ComposerEvent::None;
+        }
+        // Stopping is global even while a completion, history search or chooser is open.
+        // A user-mapped dismiss chord still belongs to the local layer first.
+        if self.busy
+            && ctx.keys.matches(Action::Interrupt, &key)
+            && !self.dismisses_interrupt(&key, ctx.keys)
+        {
+            self.editor.cancel_jump();
+            return ComposerEvent::Interrupt;
         }
         // A pending Ctrl-] jump takes the next typed letter; any other key cancels it before dispatch.
         let plain = matches!(key.code, KeyCode::Char(_))
@@ -1090,12 +1113,17 @@ impl Composer {
     }
 
     fn submit(&mut self) -> ComposerEvent {
-        // Enter runs the selected command; file mentions only complete the draft.
+        // File mentions complete the draft. Commands only accept a suggestion after navigation;
+        // otherwise Enter executes exactly the command the user typed.
         let file_menu = self
             .menu
             .as_ref()
             .is_some_and(|menu| menu.file_start.is_some());
-        if self.complete_menu() {
+        let accept = self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| file_menu || menu.navigated);
+        if accept && self.complete_menu() {
             if file_menu {
                 return ComposerEvent::None;
             }
@@ -1188,6 +1216,21 @@ impl Composer {
             self.choice = None;
             return Some(ComposerEvent::None);
         }
+        // These shortcuts belong only to the draft chooser, not the underlying editor.
+        if options == DRAFT_CHOICES {
+            let redirect = (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::CONTROL)
+                || (key.code == KeyCode::Char('r') && key.modifiers.is_empty());
+            let worker = key.code == KeyCode::Char('w')
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL);
+            if redirect || worker {
+                self.choice = None;
+                return Some(self.send_explicit(if redirect {
+                    SteerKind::Steer
+                } else {
+                    SteerKind::Independent
+                }));
+            }
+        }
         if keys.matches(Action::SelectUp, &key) || keys.matches(Action::SelectDown, &key) {
             let next = if keys.matches(Action::SelectUp, &key) {
                 selected.saturating_sub(1)
@@ -1206,8 +1249,6 @@ impl Composer {
                 BusyChoice::AfterTurn => self.submit_queued(true),
                 BusyChoice::KeepWorking => ComposerEvent::None,
                 BusyChoice::StopAndSend => self.send_oldest_queued(),
-                BusyChoice::SteerNow => self.send_explicit(SteerKind::Steer),
-                BusyChoice::Independent => self.send_explicit(SteerKind::Independent),
             };
             return Some(event);
         }
@@ -1364,6 +1405,7 @@ impl Composer {
         if total == 0 {
             return;
         }
+        menu.navigated = true;
         let next = menu.selected as isize + delta;
         menu.selected = if wrap {
             next.rem_euclid(total)
@@ -1711,6 +1753,7 @@ impl Composer {
                     arguments,
                     matches,
                     selected: 0,
+                    navigated: false,
                     scroll: 0,
                     pending,
                 });
@@ -2007,6 +2050,9 @@ impl Composer {
             ));
         }
 
+        if !landing && ctx.status.planning.is_some() {
+            rows.push(statusline::controls_row(ctx.status, ctx.keys, theme, width));
+        }
         let mut cursor = cursor;
         if let Some(search) = &self.search {
             let (list, col) = self.search_rows(search, w, ctx);
@@ -2243,6 +2289,20 @@ impl Composer {
                 w,
             ));
         }
+        if !queue {
+            for shortcut in [
+                "r / Ctrl+Enter hard redirect",
+                "w / Ctrl+W worker; /worker <message>",
+            ] {
+                rows.push(finish_row(
+                    vec![Span::styled(
+                        text::ellipsize(shortcut, w, theme.ascii()),
+                        theme.fg(Tok::Muted),
+                    )],
+                    w,
+                ));
+            }
+        }
         if panel {
             rows = super::chrome::framed_lines(
                 theme,
@@ -2284,7 +2344,9 @@ impl Composer {
                     let key = KeyEvent::new(chord.code, chord.mods);
                     // State-specific actions must not advertise a shadowed shortcut.
                     !(self.search.is_none()
-                        && ((self.editing_queue.is_some() && key.code == KeyCode::Esc)
+                        && ((self.editing_queue.is_some()
+                            && key.code == KeyCode::Esc
+                            && action != Action::Dismiss)
                             || (self.busy
                                 && action != Action::FollowUp
                                 && keys.matches(Action::FollowUp, &key))
@@ -2321,6 +2383,12 @@ impl Composer {
         };
         let plain = |what: String| Some(Hint { key: None, what });
         let mut pieces = Vec::new();
+        if self.busy {
+            pieces.extend([
+                hint(Action::Dismiss, "close"),
+                hint(Action::Interrupt, "stop"),
+            ]);
+        }
         if self.choice.is_some() {
             pieces.extend([
                 hint(Action::Submit, "confirm"),
@@ -2334,9 +2402,6 @@ impl Composer {
                 hint(Action::Dismiss, "cancel"),
             ]);
         } else {
-            if self.busy {
-                pieces.push(hint(Action::Interrupt, "interrupt"));
-            }
             if let Some(QueuedEdit { follow_up, .. }) = self.editing_queue {
                 pieces.push(plain(format!(
                     "editing queued message ({})",
@@ -2499,11 +2564,28 @@ impl Composer {
                 let prefix: usize = spans.iter().map(|s| text::width(&s.content)).sum();
                 let name = text::ellipsize(&command.name, name_col, theme.ascii());
                 let name_cells = text::width(&name);
+                let unavailable = (command.kind == CommandKind::Builtin)
+                    .then(|| {
+                        crate::ui::command_surface::unavailable_reason(
+                            &command.name,
+                            "",
+                            self.command_context,
+                        )
+                    })
+                    .flatten();
                 spans.extend(highlighted(
                     &name,
                     &found.name_hits,
-                    theme.fg(Tok::Text),
-                    hit,
+                    theme.fg(if unavailable.is_some() {
+                        Tok::Dim
+                    } else {
+                        Tok::Text
+                    }),
+                    if unavailable.is_some() {
+                        theme.fg(Tok::Dim)
+                    } else {
+                        hit
+                    },
                 ));
                 spans.push(Span::raw(
                     " ".repeat(name_col.saturating_sub(name_cells) + 2),
@@ -2525,7 +2607,11 @@ impl Composer {
                 };
                 let room = budget.saturating_sub(used + group_w);
                 if room > 0 {
-                    let description = text::ellipsize(&command.description, room, theme.ascii());
+                    let description = text::ellipsize(
+                        unavailable.unwrap_or(&command.description),
+                        room,
+                        theme.ascii(),
+                    );
                     let description_w = text::width(&description);
                     spans.extend(highlighted(
                         &description,
@@ -2545,7 +2631,18 @@ impl Composer {
             && menu.arguments.is_none()
             && let Some(found) = menu.matches.get(menu.selected)
         {
-            rows.extend(Self::command_detail_rows(&entries[found.index], w, theme));
+            let command = &entries[found.index];
+            let mut detail = command.clone();
+            if command.kind == CommandKind::Builtin
+                && let Some(reason) = crate::ui::command_surface::unavailable_reason(
+                    &command.name,
+                    "",
+                    self.command_context,
+                )
+            {
+                detail.description = reason.to_owned();
+            }
+            rows.extend(Self::command_detail_rows(&detail, w, theme));
         }
         if panel {
             // On the band layout the menu is an inset panel: its kind and position as a title.

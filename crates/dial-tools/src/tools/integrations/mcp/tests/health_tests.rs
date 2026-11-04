@@ -48,6 +48,7 @@ fn stale_catalog_revokes_read_only_exemption_and_refuses_old_definition() {
     assert!(echo.read_only_hint());
     assert!(!echo.needs_approval(&json!({})));
     loaded.sessions[0].on_signal(Signal::ToolsChanged);
+    *loaded.sessions[0].catalog_retry.lock() = Some(Instant::now() + Duration::from_secs(1));
     assert!(!echo.read_only_hint());
     assert!(echo.needs_approval(&json!({})));
     let result = call(
@@ -132,4 +133,163 @@ fn recovered_notification_channel_revalidates_unknown_catalog_without_reload() {
     assert_eq!(session.health().generation, generation);
     assert_eq!(session.health().catalog, CatalogFreshness::Fresh);
     assert!(tool(&loaded, "mcp__fake__echo").read_only_hint());
+}
+
+#[test]
+fn stale_catalog_retries_are_cancellable_rate_limited_and_recover_without_reconnect() {
+    let loaded = load(&config_with(vec![(
+        "fake",
+        fake_config("list-fails-once", 30),
+    )]));
+    let session = &loaded.sessions[0];
+    let generation = session.health().generation;
+    session.on_signal(Signal::ToolsChanged);
+    assert!(session.client_until(&|| true).is_err());
+    assert_eq!(session.health().catalog, CatalogFreshness::Stale);
+    assert!(
+        session.client_until(&|| false).is_err(),
+        "second listing fails transiently"
+    );
+    let limited = call(&loaded, "mcp__fake__plain", json!({}));
+    assert!(
+        limited.is_error,
+        "cooldown must not dispatch a stale definition"
+    );
+    assert_eq!(
+        limited.execution.integration.unwrap().dispatch,
+        DispatchState::NotDispatched
+    );
+    // Move only the retry clock, without waiting on wall time or restarting the transport.
+    *session.catalog_retry.lock() = Some(Instant::now());
+    let recovered = call(&loaded, "mcp__fake__plain", json!({}));
+    assert!(!recovered.is_error, "{}", recovered.text);
+    assert_eq!(session.health().catalog, CatalogFreshness::Fresh);
+    assert_eq!(session.health().generation, generation);
+}
+
+#[test]
+fn catalog_refresh_does_not_erase_an_invalidation_during_listing() {
+    let loaded = load_fake();
+    let session = &loaded.sessions[0];
+    let calls = std::cell::Cell::new(0);
+    let cancel = || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 2 {
+            session.on_signal(Signal::ToolsChanged);
+        }
+        false
+    };
+    session
+        .sync_catalog(
+            &session.current(),
+            Some(Instant::now() + Duration::from_secs(5)),
+            &cancel,
+        )
+        .unwrap();
+    assert!(calls.get() >= 2);
+    assert_eq!(session.health().catalog, CatalogFreshness::Stale);
+}
+
+#[test]
+fn catalog_admission_wait_is_cancellable_without_holding_request_locks() {
+    let loaded = load_fake();
+    let session = &loaded.sessions[0];
+    let client = session.current();
+    let remote = session.catalog_snapshot().1.pop().unwrap();
+    let _catalog = session.catalog.lock();
+    let cancelled = std::cell::Cell::new(false);
+    let result = session.admit_tool(&client, &remote, &|| cancelled.replace(true));
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+}
+
+struct ListingTimeouts(Mutex<Vec<(String, Duration)>>);
+impl client::Remote for ListingTimeouts {
+    fn post(
+        &self,
+        message: &Value,
+        timeout: Duration,
+        operation: &Arc<client::lifecycle::Operation>,
+        sink: &mut dyn FnMut(Value),
+    ) -> anyhow::Result<()> {
+        let method = message["method"].as_str().unwrap();
+        self.0.lock().push((method.to_owned(), timeout));
+        assert!(operation.dispatch());
+        operation.delivered();
+        let key = match method {
+            "resources/list" => "resources",
+            "resources/templates/list" => "resourceTemplates",
+            "prompts/list" => "prompts",
+            other => panic!("unexpected method {other}"),
+        };
+        sink(json!({"id":message["id"], "result":{key:[]}}));
+        Ok(())
+    }
+}
+
+#[test]
+fn background_surface_refresh_bounds_zero_timeout_without_changing_foreground_policy() {
+    let loaded = load(&config_with(vec![("fake", fake_config("", 0))]));
+    let session = &loaded.sessions[0];
+    let transport = Arc::new(ListingTimeouts(Mutex::default()));
+    // Keep the original transport alive: dropping it would legitimately signal Closed to
+    // the session supervisor, unrelated to this isolated listing transport fixture.
+    let _previous = std::mem::replace(
+        &mut *session.client.lock(),
+        Arc::new(Client::remote(
+            "fake",
+            transport.clone(),
+            Arc::new(Shared::new(vec![], None)),
+        )),
+    );
+    session.relist(&Signal::ResourcesChanged);
+    session.relist(&Signal::PromptsChanged);
+    assert!(
+        session.notices.lock().is_empty(),
+        "{:?}",
+        session.notices.lock()
+    );
+    let background = std::mem::take(&mut *transport.0.lock());
+    assert_eq!(background.len(), 3, "{background:?}");
+    assert!(
+        background
+            .iter()
+            .all(|(_, timeout)| !timeout.is_zero() && *timeout <= CONNECT_TIMEOUT),
+        "{background:?}"
+    );
+    session.listing.lock().reset();
+    session.resources().unwrap();
+    session.prompts().unwrap();
+    let foreground = transport.0.lock();
+    assert_eq!(foreground.len(), 3, "{foreground:?}");
+    assert!(
+        foreground.iter().all(|(_, timeout)| timeout.is_zero()),
+        "{foreground:?}"
+    );
+}
+
+#[test]
+fn bounded_surface_refresh_deadline_also_cancels_connection_lock_wait() {
+    let loaded = load(&config_with(vec![("fake", fake_config("", 0))]));
+    let session = &loaded.sessions[0];
+    for resources in [true, false] {
+        thread::scope(|scope| {
+            let guard = session.turn.lock();
+            let (tx, rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let deadline = Some(Instant::now() + Duration::from_millis(100));
+                let result = if resources {
+                    session.list_resources(deadline, &|| false)
+                } else {
+                    session.list_prompts(deadline, &|| false)
+                };
+                tx.send(result.is_err()).unwrap();
+            });
+            let outcome = rx.recv_timeout(Duration::from_secs(2));
+            drop(guard);
+            assert!(
+                outcome.unwrap(),
+                "deadline must stop the refresh before the connection lock becomes available"
+            );
+        });
+    }
 }

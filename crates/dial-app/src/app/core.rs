@@ -40,12 +40,23 @@ pub(super) struct App {
 impl App {
     pub(super) fn new(
         layout: Layout,
-        config: Config,
+        mut config: Config,
         overlay: toml::Table,
         launch: crate::agent::modes::Launch,
         add_dirs: Vec<std::path::PathBuf>,
         mode_flags: crate::cli::mode_flags::ModeFlags,
     ) -> Result<Self> {
+        // Model/tool launch flags are captured into the overlay after the initial config load.
+        // Record those initial sources too; reloads already resolve this overlay at the owner.
+        for def in crate::config::schema::registry() {
+            if crate::config::schema::get(&overlay, def.path).is_some()
+                && (config.setting_sources.get(def.path) != Some(&"env") || def.path == "edit.mode")
+            {
+                config
+                    .setting_sources
+                    .insert(def.path.to_owned(), "CLI flag");
+            }
+        }
         let models = Some(SessionModels::capture(
             &settings_store::load_merged(&layout, &overlay).context("reading session settings")?,
         ));
@@ -110,6 +121,16 @@ impl App {
             agent.persist_workspace_roots()?;
         }
         Ok(agent)
+    }
+
+    /// Session-only capabilities are replaced; explicit terminal launch roots remain available.
+    pub(super) fn swap_agent_session(
+        &self,
+        agent: &mut Agent<'_>,
+        session: Session,
+    ) -> Result<Session> {
+        let workspace = agent.prepare_session_workspace_with_roots(&session, &self.add_dirs)?;
+        Ok(agent.swap_session_prepared(session, workspace))
     }
 
     /// Commit the authoritative project at the agent-free rebuild boundary.
@@ -178,6 +199,14 @@ impl App {
     ) -> Result<()> {
         settings_store::save_config_checked(&self.layout, scope, changes, &self.overlay, check)?;
         self.adopt_settings(changes, None)
+    }
+
+    pub(crate) fn save_reviewed_model_settings(
+        &self,
+        review: &settings_store::ModelConfigReview,
+    ) -> Result<()> {
+        settings_store::save_reviewed_model_config(&self.layout, review)?;
+        self.adopt_settings(review.changes(), review.role())
     }
 
     fn adopt_settings(&self, changes: &[Change], role: Option<&str>) -> Result<()> {

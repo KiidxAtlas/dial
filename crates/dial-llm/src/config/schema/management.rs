@@ -117,6 +117,13 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Role names map to { provider = \"name\", model = \"identity\" }. Also managed in Models."
     ),
     structured!(
+        "vision",
+        MO,
+        "Configuration",
+        "Vision tool models",
+        "Optional grounding and image_embedding feature model selections. These are not chat roles; /setup grounding and /setup image-embeddings configure local models."
+    ),
+    structured!(
         "model_favorites",
         MO,
         "Configuration",
@@ -304,6 +311,13 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Configuration",
         "Debug adapters",
         "Named Debug Adapter Protocol executable and argument definitions."
+    ),
+    structured!(
+        "keys",
+        IN,
+        "Input",
+        "Shortcut overrides",
+        "Binding ids map to a chord or an array of chords, for example \"app.status.expand\" = [\"alt+s\", \"f11\"]. Overrides legacy keybindings.toml per binding; /hotkeys edits these interactively."
     ),
     structured!(
         "verification",

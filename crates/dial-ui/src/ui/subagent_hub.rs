@@ -59,7 +59,7 @@ impl SubagentHub {
         self.panel.set_routes(
             roles
                 .iter()
-                .filter(|role| matches!(role.role, "main" | "small" | "tester" | "planner"))
+                .filter(|role| matches!(role.role, "main" | "small" | "tester" | "task"))
                 .map(|role| {
                     format!(
                         " {} → {}{}",

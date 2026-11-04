@@ -2,6 +2,10 @@
 
 Benchmark suites, efficiency measurement, workflow regression checks, configuration comparisons and assistance ablation.
 
+For the source directory map, offline checks and fixture ownership, start with
+[the benchmark tooling index](../examples/benchmarks/README.md). Runnable non-benchmark samples
+are listed in [the examples index](../examples/README.md).
+
 **Invalid runs.** A benchmark run in which no case shows any model activity (for example, every case fails immediately with an agent error before a model request) is reported as an invalid run and fails the command, instead of being reported as a 0 score. The JSON report records the reason in `invalid_run`, and each case keeps its `evidence.agent_error_detail`; fix the setup problem before comparing results.
 
 ## Using an existing subscription sign-in
@@ -630,6 +634,31 @@ Each turn's raw stdout and stderr, including partial output on timeouts, are kep
 report in `<report-stem>.logs/<agent>-<case>-r<N>/`. Reports and existing log directories are not
 overwritten. Logs can contain source, commands and provider output: treat them as private artifacts.
 
+Pass `--capture-traces` to retain `turn-N.session.jsonl` for each Dial turn before its disposable
+home is removed. Capture reads only the CLI result's named session under that trial's isolated
+`DIAL_HOME`; it never falls back to installed user sessions. Lookup admits at most 10,000 entries,
+does not follow directory symlinks, and reads only a regular, non-symlink journal of at most 4 MiB.
+Malformed, branched or compacted histories are unavailable rather than replayed by the benchmark.
+Each turn's `trace` records `captured` with a file pointer/byte count, or `unavailable` with a reason;
+unsupported agents, missing terminal session identities, timeouts and launch failures are explicit.
+Trace availability does not change outcome scores or turn incomplete usage into complete usage.
+Capture duration (`trace.capture_ms`) is reported separately and excluded from trial `elapsed_ms`.
+
+Captures preserve native tool arguments/results, assistant-message boundaries, and journal timing
+metadata where present. An assistant message is not proof of every transport attempt or retry;
+use the CLI efficiency counters for inference timing. Continued turns retain cumulative journal
+snapshots, so do not sum their message counts. Files are owner-only (0600) under private trial log
+directories (0700), are never overwritten, and are **unredacted private artifacts**: do not upload
+them without review. The public report keeps only capture metadata, not journal contents. Use the
+same capture setting on both sides of a comparison; instrumentation itself is not a speedup.
+
+Built-in testing guidance targets owning tests for the changed entry point, not unrelated suites.
+It still broadens checks for affected interfaces, uncertainty, explicit requests and required gates;
+benchmark speed is not a reason to remove behavioral verification or weaken assertions.
+See [agent-loop recovery and verification](agent-loop.md) for unchanged-read reuse and the
+distinction between passing post-fix checks and missing pre-fix reproduction. Neither changes
+required evidence credit or completion gates.
+
 Dial runs with a default configuration: `cross-agent.toml` sets `DIAL_HOME = "{trial_root}/dial-home"`
 (a directory inside each trial, so no user settings, MCP servers, skills, memory or experimental
 options and no state shared between trials) and `DIAL_SUBSCRIPTION_AUTH_HOME = "~/.dial"`, which shares
@@ -639,6 +668,20 @@ configuration instead; opt-in features then count, for example Dial's `experimen
 adds one auxiliary request per user turn. omp runs as installed, with its user configuration,
 sessions and global skills. The sample does not isolate omp's state per trial; record and match
 configuration/state before attributing differences to the harness.
+
+Use `--comparison-mode installed` (the default) for installed/configured setups. For an explicitly
+controlled experiment, pass `--comparison-mode controlled --comparison-notes "..."` describing model,
+reasoning, permissions, enabled integrations, state isolation and remaining differences. Controlled
+runs require non-empty notes. The report retains this as an operator declaration, not proof that the
+configurations are equivalent. Never put credentials in notes; they are stored verbatim.
+
+Summaries include nearest-rank `p95_elapsed_ms_all` and two success-normalized measures:
+`elapsed_ms_per_success` is the sum of elapsed time across **all scored attempts**, including failures,
+divided by passed trials. `tokens_per_success` similarly amortizes total input plus output tokens;
+it is unknown if any scored attempt has incomplete usage. Both are unknown when nothing passed.
+These are workload-mix-dependent aggregates, not dollar costs or predictions of retry-until-success
+behavior. Compare the same case/repetition mix, inspect per-case results, and retain failed attempts.
+Small-sample p95 is usually the maximum; it does not establish a stable population tail latency.
 
 Diagnostics recorded per run:
 
@@ -668,6 +711,11 @@ Diagnostics recorded per run:
   `tool_calls[].is_error` records for failure counts, and tool-result diagnostics for their causes.
   `inference_latency`, `storage_io` and `backend_operations` are inclusive costs that nest inside the
   turn's duration, so they are not a partition of wall time and must not be added to it.
+  Prefix measurement additionally records `request_prefix.elapsed_us` in the session journal and
+  aggregates it as `projection_bytes.backend_operations.request_prefix` (`calls`, `elapsed_us`). This
+  measures provider-neutral serialization/hash preparation, excluding journal publication and model
+  inference; it overlaps request preparation and must not be added to turn wall time. Full historical
+  messages are remeasured after hooks, so this does not assume unchanged content or provider cache hits.
 - A non-zero exit records the exit code, the stderr log path (`stderr_log`) and a bounded excerpt
   (`stderr_tail`, last 800 characters) after best-effort redaction of token-like values. Excerpts are
   not a guarantee against leaking secrets: the raw logs are unredacted private artifacts. The progress

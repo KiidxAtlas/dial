@@ -36,7 +36,7 @@ const DAY_MS: i64 = 86_400_000;
 const MAX_LINE: usize = 8 * 1024 * 1024;
 
 pub fn db_path(user_dir: &Path) -> PathBuf {
-    user_dir.join("stats.sqlite3")
+    crate::config::paths::stats_db_file(user_dir)
 }
 
 /// Best-effort catch-up of the transcript index when an interactive session ends, so `sessions`
@@ -590,7 +590,7 @@ impl Db {
                 .collect::<rusqlite::Result<_>>()?
         };
         let mut present = HashSet::new();
-        let projects = user_dir.join("projects");
+        let projects = crate::config::paths::projects_dir(user_dir);
         let mut files = Vec::new();
         if let Ok(entries) = fs::read_dir(&projects) {
             for project in entries.flatten() {
@@ -931,8 +931,7 @@ impl Db {
     /// Requests and tool calls are matched by the session id recorded in the transcript header.
     pub fn trace(&self, user_dir: &Path, project: &str, file: &Path) -> Result<Option<Trace>> {
         use rusqlite::OptionalExtension;
-        let listed = user_dir
-            .join("projects")
+        let listed = crate::config::paths::projects_dir(user_dir)
             .join(project)
             .join("sessions")
             .join(file.file_name().unwrap_or_default());
@@ -1077,7 +1076,7 @@ impl Db {
 /// canonical file path; `None` for anything else (including missing files).
 pub fn session_file_in_tree(user_dir: &Path, session_file: &Path) -> Option<(String, PathBuf)> {
     use std::path::Component;
-    let projects = fs::canonicalize(user_dir.join("projects")).ok()?;
+    let projects = fs::canonicalize(crate::config::paths::projects_dir(user_dir)).ok()?;
     let file = fs::canonicalize(session_file).ok()?;
     let rel = file.strip_prefix(&projects).ok()?;
     let mut parts = rel.components();

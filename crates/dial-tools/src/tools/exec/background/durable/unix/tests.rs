@@ -451,3 +451,35 @@ fn spawn_failure_and_interrupted_acknowledgement_do_not_orphan_quota() {
         "uncertain acknowledgement never replays launch"
     );
 }
+
+#[test]
+fn durable_owner_retains_cargo_lease_after_launching_workspace_drops() {
+    let (_temp, ws, registry) = fixture();
+    let ws = ws.with_cargo_session("detached").unwrap();
+    let target = ws.cargo_target_dir().unwrap();
+    fs::create_dir_all(target.join("debug")).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(ws.root.join("release"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let started = start(&ws, &json!({"action":"start", "name":"lease", "command":"read -r token < release", "lifetime":30}), &registry, &AtomicBool::new(false)).unwrap();
+    assert!(!started.is_error, "{}", started.text);
+    let root = ws.root.clone();
+    drop(ws);
+    let removed = crate::tools::exec::cargo_target::prune_stale(&root, "new", Duration::ZERO);
+    let adopted = crate::tools::exec::cargo_target::adopt_idle(&root, "new", Duration::ZERO);
+    let reattached = Workspace::new(&root).unwrap();
+    let directory = registry.join("lease");
+    request(&directory, &reattached, &json!({"action":"kill"})).unwrap();
+    await_finished(&directory);
+    assert!(removed.is_empty(), "durable owner's target was pruned");
+    assert!(adopted.is_none(), "durable owner's target was adopted");
+    assert!(target.exists());
+    assert_eq!(
+        crate::tools::exec::cargo_target::adopt_idle(&root, "new", Duration::ZERO),
+        Some(target)
+    );
+}

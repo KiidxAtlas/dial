@@ -19,8 +19,6 @@ const SCHEMA_VERSION: i64 = 3;
 const PRUNE_DIVISOR: i64 = 64;
 /// Failure rows retained after each insert.
 const MAX_FAILURES: i64 = 64;
-/// Database location relative to the Dial user directory.
-const DEFAULT_RELATIVE_PATH: &str = "cache/commit-inference.db";
 /// Environment override for the database path.
 const PATH_ENV: &str = "DIAL_COMMIT_CACHE_DB";
 /// How long an open, read, or write waits for another process's lock before failing.
@@ -295,7 +293,7 @@ fn resolve_path(override_path: Option<OsString>, user_dir: &Path) -> Option<Path
     match override_path {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
         _ if user_dir.as_os_str().is_empty() => None,
-        _ => Some(user_dir.join(DEFAULT_RELATIVE_PATH)),
+        _ => Some(crate::config::paths::commit_cache_file(user_dir)),
     }
 }
 

@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::json;
 mod io_metrics;
+mod recovery_search;
 mod relocation_artifacts;
 mod schema;
 mod timing;
@@ -59,7 +60,7 @@ fn legacy_search_index_upgrades_without_trusting_old_offsets() {
     session.append(user("platypus")).unwrap();
     assert_eq!(Session::search(&e.layout, "platypus", 10).unwrap().len(), 1);
     let conn = Connection::open(&db).unwrap();
-    assert_eq!(super::super::sqlite::check_version(&conn, 1).unwrap(), 1);
+    assert_eq!(super::super::sqlite::check_version(&conn, 2).unwrap(), 2);
 }
 #[test]
 fn streamed_observations_survive_reopen_before_any_final_reply() {
@@ -2206,4 +2207,25 @@ fn a_complete_final_entry_without_its_newline_is_kept() {
         contents(&Session::read(&path).unwrap().messages()),
         ["one", "two"].map(String::from)
     );
+}
+
+#[test]
+fn undo_checkpoint_links_follow_the_selected_branch_and_refuse_legacy_or_forked_messages() {
+    let e = env();
+    let mut session = new_session(&e);
+    let id = session.id().to_owned();
+    for turn in 1..=3 {
+        session.append(json!({"role":"user", "content":format!("turn {turn}"), "dial_checkpoint":{"session":id,"turn":turn}})).unwrap();
+        session.append(assistant("answer")).unwrap();
+    }
+    assert_eq!(session.rewind_checkpoint_turns(1).unwrap(), [3]);
+    assert_eq!(session.rewind_checkpoint_turns(2).unwrap(), [2, 3]);
+    session.rewind(2).unwrap();
+    session.append(json!({"role":"user", "content":"replacement", "dial_checkpoint":{"session":id,"turn":4}})).unwrap();
+    assert_eq!(session.rewind_checkpoint_turns(9).unwrap(), [1, 4]);
+    session.append(json!({"role":"user", "content":"copied", "dial_checkpoint":{"session":"foreign","turn":5}})).unwrap();
+    assert!(session.rewind_checkpoint_turns(1).is_err());
+    session.rewind(1).unwrap();
+    session.append(user("legacy")).unwrap();
+    assert!(session.rewind_checkpoint_turns(1).is_err());
 }

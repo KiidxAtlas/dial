@@ -86,7 +86,14 @@ pub(crate) fn client_commit(
     let mut written: Vec<String> = Vec::new();
     for (client, change) in targets.into_iter().flatten().zip(changes) {
         let text = change.after.as_deref().unwrap_or_default();
-        if let Err(error) = client.write_text(&change.path, text) {
+        if let Err(error) = client.write_text_confirmed(&change.path, text) {
+            let certainty = match &error {
+                crate::tools::ClientWriteError::NotWritten(_) => "was not written",
+                crate::tools::ClientWriteError::Unknown(_) => {
+                    crate::tools::exec::execution::unsettled();
+                    "write was not confirmed; reconcile the editor state before retrying"
+                }
+            };
             let already = if written.is_empty() {
                 String::new()
             } else {
@@ -96,11 +103,12 @@ pub(crate) fn client_commit(
                 )
             };
             return Some(Err(format!(
-                "{} was not written by the editor client ({error}); no local write was made{already}",
+                "{} {certainty} ({error}); no local write was made{already}",
                 ws.rel(&change.path)
             )));
         }
         written.push(ws.rel(&change.path));
+        crate::tools::exec::execution::committed([change.path.clone()]);
     }
     Some(Ok(Vec::new()))
 }

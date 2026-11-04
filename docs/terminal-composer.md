@@ -1,0 +1,134 @@
+# Composer and transcript
+
+Write, paste and edit drafts without losing your place; understand the launch screen, transcript and status line.
+
+[Terminal overview](terminal-interface.md) · [Documentation index](README.md)
+
+- Inline, scrollback-native transcript with a live composer; finished turns remain in normal terminal
+  scrollback. Model, provider and settings panels use a full-screen overlay and restore the terminal
+  when closed. Approval prompts and settings adapt to narrow terminal widths.
+- User and assistant messages have muted UTC timestamp headers. Live timestamps mark submission
+  or the start of an answer; resumed messages use their recorded journal time (assistant journal
+  times mark persistence). Older imported messages without a recorded time remain unstamped.
+- Finished-turn footers show measured output speed as `tok/s` when available, alongside elapsed
+  time and token counts. Unknown or invalid rates are omitted; `ui.show_turn_stats = false` hides
+  the footer. Historical rates are not reconstructed from message timestamps.
+- New conversations open on a centered launch screen: a braille knob and wordmark (the needle turns
+  into place at start-up, then breathes and catches a passing glint, when `ui.motion` allows) above a compact input card near the window
+  midpoint. One line beneath shows the model, current directory and Git branch, then a quiet
+  shortcut hint; setup and unsafe-mode warnings appear only when relevant. Recent sessions appear
+  below the input when space allows; `Down` focuses the list and `Enter` resumes a session. A first
+  launch shows a three-step tour; Esc or sending a message dismisses it for good (the marker lives in
+  Dial's private user state). Small
+  windows shed artwork before warnings and selected actions. Sending a message restores the
+  normal conversation, and so does a command that prints a result (for example `/add-dir`), so
+  its answer is shown rather than left in scrollback behind the launch screen. Commands that
+  only open a panel keep it.
+- Text that starts with `/` but is not a command is sent as an ordinary message. A first word
+  containing another `/` (a pasted path such as `/Users/me/notes.md`) never opens the command
+  menu, so `Enter` sends it as typed, and while busy it queues like any other message.
+- A configurable status line shows model, role, path, Git state, context, token usage/rate, approval,
+  sandbox and session state. The default layout adapts to width (path drops below 120 columns, branch
+  and cost below 80); `Alt+S` or `F11` (`app.status.expand`) temporarily shows every segment. Presets
+  and custom left/right segments still apply when configured. Learning diagnostics are available in the explicit improvement views.
+- The default status line leads with the approval mode as a colored dot and plain label
+  (`● Ask first`, `Edit freely`, `Full auto`, `Read-only`): green for ask and read-only, orange for
+  full auto. Config, CLI and `/approval` values stay `ask`, `write`, `auto` and `readonly`.
+- **Work panel.** While a plan has open steps on a terminal at least 90 columns wide, one compact
+  rounded card sits above the composer. It is as tall as its content and at most 100 columns wide.
+  Its tab strip shows `plan`, `evidence` and `approvals`, switched with `Ctrl+X` (or `Alt+W` or
+  `F12`; rebind `app.work.tab`). The plan tab lists the steps with status dots (a green check for
+  done, an orange dot for the step in progress, a hollow ring for pending) and the focused step's
+  recorded reason or finding; when the card is short it keeps the focused step and drops reason
+  lines first. Evidence lists references recorded so far, labelled as agent observations, not
+  verification. Approvals shows the approval mode and sandbox. At 60–89 columns a collapsed plan-only
+  card shows the current and next step; narrower terminals keep the one-line focus summary. The panel
+  only reads the plan; it never changes it.
+- The launch input is a rounded box that asks "What are we building?". It shows no status line
+  or shortcut catalog. An active tab in any panel's tab strip is drawn as a filled pill.
+- Skill tool lines include the bundled reference-file path when one is read, for example
+  `rust-best-practices · references/handbook-11.md`, so separate reference reads do not look like
+  repeated loads of the core skill.
+- The `cost` segment shows the observed API cost of the running turn and the session, such as
+  `$0.0412 turn · $1.20 session`. Amounts use the `$` form of `/cost` (four decimals below a
+  dollar, cents above). While a turn runs, the segment counts spend observed since the turn
+  started, including workers and background work that settles meanwhile. When the turn ends it
+  shows that turn's exact ledger figure until the next turn starts. The session total includes
+  workers and is omitted when it equals the turn. The segment is hidden when the cost is unknown
+  or zero: local and subscription models, unpriced requests, and a turn with no priced reply. It
+  is part of the default, `nerd`, `ascii`, `compact` and `full` presets; custom layouts add
+  `cost` to `ui.status_left` or `ui.status_right`. It is the first segment to drop on a narrow
+  line after the token, rate, learning, usage, session and time segments. `/cost` keeps the full
+  breakdown.
+- Local inference shows **loading model**, **processing prompt**, then a live **generating tokens**
+  counter and tokens/second in the composer. Dial's MLX runners report engine counts, including
+  reasoning and tool tokens; the text runner also reports prompt processing progress. Other local
+  servers use estimates marked `~` until reported usage arrives. Counters reset for each request.
+  Text-embedded tool syntax stays hidden from the transcript, but its streamed bytes still advance
+  estimated counts and reset the generation-silence timer. Engine-reported counts remain authoritative.
+- Built-in guidance asks for brief user-facing findings, decisions, changed plans and blockers,
+  even alongside tools, without narrating each routine call. This is a model instruction, not a
+  synthetic progress message or a guarantee of prose on every reply. Reasoning is shown only when
+  the provider emits it; tool-only replies do not imply that hidden reasoning was received.
+- Active work has a dedicated row above the composer: the current operation, elapsed **turn** time,
+  and a compact activity track. Reported prompt counts fill the track; unknown progress uses a
+  travelling marker, not a guessed percentage. The metadata border stays stable and the row
+  disappears when idle. Custom status layouts opt in with the `spinner` segment.
+  Loading, prompt processing and generation all report **no progress for Ns** after 15 seconds
+  without a progress event. This is a telemetry-silence warning, not proof that inference has hung;
+  local first-event waits remain unlimited by default. Stopping takes precedence over old telemetry.
+- Searchable model/role, provider and settings panels. Settings save globally or per project outside
+  the editable workspace, validate before writing, and apply display changes immediately.
+
+- A frameless default look (`dial-dark`/`dial`): shaded bands for your messages and the composer,
+  a shared icon gutter for answers and tool calls, and inset panels and menus with a filled
+  selection. Dark, light, monochrome, Gruvbox, Nord and Paper themes; custom JSON themes, symbol
+  presets, band, box or line composer, styled headings/code/diffs, expandable tool results, and
+  `NO_COLOR`.
+- Activity reads apart at a glance. Commands, code cells, edits and web calls are framed cards
+  with the exit code and time on the bottom edge. Runs of reads and searches fold into `Read (N)` /
+  `Search (N)` trees. Notes sent to other agents show as quoted `✉ IRC` lines with delivery
+  receipts. Skill and tool loading stays in the quiet `◆` context lane.
+- Unicode-aware multiline editing, bracketed paste, persistent per-project prompt history and history
+  search. Secret provider inputs are masked and never enter prompt history.
+- Pasted text stays in the draft. Buffered unbracketed paste preserves line breaks, and an immediate
+  trailing Enter after bracketed paste is ignored. Press Enter after the paste settles to send it.
+- **Clipboard images:** the paste-image key (`app.clipboard.pasteImage`) attaches the clipboard image
+  as a quoted PNG path in the draft. Sources by platform: macOS reads the pasteboard (PNG, TIFF,
+  JPEG, including screenshots) and then an image file copied in Finder; Windows and WSL read the
+  Windows clipboard through `powershell.exe`; Wayland uses `wl-paste` and X11 uses `xclip`. Termux
+  has no clipboard image API (`termux-clipboard-get` is text only) and reports that explicitly.
+  Every image is normalized to PNG and downscaled to fit the 5 MiB attachment limit. If nothing
+  usable is found, the error lists each reader that was tried and why it produced no image.
+- Questions and approvals quarantine input queued before the dialog opens, so a buffered Enter
+  cannot approve an unseen action. A question opened over a nonempty draft starts with draft
+  focus: Enter edits that draft, Tab/Escape moves to the choices, and Ctrl+C cancels the question.
+  If a question or approval arrives while a full-screen menu is open during a turn, the menu
+  temporarily yields to the inline prompt. Its state is kept and it reopens after the prompt;
+  menu navigation and any composer draft are preserved.
+- In question dialogs, Enter in **Other/custom input** submits the answer (or advances to the next
+  question). Shift+Enter inserts a newline. Enter in **Note** saves the note and returns to the
+  choices without submitting.
+- **Inline suggestions:** command arguments offer valid choices as dim ghost text even before you have
+  used them: `/understanding ` suggests `architecture`, `/skills s` suggests `sources`, and
+  `/skills enable ` suggests an installed skill name (including disabled skills). Built-in choices
+  take priority over matching history; ordinary prompts still suggest the newest matching history entry.
+  `Tab` or `Right` accepts the ghost; `Esc` hides it; `Enter` sends only what you typed. Suggestions
+  appear only at the end of an idle draft, never in secret prompts or mid-line.
+
+- Idle terminal frames are not rewritten. Fenced code gets theme-aware lexical highlighting,
+  and a `diagram` fence (```` ```diagram Optional title ````) is drawn as a filled, framed panel: an
+  accent border with the title in its top edge, connector glyphs tinted apart from the labels, and the
+  theme's code background. Plain ASCII line art is redrawn cell for cell: `-`/`=` runs become `─`/`═`,
+  `|` becomes `│`, `->` and `<-` get `▶`/`◀` heads, a lone `v`/`^` under or over a line becomes
+  `▼`/`▲`, and each `+` becomes the matching rounded corner or junction. Hyphens and letters inside
+  words stay labels, and the ASCII glyph set shows the source unchanged. Diagram rows are clipped
+  with an ellipsis rather than wrapped, so their columns stay aligned; the source text is unchanged
+  in the transcript. The agent is advised, not required, to use a diagram only when the structure
+  branches, loops, layers or links several parts, and to write it as unboxed ASCII arrows: boxes and
+  long arrows cost tokens without adding meaning, box-drawing characters cost more than ASCII, and a
+  linear flow is shorter as one sentence or one arrow line.
+  Completed Markdown prefixes are cached while streaming. Edit and write cards show the change as a
+  numbered, coloured diff (separate hunks with two lines of context, per file); the anchored preview rows
+  and removed-lines report the model gets are left out. Each todo call renders the list as it now stands,
+  with the steps that call closed struck through and emphasized. Passing automatic checks are one line.

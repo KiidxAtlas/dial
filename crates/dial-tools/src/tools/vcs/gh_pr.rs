@@ -746,9 +746,9 @@ pub(crate) fn worktrees_root() -> Result<PathBuf, String> {
     if let Some((_, home)) = TEST_ENV.with(|value| value.borrow().clone()) {
         return Ok(home.join(".dial").join("wt"));
     }
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| "HOME is not set; cannot place the PR worktree".to_owned())?;
-    Ok(PathBuf::from(home).join(".dial").join("wt"))
+    crate::config::paths::user_dir()
+        .map(|root| crate::config::paths::worktrees_dir(&root))
+        .map_err(|error| error.to_string())
 }
 
 /// First 7 hex digits of SHA-256 over the path.

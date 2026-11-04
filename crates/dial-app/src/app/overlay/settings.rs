@@ -12,6 +12,78 @@ pub(in crate::app) fn apply_settings_hints(overlay: &mut SettingsOverlay, effect
     for (path, hint) in crate::voice::settings_hints(effective) {
         overlay.set_hint(path, hint);
     }
+    for (path, hint) in feature_readiness_hints(effective) {
+        overlay.set_hint(path, hint);
+    }
+}
+
+/// Prerequisite evidence only. In particular, configured models/credentials do not prove a
+/// service connection works. Browsing this projection never starts a process or network check.
+fn feature_readiness_hints(config: &Config) -> Vec<(&'static str, String)> {
+    let (blocking, optional) = crate::setup::memory::backend_missing(config, config.memory.backend);
+    let memory = if let Some(missing) = blocking.first() {
+        format!("Needs setup · {missing}")
+    } else if config.memory.backend == crate::config::memory_backend::MemoryBackendId::Hindsight {
+        "Unknown · service configured; connection has not been tested here".into()
+    } else {
+        crate::setup::memory::status_summary(&blocking, &optional)
+    };
+    let memory_hint = format!("{memory} · /setup memory");
+    let mut hints = vec![
+        ("memory.backend", memory_hint.clone()),
+        ("memory.enabled", memory_hint),
+    ];
+    let laya = if config.laya.engine != crate::config::laya::DecisionEngineType::Laya {
+        "Unsupported here · configured decision engine is not implemented".to_owned()
+    } else if crate::config::laya::expected_checkpoint(&config.laya).is_none() {
+        "Needs setup · no decision checkpoint configured or installed".to_owned()
+    } else {
+        // A configured path/repository is not evidence that a service is running or ready.
+        // Only an explicit owner health check can establish that; Settings never probes it.
+        "Unknown · checkpoint selected; service health not observed here".to_owned()
+    };
+    for path in ["laya.enabled", "laya.auto_start"] {
+        hints.push((
+            path,
+            format!("{laya} · /laya status; dial laya install --checkpoint PATH for setup"),
+        ));
+    }
+    for (path, enable, value) in [
+        (
+            "voice.tts.backend",
+            "voice.tts.auto_speak",
+            serde_json::to_value(config.voice.tts.backend).unwrap_or_default(),
+        ),
+        (
+            "voice.stt.backend",
+            "voice.stt.enabled",
+            serde_json::to_value(config.voice.stt.backend).unwrap_or_default(),
+        ),
+    ] {
+        let value = value.as_str().unwrap_or("unknown");
+        let readiness = crate::setup::voice::ready(config, path, value);
+        let status = match (value, readiness) {
+            ("mlx-whisper", _) if !cfg!(all(target_os = "macos", target_arch = "aarch64")) => {
+                "Unsupported here · mlx-whisper requires Apple Silicon macOS".into()
+            }
+            ("unknown", _) => "Unknown · backend could not be read".into(),
+            ("auto", _) => "Unknown · automatic backend is chosen when used".into(),
+            ("openai", Ok(())) => {
+                "Unknown · credentials available; connection not tested here".into()
+            }
+            ("openai", Err(_)) => {
+                "Needs sign-in · configure voice credentials in /providers".into()
+            }
+            (_, Ok(())) => "Ready · local backend prerequisites found (not an audio test)".into(),
+            (_, Err(error)) => format!("Needs setup · {error:#}"),
+        };
+        let destination = crate::setup::voice::recipe_for(path, value)
+            .map_or_else(|| "/settings → Voice".into(), |id| format!("/setup {id}"));
+        let hint = format!("{status} · {destination}");
+        hints.push((path, hint.clone()));
+        hints.push((enable, hint));
+    }
+    hints
 }
 
 /// Missing-dependency offers for the settings overlay, keyed by the setting path each one serves.

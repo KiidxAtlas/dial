@@ -41,11 +41,10 @@ const MAX_JSON: u64 = 256 * 1024;
 // Account catalogs include model instructions and can be much larger than OAuth responses.
 const MAX_CATALOG_JSON: u64 = 8 * 1024 * 1024;
 const FILE: &str = "chatgpt-accounts.json";
-const CATALOG_FILE: &str = "chatgpt-model-catalog.json";
 
 /// Credential file protected independently from other subscription-store data.
 pub fn credential_path(dir: &std::path::Path) -> std::path::PathBuf {
-    dir.join(FILE)
+    super::credential_store::subscription_path(dir, FILE)
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -68,7 +67,10 @@ fn cached_catalog_for(dir: &Path, selected: Option<&str>) -> Result<ModelCatalog
     }) else {
         return Ok(ModelCatalog::default());
     };
-    let Some(bytes) = crate::platform::atomic::read_private(&dir.join(CATALOG_FILE))? else {
+    let Some(bytes) = crate::platform::atomic::read_private(
+        &crate::config::paths::chatgpt_model_catalog_file(dir),
+    )?
+    else {
         return Ok(ModelCatalog::default());
     };
     let mut catalogs: BTreeMap<String, ModelCatalog> =
@@ -117,19 +119,21 @@ pub(crate) fn scoped_model_context_window(
 }
 
 fn save_catalog(dir: &Path, id: &str, catalog: &ModelCatalog) -> Result<()> {
-    let path = dir.join(CATALOG_FILE);
+    let path = crate::config::paths::chatgpt_model_catalog_file(dir);
     let _lock = locked_cancellable(&path, &AtomicBool::new(false))?;
-    let mut catalogs: BTreeMap<String, ModelCatalog> =
-        match crate::platform::atomic::read_private(&path)? {
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
-                anyhow::anyhow!(
-                    "ChatGPT model metadata cache is invalid; existing records preserved"
-                )
-            })?,
-            None => BTreeMap::new(),
-        };
+    let mut catalogs: BTreeMap<String, ModelCatalog> = match crate::platform::atomic::read_private(
+        &crate::config::paths::chatgpt_model_catalog_file(dir),
+    )? {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
+            anyhow::anyhow!("ChatGPT model metadata cache is invalid; existing records preserved")
+        })?,
+        None => BTreeMap::new(),
+    };
     catalogs.insert(id.into(), catalog.clone());
-    write_private(&path, &serde_json::to_vec(&catalogs)?)
+    write_private(
+        &crate::config::paths::chatgpt_model_catalog_file(dir),
+        &serde_json::to_vec(&catalogs)?,
+    )
 }
 
 /// The stored ChatGPT accounts: the same owner-private shape every OAuth provider uses
@@ -168,7 +172,7 @@ fn now() -> u64 {
         .as_secs()
 }
 fn load(dir: &Path) -> Result<State> {
-    match crate::platform::atomic::read_private(&dir.join(FILE))? {
+    match crate::platform::atomic::read_private(&credential_path(dir))? {
         None => Ok(State::default()),
         Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
             anyhow::anyhow!("ChatGPT credential storage is invalid; existing records preserved")
@@ -176,7 +180,7 @@ fn load(dir: &Path) -> Result<State> {
     }
 }
 fn save(dir: &Path, state: &State) -> Result<()> {
-    write_private(&dir.join(FILE), &serde_json::to_vec(state)?)
+    write_private(&credential_path(dir), &serde_json::to_vec(state)?)
 }
 pub fn accounts(dir: &Path) -> Result<Vec<AccountInfo>> {
     let state = load(dir)?;
@@ -199,7 +203,7 @@ pub fn accounts(dir: &Path) -> Result<Vec<AccountInfo>> {
         .collect())
 }
 pub fn select_account(dir: &Path, id: &str) -> Result<()> {
-    let _lock = locked_cancellable(&dir.join(FILE), &AtomicBool::new(false))?;
+    let _lock = locked_cancellable(&credential_path(dir), &AtomicBool::new(false))?;
     let mut state = load(dir)?;
     ensure!(
         state
@@ -736,7 +740,7 @@ fn login_at(
         "ChatGPT sign-in returned a different workspace; existing credentials preserved"
     );
     cancelled(&cancel)?;
-    let _lock = locked_cancellable(&dir.join(FILE), &cancel)?;
+    let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
     let mut current = load(dir)?;
     cancelled(&cancel)?;
     if let Some(existing) = current.accounts.get(&id) {
@@ -788,7 +792,7 @@ pub fn grounded_search(dir: &Path, body: &Value, timeout: u64) -> Result<super::
 /// Capture the active default once; later global switches never retarget this identity.
 pub fn resolve_account(dir: &Path, selected: Option<&str>) -> Result<String> {
     let cancel = AtomicBool::new(false);
-    let _lock = locked_cancellable(&dir.join(FILE), &cancel)?;
+    let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
     let state = load(dir)?;
     let id = selected
         .or(state.active.as_deref())
@@ -827,7 +831,7 @@ fn scoped_account_token_at(
     url: &str,
 ) -> Result<(String, SecretToken)> {
     cancelled(&cancel)?;
-    let _lock = locked_cancellable(&dir.join(FILE), &cancel)?;
+    let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
     let mut state = load(dir)?;
     let id = selected
         .map(str::to_owned)
@@ -905,7 +909,7 @@ fn scoped_account_token_at(
     Ok((account_id, SecretToken::new(tokens.access_token.clone())))
 }
 pub fn sign_out(dir: &Path, id: &str, cancel: Arc<AtomicBool>) -> Result<String> {
-    let _lock = locked_cancellable(&dir.join(FILE), &cancel)?;
+    let _lock = locked_cancellable(&credential_path(dir), &cancel)?;
     let mut state = load(dir)?;
     let account = state
         .accounts
@@ -1190,7 +1194,7 @@ pub fn test_catalog(dir: &Path, value: &Value) {
 }
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_account(dir: &Path, expired: bool) {
-    let _lock = locked(&dir.join(FILE)).unwrap();
+    let _lock = locked(&credential_path(dir)).unwrap();
     let id = "oaiapp_test";
     let account = Account {
         client_id: CLIENT_ID.into(),

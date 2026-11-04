@@ -10,6 +10,7 @@ fn row(name: &str, running: bool) -> JobRow {
         name: name.into(),
         command: format!("run {name}"),
         status: if running { "running" } else { "exited 0" }.into(),
+        process_outcome: None,
         running,
         terminal: true,
         mode: "session".into(),
@@ -149,7 +150,7 @@ fn narrow_rows_end_long_commands_in_an_ellipsis_and_exited_jobs_offer_output() {
         if width < 80 {
             assert!(row.trim_end().ends_with('…'), "{width}: {row}");
         }
-        assert!(shown[0].contains("1 exited"), "{}", shown[0]);
+        assert!(shown[0].contains("1 finished"), "{}", shown[0]);
         assert!(shown.join("\n").contains("view output"), "{shown:?}");
     }
     let ascii = crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
@@ -222,4 +223,114 @@ fn pipe_output_scrolls_and_end_resumes_following() {
     overlay.set_screen(vec!["new output".into()], None);
     let short = draw_rows(&mut overlay, &theme, 38, 12).join("\n");
     assert!(short.contains("new output"), "{short}");
+}
+
+#[test]
+fn attention_only_classifies_known_non_success_receipts() {
+    let receipt = |code, signal, cancelled, timed_out| crate::runtime::execution::ProcessOutcome {
+        started: true,
+        exit_code: code,
+        signal,
+        timed_out,
+        cancelled,
+        output_complete: true,
+    };
+    for (outcome, running, expected, attention) in [
+        (None, true, "Running", false),
+        (
+            Some(receipt(Some(0), None, false, false)),
+            false,
+            "Completed",
+            false,
+        ),
+        (
+            Some(receipt(Some(1), None, false, false)),
+            false,
+            "Failed",
+            true,
+        ),
+        (
+            Some(receipt(None, Some(15), false, false)),
+            false,
+            "Failed",
+            true,
+        ),
+        (
+            Some(receipt(None, Some(15), true, false)),
+            false,
+            "Cancelled",
+            false,
+        ),
+        (
+            Some(receipt(None, None, false, true)),
+            false,
+            "Failed",
+            true,
+        ),
+        (
+            Some(receipt(None, None, false, false)),
+            false,
+            "Unknown",
+            false,
+        ),
+        (None, false, "Unknown", false),
+        (
+            Some(receipt(Some(1), None, false, false)),
+            true,
+            "Running",
+            false,
+        ),
+    ] {
+        let mut job = row("job", running);
+        // Neither a plausible legacy string nor arbitrary printed text is lifecycle evidence.
+        job.status = "exited (exit code 1)".into();
+        job.process_outcome = outcome;
+        assert_eq!(job.lifecycle_label(), expected);
+        assert_eq!(job.needs_attention(), attention);
+    }
+}
+
+#[test]
+fn attached_interrupt_targets_only_the_selected_terminal() {
+    let keys = Keymap::defaults();
+    let mut overlay = JobsOverlay::new();
+    overlay.set_jobs(vec![row("server", true), row("watch", true)]);
+    overlay.handle(&Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)), &keys);
+    assert!(
+        matches!(overlay.handle(&Event::Key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)), &keys),
+        OverlayEvent::JobInput { name, bytes } if name == "server" && bytes == [3])
+    );
+    assert_eq!(overlay.attached(), Some("server"));
+    overlay.handle(
+        &Event::Key(key(KeyCode::Char(']'), KeyModifiers::CONTROL)),
+        &keys,
+    );
+    assert_eq!(overlay.attached(), None);
+    assert!(overlay.jobs.iter().all(|job| job.running));
+}
+
+#[test]
+fn lifecycle_leads_process_rows_and_retains_native_diagnostic_when_attached() {
+    let theme = crate::ui::theme::Theme::dark();
+    let mut overlay = JobsOverlay::new();
+    let mut completed = row("check", false);
+    completed.status = "exited (exit code 0)".into();
+    completed.process_outcome = Some(crate::runtime::execution::ProcessOutcome {
+        started: true,
+        exit_code: Some(0),
+        signal: None,
+        timed_out: false,
+        cancelled: false,
+        output_complete: true,
+    });
+    overlay.set_jobs(vec![completed]);
+    let shown = draw_rows(&mut overlay, &theme, 100, 12).join("\n");
+    assert!(shown.contains("Completed"), "{shown}");
+    overlay.handle(
+        &Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)),
+        &Keymap::defaults(),
+    );
+    let shown = draw_rows(&mut overlay, &theme, 100, 12).join("\n");
+    assert!(shown.contains("Completed"), "{shown}");
+    assert!(shown.contains("exited (exit code 0)"), "{shown}");
 }

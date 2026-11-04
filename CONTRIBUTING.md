@@ -24,6 +24,17 @@ make test-rust          # or make test-nextest
 Run the narrower tiers that match your change as well: `make test-drivers` for browser/eval/kernel
 drivers, `make test-python` for Python code, `make test-bench-offline` for benchmark tooling.
 
+`make help` is the command index. `make test-packaging test-release-policy` checks distribution
+metadata and release policy; `make test-build` checks local installation without replacing your installed binary;
+`make test-install` exercises the Unix release installer. See [examples/README.md](examples/README.md)
+for runnable samples versus benchmark infrastructure.
+
+Start with `make release-check` for no-build source, packaging and tooling readiness. It does
+not replace compilation or runtime tests. Before pushing a committed tree, use `make preflight`.
+For staged or uncommitted release work, use `make preflight-worktree`: it checks the current files
+without committing or resetting them. Both preflight commands compile; neither replaces
+native-platform CI or hosted signing verification.
+
 ## Pull requests
 
 - One coherent change per PR. Describe the behaviour change and how you verified it, listing the
@@ -53,8 +64,8 @@ measurement or says the effect is unmeasured.
 
 ## Releases
 
-Maintainers cut releases with `scripts/release.sh <version>`; see
-[docs/release-and-install.md](docs/release-and-install.md).
+Maintainers prepare release metadata with `scripts/release.sh <version>`; tagging and publication
+are separate explicit steps. See [docs/release-and-install.md](docs/release-and-install.md).
 
 ## Security issues
 

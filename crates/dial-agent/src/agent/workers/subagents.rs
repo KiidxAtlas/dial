@@ -68,7 +68,7 @@ fn role_for_agent(spec: &AgentSpec) -> &'static str {
     match spec.name {
         "reviewer" | "test-runner" => "tester",
         "seance" => "main",
-        "planner" => "planner",
+        "planner" => "coach",
         _ if spec.mutates => "task",
         _ => "small",
     }
@@ -76,20 +76,25 @@ fn role_for_agent(spec: &AgentSpec) -> &'static str {
 
 /// Resolve missing task roles through configured helpers, never an arbitrary catalogue model.
 /// These chains are delegation-only: maintenance requests keep their own role semantics.
-fn default_task_role(config: &Config, preferred: &'static str) -> &'static str {
+fn default_task_role(config: &Config, preferred: &'static str) -> (&'static str, String) {
     let candidates: &[&str] = match preferred {
         "task" => &["task", "coach", "small"],
         "small" => &["small", "task"],
         "tester" => &["tester", "coach", "task", "small"],
-        "planner" => &["planner", "coach", "task", "small"],
-        _ => return preferred,
+        "coach" => &["coach", "task", "small"],
+        _ => return (preferred, format!("{preferred} selected")),
     };
-    candidates
-        .iter()
-        .copied()
-        .find(|role| config.role_selection(role).is_some())
-        // Retain the requested role in diagnostics when its final fallback is Main.
-        .unwrap_or(preferred)
+    let mut evaluated = Vec::new();
+    for &role in candidates {
+        if config.role_selection(role).is_some() {
+            evaluated.push(format!("{role} assigned, selected"));
+            return (role, evaluated.join(" -> "));
+        }
+        evaluated.push(format!("{role} unassigned"));
+    }
+    evaluated.push("main selected (missing-assignment default)".into());
+    // Retain the requested role in diagnostics when its final fallback is Main.
+    (preferred, evaluated.join(" -> "))
 }
 
 /// Whether a `task` call would launch an agent that can change files, so the call needs approval.
@@ -519,6 +524,7 @@ pub(in crate::agent) struct Job<'c> {
     pub limit: usize,
     pub(in crate::agent) work_packet: Option<WorkPacket>,
     pub acceptance_checks: Vec<String>,
+    pub(in crate::agent) promotion: Option<crate::agent::workers::contracts::Promotion>,
     /// Skills the agent definition autoloads; `preloaded` holds their rendered bodies once resolved.
     pub autoload_skills: Vec<String>,
     pub preloaded: String,
@@ -531,11 +537,13 @@ pub(in crate::agent) struct ModelRoute {
     pub role: &'static str,
     pub config: Config,
     pub source: &'static str,
+    /// Recorded at selection time, never reconstructed from today's configuration.
+    pub explanation: String,
 }
 
 impl ModelRoute {
     pub fn metadata(&self) -> Value {
-        json!({"role":self.role,"model":self.config.selection().display_name(),"model_source":self.source})
+        json!({"role":self.role,"model":self.config.selection().display_name(),"model_source":self.source,"model_explanation":self.explanation})
     }
 }
 
@@ -557,7 +565,7 @@ fn model_routes(
     let mut routes = selectors
         .into_iter()
         .map(|selector| {
-            let mut role = default_task_role(config, job.role);
+            let (mut role, evaluated) = default_task_role(config, job.role);
             let mut suffix_thinking = None;
             let mut selected = config.for_role(role);
             if let Some(selector) = selector {
@@ -633,10 +641,30 @@ fn model_routes(
             } else {
                 "follows main"
             };
+            let reason = if let Some(profile) = profile {
+                format!("Explicit model profile {profile} selected")
+            } else if let Some(selector) = selector {
+                format!(
+                    "{} model selector {selector} selected",
+                    if job.seance.is_some() {
+                        "Consultation"
+                    } else {
+                        "Agent definition"
+                    }
+                )
+            } else {
+                evaluated
+            };
+            let explanation = format!(
+                "{}: {reason}; route {}",
+                job.kind,
+                selected.selection().display_name()
+            );
             Ok(ModelRoute {
                 role,
                 config: selected,
                 source,
+                explanation,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -656,6 +684,11 @@ fn model_routes(
                 role,
                 config: primary.config.with_selection(&next),
                 source: "fallback",
+                explanation: format!(
+                    "{}; provider-error fallback selected: {}",
+                    primary.explanation,
+                    next.display_name()
+                ),
             })
             .collect::<Vec<_>>();
         routes.extend(chained);
@@ -1092,6 +1125,7 @@ fn parse_job<'c>(
         limit,
         work_packet,
         acceptance_checks,
+        promotion: None,
         autoload_skills,
         preloaded: String::new(),
         seance,
@@ -2345,7 +2379,7 @@ fn worker_body(ui: &mut dyn Ui, job: &Job, role: &Config) -> Option<crate::runti
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
-    body.settle(String::new(),Some(json!({"name":job.label,"agent":job.kind,"role":job.role,"model":role.selection().display_name(),"model_source":job.model_routes[0].source,"status":"running","phase":"starting","steps":0,"tools":0,"started_ms":started_ms,"task":prompt::truncate_chars(&job.prompt, 120)})),crate::runtime::Phase::Running);
+    body.settle(String::new(),Some(json!({"name":job.label,"agent":job.kind,"role":job.role,"model":role.selection().display_name(),"model_source":job.model_routes[0].source,"model_explanation":job.model_routes[0].explanation,"status":"running","phase":"starting","steps":0,"tools":0,"started_ms":started_ms,"task":prompt::truncate_chars(&job.prompt, 120)})),crate::runtime::Phase::Running);
     ui.result_node(&body);
     Some(body)
 }
@@ -2404,8 +2438,15 @@ pub(in crate::agent) fn run_child(
                 return Outcome::failed(attempts, format!("subagent fallback: {error:#}"));
             }
         };
-        approver.model_route(&route.metadata());
-        route_used = Some(route.metadata());
+        let mut metadata = route.metadata();
+        if route.source != "fallback" {
+            metadata["model_explanation"] = json!(format!(
+                "Provider-error alternate route selected (before worker progress): {}",
+                route.explanation
+            ));
+        }
+        approver.model_route(&metadata);
+        route_used = Some(metadata);
         let earlier_inspections = outcome.inspections;
         outcome = child::run(
             Env {
@@ -2788,7 +2829,16 @@ pub(in crate::agent) fn run_job(
             isolated.recover("controller acceptance checks did not authorize promotion")
         }
         crate::runtime::Phase::Completed => {
+            // Acquire ledger authority only inside the workspace transaction. Retain it through
+            // both validation calls and any rollback so a controller update cannot race commit.
+            let mut authority = None;
             isolated.merge_checked(env.workspace, env.interrupt, |workspace| {
+                if let Some(promotion) = &job.promotion {
+                    authority.get_or_insert_with(|| promotion.lock())(
+                        env.workspace,
+                        &env.config.verification,
+                    )?;
+                }
                 if job.acceptance_checks.is_empty() {
                     return Ok(());
                 }
@@ -2826,9 +2876,7 @@ pub(in crate::agent) fn run_job(
         }
     }
     if !isolation.errors.is_empty() || !isolation.conflicts.is_empty() || isolation.interrupted {
-        outcome
-            .acceptance
-            .reject("candidate was not coherently integrated");
+        outcome.acceptance.integration_failed(&isolation);
     } else {
         outcome
             .acceptance
@@ -3322,7 +3370,7 @@ fn render(
         result["role"] = json!(job.role);
         result["model"] = json!(models.get(&job.index));
         if let Some(route) = &outcome.model_route {
-            for key in ["role", "model", "model_source"] { result[key] = route[key].clone(); }
+            for key in ["role", "model", "model_source", "model_explanation"] { result[key] = route[key].clone(); }
         }
         if let Some(rules) = &outcome.portable_rules { result["portable_rules"] = rules.clone(); }
         if let Some(isolation) = &outcome.isolation {

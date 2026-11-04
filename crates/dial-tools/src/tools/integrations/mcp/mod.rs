@@ -40,6 +40,7 @@ pub mod registry;
 pub mod smithery;
 pub use oauth::{login, logout};
 mod live;
+mod signals;
 mod tool;
 use crate::config::types::{Config, McpServerConfig};
 use crate::runtime::integration::{
@@ -53,13 +54,11 @@ pub use live::Live;
 use parking_lot::{Mutex, MutexGuard};
 use serde_json::{Value, json};
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak, mpsc};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
-use tool::RemoteTool;
 
 #[derive(Clone, Debug)]
 pub enum Signal {
@@ -88,6 +87,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Guards against a server that paginates forever.
 const MAX_PAGES: usize = 50;
 const MAX_TOOLS_PER_SERVER: usize = 256;
+/// Minimum spacing between on-demand catalog validation attempts.
+const CATALOG_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// Delays before each automatic reconnect after the transport dropped.
 const RECONNECT_LADDER_MS: [u64; 4] = [500, 1000, 2000, 4000];
 /// Automatic reconnect attempts allowed per [`RECONNECT_BURST_WINDOW`] before calls fail fast.
@@ -135,6 +136,10 @@ pub struct Session {
     /// User-visible notices about catalog changes and failed refreshes, drained by the registry.
     notices: Mutex<Vec<String>>,
     reported_transitions: AtomicU64,
+    /// Transport invalidation revision covered by the last successful listing.
+    catalog_signal_revision: AtomicU64,
+    /// Earliest next on-demand validation; guarded by the existing turn lock.
+    catalog_retry: Mutex<Option<Instant>>,
 }
 
 /// Cached `resources/list` + templates and `prompts/list` results; `None` until fetched or
@@ -189,8 +194,14 @@ impl Session {
         }
     }
 
+    fn catalog_current_for(&self, client: &Client) -> bool {
+        self.catalog_signal_revision.load(Ordering::Acquire) == client.signal_revision()
+    }
+
     pub(super) fn catalog_current(&self) -> bool {
         self.health().catalog == CatalogFreshness::Fresh
+            && self.catalog_signal_revision.load(Ordering::Acquire)
+                == self.current().signal_revision()
     }
 
     /// Claim each transition once even when several calls settle concurrently.
@@ -211,6 +222,16 @@ impl Session {
         Duration::from_secs(self.server.timeout_secs)
     }
 
+    /// Even a configuration with no request timeout must bound catalog refresh work.
+    fn catalog_timeout(&self) -> Duration {
+        let timeout = self.timeout();
+        if timeout.is_zero() {
+            CONNECT_TIMEOUT
+        } else {
+            timeout.min(CONNECT_TIMEOUT)
+        }
+    }
+
     /// The client as it is now, without reconnecting.
     pub(super) fn current(&self) -> Arc<Client> {
         self.client.lock().clone()
@@ -223,15 +244,19 @@ impl Session {
         let current = self.current();
         if !current.is_closed() {
             let snapshot = self.health();
-            if snapshot.catalog == CatalogFreshness::Unknown {
-                let deadline = crate::tools::exec::kernel::execution_deadline(self.timeout());
-                self.sync_catalog(&current, deadline, cancel)?;
-                self.update_health(|health| {
-                    // Never erase a concurrent invalidation while the listing was in flight.
-                    if health.transitions == snapshot.transitions {
-                        health.catalog = CatalogFreshness::Fresh;
+            if snapshot.catalog != CatalogFreshness::Fresh || !self.catalog_current() {
+                ensure!(!cancel(), "MCP catalog refresh cancelled");
+                let now = Instant::now();
+                let mut retry = self.catalog_retry.lock();
+                if retry.is_none_or(|at| now >= at) {
+                    *retry = Some(now + CATALOG_RETRY_INTERVAL);
+                    drop(retry);
+                    let deadline = Some(now + self.catalog_timeout());
+                    if let Err(error) = self.sync_catalog(&current, deadline, cancel) {
+                        self.update_health(|health| health.catalog = CatalogFreshness::Stale);
+                        return Err(error);
                     }
-                });
+                }
             }
             return Ok(current);
         }
@@ -278,7 +303,7 @@ impl Session {
             }
         };
         let fresh = match self.sync_catalog(&client, deadline, cancel) {
-            Ok(_) => true,
+            Ok(_) => self.catalog_current_for(&client),
             Err(error) => {
                 self.push_notice(format!(
                     "MCP server `{}`: tools/list failed after reconnect; calls stay refused until a refresh succeeds: {error:#}",
@@ -319,13 +344,21 @@ impl Session {
         if let Some(cached) = self.cached_listing(|listing| listing.resources.clone()) {
             return Ok(cached);
         }
-        self.list_resources(cancel)
+        self.list_resources(
+            crate::tools::exec::kernel::execution_deadline(self.timeout()),
+            cancel,
+        )
     }
 
     /// Fetches resources and resource templates from the server and caches them.
-    fn list_resources(self: &Arc<Self>, cancel: &dyn Fn() -> bool) -> Result<Value> {
+    fn list_resources(
+        self: &Arc<Self>,
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Value> {
         let generation = self.listing.lock().generation;
-        let deadline = crate::tools::exec::kernel::execution_deadline(self.timeout());
+        let stopped = || cancel() || deadline.is_some_and(|end| Instant::now() >= end);
+        let cancel = &stopped;
         let client = self.client_until(cancel)?;
         let listing = json!({
             "resources": list_all(&client, "resources/list", "resources", deadline, cancel)?,
@@ -347,13 +380,21 @@ impl Session {
         if let Some(cached) = self.cached_listing(|listing| listing.prompts.clone()) {
             return Ok(cached);
         }
-        self.list_prompts(cancel)
+        self.list_prompts(
+            crate::tools::exec::kernel::execution_deadline(self.timeout()),
+            cancel,
+        )
     }
 
     /// Fetches prompts from the server and caches them.
-    fn list_prompts(self: &Arc<Self>, cancel: &dyn Fn() -> bool) -> Result<Value> {
+    fn list_prompts(
+        self: &Arc<Self>,
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Value> {
         let generation = self.listing.lock().generation;
-        let deadline = crate::tools::exec::kernel::execution_deadline(self.timeout());
+        let stopped = || cancel() || deadline.is_some_and(|end| Instant::now() >= end);
+        let cancel = &stopped;
         let client = self.client_until(cancel)?;
         let listing =
             json!({"prompts": list_all(&client, "prompts/list", "prompts", deadline, cancel)?});
@@ -456,7 +497,9 @@ impl Session {
         match signal {
             Signal::ToolsChanged => self.refresh_tools(),
             Signal::ResourcesChanged => {
-                if let Err(error) = self.list_resources(&|| false) {
+                if let Err(error) =
+                    self.list_resources(Some(Instant::now() + self.catalog_timeout()), &|| false)
+                {
                     self.push_notice(format!(
                         "mcp `{}`: resources/list refresh failed; keeping previous resources: {error:#}",
                         self.name
@@ -464,7 +507,9 @@ impl Session {
                 }
             }
             Signal::PromptsChanged => {
-                if let Err(error) = self.list_prompts(&|| false) {
+                if let Err(error) =
+                    self.list_prompts(Some(Instant::now() + self.catalog_timeout()), &|| false)
+                {
                     self.push_notice(format!(
                         "mcp `{}`: prompts/list refresh failed; keeping previous prompts: {error:#}",
                         self.name
@@ -522,35 +567,23 @@ const TOOLS_CHANGED_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Routes a session's signals: a tool-list notice refreshes the catalog once per burst, other list
 /// notices invalidate their cache, and a closed transport triggers recovery. The thread holds only a
 /// weak reference, so dropping the session (its tools) stops the server.
-fn listen(session: &Arc<Session>, signals: mpsc::Receiver<Signal>) -> Result<()> {
+fn listen(session: &Arc<Session>, signals: signals::Receiver) -> Result<()> {
     let weak: Weak<Session> = Arc::downgrade(session);
     let generation = session.health.lock().generation;
     thread::Builder::new()
         .name(format!("mcp-{}-signals", session.name))
         .spawn(move || {
-            let mut queued = VecDeque::new();
             loop {
-                let signal = match queued.pop_front() {
-                    Some(signal) => signal,
-                    None => match signals.recv() {
-                        Ok(signal) => signal,
-                        Err(_) => return,
-                    },
+                let signal = match signals.recv() {
+                    Ok(signal) => signal,
+                    Err(_) => return,
                 };
-                let debounced = matches!(
+                if matches!(
                     signal,
                     Signal::ToolsChanged | Signal::PromptsChanged | Signal::ResourcesChanged
-                );
-                if debounced {
-                    // Notices of one kind sent together share one re-list: wait out the burst, drop
-                    // the extra notices of that kind it holds and keep the rest in order.
-                    let kind = std::mem::discriminant(&signal);
+                ) {
                     thread::sleep(TOOLS_CHANGED_DEBOUNCE);
-                    queued.extend(
-                        signals
-                            .try_iter()
-                            .filter(|next| std::mem::discriminant(next) != kind),
-                    );
+                    signals.coalesce(&signal);
                 }
                 let Some(session) = weak.upgrade() else {
                     return;
@@ -867,6 +900,8 @@ fn connect(
         attempts: Mutex::new(Vec::new()),
         listing: Mutex::new(Listing::default()),
         reported_transitions: AtomicU64::new(0),
+        catalog_signal_revision: AtomicU64::new(0),
+        catalog_retry: Mutex::new(None),
         health: Mutex::new(IntegrationHealth {
             connection: ConnectionHealth::Connected,
             notifications: if server.url.is_none() {
@@ -882,50 +917,15 @@ fn connect(
         notices: Mutex::new(Vec::new()),
     });
 
-    let mut tools = Vec::new();
-    let mut notice = None;
     let client = session.current();
-    let budget = || remaining(deadline);
-    let mut cursor: Option<String> = None;
-    // A resource- or prompt-only server does not declare `tools`; probing `tools/list` would fail it.
-    let serves_tools = client.has_capability("tools") || !(resources || prompts);
-    let page_limit = if serves_tools { MAX_PAGES } else { 0 };
-    for _ in 0..page_limit {
-        let params = cursor
-            .as_ref()
-            .map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
-        let page = client.request_with("tools/list", params, budget(), cancel, None)?;
-        let Some(entries) = page.get("tools").and_then(Value::as_array) else {
-            bail!("`tools/list` returned no `tools` array");
-        };
-        tools.extend(
-            entries
-                .iter()
-                .filter_map(RemoteTool::parse)
-                .map(|mut tool| {
-                    tool.read_only_hint &= server.trust_read_only_hint;
-                    tool
-                }),
-        );
-        cursor = page
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .filter(|c| !c.is_empty())
-            .map(str::to_owned);
-        if cursor.is_none() || tools.len() >= MAX_TOOLS_PER_SERVER {
-            break;
-        }
-    }
-    let truncated = cursor.is_some() || tools.len() > MAX_TOOLS_PER_SERVER;
-    tools.truncate(MAX_TOOLS_PER_SERVER);
-    if truncated {
-        notice = Some(format!(
-            "mcp `{name}`: tool list cut off after {} tools",
-            tools.len()
-        ));
-    }
+    let revision = client.signal_revision();
+    let tools = session.fetch_tools(&client, deadline, cancel)?;
     let offers_tools = !tools.is_empty();
     session.apply_catalog(tools);
+    session
+        .catalog_signal_revision
+        .store(revision, Ordering::Release);
+    let notice = session.notices.lock().pop();
     listen(&session, signals)?;
     Ok(Connected {
         session,
@@ -983,12 +983,16 @@ fn open(
     user_dir: &Path,
     deadline: Option<Instant>,
     cancel: &dyn Fn() -> bool,
-) -> Result<(Client, mpsc::Receiver<Signal>)> {
-    let (tx, rx) = mpsc::channel();
+) -> Result<(Client, signals::Receiver)> {
+    let (tx, rx) = signals::channel();
     let shared = Shared::new(vec![root.to_path_buf()], Some(tx));
     let client = if let Some(url) = &server.url {
-        let oauth = Arc::new(oauth::TokenSource::load(user_dir, name)?);
-        let remote = Arc::new(http::Http::new(name, url, server, Some(oauth))?);
+        let oauth = if http::Auth::has_fixed_credentials(server) {
+            None
+        } else {
+            Some(Arc::new(oauth::TokenSource::load(user_dir, name, url)?))
+        };
+        let remote = Arc::new(http::Http::new(name, url, server, oauth)?);
         let shared = Arc::new(shared);
         if server.transport == Some(crate::config::types::McpTransport::Sse) {
             remote

@@ -10,14 +10,24 @@ fn memory_model_roles_default_to_memory_decision_and_accept_only_role_names() {
         "small",
         "coach",
         "tester",
-        "planner",
         "memory",
         "decision",
         "embedding",
     ] {
         assert!(role(name).is_ok(), "{name} should be accepted");
     }
-    for name in ["", "smol", "slow", "default", "bad role", "reranker"] {
+    for name in [
+        "",
+        "smol",
+        "slow",
+        "default",
+        "bad role",
+        "reranker",
+        "planner",
+        "judge",
+        "grounding",
+        "image_embedding",
+    ] {
         assert!(role(name).is_err(), "{name:?} should be rejected");
     }
 }

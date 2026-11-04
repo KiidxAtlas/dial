@@ -139,6 +139,7 @@ impl Background {
                 name: proc.name.clone(),
                 command: proc.command.clone(),
                 status: proc.state.label(),
+                process_outcome: Some(proc.state.outcome(&lock(&proc.ring))),
                 running: proc.is_running(),
                 terminal: proc.terminal,
             })
@@ -426,7 +427,7 @@ impl Background {
         } else {
             super::kernel::execution_deadline(Duration::from_secs(secs))
         };
-        let mut scanned = None;
+        let mut scanned = ReadinessScan::default();
         let mut matched = None;
         let mut next_probe = Instant::now();
         let initial = self.table().snapshot(name)?;
@@ -484,7 +485,16 @@ impl Background {
             if matched.is_none()
                 && let Some(pattern) = &until
             {
-                matched = find_match(&snap.ring, snap.terminal, pattern, &mut scanned);
+                matched = match find_match(&snap.ring, snap.terminal, pattern, &mut scanned) {
+                    Ok(matched) => matched,
+                    Err(error) => {
+                        return Ok(snap.with_launch(
+                            ToolOutput::err(format!("not ready: {name}: {error}"))
+                                .with_observation(ObservationKind::Readiness, false)
+                                .with_process(process_outcome(&snap)),
+                        ));
+                    }
+                };
             }
             let mut port_ok = false;
             if let Some(address) = port
@@ -711,29 +721,62 @@ fn plain_terminal(raw: &str) -> String {
     out
 }
 
-/// The line holding the first match in the retained output, scanning only if it grew since
-/// `scanned`. Terminal output is matched as plain text (see [`plain_terminal`]).
+/// A wait owns its observation cursor independently of display and notification readers.
+/// Keep a bounded contiguous raw prefix so split UTF-8/terminal escapes and arbitrary regex
+/// anchors retain their semantics. Never silently turn an overrun into "not matched yet".
+#[derive(Default)]
+struct ReadinessScan {
+    cursor: u64,
+    raw: Vec<u8>,
+    observed: bool,
+}
+
 fn find_match(
     ring: &Mutex<Ring>,
     terminal: bool,
     pattern: &Regex,
-    scanned: &mut Option<u64>,
-) -> Option<String> {
-    let text = {
+    scanned: &mut ReadinessScan,
+) -> Result<Option<String>, String> {
+    let (bytes, lost) = {
         let ring = lock(ring);
-        if *scanned == Some(ring.total) {
-            return None;
+        if scanned.observed && scanned.cursor == ring.total {
+            return Ok(None);
         }
-        *scanned = Some(ring.total);
-        let raw = ring.text();
-        if terminal { plain_terminal(&raw) } else { raw }
+        ring.oldest_since(
+            scanned.cursor,
+            table::MAX_BUFFER.saturating_sub(scanned.raw.len()) + 1,
+        )
     };
-    let found = pattern.find(&text)?;
+    if lost != 0 {
+        return Err(format!(
+            "readiness output overrun ({lost} bytes missed); inspect the saved output or use an earlier wait"
+        ));
+    }
+    if scanned.raw.len() + bytes.len() > table::MAX_BUFFER {
+        return Err(format!(
+            "readiness observation exceeded {} bytes; narrow the startup output or use a port readiness check",
+            table::MAX_BUFFER
+        ));
+    }
+    scanned.cursor += bytes.len() as u64;
+    scanned.raw.extend_from_slice(&bytes);
+    scanned.observed = true;
+    let raw = String::from_utf8_lossy(&scanned.raw);
+    let text = if terminal {
+        std::borrow::Cow::Owned(plain_terminal(&raw))
+    } else {
+        raw
+    };
+    let Some(found) = pattern.find(&text) else {
+        return Ok(None);
+    };
     let start = text[..found.start()].rfind('\n').map_or(0, |i| i + 1);
     let end = text[found.end()..]
         .find('\n')
         .map_or(text.len(), |i| found.end() + i);
-    Some(text[start..end].chars().take(MAX_MATCH_LINE).collect())
+    Ok(Some(
+        text[start..end].chars().take(MAX_MATCH_LINE).collect(),
+    ))
 }
 
 /// The last `n` lines of `text`, trailing newline included.
@@ -868,24 +911,7 @@ fn take_unread(snap: &Snapshot) -> (String, u64) {
 }
 
 fn process_outcome(snap: &Snapshot) -> ProcessOutcome {
-    let status = match &snap.state {
-        State::Exited { status, .. } => *status,
-        State::Running => None,
-    };
-    let ring = lock(&snap.ring);
-    ProcessOutcome {
-        started: true,
-        exit_code: status.and_then(|status| status.code()),
-        signal: status
-            .as_ref()
-            .and_then(crate::platform::process::exit_signal),
-        timed_out: false,
-        cancelled: false,
-        output_complete: ring.closed
-            && ring.reached_eof
-            && ring.error.is_none()
-            && ring.elided_bytes == 0,
-    }
+    snap.state.outcome(&lock(&snap.ring))
 }
 
 fn output_integrity(

@@ -34,7 +34,7 @@ fn sample() -> Browser {
 fn tabs_wrap_both_ways() {
     let mut b = Browser::new();
     b.prev_tab();
-    assert_eq!(b.tab(), Tab::Skills);
+    assert_eq!(b.tab(), Tab::Hooks);
     b.next_tab();
     assert_eq!(b.tab(), Tab::Mcp);
 }
@@ -126,7 +126,10 @@ fn match_summary_counts_each_tab_while_searching() {
     for c in "web".chars() {
         b.push_query(c);
     }
-    assert_eq!(b.match_summary(), "MCP servers 1 · Skills 1");
+    assert_eq!(
+        b.match_summary(),
+        "MCP servers 1 · Skills 1 · Tool groups 0 · Hooks 0"
+    );
 }
 
 #[test]

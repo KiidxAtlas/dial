@@ -18,10 +18,7 @@ pub use managed::{directory_path as managed_directory, read_skill as read_manage
 /// OpenAI-compatible embedding wire helpers, shared with the `image_embedding` role.
 pub use semantic::{EmbeddingWire, embedding_url, parse_embeddings};
 pub fn managed_root(layout: &Layout) -> std::path::PathBuf {
-    layout
-        .user_dir
-        .join("memory-backends")
-        .join("managed-skills")
+    crate::config::paths::memory_backends_dir(&layout.user_dir).join("managed-skills")
 }
 
 use crate::config::memory_backend::{MemoryBackendId, MemoryScoping};

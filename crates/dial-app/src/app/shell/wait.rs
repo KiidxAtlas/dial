@@ -39,7 +39,9 @@ impl Shell {
             return Ok(true);
         }
         let _request = crate::learn::compute::Request::foreground(&app.layout.user_dir)?;
-        let lock = auto::lock_file(&app.layout.user_dir.join("compute.lock"))?;
+        let lock = auto::lock_file(&crate::config::paths::compute_lock_file(
+            &app.layout.user_dir,
+        ))?;
         let waiting_since = Instant::now();
         let elapsed_before_wait = self.status.elapsed_secs;
         let idle_input = self
@@ -97,7 +99,7 @@ impl Shell {
     }
 
     /// Keep painting and accepting input while local preparation owns a subprocess. Typed text
-    /// queues in the composer (the busy composer), and the configured interrupt or Escape cancels.
+    /// queues in the composer (the busy composer), and the configured interrupt cancels.
     fn wait_local_preparation(
         &mut self,
         app: &App,
@@ -130,22 +132,12 @@ impl Shell {
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 }
             }
-            self.status.activity = "preparing local model · Esc cancels".into();
+            self.status.activity = "preparing local model · Ctrl+C stops".into();
             self.poll_clipboard_image();
             self.paint_waiting(app)?;
             if poll(TICK)? {
                 let event = read()?;
-                // Escape and the configured interrupt cancel preparation, unless a panel is open
-                // (then Escape closes the panel first, as everywhere else).
-                let cancel_key = self.busy_overlay.is_none()
-                    && matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release
-                        && (self.keys.matches(Action::Interrupt, key)
-                            || self.keys.matches(Action::SelectCancel, key)));
-                let flow = if cancel_key {
-                    WaitFlow::Cancel
-                } else {
-                    self.wait_event(app, event)?
-                };
+                let flow = self.wait_event(app, event)?;
                 match flow {
                     WaitFlow::Continue => {}
                     WaitFlow::Cancel => {
@@ -201,7 +193,7 @@ impl Shell {
 
     fn wait_key(&mut self, app: &App, key: crossterm::event::KeyEvent) -> Result<WaitFlow> {
         // Compute admission can also run for idle maintenance, when the composer is not busy.
-        // Let local menus/search/choices consume dismissal, but still cancel an otherwise idle wait.
+        // Escape dismisses local menus/search/choices; only the configured interrupt stops a wait.
         if self.keys.matches(Action::Interrupt, &key)
             && !self.composer.dismisses_interrupt(&key, &self.keys)
         {
@@ -217,6 +209,7 @@ impl Shell {
                 }
             }
             ComposerEvent::Action(Action::CommandPalette) => self.wait_command(app, "/palette"),
+            ComposerEvent::Action(Action::StatusFocus) => self.wait_command(app, "/controls"),
             ComposerEvent::Action(Action::ModelSelect) => self.wait_command(app, "/model"),
             ComposerEvent::Action(Action::ModelRoles) => self.wait_command(app, "/roles"),
             ComposerEvent::Action(Action::ProviderSetup) => self.wait_command(app, "/providers"),
@@ -236,6 +229,10 @@ impl Shell {
             }
             ComposerEvent::Action(Action::ThinkingToggle) => {
                 self.ui.show_thinking = !self.ui.show_thinking;
+                WaitFlow::Continue
+            }
+            ComposerEvent::Action(Action::StatusExpand) => {
+                self.status.toggle_status_expanded();
                 WaitFlow::Continue
             }
             ComposerEvent::Action(Action::WorkTab) => {
@@ -412,7 +409,9 @@ impl Shell {
             return Ok(());
         }
         let _lease = if app.config.compute_locks {
-            let lock = auto::lock_file(&app.layout.user_dir.join("compute.lock"))?;
+            let lock = auto::lock_file(&crate::config::paths::compute_lock_file(
+                &app.layout.user_dir,
+            ))?;
             if let Err(error) = std::fs::File::try_lock_shared(&lock).map_err(std::io::Error::from)
             {
                 self.note("LoRA verification", format!("An improvement or training job holds local compute; retry F6 when it finishes. {error}"));
@@ -425,7 +424,7 @@ impl Shell {
         let mut config = app.config.with_selection(selection);
         config.state_dir = config.learning_dir(&app.layout);
         app.interrupt.store(false, Ordering::SeqCst);
-        self.note("LoRA verification", format!("Loading {} to verify adapter gradients and save/reload with a tiny temporary update. Esc cancels.", selection.display_name()));
+        self.note("LoRA verification", format!("Loading {} to verify adapter gradients and save/reload with a tiny temporary update. {} stops.", selection.display_name(), self.keys.label(Action::Interrupt)));
         let started = Instant::now();
         let result = std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::channel();

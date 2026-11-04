@@ -62,6 +62,11 @@ pub struct Config {
     /// `assistance.local.edit_mode` still wins; this only lets Dial say so once. Never serialized.
     #[serde(skip)]
     pub edit_mode_explicit: bool,
+    /// Runtime provenance for schema settings; never persisted.
+    #[serde(skip)]
+    pub setting_sources: BTreeMap<String, &'static str>,
+    /// Shortcut overrides; binding ids remain owned and validated by the UI keymap.
+    pub keys: toml::Table,
     /// Python with mlx-lm for local models; defaults to the environment `dial setup` creates.
     pub python: PathBuf,
     pub worker: PathBuf,
@@ -71,6 +76,11 @@ pub struct Config {
     pub endpoint: Option<EndpointConfig>,
     pub providers: BTreeMap<String, crate::llm::model_config::ProviderSpec>,
     pub model_roles: BTreeMap<String, crate::llm::model_config::ModelSelection>,
+    /// Explicit vision feature models; absent selections leave the corresponding tools disabled.
+    pub vision: config::vision::Config,
+    /// Runtime-only planning override for a plan worker; never a persisted model role.
+    #[serde(skip)]
+    pub plan_model: Option<crate::llm::model_config::ModelSelection>,
     /// Favorite model identities, independent of role assignments.
     pub model_favorites: Vec<crate::llm::model_config::ModelSelection>,
     /// Exact provider/model profiles; capabilities must be declared by the operator.
@@ -231,6 +241,8 @@ impl Default for Config {
             provider_cache_namespace: None,
             harness_temperature_pinned: false,
             edit_mode_explicit: false,
+            setting_sources: BTreeMap::new(),
+            keys: toml::Table::new(),
             python: PathBuf::new(),
             worker: PathBuf::new(),
             model: String::new(),
@@ -239,6 +251,8 @@ impl Default for Config {
             use_case: String::new(),
             providers: BTreeMap::new(),
             model_roles: BTreeMap::new(),
+            vision: Default::default(),
+            plan_model: None,
             model_favorites: Vec::new(),
             ui: crate::llm::model_config::UiConfig::default(),
             model_profiles: BTreeMap::new(),

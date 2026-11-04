@@ -1,12 +1,13 @@
 //! Remappable key bindings. Every non-text shortcut the UI reacts to is an [`Action`] with a stable id
-//! (`app.model.select`), default chords, and a description. Users remap them in
-//! `<dial home>/keybindings.toml`:
+//! (`app.model.select`), default chords, and a description. Users remap them in the `[keys]` table
+//! of `<dial home>/config.toml`; `keybindings.toml` remains a per-id fallback:
 //!
 //! ```toml
+//! [keys]
 //! "app.model.select" = "Alt+M"                  # one chord
 //! "tui.input.newline" = ["Shift+Enter", "Alt+Enter"]   # several
 //! "app.history.search" = []                      # an empty list disables the action
-//! # nested tables work too:  [app.model]  select = "Alt+M"
+//! # nested tables work too:  [keys.app.model]  select = "Alt+M"
 //! ```
 //!
 //! Components ask the [`Keymap`] — they never match raw key codes for these actions — so the footer
@@ -21,6 +22,25 @@
 //! Model selection uses Ctrl+K on macOS so it works without changing terminal Option settings.
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{collections::HashSet, fs, path::Path};
+
+fn flatten_bindings(table: &toml::Table) -> Vec<(String, toml::Value)> {
+    fn walk(prefix: &str, table: &toml::Table, out: &mut Vec<(String, toml::Value)>) {
+        for (key, value) in table {
+            let id = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            match value {
+                toml::Value::Table(inner) => walk(&id, inner, out),
+                value => out.push((id, value.clone())),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk("", table, &mut out);
+    out
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -46,6 +66,8 @@ pub enum Action {
     ToolsExpand,
     ToolsToggle,
     ThinkingToggle,
+    StatusExpand,
+    StatusFocus,
     ApprovalCycle,
     SubagentsHub,
     WorkTab,
@@ -106,6 +128,8 @@ impl Action {
         Action::ToolsExpand,
         Action::ToolsToggle,
         Action::ThinkingToggle,
+        Action::StatusExpand,
+        Action::StatusFocus,
         Action::ApprovalCycle,
         Action::SubagentsHub,
         Action::WorkTab,
@@ -188,6 +212,8 @@ impl Action {
             Action::ToolsExpand => "app.tools.expand",
             Action::ToolsToggle => "app.tools.toggleVisibility",
             Action::ThinkingToggle => "app.thinking.toggle",
+            Action::StatusExpand => "app.status.expand",
+            Action::StatusFocus => "app.status.focus",
             Action::ApprovalCycle => "app.approval.cycle",
             Action::SubagentsHub => "app.subagents.hub",
             Action::WorkTab => "app.work.tab",
@@ -253,6 +279,8 @@ impl Action {
             Action::ToolsExpand => "Expand or collapse tool output",
             Action::ToolsToggle => "Show or hide tool activity",
             Action::ThinkingToggle => "Show or hide reasoning text",
+            Action::StatusExpand => "Expand or collapse status details",
+            Action::StatusFocus => "Focus session controls and status editors",
             Action::ApprovalCycle => "Cycle approval mode (ask, write, auto, read-only)",
             Action::SubagentsHub => {
                 "Open the worker hub: every worker, its activity, steering and cancel (Left twice on an empty composer also opens it)"
@@ -324,6 +352,7 @@ impl Action {
             Action::ToolsExpand
             | Action::ToolsToggle
             | Action::ThinkingToggle
+            | Action::StatusExpand
             | Action::WorkTab
             | Action::DisplayReset => "Display",
             Action::EditorLeft
@@ -356,7 +385,7 @@ impl Action {
             Action::Newline => &["Shift+Enter", "Ctrl+J"],
             Action::Complete => &["Tab", "Right"],
             Action::Dismiss => &["Esc"],
-            Action::Interrupt => &["Esc", "Ctrl+C"],
+            Action::Interrupt => &["Ctrl+C"],
             Action::ClearDraft => &["Ctrl+C"],
             Action::Exit => &["Ctrl+D"],
             Action::HistorySearch => &["Ctrl+R"],
@@ -373,11 +402,13 @@ impl Action {
             Action::ToolsExpand => &["Ctrl+O"],
             Action::ToolsToggle => &["Alt+O", "F5"],
             Action::ThinkingToggle => &["Ctrl+T"],
+            Action::StatusExpand => &["Alt+S", "F11"],
+            Action::StatusFocus => &["F10"],
             Action::ApprovalCycle => &["Shift+Tab"],
             Action::SubagentsHub => &["Alt+A", "F6"],
             Action::SubagentsRecent => &["Alt+Shift+A", "F7"],
             // Option+letter chords type glyphs on macOS, so the primary default is a Ctrl chord.
-            Action::WorkTab => &["Ctrl+F", "Alt+W", "F12"],
+            Action::WorkTab => &["Ctrl+X", "Alt+W", "F12"],
             Action::RateGood => &["Alt+Up"],
             Action::RateBad => &["Alt+Down"],
             Action::SelectUp => &["Up", "Ctrl+P"],
@@ -605,10 +636,6 @@ pub struct Keymap {
     customized: HashSet<Action>,
 }
 
-fn file_name() -> &'static str {
-    "keybindings.toml"
-}
-
 impl Keymap {
     pub fn defaults() -> Keymap {
         Keymap {
@@ -628,52 +655,90 @@ impl Keymap {
         }
     }
 
-    /// Defaults overlaid with `<user_dir>/keybindings.toml`. Returns human-readable warnings for
-    /// anything ignored (unknown action, bad chord, conflict, unreadable file) instead of failing startup.
+    /// Defaults, legacy keybindings.toml, then config.toml [keys] per binding id.
+    /// Invalid entries and conflicts use the same validation in every layer.
     pub fn load(user_dir: &Path) -> (Keymap, Vec<String>) {
-        let path = user_dir.join(file_name());
-        match fs::read_to_string(&path) {
-            Ok(text) => match text.parse::<toml::Table>() {
-                Ok(table) => Keymap::from_table(&table),
-                Err(error) => (
-                    Keymap::defaults(),
-                    vec![format!(
+        let mut warnings = Vec::new();
+        let mut entries = toml::Table::new();
+        for (path, section) in [
+            (crate::config::paths::keybindings_file(user_dir), None),
+            (user_dir.join("config.toml"), Some("keys")),
+        ] {
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    warnings.push(format!(
                         "{}: {error}; using default key bindings",
                         path.display()
-                    )],
-                ),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (Keymap::defaults(), Vec::new())
-            }
-            Err(error) => (
-                Keymap::defaults(),
-                vec![format!(
+                    ));
+                    continue;
+                }
+            };
+            match text.parse::<toml::Table>() {
+                Ok(table) => {
+                    let selected = match section {
+                        None => Some(&table),
+                        Some(section) => match table.get(section) {
+                            Some(toml::Value::Table(table)) => Some(table),
+                            Some(_) => {
+                                warnings.push("config.toml [keys] must be a table".into());
+                                None
+                            }
+                            None => None,
+                        },
+                    };
+                    if let Some(table) = selected {
+                        for (id, value) in flatten_bindings(table) {
+                            entries.insert(id, value);
+                        }
+                    }
+                }
+                Err(error) => warnings.push(format!(
                     "{}: {error}; using default key bindings",
                     path.display()
-                )],
-            ),
+                )),
+            }
         }
+        let (map, invalid) = Self::from_table(&entries);
+        warnings.extend(invalid);
+        (map, warnings)
+    }
+
+    /// Reload both shortcut files, retaining the live keymap when either file is unreadable or
+    /// syntactically invalid. Entry-level warnings follow the same policy as startup.
+    pub fn reload(&mut self, user_dir: &Path) -> Vec<String> {
+        let mut errors = Vec::new();
+        for path in [
+            crate::config::paths::keybindings_file(user_dir),
+            user_dir.join("config.toml"),
+        ] {
+            let result = match fs::read_to_string(&path) {
+                Ok(text) => text
+                    .parse::<toml::Table>()
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = result {
+                errors.push(format!(
+                    "{}: {error}; keeping last good key bindings",
+                    path.display()
+                ));
+            }
+        }
+        if !errors.is_empty() {
+            return errors;
+        }
+        let (map, warnings) = Self::load(user_dir);
+        *self = map;
+        warnings
     }
 
     /// Overlay a parsed `keybindings.toml` table (flat dotted keys or nested tables) on the defaults.
     pub fn from_table(table: &toml::Table) -> (Keymap, Vec<String>) {
-        fn flatten(prefix: &str, table: &toml::Table, out: &mut Vec<(String, toml::Value)>) {
-            for (key, value) in table {
-                let id = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                match value {
-                    // A table is a namespace only when it is not itself a recognizable action id's value.
-                    toml::Value::Table(inner) => flatten(&id, inner, out),
-                    other => out.push((id, other.clone())),
-                }
-            }
-        }
-        let mut entries = Vec::new();
-        flatten("", table, &mut entries);
+        let entries = flatten_bindings(table);
         let mut keymap = Keymap::defaults();
         let mut warnings = Vec::new();
         let mut wanted: Vec<(Action, Vec<Chord>)> = Vec::new();
@@ -836,15 +901,13 @@ impl Keymap {
     /// Persist customized and displaced default bindings (atomic, owner-only). Refuses
     /// to overwrite a file that cannot be parsed, so a hand-edit with a typo is never destroyed.
     pub fn save(&self, user_dir: &Path) -> anyhow::Result<()> {
-        let path = user_dir.join(file_name());
-        if let Ok(existing) = fs::read_to_string(&path) {
-            existing.parse::<toml::Table>().map_err(|e| {
-                anyhow::anyhow!(
-                    "{} is not valid TOML ({e}); fix or remove it before saving key bindings",
-                    path.display()
-                )
-            })?;
-        }
+        let legacy = match fs::read_to_string(crate::config::paths::keybindings_file(user_dir)) {
+            Ok(text) => text
+                .parse::<toml::Table>()
+                .map(|table| flatten_bindings(&table))
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
         let mut table = toml::Table::new();
         for action in Action::ALL.iter().filter(|action| {
             let defaults: Vec<_> = action
@@ -852,7 +915,9 @@ impl Keymap {
                 .iter()
                 .filter_map(|name| Chord::parse(name).ok())
                 .collect();
-            self.customized.contains(action) || self.chords(**action) != defaults
+            self.customized.contains(action)
+                || self.chords(**action) != defaults
+                || legacy.iter().any(|(id, _)| id == action.id())
         }) {
             let names: Vec<toml::Value> = self
                 .chords(*action)
@@ -869,11 +934,7 @@ impl Keymap {
             };
             table.insert(action.id().to_owned(), value);
         }
-        crate::platform::atomic::private_dir(user_dir)?;
-        crate::config::settings_store::write_private(
-            &path,
-            toml::to_string_pretty(&table)?.as_bytes(),
-        )
+        crate::config::settings_store::save_keys(user_dir, table)
     }
 
     /// Apply an editor change only after validation and persistence succeed. The interactive editor

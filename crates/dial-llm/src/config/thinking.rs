@@ -138,6 +138,17 @@ pub fn apply_thinking(mut config: Config, level: CliThinking) -> Result<Config> 
         profile.reasoning_effort = None;
     } else {
         profile.reasoning_effort = Some(effort);
+        // A fixed effort owns the switch on effort-based protocols. A pending profile may
+        // explicitly disable thinking; retaining that switch would contradict a new level.
+        if matches!(
+            profile.capabilities.reasoning,
+            ReasoningApi::OpenaiEffort
+                | ReasoningApi::OpenaiResponses
+                | ReasoningApi::GeminiLevel
+                | ReasoningApi::OllamaThink
+        ) {
+            profile.thinking = None;
+        }
     }
     // A fresh process-only entry also lets deep-merged reloads clear optional controls
     // (such as a saved Anthropic effort) without mutating the operator's named profile.

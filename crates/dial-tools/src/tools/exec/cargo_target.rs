@@ -11,9 +11,12 @@
 //! build output behind indefinitely. A new session first adopts the most recently used idle
 //! directory ([`adopt_idle`]) so its first build is incremental instead of cold.
 
+use anyhow::{Context, Result, ensure};
 use std::ffi::OsStr;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 const TARGET_ROOT: &str = "cargo-target";
@@ -40,6 +43,42 @@ pub(crate) fn dir_for(root: &Path, session: &str) -> PathBuf {
     root.join(crate::workspace_copy::SCRATCH_DIR)
         .join(TARGET_ROOT)
         .join(session)
+}
+
+// Lease files stay outside movable target directories and are never unlinked: replacing a lock
+// inode would allow two owners. Workspace clones retain a shared lease until their jobs finish.
+fn lease_file(root: &Path, session: &str) -> Result<File> {
+    ensure!(valid_session(session), "invalid Cargo session name");
+    let dir = root
+        .join(crate::workspace_copy::SCRATCH_DIR)
+        .join(TARGET_ROOT)
+        .join(".leases");
+    crate::platform::atomic::private_dir(&dir)?;
+    let file = crate::platform::fs::open_nofollow_nonblocking(
+        OpenOptions::new().read(true).write(true).create(true),
+        &dir.join(session),
+    )?;
+    ensure!(
+        file.metadata()?.is_file()
+            && crate::platform::fs::owned_by_current_user(&file)?
+            && crate::platform::fs::link_count(&file)? == 1,
+        "unsafe Cargo target lease"
+    );
+    Ok(file)
+}
+
+pub(crate) fn session_lease(root: &Path, session: &str) -> Result<Arc<File>> {
+    let file = lease_file(root, session)?;
+    file.try_lock_shared()
+        .map_err(std::io::Error::from)
+        .context("Cargo session target is being maintained; retry after maintenance")?;
+    Ok(Arc::new(file))
+}
+
+fn maintenance_lease(root: &Path, session: &str) -> Option<File> {
+    let file = lease_file(root, session).ok()?;
+    file.try_lock().ok()?;
+    Some(file)
 }
 
 /// Chooses the directory to export: none when the inherited environment already names one.
@@ -90,25 +129,76 @@ pub fn adopt_idle(root: &Path, session: &str, idle: Duration) -> Option<PathBuf>
     if own.exists() {
         return None;
     }
-    let candidate = idle_directories(root, session, idle)
-        .into_iter()
-        .filter(|(path, _)| !cargo_build_running(path))
-        .max_by_key(|(_, used)| *used)?
-        .0;
-    std::fs::rename(&candidate, &own).ok()?;
-    mark_used(&own);
-    Some(candidate)
+    let mut candidates = idle_directories(root, session, idle);
+    candidates.sort_by_key(|(_, used)| std::cmp::Reverse(*used));
+    for (candidate, _) in candidates {
+        let name = candidate.file_name()?.to_str()?;
+        let Some(_lease) = maintenance_lease(root, name) else {
+            continue;
+        };
+        let Ok(_build_locks) = cargo_build_locks(&candidate) else {
+            continue;
+        };
+        // Recheck after taking ownership; another maintainer may already have moved it.
+        if own.exists() || !candidate.is_dir() {
+            continue;
+        }
+        if std::fs::rename(&candidate, &own).is_ok() {
+            mark_used(&own);
+            return Some(candidate);
+        }
+    }
+    None
 }
 
-/// Whether Cargo holds the build lock of any profile directory in `dir`.
+/// Hold every existing Cargo profile lock through maintenance, including cross-target profiles.
+/// Enumeration errors, links and unexpectedly large layouts fail closed rather than imply idle.
+fn cargo_build_locks(dir: &Path) -> Result<Vec<File>> {
+    let mut pending = vec![(dir.to_path_buf(), 0)];
+    let mut locks = Vec::new();
+    let mut entries = 0;
+    while let Some((path, depth)) = pending.pop() {
+        for entry in std::fs::read_dir(&path)? {
+            let entry = entry?;
+            entries += 1;
+            ensure!(
+                entries <= 1024,
+                "Cargo target layout exceeds maintenance bound"
+            );
+            let kind = entry.file_type()?;
+            ensure!(!kind.is_symlink(), "Cargo target layout contains a link");
+            if !kind.is_dir() {
+                continue;
+            }
+            let lock = entry.path().join(".cargo-lock");
+            match crate::platform::fs::open_nofollow_nonblocking(
+                OpenOptions::new().read(true).write(true),
+                &lock,
+            ) {
+                Ok(file) => {
+                    ensure!(file.metadata()?.is_file(), "invalid Cargo profile lock");
+                    file.try_lock()
+                        .map_err(std::io::Error::from)
+                        .context("Cargo build holds its profile lock")?;
+                    locks.push(file);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Only a target triple can contain a second profile level. Never enumerate
+                    // profile artifacts (deps/incremental can contain millions of entries).
+                    if depth == 0 {
+                        pending.push((entry.path(), depth + 1));
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(locks)
+}
+
+#[cfg(test)]
 fn cargo_build_running(dir: &Path) -> bool {
-    let Ok(profiles) = std::fs::read_dir(dir) else {
-        return true;
-    };
-    profiles.flatten().any(|profile| {
-        let lock = profile.path().join(".cargo-lock");
-        std::fs::File::open(&lock).is_ok_and(|file| file.try_lock().is_err())
-    })
+    cargo_build_locks(dir).is_err()
 }
 
 /// Other sessions' target directories unused for at least `idle`, with their last-use time.
@@ -147,11 +237,22 @@ fn idle_directories(root: &Path, keep_session: &str, idle: Duration) -> Vec<(Pat
 /// Deletes other sessions' target directories under `root` that have not been used for `stale`.
 /// Returns the removed directories. Errors are ignored: pruning is best effort.
 pub fn prune_stale(root: &Path, keep_session: &str, stale: Duration) -> Vec<PathBuf> {
-    idle_directories(root, keep_session, stale)
-        .into_iter()
-        .filter(|(path, _)| !cargo_build_running(path) && std::fs::remove_dir_all(path).is_ok())
-        .map(|(path, _)| path)
-        .collect()
+    let mut removed = Vec::new();
+    for (path, _) in idle_directories(root, keep_session, stale) {
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let Some(_lease) = maintenance_lease(root, name) else {
+            continue;
+        };
+        let Ok(_build_locks) = cargo_build_locks(&path) else {
+            continue;
+        };
+        if std::fs::remove_dir_all(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
 }
 
 #[cfg(test)]

@@ -244,6 +244,18 @@ impl Shell {
         if let Some(report) = turn_report::render(&control["turn_summary"], &latency) {
             self.note("Turn report", report);
         }
+        // Inbox availability is independent of terminal notification preferences. Use the
+        // authoritative typed outcome, not message text, to attach its settings destination.
+        if let Some(notice) = crate::ui::termcaps::turn_end_notice(outcome, true, true) {
+            use crate::ui::overlay::inbox::Category;
+            use crate::ui::termcaps::NotifyKind;
+            let category = match notice.kind {
+                NotifyKind::Error => Category::Error,
+                NotifyKind::Completion => Category::Completion,
+                _ => Category::General,
+            };
+            self.inbox.push_category("Turn", notice.body, category);
+        }
         if let Some(notice) =
             crate::ui::termcaps::turn_end_notice(outcome, self.ui.notify, self.ui.notify_errors)
         {

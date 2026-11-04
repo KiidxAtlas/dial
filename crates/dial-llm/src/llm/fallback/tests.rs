@@ -220,3 +220,31 @@ fn resolve_selector_matches_the_chain_semantics_and_skips_blank_entries() {
         Some("https://api.together.xyz/v1")
     );
 }
+
+#[test]
+fn cross_provider_targets_honor_configured_endpoints_and_templates() {
+    let mut config = Config::default();
+    config.providers.insert(
+        "together".into(),
+        crate::llm::model_config::ProviderSpec {
+            base_url: "https://private.example/v1".into(),
+            api_key_env: Some("PRIVATE_GATEWAY_KEY".into()),
+            ..Default::default()
+        },
+    );
+    let selected = sel("openai", "primary");
+    let target = resolve_selector(&config, &selected, "together/other").unwrap();
+    let endpoint = config.selection_endpoint(&target).unwrap();
+    assert_eq!(endpoint.base_url, "https://private.example/v1");
+    assert_eq!(endpoint.api_key_env.as_deref(), Some("PRIVATE_GATEWAY_KEY"));
+
+    config.snowflake_account = Some("my-account".into());
+    let target = resolve_selector(&config, &selected, "snowflake/other").unwrap();
+    let endpoint = config.selection_endpoint(&target).unwrap();
+    assert!(
+        endpoint.base_url.contains("my-account"),
+        "{}",
+        endpoint.base_url
+    );
+    assert!(!endpoint.base_url.contains('{'), "{}", endpoint.base_url);
+}

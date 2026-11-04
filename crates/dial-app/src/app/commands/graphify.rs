@@ -5,19 +5,11 @@
 //! names, resolved the way Graphify resolves it. The exporter runs as `uvx --from graphifyy
 //! graphify …` in a background job whose output streams into the transcript. This command only
 //! renders an existing graph: it never builds one, so it starts no model or network extraction.
-use super::CommandSpec;
 use super::maintenance::spawn_process;
 use crate::app::{App, Shell, Step};
 use anyhow::{Result, ensure};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
-
-pub(super) const COMMANDS: &[CommandSpec] = &[CommandSpec {
-    name: "graphify",
-    description: "open the project's Graphify knowledge graph in the browser (default: tree)",
-    args_hint: "[tree|html|callflow]",
-    subcommands: &["tree", "html", "callflow"],
-}];
 
 const TITLE: &str = "Graphify";
 const USAGE: &str = "usage: /graphify [tree|html|callflow]";

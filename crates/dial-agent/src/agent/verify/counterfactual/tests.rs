@@ -82,14 +82,15 @@ fn install_writes_and_removes_files_but_refuses_escapes() {
 }
 
 #[test]
-fn only_configured_commands_and_related_tests_are_witnessed() {
+fn only_explicitly_declared_behavioral_commands_are_witnessed() {
     let mut config = Config::default();
+    config.experimental.fault_witness = true;
     config
         .verification
         .commands
         .push(crate::config::types::VerificationCommand {
-            name: "unit".into(),
-            command: "make test".into(),
+            name: "regression".into(),
+            command: "make regression".into(),
             file_extensions: vec![],
             timeout_secs: 30,
         });
@@ -98,19 +99,25 @@ fn only_configured_commands_and_related_tests_are_witnessed() {
         command: command.into(),
         timeout_secs: 30,
     };
-    assert!(behavioral(&config, &check("unit", "make test")));
-    assert!(behavioral(
-        &config,
-        &check("related Rust tests: x", "cargo test x")
-    ));
-    assert!(!behavioral(
-        &config,
-        &check("python AST: a.py", "python -c ...")
-    ));
-    assert!(!behavioral(
-        &config,
-        &check("cargo check: .", "cargo check")
-    ));
+    let selected = check("regression", "make regression");
+    assert!(
+        !behavioral(&config, &selected),
+        "configuration alone is not selection"
+    );
+    config
+        .verification
+        .behavioral_checks
+        .push("regression".into());
+    assert!(behavioral(&config, &selected));
+    for unselected in [
+        check("related Rust tests: x", "cargo test x"),
+        check("different name", "make regression"),
+        check("regression", "make test"),
+        check("python AST: a.py", "python -c ..."),
+        check("cargo check: .", "cargo check"),
+    ] {
+        assert!(!behavioral(&config, &unselected), "{}", unselected.name);
+    }
 }
 
 #[test]
@@ -122,12 +129,25 @@ fn witness_and_bisection_run_in_copies_and_leave_the_workspace_alone() {
     let mut config = Config::default();
     config.experimental.fault_witness = true;
     config.experimental.edit_bisection_runs = 4;
-    let mut agent = agent(&config, root.path());
     let check = FocusedCheck {
         name: "unit".into(),
         command: "(grep -qx yes fixed && grep -qx ok other) || { echo 'AssertionError: expected fixed=yes and other=ok'; exit 1; }".into(),
         timeout_secs: 30,
     };
+    config
+        .verification
+        .behavioral_checks
+        .push(check.name.clone());
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: check.name.clone(),
+            command: check.command.clone(),
+            file_extensions: vec![],
+            timeout_secs: check.timeout_secs,
+        });
+    let mut agent = agent(&config, root.path());
     let versions = [version("fixed", Some("no"), Some("yes"))];
     let line = agent.fault_witness(&check, &versions, &mut NullUi).unwrap();
     assert!(
@@ -142,7 +162,14 @@ fn witness_and_bisection_run_in_copies_and_leave_the_workspace_alone() {
         agent
             .fault_witness(&check, &versions, &mut NullUi)
             .is_none(),
-        "once per revision"
+        "once per turn, not once per revision"
+    );
+    agent.step_checks.mutations += 1;
+    assert!(
+        agent
+            .fault_witness(&check, &versions, &mut NullUi)
+            .is_none(),
+        "later edits must not reset the witness budget"
     );
 
     // Regression: `other` broke it, `noise` did not; bisection names `other`.
@@ -163,4 +190,159 @@ fn witness_and_bisection_run_in_copies_and_leave_the_workspace_alone() {
     );
     assert!(root.path().join("noise").exists());
     assert!(!agent.step_checks.counterfactual.evidence().is_null());
+}
+
+#[derive(Default)]
+struct Notices(Vec<String>);
+
+impl Ui for Notices {
+    fn notice(&mut self, text: &str) {
+        self.0.push(text.into());
+    }
+}
+
+#[test]
+fn a_passing_counterfactual_is_diagnostic_not_a_failed_verification() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.experimental.fault_witness = true;
+    let check = FocusedCheck {
+        name: "regression".into(),
+        command: "printf 'test result: ok. 1 passed'".into(),
+        timeout_secs: 5,
+    };
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: check.name.clone(),
+            command: check.command.clone(),
+            file_extensions: vec![],
+            timeout_secs: check.timeout_secs,
+        });
+    config
+        .verification
+        .behavioral_checks
+        .push(check.name.clone());
+    let mut agent = agent(&config, root.path());
+    let revision = agent.step_checks.revision();
+    agent.step_checks.evidence.observe(
+        &check.command,
+        "focused-check:regression",
+        CheckStatus::Passed,
+        revision,
+        true,
+    );
+    let mut ui = Notices::default();
+    let line = agent
+        .fault_witness(
+            &check,
+            &[version("fixed", Some("before"), Some("after"))],
+            &mut ui,
+        )
+        .unwrap();
+    assert!(
+        ui.0.is_empty(),
+        "witness progress must not emit NOTICE cards: {:?}",
+        ui.0
+    );
+    assert!(
+        !line.contains("add or run"),
+        "a passing baseline must not demand more checks: {line}"
+    );
+    assert_eq!(
+        agent
+            .step_checks
+            .evidence
+            .current_status(&check.command, revision),
+        "passed"
+    );
+    assert_eq!(agent.step_checks.evidence.passing_behavioral(revision), 1);
+    assert_eq!(
+        agent.step_checks.counterfactual.witnesses["regression"]["verdict"],
+        "passes_without_turn_changes"
+    );
+}
+
+#[test]
+fn witness_budget_includes_other_checks_and_inconclusive_attempts() {
+    for (timeout, command, verdict, deadline) in [
+        (
+            0,
+            "printf 'test result: ok. 1 passed'",
+            "passes_without_turn_changes",
+            60,
+        ),
+        (
+            600,
+            "echo 'No module named pytest'; exit 1",
+            "inconclusive",
+            60,
+        ),
+        (
+            5,
+            "printf 'test result: ok. 1 passed'",
+            "passes_without_turn_changes",
+            5,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.experimental.fault_witness = true;
+        let checks = ["first", "second"].map(|name| FocusedCheck {
+            name: name.into(),
+            command: command.into(),
+            timeout_secs: timeout,
+        });
+        for check in &checks {
+            config
+                .verification
+                .behavioral_checks
+                .push(check.name.clone());
+            config
+                .verification
+                .commands
+                .push(crate::config::types::VerificationCommand {
+                    name: check.name.clone(),
+                    command: check.command.clone(),
+                    file_extensions: vec![],
+                    timeout_secs: timeout,
+                });
+        }
+        let versions = [version("fixed", Some("before"), Some("after"))];
+        let mut disabled = config.clone();
+        disabled.experimental.fault_witness = false;
+        assert!(
+            agent(&disabled, root.path())
+                .fault_witness(&checks[0], &versions, &mut NullUi)
+                .is_none()
+        );
+        let mut agent = agent(&config, root.path());
+        assert!(
+            agent
+                .fault_witness(&checks[0], &versions, &mut NullUi)
+                .is_some()
+        );
+        let evidence = agent.step_checks.counterfactual.evidence();
+        assert_eq!(evidence["fault_witness"]["first"]["verdict"], verdict);
+        assert_eq!(evidence["fault_witness"]["first"]["timeout_secs"], deadline);
+        assert_eq!(
+            checks[0].timeout_secs, timeout,
+            "normal check deadlines must not change"
+        );
+        assert!(
+            agent
+                .fault_witness(&checks[1], &versions, &mut NullUi)
+                .is_none(),
+            "another eligible command must not get its own budget"
+        );
+        assert_eq!(agent.step_checks.counterfactual.evidence(), evidence);
+        agent.step_checks = StepChecks::default();
+        assert!(
+            agent
+                .fault_witness(&checks[1], &versions, &mut NullUi)
+                .is_some(),
+            "a new user turn gets a fresh budget"
+        );
+    }
 }

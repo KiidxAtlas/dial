@@ -27,6 +27,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("bg", &["persist", "lifetime"]),
     ("monitor", &["run"]),
     ("grep", &["output"]),
+    ("glob", &["preview"]),
     ("edit", &["allow_syntax_errors"]),
     ("write", &["allow_syntax_errors"]),
     ("ast_edit", &["allow_syntax_errors"]),

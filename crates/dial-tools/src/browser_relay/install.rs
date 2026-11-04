@@ -25,7 +25,7 @@ const FILES: [(&str, &str); 4] = [
 
 /// Folder the extension is written to, under the Dial user directory.
 pub fn extension_dir(user_dir: &Path) -> PathBuf {
-    user_dir.join("browser-extension")
+    crate::config::paths::browser_extension_dir(user_dir)
 }
 
 /// Writes the extension files and `relay-config.js` for a relay on `port`. Returns the folder.

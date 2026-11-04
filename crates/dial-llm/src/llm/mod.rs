@@ -28,6 +28,7 @@ pub mod codex_ws;
 mod connect;
 mod copilot;
 mod coreweave;
+pub mod credential_store;
 mod cursor;
 mod devin;
 pub mod download;

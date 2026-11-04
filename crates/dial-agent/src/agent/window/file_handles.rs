@@ -132,7 +132,11 @@ pub(in crate::agent) fn model_result(workspace: &Workspace, call: &ToolCall, tex
                 .filter_map(Value::as_str),
         )
         .any(|path| path.contains(":raw"));
-    if raw || !matches!(name, "read" | "edit" | "write" | "grep" | "glob" | "find") {
+    // A read pointer cites existing tool evidence, not paths. Adding labels would expand it.
+    if raw
+        || !matches!(name, "read" | "edit" | "write" | "grep" | "glob" | "find")
+        || (name == "read" && crate::agent::workflow::investigation::is_unchanged_read(text))
+    {
         return text.to_owned();
     }
     let mut result = String::with_capacity(text.len());

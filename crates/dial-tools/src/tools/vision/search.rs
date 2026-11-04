@@ -1,6 +1,6 @@
 //! The read-only `image_search` tool: rank workspace images by a text description (`text`), by
 //! likeness to a reference image (`similar`), or score given images against a prompt (`score`),
-//! with the `image_embedding` role's vectors. It is offered only while that role is assigned.
+//! with the configured image embedding model's vectors. Offered only with an explicit selection.
 //!
 //! Vectors are cached per image content (SHA-256) and embedding model in Dial's per-project state,
 //! outside the workspace, so repeated searches embed only new or changed images.
@@ -208,7 +208,7 @@ pub(crate) fn run(
     embedder: &Embedder,
 ) -> Result<String, String> {
     if !embedding::configured(config) {
-        return Err("no image embedding model is configured; run `/setup image-embeddings` or assign one to the `image_embedding` role in Alt+M".into());
+        return Err("no image embedding model is configured; run `/setup image-embeddings` or set `vision.image_embedding`".into());
     }
     let limit = match args.get("limit") {
         None | Some(Value::Null) => DEFAULT_LIMIT,
@@ -308,7 +308,7 @@ pub(crate) fn run(
 }
 
 /// The line `image_gen` appends after writing `path`: the cosine similarity of the image to its
-/// prompt under the `image_embedding` role. `None` while the role is unassigned; a failure is
+/// prompt under the image embedding model. `None` while unconfigured; a failure is
 /// reported on the line instead of failing the generation.
 pub fn prompt_similarity_line(config: &Config, prompt: &str, path: &Path) -> Option<String> {
     if !embedding::configured(config) || prompt.trim().is_empty() {
@@ -330,7 +330,7 @@ pub fn prompt_similarity_line(config: &Config, prompt: &str, path: &Path) -> Opt
     Some(match score() {
         Ok(score) => format!(
             "Prompt similarity {score:.3} ({}; cosine, compare across candidates with image_search mode=score).",
-            config.for_role(embedding::ROLE).model
+            config.for_vision(embedding::FEATURE).model
         ),
         Err(error) => format!("Prompt similarity unavailable: {error:#}"),
     })

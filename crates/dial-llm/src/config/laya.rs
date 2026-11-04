@@ -11,11 +11,10 @@ pub enum DecisionEngineType {
     Kev,
 }
 
-/// Provider name that marks `model_roles.decision` as the Laya checkpoint.
+/// Provider for Laya typed choices through the unified `decision` role.
 pub const PROVIDER: &str = "laya";
 
-/// Model id of a `judge` role served by Laya. The judge shares the service, and so the checkpoint, of the
-/// `decision` role (else the installed default), so judging never restarts the service with another one.
+/// Model id selecting the Laya engine; its checkpoint is a separate service setting.
 pub const JUDGE_MODEL: &str = "decision";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,8 +25,7 @@ pub struct Config {
     pub auto_start: bool,
     pub endpoint: String,
     pub timeout_secs: u64,
-    /// Checkpoint the service loads: the assigned `decision` role. Set from the model roles, never read from TOML.
-    #[serde(skip)]
+    /// Local path or Hugging Face repository loaded by the managed service.
     pub checkpoint: Option<String>,
 }
 
@@ -65,11 +63,17 @@ impl Config {
             matches!(host, "127.0.0.1" | "localhost") && port.parse::<u16>().is_ok_and(|p| p > 0),
             "Decision engine endpoint must be http://127.0.0.1:PORT or http://localhost:PORT, without a path"
         );
+        ensure!(
+            self.checkpoint
+                .as_ref()
+                .is_none_or(|value| !value.trim().is_empty()),
+            "laya.checkpoint must be nonempty when set"
+        );
         Ok(())
     }
 }
 
-/// The checkpoint the service must load: the assigned `decision` role, else the installed default.
+/// Explicit service checkpoint, else the installed default.
 pub fn expected_checkpoint(config: &Config) -> Option<String> {
     config.checkpoint.clone().or_else(|| {
         let model = runtime_dir().ok()?.join("model");
@@ -87,5 +91,5 @@ pub fn runtime_dir() -> Result<std::path::PathBuf> {
     } else {
         std::env::current_dir()?.join(root)
     };
-    Ok(root.join("laya"))
+    Ok(super::paths::laya_dir(&root))
 }

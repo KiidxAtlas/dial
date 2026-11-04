@@ -60,6 +60,7 @@ pub(super) fn update_model_status(
     config: &crate::config::types::Config,
 ) {
     let selection = config.selection();
+    status.assistance = Some(config.assistance.enabled);
     if status.provider != selection.provider
         || status.model.trim_end_matches(" [plan]")
             != selection
@@ -67,6 +68,7 @@ pub(super) fn update_model_status(
                 .trim_start_matches(&format!("{}/", selection.provider))
     {
         status.inference.clear();
+        status.main_model_explanation = None;
     }
     status.provider = selection.provider.clone();
     status.model = selection
@@ -193,6 +195,8 @@ impl Shell {
     }
 
     pub(in crate::app) fn paint(&mut self, panel: Option<Rows>) -> Result<()> {
+        self.status.controls_pending = self.pending_config.is_some();
+        self.composer.set_command_context(self.command_context());
         if panel.is_some() && self.busy_overlay.is_some() {
             // Approvals and questions paint inline, even when a turn has a menu open. Yield the
             // alternate screen without discarding the menu; its next step reopens and redraws it.
@@ -437,10 +441,17 @@ impl Shell {
     }
 
     pub(super) fn refresh_status(&mut self, app: &App, agent: &Agent<'_>) {
+        self.status.inbox_unread = self.inbox.unread();
         self.refresh_workers(app);
         self.adapter_monitor = agent.adapter_monitor();
         self.request_policy = agent.session().control_state();
-        update_model_status(&mut self.status, &mut self.home, agent.effective_config());
+        update_model_status(
+            &mut self.status,
+            &mut self.home,
+            agent.active_model_config(),
+        );
+        self.status.main_model_explanation = agent.main_model_explanation().map(str::to_owned);
+        self.status.planning = Some(agent.plan_mode());
         let project_root = agent
             .layout()
             .map(|layout| layout.project_root.clone())
@@ -459,6 +470,13 @@ impl Shell {
         status.prompt_tokens = (tokens > 0).then_some(tokens);
         status.context_estimated = estimated;
         status.context_window = agent.context_window();
+        status.loaded_context_window = agent.loaded_context_window();
+        status.compaction_reserve = Some(
+            agent
+                .effective_config()
+                .compaction
+                .reserve(status.context_window),
+        );
         status.approval = format!("{:?}", agent.approval()).to_lowercase();
         self.pty_approval = if agent.plan_mode() {
             Approval::Readonly

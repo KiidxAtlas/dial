@@ -123,7 +123,7 @@ fn registry(ws: &Workspace) -> Result<PathBuf> {
         private_fs::set_owner_only(&home)?;
     }
     private_dir(&home)?;
-    let jobs = home.join("background-jobs");
+    let jobs = crate::config::paths::background_jobs_dir(&home);
     create_dir(&jobs)?;
     let hash = format!(
         "{:x}",
@@ -645,7 +645,9 @@ fn run_owner(launch: Launch) -> Result<()> {
         .with_shell_backend(launch.backend)
         .with_network_rules(launch.network_rules);
     ws.additional_roots = launch.roots;
-    ws.cargo_session = launch.cargo_session;
+    if let Some(session) = launch.cargo_session {
+        ws = ws.with_cargo_session(&session)?;
+    }
     if let Some(root) = launch.artifacts {
         ws = ws.with_artifacts(crate::storage::artifact::ArtifactStore::new(&root)?);
     }

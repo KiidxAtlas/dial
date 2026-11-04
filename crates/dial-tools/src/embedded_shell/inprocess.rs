@@ -22,7 +22,7 @@
 use std::io::PipeWriter;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Environment variable that marks everything one run starts.
 pub const TOKEN_ENV: &str = "DIAL_INPROCESS_RUN";
@@ -33,6 +33,22 @@ const PANICKED: i32 = 125;
 const ABORTED: i32 = 130;
 /// How long a stopped run may take to wind down before it is abandoned.
 const STOP_GRACE: Duration = Duration::from_millis(500);
+const CLEANUP_GRACE: Duration = Duration::from_millis(500);
+#[cfg(unix)]
+const CLEANUP_OUTPUT_CAP: usize = 1024 * 1024;
+
+/// Shell completion and external-command cleanup are independent facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Termination {
+    pub shell_stopped: bool,
+    pub cleanup_error: Option<String>,
+}
+
+impl Termination {
+    pub fn uncertain(&self) -> bool {
+        !self.shell_stopped || self.cleanup_error.is_some()
+    }
+}
 
 /// What to run, and the environment and output the shell gets.
 pub struct Request {
@@ -49,6 +65,7 @@ pub struct Run {
     done: Receiver<i32>,
     code: Option<i32>,
     token: String,
+    termination: Option<Termination>,
     #[cfg(feature = "embedded-shell")]
     abort: tokio::task::AbortHandle,
 }
@@ -96,6 +113,7 @@ impl Run {
             done,
             code: None,
             token,
+            termination: None,
             abort,
         })
     }
@@ -126,9 +144,18 @@ impl Run {
         self.code
     }
 
-    /// Stops the script and kills what it started. Safe to repeat and after normal completion.
-    /// Returns `false` when the shell thread did not stop and was abandoned.
-    pub fn terminate(&mut self) -> bool {
+    /// Stops the script and attempts bounded external cleanup. Cached, including on Drop.
+    pub fn terminate(&mut self) -> Termination {
+        self.terminate_with(kill_marked_groups)
+    }
+
+    fn terminate_with(
+        &mut self,
+        cleanup: impl FnOnce(&str, Instant) -> Result<(), String>,
+    ) -> Termination {
+        if let Some(result) = &self.termination {
+            return result.clone();
+        }
         #[cfg(feature = "embedded-shell")]
         self.abort.abort();
         if self.code.is_none() {
@@ -138,8 +165,12 @@ impl Run {
                 Err(RecvTimeoutError::Disconnected) => self.code = Some(PANICKED),
             }
         }
-        kill_marked_groups(&self.token);
-        self.code.is_some()
+        let result = Termination {
+            shell_stopped: self.code.is_some(),
+            cleanup_error: cleanup(&self.token, Instant::now() + CLEANUP_GRACE).err(),
+        };
+        self.termination = Some(result.clone());
+        result
     }
 }
 
@@ -150,39 +181,98 @@ impl Drop for Run {
 }
 
 #[cfg(unix)]
-fn kill_marked_groups(token: &str) {
+fn kill_marked_groups(token: &str, deadline: Instant) -> Result<(), String> {
+    let mut budget = CLEANUP_OUTPUT_CAP;
+    cleanup_groups(
+        token,
+        deadline,
+        &mut budget,
+        group_leaders,
+        carries_token,
+        crate::platform::process::kill_group,
+    )
+}
+
+#[cfg(unix)]
+fn cleanup_groups(
+    token: &str,
+    deadline: Instant,
+    budget: &mut usize,
+    mut discover: impl FnMut(Instant, &mut usize) -> Result<Vec<u32>, String>,
+    mut marked: impl FnMut(u32, &str, Instant, &mut usize) -> Result<bool, String>,
+    mut kill: impl FnMut(u32) -> std::io::Result<()>,
+) -> Result<(), String> {
     for _ in 0..3 {
-        let marked: Vec<u32> = group_leaders(std::process::id())
-            .into_iter()
-            .filter(|pid| carries_token(*pid, token))
-            .collect();
-        if marked.is_empty() {
-            return;
+        remaining(deadline)?;
+        let mut found = false;
+        for leader in discover(deadline, budget)? {
+            remaining(deadline)?;
+            if marked(leader, token, deadline, budget)? {
+                found = true;
+                kill(leader).map_err(|e| format!("killing marked process group: {e}"))?;
+            }
         }
-        for leader in marked {
-            let _ = crate::platform::process::kill_group(leader);
+        if !found {
+            return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(30));
     }
+    Err("marked process groups remained after cleanup attempts".into())
 }
 
 #[cfg(not(unix))]
-fn kill_marked_groups(_token: &str) {}
+fn kill_marked_groups(_token: &str, _deadline: Instant) -> Result<(), String> {
+    Err("external-command cleanup is unavailable on this platform".into())
+}
 
-/// Direct children of `parent` that lead their own process group.
 #[cfg(unix)]
-fn group_leaders(parent: u32) -> Vec<u32> {
-    let output = std::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,pgid="])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            parse_leaders(&String::from_utf8_lossy(&output.stdout), parent)
-        }
-        _ => Vec::new(),
+fn remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| "external-command cleanup deadline exceeded".into())
+}
+
+/// All discovery commands share a deadline and an aggregate output budget.
+#[cfg(unix)]
+fn discovery_output(
+    mut command: std::process::Command,
+    deadline: Instant,
+    budget: &mut usize,
+) -> Result<Vec<u8>, String> {
+    use crate::runtime::process::{Policy, run_with_policy};
+    if *budget == 0 {
+        return Err("external-command discovery output budget exhausted".into());
     }
+    command.stdin(std::process::Stdio::null());
+    let mut policy = Policy::bounded(remaining(deadline)?, *budget);
+    policy.stderr_cap = 0;
+    policy.fail_on_output_limit = true;
+    policy.may_mutate = false;
+    let result = run_with_policy(
+        command,
+        None,
+        policy,
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_, _| {},
+    )?;
+    *budget = budget.saturating_sub(result.stdout_total.saturating_add(result.stderr_total));
+    if !result.success() || result.output_incomplete {
+        return Err(result.failure("external-command discovery", policy.timeout));
+    }
+    remaining(deadline)?;
+    Ok(result.stdout)
+}
+
+/// Direct children of Dial that lead their own process group.
+#[cfg(unix)]
+fn group_leaders(deadline: Instant, budget: &mut usize) -> Result<Vec<u32>, String> {
+    let mut command = std::process::Command::new("ps");
+    command.args(["-A", "-o", "pid=,ppid=,pgid="]);
+    let output = discovery_output(command, deadline, budget)?;
+    Ok(parse_leaders(
+        &String::from_utf8_lossy(&output),
+        std::process::id(),
+    ))
 }
 
 /// Leaders among `ps -o pid=,ppid=,pgid=` rows: processes whose parent is `parent` and that lead
@@ -202,22 +292,56 @@ pub(crate) fn parse_leaders(ps: &str, parent: u32) -> Vec<u32> {
         .collect()
 }
 
-/// Whether the process's environment holds this run's token (Linux: `/proc`; macOS: `ps -E`).
+/// Whether the environment holds the run token; failures are not evidence of absence.
 #[cfg(unix)]
-fn carries_token(pid: u32, token: &str) -> bool {
+fn carries_token(
+    pid: u32,
+    token: &str,
+    deadline: Instant,
+    budget: &mut usize,
+) -> Result<bool, String> {
     let needle = format!("{TOKEN_ENV}={token}");
     if cfg!(target_os = "linux") {
-        return std::fs::read(format!("/proc/{pid}/environ"))
-            .map(|bytes| bytes.split(|b| *b == 0).any(|var| var == needle.as_bytes()))
-            .unwrap_or(false);
+        use std::io::Read;
+        remaining(deadline)?;
+        let file = match std::fs::File::open(format!("/proc/{pid}/environ")) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(format!("reading process environment: {e}")),
+        };
+        let mut bytes = Vec::new();
+        file.take(budget.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("reading process environment: {e}"))?;
+        if bytes.len() > *budget {
+            return Err("external-command discovery output budget exhausted".into());
+        }
+        *budget -= bytes.len();
+        remaining(deadline)?;
+        return Ok(bytes.split(|b| *b == 0).any(|var| var == needle.as_bytes()));
     }
-    std::process::Command::new("ps")
-        .args(["-E", "-ww", "-o", "command=", "-p", &pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).contains(&needle))
-        .unwrap_or(false)
+    let mut command = std::process::Command::new("ps");
+    // Include Dial so `ps` succeeds even when the candidate disappeared since discovery.
+    // Only inspect the candidate's row; a missing row is evidence of exit, not a ps failure.
+    command.args([
+        "-E",
+        "-ww",
+        "-o",
+        "pid=,command=",
+        "-p",
+        &format!("{pid},{}", std::process::id()),
+    ]);
+    let output = discovery_output(command, deadline, budget)?;
+    Ok(token_in_ps(&String::from_utf8_lossy(&output), pid, &needle))
+}
+
+#[cfg(unix)]
+fn token_in_ps(output: &str, pid: u32, needle: &str) -> bool {
+    output.lines().any(|line| {
+        let mut columns = line.split_whitespace();
+        columns.next().and_then(|s| s.parse::<u32>().ok()) == Some(pid)
+            && columns.any(|var| var == needle)
+    })
 }
 
 #[cfg(feature = "embedded-shell")]

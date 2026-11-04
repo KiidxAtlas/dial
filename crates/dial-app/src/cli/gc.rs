@@ -248,7 +248,7 @@ pub fn execute(layout: &Layout, args: &GcArgs, now_ms: i64) -> Result<GcReport> 
         retain_newest_global: settings.retain_newest_global,
         retain_newest_per_cwd: settings.retain_newest_per_cwd,
     };
-    let db_path = layout.user_dir.join(retention::DB_FILE);
+    let db_path = crate::config::paths::gc_db_file(&layout.user_dir);
     let lock_path = db_path.with_extension("sqlite3.lock");
     let _lock = if args.apply {
         crate::platform::atomic::private_dir(&layout.user_dir)?;
@@ -807,7 +807,7 @@ fn open_archive_store(layout: &Layout, settings: &AppliedSettings) -> Result<(St
 /// Databases gc checkpoints: the user-level stats db and each learn trajectory store
 /// (`state_dir/models/<id>/state.sqlite3`) that exists.
 pub fn wal_databases(layout: &Layout) -> Vec<PathBuf> {
-    let mut out = vec![layout.user_dir.join("stats.sqlite3")];
+    let mut out = vec![crate::config::paths::stats_db_file(&layout.user_dir)];
     if let Ok(entries) = fs::read_dir(layout.state_dir.join("models")) {
         for entry in entries.flatten() {
             let db = entry.path().join("state.sqlite3");

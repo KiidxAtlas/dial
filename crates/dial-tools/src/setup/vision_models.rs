@@ -1,15 +1,14 @@
-//! Curated local models for the `grounding` and `image_embedding` roles, run by Dial's MLX-VLM
-//! server on Apple Silicon.
+//! Curated local models for optional grounding and image embedding features, run by Dial's
+//! MLX-VLM server on Apple Silicon.
 //!
 //! `/setup grounding` and `/setup image-embeddings` list the catalog; `/setup grounding:<repo> yes`
 //! (or the bare id, which means the default) installs the private MLX runtime when it is missing,
-//! downloads the checkpoint from Hugging Face, and only then assigns `mlx / <repo>` to the role
-//! through the canonical selection writer, so a previous endpoint's fields do not survive.
+//! downloads the checkpoint from Hugging Face, and only then saves `mlx / <repo>` under `[vision]`.
+//! Replacing the whole feature selection clears stale endpoint fields in the saved layer.
 //! Any other MLX repository id is accepted when typed; previews never download anything.
 
 use crate::config::paths::Layout;
-use crate::config::selection;
-use crate::config::settings_store::{self, Scope};
+use crate::config::settings_store::{self, Change, Scope};
 use crate::config::types::Config;
 use crate::llm::download::{self, Choice};
 use crate::llm::model_config::ModelSelection;
@@ -18,7 +17,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-/// Which vision role a setup id configures.
+/// Which vision feature a setup id configures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Grounding,
@@ -55,8 +54,8 @@ const IMAGE_EMBEDDING: &[Model] = &[Model {
 impl Kind {
     pub const ALL: [Kind; 2] = [Kind::Grounding, Kind::ImageEmbedding];
 
-    /// The model role this kind assigns.
-    pub fn role(self) -> &'static str {
+    /// The `[vision]` feature this kind configures.
+    pub fn feature(self) -> &'static str {
         match self {
             Kind::Grounding => "grounding",
             Kind::ImageEmbedding => "image_embedding",
@@ -78,7 +77,7 @@ impl Kind {
         }
     }
 
-    /// What the role enables, for previews and the setup picker.
+    /// What the feature enables, for previews and the setup picker.
     pub fn purpose(self) -> &'static str {
         match self {
             Kind::Grounding => {
@@ -143,7 +142,7 @@ pub fn validate_repo(repo: &str) -> Result<()> {
 /// The curated catalog for `/setup <kind id>`.
 pub fn catalog_text(kind: Kind) -> String {
     let mut lines = vec![format!(
-        "{} models (local MLX, Apple Silicon); the role {}. Set one up with /setup {}:<repo> yes:",
+        "{} models (local MLX, Apple Silicon); this feature {}. Set one up with /setup {}:<repo> yes:",
         kind.title(),
         kind.purpose(),
         kind.id()
@@ -164,8 +163,8 @@ pub fn catalog_text(kind: Kind) -> String {
         ));
     }
     lines.push(format!(
-        "Any other MLX vision checkpoint also works, or assign an OpenAI-compatible endpoint to the {} role in /roles (Alt+M).",
-        kind.role()
+        "Any other MLX vision checkpoint also works, or configure an OpenAI-compatible endpoint under vision.{}.",
+        kind.feature()
     ));
     lines.join("\n")
 }
@@ -184,15 +183,18 @@ pub fn preview_text(kind: Kind, repo: &str, user_dir: &Path) -> String {
         },
     ];
     if !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
-        lines.push("Local MLX models need macOS on Apple Silicon. On this machine, assign an OpenAI-compatible endpoint to the role in /roles (Alt+M) instead.".to_owned());
+        lines.push(format!("Local MLX models need macOS on Apple Silicon. On this machine, configure an OpenAI-compatible endpoint under vision.{} instead.", kind.feature()));
         return lines.join("\n");
     }
-    if user_dir.join("python/.venv/bin/python").is_file() {
+    if crate::config::paths::python_dir(user_dir)
+        .join(".venv/bin/python")
+        .is_file()
+    {
         lines.push("The private MLX runtime is installed.".to_owned());
     } else {
         lines.push(format!(
             "Installs the private MLX runtime first (uv sync into {}; needs uv and network access).",
-            user_dir.join("python").display()
+            crate::config::paths::python_dir(user_dir).display()
         ));
     }
     let cached = download::cached_bytes(repo);
@@ -207,14 +209,14 @@ pub fn preview_text(kind: Kind, repo: &str, user_dir: &Path) -> String {
         ));
     }
     lines.push(format!(
-        "Then sets model_roles.{} to mlx / {repo} for all projects. The model loads on first use and stays resident.",
-        kind.role()
+        "Then sets vision.{} to mlx / {repo} for all projects. The model loads on first use and stays resident.",
+        kind.feature()
     ));
     lines.push(format!("Confirm with: /setup {} yes", setup_id(kind, repo)));
     lines.join("\n")
 }
 
-/// Installs the runtime when missing, downloads `repo`, then assigns it to the role. Settings are
+/// Installs the runtime when missing, downloads `repo`, then configures the feature. Settings are
 /// written only after the download succeeds. Returns a summary for the user.
 pub fn setup(
     layout: &Layout,
@@ -226,36 +228,50 @@ pub fn setup(
     validate_repo(repo)?;
     let progress = RefCell::new(progress);
     let report = |line: &str| (progress.borrow_mut())(line);
-    if !layout.user_dir.join("python/.venv/bin/python").is_file() {
+    if !crate::config::paths::python_dir(&layout.user_dir)
+        .join(".venv/bin/python")
+        .is_file()
+    {
         report("installing the private MLX runtime (uv sync)");
         crate::setup::ensure_runtime_with(layout, cancel, &report)?;
     }
     let config = Config::load(layout, None)?;
     download::ensure_local_model_with(&config.python, repo, &Choice::Auto, cancel, &report)?;
     report("downloaded");
-    let role = kind.role();
-    let changes = selection::changes(&config, &ModelSelection::new("mlx", repo), role)?;
-    let saved = settings_store::save_model_config(layout, Scope::Global, &changes, role)?;
+    let saved = save_selection(layout, kind, repo)?;
     Ok(summary(kind, repo, &saved))
 }
 
 /// Prefix of a successful setup summary; the shell reloads the configuration when it sees it so
-/// the role (and the tools that depend on it) apply to the running session.
-pub const SUMMARY_PREFIX: &str = "Vision role ready · ";
+/// the feature (and the tools that depend on it) applies to the running session.
+pub const SUMMARY_PREFIX: &str = "Vision model ready · ";
+
+/// Replace the whole selection so stale endpoint fields in this layer do not survive.
+fn save_selection(layout: &Layout, kind: Kind, repo: &str) -> Result<Config> {
+    let value = toml::Value::try_from(ModelSelection::new("mlx", repo))?;
+    settings_store::save_config(
+        layout,
+        Scope::Global,
+        &[Change::Set {
+            path: format!("vision.{}", kind.feature()),
+            value,
+        }],
+    )
+}
 
 /// What setup reports, read from the saved config so a project override is named, not hidden.
 fn summary(kind: Kind, repo: &str, saved: &Config) -> String {
-    let role = kind.role();
+    let feature = kind.feature();
     let mut lines = vec![format!(
-        "{SUMMARY_PREFIX}{}: mlx / {repo} (model_roles.{role}, all projects). The role {}.",
+        "{SUMMARY_PREFIX}{}: mlx / {repo} (vision.{feature}, all projects). The feature {}.",
         kind.title(),
         kind.purpose()
     )];
-    if let Some(selection) = saved.role_selection(role)
+    if let Some(selection) = saved.vision_selection(feature)
         && !(selection.provider == "mlx" && selection.model == repo)
     {
         lines.push(format!(
-            "This project assigns its own {role} role ({}), which overrides the new global one. Clear it in /roles (Alt+M) with \"This project\" scope to use {repo}.",
+            "This project configures its own vision.{feature} ({}), which overrides the new global one. Remove [vision.{feature}] from this project's configuration to use {repo}.",
             selection.display_name()
         ));
     }

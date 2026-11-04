@@ -599,8 +599,12 @@ fn overlay_round_trip_restores_the_inline_view() {
     let before_len = rig.raw.len();
     rig.paint(&["╭ composer ╮", "╰──────────╯"], Some((0, 3)));
     assert!(
-        rig.raw[before_len..].windows(3).any(|w| w == b"\x1b[J"),
-        "the redraw erases from the viewport top"
+        !rig.raw[before_len..].windows(3).any(|w| w == b"\x1b[J"),
+        "display erase can preserve the old viewport in tmux scrollback"
+    );
+    assert!(
+        rig.raw[before_len..].windows(4).any(|w| w == b"\x1b[2K"),
+        "the redraw clears stale rows without a display-wide erase"
     );
     assert_eq!(rig.transcript(), before);
 }

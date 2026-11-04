@@ -393,7 +393,9 @@ impl Adapter {
                     ));
                 }
                 self.permissions.clear();
-                self.fs_requests.clear();
+                // A cancelled write may already have applied. Keep its correlation for
+                // the late acknowledgement required by ClientFsCalls reconciliation.
+                self.fs_requests.retain(|_, (_, read)| !*read);
                 "abort"
             }
             "session/close" => {
@@ -718,7 +720,7 @@ impl Adapter {
                 "session/list" => value.clone(),
                 "session/prompt" => {
                     self.permissions.clear();
-                    self.fs_requests.clear();
+                    self.fs_requests.retain(|_, (_, read)| !*read);
                     let plan = value["plan_mode"].as_bool().unwrap_or(false);
                     if let Some(session) = self.active.clone()
                         && self.modes.insert(session, plan) != Some(plan)

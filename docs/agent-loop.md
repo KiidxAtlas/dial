@@ -36,6 +36,20 @@ Focused projection and discovery regressions do not establish a live-model succe
 the outcome effect is unmeasured. Rebuild/restart Dial to use source changes; an already running
 agent is not patched in place.
 
+## Streaming delivery and cancellation
+
+Model-to-controller payload delivery applies backpressure with eight queued frames, each containing
+at most 16 KiB of string data, fragmented on UTF-8 boundaries. This is a 128 KiB queued-string bound,
+not a total request-memory bound: the provider's current callback, one blocked frame, the terminal
+reply and the controller's current event are separate. Event reassembly is capped by the existing
+model-stream byte limit and fails explicitly rather than silently truncating an event.
+
+Cancellation discards queued payloads and partial reassembly before waiting for the provider;
+late text, reasoning and tool events are not delivered. A separate single terminal slot preserves
+provider completion/error ownership. UI/journal failures disconnect delivery before joining so a
+full queue cannot by itself prevent shutdown. These transport regressions use local fixtures;
+they do not establish live-provider cancellation latency or measured memory/performance gains.
+
 ## Launch-context recovery
 
 Native shell execution carries typed controller-owned launch facts across foreground commands,
@@ -46,6 +60,11 @@ they are not status, authorization or behavioral verification. Eligible deferred
 with loading instructions; policy, unsupported routes, cancellation, uncertain effects and
 incomplete output retain their boundaries. Recovery never silently replays a command, changes
 its target, enables PTY globally or interprets a shell command as a tool call.
+
+Repeated-read recovery uses exact file content identities and the existing visible directory
+listing. A directory listing change (including a visible nested addition/removal) releases only the
+matching read feedback; unrelated or excluded/deeper-than-listing changes do not. Directory
+identities are recovery bookkeeping, never edit witnesses, authorization or verification credit.
 
 Existing managed jobs are inspected and controlled by their identity, not duplicated. Both direct
 starts and auto-background adoption require an observation before named-target completion credit.
@@ -97,6 +116,12 @@ still searches the entire eligible catalog and loads schemas for the next reques
 previews, operator instructions, custom templates/replacement prompts and project context are
 preserved. Without search, the full MCP inventory remains. Disabling efficiency restores the
 full built-in prose and inventory. Prompt-byte savings alone do not prove a live-model speedup.
+
+The compact built-in environment also refers to the supplied callable schemas instead of repeating
+their tool-name inventory. The schemas, deferred discovery catalog and capability-scoped rules are
+unchanged; custom templates and replacement prompts retain their existing environment inventory.
+This removes duplicated input text, not tool access, checks or user/project instructions.
+
 Built-in guidance asks agents to scale effort to uncertainty, impact and reversibility, reuse
 visible evidence, and implement once the path is supported. New or contradictory evidence can
 reopen investigation; successful edits alone do not prove correctness. Isolated tests with test
@@ -425,7 +450,16 @@ Duplicate recovery withholds only the exact repeated call, including reads. Diff
 Read restrictions track every target in `read.paths`, not just `read.path`; a changed or removed
 target releases that batch's restriction without releasing unrelated calls. Unchanged reads use
 short pointers when their earlier full results remain visible, including adjacent or overlapping
-ranges jointly covered by several reads. Missing lines or pruned results still return full content.
+ranges jointly covered by several reads, successful native edits, or `glob`/`find` source previews.
+Only complete numbered rows count; missing lines, changed snapshots and pruned results still return
+full content. Identical-read and covered-range pointers share one compact format and are used only
+when shorter than the model-visible source after file-handle projection. Pointers do not repeat file
+labels. Tiny successful reads retain their source text rather than longer duplicate coaching;
+duplicate accounting and retry barriers still apply.
+After a successful fresh reread, the pointer identifies unchanged source rather than a failed read
+or stale snapshot. It directs the model to reuse visible text without shell/artifact rereads, and
+to finish only when acceptance is verified and no blockers remain. This does not release retry
+barriers or prevent a legitimate read after a source change or loss of the earlier full result.
 
 Busy input defaults to **Let Dial decide**: at the next safe request boundary, a bounded auxiliary model request classifies the exact user message as steering or independent work. Changes of approach, corrections, dependent or overlapping work, and ambiguity steer the current task through its existing steering journal. Clearly independent requests start a background worker in an isolated project copy using the existing task authorization, spawn hooks, concurrency limits and result delivery. Splitting leaves the parent's current instruction and completed inference intact. Worker findings are not new user instructions; any copy integration follows the existing worker workflow. Routing failures, invalid decisions or failed admission visibly fall back to steering; cancellation restores unhandled input in order. When spawning is unavailable, steering is the only admissible route and no classifier request is made. Steering discards queued advice about the previous task's failures, repetition and completion, preserving protocol data, worker findings and safety boundaries. **Queue after this turn** remains an explicit opt-out. Automatic input does not cancel in-flight inference or tools while awaiting a decision, so a long operation can delay routing. No classifier is run when there is no pending input.
 
@@ -555,10 +589,28 @@ Four verification aids are always on (not experimental):
   workspace path is not completed until a run naming that path was observed to stay up or exit
   zero with no later effect after its launch; see
   [requirement-verification.md](requirement-verification.md#requested-run-targets).
-- **Empty-search memory.** When a local `grep` or `glob` returns no matches, the result names up
-  to three earlier empty searches from this turn in an overlapping scope, so the model widens or
-  changes approach instead of re-probing. Paged, remote and failed searches do not count, and the
-  memory clears whenever the workspace may have changed.
+- **Empty-search memory and declaration recovery.** A local `grep` or `glob` with no matches
+  names up to three earlier empty searches in an overlapping scope. Two distinct empty patterns
+  against the same explicit file queue one advisory declaration-read correction, rather than
+  encouraging another representation guess. Intentional absence checks remain valid and are
+  never refused. The correction uses the next request's actual call policy: only batch-permitted
+  requests suggest gathering independent evidence together. It reuses ordinary advisory priority,
+  delivery/retry tracking and repeat suppression; safety and failure guidance take precedence.
+  Reading the targeted file retires its earlier probes. Workspace changes clear the memory.
+  Paged, remote, incomplete and failed native searches do not count. A literal single-file
+  `grep -c` with an attributable zero count and exit 1 also counts; ambiguous compound shell
+  scripts and pipelines are deliberately not classified as empty searches.
+- **Request call policy.** Each foreground request records `tool_call_policy` in the existing
+  workflow event stream and saves `reliability.call_policy` in session control and the existing
+  request-policy history. `/reliability` shows `batch` or `one_call` and its causes: declared model
+  capability, saved reliability evidence, contract-failure recovery, or a small local tier without
+  passing batch evidence. No one-call constraint is not a promise that arbitrary shell commands
+  execute concurrently. The shell output-trimming hint no longer gives policy-blind batching
+  advice. These are diagnostics and advisory recovery, not changes to approvals or scheduling.
+  The regression suite is `examples/benchmarks/registry-discovery.toml`, run through the existing
+  cross-agent runner for joint answer and ordered-trace grading. See
+  [`registry-discovery.md`](../examples/benchmarks/registry-discovery.md) for offline commands and
+  the optional live-model tier; offline passes do not establish model-quality improvements.
 - **Worker evidence audit.** A delegated job's handoff envelope gains `evidence_audit`: each cited
   `path[:line[-end]]` reference is checked in the parent workspace as `valid`, `stale` (the file
   exists but the lines do not), `invalid` or `unparsed`. An acceptance item reported `met` whose
@@ -827,6 +879,9 @@ denial) is reported `not_shown_to_reproduce` and earns no behavioral credit, tho
 counts as an ordinary current passing check. A pass with no effect since the failure earns nothing.
 A failing or stale reproduction withholds all behavioral credit, as a failing configured behavioral
 check does. Completion evidence lists each reproduction's state under `checks.reproductions`.
+A post-fix pass without a pre-fix failure also explains that repeated reads or unchanged reruns
+cannot establish that missing history. The model must not undo the fix to manufacture credit;
+it reports any required fail-then-pass evidence gap and still satisfies remaining acceptance checks.
 Registration validates every requested check name before changing reproduction state. A rejected
 selection preserves the previous reproduction, its observations and retained failure obligations.
 An empty `names` array without an explicit `repro` is rejected: it cannot establish a passing
@@ -1183,9 +1238,9 @@ release a withheld read when its supporting file changes externally, without inv
 call feedback. Retrieval includes `source_sha256` so findings can be tied to the source version;
 hashes and storage history are identity/freshness information, not proof that a finding is correct.
 
-**Experimental workflows** are under `/settings` → **Experimental**. All default to off except the
-two check-before-change aids, `fault_witness` (on) and `repro_first` (`advise`). Set
-`fault_witness = false` or `repro_first = "off"` to opt out. Enable or disable each independently:
+**Experimental workflows** are under `/settings` → **Experimental**. All default to off except
+`repro_first` (`advise`); set `repro_first = "off"` to opt out of that advice. Fault witnessing is
+opt-in, independent of normal verification. Enable or disable each independently:
 
 - `experimental.work_packet_contracts` exposes a `work_packet` on single or batched `task` jobs:
   define `scope`, `interface`, and 1–16 `acceptance` conditions. The child must report evidence
@@ -1200,12 +1255,27 @@ two check-before-change aids, `fault_witness` (on) and `repro_first` (`advise`).
 - `experimental.profile_matching` exposes `model_profile` on a `task` call. The delegated call
   uses that named profile for all jobs in the call; only profiles already configured by the
   operator are accepted. This is explicit routing, not automatic benchmarking or model selection.
-- `experimental.fault_witness` (default on): after a behavioral focused check (a related test or configured
-  command) passes on a turn with edits, it is rerun once per evidence revision in an isolated copy
-  with this turn's checkpointed changes reverted. The verdict (`fails_without_turn_changes`,
-  `passes_without_turn_changes` or `inconclusive`) is appended to the check output and recorded
-  under `counterfactual_checks` in completion evidence. A check that passes without the change
-  does not exercise it.
+- `experimental.fault_witness` (default off): opt in to comparing a passing configured command
+  named in `verification.behavioral_checks` against this turn's checkpointed starting files in
+  an isolated copy. Automatically discovered related suites and registered `check.repro`
+  reproductions are excluded: reproductions already track their own fail-then-pass evidence.
+  Only the first eligible passing command with checkpointed changes is compared. There is at
+  most **one attempt per user turn**, including inconclusive results; later edits do not reset
+  the budget. Its command deadline is the configured timeout capped at **60 seconds** (also
+  60 seconds when the normal check has no deadline); copying the workspace is additional overhead.
+  No per-suite `NOTICE` cards are emitted. The compact diagnostic is appended to the check output
+  and retained under `counterfactual_checks` in completion evidence with its compared revision
+  and timeout. It is historical diagnostic evidence, not a reusable pass for later edits.
+  Passing without the edits shows no change sensitivity in that comparison; it does not invalidate
+  normal verification or require another test. Failure is not automatically proof of the intended
+  regression either (for example, reverted test files may no longer compile). Neither verdict
+  earns observed pre-fix reproduction or repair credit.
+
+  To opt in, explicitly enable `fault_witness = true` under `[experimental]` and declare a small,
+  deterministic regression command by name in `[verification].behavioral_checks` and
+  `[[verification.commands]]`. Merely configuring a command, or running all related suites, does
+  not select it for comparison. Existing explicit `fault_witness = true` values remain enabled,
+  but now follow these narrower selection and budget rules. No private settings are rewritten.
 - `experimental.edit_bisection_runs` (0–16, 0 = off): when a check that passed earlier this turn
   fails after edits to two or more files, halves of those files are reverted to their content at
   the last pass in isolated copies to name the file whose change broke it, within this many runs
@@ -1365,6 +1435,10 @@ on separately owned cloud backends. Incremental windows within each fold remain 
 Local/shared inference, an active worker or provider-request hook, and `task.max_concurrency = 1`
 keep the sequential path. Each request takes the existing `task.provider_concurrency` slot and
 observes cancellation and a bounded deadline; both folds settle before a result is accepted.
+Failure in either fold requests sibling cancellation through a split-local flag, never by setting
+the user's interrupt flag. Both folds are joined before returning the original failure; a normal
+method fallback can proceed unless the user actually stopped the operation. Cancellation remains
+cooperative with the existing bounded provider-request machinery.
 
 Recoverable pre-summary projection remains opt-in with `supersede_reads` and `drop_useless`
 (both default `false`). Unique observation pruning requires `drop_useless`; mutations, skills,

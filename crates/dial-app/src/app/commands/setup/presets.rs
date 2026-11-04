@@ -6,9 +6,7 @@ use crate::config::types::Approval;
 use crate::llm::model_config::ModelSelection;
 use anyhow::{Context, ensure};
 
-const TEXT_ROLES: &[&str] = &[
-    "small", "task", "coach", "tester", "planner", "memory", "judge",
-];
+const TEXT_ROLES: &[&str] = &["small", "task", "coach", "tester", "memory", "decision"];
 const USAGE: &str = "/setup presets [local-only|local-assisted|hosted] [project|global]\nChoose the main model first with /models. For hosted assistance, explicitly assign a hosted coach in /roles. Every preset is previewed and confirmed; no model is downloaded.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,6 +277,10 @@ pub(super) fn command(
             "\n• Disable coach escalation."
         }
     );
+    let preview = format!(
+        "{preview}\n\nComplete settings transaction (including route clears):\n{}",
+        super::super::config_cmds::changes_preview(&changes)
+    );
     shell.note(TITLE, &preview);
     if shell.ask(
         "Apply setup preset",
@@ -296,7 +298,7 @@ pub(super) fn command(
     shell.note(
         TITLE,
         format!(
-            "{} saved ({scope:?}). No models were downloaded.",
+            "{} saved ({scope:?}). Checklist: defaults saved; selected routes retained; provider availability not probed; no models downloaded. Run /doctor to review readiness.",
             preset.label()
         ),
     );

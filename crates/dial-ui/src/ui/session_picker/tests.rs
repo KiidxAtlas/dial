@@ -30,6 +30,21 @@ fn text_of(rows: &Rows) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[test]
+fn current_session_shortcut_is_separate_from_empty_session_filter() {
+    let mut picker = Picker::new(vec![session("one", "Work", 1)], vec![], "one", "", false);
+    assert!(matches!(
+        picker.handle(&key(KeyCode::Char('t'), KeyModifiers::CONTROL), 24),
+        Action::ThisSession
+    ));
+    assert!(!picker.show_empty());
+    assert!(matches!(
+        picker.handle(&key(KeyCode::Tab, KeyModifiers::NONE), 24),
+        Action::None
+    ));
+    assert!(picker.show_empty());
+}
 #[test]
 fn notices_and_selected_sessions_fit_even_the_smallest_browse_layout() {
     let mut picker = Picker::new(

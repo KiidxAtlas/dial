@@ -12,39 +12,6 @@ use anyhow::{Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(super) const COMMANDS: &[super::CommandSpec] = &[
-    super::CommandSpec {
-        name: "add-dir",
-        description: "Add a directory to the workspace so file tools can read and write under it",
-        args_hint: "<dir>",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "remove-dir",
-        description: "Remove an added directory from the workspace",
-        args_hint: "<dir>",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "dirs",
-        description: "List the workspace directories",
-        args_hint: "",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "wt",
-        description: "manage git worktrees for this session",
-        args_hint: "[list|create [branch]|switch <path|branch>|remove <path|branch> [--force]]",
-        subcommands: &["create", "list", "switch", "remove"],
-    },
-    super::CommandSpec {
-        name: "git",
-        description: "Show git status and recent commits, or the summary of one revision",
-        args_hint: "[revision]",
-        subcommands: &[],
-    },
-];
-
 pub(super) fn run(
     shell: &mut Shell,
     app: &App,
@@ -56,7 +23,16 @@ pub(super) fn run(
     let result = match name {
         "add-dir" => add_dir(shell, agent, args),
         "remove-dir" => remove_dir(shell, agent, args),
-        "dirs" => dirs(shell, agent),
+        "dirs" => match args {
+            "" | "list" => dirs(shell, agent),
+            _ => {
+                shell.note(
+                    "Workspace directories",
+                    "Usage: /dirs [add <dir>|remove <dir>|list]",
+                );
+                Ok(Step::Done)
+            }
+        },
         "wt" => worktree_command(shell, app, agent, args),
         "git" => git_command(shell, app, agent, args),
         _ => return None,
@@ -348,6 +324,13 @@ fn git_command(
     agent: &mut Agent<'_>,
     revision: &str,
 ) -> Result<Step> {
+    if let Some(args) = revision
+        .strip_prefix("commit run")
+        .filter(|args| args.is_empty() || args.starts_with(char::is_whitespace))
+    {
+        return super::commit::run(shell, app, agent, "commit", args.trim())
+            .unwrap_or(Ok(Step::Done));
+    }
     if revision.starts_with('-') {
         bail!("revision must not start with '-': {revision}");
     }

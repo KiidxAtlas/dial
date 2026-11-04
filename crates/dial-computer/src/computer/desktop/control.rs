@@ -581,7 +581,7 @@ impl KernelLease {
         let root = crate::config::paths::user_dir().map_err(|error| {
             DesktopError::input_failed(format!("cannot locate desktop lock directory: {error}"))
         })?;
-        Ok(root.join("desktop").join("input.lock"))
+        Ok(crate::config::paths::desktop_dir(&root).join("input.lock"))
     }
 
     /// nextest runs every test in its own process; a per-process inode keeps

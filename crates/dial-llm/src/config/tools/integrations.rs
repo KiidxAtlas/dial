@@ -57,7 +57,7 @@ integrations! {
     ("video", true, false),
     ("archive", true, true),
     ("dep_source", true, true),
-    // Registered only while the `image_embedding` role is assigned.
+    // Registered only while vision.image_embedding is configured.
     ("image_search", true, true),
     ("image_weights", true, true),
     ("github", false, false),

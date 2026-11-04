@@ -1954,7 +1954,16 @@ fn optional_findings_redirect_duplicate_reads_and_survive_resume() {
             .any(|line| line.starts_with("[Unchanged read]")),
         "{duplicate}"
     );
-    assert!(duplicate.contains("still shown above"));
+    assert!(duplicate.contains("still-visible tool call"));
+    let original = requests[3]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .unwrap();
+    assert!(duplicate.contains(original["tool_call_id"].as_str().unwrap()));
+    assert!(duplicate.len() < original["content"].as_str().unwrap().len());
     assert!(
         !requests[6]["messages"]
             .to_string()
@@ -3917,7 +3926,7 @@ fn task_role_models_reach_sync_and_background_requests_without_changing_the_pare
             let mut e = env(&main.url, "auto");
             let roles: &[&str] = match scenario {
                 "task" => &["task"],
-                "specialists" => &["task", "small", "tester", "planner"],
+                "specialists" => &["task", "small", "tester", "coach"],
                 _ => &["coach", "small"],
             };
             for role in roles {
@@ -3949,7 +3958,7 @@ fn task_role_models_reach_sync_and_background_requests_without_changing_the_pare
                     "task-model",
                     "small-model",
                     "tester-model",
-                    "planner-model",
+                    "coach-model",
                     "tester-model",
                 ],
                 "helper-defaults" => vec![
@@ -4670,7 +4679,7 @@ fn roomy_window_keeps_the_full_tool_set_without_notice() {
 
 fn with_subagent_role(e: &mut Env, url: &str) {
     // Specialist assignments win; implementation workers use the task role.
-    for role in ["main", "task", "small", "tester", "planner"] {
+    for role in ["main", "task", "small", "tester", "coach"] {
         e.config.model_roles.insert(
             role.into(),
             dial::llm::model_config::ModelSelection {
@@ -4886,7 +4895,8 @@ fn child_repeated_reads_reuse_evidence_and_stop_before_exhausting_steps() {
         "{duplicate}"
     );
     assert!(duplicate.contains("tool call read-0"));
-    assert!(duplicate.contains("still shown above"));
+    assert!(duplicate.contains("still-visible tool call"));
+    assert!(duplicate.len() < results[0]["content"].as_str().unwrap().len());
     assert!(!duplicate.contains("ORIGINAL_EVIDENCE"));
 }
 
@@ -5173,10 +5183,10 @@ fn a_batch_runs_read_only_agents_concurrently_and_reports_in_input_order() {
     );
     assert!(
         at("answer to second")
-            < at("## 3. planner#3 (planner, role planner, model reviewer/side-model) - ok")
+            < at("## 3. planner#3 (planner, role coach, model reviewer/side-model) - ok")
     );
     assert!(
-        at("## 3. planner#3 (planner, role planner, model reviewer/side-model) - ok")
+        at("## 3. planner#3 (planner, role coach, model reviewer/side-model) - ok")
             < at("answer to third")
     );
     assert!(result.starts_with("3 subagent task(s): 3 ok, 0 failed."));
@@ -5195,7 +5205,7 @@ fn a_batch_runs_read_only_agents_concurrently_and_reports_in_input_order() {
         "{:?}",
         ui.notices
     );
-    assert_eq!(ui.roles, ["small", "tester", "planner", "main"]);
+    assert_eq!(ui.roles, ["small", "tester", "coach", "main"]);
     // Each child ran as its own conversation: a system prompt and one brief. The parent's goal is
     // passed only as labelled background; the assignment itself is the child's own task.
     let prompts: Vec<String> = side.requests.lock().iter().map(prompt_of).collect();
@@ -7809,9 +7819,9 @@ fn dynamic_extension_sdk_executes_with_approval_and_evidence() {
     );
     assert_eq!(a.metrics().dynamic_tools_used, 1);
     let path = a.session().path().unwrap().to_owned();
-    a.swap_session(Session::ephemeral());
+    a.swap_session(Session::ephemeral()).unwrap();
     let resumed = Session::open(&path).unwrap();
-    a.swap_session(resumed);
+    a.swap_session(resumed).unwrap();
     assert!(a.tool_names().iter().any(|n| n == "sdk_inspect"));
 }
 
@@ -8478,9 +8488,9 @@ fn legacy_admitted_memory_selection_migrates_runtime_without_rewriting_history()
     );
     drop(requests);
     let path = a.session().path().unwrap().to_owned();
-    a.swap_session(Session::ephemeral());
+    a.swap_session(Session::ephemeral()).unwrap();
     let resumed = Session::open(&path).unwrap();
-    a.swap_session(resumed);
+    a.swap_session(resumed).unwrap();
     a.turn("continue", &mut ui).unwrap();
     assert_eq!(
         ui.notices
@@ -9405,7 +9415,8 @@ fn a_session_switch_forgets_previous_context_and_token_count() {
             },
         )
         .unwrap(),
-    );
+    )
+    .unwrap();
     assert_eq!(a.last_prompt_tokens, 0);
     assert!(a.session().messages().is_empty());
     assert!(!a.todo().has_open());
@@ -10401,7 +10412,7 @@ fn subagent_roles_reach_distinct_backends_and_custom_base_roles_keep_their_think
     let mut e = env(&main.url, "auto");
     for (role, model, url) in [
         ("tester", "review-model", &review.url),
-        ("planner", "plan-model", &plan.url),
+        ("coach", "plan-model", &plan.url),
     ] {
         e.config.model_roles.insert(
             role.into(),
@@ -10464,7 +10475,7 @@ fn subagent_roles_reach_distinct_backends_and_custom_base_roles_keep_their_think
         "{result}"
     );
     assert!(
-        result.contains("role planner, model reviewer/plan-model"),
+        result.contains("role coach, model reviewer/plan-model"),
         "{result}"
     );
 }

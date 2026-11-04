@@ -245,10 +245,10 @@ fn browser_codex_oauth_activates_account_and_preserves_workspace_isolation() {
     let (result, _, second_url) = login_fixture(dir.path(), Some(account_id), "first-person");
     assert!(result.is_ok());
     assert!(second_url.contains("id_token_hint=") && second_url.contains("login_hint="));
-    let before = std::fs::read(dir.path().join(FILE)).unwrap();
+    let before = std::fs::read(credential_path(dir.path())).unwrap();
     let (result, _, _) = login_fixture(dir.path(), Some(account_id), "different-person");
     assert!(result.is_err());
-    assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), before);
+    assert_eq!(std::fs::read(credential_path(dir.path())).unwrap(), before);
 }
 #[test]
 fn codex_authorization_url_matches_pkce_flow() {
@@ -369,7 +369,7 @@ fn resume_refresh_replaces_tokens_atomically_and_reuses_granted_scopes() {
     assert_eq!(t.refresh_token, "rotated");
     assert_eq!(t.id_token, "test-id");
     assert_eq!(
-        crate::platform::fs::mode(&std::fs::metadata(dir.path().join(FILE)).unwrap()) & 0o777,
+        crate::platform::fs::mode(&std::fs::metadata(credential_path(dir.path())).unwrap()) & 0o777,
         0o600
     );
     let requests = server.requests();
@@ -413,7 +413,7 @@ fn concurrent_refreshes_send_a_rotating_token_only_once() {
 fn refresh_errors_preserve_credentials_and_do_not_echo_secret_responses() {
     let dir = tempfile::tempdir().unwrap();
     test_account(dir.path(), true);
-    let before = std::fs::read(dir.path().join(FILE)).unwrap();
+    let before = std::fs::read(credential_path(dir.path())).unwrap();
     let server = super::super::fake::serve(vec![super::super::fake::json(
         400,
         &json!({"error":"invalid_grant","detail":"test-refresh secret"}),
@@ -421,7 +421,7 @@ fn refresh_errors_preserve_credentials_and_do_not_echo_secret_responses() {
     let error =
         access_token_at(dir.path(), Arc::new(AtomicBool::new(false)), &server.url).unwrap_err();
     assert!(!format!("{error:#}").contains("test-refresh"));
-    assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), before);
+    assert_eq!(std::fs::read(credential_path(dir.path())).unwrap(), before);
     server.requests();
 }
 #[test]
@@ -429,7 +429,7 @@ fn account_switching_is_isolated_and_corrupt_or_symlink_storage_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     test_account(dir.path(), false);
     {
-        let _lock = locked(&dir.path().join(FILE)).unwrap();
+        let _lock = locked(&credential_path(dir.path())).unwrap();
         let mut state = load(dir.path()).unwrap();
         state.accounts.insert(
             "oaiapp_two".into(),
@@ -455,10 +455,11 @@ fn account_switching_is_isolated_and_corrupt_or_symlink_storage_fails_closed() {
     #[cfg(unix)]
     {
         let other = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(dir.path().join(FILE), other.path().join(FILE)).unwrap();
+        std::os::unix::fs::symlink(credential_path(dir.path()), credential_path(other.path()))
+            .unwrap();
         assert!(accounts(other.path()).is_err());
     }
-    std::fs::write(dir.path().join(FILE), "invalid sensitive data").unwrap();
+    std::fs::write(credential_path(dir.path()), "invalid sensitive data").unwrap();
     let err = accounts(dir.path()).unwrap_err();
     assert!(!err.to_string().contains("sensitive"));
 }
@@ -686,7 +687,7 @@ fn stored_chatgpt_file_keeps_its_shape_through_the_shared_store() {
         let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         value.as_object().unwrap().keys().cloned().collect()
     };
-    let file = dir.path().join(FILE);
+    let file = credential_path(dir.path());
     assert_eq!(keys(&file), vec!["accounts", "active"]);
     let listed = accounts(dir.path()).unwrap();
     assert_eq!(listed.len(), 1);

@@ -331,7 +331,27 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
         timeout_secs: u64,
     ) -> Result<String> {
-        let parent = self.interrupt.clone();
+        self.bounded_role_chat_with_cancel(
+            main,
+            role,
+            purpose,
+            request,
+            ui,
+            (timeout_secs, self.interrupt.clone()),
+        )
+    }
+
+    /// Execute a bounded role request under an independently cancellable inference owner.
+    pub(in crate::agent) fn bounded_role_chat_with_cancel(
+        &mut self,
+        main: &mut Backend,
+        role: &str,
+        purpose: llm::usage::Purpose,
+        request: &Chat,
+        ui: &mut dyn Ui,
+        control: (u64, Arc<AtomicBool>),
+    ) -> Result<String> {
+        let (timeout_secs, parent) = control;
         with_request_deadline(parent, Duration::from_secs(timeout_secs), |cancel| {
             self.role_chat_with_control(
                 main,
@@ -384,6 +404,48 @@ impl<'a> Agent<'a> {
         let _ = main.swap_request_profile(previous_profile);
         result
     }
+
+    /// Backend reuse does not mean request-control reuse: resolve a role's thinking against the
+    /// loaded main model, not the different model deliberately skipped by reuse_main.
+    fn prepare_reused_role_request(
+        &mut self,
+        main: &mut Backend,
+        role: &str,
+        max_tokens: u32,
+        main_profile: Option<&llm::profiles::ModelProfile>,
+    ) -> Result<()> {
+        let thinking = self
+            .auth_config
+            .model_roles
+            .get(role)
+            .and_then(|s| s.thinking.as_deref());
+        let mut role_config = self.auth_config.clone();
+        if let Some(level) = thinking {
+            if let Some(profile) = main_profile {
+                role_config = crate::config::thinking::install_thinking_profile(
+                    role_config,
+                    profile.clone(),
+                )?;
+            }
+            role_config = crate::config::thinking::apply_role_thinking(role_config.clone(), level)
+                .unwrap_or(role_config);
+        }
+        let selected = if thinking.is_some() {
+            role_config.active_model_profile()
+        } else {
+            main_profile
+        };
+        if let Some(profile) = main.bounded_request_profile(selected, max_tokens) {
+            main.next_request_profile(crate::llm::profiles::request_tiers_for(
+                Some(profile),
+                &role_config.selection(),
+                role_config.effective_service_tier(),
+                role_config.extended_context,
+            )?);
+        }
+        self.prepare_local_side_request(main);
+        Ok(())
+    }
     pub(in crate::agent) fn role_chat_scoped(
         &mut self,
         main: &mut Backend,
@@ -401,18 +463,7 @@ impl<'a> Agent<'a> {
         } = call;
         let selection = self.role_selection(role).cloned();
         let Some(selection) = selection else {
-            if (request.max_tokens > 0 || main_profile.is_some())
-                && let Some(profile) =
-                    main.bounded_request_profile(main_profile, request.max_tokens)
-            {
-                main.next_request_profile(crate::llm::profiles::request_tiers_for(
-                    Some(profile),
-                    &self.auth_config.selection(),
-                    self.auth_config.effective_service_tier(),
-                    self.auth_config.extended_context,
-                )?);
-            }
-            self.prepare_local_side_request(main);
+            self.prepare_reused_role_request(main, role, request.max_tokens, main_profile)?;
             let rewritten = self.provider_request_with(request, ui)?;
             let request = rewritten.as_ref().unwrap_or(request);
             let started = Instant::now();
@@ -480,9 +531,9 @@ impl<'a> Agent<'a> {
         {
             backend.next_request_profile(crate::llm::profiles::request_tiers_for(
                 Some(profile),
-                &self.auth_config.selection(),
-                self.auth_config.effective_service_tier(),
-                self.auth_config.extended_context,
+                &role_config.selection(),
+                role_config.effective_service_tier(),
+                role_config.extended_context,
             )?);
         }
         main.release();

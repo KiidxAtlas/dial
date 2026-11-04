@@ -92,7 +92,7 @@ fn registry_includes_peer_help_completions_and_safe_scheduling() {
         .filter(|spec| spec.name == "peers")
         .collect();
     assert_eq!(specs.len(), 1);
-    assert!(specs[0].args_hint.contains("send <id> <text>"));
+    assert!(specs[0].usage.contains("send <id> <text>"));
     let completions = commands::completions(&Config::default());
     for action in ["list", "send", "claim", "clear"] {
         assert!(completions.contains(&format!("/peers {action}")));

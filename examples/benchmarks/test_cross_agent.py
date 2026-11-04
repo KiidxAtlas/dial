@@ -179,6 +179,31 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(turns[1]["efficiency"]["projection_bytes"]["first_tool_result_ms"], 100)
 
 
+class SummaryTests(unittest.TestCase):
+    def test_success_efficiency_includes_failed_attempts_and_requires_complete_usage(self):
+        def trial(passed, elapsed, complete=True):
+            return {"agent": "stub", "scored": True, "passed": passed, "agent_error": None,
+                    "elapsed_ms": elapsed, "efficiency": None, "case": "case",
+                    "usage": {**cross_agent.empty_usage(), "input_total": 100, "output": 20,
+                              "usage_complete": complete}}
+
+        trials = [trial(True, 100), trial(False, 300)]
+        summary, _ = cross_agent.summarize(trials, [{"name": "stub"}])
+        own = summary["stub"]
+        self.assertEqual(own["elapsed_ms_per_success"], 400)
+        self.assertEqual(own["tokens_per_success"], 240)
+        self.assertEqual(own["p95_elapsed_ms_all"], 300)
+        trials[1]["usage"]["usage_complete"] = False
+        summary, _ = cross_agent.summarize(trials, [{"name": "stub"}])
+        self.assertIsNone(summary["stub"]["tokens_per_success"])
+        self.assertEqual(summary["stub"]["elapsed_ms_per_success"], 400)
+
+    def test_no_success_or_no_trials_has_no_per_success_estimate(self):
+        summary, _ = cross_agent.summarize([], [{"name": "stub"}])
+        for key in ("elapsed_ms_per_success", "tokens_per_success", "p95_elapsed_ms_all"):
+            self.assertIsNone(summary["stub"][key])
+
+
 class IdentityAndOrderTests(unittest.TestCase):
     def test_binary_identity_hashes_the_resolved_executable_and_reports_missing_ones(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -277,6 +302,18 @@ class TrialTests(unittest.TestCase):
             cross_agent.add_usage(total, part, {"delegation_tools": ["task"], "delegated_usage": reported})
             self.assertEqual((total["delegations"], total["tools"], total["usage_complete"]),
                              (1, {"task": 1, "read": 1}, complete))
+
+    def test_trace_export_time_is_separate_from_agent_elapsed(self):
+        with patch.object(cross_agent, "run_agent_process", return_value=subprocess.CompletedProcess(
+                ["stub"], 0, json.dumps(DIAL_RESULT), "")), \
+             patch("registry_discovery.capture_trial_trace", return_value={"status": "unavailable"}), \
+             patch.object(cross_agent.time, "monotonic", side_effect=[0, 0, 2, 2, 7, 9]):
+            record = cross_agent.run_trial(
+                self.agent, {"id": "timing", "prompt": "go", "checks": []}, self.root, 0,
+                self.root, {"model": "m"}, 10, True, capture_traces=True)
+        self.assertEqual(record["elapsed_ms"], 4000)
+        self.assertEqual(record["turns"][0]["elapsed_ms"], 2000)
+        self.assertEqual(record["turns"][0]["trace"]["capture_ms"], 5000)
 
     def test_timeout_keeps_partial_logs_and_marks_usage_incomplete(self):
         logs = self.root / "logs"
@@ -382,7 +419,11 @@ class TrialTests(unittest.TestCase):
         report = self.root / "report.json"
         arguments = [sys.executable, str(ROOT / "cross_agent.py"), str(suite), "--agents", str(agents),
                      "--model", "m", "--repetitions", "2", "--root", str(self.root), "--report", str(report),
-                     "--seed", "3"]
+                     "--seed", "3", "--comparison-mode", "controlled"]
+        missing_notes = subprocess.run(arguments, capture_output=True, text=True, timeout=60)
+        self.assertEqual(missing_notes.returncode, 2)
+        self.assertIn("require --comparison-notes", missing_notes.stderr)
+        arguments += ["--comparison-notes", "stub setup; no live inference"]
         completed = subprocess.run(arguments, capture_output=True, text=True, timeout=60)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(report.read_text())
@@ -392,6 +433,8 @@ class TrialTests(unittest.TestCase):
         self.assertEqual(len(payload["trial_order"]), 2)
         self.assertIn("binary_sha256", payload["agents"][0])
         self.assertEqual(payload["timing_comparable"], payload["jobs"] == 1)
+        self.assertEqual(payload["comparison"]["mode"], "controlled")
+        self.assertEqual(payload["comparison"]["notes"], "stub setup; no live inference")
         self.assertEqual(subprocess.run(arguments, capture_output=True, timeout=60).returncode, 2)
 
 

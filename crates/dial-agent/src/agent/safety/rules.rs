@@ -8,7 +8,7 @@
 //! text, thinking, or tool:NAME (optionally tool:NAME(GLOB)). astCondition matches finalized
 //! source-bearing tool arguments; astLanguage optionally selects one parser. `interruptMode`
 //! (always, prose-only, tool-only, never) picks which matches abort the inference; the others are
-//! deferred to the next request. A `question` is asked of the judge role after a reply completes,
+//! deferred to the next request. A `question` is asked of the decision role after a reply completes,
 //! with any condition/astCondition as its prefilter; judged rules never interrupt.
 //! `portable_rules.repeat_after_turns` lets a fired rule fire again after that many user turns.
 //! Matching is bounded to 64 KiB per stream / 128 KiB total / 64 tool streams. Exhausted matching
@@ -48,7 +48,7 @@ struct Rule {
     ast: ast::Conditions,
     scopes: Vec<Scope>,
     interrupt: Interrupt,
-    /// Judged trigger: asked of the `judge` role about each completed output. `condition` and
+    /// Judged trigger: asked of the `decision` role about each completed output. `condition` and
     /// `astCondition` then only prefilter which outputs are judged.
     question: Option<String>,
 }

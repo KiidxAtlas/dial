@@ -27,7 +27,21 @@ use toml::{Table, Value};
 use unicode_segmentation::UnicodeSegmentation;
 use value_editors::{AddBy, EntriesEditor, ListEditor, Step, View};
 
+mod appearance;
+mod bulk;
+mod context;
 mod value_editors;
+
+/// Bulk removal is limited to canonical leaf settings; section containers can hide siblings.
+pub fn resettable_path(path: &str) -> bool {
+    let defs = crate::config::schema::registry();
+    defs.iter().any(|def| def.path == path)
+        && !defs.iter().any(|def| {
+            def.path
+                .strip_prefix(path)
+                .is_some_and(|tail| tail.starts_with('.'))
+        })
+}
 
 // ---------------------------------------------------------------------------------------------
 // Shared helpers (also used by `models` and `providers`)
@@ -262,6 +276,32 @@ pub(super) fn panel(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Keep the editing scope visible without allowing a right-aligned caption to overwrite its title.
+pub(super) fn scope_caption(scope: Scope, project: &str, max_cells: usize) -> String {
+    let full = format!(
+        "scope: {}{} · {} · Ctrl+S switch",
+        scope_name(scope),
+        if scope == Scope::Project {
+            format!(" ({project})")
+        } else {
+            String::new()
+        },
+        if scope == Scope::Global {
+            format!("project ({project})")
+        } else {
+            "global".into()
+        }
+    );
+    if crate::ui::text::width(&full) <= max_cells {
+        full
+    } else {
+        crate::ui::text::clip(
+            &format!("scope: {} ({project})", scope_name(scope)),
+            max_cells,
+        )
+    }
+}
+
 /// Cursor-aware rendering of a single-line editor inside `width` cells (the tail is kept visible).
 pub(super) fn editor_spans(
     theme: &Theme,
@@ -428,6 +468,26 @@ const LINKS: &[(&str, &str, &str)] = &[
         "See compute owners across projects; pause, resume, start or stop improvement jobs.",
         "open:compute",
     ),
+    (
+        "Tool servers & extensions",
+        "Connect tool servers and manage installed extensions in their dedicated panel.",
+        "open:extensions",
+    ),
+    (
+        "Context defaults",
+        "Set shared context defaults for future model selections; current model tuning stays separate.",
+        "open:context-defaults",
+    ),
+    (
+        "Extraction model",
+        "Choose the memory extraction model in its existing role picker; this does not enable memory.",
+        "open:role:memory",
+    ),
+    (
+        "Embedding model",
+        "Choose the embedding model in its existing role picker; this does not enable semantic memory.",
+        "open:role:embedding",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -561,20 +621,32 @@ pub fn pair_partner(path: &str) -> Option<&'static str> {
 }
 
 pub struct SettingsOverlay {
+    panel_keys: super::panel_keys::PanelKeys,
     effective: Table,
+    /// Display-only differences from the actual active config. Sensitive values are never retained.
+    application_changes: BTreeMap<&'static str, (String, String)>,
+    application_busy: bool,
     project: Table,
     global: Table,
+    sources: BTreeMap<String, &'static str>,
     scope: Scope,
     themes: Vec<String>,
     tabs: Vec<(&'static str, Vec<&'static str>)>,
-    coding_only: bool,
     learning_only: bool,
+    context_only: bool,
     tab: usize,
     cursor: usize,
     scroll: usize,
     page: usize,
     search: String,
+    /// Saved overrides from the editing layer across categories, including folded rows.
+    changed_only: bool,
+    bulk_review: Option<bulk::Review>,
+    project_name: String,
     mode: Mode,
+    /// Presentation only: the Appearance preview never owns preference values.
+    appearance_preview: bool,
+    appearance_scroll: usize,
     reveal_sensitive: bool,
     pending: BTreeMap<String, Pending>,
     /// Save feedback is shown only after the controller acknowledges persistence.
@@ -749,7 +821,17 @@ fn label_of(path: &str) -> &'static str {
 }
 
 fn haystack(def: &SettingDef) -> String {
-    format!("{} {} {} {}", def.label, def.section, def.tab, def.path)
+    let (tab, section) = def.search_location();
+    format!(
+        "{} {} {} {} {} {} {}",
+        def.label,
+        section,
+        tab,
+        def.path,
+        def.section,
+        def.tab,
+        def.search_terms()
+    )
 }
 
 /// Match words independently, keeping fuzzy matching on concise metadata rather than long prose.
@@ -774,8 +856,8 @@ fn search_match(query: &str, metadata: &str, description: &str) -> Option<(i32, 
 /// Pickers keep string identifiers, but automatic switches persist actual TOML booleans.
 fn choice_value(kind: Kind, choice: &str) -> Value {
     match (kind, choice) {
-        (Kind::AutoBool, "true") => Value::Boolean(true),
-        (Kind::AutoBool, "false") => Value::Boolean(false),
+        (Kind::Bool | Kind::AutoBool, "true") => Value::Boolean(true),
+        (Kind::Bool | Kind::AutoBool, "false") => Value::Boolean(false),
         _ => Value::String(choice.to_owned()),
     }
 }
@@ -1002,6 +1084,42 @@ fn adjust(kind: Kind, buffer: &str, dir: i64) -> Option<String> {
 }
 
 impl SettingsOverlay {
+    /// Focus a declared setting for contextual navigation. Clears local filters, expands advanced
+    /// rows and leaves editing scope unchanged. Unknown paths or active editors return `false`
+    /// without changes. Inactive backend rows use exact-path search, without activation.
+    pub fn focus_path(&mut self, path: &str) -> bool {
+        if !matches!(self.mode, Mode::Browse) {
+            return false;
+        }
+        let Some(def) = crate::config::schema::registry()
+            .iter()
+            .find(|def| def.path == path)
+        else {
+            return false;
+        };
+        self.search.clear();
+        self.changed_only = false;
+        self.mode = Mode::Browse;
+        self.learning_only = false;
+        self.tabs = crate::config::schema::tabs();
+        self.tab = self
+            .tabs
+            .iter()
+            .position(|(tab, _)| *tab == def.tab)
+            .unwrap_or(0);
+        self.advanced_open.insert((def.tab, def.section));
+        if !self.visible().iter().any(|row| matches!(row, Row::Setting(i) if crate::config::schema::registry()[*i].path == path)) {
+            self.search = path.to_owned();
+        }
+        self.move_to_path(path);
+        self.scroll = 0;
+        true
+    }
+    pub fn with_sources(mut self, sources: BTreeMap<String, &'static str>) -> Self {
+        self.sources = sources;
+        self
+    }
+
     pub fn new(
         values: Table,
         project_values: Table,
@@ -1010,20 +1128,29 @@ impl SettingsOverlay {
         themes: Vec<String>,
     ) -> Self {
         SettingsOverlay {
+            panel_keys: Default::default(),
             effective: values,
+            application_changes: BTreeMap::new(),
+            application_busy: false,
             project: project_values,
             global: global_values,
+            sources: BTreeMap::new(),
             scope,
             themes,
             tabs: crate::config::schema::tabs(),
-            coding_only: false,
             learning_only: false,
+            context_only: false,
             tab: 0,
             cursor: 0,
             scroll: 0,
             page: 8,
             search: String::new(),
+            changed_only: false,
+            bulk_review: None,
+            project_name: "this project".to_owned(),
             mode: Mode::Browse,
+            appearance_preview: false,
+            appearance_scroll: 0,
             reveal_sensitive: false,
             pending: BTreeMap::new(),
             notes: BTreeMap::new(),
@@ -1044,9 +1171,21 @@ impl SettingsOverlay {
         }
     }
 
-    pub fn coding_only(mut self) -> Self {
-        self.coding_only = true;
-        self.filter_tabs();
+    /// Identify the project whose saved layer is being edited, without exposing its full path.
+    pub fn with_project_name(mut self, name: &str) -> Self {
+        self.project_name = text::one_line(name);
+        self
+    }
+
+    fn editing_scope_label(&self) -> String {
+        match self.scope {
+            Scope::Global => "global (all projects)".to_owned(),
+            Scope::Project => format!("project ({})", self.project_name),
+        }
+    }
+
+    /// Compatibility entry point: settings includes persistent learning preferences too.
+    pub fn coding_only(self) -> Self {
         self
     }
     pub fn learning_only(mut self) -> Self {
@@ -1057,6 +1196,8 @@ impl SettingsOverlay {
 
     /// Shared defaults for future model selections, rather than a current-model override.
     pub fn context_defaults(mut self) -> Self {
+        self.context_only = true;
+        self.filter_tabs();
         let def = crate::config::schema::registry()
             .iter()
             .find(|def| def.path == "local_context_window")
@@ -1071,18 +1212,21 @@ impl SettingsOverlay {
         self
     }
     fn learning_setting(def: &SettingDef) -> bool {
-        def.tab == "Improvement"
+        def.search_location().0 == "Improvement"
             || def.path.starts_with("laya.")
             || def.path.starts_with("memory.autolearn")
             || def.path.starts_with("memory.learn_")
     }
     fn scope_shown(&self, def: &SettingDef) -> bool {
+        if self.context_only {
+            return Self::context_setting(def);
+        }
         // The one learning switch that changes coding sessions belongs in both views.
         if def.path == "improve.teach" {
             return true;
         }
         let learning = Self::learning_setting(def);
-        (!self.coding_only || !learning) && (!self.learning_only || learning)
+        !self.learning_only || learning
     }
     fn filter_tabs(&mut self) {
         self.tabs = crate::config::schema::tabs()
@@ -1159,6 +1303,93 @@ impl SettingsOverlay {
         self.staged_pair = None;
         self.notes.clear();
         self.load_error = None;
+    }
+
+    /// Refresh a retained page without discarding its editor, staged pair or navigation state.
+    pub fn refresh_values(
+        &mut self,
+        values: Table,
+        project_values: Table,
+        global_values: Table,
+        sources: BTreeMap<String, &'static str>,
+    ) {
+        self.effective = values;
+        self.project = project_values;
+        self.global = global_values;
+        self.sources = sources;
+        self.load_error = None;
+    }
+
+    /// Compare saved values with the controller's immutable active snapshot, not a disk reload.
+    /// Keep only rendered values (or hidden markers), leaving editors and navigation untouched.
+    pub fn set_application_state(&mut self, active: &Table, busy: bool) {
+        self.set_projected_application_state(active, None, busy);
+    }
+
+    /// An optional canonical runtime projection excludes mode-inactive saved preferences from
+    /// pending adoption, without duplicating the controller's runtime-mode rules.
+    pub fn set_projected_application_state(
+        &mut self,
+        active: &Table,
+        projected: Option<&Table>,
+        busy: bool,
+    ) {
+        self.application_busy = busy;
+        self.application_changes.clear();
+        for def in crate::config::schema::registry() {
+            let default = def.default_value();
+            let before = crate::config::schema::get(active, def.path).or(default.as_ref());
+            let saved = crate::config::schema::get(&self.effective, def.path).or(default.as_ref());
+            if !def.restart
+                && !def.path.starts_with("ui.")
+                && projected.is_some_and(|values| {
+                    crate::config::schema::get(values, def.path).or(default.as_ref()) == before
+                })
+            {
+                continue;
+            }
+            if before != saved {
+                let shown = |value: Option<&Value>| {
+                    value.map_or_else(|| "(not set)".into(), |value| value_text(def, value))
+                };
+                self.application_changes
+                    .insert(def.path, (shown(before), shown(saved)));
+            }
+        }
+    }
+
+    pub fn pending_application_count(&self) -> usize {
+        crate::config::schema::registry()
+            .iter()
+            .filter(|def| {
+                !def.restart
+                    && !def.path.starts_with("ui.")
+                    && self.application_changes.contains_key(def.path)
+            })
+            .count()
+    }
+
+    fn application_timing(&self, def: &SettingDef) -> &'static str {
+        if def.restart {
+            "restart required"
+        } else if def.path.starts_with("ui.") {
+            "display preference; applies on panel close"
+        } else if self.application_busy {
+            "after this turn"
+        } else {
+            "next request"
+        }
+    }
+
+    fn application_detail(&self, def: &SettingDef) -> Option<String> {
+        self.application_changes
+            .get(def.path)
+            .map(|(active, saved)| {
+                format!(
+                    "Active {active} → Saved {saved} · {}",
+                    self.application_timing(def)
+                )
+            })
     }
 
     /// A model role was assigned or cleared elsewhere (the Embedding model row, or a setup job):
@@ -1440,6 +1671,9 @@ impl SettingsOverlay {
     }
 
     fn source(&self, path: &str) -> &'static str {
+        if let Some(source @ ("env" | "CLI flag")) = self.sources.get(path).copied() {
+            return source;
+        }
         if crate::config::schema::get(&self.project, path).is_some() {
             "project"
         } else if crate::config::schema::get(&self.global, path).is_some() {
@@ -1451,12 +1685,52 @@ impl SettingsOverlay {
 
     /// What `path` falls back to once it is removed from `scope`.
     fn after_unset(&self, def: &SettingDef, scope: Scope) -> Option<Value> {
+        if matches!(self.source(def.path), "env" | "CLI flag") {
+            return crate::config::schema::get(&self.effective, def.path).cloned();
+        }
         crate::config::schema::get(
             self.layer_ref(super::settings::other_scope(scope)),
             def.path,
         )
         .cloned()
         .or_else(|| def.default_value())
+    }
+
+    /// Explain persistence and precedence without exposing raw sensitive values.
+    fn source_detail(&self, def: &SettingDef) -> String {
+        let source = self.source(def.path);
+        let owned = crate::config::schema::get(self.layer_ref(self.scope), def.path).is_some();
+        let action = if matches!(source, "env" | "CLI flag") {
+            format!("{source} wins over saved settings; reset keeps this runtime value")
+        } else if owned {
+            let fallback_source =
+                if crate::config::schema::get(self.layer_ref(other_scope(self.scope)), def.path)
+                    .is_some()
+                {
+                    scope_name(other_scope(self.scope))
+                } else {
+                    "default"
+                };
+            let fallback = self
+                .after_unset(def, self.scope)
+                .map_or_else(|| "(not set)".to_owned(), |value| value_text(def, &value));
+            format!("Delete: {fallback_source} ({fallback})")
+        } else {
+            format!("Inherited; edit adds a {} override", scope_name(self.scope))
+        };
+        let source_detail = format!(
+            "Using {source} value · {action} · {}{}",
+            def.path,
+            if def.restart {
+                " · Restart required"
+            } else {
+                ""
+            }
+        );
+        match self.application_detail(def) {
+            Some(timing) => format!("{timing} · {source_detail}"),
+            None => source_detail,
+        }
     }
 
     fn current_path(&self, path: &str) -> Value {
@@ -1563,6 +1837,9 @@ impl SettingsOverlay {
                 }
             }
         }
+        if let Some((def, value)) = self.appearance_draft() {
+            crate::config::schema::set(&mut table, def.path, value);
+        }
         table
             .get("ui")
             .and_then(Value::as_table)
@@ -1573,15 +1850,20 @@ impl SettingsOverlay {
 
     fn visible(&self) -> Vec<Row> {
         let defs = crate::config::schema::registry();
-        if !self.search.is_empty() {
+        if !self.search.is_empty() || self.changed_only {
             let mut hits: Vec<(i32, Row)> = Vec::new();
-            for (i, def) in defs
-                .iter()
-                .enumerate()
-                .filter(|(_, def)| self.scope_shown(def))
-            {
-                if let Some((score, _)) =
-                    search_match(&self.search, &haystack(def), def.description).or_else(|| {
+            for (i, def) in defs.iter().enumerate().filter(|(_, def)| {
+                self.scope_shown(def)
+                    && (!self.changed_only
+                        || crate::config::schema::get(self.layer_ref(self.scope), def.path)
+                            .is_some())
+            }) {
+                if let Some((score, _)) = self
+                    .search
+                    .is_empty()
+                    .then_some((0, Vec::new()))
+                    .or_else(|| search_match(&self.search, &haystack(def), def.description))
+                    .or_else(|| {
                         // Exact descendant paths find their complete structured editor, including
                         // optional fields and operator-defined map entries absent from defaults.
                         (matches!(def.kind, Kind::Toml)
@@ -1600,7 +1882,9 @@ impl SettingsOverlay {
                     hits.push((score, Row::Setting(i)));
                 }
             }
-            for (i, (label, description, _)) in LINKS.iter().enumerate() {
+            for (i, (label, description, _)) in
+                LINKS.iter().enumerate().filter(|_| !self.changed_only)
+            {
                 if let Some((score, _)) = search_match(
                     &self.search,
                     &format!("{label} {LINK_SECTION} {PROVIDERS_TAB}"),
@@ -1615,6 +1899,15 @@ impl SettingsOverlay {
         match self.tabs.get(self.tab) {
             Some((tab, sections)) => {
                 let mut rows = Vec::new();
+                let launchers: &[usize] = match *tab {
+                    "Connections" => &[0, 4],
+                    "Model" => &[1, 5],
+                    "Memory" => &[6, 7],
+                    "Keys" => &[2],
+                    "Learning" => &[3],
+                    _ => &[],
+                };
+                rows.extend(launchers.iter().copied().map(Row::Link));
                 for section in sections {
                     let in_section = |d: &SettingDef| {
                         d.tab == *tab
@@ -1660,6 +1953,19 @@ impl SettingsOverlay {
     // ---- input ----------------------------------------------------------------------------
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if self.bulk_review.is_some() {
+            return self.bulk_handle(event, keys);
+        }
+        if self.panel_keys.handle(
+            event,
+            !matches!(self.mode, Mode::Browse) || !self.search.is_empty(),
+            true,
+        ) {
+            return OverlayEvent::None;
+        }
+        if self.appearance_key(event, keys) {
+            return OverlayEvent::None;
+        }
         match event {
             Event::Key(key) if pressed(key) => match self.mode {
                 Mode::Browse => self.browse_key(key, keys),
@@ -1695,8 +2001,37 @@ impl SettingsOverlay {
 
     fn browse_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
         self.feedback = None;
+        if key.code == KeyCode::Delete && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_bulk_review();
+            return OverlayEvent::None;
+        }
+        if is_ctrl(key, 'o')
+            && ![
+                Action::SelectConfirm,
+                Action::SelectCancel,
+                Action::SelectUp,
+                Action::SelectDown,
+                Action::TabNext,
+                Action::TabPrev,
+                Action::SectionNext,
+                Action::SectionPrev,
+                Action::SelectPageUp,
+                Action::SelectPageDown,
+            ]
+            .iter()
+            .any(|action| keys.matches(*action, key))
+        {
+            self.changed_only = !self.changed_only;
+            self.cursor = 0;
+            self.scroll = 0;
+            return OverlayEvent::None;
+        }
         if is_ctrl(key, 's') {
             self.scope = other_scope(self.scope);
+            if self.changed_only {
+                self.cursor = 0;
+                self.scroll = 0;
+            }
             // The title's scope label is shed on narrow panels, so say what changed here too.
             self.feedback = Some(
                 match self.scope {
@@ -1710,11 +2045,15 @@ impl SettingsOverlay {
         if is_ctrl(key, 'l') && !keys.matches(Action::TabNext, key) {
             return self.setup_key();
         }
-        if keys.matches(Action::SelectCancel, key) {
-            if self.search.is_empty() {
+        if super::panel_keys::matches(keys, Action::SelectCancel, key) {
+            if self.search.is_empty() && !self.changed_only {
                 return OverlayEvent::Close;
             }
-            self.search.clear();
+            if self.search.is_empty() {
+                self.changed_only = false;
+            } else {
+                self.search.clear();
+            }
             self.cursor = 0;
             self.scroll = 0;
             return OverlayEvent::None;
@@ -1770,7 +2109,7 @@ impl SettingsOverlay {
     }
 
     fn change_tab(&mut self, delta: isize) {
-        if !self.search.is_empty() {
+        if !self.search.is_empty() || self.changed_only {
             return;
         }
         let n = self.tabs.len() + 1;
@@ -1890,6 +2229,16 @@ impl SettingsOverlay {
             return event;
         }
         match def.kind_for(&self.effective) {
+            Kind::Bool if appearance::is_appearance(def) => {
+                self.notes.remove(def.path);
+                self.mode = Mode::Pick {
+                    def,
+                    choices: vec!["true".into(), "false".into()],
+                    cursor: usize::from(!current.as_bool().unwrap_or(false)),
+                    filter: Editor::default(),
+                };
+                OverlayEvent::None
+            }
             Kind::Bool => {
                 let next = !current.as_bool().unwrap_or(false);
                 self.emit_set(def, Value::Boolean(next))
@@ -1965,15 +2314,16 @@ impl SettingsOverlay {
                 };
                 OverlayEvent::None
             }
-            Kind::Table | Kind::Toml if !def.sensitive() => {
+            Kind::Table | Kind::Toml => {
                 let seed = self.edit_seed(def);
                 if !matches!(seed, Value::Table(_) | Value::Array(_)) {
                     return self.open_text_editor(def, &seed);
                 }
                 self.notes.remove(def.path);
+                self.reveal_sensitive = false;
                 self.mode = Mode::Entries {
                     def,
-                    editor: Box::new(EntriesEditor::new(seed)),
+                    editor: Box::new(EntriesEditor::for_setting(seed, def.sensitive())),
                 };
                 OverlayEvent::None
             }
@@ -1982,9 +2332,7 @@ impl SettingsOverlay {
             | Kind::Float { .. }
             | Kind::AutoFloat { .. }
             | Kind::Text
-            | Kind::StringList
-            | Kind::Table
-            | Kind::Toml => {
+            | Kind::StringList => {
                 let seed = self.edit_seed(def);
                 self.open_text_editor(def, &seed)
             }
@@ -2349,8 +2697,8 @@ impl SettingsOverlay {
             if self.download_armed.take().is_some() {
                 self.feedback = None;
             }
-            // Esc first clears the filter; only a bare Esc leaves the picker.
-            if !filter.text.is_empty() {
+            // Appearance Esc always discards; other pickers first clear their filter.
+            if !appearance::is_appearance(def) && !filter.text.is_empty() {
                 filter.set("");
                 return OverlayEvent::None;
             }
@@ -2517,8 +2865,8 @@ impl SettingsOverlay {
         }
         match (def.kind_for(&self.effective), choice) {
             (Kind::AutoBool, "auto") => "Auto (let Dial decide)".to_owned(),
-            (Kind::AutoBool, "true") => "On (enabled)".to_owned(),
-            (Kind::AutoBool, "false") => "Off (disabled)".to_owned(),
+            (Kind::Bool | Kind::AutoBool, "true") => "On (enabled)".to_owned(),
+            (Kind::Bool | Kind::AutoBool, "false") => "Off (disabled)".to_owned(),
             _ if def.path == EMBEDDING_MODEL_PATH => self.embedding_choice_label(choice),
             _ => value_text(def, &Value::String(choice.to_owned())),
         }
@@ -2569,13 +2917,28 @@ impl SettingsOverlay {
     // ---- drawing --------------------------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        if let Some(review) = &mut self.bulk_review {
+            review.display_ready = false;
+        }
+        if self.panel_keys.draw(frame, ctx, "Settings", "Ctrl+S changes save scope · Ctrl+O filters saved overrides across categories · Delete resets the selected setting · Ctrl+L reviews available setup", true, true) {
+            return;
+        }
         let scope = match self.scope {
             Scope::Global => "All projects",
             Scope::Project => "This project",
         };
         // Narrow panels shed the key, then the label, so the scope never runs into the title.
-        let full = format!("Save to: {scope} {} Ctrl+S", ctx.theme.sym(Sym::Dot));
-        let short = format!("Save to: {scope}");
+        let count = self.pending_application_count();
+        let pending = if count == 0 {
+            String::new()
+        } else {
+            format!(" · {count} pending")
+        };
+        let full = format!(
+            "Save to: {scope}{pending} {} Ctrl+S",
+            ctx.theme.sym(Sym::Dot)
+        );
+        let short = format!("Save to: {scope}{pending}");
         let extra = super::palette::title_extra(
             ctx.theme,
             "Settings",
@@ -2592,24 +2955,15 @@ impl SettingsOverlay {
         );
     }
 
-    fn compose(&mut self, w: u16, h: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
+    fn compose_controls(&mut self, w: u16, h: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
+        if self.bulk_review.is_some() {
+            return self.bulk_compose(usize::from(w), usize::from(h), ctx);
+        }
         let (w, h) = (usize::from(w), usize::from(h));
         let theme = ctx.theme;
         let rows = self.visible();
         self.cursor = self.cursor.min(rows.len().saturating_sub(1));
         let cursor_row = rows.get(self.cursor).copied();
-        let appearance = matches!(cursor_row, Some(Row::Setting(i)) if crate::config::schema::registry()[i].tab == "Appearance");
-        // The preview row appears only when the status line has something to show for it.
-        let preview_label = " Preview: ";
-        let preview_room = w.saturating_sub(preview_label.len());
-        let preview = (appearance && preview_room > 0)
-            .then(|| {
-                (ctx.preview_status)(
-                    &self.preview_config(),
-                    preview_room.min(usize::from(u16::MAX)) as u16,
-                )
-            })
-            .filter(|line| line.width() > 0);
         let body_min = h.min(3);
         let mut spare = h - body_min;
         let mut grant = || {
@@ -2621,13 +2975,12 @@ impl SettingsOverlay {
             }
         };
         // Keep navigation and search visible before optional details on short terminals.
-        let (show_footer, show_search, show_tabs, show_desc, show_desc2) =
-            (grant(), grant(), grant(), grant(), grant());
-        let show_preview = preview.is_some() && grant();
+        let (show_footer, show_search, show_tabs, show_scope, show_desc, show_desc2) =
+            (grant(), grant(), grant(), grant(), grant(), grant());
         let body_rows = h - [
             show_tabs,
+            show_scope,
             show_footer,
-            show_preview,
             show_desc,
             show_search,
             show_desc2,
@@ -2641,24 +2994,35 @@ impl SettingsOverlay {
         if show_tabs {
             lines.push(self.tab_bar(theme, w));
         }
+        if show_scope {
+            lines.push(Line::from(fit(
+                vec![Span::styled(
+                    format!(
+                        " Editing: {} · Ctrl+S scope · Ctrl+O {}",
+                        self.editing_scope_label(),
+                        if self.changed_only {
+                            "all settings"
+                        } else {
+                            "changed only"
+                        }
+                    ),
+                    theme.fg(Tok::Accent),
+                )],
+                w,
+            )));
+        }
         if show_search {
             lines.push(self.search_line(theme, w));
         }
 
-        // Left column of sections.
-        let longest = self.tabs.get(self.tab).map_or(0, |(_, s)| {
-            s.iter().map(|s| text::width(s)).max().unwrap_or(0)
-        });
-        let left_w = if w >= 64 {
-            (longest + 4).max(w / 4).min(28).min(w / 3)
-        } else {
-            0
-        };
-        let list_w_total = w - if left_w > 0 { left_w + 1 } else { 0 };
-
-        // Right list items.
-        let searching = !self.search.is_empty();
-        let mut items: Vec<Item> = Vec::new();
+        let list_w_total = w;
+        let searching = !self.search.is_empty() || self.changed_only;
+        // Page summaries belong to the scrollable content, never to a changing header.
+        let mut items: Vec<Item> = self
+            .context_summary(ctx)
+            .into_iter()
+            .map(Item::Hint)
+            .collect();
         let mut cursor_item = 0;
         let mut last_section = "";
         for (i, row) in rows.iter().enumerate() {
@@ -2722,8 +3086,13 @@ impl SettingsOverlay {
                     }
                     if visible.is_empty() {
                         items.push(Item::Hint(format!(
-                            "No option matches \"{}\". Esc clears the filter.",
-                            text::one_line(&filter.text)
+                            "No option matches \"{}\". {}",
+                            text::one_line(&filter.text),
+                            if appearance::is_appearance(def) {
+                                "Backspace edits the filter; Esc discards."
+                            } else {
+                                "Esc clears the filter."
+                            }
                         )));
                     }
                     let at = visible.iter().position(|&n| n == *cursor).unwrap_or(0);
@@ -2876,23 +3245,17 @@ impl SettingsOverlay {
             }
         };
 
-        let section_lines = self.section_column(theme, left_w, cursor_row, rows.len());
         for y in 0..body_rows {
             let mut spans: Vec<Span<'static>> = Vec::new();
-            if left_w > 0 {
-                let left = section_lines.get(y).cloned().unwrap_or_default();
-                let used = spans_width(&left);
-                spans.extend(left);
-                spans.push(Span::raw(" ".repeat(left_w.saturating_sub(used))));
-                spans.push(Span::styled(
-                    theme.sym(Sym::BoxV).to_owned(),
-                    theme.fg(Tok::BorderMuted),
-                ));
-            }
             let item = items.get(self.scroll + y);
             let list_line = match item {
                 None if rows.is_empty() && y == 0 => {
-                    let msg = if searching {
+                    let msg = if self.changed_only && self.search.is_empty() {
+                        format!(
+                            " No saved {} overrides. Ctrl+O shows all settings.",
+                            scope_name(self.scope)
+                        )
+                    } else if searching {
                         format!(
                             " No settings match \"{}\". Esc clears the search.",
                             text::one_line(&self.search)
@@ -3038,20 +3401,7 @@ impl SettingsOverlay {
                         if let Some(feedback) = &self.feedback {
                             head.push((feedback.clone(), Tok::Success));
                         }
-                        let dot = format!(" {} ", theme.sym(Sym::Dot));
-                        meta = Some((
-                            format!(
-                                "{}{dot}Using {} value{}",
-                                def.path,
-                                self.source(def.path),
-                                if def.restart {
-                                    format!("{dot}Restart required")
-                                } else {
-                                    String::new()
-                                }
-                            ),
-                            Tok::Dim,
-                        ));
+                        meta = Some((self.source_detail(def), Tok::Dim));
                     }
                     head.extend(
                         text::wrap_words(def.description, w.saturating_sub(2).max(1))
@@ -3095,27 +3445,47 @@ impl SettingsOverlay {
                 });
             }
         }
-        if show_preview && let Some(preview) = preview {
-            let mut spans = vec![Span::styled(preview_label, theme.fg(Tok::Muted))];
-            spans.extend(fit(preview.spans, preview_room));
-            lines.push(Line::from(fit(spans, w)));
-        }
         if show_footer {
-            lines.push(hint_line(theme, &self.footer(ctx.keys), w));
+            let mut hints = self.footer(ctx.keys);
+            if self.appearance_selected() {
+                hints.insert(1.min(hints.len()), "F4 preview".into());
+            }
+            lines.push(hint_line(theme, &hints, w));
         }
         lines
     }
 
     fn tab_bar(&self, theme: &Theme, w: usize) -> Line<'static> {
-        let names: Vec<&str> = self
+        let names: Vec<String> = self
             .tabs
             .iter()
-            .map(|(t, _)| *t)
+            .map(|(name, _)| *name)
             .chain(std::iter::once(PROVIDERS_TAB))
+            .map(|name| {
+                let count = crate::config::schema::registry()
+                    .iter()
+                    .filter(|def| {
+                        def.tab == name
+                            && self.scope_shown(def)
+                            && crate::config::schema::get(self.layer_ref(self.scope), def.path)
+                                .is_some()
+                    })
+                    .count();
+                if count == 0 {
+                    name.to_owned()
+                } else {
+                    format!("{name} {count}")
+                }
+            })
             .collect();
-        // Plain words, two cells apart: the active tab's accent and underline mark it, so icons
-        // would only add noise.
-        tab_strip(theme, &names, self.tab, self.search.is_empty(), w)
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        tab_strip(
+            theme,
+            &refs,
+            self.tab,
+            self.search.is_empty() && !self.changed_only,
+            w,
+        )
     }
 
     /// The search field reads as an input: a muted label, then the query with its caret, or a
@@ -3136,75 +3506,6 @@ impl SettingsOverlay {
             ]
         };
         Line::from(fit(spans, w))
-    }
-
-    fn section_column(
-        &self,
-        theme: &Theme,
-        width: usize,
-        cursor_row: Option<Row>,
-        hits: usize,
-    ) -> Vec<Vec<Span<'static>>> {
-        if width == 0 {
-            return Vec::new();
-        }
-        let mut out: Vec<Vec<Span<'static>>> = Vec::new();
-        if !self.search.is_empty() {
-            out.push(vec![chrome::label(theme, " Results")]);
-            out.push(vec![Span::styled(
-                format!(" {hits} {}", if hits == 1 { "match" } else { "matches" }),
-                theme.fg(Tok::Muted),
-            )]);
-            return out;
-        }
-        let sections: Vec<&str> = match self.tabs.get(self.tab) {
-            Some((_, s)) => s.clone(),
-            None => vec![LINK_SECTION],
-        };
-        let active = cursor_row.map(Self::section_of);
-        // A trailing count tells where the user's own overrides live, so a customised section
-        // is visible without opening it. Folded advanced rows count too.
-        let tab = self.tabs.get(self.tab).map(|(tab, _)| *tab);
-        let overrides = |section: &str| {
-            crate::config::schema::registry()
-                .iter()
-                .filter(|def| {
-                    Some(def.tab) == tab
-                        && def.section == section
-                        && self.scope_shown(def)
-                        && self.source(def.path) != "default"
-                })
-                .count()
-        };
-        for section in sections {
-            let on = Some(section) == active;
-            let changed = overrides(section);
-            let badge = if changed > 0 {
-                format!(" {}{changed}", theme.sym(Sym::Bullet))
-            } else {
-                String::new()
-            };
-            let label = text::ellipsize(
-                section,
-                width.saturating_sub(3 + text::width(&badge)),
-                theme.ascii(),
-            );
-            // The section holding the selection is named in the accent; the selection marker
-            // belongs to the selected row alone.
-            let mut spans = vec![Span::styled(
-                format!("   {label}"),
-                if on {
-                    theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)
-                } else {
-                    theme.fg(Tok::Muted)
-                },
-            )];
-            if !badge.is_empty() {
-                spans.push(Span::styled(badge, theme.fg(Tok::Accent)));
-            }
-            out.push(spans);
-        }
-        out
     }
 
     fn row_line(
@@ -3294,9 +3595,17 @@ impl SettingsOverlay {
                 };
                 let mut tags: Vec<(String, Tok)> = Vec::new();
                 if editing.is_none() {
-                    // Defaults carry no tag; an override names where it is set, in the accent.
-                    if source != "default" {
-                        tags.push((format!("{} {source}", theme.sym(Sym::Bullet)), Tok::Accent));
+                    // A common source column makes inheritance explicit, including defaults.
+                    tags.push((
+                        format!("{} {source}", theme.sym(Sym::Bullet)),
+                        if source == "default" {
+                            Tok::Dim
+                        } else {
+                            Tok::Accent
+                        },
+                    ));
+                    if self.application_changes.contains_key(def.path) {
+                        tags.push((self.application_timing(def).to_owned(), Tok::Warning));
                     }
                     if def.restart {
                         tags.push(("restart".to_owned(), Tok::Warning));
@@ -3423,7 +3732,9 @@ impl SettingsOverlay {
                     hints.push(pair(
                         Action::SelectUp,
                         Action::SelectDown,
-                        if matches!(def.kind_for(&self.effective), Kind::Theme) {
+                        if appearance::is_appearance(def)
+                            || matches!(def.kind_for(&self.effective), Kind::Theme)
+                        {
                             "preview"
                         } else {
                             "choose"
@@ -3436,7 +3747,13 @@ impl SettingsOverlay {
                 hints.push(hint(
                     keys,
                     Action::SelectCancel,
-                    if filtering { "clear filter" } else { "cancel" },
+                    if filtering && !appearance::is_appearance(def) {
+                        "clear filter"
+                    } else if appearance::is_appearance(def) {
+                        "discard"
+                    } else {
+                        "cancel"
+                    },
                 ));
                 hints
             }
@@ -3478,6 +3795,7 @@ impl SettingsOverlay {
                     Some(Row::Setting(i)) => {
                         let def = &crate::config::schema::registry()[i];
                         match (def.kind, def.source()) {
+                            (Kind::Bool, _) if appearance::is_appearance(def) => "preview",
                             (Kind::Bool, _) => "toggle",
                             (_, Some(Source::Path(_))) => "browse",
                             (_, Some(_))
@@ -3492,15 +3810,18 @@ impl SettingsOverlay {
                 let mut hints = vec![
                     hint(keys, Action::SelectConfirm, verb),
                     pair(Action::SelectUp, Action::SelectDown, "move"),
-                    if self.search.is_empty() {
-                        pair(Action::TabPrev, Action::TabNext, "tabs")
+                    if self.search.is_empty() && !self.changed_only {
+                        pair(Action::TabPrev, Action::TabNext, "categories")
                     } else {
                         // Tab does not switch tabs while searching, so do not advertise it then.
                         String::new()
                     },
                     hint(keys, Action::SectionNext, "sections"),
                     "Ctrl+S scope".to_owned(),
+                    "Ctrl+O changed only".to_owned(),
+                    "Alt+Left back".to_owned(),
                     "Del clear override".to_owned(),
+                    "Ctrl+Del review removals".to_owned(),
                     if self.setup_offers.is_empty() {
                         String::new()
                     } else {
@@ -3509,10 +3830,12 @@ impl SettingsOverlay {
                     hint(
                         keys,
                         Action::SelectCancel,
-                        if self.search.is_empty() {
-                            "close"
-                        } else {
+                        if !self.search.is_empty() {
                             "clear search"
+                        } else if self.changed_only {
+                            "all settings"
+                        } else {
+                            "close"
                         },
                     ),
                 ];

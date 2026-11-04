@@ -20,6 +20,8 @@ use ratatui::{
 
 /// Narrower terminals keep the one-line summary.
 pub const MIN_WIDTH: usize = 90;
+/// Medium terminals retain a collapsed plan-only card.
+pub const COLLAPSED_MIN_WIDTH: usize = 60;
 /// The card never grows past this many columns, however wide the terminal is.
 pub const MAX_WIDTH: usize = 100;
 /// Borders, the tab strip and one step.
@@ -77,11 +79,35 @@ pub fn rows(
     theme: &Theme,
     spinner: Option<&str>,
 ) -> Rows {
-    if !todo.has_open() || width < MIN_WIDTH || max_rows < MIN_ROWS {
+    if !todo.has_open() || width < COLLAPSED_MIN_WIDTH || max_rows < MIN_ROWS {
         return Vec::new();
     }
     let card_w = width.min(MAX_WIDTH);
     let content_w = card_w - 4;
+    if width < MIN_WIDTH {
+        let tasks = todo.tasks();
+        let Some(focus) = focus_index(tasks) else {
+            return Vec::new();
+        };
+        let mut body = vec![vec![Span::styled(" plan ", chrome::tab_style(theme, true))]];
+        body.extend(
+            tasks
+                .iter()
+                .skip(focus)
+                .take(2.min(max_rows - 3))
+                .map(|task| tasks::task_spans(task, "", theme, spinner, false)),
+        );
+        let inner = body.len();
+        let (closed, total) = todo.progress();
+        return card(
+            theme,
+            card_w,
+            Some(&format!("tasks {closed}/{total}")),
+            None,
+            body,
+            inner,
+        );
+    }
     // The top and bottom borders and the tab strip take three rows; the detail gets the rest.
     let detail_rows = max_rows - 3;
     let mut body = vec![tab_strip(theme, tab)];
@@ -215,7 +241,7 @@ fn detail(
             let mut out = vec![vec![
                 Span::styled(format!("{} ", theme.sym(Sym::Bullet)), theme.fg(dot)),
                 Span::styled(
-                    mode.clone(),
+                    super::status::approval_label(&mode).to_owned(),
                     theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
                 ),
             ]];

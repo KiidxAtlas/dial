@@ -410,21 +410,22 @@ impl EditStore {
         match snapshot {
             None => {
                 let hint = if snapshots.is_some() {
-                    "witness was dropped from memory pressure; re-read its affected lines with a targeted read such as `{}:START-END`"
+                    "witness was dropped from memory pressure; re-read its affected lines"
                 } else {
-                    "read its affected lines with a targeted read such as `{}:START-END`"
+                    "read its affected lines"
                 };
                 Err(format!(
-                    "{} has no current source/read witness ({}); for a hashline edit, retry with the fresh [path#TAG] header that read returns",
+                    "{} has no current source/read witness ({} with a targeted read such as `{}:START-END`); for a hashline edit, retry with the fresh [path#TAG] header that read returns; otherwise retry the edit after the refreshed read",
                     path.display(),
-                    hint
+                    hint,
+                    path.display()
                 ))
             }
             Some(snapshot) => {
                 for &(a, b) in ranges {
                     if let Some((first, last)) = snapshot.seen.first_unseen(a, b) {
                         return Err(format!(
-                            "{} lines {first}-{last} were not displayed in full; read `{}:{first}-{last}` first; for a hashline edit, retry with the fresh [path#TAG] header that read returns",
+                            "{} lines {first}-{last} were not displayed in full; read `{}:{first}-{last}` first; for a hashline edit, retry with the fresh [path#TAG] header that read returns; otherwise retry the edit after the refreshed read",
                             path.display(),
                             path.display()
                         ));
@@ -2992,6 +2993,7 @@ pub fn rehydrate<'a>(
                 editable
             }
             "find" => crate::tools::code::navigation::source_targets(ws, args, text),
+            "glob" => crate::tools::fs::search::glob_source_targets(ws, args, text),
             "write" => {
                 let Some(path) = args["path"].as_str() else {
                     continue;
@@ -3016,7 +3018,8 @@ pub fn rehydrate<'a>(
         requested.sort();
         requested.dedup();
         let mut current = None;
-        let multiple = tool == "find" || (tool == "read" && args["paths"].is_array());
+        let multiple =
+            matches!(tool, "find" | "glob") || (tool == "read" && args["paths"].is_array());
         if tool == "read"
             && !multiple
             && !text

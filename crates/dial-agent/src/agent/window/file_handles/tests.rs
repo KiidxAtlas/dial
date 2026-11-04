@@ -393,3 +393,14 @@ fn recorded_read_selectors_compact_but_signed_replay_stays_untouched() {
         json!(["@f1:1-3", "@f1:raw:8-9"])
     );
 }
+
+#[test]
+fn pointer_projection_does_not_reintroduce_file_labels() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(root.path()).unwrap();
+    std::fs::write(root.path().join("note.rs"), "source").unwrap();
+    let read = call("read", json!({"path":"note.rs"}));
+    let pointer = "[Unchanged read] Fresh read succeeded; same rows in still-visible tool call first. Reuse them.";
+    assert_eq!(model_result(&ws, &read, pointer), pointer);
+    assert!(ws.existing_file_handle("note.rs").is_none());
+}

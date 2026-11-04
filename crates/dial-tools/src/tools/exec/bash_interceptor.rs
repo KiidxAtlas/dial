@@ -109,7 +109,7 @@ pub fn trim_hint(config: &BashInterceptorConfig, command: &str) -> Option<String
         })
     });
     trims.then(|| {
-        "[hint] `bash` already bounds long output (it keeps the start and end), so `| head`/`| tail` only hides lines you may rerun the command to see. Drop the trim, and put independent commands in one response instead of one call each.".to_owned()
+        "[hint] `bash` already bounds long output (it keeps the start and end), so `| head`/`| tail` only hides lines you may rerun the command to see. Drop the output trim unless it selects part of the result required by the task.".to_owned()
     })
 }
 

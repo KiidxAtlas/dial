@@ -55,3 +55,20 @@ fn a_parent_without_workers_restores_nothing() {
     assert!(interrupted_workers(&layout, "parent").is_empty());
     assert!(interrupted_workers(&layout, "other").is_empty());
 }
+
+#[test]
+fn restore_review_rejection_never_calls_resume() {
+    for choice in [None, Some(0), Some(2)] {
+        let report =
+            reviewed_action(choice, || panic!("cancelled review must not resume")).unwrap();
+        assert_eq!(report, Report::default());
+    }
+    let report = reviewed_action(Some(1), || {
+        Ok(Report {
+            restored: vec!["task-1".into()],
+            rejected: vec![],
+        })
+    })
+    .unwrap();
+    assert_eq!(report.restored, ["task-1"]);
+}

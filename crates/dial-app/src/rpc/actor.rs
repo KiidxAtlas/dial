@@ -22,6 +22,7 @@ impl ParkedSession {
 fn activate_session(
     agent: &mut Agent<'_>,
     next: ParkedSession,
+    workspace: crate::agent::base::SessionWorkspace,
     parked: &mut std::collections::HashMap<String, ParkedSession>,
     current: bool,
 ) {
@@ -29,7 +30,7 @@ fn activate_session(
     let previous = ParkedSession {
         plan: agent.plan_mode(),
         tools: agent.replace_session_tools(next.tools),
-        session: agent.swap_session(next.session),
+        session: agent.swap_session_prepared(next.session, workspace),
     };
     agent.set_plan_mode(next.plan);
     if current {
@@ -335,8 +336,9 @@ impl ActorRuntime<'_> {
                 self.config.compute_locks && self.agent.foreground_idle_pending(queued)?;
             let mut ready = !foreground || self.compute.is_some();
             if foreground && self.compute.is_none() {
-                let lock =
-                    crate::learn::auto::lock_file(&self.layout.user_dir.join("compute.lock"))?;
+                let lock = crate::learn::auto::lock_file(
+                    &crate::config::paths::compute_lock_file(&self.layout.user_dir),
+                )?;
                 match std::fs::File::try_lock(&lock).map_err(std::io::Error::from) {
                     Ok(()) => {
                         crate::learn::compute::register(
@@ -390,8 +392,57 @@ impl ActorRuntime<'_> {
         Ok(())
     }
 
+    /// Implicit ACP selection is a real session switch, including for query requests.
+    fn activate_parked(&mut self, wanted: &str) -> Result<()> {
+        let next = self.parked.get(wanted).context("session is not open")?;
+        self.agent
+            .gate_session_change(
+                "session_before_switch",
+                json!({"reason":"activate","target_session_id":wanted}),
+            )
+            .map_err(anyhow::Error::msg)?;
+        let workspace = self.agent.prepare_session_workspace(&next.session)?;
+        stop_owned_tasks(&mut self.agent, &mut self.ui);
+        drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
+        let next = self.parked.remove(wanted).context("session is not open")?;
+        activate_session(
+            &mut self.agent,
+            next,
+            workspace,
+            &mut self.parked,
+            self.current,
+        );
+        self.current = true;
+        Ok(())
+    }
+
     fn handle_request(&mut self, request: &Value) -> Result<Value> {
         let params = &request["params"];
+        let method = request["method"].as_str().unwrap_or("");
+        if self.acp
+            && !matches!(
+                method,
+                "new_session"
+                    | "resume"
+                    | "fork_session"
+                    | "list_sessions"
+                    | "close_session"
+                    | "_cancel"
+            )
+        {
+            let wanted = params["session_id"]
+                .as_str()
+                .context("session_id required")?;
+            anyhow::ensure!(
+                self.current || self.parked.contains_key(wanted),
+                "session is not open"
+            );
+            if !self.current || self.agent.session().id() != wanted {
+                self.activate_parked(wanted)?;
+            }
+            self.worker_out
+                .emit(json!({"event":"active_session","session_id":self.agent.session().id()}));
+        }
         let memory_compute = request["method"] == "memory"
             && self.config.memory_uses_local_compute()
             && !matches!(
@@ -422,34 +473,6 @@ impl ActorRuntime<'_> {
                 &self.config.state_dir,
                 &self.config.model,
             )?;
-        }
-        let method = request["method"].as_str().unwrap_or("");
-        if self.acp
-            && !matches!(
-                method,
-                "new_session"
-                    | "resume"
-                    | "fork_session"
-                    | "list_sessions"
-                    | "close_session"
-                    | "_cancel"
-            )
-        {
-            let wanted = params["session_id"]
-                .as_str()
-                .context("session_id required")?;
-            anyhow::ensure!(
-                self.current || self.parked.contains_key(wanted),
-                "session is not open"
-            );
-            if !self.current || self.agent.session().id() != wanted {
-                stop_owned_tasks(&mut self.agent, &mut self.ui);
-                let session = self.parked.remove(wanted).context("session is not open")?;
-                activate_session(&mut self.agent, session, &mut self.parked, self.current);
-                self.current = true;
-            }
-            self.worker_out
-                .emit(json!({"event":"active_session","session_id":self.agent.session().id()}));
         }
         match request["method"].as_str().unwrap_or("") {
             "send" | "live_listen" => self.send(request, params),
@@ -676,21 +699,28 @@ impl ActorRuntime<'_> {
         self.agent
             .gate_session_change("session_before_switch", json!({"reason":"new"}))
             .map_err(anyhow::Error::msg)?;
-        drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
         let session = Session::create(
             self.layout,
             SessionMeta {
                 model: self.config.model.clone(),
             },
         )?;
+        let workspace = self.agent.prepare_session_workspace(&session)?;
+        drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
         if self.acp {
             stop_owned_tasks(&mut self.agent, &mut self.ui);
             let next = ParkedSession::fresh(&self.agent, session);
-            activate_session(&mut self.agent, next, &mut self.parked, self.current);
+            activate_session(
+                &mut self.agent,
+                next,
+                workspace,
+                &mut self.parked,
+                self.current,
+            );
             self.agent.set_plan_mode(false);
             self.current = true;
         } else {
-            self.agent.swap_session(session);
+            self.agent.swap_session_prepared(session, workspace);
             self.agent.set_plan_mode(false);
         }
         Ok(json!({"session_id":self.agent.session().id(),"plan_mode":self.agent.plan_mode()}))
@@ -740,20 +770,33 @@ impl ActorRuntime<'_> {
         let wanted = params["session_id"]
             .as_str()
             .context("resume requires params.session_id")?;
-        if !self.agent.session().id().starts_with(wanted) {
+        if !self.current
+            || (if self.acp {
+                self.agent.session().id() != wanted
+            } else {
+                !self.agent.session().id().starts_with(wanted)
+            })
+        {
             self.agent
                 .gate_session_change(
                     "session_before_switch",
                     json!({"reason":"resume","target_session_id":wanted}),
                 )
                 .map_err(anyhow::Error::msg)?;
-            drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
         }
         let mut forked_from: Option<String> = None;
         if self.acp {
             if !self.current || self.agent.session().id() != wanted {
-                let session = if let Some(session) = self.parked.remove(wanted) {
-                    session
+                let workspace = self
+                    .parked
+                    .get(wanted)
+                    .map(|next| self.agent.prepare_session_workspace(&next.session))
+                    .transpose()?;
+                let (session, workspace) = if let Some(workspace) = workspace {
+                    (
+                        self.parked.remove(wanted).context("session is not open")?,
+                        workspace,
+                    )
                 } else {
                     let info = Session::find_prefix(self.layout, wanted)?
                         .into_iter()
@@ -766,10 +809,18 @@ impl ActorRuntime<'_> {
                         }
                     };
                     forked_from = source;
-                    ParkedSession::fresh(&self.agent, session)
+                    let workspace = self.agent.prepare_session_workspace(&session)?;
+                    (ParkedSession::fresh(&self.agent, session), workspace)
                 };
                 stop_owned_tasks(&mut self.agent, &mut self.ui);
-                activate_session(&mut self.agent, session, &mut self.parked, self.current);
+                drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
+                activate_session(
+                    &mut self.agent,
+                    session,
+                    workspace,
+                    &mut self.parked,
+                    self.current,
+                );
                 self.current = true;
             }
             if params["_replay"] == true {
@@ -800,7 +851,10 @@ impl ActorRuntime<'_> {
                     }
                 };
                 forked_from = source;
-                self.agent.swap_session(session);
+                let workspace = self.agent.prepare_session_workspace(&session)?;
+                stop_owned_tasks(&mut self.agent, &mut self.ui);
+                drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
+                self.agent.swap_session_prepared(session, workspace);
                 self.agent.set_plan_mode(false);
             }
             Ok(json!({"session_id":self.agent.session().id(),"forked_from":forked_from}))
@@ -817,9 +871,13 @@ impl ActorRuntime<'_> {
                 json!({"reason":"fork","source_session_id":wanted}),
             )
             .map_err(anyhow::Error::msg)?;
-        drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
+        self.agent
+            .gate_session_change(
+                "session_before_switch",
+                json!({"reason":"fork","source_session_id":wanted}),
+            )
+            .map_err(anyhow::Error::msg)?;
         let session = if self.current && self.agent.session().id() == wanted {
-            stop_owned_tasks(&mut self.agent, &mut self.ui);
             self.agent.session().fork(self.layout)?
         } else if let Some(session) = self.parked.get(wanted) {
             session.session.fork(self.layout)?
@@ -830,11 +888,17 @@ impl ActorRuntime<'_> {
                 .context("session id not found in launched project")?;
             Session::read(&info.path)?.fork(self.layout)?
         };
-        if !self.current || self.agent.session().id() != wanted {
-            stop_owned_tasks(&mut self.agent, &mut self.ui);
-        }
+        let workspace = self.agent.prepare_session_workspace(&session)?;
+        stop_owned_tasks(&mut self.agent, &mut self.ui);
+        drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
         let next = ParkedSession::fresh(&self.agent, session);
-        activate_session(&mut self.agent, next, &mut self.parked, self.current);
+        activate_session(
+            &mut self.agent,
+            next,
+            workspace,
+            &mut self.parked,
+            self.current,
+        );
         self.agent.set_plan_mode(false);
         self.current = true;
         Ok(json!({"session_id":self.agent.session().id(),"plan_mode":self.agent.plan_mode()}))
@@ -845,11 +909,16 @@ impl ActorRuntime<'_> {
             .as_str()
             .context("session_id required")?;
         if self.current && self.agent.session().id() == wanted {
+            self.agent
+                .gate_session_change("session_before_switch", json!({"reason":"close"}))
+                .map_err(anyhow::Error::msg)?;
+            let session = Session::ephemeral();
+            let workspace = self.agent.prepare_session_workspace(&session)?;
             stop_owned_tasks(&mut self.agent, &mut self.ui);
             drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
             let tools = self.agent.fresh_session_tools();
             self.agent.replace_session_tools(tools);
-            self.agent.swap_session(Session::ephemeral());
+            self.agent.swap_session_prepared(session, workspace);
             self.agent.set_plan_mode(false);
             self.current = false;
         } else {

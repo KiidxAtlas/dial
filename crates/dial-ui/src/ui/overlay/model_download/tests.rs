@@ -316,6 +316,98 @@ fn a_finished_download_asks_for_a_rescan_once() {
 }
 
 #[test]
+fn releasing_the_final_session_owner_cancels_a_download() {
+    let session = ModelDownloads::idle().into_shared();
+    let view = session.clone();
+    let (cancel, _done) = session.borrow_mut().fake_download("org/model");
+    drop(view);
+    assert!(!cancel.load(Ordering::SeqCst));
+    drop(session);
+    assert!(cancel.load(Ordering::SeqCst));
+}
+
+#[test]
+fn hidden_session_downloads_retain_bounded_failure_evidence_without_starting_work() {
+    let session = ModelDownloads::idle().into_shared();
+    let view = session.clone();
+    let (_cancel, done) = session.borrow_mut().fake_download("org/model");
+    drop(view);
+    assert!(session.borrow().last_failure().is_none());
+    done.send(Err("é".repeat(4096))).unwrap();
+    session.borrow_mut().poll();
+    let failure = session.borrow().last_failure().cloned().unwrap();
+    assert_eq!(failure.repo, "org/model");
+    assert_eq!(failure.detail.chars().count(), 2048);
+    assert!(session.borrow().task.is_none());
+    session.borrow_mut().poll();
+    assert_eq!(session.borrow().last_failure(), Some(&failure));
+    assert!(!session.borrow_mut().take_rescan());
+}
+
+#[test]
+fn hidden_success_keeps_session_ownership_and_rescans_once_from_a_reopened_view() {
+    let session = ModelDownloads::idle().into_shared();
+    let view = session.clone();
+    let (cancel, done) = view.borrow_mut().fake_download("org/model");
+    drop(view);
+    assert!(
+        !cancel.load(Ordering::SeqCst),
+        "closing a view is not cancellation"
+    );
+    done.send(Ok("/no/such/path".to_owned())).unwrap();
+    session.borrow_mut().poll();
+    assert!(session.borrow().task.is_none());
+    assert!(session.borrow().last_failure().is_none());
+    let reopened = session.clone();
+    assert!(
+        reopened.borrow_mut().take_rescan(),
+        "hidden success survives until observed"
+    );
+    assert!(
+        !session.borrow_mut().take_rescan(),
+        "the shared owner consumes completion exactly once"
+    );
+    assert!(
+        !cancel.load(Ordering::SeqCst),
+        "completed work is not cancelled when a view changes"
+    );
+}
+
+#[test]
+fn task_error_and_disconnect_are_observed_but_cancellation_and_pending_are_not_failures() {
+    for (disconnect, cancelled) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut group = ModelDownloads::idle();
+        let (cancel, done) = group.fake_download("org/model");
+        group.poll();
+        assert!(group.last_failure().is_none());
+        cancel.store(cancelled, Ordering::SeqCst);
+        if !disconnect {
+            done.send(Err("fixture error".into())).unwrap();
+        }
+        drop(done);
+        group.poll();
+        assert_eq!(group.last_failure().is_some(), !cancelled);
+        assert!(group.task.is_none());
+    }
+    for disconnected in [false, true] {
+        let mut group = ModelDownloads::idle();
+        let (send, rx) = mpsc::channel();
+        group.task = Some(Task::Inspect {
+            repo: "org/listing".into(),
+            family: Family::Mlx,
+            rx,
+        });
+        if !disconnected {
+            send.send(Err("fixture listing error".into())).unwrap();
+        }
+        drop(send);
+        group.poll();
+        assert_eq!(group.last_failure().unwrap().repo, "org/listing");
+        assert!(group.task.is_none());
+    }
+}
+
+#[test]
 fn same_model_accepts_a_file_inside_the_listed_directory() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path().join("snapshot");
@@ -730,4 +822,24 @@ fn backspace_after_moving_to_results_edits_the_query_again() {
         Focus::Results,
         "nothing to delete leaves the results focused"
     );
+}
+
+#[test]
+fn retained_download_failure_redacts_credentials_before_truncation() {
+    let mut group = ModelDownloads::idle();
+    group.record_failure(
+        "org/model",
+        &format!(
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234567890 {}",
+            "é".repeat(4096)
+        ),
+    );
+    let failure = group.last_failure().unwrap();
+    assert!(failure.detail.contains("REDACTED"));
+    assert!(
+        !failure
+            .detail
+            .contains("abcdefghijklmnopqrstuvwxyz1234567890")
+    );
+    assert!(failure.detail.chars().count() <= 2048);
 }

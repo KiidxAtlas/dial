@@ -1,6 +1,7 @@
 {
   description = "Dial local-first coding agent harness";
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  # Immutable nixos-unstable revision; update deliberately and regenerate flake.lock with Nix.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/1d060086d60cb76a40cf37109f979d88a5bd6396";
   outputs = { self, nixpkgs }:
     let
       systems = [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ];

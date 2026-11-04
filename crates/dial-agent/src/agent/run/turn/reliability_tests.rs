@@ -1168,3 +1168,97 @@ fn an_empty_tool_search_returns_catalog_without_enabling_a_capability() {
         "an empty search must not change the next request's callable tools"
     );
 }
+
+#[test]
+fn discovery_recovery_uses_the_next_requests_policy_and_is_delivered_once() {
+    for one_call in [false, true] {
+        let server = llm::fake::serve(vec![
+            response(
+                "",
+                Some(("grep", json!({"pattern":"name:","path":"registry.rs"}))),
+            ),
+            slots(),
+            response(
+                "",
+                Some((
+                    "grep",
+                    json!({"pattern":"CommandSpec", "path":"registry.rs"}),
+                )),
+            ),
+            response("", Some(("read", json!({"path":"registry.rs"})))),
+            response("There are two tuple commands: help and exit.", None),
+        ]);
+        with_agent(
+            "[compaction]\nenabled=false\n[reliability]\nmeasured_interfaces=true\n",
+            |agent| {
+                connect(agent, &server.url);
+                std::fs::write(agent.workspace.root().join("registry.rs"), "const COMMANDS: &[(&str, &str)] = &[(\"help\", \"Help\"), (\"exit\", \"Exit\")];\n").unwrap();
+                if one_call {
+                    std::fs::create_dir_all(&agent.config.state_dir).unwrap();
+                    let record = json!({"version":1,"measured_at":crate::learn::improve::now(),"binding":crate::reliability::binding(agent.config),"batch_passed":false,"passed":1,"total":2});
+                    std::fs::write(
+                        agent.config.state_dir.join("reliability.json"),
+                        serde_json::to_vec(&record).unwrap(),
+                    )
+                    .unwrap();
+                }
+                let report = agent
+                    .turn(
+                        "Inspect registry.rs and report the command names.",
+                        &mut NullUi,
+                    )
+                    .unwrap();
+                assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+                let control = agent.session.control_state();
+                let policy = &control["reliability"]["call_policy"];
+                assert_eq!(policy["mode"], if one_call { "one_call" } else { "batch" });
+                assert_eq!(
+                    policy["reasons"],
+                    if one_call {
+                        json!(["saved_reliability_record"])
+                    } else {
+                        json!([])
+                    }
+                );
+                assert_eq!(
+                    control["adaptive_policy"]["selection"]["call_policy"],
+                    *policy
+                );
+                assert!(
+                    control["adaptive_history"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|entry| entry["selection"]["call_policy"] == *policy)
+                );
+            },
+        );
+        let requests = completion_requests(&server);
+        assert_eq!(
+            requests.len(),
+            4,
+            "the harness should not add inference rounds; raw requests: {:?}",
+            server
+                .requests()
+                .iter()
+                .map(|request| String::from_utf8_lossy(request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(!mentions(&requests[0], "[Discovery recovery]"));
+        assert!(!mentions(&requests[1], "[Discovery recovery]"));
+        assert!(mentions(&requests[2], "[Discovery recovery]"));
+        assert_eq!(mentions(&requests[2], "Gather unrelated docs"), !one_call);
+        assert_eq!(
+            mentions(&requests[2], "inspect that declaration next"),
+            one_call
+        );
+        assert!(
+            !mentions(&requests[3], "[Discovery recovery]"),
+            "a delivered correction must retire"
+        );
+    }
+}

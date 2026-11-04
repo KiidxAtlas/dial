@@ -9,8 +9,8 @@ use crate::config::settings_store::{locked, write_private};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(test)]
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -27,6 +27,10 @@ const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 512;
 const MAX_PROVIDERS: usize = 64;
 const CONCURRENCY: usize = 8;
+const MAX_PAGES: usize = 16;
+const LISTING_BUDGET: Duration = Duration::from_secs(5);
+const ENRICHMENT_BUDGET: Duration = Duration::from_secs(1);
+const MAX_ENRICHMENTS: usize = 16;
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const OPENROUTER_VALIDATE_URL: &str = "https://openrouter.ai/api/v1/auth/key";
 const KNOWN: &[(&str, &str, &str, &str)] = &[
@@ -567,10 +571,10 @@ pub fn model_metadata(layout: &Layout, selection: &ModelSelection) -> ModelMetad
         return local_model_metadata(Path::new(&model));
     }
     let metadata = cached(&layout.user_dir)
-        .remove(&selection_cache_key(selection))
+        .get(&selection_cache_key(selection))
         .and_then(|entries| {
             entries
-                .into_iter()
+                .iter()
                 .find(|entry| same_model(&entry.selection, selection))
         })
         .map(|entry| entry.metadata)
@@ -615,7 +619,8 @@ fn valid_token(token: &str) -> Result<()> {
     Ok(())
 }
 fn credential_map(user_dir: &Path) -> Result<BTreeMap<String, String>> {
-    let bytes = crate::platform::atomic::read_private(&user_dir.join("credentials.json"))?;
+    let bytes =
+        crate::platform::atomic::read_private(&super::credential_store::api_key_path(user_dir))?;
     match bytes {
         Some(bytes) => serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("credential file is invalid; no changes saved")),
@@ -624,7 +629,7 @@ fn credential_map(user_dir: &Path) -> Result<BTreeMap<String, String>> {
 }
 pub fn credential_token(user_dir: &Path, base_url: &str) -> Result<Option<String>> {
     validated_url(base_url, true)?;
-    let path = user_dir.join("credentials.json");
+    let path = super::credential_store::api_key_path(user_dir);
     let _lock = locked(&path)?;
     let token = credential_map(user_dir)?.remove(base_url);
     if let Some(token) = &token {
@@ -647,19 +652,25 @@ pub fn known_key_env(base_url: &str) -> Option<&'static str> {
 pub fn save_credential(user_dir: &Path, base_url: &str, token: &str) -> Result<()> {
     validated_url(base_url, true)?;
     valid_token(token)?;
-    let path = user_dir.join("credentials.json");
+    let path = super::credential_store::api_key_path(user_dir);
     let _lock = locked(&path)?;
     let mut credentials = credential_map(user_dir)?;
     credentials.insert(base_url.to_owned(), token.to_owned());
-    write_private(&path, &serde_json::to_vec(&credentials)?)
+    write_private(
+        &super::credential_store::api_key_path(user_dir),
+        &serde_json::to_vec(&credentials)?,
+    )
 }
 pub fn remove_credential(user_dir: &Path, base_url: &str) -> Result<()> {
     validated_url(base_url, true)?;
-    let path = user_dir.join("credentials.json");
+    let path = super::credential_store::api_key_path(user_dir);
     let _lock = locked(&path)?;
     let mut credentials = credential_map(user_dir)?;
     credentials.remove(base_url);
-    write_private(&path, &serde_json::to_vec(&credentials)?)
+    write_private(
+        &super::credential_store::api_key_path(user_dir),
+        &serde_json::to_vec(&credentials)?,
+    )
 }
 
 // Never derive Debug: this transient object can contain a bearer credential.
@@ -1067,6 +1078,14 @@ fn parse_models(value: &Value, probe: &Probe) -> Result<Vec<ModelEntry>> {
 /// settings panel shows it as "not running" for a local server, rather than as a failure.
 pub const UNREACHABLE_DETAIL: &str = "Connection failed or metadata probe timed out";
 fn probe_models(probe: &Probe) -> (ProviderStatus, Vec<ModelEntry>) {
+    let (mut state, models) = probe_models_inner(probe);
+    if state.state == "unavailable" && state.detail != UNREACHABLE_DETAIL {
+        state.detail = format!("Model listing incomplete; {}", state.detail);
+    }
+    (state, models)
+}
+
+fn probe_models_inner(probe: &Probe) -> (ProviderStatus, Vec<ModelEntry>) {
     if super::model_config::validate_headers(probe.spec.headers.as_deref().unwrap_or_default())
         .is_err()
     {
@@ -1137,150 +1156,282 @@ fn probe_models(probe: &Probe) -> (ProviderStatus, Vec<ModelEntry>) {
             chat.strip_suffix("chat/completions").unwrap_or(&chat)
         )
     };
-    let mut request = agent.get(&url).header("Accept", "application/json");
-    let resolved_headers = match super::model_config::resolve_validated_headers(
-        probe.spec.headers.as_deref().unwrap_or_default(),
-    ) {
-        Ok(headers) => headers,
-        Err(_) => {
+    let deadline = Instant::now()
+        + if local {
+            Duration::from_secs(1)
+        } else {
+            LISTING_BUDGET
+        };
+    let mut cursor: Option<String> = None;
+    let mut cursors = BTreeSet::new();
+    let mut models = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut total_rows = 0_usize;
+    for page in 0..MAX_PAGES {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return (
+                status(probe, "unavailable", "Model listing deadline reached", 0),
+                Vec::new(),
+            );
+        };
+        let mut request = agent.get(&url).header("Accept", "application/json");
+        if let Some(cursor) = &cursor {
+            // Continuations are opaque query values, never provider-controlled URLs. Reuse the
+            // validated endpoint and the same authentication on every page.
+            request = request.query(
+                if protocol == ApiProtocol::Gemini {
+                    "pageToken"
+                } else {
+                    "after_id"
+                },
+                cursor,
+            );
+        }
+        let resolved_headers = match super::model_config::resolve_validated_headers(
+            probe.spec.headers.as_deref().unwrap_or_default(),
+        ) {
+            Ok(headers) => headers,
+            Err(_) => {
+                return (
+                    status(
+                        probe,
+                        "unavailable",
+                        "Request header environment is unavailable or invalid",
+                        0,
+                    ),
+                    Vec::new(),
+                );
+            }
+        };
+        for (name, value) in resolved_headers.pairs() {
+            let field = match super::model_config::private_header_value(value) {
+                Ok(field) => field,
+                Err(_) => {
+                    return (
+                        status(probe, "unavailable", "Invalid request header value", 0),
+                        Vec::new(),
+                    );
+                }
+            };
+            request = request.header(name, field);
+        }
+        if let Some(token) = &probe.token {
+            if protocol == ApiProtocol::Gemini {
+                request = request.header("x-goog-api-key", token);
+            } else if protocol == ApiProtocol::Anthropic {
+                let headers = match super::anthropic::auth_headers(&url, token) {
+                    Ok(headers) => headers,
+                    Err(_) => {
+                        return (
+                            status(
+                                probe,
+                                "auth-required",
+                                "Subscription credentials require the official Anthropic endpoint",
+                                0,
+                            ),
+                            Vec::new(),
+                        );
+                    }
+                };
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+            } else {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+        }
+        let mut response = match request
+            .config()
+            .timeout_global(Some(remaining))
+            .build()
+            .call()
+        {
+            Ok(response) => response,
+            Err(_) => {
+                return (
+                    status(probe, "unavailable", UNREACHABLE_DETAIL, 0),
+                    Vec::new(),
+                );
+            }
+        };
+        let code = response.status().as_u16();
+        if code == 401 || code == 403 {
             return (
                 status(
                     probe,
-                    "unavailable",
-                    "Request header environment is unavailable or invalid",
+                    "auth-required",
+                    "Endpoint requires valid credentials",
                     0,
                 ),
                 Vec::new(),
             );
         }
-    };
-    for (name, value) in resolved_headers.pairs() {
-        let field = match super::model_config::private_header_value(value) {
-            Ok(field) => field,
+        if !(200..300).contains(&code) {
+            return (
+                status(
+                    probe,
+                    "unavailable",
+                    &format!("Endpoint returned HTTP {code}; redirects are not followed"),
+                    0,
+                ),
+                Vec::new(),
+            );
+        }
+        let mut bytes = Vec::new();
+        if response
+            .body_mut()
+            .as_reader()
+            .take(MAX_RESPONSE.saturating_sub(total_bytes) + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MAX_RESPONSE.saturating_sub(total_bytes)
+        {
+            return (
+                status(
+                    probe,
+                    "unavailable",
+                    "Metadata response exceeded limits or could not be read",
+                    0,
+                ),
+                Vec::new(),
+            );
+        }
+        total_bytes += bytes.len() as u64;
+        let value = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => value,
             Err(_) => {
                 return (
-                    status(probe, "unavailable", "Invalid request header value", 0),
+                    status(
+                        probe,
+                        "unavailable",
+                        "Endpoint returned malformed model metadata",
+                        0,
+                    ),
                     Vec::new(),
                 );
             }
         };
-        request = request.header(name, field);
-    }
-    if let Some(token) = &probe.token {
-        if protocol == ApiProtocol::Gemini {
-            request = request.header("x-goog-api-key", token);
-        } else if protocol == ApiProtocol::Anthropic {
-            let headers = match super::anthropic::auth_headers(&url, token) {
-                Ok(headers) => headers,
-                Err(_) => {
-                    return (
-                        status(
-                            probe,
-                            "auth-required",
-                            "Subscription credentials require the official Anthropic endpoint",
-                            0,
-                        ),
-                        Vec::new(),
-                    );
-                }
-            };
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-        } else {
-            request = request.header("Authorization", format!("Bearer {token}"));
-        }
-    }
-    let mut response = match request.call() {
-        Ok(response) => response,
-        Err(_) => {
+        let rows = value
+            .get(
+                if matches!(protocol, ApiProtocol::Gemini | ApiProtocol::Ollama) {
+                    "models"
+                } else {
+                    "data"
+                },
+            )
+            .and_then(Value::as_array);
+        total_rows += rows.map_or(0, Vec::len);
+        if total_rows > MAX_MODELS {
             return (
-                status(probe, "unavailable", UNREACHABLE_DETAIL, 0),
+                status(
+                    probe,
+                    "unavailable",
+                    "Model listing exceeded model limit",
+                    0,
+                ),
                 Vec::new(),
             );
         }
-    };
-    let code = response.status().as_u16();
-    if code == 401 || code == 403 {
-        return (
-            status(
-                probe,
-                "auth-required",
-                "Endpoint requires valid credentials",
-                0,
-            ),
-            Vec::new(),
-        );
-    }
-    if !(200..300).contains(&code) {
-        return (
-            status(
-                probe,
-                "unavailable",
-                &format!("Endpoint returned HTTP {code}; redirects are not followed"),
-                0,
-            ),
-            Vec::new(),
-        );
-    }
-    let mut bytes = Vec::new();
-    if response
-        .body_mut()
-        .as_reader()
-        .take(MAX_RESPONSE + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.len() as u64 > MAX_RESPONSE
-    {
-        return (
-            status(
-                probe,
-                "unavailable",
-                "Metadata response exceeded limits or could not be read",
-                0,
-            ),
-            Vec::new(),
-        );
-    }
-    match serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|value| parse_models(&value, probe).ok())
-    {
-        Some(mut models) => {
-            if protocol == ApiProtocol::Ollama {
-                annotate_ollama(
-                    &mut models,
-                    &agent,
-                    url.strip_suffix("/api/tags").unwrap_or(&url),
-                    probe.token.as_deref(),
-                    &resolved_headers,
+        let entries = match parse_models(&value, probe) {
+            Ok(entries) => entries,
+            Err(_) => {
+                return (
+                    status(
+                        probe,
+                        "unavailable",
+                        "Endpoint returned malformed model metadata",
+                        0,
+                    ),
+                    Vec::new(),
                 );
             }
-            if local
-                && probe.id != "ollama"
-                && let Some(info) = lmstudio_models_with_headers(
-                    &probe.spec.base_url,
-                    probe.token.as_deref(),
-                    &resolved_headers,
-                )
-            {
-                annotate_lmstudio(&mut models, &info);
+        };
+        models.extend(entries);
+        let next = match listing_cursor(&value, protocol) {
+            Ok(next) => next,
+            Err(_) => {
+                return (
+                    status(
+                        probe,
+                        "unavailable",
+                        "Invalid model listing continuation",
+                        0,
+                    ),
+                    Vec::new(),
+                );
             }
-            (
-                status(probe, "reachable", "Live model metadata", models.len()),
-                models,
-            )
+        };
+        if let Some(next) = next {
+            if page + 1 == MAX_PAGES || !cursors.insert(next.clone()) {
+                return (
+                    status(
+                        probe,
+                        "unavailable",
+                        "Model listing continuation limit reached or repeated cursor",
+                        0,
+                    ),
+                    Vec::new(),
+                );
+            }
+            cursor = Some(next);
+            continue;
         }
-        None => (
-            status(
-                probe,
-                "unavailable",
-                "Endpoint returned malformed model metadata",
-                0,
-            ),
-            Vec::new(),
-        ),
+        let mut seen = BTreeSet::new();
+        models.retain(|entry| seen.insert(entry.selection.model.clone()));
+        if protocol == ApiProtocol::Ollama {
+            annotate_ollama(
+                &mut models,
+                &agent,
+                url.strip_suffix("/api/tags").unwrap_or(&url),
+                probe.token.as_deref(),
+                &resolved_headers,
+            );
+        }
+        if local
+            && probe.id != "ollama"
+            && let Some(info) = lmstudio_models_with_headers(
+                &probe.spec.base_url,
+                probe.token.as_deref(),
+                &resolved_headers,
+            )
+        {
+            annotate_lmstudio(&mut models, &info);
+        }
+        return (
+            status(probe, "reachable", "Live model metadata", models.len()),
+            models,
+        );
     }
+    (
+        status(probe, "unavailable", "Model listing page limit reached", 0),
+        Vec::new(),
+    )
+}
+
+// Gemini ListModels uses nextPageToken/pageToken; Anthropic List Models uses
+// has_more and last_id/after_id. Other protocols retain their single-response contract.
+fn listing_cursor(value: &Value, protocol: ApiProtocol) -> Result<Option<String>> {
+    let cursor = match protocol {
+        ApiProtocol::Gemini => match value.get("nextPageToken") {
+            None => return Ok(None),
+            Some(Value::String(token)) if token.is_empty() => return Ok(None),
+            Some(token) => token.as_str(),
+        },
+        ApiProtocol::Anthropic => match value.get("has_more") {
+            None | Some(Value::Bool(false)) => return Ok(None),
+            Some(Value::Bool(true)) => value.get("last_id").and_then(Value::as_str),
+            _ => None,
+        },
+        _ => return Ok(None),
+    };
+    let cursor = cursor.filter(|cursor| {
+        !cursor.is_empty() && cursor.len() <= 4096 && !cursor.chars().any(char::is_control)
+    });
+    Ok(Some(
+        cursor
+            .ok_or_else(|| anyhow::anyhow!("invalid listing cursor"))?
+            .to_owned(),
+    ))
 }
 
 /// Verify credentials with a provider endpoint before persisting them.
@@ -1826,8 +1977,9 @@ fn declared_kind(row: &Value) -> ModelKind {
 
 /// Ollama's `/api/tags` states no purpose; its `/api/show` reports `capabilities` (`embedding`,
 /// `completion`, `tools`, `vision`, `thinking`, ...). Asked only for rows still `Unknown`, at most
-/// `CONCURRENCY` at a time, through the probe's agent, headers and key. A failed request leaves the
-/// row `Unknown` (still listed) with unknown capabilities.
+/// `CONCURRENCY` at a time, through the probe's agent, headers and key. Optional enrichment has
+/// one shared deadline and a request cap; failures or exhausted budget leave rows listed with
+/// unknown capabilities rather than withholding the basic catalog.
 fn annotate_ollama(
     models: &mut [ModelEntry],
     agent: &ureq::Agent,
@@ -1835,18 +1987,28 @@ fn annotate_ollama(
     token: Option<&str>,
     headers: &super::model_config::ResolvedHeaders<'_>,
 ) {
+    let deadline = Instant::now() + ENRICHMENT_BUDGET;
     let pending: Vec<(usize, String)> = models
         .iter()
         .enumerate()
         .filter(|(_, entry)| entry.metadata.kind == ModelKind::Unknown)
+        .take(MAX_ENRICHMENTS)
         .map(|(index, entry)| (index, entry.selection.model.clone()))
         .collect();
     for chunk in pending.chunks(CONCURRENCY) {
+        if Instant::now() >= deadline {
+            break;
+        }
         let shown: Vec<(usize, Value)> = std::thread::scope(|scope| {
             let jobs: Vec<_> = chunk
                 .iter()
                 .map(|(index, model)| {
-                    scope.spawn(move || (*index, ollama_show(agent, base, model, token, headers)))
+                    scope.spawn(move || {
+                        (
+                            *index,
+                            ollama_show(agent, base, model, token, headers, deadline),
+                        )
+                    })
                 })
                 .collect();
             jobs.into_iter()
@@ -1866,6 +2028,7 @@ fn ollama_show(
     model: &str,
     token: Option<&str>,
     headers: &super::model_config::ResolvedHeaders<'_>,
+    deadline: Instant,
 ) -> Option<Value> {
     let mut request = agent
         .post(format!("{base}/api/show"))
@@ -1877,6 +2040,8 @@ fn ollama_show(
     if let Some(token) = token {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    let request = request.config().timeout_global(Some(remaining)).build();
     let mut response = request
         .send_json(serde_json::json!({ "model": model }))
         .ok()?;
@@ -2274,7 +2439,7 @@ pub(crate) fn hf_cache() -> Option<PathBuf> {
 }
 /// The `mlx_lm/models` directory of dial's Python environment (`dial setup` creates it under the user dir).
 fn mlx_architectures(user_dir: &Path) -> Option<PathBuf> {
-    let lib = user_dir.join("python/.venv/lib");
+    let lib = crate::config::paths::python_dir(user_dir).join(".venv/lib");
     fs::read_dir(&lib)
         .ok()?
         .filter_map(Result::ok)
@@ -2456,22 +2621,22 @@ fn catalog_stamp(path: &Path) -> Option<(u64, std::time::SystemTime, u64)> {
 }
 
 type CatalogStamp = (std::path::PathBuf, (u64, std::time::SystemTime, u64));
-type ParsedCatalog = (CatalogStamp, BTreeMap<String, Vec<ModelEntry>>);
+type ParsedCatalog = (CatalogStamp, Arc<BTreeMap<String, Vec<ModelEntry>>>);
 static PARSED: std::sync::Mutex<Option<ParsedCatalog>> = std::sync::Mutex::new(None);
 
 /// The saved catalog, parsed once per file version. Role and backend construction read it on
 /// every request path; reparsing and re-keying every row each time was pure repeated work.
-fn cached(user_dir: &Path) -> BTreeMap<String, Vec<ModelEntry>> {
-    let path = user_dir.join("model-catalog.json");
+fn cached(user_dir: &Path) -> Arc<BTreeMap<String, Vec<ModelEntry>>> {
+    let path = crate::config::paths::model_catalog_file(user_dir);
     let Some(stamp) = catalog_stamp(&path).map(|stamp| (path.clone(), stamp)) else {
-        return parse_cached(user_dir);
+        return Arc::new(parse_cached(user_dir));
     };
     if let Some((seen, parsed)) = PARSED.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
         && *seen == stamp
     {
         return parsed.clone();
     }
-    let parsed = parse_cached(user_dir);
+    let parsed = Arc::new(parse_cached(user_dir));
     // Only remember a parse of the version that was stamped, never one that changed underneath.
     if catalog_stamp(&path) == Some(stamp.1) {
         *PARSED.lock().unwrap_or_else(|e| e.into_inner()) = Some((stamp, parsed.clone()));
@@ -2481,7 +2646,7 @@ fn cached(user_dir: &Path) -> BTreeMap<String, Vec<ModelEntry>> {
 
 fn parse_cached(user_dir: &Path) -> BTreeMap<String, Vec<ModelEntry>> {
     let mut cache: BTreeMap<String, Vec<ModelEntry>> =
-        crate::platform::atomic::read_private(&user_dir.join("model-catalog.json"))
+        crate::platform::atomic::read_private(&crate::config::paths::model_catalog_file(user_dir))
             .ok()
             .flatten()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -2536,8 +2701,8 @@ pub(crate) fn model_context_window(user_dir: &Path, selection: &ModelSelection) 
         .context_window
         .or_else(|| {
             cached(user_dir)
-                .remove(&selection_cache_key(selection))?
-                .into_iter()
+                .get(&selection_cache_key(selection))?
+                .iter()
                 .find(|entry| {
                     entry.selection.provider == selection.provider
                         && entry.selection.model == selection.model
@@ -2648,9 +2813,9 @@ fn persist_cache(user_dir: &Path, updates: BTreeMap<String, Vec<ModelEntry>>) ->
     if updates.is_empty() {
         return Ok(());
     }
-    let path = user_dir.join("model-catalog.json");
+    let path = crate::config::paths::model_catalog_file(user_dir);
     let _lock = locked(&path)?;
-    let mut cache = cached(user_dir);
+    let mut cache = (*cached(user_dir)).clone();
     let fresh: Vec<String> = updates.keys().cloned().collect();
     cache.extend(updates);
     while cache.len() > MAX_PROVIDERS {

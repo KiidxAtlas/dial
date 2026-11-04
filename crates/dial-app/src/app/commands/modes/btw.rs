@@ -17,6 +17,19 @@ pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
         shell.note("BTW", format!("error: {error:#}"));
         return Ok(Step::Done);
     }
+    if args.is_empty() {
+        return shell.open(
+            app,
+            agent,
+            crate::app::overlay::Which::Choice(Box::new(shell.side_thread_picker())),
+        );
+    }
+    if args == "threads new" || args.starts_with("threads actions ") {
+        return match shell.side_thread_action(args) {
+            Some(action) => run(shell, app, agent, &action),
+            None => Ok(Step::Done),
+        };
+    }
     if verb == "promote" {
         if rest.is_empty() {
             shell.note("BTW", "usage: /btw promote <id>");

@@ -879,7 +879,7 @@ fn live_handoff_keeps_the_exact_recent_tail_and_portable_fallback_is_non_destruc
             },
             Arc::new(AtomicBool::new(false)),
             &mut crate::agent::NullUi,
-            &mut |_, summary_request, _| {
+            &mut |_, summary_request, _, _| {
                 calls += 1;
                 let live = summary_request
                     .messages

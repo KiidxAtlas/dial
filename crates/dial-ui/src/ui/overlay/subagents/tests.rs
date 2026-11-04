@@ -64,6 +64,57 @@ fn keymap() -> Keymap {
 }
 
 #[test]
+fn settings_inspector_wraps_lifecycle_receipts_without_claiming_requested_model_is_active() {
+    use crate::ui::subagent_model::WorkerConfig;
+
+    let theme = Theme::dark();
+    for (state, label, applied, failure) in [
+        ("queued", "queued", 1, None),
+        ("applying", "applying", 1, None),
+        ("applied", "applied", 2, None),
+        (
+            "not_applied",
+            "failed (not applied)",
+            1,
+            Some("backend unavailable"),
+        ),
+    ] {
+        let mut worker = agent("task-1", AgentStatus::Running);
+        worker.model = "active-model".into();
+        worker.config = Some(WorkerConfig {
+            revision: 2,
+            applied_revision: applied,
+            state: state.into(),
+            requested_model: Some("requested-model".into()),
+            requested_thinking: Some("high".into()),
+            failure: failure.map(str::to_owned),
+        });
+        let mut hub = SubagentsOverlay::new();
+        hub.set_snapshot(snapshot(vec![worker]));
+        for width in [28, 38, 60] {
+            let lines = hub.inspector_lines(width, 100, &theme);
+            assert!(
+                lines.iter().all(|line| line.width() <= width),
+                "{state} at {width}"
+            );
+            let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+            let text = rows.join("\n");
+            let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                normalized.contains(&format!("revision 2 {label}; applied {applied}")),
+                "{text}"
+            );
+            assert!(normalized.contains("active active-model"), "{text}");
+            assert!(normalized.contains("requested requested-model"), "{text}");
+            assert!(normalized.contains("thinking high"), "{text}");
+            if let Some(error) = failure {
+                assert!(normalized.contains(error), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
 fn x_needs_a_second_press_within_the_window() {
     let keys = keymap();
     let mut hub = SubagentsOverlay::new();
@@ -73,6 +124,10 @@ fn x_needs_a_second_press_within_the_window() {
         OverlayEvent::None
     ));
     assert!(hub.banner_text().unwrap().contains("Press x again"));
+    let scope = hub.banner_text().unwrap();
+    assert!(scope.contains("only worker task-1-name"), "{scope}");
+    assert!(scope.contains("main turn continue"), "{scope}");
+    assert!(scope.contains("not undone"), "{scope}");
     assert!(matches!(
         hub.handle(&key(KeyCode::Char('x')), &keys),
         OverlayEvent::Action(a) if a == "subagent-cancel:task-1"
@@ -337,7 +392,7 @@ fn wide_layout_shows_roster_inspector_and_tabs() {
     assert!(text.contains("2 Activity"), "{text}");
     assert!(text.contains("task-1-name"), "{text}");
     assert!(text.contains("Recent activity"), "{text}");
-    assert!(text.contains("x cancel"), "{text}");
+    assert!(text.contains("x stop worker"), "{text}");
 }
 
 #[test]
@@ -890,10 +945,10 @@ fn footer_offers_only_actions_the_selected_worker_supports() {
     let mut hub = SubagentsOverlay::new();
     hub.set_snapshot(snapshot(vec![agent("done", AgentStatus::Done)]));
     let footer = hub.footer(&ctx);
-    assert!(!footer.iter().any(|s| s == "x cancel"), "{footer:?}");
+    assert!(!footer.iter().any(|s| s == "x stop worker"), "{footer:?}");
     assert!(footer.iter().any(|s| s == "m continue"), "{footer:?}");
     hub.set_snapshot(snapshot(vec![agent("live", AgentStatus::Running)]));
     let footer = hub.footer(&ctx);
-    assert!(footer.iter().any(|s| s == "x cancel"), "{footer:?}");
+    assert!(footer.iter().any(|s| s == "x stop worker"), "{footer:?}");
     assert!(footer.iter().any(|s| s == "m message"), "{footer:?}");
 }

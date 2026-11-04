@@ -33,6 +33,7 @@ const REF_FILE_CAP: usize = 64 * 1024;
 const REF_TOTAL_CAP: usize = 256 * 1024;
 const MAX_REFS: usize = 16;
 const DIR_LISTING_CAP: usize = 200;
+const DIR_LISTING_BYTES: usize = 16 * 1024;
 const GIT_OUTPUT_CAP: usize = 64 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_FILE_CAP: usize = 32 * 1024;
@@ -283,7 +284,7 @@ fn discover_with(
             )
         })
         .unwrap_or_default();
-    let user_path = layout.user_dir.join("AGENTS.md");
+    let user_path = crate::config::paths::agents_file(&layout.user_dir);
     let user = if user_path.exists() {
         let imports = user_import_scope(layout, home, &[layout.user_dir.as_path()]);
         let display = format!("{} (user)", display_for(layout, home, &user_path));
@@ -543,7 +544,7 @@ fn read_override(path: &Path) -> Option<String> {
 
 /// `<user_dir>/SOUL.md`: the agent's identity and tone.
 pub fn soul(layout: &Layout) -> Option<String> {
-    read_override(&layout.user_dir.join("SOUL.md"))
+    read_override(&crate::config::paths::soul_file(&layout.user_dir))
 }
 
 /// (`.dial/SYSTEM.md` replacing the base system prompt, `.dial/APPEND_SYSTEM.md` appended to it).
@@ -567,6 +568,11 @@ pub fn expand_references(root: &Path, text: &str, interrupt: &AtomicBool) -> (St
     let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
     for token in reference_tokens(text) {
+        if interrupt.load(Ordering::Relaxed) {
+            warnings
+                .push("@reference expansion interrupted; remaining references not attached".into());
+            break;
+        }
         if !seen.insert(token) {
             continue;
         }
@@ -580,7 +586,7 @@ pub fn expand_references(root: &Path, text: &str, interrupt: &AtomicBool) -> (St
             _ if crate::llm::images::is_image(Path::new(token)) => None,
             "diff" => git_block(&canonical_root, false, &mut warnings, interrupt),
             "staged" => git_block(&canonical_root, true, &mut warnings, interrupt),
-            _ => path_block(&canonical_root, token, &mut warnings),
+            _ => path_block(&canonical_root, token, &mut warnings, interrupt),
         };
         if let Some(block) = block {
             if total + block.len() > REF_TOTAL_CAP {
@@ -615,6 +621,9 @@ pub fn expand_message(
         .filter(|token| seen.insert(*token))
         .take(MAX_REFS)
     {
+        if interrupt.load(Ordering::Relaxed) {
+            break;
+        }
         if !crate::llm::images::is_image(Path::new(token)) {
             continue;
         }
@@ -713,7 +722,12 @@ pub(in crate::agent) fn xml_attr(s: &str) -> String {
         .replace('<', "&lt;")
 }
 
-fn path_block(root: &Path, token: &str, warnings: &mut Vec<String>) -> Option<String> {
+fn path_block(
+    root: &Path,
+    token: &str,
+    warnings: &mut Vec<String>,
+    interrupt: &AtomicBool,
+) -> Option<String> {
     let rel = Path::new(token);
     let path_like = looks_like_path(token);
     let escapes = rel.is_absolute()
@@ -741,10 +755,14 @@ fn path_block(root: &Path, token: &str, warnings: &mut Vec<String>) -> Option<St
     }
     let shown = xml_attr(token);
     if real.is_dir() {
-        return Some(format!(
-            "<dir path=\"{shown}\">\n{}</dir>",
-            dir_listing(&real)
-        ));
+        let listing = match dir_listing(&real, interrupt) {
+            Ok(listing) => listing,
+            Err(reason) => {
+                warnings.push(format!("@{token}: {reason}"));
+                format!("[directory listing omitted: {reason}; use a narrower @path]\n")
+            }
+        };
+        return Some(format!("<dir path=\"{shown}\">\n{listing}</dir>"));
     }
     match read_text(&real, REF_FILE_CAP) {
         Some((body, cut)) => {
@@ -763,37 +781,71 @@ fn path_block(root: &Path, token: &str, warnings: &mut Vec<String>) -> Option<St
     }
 }
 
-fn dir_listing(dir: &Path) -> String {
-    let mut names: Vec<String> = match fs::read_dir(dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name() != ".git")
-            .map(|e| {
-                let mut name: String = e
-                    .file_name()
-                    .to_string_lossy()
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .collect();
-                if e.file_type().is_ok_and(|t| t.is_dir()) {
-                    name.push('/');
-                }
-                name
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+fn dir_listing(dir: &Path, interrupt: &AtomicBool) -> Result<String, &'static str> {
+    if interrupt.load(Ordering::Relaxed) {
+        return Err("interrupted");
+    }
+    let entries = fs::read_dir(dir).map_err(|_| "unreadable directory")?;
+    directory_listing(
+        entries.map(|entry| {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            Ok((entry.file_name(), kind.is_dir()))
+        }),
+        interrupt,
+    )
+}
+
+/// Admit only complete, bounded listings: never present a filesystem-order-dependent subset.
+/// Keep this collector local: the tool walker's private collector has different traversal budgets.
+fn directory_listing(
+    mut entries: impl Iterator<Item = std::io::Result<(std::ffi::OsString, bool)>>,
+    interrupt: &AtomicBool,
+) -> Result<String, &'static str> {
+    let mut names = Vec::new();
+    let mut bytes = 0;
+    let mut scanned = 0;
+    loop {
+        if interrupt.load(Ordering::Relaxed) {
+            return Err("interrupted");
+        }
+        let Some(entry) = entries.next() else { break };
+        // One excluded .git entry and one lookahead are the only extra work allowed.
+        scanned += 1;
+        if scanned > DIR_LISTING_CAP + 1 {
+            return Err("directory entry limit exceeded");
+        }
+        let (name, is_dir) = entry.map_err(|_| "unreadable directory entry or entry type")?;
+        if name == ".git" {
+            continue;
+        }
+        if names.len() == DIR_LISTING_CAP {
+            return Err("directory entry limit exceeded");
+        }
+        // Bound conversion allocation too; lossy conversion may grow at most threefold.
+        if name.len() > DIR_LISTING_BYTES - bytes {
+            return Err("directory listing byte limit exceeded");
+        }
+        let mut name: String = name
+            .to_string_lossy()
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        if is_dir {
+            name.push('/');
+        }
+        bytes += name.len() + 1;
+        if bytes > DIR_LISTING_BYTES {
+            return Err("directory listing byte limit exceeded");
+        }
+        names.push(name);
+    }
     names.sort();
-    let extra = names.len().saturating_sub(DIR_LISTING_CAP);
-    names.truncate(DIR_LISTING_CAP);
     let mut out = names.join("\n");
     if !out.is_empty() {
         out.push('\n');
     }
-    if extra > 0 {
-        out.push_str(&format!("[... {extra} more entries ...]\n"));
-    }
-    out
+    Ok(out)
 }
 
 fn git_block(
@@ -928,7 +980,7 @@ pub fn discover_commands(layout: &Layout) -> Vec<CommandDef> {
     let mut out: Vec<CommandDef> = Vec::new();
     for dir in [
         layout.project_dir.join("commands"),
-        layout.user_dir.join("commands"),
+        crate::config::paths::commands_dir(&layout.user_dir),
     ] {
         let Ok(rd) = fs::read_dir(&dir) else { continue };
         let mut paths: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();

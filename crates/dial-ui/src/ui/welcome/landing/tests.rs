@@ -268,3 +268,56 @@ fn tiny_launch_screens_keep_a_margin_and_name_the_project_whole() {
         assert!(!place.contains("..."), "no mid-word cut: {place:?}");
     }
 }
+
+#[test]
+fn recent_sessions_are_visible_at_rest_but_yield_to_warnings() {
+    let theme = Theme::dark();
+    let mut info = info();
+    info.recent = vec![
+        ("fix parser".into(), "2h".into()),
+        ("add tests".into(), "1d".into()),
+    ];
+    info.model.clear();
+    let render = |height| {
+        frame(
+            &info,
+            100,
+            height,
+            &theme,
+            View::default(),
+            ComposerView {
+                rows: vec![Line::from("draft")],
+                cursor: (0, 0),
+            },
+            vec![],
+        )
+    };
+    let tall = plain(&render(30).rows).join("\n");
+    assert!(tall.contains("fix parser") && tall.contains("add tests"));
+    let short = plain(&render(6).rows).join("\n");
+    assert!(short.contains("no model selected"));
+    assert!(!short.contains("fix parser"));
+}
+
+#[test]
+fn first_run_guidance_fits_and_respects_ascii_glyphs() {
+    let theme = Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let mut info = info();
+    info.tour = true;
+    let view = frame(
+        &info,
+        100,
+        30,
+        &theme,
+        View::default(),
+        ComposerView {
+            rows: vec![Line::from("draft")],
+            cursor: (0, 0),
+        },
+        vec![],
+    );
+    let lines = plain(&view.rows);
+    assert!(lines.iter().all(|line| line.is_ascii()));
+    let text = lines.join("\n");
+    assert!(text.contains("Type a request") && text.contains("Ctrl+P") && text.contains("/models"));
+}

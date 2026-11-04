@@ -389,7 +389,7 @@ def run_agent_process(command, *, timeout, cwd, env, stdin, **_):
 
 
 def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, keep, logs=None,
-              prepare_workspace=None, *, hard_timeout=None):
+              prepare_workspace=None, *, hard_timeout=None, capture_traces=False):
     trial_dir = Path(tempfile.mkdtemp(prefix=f"{agent['name']}-{case['id']}-r{repetition}-", dir=work_root))
     workspace = trial_dir / "project"
     source = suite_root / case["project"] if case.get("project") else None
@@ -402,15 +402,20 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
     log_dir = None
     if logs is not None:
         log_dir = logs / f"{agent['name']}-{case['id']}-r{repetition}"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     environment = agent_environment(agent, {**values, "work_root": str(work_root), "trial_root": str(trial_dir)})
     prompts = [first_prompt(case)] + [turn["prompt"] for turn in case.get("turns", [])]
     usage = empty_usage()
+    # Session evidence is diagnostic unless the case explicitly opts into trace grading.
+    from registry_discovery import capture_trial_trace, discovery_mode, grade_trial_session
+    discovery = discovery_mode(case)
+    final_session_id = None
     turns = []
     final_text = None
     process_timeout = timeout + 30 if hard_timeout is None else hard_timeout
     agent_error = None
     started = time.monotonic()
+    trace_capture_secs = 0
     for index, prompt in enumerate(prompts):
         template = agent["first"] if index == 0 else agent["follow_up"]
         command = render(template, {**values, "prompt": prompt, "timeout": str(timeout)})
@@ -428,12 +433,16 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
             agent_error = f"turn {index} exceeded {process_timeout}s"
             turns.append({"exit": None, "elapsed_ms": round((time.monotonic() - turn_started) * 1000),
                           "efficiency": None, "stderr_log": stderr_path, "stderr_tail": stderr_excerpt(stderr)})
+            if capture_traces:
+                turns[-1]["trace"] = {"status": "unavailable", "reason": "turn_timeout_no_terminal_session"}
             break
         except OSError as error:
             usage["usage_complete"] = False
             agent_error = f"turn {index} could not start: {error}"
             turns.append({"exit": None, "elapsed_ms": round((time.monotonic() - turn_started) * 1000),
                           "efficiency": None, "stderr_log": None, "stderr_tail": ""})
+            if capture_traces:
+                turns[-1]["trace"] = {"status": "unavailable", "reason": "agent_start_failed"}
             break
         if log_dir is not None:
             (log_dir / f"turn-{index}.stdout").write_text(process.stdout)
@@ -441,6 +450,15 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
         text, part = PARSERS[agent["output"]](process.stdout)
         add_usage(usage, part, agent)
         final_text = text
+        final_session_id = None
+        if (discovery or capture_traces) and agent["output"] == "dial-json":
+            for line in process.stdout.splitlines():
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("type") == "result":
+                    final_session_id = event.get("session_id")
         # A non-zero exit keeps its exit code, the stderr log path and a redacted excerpt. Successful
         # turns carry no stderr excerpt, so routine warnings never reach the report.
         turns.append({"exit": process.returncode,
@@ -448,10 +466,17 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
                       "efficiency": part.get("efficiency"),
                       "stderr_log": stderr_path,
                       "stderr_tail": stderr_excerpt(process.stderr) if process.returncode else ""})
+        if capture_traces:
+            capture_started = time.monotonic()
+            turns[-1]["trace"] = capture_trial_trace(
+                agent, environment, final_session_id, trial_dir, log_dir, index)
+            capture_secs = time.monotonic() - capture_started
+            trace_capture_secs += capture_secs
+            turns[-1]["trace"]["capture_ms"] = round(capture_secs * 1000)
         if process.returncode != 0:
             agent_error = f"turn {index} exited {process.returncode}"
             break
-    elapsed_ms = round((time.monotonic() - started) * 1000)
+    elapsed_ms = round((time.monotonic() - started - trace_capture_secs) * 1000)
     checks = []
     for index, check in enumerate(case.get("checks", [])):
         if not portable(check):
@@ -460,6 +485,11 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
         outcome = run_check(check, workspace, final_text)
         checks.append({"index": index, "kind": check["kind"],
                        "result": {True: "passed", False: "failed", None: "unavailable"}[outcome]})
+    trace_check = None
+    if discovery:
+        trace_check = grade_trial_session(agent, case, environment, final_session_id, trial_dir, log_dir)
+        checks.append({"index": len(checks), "kind": "registry_discovery_trace",
+                       "result": trace_check["result"]})
     scored = [c for c in checks if c["result"] != "not_portable"]
     record = {
         "agent": agent["name"], "case": case["id"], "repetition": repetition,
@@ -471,6 +501,8 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
         "checks": checks, "usage": usage,
         "skipped_compactions": sum(1 for turn in case.get("turns", []) if turn.get("compact_before")),
     }
+    if trace_check is not None:
+        record["discovery_trace"] = trace_check
     if keep:
         record["workspace"] = str(workspace)
     else:
@@ -480,6 +512,12 @@ def run_trial(agent, case, suite_root, repetition, work_root, values, timeout, k
 
 def median(values):
     return statistics.median(values) if values else None
+
+
+def percentile95(values):
+    """Nearest-rank p95; small samples report their maximum, not an interpolated estimate."""
+    ordered = sorted(values)
+    return ordered[(95 * len(ordered) + 99) // 100 - 1] if ordered else None
 
 
 def summarize(trials, agents):
@@ -495,6 +533,11 @@ def summarize(trials, agents):
             "agent_errors": sum(1 for t in own if t["agent_error"]),
             "median_elapsed_ms_all": median([t["elapsed_ms"] for t in own]),
             "median_elapsed_ms_passed": median([t["elapsed_ms"] for t in passed]),
+            "p95_elapsed_ms_all": percentile95([t["elapsed_ms"] for t in own]),
+            # Amortize failed attempts too; successful-only medians hide their real cost.
+            "elapsed_ms_per_success": sum(t["elapsed_ms"] for t in own) / len(passed) if passed else None,
+            "tokens_per_success": (sum(t["usage"]["input_total"] + t["usage"]["output"] for t in own)
+                                   / len(passed) if passed and len(complete) == len(own) else None),
             "usage_complete_trials": len(complete),
             "median_input_total_tokens": median([t["usage"]["input_total"] for t in complete]),
             "median_uncached_input_tokens": median([t["usage"]["uncached_input"] for t in complete]),
@@ -528,6 +571,9 @@ def table(summary, by_case, agents):
             ("agent errors", "agent_errors", str),
             ("median wall s (all)", "median_elapsed_ms_all", lambda v: f"{v / 1000:.1f}"),
             ("median wall s (passed)", "median_elapsed_ms_passed", lambda v: f"{v / 1000:.1f}"),
+            ("p95 wall s (all)", "p95_elapsed_ms_all", lambda v: f"{v / 1000:.1f}"),
+            ("wall s / success (all attempts)", "elapsed_ms_per_success", lambda v: f"{v / 1000:.1f}"),
+            ("tokens / success (all attempts)", "tokens_per_success", lambda v: f"{v:,.0f}"),
             ("median prompt tok (all)", "median_input_total_tokens", lambda v: f"{v:,.0f}"),
             ("median uncached prompt", "median_uncached_input_tokens", lambda v: f"{v:,.0f}"),
             ("median output tok", "median_output_tokens", lambda v: f"{v:,.0f}"),
@@ -605,8 +651,16 @@ def main():
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="directory case projects are relative to")
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--keep-workspaces", action="store_true")
+    parser.add_argument("--capture-traces", action="store_true",
+                        help="retain private bounded per-turn Dial session journals from isolated trial homes")
+    parser.add_argument("--comparison-mode", choices=("installed", "controlled"), default="installed",
+                        help="declared setup: installed defaults or explicitly controlled configuration")
+    parser.add_argument("--comparison-notes", default="",
+                        help="configuration/permission differences and controls; required for controlled runs")
     args = parser.parse_args()
     try:
+        if args.comparison_mode == "controlled" and not args.comparison_notes.strip():
+            raise ValueError("controlled comparisons require --comparison-notes describing controls and remaining differences")
         if not 1 <= args.repetitions <= 10 or args.jobs < 1 or args.timeout < 1:
             raise ValueError("repetitions must be 1..=10; jobs and timeout must be positive")
         if args.report.exists() or args.report.with_name(args.report.stem + ".logs").exists():
@@ -641,7 +695,8 @@ def main():
     trials = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = [pool.submit(run_trial, agent, case, args.root, rep, work_root, values,
-                               args.timeout, args.keep_workspaces, logs) for agent, case, rep in plan]
+                               args.timeout, args.keep_workspaces, logs,
+                               capture_traces=args.capture_traces) for agent, case, rep in plan]
         for future in concurrent.futures.as_completed(futures):
             trial = future.result()
             trials.append(trial)
@@ -662,11 +717,14 @@ def main():
         "suites": [suite["name"] for suite in suites], "model": args.model, "thinking": args.thinking,
         "repetitions": args.repetitions, "timeout_secs": args.timeout, "jobs": args.jobs,
         "timing_comparable": args.jobs == 1, "seed": args.seed,
+        "comparison": {"mode": args.comparison_mode, "notes": args.comparison_notes,
+                       "basis": "operator declaration, not independently verified configuration equivalence"},
         "trial_order": [f"{agent['name']}/{case['id']}/r{rep}" for agent, case, rep in plan],
         "agents": [{"name": a["name"], "first": a["first"], "follow_up": a["follow_up"], "env": a["env"],
                     "delegation_tools": a["delegation_tools"], "delegated_usage": a["delegated_usage"],
                     **identities[a["name"]]} for a in agents],
         "logs": str(logs),
+        "capture_traces": args.capture_traces,
         "excluded_checks": not_portable, "summary": summary, "by_case": by_case, "trials": trials,
     }
     args.report.write_text(json.dumps(report, indent=2) + "\n")

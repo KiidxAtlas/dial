@@ -263,6 +263,31 @@ fn tool_specific_rules_follow_the_offered_tools() {
         }
         assert!(guidance_for(&rich, lean, false).contains(SKILL_RULE));
     }
+    for (lean, one_call, concise) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        for glob in [false, true] {
+            let tools = if glob {
+                names(&["read", "glob"])
+            } else {
+                names(&["read"])
+            };
+            let policy = scoped_guidance(
+                &Offer {
+                    tools: &tools,
+                    lean,
+                    one_call,
+                },
+                concise,
+                false,
+            );
+            assert_eq!(policy.contains(SOURCE_PREVIEW_RULE), glob);
+            assert_eq!(policy.contains("preview=true"), glob);
+        }
+    }
     let full = guidance_for(&rich, false, false);
     assert!(full.contains(PROJECT_MAP_RULE) && full.contains(LSP_RULE));
     assert!(!guidance_for(&names(&["read", "lsp"]), false, false).contains(SKILL_RULE));
@@ -519,9 +544,19 @@ fn concise_guidance_preserves_visual_rules_and_operator_owned_content() {
     };
     let full = build(false, None, None);
     let concise = build(true, None, None);
-    // Only the frozen built-in policy band changes; environment, discovery, skills,
-    // operator guidance/notes and memory remain byte-identical in the later bands.
-    assert_eq!(&concise[1..], &full[1..]);
+    // Besides the frozen policy, only the duplicate callable inventory changes. Discovery,
+    // skills, operator guidance/notes and memory retain every other byte in the later bands.
+    let mut expected = full[1..].to_vec();
+    let inventory = format!(
+        "- Tools: {} (the supplied schemas are the callable set)\n",
+        tools.join(", ")
+    );
+    expected[0]["content"] = serde_json::json!(expected[0]["content"].as_str().unwrap().replacen(
+        &inventory,
+        "- Tools: supplied schemas define the callable set.\n",
+        1,
+    ));
+    assert_eq!(&concise[1..], &expected);
     assert!(
         concise[0]["content"]
             .as_str()
@@ -1310,5 +1345,54 @@ fn custom_template_without_replacement_opts_out_of_reasoning_strategy() {
     assert_eq!(
         build(Default::default()),
         build(crate::config::types::ReasoningStrategy::MinimalChange)
+    );
+}
+
+#[test]
+fn compact_environment_omits_only_the_duplicate_callable_inventory() {
+    crate::agent::run::tool_exposure::default_offer_tests::with_agent(
+        "[assistance]\nlean_local=false",
+        |agent| {
+            let tools = agent.offered();
+            let schemas = agent.schemas(&tools).unwrap();
+            let harness = Harness::default();
+            let context = [rule("AGENTS.md", "PROJECT RULE")];
+            let template = prompt_template::compile("CUSTOM TEMPLATE").unwrap();
+            let build = |concise, replacement, custom_template| {
+                let mut inputs = template_inputs(&harness, &context, &template);
+                inputs.template = custom_template;
+                inputs.overrides.0 = replacement;
+                inputs.tools = &tools;
+                inputs.skills = "SKILL CATALOG".into();
+                inputs.concise_guidance = concise;
+                environment_prompt(&inputs, None, TurnNotes::Inline)
+            };
+            let full = build(false, None, None);
+            let compact = build(true, None, None);
+            let inventory = format!(
+                "- Tools: {} (the supplied schemas are the callable set)\n",
+                tools.join(", ")
+            );
+            let reference = "- Tools: supplied schemas define the callable set.\n";
+            eprintln!(
+                "environment bytes: {} -> {}; {} unchanged callable schemas ({} serialized bytes)",
+                full.len(),
+                compact.len(),
+                schemas.len(),
+                serde_json::to_vec(&schemas).unwrap().len(),
+            );
+            assert!(full.contains(&inventory));
+            assert_eq!(compact, full.replacen(&inventory, reference, 1));
+            assert!(compact.len() < full.len());
+            // Operator-owned presentations and the efficiency-off environment stay verbatim.
+            for (replacement, custom_template) in [
+                (Some("CUSTOM POLICY".into()), None),
+                (None, Some(&template)),
+            ] {
+                assert_eq!(build(true, replacement, custom_template), full);
+            }
+            assert_eq!(agent.offered(), tools);
+            assert_eq!(agent.schemas(&tools).unwrap(), schemas);
+        },
     );
 }

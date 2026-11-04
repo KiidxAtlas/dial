@@ -36,6 +36,7 @@ enum Outcome {
     Finished,
     Failed,
     NeedsInput,
+    Interrupted,
 }
 
 /// Session workers as of the last refresh, plus the transitions still owed a notice.
@@ -113,6 +114,7 @@ impl WorkerBoard {
             let outcome = match agent.status {
                 AgentStatus::Done => Outcome::Finished,
                 AgentStatus::Failed => Outcome::Failed,
+                AgentStatus::Interrupted => Outcome::Interrupted,
                 AgentStatus::Waiting => Outcome::NeedsInput,
                 AgentStatus::Running | AgentStatus::Cancelled => continue,
             };
@@ -132,6 +134,7 @@ impl WorkerBoard {
                     Outcome::Finished => "finished",
                     Outcome::Failed => "failed",
                     Outcome::NeedsInput => "needs input",
+                    Outcome::Interrupted => "interrupted",
                 };
                 format!("{name} {verb} — {hub_key}")
             })

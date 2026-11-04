@@ -20,6 +20,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
@@ -660,6 +661,18 @@ fn remove_side_thread(session: &Path) -> io::Result<()> {
     match fs::remove_file(side_thread::path_for(session)) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
+    }
+}
+/// Makes a directory entry change durable. Unix only: Windows has no unprivileged directory flush.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
     }
 }
 
@@ -1502,7 +1515,7 @@ impl Session {
     /// Journals of every project under the user dir, newest file first.
     fn all_session_files(layout: &Layout) -> Result<Vec<PathBuf>> {
         let mut paths = Vec::new();
-        let projects = layout.user_dir.join("projects");
+        let projects = crate::config::paths::projects_dir(&layout.user_dir);
         if projects.is_dir() {
             for entry in fs::read_dir(projects)? {
                 let entry = entry?;
@@ -1656,9 +1669,9 @@ impl Session {
     /// Copies this journal, stream supplement, side-thread file and referenced project-local artifacts
     /// into `target`, with the header cwd rewritten, then opens the copy as its writer. The caller
     /// swaps the copy in and calls `remove_file` on the old session. A side-thread file already at the
-    /// destination is refused before anything is written. Failure removes the copies this call
-    /// created and leaves the source untouched; reusable immutable imports may remain in the target
-    /// artifact store.
+    /// destination is refused before anything is written. Pre-publication failures remove the copies
+    /// this call created and leave the source untouched. Uncertain ledger publication retains both
+    /// journals and reports their state. Reusable immutable artifact imports may remain in the target.
     pub fn relocate_to(&self, target: &Layout) -> Result<Session> {
         self.relocate_with(target, Session::open)
     }
@@ -1668,6 +1681,16 @@ impl Session {
         &self,
         target: &Layout,
         reopen: impl FnOnce(&Path) -> Result<Session>,
+    ) -> Result<Session> {
+        self.relocate_with_record(target, reopen, transfers::record)
+    }
+
+    /// Injection at the final publication boundary distinguishes refusal from uncertain durability.
+    fn relocate_with_record(
+        &self,
+        target: &Layout,
+        reopen: impl FnOnce(&Path) -> Result<Session>,
+        record: impl FnOnce(&Layout, &str, &Path, &Path) -> Result<()>,
     ) -> Result<Session> {
         let src = self
             .path
@@ -1772,9 +1795,52 @@ impl Session {
             return Err(error);
         }
         let moved = reopen(dst.as_path()).inspect_err(|_| discard_moved_copy(&dst, created))?;
-        transfers::record(target, self.id(), src, &dst)
-            .context("recording moved session in the transfer ledger")?;
+        if let Err(error) = record(target, self.id(), src, &dst) {
+            // Private-state publication may fail after rename. Only a failure known to precede
+            // publication permits destination cleanup; unreadable or corrupt state proves nothing.
+            if transfers::definitely_unpublished(&error) {
+                return Err(match moved.remove_file() {
+                    Ok(()) => error.context("recording moved session failed; source retained and destination removed"),
+                    Err(cleanup) => error.context(format!("recording moved session failed; source retained, but destination cleanup failed: {cleanup:#}")),
+                });
+            }
+            return Err(error.context(format!(
+                "transfer ledger publication uncertain; source and destination {} retained; no rollback claimed",
+                dst.display()
+            )));
+        }
         Ok(moved)
+    }
+
+    /// Reverts a relocation before workspace publication, retaining the source writer.
+    ///
+    /// The ledger is settled before deleting the copied journals. If ledger rollback cannot be
+    /// acknowledged, the destination is retained and the error must not be presented as rollback.
+    pub fn rollback_relocation(self, target: &Layout, source: &Session) -> Result<()> {
+        ensure!(
+            self.id() == source.id(),
+            "relocation source has a different session id"
+        );
+        let from = source.path().context("relocation source has no journal")?;
+        let to = self
+            .path()
+            .context("relocation destination has no journal")?;
+        ensure!(
+            from != to,
+            "relocation source and destination are the same journal"
+        );
+        ensure!(
+            source.file.is_some(),
+            "relocation rollback requires the source writer"
+        );
+        ensure!(
+            to.parent() == Some(target.sessions_dir().as_path()),
+            "relocation target does not own the copied journal"
+        );
+        transfers::rollback(target, self.id(), from, to)
+            .context("transfer ledger rollback uncertain; copied journals retained")?;
+        self.remove_file()
+            .context("transfer ledger rolled back, but copied journal cleanup failed")
     }
 
     /// Workspace roots added beyond the project root, as recorded in the session header.
@@ -1786,6 +1852,15 @@ impl Session {
     /// exclusive lock, rename) and this session's writer is reopened on the new file. Ephemeral
     /// sessions keep the value in memory only. Read-only snapshots are refused.
     pub fn set_additional_dirs(&mut self, dirs: &[PathBuf]) -> Result<()> {
+        self.set_additional_dirs_with(dirs, sync_dir)
+    }
+
+    /// `set_additional_dirs` with the directory sync injected so tests can fail it after the rename.
+    fn set_additional_dirs_with(
+        &mut self,
+        dirs: &[PathBuf],
+        sync: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<()> {
         if self.additional_dirs == dirs {
             return Ok(());
         }
@@ -1858,9 +1933,17 @@ impl Session {
                 return Err(err).with_context(|| format!("rewriting {}", path.display()));
             }
         };
+        // The rename published the header, so the writer and roots follow it before the directory
+        // sync. A sync failure leaves them applied and reports only durability as uncertain.
         self.file = Some(out);
         self.pending_newline = self.pending_newline && copied > 0;
         self.additional_dirs = dirs.to_vec();
+        sync(dir).with_context(|| {
+            format!(
+                "workspace roots applied to {}, but durability is uncertain",
+                path.display()
+            )
+        })?;
         Ok(())
     }
 
@@ -3708,6 +3791,51 @@ impl Session {
         Some((visible[n], visible.len() - n))
     }
 
+    /// Checkpoint ids for precisely the active conversation range a rewind would abandon.
+    /// Legacy messages, copied fork links and unavailable checkpoints must not be guessed.
+    pub fn rewind_checkpoint_turns(&self, user_turns: usize) -> Result<Vec<u64>> {
+        let target = if let Some(targets) = self.context_rewind_targets() {
+            targets
+                .iter()
+                .rev()
+                .nth(user_turns.saturating_sub(1))
+                .or(targets.first())
+                .and_then(|(id, _)| self.by_id.get(*id).copied())
+        } else {
+            self.rewind_target(user_turns).map(|(target, _)| target)
+        };
+        let Some(target) = target.filter(|_| user_turns > 0) else {
+            return Ok(Vec::new());
+        };
+        let branch = self.branch();
+        let pos = branch
+            .iter()
+            .position(|&i| i == target)
+            .context("undo target is not on the active branch")?;
+        let mut turns = Vec::new();
+        for &i in &branch[pos..] {
+            if let Kind::Message(message) = &self.entries[i].kind
+                && role_of(message) == "user"
+            {
+                let link = &message["dial_checkpoint"];
+                ensure!(
+                    link["session"].as_str() == Some(self.id()),
+                    "turn {} has no matching checkpoint session link (legacy or fork); conversation kept",
+                    self.entries[i].id
+                );
+                let turn = link["turn"]
+                    .as_u64()
+                    .context("turn has no durable checkpoint link; conversation kept")?;
+                ensure!(
+                    turns.last().is_none_or(|previous| *previous < turn),
+                    "checkpoint links are not ordered; conversation kept"
+                );
+                turns.push(turn);
+            }
+        }
+        Ok(turns)
+    }
+
     /// The messages a summarized rewind of `user_turns` would abandon: the current leaf (the fork point
     /// for the summary) and the active-branch messages from the rewind point onward, chronological.
     /// None when nothing is abandoned: a no-op, or a notes-backed context reset (which keeps no branch).
@@ -4208,6 +4336,7 @@ fn open_index(layout: &Layout) -> Result<Connection> {
         "CREATE TABLE IF NOT EXISTS indexed(session_id TEXT PRIMARY KEY, bytes INTEGER NOT NULL);
          CREATE VIRTUAL TABLE IF NOT EXISTS msgs USING fts5(text, session_id UNINDEXED, role UNINDEXED, ts UNINDEXED, tokenize='porter unicode61');
          ALTER TABLE indexed ADD COLUMN identity TEXT NOT NULL DEFAULT '';",
+        "ALTER TABLE indexed ADD COLUMN prefix_digest TEXT NOT NULL DEFAULT '';",
     ])
     .context("creating the session search index (SQLite without FTS5?)")?;
     Ok(conn)
@@ -4262,14 +4391,12 @@ fn sync_index(conn: &mut Connection, dir: &Path) -> Result<()> {
             continue;
         };
         present.insert(sid.clone());
-        let Ok(len) = fs::metadata(&path).map(|m| m.len()) else {
+        let Ok(_) = fs::metadata(&path) else {
             continue;
         };
-        let identity = platform_fs::path_identity(&path)?;
-        let identity = format!("{}:{}", identity.device, identity.inode);
-        if known.get(&sid) != Some(&(len, identity)) {
-            index_session(conn, &sid, &path, len)?;
-        }
+        // Metadata alone cannot distinguish an in-place rewrite, even at the same length.
+        // Validate the indexed prefix on every search; parsing remains incremental for appends.
+        index_session(conn, &sid, &path)?;
     }
     for gone in known.keys().filter(|k| !present.contains(*k)) {
         let tx = conn.transaction()?;
@@ -4283,32 +4410,61 @@ fn sync_index(conn: &mut Connection, dir: &Path) -> Result<()> {
 /// Indexes complete lines of `path` from the stored offset up to `len` (a half-written tail line is
 /// left for the next sync). Serialised per database by an immediate transaction, so two processes
 /// searching at once never index a line twice.
-fn index_session(conn: &mut Connection, sid: &str, path: &Path, len: u64) -> Result<()> {
+fn index_session(conn: &mut Connection, sid: &str, path: &Path) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut file = platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path)?;
+    let len = file.metadata()?.len();
     let identity = platform_fs::identity(&file)?;
     let identity = format!("{}:{}", identity.device, identity.inode);
-    let previous: Option<(i64, String)> = tx
+    let previous: Option<(i64, String, String)> = tx
         .query_row(
-            "SELECT bytes, identity FROM indexed WHERE session_id = ?1",
+            "SELECT bytes, identity, prefix_digest FROM indexed WHERE session_id = ?1",
             [sid],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let mut offset = previous.as_ref().map_or(0, |(bytes, _)| *bytes as u64);
-    if len < offset || previous.is_some_and(|(_, old)| old != identity) {
-        tx.execute("DELETE FROM msgs WHERE session_id = ?1", [sid])?; // file was replaced
-        offset = 0;
+    let mut offset = previous.as_ref().map_or(0, |(bytes, _, _)| *bytes as u64);
+    let mut hash = Sha256::new();
+    let mut unchanged = false;
+    if let Some((_, old_identity, digest)) = &previous
+        && *old_identity == identity
+        && offset <= len
+    {
+        let mut prefix = (&mut file).take(offset);
+        let mut buffer = [0; 64 * 1024];
+        let mut read = 0;
+        loop {
+            let n = prefix.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+            read += n as u64;
+        }
+        unchanged = read == offset && *digest == format!("{:x}", hash.clone().finalize());
     }
+    if unchanged && offset == len {
+        return Ok(());
+    }
+    if !unchanged {
+        tx.execute("DELETE FROM msgs WHERE session_id = ?1", [sid])?;
+        offset = 0;
+        hash = Sha256::new();
+    }
+    let mut digest = format!("{:x}", hash.clone().finalize());
     if len > offset {
         file.seek(SeekFrom::Start(offset))?;
-        let mut reader = BufReader::new(file.take(len - offset));
+        let mut reader = IndexReader {
+            inner: BufReader::new(file.take(len - offset)),
+            hash,
+        };
         let mut buf = Vec::new();
         while let Some(line) = read_bounded_line(&mut reader, &mut buf)? {
             if !line.terminated {
                 break;
             }
             offset += line.consumed as u64;
+            digest = format!("{:x}", reader.hash.clone().finalize());
             if line.oversized {
                 continue;
             }
@@ -4331,11 +4487,37 @@ fn index_session(conn: &mut Connection, sid: &str, path: &Path, len: u64) -> Res
         }
     }
     tx.execute(
-        "INSERT OR REPLACE INTO indexed(session_id, bytes, identity) VALUES(?1, ?2, ?3)",
-        params![sid, offset as i64, identity],
+        "INSERT OR REPLACE INTO indexed(session_id, bytes, identity, prefix_digest) VALUES(?1, ?2, ?3, ?4)",
+        params![sid, offset as i64, identity, digest],
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Hash exactly the bytes consumed by the bounded line reader, including skipped oversized rows.
+/// Hashing below `BufReader` would also hash read-ahead bytes and accidentally admit a torn tail.
+struct IndexReader<R> {
+    inner: BufReader<R>,
+    hash: Sha256,
+}
+
+impl<R: Read> Read for IndexReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hash.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+impl<R: Read> BufRead for IndexReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.hash.update(&self.inner.buffer()[..amount]);
+        self.inner.consume(amount);
+    }
 }
 
 // ---------------------------------------------------------------- session_search tool

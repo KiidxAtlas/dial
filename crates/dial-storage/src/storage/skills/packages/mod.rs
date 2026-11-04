@@ -79,7 +79,7 @@ fn lock_path(layout: &Layout, scope: Scope) -> PathBuf {
 }
 
 fn state_dir(layout: &Layout) -> PathBuf {
-    layout.user_dir.join("skill-packages")
+    crate::config::paths::skill_packages_dir(&layout.user_dir)
 }
 
 fn store_root(layout: &Layout) -> PathBuf {

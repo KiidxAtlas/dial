@@ -53,7 +53,7 @@ pub struct ProbeMatch {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Probe {
     pub matches: Vec<ProbeMatch>,
-    /// Sources of judged `question` rules the judge role would be asked about this sample.
+    /// Sources of judged `question` rules the decision role would be asked about this sample.
     pub judged: Vec<String>,
 }
 

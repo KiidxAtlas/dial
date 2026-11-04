@@ -146,7 +146,7 @@ fn symlinks_are_not_followed_or_reported_by_either_walker() {
     assert_eq!(files(&mut Walk::new(&ws), &root), ["real"]);
     let mut found = Vec::new();
     let mut search = SearchWalk::new(&ws, true, true, None);
-    search.run(&root, &mut |path| {
+    search.run_with_prefix(&root, &root, &mut |path| {
         found.push(path.to_path_buf());
         true
     });

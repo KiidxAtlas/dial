@@ -113,7 +113,7 @@ impl Store {
     /// Opens (creating directories as needed) the store for `repository_root` under `user_dir`.
     pub fn open(user_dir: &Path, repository_root: &str) -> Result<Self> {
         let project_key = contracts::project_key(repository_root);
-        let dir = user_dir.join("security").join(&project_key);
+        let dir = crate::config::paths::security_dir(user_dir).join(&project_key);
         ensure_private_dir(&dir)?;
         Ok(Self {
             dir,

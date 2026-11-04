@@ -5,7 +5,7 @@
 //! builtin that never yields) are documented in docs/shell.md.
 
 use super::*;
-use crate::embedded_shell::inprocess::{Request, Run};
+use crate::embedded_shell::inprocess::{Request, Run, Termination};
 
 /// The environment the shell gets: Dial's, minus secrets, plus the same non-interactive settings
 /// the unsandboxed child-process backends set.
@@ -113,8 +113,7 @@ pub(super) fn run(
             .wait((!eof).then_some(&reader), None::<&Child>, Some(limit))
             .map_err(|e| format!("waiting for command output: {e}"))?;
     }
-    let stopped = cancelled || timed_out || capture_error.is_some();
-    let abandoned = stopped && !shell.terminate();
+    let termination = shell.terminate();
     // Collect what the script wrote; a stuck descendant may keep the pipe open, so this is bounded.
     drain_after_exit(
         &mut reader,
@@ -134,17 +133,12 @@ pub(super) fn run(
     let body_len = text.len();
     let code = shell.code();
     let success = code == Some(0) && !timed_out && !cancelled;
-    if cancelled {
-        text.push_str("[cancelled; in-process shell stopped]\n");
-    } else if timed_out {
-        text.push_str(&format!(
-            "[timed out after {timeout_secs}s; in-process shell stopped]\n"
-        ));
-    } else if let Some(code) = code {
+    append_stop_notes(&mut text, cancelled, timed_out, timeout_secs, &termination);
+    if !cancelled
+        && !timed_out
+        && let Some(code) = code
+    {
         text.push_str(&format!("[exit code: {code}]\n"));
-    }
-    if abandoned {
-        text.push_str("[in-process shell did not stop (a builtin that never yields cannot be interrupted); it was abandoned and may keep using CPU until Dial exits]\n");
     }
     let artifact = append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
     let minimized = minimize_body(
@@ -167,7 +161,10 @@ pub(super) fn run(
         execution: Default::default(),
         data: None,
         text,
-        is_error: !success || capture_error.is_some() || artifact_error.is_some(),
+        is_error: !success
+            || capture_error.is_some()
+            || artifact_error.is_some()
+            || termination.uncertain(),
     }
     .with_process(crate::runtime::execution::ProcessOutcome {
         started: true,
@@ -186,13 +183,49 @@ pub(super) fn run(
         terminal_allocated: false,
         job: None,
     });
-    Ok(if cancelled {
-        output
-            .with_status(crate::tools::ToolStatus::Aborted)
-            .with_effects(crate::tools::surface::outcome::Effects::Unknown)
-    } else if timed_out {
-        output.with_status(crate::tools::ToolStatus::Timeout)
+    Ok(finish_stop(output, cancelled, timed_out, &termination))
+}
+
+pub(super) fn append_stop_notes(
+    text: &mut String,
+    cancelled: bool,
+    timed_out: bool,
+    timeout_secs: u64,
+    termination: &Termination,
+) {
+    let state = if termination.shell_stopped {
+        "stopped"
     } else {
-        output
-    })
+        "not stopped"
+    };
+    if cancelled {
+        text.push_str(&format!("[cancelled; in-process shell {state}]\n"));
+    } else if timed_out {
+        text.push_str(&format!(
+            "[timed out after {timeout_secs}s; in-process shell {state}]\n"
+        ));
+    }
+    if !termination.shell_stopped {
+        text.push_str("[in-process shell did not stop (a builtin that never yields cannot be interrupted); it was abandoned and may keep using CPU until Dial exits]\n");
+    }
+    if let Some(error) = &termination.cleanup_error {
+        text.push_str(&format!("[external-command cleanup could not be established: {error}; processes may still be running]\n"));
+    }
+}
+
+pub(super) fn finish_stop(
+    mut output: ToolOutput,
+    cancelled: bool,
+    timed_out: bool,
+    termination: &Termination,
+) -> ToolOutput {
+    if cancelled {
+        output = output.with_status(crate::tools::ToolStatus::Aborted);
+    } else if timed_out {
+        output = output.with_status(crate::tools::ToolStatus::Timeout);
+    }
+    if cancelled || termination.uncertain() {
+        output = output.with_effects(crate::tools::surface::outcome::Effects::Unknown);
+    }
+    output
 }

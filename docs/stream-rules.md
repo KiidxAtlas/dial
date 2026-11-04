@@ -41,7 +41,7 @@ other field is refused.
 | `astCondition`, `astLanguage` | ast-grep pattern(s) matched against finalized source-bearing tool arguments ([structural guidance](extensibility.md#structural-guidance)). |
 | `scope` | Where `condition` looks: `text`, `thinking`, `tool:NAME` or `tool:NAME(GLOB)`. Defaults to text, thinking and every tool. |
 | `interruptMode` | Which matches stop the inference (below). Default `always`. |
-| `question` | A yes/no question the judge role answers about each completed reply (below). |
+| `question` | A yes/no question the decision role answers about each completed reply (below). |
 | `globs` / `applyTo` | Paths the rule applies to; GitHub instructions require `applyTo`. |
 | `alwaysApply` | `true` keeps the rule in context on every request. |
 | `agents` | Agent names the rule applies to (`main`, worker names; globs allowed). |
@@ -66,7 +66,7 @@ Each firing shows a notice in the conversation (`…; regenerating with its guid
 
 ## Judged rules
 
-A rule with `question` is not matched while streaming. After a reply completes, the judge role is
+A rule with `question` is not matched while streaming. After a reply completes, the decision role is
 asked the question about the reply's in-scope content and answers `yes` or `no`; `yes` fires the
 rule as a deferred reminder. A `condition` or `astCondition` on the same rule acts as a prefilter:
 only replies it matches are judged. Judged rules never interrupt, so `interruptMode` other than
@@ -74,9 +74,9 @@ only replies it matches are judged. Judged rules never interrupt, so `interruptM
 
 `portable_rules.judge` controls the cost:
 
-- `auto` (default): judge only when the `judge` role is explicitly assigned in `[model_roles]`, so
+- `auto` (default): judge only when the `decision` role is explicitly assigned in `[model_roles]`, so
   no main-model calls are spent without a deliberate choice.
-- `on`: judge through the judge role, falling back to the `small` role and then the main model.
+- `on`: judge through the decision role, falling back to the `small` role and then the main model.
 - `off`: never judge.
 
 A failed judgment is reported as a diagnostic and does not fire the rule.
@@ -114,4 +114,4 @@ dial rules --json test --agent reviewer 'looks good'
 ```
 
 It prints whether each matching rule interrupts or defers, and which judged rules would be asked of
-the judge role (they are not asked). The exit status is 1 when anything fires, 0 otherwise.
+the decision role (they are not asked). The exit status is 1 when anything fires, 0 otherwise.

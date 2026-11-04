@@ -756,3 +756,51 @@ fn tab_and_backtab_reach_suggestion_rows_and_wrap_back() {
         "BackTab from a suggestion lands on the last field section"
     );
 }
+
+#[test]
+fn selected_tuning_names_scope_and_routes_connections_without_assigning_main() {
+    let rig = Rig::new();
+    let mut overlay = ModelSettingsOverlay::new("local".into(), mlx())
+        .for_selected_model()
+        .with_project_name("example-project");
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &|ui, w| status_preview(ui, w),
+    };
+    let shown = screen(&render(180, 30, |frame| overlay.draw(frame, &ctx)));
+    assert!(
+        shown.contains("scope: project (example-project)"),
+        "{shown}"
+    );
+    assert!(shown.contains("global"), "{shown}");
+    assert!(shown.contains("connections"), "{shown}");
+    assert!(
+        matches!(overlay.event(&ch('c'), &rig.keys), OverlayEvent::Action(action) if action == "open:providers")
+    );
+    assert!(!overlay.activates_profile());
+    assert!(overlay.pending.is_none());
+}
+
+#[test]
+fn selected_profile_save_does_not_claim_main_activation_or_next_request() {
+    let rig = Rig::new();
+    for activates_main in [false, true] {
+        let mut overlay = ModelSettingsOverlay::new("local".into(), mlx());
+        if !activates_main {
+            overlay = overlay.for_selected_model();
+        }
+        go(&mut overlay, &rig, "temperature");
+        assert!(matches!(overlay.apply("0.5"), OverlayEvent::Set { .. }));
+        overlay.settled(Ok(()));
+        let message = overlay.message.as_ref().unwrap().0.as_str();
+        if activates_main {
+            assert!(message.contains("saved main profile"));
+        } else {
+            assert!(message.contains("saved selected-model profile"));
+            assert!(message.contains("main selection unchanged"));
+            assert!(!message.contains("next request") && !message.contains("active turn"));
+        }
+    }
+}

@@ -107,6 +107,7 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
         ("skill", SKILL_RULE),
         ("codebase_memory", PROJECT_MAP_RULE),
         ("lsp", LSP_RULE),
+        ("glob", SOURCE_PREVIEW_RULE),
     ]
     .into_iter()
     .filter(|(tool, _)| has(tool))
@@ -326,12 +327,21 @@ enum TurnNotes {
 fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) -> String {
     let repeated = |text: &str| already_rendered(rendered, text);
     let mut out = String::new();
+    let compact = i.concise_guidance && i.template.is_none() && i.overrides.0.is_none();
     out.push_str(&format!(
-        "\n\n# Environment\n- Project directory: {}\n- Platform: {}\n- Tools: {} (the supplied schemas are the callable set)\n",
+        "\n\n# Environment\n- Project directory: {}\n- Platform: {}\n",
         i.cwd.display(),
         std::env::consts::OS,
-        i.tools.join(", ")
     ));
+    if compact {
+        // Names already travel in the callable schemas; keep only the authority boundary.
+        out.push_str("- Tools: supplied schemas define the callable set.\n");
+    } else {
+        out.push_str(&format!(
+            "- Tools: {} (the supplied schemas are the callable set)\n",
+            i.tools.join(", ")
+        ));
+    }
     out.push_str(crate::agent::window::file_handles::GUIDANCE);
     out.push('\n');
     if i.tools.iter().any(|tool| tool == "tool_search") {
@@ -340,10 +350,7 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
     if !i.discoverable.is_empty() {
         out.push_str("- Loadable tools, not in the schema yet: call `tool_load` with the exact name and use the tool next round. NEVER call one before loading it.\n");
         // Names alone suffice when `tool_search` can describe them on demand.
-        let names_only = i.concise_guidance
-            && i.template.is_none()
-            && i.overrides.0.is_none()
-            && i.tools.iter().any(|tool| tool == "tool_search");
+        let names_only = compact && i.tools.iter().any(|tool| tool == "tool_search");
         if i.lean || i.one_call {
             // Small models invent what a bare name does, so native tools get one bounded line
             // each; MCP names stay on the `Names:` line with the bounded hints below.

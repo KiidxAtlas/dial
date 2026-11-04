@@ -153,11 +153,79 @@ fn lib_and_bin_share_src_and_the_lib_wins_the_tie() {
     let root = tmp.path();
     write(root, "Cargo.toml", "[package]\nname = \"both\"\n");
     write(root, "src/lib.rs", "pub mod shared;\n");
-    write(root, "src/main.rs", "fn main() {}\n");
+    write(root, "src/main.rs", "mod shared;\nfn main() {}\n");
     write(root, "src/shared.rs", "#[test]\nfn s() {}\n");
     assert_eq!(
         commands(&plan_for(root, &["src/shared.rs"])),
         vec!["cargo test --offline --manifest-path 'Cargo.toml' --lib 'shared::' --quiet -j1"]
+    );
+}
+
+#[test]
+fn binary_only_module_under_shared_src_selects_binary_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "Cargo.toml", "[package]\nname = \"dial\"\n");
+    write(
+        root,
+        "src/lib.rs",
+        "// mod cmd;\nconst EXAMPLE: &str = \"mod cmd;\";\nmod nested { mod cmd; }\n",
+    );
+    write(root, "src/main.rs", "pub(crate) mod\ncmd;\nfn main() {}\n");
+    write(root, "src/cmd.rs", "mod benchmark;\n");
+    write(root, "src/cmd/benchmark.rs", "mod rpc;\n");
+    write(
+        root,
+        "src/cmd/benchmark/rpc.rs",
+        "#[cfg(test)]\nmod tests;\n",
+    );
+    write(
+        root,
+        "src/cmd/benchmark/rpc/tests.rs",
+        "#[test]\nfn deadline() {}\n",
+    );
+    let plan = plan_for(
+        root,
+        &["src/cmd/benchmark/rpc.rs", "src/cmd/benchmark/rpc/tests.rs"],
+    );
+    assert_eq!(
+        commands(&plan),
+        vec![
+            "cargo test --offline --manifest-path 'Cargo.toml' --bin 'dial' 'cmd::benchmark::rpc::tests::' --quiet -j1"
+        ]
+    );
+    assert!(plan.limits.is_empty(), "{:?}", plan.limits);
+}
+
+#[test]
+fn remapped_library_module_does_not_claim_the_binarys_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "Cargo.toml", "[package]\nname = \"both\"\n");
+    write(root, "src/lib.rs", "#[path = \"lib_cmd.rs\"]\nmod cmd;\n");
+    write(root, "src/main.rs", "mod cmd;\nfn main() {}\n");
+    write(root, "src/lib_cmd.rs", "");
+    write(root, "src/cmd.rs", "#[test]\nfn runs() {}\n");
+    assert_eq!(
+        commands(&plan_for(root, &["src/cmd.rs"])),
+        vec!["cargo test --offline --manifest-path 'Cargo.toml' --bin 'both' 'cmd::' --quiet -j1"]
+    );
+}
+
+#[test]
+fn undeclared_module_under_shared_src_reports_a_gap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "Cargo.toml", "[package]\nname = \"both\"\n");
+    write(root, "src/lib.rs", "");
+    write(root, "src/main.rs", "fn main() {}\n");
+    write(root, "src/orphan.rs", "#[test]\nfn orphan() {}\n");
+    let plan = plan_for(root, &["src/orphan.rs"]);
+    assert!(plan.checks.is_empty(), "{:?}", plan.checks);
+    assert!(
+        gap_mentions(&plan, "registered target"),
+        "{:?}",
+        plan.limits
     );
 }
 

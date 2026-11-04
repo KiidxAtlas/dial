@@ -163,8 +163,8 @@ impl Agent<'_> {
                 _ => anyhow::bail!("invalid message-routing choice"),
             };
         }
-        let role = if self.config.role_selection("judge").is_some() {
-            "judge"
+        let role = if self.config.role_selection("decision").is_some() {
+            "decision"
         } else {
             "small"
         };

@@ -124,7 +124,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         EX,
         "Verification",
         "Fault witness",
-        "After a focused check passes on a turn with edits, rerun it once in an isolated copy with the changed files restored to their turn-start content. A failure there witnesses the change; a pass there marks the check vacuous. Costs one extra check run, often with a cold build.",
+        "Opt in to comparing a passing command named in verification.behavioral_checks against turn-start files in an isolated copy. At most one attempt per turn, capped at 60 seconds (possibly a cold build). Related suites and registered reproductions are skipped; a passing comparison does not invalidate normal verification.",
         Kind::Bool,
     ),
     field!(

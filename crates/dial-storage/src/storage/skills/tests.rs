@@ -712,7 +712,6 @@ fn authored_body_limit_can_be_imported_and_updated() {
 fn versioned_skill_examples_import_discover_and_load() {
     let e = env();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/skills");
-    let reports = import::run(&e.layout, &root, Scope::Project, false, false).unwrap();
     let names = [
         "art-to-ui",
         "code-cleanup",
@@ -721,9 +720,11 @@ fn versioned_skill_examples_import_discover_and_load() {
         "implementation-quality",
         "test-runner",
     ];
-    assert_eq!(reports.len(), names.len());
     for name in names {
-        assert!(reports.contains(&format!("Imported {name}")), "{reports:?}");
+        // Import authored fixtures explicitly; Finder metadata is not a skill fixture.
+        let reports =
+            import::run(&e.layout, &root.join(name), Scope::Project, false, false).unwrap();
+        assert_eq!(reports, vec![format!("Imported {name}")]);
         let original = fs::read_to_string(root.join(name).join(SKILL_FILE)).unwrap();
         let (frontmatter, body) = split_frontmatter(&original).unwrap();
         let fields = parse_fields(frontmatter);

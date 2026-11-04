@@ -2,6 +2,27 @@ use super::super::settings::testkit::*;
 use super::*;
 use crate::llm::model_config::UiConfig;
 
+fn shifted_function(number: u8) -> Event {
+    Event::Key(KeyEvent::new(KeyCode::F(number), KeyModifiers::SHIFT))
+}
+
+#[test]
+fn local_function_keys_keep_unshadowed_legacy_bindings() {
+    for (number, global) in [
+        (2, Action::ModelSelect),
+        (3, Action::ModelRoles),
+        (8, Action::ModelFavoriteNext),
+    ] {
+        let mut keys = Keymap::defaults();
+        let old = KeyEvent::new(KeyCode::F(number), KeyModifiers::NONE);
+        let new = KeyEvent::new(KeyCode::F(number), KeyModifiers::SHIFT);
+        assert!(!local_function_key(&old, &keys, number, global));
+        assert!(local_function_key(&new, &keys, number, global));
+        keys.rebind(global, &[]).unwrap();
+        assert!(local_function_key(&old, &keys, number, global));
+    }
+}
+
 fn favorite_routes(selections: Vec<ModelSelection>) -> Vec<FavoriteRoute> {
     selections
         .into_iter()
@@ -139,9 +160,12 @@ fn names(o: &ModelOverlay) -> Vec<String> {
 }
 
 #[test]
-fn judge_role_can_select_laya_once_a_decision_checkpoint_exists() {
+fn decision_role_can_select_laya_once_a_checkpoint_exists() {
     let rig = Rig::new();
-    let judge = ROLES.iter().position(|(role, _)| *role == "judge").unwrap();
+    let decision = ROLES
+        .iter()
+        .position(|(role, _)| *role == "decision")
+        .unwrap();
     let small = ROLES.iter().position(|(role, _)| *role == "small").unwrap();
     let mut o = overlay();
     o.show_roles();
@@ -154,7 +178,7 @@ fn judge_role_can_select_laya_once_a_decision_checkpoint_exists() {
     );
     send(&mut o, &rig, key(KeyCode::Esc));
 
-    o.cursor = judge;
+    o.cursor = decision;
     send(&mut o, &rig, key(KeyCode::Enter));
     assert_eq!(o.rows()[0].0.selection.provider, "laya");
     // No checkpoint yet: refused with the way to get one.
@@ -164,34 +188,20 @@ fn judge_role_can_select_laya_once_a_decision_checkpoint_exists() {
     ));
     assert!(o.message.as_ref().unwrap().0.contains("dial laya install"));
 
-    let mut roles = roles_with_main();
-    roles.push(RoleStatus {
-        role: "decision",
-        assigned: None,
-        effective: Some("Laya · /ckpt".into()),
-        source: RoleSource::LayaInstalled,
-    });
-    o.set_roles(roles);
+    o.set_laya_checkpoint(Some("/ckpt".into()));
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Enter)),
         OverlayEvent::AssignModel { role, selection, .. }
-            if role == "judge"
+            if role == "decision"
                 && selection.provider == crate::config::laya::PROVIDER
-                && selection.model == crate::config::laya::JUDGE_MODEL
+                && selection.model == "decision"
     ));
 }
 
 #[test]
-fn decision_role_picks_checkpoint_instead_of_the_judge_alias() {
+fn decision_role_offers_chat_models_without_a_checkpoint() {
     let rig = Rig::new();
-    let mut roles = roles_with_main();
-    roles.push(RoleStatus {
-        role: "decision",
-        assigned: Some(ModelSelection::new("laya", "/tmp/laya-checkpoint")),
-        effective: Some("laya//tmp/laya-checkpoint".into()),
-        source: RoleSource::Assigned,
-    });
-    let mut o = ModelOverlay::new(Some(discovery()), roles, Scope::Global).with_learning(false);
+    let mut o = overlay();
     o.show_roles();
     o.cursor = o
         .visible_roles()
@@ -199,15 +209,19 @@ fn decision_role_picks_checkpoint_instead_of_the_judge_alias() {
         .position(|(role, _)| *role == "decision")
         .unwrap();
     send(&mut o, &rig, key(KeyCode::Enter));
-    assert!(o.prompt.is_none());
     assert_eq!(o.target_role.as_deref(), Some("decision"));
-    assert_eq!(o.rows().len(), 1);
-    assert_eq!(o.rows()[0].0.selection.model, "/tmp/laya-checkpoint");
+    let rows = o.rows();
+    assert!(
+        rows.iter()
+            .any(|(entry, _)| entry.selection.provider == "laya" && !entry.available)
+    );
+    o.cursor = rows
+        .iter()
+        .position(|(entry, _)| entry.available && entry.supports_chat())
+        .unwrap();
     assert!(matches!(send(&mut o, &rig, key(KeyCode::Enter)),
         OverlayEvent::AssignModel { role, selection, .. }
-            if role == "decision" && selection.model == "/tmp/laya-checkpoint"));
-    send(&mut o, &rig, key(KeyCode::F(2)));
-    assert!(o.prompt.is_some());
+            if role == "decision" && selection.provider != "laya"));
 }
 
 #[test]
@@ -468,7 +482,7 @@ fn cleared_role_refresh_removes_assignment_and_preserves_selected_row() {
         };
         config.codebase.architecture_model.clear();
         config.experimental.turn_optimizer = true;
-        let provider = if role == "decision" { "laya" } else { "mlx" };
+        let provider = "mlx";
         config
             .model_roles
             .insert(role.into(), ModelSelection::new(provider, "assigned-model"));
@@ -570,26 +584,11 @@ fn empty_catalog_still_allows_roles() {
 }
 
 #[test]
-fn checkpoint_paste_updates_prompt_not_model_search() {
-    let rig = Rig::new();
-    let mut o = overlay();
-    o.show_roles();
-    o.open_prompt("decision");
-    send(&mut o, &rig, Event::Paste("/tmp/checkpoint".into()));
-    assert_eq!(o.prompt.as_ref().unwrap().text, "/tmp/checkpoint");
-    assert!(o.search.is_empty());
-    assert_eq!(o.group, Group::Roles);
-    assert!(
-        matches!(send(&mut o, &rig, key(KeyCode::Enter)), OverlayEvent::AssignModel { role, selection, .. } if role == "decision" && selection.model == "/tmp/checkpoint")
-    );
-}
-
-#[test]
 fn role_chooser_keeps_header_shortcut_from_opening_a_second_modal() {
     let rig = Rig::new();
     let mut o = overlay();
     send(&mut o, &rig, ctrl('a'));
-    send(&mut o, &rig, key(KeyCode::F(8)));
+    send(&mut o, &rig, shifted_function(8));
     assert!(o.chooser.is_some());
     assert!(o.headers_editor.is_none());
     send(&mut o, &rig, key(KeyCode::Down));
@@ -603,7 +602,7 @@ fn header_editing_needs_a_role_and_only_ever_assigns_that_role() {
     let rig = Rig::new();
     let mut o = overlay();
     assert!(matches!(
-        send(&mut o, &rig, key(KeyCode::F(8))),
+        send(&mut o, &rig, shifted_function(8)),
         OverlayEvent::None
     ));
     assert!(
@@ -618,7 +617,7 @@ fn header_editing_needs_a_role_and_only_ever_assigns_that_role() {
     o.show_roles();
     o.cursor = ROLES.iter().position(|(role, _)| *role == "small").unwrap();
     send(&mut o, &rig, key(KeyCode::Enter));
-    send(&mut o, &rig, key(KeyCode::F(8)));
+    send(&mut o, &rig, shifted_function(8));
     assert!(o.headers_editor.is_some());
     let OverlayEvent::AssignModel { role, .. } = send(&mut o, &rig, key(KeyCode::F(10))) else {
         panic!("saving headers assigns the role being edited");
@@ -1086,12 +1085,15 @@ fn detail_lines_name_context_state_and_roles_using_the_model() {
     );
     let mut o = ModelOverlay::new(Some(discovery()), roles, Scope::Global);
     let shown = draw(&mut o, &rig, 130, 30);
-    assert!(shown.contains("used by: main, coach"), "{shown}");
+    assert!(
+        shown.contains("assigned to: Conversation (main), Advisor (coach)"),
+        "{shown}"
+    );
     send(&mut o, &rig, key(KeyCode::Down));
     let shown = draw(&mut o, &rig, 130, 30);
     assert!(
         shown.contains("context 32k")
-            && shown.contains("not used by any role")
+            && shown.contains("no explicit role assignment")
             && !shown.contains("Source"),
         "{shown}"
     );
@@ -1294,10 +1296,13 @@ fn ctrl_a_opens_the_role_chooser_and_assigns_that_role() {
     let shown = draw(&mut o, &rig, 120, 30);
     assert!(
         shown.contains("ASSIGN LM-STUDIO/QWEN-WARM TO:")
-            && shown.contains("small")
-            && shown.contains("planner"),
+            && shown.contains("Fast helpers")
+            && shown.contains("Decisions"),
         "{shown}"
     );
+    for removed in ["planner", "judge", "grounding", "image_embedding"] {
+        assert!(!o.chooser.as_ref().unwrap().roles.contains(&removed));
+    }
     send(&mut o, &rig, key(KeyCode::Down));
     match send(&mut o, &rig, key(KeyCode::Enter)) {
         OverlayEvent::AssignModel {
@@ -1331,7 +1336,7 @@ fn roles_view_lists_roles_picks_models_and_clears() {
         "{shown}"
     );
     assert!(
-        shown.contains("coach") && shown.contains("planner"),
+        shown.contains("Advisor") && shown.contains("Decisions") && !shown.contains("planner"),
         "every role must be listed: {shown}"
     );
     send(&mut o, &rig, key(KeyCode::Down));
@@ -1619,14 +1624,14 @@ fn get_models_short_panel_shows_recommendations_before_any_input() {
         .clone();
     let shown = draw(&mut o, &rig, 120, 10);
     assert!(shown.contains(&repo), "{shown}");
-    assert!(o.downloads.idle_now());
-    assert!(o.downloads.query_text().is_empty());
+    assert!(o.downloads.borrow().idle_now());
+    assert!(o.downloads.borrow().query_text().is_empty());
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Enter)),
         OverlayEvent::None
     ));
     assert!(
-        o.downloads.idle_now(),
+        o.downloads.borrow().idle_now(),
         "idle fixture must not search on Enter"
     );
     assert!(draw(&mut o, &rig, 120, 10).contains("Downloads are unavailable"));
@@ -1669,8 +1674,8 @@ fn typing_in_get_models_edits_its_query_and_never_starts_a_download() {
     for c in "qwen".chars() {
         assert!(matches!(send(&mut o, &rig, ch(c)), OverlayEvent::None));
     }
-    assert_eq!(o.downloads.query_text(), "qwen");
-    assert!(o.downloads.idle_now());
+    assert_eq!(o.downloads.borrow().query_text(), "qwen");
+    assert!(o.downloads.borrow().idle_now());
     assert!(o.search.is_empty(), "the models search is not touched");
     assert!(!o.take_refresh());
 }
@@ -1680,7 +1685,7 @@ fn enter_on_an_embedding_catalog_row_asks_for_its_setup() {
     let rig = Rig::new();
     let mut o = overlay();
     o.show_downloads();
-    o.downloads.show_embedding_for_test();
+    o.downloads.borrow_mut().show_embedding_for_test();
     // Discovered embedders lead; the fixture's only one is not served, so Enter stays here.
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Enter)),
@@ -1703,7 +1708,7 @@ fn switching_groups_keeps_a_running_download() {
     let rig = Rig::new();
     let mut o = overlay();
     o.show_downloads();
-    let (cancel, done) = o.downloads.fake_download("org/model");
+    let (cancel, done) = o.downloads.borrow_mut().fake_download("org/model");
     // Left reaches the groups column without cancelling the download.
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Left)),
@@ -1719,8 +1724,53 @@ fn switching_groups_keeps_a_running_download() {
     send(&mut o, &rig, key(KeyCode::Up));
     assert_eq!(o.group, Group::All);
     assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(o.downloads.is_running());
+    assert!(o.downloads.borrow().is_running());
     done.send(Ok("/no/such/path".into())).unwrap();
+}
+
+#[test]
+fn closing_and_reopening_models_retains_the_same_download_and_browse_position() {
+    let rig = Rig::new();
+    let shared = ModelDownloads::idle().into_shared();
+    let mut first = overlay().with_shared_downloads(shared.clone());
+    first.show_downloads();
+    send(&mut first, &rig, ch('q'));
+    let (cancel, done) = shared.borrow_mut().fake_download("org/model");
+    // Closing from the groups column drops the view, not the session's download owner.
+    send(&mut first, &rig, key(KeyCode::Left));
+    assert!(matches!(
+        send(&mut first, &rig, key(KeyCode::Esc)),
+        OverlayEvent::Close
+    ));
+    drop(first);
+    assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(shared.borrow().is_running());
+
+    let mut reopened = overlay().with_shared_downloads(shared.clone());
+    reopened.show_downloads();
+    assert_eq!(reopened.downloads.borrow().query_text(), "q");
+    assert!(reopened.downloads.borrow().is_running());
+    // Explicit cancellation still reaches that exact worker through the reopened view.
+    send(&mut reopened, &rig, key(KeyCode::Esc));
+    assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+    done.send(Err("download cancelled".into())).unwrap();
+    shared.borrow_mut().poll();
+    assert!(!shared.borrow().is_running());
+}
+
+#[test]
+fn hidden_download_completion_is_polled_and_requests_one_catalog_rescan() {
+    let shared = ModelDownloads::idle().into_shared();
+    let view = overlay().with_shared_downloads(shared.clone());
+    let (cancel, done) = shared.borrow_mut().fake_download("org/model");
+    drop(view);
+    done.send(Ok("/no/such/path".into())).unwrap();
+    shared.borrow_mut().poll();
+    assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!shared.borrow().is_running());
+    let mut reopened = overlay().with_shared_downloads(shared);
+    assert!(reopened.take_refresh());
+    assert!(!reopened.take_refresh());
 }
 
 #[test]
@@ -1799,7 +1849,7 @@ fn get_models_escape_clears_query_before_returning_to_groups() {
         send(&mut o, &rig, key(KeyCode::Esc)),
         OverlayEvent::None
     ));
-    assert!(o.downloads.query_text().is_empty());
+    assert!(o.downloads.borrow().query_text().is_empty());
     assert_eq!(o.focus, Focus::List);
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Esc)),
@@ -1863,13 +1913,13 @@ fn ctrl(c: char) -> Event {
 fn f2_cycles_the_show_filter_and_escape_resets_it_before_closing() {
     let rig = Rig::new();
     let mut o = overlay();
-    send(&mut o, &rig, key(KeyCode::F(2)));
+    send(&mut o, &rig, shifted_function(2));
     assert_eq!(o.show, ShowFilter::Available);
     let shown = names(&o);
     assert!(shown.contains(&"llama3".to_owned()), "{shown:?}");
     assert!(!shown.contains(&"gpt-cached".to_owned()), "{shown:?}");
     assert!(!shown.contains(&"nomic-embed".to_owned()), "{shown:?}");
-    send(&mut o, &rig, key(KeyCode::F(2)));
+    send(&mut o, &rig, shifted_function(2));
     assert_eq!(o.show, ShowFilter::Loaded);
     assert_eq!(names(&o), vec!["qwen-warm".to_owned()]);
     assert!(draw(&mut o, &rig, 120, 24).contains("show  loaded"));
@@ -1902,17 +1952,17 @@ fn f3_sorts_by_price_speed_and_use_with_unknown_values_last() {
         .insert("qwen-chat".into(), usage(9, Some(80.0), 0.09));
     o.kind = KindFilter::Chat;
 
-    send(&mut o, &rig, key(KeyCode::F(3)));
+    send(&mut o, &rig, shifted_function(3));
     assert_eq!(o.sort, SortOrder::Name);
     // Names sort as shown: `provider/model`.
     assert_eq!(
         names(&o),
         vec!["qwen-chat", "qwen-warm", "llama3", "gpt-cached"]
     );
-    send(&mut o, &rig, key(KeyCode::F(3)));
+    send(&mut o, &rig, shifted_function(3));
     assert_eq!(o.sort, SortOrder::Price);
     assert_eq!(names(&o)[..2], ["qwen-warm", "qwen-chat"]);
-    send(&mut o, &rig, key(KeyCode::F(3)));
+    send(&mut o, &rig, shifted_function(3));
     assert_eq!(o.sort, SortOrder::Speed);
     assert_eq!(names(&o)[..2], ["qwen-chat", "llama3"]);
     o.sort = SortOrder::Usage;
@@ -2060,17 +2110,17 @@ fn picking_the_memory_role_from_roles_lands_in_the_memory_group() {
 }
 
 #[test]
-fn detail_lines_skip_unknown_values_and_groups_skip_zero_counts() {
+fn detail_lines_label_unknown_values_and_groups_skip_zero_counts() {
     let rig = Rig::new();
     let mut o = overlay();
     let shown = draw(&mut o, &rig, 120, 40);
-    // llama3 reports no capabilities, context or price: one phrase, no wall of "unknown".
+    // Missing metadata stays visible rather than implying unsupported or zero.
     let detail = shown
         .lines()
         .find(|l| l.contains("ollama/llama3") && l.contains("available") && !l.contains('›'))
         .unwrap_or_else(|| panic!("{shown}"));
     assert!(detail.contains("capabilities not reported"), "{detail}");
-    assert!(!detail.contains("unknown"), "{detail}");
+    assert!(detail.contains("context unknown"), "{detail}");
     // Empty groups show no count rather than a column of zeros.
     let favorites = shown.lines().find(|l| l.contains("Favorites")).unwrap();
     assert!(!favorites.contains(" 0 "), "{favorites}");
@@ -2182,4 +2232,173 @@ fn chatgpt_plan_models_are_image_role_candidates_unless_disabled() {
 
     plan.metadata.image_generation = Some(ImageGenerationApi::Disabled);
     assert!(!role_accepts("image", &plan));
+}
+
+#[test]
+fn selected_tuning_carries_identity_without_reassigning_conversation() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    let main = o.role_selection("main").cloned();
+    send(&mut o, &rig, key(KeyCode::Down));
+    let selected = o.highlighted().unwrap().selection.clone();
+    let OverlayEvent::Action(action) = send(&mut o, &rig, key(KeyCode::F(7))) else {
+        panic!("F7 must open selected tuning, not assign a model");
+    };
+    let carried: ModelSelection =
+        serde_json::from_str(action.strip_prefix("open:model-settings:").unwrap()).unwrap();
+    assert_eq!(carried, selected);
+    assert_eq!(o.role_selection("main"), main.as_ref());
+    let shown = draw(&mut o, &rig, 180, 30);
+    assert!(shown.contains("ACTIVE SESSION: OLLAMA/LLAMA3"), "{shown}");
+    assert!(shown.contains("Selected: lm-studio/qwen-warm"), "{shown}");
+    assert!(shown.contains("Connection overrides"), "{shown}");
+    assert!(
+        o.assignment_effect()
+            .contains("user default; clears this project's overrides")
+    );
+    o.scope = Scope::Project;
+    assert!(o.assignment_effect().contains("project override"));
+    o.show_roles();
+    o.cursor = ROLES.iter().position(|(role, _)| *role == "small").unwrap();
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::F(7))),
+        OverlayEvent::None
+    ));
+    assert_eq!(o.role_selection("main"), main.as_ref());
+}
+
+#[test]
+fn reviewed_assignment_requires_confirmation_and_cancels_without_mutation() {
+    let rig = Rig::new();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let config = crate::config::settings_store::load_config(&layout, &toml::Table::new()).unwrap();
+    let mut selection = discovery().models[0].selection.clone();
+    selection.allow_insecure = true;
+    let changes = crate::config::selection::changes(&config, &selection, "main").unwrap();
+    let transaction = crate::config::settings_store::review_model_config(
+        &layout,
+        Scope::Global,
+        &changes,
+        Some("main"),
+    )
+    .unwrap();
+    let mut o = overlay();
+    o.discovery.as_mut().unwrap().models[0].metadata.tools = Some(false);
+    let main = o.role_selection("main").cloned();
+    for confirm in [false, true] {
+        o.review_assignment(
+            transaction.clone(),
+            OverlayEvent::AssignModel {
+                role: "main".into(),
+                selection: selection.clone(),
+                scope: Scope::Global,
+            },
+            "main".into(),
+            vec!["This session + saved Global; other sessions unchanged".into()],
+        );
+        assert!(o.take_confirmed_assignment().is_none());
+        let shown = draw(&mut o, &rig, 180, 35);
+        assert!(shown.contains("global SAVE: model"), "{shown}");
+        assert!(shown.contains("unknown (not reported)"), "{shown}");
+        assert!(shown.contains("tools: unsupported"), "{shown}");
+        assert!(
+            !shown.contains("http://ollama"),
+            "no endpoint values rendered: {shown}"
+        );
+        let event = send(
+            &mut o,
+            &rig,
+            key(if confirm {
+                KeyCode::Enter
+            } else {
+                KeyCode::Esc
+            }),
+        );
+        assert_eq!(matches!(event, OverlayEvent::AssignModel { .. }), confirm);
+        assert_eq!(o.take_confirmed_assignment().is_some(), confirm);
+        assert_eq!(o.role_selection("main"), main.as_ref());
+        assert!(
+            crate::config::settings_store::load_layer(&layout, Scope::Global)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            crate::config::settings_store::load_layer(&layout, Scope::Project)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn named_scope_and_role_connection_reasoning_details_stay_visible_without_secrets() {
+    let rig = Rig::new();
+    let mut o = overlay().with_project_name("example-project");
+    o.show_roles();
+    o.cursor = ROLES.iter().position(|(role, _)| *role == "small").unwrap();
+    let mut selection = discovery().models[0].selection.clone();
+    selection.thinking = Some("high".into());
+    selection.headers = Some(vec![crate::llm::model_config::RequestHeader {
+        name: "X-Private".into(),
+        value: crate::llm::model_config::HeaderValue::Literal("never-render-this".into()),
+    }]);
+    assign(
+        o.roles
+            .iter_mut()
+            .find(|status| status.role == "small")
+            .unwrap(),
+        selection,
+    );
+    let shown = draw(&mut o, &rig, 220, 35);
+    for expected in [
+        "scope: global",
+        "project (example-project)",
+        "reasoning: high",
+        "1 masked row(s)",
+        "Composer reasoning is main-only",
+        "Shift+F8",
+    ] {
+        assert!(shown.contains(expected), "missing {expected}: {shown}");
+    }
+    assert!(!shown.contains("never-render-this"));
+    let event = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(matches!(send(&mut o, &rig, event), OverlayEvent::None));
+    assert!(draw(&mut o, &rig, 220, 35).contains("scope: project (example-project)"));
+    o.set_roles(roles_with_main());
+    o.message = None;
+    let shown = draw(&mut o, &rig, 220, 35);
+    assert!(shown.contains("reasoning: inherits main"), "{shown}");
+    assert!(shown.contains("Headers: inherits main"), "{shown}");
+}
+
+#[test]
+fn direct_role_picker_reuses_role_filters_and_cancel_destination_without_assignment() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    let main = o.role_selection("main").cloned();
+    for (role, group) in [
+        ("memory", Group::Memory),
+        ("embedding", Group::All),
+        ("image", Group::Images),
+    ] {
+        assert!(o.show_role(role));
+        assert_eq!(o.group, group);
+        assert_eq!(o.target_role.as_deref(), Some(role));
+        assert!(
+            o.rows()
+                .iter()
+                .all(|(entry, _)| role_picker_accepts(role, entry))
+        );
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Esc)),
+            OverlayEvent::None
+        ));
+        assert_eq!(o.group, Group::Roles);
+        assert_eq!(o.role_selection("main"), main.as_ref());
+    }
+    assert!(!o.show_role("not-a-role"));
+    o.roles.retain(|status| status.role != TURN_DRAFTER);
+    assert!(!o.show_role(TURN_DRAFTER));
 }

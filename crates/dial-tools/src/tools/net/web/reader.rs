@@ -93,6 +93,12 @@ pub fn convert(
     page: &str,
 ) -> Result<Option<String>, String> {
     for reader in chain(config)? {
+        if client.is_interrupted() {
+            return Err("web request cancelled".into());
+        }
+        if client.remaining_timeout().is_zero() {
+            break;
+        }
         let produced = match reader {
             "native" => Ok(html::to_text(page, url)),
             "trafilatura" => run_external(
@@ -167,6 +173,11 @@ fn run_external(
     args: &[&str],
     input: &str,
 ) -> Result<String, String> {
+    let timeout = READER_TIMEOUT.min(client.remaining_timeout());
+    if timeout.is_zero() || client.is_interrupted() {
+        return Err(format!("{program} discovery stopped"));
+    }
+    let deadline = Instant::now() + timeout;
     let executable =
         crate::tools::exec::kernel::resolve_operator_executable(workspace, program, "web reader")?;
     let mut command = Command::new(&executable);
@@ -196,7 +207,6 @@ fn run_external(
         let _ = stdout.read_to_end(&mut output);
         output
     });
-    let deadline = Instant::now() + READER_TIMEOUT;
     loop {
         match group.exited() {
             Ok(true) => break,

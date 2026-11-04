@@ -9,6 +9,10 @@ use std::sync::{Arc, atomic::AtomicBool};
 pub(super) type Completion =
     dyn FnMut(&mut Backend, &Chat, &mut dyn Ui, Arc<AtomicBool>) -> Result<String> + Send;
 
+/// A borrowed completion may capture caller state and need not be transferable to another thread.
+pub(super) type RequestCompletion<'a> =
+    dyn FnMut(&mut Backend, &Chat, &mut dyn Ui, Arc<AtomicBool>) -> Result<String> + 'a;
+
 /// An independently owned cloud route and guidance loop, never a borrowed resident local model.
 pub(in crate::agent) struct SummaryWorker {
     pub backend: Backend,

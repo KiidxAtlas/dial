@@ -48,11 +48,6 @@ impl Agent<'_> {
                 .unwrap_or_else(|| {
                     worker_acceptance::Acceptance::unverified("no controller receipt")
                 });
-            let status = if report["data"]["dial_effects"] == "unknown" {
-                "lost"
-            } else {
-                status
-            };
             self.workflow_contracts
                 .settle(
                     &id,
@@ -137,6 +132,10 @@ impl Agent<'_> {
             parsed.jobs.len() == 1,
             "contract requires exactly one worker"
         );
+        ensure!(
+            parsed.jobs[0].isolated,
+            "strict contracts require an isolated worker; read-only/advisory output verification is unsupported"
+        );
         let checks = &parsed.jobs[0].acceptance_checks;
         worker_acceptance::validate_contract(checks, &self.auth_config.verification)
             .map_err(anyhow::Error::msg)?;
@@ -177,7 +176,11 @@ impl Agent<'_> {
                 json!(dependencies)
             ));
         }
-        match self.start_live_subagents(&launch, ui, true) {
+        match self.start_live_subagents(
+            &launch,
+            ui,
+            Some(self.workflow_contracts.promotion(&contract.id)),
+        ) {
             Ok(reply) => {
                 let worker = reply
                     .as_array()

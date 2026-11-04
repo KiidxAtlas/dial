@@ -25,24 +25,7 @@ mod presets;
 
 const TITLE: &str = "Setup";
 
-const USAGE: &str = "/setup                 guided setup: search, review, then confirm\n/setup presets [local-only|local-assisted|hosted] [project|global]   review and save a model-routing setup\n/setup list            list capabilities and their status as text\n/setup updates         check installed external runtimes/tools for updates (no installs)\n/setup update <id>     review update commands and destination\n/setup update <id> yes explicitly approve and run that update\n/setup <id>            preview what would run and where it installs\n/setup <id> yes        set it up (prerequisites first), then save its settings\n/setup providers       connect a model provider\n/setup memory          choose a memory backend: what each needs and whether it is ready\n/setup memory <backend>   switch memory to off, provenance, local, hindsight, sharpshooter or semantic (all projects)\n/setup embeddings      list local embedding models (Ollama)\n/setup embeddings:<model> [yes]   preview, then pull the model and assign it to the embedding role (used by the semantic memory backend)\n/setup grounding [yes] list, or set up the default UI grounding model (computer/browser locate)\n/setup grounding:<repo> [yes]   preview, then download an MLX grounding model and assign it to the grounding role\n/setup image-embeddings [yes]   list, or set up the default image embedding model (image_search)\n/setup image-embeddings:<repo> [yes]   preview, then download an MLX image embedding model and assign it to the image_embedding role";
-
-pub(super) const COMMANDS: &[super::CommandSpec] = &[super::CommandSpec {
-    name: "setup",
-    description: "check optional capabilities, set one up, choose memory, or sign in to providers",
-    args_hint: "[<id> [yes]]",
-    subcommands: &[
-        "presets",
-        "providers",
-        "memory",
-        "embeddings",
-        "grounding",
-        "image-embeddings",
-        "list",
-        "updates",
-        "update",
-    ],
-}];
+const USAGE: &str = "/setup                 guided setup: search, review, then confirm\n/setup presets [local-only|local-assisted|hosted] [project|global]   review and save a model-routing setup\n/setup list            list capabilities and their status as text\n/setup updates         check installed external runtimes/tools for updates (no installs)\n/setup update <id>     review update commands and destination\n/setup update <id> yes explicitly approve and run that update\n/setup <id>            preview what would run and where it installs\n/setup <id> yes        set it up (prerequisites first), then save its settings\n/setup providers       connect a model provider\n/setup memory          choose a memory backend: what each needs and whether it is ready\n/setup memory <backend>   switch memory to off, provenance, local, hindsight, sharpshooter or semantic (all projects)\n/setup embeddings      list local embedding models (Ollama)\n/setup embeddings:<model> [yes]   preview, then pull the model and assign it to the embedding role (used by the semantic memory backend)\n/setup grounding [yes] list, or set up the default UI grounding model (computer/browser locate)\n/setup grounding:<repo> [yes]   preview, then download an MLX grounding model and set vision.grounding\n/setup image-embeddings [yes]   list, or set up the default image embedding model (image_search)\n/setup image-embeddings:<repo> [yes]   preview, then download an MLX image embedding model and set vision.image_embedding";
 
 pub(super) fn run_command(
     shell: &mut Shell,
@@ -51,6 +34,46 @@ pub(super) fn run_command(
     name: &str,
     args: &str,
 ) -> Option<Result<Step>> {
+    if name == "inbox" {
+        if args.trim() == "notifications" {
+            return Some(shell.open(app, agent, Which::SettingsAt("ui.notify".into())));
+        }
+        if let Some(id) = args
+            .trim()
+            .strip_prefix("notifications ")
+            .and_then(|id| id.parse().ok())
+        {
+            let path = shell.inbox.settings_path(id).unwrap_or("ui.notify");
+            return Some(shell.open(app, agent, Which::SettingsAt(path.into())));
+        }
+        if let Some(choices) = args
+            .trim()
+            .strip_prefix("notice ")
+            .and_then(|id| id.parse().ok())
+            .and_then(|id| shell.inbox.notice_choices(id))
+        {
+            return Some(shell.open(app, agent, Which::Choice(Box::new(choices))));
+        }
+        if args.trim().is_empty() {
+            return Some(shell.open(app, agent, Which::Choice(Box::new(shell.inbox.choices()))));
+        }
+        let message = args
+            .trim()
+            .parse()
+            .ok()
+            .and_then(|id| shell.inbox.read(id))
+            .map(|(title, text)| (title.to_owned(), text.to_owned()));
+        if let Some((title, text)) = message {
+            // Reading a notice must not feed it back into the inbox.
+            shell.transcript.notice(&title, &text);
+        } else {
+            shell.note(
+                "Inbox",
+                "Notice not found. Open /inbox to choose a session notification.",
+            );
+        }
+        return Some(Ok(Step::Done));
+    }
     if name != "setup" && name != "doctor" {
         return None;
     }
@@ -67,7 +90,12 @@ pub(super) fn run_command(
     match parts.as_slice() {
         [] => {
             let env = Env::current(&app.layout.user_dir);
-            Some(shell.open(app, agent, Which::Choice(Box::new(setup_choices(&env)))))
+            let choices = if name == "doctor" {
+                doctor_choices(&env, &app.config)
+            } else {
+                setup_choices(&env)
+            };
+            Some(shell.open(app, agent, Which::Choice(Box::new(choices))))
         }
         ["providers"] => Some(shell.open(app, agent, Which::Providers)),
         // Everything else was answered by `run_live`, which `commands::run` tries first.
@@ -183,6 +211,13 @@ fn runtime_update_command(shell: &mut Shell, app: &App, action: UpdateAction<'_>
 fn setup_choices(env: &Env) -> ChoiceSpec {
     let mut items = vec![
         ChoiceItem {
+            value: "local-model".into(),
+            label: "Use a local model · checklist".into(),
+            detail: "Review runtime readiness, choose a model, then explicitly test its provider"
+                .into(),
+            current: false,
+        },
+        ChoiceItem {
             value: "presets".into(),
             label: "Choose local or hosted setup".into(),
             detail: "Local only, approved hosted assistance, or hosted; preview before saving"
@@ -240,6 +275,33 @@ fn setup_choices(env: &Env) -> ChoiceSpec {
     choice_spec("Setup · choose what you need", items)
 }
 
+/// The same local dependency and memory diagnostics used by `dial doctor`.
+fn doctor_choices(env: &Env, config: &Config) -> ChoiceSpec {
+    let items = deps::report(env)
+        .into_iter()
+        .map(|row| ChoiceItem {
+            value: row.id.to_owned(),
+            label: format!(
+                "{} · {}",
+                if row.status == deps::Status::Ready {
+                    "Ready"
+                } else {
+                    "Missing"
+                },
+                row.title
+            ),
+            detail: row.detail.to_owned(),
+            current: false,
+        })
+        .collect();
+    let mut spec = choice_spec("Doctor · local diagnostics", items);
+    spec.summary = format!(
+        "{}\nOptional capabilities need not all be installed. Enter reviews a fix; nothing is installed without confirmation.",
+        crate::setup::memory::doctor_text(config)
+    );
+    spec
+}
+
 fn embedding_choices() -> ChoiceSpec {
     choice_spec(
         "Setup · choose an embedding model",
@@ -271,6 +333,51 @@ fn vision_choices(kind: Kind) -> ChoiceSpec {
             })
             .collect(),
     )
+}
+
+/// Outcome guidance projects existing local evidence; it never starts a runtime or probes a URL.
+fn local_model_choices(
+    env: &Env,
+    config: &Config,
+    discovery: Option<&crate::llm::catalog::Discovery>,
+) -> ChoiceSpec {
+    let selection = config.selection();
+    let mut items: Vec<_> = ["ollama", "llama-cpp", "mlx-runtime"]
+        .into_iter()
+        .filter_map(recipe)
+        .map(|runtime| ChoiceItem {
+            value: runtime.id.into(),
+            label: format!("1 · {}", runtime.title),
+            detail: if deps::is_ready(runtime, env) {
+                "Ready · installed locally; running state unknown. Enter reviews existing installation.".into()
+            } else {
+                "Needs setup · review this runtime's plan; install only after confirmation".into()
+            },
+            current: false,
+        })
+        .collect();
+    items.extend([
+        ChoiceItem {
+            value: "models".into(),
+            label: "2 · Choose a local model".into(),
+            detail: format!("Current selection: {}/{} · opens Models; select a local model there", selection.provider, selection.model),
+            current: false,
+        },
+        ChoiceItem {
+            value: "providers".into(),
+            label: "3 · Test the connection explicitly".into(),
+            detail: discovery
+                .and_then(|found| found.providers.iter().find(|provider| provider.id == selection.provider))
+                .map_or_else(
+                    || "Unknown · no provider check result in this session".to_owned(),
+                    |provider| format!("Last known {}: {} · {}", provider.id, provider.state, provider.detail),
+                ) + " · opens Providers; select the local endpoint and use Test connection. Selection is not a successful test.",
+            current: false,
+        },
+    ]);
+    let mut spec = choice_spec("Setup · use a local model", items);
+    spec.summary = "Choose one runtime, not every runtime. Installed does not mean running. Reopen /setup after each step to see current local readiness. Downloads, installs and connection tests are separate explicit actions.".into();
+    spec
 }
 
 fn choice_spec(title: &str, items: Vec<ChoiceItem>) -> ChoiceSpec {
@@ -322,6 +429,21 @@ fn guided_command(
     };
     match *id {
         "presets" => return presets::command(shell, app, agent, &[]),
+        "local-model" => {
+            let env = Env::current(&app.layout.user_dir);
+            let config = app.reload()?;
+            let discovery = shell.catalog.get();
+            return shell.open(
+                app,
+                agent,
+                Which::Choice(Box::new(local_model_choices(
+                    &env,
+                    &config,
+                    discovery.as_ref(),
+                ))),
+            );
+        }
+        "models" => return shell.open(app, agent, Which::Models),
         "providers" => return shell.open(app, agent, Which::Providers),
         "embeddings" => {
             return shell.open(app, agent, Which::Choice(Box::new(embedding_choices())));
@@ -413,7 +535,7 @@ fn embedding_command(shell: &mut Shell, app: &App, parts: &[&str]) {
 
 /// `/setup grounding` / `/setup image-embeddings` list the curated catalog; `<id>:<repo>` previews,
 /// and `... yes` (also on the bare id, meaning the default) downloads it in the background and
-/// assigns it to the role.
+/// saves it to the owning vision worker setting.
 fn vision_command(shell: &mut Shell, app: &App, parts: &[&str]) {
     let Some((kind, repo)) = parts.first().and_then(|id| vision_models::parse_id(id)) else {
         shell.note(

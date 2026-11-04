@@ -327,3 +327,137 @@ fn contracts_lost_output_and_unknown_effects_never_count_as_acceptance() {
     ledger.settle("unknown", "lost", receipt, None).unwrap();
     assert!(ledger.begin(&node, request).is_err());
 }
+
+#[test]
+fn running_contract_rechecks_upstream_authority_before_promotion_and_retains_stale_candidate() {
+    use crate::agent::workers::{
+        contracts::{Contract, Ledger},
+        subagents::{self, Outcome, Status},
+    };
+    struct Approved;
+    impl Approver for Approved {
+        fn authorize(
+            &mut self,
+            _: &crate::llm::ToolCall,
+            _: &str,
+            _: bool,
+        ) -> Result<(), crate::agent::safety::approval::Denial> {
+            Ok(())
+        }
+    }
+    // Upstream is deliberately not in the child's declared inputs: the ledger binding itself
+    // must guard promotion, rather than accidentally relying on overlapping check inputs.
+    for changed in [false, true] {
+        let (dir, workspace, mut verification) = fixture();
+        fs::write(dir.path().join("upstream.txt"), "upstream").unwrap();
+        verification.commands[0].command = "test -f source.txt && printf '1 test passed\\n'".into();
+        verification.commands.push(VerificationCommand {
+            name: "upstream".into(),
+            command: "unused".into(),
+            file_extensions: vec![],
+            timeout_secs: 5,
+        });
+        verification.inputs.insert(
+            "upstream".into(),
+            VerificationInputs {
+                paths: vec!["upstream.txt".into()],
+                environment: vec![],
+            },
+        );
+        let artifacts = tempfile::tempdir().unwrap();
+        let store = crate::storage::artifact::ArtifactStore::new(artifacts.path()).unwrap();
+        let output = store.retain("upstream result").unwrap();
+        let workspace = workspace.with_artifacts(store);
+        let mut ledger = Ledger::default();
+        ledger
+            .begin(
+                &Contract {
+                    id: "upstream".into(),
+                    depends_on: vec![],
+                },
+                json!({"acceptance_checks":["upstream"]}),
+            )
+            .unwrap();
+        let receipt = evaluate_with(
+            &workspace,
+            &verification,
+            &["upstream".into()],
+            |_| observed(0),
+            || false,
+        );
+        ledger
+            .settle("upstream", "done", receipt, Some(output))
+            .unwrap();
+        ledger
+            .begin(
+                &Contract {
+                    id: "child".into(),
+                    depends_on: vec!["upstream".into()],
+                },
+                json!({"acceptance_checks":["behavior"]}),
+            )
+            .unwrap();
+        ledger.attach("child", "task-child").unwrap();
+        let mut config = crate::config::types::Config {
+            verification,
+            ..Default::default()
+        };
+        config.isolation.backend = crate::config::isolation::Preference::Copy;
+        let mut request = subagents::parse(&json!({"agent":"worker","task":"edit","solution_space":"source only","acceptance_checks":["behavior"]}), &config).unwrap();
+        request.jobs[0].promotion = Some(ledger.promotion("child"));
+        let registry = crate::tools::integrations::ext::Registry::new();
+        let harness = crate::config::Harness::default();
+        let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let outcome = subagents::run_job(
+            Env {
+                config: &config,
+                workspace: &workspace,
+                ext: &registry,
+                layout: None,
+                harness: &harness,
+                interrupt: &interrupt,
+                usage: None,
+                context_cap: None,
+                memory: None,
+                plan_mode: false,
+                agents_messages: &[],
+            },
+            &request.jobs[0],
+            &mut Approved,
+            |env, _| {
+                fs::write(env.workspace.root().join("source.txt"), "new candidate").unwrap();
+                if changed {
+                    fs::write(dir.path().join("upstream.txt"), "new upstream").unwrap();
+                    // Controller revalidation happens while the child is still running.
+                    ledger.refresh(&workspace, &config.verification);
+                }
+                let mut outcome = Outcome::incomplete(1, "unused");
+                outcome.status = Status::done("worker says accepted".into());
+                outcome
+            },
+        );
+        let merge = outcome.isolation.unwrap();
+        assert_eq!(merge.integrated, !changed, "{merge:?}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("source.txt")).unwrap(),
+            if changed {
+                "candidate"
+            } else {
+                "new candidate"
+            }
+        );
+        if changed {
+            assert!(merge.applied.is_empty());
+            assert_eq!(
+                ledger.node("upstream").unwrap()["state"],
+                "needs_verification"
+            );
+            let kept = merge.kept.expect("stale candidate retained");
+            assert_eq!(
+                fs::read_to_string(kept.join("source.txt")).unwrap(),
+                "new candidate"
+            );
+            fs::remove_dir_all(kept).unwrap();
+        }
+    }
+}

@@ -109,6 +109,18 @@ impl Shell {
         let (name, args) = rest
             .split_once(char::is_whitespace)
             .map_or((rest, ""), |(name, args)| (name, args.trim()));
+        if let Some(draft) = crate::app::command_registry::hubs::draft(name, args) {
+            if self.composer.draft().trim().is_empty() {
+                self.composer.set_draft(draft);
+            } else {
+                self.note(
+                    "Command",
+                    format!("Your draft is kept. Enter {draft}<value> to continue."),
+                );
+            }
+            return Ok(Step::Done);
+        }
+        let (name, args) = crate::app::command_registry::hubs::expand(name, args);
         // `/accounts pin` is the clearer spelling of `/session pin`, which pins a ChatGPT account.
         let accounts_pin;
         let (name, args) = if name == "accounts" && (args == "pin" || args.starts_with("pin ")) {
@@ -118,6 +130,50 @@ impl Shell {
             (name, args)
         };
         let name = canonical_command(name);
+        // Compatibility spellings keep their distinct behavior through unified subactions.
+        let (name, args) = if name == "help" && args == "commands" {
+            ("commands", "")
+        } else if name == "undo" && (args == "files" || args.starts_with("files ")) {
+            ("rollback", args.strip_prefix("files").unwrap_or("").trim())
+        } else if name == "review" && (args == "files" || args.starts_with("files ")) {
+            (
+                "review-file",
+                args.strip_prefix("files").unwrap_or("").trim(),
+            )
+        } else if name == "sessions" && args == "fork" {
+            ("fork", "")
+        } else {
+            (name, args)
+        };
+        if let Some(reason) =
+            crate::ui::command_surface::unavailable_reason(name, args, self.command_context())
+        {
+            self.note(&format!("/{name}"), reason);
+            return Ok(Step::Done);
+        }
+        if name == "worker" {
+            if args.is_empty() {
+                self.note("Worker", "Usage: /worker <message>");
+                return Ok(Step::Done);
+            }
+            self.note("Worker", "No turn is running; sending this as a normal task. Use /worker during a turn for independent work.");
+            return self.run_turn(app, agent, args);
+        }
+        if name == "activity" && args == "resume" {
+            let report = crate::app::restore::reviewed_restore(app, self, agent)?;
+            self.note(
+                "Resume interrupted workers",
+                format!(
+                    "{} resumed; {} refused",
+                    report.restored.len(),
+                    report.rejected.len()
+                ),
+            );
+            for (id, reason) in report.rejected {
+                self.note("Resume refused", format!("{id}: {reason}"));
+            }
+            return Ok(Step::Done);
+        }
         if name == "todo" {
             self.todo = agent.todo().clone();
             let progress = agent.progress_view();
@@ -164,7 +220,8 @@ impl Shell {
                     self.note("Help", text);
                 }
                 _ => {
-                    let text = self.help_text(false);
+                    let text =
+                        super::help::command_help(args).or_else(|| super::help::topic_help(args)).unwrap_or_else(|| self.help_text(false));
                     self.note("Help", text);
                 }
             },
@@ -189,7 +246,7 @@ impl Shell {
             }
             "profile" => return self.profile_command(app, Some(agent), args),
             "hotkeys" => return self.open(app, agent, Which::Shortcuts),
-            "accounts" => self.accounts_note(),
+            "accounts" => self.accounts_note(app),
             "improve" => return self.improve_command(app, agent, args),
             "changes" => self.changes_note(&agent.layout().unwrap_or(&app.layout).project_root),
             "theme" => return self.theme_command(app, Some(agent), args),
@@ -203,11 +260,11 @@ impl Shell {
             }) {
                 Ok(session) => {
                     let id = session.id().to_owned();
-                    agent.swap_session(session);
+                    app.swap_agent_session(agent, session)?;
                     agent.set_plan_mode(false);
                     self.stop_loop_for_session_change();
                     self.show_session(agent.session());
-                    self.session_id = id.clone();
+                    self.set_session_id(&id);
                     self.note("Session", format!("new session {}", short(&id)));
                 }
                 Err(error) => self.note("Session", format!("error: {error:#}")),
@@ -221,7 +278,7 @@ impl Shell {
                     return Ok(Step::Done);
                 }
                 let query = if name == "tree" { "" } else { args };
-                match self.pick_session(agent, query, name == "tree", name == "resume") {
+                match self.pick_session(agent, query, name == "tree", name == "sessions" || name == "resume") {
                     Ok(Some(session)) => {
                         if let Err(reason) = agent.gate_session_change(
                             "session_before_switch",
@@ -230,8 +287,8 @@ impl Shell {
                             self.note("Resume", reason);
                             return Ok(Step::Done);
                         }
-                        self.show_session(&session);
-                        agent.swap_session(session);
+                        app.swap_agent_session(agent, session)?;
+                        self.show_session(agent.session());
                         agent.set_plan_mode(false);
                         self.stop_loop_for_session_change();
                         self.note("Resume", Self::resume_note(agent.session()));
@@ -330,10 +387,10 @@ impl Shell {
             "fork" => match agent.gate_session_change("session_before_branch", serde_json::json!({"reason":"fork"})).map_err(anyhow::Error::msg).and_then(|()| agent.layout().context("agent has no project layout")).and_then(|layout| agent.session().fork(layout)) {
                 Ok(session) => {
                     let id = session.id().to_owned();
-                    agent.swap_session(session);
+                    app.swap_agent_session(agent, session)?;
                     agent.set_plan_mode(false);
                     self.stop_loop_for_session_change();
-                    self.session_id = id.clone();
+                    self.set_session_id(&id);
                     self.set_scope(&agent.session().title());
                     self.note("Session", format!("forked into {}", short(&id)));
                 }
@@ -351,8 +408,9 @@ impl Shell {
                         Ok(report) => self.note(
                             "Rollback",
                             format!(
-                                "restored {:?}, removed {:?}",
-                                report.restored, report.removed
+                                "restored {:?}, removed {:?}{}",
+                                report.restored, report.removed,
+                                if report.warnings.is_empty() { String::new() } else { format!("\n{}", report.warnings.join("\n")) }
                             ),
                         ),
                         Err(error) => self.note("Rollback", format!("{error:#}")),
@@ -461,18 +519,9 @@ impl Shell {
                 self.note("Commands", text);
             }
             "search" if args.trim().is_empty() => self.note("Search", Self::SEARCH_USAGE),
-            "search" => match agent.layout().ok_or_else(|| anyhow::anyhow!("agent has no project layout")).and_then(|layout| Session::search(layout, args, 8)) {
-                Ok(hits) if hits.is_empty() => self.note("Search", format!("No past messages match \"{}\".", args.trim())),
-                Ok(hits) => self.note(
-                    "Search",
-                    hits.iter()
-                        .map(|hit| {
-                            format!("{} [{}] {}", short(&hit.session_id), hit.role, hit.snippet)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-                Err(error) => self.note("Search", format!("error: {error:#}")),
+            "search" => match agent.layout() {
+                Some(layout) => self.start_search(layout, args.trim()),
+                None => self.note("Search", "error: agent has no project layout"),
             },
             "context" => return self.context_command(agent),
             "approval" => {
@@ -534,6 +583,24 @@ impl Shell {
     }
 
     fn review_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        if args.is_empty()
+            && agent
+                .checkpoints()
+                .is_some_and(|checkpoints| checkpoints.list().iter().any(|turn| turn.files > 0))
+        {
+            match self.ask(
+                "Review changes",
+                "Get a read-only AI review, or inspect checkpointed changes to keep or revert files.",
+                &[("AI review", 'a'), ("Keep / revert files", 'f')],
+            ) {
+                Some(0) => {}
+                Some(1) => {
+                    self.review_checkpoints(agent, "");
+                    return Ok(Step::Done);
+                }
+                _ => return Ok(Step::Done),
+            }
+        }
         platform::interrupt::clear_interrupt();
         self.live_tasks = Some(agent.live_task_control());
         self.background_control = agent.background_control();
@@ -907,6 +974,22 @@ impl Shell {
             );
             return Ok(Step::Done);
         };
+        // Resolve and validate the exact conversation range before any filesystem mutation.
+        let checkpoint_turns = match agent.session().rewind_checkpoint_turns(turns) {
+            Ok(turns) => turns,
+            Err(error) => {
+                self.note("Undo", format!("{error:#}"));
+                return Ok(Step::Done);
+            }
+        };
+        let approval = match crate::app::commands::branch::preflight_rewind(agent, turns) {
+            Ok(approval) => approval,
+            Err(error) => {
+                self.note("Undo", format!("{error:#}; files and conversation kept"));
+                return Ok(Step::Done);
+            }
+        };
+        let checkpoint_session = agent.session().id().to_owned();
         let mut lines = Vec::new();
         if let (Some(trajectory), Some(store)) = (self.last_trajectory, app.store.as_ref()) {
             let outcome = Outcome {
@@ -920,21 +1003,47 @@ impl Shell {
                 Err(error) => lines.push(format!("could not record undo feedback: {error:#}")),
             }
         }
-        if let Some(checkpoints) = agent.checkpoints() {
-            match checkpoints.rollback(turns) {
-                Ok(report) => lines.push(format!(
-                    "restored {} file(s), removed {}",
-                    report.restored.len(),
-                    report.removed.len()
-                )),
-                Err(error) => lines.push(format!("rollback: {error:#}")),
+        if !checkpoint_turns.is_empty() {
+            let result = agent
+                .checkpoints()
+                .context("checkpoints unavailable; conversation kept")
+                .and_then(|checkpoints| {
+                    checkpoints.rollback_conversation(agent.session().id(), &checkpoint_turns)
+                });
+            match result {
+                Ok(report) => {
+                    lines.push(format!(
+                        "restored {} file(s), removed {}",
+                        report.restored.len(),
+                        report.removed.len()
+                    ));
+                    if !report.warnings.is_empty() {
+                        lines.extend(report.warnings);
+                        lines.push("Restoration incomplete; conversation kept. Inspect files before retrying.".into());
+                        self.note("Undo", lines.join("\n"));
+                        return Ok(Step::Done);
+                    }
+                }
+                Err(error) => {
+                    lines.push(format!("rollback: {error:#}; conversation kept"));
+                    self.note("Undo", lines.join("\n"));
+                    return Ok(Step::Done);
+                }
             }
         }
         agent.cancel_background_compaction();
-        match crate::app::commands::branch::rewind(app, agent, turns) {
+        match crate::app::commands::branch::rewind_approved(app, agent, approval) {
             Ok(rewound) => {
                 lines.push(format!("dropped {} message(s)", rewound.dropped));
                 lines.extend(rewound.note);
+                if let Some(checkpoints) = agent.checkpoints()
+                    && let Err(error) = checkpoints
+                        .finalize_conversation_rollback(&checkpoint_session, &checkpoint_turns)
+                {
+                    lines.push(format!(
+                        "conversation rewound, checkpoint cleanup: {error:#}"
+                    ));
+                }
             }
             Err(error) => lines.push(format!("rewind: {error:#}")),
         }

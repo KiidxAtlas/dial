@@ -14,6 +14,65 @@ fn entry(id: &str, parent: Option<&str>, status: AgentStatus, last: Option<u64>)
 }
 
 #[test]
+fn settings_lifecycle_keeps_requested_values_separate_from_active_model() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    let tree = Tree::default();
+    let body = tree.start("worker", "review", None);
+    for (state, revision, applied, model, failure) in [
+        ("launch", 0, 0, "original", None),
+        ("queued", 1, 0, "original", None),
+        ("applying", 1, 0, "original", None),
+        ("applied", 1, 1, "replacement", None),
+        ("queued", 2, 1, "replacement", None),
+        (
+            "not_applied",
+            2,
+            1,
+            "replacement",
+            Some("backend unavailable"),
+        ),
+    ] {
+        body.settle(
+            String::new(),
+            Some(serde_json::json!({
+                "id": "task-1", "model": model,
+                "config": {
+                    "revision": revision, "applied_revision": applied, "state": state,
+                    "requested": {"model": "requested", "thinking": "high"},
+                    "failure": failure,
+                },
+            })),
+            Phase::Running,
+        );
+        let snap = snapshot(&layout, "parent", &tree, None);
+        let worker = &snap.agents[0];
+        assert_eq!(worker.model, model, "{state}");
+        let config = worker.config.as_ref().unwrap();
+        assert_eq!(config.state, state);
+        assert_eq!(config.revision, revision);
+        assert_eq!(config.applied_revision, applied);
+        assert_eq!(config.requested_model.as_deref(), Some("requested"));
+        assert_eq!(config.requested_thinking.as_deref(), Some("high"));
+        assert_eq!(config.failure.as_deref(), failure);
+    }
+}
+
+#[test]
+fn absent_settings_metadata_does_not_invent_a_receipt() {
+    let mut worker = AgentEntry::default();
+    apply_body(
+        &mut worker,
+        &serde_json::json!({"model": "original"}),
+        Phase::Running,
+        0,
+    );
+    assert!(worker.config.is_none());
+    assert_eq!(worker.model, "original");
+}
+
+#[test]
 fn status_mapping_covers_every_phase() {
     assert_eq!(
         AgentStatus::from_phase(Phase::Running),
@@ -35,10 +94,16 @@ fn status_mapping_covers_every_phase() {
     );
     assert_eq!(
         AgentStatus::from_phase(Phase::Interrupted),
-        AgentStatus::Cancelled
+        AgentStatus::Interrupted
     );
     assert_eq!(AgentStatus::from_wire("done"), AgentStatus::Done);
     assert_eq!(AgentStatus::from_wire("cancelled"), AgentStatus::Cancelled);
+    assert_eq!(
+        AgentStatus::from_wire("interrupted"),
+        AgentStatus::Interrupted
+    );
+    assert_eq!(AgentStatus::Done.label(), "completed");
+    assert_ne!(AgentStatus::Cancelled, AgentStatus::Interrupted);
 }
 
 #[test]
@@ -240,6 +305,10 @@ fn transcript_projection_reads_header_status_and_metrics() {
     let agent = &snap.agents[0];
     assert_eq!(agent.status, AgentStatus::Done);
     assert_eq!(agent.task, "Find the parser");
+    assert_eq!(
+        agent.model_explanation, None,
+        "legacy records never infer routing"
+    );
     assert_eq!(agent.steps, 4);
     assert_eq!(agent.requests, 3);
     assert_eq!(agent.tool_calls, 2);
@@ -275,7 +344,7 @@ fn transcript_projection_reads_header_status_and_metrics() {
 }
 
 #[test]
-fn transcript_without_final_record_is_cancelled_unless_still_live() {
+fn transcript_without_final_record_is_interrupted_unless_still_live() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
@@ -287,7 +356,7 @@ fn transcript_without_final_record_is_cancelled_unless_still_live() {
     )
     .unwrap();
     let snap = snapshot(&layout, "parent", &Tree::default(), None);
-    assert_eq!(snap.agents[0].status, AgentStatus::Cancelled);
+    assert_eq!(snap.agents[0].status, AgentStatus::Interrupted);
     assert!(!snap.agents[0].cancellable);
 }
 
@@ -561,4 +630,88 @@ fn feed_drops_on_read_error_and_replays_a_truncated_transcript() {
         [(Some(0), "x".to_owned())]
     );
     assert_eq!(cache.stats().read_errors, 1);
+}
+
+#[test]
+fn attention_uses_observed_lifecycle_or_rejected_settings_not_pending_changes() {
+    for (status, expected) in [
+        (AgentStatus::Running, false),
+        (AgentStatus::Waiting, true),
+        (AgentStatus::Done, false),
+        (AgentStatus::Failed, true),
+        (AgentStatus::Cancelled, false),
+        (AgentStatus::Interrupted, true),
+    ] {
+        assert_eq!(
+            entry("w", None, status, None).needs_attention(),
+            expected,
+            "{status:?}"
+        );
+    }
+    for (state, expected) in [
+        ("queued", false),
+        ("applying", false),
+        ("applied", false),
+        ("not_applied", true),
+    ] {
+        let mut worker = entry("w", None, AgentStatus::Running, None);
+        worker.config = Some(WorkerConfig {
+            revision: 1,
+            applied_revision: 0,
+            state: state.into(),
+            requested_model: None,
+            requested_thinking: None,
+            failure: None,
+        });
+        assert_eq!(worker.needs_attention(), expected, "{state}");
+    }
+}
+
+#[test]
+fn interrupted_body_keeps_explicit_cancellation_receipt_but_not_stale_running_state() {
+    let mut worker = entry("w", None, AgentStatus::Cancelled, None);
+    apply_body(&mut worker, &Value::Null, Phase::Interrupted, 0);
+    assert_eq!(worker.status, AgentStatus::Cancelled);
+    apply_body(&mut worker, &Value::Null, Phase::Running, 0);
+    assert_eq!(worker.status, AgentStatus::Running);
+    apply_body(&mut worker, &Value::Null, Phase::Interrupted, 0);
+    assert_eq!(worker.status, AgentStatus::Interrupted);
+}
+
+#[test]
+fn recorded_model_explanation_projects_header_final_and_runtime_without_reconstruction() {
+    let header = serde_json::json!({"model_explanation":"reviewer: tester unassigned -> coach assigned, selected; route coach-model"});
+    let final_route = "reviewer: tester unassigned -> coach assigned, selected; route coach-model; provider-error fallback selected: backup";
+    for (status, expected) in [
+        (None, header["model_explanation"].as_str().unwrap()),
+        (
+            Some(serde_json::json!({"model_explanation":final_route})),
+            final_route,
+        ),
+    ] {
+        let summary = TranscriptSummary {
+            path: "record.jsonl".into(),
+            header: header.clone(),
+            status,
+        };
+        let mut entry = entry_from_transcript("task-1", &summary, &HashSet::new());
+        assert_eq!(entry.model_explanation.as_deref(), Some(expected));
+        apply_body(
+            &mut entry,
+            &serde_json::json!({"steps":3}),
+            Phase::Running,
+            0,
+        );
+        assert_eq!(entry.model_explanation.as_deref(), Some(expected));
+        apply_body(
+            &mut entry,
+            &serde_json::json!({"model_explanation":"explicit replacement receipt"}),
+            Phase::Running,
+            0,
+        );
+        assert_eq!(
+            entry.model_explanation.as_deref(),
+            Some("explicit replacement receipt")
+        );
+    }
 }

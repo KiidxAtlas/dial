@@ -13,11 +13,28 @@ use crate::storage::skills;
 use anyhow::Result;
 
 impl Shell {
-    pub(super) fn accounts_note(&mut self) {
-        self.note(
-            "Accounts",
-            "Usage: /accounts pin (chooses which ChatGPT account this session uses)",
-        );
+    pub(super) fn accounts_note(&mut self, app: &App) {
+        let listing = match crate::llm::credential_store::list(&app.layout.user_dir) {
+            Ok(rows) if rows.is_empty() => {
+                "No saved logins. Use /providers to sign in or save an API key.".to_owned()
+            }
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| {
+                    let expiry = row
+                        .expires_at
+                        .map(|expiry| format!("; expires at Unix {expiry}"))
+                        .unwrap_or_default();
+                    format!(
+                        "{} · {} · {} · {}{}",
+                        row.provider, row.label, row.kind, row.status, expiry
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(error) => format!("Could not read saved logins: {error}"),
+        };
+        self.note("Accounts", format!("{listing}\n\n/accounts pin chooses the ChatGPT account for this session. /providers manages sign-ins."));
     }
 
     /// `/profile [name|off]`; `agent` is `None` during a turn (see `Shell::save`).

@@ -5,6 +5,7 @@ use crate::agent::{self, Decision, Ui};
 use crate::app::bridge::Bridge;
 use crate::app::notices::RetryNotice;
 use crate::app::shell::TICK;
+use crate::app::shell::prompts::{ATTENTION_HINT, AttentionExit, attention_key};
 use crate::runtime::tool_output::ToolOutput;
 use crate::ui::composer::SteerStage;
 use crate::ui::input::{poll, read};
@@ -204,7 +205,7 @@ impl Ui for Bridge<'_> {
     }
 
     fn background_notice(&mut self, message: &str) {
-        self.shell.transcript.notice("Background", message);
+        self.shell.note("Background", message);
         self.repaint(true);
     }
 
@@ -389,8 +390,8 @@ impl Ui for Bridge<'_> {
                 self.shell.note(
                     "Retrying",
                     format!(
-                        "The model request failed ({}). Dial retries up to {} times; the status line shows each wait. /retry retries now; Esc stops.",
-                        retry.cause, retry.max
+                        "The model request failed ({}). Dial retries up to {} times; the status line shows each wait. /retry retries now; {} stops.",
+                        retry.cause, retry.max, self.shell.keys.label(crate::ui::keys::Action::Interrupt)
                     ),
                 );
             }
@@ -645,8 +646,9 @@ impl Ui for Bridge<'_> {
             let inner_width = usize::from(width).saturating_sub(4);
             let mut body = dialog.rows(
                 inner_width,
-                usize::from(height).saturating_sub(5 + draft_height),
+                usize::from(height).saturating_sub(6 + draft_height),
             );
+            body.insert(1.min(body.len()), ATTENTION_HINT.into());
             if let Some(note) = draft_note {
                 body.extend(note.lines().take(draft_height).map(|line| {
                     crate::ui::text::ellipsize(
@@ -680,6 +682,28 @@ impl Ui for Bridge<'_> {
             }
             match read() {
                 Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                    if attention_key(&key) {
+                        dialog.pause_timeout(Instant::now());
+                        let pending = dialog
+                            .rows(inner_width, usize::from(height).saturating_sub(5))
+                            .join("\n");
+                        let exit =
+                            self.shell
+                                .inspect_modal_attention("Main question", &pending, || {
+                                    cancel.load(Ordering::SeqCst)
+                                        || self.interrupt.load(Ordering::SeqCst)
+                                });
+                        match exit {
+                            AttentionExit::Cancelled => break QuestionOutcome::Cancelled,
+                            AttentionExit::Disconnected => break QuestionOutcome::Disconnected,
+                            AttentionExit::Returned => {
+                                if let Err(error) = dialog.resume_timeout(Instant::now()) {
+                                    break QuestionOutcome::Unsupported(error);
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     if focus == Focus::Draft {
                         match self.shell.draft_step(key) {
                             DraftStep::Stay => {}
@@ -741,12 +765,22 @@ impl Ui for Bridge<'_> {
                             theme.fg(Tok::Warning),
                         )),
                         Line::from(text::clip(&text::one_line(&editor.text), width as usize)),
+                        Line::from(text::clip(ATTENTION_HINT, width as usize)),
                     ];
                     if self.shell.paint(Some(rows)).is_err() {
                         break;
                     }
                     match read() {
                         Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                            if attention_key(&key) {
+                                match self
+                                    .shell
+                                    .inspect_modal_attention(title, question, || false)
+                                {
+                                    AttentionExit::Returned => continue,
+                                    AttentionExit::Cancelled | AttentionExit::Disconnected => break,
+                                }
+                            }
                             match key.code {
                                 KeyCode::Enter => {
                                     if !editor.text.trim().is_empty() {
@@ -796,6 +830,7 @@ impl Ui for Bridge<'_> {
                     theme.fg(Tok::Warning),
                 )),
                 Line::from(text::clip(&text::one_line(&editor.text), width as usize)),
+                Line::from(text::clip(ATTENTION_HINT, width as usize)),
             ];
             if self.shell.paint(Some(rows)).is_err() {
                 break None;
@@ -804,6 +839,12 @@ impl Ui for Bridge<'_> {
                 break None;
             };
             match event {
+                Event::Key(key) if attention_key(&key) => {
+                    match self.shell.inspect_modal_attention("Plan denied: feedback pending", "Return to the feedback field before entering a reason. No plan can be approved here.", || false) {
+                        AttentionExit::Returned => continue,
+                        AttentionExit::Cancelled | AttentionExit::Disconnected => break None,
+                    }
+                }
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                     KeyCode::Enter => {
                         if !editor.text.trim().is_empty() {

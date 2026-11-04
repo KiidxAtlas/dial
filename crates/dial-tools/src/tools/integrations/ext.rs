@@ -312,6 +312,8 @@ pub struct JobEntry {
     pub name: String,
     pub command: String,
     pub status: String,
+    /// Optional native owner receipt; absent for older/custom job-view providers.
+    pub process_outcome: Option<crate::runtime::execution::ProcessOutcome>,
     pub running: bool,
     /// Runs on a pseudo-terminal.
     pub terminal: bool,

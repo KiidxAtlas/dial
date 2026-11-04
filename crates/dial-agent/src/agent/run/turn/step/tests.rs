@@ -173,3 +173,95 @@ fn text_answers_during_an_open_investigation_stop_after_a_bounded_number_of_remi
         .unwrap_or_default();
     assert_eq!(reminders, 2, "two reminders, then stop");
 }
+
+#[test]
+fn discovery_advice_survives_priority_and_policy_changing_discarded_requests() {
+    fn prepare(
+        agent: &mut Agent<'_>,
+        turn: &mut TurnState<'_>,
+        backend: &mut Backend,
+        step: u32,
+    ) -> PreparedRequest {
+        let mut engine = crate::agent::run::engine::Engine::default();
+        let mut schemas = Vec::new();
+        let mut ui = NullUi;
+        let result = agent
+            .prepare_step_request(
+                &mut StepContext {
+                    turn,
+                    engine: &mut engine,
+                    backend,
+                    schemas: &mut schemas,
+                    ui: &mut ui,
+                },
+                step,
+            )
+            .unwrap();
+        match result {
+            ControlFlow::Continue(prepared) => prepared,
+            ControlFlow::Break(_) => panic!("the request should fit without a recovery round"),
+        }
+    }
+    with_agent(
+        "[compaction]\nenabled=false\n[reliability]\nmeasured_interfaces=true\n",
+        |agent| {
+            let mut backend = agent.backend.take().unwrap();
+            let mut turn = agent
+                .begin_turn(&mut backend, &[], 10, "Inspect registry.rs", &mut NullUi)
+                .unwrap();
+            for pattern in ["name:", "CommandSpec"] {
+                agent.step_checks.empty_searches.observe(
+                    "grep",
+                    &json!({"pattern":pattern,"path":"registry.rs"}),
+                    "no matches\n[coverage: walk complete]",
+                    false,
+                    [0, 0, 0],
+                );
+            }
+            turn.pending_nudges.push(crate::agent::run::guidance::note(
+                crate::agent::run::guidance::Priority::Failure,
+                "Resolve the failed prerequisite.",
+            ));
+            let first = prepare(agent, &mut turn, &mut backend, 0);
+            assert!(
+                !json!(first.request.messages)
+                    .to_string()
+                    .contains("Discovery recovery")
+            );
+            turn.reply_received(agent.session.message_count());
+            agent
+                .push(json!({"role":"assistant","content":"Checking the prerequisite."}))
+                .unwrap();
+
+            let batch = prepare(agent, &mut turn, &mut backend, 1);
+            assert!(!batch.single_call);
+            assert!(
+                json!(batch.request.messages)
+                    .to_string()
+                    .contains("Gather unrelated docs")
+            );
+            // The response is discarded; a contract recovery changes the next request's policy.
+            turn.reply_received(agent.session.message_count());
+            turn.reliability.consecutive_contract_failures = 2;
+            let retry = prepare(agent, &mut turn, &mut backend, 2);
+            assert!(retry.single_call);
+            let text = json!(retry.request.messages).to_string();
+            assert!(text.contains("inspect that declaration next"), "{text}");
+            assert!(
+                !text.contains("Gather unrelated docs"),
+                "stale batching guidance: {text}"
+            );
+            turn.reply_received(agent.session.message_count());
+            agent
+                .push(json!({"role":"assistant","content":"Inspecting the declaration."}))
+                .unwrap();
+            let delivered = prepare(agent, &mut turn, &mut backend, 3);
+            assert!(
+                !json!(delivered.request.messages)
+                    .to_string()
+                    .contains("Discovery recovery")
+            );
+            agent.backend = Some(backend);
+        },
+    );
+}

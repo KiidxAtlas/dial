@@ -3,10 +3,10 @@
 //!
 //! Nothing here fetches weights on its own. Searching, listing and reading Ollama's model list run on
 //! worker threads. Weights are fetched only after Enter on a result (or on a GGUF quantization the user
-//! picked), through `llm::download::ensure_local_model_with`. Esc cancels a running download, and
-//! dropping the component (closing `/models`) cancels it too. Enter on an installed model and on an
-//! embedding model comes back as a [`Step`] for the models panel to turn into an event: the same
-//! assignment `/models` makes, and the same setup `/setup embeddings:<model> yes` runs.
+//! picked), through `llm::download::ensure_local_model_with`. Esc cancels a running download.
+//! A session can share the manager with successive panels, so closing a view does not stop work;
+//! dropping the last owner cancels it. Enter on an installed model or embedding model returns a
+//! [`Step`] for the panel to turn into the same assignment or setup event as `/models`.
 use super::settings::{filled, fit, hint, pair_label, selected_fill, typed_char};
 use crate::config::paths::Layout;
 use crate::llm::catalog::ModelEntry;
@@ -26,8 +26,10 @@ use ratatui::{
     style::Style,
     text::{Line, Span},
 };
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -175,8 +177,16 @@ struct Download {
     done: Receiver<Result<String, String>>,
 }
 
-/// State of the Get models group. Owned by `ModelOverlay`, so a download keeps running while the user
-/// browses other groups; closing the panel drops it and cancels a running download.
+/// Bounded evidence of the last unsuccessful repository listing or weight download.
+/// Constructed only from a received error or a disconnected task, never display-text parsing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadFailure {
+    pub repo: String,
+    pub detail: String,
+}
+
+/// Session-owned Get models state. Panels borrow the same manager across closing and reopening.
+/// The final owner dropping the manager cancels a running download.
 pub struct ModelDownloads {
     source: Option<Source>,
     dashboard: Dashboard,
@@ -199,6 +209,7 @@ pub struct ModelDownloads {
     task: Option<Task>,
     /// One-line result of the last action, shown in place of the status when there is no download.
     message: String,
+    last_failure: Option<DownloadFailure>,
     /// Ollama's pulled models, read on a worker thread when the Embedding shelf is shown. `None` while
     /// unknown or when Ollama is not reachable.
     pulled: Option<Vec<String>>,
@@ -215,7 +226,16 @@ pub struct ModelDownloads {
     rescan: bool,
 }
 
+/// A session retains one handle while Models views come and go. This shares the existing manager,
+/// including its browse position and pending results, rather than starting another job pipeline.
+pub type SharedModelDownloads = Rc<RefCell<ModelDownloads>>;
+
 impl ModelDownloads {
+    /// Share this manager with the session and any open Models view. Does not start work.
+    pub fn into_shared(self) -> SharedModelDownloads {
+        Rc::new(RefCell::new(self))
+    }
+
     /// A group with no installed models read and no downloads: downloads report unavailable.
     pub fn idle() -> Self {
         Self::with(
@@ -269,6 +289,7 @@ impl ModelDownloads {
             picker: None,
             task: None,
             message: String::new(),
+            last_failure: None,
             pulled: None,
             known_models: Vec::new(),
             downloaded_images: BTreeSet::new(),
@@ -289,6 +310,24 @@ impl ModelDownloads {
     #[cfg(test)]
     pub fn is_running(&self) -> bool {
         self.is_downloading()
+    }
+
+    /// Last observed task failure, retained across hidden views; does not poll or start work.
+    pub fn last_failure(&self) -> Option<&DownloadFailure> {
+        self.last_failure.as_ref()
+    }
+
+    fn record_failure(&mut self, repo: &str, detail: &str) {
+        self.last_failure = Some(DownloadFailure {
+            repo: text::one_line(&crate::storage::redact::redact_text(repo))
+                .chars()
+                .take(256)
+                .collect(),
+            detail: text::one_line(&crate::storage::redact::redact_text(detail))
+                .chars()
+                .take(2048)
+                .collect(),
+        });
     }
 
     /// Installed MLX and GGUF models, for the group's count.
@@ -1295,11 +1334,16 @@ impl ModelDownloads {
                 }
                 Ok(Err(error)) => {
                     self.message = format!("Could not list {repo}: {error}");
+                    self.record_failure(&repo, &format!("Repository listing failed: {error}"));
                     None
                 }
                 Err(TryRecvError::Empty) => Some(Task::Inspect { repo, family, rx }),
                 Err(TryRecvError::Disconnected) => {
                     self.message = format!("Listing {repo} stopped unexpectedly.");
+                    self.record_failure(
+                        &repo,
+                        "Repository listing stopped unexpectedly (result channel disconnected)",
+                    );
                     None
                 }
             },
@@ -1316,6 +1360,7 @@ impl ModelDownloads {
                         self.message = if download.cancel.load(Ordering::SeqCst) {
                             format!("Cancelled the download of {}.", download.repo)
                         } else {
+                            self.record_failure(&download.repo, &error);
                             format!("Download of {} failed: {error}", download.repo)
                         };
                         None
@@ -1324,6 +1369,12 @@ impl ModelDownloads {
                     Err(TryRecvError::Disconnected) => {
                         self.message =
                             format!("The download of {} stopped unexpectedly.", download.repo);
+                        if !download.cancel.load(Ordering::SeqCst) {
+                            self.record_failure(
+                                &download.repo,
+                                "Download stopped unexpectedly (result channel disconnected)",
+                            );
+                        }
                         None
                     }
                 }
@@ -1636,7 +1687,7 @@ impl ModelDownloads {
     }
 }
 
-/// Stops a running download when the group is dropped (closing `/models`).
+/// Stops a running download when the session releases its final manager owner.
 impl Drop for ModelDownloads {
     fn drop(&mut self) {
         if let Some(Task::Download(download)) = &self.task {

@@ -682,11 +682,10 @@ impl Default for UiConfig {
     }
 }
 
-/// Model roles a user can assign, each with the consumers it drives. `main` is the session model and is
-/// always assigned. Unassigned `judge` follows `small`, which follows `main`; `task`, `coach`, `tester`,
-/// `planner`, `memory` and `turn_drafter` follow `main`. `decision` is the Laya checkpoint (never a chat
-/// model) and has no chat fallback. `turn_drafter` stays last: it is listed only while
-/// `experimental.turn_optimizer` is on, so hiding it never shifts another row.
+/// Assignable model roles and their consumers. Unassigned `decision` follows `small`, then `main`.
+/// Delegation resolves its purpose-specific helper chain; model-backed memory requires an explicit
+/// assignment. Vision tool models and Laya checkpoints live in feature settings, not chat roles.
+/// `turn_drafter` stays last and is listed only while `experimental.turn_optimizer` is enabled.
 pub const ROLES: &[(&str, &str)] = &[
     ("main", "Conversation and coding agent"),
     (
@@ -705,18 +704,13 @@ pub const ROLES: &[(&str, &str)] = &[
         "tester",
         "Review and verification: reviewer and test-runner subagents and review workflows",
     ),
-    ("planner", "Plan mode and planner subagents"),
     (
         "memory",
         "Memory extraction, consolidation and Sharpshooter decision memory (local, sharpshooter); required while a model-backed memory backend is enabled",
     ),
     (
-        "judge",
-        "Cheap typed decisions: a single choice from a fixed list, cached locally; unassigned follows small, then main",
-    ),
-    (
         "decision",
-        "Laya decision checkpoint (local path or Hugging Face repo id) for advisory decisions; unassigned uses the installed Laya checkpoint",
+        "Typed choices for automatic thinking, judged rules and message routing; chat model or Laya; unassigned follows small, then main",
     ),
     (
         "embedding",
@@ -727,14 +721,6 @@ pub const ROLES: &[(&str, &str)] = &[
         "Image generation; unassigned follows the main model when it supports image output",
     ),
     (
-        "grounding",
-        "UI grounding vision model: finds an element in a screenshot for computer `win.locate` and browser `locate`; unassigned leaves locate off",
-    ),
-    (
-        "image_embedding",
-        "Multimodal image embedding model for the image_search tool (text-to-image, similar images, prompt match); unassigned leaves image_search off",
-    ),
-    (
         TURN_DRAFTER,
         "Turn optimizer (experimental): rewrites each user message into a structured prompt with diagrams; the main model sees only the draft; unassigned follows main",
     ),
@@ -743,6 +729,23 @@ pub const ROLES: &[(&str, &str)] = &[
 /// Role key of the experimental turn optimizer's drafting model.
 pub const TURN_DRAFTER: &str = "turn_drafter";
 
+/// Human-facing role name; persisted keys remain stable and are shown separately by editors.
+pub fn role_label(role: &str) -> &str {
+    match role {
+        "main" => "Conversation",
+        "small" => "Fast helpers",
+        "task" => "Task workers",
+        "coach" => "Advisor",
+        "tester" => "Review & tests",
+        "memory" => "Memory",
+        "decision" => "Decisions",
+        "embedding" => "Semantic recall",
+        "image" => "Image generation",
+        TURN_DRAFTER => "Turn drafter",
+        other => other,
+    }
+}
+
 /// Where a role's effective model comes from. Shown next to each role in the Alt+M Roles view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoleSource {
@@ -750,12 +753,10 @@ pub enum RoleSource {
     Assigned,
     /// The session model (`main`).
     Main,
-    /// Unassigned `judge`: falls back to the small model, which itself follows the main model.
+    /// Unassigned `decision`: falls back to small, which itself follows main.
     FollowsSmall,
     /// Unassigned: falls back to the main model.
     FollowsMain,
-    /// Unassigned `decision`: the installed Laya checkpoint serves decisions.
-    LayaInstalled,
     /// Nothing supplies the role (required or simply unset).
     NotSet,
 }
@@ -768,6 +769,39 @@ pub struct RoleStatus {
     /// Display name of the model in use; `None` when nothing supplies the role.
     pub effective: Option<String>,
     pub source: RoleSource,
+}
+
+impl RoleStatus {
+    /// Configured route only: this is not evidence of a runtime fallback or promotion.
+    pub fn explanation(&self) -> String {
+        let route = match self.source {
+            RoleSource::Assigned => "explicit role assignment",
+            RoleSource::Main => "current session conversation model",
+            RoleSource::FollowsSmall => "unassigned; default route follows Fast helpers",
+            RoleSource::FollowsMain => "unassigned; default route follows Conversation",
+            RoleSource::NotSet if self.role == "embedding" => "unassigned; lexical recall only",
+            RoleSource::NotSet if self.role == "memory" => {
+                "unassigned; model-backed memory needs assignment"
+            }
+            RoleSource::NotSet => "no configured route",
+        };
+        let delegation = match self.role {
+            "small" => {
+                "; scout/read-only delegation prefers Fast helpers → Task workers → Conversation"
+            }
+            "task" => {
+                "; implementation delegation defaults to Task workers → Advisor → Fast helpers → Conversation"
+            }
+            "tester" => {
+                "; review/test delegation prefers Review & tests → Advisor → Task workers → Fast helpers → Conversation"
+            }
+            "coach" => {
+                "; planner delegation prefers Advisor → Task workers → Fast helpers → Conversation"
+            }
+            _ => "",
+        };
+        format!("{route}{delegation}; runtime fallback/promotion not reported here")
+    }
 }
 
 /// Legacy `model_roles` keys and the role each one migrates to. `default` is handled separately
@@ -786,7 +820,9 @@ pub const LEGACY_ROLE_MIGRATIONS: &[(&str, &str)] = &[
     ("feedback", "coach"),
     ("feedback-helper", "coach"),
     ("experience", "coach"),
-    ("plan", "planner"),
+    ("planner", "coach"),
+    ("plan", "coach"),
+    ("judge", "decision"),
 ];
 
 impl ModelSelection {

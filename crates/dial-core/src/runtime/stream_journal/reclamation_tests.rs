@@ -116,6 +116,67 @@ fn copy_creates_only_a_fresh_destination_and_keeps_an_existing_one() {
 }
 
 #[test]
+fn copy_snapshot_refusal_cleans_destination_and_allows_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.jsonl");
+    let destination = root.path().join("copy.jsonl");
+    let journal = Journal::open(&source).unwrap();
+    let tree = crate::runtime::Tree::default();
+    tree.journal(journal.clone());
+    tree.start("assistant", "live", None).append("kept");
+    let before = std::fs::read(path(&source)).unwrap();
+
+    let error = copy_with_snapshot(&source, &destination, |_, _| false).unwrap_err();
+    assert!(error.to_string().contains("exceeds the replay row limit"));
+    assert_eq!(std::fs::read(path(&source)).unwrap(), before);
+    assert!(!path(&destination).exists());
+    copy(&source, &destination).unwrap();
+    assert_eq!(recover(&destination).unwrap()[0].result.text, "kept");
+}
+
+#[test]
+fn copy_write_failure_cleans_destination_and_cleanup_failure_keeps_both_errors() {
+    for cleanup_fails in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jsonl");
+        let destination = root.path().join("copy.jsonl");
+        let journal = Journal::open(&source).unwrap();
+        let tree = crate::runtime::Tree::default();
+        tree.journal(journal.clone());
+        tree.start("assistant", "live", None).append("kept");
+        let before = std::fs::read(path(&source)).unwrap();
+        let error = copy_with_snapshot(&source, &destination, |journal, node| {
+            journal.fail_writes_for_test(File::open(path(&source)).unwrap());
+            let accepted = journal.snapshot(node);
+            if cleanup_fails {
+                // A directory cannot be removed by the journal's file cleanup owner.
+                std::fs::remove_file(path(&destination)).unwrap();
+                std::fs::create_dir(path(&destination)).unwrap();
+            }
+            accepted
+        })
+        .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("stream journal failed:"),
+            "{diagnostic}"
+        );
+        assert_eq!(std::fs::read(path(&source)).unwrap(), before);
+        if cleanup_fails {
+            assert!(
+                diagnostic.contains("destination may remain"),
+                "{diagnostic}"
+            );
+            assert!(path(&destination).is_dir());
+        } else {
+            assert!(!path(&destination).exists());
+            copy(&source, &destination).unwrap();
+            assert_eq!(recover(&destination).unwrap()[0].result.text, "kept");
+        }
+    }
+}
+
+#[test]
 fn aggregate_live_baselines_above_the_private_limit_defer_without_poisoning_the_writer() {
     let root = tempfile::tempdir().unwrap();
     let session = root.path().join("session.jsonl");

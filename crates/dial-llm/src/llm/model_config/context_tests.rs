@@ -19,3 +19,35 @@ fn context_overrides_accept_auto_without_restricting_catalog_capacities() {
             .is_err()
     );
 }
+
+#[test]
+fn role_explanations_keep_assignment_defaults_and_runtime_distinct() {
+    for (role, source, expected) in [
+        ("main", RoleSource::Main, "current session"),
+        ("task", RoleSource::Assigned, "explicit role assignment"),
+        ("decision", RoleSource::FollowsSmall, "follows Fast helpers"),
+        (
+            "tester",
+            RoleSource::FollowsMain,
+            "Review & tests → Advisor → Task workers",
+        ),
+        (
+            "memory",
+            RoleSource::NotSet,
+            "model-backed memory needs assignment",
+        ),
+        ("embedding", RoleSource::NotSet, "lexical recall only"),
+    ] {
+        let status = RoleStatus {
+            role,
+            assigned: None,
+            effective: None,
+            source,
+        };
+        let explanation = status.explanation();
+        assert!(explanation.contains(expected), "{explanation}");
+        assert!(explanation.contains("runtime fallback/promotion not reported"));
+        assert_ne!(role_label(role), role);
+    }
+    assert_eq!(role_label("future-role"), "future-role");
+}

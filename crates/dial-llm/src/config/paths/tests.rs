@@ -95,3 +95,48 @@ fn subscription_auth_override_is_explicit_absolute_and_separate_from_state() {
     assert!(subscription_auth_dir_from(isolated.path(), Some(file.into_os_string())).is_err());
     assert_eq!(fs::read_dir(isolated.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn grouped_records_copy_without_removing_legacy_and_new_wins() {
+    for group in ["auth", "state", "cache"] {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().into()).unwrap();
+        let legacy = layout.user_dir.join("record.json");
+        let target = layout.user_dir.join(group).join("record.json");
+        assert_eq!(grouped_file(&layout.user_dir, group, "record.json"), target);
+        fs::write(&legacy, b"old").unwrap();
+        assert_eq!(grouped_file(&layout.user_dir, group, "record.json"), target);
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(fs::read(&legacy).unwrap(), b"old");
+        assert_eq!(
+            crate::platform::fs::mode(&fs::metadata(&target).unwrap()) & 0o777,
+            0o600
+        );
+        fs::write(&target, b"new").unwrap();
+        assert_eq!(grouped_file(&layout.user_dir, group, "record.json"), target);
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        let lock = super::super::settings_store::locked(&target).unwrap();
+        assert!(super::super::settings_store::try_locked(&legacy).is_err());
+        drop(lock);
+    }
+}
+
+#[test]
+fn grouped_record_failure_and_busy_lock_fall_back_to_legacy() {
+    for blocked_directory in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join("record.json");
+        fs::write(&legacy, b"original").unwrap();
+        let lock = if blocked_directory {
+            fs::write(home.path().join("auth"), b"not a directory").unwrap();
+            None
+        } else {
+            Some(super::super::settings_store::locked(&legacy).unwrap())
+        };
+        assert_eq!(auth_file(home.path(), "record.json"), legacy);
+        assert_eq!(fs::read(&legacy).unwrap(), b"original");
+        assert!(!home.path().join("auth/record.json").exists());
+        drop(lock);
+    }
+}

@@ -18,7 +18,6 @@ use crate::config::settings_store;
 use crate::storage::dump::resolve_allowing_missing;
 
 const LEDGER_FILE: &str = "session-transfers.json";
-const LEDGER_LOCK: &str = "session-transfers.lock";
 
 /// One recorded move.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +38,7 @@ struct Ledger {
 }
 
 fn ledger_path(layout: &Layout) -> PathBuf {
-    layout.user_dir.join(LEDGER_FILE)
+    crate::config::paths::session_transfers_file(&layout.user_dir)
 }
 
 /// Loads the ledger. A corrupt ledger is moved aside to `session-transfers.json.corrupt-<unix-ts>`
@@ -76,16 +75,49 @@ fn load(layout: &Layout) -> Result<Ledger> {
     }
 }
 
+/// A ledger failure refused before any publication was attempted. Only this marker proves that no
+/// entry was written; every other error from a ledger write may have published, so it is uncertain.
+#[derive(Debug)]
+struct Unpublished(anyhow::Error);
+
+impl std::fmt::Display for Unpublished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for Unpublished {}
+
+fn unpublished(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(Unpublished(error))
+}
+
+/// Whether a ledger error occurred before publication, so no entry was written. Callers may remove
+/// a copied destination only on `true`; any other error can mean the ledger entry was published.
+pub(super) fn definitely_unpublished(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Unpublished>().is_some()
+}
+
+/// Takes the ledger lock and loads the current ledger. Every failure here precedes publication.
+fn locked_ledger(layout: &Layout) -> Result<(std::fs::File, Ledger)> {
+    let prepared = (|| -> Result<(std::fs::File, Ledger)> {
+        crate::platform::atomic::private_dir(&layout.user_dir)?;
+        let lock = settings_store::locked(&crate::config::paths::session_transfers_lock_file(
+            &layout.user_dir,
+        ))?;
+        Ok((lock, load(layout)?))
+    })();
+    prepared.map_err(unpublished)
+}
+
 /// Records that `session_id` moved from `from` to `to`. A move onto the same path records nothing.
 pub(super) fn record(layout: &Layout, session_id: &str, from: &Path, to: &Path) -> Result<()> {
-    let from = resolve_allowing_missing(from)?;
-    let to = resolve_allowing_missing(to)?;
+    let from = resolve_allowing_missing(from).map_err(unpublished)?;
+    let to = resolve_allowing_missing(to).map_err(unpublished)?;
     if from == to {
         return Ok(());
     }
-    crate::platform::atomic::private_dir(&layout.user_dir)?;
-    let _lock = settings_store::locked(&layout.user_dir.join(LEDGER_LOCK))?;
-    let mut ledger = load(layout)?;
+    let (_lock, mut ledger) = locked_ledger(layout)?;
     let at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -96,8 +128,29 @@ pub(super) fn record(layout: &Layout, session_id: &str, from: &Path, to: &Path) 
         to,
         at_ms,
     });
-    settings_store::write_private(&ledger_path(layout), &serde_json::to_vec_pretty(&ledger)?)
+    let bytes = serde_json::to_vec_pretty(&ledger).map_err(|e| unpublished(e.into()))?;
+    settings_store::write_private(&ledger_path(layout), &bytes)
         .context("writing session transfer ledger")
+}
+
+/// Removes only the newest entry recorded exactly as `session_id` moving `from` to `to`; every other
+/// entry is kept in order. An absent entry is not an error, since no claim exists for those paths.
+/// Any error means the caller cannot prove the entry is gone and must keep the destination.
+pub(super) fn rollback(layout: &Layout, session_id: &str, from: &Path, to: &Path) -> Result<()> {
+    let from = resolve_allowing_missing(from)?;
+    let to = resolve_allowing_missing(to)?;
+    let (_lock, mut ledger) = locked_ledger(layout)?;
+    let Some(index) = ledger
+        .transfers
+        .iter()
+        .rposition(|t| t.session_id == session_id && t.from == from && t.to == to)
+    else {
+        return Ok(());
+    };
+    ledger.transfers.remove(index);
+    let bytes = serde_json::to_vec_pretty(&ledger)?;
+    settings_store::write_private(&ledger_path(layout), &bytes)
+        .context("removing session transfer ledger entry")
 }
 
 /// Moves recorded as leaving `path`, in recording order.

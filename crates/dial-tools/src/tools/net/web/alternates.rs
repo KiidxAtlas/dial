@@ -3,6 +3,10 @@
 
 use super::fetch::{parse_url, resolve_url};
 use super::html::{self, Token};
+use std::collections::HashSet;
+
+/// Bound candidate allocation as well as the requests performed by the pipeline.
+const MAX_CANDIDATES: usize = 12;
 
 /// Accept header for markdown-first requests; HTML is still acceptable as a last resort.
 pub const MARKDOWN_ACCEPT: &str = "text/markdown, text/plain;q=0.9, text/html;q=0.8";
@@ -41,6 +45,9 @@ pub fn llms_candidates(url: &str) -> Vec<String> {
         let prefix = segments[..scope].join("/");
         candidates.push(format!("{origin}/{prefix}/llms.txt"));
         candidates.push(format!("{origin}/{prefix}/llms.md"));
+        if candidates.len() + 2 > MAX_CANDIDATES - 3 {
+            break;
+        }
     }
     candidates.push(format!("{origin}/.well-known/llms.txt"));
     candidates.push(format!("{origin}/llms.txt"));
@@ -61,6 +68,7 @@ pub fn md_candidate(url: &str) -> Option<String> {
 /// Markdown `<link rel="alternate" type="text/markdown">` targets in `page`, resolved against `base`.
 pub fn markdown_alternates(page: &str, base: &str) -> Vec<String> {
     let mut found = Vec::new();
+    let mut seen = HashSet::new();
     for token in html::tokenize(page) {
         let Token::Open { name, attrs, .. } = token else {
             continue;
@@ -79,8 +87,12 @@ pub fn markdown_alternates(page: &str, base: &str) -> Vec<String> {
         }
         if let Some(href) = html::attr(&attrs, "href")
             && let Some(resolved) = resolve_url(base, href)
+            && seen.insert(resolved.clone())
         {
             found.push(resolved);
+            if found.len() == MAX_CANDIDATES {
+                break;
+            }
         }
     }
     found

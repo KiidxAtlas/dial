@@ -317,7 +317,7 @@ pub fn turn(
 fn project_key(config: &Config) -> String {
     config
         .state_dir
-        .strip_prefix(config.user_dir.join("projects"))
+        .strip_prefix(crate::config::paths::projects_dir(&config.user_dir))
         .ok()
         .and_then(|rest| rest.components().next())
         .map(|name| name.as_os_str().to_string_lossy().into_owned())

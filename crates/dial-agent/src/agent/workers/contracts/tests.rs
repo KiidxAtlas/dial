@@ -183,3 +183,20 @@ fn journal_with_an_invalid_id_or_missing_dependency_fails_closed() {
             .contains("invalid node")
     );
 }
+
+#[test]
+fn replacing_the_controller_revokes_retained_promotion_authority() {
+    let mut ledger = Ledger::default();
+    ledger.begin(&contract("child", &[]), request()).unwrap();
+    let promotion = ledger.promotion("child");
+    drop(ledger);
+    let root = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let error = promotion.lock()(&workspace, &VerificationConfig::default()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("workflow authority is unavailable"),
+        "{error:#}"
+    );
+}

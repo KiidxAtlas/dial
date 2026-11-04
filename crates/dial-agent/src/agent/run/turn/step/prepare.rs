@@ -19,10 +19,14 @@ impl Agent<'_> {
         let backend = &mut **backend;
         let schemas = &mut **schemas;
         let ui = &mut **ui;
-        turn.settle_delivered(|mark| {
+        for note in turn.settle_delivered(|mark| {
             self.session
                 .weigh_from(mark, |message| usize::from(message["role"] == "assistant"))
-        });
+        }) {
+            if crate::agent::run::search_frontier::EmptySearches::is_advice(&note) {
+                self.step_checks.empty_searches.delivered_advice(&note);
+            }
+        }
         // `schemas` is the turn's full offer. A request narrows its own copy (planning gate,
         // single-call simplification) and the next request starts from the full offer again.
         turn.names = offered_names(schemas);
@@ -107,16 +111,38 @@ impl Agent<'_> {
             turn.names.retain(|name| name == "todo" || name == "finish");
         }
         turn.planning_notice = planning_required;
-        let measured_single = !self.hermetic
-            && crate::reliability::single_call(
+        let mut call_reasons = if self.hermetic {
+            Vec::new()
+        } else {
+            crate::reliability::single_call_reasons(
                 self.config,
                 turn.measured.as_ref(),
                 &turn.reliability,
-            );
-        // The small local tier defaults to one call per response unless its saved record passed
-        // the batch fixture; the system prompt states the same mode for the whole turn. Its
-        // offer is already minimal and listed in that prompt, so it is not simplified further.
-        let single_call = measured_single || (!self.hermetic && self.local_one_call());
+            )
+        };
+        let measured_single = !call_reasons.is_empty();
+        // Local and measured constraints compose; record every applicable cause.
+        if !self.hermetic && self.local_one_call() {
+            call_reasons.push("small_local_tier_without_batch_evidence");
+        }
+        let single_call = !call_reasons.is_empty();
+        request_control["reliability"]["call_policy"] = json!({
+            "mode": if single_call { "one_call" } else { "batch" },
+            "reasons": call_reasons,
+        });
+        // Re-render deferred advice, rather than replaying a batch recommendation after the
+        // request policy changes. Keep the target pending if higher-priority guidance wins.
+        turn.pending_nudges
+            .retain(|note| !crate::agent::run::search_frontier::EmptySearches::is_advice(note));
+        let discovery_advice = (!self.hermetic)
+            .then(|| self.step_checks.empty_searches.advice(single_call))
+            .flatten();
+        if let Some(advice) = &discovery_advice {
+            turn.pending_nudges.push(crate::agent::run::guidance::note(
+                crate::agent::run::guidance::Priority::Loop,
+                advice.clone(),
+            ));
+        }
         let mut contract = crate::reliability::Contract::new(offer)?;
         if measured_single {
             let loaded = self
@@ -219,6 +245,16 @@ impl Agent<'_> {
         // delivered nothing.
         turn.emissions.retract();
         crate::agent::run::guidance::assemble(&mut messages, notes_start, &mut turn.emissions);
+        if discovery_advice.as_ref().is_some_and(|advice| {
+            !messages.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(advice))
+            })
+        }) {
+            turn.pending_nudges
+                .retain(|note| !crate::agent::run::search_frontier::EmptySearches::is_advice(note));
+        }
         if !self.experimental_context_owner()
             && let Some(guidance) = turn.rule_catalog.guidance(&mut turn.rule_state, "main")
         {

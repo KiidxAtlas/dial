@@ -705,3 +705,161 @@ fn producer_stream_is_visible_live_settled_and_reopened_without_duplicates() {
     view.cache = None;
     assert!(render(&mut view).contains("Partial answer survives disconnect"));
 }
+
+#[test]
+fn inspector_switch_keeps_draft_cursor_transcript_scroll_and_entry() {
+    let keys = Keymap::defaults();
+    let now = Instant::now();
+    let mut view = viewer(Some(3), true);
+    view.agent = Some(agent(AgentStatus::Running));
+    view.scroll = Scroll {
+        top: 17,
+        follow: false,
+    };
+    view.transcript_geometry = (100, 10);
+    view.geometry = view.transcript_geometry;
+    type_text(&mut view, &keys, "keep my draft");
+    view.key(&key(KeyCode::Left), &keys, now);
+    let cursor = view.draft.cursor;
+    assert_eq!(tag(view.key(&key(KeyCode::Tab), &keys, now)), "none");
+    assert!(view.inspector);
+    view.geometry = (100, 10);
+    view.scroll_by(3);
+    assert_eq!(view.inspector_scroll.top, 3);
+    assert_eq!(view.scroll.top, 17);
+    view.key(
+        &KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        &keys,
+        now,
+    );
+    assert!(!view.inspector);
+    assert_eq!(view.geometry, (100, 10));
+    assert_eq!(view.id(), "w1");
+    assert_eq!(view.pending_entry, Some(3));
+    assert_eq!(view.draft.text, "keep my draft");
+    assert_eq!(view.draft.cursor, cursor);
+}
+
+#[test]
+fn inspector_distinguishes_observations_requests_permissions_and_unknowns() {
+    use crate::ui::subagent_model::WorkerConfig;
+    let mut view = viewer(None, false);
+    view.agent = Some(AgentEntry {
+        model: "actual-model".into(),
+        model_source: "runtime-route".into(),
+        role: "configured-role".into(),
+        context: Some((123, 4096)),
+        artifacts: vec![("report".into(), "artifact://worker/report".into())],
+        config: Some(WorkerConfig {
+            revision: 2,
+            applied_revision: 1,
+            state: "not_applied".into(),
+            requested_model: Some("requested-model".into()),
+            requested_thinking: None,
+            failure: Some("unsupported".into()),
+        }),
+        ..agent(AgentStatus::Running)
+    });
+    view.conversation.record(
+        record(&json!({"role":"user", "content":"original prompt\nsecond line"})).as_bytes(),
+    );
+    let call = record(&json!({"role":"assistant", "tool_calls":[{"function":{"name":"bash"}}]}));
+    view.conversation.record(call.as_bytes());
+    view.conversation
+        .record(br#"{"type":"worker_settings","thinking":"high"}"#);
+    view.conversation
+        .record(br#"{"type":"execution_contract","tools":["bash","read"]}"#);
+    let theme = Theme::dark();
+    let rendered = view
+        .inspector_rows(120, &theme)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "Recorded model: actual-model",
+        "Routing source: runtime-route",
+        "Why this model (recorded launch/provider route): unavailable (not recorded)",
+        "Context promotion: separate request event, not inferred from launch routing",
+        "Role label (not routing): configured-role",
+        "Context used/window: 123/4096",
+        "Budget limits: unknown",
+        "Config state: not_applied",
+        "Config revision requested/applied: 2/1",
+        "Requested model (not active): requested-model",
+        "Requested thinking: unknown",
+        "Config refusal/failure: unsupported",
+        "Artifact report: artifact://worker/report",
+        "Observed tool: bash (1 calls)",
+        "Allowed tools: unknown; observed use is not permission",
+        "Recorded applied thinking: high",
+        "Recorded tool contract (not current permission): bash, read",
+        "original prompt",
+        "second line",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}: {rendered}"
+        );
+    }
+    view.agent.as_mut().unwrap().model_explanation =
+        Some("reviewer: tester unassigned -> coach assigned, selected".into());
+    let recorded = view
+        .inspector_rows(120, &theme)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(recorded.contains("reviewer: tester unassigned -> coach assigned, selected"));
+    assert!(!recorded.contains("unavailable (not recorded)"));
+    for state in ["pending", "applied", "not_applied"] {
+        view.agent.as_mut().unwrap().config.as_mut().unwrap().state = state.into();
+        assert!(
+            view.inspector_rows(120, &theme)
+                .iter()
+                .any(|row| row.to_string().contains(&format!("Config state: {state}")))
+        );
+    }
+    view.agent.as_mut().unwrap().config = None;
+    let rows = view.inspector_rows(120, &theme);
+    assert!(
+        rows.iter()
+            .any(|row| row.to_string().contains("Config lifecycle: unknown"))
+    );
+}
+
+#[test]
+fn inspector_renders_narrow_ascii_and_clips_terminal_cells() {
+    use crate::ui::theme::Glyphs;
+    let theme = Theme::dark().with_glyphs(Glyphs::Ascii);
+    let keys = Keymap::defaults();
+    let status = StatusData::default();
+    let preview = |_: &UiConfig, _: u16| Line::default();
+    let ctx = DrawCtx {
+        theme: &theme,
+        keys: &keys,
+        status: &status,
+        preview_status: &preview,
+    };
+    let mut view = viewer(None, false);
+    view.agent = Some(agent(AgentStatus::Done));
+    view.inspector = true;
+    for (width, height) in [(30, 12), (18, 8), (4, 2)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| view.draw(frame, &ctx)).unwrap();
+        assert_eq!(terminal.backend().buffer().area.width, width);
+        for row in view.inspector_rows(usize::from(width), &theme) {
+            assert!(row.width() <= usize::from(width), "{row}");
+            assert!(row.to_string().is_ascii(), "{row}");
+        }
+    }
+    let rows = view.compose(60, 40, &ctx);
+    let rendered = rows
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("[Inspector]"));
+    assert!(rendered.contains("Recorded model: unknown"));
+    assert!(rendered.contains("Config lifecycle: unknown"));
+}

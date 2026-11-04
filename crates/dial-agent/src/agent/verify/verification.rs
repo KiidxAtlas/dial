@@ -956,23 +956,75 @@ fn owning_package(root: &Path, file: &Path) -> Result<RustPackage, &'static str>
     }
 }
 
-/// Deepest directory-owning target that contains `file`; the lib wins ties with the bin at `src/`.
-fn owning_target<'a>(package: &'a RustPackage, file: &Path) -> Option<(&'a RustTarget, &'a Path)> {
-    let mut best: Option<(&'a RustTarget, &'a Path)> = None;
-    for target in &package.targets {
-        let Some(module_dir) = target.module_dir.as_deref() else {
-            continue;
-        };
-        if module_dir.as_os_str().is_empty() || !file.starts_with(module_dir) {
-            continue;
-        }
-        if best.is_none_or(|(_, current)| {
-            module_dir.components().count() > current.components().count()
-        }) {
-            best = Some((target, module_dir));
-        }
+/// Deepest directory-owning target containing `file`. Same-directory crate roots must declare
+/// its top-level module; the library wins only when both roots actually share that module.
+fn owning_target<'a>(
+    root: &Path,
+    package: &'a RustPackage,
+    file: &Path,
+) -> Option<(&'a RustTarget, &'a Path)> {
+    let candidates: Vec<_> = package
+        .targets
+        .iter()
+        .filter_map(|target| {
+            let dir = target.module_dir.as_deref()?;
+            (!dir.as_os_str().is_empty() && file.starts_with(dir)).then_some((target, dir))
+        })
+        .collect();
+    let depth = candidates
+        .iter()
+        .map(|(_, dir)| dir.components().count())
+        .max()?;
+    let mut deepest = candidates
+        .into_iter()
+        .filter(|(_, dir)| dir.components().count() == depth);
+    let first = deepest.next()?;
+    let rest: Vec<_> = deepest.collect();
+    if rest.is_empty() {
+        return Some(first);
     }
-    best
+    std::iter::once(first).chain(rest).find(|(target, dir)| {
+        let Some(component) = file
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|rel| rel.components().next())
+        else {
+            return false;
+        };
+        let Some(module) = Path::new(component.as_os_str())
+            .file_stem()
+            .and_then(|name| name.to_str())
+        else {
+            return false;
+        };
+        declares_root_module(root, &target.root, module)
+    })
+}
+
+fn declares_root_module(root: &Path, file: &Path, module: &str) -> bool {
+    use ast_grep_language::{LanguageExt, SupportLang};
+
+    let path = root.join(file);
+    if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= 1024 * 1024) {
+        return false;
+    }
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let parsed = SupportLang::Rust.ast_grep(&source);
+    let node = parsed.root();
+    if node.get_inner_node().has_error() {
+        return false;
+    }
+    node.children().any(|item| {
+        item.kind() == "mod_item"
+            && item.field("body").is_none()
+            // A path override (including cfg_attr) is not evidence of conventional ownership.
+            && !item.prev_all()
+                .take_while(|node| matches!(node.kind().as_ref(), "attribute_item" | "line_comment" | "block_comment"))
+                .any(|attribute| attribute.dfs().any(|node| node.kind() == "identifier" && node.text() == "path"))
+            && item.field("name").is_some_and(|name| name.text() == module)
+    })
 }
 
 /// Maps a changed Rust path to one focused `cargo test`, or to an explicit gap.
@@ -1024,7 +1076,7 @@ fn rust_selection(root: &Path, changed: &Path) -> RustSelection {
 
     // Files under `src/bin` belong to a registered binary only, never to the library's tree.
     let bin_dir = package.dir.join("src/bin");
-    let Some((target, module_dir)) = owning_target(&package, &file)
+    let Some((target, module_dir)) = owning_target(root, &package, &file)
         .filter(|(_, dir)| !file.starts_with(&bin_dir) || dir.starts_with(&bin_dir))
     else {
         return RustSelection::Gap("not inside any registered target's source tree".into());

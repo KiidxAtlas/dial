@@ -13,8 +13,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  validate:
+    name: No-build readiness
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install check dependencies
+        run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
+      - name: No-build release and workflow contracts
+        run: make release-check test-release-policy
+      - name: Format before any compilation
+        run: cargo fmt --check
+
   test:
     name: fmt, build, test (${{ matrix.os }})
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -51,21 +70,19 @@ jobs:
           # restore main's caches but do not add their own.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install installer test dependencies
-        run: python3 -m pip install --disable-pip-version-check -r scripts/requirements-ci.txt
+        run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
       - name: Test terminal installer
-        run: bash scripts/test-install.sh
+        run: make test-install
       - name: Test local build and update commands
-        run: python3 scripts/test-build.py
+        run: make test-build
       - name: Test focused Windows contract runner
-        run: python3 scripts/test-windows-contract.py
+        run: make test-windows-contract
       - name: Check packaging and release policy
-        run: python3 scripts/test-packaging.py && python3 scripts/check-packaging.py && python3 scripts/test-release-policy.py
+        run: make test-packaging test-release-policy
       - name: Verify Linux sandbox enforcement
         if: runner.os == 'Linux'
         timeout-minutes: 10
         run: cargo test --locked --profile ci --workspace linux_sandbox_enforces_filesystem_and_both_network_modes
-      - name: Format
-        run: cargo fmt --check
       - name: Build
         # The `dial` library and its unit-test build each peak near 5 GB in rustc. Built together
         # they exceed the 7 GB macOS arm64 runner and swap (11-16 min); one at a time they fit.
@@ -137,6 +154,7 @@ jobs:
           path: target/pty-captures
   lint:
     name: Clippy (${{ matrix.os }}) and dependency policy
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -164,6 +182,7 @@ jobs:
     # Release builds ship musl binaries; check them on every push so target-specific type
     # differences (for example libc's ioctl request type) fail here, not at publish time.
     name: musl check (${{ matrix.target }})
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -198,12 +217,13 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - run: python -m pip install -r scripts/requirements-ci.txt
+      - run: python -m pip install --require-hashes -r scripts/requirements-ci.lock
       - run: make test-python PYTHON=python
       - name: Benchmark graders and repeated-trial reporting
         run: make test-bench-offline PYTHON=python
   docker:
     name: Container image
+    needs: validate
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -242,6 +262,7 @@ jobs:
         run: ./scripts/test-install.ps1
   windows-rust:
     name: Windows Rust contract
+    needs: validate
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -262,6 +283,7 @@ jobs:
 
   linux-features:
     name: Linux feature powerset
+    needs: validate
     # libspa 0.9 needs PipeWire headers newer than Ubuntu 22.04's 0.3.48 (spa_video_info_raw.flags,
     # u64 modifier); compile the PipeWire combinations against Ubuntu 24.04's PipeWire 1.0.
     runs-on: ${{ matrix.wayland && 'ubuntu-24.04' || 'ubuntu-22.04' }}

@@ -10,45 +10,6 @@ use crate::collab::{
 use crate::storage::share;
 use anyhow::{Context, Result, bail};
 
-pub(super) const COMMANDS: &[super::CommandSpec] = &[
-    super::CommandSpec {
-        name: "collab",
-        description: "host a live collab session; status and stop manage it",
-        args_hint: "[view|status|stop|list|abort]",
-        subcommands: &["view", "status", "stop", "list", "abort"],
-    },
-    super::CommandSpec {
-        name: "join",
-        description: "Join a collab session from a link",
-        args_hint: "<link>",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "leave",
-        description: "Leave the collab session you joined",
-        args_hint: "",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "share",
-        description: "upload this session encrypted and print the link",
-        args_hint: "[gist] [whole-journal]",
-        subcommands: &["gist", "whole-journal"],
-    },
-    super::CommandSpec {
-        name: "dump",
-        description: "Write this session's transcript to a file and print its path",
-        args_hint: "[all|anon]",
-        subcommands: &["all", "anon"],
-    },
-    super::CommandSpec {
-        name: "trace",
-        description: "Open this session in the stats dashboard",
-        args_hint: "",
-        subcommands: &[],
-    },
-];
-
 pub(super) fn run(
     shell: &mut Shell,
     app: &App,
@@ -59,7 +20,15 @@ pub(super) fn run(
     let result = match name {
         "collab" => collab(shell, app, agent, args),
         "join" => join(shell, app, args),
-        "share" => share_session(shell, app, agent, args),
+        "share" => share_session(
+            shell,
+            app,
+            agent,
+            args.strip_prefix("upload")
+                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                .unwrap_or(args)
+                .trim(),
+        ),
         "dump" => dump(shell, app, agent, args),
         "trace" => trace(shell, app, agent),
         _ => return None,
@@ -86,7 +55,7 @@ pub(super) fn run_live(
 
 pub(super) fn completions(_config: &crate::config::types::Config) -> Vec<String> {
     [
-        "/join",
+        "/collab join",
         "/collab view",
         "/collab status",
         "/collab stop",

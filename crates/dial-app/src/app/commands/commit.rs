@@ -14,13 +14,6 @@ use crate::commit::cli::{commit_help, parse_commit_args};
 use crate::commit::run::run_commit_command;
 use anyhow::{Result, anyhow};
 
-pub(super) const COMMANDS: &[super::CommandSpec] = &[super::CommandSpec {
-    name: "commit",
-    description: "generate a commit message and commit the changes",
-    args_hint: "[--push] [--dry-run] [--legacy] [--no-changelog] [-c <context>] [-m <model>]",
-    subcommands: &[],
-}];
-
 pub(super) fn run(
     shell: &mut Shell,
     app: &App,

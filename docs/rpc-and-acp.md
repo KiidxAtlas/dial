@@ -110,6 +110,14 @@ Each parked ACP session owns its tools and plan mode in one record, so switching
 cannot leave independently keyed execution state behind. This separation does not change wire
 methods, approval authority, queue limits or cancellation deadlines.
 
+Every activation runs the cancelable `session_before_switch` hook before cancelling
+outgoing work or removing a parked session, including implicit ACP selection by a
+session-scoped request. A veto leaves the active session and parked writer intact.
+Forking runs both the branch and switch gates. Activation restores only the incoming
+session's saved, still-existing directory roots and rebinds its checkpoint observer;
+outgoing session roots, sensitive native-access grants and file handles do not carry
+over. Invalid incoming workspace/checkpoint setup fails before outgoing work is torn down.
+
 ACP renders `notice`, `background` and `fatal` events as unchanged `agent_message_chunk` text. Each chunk also carries standard `_meta.dial` with `event` and, only when present, `kind`, `lane`, `tokens`, `name` and `replace`, so clients can tell sources apart. This is metadata preservation only; ACP does not implement client-side replacement of background output.
 
 ACP correlates tool calls and final results by the RPC `call_id`, not the tool name, so overlapping
@@ -140,6 +148,21 @@ In-flight ACP request IDs are rejected before prompt preparation or cancellation
 Cancellation requests with IDs receive their own replies; cancellation notifications never produce
 responses and cannot consume the pending prompt's final response. Cancelling a parked session does
 not interrupt the active session.
+
+### Uncertain editor writes
+
+ACP client filesystem writes wait up to 30 seconds for the editor's response. Refusal before
+delivery has no write effects; timeout, cancellation, lost acknowledgement or an error after
+delivery leaves effects unknown. Diagnostics retain the originating call identity and never
+claim that the editor did not write merely because Dial did not observe success. No local write
+is substituted after a client error, and confirmed earlier files in a batch remain reported.
+
+On the current connection, an uncertain write blocks another write to that path. Its late response
+remains correlatable after cancellation or prompt completion. Only acknowledgement followed by
+a successful fresh read releases the barrier; a read racing an unacknowledged write cannot do so.
+The pending-write registry is bounded at 128 paths and refuses further writes when full. A client
+that never acknowledges requires inspection rather than automatic replay. Reconnecting is not
+evidence that an earlier request finished; these in-memory correlations are not a crash journal.
 
 ## Building a client
 

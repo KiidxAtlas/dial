@@ -3,6 +3,34 @@ use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[test]
+fn unavailable_palette_commands_stay_searchable_with_a_requirement() {
+    let mut palette = PaletteOverlay::new(
+        vec![PaletteEntry {
+            command: CommandEntry {
+                name: "commit".into(),
+                description: "Commit changes".into(),
+                kind: CommandKind::Builtin,
+                args_hint: None,
+            },
+            during_turn: "Runs later.",
+        }],
+        false,
+    )
+    .with_command_context(crate::ui::command_surface::AvailabilityContext {
+        git: Some(false),
+        busy: false,
+        session: true,
+    });
+    palette.handle(&Event::Paste("commit".into()), &Keymap::defaults());
+    assert_eq!(names(&palette), ["commit"]);
+    assert!(
+        text_lines(&mut palette)
+            .join("\n")
+            .contains("needs a git repository")
+    );
+}
+
+#[test]
 fn the_goal_header_and_count_use_ascii_separators_when_requested() {
     let mut rig = Rig::new();
     rig.theme = rig.theme.with_glyphs(crate::ui::theme::Glyphs::Ascii);
@@ -45,7 +73,7 @@ fn entries() -> Vec<PaletteEntry> {
     [
         ("compute", "Stop unused processes and inspect memory", None),
         ("model", "Select a model", None),
-        ("resume", "Resume a conversation", Some("[id]")),
+        ("sessions", "Browse conversations", Some("[id]")),
         ("rename", "Name this conversation", Some("<title>")),
         ("undo", "Restore changes from the latest turn", None),
         ("settings", "Change preferences", None),
@@ -112,9 +140,9 @@ fn goals_are_the_first_screen_and_open_their_commands() {
         OverlayEvent::None
     ));
     assert_eq!(palette.view, View::Goal(0));
-    assert_eq!(names(&palette), ["resume", "model", "rename"]);
+    assert_eq!(names(&palette), ["sessions", "model", "rename"]);
     assert!(
-        matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/resume")
+        matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/sessions")
     );
 }
 
@@ -210,7 +238,7 @@ fn busy_turn_still_lets_goals_open_and_leaves_command_policy_to_the_app() {
     assert!(lines.iter().any(|l| l.contains("Stops the current turn")));
     assert!(matches!(
         palette.handle(&plain(KeyCode::Enter), &keys),
-        OverlayEvent::Action(action) if action == "command:/resume"
+        OverlayEvent::Action(action) if action == "command:/sessions"
     ));
 }
 
@@ -232,7 +260,7 @@ fn all_actions_opens_the_category_tabs_and_tab_cycles_them() {
     );
     assert!(all.contains(&"model") && all.contains(&"undo") && all.contains(&"compute"));
     palette.handle(&plain(KeyCode::Tab), &keys);
-    assert_eq!(names(&palette), ["resume", "rename"]);
+    assert_eq!(names(&palette), ["sessions", "rename"]);
     palette.handle(&Event::Paste("compute".into()), &keys);
     assert_eq!(
         names(&palette),
@@ -258,9 +286,9 @@ fn search_categories_and_default_actions_use_the_selected_command() {
     // Tab from the goal list opens "All"; a second Tab moves to "Sessions".
     palette.handle(&plain(KeyCode::Tab), &keys);
     palette.handle(&plain(KeyCode::Tab), &keys);
-    assert_eq!(names(&palette), ["resume", "rename"]);
+    assert_eq!(names(&palette), ["sessions", "rename"]);
     assert!(
-        matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/resume")
+        matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/sessions")
     );
 }
 
@@ -299,12 +327,12 @@ fn arguments_require_explicit_confirmation_and_escape_keeps_search() {
 fn optional_arguments_are_available_without_replacing_the_default_action() {
     let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(entries(), false);
-    palette.handle(&Event::Paste("resume".into()), &keys);
+    palette.handle(&Event::Paste("sessions".into()), &keys);
     palette.handle(&key(KeyCode::Enter, KeyModifiers::SHIFT), &keys);
     assert!(palette.arguments.is_some());
     palette.handle(&Event::Paste("abc123".into()), &keys);
     assert!(
-        matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/resume abc123")
+        matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/sessions abc123")
     );
 }
 
@@ -707,5 +735,49 @@ fn clicking_a_goal_invalidates_its_old_hitbox_but_selection_alone_does_not() {
     let bounds = palette.list_bounds.unwrap();
     assert!(
         matches!(palette.click(bounds.x, bounds.y), OverlayEvent::Action(action) if action == "command:/undo")
+    );
+}
+
+#[test]
+fn todo_tabs_preserve_plan_selection_and_never_execute_progress() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::choice(ChoiceSpec {
+        command: "todo".into(),
+        verb: "show",
+        items: vec![
+            ChoiceItem {
+                value: "2".into(),
+                label: "Second step".into(),
+                detail: String::new(),
+                current: true,
+            },
+            ChoiceItem {
+                value: "__progress".into(),
+                label: "Progress".into(),
+                detail: "Recorded deliverable evidence".into(),
+                current: false,
+            },
+        ],
+        ..Default::default()
+    });
+    for code in [KeyCode::Tab, KeyCode::Left, KeyCode::Right, KeyCode::Tab] {
+        assert!(matches!(
+            palette.handle(&plain(code), &keys),
+            OverlayEvent::None
+        ));
+        if palette.progress_tab {
+            assert!(
+                text_lines(&mut palette)
+                    .iter()
+                    .any(|line| line.contains("Recorded deliverable evidence"))
+            );
+            assert!(matches!(
+                palette.handle(&plain(KeyCode::Enter), &keys),
+                OverlayEvent::None
+            ));
+        }
+    }
+    assert!(
+        matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/todo show 2")
     );
 }

@@ -3,6 +3,21 @@ use crate::config;
 
 use crate::agent::*;
 
+/// Validated incoming directory capabilities and checkpoint observer, prepared before teardown.
+pub struct SessionWorkspace {
+    session_id: String,
+    workspace: Workspace,
+    checkpoints: Option<Arc<Checkpoints>>,
+}
+
+impl std::fmt::Debug for SessionWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionWorkspace")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> Agent<'a> {
     pub fn session(&self) -> &Session {
         &self.session
@@ -147,8 +162,81 @@ impl<'a> Agent<'a> {
     pub fn replace_session_tools(&mut self, tools: Registry) -> Registry {
         std::mem::replace(&mut self.ext, tools)
     }
-    /// Return the previous writer so multi-session controllers can retain its ownership.
-    pub fn swap_session(&mut self, session: Session) -> Session {
+    /// Validate incoming directory capabilities and checkpoint storage before a controller
+    /// cancels work or removes a parked writer. Missing saved directories are not restored.
+    ///
+    /// # Errors
+    /// Returns an error if workspace confinement, the Cargo lease, or checkpoint setup fails.
+    pub fn prepare_session_workspace(&self, session: &Session) -> Result<SessionWorkspace> {
+        self.prepare_session_workspace_with_roots(session, &[])
+    }
+
+    /// Prepare a session with controller-owned launch roots in addition to its saved grants.
+    /// These roots are explicit launch authority, never roots inherited from the outgoing session.
+    pub fn prepare_session_workspace_with_roots(
+        &self,
+        session: &Session,
+        launch_roots: &[PathBuf],
+    ) -> Result<SessionWorkspace> {
+        let mut workspace = self.workspace.reroot(self.workspace.root())?;
+        workspace = workspace.with_cargo_session(session.id())?;
+        let mut dirs: Vec<_> = session
+            .additional_dirs()
+            .iter()
+            .filter(|dir| dir.is_dir())
+            .cloned()
+            .collect();
+        for root in launch_roots {
+            if !dirs.contains(root) {
+                dirs.push(root.clone());
+            }
+        }
+        workspace = workspace.with_additional_roots(&dirs)?;
+        let checkpoints = if let Some(layout) = &self.layout
+            && self.checkpoints.is_some()
+        {
+            let checkpoints = Arc::new(Checkpoints::new(
+                layout.checkpoints_dir().join(session.id()),
+                layout.project_root.clone(),
+            )?);
+            checkpoints.set_added_roots(workspace.additional_roots());
+            workspace = workspace.with_observer(Arc::new(CheckpointObserver(checkpoints.clone())));
+            Some(checkpoints)
+        } else {
+            None
+        };
+        Ok(SessionWorkspace {
+            session_id: session.id().to_owned(),
+            workspace,
+            checkpoints,
+        })
+    }
+
+    /// Swap sessions and return the previous writer after incoming workspace preparation succeeds.
+    ///
+    /// # Errors
+    /// Returns workspace or checkpoint preparation errors before cancelling outgoing work or
+    /// replacing the active writer. A failed swap never reports an incoming writer as outgoing.
+    pub fn swap_session(&mut self, session: Session) -> Result<Session> {
+        let prepared = self.prepare_session_workspace(&session)?;
+        Ok(self.swap_session_prepared(session, prepared))
+    }
+
+    /// Publish a session with the workspace prepared for its id, without fallible setup
+    /// after the controller has cancelled work. A preparation must not be reused for another id.
+    ///
+    /// # Panics
+    /// Panics if `prepared` was created for a different session id.
+    pub fn swap_session_prepared(
+        &mut self,
+        session: Session,
+        prepared: SessionWorkspace,
+    ) -> Session {
+        assert_eq!(
+            session.id(),
+            prepared.session_id,
+            "prepared workspace belongs to another session"
+        );
         self.cancel_background_compaction();
         self.memory_controller = crate::agent::memory::memory_controller::Controller::default();
         self.reset_context_lifecycle();
@@ -156,6 +244,8 @@ impl<'a> Agent<'a> {
         // The outgoing session ends here, while its id is still the observed one.
         self.observe_session_end();
         let previous = std::mem::replace(&mut self.session, session);
+        self.workspace = prepared.workspace;
+        self.checkpoints = prepared.checkpoints;
         // The incoming session starts its own lifecycle.
         self.begin_session_lifecycle();
         // A swapped-in session starts its own cost budget: rebase the observed ledger so the
@@ -163,29 +253,6 @@ impl<'a> Agent<'a> {
         self.session_cost = None;
         self.usage_cost_base = -self.usage_scope.observed_cost().unwrap_or(0.0);
         self.session_cost_warn = None;
-        if let Some(layout) = &self.layout
-            && self.checkpoints.is_some()
-        {
-            match Checkpoints::new(
-                layout.checkpoints_dir().join(self.session.id()),
-                layout.project_root.clone(),
-            ) {
-                Ok(checkpoints) => {
-                    let checkpoints = Arc::new(checkpoints);
-                    checkpoints.set_added_roots(self.workspace.additional_roots());
-                    self.workspace = self
-                        .workspace
-                        .clone()
-                        .with_observer(Arc::new(CheckpointObserver(checkpoints.clone())));
-                    self.checkpoints = Some(checkpoints);
-                }
-                Err(error) => {
-                    if let Some(backend) = &mut self.backend {
-                        backend.remember_session_error(error);
-                    }
-                }
-            }
-        }
         if let Some(memory) = &self.memory_runtime {
             memory.resume(memory_authority(&self.session, 0));
         }
@@ -264,6 +331,10 @@ impl<'a> Agent<'a> {
                 .map_or(loaded, |limit| limit.min(loaded)),
             None => self.auth_config.context_window,
         }
+    }
+    /// A ceiling actually reported by the loaded server, not a configured/model-metadata guess.
+    pub fn loaded_context_window(&self) -> Option<u32> {
+        self.context_cap
     }
     /// Window the history budget (compaction and pruning thresholds) is planned against. With the
     /// economy policy on, an absolute cap keeps huge-window models from carrying huge requests.
@@ -410,7 +481,7 @@ impl<'a> Agent<'a> {
         }
         self.rebuild_system();
     }
-    pub(in crate::agent) fn validate_tool_registration(
+    pub(crate) fn validate_tool_registration(
         &self,
         tool: &dyn crate::tools::integrations::ext::Tool,
     ) -> Result<()> {
@@ -666,7 +737,7 @@ impl<'a> Agent<'a> {
         self.pending_plan = carry.1;
     }
 
-    /// Turn start: while plan mode is on, runs the session on the `planner` model role;
+    /// Turn start: while plan mode is on, uses the launch model override or explicitly assigned coach;
     /// once plan mode ends, restores the model in force before it. Runs between turns, when the
     /// backend is free, so it also covers plan mode ended inside a turn (`exit_plan` approval).
     pub(crate) fn plan_model_resume(&mut self) -> Result<()> {
@@ -674,24 +745,54 @@ impl<'a> Agent<'a> {
             if let Some(prior) = self.plan_model_prior.clone() {
                 self.install_model_override(prior)?;
                 self.plan_model_prior = None;
+                self.record_main_model_route(
+                    "Plan mode ended; the pre-plan main selection was restored",
+                );
                 self.prewalk_resume()?;
             }
             return Ok(());
         }
-        if !self.effective_config().model_roles.contains_key("planner") {
+        let config = self.effective_config();
+        let Some(selection) = config
+            .plan_model
+            .clone()
+            .or_else(|| config.role_selection("coach").cloned())
+        else {
             return Ok(());
+        };
+        let mut config = modes::switch::switched_config(self.effective_config(), &selection, None)?;
+        if let Some(level) = selection.thinking.as_deref() {
+            // Match role thinking semantics: unsupported model metadata keeps its default.
+            config = crate::config::thinking::apply_role_thinking(config.clone(), level)
+                .unwrap_or(config);
         }
-        let selection = modes::switch::resolve(self.effective_config(), "@planner")?;
-        let current = self.effective_config().selection();
-        if current.provider == selection.provider && current.model == selection.model {
+        let reasoning = |config: &Config| {
+            config.active_model_profile().map(|profile| {
+                (
+                    profile.reasoning_effort,
+                    profile.thinking,
+                    profile.thinking_budget,
+                )
+            })
+        };
+        let current = self.effective_config();
+        if current.same_model_identity(&config)
+            && reasoning(current) == reasoning(&config)
+            && current.thinking_auto == config.thinking_auto
+        {
             return Ok(());
         }
         let prior = match &self.plan_model_prior {
             Some(prior) => prior.clone(),
             None => self.model_override.clone(),
         };
-        let config = modes::switch::switched_config(self.effective_config(), &selection, None)?;
+        let reason = if self.effective_config().plan_model.is_some() {
+            "Plan mode selected the explicit plan_model assignment"
+        } else {
+            "Plan mode selected the assigned coach role because plan_model was absent"
+        };
         self.install_model_override(Some(config))?;
+        self.record_main_model_route(reason);
         self.plan_model_prior = Some(prior);
         Ok(())
     }
@@ -717,6 +818,7 @@ impl<'a> Agent<'a> {
         self.model_override = config;
         self.context_cap = None;
         self.route.reset();
+        self.record_main_model_route("Session main model override installed or restored; originating command/mode provenance unavailable (not recorded)");
         Ok(())
     }
     pub fn permission_rules(&self) -> &[crate::agent::safety::approval::PermissionRule] {
@@ -793,3 +895,6 @@ impl<'a> Agent<'a> {
         self.authorize_call(&call, ui).is_ok()
     }
 }
+
+#[cfg(test)]
+mod tests;

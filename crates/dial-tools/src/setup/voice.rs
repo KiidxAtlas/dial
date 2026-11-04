@@ -199,7 +199,7 @@ pub fn prepare(
                         "-c".into(),
                         "import sys; from piper.voice import PiperVoice; PiperVoice.load(sys.argv[1], download_dir=sys.argv[2])".into(),
                         model.display().to_string(),
-                        layout.user_dir.join("models/piper").display().to_string(),
+                        crate::config::paths::piper_models_dir(&layout.user_dir).display().to_string(),
                     ],
                     env: vec![],
                 },
@@ -269,7 +269,7 @@ fn ensure_piper_model(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<PathBuf> {
-    let dir = layout.user_dir.join("models/piper");
+    let dir = crate::config::paths::piper_models_dir(&layout.user_dir);
     let model = dir.join(format!("{PIPER_VOICE}.onnx"));
     if piper_model_ready(&model) {
         return Ok(model);

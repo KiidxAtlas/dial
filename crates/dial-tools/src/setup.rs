@@ -21,7 +21,7 @@ const PYPROJECT: &str = include_str!("../../../python/pyproject.toml");
 /// Keep the managed worker aligned with the binary without reinstalling Python packages.
 /// Explicit custom worker paths are never replaced.
 pub fn refresh_worker(config: &Config) -> Result<()> {
-    let managed = config.user_dir.join("python/dial_worker.py");
+    let managed = crate::config::paths::python_dir(&config.user_dir).join("dial_worker.py");
     if config.worker == managed
         && std::fs::read(&managed).ok().as_deref() != Some(WORKER.as_bytes())
     {
@@ -29,7 +29,7 @@ pub fn refresh_worker(config: &Config) -> Result<()> {
     }
     if config.worker == managed {
         for (name, source) in [("dial_steering.py", STEERING), ("dial_weights.py", WEIGHTS)] {
-            let path = config.user_dir.join("python").join(name);
+            let path = crate::config::paths::python_dir(&config.user_dir).join(name);
             if std::fs::read(&path).ok().as_deref() != Some(source.as_bytes()) {
                 settings_store::write_private(&path, source.as_bytes())?;
             }
@@ -57,7 +57,7 @@ pub fn ensure_runtime_with(
         cfg!(target_os = "macos") && cfg!(target_arch = "aarch64"),
         "the Python MLX runtime (for MLX models, training and steering) requires macOS on Apple Silicon; GGUF models run on llama.cpp and need no runtime install. Use /providers to configure a hosted or OpenAI-compatible provider"
     );
-    let dir = layout.user_dir.join("python");
+    let dir = crate::config::paths::python_dir(&layout.user_dir);
     crate::platform::atomic::private_dir(&dir)?;
     settings_store::write_private(&dir.join("dial_worker.py"), WORKER.as_bytes())?;
     settings_store::write_private(&dir.join("dial_steering.py"), STEERING.as_bytes())?;
@@ -129,7 +129,7 @@ pub fn run(
     let prepare = |config: &Config| {
         eprintln!(
             "installing mlx-lm into {} (uv)…",
-            layout.user_dir.join("python").display()
+            crate::config::paths::python_dir(&layout.user_dir).display()
         );
         ensure_runtime(layout)?;
         eprintln!("verifying {} (first run downloads weights)…", config.model);

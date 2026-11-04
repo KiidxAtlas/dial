@@ -47,6 +47,7 @@ enum Tab {
 
 #[derive(Default)]
 pub struct SubagentsOverlay {
+    panel_keys: super::panel_keys::PanelKeys,
     agents: Vec<AgentEntry>,
     activity: Vec<ActivityEvent>,
     totals: Totals,
@@ -183,6 +184,13 @@ impl SubagentsOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if self.panel_keys.handle(
+            event,
+            self.search.is_some() || self.compose.is_some(),
+            false,
+        ) {
+            return OverlayEvent::None;
+        }
         if let Event::Paste(text) = event {
             // Paste only fills an open message draft; it never opens one or triggers shortcuts.
             if let Some(draft) = self.compose.as_mut() {
@@ -210,9 +218,10 @@ impl SubagentsOverlay {
             return OverlayEvent::None;
         }
         self.message = None;
-        if keys.matches(Action::SelectCancel, key) {
+        if super::panel_keys::matches(keys, Action::SelectCancel, key) {
             return self.escape();
         }
+        // Preserve narrow-layout Tab: it opens the inspector, not a different work tab.
         if keys.matches(Action::TabNext, key) || keys.matches(Action::TabPrev, key) {
             self.tab = match self.tab {
                 Tab::Agents => Tab::Activity,
@@ -303,7 +312,7 @@ impl SubagentsOverlay {
             } else {
                 self.move_agent(isize::MAX / 2);
             }
-        } else if keys.matches(Action::SelectConfirm, key) {
+        } else if super::panel_keys::matches(keys, Action::SelectConfirm, key) {
             if let Some(agent) = self.selected_agent() {
                 return OverlayEvent::Action(format!("subagent-open:{}", agent.id));
             }
@@ -358,7 +367,7 @@ impl SubagentsOverlay {
             // The newest event, and keep following new ones.
             self.follow = true;
             self.activity_cursor = usize::MAX;
-        } else if keys.matches(Action::SelectConfirm, key) {
+        } else if super::panel_keys::matches(keys, Action::SelectConfirm, key) {
             if let Some(&index) = rows.get(pos) {
                 let event = &self.activity[index];
                 return OverlayEvent::Action(match event.entry {
@@ -418,7 +427,12 @@ impl SubagentsOverlay {
             return OverlayEvent::Action(format!("subagent-cancel:{id}"));
         }
         self.armed = Some((id, Instant::now()));
-        self.message = Some((format!("Press x again within 2 s to cancel {name}."), false));
+        self.message = Some((
+            format!(
+                "Press x again within 2 s to stop only worker {name}. Other workers and the main turn continue; completed effects are not undone."
+            ),
+            false,
+        ));
         OverlayEvent::None
     }
 
@@ -439,7 +453,7 @@ impl SubagentsOverlay {
     }
 
     fn handle_compose(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
-        if keys.matches(Action::SelectCancel, key) {
+        if super::panel_keys::matches(keys, Action::SelectCancel, key) {
             self.compose = None;
             return OverlayEvent::None;
         }
@@ -700,6 +714,16 @@ impl SubagentsOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        if self.panel_keys.draw(
+            frame,
+            ctx,
+            "Workers",
+            "/ searches · Enter opens a worker · x reviews cancellation · m writes a message",
+            true,
+            true,
+        ) {
+            return;
+        }
         // The panel's inner area starts one cell inside the border, unless the box is too small.
         let area = frame.area();
         // Counts share the top border with the title; drop the least urgent ones until they fit.
@@ -867,7 +891,7 @@ impl SubagentsOverlay {
                 // Only offer what the selected worker can do right now.
                 if let Some(agent) = self.selected_agent() {
                     if agent.cancellable {
-                        s.push("x cancel".to_owned());
+                        s.push("x stop worker".to_owned());
                     }
                     if agent.steerable {
                         s.push("m message".to_owned());
@@ -1190,7 +1214,7 @@ impl SubagentsOverlay {
                     "asks",
                     current
                         .as_deref()
-                        .unwrap_or("an approval or an answer to a question"),
+                        .unwrap_or("input requested; no prompt details recorded"),
                     w,
                     theme,
                 ));
@@ -1204,6 +1228,45 @@ impl SubagentsOverlay {
         }
         if let Some((n, max)) = agent.retry {
             lines.push(kv("retry", &format!("attempt {n}/{max}"), w, theme));
+        }
+
+        if let Some(config) = &agent.config {
+            lines.push(heading("Settings", w, theme));
+            let state = match config.state.as_str() {
+                "not_applied" => "failed (not applied)",
+                "launch" => "launch config",
+                state => state,
+            };
+            lines.extend(kv_wrapped(
+                "revision",
+                &format!(
+                    "{} {state}; applied {}",
+                    config.revision, config.applied_revision
+                ),
+                w,
+                theme,
+            ));
+            lines.extend(kv_wrapped("active", &agent.model, w, theme));
+            lines.extend(kv_wrapped(
+                "requested",
+                config.requested_model.as_deref().unwrap_or("inherited"),
+                w,
+                theme,
+            ));
+            lines.extend(kv_wrapped(
+                "thinking",
+                config.requested_thinking.as_deref().unwrap_or("inherited"),
+                w,
+                theme,
+            ));
+            if let Some(error) = &config.failure {
+                lines.extend(kv_wrapped("error", error, w, theme));
+                lines.push(field(
+                    " Enter: inspect output; r: role settings. No automatic retry.",
+                    w,
+                    theme,
+                ));
+            }
         }
 
         lines.push(heading("Usage", w, theme));
@@ -1383,6 +1446,7 @@ fn status_glyph(status: AgentStatus, theme: &Theme) -> (String, Tok) {
         AgentStatus::Done => (theme.sym(Sym::Check).to_string(), Tok::Success),
         AgentStatus::Failed => (theme.sym(Sym::Cross2).to_string(), Tok::Error),
         AgentStatus::Cancelled => (theme.sym(Sym::Dot).to_string(), Tok::Dim),
+        AgentStatus::Interrupted => (theme.sym(Sym::Warn).to_string(), Tok::Warning),
     }
 }
 
@@ -1490,9 +1554,10 @@ fn status_phrase(status: AgentStatus) -> &'static str {
     match status {
         AgentStatus::Running => "running",
         AgentStatus::Waiting => "needs your input",
-        AgentStatus::Done => "done",
+        AgentStatus::Done => "completed",
         AgentStatus::Failed => "failed",
         AgentStatus::Cancelled => "cancelled",
+        AgentStatus::Interrupted => "interrupted",
     }
 }
 

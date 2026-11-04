@@ -2,7 +2,7 @@
 name = "dial"
 version.workspace = true
 edition.workspace = true
-description = "Local, gated model and harness improvement on Apple Silicon"
+description = "Local-first coding agent harness"
 license.workspace = true
 publish = false
 
@@ -11,7 +11,7 @@ members = [".", "crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.11"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 

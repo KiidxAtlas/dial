@@ -14,47 +14,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub(super) const COMMANDS: &[super::CommandSpec] = &[
-    super::CommandSpec {
-        name: "mcp",
-        description: "manage MCP servers: list, add, remove, enable, disable, test, login, reload",
-        args_hint: "[list|add|remove|enable|disable|test|login|reload|help]",
-        subcommands: &[
-            "list",
-            "add",
-            "remove",
-            "enable",
-            "disable",
-            "test",
-            "login",
-            "reload",
-            "reconnect",
-            "logout",
-            "resources",
-            "prompts",
-            "prompt",
-            "notifications",
-            "smithery-search",
-            "smithery-install",
-            "smithery-login",
-            "smithery-logout",
-            "help",
-        ],
-    },
-    super::CommandSpec {
-        name: "tools",
-        description: "list the tools offered to the agent and those available",
-        args_hint: "",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "extensions",
-        description: "browse and install MCP servers and skills (/status shows the configuration)",
-        args_hint: "",
-        subcommands: &[],
-    },
-];
-
 pub(super) fn run(
     shell: &mut Shell,
     app: &App,

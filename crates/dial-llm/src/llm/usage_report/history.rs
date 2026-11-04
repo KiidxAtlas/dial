@@ -8,6 +8,7 @@ use anyhow::Result;
 use super::types::{UsageHistoryEntry, UsageReport, resolve_used_fraction};
 use crate::config::settings_store::{locked, write_private};
 
+#[cfg(test)]
 const FILE: &str = "usage-history.jsonl";
 const MAX_ENTRIES: usize = 2_048;
 
@@ -17,7 +18,7 @@ pub fn append(user_dir: &Path, report: &UsageReport) -> Result<()> {
     if fresh.is_empty() {
         return Ok(());
     }
-    let path = user_dir.join(FILE);
+    let path = crate::config::paths::usage_history_file(user_dir);
     let _lock = locked(&path)?;
     let mut all = read_entries(&path)?;
     all.extend(fresh);
@@ -40,7 +41,7 @@ fn encode(entries: &[UsageHistoryEntry]) -> Result<Vec<u8>> {
 /// Reads history oldest-first, optionally restricted to one provider. Corrupt lines are skipped.
 #[cfg(any(test, feature = "test-support"))]
 pub fn read(user_dir: &Path, provider: Option<&str>) -> Result<Vec<UsageHistoryEntry>> {
-    let mut entries = read_entries(&user_dir.join(FILE))?;
+    let mut entries = read_entries(&crate::config::paths::usage_history_file(user_dir))?;
     if let Some(provider) = provider {
         entries.retain(|entry| entry.provider == provider);
     }

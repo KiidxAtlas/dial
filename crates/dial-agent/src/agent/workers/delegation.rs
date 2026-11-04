@@ -151,14 +151,14 @@ impl<'a> Agent<'a> {
         if args.get("contract").is_some() {
             return self.contract_task(args, ui);
         }
-        self.start_live_subagents(args, ui, false)
+        self.start_live_subagents(args, ui, None)
     }
 
     fn start_live_subagents(
         &mut self,
         args: &Value,
         ui: &mut dyn Ui,
-        strict: bool,
+        promotion: Option<crate::agent::workers::contracts::Promotion>,
     ) -> Result<Value> {
         self.gate_subagent_spawn(args, ui)
             .map_err(anyhow::Error::msg)?;
@@ -176,7 +176,7 @@ impl<'a> Agent<'a> {
         self.authorize_call(&call, ui)
             .map_err(|e| anyhow::anyhow!(e.message()))?;
         let mut harness = self.child_harness();
-        if strict {
+        if promotion.is_some() {
             // A bounded workflow node cannot hide unlimited descendants inside one request.
             harness
                 .tools
@@ -184,7 +184,7 @@ impl<'a> Agent<'a> {
         }
         let result = self
             .live_tasks
-            .start(
+            .start_with_promotion(
                 crate::agent::workers::live_tasks::StartContext {
                     config: &self.auth_config,
                     workspace: &self.workspace,
@@ -203,6 +203,7 @@ impl<'a> Agent<'a> {
                     ),
                 },
                 args,
+                promotion,
             )
             .map_err(anyhow::Error::msg);
         self.session.flush_runtime()?;

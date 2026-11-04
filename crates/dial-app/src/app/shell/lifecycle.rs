@@ -29,7 +29,6 @@ use crate::ui::transcript::Transcript;
 use crate::ui::welcome::{self, WelcomeInfo};
 use anyhow::Result;
 use serde_json::Value;
-use std::fs;
 use std::time::Instant;
 
 impl Shell {
@@ -61,6 +60,8 @@ impl Shell {
             pending_result: None,
             shared_prose: false,
             auth_job: None,
+            last_setup_failure: None,
+            model_downloads: None,
             extensions_pending: None,
             extensions_job: None,
             restart_requested: false,
@@ -68,6 +69,7 @@ impl Shell {
             retry_control: None,
             smithery_resume: None,
             commit_job: None,
+            search: Default::default(),
             worker_editors: Default::default(),
             term,
             themes,
@@ -79,11 +81,14 @@ impl Shell {
                 ));
                 composer.set_word_completion(app.config.ui.word_completion);
                 composer.set_project_root(app.layout.project_root.clone());
-                composer.load_learned_words(app.layout.user_dir.join("learned-words.json"));
+                composer.load_learned_words(crate::config::paths::learned_words_file(
+                    &app.layout.user_dir,
+                ));
                 composer
             },
             paste_guard: Default::default(),
             transcript: Transcript::new(),
+            inbox: Default::default(),
             status: StatusData::default(),
             ui: app.config.ui.clone(),
             usage_status: crate::app::commands::UsageStatus::new(app.layout.user_dir.clone()),
@@ -175,6 +180,18 @@ impl Shell {
     /// Observe disk on a bounded timer. A running agent only receives a pending snapshot.
     pub(in crate::app) fn refresh_resources(&mut self, app: &App, force: bool, busy: bool) -> bool {
         let mut files_changed = false;
+        if let Some(downloads) = &self.model_downloads {
+            let rescan = {
+                let mut downloads = downloads.borrow_mut();
+                downloads.poll();
+                downloads.take_rescan()
+            };
+            if rescan {
+                self.catalog.refresh(app);
+                self.inbox.push("Model download", "Download finished; the model catalog is refreshing. /activity downloads shows the retained result.");
+                files_changed = true;
+            }
+        }
         let side_bytes = self.side.streamed().map(|(_, text)| text.len());
         let session_id = (!self.session_id.is_empty()).then_some(self.session_id.as_str());
         let side_notes = self.side.drain(session_id);
@@ -192,6 +209,12 @@ impl Shell {
                 files_changed = true;
             }
             files_changed |= self.release_notice.poll(&app.layout.user_dir);
+            if let Some(message) = self.release_notice.notice() {
+                self.inbox.push("Update available", message);
+            }
+            if let Some(message) = self.runtime_updates.notice() {
+                self.inbox.push("Runtime updates", message);
+            }
         }
         self.files.request(&app.layout.project_root);
         if let Some(listing) = self.files.poll() {
@@ -287,27 +310,7 @@ impl Shell {
 
     fn reload_disk_resources(&mut self, app: &App) -> Vec<String> {
         let mut diagnostics = Vec::new();
-        let key_path = app.layout.user_dir.join("keybindings.toml");
-        match fs::read_to_string(&key_path) {
-            Ok(text) => match text.parse::<toml::Table>() {
-                Ok(table) => {
-                    let (keys, warnings) = Keymap::from_table(&table);
-                    self.keys = keys;
-                    diagnostics.extend(warnings);
-                }
-                Err(error) => diagnostics.push(format!(
-                    "{}: {error}; keeping last good key bindings",
-                    key_path.display()
-                )),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.keys = Keymap::defaults()
-            }
-            Err(error) => diagnostics.push(format!(
-                "{}: {error}; keeping last good key bindings",
-                key_path.display()
-            )),
-        }
+        diagnostics.extend(self.keys.reload(&app.layout.user_dir));
         let themes = ThemeManager::new(&app.layout.user_dir, &self.ui, self.dark);
         if let Some(error) = themes.last_error() {
             diagnostics.push(format!("{error}; keeping last good theme"));
@@ -347,7 +350,7 @@ impl Shell {
 
     /// Home screen and, for a resumed session, its earlier conversation.
     pub(in crate::app) fn begin(&mut self, app: &App, session: &Session, resumed: bool) {
-        self.session_id = session.id().to_owned();
+        self.set_session_id(session.id());
         self.set_scope(&session.title());
         if self.ui.welcome {
             let (sessions, recent): (Vec<String>, Vec<(String, String)>) =
@@ -432,9 +435,16 @@ impl Shell {
                 branch,
                 approval: format!("{:?}", app.config.approval).to_lowercase(),
                 sandbox: format!("{:?}", app.config.sandbox.mode).to_lowercase(),
+                doctor_issues: usize::from(app.store_error.is_some())
+                    + usize::from(self.themes.last_error().is_some())
+                    + usize::from(selection.provider.is_empty()),
+                tour: false,
             };
             let motion = crate::ui::fx::motion(self.ui.motion, self.themes.current());
-            self.home = Some(welcome::Home::new(info, sessions, motion));
+            self.home = Some(
+                welcome::Home::new(info, sessions, motion)
+                    .with_tour(crate::config::paths::tour_seen_file(&app.layout.user_dir)),
+            );
             self.home_mark = None;
         }
         super::paint::update_model_status(&mut self.status, &mut self.home, &app.config);
@@ -445,6 +455,7 @@ impl Shell {
     }
 
     pub(in crate::app) fn after_project_change(&mut self, app: &App) {
+        self.search.invalidate();
         self.pending_config = None;
         self.resources = ResourceWatch {
             at: Instant::now() - RESOURCE_TTL,

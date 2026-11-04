@@ -61,6 +61,36 @@ was emitted. Journals are not scored reports or resume files. RPC errors additio
 the waiting method and request ID without logging request parameters. The live timings above
 predate that final diagnostic-only change.
 
+### Reliability follow-up
+
+The historical report and adjacent progress journal were unavailable in this checkout during the
+0.3.0 reliability pass. The waiting RPC operation cannot be attributed from the aggregate table;
+the live timeout remains unresolved. The benchmark's 180-second case deadline covers startup
+through shutdown, while production compaction maintenance can allow 300 seconds. That difference
+does not establish a production compaction defect, and no timeout budget was increased.
+
+A separate deterministic RPC defect was reproduced and fixed: an expired call could dispatch
+request bytes or accept a queued event/reply. Deadline checks now precede dispatch and event
+consumption and follow receipt. The focused RPC suite passed **15 tests**, including expired
+buffered events/replies, zero-byte expired requests and parameter-redacted diagnostics.
+
+The rebuilt local binary passed scripted recovery **16/16** cases (76 provider requests) and
+compaction **4/4** cases (20 provider requests), using baseline/compact-tools configurations and
+two repetitions. Reports are local artifacts at `.tmp/reliability-recovery-62e9120d.json` and
+`.tmp/reliability-compaction-62e9120d.json`. These prove harness orchestration only, not resolution
+of the live timeout, model quality, or an improved live success rate.
+
+The subsequently authorized three-trial local-only run used the existing
+`http://127.0.0.1:1234/v1` endpoint and `local-measurement.toml` without downloading a model.
+It failed waiting for RPC **request 4 (`send`)**, the post-compaction final response, within
+the unchanged 180-second whole-case deadline. This is not evidence that `compact` itself
+timed out. The process then reported a missing temporary benchmark source; neither the
+requested final report nor its kept progress journal remained available. Source-lifetime
+inspection established no cleanup cause. This is an unsuccessful measurement attempt, not
+a completed three-trial result or an improved live success rate. No further live retry or
+timeout extension was performed. The focused binary-target RPC suite again passed **15 tests**.
+Retained failure output: `artifact://73be35444598ec1711fa2f8dc20f4ee5b35c864175e3911ee6d69c5e1b03b3f9`.
+
 ## Workspace copying: candidate rejected
 
 Reusable real-filesystem benchmark:

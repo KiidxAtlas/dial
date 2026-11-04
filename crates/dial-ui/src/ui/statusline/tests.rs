@@ -46,6 +46,18 @@ const ALL_SEPARATORS: [StatusSeparator; 7] = [
 ];
 
 #[test]
+fn unread_inbox_is_visible_when_roomy_and_shed_before_essential_status() {
+    let cfg = cfg_with(StatusPreset::Default);
+    let mut status = data();
+    assert!(!plain(&render(&cfg, &status, 200)).contains("/inbox"));
+    status.inbox_unread = 3;
+    assert!(plain(&render(&cfg, &status, 200)).contains("3 unread"));
+    let narrow = plain(&render(&cfg, &status, 40));
+    assert!(!narrow.contains("unread"), "{narrow}");
+    assert!(narrow.contains("qwen3"), "{narrow}");
+}
+
+#[test]
 fn settings_offers_exactly_the_segments_the_renderer_understands() {
     for name in crate::config::schema::STATUS_SEGMENTS {
         assert_eq!(
@@ -138,7 +150,7 @@ fn activity_row_fits_all_widths_and_preserves_silence_and_custom_preferences() {
 }
 
 #[test]
-fn local_progress_shows_stages_live_tokens_and_rates_in_the_default_composer() {
+fn local_progress_shows_stages_live_tokens_and_rates_in_one_composer_row() {
     use crate::llm::{InferencePhase, ModelProgress};
     let mut progress = ModelProgress::new(InferencePhase::Loading);
     let mut data = StatusData {
@@ -146,38 +158,29 @@ fn local_progress_shows_stages_live_tokens_and_rates_in_the_default_composer() {
         model_progress: Some(progress.clone()),
         ..data()
     };
-    assert!(plain(&render(&UiConfig::default(), &data, 110)).contains("loading model"));
+    let row = |data: &StatusData, width| {
+        plain(&activity_row(&UiConfig::default(), data, &Theme::dark(), width).unwrap())
+    };
+    assert!(row(&data, 110).contains("Loading 0s"));
     progress.phase = InferencePhase::Processing;
     progress.prompt_tokens = Some(6000);
     progress.processed_tokens = Some(2048);
     data.model_progress = Some(progress.clone());
-    assert!(plain(&render(&UiConfig::default(), &data, 110)).contains("2048/6000 tokens (34%)"));
+    assert!(row(&data, 110).contains("Processing 0s · 2k/6k tok"));
     progress.phase = InferencePhase::Generating;
     progress.output_tokens = Some(128);
     progress.tokens_per_second = Some(31.2);
     data.model_progress = Some(progress.clone());
-    assert!(
-        plain(&render(&UiConfig::default(), &data, 110))
-            .contains("generating 128 tokens · 31.2 tok/s")
-    );
-    for width in [60, 80] {
-        let row = plain(&render(&UiConfig::default(), &data, width));
-        assert!(row.contains("generating 128"), "width {width}: {row}");
-    }
-    for width in 1..140 {
-        assert_eq!(
-            render(&UiConfig::default(), &data, width).width(),
-            width as usize
-        );
+    assert!(row(&data, 110).contains("Generating 0s · 128 tok · 31.2 tok/s"));
+    assert!(!plain(&render(&UiConfig::default(), &data, 110)).contains("Generating"));
+    for width in 8..140 {
+        assert_eq!(text::width(&row(&data, width)), usize::from(width));
     }
     data.output_tokens = 100;
     assert_eq!(data.live_output_tokens(), (228, false));
     progress.estimated = true;
     data.model_progress = Some(progress);
-    assert!(
-        plain(&render(&UiConfig::default(), &data, 110))
-            .contains("generating ~128 tokens · ~31.2 tok/s")
-    );
+    assert!(row(&data, 110).contains("~128 tok · ~31.2 tok/s"));
     data.model_progress = None;
     assert_eq!(data.live_output_tokens(), (100, false));
 }
@@ -275,7 +278,7 @@ fn presets_map_to_their_segment_lists_and_custom_uses_the_configured_ones() {
                 "path",
                 "git"
             ]),
-            names(&["workers", "cost", "context"])
+            names(&["inbox", "workers", "cost", "context"])
         )
     );
     assert_eq!(
@@ -382,7 +385,7 @@ fn the_line_is_exactly_the_requested_width_for_every_preset_separator_and_width(
 
 #[test]
 fn default_line_shows_segments_in_order_with_the_context_on_the_right() {
-    let line = plain(&render(&UiConfig::default(), &data(), 100));
+    let line = plain(&render(&UiConfig::default(), &data(), 140));
     assert!(line.starts_with("╭─") && line.ends_with("─╮"), "{line:?}");
     let at = |needle: &str| {
         line.find(needle)
@@ -428,13 +431,13 @@ fn the_least_important_segments_leave_first_and_the_model_stays_longest() {
         vanishes_at("qwen"),
     );
     assert!(
-        git > path && path > context && context > model,
+        path > git && git > context && context > model,
         "git {git} path {path} context {context} model {model}"
     );
-    // Between the git and path thresholds: path and model remain, git is gone.
-    let line = plain(&render(&cfg, &data(), git));
+    // Medium widths retain branch and model after the path yields.
+    let line = plain(&render(&cfg, &data(), path));
     assert!(
-        line.contains("projects/dial") && line.contains("mlx/qwen3-9b") && !line.contains("main"),
+        !line.contains("projects/dial") && line.contains("mlx/qwen3-9b") && line.contains("main"),
         "{line:?}"
     );
     // Once an optional segment is gone it never comes back at narrower widths... or the reverse.
@@ -528,12 +531,11 @@ fn unknown_facts_are_absent_and_an_unknown_context_is_never_zero() {
 fn full_preset_shows_every_known_segment() {
     let line = plain(&render(&cfg_with(StatusPreset::Full), &busy_full(), 200));
     for expected in [
-        "12s",
         "mlx/qwen3-9b",
         "subagent",
         "projects/dial",
         "main +1 ~2 ?3",
-        "ask",
+        "Ask first",
         "workspace",
         "1.2k",
         "27.5 tok/s",
@@ -552,7 +554,7 @@ fn full_preset_shows_every_known_segment() {
         "+",
     ));
     assert!(
-        ascii.contains("approval ask") && ascii.contains("sandbox workspace"),
+        ascii.contains("approval Ask first") && ascii.contains("sandbox workspace"),
         "without icons the segments carry a word label: {ascii:?}"
     );
     let main_role = StatusData {
@@ -768,7 +770,7 @@ fn spinner_is_busy_only_and_animates_with_the_tick() {
     let cfg = UiConfig::default();
     let theme = Theme::dark();
     let at = |tick: u64, phase: Phase| {
-        plain(&border_line(
+        activity_row(
             &cfg,
             &StatusData {
                 phase,
@@ -778,10 +780,8 @@ fn spinner_is_busy_only_and_animates_with_the_tick() {
             },
             &theme,
             100,
-            Style::default(),
-            "╭",
-            "╮",
-        ))
+        )
+        .map_or_else(String::new, |row| plain(&row))
     };
     let (a, b) = (at(0, Phase::Working), at(1, Phase::Working));
     assert!(
@@ -1112,4 +1112,24 @@ fn narrow_lines_drop_whole_segments_instead_of_leaving_stubs() {
         line.contains("qwen3.5-9b") && !line.contains("local/"),
         "{line:?}"
     );
+}
+
+#[test]
+fn default_status_adapts_and_expands_without_changing_custom_layouts() {
+    let mut status = StatusData {
+        approval: "write".into(),
+        ..data()
+    };
+    let cfg = UiConfig::default();
+    assert!(!plain(&render(&cfg, &status, 100)).contains("projects/dial"));
+    status.toggle_status_expanded();
+    assert!(plain(&render(&cfg, &status, 200)).contains("projects/dial"));
+    let custom = UiConfig {
+        status_left: vec!["path".into()],
+        status_right: vec![],
+        ..cfg_with(StatusPreset::Custom)
+    };
+    let expanded = plain(&render(&custom, &status, 100));
+    status.toggle_status_expanded();
+    assert_eq!(expanded, plain(&render(&custom, &status, 100)));
 }

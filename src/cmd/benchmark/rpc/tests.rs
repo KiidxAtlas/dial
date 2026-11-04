@@ -60,6 +60,16 @@ fn closed_rpc_is_not_misreported_as_timeout() {
 }
 
 #[test]
+fn expired_receive_rejects_buffered_events_and_replies() {
+    for event in [json!({"event":"ready"}), json!({"id":4,"result":{}})] {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(event)).unwrap();
+        let error = receive(&rx, Some(Instant::now())).unwrap_err();
+        assert_eq!(error.to_string(), "benchmark RPC timed out");
+    }
+}
+
+#[test]
 fn request_failures_identify_the_pending_operation_without_logging_params() {
     let (_tx, rx) = mpsc::channel();
     let mut input = Vec::new();
@@ -78,6 +88,7 @@ fn request_failures_identify_the_pending_operation_without_logging_params() {
     assert!(detail.contains("request 4"));
     assert!(detail.contains("timed out"));
     assert!(!detail.contains("not-for-diagnostics"));
+    assert!(input.is_empty(), "expired request must not emit bytes");
 }
 #[test]
 fn runtime_ledger_replaces_main_agent_events_across_turns() {

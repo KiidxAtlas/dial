@@ -62,6 +62,47 @@ pub struct SettingDef {
 }
 
 impl SettingDef {
+    /// Original metadata remains searchable after presentation-only regrouping.
+    pub fn search_location(&self) -> (&'static str, &'static str) {
+        REGISTRY
+            .iter()
+            .chain(management::DECLARATIONS)
+            .find(|def| def.path == self.path)
+            .map_or((self.tab, self.section), |def| (def.tab, def.section))
+    }
+    /// Goal-oriented discovery terms shared by every settings surface. These are static
+    /// metadata, never configured values (which may contain credentials).
+    pub fn search_terms(&self) -> &'static str {
+        match self.path {
+            "approval" => "stop asking fewer prompts permissions approval confirm confirmations",
+            "sandbox.allow_network" => "stay offline no network internet privacy",
+            "sandbox.mode" => "stay offline confinement isolation safety permissions",
+            "sandbox.extra_write" | "extra_dirs" => {
+                "allow directories folders writable paths permissions access"
+            }
+            "isolation.backend" => "isolate workers separate checkout workspace safety",
+            "budget" => "spend less cost costs cheaper money spending limit budget",
+            "thinking_auto" | "thinking_level" | "harness.max_tokens" => {
+                "spend less faster cheaper reasoning thinking tokens latency"
+            }
+            "ui.notify" | "ui.notify_errors" | "ask.notify" => {
+                "notifications alerts notify bell attention finished failure questions"
+            }
+            "providers" | "endpoint" | "provider" => {
+                "connections connect credentials authentication login api server endpoint provider"
+            }
+            "mcp" | "mcp_settings" => "connections connect mcp external tools servers integrations",
+            "keys" => "keyboard shortcuts hotkeys bindings remap keys",
+            "ui.theme" => "appearance colors colours dark light theme",
+            path if path.starts_with("memory.") => {
+                "memory remember forget recall knowledge facts previous sessions persistence"
+            }
+            path if path.starts_with("improve.") || path.starts_with("training.") => {
+                "learning learn improve training fine tune finetune adaptation"
+            }
+            _ => "",
+        }
+    }
     /// Collections that may contain credentials never render their contents in the panel.
     pub fn sensitive(&self) -> bool {
         matches!(
@@ -180,10 +221,8 @@ const MODEL_ROLES: EnumValues = &[
     ("main", "Main"),
     ("small", "Small"),
     ("task", "Task"),
-    ("judge", "Judge"),
     ("coach", "Coach"),
     ("tester", "Tester"),
-    ("planner", "Planner"),
     ("memory", "Memory"),
     ("decision", "Decision"),
     ("image", "Image"),
@@ -198,9 +237,9 @@ const SERVICE_TIER: EnumValues = &[
     ("ultrafast", "Ultrafast"),
 ];
 const APPROVAL: EnumValues = &[
-    ("ask", "Ask"),
-    ("write", "Write"),
-    ("auto", "Auto"),
+    ("ask", "Ask first"),
+    ("write", "Edit freely"),
+    ("auto", "Full auto"),
     ("readonly", "Read-only"),
 ];
 const SANDBOX: EnumValues = &[("off", "Off"), ("dev", "Dev"), ("strict", "Strict")];
@@ -225,8 +264,8 @@ const GIT_GUARD: EnumValues = &[
     ("off", "Off"),
 ];
 const RULE_JUDGE: EnumValues = &[
-    ("auto", "When the judge role is assigned"),
-    ("on", "Always (judge, small or main model)"),
+    ("auto", "When the decision role is assigned"),
+    ("on", "Always (decision, small or main model)"),
     ("off", "Off"),
 ];
 const EDIT_MODE: EnumValues = &[
@@ -771,6 +810,7 @@ static REGISTRY: &[SettingDef] = &[
     model::DECLARATIONS[32],
     model::DECLARATIONS[36],
     model::DECLARATIONS[37],
+    model::DECLARATIONS[38],
     memory::DECLARATIONS[0],
     memory::DECLARATIONS[1],
     memory::DECLARATIONS[2],
@@ -1087,9 +1127,69 @@ pub fn registry() -> &'static [SettingDef] {
             .iter()
             .chain(management::DECLARATIONS)
             .copied()
+            .map(|mut def| {
+                def.tab = settings_group(def.path, def.tab, def.section);
+                if COMMON_SETTINGS.contains(&def.path) {
+                    def.tab = "Common";
+                    def.section = "Common";
+                }
+                def
+            })
             .collect()
     });
     &ALL
+}
+
+/// Frequently changed settings, surfaced first without duplicating declarations or values.
+pub const COMMON_SETTINGS: &[&str] = &[
+    "ui.theme",
+    "thinking_auto",
+    "ui.motion",
+    "ui.show_turn_stats",
+];
+
+fn settings_group(path: &str, tab: &'static str, section: &str) -> &'static str {
+    // Structured collections retain their original searchable locations, but belong to
+    // their purpose here rather than the generic Configuration section they came from.
+    if matches!(
+        path,
+        "providers"
+            | "endpoint"
+            | "provider"
+            | "mcp"
+            | "mcp_settings"
+            | "ssh_hosts"
+            | "ssh"
+            | "snowflake_account"
+            | "cloudflare_account_id"
+            | "cloudflare_gateway_id"
+    ) {
+        return "Connections";
+    }
+    if matches!(path, "approval" | "extra_dirs" | "secrets.values")
+        || path.starts_with("sandbox.")
+        || path.starts_with("isolation.")
+        || path.starts_with("permissions.")
+    {
+        return "Safety";
+    }
+    if path.starts_with("memory.") {
+        return "Memory";
+    }
+    match (tab, section) {
+        ("Appearance" | "Voice", _) | ("Interaction", "Notifications") => "Appearance",
+        ("Interaction", "Approvals") | ("Tools", "Sandbox" | "Secrets" | "Portable rules") => {
+            "Safety"
+        }
+        ("Interaction", "Input" | "Terminal") => "Keys",
+        ("Improvement", _) | ("Model", "Learning" | "Adaptive policy" | "Laya") => "Learning",
+        ("Model", "Runtime" | "Local worker") => "Advanced",
+        ("Model", _) => "Model",
+        ("Tools", _) => "Tools",
+        // Opt-in experiments stay visibly separate rather than blending into Advanced.
+        ("Experimental", _) => "Experimental",
+        _ => "Advanced",
+    }
 }
 
 /// Checks a value written outside `/settings` (the CLI) against its schema entry, so a value the
@@ -1234,9 +1334,9 @@ const LAYOUT: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Tabs and their sections in panel order (see [`LAYOUT`]). Names the table does not list keep
-/// their registry order after the listed ones. The panel adds a `Providers` tab of its own that
-/// launches the provider and model screens; it holds no settings, so it is not listed here.
+/// Tabs and their sections in panel order (see [`LAYOUT`]). Original locations determine
+/// section order even when path-specific presentation groups split a declaration section.
+/// Setup launchers belong to the UI rather than the settings registry.
 pub fn tabs() -> Vec<(&'static str, Vec<&'static str>)> {
     let mut out: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
     for def in registry() {
@@ -1249,14 +1349,40 @@ pub fn tabs() -> Vec<(&'static str, Vec<&'static str>)> {
             None => out.push((def.tab, vec![def.section])),
         }
     }
-    let tab_rank = |tab: &str| LAYOUT.iter().position(|(name, _)| *name == tab);
-    // `sort_by_key` is stable, so unlisted names keep registry order behind the listed ones.
-    out.sort_by_key(|(tab, _)| tab_rank(tab).unwrap_or(usize::MAX));
-    for (tab, sections) in &mut out {
-        let listed = LAYOUT
+    let order = [
+        "Common",
+        "Appearance",
+        "Keys",
+        "Model",
+        "Connections",
+        "Safety",
+        "Tools",
+        "Memory",
+        "Learning",
+        "Experimental",
+        "Advanced",
+    ];
+    out.sort_by_key(|(tab, _)| {
+        order
             .iter()
-            .find(|(name, _)| name == tab)
-            .map_or(&[][..], |(_, sections)| *sections);
+            .position(|name| name == tab)
+            .unwrap_or(usize::MAX)
+    });
+    for (tab, sections) in &mut out {
+        let target = *tab;
+        let listed: Vec<_> = LAYOUT
+            .iter()
+            .flat_map(|(old_tab, sections)| {
+                sections.iter().filter_map(move |section| {
+                    registry()
+                        .iter()
+                        .any(|def| {
+                            def.tab == target && def.search_location() == (*old_tab, *section)
+                        })
+                        .then_some(*section)
+                })
+            })
+            .collect();
         sections.sort_by_key(|section| {
             listed
                 .iter()

@@ -23,6 +23,120 @@ pub enum Scope {
     Global,
     Project,
 }
+
+/// Frozen, validated model transaction. Values stay private; the UI exposes paths only.
+#[derive(Clone)]
+pub struct ModelConfigReview {
+    scope: Scope,
+    changes: Vec<Change>,
+    role: Option<String>,
+    original: [toml::Table; 2],
+    effects: Vec<(Scope, String, bool)>,
+}
+
+impl ModelConfigReview {
+    /// Actual changed keys, including canonical project resets; `true` means removal.
+    pub fn effects(&self) -> &[(Scope, String, bool)] {
+        &self.effects
+    }
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+    pub fn changes(&self) -> &[Change] {
+        &self.changes
+    }
+    pub fn role(&self) -> Option<&str> {
+        self.role.as_deref()
+    }
+}
+
+/// Prepare through the same owner as publication, without writing settings or acquiring models.
+pub fn review_model_config(
+    layout: &Layout,
+    scope: Scope,
+    changes: &[Change],
+    role: Option<&str>,
+) -> Result<ModelConfigReview> {
+    let files = layout.config_files();
+    let _global = interactive_lock(&files[0])?;
+    let _project = interactive_lock(&files[1])?;
+    let original = [
+        load_layer(layout, Scope::Global)?,
+        load_layer(layout, Scope::Project)?,
+    ];
+    let resets = role
+        .map(model_project_resets)
+        .transpose()?
+        .unwrap_or_default();
+    let (layers, _) = prepare_config(layout, scope, changes, &resets)?;
+    fn diff(
+        before: &toml::Table,
+        after: &toml::Table,
+        prefix: &str,
+        scope: Scope,
+        out: &mut Vec<(Scope, String, bool)>,
+    ) {
+        let keys: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).collect();
+        for key in keys {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            match (before.get(key), after.get(key)) {
+                (Some(a), Some(b)) if a == b => {}
+                (Some(toml::Value::Table(a)), Some(toml::Value::Table(b))) => {
+                    diff(a, b, &path, scope, out)
+                }
+                (None, Some(toml::Value::Table(b))) => {
+                    diff(&toml::Table::new(), b, &path, scope, out)
+                }
+                (_, None) => out.push((scope, path, true)),
+                _ => out.push((scope, path, false)),
+            }
+        }
+    }
+    let mut effects = Vec::new();
+    for (index, layer_scope) in [Scope::Global, Scope::Project].into_iter().enumerate() {
+        if !publication_layers(scope, &resets)[index] {
+            continue;
+        }
+        diff(
+            &original[index],
+            &layers[index],
+            "",
+            layer_scope,
+            &mut effects,
+        );
+    }
+    Ok(ModelConfigReview {
+        scope,
+        changes: changes.to_vec(),
+        role: role.map(str::to_owned),
+        original,
+        effects,
+    })
+}
+
+/// Revalidate the frozen review under publication locks. Stale reviews never write either layer.
+pub fn save_reviewed_model_config(
+    layout: &Layout,
+    review: &ModelConfigReview,
+) -> Result<crate::config::types::Config> {
+    let resets = review
+        .role
+        .as_deref()
+        .map(model_project_resets)
+        .transpose()?
+        .unwrap_or_default();
+    save_config_with_project_resets(
+        layout,
+        review.scope,
+        &review.changes,
+        &resets,
+        Some(&review.original),
+    )
+}
 #[derive(Clone)]
 pub enum Change {
     Set {
@@ -44,6 +158,8 @@ pub enum Change {
 pub use crate::platform::atomic::{validate_private_path, write_private};
 
 fn open_lock(path: &Path) -> Result<File> {
+    let anchor = super::paths::record_lock_anchor(path);
+    let path = anchor.as_path();
     private_dir(path.parent().context("storage path has no parent")?)?;
     let lock_path = path.with_extension(format!(
         "{}.lock",
@@ -210,13 +326,27 @@ pub fn save(layout: &Layout, scope: Scope, changes: &[Change]) -> Result<()> {
     write_private(&files[selected], toml::to_string_pretty(&doc)?.as_bytes())
 }
 
+/// Atomically replace global shortcut overrides while preserving other configuration values.
+pub fn save_keys(user_dir: &Path, keys: toml::Table) -> Result<()> {
+    let path = user_dir.join("config.toml");
+    let _lock = interactive_lock(&path)?;
+    let doc = changed_document(
+        &path,
+        &[Change::Set {
+            path: "keys".into(),
+            value: toml::Value::Table(keys),
+        }],
+    )?;
+    write_private(&path, toml::to_string_pretty(&doc)?.as_bytes())
+}
+
 /// Re-read, apply changes (including insert preconditions), validate, then atomically save.
 pub fn save_config(
     layout: &Layout,
     scope: Scope,
     changes: &[Change],
 ) -> Result<crate::config::types::Config> {
-    save_config_with_project_resets(layout, scope, changes, &[])
+    save_config_with_project_resets(layout, scope, changes, &[], None)
 }
 
 /// Explicit Global model choices clear only this project's override for the chosen role.
@@ -227,7 +357,7 @@ pub fn save_model_config(
     role: &str,
 ) -> Result<crate::config::types::Config> {
     let resets = model_project_resets(role)?;
-    save_config_with_project_resets(layout, scope, changes, &resets)
+    save_config_with_project_resets(layout, scope, changes, &resets, None)
 }
 
 /// Validate the same future layers as `save_model_config`, without publishing or migrating files.
@@ -311,11 +441,20 @@ fn model_project_resets(role: &str) -> Result<Vec<Change>> {
         .collect())
 }
 
+/// The layers actually published by the canonical save transaction, not merely prepared/validated.
+fn publication_layers(scope: Scope, project_resets: &[Change]) -> [bool; 2] {
+    match scope {
+        Scope::Global => [true, !project_resets.is_empty()],
+        Scope::Project => [false, true],
+    }
+}
+
 fn save_config_with_project_resets(
     layout: &Layout,
     scope: Scope,
     changes: &[Change],
     project_resets: &[Change],
+    expected: Option<&[toml::Table; 2]>,
 ) -> Result<crate::config::types::Config> {
     layout.ensure_project_outside_storage()?;
     let files = layout.config_files();
@@ -324,10 +463,17 @@ fn save_config_with_project_resets(
     let inserts = changes
         .iter()
         .any(|change| matches!(change, Change::Insert { .. }));
-    let reset_project = scope == Scope::Global && !project_resets.is_empty();
-    let both = inserts || reset_project;
+    let reset_project = publication_layers(scope, project_resets) == [true, true];
+    let both = inserts || reset_project || expected.is_some();
     let _lock = interactive_lock(&files[if both { 0 } else { selected }])?;
     let _project_lock = both.then(|| interactive_lock(&files[1])).transpose()?;
+    if let Some(expected) = expected {
+        ensure!(
+            load_layer(layout, Scope::Global)? == expected[0]
+                && load_layer(layout, Scope::Project)? == expected[1],
+            "Model settings changed since review; select the model again. No settings saved."
+        );
+    }
     let (layers, config) = prepare_config(layout, scope, changes, project_resets)?;
     let selected_bytes = toml::to_string_pretty(&layers[selected])?;
     if reset_project {
@@ -382,6 +528,15 @@ fn prepare_config(
             }
         }
         layers[index] = layer;
+    }
+    if scope == Scope::Global {
+        // A project override must not hide an invalid default for other projects.
+        crate::config::types::Config::from_layers(
+            layout,
+            &layers[0],
+            &toml::Table::new(),
+            &toml::Table::new(),
+        )?;
     }
     let config = crate::config::types::Config::from_layers(
         layout,

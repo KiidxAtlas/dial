@@ -19,6 +19,76 @@ fn native_alt(key: &str) -> String {
 }
 
 #[test]
+fn primary_shortcuts_preserve_alternates_and_avoid_panel_and_editor_collisions() {
+    let map = Keymap::defaults();
+    // This is the documented local model-panel surface, not the global fallback surface.
+    let local = ["Ctrl+F", "Shift+F2", "Shift+F3", "Shift+F8"];
+    for action in Action::ALL.iter().filter(|a| a.context() == 0) {
+        for name in local {
+            assert!(
+                !map.chords(*action).contains(&Chord::parse(name).unwrap()),
+                "{} shadows panel-local {name}",
+                action.id()
+            );
+        }
+    }
+    // Both primaries must work without Option settings or Windows Terminal reserved chords.
+    // Status has an Option primary but a function-key fallback for those terminals.
+    for (action, expected) in [(Action::WorkTab, "Ctrl+X"), (Action::StatusExpand, "Alt+S")] {
+        let primary = map.chords(action)[0];
+        assert_eq!(primary, Chord::parse(expected).unwrap());
+        for other in Action::ALL
+            .iter()
+            .filter(|a| **a != action && (a.context() == 0 || a.context() == 2))
+        {
+            assert!(
+                !map.chords(*other).contains(&primary),
+                "{} shadows {}",
+                other.id(),
+                action.id()
+            );
+        }
+        for reserved in [
+            "Alt+Enter",
+            "Ctrl+Shift+Space",
+            "Ctrl+Space",
+            "Ctrl+Shift+V",
+        ] {
+            assert_ne!(primary, Chord::parse(reserved).unwrap());
+        }
+        assert_eq!(map.label(action), primary.display());
+        assert!(
+            map.hotkeys()
+                .iter()
+                .find(|row| row.id == action.id())
+                .unwrap()
+                .keys
+                .contains(" / ")
+        );
+    }
+    for (action, fallback) in [
+        (Action::WorkTab, "F12"),
+        (Action::StatusExpand, "F11"),
+        (Action::ModelSelect, "F2"),
+        (Action::ModelRoles, "F3"),
+        (Action::ModelFavoriteNext, "F8"),
+    ] {
+        assert!(
+            map.chords(action)
+                .contains(&Chord::parse(fallback).unwrap())
+        );
+    }
+    // Existing ids and overrides still load even where a default changed.
+    let (custom, warnings) = Keymap::from_table(&table(
+        r#""app.work.tab" = "Ctrl+F"
+"app.interrupt" = ["Esc", "Ctrl+C"]"#,
+    ));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(custom.label(Action::WorkTab), "Ctrl+F");
+    assert_eq!(custom.label(Action::Interrupt), "Esc");
+}
+
+#[test]
 fn native_labels_preserve_aliases_modifiers_and_config_spelling() {
     for name in ["Alt+M", "Option+M", "Meta+M"] {
         let chord = Chord::parse(name).unwrap();
@@ -301,12 +371,12 @@ fn conflicts_resolve_deterministically_in_the_users_favor() {
         map.matches(Action::Complete, &key(KeyCode::Right, KeyModifiers::NONE))
             && map.matches(Action::TabNext, &key(KeyCode::Right, KeyModifiers::NONE))
     );
-    // Esc legitimately serves dismiss, interrupt and clear at once.
+    // Esc dismisses local UI; Ctrl+C alone interrupts the running turn by default.
     let defaults = Keymap::defaults();
     let esc = key(KeyCode::Esc, KeyModifiers::NONE);
     assert!(
         defaults.actions_for(&esc).contains(&Action::Dismiss)
-            && defaults.actions_for(&esc).contains(&Action::Interrupt)
+            && !defaults.actions_for(&esc).contains(&Action::Interrupt)
     );
 }
 
@@ -365,8 +435,9 @@ fn saved_bindings_round_trip_and_a_corrupt_file_is_never_overwritten() {
         assert_eq!(loaded.chords(action), map.chords(action), "{action:?}");
     }
     assert!(loaded.is_customized(Action::HistorySearch) && !loaded.is_customized(Action::Settings));
-    let text = fs::read_to_string(dir.path().join("keybindings.toml")).unwrap();
-    let saved: toml::Table = text.parse().unwrap();
+    let text = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    let doc: toml::Table = text.parse().unwrap();
+    let saved = doc["keys"].as_table().unwrap();
     assert_eq!(
         saved[Action::Newline.id()].as_array().unwrap()[0].as_str(),
         Some("Alt+Enter")
@@ -379,7 +450,7 @@ fn saved_bindings_round_trip_and_a_corrupt_file_is_never_overwritten() {
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            fs::metadata(dir.path().join("keybindings.toml"))
+            fs::metadata(dir.path().join("config.toml"))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -387,14 +458,10 @@ fn saved_bindings_round_trip_and_a_corrupt_file_is_never_overwritten() {
             0o600
         );
     }
-    fs::write(
-        dir.path().join("keybindings.toml"),
-        "app.model.select = [oops",
-    )
-    .unwrap();
+    fs::write(dir.path().join("config.toml"), "app.model.select = [oops").unwrap();
     assert!(map.save(dir.path()).is_err());
     assert_eq!(
-        fs::read_to_string(dir.path().join("keybindings.toml")).unwrap(),
+        fs::read_to_string(dir.path().join("config.toml")).unwrap(),
         "app.model.select = [oops",
         "the user's file is untouched"
     );
@@ -421,7 +488,7 @@ fn interactive_edits_persist_before_applying_and_reject_collisions_or_lockout() 
         Keymap::load(dir.path()).0.label(Action::ModelSelect),
         "Ctrl+K"
     );
-    let path = dir.path().join("keybindings.toml");
+    let path = dir.path().join("config.toml");
     let before = fs::read_to_string(&path).unwrap();
     for (action, chords) in [
         (Action::HistorySearch, vec!["Ctrl+K"]),
@@ -453,7 +520,8 @@ fn interactive_edits_persist_before_applying_and_reject_collisions_or_lockout() 
         "Ctrl+R"
     );
     assert!(
-        !toml::from_str::<toml::Table>(&fs::read_to_string(&path).unwrap())
+        !toml::from_str::<toml::Table>(&fs::read_to_string(&path).unwrap()).unwrap()["keys"]
+            .as_table()
             .unwrap()
             .contains_key(Action::HistorySearch.id())
     );
@@ -606,12 +674,90 @@ fn mac_option_v_text_fallback_respects_platform_modifiers_and_remaps() {
 #[test]
 fn work_tab_defaults_lead_with_a_non_option_chord() {
     let map = Keymap::defaults();
-    assert_eq!(map.label(Action::WorkTab), "Ctrl+F");
+    assert_eq!(map.label(Action::WorkTab), "Ctrl+X");
     assert!(map.matches(
         Action::WorkTab,
-        &key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        &key(KeyCode::Char('x'), KeyModifiers::CONTROL)
     ));
     // The earlier Option and function-key defaults keep working as aliases.
     assert!(map.matches(Action::WorkTab, &key(KeyCode::Char('w'), KeyModifiers::ALT)));
     assert!(map.matches(Action::WorkTab, &key(KeyCode::F(12), KeyModifiers::NONE)));
+}
+
+#[test]
+fn config_keys_override_legacy_per_id_and_keep_other_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("keybindings.toml"),
+        "[app.model]\nselect = 'Ctrl+Y'\n[app.history]\nsearch = []\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        "model = 'keep-me'\n[keys]\n'app.model.select' = 'Ctrl+K'\n",
+    )
+    .unwrap();
+    let (mut map, warnings) = Keymap::load(dir.path());
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(map.label(Action::ModelSelect), "Ctrl+K");
+    assert!(map.chords(Action::HistorySearch).is_empty());
+    map.edit_and_save(
+        dir.path(),
+        Action::HistorySearch,
+        Action::HistorySearch.defaults(),
+    )
+    .unwrap();
+    let (loaded, warnings) = Keymap::load(dir.path());
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(loaded.label(Action::HistorySearch), "Ctrl+R");
+    let doc: toml::Table = fs::read_to_string(dir.path().join("config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(doc["model"].as_str(), Some("keep-me"));
+    assert!(dir.path().join("keybindings.toml").exists());
+}
+
+#[test]
+fn config_keys_share_invalid_entry_and_conflict_validation() {
+    for text in [
+        "'app.model.select' = 1",
+        "'app.model.select' = 'Ctrl+Banana'",
+        "'unknown.action' = 'Ctrl+K'",
+        "'app.model.select' = 'Ctrl+K'\n'app.history.search' = 'Ctrl+K'",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), format!("[keys]\n{text}\n")).unwrap();
+        let (expected, expected_warnings) = Keymap::from_table(&table(text));
+        let (actual, warnings) = Keymap::load(dir.path());
+        assert!(!warnings.is_empty());
+        assert_eq!(warnings, expected_warnings);
+        for action in Action::ALL {
+            assert_eq!(actual.chords(*action), expected.chords(*action));
+        }
+    }
+}
+
+#[test]
+fn reload_keys_reads_config_and_retains_live_bindings_after_invalid_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut map = Keymap::defaults();
+    fs::write(
+        dir.path().join("config.toml"),
+        "[keys]\n'app.model.select' = 'Ctrl+Y'\n",
+    )
+    .unwrap();
+    assert!(map.reload(dir.path()).is_empty());
+    assert_eq!(map.label(Action::ModelSelect), "Ctrl+Y");
+    for file in ["config.toml", "keybindings.toml"] {
+        let path = dir.path().join(file);
+        let before = fs::read_to_string(&path).ok();
+        fs::write(&path, "broken = [").unwrap();
+        assert!(!map.reload(dir.path()).is_empty());
+        assert_eq!(map.label(Action::ModelSelect), "Ctrl+Y");
+        match before {
+            Some(text) => fs::write(path, text).unwrap(),
+            None => fs::remove_file(path).unwrap(),
+        }
+    }
 }

@@ -1,6 +1,6 @@
 //! Cheap typed decisions: one model call must answer with exactly one of a fixed set of choices, and the
-//! answer is cached locally. Calls go through the `judge` model role, which falls back to `small` and then
-//! to the main model, so it works without configuration. A `judge` role assigned to Laya
+//! answer is cached locally. Calls go through the `decision` model role, which falls back to `small` and then
+//! to the main model, so it works without configuration. A `decision` role assigned to Laya
 //! (`provider = "laya"`) asks the local Laya service's typed `choice` API instead of a chat model.
 
 pub mod cache;
@@ -198,27 +198,27 @@ pub fn judge(
     bail!("judgment failed after {MAX_ATTEMPTS} attempts: {last_error}")
 }
 
-/// The configuration that answers judgments: the `judge` role if assigned, else `small`, else the main
+/// The configuration that answers judgments: the `decision` role if assigned, else `small`, else the main
 /// model (both through their own fallbacks in `for_role`).
 pub fn judge_config(config: &Config) -> Config {
-    if config.role_selection("judge").is_some() {
-        config.for_role("judge")
+    if config.role_selection("decision").is_some() {
+        config.for_role("decision")
     } else {
         config.for_role("small")
     }
 }
 
-/// Whether the `judge` role is assigned to the Laya decision engine rather than a chat model.
+/// Whether the `decision` role is assigned to the Laya decision engine rather than a chat model.
 pub fn judge_uses_laya(config: &Config) -> bool {
     config
-        .role_selection("judge")
+        .role_selection("decision")
         .is_some_and(|selection| selection.provider == crate::config::laya::PROVIDER)
 }
 
-/// Whether the `judge` role is assigned to TypeSafe System One rather than a chat model.
+/// Whether the `decision` role is assigned to TypeSafe System One rather than a chat model.
 pub fn judge_uses_typesafe(config: &Config) -> bool {
     config
-        .role_selection("judge")
+        .role_selection("decision")
         .is_some_and(|selection| selection.provider == typesafe::PROVIDER)
 }
 
@@ -229,7 +229,7 @@ const RULE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// Most judgments kept on disk; least recently used rows go first.
 const CACHE_MAX_ROWS: u64 = 5000;
 
-/// Judge one user turn's reasoning effort for `thinking = "auto"`: the judge role, the persistent cache
+/// Judge one user turn's reasoning effort for `thinking = "auto"`: the decision role, the persistent cache
 /// under `user_dir` when it can be opened, and one judge call on a cache miss. `cancel` interrupts
 /// either provider, including waiting for the Laya service to start.
 pub fn judge_turn_thinking(
@@ -256,7 +256,7 @@ const RULE_CRITERIA: [&str; 2] = [
     "It does not, or the output gives too little evidence to say.",
 ];
 
-/// Ask a stream rule's `question` about one completed reply's in-scope `content` through the judge
+/// Ask a stream rule's `question` about one completed reply's in-scope `content` through the decision
 /// role. `yes` triggers the rule.
 pub fn judge_rule(
     main: &Config,
@@ -290,7 +290,7 @@ pub fn judge_rule(
 }
 
 /// Runs `ask` with the persistent cache under `user_dir` (when it can be opened) and the backend the
-/// `judge` role selects: Laya, TypeSafe, or a chat model through the judge/small/main fallbacks.
+/// `decision` role selects: Laya, TypeSafe, or a chat model through the decision/small/main fallbacks.
 fn with_judge(
     main: &Config,
     user_dir: &std::path::Path,
@@ -311,7 +311,7 @@ fn with_judge(
         let config = main.laya_service();
         let checkpoint = crate::config::laya::expected_checkpoint(&config).ok_or_else(|| {
             anyhow!(
-                "the judge role uses Laya, but no Laya checkpoint is installed or assigned to the decision role"
+                "the decision role uses Laya, but no Laya checkpoint is configured or installed"
             )
         })?;
         // The checkpoint is the model identity: a new checkpoint is asked again instead of hitting the cache.
@@ -320,8 +320,8 @@ fn with_judge(
     }
     if judge_uses_typesafe(main) {
         let selection = main
-            .role_selection("judge")
-            .ok_or_else(|| anyhow!("the judge role is not assigned"))?;
+            .role_selection("decision")
+            .ok_or_else(|| anyhow!("the decision role is not assigned"))?;
         let mut backend = typesafe::TypesafeBackend::from_env(
             &selection.model,
             main.worker_timeout_secs,

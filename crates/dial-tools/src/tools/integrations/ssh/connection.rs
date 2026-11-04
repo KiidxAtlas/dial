@@ -217,7 +217,7 @@ pub fn fallback_control_dir(canonical: &Path, uid: u32) -> PathBuf {
 
 /// The chosen control directory and whether it is the shared-`/tmp` fallback.
 pub fn control_dir(settings: &Settings) -> (PathBuf, bool) {
-    let canonical = settings.user_dir.join("ssh").join("cm");
+    let canonical = crate::config::paths::ssh_dir(&settings.user_dir).join("cm");
     if control_path_fits(&canonical, cfg!(target_os = "macos")) {
         return (canonical, false);
     }
@@ -573,9 +573,7 @@ pub fn cached_info(target: &Target, settings: &Settings) -> Option<HostInfo> {
 }
 
 fn info_path(settings: &Settings, name: &str) -> PathBuf {
-    settings
-        .user_dir
-        .join("ssh")
+    crate::config::paths::ssh_dir(&settings.user_dir)
         .join("hosts")
         .join(format!("{}.json", sanitize_host_name(name)))
 }

@@ -1,5 +1,5 @@
 //! `/review-file`: review checkpointed changes by writer group (main or a worker) and by file.
-//! Reverts are token-checked per file and get their own checkpoint for `/undo`; they are not
+//! Reverts are token-checked per file and get their own checkpoint for `/undo files`; they are not
 //! transactions (see `Checkpoints::restore_files`). Overlap with
 //! another writer or a later turn is shown as a risk signal and needs explicit confirmation; its
 //! absence is not proof that files are independent.
@@ -149,7 +149,7 @@ impl Shell {
             for (path, why) in &plan.held {
                 text.push_str(&format!("\n  held    {path} ({why})"));
             }
-            text.push_str("\nNo recorded overlap does not prove files are independent of other code. The revert has one checkpoint for /undo.");
+            text.push_str("\nNo recorded overlap does not prove files are independent of other code. The revert has one checkpoint for /undo files.");
             let mut options = vec![("Review files", 'f'), ("Back", 'b')];
             if !plan.safe.is_empty() {
                 options.insert(1, ("Revert unshared files", 'r'));
@@ -209,7 +209,7 @@ impl Shell {
             return;
         }
         let body = format!(
-            "Revert {} file(s) to their state before this turn. The diffs below include any edits you made since.\n{}\nEach file is compared again right before it is written; if one changed, the revert stops, files it already wrote are put back only if they are unchanged since, and the revert checkpoint stays for /undo. This is not a transaction.",
+            "Revert {} file(s) to their state before this turn. The diffs below include any edits you made since.\n{}\nEach file is compared again right before it is written; if one changed, the revert stops, files it already wrote are put back only if they are unchanged since, and the revert checkpoint stays for /undo files. This is not a transaction.",
             items.len(),
             diffs
         );
@@ -220,7 +220,7 @@ impl Shell {
             Ok(done) => self.note(
                 "Review",
                 format!(
-                    "Restored {} file(s). The revert has its own checkpoint for /undo.",
+                    "Restored {} file(s). The revert has its own checkpoint for /undo files.",
                     done.len()
                 ),
             ),
@@ -325,7 +325,7 @@ impl Shell {
                 checkpoints.restore_files(turn, &[(path.to_owned(), token)], true)?;
                 self.note(
                     "Review",
-                    "Restored only the selected file. The revert has its own checkpoint for /undo.",
+                    "Restored only the selected file. The revert has its own checkpoint for /undo files.",
                 );
             }
             _ => {}

@@ -37,44 +37,62 @@ pub struct ExtensionHost {
 }
 impl ExtensionHost {
     pub fn install(&mut self, agent: &mut Agent<'_>, extension: &dyn Extension) -> Result<()> {
-        ensure!(
-            extension.api_version() == SDK_VERSION,
-            "unsupported extension SDK version"
-        );
         let name = extension.name();
+        let actual_version = extension.api_version();
         ensure!(
-            !name.is_empty() && !self.names.iter().any(|n| n == name),
-            "empty or duplicate extension name"
+            actual_version == SDK_VERSION,
+            "extension {name:?}: unsupported SDK version (expected {SDK_VERSION}, actual {actual_version})"
+        );
+        ensure!(!name.is_empty(), "extension name is empty");
+        ensure!(
+            !self.names.iter().any(|n| n == name),
+            "extension {name:?}: duplicate extension name"
         );
         let tools = extension.tools();
         let commands = extension.commands();
         let mut seen = std::collections::HashSet::new();
-        let existing = agent.available_tool_names();
         for tool in &tools {
-            crate::tools::surface::catalog::validate_tool(tool.as_ref())?;
             ensure!(
-                !existing.iter().any(|n| n == tool.name()) && seen.insert(tool.name().to_owned()),
-                "tool name collides: {}",
+                !tool.name().is_empty(),
+                "extension {name:?}: tool name is empty"
+            );
+            agent.validate_tool_registration(tool.as_ref()).with_context(|| {
+                format!(
+                    "extension {name:?} tool {:?}: invalid tool (SDK version: expected {}, actual {})",
+                    tool.name(),
+                    crate::tools::integrations::ext::EXTENSION_API_VERSION,
+                    tool.extension_api_version()
+                )
+            })?;
+            ensure!(
+                seen.insert(tool.name().to_owned()),
+                "extension {name:?} tool {:?}: duplicate tool name",
                 tool.name()
             );
         }
         seen.clear();
         for command in &commands {
             ensure!(
-                !command.name.is_empty()
-                    && command
-                        .name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-                "invalid command name"
+                !command.name.is_empty(),
+                "extension {name:?}: command name is empty"
+            );
+            ensure!(
+                command
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "extension {name:?} command {:?}: invalid command name (use ASCII letters, digits, '_' or '-')",
+                command.name
             );
             ensure!(
                 !self.commands.contains_key(&command.name) && seen.insert(command.name.clone()),
-                "command name collides: {}",
+                "extension {name:?} command {:?}: duplicate command name",
                 command.name
             );
         }
-        agent.register_tools(tools)?;
+        agent
+            .register_tools(tools)
+            .with_context(|| format!("extension {name:?}: tool registration failed"))?;
         for command in commands {
             self.commands.insert(command.name.clone(), command);
         }

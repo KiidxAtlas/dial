@@ -14,6 +14,7 @@ use crate::ui::overlay::{DrawCtx, OverlayEvent};
 use crossterm::event::Event;
 use std::time::Instant;
 
+pub(in crate::app) mod activity;
 pub(in crate::app) mod apply;
 pub(in crate::app) mod auth;
 pub(in crate::app) mod compute;
@@ -30,7 +31,9 @@ pub(super) struct ImproveWatch {
 
 pub(super) enum Which {
     Palette,
+    Controls,
     Choice(Box<ChoiceSpec>),
+    Activity(activity::ActivityTab),
     Compute,
     Improve,
     Jobs,
@@ -44,14 +47,20 @@ pub(super) enum Which {
         from_hub: bool,
     },
     Extensions,
+    ExtensionsTab(crate::ui::overlay::extensions::model::Tab),
+    Stats(String),
     Settings,
     LearningSettings,
     LearningModels,
     ModelSettings,
+    SelectedModelSettings(ModelSelection),
+    /// Open the canonical settings editor at a known configuration path.
+    SettingsAt(String),
     ImageSettings,
     ContextDefaults,
     Models,
     ModelRoles,
+    ModelRole(String),
     Providers,
     Shortcuts,
     /// `/peers`: the board, built from the agent before the panel opens.
@@ -78,6 +87,29 @@ fn subagent_viewer_destination(action: &str) -> Option<Which> {
 
 /// Overlay navigation uses the same destinations while idle and during work.
 pub(super) fn overlay_destination(action: &str) -> Option<Which> {
+    if let Some(path) = action.strip_prefix("open:settings:") {
+        return crate::config::schema::registry()
+            .iter()
+            .any(|def| def.path == path)
+            .then(|| Which::SettingsAt(path.to_owned()));
+    }
+    if let Some(role) = action.strip_prefix("open:role:") {
+        return crate::llm::model_config::ROLES
+            .iter()
+            .any(|(id, _)| *id == role)
+            .then(|| Which::ModelRole(role.to_owned()));
+    }
+    if let Some(selection) = action.strip_prefix("open:model-settings:") {
+        return serde_json::from_str(selection)
+            .ok()
+            .map(Which::SelectedModelSettings);
+    }
+    if let Some(tab) = action
+        .strip_prefix("open:activity:")
+        .and_then(activity::ActivityTab::parse)
+    {
+        return Some(tab.destination());
+    }
     match action {
         "open:models" => Some(Which::Models),
         "open:roles" => Some(Which::ModelRoles),
@@ -99,6 +131,16 @@ pub(super) fn overlay_destination(action: &str) -> Option<Which> {
 
 /// Work navigation is identical while idle and while a turn is running.
 pub(super) fn work_panel(name: &str, args: &str) -> Option<Which> {
+    if name == "activity" {
+        return activity::ActivityTab::parse(args).map(activity::ActivityTab::destination);
+    }
+    if args.is_empty() {
+        match name {
+            "schedule" => return Some(Which::Activity(activity::ActivityTab::Schedule)),
+            "queue" => return Some(Which::Activity(activity::ActivityTab::Queue)),
+            _ => {}
+        }
+    }
     if !args.is_empty() {
         return None;
     }
@@ -120,10 +162,12 @@ pub(super) struct OverlayOutcome {
 }
 
 pub(super) enum ActiveOverlay {
+    Activity(Box<activity::ActivityOverlay>),
     Palette(PaletteOverlay),
     Compute(ComputeOverlay),
     Improve(Box<crate::ui::overlay::improve::ImproveOverlay>),
     Extensions(Box<crate::ui::overlay::extensions::ExtensionsOverlay>),
+    Stats(Box<crate::ui::overlay::stats::StatsOverlay>),
     Settings(Box<SettingsOverlay>),
     ModelSettings(Box<crate::ui::overlay::model_settings::ModelSettingsOverlay>),
     ImageSettings(Box<crate::ui::overlay::image_settings::ImageSettingsOverlay>),
@@ -138,8 +182,27 @@ pub(super) enum ActiveOverlay {
 }
 
 impl ActiveOverlay {
+    /// Retain browser state, not live worker editors whose drop flushes a shared draft.
+    pub(super) fn retains_navigation(&self) -> bool {
+        matches!(
+            self,
+            Self::Settings(_)
+                | Self::Models(_)
+                | Self::Providers(_)
+                | Self::Palette(_)
+                | Self::Shortcuts(_)
+        )
+    }
+    pub(super) fn content_mut(&mut self) -> &mut Self {
+        match self {
+            Self::Activity(activity) => activity.panel.content_mut(),
+            _ => self,
+        }
+    }
+
     pub(super) fn draw(&mut self, frame: &mut ratatui::Frame, ctx: &DrawCtx) {
         match self {
+            Self::Activity(o) => o.draw(frame, ctx),
             Self::Palette(o) => o.draw(frame, ctx),
             Self::Settings(o) => o.draw(frame, ctx),
             Self::ModelSettings(o) => o.draw(frame, ctx),
@@ -147,6 +210,7 @@ impl ActiveOverlay {
             Self::Compute(o) => o.draw(frame, ctx),
             Self::Improve(o) => o.draw(frame, ctx),
             Self::Extensions(o) => o.draw(frame, ctx),
+            Self::Stats(o) => o.draw(frame, ctx),
             Self::Models(o) => o.draw(frame, ctx),
             Self::Providers(o) => o.draw(frame, ctx),
             Self::Shortcuts(o) => o.draw(frame, ctx),
@@ -167,12 +231,16 @@ impl ActiveOverlay {
     }
 
     pub(super) fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if let Self::Activity(activity) = self {
+            return activity.handle(event, keys);
+        }
         if let Event::Mouse(mouse) = event
             && !matches!(self, Self::Git(_) | Self::SubagentViewer(_))
         {
             return self.mouse(*mouse, keys);
         }
         match self {
+            Self::Activity(o) => o.handle(event, keys),
             Self::Palette(o) => o.handle(event, keys),
             Self::Settings(o) => o.handle(event, keys),
             Self::ModelSettings(o) => o.event(event, keys),
@@ -180,6 +248,7 @@ impl ActiveOverlay {
             Self::Compute(o) => o.handle(event, keys),
             Self::Improve(o) => o.handle(event, keys),
             Self::Extensions(o) => o.handle(event, keys),
+            Self::Stats(o) => o.handle(event, keys),
             Self::Models(o) => o.handle(event, keys),
             Self::Providers(o) => o.handle(event, keys),
             Self::Shortcuts(o) => o.handle(event, keys),
@@ -226,6 +295,7 @@ impl ActiveOverlay {
 
     pub(super) fn banner(&mut self, message: String, is_error: bool) {
         match self {
+            Self::Activity(o) => o.panel.banner(message, is_error),
             Self::Models(o) => o.set_status(message, is_error),
             Self::Compute(o) => o.banner(message, is_error),
             Self::Improve(o) => o.banner(message, is_error),
@@ -238,7 +308,7 @@ impl ActiveOverlay {
             Self::Jobs(o) => o.banner(message, is_error),
             Self::Peers(o) => o.banner(message, is_error),
             Self::Settings(o) => o.banner(message, is_error),
-            Self::Palette(_) | Self::Shortcuts(_) | Self::Git(_) => {}
+            Self::Palette(_) | Self::Shortcuts(_) | Self::Git(_) | Self::Stats(_) => {}
         }
     }
 }

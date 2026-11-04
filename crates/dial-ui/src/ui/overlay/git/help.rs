@@ -47,7 +47,7 @@ pub(super) const GROUPS: &[Group] = &[
             },
             Binding {
                 keys: &["tab"],
-                label: "Switch between the diff and the changes",
+                label: "Switch Status / Diff / Commit / Log tabs (Shift+Tab goes back)",
             },
             Binding {
                 keys: &["]", "["],

@@ -72,10 +72,13 @@ pub fn resolve_selector(
                 model: model.to_owned(),
                 ..Default::default()
             };
-            if let Some((url, key, protocol)) = crate::llm::catalog::provider_endpoint(provider) {
-                candidate.base_url = Some(url.to_owned());
-                candidate.api_key_env = key.map(str::to_owned);
-                candidate.protocol = Some(protocol);
+            if let Some(endpoint) = config.selection_endpoint(&candidate) {
+                candidate.base_url = Some(endpoint.base_url);
+                candidate.api_key_env = endpoint.api_key_env;
+                candidate.protocol = endpoint.protocol;
+                candidate.headers = endpoint.headers;
+                candidate.allow_insecure = endpoint.allow_insecure;
+                candidate.account_id = endpoint.account_id;
             }
         } else {
             candidate.model = model.to_owned();

@@ -10,7 +10,7 @@
 //! (tool calls), `current_tool`, `current`, `requests`, `tokens_in`, `tokens_out`, `cost_usd`,
 //! `context` (`[used, window]`), `retry` (`[attempt, max]`), `started_ms`, `elapsed_ms`,
 //! `last_activity_ms`, `parent` (worker id), `artifacts` (`[[label, path-or-uri], ...]`),
-//! `isolation` (backend and branch or path).
+//! `isolation` (backend and branch or path), `config` (settings lifecycle metadata).
 //!
 //! Transcript fields are the same keys, in the header or the final `status` record.
 //!
@@ -48,6 +48,8 @@ pub enum AgentStatus {
     Done,
     Failed,
     Cancelled,
+    /// Work ended without an explicit cancellation receipt.
+    Interrupted,
 }
 
 impl AgentStatus {
@@ -55,14 +57,18 @@ impl AgentStatus {
         match self {
             Self::Running => "running",
             Self::Waiting => "waiting",
-            Self::Done => "done",
+            Self::Done => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
         }
     }
 
     pub fn is_finished(self) -> bool {
-        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Done | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
     }
 
     /// Roster order: work that needs the operator first (input requests, then failures), then
@@ -70,7 +76,7 @@ impl AgentStatus {
     pub fn rank(self) -> u8 {
         match self {
             Self::Waiting => 0,
-            Self::Failed => 1,
+            Self::Failed | Self::Interrupted => 1,
             Self::Running => 2,
             Self::Done => 3,
             Self::Cancelled => 4,
@@ -82,7 +88,7 @@ impl AgentStatus {
     pub fn attention(self) -> u8 {
         match self {
             Self::Waiting => 0,
-            Self::Failed => 1,
+            Self::Failed | Self::Interrupted => 1,
             _ => 2,
         }
     }
@@ -93,13 +99,41 @@ impl AgentStatus {
             Phase::Blocked | Phase::NeedsInput => Self::Waiting,
             Phase::Completed => Self::Done,
             Phase::Failed | Phase::Incomplete => Self::Failed,
-            Phase::Interrupted => Self::Cancelled,
+            Phase::Interrupted => Self::Interrupted,
         }
     }
 
     /// Status from a persisted wire string (`done`, `failed`, `cancelled`, `running`, ...).
     fn from_wire(status: &str) -> Self {
-        Self::from_phase(Phase::from_status(status))
+        if status == "cancelled" {
+            Self::Cancelled
+        } else {
+            Self::from_phase(Phase::from_status(status))
+        }
+    }
+}
+
+/// Read-only settings receipt. Requested values never replace the worker's active `model`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerConfig {
+    pub revision: u64,
+    pub applied_revision: u64,
+    pub state: String,
+    pub requested_model: Option<String>,
+    pub requested_thinking: Option<String>,
+    pub failure: Option<String>,
+}
+
+impl WorkerConfig {
+    fn from_data(data: &Value) -> Option<Self> {
+        Some(Self {
+            revision: data["revision"].as_u64()?,
+            applied_revision: data["applied_revision"].as_u64()?,
+            state: data["state"].as_str()?.to_owned(),
+            requested_model: data["requested"]["model"].as_str().map(str::to_owned),
+            requested_thinking: data["requested"]["thinking"].as_str().map(str::to_owned),
+            failure: data["failure"].as_str().map(str::to_owned),
+        })
     }
 }
 
@@ -114,6 +148,9 @@ pub struct AgentEntry {
     pub role: String,
     pub model: String,
     pub model_source: String,
+    /// Selection-time receipt; absent in older recordings, never inferred from config.
+    pub model_explanation: Option<String>,
+    pub config: Option<WorkerConfig>,
     pub status: AgentStatus,
     /// One line.
     pub task: String,
@@ -146,6 +183,17 @@ pub struct AgentEntry {
     pub resumable: bool,
     /// Can be cancelled now.
     pub cancellable: bool,
+}
+
+impl AgentEntry {
+    /// Only observed input requests, failed/interrupted work or rejected settings need attention.
+    pub fn needs_attention(&self) -> bool {
+        self.status.attention() < 2
+            || self
+                .config
+                .as_ref()
+                .is_some_and(|config| config.state == "not_applied")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -430,6 +478,10 @@ fn entry_from_transcript(
         role: field("role"),
         model: field("model"),
         model_source: field("model_source"),
+        model_explanation: status_record
+            .and_then(|status| status["model_explanation"].as_str())
+            .or_else(|| header["model_explanation"].as_str())
+            .map(str::to_owned),
         task: task_line(&header["task"]),
         transcript: Some(summary.path.clone()),
         ..AgentEntry::default()
@@ -465,7 +517,7 @@ fn entry_from_transcript(
         Some(wire) => AgentStatus::from_wire(wire),
         // No final record: running if the owner still has it, otherwise interrupted.
         None if live.contains(id) => AgentStatus::Running,
-        None => AgentStatus::Cancelled,
+        None => AgentStatus::Interrupted,
     };
     entry
 }
@@ -481,10 +533,23 @@ fn apply_body(entry: &mut AgentEntry, data: &Value, phase: Phase, now: u64) {
     set(&mut entry.role, "role");
     set(&mut entry.model, "model");
     set(&mut entry.model_source, "model_source");
+    if let Some(explanation) = data["model_explanation"].as_str() {
+        entry.model_explanation = Some(explanation.to_owned());
+    }
+    entry.config = WorkerConfig::from_data(&data["config"]).or_else(|| entry.config.take());
     if let Some(task) = data["task"].as_str() {
         entry.task = one_line_clip(task);
     }
-    entry.status = AgentStatus::from_phase(phase);
+    // A final transcript is an explicit cancellation receipt; Phase alone cannot distinguish it
+    // from shutdown/recovery interruption. Only preserve it for this same interrupted incarnation.
+    let cancelled = entry.status == AgentStatus::Cancelled
+        || data["phase"].as_str() == Some("cancelled")
+        || data["status"].as_str() == Some("cancelled");
+    entry.status = if phase == Phase::Interrupted && cancelled {
+        AgentStatus::Cancelled
+    } else {
+        AgentStatus::from_phase(phase)
+    };
     if entry.status == AgentStatus::Running && data["phase"].as_str() == Some("waiting") {
         entry.status = AgentStatus::Waiting;
     }
@@ -545,7 +610,7 @@ fn finish_projection(agent: &mut AgentEntry, live: &HashSet<String>, now: u64) {
     let running_live = live.contains(&agent.id);
     if agent.status == AgentStatus::Running && !running_live && agent.transcript.is_some() {
         // A background body still marked running but no longer owned by the live job.
-        agent.status = AgentStatus::Cancelled;
+        agent.status = AgentStatus::Interrupted;
     }
     let active =
         matches!(agent.status, AgentStatus::Running | AgentStatus::Waiting) && running_live;

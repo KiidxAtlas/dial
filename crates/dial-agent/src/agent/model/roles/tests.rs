@@ -247,3 +247,102 @@ fn cancelled_role_request_never_initializes_a_backend_or_sends_a_request() {
     });
     assert!(server.requests().is_empty());
 }
+
+#[test]
+fn reused_role_thinking_is_scoped_to_the_request_not_the_loaded_model() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    use llm::profiles::{ModelCapabilities, ModelProfile, ReasoningApi, ReasoningEffort};
+    for reuse in [false, true] {
+        let server = llm::fake::serve(vec![llm::fake::Script::Sse(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]})
+        ))]);
+        let main_provider = "mlx";
+        let endpoint = "";
+        let overlay = format!(
+            r#"
+provider='{main_provider}'
+model='test'
+{endpoint}
+model_profile='reasoning'
+[model_profiles.reasoning]
+provider='{main_provider}'
+model='test'
+reasoning_effort='low'
+[model_profiles.reasoning.capabilities]
+reasoning='openai-effort'
+reasoning_efforts=['none','low','high']
+[model_roles.small]
+provider='{main_provider}'
+model='{}'
+thinking='high'
+[assistance.local]
+side_models='reuse_main'
+"#,
+            if reuse { "other-model" } else { "test" }
+        );
+        with_agent(&overlay, |agent| {
+            assert!(agent.role_selection("small").is_none());
+            let profile = ModelProfile {
+                provider: main_provider.into(),
+                model: "test".into(),
+                reasoning_effort: Some(ReasoningEffort::None),
+                thinking: Some(false),
+                max_tokens: Some(1024),
+                capabilities: ModelCapabilities {
+                    reasoning: ReasoningApi::OpenaiEffort,
+                    reasoning_efforts: vec![
+                        ReasoningEffort::None,
+                        ReasoningEffort::Low,
+                        ReasoningEffort::High,
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut backend = Backend::new(
+                ProviderKind::Endpoint {
+                    base_url: format!("{}/v1", server.url),
+                    model: "test".into(),
+                    api_key: None,
+                },
+                Default::default(),
+                5,
+            )
+            .with_profile(profile.clone())
+            .with_session_id(agent.session().id());
+            backend.next_request_profile(Some(profile.clone()));
+            let request = Chat {
+                messages: vec![json!({"role":"user","content":"Decide"})],
+                tools: vec![],
+                temperature: 0.0,
+                max_tokens: 64,
+                seed: None,
+            };
+            assert_eq!(
+                agent
+                    .role_chat(
+                        &mut backend,
+                        "small",
+                        llm::usage::Purpose::Judgment,
+                        &request,
+                        &mut NullUi
+                    )
+                    .unwrap(),
+                "ok"
+            );
+            let requests = server.requests();
+            let body = llm::fake::body(requests.last().unwrap());
+            assert_eq!(body["reasoning_effort"], "high");
+            assert_eq!(body["max_tokens"], 64);
+            assert_eq!(
+                backend.compaction_profile().unwrap().reasoning_effort,
+                Some(ReasoningEffort::None)
+            );
+            assert_eq!(
+                backend.model_profile().unwrap().reasoning_effort,
+                Some(ReasoningEffort::None)
+            );
+        });
+    }
+}

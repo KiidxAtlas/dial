@@ -144,10 +144,10 @@ fn locates_a_described_element_with_the_real_model() {
         python: std::path::PathBuf::from(home).join(".dial/python/.venv/bin/python"),
         ..Default::default()
     };
-    config.model_roles.insert(
-        ROLE.into(),
-        crate::llm::model_config::ModelSelection::new("mlx", &env("DIAL_TEST_GROUNDING_MODEL")),
-    );
+    config.vision.grounding = Some(crate::llm::model_config::ModelSelection::new(
+        "mlx",
+        &env("DIAL_TEST_GROUNDING_MODEL"),
+    ));
     let located = locate(
         &config,
         &screenshot,

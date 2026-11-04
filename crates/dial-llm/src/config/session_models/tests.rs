@@ -54,3 +54,37 @@ fn adopting_a_role_takes_its_complete_selection() {
     pin.apply(&mut merged);
     assert_eq!(merged, disk);
 }
+
+#[test]
+fn moved_feature_models_stay_session_local_and_adopt_only_own_writes() {
+    let initial = table(
+        "[vision.grounding]\nprovider='mlx'\nmodel='own-grounding'\n\
+         [vision.image_embedding]\nprovider='mlx'\nmodel='own-vectors'\n\
+         [laya]\ncheckpoint='/own'\nenabled=false\n",
+    );
+    let disk = table(
+        "[vision.grounding]\nprovider='mlx'\nmodel='other-grounding'\n\
+         [vision.image_embedding]\nprovider='mlx'\nmodel='other-vectors'\n\
+         [laya]\ncheckpoint='/other'\nenabled=true\n",
+    );
+    let mut pin = SessionModels::capture(&initial);
+    let mut merged = disk.clone();
+    pin.apply(&mut merged);
+    assert_eq!(merged["vision"], initial["vision"]);
+    assert_eq!(merged["laya"]["checkpoint"].as_str(), Some("/own"));
+    assert_eq!(merged["laya"]["enabled"].as_bool(), Some(true));
+    pin.adopt_paths(&disk, ["vision.grounding", "laya.checkpoint"]);
+    pin.apply(&mut merged);
+    assert_eq!(merged["vision"]["grounding"], disk["vision"]["grounding"]);
+    assert_eq!(
+        merged["vision"]["image_embedding"],
+        initial["vision"]["image_embedding"]
+    );
+    assert_eq!(merged["laya"]["checkpoint"].as_str(), Some("/other"));
+    let empty = table("[laya]\nenabled=false\n");
+    pin.adopt_paths(&empty, ["vision", "laya.checkpoint"]);
+    pin.apply(&mut merged);
+    assert!(!merged.contains_key("vision"));
+    assert!(merged["laya"].get("checkpoint").is_none());
+    assert_eq!(merged["laya"]["enabled"].as_bool(), Some(true));
+}

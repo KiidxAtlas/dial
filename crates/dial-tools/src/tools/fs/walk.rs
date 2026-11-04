@@ -216,11 +216,6 @@ impl<'a> SearchWalk<'a> {
         }
     }
 
-    pub fn run(&mut self, start: &Path, visit: &mut dyn FnMut(&Path) -> bool) {
-        let ws = self.ws;
-        self.run_with_prefix(start, &ws.root, visit);
-    }
-
     pub fn run_with_prefix(
         &mut self,
         start: &Path,

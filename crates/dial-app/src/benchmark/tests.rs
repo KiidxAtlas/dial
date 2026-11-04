@@ -25,6 +25,32 @@ fn efficiency_suite_and_fixture_are_valid() {
 }
 
 #[test]
+fn registry_discovery_suite_and_fixture_are_valid() {
+    let suite = BenchmarkSuite::parse_toml(include_str!(
+        "../../../../examples/benchmarks/registry-discovery.toml"
+    ))
+    .unwrap();
+    assert_eq!(suite.cases.len(), 2);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for case in &suite.cases {
+        let fixture = root.join(case.project.as_ref().unwrap());
+        for source in [
+            "src/command_registry.rs",
+            "docs/interface.md",
+            "config/settings.toml",
+            "src/keybindings.rs",
+        ] {
+            assert!(fixture.join(source).is_file(), "{}: {source}", case.id);
+        }
+        assert!(
+            case.checks
+                .iter()
+                .any(|check| matches!(check, Assertion::Command { .. }))
+        );
+    }
+}
+
+#[test]
 fn representative_suite_uses_external_outcomes_and_real_projects() {
     let suite = BenchmarkSuite::parse_toml(include_str!(
         "../../../../examples/benchmarks/representative.toml"

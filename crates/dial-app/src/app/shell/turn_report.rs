@@ -34,6 +34,20 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
         format!("Changed: {}", changed_line(&files))
     });
     lines.push(checks_line(summary));
+    for check in summary["recorded_checks"].as_array().into_iter().flatten() {
+        let name = check["name"].as_str().unwrap_or("unnamed check");
+        let availability = if check["evidence_ref"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty())
+        {
+            "inspect exact retained evidence (availability checked on open)"
+        } else {
+            "exact retained log unavailable"
+        };
+        lines.push(format!(
+            "Check evidence: /evidence check {name} — {availability}"
+        ));
+    }
     if let Some(timing) = timing_line(latency) {
         lines.push(timing);
     }
@@ -43,7 +57,7 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
     }
     if !files.is_empty() {
         lines.push(
-            "Undo: /undo can revert checkpointed edits; /review-file shows their diffs.".to_owned(),
+            "Undo: /undo can revert checkpointed edits; /review-file shows their diffs. Conversation rewind does not undo external effects; /settings changes settings, not file or conversation history.".to_owned(),
         );
     }
     let shell = summary["uncheckpointed_shell_commands"]
@@ -61,10 +75,52 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
     });
     if stopped {
         lines.push(
-            "Resume: send your next message; the session and its open tasks are kept.".to_owned(),
+            "Resume: send your next message to continue the main conversation; /activity resume reviews interrupted workers only. The session and its open tasks are kept.".to_owned(),
         );
     }
-    Some(lines.join("\n"))
+    lines.push(if stopped {
+        if files.is_empty() {
+            "Next: continue".to_owned()
+        } else {
+            "Next: continue · /undo".to_owned()
+        }
+    } else {
+        "Next: /review · /undo".to_owned()
+    });
+    let checks = if summary["recorded_checks"]
+        .as_array()
+        .is_none_or(Vec::is_empty)
+    {
+        "checks not run"
+    } else if summary["recorded_checks"].as_array().is_some_and(|checks| {
+        checks
+            .iter()
+            .any(|check| check["status"].as_str() == Some("failed"))
+    }) {
+        "checks failed"
+    } else if summary["checks_current"].as_bool() == Some(true) {
+        "checks current when recorded (live freshness unknown)"
+    } else {
+        "checks not current"
+    };
+    let mut compact = vec![format!("{} files changed", files.len()), checks.to_owned()];
+    if stopped {
+        compact.insert(0, outcome.to_owned());
+    }
+    if open > 0 {
+        compact.push(format!(
+            "{open} open task{}",
+            if open == 1 { "" } else { "s" }
+        ));
+    }
+    if !files.is_empty() {
+        compact.push("/undo available".to_owned());
+    }
+    if shell + extension > 0 {
+        compact.push("non-reversible effects".to_owned());
+    }
+    lines.push(format!("Summary: {}", compact.join(" · ")));
+    Some(crate::storage::redact::redact_text(&lines.join("\n")).into_owned())
 }
 
 fn changed_line(files: &[&str]) -> String {
@@ -86,8 +142,13 @@ fn checks_line(summary: &Value) -> String {
         .into_iter()
         .flatten()
         .map(|check| {
+            let reuse = if check["reused"] == true {
+                " (reused, not rerun)"
+            } else {
+                ""
+            };
             format!(
-                "{} {}",
+                "{} {}{reuse}",
                 check["name"].as_str().unwrap_or("check"),
                 check["status"].as_str().unwrap_or("unverified")
             )
@@ -97,7 +158,7 @@ fn checks_line(summary: &Value) -> String {
         return "Checks: none run".to_owned();
     }
     let current = if summary["checks_current"].as_bool() == Some(true) {
-        ""
+        "; current with final edits when recorded, live freshness unknown"
     } else {
         "; not current with the final edits"
     };

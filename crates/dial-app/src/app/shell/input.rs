@@ -20,6 +20,11 @@ impl Shell {
     /// input, Enter picks, Esc leaves. `None` passes the key on; `Some(Some(command))` asks to run it.
     pub(super) fn home_key(&mut self, key: &crossterm::event::KeyEvent) -> Option<Option<String>> {
         let home = self.home.as_mut()?;
+        if key.code == KeyCode::Esc && home.info.tour {
+            home.dismiss_tour();
+            home.deselect();
+            return Some(None);
+        }
         if !key.modifiers.is_empty()
             || !self.composer.draft().is_empty()
             || self.composer.menu_open()
@@ -29,7 +34,10 @@ impl Shell {
         match key.code {
             KeyCode::Down => home.down().then_some(None),
             KeyCode::Up => home.up().then_some(None),
-            KeyCode::Esc => home.deselect().then_some(None),
+            KeyCode::Esc => {
+                let dismissed = home.dismiss_tour();
+                (home.deselect() || dismissed).then_some(None)
+            }
             KeyCode::Enter => match home.pick()? {
                 welcome::Pick::Resume(id) => Some(Some(format!("/resume {id}"))),
                 welcome::Pick::Draft(text) => {
@@ -163,6 +171,7 @@ impl Shell {
     ) -> Result<Step> {
         match action {
             Action::CommandPalette => self.open(app, agent, Which::Palette),
+            Action::StatusFocus => self.open(app, agent, Which::Controls),
             Action::SubagentsHub => self.open(app, agent, Which::Subagents),
             Action::SubagentsRecent => self.open_recent_worker(app, agent),
             Action::ModelSelect => self.open(app, agent, Which::Models),
@@ -201,6 +210,10 @@ impl Shell {
                         "reasoning text collapsed"
                     },
                 );
+                Ok(Step::Done)
+            }
+            Action::StatusExpand => {
+                self.status.toggle_status_expanded();
                 Ok(Step::Done)
             }
             Action::WorkTab => {

@@ -211,10 +211,10 @@ impl Checkpoints {
     ///
     /// This is not a transaction. If a later file fails, files already written are put back only
     /// when they still hold exactly what this revert wrote; any that changed since are left as
-    /// they are and the revert checkpoint is kept (`/undo` would overwrite them).
+    /// they are and the revert checkpoint is kept (`/undo files` would overwrite them).
     ///
     /// A file with an overlap signal ([`ReviewFile::overlap`]) is refused unless
-    /// `overlap_confirmed`. The revert gets its own checkpoint turn, so `/undo` reverses it.
+    /// `overlap_confirmed`. The revert gets its own checkpoint turn, so `/undo files` reverses it.
     pub fn restore_files(
         &self,
         turn: u64,
@@ -318,9 +318,9 @@ impl Checkpoints {
                     "revert stopped; files it had already written were put back because they still held what it wrote",
                 ));
             }
-            // Retain the revert checkpoint: it holds the pre-revert content for /undo.
+            // Retain the revert checkpoint: it holds the pre-revert content for /undo files.
             return Err(error.context(format!(
-                "revert stopped part-way. Left reverted (changed since the revert wrote them, or could not be put back): {}. The revert checkpoint is kept for /undo; review those files before using it, because /undo overwrites them.",
+                "revert stopped part-way. Left reverted (changed since the revert wrote them, or could not be put back): {}. The revert checkpoint is kept for /undo files; review those files before using it, because /undo files overwrites them.",
                 left.join(", ")
             )));
         }

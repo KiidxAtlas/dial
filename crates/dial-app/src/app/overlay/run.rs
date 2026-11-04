@@ -38,9 +38,59 @@ pub(in crate::app) struct BusyOverlay {
     pub(in crate::app) latest: Option<Config>,
     pub(in crate::app) next: Option<String>,
     pub(in crate::app) seen_generation: u64,
+    pub(in crate::app) history: Vec<ActiveOverlay>,
 }
 
 pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut ActiveOverlay) {
+    if let ActiveOverlay::Activity(activity) = overlay {
+        activity.tick();
+        if activity.attention_due() {
+            let jobs = env
+                .background_control
+                .and_then(|control| control.jobs_view(None))
+                .map(|view| {
+                    view.jobs
+                        .into_iter()
+                        .map(|job| crate::ui::overlay::jobs::JobRow {
+                            name: job.name,
+                            command: job.command,
+                            status: job.status,
+                            process_outcome: job.process_outcome,
+                            running: job.running,
+                            terminal: job.terminal,
+                            mode: "session".into(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let download_failure = env.model_downloads.and_then(|downloads| {
+                let mut downloads = downloads.borrow_mut();
+                downloads.poll();
+                downloads.last_failure().cloned()
+            });
+            activity.refresh_attention(
+                env.app.layout(),
+                env.runtime,
+                env.live_tasks,
+                &jobs,
+                crate::app::overlay::activity::AttentionContext {
+                    status: Some(env.status),
+                    todo: Some(env.todo),
+                    download_failure: download_failure.as_ref(),
+                    setup_failure: env.last_setup_failure.as_ref(),
+                },
+            );
+        }
+    }
+    let overlay = overlay.content_mut();
+    if let (ActiveOverlay::Settings(settings), Some(saved)) = (&mut *overlay, &env.latest) {
+        crate::app::overlay::env::refresh_settings_application(
+            settings,
+            env.app,
+            saved,
+            env.status.phase != Phase::Idle,
+        );
+    }
     if let Some(finished) = crate::app::commands::extensions_browser::step(
         env.extensions_pending,
         env.extensions_job,
@@ -118,6 +168,7 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
                         name: job.name,
                         command: job.command,
                         status: job.status,
+                        process_outcome: job.process_outcome,
                         running: job.running,
                         terminal: job.terminal,
                         mode: "session".into(),
@@ -180,6 +231,11 @@ pub(in crate::app) fn overlay_input(
     paste_guard: &mut crate::ui::input::PasteGuard,
     mut event: Event,
 ) -> bool {
+    if matches!(&event, Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release && key.code == crossterm::event::KeyCode::Left && key.modifiers == crossterm::event::KeyModifiers::ALT)
+    {
+        env.next = Some("navigate:back".into());
+        return true;
+    }
     if matches!(overlay, ActiveOverlay::Palette(_)) {
         match &event {
             Event::Paste(_) => paste_guard.pasted(Instant::now()),
@@ -216,6 +272,9 @@ pub(in crate::app) fn run_overlay(
     let motion = crate::ui::fx::motion(env.app.config.ui.motion, env.themes.current());
     loop {
         refresh_overlay(env, overlay);
+        if env.next.is_some() {
+            return Ok(());
+        }
         let progress = if motion {
             crate::ui::fx::progress(opened.elapsed(), crate::ui::fx::REVEAL)
         } else {

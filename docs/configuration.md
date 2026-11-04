@@ -17,6 +17,11 @@ Both text and JSON redact credential values recursively (also when requesting an
 ordinary token budgets such as `harness.max_tokens` remain visible. Environment-variable names are not
 credential values. The settings panel reports read failures instead of displaying empty fallback layers.
 
+Every supplied `hooks` layer must be an array; malformed higher-precedence values are rejected,
+not silently discarded during append/deduplication. Global settings saves and previews validate
+the global-only configuration as well as the effective project configuration, so a project override
+cannot mask an invalid global value that would break another project.
+
 Changing the provider discards the previous provider's endpoint metadata before resolving the new
 route: its URL, protocol, credentials, headers and account pin are not inherited. Re-selecting the
 same provider preserves its configured custom endpoint. `--provider` with `--endpoint` uses the
@@ -32,21 +37,22 @@ Learning stores and adapters are additionally isolated under
 `~/.dial/projects/<name>-<hash>/models/<identity>/`, so switching providers/models does not reuse an
 incompatible adapter. Sessions, skills, memory and prompt history remain project-scoped.
 
-Service options are settings too. `fast_mode`, `slow_mode` and `extended_context` are the flags behind `/fast`, `/slow` and `/extended-context`; `/settings` → Model → Requests shows and toggles the same three rows, and `service_tier` sets an explicit tier that takes precedence over them. The session-only modes (`/vibe`, `/skillful`, `/advisor`, `/external-thinking`) are not stored in config and stay command-only.
+Service options are settings too. `fast_mode`, `slow_mode` and `extended_context` are the flags behind `/fast`, `/slow` and `/extended-context`; `/settings` → Model → Requests shows and toggles the same rows, and `service_tier` sets an explicit tier that takes precedence over them. Session-only modes (`/vibe`, `/skillful`, `/advisor`, `/external-thinking`) are not stored in config. `/controls` and the composer control strip expose their existing session owners rather than saving a second configuration.
 
 ## Interactive management and coverage
 
-`/settings` exposes coding/interactive configuration; `/improve settings` exposes learning and
-evaluation configuration. The shared registry in `crates/dial-llm/src/config/schema.rs` is the
-definitive inventory for editable controls. Coverage tests compare it to serialized defaults and
+`/settings` exposes persistent configuration, including learning preferences; `/improve settings`
+is a focused learning/evaluation view of the same controls. The shared registry in
+`crates/dial-llm/src/config/schema.rs` is the definitive inventory for editable controls. Coverage
+tests compare it to serialized defaults and
 Serde's field inventory, including optional fields and empty collections. Runtime-only fields and
 the retired `ui.hyperlinks` compatibility input are excluded.
 
-Simple settings use switches, choices and typed fields. Complex maps, nested options and arrays of
-tables use a validated TOML editor, discoverable by parent or descendant path. Structured editors
-manage only the selected global/project layer, so saving does not copy inherited values or credentials.
-Sensitive editors are masked until explicitly revealed. See [Settings in the terminal interface](terminal-interface.md#settings)
-for editing controls and surrounding setup navigation.
+Simple settings use switches, choices and typed fields. Complex maps and arrays use focused
+entry/field editors with Advanced TOML available. Editors manage only the selected global/project
+layer, so saving does not copy inherited values or credentials. Sensitive rows and inputs are
+masked until explicitly revealed. See [Settings in the terminal interface](terminal-settings.md#settings)
+for Changed-only filtering, reviewed bulk removal, source explanations and setup navigation.
 During a turn, shell display changes apply immediately on panel close; agent-bound settings are saved
 and adopted at the next safe turn boundary.
 
@@ -63,15 +69,16 @@ deadline and report connection failures normally.
 
 ## Settings layout
 
-`/settings` lists tabs and sections in the order of the `LAYOUT` table in
-`crates/dial-llm/src/config/schema.rs`, not in registry declaration order: **Appearance**,
-**Interaction**, **Model**, **Tools**, **Memory**, **Improvement**, **Voice**, **Experimental**
-(then the panel's own **Setup** tab). Everyday coding controls come first, learning and voice
-after them, experiments last; inside a tab the most-used sections lead and the catch-all
-**Configuration** section (whole-table editors) is last. A test fails when a setting names a tab or
-section that `LAYOUT` does not list, so new settings always get a deliberate place. The section list
-shows a `● n` count beside any section where you have overridden `n` settings in the global or
-project layer, so customised areas are visible without opening them.
+The shared schema groups settings by purpose: **Common**, **Appearance**, **Keys**, **Model**,
+**Connections**, **Safety**, **Tools**, **Memory**, **Learning**, **Experimental**, and **Advanced**,
+followed by the panel's setup launchers. Categories run horizontally across the top, with the
+active tab kept visible on narrow terminals. Left/Right switch categories; Up/Down move through
+the settings below. The scope/search header stays stable, and Appearance previews open only on
+explicit F4. Connections groups provider/tool-server configuration;
+Safety keeps approval, isolation, allowed directories and permission rules together without implying
+that automatic approval provides a sandbox. Learning preferences remain separate from Learn's jobs.
+The registry retains historical locations as search metadata and uses its `LAYOUT` section order
+within these purpose-based categories. Section counts show saved overrides, not active jobs.
 
 Reordering changes only presentation: configuration keys, files and saved overrides are untouched.
 
@@ -267,7 +274,7 @@ Values set for another API are kept but not sent. A LoRA `path` is absolute, or 
 
 ## Stream rules (`[portable_rules]`)
 
-`enabled` loads portable rule files; `max_regenerations` (1–64, default 8) bounds interrupting regenerations per turn; `repeat_after_turns` (0–1000, default 0) lets a fired rule fire again after that many user turns, where 0 means once per session; `judge` (`auto`, `on`, `off`) decides when judged `question` rules are asked, where `auto` requires an explicitly assigned `judge` role. See [Stream rules](stream-rules.md).
+`enabled` loads portable rule files; `max_regenerations` (1–64, default 8) bounds interrupting regenerations per turn; `repeat_after_turns` (0–1000, default 0) lets a fired rule fire again after that many user turns, where 0 means once per session; `judge` (`auto`, `on`, `off`) decides when judged `question` rules are asked, where `auto` requires an explicitly assigned `decision` role. See [Stream rules](stream-rules.md).
 
 ## Example configuration
 

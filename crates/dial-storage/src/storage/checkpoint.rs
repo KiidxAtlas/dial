@@ -7,7 +7,8 @@
 //! works after dial restarts. Nothing outside the project root and the directories attached to the
 //! workspace (`/add-dir`) is ever read or written.
 //!
-//! Only turns that touched files are materialised: a read-only turn leaves no trace and does not
+//! Standalone turns materialize only on writes. Conversation-linked turns also persist empty
+//! manifests so `/undo` can distinguish a read-only turn from missing history; these do not
 //! count toward `rollback(n)`.
 use crate::platform::atomic::write_checkpoint as atomic_write;
 use anyhow::{Context, Result, bail, ensure};
@@ -88,6 +89,17 @@ struct Manifest {
     entries: Vec<Entry>,
     /// Files that were too large to record.
     skipped: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    /// Restoration completed, but the linked conversation rewind has not committed yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restored: bool,
+}
+
+#[derive(Clone, Copy)]
+enum RestoreMode {
+    Consume,
+    Conversation,
 }
 
 struct Inner {
@@ -174,7 +186,17 @@ impl Checkpoints {
             !root.starts_with(&dir),
             "project directory must not be inside its checkpoint storage"
         );
-        let next_turn = disk_turns(&dir).last().map_or(1, |t| t + 1);
+        let recorded_next = match fs::read(dir.join("next_turn")) {
+            Ok(bytes) => Some(
+                serde_json::from_slice::<u64>(&bytes).context("invalid checkpoint turn counter")?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("reading checkpoint turn counter"),
+        };
+        let next_turn = disk_turns(&dir)
+            .last()
+            .map_or(1, |t| t + 1)
+            .max(recorded_next.unwrap_or(1));
         Ok(Self {
             dir,
             root,
@@ -200,18 +222,41 @@ impl Checkpoints {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
-
-    /// Start a new turn; later `before_write` calls record into it. Returns the turn number.
+    /// Start a new standalone turn; later writes record into it. Returns its unique turn number.
     pub fn begin_turn(&self, label: &str) -> Result<u64> {
+        self.begin_linked_turn(label, None)
+    }
+
+    /// Start a durable conversation-linked turn, including turns that never write a file.
+    /// The session identity prevents copied conversation records from addressing another journal.
+    pub fn begin_conversation_turn(&self, label: &str, session: &str) -> Result<u64> {
+        self.begin_linked_turn(label, Some(session))
+    }
+
+    fn begin_linked_turn(&self, label: &str, session: Option<&str>) -> Result<u64> {
         let mut inner = self.lock();
         let turn = inner.next_turn;
-        inner.next_turn += 1;
+        let next = turn
+            .checked_add(1)
+            .context("checkpoint turn counter exhausted")?;
+        // Never reuse a durable link, even after every checkpoint has been rolled back.
+        atomic_write(
+            &self.dir.join("next_turn"),
+            &serde_json::to_vec(&next)?,
+            0o600,
+        )?;
+        inner.next_turn = next;
         inner.journal.reset(&self.dir, None);
-        inner.current = Some(Manifest {
+        let manifest = Manifest {
             turn,
             label: one_line(label),
+            session: session.map(str::to_owned),
             ..Manifest::default()
-        });
+        };
+        if session.is_some() {
+            write_manifest(&self.dir, &manifest)?;
+        }
+        inner.current = Some(manifest);
         Ok(turn)
     }
     /// The number the next `begin_turn` returns; turns in `[before, after)` of two reads ran
@@ -574,7 +619,7 @@ impl Checkpoints {
         let mut out: Vec<CheckpointInfo> = disk_turns(&self.dir)
             .into_iter()
             .rev()
-            .filter_map(|t| read_manifest(&self.dir, t).ok())
+            .filter_map(|t| read_manifest(&self.dir, t).ok().filter(|m| !m.restored))
             .map(|m| CheckpointInfo {
                 turn: m.turn,
                 label: m.label,
@@ -598,7 +643,9 @@ impl Checkpoints {
                 break;
             }
             match read_manifest(&self.dir, t) {
-                Ok(m) if !m.entries.is_empty() || !m.skipped.is_empty() => manifests.push(m),
+                Ok(m) if !m.restored && (!m.entries.is_empty() || !m.skipped.is_empty()) => {
+                    manifests.push(m)
+                }
                 Ok(_) => {}
                 Err(e) => report
                     .warnings
@@ -609,8 +656,80 @@ impl Checkpoints {
             !manifests.is_empty(),
             "nothing to roll back: no checkpointed turns"
         );
-        for manifest in &manifests {
-            let mut failed = false;
+        self.restore_manifests(&mut inner, &manifests, report, RestoreMode::Consume)
+    }
+
+    /// Restore exactly the checkpoint turns linked to a selected conversation range.
+    /// Missing links and intervening file-changing turns fail before touching any file.
+    pub fn rollback_conversation(&self, session: &str, turns: &[u64]) -> Result<RollbackReport> {
+        let mut inner = self.lock();
+        ensure!(
+            turns.windows(2).all(|pair| pair[0] < pair[1]),
+            "checkpoint links must be chronological"
+        );
+        let mut manifests = Vec::new();
+        for &turn in turns.iter().rev() {
+            let manifest = read_manifest(&self.dir, turn).with_context(|| {
+                format!("turn {turn}: linked checkpoint unavailable; conversation kept")
+            })?;
+            ensure!(
+                manifest.session.as_deref() == Some(session),
+                "turn {turn}: checkpoint has no matching session link; conversation kept"
+            );
+            manifests.push(manifest);
+        }
+        if let Some(oldest) = turns.iter().min() {
+            for turn in disk_turns(&self.dir)
+                .into_iter()
+                .filter(|turn| turn >= oldest)
+            {
+                let manifest = read_manifest(&self.dir, turn)?;
+                ensure!(
+                    turns.contains(&turn)
+                        || manifest.restored
+                        || (manifest.entries.is_empty() && manifest.skipped.is_empty()),
+                    "turn {turn}: unrelated newer file checkpoint blocks undo; conversation kept"
+                );
+            }
+        }
+        self.restore_manifests(
+            &mut inner,
+            &manifests,
+            RollbackReport::default(),
+            RestoreMode::Conversation,
+        )
+    }
+
+    /// Remove completed restoration markers only after the conversation rewind commits.
+    /// Cleanup failures leave harmless markers, never checkpoints that replay restored files.
+    pub fn finalize_conversation_rollback(&self, session: &str, turns: &[u64]) -> Result<()> {
+        let _inner = self.lock();
+        for &turn in turns {
+            let manifest = read_manifest(&self.dir, turn)?;
+            ensure!(
+                manifest.session.as_deref() == Some(session) && manifest.restored,
+                "turn {turn}: conversation restoration has not completed"
+            );
+        }
+        for &turn in turns {
+            discard_turn(&self.dir, turn)
+                .with_context(|| format!("cleaning restored checkpoint {turn}"))?;
+        }
+        Ok(())
+    }
+
+    fn restore_manifests(
+        &self,
+        inner: &mut Inner,
+        manifests: &[Manifest],
+        mut report: RollbackReport,
+        mode: RestoreMode,
+    ) -> Result<RollbackReport> {
+        for manifest in manifests {
+            if manifest.restored {
+                continue;
+            }
+            let mut failed = !manifest.skipped.is_empty();
             for skipped in &manifest.skipped {
                 report.warnings.push(format!(
                     "turn {}: {skipped} was too large to checkpoint and was not restored",
@@ -640,6 +759,15 @@ impl Checkpoints {
                     manifest.turn
                 ));
                 break;
+            }
+            if matches!(mode, RestoreMode::Conversation) {
+                let mut completed = manifest.clone();
+                completed.restored = true;
+                if let Err(error) = write_manifest(&self.dir, &completed) {
+                    report.warnings.push(format!("turn {}: restoration progress could not be saved; rollback stopped: {error:#}", manifest.turn));
+                    break;
+                }
+                continue;
             }
             if let Err(e) = discard_turn(&self.dir, manifest.turn)
                 && e.kind() != std::io::ErrorKind::NotFound

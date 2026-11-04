@@ -27,10 +27,10 @@ fn correlates_unordered_partial_results_and_rejects_invalid_ids() {
     for provider in [Provider::Openai, Provider::Anthropic] {
         let row = match provider {
             Provider::Openai => {
-                json!({"custom_id":"b","response":{"status_code":200,"body":{"choices":[{"message":{"content":"B"}}]}}})
+                json!({"custom_id":"b","response":{"status_code":200,"body":{"choices":[{"finish_reason":"stop","message":{"content":"B"}}]}}})
             }
             Provider::Anthropic => {
-                json!({"custom_id":"b","result":{"type":"succeeded","message":{"content":[{"type":"text","text":"B"}]}}})
+                json!({"custom_id":"b","result":{"type":"succeeded","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"B"}]}}})
             }
         };
         let bytes = serde_json::to_vec(&row).unwrap();
@@ -157,12 +157,12 @@ fn native_submit_status_cancel_and_results_use_fixed_routes() {
         let (result_path, row) = if provider == Provider::Openai {
             (
                 "/files/file_out/content",
-                json!({"custom_id":"a","response":{"status_code":200,"body":{"choices":[{"message":{"content":"summary"}}]}}}),
+                json!({"custom_id":"a","response":{"status_code":200,"body":{"choices":[{"finish_reason":"stop","message":{"content":"summary"}}]}}}),
             )
         } else {
             (
                 "/messages/batches/job_1/results",
-                json!({"custom_id":"a","result":{"type":"succeeded","message":{"content":[{"text":"summary"}]}}}),
+                json!({"custom_id":"a","result":{"type":"succeeded","message":{"stop_reason":"end_turn","content":[{"text":"summary"}]}}}),
             )
         };
         replies.push(("GET", result_path, row.to_string()));
@@ -203,5 +203,156 @@ fn cancellation_remains_nonterminal_and_result_states_are_not_success() {
         )
         .unwrap();
         assert_eq!(result["a"], expected);
+    }
+}
+
+#[test]
+fn stop_reasons_and_refusals_retain_partial_output_without_success() {
+    for (provider, reason, refused, complete) in [
+        (Provider::Openai, "stop", false, true),
+        (Provider::Openai, "length", false, false),
+        (Provider::Openai, "content_filter", true, false),
+        (Provider::Openai, "tool_calls", false, false),
+        (Provider::Openai, "new_reason", false, false),
+        (Provider::Openai, "", false, false),
+        (Provider::Anthropic, "end_turn", false, true),
+        (Provider::Anthropic, "stop_sequence", false, true),
+        (Provider::Anthropic, "max_tokens", false, false),
+        (Provider::Anthropic, "refusal", true, false),
+        (Provider::Anthropic, "tool_use", false, false),
+        (Provider::Anthropic, "pause_turn", false, false),
+        (Provider::Anthropic, "new_reason", false, false),
+        (Provider::Anthropic, "", false, false),
+    ] {
+        let stop = if reason.is_empty() {
+            Value::Null
+        } else {
+            json!(reason)
+        };
+        let row = match provider {
+            Provider::Openai => {
+                json!({"custom_id":"a","response":{"status_code":200,"body":{"choices":[{"finish_reason":stop,"message":{"content":"partial"}}]}}})
+            }
+            Provider::Anthropic => {
+                json!({"custom_id":"a","result":{"type":"succeeded","message":{"stop_reason":stop,"content":[{"text":"partial"}]}}})
+            }
+        };
+        let result = parse_results(provider, row.to_string().as_bytes(), &plan(provider)).unwrap();
+        let fallback = match provider {
+            Provider::Openai => "missing_finish_reason",
+            Provider::Anthropic => "missing_stop_reason",
+        };
+        let reason = if reason.is_empty() { fallback } else { reason }.to_owned();
+        let expected = if complete {
+            Outcome::Succeeded("partial".into())
+        } else if refused {
+            Outcome::Refused {
+                output: "partial".into(),
+                reason,
+            }
+        } else {
+            Outcome::Incomplete {
+                output: "partial".into(),
+                reason,
+            }
+        };
+        assert_eq!(result["a"], expected, "{provider:?} row {row}");
+    }
+    for content in [Value::Null, json!("partial")] {
+        let row = json!({"custom_id":"a","response":{"status_code":200,"body":{"choices":[{"finish_reason":"stop","message":{"content":content,"refusal":"policy refusal"}}]}}});
+        let result = parse_results(
+            Provider::Openai,
+            row.to_string().as_bytes(),
+            &plan(Provider::Openai),
+        )
+        .unwrap();
+        assert_eq!(
+            result["a"],
+            Outcome::Refused {
+                output: content.as_str().unwrap_or_default().to_owned(),
+                reason: "policy refusal".into()
+            }
+        );
+    }
+}
+
+#[test]
+fn legacy_success_serde_and_all_retained_text_redaction() {
+    let legacy = json!({"state":"succeeded","text":"old summary"});
+    let success: Outcome = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(success, Outcome::Succeeded("old summary".into()));
+    assert_eq!(serde_json::to_value(success).unwrap(), legacy);
+    for mut outcome in [
+        Outcome::Succeeded("secret".into()),
+        Outcome::Incomplete {
+            output: "secret".into(),
+            reason: "secret".into(),
+        },
+        Outcome::Refused {
+            output: "secret".into(),
+            reason: "secret".into(),
+        },
+    ] {
+        outcome.redact(|s| s.replace("secret", "[REDACTED]"));
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        assert!(!encoded.contains("secret"));
+        assert_eq!(serde_json::from_str::<Outcome>(&encoded).unwrap(), outcome);
+    }
+}
+
+#[test]
+fn paid_admission_bounds_result_envelope_and_native_wire_before_network() {
+    for provider in [Provider::Openai, Provider::Anthropic] {
+        let mut bounded = plan(provider);
+        bounded.items.truncate(1);
+        // One-token boundary on the conservative 4 MiB collection envelope.
+        bounded.max_tokens = 2719;
+        bounded.validate_submission().unwrap();
+        bounded.max_tokens = 2720;
+        assert!(
+            bounded
+                .validate_submission()
+                .unwrap_err()
+                .to_string()
+                .contains("output envelope")
+        );
+        // Formerly legal item/token maxima are still readable, but not paid admission.
+        bounded.max_tokens = 16384;
+        bounded.validate().unwrap();
+        assert!(bounded.validate_submission().is_err());
+        bounded.max_tokens = 1024;
+        bounded.items.push(Item {
+            custom_id: "b".into(),
+            prompt: "summary".into(),
+        });
+        bounded.validate_submission().unwrap();
+        bounded.items.push(Item {
+            custom_id: "c".into(),
+            prompt: "summary".into(),
+        });
+        assert!(bounded.validate_submission().is_err());
+
+        bounded.items.truncate(1);
+        bounded.max_tokens = 1;
+        bounded.items[0].prompt.clear();
+        let overhead = serde_json::to_vec(&bounded).unwrap().len();
+        bounded.items[0].prompt = "x".repeat(MAX_BYTES - overhead);
+        bounded.validate().unwrap();
+        assert_eq!(serde_json::to_vec(&bounded).unwrap().len(), MAX_BYTES);
+        let error = bounded.validate_submission().unwrap_err().to_string();
+        assert!(error.contains("wire payload"), "{provider:?}: {error}");
+        // A dead endpoint proves invalid work is rejected locally, not uploaded.
+        let client = Client::new(
+            provider,
+            "http://127.0.0.1:0".into(),
+            "fixture-paid-key".into(),
+        );
+        assert!(
+            client
+                .submit(&bounded)
+                .unwrap_err()
+                .to_string()
+                .contains("wire payload")
+        );
     }
 }

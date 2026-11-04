@@ -177,7 +177,7 @@ fn chatgpt_never_falls_back_to_openai_key_when_subscription_is_missing_or_signed
     let backend = make_backend(&fixture.config).unwrap();
     assert_eq!(backend.account_id(), Some("oaiapp_test"));
     // A signed-out remembered account is distinct from a missing account store.
-    let path = fixture.config.user_dir.join("chatgpt-accounts.json");
+    let path = llm::chatgpt::credential_path(&fixture.config.user_dir);
     let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     state["accounts"]["oaiapp_test"]["tokens"] = Value::Null;
     write_private(&path, &serde_json::to_vec(&state).unwrap()).unwrap();

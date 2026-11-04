@@ -73,6 +73,7 @@ pub(super) struct Git {
     pub(super) root: Option<Arc<Path>>,
     pub(super) cache: StatusCache<GitStatus>,
     pub(super) files: StatusCache<Vec<crate::ui::rail::FileDiff>>,
+    pub(super) repository: StatusCache<Option<bool>>,
 }
 
 impl Git {
@@ -85,6 +86,7 @@ impl Git {
         if self.root.as_deref() != Some(root) {
             self.cache = StatusCache::default();
             self.files = StatusCache::default();
+            self.repository = StatusCache::default();
             self.root = Some(Arc::from(root));
         }
         self.root.clone()
@@ -142,6 +144,10 @@ impl Git {
         let Some(root) = self.bind_root(root) else {
             return GitStatus::default();
         };
+        let repository_root = root.clone();
+        self.repository.refresh(GIT_TTL, move || {
+            Some(git_output(&repository_root, &["rev-parse", "--git-dir"]).is_some())
+        });
         self.cache.refresh(GIT_TTL, move || {
             let branch = git_output(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
                 .map(|b| b.trim().to_owned())

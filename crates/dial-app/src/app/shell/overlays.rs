@@ -175,6 +175,20 @@ impl Shell {
     }
 
     fn make_overlay(&mut self, app: &App, which: Which) -> Result<ActiveOverlay> {
+        use crate::app::overlay::activity::{
+            ActivityOverlay, ActivityTab, queue_choices, schedule_choices,
+        };
+        let activity_tab = match &which {
+            Which::Subagents | Which::SubagentsActivity => Some(ActivityTab::Workers),
+            Which::Jobs => Some(ActivityTab::Processes),
+            Which::Compute => Some(ActivityTab::Compute),
+            Which::Activity(tab) => Some(*tab),
+            _ => None,
+        };
+        let which = match which {
+            Which::Activity(ActivityTab::Downloads) => Which::ModelDownloads,
+            other => other,
+        };
         self.refresh_resources(app, false, self.status.phase != Phase::Idle);
         if matches!(
             which,
@@ -196,14 +210,47 @@ impl Shell {
         };
         let discovery = self.catalog.get();
         let learning_settings = matches!(which, Which::LearningSettings);
+        let settings_path = match &which {
+            Which::SettingsAt(path) => Some(path.clone()),
+            _ => None,
+        };
+        let selected_model = match &which {
+            Which::SelectedModelSettings(selection) => Some(effective.with_selection(selection)),
+            _ => None,
+        };
         let context_defaults = matches!(which, Which::ContextDefaults);
         let learning_models = matches!(which, Which::LearningModels);
         let overlay = match which {
+            Which::Activity(tab) => {
+                let spec = match tab {
+                    ActivityTab::Queue => queue_choices(&self.composer.queued_messages()),
+                    ActivityTab::Schedule => schedule_choices(),
+                    ActivityTab::Attention => {
+                        crate::app::overlay::activity::attention_choices(&Default::default(), &[])
+                    }
+                    _ => return self.make_overlay(app, tab.destination()),
+                };
+                ActiveOverlay::Palette(PaletteOverlay::choice(spec))
+            }
             Which::Choice(spec) => ActiveOverlay::Palette(PaletteOverlay::choice(*spec)),
-            Which::Palette => ActiveOverlay::Palette(PaletteOverlay::new(
-                palette_entries(&self.commands, &self.skills),
-                self.status.phase != Phase::Idle,
-            )),
+            Which::Controls => {
+                ActiveOverlay::Palette(PaletteOverlay::choice(self.controls_picker(&effective)))
+            }
+            Which::Palette => ActiveOverlay::Palette(
+                PaletteOverlay::new(
+                    palette_entries(&self.commands, &self.skills),
+                    self.status.phase != Phase::Idle,
+                )
+                .with_command_context(self.command_context())
+                .with_unified_search(super::help::palette_topics(), {
+                    let layout = app.layout.clone();
+                    let current = self.session_id.clone();
+                    move || {
+                        crate::app::command_registry::palette_sessions(&layout, &current)
+                            .map_err(|error| format!("{error:#}"))
+                    }
+                }),
+            ),
             Which::Compute => ActiveOverlay::Compute(ComputeOverlay::new()),
             Which::Improve => ActiveOverlay::Improve(Box::new(
                 crate::ui::overlay::improve::ImproveOverlay::new(improve_view(app)),
@@ -236,6 +283,18 @@ impl Shell {
                     self.extensions_job.as_ref(),
                 ),
             )),
+            Which::ExtensionsTab(tab) => {
+                let mut panel = crate::app::commands::extensions_browser::overlay(
+                    app.layout(),
+                    &effective,
+                    self.extensions_job.as_ref(),
+                );
+                panel.browser.select_tab(tab);
+                ActiveOverlay::Extensions(Box::new(panel))
+            }
+            Which::Stats(range) => ActiveOverlay::Stats(Box::new(
+                crate::app::commands::session::stats_overlay(app, &range)?,
+            )),
             Which::Shortcuts => ActiveOverlay::Shortcuts(ShortcutOverlay::new()),
             Which::Peers(panel) => {
                 let panel = *panel;
@@ -251,18 +310,26 @@ impl Shell {
             Which::Jobs => {
                 ActiveOverlay::Jobs(Box::new(crate::ui::overlay::jobs::JobsOverlay::new()))
             }
-            Which::Git { root, revision } => ActiveOverlay::Git(Box::new(
-                crate::ui::overlay::git::GitOverlay::open(
+            Which::Git { root, revision } => {
+                use crate::ui::overlay::git::{GitOverlay, GitTab};
+                let tab = GitTab::from_args(&revision);
+                let pinned = revision.as_str();
+                let mut panel = GitOverlay::open(
                     crate::git_panel::Repo::new(&root, &effective),
-                    (!revision.is_empty()).then_some(revision.as_str()),
+                    (tab.is_none() && !pinned.is_empty()).then_some(pinned),
                 )
-                .map_err(anyhow::Error::msg)?,
-            )),
-            Which::ModelSettings => {
-                let (name, profile) = model_settings_profile(&effective);
+                .map_err(anyhow::Error::msg)?;
+                if let Some(tab) = tab {
+                    panel.select_tab(tab);
+                }
+                ActiveOverlay::Git(Box::new(panel))
+            }
+            Which::ModelSettings | Which::SelectedModelSettings(_) => {
+                let target = selected_model.as_ref().unwrap_or(&effective);
+                let (name, profile) = model_settings_profile(target);
                 // Resolve the selected route's raw admitted harness, not the current agent's
                 // effective version: that version already contains the profile pin being reset.
-                let stored = if effective.teaching() {
+                let stored = if target.teaching() && selected_model.is_none() {
                     let store = app.store.as_ref().filter(|_| {
                         effective.state_dir == app.config.state_dir
                             && effective.model == app.config.model
@@ -280,17 +347,28 @@ impl Shell {
                     None
                 };
                 let inherited_edit_mode = model_settings_inherited_edit_mode(
-                    &effective,
+                    target,
                     &name,
-                    stored.as_ref().unwrap_or(&effective.harness),
+                    stored.as_ref().unwrap_or(&target.harness),
                 )?;
                 let mut overlay =
                     crate::ui::overlay::model_settings::ModelSettingsOverlay::new(name, profile)
+                        .with_scope(self.scope)
+                        .with_project_name(
+                            &app.layout
+                                .project_root
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy(),
+                        )
                         .with_inherited_edit_mode(inherited_edit_mode)
                         .with_model_files();
-                if effective.assistance.local.suggestions {
-                    overlay = overlay
-                        .with_suggestions(&effective.user_dir, local_suggestion_base(&effective));
+                if selected_model.is_some() {
+                    overlay = overlay.for_selected_model();
+                }
+                if target.assistance.local.suggestions {
+                    overlay =
+                        overlay.with_suggestions(&target.user_dir, local_suggestion_base(target));
                 }
                 ActiveOverlay::ModelSettings(Box::new(overlay))
             }
@@ -308,7 +386,10 @@ impl Shell {
                     ),
                 ))
             }
-            Which::Settings | Which::LearningSettings | Which::ContextDefaults => {
+            Which::Settings
+            | Which::LearningSettings
+            | Which::ContextDefaults
+            | Which::SettingsAt(_) => {
                 let (values, global, project) = settings_tables(app, &effective)?;
                 let themes = self
                     .themes
@@ -317,7 +398,15 @@ impl Shell {
                     .filter(|e| e.error.is_none())
                     .map(|e| e.name)
                     .collect();
-                let overlay = SettingsOverlay::new(values, project, global, self.scope, themes);
+                let overlay = SettingsOverlay::new(values, project, global, self.scope, themes)
+                    .with_sources(effective.setting_sources.clone())
+                    .with_project_name(
+                        &app.layout
+                            .project_root
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy(),
+                    );
                 let mut overlay = if learning_settings {
                     overlay.learning_only()
                 } else {
@@ -325,6 +414,9 @@ impl Shell {
                 };
                 if context_defaults {
                     overlay = overlay.context_defaults();
+                }
+                if let Some(path) = settings_path.as_deref() {
+                    overlay.focus_path(path);
                 }
                 apply_settings_hints(&mut overlay, &effective);
                 overlay.set_setup_offers(setting_setup_offers(&app.layout.user_dir, &effective));
@@ -343,15 +435,43 @@ impl Shell {
                     &app.layout.user_dir,
                 ));
                 overlay.set_base_dir(app.layout.project_root.clone());
+                crate::app::overlay::env::refresh_settings_application(
+                    &mut overlay,
+                    app,
+                    &effective,
+                    self.status.phase != Phase::Idle,
+                );
                 ActiveOverlay::Settings(Box::new(overlay))
             }
             Which::Models
             | Which::ModelRoles
+            | Which::ModelRole(_)
             | Which::LearningModels
             | Which::ModelDownloads
             | Which::ModelMemory => {
+                let downloads = self
+                    .model_downloads
+                    .get_or_insert_with(|| {
+                        crate::ui::overlay::models::ModelDownloads::open(
+                            app.layout(),
+                            crate::stats::local_models::Settings::from_config(&effective),
+                            effective.python.clone(),
+                        )
+                        .into_shared()
+                    })
+                    .clone();
                 let mut models =
                     ModelOverlay::new(discovery, effective.role_statuses(), self.scope)
+                        .with_project_name(
+                            &app.layout
+                                .project_root
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy(),
+                        )
+                        .with_laya_checkpoint(crate::config::laya::expected_checkpoint(
+                            &effective.laya,
+                        ))
                         .with_favorites(favorite_routes(&effective))
                         .with_memory_required(crate::config::memory_backend::requires_memory_role(
                             &effective.memory,
@@ -359,11 +479,7 @@ impl Shell {
                         .with_main_lora(self.status.lora)
                         .with_learning(learning_models)
                         .with_usage(&app.layout.user_dir)
-                        .with_downloads(
-                            app.layout(),
-                            crate::stats::local_models::Settings::from_config(&effective),
-                            effective.python.clone(),
-                        );
+                        .with_shared_downloads(downloads);
                 models.set_memory_optional(
                     crate::config::memory_backend::auto_retain_uses_memory_role(&effective.memory),
                 );
@@ -372,6 +488,9 @@ impl Shell {
                 );
                 match which {
                     Which::ModelRoles => models.show_roles(),
+                    Which::ModelRole(role) => {
+                        models.show_role(&role);
+                    }
                     Which::ModelDownloads => models.show_downloads(),
                     Which::ModelMemory => models.show_memory(),
                     _ => {}
@@ -392,7 +511,14 @@ impl Shell {
                     discovery.as_ref().map_or(&[], |d| d.providers.as_slice()),
                 );
                 let mut providers =
-                    ProviderOverlay::new(discovery, effective.providers, has_key, self.scope);
+                    ProviderOverlay::new(discovery, effective.providers, has_key, self.scope)
+                        .with_project_name(
+                            &app.layout
+                                .project_root
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy(),
+                        );
                 providers.set_chatgpt_accounts(
                     crate::llm::chatgpt::accounts(&app.layout.user_dir).unwrap_or_default(),
                 );
@@ -411,19 +537,72 @@ impl Shell {
                 ActiveOverlay::Providers(providers)
             }
         };
+        let overlay = if let Some(tab) = activity_tab {
+            let mut activity = ActivityOverlay::new(tab, overlay).with_session(&self.session_id);
+            if tab == ActivityTab::Schedule {
+                activity.load_schedule(app.layout.clone());
+            }
+            ActiveOverlay::Activity(Box::new(activity))
+        } else {
+            overlay
+        };
         Ok(overlay)
     }
 
     pub(in crate::app) fn run_overlay(
         &mut self,
         app: &App,
-        agent: Option<&mut Agent<'_>>,
+        mut agent: Option<&mut Agent<'_>>,
         which: Which,
     ) -> Result<OverlayOutcome> {
-        let compute = matches!(which, Which::Compute);
-        let peers = matches!(which, Which::Peers(_));
-        self.term.set_overlay_mouse(self.ui.mouse);
         let mut overlay = self.make_overlay(app, which)?;
+        let mut history = Vec::new();
+        let mut latest = None;
+        loop {
+            let mut outcome =
+                self.run_overlay_panel(app, agent.as_deref_mut(), &mut overlay, &mut history)?;
+            if outcome.latest.is_some() {
+                latest = outcome.latest.take();
+            }
+            if outcome.next.as_deref() == Some("navigate:back")
+                || (outcome.next.is_none() && !history.is_empty())
+            {
+                if let Some(previous) = history.pop() {
+                    overlay = previous;
+                    continue;
+                }
+                outcome.next = None;
+            } else if let Some(destination) = outcome.next.as_deref().and_then(overlay_destination)
+            {
+                // Editors with drop-flushed drafts must settle before constructing a sibling.
+                let retain = overlay.retains_navigation();
+                if retain {
+                    // Keep navigation memory bounded even when a panel links back to itself.
+                    if history.len() == 16 {
+                        history.remove(0);
+                    }
+                    history.push(overlay);
+                } else {
+                    drop(overlay);
+                }
+                overlay = self.make_overlay(app, destination)?;
+                continue;
+            }
+            outcome.latest = latest;
+            return Ok(outcome);
+        }
+    }
+
+    fn run_overlay_panel(
+        &mut self,
+        app: &App,
+        agent: Option<&mut Agent<'_>>,
+        overlay: &mut ActiveOverlay,
+        history: &mut Vec<ActiveOverlay>,
+    ) -> Result<OverlayOutcome> {
+        let compute = matches!(overlay.content_mut(), ActiveOverlay::Compute(_));
+        let peers = matches!(overlay.content_mut(), ActiveOverlay::Peers(_));
+        self.term.set_overlay_mouse(self.ui.mouse);
         let Shell {
             term,
             themes,
@@ -433,12 +612,15 @@ impl Shell {
             scope,
             dark,
             auth_job,
+            last_setup_failure,
             background_control,
             pty_approval,
             extensions_pending,
             extensions_job,
             live_tasks,
             runtime,
+            todo,
+            model_downloads,
             ..
         } = self;
         // Browsing panels keep resident models loaded; only an explicit compute action releases them.
@@ -449,6 +631,7 @@ impl Shell {
             peer_agent.map(|agent| move || crate::app::commands::peers::snapshot(agent));
         let mut env = OverlayEnv {
             app,
+            history,
             themes,
             keys,
             status,
@@ -464,10 +647,13 @@ impl Shell {
             }),
             seen_generation: 0,
             auth_job,
+            last_setup_failure,
             background_control: background_control.as_ref(),
             pty_approval: *pty_approval,
             live_tasks: live_tasks.as_ref(),
             runtime,
+            todo,
+            model_downloads: model_downloads.as_ref(),
             extensions_pending,
             extensions_job,
             compute_monitor: if compute {
@@ -477,7 +663,13 @@ impl Shell {
             },
         };
         env.seen_generation = env.catalog.generation;
-        let result = term.with_overlay(|ot| run_overlay(ot, &mut env, &mut overlay));
+        crate::app::overlay::env::refresh_navigation(
+            app,
+            env.catalog,
+            overlay,
+            env.status.phase != Phase::Idle,
+        );
+        let result = term.with_overlay(|ot| run_overlay(ot, &mut env, overlay));
         env.themes.restore();
         result?;
         Ok(OverlayOutcome {
@@ -503,6 +695,7 @@ impl Shell {
             latest: None,
             next: None,
             seen_generation: self.catalog.generation,
+            history: Vec::new(),
         });
         Ok(())
     }
@@ -525,12 +718,15 @@ impl Shell {
             scope,
             dark,
             auth_job,
+            last_setup_failure,
             background_control,
             pty_approval,
             extensions_pending,
             extensions_job,
             live_tasks,
             runtime,
+            todo,
+            model_downloads,
             ..
         } = self;
         let mut env = OverlayEnv {
@@ -540,13 +736,17 @@ impl Shell {
             next: state.next.take(),
             seen_generation: state.seen_generation,
             auth_job,
+            last_setup_failure,
             background_control: background_control.as_ref(),
             pty_approval: *pty_approval,
             live_tasks: live_tasks.as_ref(),
             runtime,
+            todo,
+            model_downloads: model_downloads.as_ref(),
             extensions_pending,
             extensions_job,
             app,
+            history: &mut state.history,
             themes,
             keys,
             status,
@@ -558,9 +758,10 @@ impl Shell {
         };
         refresh_overlay(&mut env, &mut state.overlay);
         let redraw = event.is_none();
-        let closed = event.is_some_and(|event| {
-            overlay_input(&mut env, &mut state.overlay, &mut state.paste_guard, event)
-        });
+        let closed = env.next.is_some()
+            || event.is_some_and(|event| {
+                overlay_input(&mut env, &mut state.overlay, &mut state.paste_guard, event)
+            });
         let draw_result = if redraw && !closed {
             // An inline prompt may have temporarily yielded the screen while retaining this menu.
             term.open_overlay().and_then(|()| {
@@ -586,13 +787,24 @@ impl Shell {
     }
 
     pub(in crate::app) fn finish_busy_overlay(&mut self, app: &App) -> Result<bool> {
-        let Some(state) = self.busy_overlay.take() else {
+        let Some(mut state) = self.busy_overlay.take() else {
             return Ok(false);
         };
         self.themes.restore();
         self.term.close_overlay()?;
-        // Persist the departing worker editor before constructing its sibling or reopened view.
-        drop(state.overlay);
+        let next_panel = state.next.as_deref().and_then(overlay_destination);
+        let returning = state.next.as_deref() == Some("navigate:back")
+            || (state.next.is_none() && !state.history.is_empty());
+        let previous = returning.then(|| state.history.pop()).flatten();
+        if next_panel.is_some() && state.overlay.retains_navigation() {
+            if state.history.len() == 16 {
+                state.history.remove(0);
+            }
+            state.history.push(state.overlay);
+        } else {
+            // Flush a worker draft before constructing its sibling or reopened view.
+            drop(state.overlay);
+        }
         if let Some(config) = state.latest {
             self.apply_display(app, &config);
             self.adopt_after_turn(app, Step::Rebuild(Box::new(config.for_coding())));
@@ -604,9 +816,29 @@ impl Shell {
                 "Verification runs after the current turn releases compute.",
             );
         }
-        let next_panel = state.next.as_deref().and_then(overlay_destination);
-        if let Some(which) = next_panel {
+        if let Some(mut overlay) = previous {
+            crate::app::overlay::env::refresh_navigation(
+                app,
+                &self.catalog,
+                &mut overlay,
+                self.status.phase != Phase::Idle,
+            );
+            self.term.open_overlay()?;
+            self.busy_overlay = Some(BusyOverlay {
+                overlay,
+                history: state.history,
+                paste_guard: Default::default(),
+                compute_monitor: None,
+                verify_lora: None,
+                latest: None,
+                next: None,
+                seen_generation: 0,
+            });
+        } else if let Some(which) = next_panel {
             self.start_busy_overlay(app, which)?;
+            if let Some(next) = self.busy_overlay.as_mut() {
+                next.history = state.history;
+            }
         } else if let Some(command) = state
             .next
             .as_deref()

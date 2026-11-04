@@ -2,7 +2,6 @@
 //! text adapter over the agent's existing coordination API. The panel's requests (refresh, clear
 //! this session's claims, send a message) come back through `Shell::open`, run here against the
 //! same API, and reopen the panel on a fresh snapshot.
-use super::CommandSpec;
 use crate::agent::{Agent, PeerBoard};
 use crate::app::overlay::Which;
 use crate::app::{App, Shell, Step};
@@ -11,13 +10,6 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
 const USAGE: &str = "Usage: /peers [list|send <id> <text>|claim <paths...>|clear]";
-
-pub(super) const COMMANDS: &[CommandSpec] = &[CommandSpec {
-    name: "peers",
-    description: "show same-checkout sessions, claims and overlaps; message peers or claim paths",
-    args_hint: "[list|send <id> <text>|claim <paths...>|clear]",
-    subcommands: &["list", "send", "claim", "clear"],
-}];
 
 /// What the panel opens on: the snapshot, the peer to select and an outcome to show.
 pub(in crate::app) struct PeersPanel {

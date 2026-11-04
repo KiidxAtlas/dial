@@ -644,6 +644,20 @@ impl Engine {
         {
             self.round_progress = RoundProgress::Stalled;
         }
+        // Keep duplicate accounting and retry barriers even when coaching would be larger
+        // than a successful read's model-visible source, including compact file handles.
+        let duplicate = duplicate.filter(|body| {
+            if call.name != "read"
+                || status != crate::runtime::execution::ToolStatus::Ok
+                || output.is_error
+            {
+                return true;
+            }
+            let model = crate::agent::window::file_handles::model_result(workspace, call, body);
+            let source =
+                crate::agent::window::file_handles::model_result(workspace, call, &output.text);
+            model.len() < source.len()
+        });
         (duplicate, repeat, stop)
     }
 

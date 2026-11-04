@@ -24,6 +24,10 @@ use ratatui::{
     text::{Line, Span},
 };
 
+mod unified;
+use unified::UnifiedSearch;
+pub use unified::{UnifiedEntry, UnifiedKind};
+
 /// Tabs for the category view: everything, one per command category, then custom commands and
 /// skills.
 const GROUPS: &[&str] = &[
@@ -55,9 +59,7 @@ const GOALS: &[Goal] = &[
     Goal {
         title: "Start or continue work",
         blurb: "begin, resume or plan a conversation",
-        commands: &[
-            "new", "resume", "sessions", "model", "plan", "rename", "fork", "help",
-        ],
+        commands: &["new", "sessions", "model", "plan", "rename", "fork", "help"],
         custom: false,
     },
     Goal {
@@ -69,7 +71,6 @@ const GOALS: &[Goal] = &[
             "checks",
             "undo",
             "commit",
-            "rollback",
             "code-history",
             "plan-review",
         ],
@@ -189,13 +190,15 @@ enum Row {
     Goal(usize),
     AllActions,
     Entry(usize),
+    Unified(usize),
 }
 
 fn group(command: &CommandEntry) -> &'static str {
     if command.kind != CommandKind::Builtin {
         return "Extensions";
     }
-    crate::ui::command_surface::category(&command.name).tab()
+    crate::ui::command_surface::category(command.name.split_whitespace().next().unwrap_or_default())
+        .tab()
 }
 
 fn shortcut(name: &str) -> Option<Action> {
@@ -245,9 +248,9 @@ fn action_label(command: &CommandEntry) -> &str {
     }
 }
 
-/// A key hint that lists every chord for the action (Shift+Enter and Ctrl+J both work for newline).
+/// Show the primary effective shortcut; alternates remain available in `/hotkeys`.
 fn keys_hint(keys: &Keymap, action: Action, what: &str) -> String {
-    let label = keys.labels(action);
+    let label = keys.label(action);
     if label.is_empty() {
         String::new()
     } else {
@@ -282,6 +285,7 @@ fn choice_action(spec: &ChoiceSpec, value: &str, verb: &str) -> OverlayEvent {
 }
 
 pub struct PaletteOverlay {
+    panel_keys: super::panel_keys::PanelKeys,
     entries: Vec<PaletteEntry>,
     search: Editor,
     view: View,
@@ -298,6 +302,12 @@ pub struct PaletteOverlay {
     /// The picker item a first Delete/x armed for removal; any other key disarms it.
     remove_armed: Option<usize>,
     busy: bool,
+    command_context: crate::ui::command_surface::AvailabilityContext,
+    /// The todo inspector keeps the plan's search and selection while its Progress tab is open.
+    progress: Option<String>,
+    progress_tab: bool,
+    progress_scroll: usize,
+    unified: Option<UnifiedSearch>,
 }
 
 impl PaletteOverlay {
@@ -307,11 +317,18 @@ impl PaletteOverlay {
             .into_iter()
             .filter_map(|mut entry| {
                 let name = &entry.command.name;
+                // Schema-generated deep links are built-in actions, not custom command names.
+                let setting_action = entry.command.kind == CommandKind::Builtin
+                    && name.strip_prefix("settings ").is_some_and(|path| {
+                        crate::config::schema::registry()
+                            .iter()
+                            .any(|def| def.path == path)
+                    });
                 if name == "palette"
                     || name.is_empty()
-                    || name
-                        .chars()
-                        .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+                    || name.chars().any(|c| {
+                        c.is_control() || c == '/' || (c.is_whitespace() && !setting_action)
+                    })
                     || !seen.insert(name.clone())
                 {
                     return None;
@@ -322,6 +339,7 @@ impl PaletteOverlay {
             })
             .collect();
         Self {
+            panel_keys: Default::default(),
             entries,
             search: Editor::default(),
             view: View::Goals,
@@ -335,13 +353,66 @@ impl PaletteOverlay {
             notice: None,
             remove_armed: None,
             busy,
+            command_context: Default::default(),
+            progress: None,
+            progress_tab: false,
+            progress_scroll: 0,
+            unified: None,
         }
+    }
+
+    pub fn with_command_context(
+        mut self,
+        context: crate::ui::command_surface::AvailabilityContext,
+    ) -> Self {
+        self.command_context = context;
+        self
+    }
+
+    /// `all:` explicitly expands this palette to cached local sessions and topic help.
+    /// The controller supplies the bounded listing; ordinary action search never starts it.
+    pub fn with_unified_search(
+        mut self,
+        topics: Vec<UnifiedEntry>,
+        sessions: impl FnOnce() -> Result<Vec<UnifiedEntry>, String> + Send + 'static,
+    ) -> Self {
+        self.unified = Some(UnifiedSearch::new(topics, Box::new(sessions)));
+        self
+    }
+
+    fn unified_query(&self) -> Option<&str> {
+        self.unified.as_ref()?;
+        self.search.text.trim().strip_prefix("all:").map(str::trim)
+    }
+
+    fn poll_unified(&mut self) {
+        if self.unified_query().is_some() {
+            let changed = self.unified.as_mut().is_some_and(UnifiedSearch::poll);
+            if changed {
+                self.reset_selection();
+            }
+        }
+    }
+
+    fn unavailable(&self, command: &CommandEntry) -> Option<&'static str> {
+        if self.choice.is_some() || command.kind != CommandKind::Builtin {
+            return None;
+        }
+        crate::ui::command_surface::unavailable_reason(&command.name, "", self.command_context)
     }
 
     /// A picker over `spec.items`, reusing the palette's search, cursor, panel and footer. The
     /// cursor starts on the current value, so reopening a picker lands on what is already set.
-    pub fn choice(spec: ChoiceSpec) -> Self {
+    pub fn choice(mut spec: ChoiceSpec) -> Self {
         let mut palette = Self::new(Vec::new(), false);
+        if spec.command == "todo"
+            && let Some(index) = spec
+                .items
+                .iter()
+                .position(|item| item.value == "__progress")
+        {
+            palette.progress = Some(spec.items.remove(index).detail);
+        }
         palette.entries = spec
             .items
             .iter()
@@ -360,15 +431,37 @@ impl PaletteOverlay {
         palette
     }
 
+    /// Refresh a live choice list without discarding the user's search or selected identity.
+    pub fn refresh_choices(&mut self, spec: ChoiceSpec) {
+        let selected = self
+            .rows()
+            .get(self.cursor)
+            .and_then(|row| match row {
+                Row::Entry(index) => self.choice.as_ref()?.items.get(*index),
+                _ => None,
+            })
+            .map(|item| (item.value.clone(), item.label.clone()));
+        let mut next = Self::choice(spec);
+        next.search = std::mem::take(&mut self.search);
+        next.scroll = self.scroll;
+        next.page = self.page;
+        let rows = next.rows();
+        next.cursor = selected.and_then(|(value, label)| rows.iter().position(|row| {
+            matches!(row, Row::Entry(index) if next.choice.as_ref().and_then(|spec| spec.items.get(*index)).is_some_and(|item| item.value == value && item.label == label))
+        })).unwrap_or_else(|| self.cursor.min(rows.len().saturating_sub(1)));
+        *self = next;
+    }
+
     /// Keeps the "turn running" wording in step with the shell while the palette stays open.
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
     }
 
     fn rows(&self) -> Vec<Row> {
-        let query = self.search.text.trim().trim_start_matches('/');
+        let unified = self.unified_query();
+        let query = unified.unwrap_or_else(|| self.search.text.trim().trim_start_matches('/'));
         let picker = self.choice.is_some();
-        if !picker && query.is_empty() {
+        if !picker && unified.is_none() && query.is_empty() {
             match self.view {
                 View::Goals => {
                     return (0..GOALS.len())
@@ -391,7 +484,7 @@ impl PaletteOverlay {
                 View::Tabs => {}
             }
         }
-        let tabs = !picker && self.view == View::Tabs;
+        let tabs = !picker && unified.is_none() && self.view == View::Tabs;
         let mut rows: Vec<_> = self
             .entries
             .iter()
@@ -434,9 +527,27 @@ impl PaletteOverlay {
                     .unwrap_or(STARTERS.len())
             });
         }
-        rows.into_iter()
+        if unified.is_some() {
+            // Result types are stable groups; relevance and registry order stay intact within each.
+            rows.sort_by_key(|(index, _)| {
+                self.entries[*index].command.name.starts_with("settings ")
+            });
+        }
+        let mut rows: Vec<_> = rows
+            .into_iter()
             .map(|(index, _)| Row::Entry(index))
-            .collect()
+            .collect();
+        if let Some(query) = unified {
+            rows.extend(
+                self.unified
+                    .as_ref()
+                    .unwrap()
+                    .rows(query)
+                    .into_iter()
+                    .map(Row::Unified),
+            );
+        }
+        rows
     }
 
     /// Command entries among the rows, in order. Picker rows are all entries.
@@ -486,7 +597,7 @@ impl PaletteOverlay {
 
     /// Whether the category tab strip is drawn (and therefore shifts the list down one row).
     fn shows_tabs(&self) -> bool {
-        self.choice.is_none() && self.view == View::Tabs
+        self.choice.is_none() && self.unified_query().is_none() && self.view == View::Tabs
     }
 
     /// What Esc does in the current mode, so the footer names it correctly.
@@ -503,6 +614,9 @@ impl PaletteOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if self.panel_keys.handle(event, true, true) {
+            return OverlayEvent::None;
+        }
         if let Event::Paste(value) = event {
             let value = text::one_line(value);
             self.notice = None;
@@ -521,9 +635,32 @@ impl PaletteOverlay {
         if !pressed(key) {
             return OverlayEvent::None;
         }
+        if self.progress.is_some() {
+            if matches!(
+                key.code,
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right
+            ) {
+                self.progress_tab = !self.progress_tab;
+                return OverlayEvent::None;
+            }
+            if self.progress_tab && !keys.matches(Action::SelectCancel, key) {
+                match key.code {
+                    KeyCode::Up => self.progress_scroll = self.progress_scroll.saturating_sub(1),
+                    KeyCode::Down => self.progress_scroll = self.progress_scroll.saturating_add(1),
+                    KeyCode::PageUp => {
+                        self.progress_scroll = self.progress_scroll.saturating_sub(self.page)
+                    }
+                    KeyCode::PageDown => {
+                        self.progress_scroll = self.progress_scroll.saturating_add(self.page)
+                    }
+                    _ => {}
+                }
+                return OverlayEvent::None;
+            }
+        }
         self.notice = None;
         let armed = self.remove_armed.take();
-        if keys.matches(Action::SelectCancel, key) {
+        if super::panel_keys::matches(keys, Action::SelectCancel, key) {
             if self.arguments.take().is_some() {
                 return OverlayEvent::None;
             }
@@ -583,6 +720,7 @@ impl PaletteOverlay {
             }
         }
         if self.choice.is_none()
+            && self.unified_query().is_none()
             && (keys.matches(Action::SectionNext, key) || keys.matches(Action::SectionPrev, key))
         {
             let forward = keys.matches(Action::SectionNext, key);
@@ -632,6 +770,10 @@ impl PaletteOverlay {
     /// Open a goal or the tabs, or run the entry (or ask for its required arguments first).
     fn activate(&mut self, row: Row) -> OverlayEvent {
         match row {
+            Row::Unified(index) => {
+                let result = &self.unified.as_ref().unwrap().entries[index];
+                OverlayEvent::Action(format!("command:/{}", result.command))
+            }
             Row::Goal(goal) => {
                 self.view = View::Goal(goal);
                 self.reset_selection();
@@ -644,6 +786,12 @@ impl PaletteOverlay {
                 OverlayEvent::None
             }
             Row::Entry(index) => {
+                if self.unified_query().is_some()
+                    && let Some(reason) = self.unavailable(&self.entries[index].command)
+                {
+                    self.notice = Some(reason.into());
+                    return OverlayEvent::None;
+                }
                 if let Some(spec) = &self.choice {
                     return choice_action(spec, &spec.items[index].value, spec.verb);
                 }
@@ -692,11 +840,31 @@ impl PaletteOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        if self.panel_keys.draw(
+            frame,
+            ctx,
+            "Actions",
+            "Type to filter · arrows select · Delete reviews removal where offered",
+            self.choice.is_none() || self.progress.is_some(),
+            true,
+        ) {
+            return;
+        }
         // Only a running turn is worth a title note; an idle palette needs no status.
         let title = self
             .choice
             .as_ref()
-            .map_or("Actions", |spec| spec.title.as_str())
+            .map_or("Actions", |spec| {
+                if self.progress.is_some() {
+                    if self.progress_tab {
+                        "Plan | [Progress]"
+                    } else {
+                        "[Plan] | Progress"
+                    }
+                } else {
+                    spec.title.as_str()
+                }
+            })
             .to_owned();
         let extras: &[&str] = if self.busy {
             &["turn running", ""]
@@ -728,6 +896,14 @@ impl PaletteOverlay {
     /// selection keys are left out when the list is empty, so nothing advertises a no-op.
     fn footer(&self, keys: &Keymap, theme: &Theme, w: usize) -> Line<'static> {
         let mut items = Vec::new();
+        if self.progress.is_some() {
+            items.push("Tab/Left/Right switch tab".to_owned());
+            if self.progress_tab {
+                items.push("Up/Down scroll".to_owned());
+                items.push(keys_hint(keys, Action::SelectCancel, "close"));
+                return hint_line(theme, &items, w);
+            }
+        }
         let rows = self.rows();
         let empty = self.arguments.is_none() && rows.is_empty();
         if let Some(spec) = &self.choice {
@@ -749,16 +925,21 @@ impl PaletteOverlay {
         } else if !empty {
             items.push(keys_hint(keys, Action::SelectConfirm, "choose"));
             items.push(keys_hint(keys, Action::SelectDown, "navigate"));
-            items.push(keys_hint(keys, Action::SectionNext, "category"));
+            if self.unified_query().is_none() {
+                items.push(keys_hint(keys, Action::SectionNext, "category"));
+            }
             if matches!(
                 rows.get(self.cursor),
                 Some(&Row::Entry(index)) if self.entries[index].command.args_hint.is_some()
             ) {
                 items.push(keys_hint(keys, Action::Newline, "arguments"));
             }
-        } else {
+        } else if self.unified_query().is_none() {
             // Nothing to select: the only useful move is to look at another category.
             items.push(keys_hint(keys, Action::SectionNext, "category"));
+        }
+        if self.unified.is_some() && self.arguments.is_none() {
+            items.push("all: local search".into());
         }
         items.push(keys_hint(keys, Action::SelectCancel, self.cancel_label()));
         hint_line(theme, &items, w)
@@ -766,6 +947,12 @@ impl PaletteOverlay {
 
     /// What an empty list says, naming the key that gets the user out of the dead end.
     fn empty_message(&self) -> String {
+        if self.unified_query().is_some() {
+            return format!(
+                " No local results match. {} Esc clears the search.",
+                self.unified.as_ref().unwrap().status()
+            );
+        }
         let searching = !self.search.text.trim().is_empty();
         match (self.choice.is_some(), searching, self.view) {
             (true, true, _) => " No choices match. Esc clears the search.",
@@ -780,9 +967,31 @@ impl PaletteOverlay {
     /// Usage and the full description of the selected command, drawn under the menu. Both rows are
     /// ellipsized to the width, so the detail never wraps into the composer.
     fn compose(&mut self, width: u16, height: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
+        self.poll_unified();
         let (w, h) = (usize::from(width), usize::from(height));
         if w == 0 || h == 0 {
             return Vec::new();
+        }
+        if self.progress_tab {
+            let text = self.progress.as_deref().unwrap_or("");
+            let mut rows: Vec<Line<'static>> = text
+                .lines()
+                .flat_map(|line| {
+                    text::wrap_words(line, w.max(1))
+                        .into_iter()
+                        .map(Line::from)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let page = h.saturating_sub(1).max(1);
+            self.progress_scroll = self.progress_scroll.min(rows.len().saturating_sub(page));
+            rows = rows
+                .into_iter()
+                .skip(self.progress_scroll)
+                .take(page)
+                .collect();
+            rows.push(self.footer(ctx.keys, ctx.theme, w));
+            return rows;
         }
         let theme = ctx.theme;
         let ascii = theme.ascii();
@@ -856,6 +1065,10 @@ impl PaletteOverlay {
             // where its matches came from instead of repeating the view's purpose.
             let searching = !self.search.text.trim().is_empty();
             let (label, purpose) = match (&self.choice, self.view) {
+                (None, _) if self.unified_query().is_some() => (
+                    "Local search",
+                    self.unified.as_ref().unwrap().status().to_owned(),
+                ),
                 (Some(spec), _) if !spec.summary.is_empty() => {
                     (spec.summary.as_str(), String::new())
                 }
@@ -940,6 +1153,15 @@ impl PaletteOverlay {
                         Style::default()
                     };
                     let (name, description, right, current) = match picked {
+                        Row::Unified(index) => {
+                            let result = &self.unified.as_ref().unwrap().entries[index];
+                            (
+                                result.label.clone(),
+                                result.description.clone(),
+                                result.kind.label().into(),
+                                false,
+                            )
+                        }
                         Row::Goal(goal) => {
                             let n = self.goal_size(goal);
                             let right =
@@ -966,9 +1188,18 @@ impl PaletteOverlay {
                                 ),
                                 Some(_) => (String::new(), false),
                                 None => (
-                                    shortcut(&entry.command.name)
-                                        .map(|a| ctx.keys.labels(a))
-                                        .unwrap_or_else(|| group(&entry.command).into()),
+                                    if self.unified_query().is_some() {
+                                        if entry.command.name.starts_with("settings ") {
+                                            "Settings"
+                                        } else {
+                                            "Actions"
+                                        }
+                                        .into()
+                                    } else {
+                                        shortcut(&entry.command.name)
+                                            .map(|a| ctx.keys.label(a))
+                                            .unwrap_or_else(|| group(&entry.command).into())
+                                    },
                                     false,
                                 ),
                             };
@@ -977,8 +1208,21 @@ impl PaletteOverlay {
                             } else {
                                 action_label(&entry.command).to_owned()
                             };
-                            (name, entry.command.description.clone(), right, current)
+                            (
+                                name,
+                                self.unavailable(&entry.command)
+                                    .unwrap_or(&entry.command.description)
+                                    .to_owned(),
+                                right,
+                                current,
+                            )
                         }
+                    };
+                    let unavailable = match picked {
+                        Row::Entry(index) => {
+                            self.unavailable(&self.entries[index].command).is_some()
+                        }
+                        _ => false,
                     };
                     let right = if w < 64 { String::new() } else { right };
                     let right_w = text::width(&right);
@@ -1004,7 +1248,7 @@ impl PaletteOverlay {
                         ),
                         Span::styled(
                             text::pad(&text::ellipsize(&name, name_w, ascii), name_w),
-                            theme.fg(Tok::Text),
+                            theme.fg(if unavailable { Tok::Dim } else { Tok::Text }),
                         ),
                         Span::styled(
                             format!(" {} ", text::pad(&description, description_w)),
@@ -1014,6 +1258,11 @@ impl PaletteOverlay {
                     ];
                     if selected {
                         crate::ui::chrome::select_spans(theme, &mut spans);
+                    }
+                    if unavailable {
+                        for span in &mut spans {
+                            span.style = span.style.fg(theme.fg(Tok::Dim).fg.unwrap_or_default());
+                        }
                     }
                     out.push(filled(spans, w, fill));
                 } else if row == 0 {
@@ -1033,6 +1282,15 @@ impl PaletteOverlay {
             }
             if let Some(&picked) = rows.get(self.cursor) {
                 let (header, description, note) = match picked {
+                    Row::Unified(index) => {
+                        let result = &self.unified.as_ref().unwrap().entries[index];
+                        (
+                            format!(" /{}", result.command),
+                            result.description.clone(),
+                            " Enter uses the normal command rules. Your chat draft is preserved."
+                                .into(),
+                        )
+                    }
                     Row::Goal(goal) => (
                         format!(" {}", GOALS[goal].title),
                         GOALS[goal].blurb.to_owned(),
@@ -1060,6 +1318,8 @@ impl PaletteOverlay {
                         };
                         let note = if self.choice.is_some() {
                             " Your chat draft is preserved.".into()
+                        } else if let Some(reason) = self.unavailable(&entry.command) {
+                            format!(" {reason}")
                         } else if self.busy {
                             format!(" {}", entry.during_turn)
                         } else {
@@ -1167,3 +1427,6 @@ mod tests;
 
 #[cfg(test)]
 mod mode_tests;
+
+#[cfg(test)]
+mod unified_tests;

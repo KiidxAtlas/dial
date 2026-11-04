@@ -58,19 +58,26 @@ fn host_answer_completes_the_call() {
 fn host_error_answer_is_an_error_output() {
     let bridge = HostBridge::default();
     let interrupt = AtomicBool::new(false);
+    let mut delivered = String::new();
     let out = run_call(
         &bridge,
         &interrupt,
         "lookup_ticket",
         Duration::from_secs(5),
         |call_id| {
+            delivered = call_id.to_owned();
             bridge.complete(call_id, "not found".into(), true).unwrap();
             true
         },
         || false,
     );
     assert!(out.is_error);
-    assert_eq!(out.text, "not found");
+    assert!(out.text.starts_with("not found"), "{}", out.text);
+    assert_eq!(
+        out.execution.effects,
+        crate::runtime::execution::Effects::Unknown
+    );
+    assert!(out.text.contains(&delivered), "{}", out.text);
 }
 
 #[test]
@@ -181,4 +188,27 @@ fn reset_cancels_a_waiting_call() {
     );
     assert!(out.is_error);
     assert!(out.text.contains("was cancelled"), "{}", out.text);
+}
+
+#[test]
+fn delivered_host_timeout_retains_identity_and_unknown_effects() {
+    let bridge = HostBridge::default();
+    let interrupt = AtomicBool::new(false);
+    let mut delivered = String::new();
+    let out = run_call(
+        &bridge,
+        &interrupt,
+        "write buffer",
+        Duration::ZERO,
+        |call_id| {
+            delivered = call_id.to_owned();
+            true
+        },
+        || false,
+    );
+    assert_eq!(
+        out.execution.effects,
+        crate::runtime::execution::Effects::Unknown
+    );
+    assert!(out.text.contains(&delivered), "{}", out.text);
 }

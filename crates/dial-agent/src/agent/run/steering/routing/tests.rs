@@ -655,14 +655,14 @@ fn occupied_routing_provider_falls_back_without_waiting_or_making_a_request() {
 }
 
 #[test]
-fn configured_judge_answers_routing_instead_of_the_main_provider() {
+fn configured_decision_answers_routing_instead_of_the_main_provider() {
     let main = llm::fake::serve(vec![]);
     let judge = llm::fake::serve(vec![reply(
         r#"{"route":"steer","reason":"Changes approach"}"#,
     )]);
     with_agent(
         &format!(
-            "[message_routing]\nroute='classify'\n[model_roles.judge]\nprovider='endpoint'\nmodel='judge-test'\nbase_url='{}/v1'",
+            "[message_routing]\nroute='classify'\n[model_roles.decision]\nprovider='endpoint'\nmodel='judge-test'\nbase_url='{}/v1'",
             judge.url
         ),
         |agent| {
@@ -681,6 +681,42 @@ fn configured_judge_answers_routing_instead_of_the_main_provider() {
     );
     assert!(main.requests().is_empty());
     assert_eq!(judge.requests().len(), 1);
+}
+
+#[test]
+fn decision_laya_routes_with_checkpoint_and_never_falls_back_to_chat() {
+    for choice in ["steer", "invalid-route"] {
+        let main = llm::fake::serve(vec![]);
+        let health = json!({"service":"dial-laya","protocol":1,"status":"ok","busy":false,"checkpoint":"/routing-ckpt","device":"cpu"});
+        let laya = llm::fake::serve(vec![
+            llm::fake::json(200, &health),
+            llm::fake::json(
+                200,
+                &json!({"answers":{"choice":{"choice":choice,"confidence":0.9}}}),
+            ),
+        ]);
+        with_agent(
+            &format!(
+                "[model_roles.decision]\nprovider='laya'\nmodel='decision'\n[laya]\nendpoint='{}'\ncheckpoint='/routing-ckpt'",
+                laya.url
+            ),
+            |agent| {
+                let chat = request("Fix the parser", &[], "Use v2", true);
+                let result = agent.classify_pending_message(
+                    &mut backend(&main.url),
+                    &chat,
+                    &mut Input::default(),
+                );
+                if choice == "steer" {
+                    assert_eq!(result.unwrap().route, Route::Steer);
+                } else {
+                    assert!(result.is_err(), "invalid typed routing must fail closed");
+                }
+            },
+        );
+        assert_eq!(laya.requests().len(), 2);
+        assert!(main.requests().is_empty());
+    }
 }
 
 #[test]

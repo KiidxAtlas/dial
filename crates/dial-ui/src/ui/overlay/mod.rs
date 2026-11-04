@@ -8,16 +8,19 @@ pub mod git;
 mod headers;
 pub mod image_settings;
 pub mod improve;
+pub mod inbox;
 pub mod jobs;
 mod model_download;
 pub mod model_settings;
 pub mod models;
 pub mod palette;
+pub mod panel_keys;
 pub mod path_browser;
 pub mod peers;
 pub mod providers;
 pub mod settings;
 pub mod shortcuts;
+pub mod stats;
 pub mod subagent_viewer;
 pub mod subagents;
 
@@ -46,6 +49,11 @@ pub enum OverlayEvent {
     /// Remove the key from `scope` so the lower layer or default applies again.
     Unset {
         path: String,
+        scope: Scope,
+    },
+    /// Remove reviewed overrides in one validated transaction in the named layer.
+    UnsetMany {
+        paths: Vec<String>,
         scope: Scope,
     },
     /// Make `selection` the model for a supported role in `model_config::ROLES`.
@@ -157,6 +165,11 @@ impl fmt::Debug for OverlayEvent {
             Self::Unset { path, scope } => f
                 .debug_struct("Unset")
                 .field("path", path)
+                .field("scope", scope)
+                .finish(),
+            Self::UnsetMany { paths, scope } => f
+                .debug_struct("UnsetMany")
+                .field("paths", paths)
                 .field("scope", scope)
                 .finish(),
             Self::AssignModel {

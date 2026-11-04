@@ -283,19 +283,19 @@ fn budget_caps_must_be_positive_and_parse_from_toml() {
 }
 
 #[test]
-fn laya_judge_must_name_the_shared_decision_checkpoint() {
+fn laya_decision_must_name_the_engine_alias_not_a_checkpoint() {
     let mut config = resolve("provider='chatgpt'\nmodel='m'\n").unwrap();
     config.model_roles.insert(
-        "judge".into(),
+        "decision".into(),
         crate::llm::model_config::ModelSelection::new(
             crate::config::laya::PROVIDER,
             crate::config::laya::JUDGE_MODEL,
         ),
     );
     config.validate().unwrap();
-    config.model_roles.get_mut("judge").unwrap().model = "/other/checkpoint".into();
+    config.model_roles.get_mut("decision").unwrap().model = "/other/checkpoint".into();
     let error = config.validate().unwrap_err().to_string();
-    assert!(error.contains("decision role's checkpoint"), "{error}");
+    assert!(error.contains("laya.checkpoint"), "{error}");
 }
 
 #[test]
@@ -353,18 +353,16 @@ fn compute_locks_can_be_disabled_without_changing_local_routing() {
 #[test]
 fn laya_roles_never_require_compute_locks_for_cloud_sessions() {
     let mut config = resolve("provider='chatgpt'\nmodel='account-model'\n").unwrap();
-    for role in ["decision", "judge"] {
-        config.model_roles.insert(
-            role.into(),
-            crate::llm::model_config::ModelSelection::new(
-                crate::config::laya::PROVIDER,
-                crate::config::laya::JUDGE_MODEL,
-            ),
-        );
-    }
+    config.model_roles.insert(
+        "decision".into(),
+        crate::llm::model_config::ModelSelection::new(
+            crate::config::laya::PROVIDER,
+            crate::config::laya::JUDGE_MODEL,
+        ),
+    );
     assert!(!config.uses_local_compute());
     assert!(!config.requires_compute_lock());
-    assert!(!config.memory_role_is_local("judge", None));
+    assert!(!config.memory_role_is_local("decision", None));
 }
 
 #[test]

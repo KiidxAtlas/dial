@@ -12,7 +12,10 @@ fn views_parse_with_tree_as_default_and_reject_unknown_words() {
 
 #[test]
 fn every_subcommand_in_the_spec_is_a_view() {
-    for sub in COMMANDS[0].subcommands {
+    for sub in crate::app::command_registry::command_spec("graphify")
+        .unwrap()
+        .subcommands
+    {
         assert!(View::parse(sub).is_some(), "{sub}");
     }
 }

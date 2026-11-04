@@ -147,3 +147,66 @@ fn voice_choices_distinguish_missing_models_ready_custom_programs_and_credential
         );
     }
 }
+
+#[test]
+fn feature_hints_follow_prerequisites_without_claiming_remote_health() {
+    use crate::config::{memory_backend::MemoryBackendId, voice::TtsBackendChoice};
+    let home = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        user_dir: home.path().into(),
+        ..Config::default()
+    };
+    config.voice.tts.backend = TtsBackendChoice::Piper;
+    config.voice.tts.piper_program = std::env::current_exe().unwrap();
+    let model = home.path().join("voice.onnx");
+    std::fs::write(&model, b"fixture").unwrap();
+    config.voice.tts.piper_model = Some(model.clone());
+    for (complete, expected) in [(false, "Needs setup"), (true, "Ready")] {
+        if complete {
+            std::fs::write(
+                model.with_added_extension("json"),
+                br#"{"audio":{"sample_rate":22050},"phoneme_id_map":{}}"#,
+            )
+            .unwrap();
+        }
+        let hints: BTreeMap<_, _> = feature_readiness_hints(&config).into_iter().collect();
+        for path in ["voice.tts.backend", "voice.tts.auto_speak"] {
+            assert!(hints[path].starts_with(expected), "{}", hints[path]);
+            assert!(hints[path].contains("/setup piper"));
+        }
+    }
+    for (backend, expected) in [
+        (MemoryBackendId::Local, "Needs setup"),
+        (MemoryBackendId::Provenance, "Ready"),
+        (MemoryBackendId::Hindsight, "Unknown"),
+    ] {
+        config.memory.backend = backend;
+        config.memory.hindsight.endpoint = "http://127.0.0.1:9".into();
+        let hints: BTreeMap<_, _> = feature_readiness_hints(&config).into_iter().collect();
+        assert!(
+            hints["memory.enabled"].starts_with(expected),
+            "{}",
+            hints["memory.enabled"]
+        );
+        assert!(hints["memory.enabled"].contains("/setup memory"));
+        assert_eq!(hints["memory.backend"], hints["memory.enabled"]);
+    }
+    config.voice.tts.backend = TtsBackendChoice::Auto;
+    let hints: BTreeMap<_, _> = feature_readiness_hints(&config).into_iter().collect();
+    assert!(hints["voice.tts.auto_speak"].starts_with("Unknown"));
+}
+
+#[test]
+fn laya_readiness_does_not_confuse_checkpoint_selection_with_service_health() {
+    let mut config = Config::default();
+    config.laya.checkpoint = Some("org/not-downloaded".into());
+    let hints: BTreeMap<_, _> = feature_readiness_hints(&config).into_iter().collect();
+    for path in ["laya.enabled", "laya.auto_start"] {
+        assert!(hints[path].starts_with("Unknown"));
+        assert!(hints[path].contains("/laya status"));
+        assert!(!hints[path].starts_with("Ready"));
+    }
+    config.laya.engine = crate::config::laya::DecisionEngineType::Kev;
+    let hints: BTreeMap<_, _> = feature_readiness_hints(&config).into_iter().collect();
+    assert!(hints["laya.enabled"].starts_with("Unsupported here"));
+}

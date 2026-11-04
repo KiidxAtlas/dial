@@ -10,6 +10,7 @@ fn on_fallback_until(until: Instant) -> ActiveRoute {
         }),
         promoted: None,
         generation: 0,
+        receipt: None,
     }
 }
 
@@ -121,6 +122,9 @@ fn promote(agent: &mut Agent<'_>, request_tokens: u64, overflow: bool) -> (bool,
 fn promotion_installs_the_larger_model_and_says_so() {
     with_promotion_agent(200_000, "", |agent| {
         let before = agent.context_window();
+        let initial = agent.main_model_explanation().unwrap();
+        assert!(initial.contains("Main backend initialized"));
+        assert!(initial.contains("earlier launch-selection provenance unavailable"));
         assert!(before < 200_000);
         let (promoted, ui) = promote(agent, 40_000, false);
         assert!(promoted);
@@ -128,6 +132,14 @@ fn promotion_installs_the_larger_model_and_says_so() {
         assert_eq!(agent.context_window(), 200_000);
         assert_eq!(agent.auth_config.model, "big");
         assert!(!agent.route.on_fallback());
+        assert_eq!(agent.active_model_config().model, "big");
+        let explanation = agent.main_model_explanation().unwrap();
+        assert!(explanation.contains("Context promotion from"));
+        assert!(explanation.contains("larger window 200000"));
+        assert_eq!(
+            agent.session.control_state()["main_model_route"]["explanation"],
+            explanation
+        );
         assert!(
             ui.0.iter()
                 .any(|text| text.contains("instead of compacting"))
@@ -137,6 +149,10 @@ fn promotion_installs_the_larger_model_and_says_so() {
         // A user model switch forgets the promotion.
         agent.route.reset();
         assert!(!agent.route.promoted.is_some());
+        assert!(
+            agent.main_model_explanation().is_none(),
+            "reset must not reuse historical receipts"
+        );
     });
 }
 
@@ -196,10 +212,23 @@ fn promotion_clears_a_fallback_and_fallbacks_return_to_the_promoted_model() {
             assert!(agent.fail_over(&mut backend, &error, &mut ui));
             assert!(agent.route.on_fallback());
             assert_eq!(agent.auth_config.model, "fb");
+            assert_eq!(agent.active_model_config().model, "fb");
+            assert!(
+                agent
+                    .main_model_explanation()
+                    .unwrap()
+                    .contains("Provider-error fallback from")
+            );
             // Promotion replaces the fallback and carries no cooldown back to `test`.
             assert!(agent.try_promote_context(&mut backend, 40_000, 1024, false, &mut ui));
             assert!(!agent.route.on_fallback());
             assert_eq!(agent.auth_config.model, "big");
+            assert!(
+                agent
+                    .main_model_explanation()
+                    .unwrap()
+                    .contains("Context promotion from")
+            );
             assert!(
                 !agent
                     .route
@@ -212,6 +241,12 @@ fn promotion_clears_a_fallback_and_fallbacks_return_to_the_promoted_model() {
             assert!(agent.restore_primary_if_due(&mut backend, &mut ui));
             assert_eq!(agent.auth_config.model, "big");
             assert!(agent.route.promoted.is_some());
+            assert!(
+                agent
+                    .main_model_explanation()
+                    .unwrap()
+                    .contains("Primary restored after provider-error fallback cooldown")
+            );
             agent.backend = Some(backend);
         },
     );
@@ -358,4 +393,24 @@ fn overflow_promotes_and_retries_on_the_larger_model_before_compacting() {
     assert_eq!(requests.len(), 2);
     assert_eq!(fake::body(&requests[0])["model"], "test");
     assert_eq!(fake::body(&requests[1])["model"], "big");
+}
+
+#[test]
+fn main_route_receipt_is_bounded_and_never_reconstructed_after_reset() {
+    with_server_agent("http://127.0.0.1:9", "", |agent| {
+        agent.record_main_model_route(&"observed route ".repeat(200));
+        let explanation = agent.main_model_explanation().unwrap();
+        assert!(explanation.chars().count() <= 768);
+        assert_eq!(
+            agent.session.control_state()["main_model_route"]["explanation"],
+            explanation
+        );
+        agent.route.reset();
+        agent.restore_control().unwrap();
+        assert!(agent.main_model_explanation().is_none());
+        assert!(
+            agent.session.control_state()["main_model_route"].is_object(),
+            "historical receipt remains historical"
+        );
+    });
 }

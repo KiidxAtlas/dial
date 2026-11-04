@@ -79,6 +79,16 @@ const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
 const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 const RESET: &str = "\x1b[0m";
 const LINK_END: &str = "\x1b]8;;\x1b\\";
+/// Erase below the cursor without scrolling or a display-wide clear. tmux's `scroll-on-clear`
+/// preserves a full-screen ED erase in history, which would commit the live viewport twice.
+fn erase_below(buf: &mut String, rows: u16) {
+    buf.push_str("\x1b7\x1b[2K");
+    for _ in 1..rows {
+        buf.push_str("\x1b[B\x1b[2K");
+    }
+    buf.push_str("\x1b8");
+}
+
 /// A row within this many cells of the width may have been hard-wrapped, so its last token is
 /// never linked (it could be the first half of a longer URL or path).
 const LINK_EDGE: usize = 4;
@@ -482,7 +492,7 @@ impl InlineTerminal {
         }
         buf.push('\r');
         if erase_first {
-            buf.push_str("\x1b[J");
+            erase_below(&mut buf, rows);
         }
         for (index, (row, _)) in history.iter().enumerate() {
             buf.push_str("\x1b[2K");
@@ -518,7 +528,9 @@ impl InlineTerminal {
             (self.painted_rows as usize).saturating_sub(covered)
         };
         if leftover > 0 {
-            buf.push_str("\x1b[B\r\x1b[J\x1b[A");
+            buf.push_str("\x1b[B\r");
+            erase_below(&mut buf, rows);
+            buf.push_str("\x1b[A");
         }
 
         let n = rendered.len();
@@ -805,7 +817,8 @@ impl InlineTerminal {
         if self.cursor_row > 0 {
             s.push_str(&format!("\x1b[{}A", self.cursor_row));
         }
-        s.push_str("\r\x1b[J");
+        s.push('\r');
+        erase_below(&mut s, terminal_rows);
         let mut linker = self.linker.as_mut().filter(|_| self.linking);
         for (index, line) in self.pending.iter().enumerate() {
             s.push_str(&render_row_linked(line, cols as usize, linker.as_deref_mut()).0);
@@ -885,7 +898,8 @@ impl InlineTerminal {
         if self.cursor_row > 0 {
             s.push_str(&format!("\x1b[{}A", self.cursor_row));
         }
-        s.push_str("\r\x1b[J");
+        s.push('\r');
+        erase_below(&mut s, self.size().1);
         s.push_str(WRAP_ON);
         s.push_str(CURSOR_SHOW);
         if self.keyboard_flags {

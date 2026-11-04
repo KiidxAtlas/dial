@@ -229,7 +229,7 @@ pub fn background_call_controlled<T>(
 }
 
 fn acquire(config: &Config, cancel: Option<&AtomicBool>) -> Result<File> {
-    let file = super::auto::lock_file(&config.user_dir.join("compute.lock"))?;
+    let file = super::auto::lock_file(&crate::config::paths::compute_lock_file(&config.user_dir))?;
     loop {
         ensure!(
             !cancel.is_some_and(|c| c.load(Ordering::SeqCst)),

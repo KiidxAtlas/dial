@@ -399,7 +399,7 @@ pub fn recipe(id: &str) -> Option<&'static Recipe> {
 
 /// Dial's own install directory for one dependency.
 pub fn install_dir(user_dir: &Path, id: &str) -> PathBuf {
-    user_dir.join("tools").join(id)
+    crate::config::paths::tools_dir(user_dir).join(id)
 }
 
 /// What `PATH` and the user directory look like at one moment.
@@ -487,8 +487,7 @@ pub const WHISPER_MODEL_BYTES: u64 = 147_964_211;
 
 /// Where Dial keeps the whisper.cpp model it downloads during setup.
 pub fn whisper_model_path(user_dir: &Path) -> PathBuf {
-    user_dir
-        .join("models")
+    crate::config::paths::models_dir(user_dir)
         .join("whisper")
         .join("ggml-base.en.bin")
 }

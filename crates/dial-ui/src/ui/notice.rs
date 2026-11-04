@@ -38,6 +38,35 @@ pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows
     {
         return rows;
     }
+    if title == "Turn report" {
+        let next = body.lines().find(|line| line.starts_with("Next: "));
+        let summary = body.lines().find_map(|line| line.strip_prefix("Summary: "));
+        if !ctx.tools_expanded
+            && let Some(summary) = summary
+        {
+            let mut rows = vec![fitted(
+                vec![Span::styled(summary.to_owned(), ctx.theme.fg(Tok::Muted))],
+                w as usize,
+                ctx.theme,
+            )];
+            if let Some(next) = next {
+                rows.push(fitted(
+                    vec![Span::styled(next.to_owned(), ctx.theme.fg(Tok::Dim))],
+                    w as usize,
+                    ctx.theme,
+                ));
+            }
+            return rows;
+        }
+        if summary.is_some() {
+            let full = body
+                .lines()
+                .filter(|line| !line.starts_with("Summary: "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return rows("Turn details", &full, w, ctx);
+        }
+    }
     let w = w as usize;
     let theme = ctx.theme;
     let title = text::one_line(title);

@@ -51,6 +51,7 @@ pub struct Dialog<'a> {
     mode: Mode,
     presented: bool,
     deadline: Option<Instant>,
+    paused_timeout: Option<Duration>,
     feedback: String,
 }
 impl<'a> Dialog<'a> {
@@ -65,6 +66,7 @@ impl<'a> Dialog<'a> {
             mode: Mode::Choices,
             presented: false,
             deadline: None,
+            paused_timeout: None,
             feedback: String::new(),
         }
     }
@@ -87,11 +89,31 @@ impl<'a> Dialog<'a> {
         };
         Ok(())
     }
+    /// Inspection owns input without consuming question time or advancing answers.
+    pub fn pause_timeout(&mut self, now: Instant) {
+        if let Some(deadline) = self.deadline.take() {
+            self.paused_timeout = Some(deadline.saturating_duration_since(now));
+        }
+    }
+
+    pub fn resume_timeout(&mut self, now: Instant) -> Result<(), String> {
+        if let Some(remaining) = self.paused_timeout {
+            self.deadline = Some(
+                now.checked_add(remaining)
+                    .ok_or("ask timeout cannot be represented by the input clock")?,
+            );
+            self.paused_timeout = None;
+        }
+        Ok(())
+    }
+
     pub fn expired(&mut self) -> Option<QuestionOutcome> {
+        self.expired_at(Instant::now())
+    }
+
+    fn expired_at(&mut self, now: Instant) -> Option<QuestionOutcome> {
         if !matches!(self.mode, Mode::Choices)
-            || !self
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
+            || !self.deadline.is_some_and(|deadline| now >= deadline)
         {
             return None;
         }
@@ -138,6 +160,7 @@ impl<'a> Dialog<'a> {
         self.preview_scroll = 0;
         self.presented = false;
         self.deadline = None;
+        self.paused_timeout = None;
         self.feedback.clear();
     }
     pub fn paste(&mut self, value: &str) {

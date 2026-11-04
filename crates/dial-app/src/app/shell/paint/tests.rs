@@ -36,11 +36,16 @@ fn model_change_updates_status_and_home_without_resetting_navigation() {
             ..Default::default()
         };
         status.inference = "previous model settings".into();
+        status.main_model_explanation = Some("stale route receipt".into());
         update_model_status(&mut status, &mut home, &config);
         assert_eq!(status.model, model);
         assert!(
             status.inference.is_empty(),
             "A model switch clears old request settings"
+        );
+        assert!(
+            status.main_model_explanation.is_none(),
+            "a new selection cannot inherit an old receipt"
         );
         let home = home.as_ref().unwrap();
         assert_eq!(home.info.model, status.model);

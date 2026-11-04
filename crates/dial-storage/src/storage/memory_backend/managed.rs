@@ -11,9 +11,7 @@ use std::{
     path::PathBuf,
 };
 pub fn directory_path(layout: &Layout) -> PathBuf {
-    layout
-        .user_dir
-        .join("memory-backends")
+    crate::config::paths::memory_backends_dir(&layout.user_dir)
         .join("managed-skills")
         .join(format!(
             "{:x}",
@@ -370,10 +368,7 @@ pub fn prepare(layout: &Layout, values: &[Value]) -> Result<Publication> {
     let generations = path.join("generations");
     let generation_root = generations.join(&generation);
     let mut targets = vec![
-        layout
-            .user_dir
-            .join("memory-backends")
-            .join("managed-skills"),
+        crate::config::paths::memory_backends_dir(&layout.user_dir).join("managed-skills"),
         path.clone(),
         path.join("skills.sqlite3"),
         path.join("skills.sqlite3-journal"),

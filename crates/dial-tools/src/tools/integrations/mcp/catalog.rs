@@ -422,7 +422,7 @@ pub fn looks_secret(key: &str) -> bool {
 
 /// `<user_dir>/mcp`, where package caches are redirected so nothing lands in a global cache.
 pub fn mcp_cache_dir(user_dir: &Path) -> PathBuf {
-    user_dir.join("mcp")
+    crate::config::paths::mcp_dir(user_dir)
 }
 
 /// Environment that keeps npm and uv caches under Dial's user directory.

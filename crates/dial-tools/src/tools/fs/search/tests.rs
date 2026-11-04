@@ -493,6 +493,13 @@ fn anchored_globs_preserve_ignore_and_symlink_boundaries() {
             body(&glob_tool(&ws, &json!({"pattern": format!("{prefix}/**/*.rs")})).unwrap()),
             "no matches\n"
         );
+        assert_eq!(
+            body(&grep(
+                &ws,
+                json!({"pattern": "needle", "glob": format!("{prefix}/**/*.rs")})
+            )),
+            "no matches\n"
+        );
     }
     assert_eq!(
         body(&glob_tool(&ws, &json!({"pattern": "src/**/mod.rs"})).unwrap()),
@@ -844,6 +851,71 @@ fn search_state(mode: OutputMode, max_matches: usize) -> GrepState {
 }
 
 #[test]
+fn anchored_grep_prunes_unrelated_subtrees_on_complete_and_capped_pages() {
+    let (dir, ws) = workspace();
+    // Exceed the depth bound with only a few dozen directories, not a huge entry matrix.
+    let unrelated = dir.path().join("aaa").join("d/".repeat(41));
+    fs::create_dir_all(&unrelated).unwrap();
+    fs::write(unrelated.join("other.rs"), "needle\n").unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    for name in ["a.rs", "b.rs"] {
+        fs::write(dir.path().join("src").join(name), "needle\n").unwrap();
+    }
+    for max in [1, 10] {
+        let mut args = json!({"pattern": "needle", "glob": "src/**/*.rs", "max_results": max});
+        let serial = grep_with_workers(&ws, &args, 1).unwrap();
+        assert!(!serial.contains("depth-capped directory"), "{serial}");
+        assert_eq!(grep_with_workers(&ws, &args, 4).unwrap(), serial);
+        if max == 1 {
+            assert_eq!(body(&serial), "src/a.rs:1:needle\n");
+            args["cursor"] = page(&serial)["next_cursor"].clone();
+            let resumed = grep_with_workers(&ws, &args, 1).unwrap();
+            assert_eq!(body(&resumed), "src/b.rs:1:needle\n");
+            assert_eq!(grep_with_workers(&ws, &args, 4).unwrap(), resumed);
+        } else {
+            assert!(serial.contains("walk complete"), "{serial}");
+        }
+    }
+}
+
+#[test]
+fn grep_footer_reports_the_continuation_budget_cause_in_every_mode() {
+    let (dir, ws) = workspace();
+    let path = dir.path().join("next.txt");
+    for mode in [OutputMode::Lines, OutputMode::Files, OutputMode::Count] {
+        for (bytes, cap, expected) in [
+            (MAX_GREP_BYTES, None, "byte limit of 64 MiB"),
+            (0, None, "walk limit"),
+            (0, Some("match limit of 1"), "match limit of 1"),
+            (
+                0,
+                Some("output size limit of 48 KiB"),
+                "output size limit of 48 KiB",
+            ),
+        ] {
+            let mut state = search_state(mode, 1);
+            state.bytes = bytes;
+            state.cap = cap.map(str::to_string);
+            let next = Some((path.clone(), 0));
+            let text = if mode == OutputMode::Lines {
+                state.finish(&ws, next, "", false)
+            } else {
+                state.finish_summary(&ws, next, "", false)
+            }
+            .unwrap();
+            assert!(
+                text.contains(&format!("page_capped_by={expected};")),
+                "{text}"
+            );
+            assert_eq!(
+                page(&text)["next_cursor"],
+                json!({"path": "next.txt", "match": 0})
+            );
+        }
+    }
+}
+
+#[test]
 fn parallel_search_reserves_actual_reads_before_dispatch() {
     let (dir, ws) = workspace();
     // Reusing one large source avoids a 256 MiB on-disk fixture. Each batch
@@ -1053,4 +1125,195 @@ fn a_search_scoped_to_a_subdirectory_honours_its_ancestors_ignore_rules() {
         json!({"pattern": "needle", "path": "packages/web/dist"}),
     );
     assert!(explicit.contains("app.js"), "{explicit}");
+}
+
+#[test]
+fn glob_preview_is_opt_in_and_only_returned_rows_are_editable_after_resume() {
+    let (dir, ws) = workspace();
+    let ws = ws.with_edit_mode(crate::tools::EditMode::Hashline);
+    let source = format!("def total():\n{}", "    value = 1\n".repeat(44));
+    fs::write(dir.path().join("calc.py"), &source).unwrap();
+    let plain = glob_tool(&ws, &json!({"pattern":"*.py"})).unwrap();
+    assert_eq!(
+        plain,
+        glob_tool(&ws, &json!({"pattern":"*.py", "preview":false})).unwrap()
+    );
+    assert!(!plain.contains("1:def total()"), "{plain}");
+    let args = json!({"pattern":"*.py", "preview":true});
+    let shown = glob_tool(&ws, &args).unwrap();
+    assert!(shown.contains("40:    value = 1"), "{shown}");
+    assert!(!shown.contains("41:    value = 1"), "{shown}");
+    let tag = crate::tools::edit::hashline::tag_of(&source);
+    let resumed = Workspace::new(dir.path()).unwrap();
+    crate::tools::edit::hashline::rehydrate(&resumed, [("glob", &args, shown.as_str())]);
+    let unseen = format!("[calc.py#{tag}]\nPUT 41.=41:\n+    value = 2\n");
+    assert!(crate::tools::edit::hashline::edit(&resumed, &unseen).is_err());
+    let edit = format!("[calc.py#{tag}]\nPUT 2.=2:\n+    value = 2\n");
+    crate::tools::edit::hashline::edit(&resumed, &edit).unwrap();
+    assert!(
+        fs::read_to_string(dir.path().join("calc.py"))
+            .unwrap()
+            .starts_with("def total():\n    value = 2\n")
+    );
+    let stale = Workspace::new(dir.path()).unwrap();
+    crate::tools::edit::hashline::rehydrate(&stale, [("glob", &args, shown.as_str())]);
+    assert!(crate::tools::edit::hashline::edit(&stale, &edit).is_err());
+}
+
+#[test]
+fn glob_preview_preserves_pagination_and_does_not_witness_unlisted_files() {
+    let (dir, ws) = workspace();
+    let ws = ws.with_edit_mode(crate::tools::EditMode::Hashline);
+    for name in ["a.py", "b.py", "c.py", "d.py"] {
+        fs::write(dir.path().join(name), "value = 1\n").unwrap();
+    }
+    let first = glob_tool(&ws, &json!({"pattern":"*.py", "preview":true, "limit":1})).unwrap();
+    assert_eq!(
+        glob_source_targets(&ws, &json!({"pattern":"*.py", "preview":true}), &first),
+        vec!["a.py"]
+    );
+    let continuation = page(&first);
+    let args =
+        json!({"pattern":"*.py", "preview":true, "limit":1, "cursor":continuation["next_cursor"]});
+    let next = glob_tool(&ws, &args).unwrap();
+    assert_eq!(glob_source_targets(&ws, &args, &next), vec!["b.py"]);
+    let tag = crate::tools::edit::hashline::tag_of("value = 1\n");
+    let unseen = format!("[c.py#{tag}]\nPUT 1.=1:\n+value = 2\n");
+    assert!(crate::tools::edit::hashline::edit(&ws, &unseen).is_err());
+    let all = glob_tool(&ws, &json!({"pattern":"*.py", "preview":true})).unwrap();
+    assert!(all.len() <= MAX_GREP_OUTPUT);
+    assert_eq!(
+        glob_source_targets(&ws, &json!({"pattern":"*.py", "preview":true}), &all),
+        vec!["a.py", "b.py", "c.py"]
+    );
+    assert!(glob_source_targets(&ws, &json!({"pattern":"z*.py", "preview":true}), &all).is_empty());
+    assert!(glob_source_targets(&ws, &json!({"pattern":"*.py"}), &all).is_empty());
+}
+
+#[test]
+fn glob_preview_screens_secrets_and_skips_non_code_and_protected_files() {
+    let (dir, ws) = workspace();
+    let ws = ws
+        .with_edit_mode(crate::tools::EditMode::Hashline)
+        .with_protected_paths(&[dir.path().join("private")]);
+    fs::create_dir(dir.path().join("private")).unwrap();
+    for (path, source) in [
+        ("secret.py", "key = 'sk-abcdefghijklmnopqrstuvwxyz123456'\n"),
+        ("notes.txt", "noncode-marker\n"),
+        ("private/hidden.py", "private_marker = 1\n"),
+        ("safe.py", "safe_marker = 1\n"),
+    ] {
+        fs::write(dir.path().join(path), source).unwrap();
+    }
+    let args = json!({"pattern":"*", "preview":true});
+    let text = glob_tool(&ws, &args).unwrap();
+    assert!(!text.contains("abcdefghijklmnopqrstuvwxyz"), "{text}");
+    assert!(!text.contains("noncode-marker"), "{text}");
+    assert!(!text.contains("private_marker"), "{text}");
+    assert_eq!(glob_source_targets(&ws, &args, &text), vec!["safe.py"]);
+    let source = fs::read_to_string(dir.path().join("secret.py")).unwrap();
+    let tag = crate::tools::edit::hashline::tag_of(&source);
+    assert!(
+        crate::tools::edit::hashline::edit(
+            &ws,
+            &format!("[secret.py#{tag}]\nPUT 1.=1:\n+value = 2\n")
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn glob_preview_restoration_honors_multiple_scopes() {
+    let (dir, ws) = workspace();
+    for folder in ["a", "b", "c"] {
+        fs::create_dir(dir.path().join(folder)).unwrap();
+        fs::write(dir.path().join(folder).join("calc.py"), "value = 1\n").unwrap();
+    }
+    let args = json!({"pattern":"*.py", "path":"a;b", "preview":true});
+    let text = glob_tool(&ws, &args).unwrap();
+    assert_eq!(
+        glob_source_targets(&ws, &args, &text),
+        vec!["a/calc.py", "b/calc.py"]
+    );
+    assert_eq!(
+        glob_source_targets(
+            &ws,
+            &json!({"pattern":"*.py", "path":"a", "preview":true}),
+            &text
+        ),
+        vec!["a/calc.py"]
+    );
+}
+
+#[test]
+fn broad_glob_preview_includes_a_test_without_growing_its_budget_or_path_page() {
+    let (dir, ws) = workspace();
+    let ws = ws.with_edit_mode(crate::tools::EditMode::Hashline);
+    for name in [
+        "billing.py",
+        "check_environment.py",
+        "checkout.py",
+        "test_billing.py",
+    ] {
+        fs::write(dir.path().join(name), "value = 1\n").unwrap();
+    }
+    let plain = glob_tool(&ws, &json!({"pattern":"*.py"})).unwrap();
+    let args = json!({"pattern":"*.py", "preview":true});
+    let text = glob_tool(&ws, &args).unwrap();
+    assert!(
+        text.starts_with(&plain),
+        "the sorted page and coverage must not change: {text}"
+    );
+    assert_eq!(
+        glob_source_targets(&ws, &args, &text),
+        vec!["test_billing.py", "billing.py", "check_environment.py"]
+    );
+    assert!(text.len() - plain.len() <= 6 * 1024);
+    let first = glob_tool(&ws, &json!({"pattern":"*.py", "preview":true, "limit":1})).unwrap();
+    assert_eq!(glob_source_targets(&ws, &args, &first), vec!["billing.py"]);
+}
+
+#[test]
+fn glob_test_preference_stays_inside_the_first_sixteen_returned_paths() {
+    let (dir, ws) = workspace();
+    for index in 0..16 {
+        fs::write(dir.path().join(format!("a{index:02}.py")), "value = 1\n").unwrap();
+    }
+    fs::write(dir.path().join("test_last.py"), "test_marker = 1\n").unwrap();
+    let args = json!({"pattern":"*.py", "preview":true});
+    let text = glob_tool(&ws, &args).unwrap();
+    assert_eq!(
+        glob_source_targets(&ws, &args, &text),
+        vec!["a00.py", "a01.py", "a02.py"]
+    );
+    assert!(!text.contains("test_marker"));
+}
+
+#[test]
+fn glob_preview_recognizes_common_test_names_but_not_incidental_substrings() {
+    for (name, preferred) in [
+        ("test_invoice.py", true),
+        ("invoice_test.go", true),
+        ("invoice.test.ts", true),
+        ("InvoiceTest.java", true),
+        ("tests/invoice.rs", true),
+        ("spec/invoice.rb", true),
+        ("contest.py", false),
+    ] {
+        let (dir, ws) = workspace();
+        for source in ["a.py", "b.py", "c.py", name] {
+            let path = dir.path().join(source);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "value = 1\n").unwrap();
+        }
+        let args = json!({"pattern":"*", "preview":true});
+        let text = glob_tool(&ws, &args).unwrap();
+        let targets = glob_source_targets(&ws, &args, &text);
+        assert_eq!(targets.len(), 3, "{name}: {text}");
+        assert_eq!(
+            targets.contains(&name.to_owned()),
+            preferred,
+            "{name}: {text}"
+        );
+    }
 }

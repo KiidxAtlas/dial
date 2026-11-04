@@ -430,6 +430,12 @@ fn wait_without_pattern_returns_at_exit_with_status() {
     assert!(wait.execution.observation.as_ref().unwrap().satisfied);
     assert_eq!(wait.execution.process.as_ref().unwrap().exit_code, Some(3));
     assert_eq!(wait.data.as_ref().unwrap()["process"]["exit_code"], 3);
+    let jobs = tool.jobs_view(None).jobs;
+    assert_eq!(jobs[0].status, "exited (exit code 3)");
+    assert_eq!(
+        jobs[0].process_outcome.as_ref(),
+        wait.execution.process.as_ref()
+    );
     // `output` shares the model-visible cursor: nothing is repeated, but the status still is.
     let out = bg(&tool, &ws, json!({"action": "output", "name": "quick"}));
     assert!(
@@ -531,21 +537,27 @@ fn output_buffer_is_bounded_and_reports_discarded_bytes() {
         &tool,
         &ws,
         "flood",
-        "head -c 1000000 /dev/zero | tr '\\0' x; echo; echo END; sleep 30",
+        "head -c 1000000 /dev/zero | tr '\\0' x; echo; echo END",
     );
     let wait = bg(
         &tool,
         &ws,
-        json!({"action": "wait", "name": "flood", "until": "^END$", "timeout": 20}),
+        json!({"action": "wait", "name": "flood", "timeout": 20}),
     );
-    assert!(wait.text.starts_with("ready:"), "{}", wait.text);
+    // Wait for exit, not a regex past the bounded readiness observation window.
+    // The exit result uses the same bounded unread-output renderer as `output`.
+    assert!(
+        !wait.is_error && wait.text.starts_with("ready:"),
+        "{}",
+        wait.text
+    );
     {
         let table = tool.table();
         let ring = lock(&table.procs[0].ring);
         assert!(ring.total > 1_000_000);
         assert_eq!(ring.text().len(), MAX_BUFFER);
     }
-    let out = bg(&tool, &ws, json!({"action": "output", "name": "flood"}));
+    let out = wait;
     assert!(
         out.text.len() < MAX_OUTPUT + 512,
         "{} bytes",
@@ -602,11 +614,55 @@ fn terminal_match_text_drops_escapes_and_crlf() {
     let pattern = compile("ready$").unwrap();
     let ring = Mutex::new(Ring::terminal(64, 3, 20));
     lock(&ring).push(b"\x1b[1mready\x1b[0m\r\n");
-    let mut scanned = None;
+    let mut scanned = ReadinessScan::default();
     assert_eq!(
-        find_match(&ring, true, &pattern, &mut scanned).as_deref(),
+        find_match(&ring, true, &pattern, &mut scanned)
+            .unwrap()
+            .as_deref(),
         Some("ready")
     );
+}
+
+#[test]
+fn readiness_scan_keeps_split_regex_utf8_and_terminal_sequences() {
+    let ring = Mutex::new(Ring::terminal(128, 3, 20));
+    let pattern = compile("(?s)\\Aready\\n.*café\\z").unwrap();
+    let mut scan = ReadinessScan::default();
+    lock(&ring).push(b"\x1b[3");
+    assert_eq!(find_match(&ring, true, &pattern, &mut scan).unwrap(), None);
+    lock(&ring).push(b"1mready\x1b[0m\r\ncaf\xc3");
+    assert_eq!(find_match(&ring, true, &pattern, &mut scan).unwrap(), None);
+    lock(&ring).push(b"\xa9");
+    assert_eq!(
+        find_match(&ring, true, &pattern, &mut scan)
+            .unwrap()
+            .as_deref(),
+        Some("ready\ncafé")
+    );
+    let copied = scan.raw.clone();
+    assert_eq!(find_match(&ring, true, &pattern, &mut scan).unwrap(), None);
+    assert_eq!(scan.raw, copied, "unchanged output is not recopied");
+}
+
+#[test]
+fn readiness_scan_reports_ring_loss_and_its_own_observation_limit() {
+    let pattern = compile("never-ready").unwrap();
+    let ring = Mutex::new(Ring::new(8));
+    lock(&ring).push(b"ready followed by enough output to evict the banner");
+    let error = find_match(&ring, false, &pattern, &mut ReadinessScan::default()).unwrap_err();
+    assert!(
+        error.contains("overrun") && error.contains("bytes missed"),
+        "{error}"
+    );
+
+    let ring = Mutex::new(Ring::new(table::MAX_BUFFER));
+    let mut scan = ReadinessScan::default();
+    lock(&ring).push(&vec![b'x'; table::MAX_BUFFER]);
+    assert_eq!(find_match(&ring, false, &pattern, &mut scan).unwrap(), None);
+    lock(&ring).push(b"x");
+    let error = find_match(&ring, false, &pattern, &mut scan).unwrap_err();
+    assert!(error.contains("observation exceeded"), "{error}");
+    assert_eq!(scan.raw.len(), table::MAX_BUFFER);
 }
 
 #[test]
@@ -1253,6 +1309,10 @@ fn jobs_view_shows_pipe_output_without_consuming_it() {
     let view = tool.jobs_view(Some("pipe-view"));
     assert_eq!(view.screen, ["first", "last"]);
     assert_eq!(view.cursor, None);
+    let receipt = view.jobs[0].process_outcome.as_ref().unwrap();
+    assert_eq!(receipt.exit_code, Some(0));
+    assert!(!receipt.cancelled);
+    assert!(receipt.output_complete);
     let output = bg(&tool, &ws, json!({"action":"output", "name":"pipe-view"}));
     assert!(output.text.contains("first\nlast\n"), "{}", output.text);
 }
@@ -1731,4 +1791,19 @@ fn a_failed_job_whose_first_error_scrolled_out_of_the_read_gets_a_digest() {
     ok.command = "cargo build".into();
     let (body, _, _) = take_presented(&ws, &ok, None);
     assert!(!body.contains("[failure digest"));
+}
+
+#[test]
+fn readiness_empty_output_keeps_zero_width_regex_semantics() {
+    let ring = Mutex::new(Ring::new(MAX_BUFFER));
+    let mut scanned = ReadinessScan::default();
+    assert_eq!(
+        find_match(&ring, false, &compile("^$").unwrap(), &mut scanned).unwrap(),
+        Some(String::new())
+    );
+    assert!(
+        find_match(&ring, false, &compile("^$").unwrap(), &mut scanned)
+            .unwrap()
+            .is_none()
+    );
 }

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 #[test]
 fn sse_events_join_data_lines_and_skip_noise() {
-    let body = ": keep-alive\nevent: message\ndata: {\"id\":1,\ndata: \"result\":{}}\n\ndata: not json\n\ndata:{\"id\":2}\n";
+    let body = ": keep-alive\nevent: message\ndata: {\"id\":1,\ndata: \"result\":{}}\n\ndata: not json\n\ndata:{\"id\":2}\n\n";
     assert_eq!(
         parse_sse(body),
         vec![json!({"id":1,"result":{}}), json!({"id":2})]
@@ -245,7 +245,7 @@ fn streamable_get_session_termination_closes_the_shared_connection() {
         if known_session {
             *http.session.lock().unwrap() = Some("expired-session".into());
         }
-        let (signals, received) = mpsc::channel();
+        let (signals, received) = super::super::signals::channel();
         let shared = Arc::new(Shared::new(Vec::new(), Some(signals)));
         if known_session {
             http.listen(shared.clone(), None);
@@ -317,7 +317,7 @@ fn notification_drop_recovers_and_shutdown_interrupts_a_silent_stream() {
         );
     });
     let http = Arc::new(Http::new("recover", &url, &McpServerConfig::default(), None).unwrap());
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = super::super::signals::channel();
     let shared = Arc::new(Shared::new(Vec::new(), Some(tx)));
     http.clone().after_initialize("2025-06-18", shared.clone());
     assert!(matches!(
@@ -354,7 +354,7 @@ fn notification_405_is_unsupported_not_a_connection_failure_or_retry_loop() {
         listener
     });
     let http = Arc::new(Http::new("unsupported", &url, &McpServerConfig::default(), None).unwrap());
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = super::super::signals::channel();
     let shared = Arc::new(Shared::new(Vec::new(), Some(tx)));
     http.clone().after_initialize("2025-06-18", shared.clone());
     assert!(matches!(
@@ -418,4 +418,100 @@ fn cancelled_http_request_closes_socket_and_settles_owned_worker() {
     assert!(began.elapsed() < Duration::from_secs(2));
     assert!(error.downcast_ref::<RequestFailure>().unwrap().dispatched);
     server.join().unwrap();
+}
+
+#[test]
+fn event_replay_ids_are_bounded_resettable_and_ignore_nul() {
+    let body = format!(
+        "id: first\ndata: {{}}\n\nid: bad\0id\ndata: {{}}\n\nid: {}\n\nid: next\n\nid:\n\n",
+        "x".repeat(MAX_EVENT_ID_BYTES + 1)
+    );
+    let mut ids = Vec::new();
+    read_events_with_id(body.as_bytes(), &|| true, &mut |_, _| true, &mut |id| {
+        ids.push(replay_cursor(id))
+    })
+    .unwrap();
+    assert_eq!(
+        ids,
+        vec![Some("first".into()), None, Some("next".into()), None]
+    );
+    assert!(replay_cursor(&"x".repeat(MAX_EVENT_ID_BYTES)).is_some());
+    assert!(replay_cursor("header\nvalue").is_none());
+}
+
+#[test]
+fn streamable_reconnect_sends_last_event_id_and_empty_id_clears_it_but_legacy_does_not() {
+    use std::io::Write;
+    for legacy in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (index, body) in ["id: replay-1\ndata: {}\n\n", "id:\n\n", ": end\n\n"]
+                .into_iter()
+                .enumerate()
+            {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut cursor = None;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("Last-Event-ID")
+                    {
+                        cursor = Some(value.trim().to_owned());
+                    }
+                }
+                let expected = (!legacy && index == 1).then(|| "replay-1".to_owned());
+                assert_eq!(cursor, expected, "legacy={legacy}, request={index}");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let config = McpServerConfig {
+            transport: legacy.then_some(McpTransport::Sse),
+            ..Default::default()
+        };
+        let http = Http::new("replay", &url, &config, None).unwrap();
+        let shared = Shared::new(Vec::new(), None);
+        for _ in 0..3 {
+            http.read_stream(&shared, &mut None).unwrap();
+        }
+        assert!(http.last_event_id.lock().unwrap().is_none());
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn replay_cursor_and_data_commit_only_at_complete_sse_event_boundaries() {
+    let first = "id: committed\ndata: {}\n\n";
+    for (tail, delivered, cursor) in [
+        ("id: next\ndata: {}\n\n", 2, "next"),
+        ("id: next\ndata: {}\n", 1, "committed"),
+        ("id: next\ndata: {}", 1, "committed"),
+        ("id: next\ndata: {\"method\":", 1, "committed"),
+        ("id: next\n", 1, "committed"),
+        ("id:\n", 1, "committed"),
+        ("id:\n\n", 1, ""),
+    ] {
+        let mut events = Vec::new();
+        let mut id = String::new();
+        read_events_with_id(
+            format!("{first}{tail}").as_bytes(),
+            &|| true,
+            &mut |_, data| {
+                events.push(data.to_owned());
+                true
+            },
+            &mut |next| id = next.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(events.len(), delivered, "tail={tail:?}");
+        assert_eq!(id, cursor, "tail={tail:?}");
+    }
 }

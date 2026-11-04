@@ -40,6 +40,11 @@ impl Agent<'_> {
         self.efficiency_metrics
             .request(&request_overhead, lightweight, self.request_phase.phase);
         let requested_tokens = request.max_tokens;
+        self.record(
+            step,
+            "tool_call_policy",
+            request_control["reliability"]["call_policy"].clone(),
+        )?;
         let repairing = turn.repair.take_request();
         let mut request_selection = None;
         if !self.hermetic {
@@ -117,6 +122,9 @@ impl Agent<'_> {
             control["reliability"]["current_tools"] = json!(turn.names);
             self.session.set_control_state(control)?;
             let mut selected = serde_json::to_value(&selection)?;
+            // Keep the exact call contract with the existing per-request policy/history.
+            selected["call_policy"] =
+                self.session.control_state()["reliability"]["call_policy"].clone();
             if let Some(effective) = effective {
                 selected["temperature"] = effective["temperature"].clone();
                 selected["top_p"] = effective["top_p"].clone();

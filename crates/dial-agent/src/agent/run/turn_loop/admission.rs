@@ -183,11 +183,13 @@ impl Agent<'_> {
             .checkpoints
             .as_ref()
             .map(|checkpoints| {
-                checkpoints.begin_turn(&crate::agent::window::prompt::truncate_chars(
-                    typed_text, 60,
-                ))
+                checkpoints.begin_conversation_turn(
+                    &crate::agent::window::prompt::truncate_chars(typed_text, 60),
+                    self.session.id(),
+                )
             })
             .transpose()?;
+        message["dial_checkpoint"] = json!({"session": self.session.id(), "turn": checkpoint_turn});
         self.step_checks = StepChecks {
             turn: checkpoint_turn,
             visual: if self.hermetic {

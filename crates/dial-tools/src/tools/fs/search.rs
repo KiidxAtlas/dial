@@ -12,6 +12,7 @@
 use super::walk::SearchWalk;
 use crate::tools::{MAX_LIST, Workspace, io_message, opt_bool, opt_str, opt_u64, req_str};
 use anyhow::Result;
+use ast_grep_core::Language as _;
 use regex::bytes::{Regex, RegexBuilder};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -575,6 +576,8 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
         return Err(format!("limit must be 1..={MAX_LIST}"));
     }
     let mut skip = opt_u64(args, "skip")?.unwrap_or(0);
+    let preview = opt_bool(args, "preview")?;
+    let mut preview_paths = Vec::new();
     let unpaged = skip == 0 && resume.is_none();
     let hidden = bool_default(args, "hidden", true)?;
     let gitignore = bool_default(args, "gitignore", true)?;
@@ -602,6 +605,9 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
                 return false;
             }
             text.push_str(&row);
+            if preview && preview_paths.len() < 16 {
+                preview_paths.push(ws.rel(path));
+            }
             count += 1;
             true
         });
@@ -629,7 +635,71 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
             "; pattern_hint=whitespace is literal in a glob and does not separate patterns; for alternatives use {a,b} or one glob per call",
         );
     }
-    finish_page(text, ws, next, skip, &coverage)
+    let mut page = finish_page(text, ws, next, skip, &coverage)?;
+    if preview {
+        // Reserve the first bounded excerpt for a conventionally named test when one is
+        // already on this page. Keep the sorted path listing and the 16-candidate cap intact.
+        if let Some(index) = preview_paths.iter().position(|path| {
+            let path = std::path::Path::new(path);
+            if ast_grep_language::SupportLang::from_path(path).is_none() {
+                return false;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            path.components().any(|part| {
+                matches!(
+                    part.as_os_str().to_str(),
+                    Some("test" | "tests" | "spec" | "specs")
+                )
+            }) || stem
+                .split(['_', '-', '.'])
+                .any(|part| matches!(part, "test" | "tests" | "spec" | "specs"))
+                || stem.ends_with("Test")
+                || stem.ends_with("Tests")
+        }) {
+            preview_paths[..=index].rotate_right(1);
+        }
+        let hits: Vec<_> = preview_paths
+            .iter()
+            .map(|path| (path.as_str(), 1, 40, ""))
+            .collect();
+        // Budget before recording witnesses: never clip an already witnessed excerpt.
+        let excerpts = crate::tools::code::navigation::source_section(
+            ws,
+            &hits,
+            MAX_GREP_OUTPUT.saturating_sub(page.len()),
+        );
+        page.push_str(&excerpts);
+    }
+    Ok(page)
+}
+
+/// Restore only source previews admitted by this glob's original scope and pattern.
+pub(in crate::tools) fn glob_source_targets(
+    ws: &Workspace,
+    args: &Value,
+    text: &str,
+) -> Vec<String> {
+    if args["preview"] != true {
+        return Vec::new();
+    }
+    let (Ok(roots), Ok(pattern)) = (scopes(ws, args), req_str(args, "pattern")) else {
+        return Vec::new();
+    };
+    let Ok(glob) = Glob::new(pattern) else {
+        return Vec::new();
+    };
+    crate::tools::code::navigation::source_paths(ws, text)
+        .into_iter()
+        .filter(|path| {
+            glob.matches(path)
+                && ws
+                    .resolve(path)
+                    .is_ok_and(|path| roots.iter().any(|root| path.starts_with(root)))
+        })
+        .collect()
 }
 
 /// Compile once for bounded byte matching, on lines or whole files.
@@ -751,6 +821,16 @@ struct GrepState {
 }
 
 impl GrepState {
+    /// Explicit rendering caps take precedence; otherwise continuation came from admission
+    /// of the next file's byte reservation or from the shared walker.
+    fn continuation_cap(&self) -> &str {
+        match self.cap.as_deref() {
+            Some(cap) => cap,
+            None if self.bytes + MAX_GREP_FILE > MAX_GREP_BYTES => "byte limit of 64 MiB",
+            None => "walk limit",
+        }
+    }
+
     fn match_row(&self, rel: &str, number: usize, raw: &[u8]) -> FormattedRow {
         let line = trim_eol(raw);
         match self.matcher.find(line) {
@@ -1078,11 +1158,7 @@ impl GrepState {
             let limited =
                 !walk_complete || next.is_some() || self.unreadable > 0 || self.oversized > 0;
             let omitted = if next.is_some() {
-                let cap = match &self.cap {
-                    Some(cap) => cap.as_str(),
-                    None if self.bytes + MAX_GREP_FILE > MAX_GREP_BYTES => "byte limit of 64 MiB",
-                    None => "walk limit",
-                };
+                let cap = self.continuation_cap();
                 format!(
                     "; page_capped_by={cap}; files and matches past the cap are omitted from this page and not counted; continue by repeating this grep with cursor=next_cursor and skip=remaining_skip from [page]"
                 )
@@ -1398,7 +1474,7 @@ impl GrepState {
             let mut omitted = if next.is_some() {
                 format!(
                     "; page_capped_by={}; page_files_with_matches={}; matches and files past the cap are omitted from this page and not counted; continue by repeating this grep with cursor=next_cursor and skip=remaining_skip from [page]",
-                    self.cap.as_deref().unwrap_or("output size limit of 48 KiB"),
+                    self.continuation_cap(),
                     self.matched_files.len(),
                 )
             } else {
@@ -1468,6 +1544,7 @@ impl GrepState {
                 .is_some_and(|matched| matched.end > budget)
             {
                 let matched = self.page_matches.pop().unwrap();
+                self.cap = Some("output size limit of 48 KiB".to_string());
                 next = Some((self.files[matched.file].path.clone(), matched.consumed));
                 let cut = match self.files[matched.file].header {
                     Some((at, end)) if end == matched.start => at,
@@ -1642,6 +1719,9 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         return Err(format!("max_results must be 1..={MAX_GREP_MATCHES}"));
     }
     let glob = opt_str(args, "glob")?.map(Glob::new).transpose()?;
+    let prefix = glob
+        .as_ref()
+        .map_or_else(|| ws.root.clone(), |g| ws.root.join(&g.prefix));
     let per_file = if args
         .get("max_results")
         .is_some_and(|value| !value.is_null())
@@ -1699,7 +1779,7 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     let batch_size = if batched { PARALLEL_BATCH } else { 1 };
     let workers = if batched { workers } else { 1 };
     for root in &roots {
-        walk.run(root, &mut |path| {
+        walk.run_with_prefix(root, &prefix, &mut |path| {
             if glob.as_ref().is_none_or(|g| g.matches(&ws.rel(path))) && !state.before_resume(path)
             {
                 batch.push(path.to_path_buf());
@@ -1725,7 +1805,7 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         );
         let mut reached = false;
         for root in &roots {
-            walk.run(root, &mut |path| {
+            walk.run_with_prefix(root, &prefix, &mut |path| {
                 reached = path == stop;
                 !reached
             });

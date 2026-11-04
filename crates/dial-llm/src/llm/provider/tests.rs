@@ -1127,7 +1127,7 @@ fn endpoint_retry_resolves_rotated_or_removed_key_without_stale_fallback() {
 // All account/transport fixtures are local; these tests never refresh a token or contact ChatGPT.
 fn rotation_backend(dir: &Path, url: &str) -> Backend {
     llm::chatgpt::test_account(dir, false);
-    let path = dir.join("chatgpt-accounts.json");
+    let path = llm::chatgpt::credential_path(dir);
     let mut state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let mut other = state["accounts"]["oaiapp_test"].clone();

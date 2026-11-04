@@ -135,7 +135,9 @@ pub fn preview(id: &str, env: &Env) -> Result<String> {
         if id == "mlx-runtime" {
             text.push_str(&format!(
                 "Write embedded compatibility manifest to {}:\n{}\n",
-                env.user_dir.join("python/pyproject.toml").display(),
+                crate::config::paths::python_dir(&env.user_dir)
+                    .join("pyproject.toml")
+                    .display(),
                 PYPROJECT
             ));
         }
@@ -183,7 +185,7 @@ pub fn update(
     ensure!(!cancel.load(Ordering::Acquire), "update cancelled");
     if id == "mlx-runtime" {
         crate::config::settings_store::write_private(
-            &env.user_dir.join("python/pyproject.toml"),
+            &crate::config::paths::python_dir(&env.user_dir).join("pyproject.toml"),
             PYPROJECT.as_bytes(),
         )?;
     }
@@ -271,7 +273,8 @@ fn json(query: Query) -> Result<serde_json::Value> {
 fn stamp(path: &Path, env: &Env) -> Result<String> {
     let real = path.canonicalize().context("resolving installed tool")?;
     let meta = std::fs::metadata(&real)?;
-    let manifest = std::fs::read(env.user_dir.join("python/pyproject.toml")).ok();
+    let manifest =
+        std::fs::read(crate::config::paths::python_dir(&env.user_dir).join("pyproject.toml")).ok();
     Ok(format!(
         "{:?}:{:?}:{:?}:{:?}",
         real,
@@ -825,7 +828,7 @@ fn upstream(recipe: &Recipe, path: &Path, env: &Env, query: &mut QueryFn<'_>) ->
 }
 
 fn mlx(recipe: &Recipe, path: &Path, env: &Env, query: &mut QueryFn<'_>) -> Result<Candidate> {
-    let root = env.user_dir.join("python");
+    let root = crate::config::paths::python_dir(&env.user_dir);
     // uv's venv Python is normally a symlink to its interpreter cache outside this directory.
     // Prove ownership of the venv directory, not of the shared interpreter target.
     ensure!(
@@ -891,7 +894,7 @@ fn mlx(recipe: &Recipe, path: &Path, env: &Env, query: &mut QueryFn<'_>) -> Resu
     let plan = if change {
         let uv = locate(super::recipe("uv").context("uv recipe missing")?, env)
             .context("uv unavailable for private runtime sync")?;
-        let dir = env.user_dir.join("python");
+        let dir = crate::config::paths::python_dir(&env.user_dir);
         ensure!(
             !dir.join("pyproject.toml").is_symlink(),
             "MLX manifest is a symlink; refusing to overwrite"

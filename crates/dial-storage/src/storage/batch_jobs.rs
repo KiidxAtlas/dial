@@ -67,7 +67,7 @@ pub struct Ledger {
 }
 impl Ledger {
     pub fn open(user_dir: &Path) -> Result<Self> {
-        let dir = user_dir.join("provider-batches");
+        let dir = crate::config::paths::provider_batches_dir(user_dir);
         private_dir(&dir)?;
         let lock_path = dir.join("lock");
         let lock = platform_fs::open_nofollow_nonblocking(
@@ -98,7 +98,7 @@ impl Ledger {
         write_private(&self.path(&job.id)?, &serde_json::to_vec(job)?)
     }
     pub fn prepare(&self, mut plan: Plan) -> Result<Job> {
-        plan.validate()?;
+        plan.validate_submission()?;
         ensure!(
             crate::storage::redact::redact_text(&plan.model) == plan.model,
             "credential-shaped model identity refused"
@@ -110,7 +110,7 @@ impl Ledger {
             );
             item.prompt = crate::storage::redact::redact_text(&item.prompt).into_owned();
         }
-        plan.validate()?;
+        plan.validate_submission()?;
         ensure!(
             std::fs::read_dir(&self.dir)?.count() <= 1000,
             "batch ledger quota reached; explicitly remove old private jobs first"
@@ -142,6 +142,8 @@ impl Ledger {
             job.state == State::Prepared,
             "batch already submitted or submission uncertain; automatic replay refused"
         );
+        // Reject inadmissible legacy prepared plans before recording network uncertainty.
+        job.plan.validate_submission()?;
         job.state = State::SubmissionUnknown;
         self.save(&job)?;
         let remote = client.submit(&job.plan)?;
@@ -177,9 +179,7 @@ impl Ledger {
             &job.plan,
         )?;
         for outcome in results.values_mut() {
-            if let Outcome::Succeeded(text) = outcome {
-                *text = crate::storage::redact::redact_text(text).into_owned();
-            }
+            outcome.redact(|text| crate::storage::redact::redact_text(text).into_owned());
         }
         job.results = Some(results);
         job.state = State::ResultsReady;

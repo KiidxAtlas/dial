@@ -278,5 +278,159 @@ class InstallDevTests(unittest.TestCase):
                     self.module.positive_keep(value)
 
 
+class CheckTargetTests(unittest.TestCase):
+    def test_python_targets_use_selected_interpreter_and_stop_on_failure(self):
+        targets = {
+            "test-build": ["scripts/test-build.py"],
+            "test-windows-contract": ["scripts/test-windows-contract.py"],
+            "test-packaging": ["scripts/test-packaging.py", "scripts/check-packaging.py"],
+            "test-release-policy": ["scripts/test-release-policy.py"],
+        }
+        with tempfile.TemporaryDirectory(prefix="dial-check-targets-") as directory:
+            root = Path(directory)
+            shutil.copy2(ROOT / "Makefile", root / "Makefile")
+            runner = root / "selected-python"
+            runner.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> calls\n"
+                "[ \"${FAIL_CHECK:-0}\" != 1 ]\n"
+            )
+            runner.chmod(0o755)
+            env = {key: value for key, value in os.environ.items()
+                   if key not in ("MAKEFLAGS", "MFLAGS", "FAIL_CHECK")}
+            for target, expected in targets.items():
+                for fail in (False, True):
+                    with self.subTest(target=target, fail=fail):
+                        (root / "calls").unlink(missing_ok=True)
+                        result = subprocess.run(
+                            ["make", target, f"PYTHON={runner}"], cwd=root,
+                            env=dict(env, FAIL_CHECK=str(int(fail))),
+                            capture_output=True, text=True,
+                        )
+                        self.assertEqual(result.returncode == 0, not fail,
+                                         result.stdout + result.stderr)
+                        self.assertEqual((root / "calls").read_text().splitlines(),
+                                         expected[:1] if fail else expected)
+
+
+    def test_release_check_parses_both_shell_scripts_and_aggregates_failures(self):
+        with tempfile.TemporaryDirectory(prefix="dial-release-check-") as directory:
+            root = Path(directory)
+            shutil.copy2(ROOT / "Makefile", root / "Makefile")
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "release.sh").write_text("exit 0\n")
+            (scripts / "preflight.sh").write_text("if then\n")
+            runner = root / "python-fixture"
+            runner.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> calls\nexit "${FAIL_PYTHON:-0}"\n')
+            runner.chmod(0o755)
+            for failure in ("0", "1"):
+                with self.subTest(failure=failure):
+                    (root / "calls").unlink(missing_ok=True)
+                    result = subprocess.run(["make", "release-check", f"PYTHON={runner}", "RELEASE_TAG="], cwd=root,
+                                            env=dict(os.environ, FAIL_PYTHON=failure), capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("preflight.sh", result.stderr)
+                    self.assertEqual((root / "calls").read_text().splitlines(),
+                                     ["scripts/release-policy.py check", "scripts/check-packaging.py",
+                                      "scripts/release-policy.py tools"])
+
+    def test_preflight_stops_before_compilation_on_readiness_failure_even_with_keep_going(self):
+        with tempfile.TemporaryDirectory(prefix="dial-preflight-readiness-") as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            shutil.copy2(ROOT / "scripts/preflight.sh", scripts / "preflight.sh")
+            (scripts / "release-policy.py").write_text("pass\n")
+            (root / "Makefile").write_text('release-check:\n\t@echo readiness >> calls\n\t@exit 1\n')
+            tools = root / "bin"
+            tools.mkdir()
+            stubs = {
+                "git": f'echo "{root}"\n',
+                "rustup": f'if [ "$1" = which ]; then echo "{tools}/cargo"; else echo aarch64-apple-darwin; fi\n',
+                "rustc": "printf 'rustc fixture\\nhost: aarch64-apple-darwin\\n'\n",
+                "cargo": 'echo "cargo $*" >> calls\nexit 97\n',
+                "uv": 'while [ "$1" != --with-requirements ]; do shift; done\nshift 2\nexec "$@"\n',
+            }
+            for name, body in stubs.items():
+                path = tools / name
+                path.write_text("#!/bin/sh\n" + body)
+                path.chmod(0o755)
+            env = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", PREFLIGHT_KEEP_GOING="1")
+            for args in ([], ["--quick"]):
+                with self.subTest(args=args):
+                    (root / "calls").unlink(missing_ok=True)
+                    result = subprocess.run(["bash", str(scripts / "preflight.sh"), "--in-place", *args],
+                                            cwd=root, env=env, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual((root / "calls").read_text().splitlines(), ["readiness"])
+
+    def test_preflight_uses_selected_revision_dependencies_and_check_interface(self):
+        with tempfile.TemporaryDirectory(prefix="dial-preflight-test-") as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            shutil.copy2(ROOT / "scripts/preflight.sh", scripts / "preflight.sh")
+            (scripts / "requirements-ci.txt").write_text("selected-legacy\n")
+            (scripts / "test-install.sh").write_text("exit 0\n")
+            for name in ("test-build", "test-windows-contract", "test-packaging",
+                         "check-packaging", "test-release-policy", "interactive_smoke",
+                         "interactive_surfaces", "session_contention_smoke", "side_lifecycle_smoke"):
+                path = (scripts if "smoke" not in name and name != "interactive_surfaces"
+                        else root / "examples/benchmarks") / f"{name}.py"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("pass\n")
+            tiers = "test-drivers test-python test-bench-offline test-nextest test-rust test-smoke"
+            (root / "Makefile").write_text(f".PHONY: {tiers}\n{tiers}:\n\t@true\n")
+            env = dict(os.environ, GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.invalid",
+                       GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.invalid")
+            for key in ("MAKEFLAGS", "MFLAGS", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+                env.pop(key, None)
+
+            def git(*args):
+                return subprocess.check_output(
+                    ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", *args],
+                    cwd=root, env=env, text=True, stderr=subprocess.STDOUT,
+                ).strip()
+
+            git("init", "-q")
+            git("add", "Makefile", "scripts", "examples")
+            git("commit", "-qm", "legacy check interface")
+            legacy = git("rev-parse", "HEAD")
+            (scripts / "requirements-ci.lock").write_text("selected-lock\n")
+            shared = "test-install test-build test-windows-contract test-packaging test-release-policy"
+            with (root / "Makefile").open("a") as handle:
+                handle.write(f".PHONY: {shared}\n{shared}:\n\t@true\n")
+            git("add", "Makefile", "scripts/requirements-ci.lock")
+            git("commit", "-qm", "shared check interface")
+            modern = git("rev-parse", "HEAD")
+            # The launching checkout must not supply dependencies for either selected revision.
+            (scripts / "requirements-ci.lock").write_text("wrong-current-lock\n")
+            (scripts / "requirements-ci.txt").write_text("wrong-current-direct\n")
+            tools = root / "fake-tools"
+            tools.mkdir()
+            stubs = {
+                "cargo": "exit 0\n",
+                "rustup": f"if [ \"$1\" = which ]; then echo '{tools}/cargo'; else echo aarch64-apple-darwin; fi\n",
+                "rustc": "printf 'rustc test\\nhost: aarch64-apple-darwin\\n'\n",
+                "uv": 'while [ "$1" != --with-requirements ]; do shift; done\n'
+                      'cat "$2" >> "$PREFLIGHT_DEPENDENCY_LOG"\nshift 2\nexec "$@"\n',
+            }
+            for name, body in stubs.items():
+                path = tools / name
+                path.write_text("#!/bin/sh\n" + body)
+                path.chmod(0o755)
+            log = root / "dependencies.log"
+            env.update(PATH=f"{tools}{os.pathsep}{env['PATH']}", PREFLIGHT_DEPENDENCY_LOG=str(log))
+            for revision, expected in ((legacy, "selected-legacy"), (modern, "selected-lock")):
+                with self.subTest(revision=revision):
+                    log.unlink(missing_ok=True)
+                    result = subprocess.run(["bash", str(scripts / "preflight.sh"), "--force", revision],
+                                            cwd=root, env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertGreater(len(log.read_text().splitlines()), 5)
+                    self.assertEqual(set(log.read_text().splitlines()), {expected})
+
+
 if __name__ == "__main__":
     unittest.main()

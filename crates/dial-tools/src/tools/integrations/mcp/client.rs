@@ -111,10 +111,11 @@ pub(super) struct Shared {
     stderr: Mutex<Vec<u8>>,
     /// Set once the server's stderr reached EOF.
     stderr_done: AtomicBool,
+    signal_revision: AtomicU64,
     /// Answer to `roots/list`.
     roots: Vec<PathBuf>,
     /// Where signals for the supervisor go.
-    signals: Option<Sender<Signal>>,
+    signals: Option<super::signals::Sender>,
 }
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -124,11 +125,12 @@ pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Shared {
-    pub(super) fn new(roots: Vec<PathBuf>, signals: Option<Sender<Signal>>) -> Self {
+    pub(super) fn new(roots: Vec<PathBuf>, signals: Option<super::signals::Sender>) -> Self {
         Shared {
             state: Mutex::default(),
             stderr: Mutex::default(),
             stderr_done: AtomicBool::new(false),
+            signal_revision: AtomicU64::new(0),
             roots,
             signals,
         }
@@ -157,8 +159,11 @@ impl Shared {
     }
 
     pub(super) fn signal(&self, signal: Signal) {
+        if matches!(signal, Signal::ToolsChanged | Signal::NotificationDegraded) {
+            self.signal_revision.fetch_add(1, Ordering::AcqRel);
+        }
         if let Some(sender) = &self.signals {
-            let _ = sender.send(signal);
+            sender.send(signal);
         }
     }
 
@@ -344,6 +349,10 @@ pub struct Client {
 }
 
 impl Client {
+    pub(super) fn signal_revision(&self) -> u64 {
+        self.shared.signal_revision.load(Ordering::Acquire)
+    }
+
     /// Starts `program` and its helper threads. No protocol traffic yet; see [`Client::initialize`].
     pub(super) fn spawn(server: &str, config: &McpServerConfig, shared: Shared) -> Result<Client> {
         let mut command = Command::new(&config.program);

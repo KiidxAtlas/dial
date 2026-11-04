@@ -1,7 +1,7 @@
 //! Launch-mode flags: validation, normalization, and application.
 //!
 //! Flags that Dial honors are applied through real subsystems:
-//! - `--plan [model]` → plan mode on; a named model becomes the `planner` model role (`ModeFlags::apply_plan_model`).
+//! - `--plan [model]` → plan mode on; a named model becomes a launch-only override (`ModeFlags::apply_plan_model`).
 //! - `--goal <OBJECTIVE>` → fresh interactive session; the goal engine starts with the objective before the first turn.
 //! - `--plan-yolo` / `--plan-yolo-into <MODEL>` → plan mode on; the first plan is approved automatically and execution hands off to the target model.
 //! - `--advisor` → the `coach` role reviews tool evidence and can request one in-loop repair (launch-scoped).
@@ -318,7 +318,7 @@ impl ModeFlags {
         }
     }
 
-    /// Apply `--plan <model>` as the in-memory `planner` model role.
+    /// Apply `--plan <model>` as a launch-only plan model override, leaving coach unchanged.
     /// The spec resolves through the `/switch` selector, so `@role`, `provider/id`, and bare ids all work.
     /// Bare `--plan` and no `--plan` return the config unchanged.
     pub fn apply_plan_model(
@@ -333,7 +333,7 @@ impl ModeFlags {
                 "Model \"{spec}\" not found. Run \"dial models\" to see available models."
             )
         })?;
-        config.model_roles.insert("planner".to_owned(), selection);
+        config.plan_model = Some(selection);
         config.validate()?;
         Ok(config)
     }

@@ -8,7 +8,7 @@
 use super::input;
 use super::input::{Handle, Input};
 use super::wake;
-use crate::runtime::execution::{ShellLaunch, ShellStdin};
+use crate::runtime::execution::{ProcessOutcome, ShellLaunch, ShellStdin};
 use crate::storage::artifact::ArtifactSpool;
 use crate::tools::Workspace;
 use crate::tools::exec::shell::session::SessionClaim;
@@ -314,6 +314,27 @@ pub(super) enum State {
 }
 
 impl State {
+    /// The same native completion receipt used by tool results and read-only job views.
+    pub(super) fn outcome(&self, ring: &Ring) -> ProcessOutcome {
+        let status = match self {
+            Self::Exited { status, .. } => *status,
+            Self::Running => None,
+        };
+        ProcessOutcome {
+            started: true,
+            exit_code: status.and_then(|status| status.code()),
+            signal: status
+                .as_ref()
+                .and_then(crate::platform::process::exit_signal),
+            timed_out: false,
+            cancelled: false,
+            output_complete: ring.closed
+                && ring.reached_eof
+                && ring.error.is_none()
+                && ring.elided_bytes == 0,
+        }
+    }
+
     pub(super) fn label(&self) -> String {
         match self {
             State::Running => "running".to_string(),

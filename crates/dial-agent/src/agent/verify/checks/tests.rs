@@ -74,6 +74,76 @@ fn printed_exit_code_earns_no_behavior_credit_without_observed_completion() {
 }
 
 #[test]
+fn check_log_identity_never_falls_back_to_old_or_rendered_output() {
+    use crate::runtime::execution::OutputIntegrity;
+
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    let store = crate::storage::artifact::ArtifactStore::new(state.path()).unwrap();
+    let original = store.retain_exact_bytes(b"original log").unwrap();
+    agent.workspace = agent.workspace.clone().with_artifacts(store.clone());
+    let call = ToolCall {
+        id: "focused-check:log".into(),
+        name: "bash".into(),
+        arguments: json!({"command":"printf check"}),
+        malformed_arguments: false,
+    };
+    let output = ToolOutput::ok("filtered, unrelated presentation".into())
+        .with_process(completed_process(0))
+        .with_output_integrity(OutputIntegrity {
+            artifact: Some(original.clone()),
+            ..Default::default()
+        });
+    agent.note_verification(&call, &output, &mut NullUi);
+    let reference = agent
+        .step_checks
+        .evidence
+        .evidence_ref("printf check")
+        .unwrap()
+        .to_owned();
+    let record = store.evidence_record(&reference).unwrap();
+    assert_eq!(record.representation_uri, original);
+    assert_eq!(
+        store.evidence_bytes(&record, 4096).unwrap(),
+        b"original log"
+    );
+
+    // Each is a new observation, including absent, invalid and evicted native log identities.
+    // An unrelated retained output exists throughout and must never be substituted.
+    store.retain_exact_bytes(b"unrelated newer log").unwrap();
+    for artifact in [
+        None,
+        Some("artifact://invalid".into()),
+        Some(format!("artifact://{}", "0".repeat(64))),
+    ] {
+        agent.note_verification(&call, &output, &mut NullUi);
+        assert!(
+            agent
+                .step_checks
+                .evidence
+                .evidence_ref("printf check")
+                .is_some()
+        );
+        let missing = ToolOutput::ok("original log".into())
+            .with_process(completed_process(0))
+            .with_output_integrity(OutputIntegrity {
+                artifact,
+                ..Default::default()
+            });
+        agent.note_verification(&call, &missing, &mut NullUi);
+        assert!(
+            agent
+                .step_checks
+                .evidence
+                .evidence_ref("printf check")
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn only_confirmed_code_failures_drive_automatic_repair() {
     let root = tempfile::tempdir().unwrap();
     let config = Config::default();
