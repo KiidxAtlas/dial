@@ -57,6 +57,11 @@ fn installed_languages_reports_only_resolvable_operator_runtimes() {
     std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
     config.kernel.python = planted.to_str().unwrap().into();
     assert!(installed_languages(dir.path(), &config).is_empty());
+    // An aliased workspace must not hide a planted runtime from the containment check.
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("workspace");
+    std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+    assert!(installed_languages(&alias, &config).is_empty());
 }
 
 #[test]

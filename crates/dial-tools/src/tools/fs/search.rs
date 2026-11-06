@@ -276,7 +276,11 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
             if fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
                 return Err(format!("search scopes must not follow symlinks: {input:?}"));
             }
-            if p == ws.root {
+            // Ancestors above an authorized root are not search scopes. They may
+            // include OS aliases such as /var -> /private/var on macOS.
+            if p.canonicalize()
+                .is_ok_and(|canonical| ws.read_roots().any(|root| root == canonical))
+            {
                 break;
             }
             ancestor = p.parent();

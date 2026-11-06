@@ -334,14 +334,23 @@ fn read_only_roots_do_not_allow_symlink_escapes() {
         .unwrap();
     let path = extra.path().join("escape/secret.txt");
     assert!(run(&ws, "read", json!({"path": path})).is_error);
+    // A symlink above the granted root is an alias for the root, not a scope escape.
+    let aliases = tempfile::tempdir().unwrap();
+    let parent_alias = aliases.path().join("parent");
+    std::os::unix::fs::symlink(extra.path().parent().unwrap(), &parent_alias).unwrap();
+    let aliased_root = parent_alias.join(extra.path().file_name().unwrap());
+    for root in [extra.path(), aliased_root.as_path()] {
+        let out = run(&ws, "grep", json!({"path": root, "pattern": "canary"}));
+        assert!(
+            !out.is_error && !out.text.contains("outside-canary"),
+            "{}",
+            out.text
+        );
+    }
     let out = run(
         &ws,
         "grep",
-        json!({"path": extra.path(), "pattern": "canary"}),
+        json!({"path": extra.path().join("escape"), "pattern": "canary"}),
     );
-    assert!(
-        !out.is_error && !out.text.contains("outside-canary"),
-        "{}",
-        out.text
-    );
+    assert!(out.is_error, "{}", out.text);
 }

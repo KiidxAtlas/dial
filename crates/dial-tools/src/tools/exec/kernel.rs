@@ -284,6 +284,11 @@ pub(crate) fn resolve_operator_executable(
     program: &str,
     label: &str,
 ) -> Result<PathBuf, String> {
+    // Compare canonical identities even when the caller names a workspace through an
+    // OS alias (for example /var on macOS) or another symlinked ancestor.
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve editable workspace: {e}"))?;
     let path = Path::new(program);
     let candidate = if path.is_absolute() || path.components().count() > 1 {
         let candidate = if path.is_absolute() {
@@ -303,7 +308,7 @@ pub(crate) fn resolve_operator_executable(
     let resolved = candidate
         .canonicalize()
         .map_err(|e| format!("{label} {program:?}: {e}"))?;
-    if resolved.starts_with(workspace) {
+    if resolved.starts_with(&workspace) {
         return Err(format!(
             "{label} must be an operator-installed executable outside the editable workspace"
         ));

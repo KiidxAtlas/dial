@@ -606,6 +606,7 @@ fn tool_results(request: &Value) -> Vec<String> {
 #[test]
 fn repository_git_is_offered_without_loading_but_pinned_selections_stay_pinned() {
     with_agent("[assistance]\nlean_local=false\n", |agent| {
+        std::fs::create_dir(agent.workspace.root().join(".git")).unwrap();
         assert!(
             agent
                 .workspace
@@ -618,6 +619,7 @@ fn repository_git_is_offered_without_loading_but_pinned_selections_stay_pinned()
         assert!(agent.offered().iter().any(|name| name == "git"));
     });
     with_agent("[harness]\ntools=['read','bash']\n", |agent| {
+        std::fs::create_dir(agent.workspace.root().join(".git")).unwrap();
         assert!(
             agent
                 .workspace

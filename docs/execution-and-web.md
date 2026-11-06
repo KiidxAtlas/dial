@@ -135,6 +135,10 @@ as cell errors without discarding an otherwise healthy namespace. Node 26 uses t
 error hook, while earlier supported releases use the legacy REPL error path. Strings crossing the
 JSON transport are normalized to well-formed Unicode, including truncated output and nested values.
 
+Both eval runtimes must resolve outside the editable workspace. Dial compares canonical
+workspace and executable identities, including when the workspace has symlinked ancestors;
+an alias cannot make a workspace-planted interpreter count as operator-installed.
+
 Computer helpers in JavaScript and Python consume the host's raw structured tool data. Returned
 values, display text, and screenshot artifacts remain available through the same approval-gated
 bridge; a denied or malformed response raises an error rather than returning an empty result.

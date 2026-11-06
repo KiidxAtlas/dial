@@ -330,6 +330,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Reliability corrections
 
+- Runtime containment compares canonical workspace and executable paths, so symlinked
+  workspace ancestors cannot disguise a workspace-planted eval interpreter. Search scope
+  checks stop at authorized read roots: OS aliases above a root no longer cause false
+  refusals, while symlink scopes and escapes remain blocked.
 - Shell results no longer repeat the launch receipt line, and omit the `[complete output: …]`
   link when the whole output is already inline; launch facts and the artifact stay in the
   structured execution record. A clean first failure (known effects, no committed paths,
