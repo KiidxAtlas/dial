@@ -226,8 +226,8 @@ fn probe_child() -> Result<(), String> {
     // SAFETY: clone without CLONE_VM acts like fork. On a regression the child immediately
     // exits using only _exit; the parent reaps it below. Arguments contain no dereferenced pointer.
     let pid = unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0, 0, 0, 0) };
-    // SAFETY: only the newly created probe child enters this branch; _exit never unwinds.
     if pid == 0 {
+        // SAFETY: only the newly created probe child enters this branch; _exit never unwinds.
         unsafe { libc::_exit(92) }
     }
     if pid > 0 {
