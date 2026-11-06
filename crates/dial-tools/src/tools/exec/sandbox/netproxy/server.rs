@@ -460,9 +460,7 @@ pub fn bridge_main() -> i32 {
     let mut command = std::process::Command::new(&program);
     command.args(args);
     #[cfg(target_os = "linux")]
-    if fork_fence
-        && let Err(error) = super::super::fork_fence::direct(&mut command)
-    {
+    if fork_fence && let Err(error) = super::super::fork_fence::direct(&mut command) {
         eprintln!("dial: cannot establish eval process-fork containment: {error}");
         return 125;
     }
