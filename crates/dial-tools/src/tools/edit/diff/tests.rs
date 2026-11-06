@@ -28,4 +28,16 @@ fn separate_edits_stay_separate_hunks_without_unchanged_lines_marked() {
 fn bounds_large_replacements_and_reports_newline_changes() {
     assert!(preview(&"old\n".repeat(100), "new\n").contains("truncated"));
     assert!(preview("same", "same\n").contains("final newline added"));
+    assert!(preview("same\n", "same").contains("final newline removed"));
+}
+
+#[test]
+fn emptying_or_creating_a_file_reports_no_newline_note() {
+    let deleted = preview("alpha\nbeta\n", "");
+    assert!(
+        deleted.contains("-alpha") && deleted.contains("-beta"),
+        "{deleted}"
+    );
+    assert!(!deleted.contains("final newline"), "{deleted}");
+    assert!(!preview("", "alpha\n").contains("final newline"));
 }

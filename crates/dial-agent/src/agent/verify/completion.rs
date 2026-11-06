@@ -1,7 +1,8 @@
 //! Stop-time handling for open work and missing evidence. Text alone never closes pending todos:
 //! an accepted completed answer closes only the in-progress task (see
-//! `TodoList::complete_reported_work`), and not in goal mode. Edits with no passing check earn
-//! one reminder per round; after it the answer is accepted, with the gap disclosed, not hidden.
+//! `TodoList::complete_reported_work`), and not in goal mode. Tests are never mandatory: edits with
+//! no passing check are accepted with the gap disclosed; only a failure the gate itself observed
+//! earns one reminder per round.
 use crate::agent::workflow::todo::{Status, TodoList};
 use serde_json::{Value, json};
 
@@ -103,7 +104,7 @@ impl Finish {
 pub fn schema() -> Value {
     json!({"type":"function","function":{
         "name":"finish",
-        "description":"Optional structured outcome; ordinary work completes with a plain final answer and needs no finish call. completed reports finished work and requires no live tasks still running. Todos are optional progress bookkeeping; an accepted completed report closes only the in-progress task and leaves pending entries open. Explicitly blocked tasks must be resolved or reported blocked. A review-pending response continues the turn: inspect the supplied diff and requested evidence, then call finish again. blocked means a concrete missing prerequisite prevents further work. needs_input asks a specific question and waits for the user's response inside the tool call, then continues the same turn; optionally provide 1–8 choices in options, and the interactive UI always offers an Other typed response. Both blocked and needs_input require reason and leave todos open. Use as the last call in a batch. Never claim completed for promised or unverified work.",
+        "description":"Optional structured outcome; ordinary work ends with a plain final answer instead. completed reports finished, verified work and requires no live tasks; it closes only the in-progress todo. A review-pending response continues the turn: inspect the supplied diff and evidence, then call finish again. blocked names a concrete missing prerequisite. needs_input asks a specific question (optional 1–8 options) and continues the turn with the answer. blocked and needs_input require reason. Use as the last call in a batch.",
         "parameters":{"type":"object","properties":{
             "outcome":{"type":"string","enum":["completed","blocked","needs_input"]},
             "summary":{"type":"string","minLength":1,"maxLength":8192},
@@ -293,20 +294,31 @@ impl CompletionGuard {
     }
 
     /// `unverified` names the applicable checks when this turn's edits have no passing check on the
-    /// current revision, `None` when evidence is not owed. Without `can_remind`, or once the
-    /// reminder was spent, the gap is disclosed instead of blocking the answer.
-    pub fn evidence(&mut self, unverified: Option<&[String]>, can_remind: bool) -> EvidenceGate {
+    /// current revision, `None` when evidence is not owed. `failures` is what the gate's own run of
+    /// those checks observed. A missing check is disclosed, never demanded; only an observed failure
+    /// earns one reminder (carrying its output), and without `can_remind` or once spent it is
+    /// disclosed too.
+    pub fn evidence(
+        &mut self,
+        unverified: Option<&[String]>,
+        failures: &[String],
+        can_remind: bool,
+    ) -> EvidenceGate {
         let Some(checks) = unverified else {
             return EvidenceGate::Accept;
         };
         let applicable = checks.join(", ");
-        if !can_remind || std::mem::replace(&mut self.evidence_reminded, true) {
+        if failures.is_empty()
+            || !can_remind
+            || std::mem::replace(&mut self.evidence_reminded, true)
+        {
             return EvidenceGate::Disclose(format!(
                 "\n\nUnverified: no relevant check passed after the last edit (applicable: {applicable})."
             ));
         }
         EvidenceGate::Remind(format!(
-            "[Dial] Files changed this turn, but no relevant check has passed on the current revision (applicable: {applicable}). Run the relevant check now. If it cannot run here, say so and why in the final answer. This reminder is sent once."
+            "[Dial] The completion gate ran the applicable checks after this turn's edits and they failed (applicable: {applicable}). Fix the failure, or explain it in the final answer. This reminder is sent once.\nThe completion gate ran the applicable checks:\n{}",
+            failures.join("\n")
         ))
     }
 
@@ -315,16 +327,13 @@ impl CompletionGuard {
     }
 }
 
-/// The evidence reminder plus what the gate's own check run observed, so the next request can
-/// repair without rerunning the check first.
-pub fn with_gate_failures(note: String, failures: &[String]) -> String {
-    if failures.is_empty() {
-        return note;
-    }
-    format!(
-        "{note}\nThe completion gate ran the applicable checks:\n{}",
-        failures.join("\n")
-    )
+/// A successful `eval` cell whose code asserts its results is verification the model already ran:
+/// a failed assertion makes the cell an error. It counts like a passing shell check.
+pub(in crate::agent) fn asserting_eval(code: &str) -> bool {
+    code.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == "assert")
+        || code.contains("assert.")
+        || code.contains("assert(")
 }
 
 /// Preserve a candidate as unaccepted work alongside the controller's exact missing prerequisite.

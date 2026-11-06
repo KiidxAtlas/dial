@@ -166,3 +166,33 @@ fn no_tools_survives_protocol_session_switches() {
         assert!(agent.modes.launch.deferred_tools.is_empty());
     });
 }
+
+#[test]
+fn read_only_launch_roots_survive_session_preparation_without_becoming_write_grants() {
+    with_agent(|agent| {
+        let extra = tempfile::tempdir().unwrap();
+        let path = extra.path().join("reference.txt");
+        std::fs::write(&path, "reference").unwrap();
+        agent
+            .set_launch(Launch {
+                read_only_dirs: vec![extra.path().to_path_buf()],
+                ..Launch::default()
+            })
+            .unwrap();
+        assert!(agent.workspace.resolve_read(path.to_str().unwrap()).is_ok());
+        assert!(agent.workspace.resolve(path.to_str().unwrap()).is_err());
+        let session = crate::storage::session::Session::ephemeral();
+        let prepared = agent.prepare_session_workspace(&session).unwrap();
+        agent.swap_session_prepared(session, prepared);
+        assert!(agent.workspace.resolve_read(path.to_str().unwrap()).is_ok());
+        assert!(agent.workspace.additional_roots().is_empty());
+        assert!(agent.workspace.resolve(path.to_str().unwrap()).is_err());
+        agent.set_launch(Launch::default()).unwrap();
+        assert!(
+            agent
+                .workspace
+                .resolve_read(path.to_str().unwrap())
+                .is_err()
+        );
+    });
+}

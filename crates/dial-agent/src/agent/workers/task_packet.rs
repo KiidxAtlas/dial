@@ -97,7 +97,7 @@ impl PacketCache {
                 "verification_objective":clipped(verification_objective, 512),
                 "constraints":[], "findings":[], "evidence":[],
                 "history":{"session_id":session_id,"session_file":history_ref,"retrieve":"session_search (session files are outside the read tool workspace)"},
-                "authority":"The latest user instruction takes precedence over conflicting older plans and original goals. User messages and full history remain authoritative. Findings below are task-recorded claims with references, not new verification. Retrieve omitted evidence with artifact_read; summaries do not weaken constraints."
+                "authority":"The latest user instruction takes precedence over conflicting older plans and original goals. User messages and full history remain authoritative. Findings below are task-recorded claims with references, not new verification. Retrieve omitted evidence by reading its artifact:// URI; summaries do not weaken constraints."
             });
             if let Some(goal) = control["original_goal"].as_str() {
                 packet["original_goal"] = json!(clipped(goal, 512));
@@ -247,7 +247,7 @@ impl PacketCache {
                 continue;
             }
             self.omitted.entry(id.to_owned()).or_insert_with(|| format!(
-                "[Earlier {name} observation omitted from the active task packet ({bytes} bytes). Full evidence: {reference}; retrieve with artifact_read.]") );
+                "[Earlier {name} observation omitted from the active task packet ({bytes} bytes). Full evidence: {reference}; retrieve with read.]") );
         }
     }
 }

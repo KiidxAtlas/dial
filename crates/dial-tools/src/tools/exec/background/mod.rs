@@ -29,6 +29,8 @@ mod wake;
 pub use wake::notify_cancel;
 #[cfg(all(test, unix))]
 mod tests;
+#[cfg(test)]
+mod tool_tests;
 
 use crate::config::types::Config;
 use crate::runtime::execution::{
@@ -52,6 +54,66 @@ use table::{Attachment, Ring, Snapshot, State, Table, kill_all_entries, kill_ent
 pub enum AdoptedJob {
     Shell(Box<crate::tools::exec::shell::ForegroundJob>),
     Cell(CellJob),
+    Tool(ToolJob),
+}
+
+/// Finite tool work already admitted by the controller through normal authorization.
+/// Cancellation is cooperative; the owner retains a killed job until its callback returns.
+/// Drop requests cancellation but cannot hard-stop a callback that ignores the flag.
+/// Results above 8 MiB (serialized) become explicit retention failures, never apparent successes.
+pub struct ToolJob {
+    pub name: Option<String>,
+    pub command: String,
+    pub work: Box<dyn FnOnce(Arc<AtomicBool>) -> ToolOutput + Send>,
+}
+
+/// Validated tool launch; parsing does not authorize or execute the nested call.
+pub struct ToolCallRequest {
+    pub name: Option<String>,
+    pub tool: String,
+    pub arguments: Value,
+}
+
+pub fn tool_call_request(args: &Value) -> Result<Option<ToolCallRequest>, String> {
+    let Some(call) = args.get("call") else {
+        return Ok(None);
+    };
+    if req_str(args, "action")? != "start" {
+        return Err("call is only supported by bg start".into());
+    }
+    if args.get("command").is_some() {
+        return Err("bg start requires exactly one of command or call".into());
+    }
+    let object = args.as_object().ok_or("bg arguments must be an object")?;
+    if let Some(field) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "action" | "name" | "call"))
+    {
+        return Err(format!(
+            "{field} is not supported for background tool calls"
+        ));
+    }
+    let call = call.as_object().ok_or("call must be an object")?;
+    if call.len() != 2 || !call.contains_key("name") || !call.contains_key("arguments") {
+        return Err("call requires only name and arguments".into());
+    }
+    let tool = call["name"]
+        .as_str()
+        .filter(|name| !name.trim().is_empty())
+        .ok_or("call.name must be a nonempty string")?
+        .to_owned();
+    let arguments = call["arguments"]
+        .as_object()
+        .ok_or("call.arguments must be an object")?;
+    let name = opt_str(args, "name")?.map(str::to_owned);
+    if let Some(name) = &name {
+        table::validate_name(name)?;
+    }
+    Ok(Some(ToolCallRequest {
+        name,
+        tool,
+        arguments: Value::Object(arguments.clone()),
+    }))
 }
 
 const MAX_COMMAND: usize = 64 * 1024;
@@ -71,14 +133,8 @@ enum WaitFor {
     PtyStartup,
 }
 
-const DESCRIPTION: &str = "Background jobs owned by this session; ending the session kills them. \
-`start` a command (optional unique `name`, `cwd`; `pty` for a terminal, `stdin` for a pipe). \
-`output` returns new output (`tail` N lines; PTY: the current screen). `wait` blocks until the \
-`until` regex matches or the job exits (default 5 s, max 300, 0 = unlimited). \
-`input`/`close_stdin`/`resize` drive an interactive job; `list`; `kill` (`name` or `all`). `ready` on \
-a named start/wait also waits for a log regex and/or a TCP port. At most 32 KiB of output is inline; \
-the rest stays in artifacts. `persist=true` (Unix, named, pipe only) keeps a finite-lifetime job \
-across restarts; pass it on every call for that job.";
+const DESCRIPTION: &str = "bg: run and monitor background jobs or logs. Jobs end with the session; `wait` blocks until `until` matches or the job exits; \
+output past 32 KiB stays in artifacts.";
 
 /// Owns every background process; dropping it kills them all (each entry kills its process
 /// group when dropped).
@@ -139,7 +195,10 @@ impl Background {
                 name: proc.name.clone(),
                 command: proc.command.clone(),
                 status: proc.state.label(),
-                process_outcome: Some(proc.state.outcome(&lock(&proc.ring))),
+                process_outcome: {
+                    let ring = lock(&proc.ring);
+                    (!ring.tool_job).then(|| proc.state.outcome(&ring))
+                },
                 running: proc.is_running(),
                 terminal: proc.terminal,
             })
@@ -172,6 +231,9 @@ impl Background {
         on_event: Option<&(dyn Fn(ToolEvent) + Sync)>,
         cancel: &AtomicBool,
     ) -> Result<ToolOutput, String> {
+        if tool_call_request(args)?.is_some() {
+            return Err("background tool calls require controller admission; this direct tool context cannot launch them".into());
+        }
         if opt_bool(args, "persist")? {
             return durable::dispatch(ws, args, cancel, &self.interrupt);
         }
@@ -431,6 +493,11 @@ impl Background {
         let mut matched = None;
         let mut next_probe = Instant::now();
         let initial = self.table().snapshot(name)?;
+        if lock(&initial.ring).tool_job && (until.is_some() || port.is_some()) {
+            return Err(
+                "tool jobs support completion waits, not shell readiness conditions".into(),
+            );
+        }
         loop {
             let seen = wake::generation();
             if let Some(on_event) = on_event {
@@ -463,7 +530,7 @@ impl Background {
                 ));
             }
             let snap = self.table().snapshot(name)?;
-            if snap.pid != initial.pid {
+            if !Arc::ptr_eq(&snap.ring, &initial.ring) {
                 return Err(format!("not ready: {name} was replaced while waiting"));
             }
             if let Some(refusal) =
@@ -534,27 +601,42 @@ impl Background {
                 ));
             }
             if exited {
+                if lock(&snap.ring).tool_job {
+                    return Ok(snapshot_output(ws, &snap, None));
+                }
                 let state = snap.state.label();
                 // The exit result carries the unread output, so a finished build or test needs no
                 // separate `output` round trip. Shares the model-visible cursor with `output`.
                 let (body, lost, integrity) = take_presented(ws, &snap, None);
                 let output = render_body(&snap, body, lost, None);
                 let observation_satisfied = !conditions && lock(&snap.ring).error.is_none();
+                // A plain `wait` ends when its pattern matches or the job exits, so a clean exit
+                // is a normal ending that reports the unmatched pattern. Service readiness and
+                // failed exits remain errors.
+                let clean_exit = !service
+                    && lock(&snap.ring).error.is_none()
+                    && matches!(snap.state, State::Exited { status: Some(status), .. } if status.success());
+                let unmet = until.as_ref().map_or_else(
+                    || "port readiness".into(),
+                    |pattern| {
+                        format!(
+                            "/{pattern}/{}",
+                            if port.is_some() {
+                                " and port readiness"
+                            } else {
+                                ""
+                            }
+                        )
+                    },
+                );
                 return Ok(snap.with_launch(
-                    if conditions {
+                    if conditions && clean_exit {
+                        ToolOutput::ok(format!(
+                            "finished: {name} {state} without matching {unmet}\n{output}"
+                        ))
+                    } else if conditions {
                         ToolOutput::err(format!(
-                            "not ready: {name} {state} before {} was established\n{output}",
-                            until.as_ref().map_or_else(
-                                || "port readiness".into(),
-                                |pattern| format!(
-                                    "/{pattern}/{}",
-                                    if port.is_some() {
-                                        " and port readiness"
-                                    } else {
-                                        ""
-                                    }
-                                )
-                            )
+                            "not ready: {name} {state} before {unmet} was established\n{output}"
                         ))
                     } else {
                         let text = format!("ready: {name} {state}\n{output}");
@@ -577,6 +659,12 @@ impl Background {
                 ));
             }
             if deadline.is_some_and(|end| Instant::now() >= end) {
+                if lock(&snap.ring).tool_job {
+                    return Ok(ToolOutput::ok(format!(
+                        "not ready: timed out after {secs}s; {name} is still running"
+                    ))
+                    .with_observation(ObservationKind::Wait, false));
+                }
                 return Ok(snap.with_launch(
                     ToolOutput::ok(format!(
                         "not ready: timed out after {secs}s; {name} is still running"
@@ -605,18 +693,38 @@ impl Background {
         match (opt_str(args, "name")?, all) {
             (Some(name), false) => {
                 let state = kill_entry(&self.table, name)?;
-                Ok(ToolOutput::ok(format!(
-                    "killed {name} (was {})",
-                    state.label()
-                )))
+                Ok(ToolOutput::ok(self.kill_message(name, &state)))
             }
             (None, true) => {
                 let running = kill_all_entries(&self.table);
-                Ok(ToolOutput::ok(format!(
-                    "killed {running} running process(es); table cleared"
-                )))
+                let cancelling = self
+                    .table()
+                    .procs
+                    .iter()
+                    .filter(|proc| proc.is_running() && lock(&proc.ring).tool_job)
+                    .count();
+                Ok(ToolOutput::ok(if cancelling > 0 {
+                    format!(
+                        "signalled {running} running job(s); cancellation requested for {cancelling} tool job(s), still managed until completion"
+                    )
+                } else {
+                    format!("killed {running} running process(es); table cleared")
+                }))
             }
             _ => Err("kill needs either `name` or `all: true`".to_string()),
+        }
+    }
+
+    fn kill_message(&self, name: &str, previous: &State) -> String {
+        let retained = self
+            .table()
+            .procs
+            .iter()
+            .any(|proc| proc.name == name && lock(&proc.ring).tool_job);
+        if retained {
+            format!("cancellation requested for {name}; still managed until actual completion")
+        } else {
+            format!("killed {name} (was {})", previous.label())
         }
     }
 }
@@ -846,7 +954,7 @@ fn take_presented(
         // from this view while the ring still holds it.
         body.insert_str(
             0,
-            &format!("[failure digest: first error lines; the newest output follows]\n{digest}[end of digest]\n"),
+            &format!("[failure digest: failing tests and first errors; the newest output follows]\n{digest}[end of digest]\n"),
         );
     }
     (body, lost, integrity)
@@ -960,6 +1068,9 @@ fn output_integrity(
 
 /// Render an observed state with the same capture and process facts for reads and PTY startup.
 fn snapshot_output(ws: &Workspace, snap: &Snapshot, tail: Option<usize>) -> ToolOutput {
+    if lock(&snap.ring).tool_job {
+        return tool_snapshot_output(ws, snap, tail);
+    }
     let (body, lost, integrity) = take_presented(ws, snap, tail);
     let is_error = lock(&snap.ring).error.is_some();
     snap.with_launch(
@@ -974,6 +1085,60 @@ fn snapshot_output(ws: &Workspace, snap: &Snapshot, tail: Option<usize>) -> Tool
         .with_output_integrity(integrity),
     )
 }
+
+/// Keep the typed receipt unchanged when it fits. Large payloads are explicitly redirected to a
+/// complete structured artifact rather than silently clipped or reconstructed from display text.
+fn tool_snapshot_output(ws: &Workspace, snap: &Snapshot, tail: Option<usize>) -> ToolOutput {
+    let mut ring = lock(&snap.ring);
+    let Some(mut output) = ring.tool_result.clone() else {
+        return ToolOutput::ok(format!("[{}: running tool job]", snap.name));
+    };
+    if ring.artifact.is_none() && ring.error.is_none() {
+        let retained = (|| -> anyhow::Result<_> {
+            let store = ws.artifacts().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "artifact storage unavailable; full structured result retained only in this job"
+                )
+            })?;
+            let mut spool = store.spool()?;
+            table::write_tool_result(&mut spool, &output)?;
+            spool.finish_with_integrity()
+        })();
+        match retained {
+            Ok((uri, integrity)) => {
+                ring.artifact = Some(uri);
+                ring.elided_bytes = integrity.omitted_bytes.unwrap_or(0);
+            }
+            Err(error) => ring.error = Some(error.to_string()),
+        }
+    }
+    if output
+        .data
+        .as_ref()
+        .is_some_and(|data| data.to_string().len() > MAX_OUTPUT)
+    {
+        // Delivery is a failure when the inline result is omitted without a complete artifact.
+        output.is_error |= ring.artifact.is_none() || ring.error.is_some() || ring.elided_bytes > 0;
+        output.data = Some(json!({"background_result": {
+            "omitted": true, "artifact": ring.artifact,
+            "artifact_complete": ring.artifact.is_some() && ring.elided_bytes == 0,
+            "reason": "structured data exceeds inline display limit"
+        }}));
+    }
+    let text = output.text.clone();
+    let omitted_text = ring.total.saturating_sub(text.len() as u64);
+    drop(ring);
+    output.text = format!(
+        "[{}: {}]\n{}",
+        snap.name,
+        snap.state.label(),
+        render_body(snap, text, omitted_text, tail)
+    );
+    output
+}
+
+/// Maximum serialized structured result retained in a tool entry, including execution metadata.
+const MAX_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
 
 fn render_output(snap: &Snapshot, body: String, lost: u64, tail: Option<usize>) -> String {
     format!(
@@ -1044,7 +1209,7 @@ impl Tool for Background {
     }
     fn kill_job(&self, name: &str) -> Result<String, String> {
         let state = kill_entry(&self.table, name)?;
-        Ok(format!("killed {name} (was {})", state.label()))
+        Ok(self.kill_message(name, &state))
     }
 
     fn schema(&self) -> Value {
@@ -1054,6 +1219,9 @@ impl Tool for Background {
             json!({
                 "action": {"type": "string", "enum": ["start", "list", "output", "wait", "input", "close_stdin", "resize", "kill"]},
                 "command": {"type": "string", "description": "start: shell command to run"},
+                "call": {"type": "object", "additionalProperties": false, "required": ["name", "arguments"], "properties": {
+                    "name": {"type": "string"}, "arguments": {"type": "object"}
+                }, "description": "start: authorized tool call instead of command; only name may accompany it"},
                 "name": {"type": "string", "description": "start: optional unique name (letters, digits, - _ .); other actions: which job"},
                 "cwd": {"type": "string", "description": "start: working directory (default workspace root)"},
                 "persist": {"type": "boolean", "description": "Unix only: a named pipe job that survives restarts until `lifetime`; pass true on every call for it. No PTY, stdin or ready."},
@@ -1133,6 +1301,7 @@ impl Tool for Background {
         match job {
             AdoptedJob::Shell(job) => self.table().adopt(*job),
             AdoptedJob::Cell(job) => self.table().adopt_cell(job),
+            AdoptedJob::Tool(job) => self.table().adopt_tool(job),
         }
     }
 

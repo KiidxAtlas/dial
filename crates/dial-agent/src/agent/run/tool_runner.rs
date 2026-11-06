@@ -125,6 +125,7 @@ impl Agent<'_> {
             ui,
             backend,
             crate::agent::safety::approval::CallProvenance::Structured,
+            None,
         )
     }
 
@@ -135,6 +136,7 @@ impl Agent<'_> {
         ui: &mut dyn Ui,
         backend: Option<&mut Backend>,
         provenance: crate::agent::safety::approval::CallProvenance,
+        read_reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
     ) -> Option<ToolOutput> {
         let call = ToolCall {
             id: String::new(),
@@ -142,14 +144,21 @@ impl Agent<'_> {
             arguments: args.clone(),
             malformed_arguments: false,
         };
-        self.run_tools_off_thread(std::slice::from_ref(&call), ui, backend, false, provenance)
-            .map(|outputs| {
-                outputs
-                    .into_iter()
-                    .next()
-                    .expect("one result for one call")
-                    .0
-            })
+        self.run_tools_off_thread(
+            std::slice::from_ref(&call),
+            ui,
+            backend,
+            false,
+            provenance,
+            read_reuse,
+        )
+        .map(|outputs| {
+            outputs
+                .into_iter()
+                .next()
+                .expect("one result for one call")
+                .0
+        })
     }
 
     /// Like [`Self::run_background_tool`], but the command is never handed to `bg` at the
@@ -174,6 +183,7 @@ impl Agent<'_> {
             None,
             true,
             crate::agent::safety::approval::CallProvenance::Structured,
+            None,
         )
         .map(|outputs| {
             outputs
@@ -191,6 +201,7 @@ impl Agent<'_> {
         calls: &[ToolCall],
         ui: &mut dyn Ui,
         backend: Option<&mut Backend>,
+        read_reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
     ) -> Option<Vec<(ToolOutput, f64)>> {
         self.run_tools_off_thread(
             calls,
@@ -198,6 +209,7 @@ impl Agent<'_> {
             backend,
             false,
             crate::agent::safety::approval::CallProvenance::Structured,
+            read_reuse,
         )
     }
 
@@ -208,9 +220,16 @@ impl Agent<'_> {
         mut backend: Option<&mut Backend>,
         foreground: bool,
         provenance: crate::agent::safety::approval::CallProvenance,
+        read_reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
     ) -> Option<Vec<(ToolOutput, f64)>> {
         self.portable_callback_intercepted = false;
-        if self.hermetic {
+        // A tool-backed launch needs the live controller for the nested call's admission.
+        // Its admitted owned operation, not the approval callback, enters the job table.
+        if self.hermetic
+            || calls
+                .iter()
+                .any(|call| call.name == "bg" && call.arguments.get("call").is_some())
+        {
             return None;
         }
         if calls.iter().any(|call| {
@@ -297,9 +316,26 @@ impl Agent<'_> {
             }
         }
         let failed_start = tx.clone();
+        let read_reuse = read_reuse
+            .filter(|reuse| !reuse.is_empty())
+            .map(|reuse| Arc::new(reuse.clone()));
         for (index, call) in calls.iter().enumerate() {
             let name = call.name.clone();
             let arguments = call.arguments.clone();
+            let read_reuse = read_reuse
+                .as_ref()
+                .filter(|_| {
+                    name == "read"
+                        && provenance == crate::agent::safety::approval::CallProvenance::Structured
+                        && !["pre_tool_use", "post_tool_use"].iter().any(|event| {
+                            crate::agent::safety::hooks::wanted_for_tool(
+                                self.tool_hooks(),
+                                event,
+                                &name,
+                            )
+                        })
+                })
+                .cloned();
             let builtin = config::tools::BUILTIN.contains(&name.as_str());
             let extension = self.ext.get(&name).cloned();
             let external = self.config.tools.get(&name).cloned();
@@ -346,10 +382,14 @@ impl Agent<'_> {
                         let _ = tx.send(Event::Output(event));
                     };
                     if matches!(name.as_str(), "bash" | "read") {
-                        return crate::tools::exec::execution::native(
+                        let read = |effective: &Value| crate::tools::exec::execution::native(
                             &ToolContext { workspace: &workspace, config: &config, mutation_authorizer: None, confirm: None },
-                            &registry, &name, &arguments, &emit, &cancel,
+                            &registry, &name, effective, &emit, &cancel,
                         ).expect("native tool");
+                        return match read_reuse {
+                            Some(reuse) => reuse.execute(&workspace, &arguments, read),
+                            None => read(&arguments),
+                        };
                     }
                         let authorize_mutation = |requested: &str, paths: &[PathBuf], unbounded: bool| {
                             if cancel.load(Ordering::SeqCst) { return Err("native effect cancelled before authorization".into()); }
@@ -552,7 +592,8 @@ impl Agent<'_> {
                                 ui.tool_output(&event.name, &event.text);
                             } else if event.kind == "progress" {
                                 ui.tool_progress(&event.name, &event.text);
-                            } else {
+                            } else if event.kind != "start" {
+                                // Job starts are already visible in the launching tool's card.
                                 ui.background_notice(&format!(
                                     "{}: {}{}",
                                     event.name,

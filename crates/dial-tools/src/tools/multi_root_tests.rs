@@ -179,3 +179,178 @@ fn protected_write_is_blocked_with_no_effects() {
     assert_eq!(output.execution.effects, Effects::None);
     assert!(!protected.join("out.txt").exists());
 }
+
+#[test]
+fn read_only_roots_allow_native_reads_and_searches_but_not_mutations() {
+    let (_dir, ws) = workspace();
+    let extra = tempfile::tempdir().unwrap();
+    let root = extra.path().canonicalize().unwrap();
+    std::fs::write(root.join("e.txt"), "read-only-canary\n").unwrap();
+    assert!(
+        ws.resolve_read(root.join("e.txt").to_str().unwrap())
+            .is_err()
+    );
+    let ws = ws
+        .with_read_only_roots(std::slice::from_ref(&root))
+        .unwrap();
+    for (tool, args) in [
+        ("read", json!({"path": root.join("e.txt")})),
+        (
+            "read",
+            json!({"path": format!("{}:1-1", root.join("e.txt").display())}),
+        ),
+        ("glob", json!({"path": root, "pattern": "*.txt"})),
+        ("grep", json!({"path": root, "pattern": "read-only-canary"})),
+    ] {
+        let output = run(&ws, tool, args);
+        assert!(
+            !output.is_error
+                && output.text.contains(if tool == "read" {
+                    "read-only-canary"
+                } else {
+                    "e.txt"
+                }),
+            "{tool}: {}",
+            output.text
+        );
+    }
+    let handle = ws
+        .file_handle(root.join("e.txt").to_str().unwrap())
+        .unwrap();
+    assert!(!run(&ws, "read", json!({"path": handle})).is_error);
+    for (tool, args) in [
+        (
+            "write",
+            json!({"path": root.join("e.txt"), "content": "changed"}),
+        ),
+        (
+            "write",
+            json!({"path": root.join("new/created.txt"), "content": "changed"}),
+        ),
+        ("write", json!({"path": handle, "content": "changed"})),
+        (
+            "edit",
+            json!({"path": root.join("e.txt"), "old_string": "read-only-canary", "new_string": "changed"}),
+        ),
+    ] {
+        let output = if tool == "edit" {
+            run(
+                &ws.clone()
+                    .with_edit_mode(crate::config::types::EditMode::Replace),
+                tool,
+                args,
+            )
+        } else {
+            run(&ws, tool, args)
+        };
+        assert!(output.is_error, "{tool}: {}", output.text);
+        assert_eq!(
+            output.execution.effects,
+            Effects::None,
+            "{tool}: {}",
+            output.text
+        );
+    }
+    assert!(ws.resolve(root.join("e.txt").to_str().unwrap()).is_err());
+    assert!(ws.observe_write(&root.join("e.txt")).is_err());
+    assert!(ws.observe_delete(&root.join("e.txt")).is_err());
+    assert!(!root.join("new").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("e.txt")).unwrap(),
+        "read-only-canary\n"
+    );
+    let extra_write = match ws.sandbox_policy() {
+        crate::tools::sandbox::Policy::Strict { extra_write, .. }
+        | crate::tools::sandbox::Policy::Dev { extra_write, .. } => extra_write,
+    };
+    assert!(!extra_write.contains(&root));
+    assert!(
+        !run(
+            &ws,
+            "write",
+            json!({"path": "local.txt", "content": "local"})
+        )
+        .is_error
+    );
+}
+
+#[test]
+fn read_only_roots_preserve_private_storage_and_validate_directories() {
+    let (_dir, ws) = workspace();
+    let extra = tempfile::tempdir().unwrap();
+    let root = extra.path().canonicalize().unwrap();
+    let private = root.join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::write(private.join("secret.txt"), "private-canary").unwrap();
+    std::fs::write(root.join("public.txt"), "public-canary").unwrap();
+    let ws = ws.with_protected_paths(std::slice::from_ref(&private));
+    for dir in [
+        private.clone(),
+        root.join("missing"),
+        root.join("public.txt"),
+    ] {
+        assert!(ws.clone().with_read_only_roots(&[dir]).is_err());
+    }
+    let filesystem_root = root.ancestors().last().unwrap().to_path_buf();
+    assert!(ws.clone().with_read_only_roots(&[filesystem_root]).is_err());
+    let ws = ws
+        .with_read_only_roots(std::slice::from_ref(&root))
+        .unwrap();
+    assert!(run(&ws, "read", json!({"path": private.join("secret.txt")})).is_error);
+    for (tool, args) in [
+        (
+            "glob",
+            json!({"path": root, "pattern": "**/*", "gitignore": false}),
+        ),
+        (
+            "grep",
+            json!({"path": root, "pattern": "canary", "gitignore": false}),
+        ),
+    ] {
+        let out = run(&ws, tool, args);
+        assert!(
+            !out.is_error && out.text.contains("public.txt"),
+            "{tool}: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("secret.txt") && !out.text.contains("private-canary"),
+            "{tool}: {}",
+            out.text
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_roots_do_not_allow_symlink_escapes() {
+    let (_dir, ws) = workspace();
+    let extra = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "outside-canary").unwrap();
+    std::os::unix::fs::symlink(outside.path(), extra.path().join("escape")).unwrap();
+    let ws = ws
+        .with_read_only_roots(&[extra.path().to_path_buf()])
+        .unwrap();
+    let path = extra.path().join("escape/secret.txt");
+    assert!(run(&ws, "read", json!({"path": path})).is_error);
+    // A symlink above the granted root is an alias for the root, not a scope escape.
+    let aliases = tempfile::tempdir().unwrap();
+    let parent_alias = aliases.path().join("parent");
+    std::os::unix::fs::symlink(extra.path().parent().unwrap(), &parent_alias).unwrap();
+    let aliased_root = parent_alias.join(extra.path().file_name().unwrap());
+    for root in [extra.path(), aliased_root.as_path()] {
+        let out = run(&ws, "grep", json!({"path": root, "pattern": "canary"}));
+        assert!(
+            !out.is_error && !out.text.contains("outside-canary"),
+            "{}",
+            out.text
+        );
+    }
+    let out = run(
+        &ws,
+        "grep",
+        json!({"path": extra.path().join("escape"), "pattern": "canary"}),
+    );
+    assert!(out.is_error, "{}", out.text);
+}

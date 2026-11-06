@@ -9,7 +9,7 @@ use crate::{
         usage::{ExternalUsageReceipt, Scope},
     },
     storage::memory_backend::{
-        MemoryModelLimits, MemoryModelRequest, MemoryModelRunner, Operation,
+        self, MemoryModelLimits, MemoryModelRequest, MemoryModelRunner, Operation,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -24,6 +24,18 @@ use std::{
 /// `/memory` with no memory backend selected.
 const MEMORY_OFF: &str = "Memory is off: nothing is remembered or recalled. Choose a backend in /settings → Memory or with /setup memory.";
 const MEMORY_OFF_STATUS: &str = "Memory is off: nothing is remembered or recalled.";
+
+/// A `memory` call with `action` added to `arguments`, standing for an automatic or `/memory`
+/// operation so permission rules on the memory tool apply to it.
+fn memory_call(action: &str, mut arguments: Value) -> ToolCall {
+    arguments["action"] = json!(action);
+    ToolCall {
+        id: String::new(),
+        name: memory_backend::TOOL_NAME.into(),
+        arguments,
+        malformed_arguments: false,
+    }
+}
 
 /// `/memory help` for the provenance backend.
 const PROVENANCE_HELP: &str =
@@ -97,12 +109,7 @@ impl Runner<'_, '_> {
     }
     fn permit(&self, op: &Operation, fallback: &str, writes: bool) -> Result<()> {
         self.check(op)?;
-        let automatic = ToolCall {
-            id: String::new(),
-            name: fallback.into(),
-            arguments: Value::Null,
-            malformed_arguments: false,
-        };
+        let automatic = memory_call(fallback, json!({}));
         let call = self.origin.unwrap_or(&automatic);
         ensure!(
             !approval::denied_by_rule(&self.agent.always, call, self.agent.workspace.root()),
@@ -232,9 +239,10 @@ impl MemoryModelRunner for Runner<'_, '_> {
     }
     fn complete(&mut self, request: MemoryModelRequest) -> Result<String> {
         self.check(&request.operation)?;
-        let writes = self
-            .origin
-            .is_none_or(|call| matches!(call.name.as_str(), "learn" | "retain" | "forget"));
+        let writes = self.origin.is_none_or(|call| {
+            !memory_backend::call_action(&call.name, &call.arguments)
+                .is_some_and(memory_backend::reads)
+        });
         self.permit(&request.operation, "learn", writes)?;
         let (config, key) = self.backend(&request.role, request.model_override.as_deref())?;
         let backend = &self.agent.role_backends[&key];
@@ -423,12 +431,7 @@ impl MemoryModelRunner for Runner<'_, '_> {
             .layout
             .as_ref()
             .context("managed memory requires owning layout")?;
-        let automatic = ToolCall {
-            id: String::new(),
-            name: "learn".into(),
-            arguments: Value::Null,
-            malformed_arguments: false,
-        };
+        let automatic = memory_call("learn", json!({}));
         let call = self.origin.unwrap_or(&automatic);
         approval::authorize_managed_memory_paths(&self.agent.always, layout, false, call, targets)
             .map_err(anyhow::Error::msg)?;
@@ -667,12 +670,10 @@ impl Agent<'_> {
                     "clear global" => Scope::Global,
                     _ => anyhow::bail!("usage: /memory clear [project|global]"),
                 };
-                let call = ToolCall {
-                    id: String::new(),
-                    name: "forget".into(),
-                    arguments: json!({"scope":if scope == Scope::Global {"global"}else{"project"}}),
-                    malformed_arguments: false,
-                };
+                let call = memory_call(
+                    "forget",
+                    json!({"scope":if scope == Scope::Global {"global"}else{"project"}}),
+                );
                 ensure!(
                     !self.plan_mode && self.approval != crate::config::types::Approval::Readonly,
                     "memory clear denied by read-only policy"
@@ -698,12 +699,7 @@ impl Agent<'_> {
                 );
             }
             let query = input.strip_prefix("search ").unwrap_or(input);
-            let call = ToolCall {
-                id: String::new(),
-                name: "recall".into(),
-                arguments: json!({"query":query}),
-                malformed_arguments: false,
-            };
+            let call = memory_call("recall", json!({"query":query}));
             ensure!(
                 !approval::denied_by_rule(&self.always, &call, self.workspace.root()),
                 "memory search denied by recall policy"
@@ -741,12 +737,10 @@ impl Agent<'_> {
         ) || input.starts_with("mm seed")
             || input.starts_with("mm delete")
             || input.starts_with("mm refresh");
-        let origin = ToolCall {
-            id: String::new(),
-            name: if mutating { "learn" } else { "recall" }.into(),
-            arguments: json!({"command":input}),
-            malformed_arguments: false,
-        };
+        let origin = memory_call(
+            if mutating { "learn" } else { "recall" },
+            json!({"command":input}),
+        );
         let mut runner = Runner {
             agent: self,
             ui,
@@ -789,7 +783,8 @@ impl Agent<'_> {
         ui: &mut dyn Ui,
     ) -> Result<Value> {
         ensure!(
-            matches!(call.name.as_str(), "recall" | "reflect")
+            memory_backend::call_action(&call.name, &call.arguments)
+                .is_some_and(memory_backend::reads)
                 || (!self.plan_mode && self.approval != crate::config::types::Approval::Readonly),
             "memory mutation denied by read-only execution policy"
         );
@@ -806,7 +801,6 @@ impl Agent<'_> {
             .for_purpose(llm::usage::Purpose::Memory);
         memory.execute_tool(
             &authority,
-            &call.name,
             &call.arguments,
             &mut Runner {
                 agent: self,
@@ -850,12 +844,7 @@ impl Agent<'_> {
         let authority = memory_authority(&self.session, 0);
         memory.bind(authority.clone());
         let messages = self.session.archived_user_assistant_messages();
-        let origin = ToolCall {
-            id: String::new(),
-            name: "recall".into(),
-            arguments: json!({"purpose":"compaction context"}),
-            malformed_arguments: false,
-        };
+        let origin = memory_call("recall", json!({"purpose":"compaction context"}));
         let mut receipts = Receipts::default();
         let scope = self
             .usage_scope
@@ -901,12 +890,7 @@ impl Agent<'_> {
             .usage_scope
             .worker()
             .for_purpose(llm::usage::Purpose::Memory);
-        let origin = ToolCall {
-            id: String::new(),
-            name: "recall".into(),
-            arguments: json!({"query":user}),
-            malformed_arguments: false,
-        };
+        let origin = memory_call("recall", json!({"query":user}));
         memory.prepare_prompt(
             &authority,
             user,

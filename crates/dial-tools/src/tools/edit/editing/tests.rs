@@ -286,3 +286,27 @@ fn parse_repair_that_reverts_the_request_is_not_already_applied() {
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
     assert!(observed.0.lock().unwrap().is_empty());
 }
+
+#[test]
+fn optional_check_is_boolean_and_valid_in_every_edit_grammar() {
+    for mode in [
+        EditMode::Hashline,
+        EditMode::Replace,
+        EditMode::Patch,
+        EditMode::ApplyPatch,
+        EditMode::Sloppy,
+    ] {
+        for check in [json!(true), json!(false), Value::Null] {
+            assert!(
+                validate_shape(mode, &json!({"check":check})).is_ok(),
+                "{mode:?}"
+            );
+        }
+        for check in [json!("yes"), json!({}), json!(1)] {
+            assert!(
+                validate_shape(mode, &json!({"check":check})).is_err(),
+                "{mode:?}"
+            );
+        }
+    }
+}

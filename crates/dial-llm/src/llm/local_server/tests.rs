@@ -279,6 +279,53 @@ fn model_loaded_reads_ollama_ps_lm_studio_state_and_llama_cpp() {
     );
 }
 
+#[test]
+fn lmstudio_v1_instance_metadata_is_shared_by_facts_and_loaded_state() {
+    let url = routed(vec![(
+        "/api/v1/models",
+        serde_json::json!({"models":[
+            {"key":"publisher/model", "type":"llm", "loaded_instances":[
+                {"id":"instance", "config":{"context_length":8192}}],
+             "capabilities":{"trained_for_tool_use":true,
+                "reasoning":{"allowed_options":["off","on"], "default":"on"}}},
+            {"key":"cold", "type":"llm", "loaded_instances":[],
+             "capabilities":{"trained_for_tool_use":false}},
+            {"key":"unknown", "type":"llm", "loaded_instances":[]}
+        ]})
+        .to_string(),
+    )]);
+    for model in ["publisher/model", "instance"] {
+        assert_eq!(
+            model_loaded("lm-studio", model, &url, None, &[]),
+            Some(true)
+        );
+        let known = facts("lm-studio", model, Some(&url), None, &[]);
+        assert_eq!(known.native_tools, Some(true));
+        assert_eq!(
+            known.thinking_switch, None,
+            "native reasoning is not enable_thinking"
+        );
+        assert_eq!(
+            known.defaults,
+            ServerDefaults::default(),
+            "no invented sampling defaults"
+        );
+    }
+    assert_eq!(
+        model_loaded("lm-studio", "cold", &url, None, &[]),
+        Some(false)
+    );
+    assert_eq!(
+        facts("lm-studio", "cold", Some(&url), None, &[]).native_tools,
+        Some(false)
+    );
+    assert_eq!(
+        facts("lm-studio", "unknown", Some(&url), None, &[]).native_tools,
+        None
+    );
+    assert_eq!(model_loaded("lm-studio", "missing", &url, None, &[]), None);
+}
+
 /// One-shot server that records the request line and body, then answers `code` with `body`.
 fn capture(code: u16, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

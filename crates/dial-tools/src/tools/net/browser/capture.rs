@@ -10,14 +10,18 @@ const FFMPEG_TIMEOUT: Duration = Duration::from_secs(300);
 const FFMPEG_STDOUT_CAP: usize = 64 * 1024;
 const FFMPEG_STDERR_CAP: usize = 16 * 1024;
 
-/// Only the native screenshot action owns the top-level artifact and URL. Evaluate/run results
-/// are page data and must never be promoted, even when they imitate this object shape.
+/// Native screenshots and explicitly requested post-action captures own the artifact and URL.
+/// Page evaluation data must never be promoted, even when it imitates this object shape.
 pub(super) fn native_receipt(
     args: &Value,
     result: &Value,
 ) -> Option<crate::runtime::execution::NativeCapture> {
     use base64::Engine;
-    if args["action"] != "screenshot" || result["artifact"]["encoding"] != "base64" {
+    let observed = args["observe"]["screenshot"] == true
+        && args["action"]
+            .as_str()
+            .is_some_and(|action| super::observe::ACTIONS.contains(&action));
+    if (args["action"] != "screenshot" && !observed) || result["artifact"]["encoding"] != "base64" {
         return None;
     }
     let media_type = result["artifact"]["media_type"].as_str()?;
@@ -30,7 +34,12 @@ pub(super) fn native_receipt(
     if bytes.is_empty() {
         return None;
     }
-    let target = result["url"]
+    let target = if observed {
+        &result["observations"]["screenshot"]["url"]
+    } else {
+        &result["url"]
+    };
+    let target = target
         .as_str()
         .filter(|url| !url.is_empty())
         .map(|url| format!("url:{url}"));

@@ -167,7 +167,7 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
         let text = prompt_text(agent);
         let rule = serde_json::to_string(crate::agent::prompts::system::LEAN_ONE_CALL).unwrap();
         assert!(text.contains(rule.trim_matches('"')));
-        assert!(!text.contains("MUST batch"));
+        assert!(!text.contains("Batch independent calls"));
         assert!(text.contains("# Example"));
         assert!(
             text.contains(r#"\"old_string\":\"    total / size\""#),
@@ -182,7 +182,7 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
         agent.rebuild_system();
         assert!(!agent.local_one_call());
         let text = prompt_text(agent);
-        assert!(text.contains("MUST batch"));
+        assert!(text.contains("Batch independent calls"));
         assert!(
             !text.contains("# Example"),
             "passing batch evidence omits the single-call tutorial"
@@ -211,23 +211,25 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
     });
 }
 
-/// The small and lean local tiers make the edit tool refuse new parser errors; the full tier and
-/// hosted routes keep the advisory, as does `assistance.syntax_guard = false`.
+/// With assistance on, the small and lean local tiers make the edit tool refuse new parser errors;
+/// the full tier and hosted routes keep the advisory, as does `assistance.syntax_guard = false`.
+/// Assistance is off by default, which disables the guard entirely.
 #[test]
 fn lean_local_tiers_block_syntax_regressions_in_edits() {
     for (overlay, blocking) in [
-        ("context_window=16384", true),
-        ("context_window=65536", true),
+        ("context_window=16384", false),
+        ("context_window=16384\n[assistance]\nenabled=true", true),
+        ("context_window=65536\n[assistance]\nenabled=true", true),
         (
-            "context_window=16384\n[assistance]\nlean_local=false",
+            "context_window=16384\n[assistance]\nenabled=true\nlean_local=false",
             false,
         ),
         (
-            "context_window=16384\n[assistance]\nsyntax_guard=false",
+            "context_window=16384\n[assistance]\nenabled=true\nsyntax_guard=false",
             false,
         ),
         (
-            "context_window=16384\n[endpoint]\nbase_url='https://api.example.com/v1'",
+            "context_window=16384\n[assistance]\nenabled=true\n[endpoint]\nbase_url='https://api.example.com/v1'",
             false,
         ),
     ] {

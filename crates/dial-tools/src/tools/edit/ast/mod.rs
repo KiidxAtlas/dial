@@ -174,7 +174,7 @@ fn search(
 ) -> Result<(String, Vec<crate::runtime::fingerprint::Observation>), String> {
     let pattern = pattern_arg(args)?;
     let limit = opt_u64(args, "limit")?.map_or(DEFAULT_LIMIT, |n| (n as usize).clamp(1, MAX_LIMIT));
-    let target = Target::resolve(ws, opt_str(args, "path")?, opt_str(args, "lang")?)?;
+    let target = Target::resolve_read(ws, opt_str(args, "path")?, opt_str(args, "lang")?)?;
     let mut queries = Queries::new(pattern, None);
     let mut out = String::new();
     let mut observations = Vec::new();

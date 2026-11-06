@@ -1,6 +1,6 @@
 //! Behavioral regression for progress-aware automatic repair, driven through the real turn loop
 //! against the deterministic scripted backend. No live model, network or sleeps are involved.
-use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+use crate::agent::run::tool_exposure::default_offer_tests::with_review_disabled as with_agent;
 use crate::agent::*;
 
 const COMMAND: &str = "grep -q ok input || { echo \"AssertionError: input is not ok\"; exit 1; }";

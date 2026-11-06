@@ -35,6 +35,8 @@ pub enum Script {
         pieces: Vec<String>,
         pause: Duration,
     },
+    /// Like [`Script::Sse`], with each piece released by the test driver; dropping the sender ends it.
+    SseControlled(std::sync::mpsc::Receiver<String>),
     /// Read the request, then close without answering.
     Hangup,
     /// SSE head, then a keep-alive comment every `pause` for `count` rounds.
@@ -340,6 +342,14 @@ fn respond(stream: &mut std::net::TcpStream, script: Script) {
                     return;
                 }
                 std::thread::sleep(pause);
+            }
+        }
+        Script::SseControlled(pieces) => {
+            let _ = stream.write_all(SSE_HEAD.as_bytes());
+            for piece in pieces {
+                if stream.write_all(piece.as_bytes()).is_err() {
+                    return;
+                }
             }
         }
         Script::Hangup => {}

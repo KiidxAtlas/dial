@@ -58,6 +58,8 @@ impl Agent<'_> {
                         .map(|p| p.to_string())
                         .unwrap_or_default();
                     (kind, format!("{} was loaded this round, but these arguments do not match its schema ({why}); this call was not executed. Retry with arguments for this schema: {schema}", call.name))
+                } else if kind == "schema" && let Some(help) = self.parameter_help(&call.name) {
+                    (kind, format!("{why}\nThis call was not executed. {help}"))
                 } else {
                     (kind, why)
                 }
@@ -188,7 +190,9 @@ impl Agent<'_> {
                         };
                         launch_sources.insert(candidate.id.clone(), sources);
                     }
-                    let outputs = self.dispatch_dependency_wave(backend, &group, ui);
+                    let read_reuse = engine.reusable_reads(|id| self.holds_full_result(id));
+                    let outputs =
+                        self.dispatch_dependency_wave(backend, &group, ui, Some(&read_reuse));
                     for (candidate, (output, seconds)) in group.iter().zip(&outputs) {
                         ui.tool_timing(&candidate.id, &candidate.name, *seconds);
                         ui.tool_result_with_id(&candidate.id, &candidate.name, output);
@@ -260,6 +264,7 @@ impl Agent<'_> {
                         .map(|(c, _)| c.clone())
                         .collect();
                     let mut steering = Vec::new();
+                    let read_reuse = engine.reusable_reads(|id| self.holds_full_result(id));
                     let mut ran = if rest.is_empty() {
                         Vec::new()
                     } else {
@@ -274,6 +279,7 @@ impl Agent<'_> {
                             },
                             &rest,
                             Some(&call.id),
+                            Some(&read_reuse),
                         )
                     }
                     .into_iter();
@@ -325,13 +331,34 @@ impl Agent<'_> {
                         streamed.invalidate();
                     }
                     let started = Instant::now();
-                    let out = self.dispatch_from(backend, call, provenance, ui);
+                    let reuse = engine.reusable_reads(|id| self.holds_full_result(id));
+                    let out =
+                        self.dispatch_from_reusing(backend, call, provenance, ui, Some(&reuse));
                     (out, started.elapsed().as_secs_f64(), true)
                 }
             };
+            let executed = executed
+                && !out
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["read_reuse"]["fully_reused"] == true);
             // Only admitted calls that reached execution count; rejected, skipped and blocked forms do not.
             if executed {
                 self.metrics.tool_trace.record_invoked(&call.name);
+                if call.name == "read"
+                    && !out.is_error
+                    && let Some(path) = call.arguments["path"].as_str()
+                    && let Ok((uri, _)) =
+                        crate::tools::integrations::resources::artifact_target(path)
+                {
+                    self.metrics.artifacts_retrieved += 1;
+                    if self.session.control_state()["truncated_artifacts"]
+                        .as_array()
+                        .is_some_and(|uris| uris.iter().any(|known| known.as_str() == Some(&uri)))
+                    {
+                        self.metrics.truncated_recoveries += 1;
+                    }
+                }
                 if matches!(call.name.as_str(), "tool_search" | "tool_load") {
                     turn.capability_search.searched();
                 }

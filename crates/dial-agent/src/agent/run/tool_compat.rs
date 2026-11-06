@@ -66,6 +66,8 @@ pub(in crate::agent) fn canonical_name<'a>(name: &'a str, catalog: &[String]) ->
 }
 
 pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) {
+    // Recorded or habitual pre-rename parameter names map onto the current ones.
+    crate::tools::surface::contracts::legacy_arguments(name, schema, args);
     normalize_container(schema, args);
     let aliases: &[(&str, &str)] = match name {
         "read" => &[
@@ -103,8 +105,7 @@ pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) 
             ("regex", "pattern"),
             ("query", "pattern"),
             ("include", "glob"),
-            ("max_matches", "max_results"),
-            ("limit", "max_results"),
+            ("max_matches", "limit"),
         ],
         "glob" => &[("glob", "pattern")],
         "web_fetch" => &[("uri", "url")],
@@ -129,9 +130,9 @@ pub(in crate::agent) fn normalize(name: &str, schema: &Value, args: &mut Value) 
     // `find` keywords are literal text. A singleton string is unambiguous; unlike
     // general array repair, preserve commas, quotes and whitespace as one keyword.
     if name == "find"
-        && schema["properties"]["grep_keywords"]["type"] == "array"
-        && schema["properties"]["grep_keywords"]["items"]["type"] == "string"
-        && let Some(keyword) = args.get_mut("grep_keywords")
+        && schema["properties"]["keywords"]["type"] == "array"
+        && schema["properties"]["keywords"]["items"]["type"] == "string"
+        && let Some(keyword) = args.get_mut("keywords")
         && keyword.is_string()
     {
         let literal = keyword.take();

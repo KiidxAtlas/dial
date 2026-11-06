@@ -22,6 +22,13 @@ fn exit_with(code: i32) -> Result<()> {
 fn main() {
     dial::install_tls_provider();
     dial::install_build_identity();
+    #[cfg(target_os = "linux")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == dial::tools::exec::sandbox::fork_fence::PROBE_ARG)
+    {
+        std::process::exit(dial::tools::exec::sandbox::fork_fence::probe_main());
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == dial::tools::exec::background::durable::OWNER_ARG)

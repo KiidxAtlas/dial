@@ -836,8 +836,8 @@ fn answer(
     }
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body).unwrap();
-    // Metadata probes are not chat requests: they must never consume a scripted reply.
-    if request_line.starts_with("GET ") {
+    // Metadata probes (including Ollama/Osaurus POSTs) must never consume a chat reply.
+    if request_line.starts_with("GET ") || request_line.starts_with("POST /api/show ") {
         let (code, payload) = match lm_context {
             Some(context) if request_line.contains("/api/v0/models/") => (
                 200,
@@ -1129,7 +1129,6 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
         "check",
         "tool_load",
         "tool_search",
-        "artifact_read",
         "working_state",
     ] {
         assert!(initial.contains(&core), "{core}");
@@ -4127,10 +4126,18 @@ fn prewalk_switches_to_small_after_the_first_write_and_keeps_it_for_later_turns(
             "small closes the todo, then answers"
         );
         assert_eq!(side_requests[0]["model"], "side-model");
-        assert!(has_message_starting(
-            &side_requests[0],
-            "Before claiming completion,"
-        ));
+        assert!(
+            side_requests[0]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "user"
+                        && message["content"].as_str().is_some_and(|content| {
+                            content.contains("Before claiming completion, check:")
+                        })
+                })
+        );
     }
     assert!(
         ui.notices
@@ -4551,7 +4558,7 @@ fn small_window_refuses_to_spend_response_reserve_or_drop_a_pinned_tool() {
     e.config
         .harness
         .system_prompt
-        .push_str(&"immutable project requirement ".repeat(100));
+        .push_str(&"immutable project requirement ".repeat(250));
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None); // Explicitly pins task for delegation.
     let error = a
@@ -4678,6 +4685,9 @@ fn roomy_window_keeps_the_full_tool_set_without_notice() {
 // ------------------------------------------------------------------------------------ subagents
 
 fn with_subagent_role(e: &mut Env, url: &str) {
+    // Route child roles without consuming their scripts for independent completion review.
+    // Review behavior has its own explicitly configured provider fixtures.
+    e.config.verification.review.enabled = Some(false);
     // Specialist assignments win; implementation workers use the task role.
     for role in ["main", "task", "small", "tester", "coach"] {
         e.config.model_roles.insert(
@@ -4894,8 +4904,8 @@ fn child_repeated_reads_reuse_evidence_and_stop_before_exhausting_steps() {
             .any(|line| line.starts_with("[Unchanged read]")),
         "{duplicate}"
     );
-    assert!(duplicate.contains("tool call read-0"));
-    assert!(duplicate.contains("still-visible tool call"));
+    assert!(duplicate.contains("tool call read-0"), "{duplicate}");
+    assert!(duplicate.contains("still-visible tool call"), "{duplicate}");
     assert!(duplicate.len() < results[0]["content"].as_str().unwrap().len());
     assert!(!duplicate.contains("ORIGINAL_EVIDENCE"));
 }
@@ -5037,10 +5047,6 @@ fn each_agent_type_gets_its_own_prompt_and_tool_allowlist() {
                 "{agent_type} lacks {tool}: {names:?}"
             );
         }
-        assert!(
-            names.iter().any(|name| name == "artifact_read"),
-            "{agent_type}: {names:?}"
-        );
         // Read-only agents may receive enabled read-only extensions (codebase/memory recall,
         // archive inspection), never writers.
         if agent_type != "worker" {
@@ -5051,9 +5057,7 @@ fn each_agent_type_gets_its_own_prompt_and_tool_allowlist() {
                         "codebase_memory"
                             | "find"
                             | "dep_source"
-                            | "recall"
-                            | "memory_history"
-                            | "artifact_read"
+                            | "memory"
                             | "archive"
                             | "code_history"
                             | "ask"
@@ -6046,6 +6050,8 @@ fn reasoning_guard_settings_load_defaults_and_validate_limits() {
 #[test]
 fn codebase_understanding_is_saved_across_new_sessions_and_invalidated_by_edits() {
     let server = serve(vec![
+        // `codebase_memory` is loadable rather than offered by default.
+        Reply::Call("tool_load", json!({"names":["codebase_memory"]})),
         Reply::Call("read", json!({"path":"src/router.rs"})),
         Reply::Call(
             "codebase_memory",
@@ -6057,6 +6063,7 @@ fn codebase_understanding_is_saved_across_new_sessions_and_invalidated_by_edits(
     ]);
     let mut e = env(&server.url, "ask");
     e.config.codebase.ambient_context = true;
+    // The tool is loadable only; the brief is opt-in.
     std::fs::create_dir(e.project.path().join("src")).unwrap();
     std::fs::write(
         e.project.path().join("src/router.rs"),
@@ -6100,19 +6107,19 @@ fn codebase_understanding_is_saved_across_new_sessions_and_invalidated_by_edits(
         "refreshed"
     );
     let requests = server.requests.lock();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 6);
     assert!(
         requests[0]["messages"]
             .to_string()
             .contains("route_request"),
         "automatic index should be available before any model tool call"
     );
-    let reused = requests[3]["messages"].to_string();
+    let reused = requests[4]["messages"].to_string();
     assert!(
         reused.contains("Router forwards requests into storage.") && reused.contains(&first_id),
         "{reused}"
     );
-    let persistent = conversation_messages(&requests[4]);
+    let persistent = conversation_messages(&requests[5]);
     let newest = persistent
         .iter()
         .rev()
@@ -6127,7 +6134,8 @@ fn codebase_understanding_is_saved_across_new_sessions_and_invalidated_by_edits(
         !newest.contains("Router forwards requests into storage.")
             && !newest.contains("route_request")
     );
-    for pair in requests[..3].windows(2) {
+    // After the load round the offer is settled; saved context must not rewrite it mid-turn.
+    for pair in requests[1..4].windows(2) {
         assert_eq!(
             pair[0]["messages"][0], pair[1]["messages"][0],
             "saved context must not rewrite the system prompt mid-turn"
@@ -8448,15 +8456,19 @@ fn extension_batch_registration_is_atomic_including_unloaded_and_core_collisions
 }
 
 #[test]
-fn legacy_admitted_memory_selection_migrates_runtime_without_rewriting_history() {
+fn legacy_admitted_split_memory_selection_migrates_runtime_without_rewriting_history() {
     let server = serve(vec![
-        Reply::Call("recall", json!({"query":"durable fixture"})),
+        Reply::Call(
+            "memory",
+            json!({"action":"recall","query":"durable fixture"}),
+        ),
         Reply::Text("recalled"),
         Reply::Text("resumed"),
     ]);
     let e = env(&server.url, "ask");
     let mut legacy = e.config.harness.clone();
-    legacy.tools.push("memory".into());
+    legacy.tools.retain(|name| name != "memory");
+    legacy.tools.push("recall".into());
     let store = Store::open(&e.layout.state_dir, "scripted", "legacy-consumer", &legacy).unwrap();
     let memory = dial::tools::provenance::ProvenanceMemory::open(&e.layout).unwrap();
     memory
@@ -8471,10 +8483,10 @@ fn legacy_admitted_memory_selection_migrates_runtime_without_rewriting_history()
     let mut a = agent_with(&e, Some(&store), Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     a.turn("recall durable fixture", &mut ui).unwrap();
-    assert_eq!(ui.calls, ["recall"]);
+    assert_eq!(ui.calls, ["memory"]);
     let requests = server.requests.lock();
     let names = tool_names(&requests[0]);
-    assert!(names.iter().any(|n| n == "recall") && !names.iter().any(|n| n == "memory"));
+    assert!(names.iter().any(|n| n == "memory") && !names.iter().any(|n| n == "recall"));
     assert!(
         requests[1]["messages"]
             .as_array()
@@ -8495,7 +8507,7 @@ fn legacy_admitted_memory_selection_migrates_runtime_without_rewriting_history()
     assert_eq!(
         ui.notices
             .iter()
-            .filter(|n| n.contains("Migrated legacy memory tool selection"))
+            .filter(|n| n.contains("Migrated legacy split memory tool selection"))
             .count(),
         1
     );
@@ -8506,7 +8518,7 @@ fn legacy_admitted_memory_selection_migrates_runtime_without_rewriting_history()
             .harness
             .tools
             .iter()
-            .any(|n| n == "memory"),
+            .any(|n| n == "recall"),
         "immutable admitted harness must not be rewritten"
     );
 }
@@ -9343,9 +9355,10 @@ fn rounds_in_which_nothing_worked_end_the_turn_even_when_no_single_tool_streak_d
 
 #[test]
 fn a_big_tool_result_triggers_compaction_before_the_request_it_would_overflow() {
-    // Fixed prompt and tool schemas cost about 9.4k tokens. The big reply (~10.5k) keeps `three?` under the
-    // 65% threshold of a 32k window; the probe (~2.2k) crosses it. Its compaction summarizes the big reply and
-    // lands at ~13.7k, inside the 80% continuation band (~17k), so the probe still answers in the same turn.
+    // Fixed prompt and tool schemas cost about 6k tokens. The big reply (~10.5k) keeps `three?` under the
+    // 65% threshold of a 32k window; the probe (~5.5k) crosses it. Its compaction summarizes the big reply and
+    // lands inside the 80% continuation band (~17k), so the probe still answers in the same turn. The probe
+    // size sits mid-way in the passing range (about 18k-26k chars) so prompt growth or shrinkage is tolerated.
     let chat = Mutex::new(std::collections::VecDeque::from([
         Reply::Text("one-answer"),
         Reply::Say(
@@ -9382,7 +9395,7 @@ fn a_big_tool_result_triggers_compaction_before_the_request_it_would_overflow() 
     a.turn("one?", &mut ui).unwrap();
     a.turn("two?", &mut ui).unwrap();
     a.turn("three?", &mut ui).unwrap();
-    let report = a.turn(&"c".repeat(8_800), &mut ui).unwrap();
+    let report = a.turn(&"c".repeat(22_000), &mut ui).unwrap();
     assert_eq!(report.text, "third");
     assert!(
         summary_requests(&server) >= 1,
@@ -9808,6 +9821,7 @@ fn silent_serial_and_parallel_subagents_keep_ui_alive_and_cancel_before_late_too
 }
 
 fn experience_checks(e: &mut Env) {
+    e.config.assistance.enabled = true;
     e.config.verification.enabled = false; // Explicit tool checks still record their observed result.
     e.config.verification.commands = vec![VerificationCommand {
         name: "value check".into(),
@@ -9916,7 +9930,8 @@ fn experience_ledger_survives_session_resume_and_unrelated_source_changes() {
         Reply::Call("read", json!({"path":"a.rs"})),
         Reply::Text("Observed."),
     ]);
-    let e = env(&server.url, "auto");
+    let mut e = env(&server.url, "auto");
+    e.config.assistance.enabled = true;
     std::fs::write(e.project.path().join("a.rs"), "fn a() {}\n").unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     a.turn("where is entry point", &mut Recorder::default())

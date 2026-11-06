@@ -18,8 +18,6 @@ pub mod session;
 use session::{SessionClaim, admit, read_published};
 
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 300;
-/// Appended to every completed native launch; consumers that count diagnostic lines skip it.
-pub const LAUNCH_NOTE: &str = "[shell launch: stdin=EOF; output=captured; no terminal allocated]";
 
 /// The command's working directory: the primary root by default, or `cwd` / a leading simple
 /// `cd path && ...` resolved through [`Workspace::resolve`], so explicitly added roots work and
@@ -62,8 +60,9 @@ fn working_directory(
     Ok((cwd, command.to_owned()))
 }
 const MAX_COMMAND: usize = 64 * 1024;
-const BASH_HEAD: usize = 6 * 1024;
-const BASH_TAIL: usize = 14 * 1024;
+// Keep the model-facing preview small; complete output is spooled independently below.
+const BASH_HEAD: usize = 4 * 1024;
+const BASH_TAIL: usize = 4 * 1024;
 /// Complete outputs up to this size are re-read from their artifact so the output filter can
 /// apply even when the inline view had to be cut to head and tail.
 const FULL_FILTER_MAX: u64 = 4 * 1024 * 1024;
@@ -71,6 +70,62 @@ const FULL_FILTER_MAX: u64 = 4 * 1024 * 1024;
 const BASH_DIAGNOSTICS: usize = 3 * 1024;
 #[cfg(not(windows))]
 const CLT_DIR: &str = "/Library/Developer/CommandLineTools";
+
+/// Adoption hint when `bg` is offered: the job's result comes from one `bg wait`.
+pub const BG_OFFERED_HINT: &str = " `bg wait` returns its output; no polling.";
+/// Adoption hint when `bg` is loadable but not offered. The agent replaces it with
+/// [`BG_OFFERED_HINT`] when it loads `bg` for the next request itself.
+pub const BG_LOAD_HINT: &str =
+    " Load the Dial `bg` tool with `tool_load` to wait for or stop it; no polling.";
+
+/// Entry names directly in `dir`, or `None` when it is unreadable or too large to compare.
+fn directory_entries(dir: &Path) -> Option<std::collections::BTreeSet<std::ffi::OsString>> {
+    const LIMIT: usize = 4096;
+    let mut names = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        // The scratch directory is Dial's own TMPDIR, created on demand; it is not a task output.
+        if entry.file_name() == crate::workspace_copy::SCRATCH_DIR {
+            continue;
+        }
+        names.insert(entry.file_name());
+        if names.len() > LIMIT {
+            return None;
+        }
+    }
+    Some(names)
+}
+
+/// Names a command left in its working directory that were absent before it ran. Bash writes are
+/// not checkpointed, so build products and scratch files would otherwise go unreported.
+fn created_entries_note(
+    before: Option<&std::collections::BTreeSet<std::ffi::OsString>>,
+    dir: &Path,
+) -> Option<String> {
+    let after = directory_entries(dir)?;
+    let created: Vec<_> = after
+        .difference(before?)
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    if created.is_empty() {
+        return None;
+    }
+    let shown = created
+        .iter()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = created.len().saturating_sub(10);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "[new in the working directory: {shown}{more}; remove scratch outputs the task does not want]\n"
+    ))
+}
 
 /// Transfers the process leader out of the foreground owner's drop guard.
 pub(crate) fn release_process(group: ProcessGroup) -> Child {
@@ -104,10 +159,13 @@ fn output_tail(bytes: &[u8]) -> String {
 
 /// The moment a foreground command is handed to the background owner, or `None` when it may not be.
 /// A zero threshold disables automatic backgrounding, so it gets no deadline. Otherwise the deadline
-/// is the configured threshold, whatever the `timeout`: a command still running after it moves to
-/// `bg`, so an explicit `timeout` never keeps a command in the foreground past the threshold.
-fn adoption_deadline(auto_background: Duration) -> Option<Duration> {
-    (!auto_background.is_zero()).then_some(auto_background)
+/// is the configured threshold, or the command's explicit `timeout` when that is longer: a caller
+/// that said how long to wait gets the result in this call instead of a `bg wait` round trip, and
+/// a command still running at that point moves to `bg` rather than being killed. Steering and an
+/// explicit background request still adopt at once.
+fn adoption_deadline(auto_background: Duration, requested: Option<Duration>) -> Option<Duration> {
+    (!auto_background.is_zero())
+        .then(|| requested.map_or(auto_background, |timeout| timeout.max(auto_background)))
 }
 
 /// Whether the timeout kills the command on this pass. A timeout at or after the adoption deadline
@@ -581,7 +639,7 @@ pub fn bash_tool_streaming(
     on_output: &(dyn Fn(&[u8]) + Sync),
     cancel: &AtomicBool,
 ) -> Result<ToolOutput, String> {
-    if opt_bool(args, "async")? || opt_bool(args, "background")? {
+    if opt_bool(args, "background")? {
         return Err("managed background adoption is unavailable".into());
     }
     // Without an adoption owner, cooperative steering must not kill foreground effects.
@@ -650,15 +708,18 @@ fn with_bash_interceptor(
         )
     });
     let hint = match &interceptor {
-        Some((config, offered)) => match bash_interceptor::check(config, offered, command) {
-            Some(Verdict::Block(message)) => {
-                return Ok(
-                    ToolOutput::err(message).with_effects(crate::runtime::execution::Effects::None)
-                );
+        Some((config, offered)) => {
+            match bash_interceptor::check_in(config, offered, command, &|path| {
+                ws.resolve(path).is_ok()
+            }) {
+                Some(Verdict::Block(message)) => {
+                    return Ok(ToolOutput::err(message)
+                        .with_effects(crate::runtime::execution::Effects::None));
+                }
+                Some(Verdict::Hint(line)) => Some(line),
+                None => None,
             }
-            Some(Verdict::Hint(line)) => Some(line),
-            None => None,
-        },
+        }
         None => None,
     };
     let mut output = run(command)?;
@@ -666,6 +727,7 @@ fn with_bash_interceptor(
         && let Some(line) = hint
             .or_else(|| bash_interceptor::ci_poll_hint(config, &offered, command, &output.text))
             .or_else(|| bash_interceptor::trim_hint(config, command))
+            .or_else(|| bash_interceptor::notes_hint(config, command))
     {
         if !output.text.ends_with('\n') {
             output.text.push('\n');
@@ -689,7 +751,6 @@ pub(super) fn bash_tool_pty(
         }
     }
     // These flags cannot delay a PTY launch, but malformed values must not be silently ignored.
-    opt_bool(args, "async")?;
     opt_bool(args, "background")?;
     with_bash_interceptor(ws, args, |command| {
         let (cwd, command) = working_directory(ws, args, command)?;
@@ -734,7 +795,7 @@ fn run_bash(
     on_adopt: &dyn Adopter,
 ) -> Result<ToolOutput, String> {
     let session = crate::tools::opt_str(args, "session")?;
-    let asynchronous = opt_bool(args, "async")? || opt_bool(args, "background")?;
+    let asynchronous = opt_bool(args, "background")?;
     if let Some(name) = session {
         if name.is_empty()
             || name.len() > 64
@@ -805,6 +866,7 @@ fn run_bash(
     if !asynchronous && session.is_none() && runner_for(ws)? == Runner::InProcess {
         return inprocess::run(ws, &command, &cwd, timeout_secs, on_output, cancel);
     }
+    let entries_before = directory_entries(&cwd);
     let mut spool = ws
         .artifacts()
         .map(|store| store.spool())
@@ -816,6 +878,7 @@ fn run_bash(
         &cwd,
         None,
         exchange.as_ref().map(|exchange| exchange.path()),
+        false,
     )?;
     let spawned = (|| {
         let (reader, writer) = io::pipe().map_err(|e| format!("creating output pipe: {e}"))?;
@@ -850,7 +913,11 @@ fn run_bash(
     let mut timed_out = false;
     let mut cancelled = false;
     let auto_background = Duration::from_secs(auto_background_secs);
-    let mut adopt_after = adoption_deadline(auto_background);
+    let requested = requested_timeout
+        .filter(|secs| *secs > 0)
+        .map(|_| timeout)
+        .filter(|timeout| !timeout.is_zero());
+    let mut adopt_after = adoption_deadline(auto_background, requested);
     // Set once no background owner could take the command (none registered, or every slot in use).
     // It then stays here under its own timeout: a refused hand-off would drop, and so stop, it.
     let mut adoption_refused = false;
@@ -905,14 +972,14 @@ fn run_bash(
                         .is_none_or(|(_, offered)| offered.iter().any(|name| name == tool))
                 };
                 let manage = if offered("bg") {
-                    " bg wait returns its output when it exits; stop it with bg kill. Do not poll it; continue independent work or use a bounded bg wait."
+                    BG_OFFERED_HINT
                 } else if offered("tool_load") {
-                    " To read, wait for or stop it, load the Dial `bg` tool with `tool_load` (it is not a shell command), then call bg wait or bg kill. Do not poll it; continue independent work."
+                    BG_LOAD_HINT
                 } else {
-                    " Do not poll it; continue independent work."
+                    " No polling."
                 };
                 let mut output = ToolOutput::ok(format!(
-                    "command is running as background job {id} (after {}s): {command}\n{so_far}Keep working; you are notified when it finishes.{manage}",
+                    "command is running as background job {id} (after {}s): {command}\n{so_far}You are notified when it finishes.{manage}",
                     started.elapsed().as_secs()
                 ));
                 // Structured so the controller can follow the job without parsing this prose.
@@ -1034,16 +1101,26 @@ fn run_bash(
         complete_capture && (original == inline_retained || full.is_some()),
         full.as_deref(),
     );
-    // A failed build or test whose first error sits pages down gets those lines up front; the
-    // full output still follows unchanged (and stays in the artifact).
+    // Output shown in full inline needs no pointer to the same bytes; the artifact URI stays in
+    // the structured output integrity record. Truncated or filtered output keeps the link.
+    if !minimized
+        && original == inline_retained
+        && let Some(uri) = &artifact
+    {
+        text = text.replacen(&format!("[complete output: {uri}]\n"), "", 1);
+    }
+    // A failed build or test whose failing tests or first errors are not visible near the top of
+    // the shown text (filtered, cut to head and tail, or pages down) gets them up front, taken from
+    // the complete output when it was read; the shown output still follows (and stays in the artifact).
     if !success
         && !cancelled
         && !timed_out
-        && let Some(digest) = super::minimizer::failure_digest(&command, &text)
+        && let Some(digest) =
+            super::minimizer::failure_digest(&command, full.as_deref().unwrap_or(&text), &text)
     {
         text.insert_str(
             0,
-            &format!("[failure digest: first error lines; the full output follows]\n{digest}[end of digest]\n"),
+            &format!("[failure digest: failing tests and first errors; the output follows]\n{digest}[end of digest]\n"),
         );
     }
     let integrity = output_integrity(
@@ -1072,6 +1149,9 @@ fn run_bash(
         } else {
             text.push_str("[shell state invalidated by incomplete execution]\n");
         }
+    }
+    if !cancelled && let Some(note) = created_entries_note(entries_before.as_ref(), &cwd) {
+        text.push_str(&note);
     }
     let output = ToolOutput {
         execution: Default::default(),
@@ -1122,6 +1202,16 @@ pub(in crate::tools) fn shell_command(
     cwd: &Path,
 ) -> Result<std::process::Command, String> {
     shell_command_mode(ws, script, cwd, None)
+}
+
+/// Eval's mandatory process fence is independent of the filesystem sandbox opt-out.
+#[cfg(target_os = "linux")]
+pub(super) fn shell_command_fenced(
+    ws: &Workspace,
+    script: &str,
+    cwd: &Path,
+) -> Result<std::process::Command, String> {
+    shell_command_with_state(ws, script, cwd, None, None, true)
 }
 
 /// Which program runs a `bash` command.
@@ -1274,7 +1364,7 @@ pub(in crate::tools) fn shell_command_mode(
     cwd: &Path,
     owned_terminal: Option<i32>,
 ) -> Result<std::process::Command, String> {
-    shell_command_with_state(ws, script, cwd, owned_terminal, None)
+    shell_command_with_state(ws, script, cwd, owned_terminal, None, false)
 }
 fn shell_command_with_state(
     ws: &Workspace,
@@ -1282,8 +1372,11 @@ fn shell_command_with_state(
     cwd: &Path,
     owned_terminal: Option<i32>,
     state: Option<&Path>,
+    fork_fence: bool,
 ) -> Result<std::process::Command, String> {
     let runner = runner_for(ws)?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = fork_fence;
     // Background jobs and tool helpers need a child process; they run the same shell in a child
     // host (only reachable with the sandbox off, which `runner_for` verified).
     let runner = if runner == Runner::InProcess {
@@ -1304,7 +1397,7 @@ fn shell_command_with_state(
         let mut spawn = match runner {
             Runner::Bash(bash) => {
                 let mut spawn = std::process::Command::new(bash);
-                spawn.args(["-c", script]);
+                spawn.args(["-c", &missing_program::decorate(script)]);
                 spawn
             }
             // `InProcess` was mapped to `Embedded` above; both run the child shell host here.
@@ -1375,7 +1468,7 @@ fn shell_command_with_state(
         let (program, args) = match runner {
             Runner::Bash(bash) => (
                 bash.to_str().ok_or("bash path is not UTF-8")?.to_owned(),
-                vec!["-c".to_owned(), script.to_owned()],
+                vec!["-c".to_owned(), missing_program::decorate(script)],
             ),
             Runner::Embedded | Runner::InProcess => embedded_invocation(&scratch, script, state)?,
             Runner::PowerShell => return Err("PowerShell is only available on Windows".into()),
@@ -1393,6 +1486,10 @@ fn shell_command_with_state(
                 .env("TMPDIR", &scratch_str)
                 .env("PAGER", "cat")
                 .env("GIT_PAGER", "cat");
+            #[cfg(target_os = "linux")]
+            if fork_fence {
+                super::sandbox::fork_fence::direct(&mut spawn)?;
+            }
         } else {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let sandbox = ws.sandbox.clone().unwrap_or_else(Sandbox::detect);
@@ -1415,7 +1512,10 @@ fn shell_command_with_state(
                 proxy.as_deref(),
                 &program,
                 &arg_refs,
-                owned_terminal,
+                super::sandbox::CommandMode {
+                    owned_terminal,
+                    fork_fence,
+                },
             );
             spawn = match built {
                 Ok(spawn) => spawn,
@@ -1459,6 +1559,7 @@ fn shell_command_with_state(
 }
 
 mod inprocess;
+mod missing_program;
 
 #[cfg(test)]
 mod backend_tests;

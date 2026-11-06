@@ -28,7 +28,8 @@ PIXEL = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+
 def unsupported_probe(handler):
     """Explicit negative responses to Dial's optional local-runtime metadata probes."""
     if handler.path.rstrip("/") not in {
-        "/props", "/api/ps", "/api/v0/models/mock-main", "/api/v0/models/mock-next"
+        "/props", "/api/ps", "/api/show", "/api/v1/models", "/api/v0/models",
+        "/api/v0/models/mock-main", "/api/v0/models/mock-next"
     }:
         return False
     data = b'{"error":"optional runtime metadata is not provided by this fixture"}'
@@ -114,6 +115,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if unsupported_probe(self):
+            return
         with self.server.lock:
             self.server.chat_requests += 1
             index = self.server.chat_requests

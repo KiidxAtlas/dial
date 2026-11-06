@@ -19,7 +19,7 @@ pub(crate) fn now_ms() -> Result<u64> {
 
 /// Open only within currently authorized roots, checking deny-read policy before descriptor access.
 pub(crate) fn read(ws: &Workspace, input: &str) -> Result<Vec<u8>> {
-    let path = ws.resolve(input).map_err(anyhow::Error::msg)?;
+    let path = ws.resolve_read(input).map_err(anyhow::Error::msg)?;
     if let Some(
         crate::tools::exec::sandbox::Policy::Dev { deny_read, .. }
         | crate::tools::exec::sandbox::Policy::Strict { deny_read, .. },
@@ -35,7 +35,7 @@ pub(crate) fn read(ws: &Workspace, input: &str) -> Result<Vec<u8>> {
         }
     }
     let (root, relative) = ws
-        .roots()
+        .read_roots()
         .filter_map(|root| path.strip_prefix(root).ok().map(|rel| (root, rel)))
         .max_by_key(|(root, _)| root.components().count())
         .context("source is outside authorized workspace roots")?;
@@ -59,7 +59,7 @@ pub(crate) fn read(ws: &Workspace, input: &str) -> Result<Vec<u8>> {
         before.len() == after.len()
             && before.modified()? == after.modified()?
             && identity == crate::platform::fs::identity(&reopened)?
-            && ws.resolve(input).map_err(anyhow::Error::msg)? == path,
+            && ws.resolve_read(input).map_err(anyhow::Error::msg)? == path,
         "evidence source changed while capturing; retry the read"
     );
     Ok(bytes)

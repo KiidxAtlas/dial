@@ -174,6 +174,13 @@ struct StepChecks {
     /// Non-read-only shell attempts outside checkpoint observation.
     uncheckpointed_shell_commands: u64,
     disclosed_shell_commands: u64,
+    /// Files modified since `started` that a bounded workspace scan found after opaque effects:
+    /// delivered artifacts outside checkpoint observation, for completion review.
+    shell_outputs: std::collections::BTreeSet<std::path::PathBuf>,
+    /// Opaque-effect count at the last scan, so an unchanged state is not rescanned.
+    shell_scan_epoch: u64,
+    /// Turn admission time less a margin for coarse filesystem timestamps; `None` disables scans.
+    started: Option<std::time::SystemTime>,
     /// Approval-requiring extension attempts that may have effects outside checkpoint observation.
     uncheckpointed_extension_calls: u64,
     disclosed_extension_calls: u64,

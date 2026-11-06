@@ -297,6 +297,34 @@ fn edit_history_recorded_before_allow_syntax_errors_stays_valid() {
 }
 
 #[test]
+fn edit_history_before_optional_check_stays_valid_in_every_grammar() {
+    use crate::config::types::EditMode;
+    let registry = Registry::new();
+    for mode in [
+        EditMode::Hashline,
+        EditMode::Replace,
+        EditMode::Patch,
+        EditMode::ApplyPatch,
+        EditMode::Sloppy,
+    ] {
+        let current = crate::tools::schema("edit", mode).unwrap();
+        let mut before = current.clone();
+        assert_eq!(
+            before["function"]["parameters"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("check")
+                .unwrap()["type"],
+            "boolean"
+        );
+        let old = identities(&[before], &registry)["edit"].clone();
+        let history = vec![json!({"role":"assistant","dial_tool_contracts":{"edit":old}})];
+        validate_history(&history, &[current], &registry)
+            .unwrap_or_else(|error| panic!("{mode:?}: {error}"));
+    }
+}
+
+#[test]
 fn write_and_ast_history_before_syntax_override_remains_compatible() {
     let registry = Registry::new();
     for current in [
@@ -536,11 +564,11 @@ fn web_search_history_recorded_before_added_providers_stays_valid() {
     }
     let mut before = current.clone();
     before["function"]["parameters"]["properties"]["provider"]["enum"] = json!(&names[..12]);
-    // History recorded before the added providers also predates the domain filters.
+    // This provider set predates both the domain filters and optional result-page fetching.
     before["function"]["parameters"]["properties"]
         .as_object_mut()
         .unwrap()
-        .retain(|name, _| name != "domains" && name != "exclude_domains");
+        .retain(|name, _| !matches!(name.as_str(), "domains" | "exclude_domains" | "fetch_top"));
     let mut registry = Registry::new();
     registry.register(std::sync::Arc::new(tool));
     let old = identities(&[before.clone()], &Registry::new())["web_search"].clone();
@@ -607,6 +635,103 @@ fn recorded_kernel_calls_with_an_explicit_language_are_refused() {
         json!({"role":"tool","tool_call_id":"c1","content":"1"}),
     ];
     assert!(project_history(&history, std::slice::from_ref(&current), &registry).is_err());
+}
+
+/// The split memory tools merged into `memory`; a recorded call resumes as `memory` with the
+/// action that selected it, and an already-actioned shape is refused.
+#[test]
+fn recorded_split_memory_calls_project_onto_memory_actions() {
+    let registry = Registry::new();
+    let update = json!({"type":"function","function":{"name":"memory_update","parameters":{"type":"object","properties":{"id":{"type":"integer"},"content":{"type":"string"}}}}});
+    let old = identities(&[update], &registry)["memory_update"].clone();
+    let current = json!({"type":"function","function":{"name":"memory","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["recall","update"]},"id":{"type":"integer"},"content":{"type":"string"}},"required":["action"]}}});
+    let history = |arguments: &str| {
+        vec![
+            json!({"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"memory_update","arguments":arguments}}],"dial_tool_contracts":{"c1":old}}),
+            json!({"role":"tool","tool_call_id":"c1","content":"{}"}),
+        ]
+    };
+    let projected = project_history(
+        &history("{\"id\":3,\"content\":\"x\"}"),
+        std::slice::from_ref(&current),
+        &registry,
+    )
+    .unwrap()
+    .expect("a recorded memory_update call must be projected onto memory");
+    let call = &projected[0]["tool_calls"][0]["function"];
+    assert_eq!(call["name"], "memory");
+    let arguments: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(arguments, json!({"action":"update","id":3,"content":"x"}));
+    validate_history(&projected, std::slice::from_ref(&current), &registry).unwrap();
+    assert!(
+        project_history(
+            &history("{\"action\":\"recall\"}"),
+            std::slice::from_ref(&current),
+            &registry
+        )
+        .is_err()
+    );
+}
+
+/// The removed pre-split monolithic `memory` contract has no projection onto the current one.
+#[test]
+fn recorded_monolithic_memory_calls_are_refused() {
+    let registry = Registry::new();
+    let monolithic = json!({"type":"function","function":{"name":"memory","parameters":{"type":"object","properties":{"op":{"type":"string"},"text":{"type":"string"}}}}});
+    let old = identities(&[monolithic], &registry)["memory"].clone();
+    let current = json!({"type":"function","function":{"name":"memory","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["recall"]},"query":{"type":"string"}},"required":["action"]}}});
+    let history = vec![
+        json!({"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"memory","arguments":"{\"op\":\"add\",\"text\":\"x\"}"}}],"dial_tool_contracts":{"c1":old}}),
+        json!({"role":"tool","tool_call_id":"c1","content":"{}"}),
+    ];
+    assert!(project_history(&history, std::slice::from_ref(&current), &registry).is_err());
+}
+
+/// `artifact_read` merged into `read`; each recorded mode resumes as the equivalent `artifact://`
+/// path selector, and a shape the old tool could not express in a selector is refused.
+#[test]
+fn recorded_artifact_read_calls_project_onto_read_selectors() {
+    let registry = Registry::new();
+    let legacy = json!({"type":"function","function":{"name":"artifact_read","parameters":{"type":"object","properties":{"uri":{"type":"string"},"info":{"type":"boolean"},"annotations":{"type":"boolean"},"start":{"type":"integer"},"count":{"type":"integer"},"offset":{"type":"integer"},"bytes":{"type":"integer"}},"required":["uri"]}}});
+    let old = identities(&[legacy], &registry)["artifact_read"].clone();
+    let current = json!({"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}});
+    let history = |arguments: Value| {
+        vec![
+            json!({"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"artifact_read","arguments":arguments.to_string()}}],"dial_tool_contracts":{"c1":old}}),
+            json!({"role":"tool","tool_call_id":"c1","content":"x"}),
+        ]
+    };
+    let uri = format!("artifact://{}", "a".repeat(64));
+    for (arguments, selector) in [
+        (json!({"uri":uri}), "1+100"),
+        (json!({"uri":uri,"start":40,"count":20}), "40+20"),
+        (json!({"uri":uri,"info":true}), "info"),
+        (json!({"uri":uri,"annotations":true}), "annotations"),
+        (json!({"uri":uri,"offset":64,"bytes":32}), "bytes=64+32"),
+        (json!({"uri":uri,"offset":0}), "bytes=0+8192"),
+    ] {
+        let projected = project_history(
+            &history(arguments),
+            std::slice::from_ref(&current),
+            &registry,
+        )
+        .unwrap()
+        .expect("a recorded artifact_read call must be projected onto read");
+        let call = &projected[0]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "read");
+        let arguments: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"path": format!("{uri}:{selector}")}));
+        validate_history(&projected, std::slice::from_ref(&current), &registry).unwrap();
+    }
+    for refused in [
+        json!({"uri":uri,"annotations":true,"start":2}),
+        json!({"uri":uri,"extra":1}),
+        json!({"start":1}),
+    ] {
+        assert!(
+            project_history(&history(refused), std::slice::from_ref(&current), &registry).is_err()
+        );
+    }
 }
 
 /// `eval` gained `language:"py"`; sessions recorded when only JavaScript existed stay valid.
@@ -745,12 +870,37 @@ fn task_acceptance_contract_is_additive_at_both_call_shapes() {
 }
 
 #[test]
+fn git_reflog_preserves_existing_session_contracts() {
+    let mut registry = Registry::new();
+    let tool = crate::tools::vcs::git::tools(&crate::config::types::Config::default())
+        .pop()
+        .unwrap();
+    let current = tool.schema();
+    registry.register(tool);
+    let mut before = current.clone();
+    let actions = before["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array_mut()
+        .unwrap();
+    let count = actions.len();
+    actions.retain(|value| value != "reflog");
+    assert_eq!(actions.len() + 1, count);
+    let identity = identities(&[before], &registry)["git"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"call":identity}})];
+    assert!(
+        project_history(&history, &[current], &registry)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn registry_contracts_accept_each_intermediate_additive_release_shape() {
     let config = crate::config::types::Config::default();
     for tool in crate::tools::net::browser::tools(&config)
         .into_iter()
         .chain(crate::tools::exec::eval::tools(&config))
         .chain(crate::tools::knowledge::data::tools(&config))
+        .chain(crate::tools::exec::background::tools(&config))
     {
         let name = tool.name().to_owned();
         let Some((_, properties)) = ADDITIVE_PROPERTIES.iter().find(|(tool, _)| *tool == name)
@@ -813,4 +963,147 @@ fn contract_identity_is_independent_of_nested_object_insertion_order() {
         identities(&[first], &Registry::new()),
         identities(&[second], &Registry::new())
     );
+}
+
+fn old_names_history(tool: &str, before: Value, arguments: &str) -> Vec<Value> {
+    let old = identities(std::slice::from_ref(&before), &Registry::new())[tool].clone();
+    vec![
+        json!({"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":tool,"arguments":arguments}}],"dial_tool_contracts":{"c":old}}),
+        json!({"role":"tool","tool_call_id":"c","content":"recorded"}),
+    ]
+}
+
+#[test]
+fn history_recorded_under_pre_rename_parameter_names_projects_onto_the_simpler_names() {
+    let registry = Registry::new();
+    let mode = crate::config::types::EditMode::Replace;
+    // grep: fixed_string -> literal, max_results -> limit.
+    let current = crate::tools::schema("grep", mode).unwrap();
+    let mut before = current.clone();
+    legacy_schema(&mut before);
+    assert!(
+        before
+            .pointer("/function/parameters/properties/fixed_string")
+            .is_some()
+    );
+    let history = old_names_history(
+        "grep",
+        before,
+        r#"{"pattern":"x","fixed_string":true,"max_results":5}"#,
+    );
+    let projected = project_history(&history, std::slice::from_ref(&current), &registry)
+        .unwrap()
+        .expect("old grep names are projected");
+    let arguments: Value = serde_json::from_str(
+        projected[0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(arguments, json!({"pattern":"x","literal":true,"limit":5}));
+    validate_history(&projected, std::slice::from_ref(&current), &registry).unwrap();
+    assert!(
+        project_history(&projected, std::slice::from_ref(&current), &registry)
+            .unwrap()
+            .is_none()
+    );
+
+    // bash: the removed async alias becomes background.
+    let current = crate::tools::schema("bash", mode).unwrap();
+    let mut before = current.clone();
+    legacy_schema(&mut before);
+    let history = old_names_history("bash", before, r#"{"command":"sleep 1","async":true}"#);
+    let projected = project_history(&history, std::slice::from_ref(&current), &registry)
+        .unwrap()
+        .expect("old bash alias is projected");
+    let arguments: Value = serde_json::from_str(
+        projected[0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(arguments, json!({"command":"sleep 1","background":true}));
+
+    // find (registry tool): grep_keywords -> keywords.
+    let current = crate::tools::code::navigation::tools(&crate::config::types::Config::default())
+        .into_iter()
+        .find(|tool| tool.name() == "find")
+        .unwrap()
+        .schema();
+    let mut before = current.clone();
+    legacy_schema(&mut before);
+    let history = old_names_history("find", before, r#"{"query":"q","grep_keywords":["a"]}"#);
+    let projected = project_history(&history, std::slice::from_ref(&current), &registry)
+        .unwrap()
+        .expect("old find names are projected");
+    assert!(
+        projected[0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("\"keywords\"")
+    );
+
+    // Any other change is still refused.
+    let mut changed = crate::tools::schema("grep", mode).unwrap();
+    changed["function"]["parameters"]["properties"]["extra"] = json!({"type":"string"});
+    let history = old_names_history("grep", changed, "{}");
+    assert!(
+        project_history(
+            &history,
+            &[crate::tools::schema("grep", mode).unwrap()],
+            &registry
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn optional_tool_bundles_preserve_prior_history_and_validate_shapes() {
+    let config = crate::config::types::Config::default();
+    let mut schemas = vec![
+        crate::tools::schema("write", config.edit.mode).unwrap(),
+        crate::tools::schema("grep", config.edit.mode).unwrap(),
+    ];
+    schemas.extend(
+        crate::tools::net::web::tools(&config)
+            .into_iter()
+            .filter(|tool| tool.name() == "web_search")
+            .map(|tool| tool.schema()),
+    );
+    schemas.extend(
+        crate::tools::net::browser::tools(&config)
+            .into_iter()
+            .map(|tool| tool.schema()),
+    );
+    let registry = Registry::new();
+    for current in schemas {
+        let name = current["function"]["name"].as_str().unwrap();
+        let property = match name {
+            "write" => "check",
+            "grep" => "preview",
+            "web_search" => "fetch_top",
+            "browser" => "observe",
+            _ => panic!("unexpected schema {name}"),
+        };
+        let mut before = current.clone();
+        assert!(
+            before["function"]["parameters"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove(property)
+                .is_some(),
+            "{name}.{property}"
+        );
+        let old = identities(&[before], &registry)[name].clone();
+        let history = vec![json!({"role":"assistant","dial_tool_contracts":{name:old}})];
+        validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
+        let mut changed = current.clone();
+        changed["function"]["parameters"]["properties"][property]["type"] = json!("null");
+        let malformed = identities(&[changed], &registry)[name].clone();
+        let history = vec![json!({"role":"assistant","dial_tool_contracts":{name:malformed}})];
+        assert!(
+            validate_history(&history, std::slice::from_ref(&current), &registry).is_err(),
+            "changed {name}.{property} is not additive"
+        );
+    }
 }

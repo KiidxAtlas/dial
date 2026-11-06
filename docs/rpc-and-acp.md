@@ -14,7 +14,7 @@ JSON modes reserve stdout for JSON. Results include session ID, answer, tool out
 Use `--allow read,edit` for named tool approval instead of blanket `-y`; read-only mode and deny rules
 still win. With both a prompt argument and piped stdin, stdin is appended as fenced context.
 Print runs offer a smaller tool set than the terminal: `ask` is disabled, and `task`/`message`,
-`working_state`, `codebase_memory`, `todo` and `find` are listed as loadable instead of offered,
+`working_state`, `todo`, `find` and `memory` are listed as loadable instead of offered,
 unless `task.prefer_subagents=true` keeps `task`. The model can still `tool_load` any of them.
 Session `bg` jobs end when a print run exits. Before the run ends, Dial tells the model once which
 explicitly started jobs are still running, and refuses `finish` once for them. A server the task

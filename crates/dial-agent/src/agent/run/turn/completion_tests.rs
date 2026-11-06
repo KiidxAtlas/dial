@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+use crate::agent::run::tool_exposure::default_offer_tests::with_review_disabled as with_agent;
 
 pub(super) fn response(text: &str, call: Option<(&str, Value)>) -> llm::fake::Script {
     let mut delta = json!({"content":text});
@@ -546,4 +546,109 @@ fn disabling_target_evidence_restores_the_unverified_completion() {
         assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
         assert!(agent.completion_evidence(TurnOutcome::Completed)["requested_targets"].is_null());
     });
+}
+
+#[test]
+fn default_artifact_reconciliation_piggybacks_plain_and_typed_completion() {
+    for explicit in [false, true] {
+        for disabled in [false, true] {
+            let final_reply = || {
+                if explicit {
+                    response(
+                        "",
+                        Some((
+                            "finish",
+                            json!({"outcome":"completed","summary":"Created result.txt."}),
+                        )),
+                    )
+                } else {
+                    response("Created result.txt.", None)
+                }
+            };
+            let scripts = vec![
+                response(
+                    "",
+                    Some((
+                        "write",
+                        json!({"path":"result.txt","content":"delivered\n"}),
+                    )),
+                ),
+                llm::fake::json(200, &json!({"total_slots":1})),
+                final_reply(),
+            ];
+            let server = llm::fake::serve(scripts);
+            let mut overlay = "[compaction]\nenabled=false\n[verification]\nautomatic_checks=true\n[[verification.commands]]\nname='artifact'\ncommand='test -f result.txt'\nfile_extensions=['txt']\ntimeout_secs=5\n".to_owned();
+            if disabled {
+                overlay.push_str("[verification.review]\nenabled=false\n");
+            }
+            crate::agent::run::tool_exposure::default_offer_tests::with_agent(&overlay, |agent| {
+                connect(agent, &server.url);
+                let report = agent
+                    .turn("Create result.txt containing delivered", &mut NullUi)
+                    .unwrap();
+                assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+                assert_eq!(
+                    std::fs::read_to_string(agent.workspace.root().join("result.txt")).unwrap(),
+                    "delivered\n"
+                );
+            });
+            let requests = completion_requests(&server);
+            assert_eq!(
+                requests.len(),
+                2,
+                "explicit={explicit}, disabled={disabled}"
+            );
+            if !disabled {
+                let last = requests.last().unwrap().to_string();
+                assert!(last.contains("one bounded self-review"));
+                assert!(last.contains("Create result.txt containing delivered"));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_permitted_computation_delivers_its_artifact_without_a_transcription_call() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"python3 -I -S -B - <<'PY'\nimport csv\nwith open('result.csv', 'w', newline='') as f:\n    writer = csv.writer(f, lineterminator='\\n')\n    writer.writerow(['value'])\n    writer.writerow([sum([2, 3])])\nwith open('result.csv', newline='') as f:\n    assert list(csv.reader(f)) == [['value'], ['5']], 'generated artifact failed verification'\nPY"}),
+            )),
+        ),
+        llm::fake::json(200, &json!({"total_slots":1})),
+        response("Generated result.csv.", None),
+    ]);
+    crate::agent::run::tool_exposure::default_offer_tests::with_agent(
+        "[compaction]\nenabled=false\n[verification]\nautomatic_checks=false",
+        |agent| {
+            agent.modes.launch.unattended = true;
+            // Match the explicit --yes benchmark launch; NullUi cannot approve this heredoc.
+            agent.approval = crate::config::types::Approval::Auto;
+            connect(agent, &server.url);
+            let report = agent
+                .turn(
+                    "Compute the sum of 2 and 3 into result.csv, with header value, and verify the delivered CSV.",
+                    &mut NullUi,
+                )
+                .unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            assert_eq!(
+                std::fs::read_to_string(agent.workspace.root().join("result.csv")).unwrap(),
+                "value\n5\n"
+            );
+        },
+    );
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 2);
+    let calls: Vec<_> = requests.last().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+        .map(|call| call["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(calls, ["bash"]);
 }

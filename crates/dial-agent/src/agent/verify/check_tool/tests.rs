@@ -1,6 +1,8 @@
 use super::*;
 
 mod incremental;
+mod post_edit;
+mod scope;
 
 fn hermetic_agent<'a>(config: &'a Config, root: &Path) -> Agent<'a> {
     let backend = Backend::new(
@@ -430,6 +432,8 @@ fn a_reproduction_that_passes_before_any_change_is_refused_and_not_rerun_by_the_
         out.data.as_ref().unwrap()["results"][0]["registration"],
         "refused"
     );
+    assert_eq!(out.data.as_ref().unwrap()["scope"]["applicable_checks"], 0);
+    assert_eq!(out.data.as_ref().unwrap()["scope"]["pending_count"], 0);
     assert!(agent.step_checks.evidence.repros().is_empty());
     assert!(!agent.step_checks.failed);
     assert!(
@@ -574,17 +578,19 @@ fn reproductions_are_capped_validated_and_cannot_relabel_selected_checks() {
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
     for index in 0..MAX_REPROS {
-        let out = agent.check_tool(
-            &repro_args(&format!("r{index}"), &format!("echo {index}")),
-            &mut NullUi,
-        );
+        // Naming only the reproduction keeps the run to it; lint fails in this fixture.
+        let mut args = repro_args(&format!("r{index}"), &format!("echo {index}"));
+        args["names"] = json!([format!("repro: r{index}")]);
+        let out = agent.check_tool(&args, &mut NullUi);
         assert!(!out.is_error, "{}", out.text);
     }
     let over = agent.check_tool(&repro_args("extra", "echo extra"), &mut NullUi);
     assert!(over.is_error);
     assert!(over.text.contains("at most 4"), "{}", over.text);
     // Reusing a name replaces it within the cap.
-    let replaced = agent.check_tool(&repro_args("r0", "echo replaced"), &mut NullUi);
+    let mut args = repro_args("r0", "echo replaced");
+    args["names"] = json!(["repro: r0"]);
+    let replaced = agent.check_tool(&args, &mut NullUi);
     assert!(!replaced.is_error, "{}", replaced.text);
     assert!(agent.step_checks.evidence.is_repro("echo replaced"));
     assert!(!agent.step_checks.evidence.is_repro("echo 0"));
@@ -695,10 +701,9 @@ fn mutating_reproduction_stales_required_checks_and_delivered_visual_evidence() 
     agent.step_checks.visual.delivered();
     assert_eq!(agent.step_checks.visual.status(before), "observed");
 
-    let out = agent.check_tool(
-        &repro_args("mutates", "printf changed > source.rs"),
-        &mut NullUi,
-    );
+    let mut args = repro_args("mutates", "printf changed > source.rs");
+    args["names"] = json!(["repro: mutates"]);
+    let out = agent.check_tool(&args, &mut NullUi);
     assert!(!out.is_error, "{}", out.text);
     assert_eq!(
         std::fs::read_to_string(root.path().join("source.rs")).unwrap(),
@@ -719,6 +724,39 @@ fn mutating_reproduction_stales_required_checks_and_delivered_visual_evidence() 
         evidence["checks"]["latest"]["printf changed > source.rs"]["revision"],
         json!(after)
     );
+}
+
+#[test]
+fn registering_a_reproduction_after_a_change_runs_the_remaining_checks_in_the_same_call() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "unit".into(),
+            command: UNIT.into(),
+            file_extensions: vec![],
+            timeout_secs: 30,
+        });
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.step_checks.mutations = 1;
+    // A benchmark run registered a repro, read "1 applicable check(s) lack a current pass" and
+    // spent another request on a plain `check`. One call now covers both.
+    let out = agent.check_tool(&repro_args("bug", "echo fixed"), &mut NullUi);
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("passed: unit"), "{}", out.text);
+    assert!(out.text.contains("passed: repro: bug"), "{}", out.text);
+    assert!(!out.text.contains("lack a current pass"), "{}", out.text);
+    let revision = agent.step_checks.revision();
+    assert_eq!(
+        agent.step_checks.evidence.current_status(UNIT, revision),
+        "passed"
+    );
+    // Before any change the reproduction still runs alone as a baseline.
+    let mut fresh = hermetic_agent(&config, root.path());
+    let baseline = fresh.check_tool(&repro_args("bug", REPRO), &mut NullUi);
+    assert!(!baseline.text.contains("passed: unit"), "{}", baseline.text);
 }
 
 #[test]
@@ -747,6 +785,53 @@ fn unsafe_reproduction_rerun_cannot_earn_its_own_fix_credit() {
             .evidence
             .passing_behavioral(agent.step_checks.revision()),
         0
+    );
+}
+
+#[test]
+fn a_reproduction_runs_first_and_its_short_name_selects_it() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "unit".into(),
+            command: UNIT.into(),
+            file_extensions: vec![],
+            timeout_secs: 30,
+        });
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.step_checks.mutations = 1;
+    // An opaque reproduction advances the shell revision. Run after `unit`, it left that
+    // check's pass reported as both "passed" and "stale" in the same receipt.
+    let command = "if test -f ran; then exit 0; else touch ran; echo 'AssertionError: first run fails'; exit 1; fi";
+    let first = agent.check_tool(&repro_args("stateful", command), &mut NullUi);
+    assert!(first.is_error, "{}", first.text);
+    assert!(first.text.contains("passed: unit"), "{}", first.text);
+    assert!(!first.text.contains("unit (stale)"), "{}", first.text);
+    // The short name given at registration selects the reproduction, alone or with others.
+    let rerun = agent.check_tool(&json!({"names":["stateful", "unit"]}), &mut NullUi);
+    assert!(!rerun.is_error, "{}", rerun.text);
+    let results = &rerun.data.as_ref().unwrap()["results"];
+    assert_eq!(results[0]["name"], "repro: stateful");
+    assert_eq!(results[1]["name"], "unit");
+    assert!(
+        !rerun.text.contains("lack a current pass"),
+        "{}",
+        rerun.text
+    );
+    let revision = agent.step_checks.revision();
+    assert_eq!(
+        agent.step_checks.evidence.current_status(UNIT, revision),
+        "passed"
+    );
+    // Unknown names are still refused.
+    let refused = agent.check_tool(&json!({"names":["missing"]}), &mut NullUi);
+    assert!(
+        refused.text.contains("unknown check name"),
+        "{}",
+        refused.text
     );
 }
 

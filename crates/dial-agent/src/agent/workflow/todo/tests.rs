@@ -261,8 +261,13 @@ fn closed_tasks_are_pruned_to_a_recent_tail() {
     );
     assert_eq!(list.progress(), (3, 4));
 
-    // Closing the last task keeps it listed as the newest closed one.
-    list.call(&json!({"op": "done"}));
+    // Closing the last task keeps it listed as the newest closed one and says what was archived.
+    let out = list.call(&json!({"op": "done"}));
+    assert!(
+        out.text.starts_with("Completed 4. t5. Archived 1 oldest closed task(s) from the list (t2); remaining tasks are renumbered.\n"),
+        "{}",
+        out.text
+    );
     assert_eq!(list.render(), "[x] 1. t3\n[x] 2. t4\n[x] 3. t5");
     assert!(!list.has_open());
 }

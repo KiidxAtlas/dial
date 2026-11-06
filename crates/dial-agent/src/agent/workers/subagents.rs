@@ -161,14 +161,7 @@ pub fn toolset(spec: &AgentSpec, enabled: &[String], ext: &Registry) -> Vec<Stri
                             .contains(name))))
         })
         .map(str::to_owned);
-    own.chain(extra)
-        .chain(
-            enabled
-                .iter()
-                .filter(|name| name.as_str() == "artifact_read")
-                .cloned(),
-        )
-        .collect()
+    own.chain(extra).collect()
 }
 
 /// The call as the user sees it in approval prompts and tool lines.
@@ -236,26 +229,29 @@ pub fn schema(config: &Config) -> Value {
         format!("{presets}\nCustom agents:{custom}")
     };
     let description = format!(
-        "Delegate self-contained work to subagents. `tasks[]` runs independent slices in one call with shared `context`; action=start runs them live while you keep working, then wait. Agent types:{types}{presets}"
+        "task: delegate self-contained work to subagents. `tasks[]` runs independent slices in one call with shared `context`; action=start runs them live while you keep working, then `wait`. Agent types:{types}{presets}"
     );
     let mut entry_properties = json!({
-        "acceptance_checks":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1},"description":"Configured verification command names, never shell commands. Mutating workers run isolated and promote only when controller checks pass on stable declared inputs. Missing input contracts remain needs_verification."},
+        "acceptance_checks":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1},"description":"Names of configured checks, not shell commands. A mutating worker's changes merge only when these pass."},
         "agent":{"type":"string","description":"Agent type or preset (default scout)."},
-        "task":{"type":"string","description":"Complete assignment: scope and acceptance criteria; shared background goes in context."},
-        "solution_space":{"type":"string","description":"Fixed decisions the child must follow versus choices it may make; never empty. Example: \"Fixed: keep the public API and edit only src/parser.rs. Free: internal helper names and test layout.\""},
+        "task":{"type":"string","description":"Complete assignment with scope and acceptance criteria."},
+        "solution_space":{"type":"string","description":"What is fixed versus what the child may choose; never empty. Example: \"Fixed: edit only src/parser.rs. Free: helper names.\""},
         "skills":{"type":"array","items":{"type":"string"},"description":"Skills to load first."},
         "max_steps":{"type":"integer","minimum":0,"description":"Step limit; 0 means unlimited."},
         "name":{"type":"string","description":"Label shown to the user."},
         "output_schema":{"type":"object","description":"JSON Schema the final answer must satisfy."},
-        "isolation":{"type":"string","enum":["copy"],"description":"Workers only: work in a private copy. Changes merge on success unless the parent changed the same files; otherwise they stay in a reported recovery copy."},
-        "isolation_backend":{"type":"string","enum":ISOLATION_BACKENDS,"description":"Workers only; implies isolation: clone (copy-on-write), worktree (git), overlay (Linux), projfs (Windows), copy, or auto. An unavailable backend fails before any worker starts."}
+        "isolation":{"type":"string","enum":["copy"],"description":"Workers only: work in a private copy, merged on success unless the parent changed the same files."},
+        "isolation_backend":{"type":"string","enum":ISOLATION_BACKENDS,"description":"Workers only; implies isolation. Fails before starting if unavailable."}
     });
-    entry_properties.as_object_mut().unwrap().insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session id prefix or worker id whose record is read."}));
-    entry_properties.as_object_mut().unwrap().insert("model".into(), json!({"type":"string","description":"seance only: answering model (default the source session's, else the main model)."}));
+    entry_properties.as_object_mut().unwrap().insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session or worker id to read."}));
+    entry_properties.as_object_mut().unwrap().insert(
+        "model".into(),
+        json!({"type":"string","description":"seance only: answering model."}),
+    );
     if config.experimental.work_packet_contracts {
         entry_properties.as_object_mut().unwrap().insert("work_packet".into(), json!({
             "type":"object",
-            "description":"Scoped handoff contract. The child reports evidence for each acceptance item and does not claim unrun checks.",
+            "description":"Scoped handoff; the child reports evidence per acceptance item.",
             "properties":{
                 "scope":{"type":"string","minLength":1,"maxLength":2048},
                 "interface":{"type":"string","minLength":1,"maxLength":2048},
@@ -270,31 +266,31 @@ pub fn schema(config: &Config) -> Value {
     let mut properties = serde_json::Map::from_iter([
         (
             "action".into(),
-            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close","verify"],"description":"run (default) waits for every task; start returns live ids; resume continues a stopped worker; status/wait/cancel manage jobs; create/push/peek/close manage pools. With contract, start launches one durable bounded node, status inspects it, and verify reruns only its configured acceptance checks without replaying the worker."}),
+            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close","verify"],"description":"run (default) waits for all tasks; start returns live ids; resume continues a stopped worker; status/wait/cancel manage jobs; create/push/peek/close manage pools; verify reruns a contract node's checks."}),
         ),
         (
             "id".into(),
-            json!({"type":"string","description":"task-N for resume/status/wait/cancel, pool-N for push/peek/close; omit on status/wait for all jobs."}),
+            json!({"type":"string","description":"task-N or pool-N; omit on status/wait for all jobs."}),
         ),
         (
             "message".into(),
-            json!({"type":"string","description":"resume only: steering delivered before the job's next model request."}),
+            json!({"type":"string","description":"resume only: steering for the job's next request."}),
         ),
         (
             "timeout".into(),
-            json!({"type":"integer","minimum":0,"maximum":120,"description":"wait only: seconds to block (default 30); jobs keep running after it."}),
+            json!({"type":"integer","minimum":0,"maximum":120,"description":"wait only: seconds to block (default 30)."}),
         ),
         (
             "task".into(),
-            json!({"type":"string","description":"Single task: complete assignment, scope and acceptance criteria."}),
+            json!({"type":"string","description":"Single task: complete assignment."}),
         ),
         (
             "solution_space".into(),
-            json!({"type":"string","description":"Single task: fixed decisions versus choices the child may make."}),
+            json!({"type":"string","description":"Single task: fixed versus free choices."}),
         ),
         (
             "context".into(),
-            json!({"type":"string","description":"Shared background for every task in this call: goal, constraints, interfaces, conventions; concise and factual."}),
+            json!({"type":"string","description":"Shared background for every task: goal, constraints, interfaces."}),
         ),
         (
             "skills".into(),
@@ -310,7 +306,7 @@ pub fn schema(config: &Config) -> Value {
         ),
         (
             "concurrency".into(),
-            json!({"type":"integer","minimum":1,"maximum":32,"description":"create only: most pool workers running at once (default task.max_concurrency, clamped to 1..4)."}),
+            json!({"type":"integer","minimum":1,"maximum":32,"description":"create only: most pool workers at once."}),
         ),
         (
             "name".into(),
@@ -318,7 +314,7 @@ pub fn schema(config: &Config) -> Value {
         ),
         (
             "output_schema".into(),
-            json!({"type":"object","description":"JSON Schema for the final answer; in a batch, the default for items without one."}),
+            json!({"type":"object","description":"JSON Schema for the final answer; batch default."}),
         ),
         (
             "isolation".into(),
@@ -330,7 +326,7 @@ pub fn schema(config: &Config) -> Value {
         ),
         (
             "tasks".into(),
-            json!({"type":"array","maxItems":MAX_BATCH,"items":entry,"description":"Independent tasks instead of `task`; each needs task and solution_space."}),
+            json!({"type":"array","maxItems":MAX_BATCH,"items":entry,"description":"Independent tasks instead of `task`."}),
         ),
     ]);
     properties.insert("acceptance_checks".into(), {
@@ -341,19 +337,22 @@ pub fn schema(config: &Config) -> Value {
     });
     properties.insert("contract".into(), json!({
         "type":"object",
-        "description":"Opt-in strict workflow node, main agent only; requires start with acceptance_checks and a persistent session. Stable id binds the assignment and up to 16 already accepted dependencies. Missing/stale evidence blocks completion. Accepted outputs are retained, retries are bounded, and unknown effects are never replayed. Use status or verify with this id after restart.",
+        "description":"Opt-in durable workflow node (start only, with acceptance_checks). The id binds the assignment and up to 16 accepted dependencies; use status or verify with it after restart.",
         "properties":{
             "id":{"type":"string","minLength":1,"maxLength":64},
             "depends_on":{"type":"array","maxItems":16,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}
         },
         "required":["id"],"additionalProperties":false
     }));
-    properties.insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session id prefix or worker id whose record is read; other agents reject it."}));
-    properties.insert("model".into(), json!({"type":"string","description":"seance only: answering model (default the source session's, else the main model); other agents reject it."}));
+    properties.insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session or worker id to read."}));
+    properties.insert(
+        "model".into(),
+        json!({"type":"string","description":"seance only: answering model."}),
+    );
     if config.experimental.work_packet_contracts {
         properties.insert("work_packet".into(), json!({
             "type":"object",
-            "description":"Scoped handoff contract for this single task.",
+            "description":"Scoped handoff contract for this task.",
             "properties":{
                 "scope":{"type":"string","minLength":1,"maxLength":2048},
                 "interface":{"type":"string","minLength":1,"maxLength":2048},
@@ -368,7 +367,7 @@ pub fn schema(config: &Config) -> Value {
         properties.insert("model_profile".into(), json!({
             "type":"string",
             "enum":names,
-            "description":"Explicitly override the task's configured role with this operator-configured model profile only when the assignment requests it. Omit this field to honor role assignments. No arbitrary model identifiers are accepted."
+            "description":"Override the role's configured model profile only when the assignment asks for it."
         }));
     }
     json!({"type":"function","function":{"name":"task","description":description,
@@ -3427,7 +3426,7 @@ fn render(
                 Some(Ok(uri)) => {
                     *body = clip(body, job.limit);
                     body.push_str(&format!(
-                        "\n\n[Preview only; complete task report: {uri}. Read with artifact_read.]"
+                        "\n\n[Preview only; complete task report: {uri}. Read it with read.]"
                     ));
                 }
                 Some(Err(error)) => body.push_str(&format!(

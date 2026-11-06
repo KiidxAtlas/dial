@@ -33,6 +33,26 @@ workspace unchanged. Hermetic and unattended surfaces cannot grant access.
 The tool is discoverable through `tool_search` / `tool_load` when not offered.
 `/add-dir`, `--add-dir`, `/remove-dir`, and `/dirs` remain available.
 
+## Explicit read-only launch access
+
+For unattended runs, pass `--read-only-dir DIR` once per external directory:
+
+```sh
+dial -p --read-only-dir /reference --read-only-dir /fixtures "Compare the workspace with /reference"
+```
+
+This grants native `read`, `glob`, `grep`, `find`, and `ast_search` access, without granting writes
+or changing shell sandbox permissions. Name external targets with absolute paths; relative tool paths still start
+at the primary workspace. Directories must exist; relative flag values resolve against the primary
+workspace. No roots are added by default, and the filesystem root is refused.
+These grants are process-local and are not saved as writable session directories. Launch grants
+remain available when switching sessions in the same process; a later invocation must opt in again.
+Private Dial storage exclusions, symlink confinement, and normal tool approvals remain in force.
+Read-only roots do not unlock protected storage or authorize external language servers/MCP servers.
+Existing workspace and `--add-dir` write authority is unchanged: adding a read-only grant does not
+revoke a separate write grant for the same path. To grant read-only access, do not also add that
+directory with `--add-dir`.
+
 ## Separate sensitive access
 
 Adding a normal directory (even a home directory) does **not** unlock protected

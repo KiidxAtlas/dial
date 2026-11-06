@@ -440,11 +440,32 @@ macOS and Ubuntu without weakening host security. CI builds the `dial` library a
 build one after the other: each peaks near 5 GB in rustc, and together they would swap on the
 7 GB macOS arm64 runner. The native Windows Rust contract (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) runs in CI's `windows-rust` job, so the CI requirement above covers it; the release does not repeat it. The Windows release jobs (x86-64 and ARM64) build `dial.exe`, smoke-test the packaged archive (`--version`, `--help`), verify the binary format for the target, and run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.sshsig`.
 
+The Windows contract selects each library's owning package rather than compiling every
+workspace test harness for each filter. Its migrated-record privacy assertion checks native
+owner-only permissions (Unix mode bits or Windows ACLs), not synthetic Windows POSIX bits.
+The Unix CI smoke tier stages the executable already produced by the workspace build into
+`target/installed/bin`, then runs the same artifact and recovery checks; it does not invoke
+`cargo install` and compile another copy. Real-terminal surface fixtures use the visible
+`/sessions this` palette route and Ctrl+C to interrupt a running turn; Escape only dismisses UI.
+
 CI caches compiled dependencies per job with `Swatinem/rust-cache`. Caches are saved only from
 `main`, and also after a failing run, so one red test does not force the next run on that OS to
 rebuild from scratch. The repository's 10 GB cache quota evicts the least recently used entries
 first, so the Linux feature-powerset jobs share one cache per runner image, saved only by the
 all-features combination; per-combination caches crowded out the macOS test caches.
+
+Push and pull-request CI run eight representative Linux feature selections: minimal, each
+of the five optional features alone, the default feature set, and all features. PipeWire
+already enables desktop, so its individual selection covers that pair without a duplicate job.
+`.github/workflows/linux-features.yml` owns the shared compile job and runs
+the exhaustive 32-combination powerset weekly (Monday 04:23 UTC). Maintainers can also
+dispatch **Linux feature coverage** manually, with exhaustive coverage enabled by default;
+run that tier before a release when full feature-interaction evidence is needed. It does
+not run the other platform suites again. Feature compilation is capped at four concurrent
+jobs per run to leave capacity for platform CI. PipeWire selections retain Ubuntu 24.04;
+other selections retain Ubuntu 22.04. Representative coverage does not prove every optional
+feature interaction; the exhaustive tier retains that coverage. This changes future runs,
+not workflows already queued from an older commit.
 
 The Intel macOS CI job (`macos-15-intel`) runs format, build and the full test suite. The
 installed-binary smoke tests, real-terminal lifecycle scripts, slim build check and runtime

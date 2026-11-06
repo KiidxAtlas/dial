@@ -4,6 +4,7 @@ use base64::engine::general_purpose::STANDARD;
 
 fn req(size: &'static str, output: &'static str) -> Request<'static> {
     Request {
+        animation: None,
         prompt: "a red fox",
         size,
         output,

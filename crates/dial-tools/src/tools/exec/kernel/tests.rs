@@ -198,42 +198,82 @@ fn unavailable_sandbox_never_runs_model_code() {
     );
     assert!(!dir.path().join("escaped").exists());
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn cancellation_interrupts_an_inflight_kernel_without_session_lock() {
-    let dir = tempfile::tempdir().unwrap();
-    // The transport/control test opts out explicitly; confinement has a separate fail-closed test.
-    let workspace = crate::tools::Workspace::new(dir.path())
-        .unwrap()
-        .without_sandbox();
-    let config = Config::default();
-    let tool = Arc::new(PythonRuntime::new(KernelConfig::default()));
-    let running = tool.clone();
-    let thread = std::thread::spawn(move || {
-        running.run(
-            &ToolContext {
-                workspace: &workspace,
-                config: &config,
-                mutation_authorizer: None,
-                confirm: None,
-            },
-            "eval",
-            &json!({"code":"while True: pass"}),
-            &AtomicBool::new(false),
-            &|_| Err("no background".to_owned()),
-            &mut |_| ToolOutput::err("no callbacks"),
-            &AtomicBool::new(false),
-        )
-    });
-    let end = Instant::now() + Duration::from_secs(5);
-    while tool.pid.load(Ordering::Acquire) == 0 && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(1));
+    // Retain the original macOS explicit-off transport test: nested Seatbelt profiles are
+    // refused by sandbox-exec. Linux's new fence must work with and without bubblewrap.
+    let modes: &[bool] = if cfg!(target_os = "linux") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &sandboxed in modes {
+        if sandboxed && !crate::tools::exec::sandbox::require_for_test() {
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cell-started");
+        let workspace = crate::tools::Workspace::new(dir.path()).unwrap();
+        let workspace = if sandboxed {
+            workspace
+        } else {
+            workspace.without_sandbox()
+        };
+        let config = Config::default();
+        let tool = Arc::new(PythonRuntime::new(KernelConfig::default()));
+        let running = tool.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let code = if cfg!(target_os = "linux") {
+                "import os,signal,time\nsignal.signal(signal.SIGINT,signal.SIG_IGN)\nfor operation in [lambda:os.setpgid(0,os.getpgid(os.getppid())),lambda:os.setsid()]:\n try:\n  operation()\n except PermissionError:\n  pass\n else:\n  raise AssertionError('escaped process ownership')\nopen('cell-started','w').close()\nwhile True: time.sleep(0.01)"
+            } else {
+                "open('cell-started','w').close()\nwhile True: pass"
+            };
+            let result = running.run(
+                &ToolContext {
+                    workspace: &workspace,
+                    config: &config,
+                    mutation_authorizer: None,
+                    confirm: None,
+                },
+                "eval",
+                &json!({"code":code,"background":false}),
+                &AtomicBool::new(false),
+                &|_| Err("no background".to_owned()),
+                &mut |_| ToolOutput::err("no callbacks"),
+                &AtomicBool::new(false),
+            );
+            let _ = send.send((result.is_err(), result.err()));
+        });
+        let end = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = marker.exists();
+        tool.cancel();
+        let result = receive.recv_timeout(INTERRUPT_GRACE + Duration::from_secs(2));
+        if result.is_err() {
+            let pid = tool.pid.load(Ordering::Acquire);
+            if pid > 0 {
+                // SAFETY: positive owned child PID; regression cleanup must not rely on its group.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+        thread.join().unwrap();
+        assert!(
+            started,
+            "sandboxed={sandboxed}: model cell never established denied group/session changes: {result:?}"
+        );
+        assert!(
+            result.as_ref().is_ok_and(|(failed, _)| *failed),
+            "sandboxed={sandboxed}: cancellation failed to finish promptly: {result:?}"
+        );
+        assert_eq!(tool.pid.load(Ordering::Acquire), 0);
+        assert!(tool.session.lock().is_none());
     }
-    assert!(tool.pid.load(Ordering::Acquire) > 0);
-    tool.cancel();
-    assert!(thread.join().unwrap().is_err());
-    assert_eq!(tool.pid.load(Ordering::Acquire), 0);
-    assert!(tool.session.lock().is_none());
 }
 #[cfg(target_os = "macos")]
 #[test]

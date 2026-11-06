@@ -5,6 +5,12 @@ fn no_timing() -> Value {
     Value::Null
 }
 
+fn line<'a>(text: &'a str, prefix: &str) -> &'a str {
+    text.lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no {prefix:?} line in {text}"))
+}
+
 #[test]
 fn plain_answer_has_no_report() {
     let summary = json!({"outcome": "completed", "changed_files": [], "recorded_checks": [], "open_tasks": 0});
@@ -17,7 +23,7 @@ fn missing_summary_has_no_report() {
 }
 
 #[test]
-fn completed_edit_reports_files_checks_and_undo() {
+fn completed_edit_is_short_and_omits_empty_sections() {
     let summary = json!({
         "outcome": "completed",
         "changed_files": ["src/a.rs"],
@@ -28,19 +34,19 @@ fn completed_edit_reports_files_checks_and_undo() {
         "uncheckpointed_extension_calls": 0
     });
     let text = render(&summary, &no_timing()).expect("edits produce a report");
-    assert!(text.contains("Changed: 1 file(s): src/a.rs"), "{text}");
-    assert!(text.contains("Checks: cargo test passed"), "{text}");
-    assert!(text.contains("Undo: /undo"), "{text}");
-    assert!(
-        text.contains("Not reversible: no shell or extension effects recorded."),
-        "{text}"
+    assert_eq!(
+        text,
+        "Outcome: completed\n\
+         Changed: src/a.rs\n\
+         Checks: cargo test passed\n\
+         Evidence: no retained log for cargo test\n\
+         Next: /review · /undo\n\
+         Summary: 1 file changed · checks passed"
     );
-    assert!(!text.contains("Resume:"), "{text}");
-    assert!(!text.contains("Timing:"), "{text}");
 }
 
 #[test]
-fn interrupted_turn_names_unreversible_effects_and_resume() {
+fn interrupted_turn_names_effects_outside_undo() {
     let summary = json!({
         "outcome": "interrupted",
         "changed_files": [],
@@ -51,15 +57,18 @@ fn interrupted_turn_names_unreversible_effects_and_resume() {
         "uncheckpointed_extension_calls": 0
     });
     let text = render(&summary, &no_timing()).expect("interruptions produce a report");
-    assert!(text.contains("Outcome: interrupted"), "{text}");
-    assert!(text.contains("Changed: no files"), "{text}");
-    assert!(text.contains("Checks: none run"), "{text}");
-    assert!(text.contains("Open tasks: 2 not finished"), "{text}");
-    assert!(
-        text.contains("Not reversible: 1 shell command(s) and 0 extension call(s)"),
-        "{text}"
+    assert_eq!(line(&text, "Outcome:"), "Outcome: interrupted");
+    assert_eq!(line(&text, "Changed:"), "Changed: none");
+    assert_eq!(line(&text, "Checks:"), "Checks: none recorded");
+    assert_eq!(line(&text, "Open tasks:"), "Open tasks: 2");
+    assert_eq!(
+        line(&text, "Outside /undo:"),
+        "Outside /undo: 1 shell command and 0 extension calls may have changed files"
     );
-    assert!(text.contains("Resume:"), "{text}");
+    assert_eq!(
+        line(&text, "Summary:"),
+        "Summary: interrupted · no files changed · no recorded checks · 2 open tasks · 1 effect outside /undo"
+    );
 }
 
 #[test]
@@ -76,6 +85,7 @@ fn failed_turn_names_its_failure_class() {
         text.starts_with("Outcome: failed (rate limited)\n"),
         "{text}"
     );
+    assert!(line(&text, "Summary:").starts_with("Summary: failed (rate limited) ·"));
     assert!(!text.contains("HTTP 429"), "{text}");
 }
 
@@ -85,21 +95,39 @@ fn stale_checks_and_long_file_lists_are_marked() {
     let summary = json!({
         "outcome": "completed",
         "changed_files": files,
-        "recorded_checks": [{"name": "lint", "status": "failed"}],
+        "recorded_checks": [{"name": "lint", "status": "passed"}],
         "checks_current": false,
         "open_tasks": 0
     });
     let text = render(&summary, &no_timing()).expect("edits produce a report");
-    assert!(text.contains("Changed: 10 file(s): f0.rs, f1.rs"), "{text}");
-    assert!(text.contains("and 2 more"), "{text}");
-    assert!(
-        text.contains("Checks: lint failed; not current with the final edits"),
-        "{text}"
+    assert!(line(&text, "Changed:").ends_with("f7.rs +2 more"), "{text}");
+    assert_eq!(
+        line(&text, "Checks:"),
+        "Checks: lint passed — stale: predates the final edits"
+    );
+    assert_eq!(
+        line(&text, "Summary:"),
+        "Summary: 10 files changed · checks stale"
     );
 }
 
 #[test]
-fn recorded_timing_separates_response_wait_from_generation_with_caveat() {
+fn collapsed_check_state_prefers_failure_then_unverified() {
+    let failed = json!({"outcome":"completed", "changed_files":["a.rs"], "checks_current":false,
+        "recorded_checks":[{"name":"lint","status":"failed"},{"name":"test","status":"passed"}]});
+    let unverified = json!({"outcome":"completed", "changed_files":["a.rs"], "checks_current":true,
+        "recorded_checks":[{"name":"test","status":"skipped"}]});
+    for (summary, expected) in [
+        (failed, "Summary: 1 file changed · 1 check failed"),
+        (unverified, "Summary: 1 file changed · checks unverified"),
+    ] {
+        let text = render(&summary, &no_timing()).unwrap();
+        assert_eq!(line(&text, "Summary:"), expected);
+    }
+}
+
+#[test]
+fn recorded_timing_lists_measured_phases() {
     let summary = json!({"outcome": "completed", "changed_files": ["a.rs"], "open_tasks": 0});
     let latency = json!({
         "requests": 2,
@@ -111,27 +139,14 @@ fn recorded_timing_separates_response_wait_from_generation_with_caveat() {
         "total_ms": 4000
     });
     let text = render(&summary, &latency).expect("edits produce a report");
-    let line = text
-        .lines()
-        .find(|line| line.starts_with("Timing:"))
-        .unwrap_or_else(|| panic!("no timing line in {text}"));
-    assert!(line.contains("response wait 1.5 s"), "{line}");
-    assert!(line.contains("generation 2.5 s"), "{line}");
-    assert!(line.contains("across 2 requests"), "{line}");
-    assert!(!line.contains("loading"), "zero phases are omitted: {line}");
-    assert!(!line.contains("retry"), "zero phases are omitted: {line}");
-    assert!(!line.to_lowercase().contains("prefill"), "{line}");
-    assert!(!line.to_lowercase().contains("first token"), "{line}");
-    assert!(line.contains("not token latency"), "{line}");
-    assert!(
-        line.contains("transport and unreported provider work"),
-        "{line}"
+    assert_eq!(
+        line(&text, "Timing:"),
+        "Timing: wait 1.5 s, generation 2.5 s over 2 requests"
     );
-    assert!(line.contains("reasoning and tool arguments"), "{line}");
 }
 
 #[test]
-fn reported_loading_retry_and_prompt_phases_are_labelled_when_measured() {
+fn loading_retry_and_prompt_phases_appear_only_when_measured() {
     let summary = json!({"outcome": "failed", "error_class": "timeout", "changed_files": [], "open_tasks": 0});
     let latency = json!({
         "requests": 1,
@@ -142,19 +157,9 @@ fn reported_loading_retry_and_prompt_phases_are_labelled_when_measured() {
         "retry_backoff_ms": 4000
     });
     let text = render(&summary, &latency).expect("failures produce a report");
-    let line = text
-        .lines()
-        .find(|line| line.starts_with("Timing:"))
-        .unwrap_or_else(|| panic!("no timing line in {text}"));
-    assert!(line.contains("response wait 120 ms"), "{line}");
-    assert!(line.contains("reported loading 800 ms"), "{line}");
-    assert!(line.contains("reported prompt processing 300 ms"), "{line}");
-    assert!(line.contains("retry backoff 4.0 s"), "{line}");
-    let phases = line.split(". Observed").next().unwrap_or(line);
-    assert!(!phases.contains("generation"), "{line}");
-    assert!(
-        !line.contains("across"),
-        "single request names no count: {line}"
+    assert_eq!(
+        line(&text, "Timing:"),
+        "Timing: wait 120 ms, loading 800 ms, prompt processing 300 ms, retry backoff 4.0 s"
     );
 }
 
@@ -174,7 +179,7 @@ fn missing_null_or_zero_timing_adds_no_line() {
     for latency in [no_timing(), json!({}), all_zero, with_nulls, wrong_types] {
         let text = render(&summary, &latency).expect("edits produce a report");
         assert!(!text.contains("Timing:"), "{latency}: {text}");
-        assert!(text.contains("Changed: 1 file(s): a.rs"), "{text}");
+        assert!(text.contains("Changed: a.rs"), "{text}");
     }
 }
 
@@ -195,24 +200,25 @@ fn next_steps_follow_turn_outcome_without_suggesting_unavailable_undo() {
         ),
     ] {
         let report = render(&summary, &no_timing()).unwrap();
-        assert_eq!(
-            report.lines().find(|line| line.starts_with("Next:")),
-            Some(expected)
-        );
+        assert_eq!(line(&report, "Next:"), expected);
         assert!(report.contains("Summary:"));
     }
 }
 
 #[test]
-fn check_actions_disclose_missing_logs_and_reused_evidence() {
+fn check_evidence_and_reuse_are_disclosed() {
     let summary = json!({"outcome":"completed", "changed_files":["a.rs"],
     "checks_current":true, "recorded_checks":[
         {"name":"test", "status":"passed", "reused":true, "evidence_ref":"artifact://exact"},
         {"name":"lint", "status":"passed"}
     ]});
     let report = render(&summary, &no_timing()).unwrap();
-    assert!(report.contains("test passed (reused, not rerun)"));
-    assert!(report.contains("live freshness unknown"));
-    assert!(report.contains("/evidence check test — inspect exact retained evidence"));
-    assert!(report.contains("/evidence check lint — exact retained log unavailable"));
+    assert_eq!(
+        line(&report, "Checks:"),
+        "Checks: test passed (reused), lint passed"
+    );
+    assert_eq!(
+        line(&report, "Evidence:"),
+        "Evidence: /evidence check test · no retained log for lint"
+    );
 }

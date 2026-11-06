@@ -175,6 +175,13 @@ fn hover_text(contents: &Value) -> String {
     }
 }
 
+/// The hover result carries no displayable text.
+pub fn hover_is_empty(result: &Value) -> bool {
+    hover_text(result.get("contents").unwrap_or(&Value::Null))
+        .trim()
+        .is_empty()
+}
+
 pub fn hover(result: &Value) -> String {
     let text = hover_text(result.get("contents").unwrap_or(&Value::Null));
     let text = text.trim();

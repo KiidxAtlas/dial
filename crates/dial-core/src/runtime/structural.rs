@@ -15,6 +15,10 @@ const MAX_LINE_CHARS: usize = 300;
 pub struct Query {
     lang: SupportLang,
     pattern: Pattern,
+    /// Search-only body-completed form of a declaration written without its body, such as
+    /// `fn $NAME($$$) -> $T`, so signature-style queries also match definitions. Never used
+    /// for rewrites: replacing such a match would silently drop the unwritten body.
+    completed: Option<Pattern>,
     template: Option<TemplateFix>,
 }
 
@@ -80,10 +84,27 @@ impl Query {
         pattern: &str,
         rewrite: Option<&str>,
     ) -> Result<Query, String> {
-        let compiled = Pattern::try_new(pattern, lang).map_err(|e| e.to_string())?;
-        if compiled.has_error() {
-            return Err(format!("pattern is not valid {lang} syntax"));
-        }
+        let primary = Pattern::try_new(pattern, lang)
+            .map_err(|e| e.to_string())
+            .and_then(|compiled| {
+                if compiled.has_error() {
+                    Err(format!("pattern is not valid {lang} syntax"))
+                } else {
+                    Ok(compiled)
+                }
+            });
+        let completed = if rewrite.is_none() {
+            completed_declaration(pattern, lang)
+        } else {
+            None
+        };
+        // A body-less declaration that is only valid with its body (a Java method, for
+        // example) is searched in its completed form alone.
+        let (compiled, completed) = match (primary, completed) {
+            (Ok(compiled), completed) => (compiled, completed),
+            (Err(_), Some(completed)) => (completed, None),
+            (Err(error), None) => return Err(error),
+        };
         let template = match rewrite {
             Some(text) => {
                 let Ok(template) = TemplateFix::try_new(text, &lang);
@@ -107,6 +128,7 @@ impl Query {
         Ok(Query {
             lang,
             pattern: compiled,
+            completed,
             template,
         })
     }
@@ -114,20 +136,34 @@ impl Query {
     /// Up to `limit` matches in source order.
     pub fn find(&self, src: &str, limit: usize) -> Result<Vec<Hit>, String> {
         let root = parse(src, self.lang)?;
-        let mut lines: Option<Vec<&str>> = None;
-        let mut hits = Vec::new();
-        for found in root.root().find_all(&self.pattern).take(limit) {
-            let start = found.start_pos();
-            let lines = lines.get_or_insert_with(|| src.lines().collect());
-            let text = lines.get(start.line()).copied().unwrap_or_default();
-            hits.push(Hit {
-                line: start.line() + 1,
-                column: start.column(&*found) + 1,
-                text: squash_line(text),
-                captures: captures(&found),
-            });
+        let node = root.root();
+        let mut found: Vec<NodeMatch<'_, Doc>> = node.find_all(&self.pattern).take(limit).collect();
+        if let Some(completed) = &self.completed {
+            // Both streams are in source pre-order, so the first `limit` merged matches come
+            // from the first `limit` of each. A node matched by both forms is reported once.
+            found.extend(node.find_all(completed).take(limit));
+            found.sort_by_key(|m| (m.range().start, std::cmp::Reverse(m.range().end)));
+            found.dedup_by_key(|m| m.range());
+            found.truncate(limit);
         }
-        Ok(hits)
+        let lines: Vec<&str> = if found.is_empty() {
+            Vec::new()
+        } else {
+            src.lines().collect()
+        };
+        Ok(found
+            .iter()
+            .map(|found| {
+                let start = found.start_pos();
+                let text = lines.get(start.line()).copied().unwrap_or_default();
+                Hit {
+                    line: start.line() + 1,
+                    column: start.column(found) + 1,
+                    text: squash_line(text),
+                    captures: captures(src, found),
+                }
+            })
+            .collect())
     }
 
     /// Rewrite every match. `Ok(None)` when nothing matches.
@@ -181,7 +217,34 @@ fn squash_line(line: &str) -> String {
     cut
 }
 
-fn captures(found: &NodeMatch<'_, Doc>) -> Vec<(String, String)> {
+/// Node kinds that name a declaration whose body a signature-style pattern may omit.
+const DECLARATION_KINDS: &[&str] = &["function", "method", "constructor", "declaration"];
+
+/// Body-completed form of a declaration pattern written without a body: the pattern with
+/// ` { $$$ }` appended, kept only when that parses as a function/method declaration. Patterns
+/// that already end in a block or statement terminator are left alone.
+fn completed_declaration(pattern: &str, lang: SupportLang) -> Option<Pattern> {
+    let trimmed = pattern.trim_end();
+    if trimmed.is_empty() || trimmed.ends_with(['}', ';']) {
+        return None;
+    }
+    let text = format!("{trimmed} {{ $$$ }}");
+    let completed = Pattern::try_new(&text, lang).ok()?;
+    if completed.has_error() {
+        return None;
+    }
+    let tree = AstGrep::new(&text, lang);
+    let root = tree.root();
+    let mut top = root.children().filter(|n| n.is_named());
+    let declaration = top.next().filter(|_| top.next().is_none())?;
+    let kind = declaration.kind();
+    DECLARATION_KINDS
+        .iter()
+        .any(|word| kind.contains(word))
+        .then_some(completed)
+}
+
+fn captures(src: &str, found: &NodeMatch<'_, Doc>) -> Vec<(String, String)> {
     let env = found.get_env();
     let mut out: Vec<(String, String)> = env
         .get_matched_variables()
@@ -191,16 +254,19 @@ fn captures(found: &NodeMatch<'_, Doc>) -> Vec<(String, String)> {
                 Some((format!("${name}"), squash(&node.text(), MAX_CAPTURE_CHARS)))
             }
             MetaVariable::MultiCapture(name) => {
+                // The original source span from the first to the last named node, so token
+                // trees (macro arguments) keep their punctuation instead of being split into
+                // fragments. Separators at either edge are outside the span.
                 let nodes = env.get_multiple_matches(&name);
-                let texts: Vec<String> = nodes
-                    .iter()
-                    .filter(|n| n.is_named())
-                    .map(|n| n.text().into_owned())
-                    .collect();
-                Some((
-                    format!("$$${name}"),
-                    squash(&texts.join(", "), MAX_CAPTURE_CHARS),
-                ))
+                let mut named = nodes.iter().filter(|n| n.is_named());
+                let text = match (named.next(), named.next_back()) {
+                    (Some(first), last) => {
+                        let end = last.unwrap_or(first).range().end;
+                        src.get(first.range().start..end).unwrap_or_default()
+                    }
+                    (None, _) => "",
+                };
+                Some((format!("$$${name}"), squash(text, MAX_CAPTURE_CHARS)))
             }
             _ => None,
         })
@@ -221,3 +287,6 @@ pub fn apply(src: &str, splices: &[Splice]) -> String {
     out.push_str(&src[cursor..]);
     out
 }
+
+#[cfg(test)]
+mod tests;

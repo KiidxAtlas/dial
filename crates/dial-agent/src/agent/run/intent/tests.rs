@@ -155,7 +155,7 @@ fn utf8_request_excerpt_keeps_both_ends_within_the_byte_budget() {
     for text in ["🦀".repeat(1_400), "a🦀é".repeat(1_000)] {
         let mut control = json!({});
         record_turn(&mut control, &text, 0);
-        let context = request_context(&control).unwrap();
+        let context = request_context(&control, &[]).unwrap();
         let (_, payload) = context.split_once('\n').unwrap();
         let payload: Value = serde_json::from_str(payload).unwrap();
         let excerpt = payload["text"].as_str().unwrap();

@@ -12,7 +12,7 @@ fn efficiency_suite_and_fixture_are_valid() {
         "../../../../examples/benchmarks/efficiency.toml"
     ))
     .unwrap();
-    assert_eq!(suite.cases.len(), 5);
+    assert_eq!(suite.cases.len(), 8);
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for case in &suite.cases {
         let fixture = root.join(case.project.as_ref().unwrap());

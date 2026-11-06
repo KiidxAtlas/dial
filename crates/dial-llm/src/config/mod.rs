@@ -158,7 +158,9 @@ pub fn migrate_memory_tool_table(table: &mut toml::Table) -> bool {
         let Some(values) = value.and_then(toml::Value::as_array_mut) else {
             return false;
         };
-        if !values.iter().any(|value| value.as_str() == Some("memory"))
+        if !values
+            .iter()
+            .any(|value| value.as_str().is_some_and(types::retired_tool_name))
             || !values.iter().all(|value| value.as_str().is_some())
         {
             return false;

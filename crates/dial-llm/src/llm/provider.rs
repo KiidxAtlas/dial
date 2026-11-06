@@ -375,7 +375,6 @@ pub struct Backend {
     image_notices: llm::images::NoticeTracker,
     /// The llama.cpp tool-template notice was shown in this conversation.
     tool_template_noticed: bool,
-    subscription_noticed: bool,
     wire: llm::wire::Shared,
     /// Provider-bound secret masking (`[secrets]`); `None` when off.
     secrets: Option<Arc<llm::secrets::Masker>>,
@@ -465,7 +464,6 @@ impl Backend {
             codex_websocket: false,
             image_notices: Default::default(),
             tool_template_noticed: false,
-            subscription_noticed: false,
             wire: Default::default(),
             secrets: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -1868,6 +1866,18 @@ impl Backend {
                 )
             }
         };
+        if let Some(profile) = &profile {
+            profile.validate()?;
+            ensure!(
+                profile.openrouter_routing.is_none()
+                    || matches!(wire, Wire::ChatCompletions | Wire::Responses),
+                "OpenRouter routing requires Chat Completions or Responses protocol"
+            );
+            ensure!(
+                profile.gemini_cache.is_none() || wire == Wire::Gemini,
+                "Gemini explicit caching requires native Gemini protocol"
+            );
+        }
         let model = model.to_owned();
         let retry_policy = llm::retry::Policy::new(
             &self
@@ -1916,7 +1926,6 @@ impl Backend {
                     fallback_auth: auth,
                     fallback_url: &url,
                 },
-                on_notice,
             )?;
             let auth = prepared_auth.token();
             let oauth_access = prepared_auth.oauth_access.as_ref();
@@ -2376,12 +2385,13 @@ pub(super) fn anthropic_exchange_shaped(
             None => true,
         };
         let patience = patience.unwrap_or_else(|| llm::Patience::for_stream(timeout_secs, false));
+        let mut progress = llm::anthropic::ReplyProgress::default();
         llm::stream::read_events_with_progress(
             response.body_mut().as_reader(),
             llm::MAX_STREAM_BYTES,
             llm::stream::MAX_LINE_BYTES,
             patience,
-            llm::anthropic::advances_reply,
+            |data| progress.advances(data),
             |data| accumulator.feed(data, &mut forward, on_event),
         )
         .map_err(|error| {

@@ -177,7 +177,7 @@ fn model_visible_recovery_states_include_retry_requirements_without_annotations(
             ToolStatus::Error,
             Effects::None,
             Retry::AfterCorrection,
-            "correcting the named cause",
+            "Correct causes",
         ),
         (
             ToolStatus::Blocked,
@@ -215,10 +215,10 @@ fn model_visible_recovery_states_include_retry_requirements_without_annotations(
         let text = report(&call("bash"), &mut output, kind, advice, 1);
         output.text.push_str(&text);
         assert!(output.text.starts_with(&original));
-        assert!(
-            text.contains("\nRetry:") && text.contains(requirement),
-            "{text}"
-        );
+        // A clean first correct-then-retry failure is one line; the others keep the state block.
+        let block = expected_retry != Retry::AfterCorrection;
+        assert_eq!(text.contains("\nRetry:"), block, "{text}");
+        assert!(text.contains(requirement), "{text}");
         assert_eq!(output.execution, facts);
         assert_eq!(output.recovery(), Some(recovery));
     }
@@ -239,6 +239,50 @@ fn rendered_committed_failure_preserves_work_and_never_promises_rollback() {
     let mut no_paths = ToolOutput::err("unknown external prerequisite");
     let text = report(&call("bash"), &mut no_paths, kind, advice, 1);
     assert!(text.contains("not proof that nothing changed"), "{text}");
+}
+
+#[test]
+fn a_first_ordinary_shell_exit_gets_a_compact_recovery_line() {
+    let compact = |code: i32, consecutive: u32| {
+        let mut output =
+            ToolOutput::err("bash: wget: command not found").with_process(process(code));
+        let (kind, advice) = classify(&shell("wget -q http://x/a.tar.xz"), &output).unwrap();
+        report(
+            &shell("wget -q http://x/a.tar.xz"),
+            &mut output,
+            kind,
+            advice,
+            consecutive,
+        )
+    };
+    let first = compact(127, 1);
+    assert!(
+        first.starts_with("\n[Dial recovery: tool_failure]"),
+        "{first}"
+    );
+    assert!(first.contains("not proof that nothing changed"), "{first}");
+    assert!(first.len() < 300, "{} bytes: {first}", first.len());
+    // A repeat keeps the full report with its streak count.
+    let repeat = compact(127, 2);
+    assert!(
+        repeat.contains("\nRetry:") && repeat.contains("2 times in a row"),
+        "{repeat}"
+    );
+    // Partial capture is not routine.
+    let mut partial = process(1);
+    partial.output_complete = false;
+    let mut output = ToolOutput::err("x").with_process(partial);
+    let (kind, advice) = classify(&shell("wget -q http://x/a.tar.xz"), &output).unwrap();
+    assert!(
+        report(
+            &shell("wget -q http://x/a.tar.xz"),
+            &mut output,
+            kind,
+            advice,
+            1
+        )
+        .contains("\nRetained:")
+    );
 }
 
 fn shell(command: &str) -> ToolCall {
@@ -300,6 +344,47 @@ fn a_dial_tool_name_shadowed_by_a_shell_builtin_gets_tool_load_guidance() {
         p.exit_code = Some(1)
     });
     assert!(shell_tool_recovery(&shell("read"), &mut other, known_read).is_none());
+}
+
+/// A missing ordinary program gets one batched-probe hint; Dial tool names, other exit codes
+/// and incomplete captures do not.
+#[test]
+fn a_missing_program_gets_a_single_batched_probe_hint() {
+    let python = shell("python -c 1");
+    let advice = missing_program_recovery(
+        &python,
+        &missing_with("bash: line 1: python: command not found", |_| {}),
+    )
+    .expect("exit 127 for an ordinary program must be coached");
+    assert!(
+        advice.contains("missing_program") && advice.contains("`python`"),
+        "{advice}"
+    );
+    assert!(advice.contains("command -v"), "{advice}");
+    let zsh = missing_with("zsh: command not found: node", |_| {});
+    assert!(
+        missing_program_recovery(&python, &zsh)
+            .unwrap()
+            .contains("`node`")
+    );
+    for output in [
+        missing_with("bash: line 1: python: command not found", |p| {
+            p.exit_code = Some(1)
+        }),
+        missing_with("bash: line 1: python: command not found", |p| {
+            p.output_complete = false
+        }),
+        missing_with("some other failure", |_| {}),
+    ] {
+        assert!(missing_program_recovery(&python, &output).is_none());
+    }
+    assert!(
+        missing_program_recovery(
+            &call("read"),
+            &missing_with("bash: line 1: python: command not found", |_| {})
+        )
+        .is_none()
+    );
 }
 
 #[test]

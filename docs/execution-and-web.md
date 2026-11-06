@@ -34,6 +34,11 @@ output condition, use the existing `bg wait` `until` regex or approved readiness
 ending a wait never establishes that the command passed. See
 [event-driven continuation](agent-loop.md#event-driven-continuation).
 
+`bg start` also accepts a structured `call` instead of `command` for explicitly supported finite
+native tool operations. These jobs **are** completion-blocking, preserve structured results and
+use cooperative cancellation. See [structured tool jobs](background-services.md#structured-tool-jobs)
+for eligible operations, approvals, hooks and retention limits.
+
 Log readiness observes new bytes with a wait-local cursor, separate from display and notification
 readers. It preserves split UTF-8, terminal escapes and multiline regexes within a contiguous
 256 KiB observation. If the display ring has already discarded unobserved bytes, or that observation
@@ -46,9 +51,64 @@ observation on growth; this is not a measured matching-speed improvement.
 
 The `eval` tool runs persistent cells in two languages selected by `language`: `js` (the default) and `py`. Each language keeps its own namespace between successful cells. Recorded `kernel` calls from earlier sessions replay as `eval` Python cells. Interrupting a running Python cell first sends SIGINT; an interrupt that does not unwind within five seconds escalates to terminating the kernel. Failed transport, cancellation and timeout paths discard the namespace. Effects already performed remain; loss of the final cell result is recorded as uncertain. Python interpreters may be selected from the project virtual environment (`.venv`/`VIRTUAL_ENV`) or conda environment when configured/approved, but execution remains subject to the mandatory process-creation fence. The cell deadline pauses while a tool callback requested by the cell is running, so callback time is not charged to the cell.
 
+Python tool callbacks are synchronous: `tool.write({'path': path, 'content': content})`,
+`tool.write(path=path, content=content)` and `tool.call('write', {...})` share the same
+controller authorization, validation and effect recording. The shorthand accepts either one
+argument dictionary or keyword arguments, not both. Result dictionaries also tolerate `await`
+for compatibility: `await tool.write({...})` returns the same completed receipt. The callback
+still executes synchronously, and awaiting its result again never repeats the call or makes it
+concurrent. Denials and failures still raise `ToolError`. JavaScript uses
+`await tool.write({path, content})`. For generated data/report files, serialize computed values
+and invoke the write callback in the producing cell, then validate the delivered file as needed,
+instead of printing data for the model to transcribe into a later write. Source/config changes
+still use the dedicated write/edit tools; callback syntax grants no additional access.
+
+For generated artifacts, keep the computation, serialization, approved write and validation
+in one **foreground** cell (`background: false` keeps callbacks available). Carry computed
+values directly from original files into the serializer; do not copy source rows or printed
+numbers into a later cell. For example, for a `values.csv` input with `status,value` columns
+and integer values, a Python cell can filter paid rows and produce a small JSON artifact:
+
+```python
+import csv
+import io
+import json
+from pathlib import Path
+
+source = Path("values.csv")
+original = source.read_bytes()
+rows = list(csv.DictReader(io.StringIO(original.decode("utf-8"))))
+paid = [row for row in rows if row["status"] == "paid"]
+computed = {"count": len(paid), "total": sum(int(row["value"]) for row in paid)}
+path = "summary.json"
+tool.write({"path": path, "content": json.dumps(computed)})
+saved = json.loads(Path(path).read_text())
+assert saved == computed
+assert set(saved) == {"count", "total"}
+assert isinstance(saved["count"], int) and isinstance(saved["total"], int)
+assert source.read_bytes() == original
+print("validated paid totals")
+```
+
+Choose assertions for the actual task: CSV headers and row counts, required periods/keys,
+types, totals and boundary cases, as appropriate. Equality to the computed object checks
+delivery, not whether the computation itself is correct. Reading the saved file inside the
+same cell is useful validation; a later model round that merely displays an already checked
+file is not. A failed assertion leaves an already completed write in place and must be reported;
+do not replay the write just because validation failed. Callback denials still stop the cell.
+The printed summary is not controller-recorded check evidence. Use owning configured checks
+for that evidence; neither a successful write receipt nor arbitrary assertion text establishes
+semantic correctness. If original inputs changed, reread and recompute instead of reusing stale
+namespace variables.
+
+Before processing unfamiliar inputs, inspect a small bounded sample sufficient to establish
+their format; expand only for a concrete unanswered question. Print a short validation summary
+rather than entire datasets. These are workflow preferences, not hard tool-call limits or
+permission exemptions. Source/config edits retain their dedicated tools and owning checks.
+
 ### Backgrounding `eval` cells and named `bash` sessions
 
-An `eval` cell that is still running after the `[shell] auto_background_secs` threshold (default 15; `0` disables it) moves to the background. The threshold is measured from the start of the cell, including runtime startup. `background: true` starts the cell in the background at once; `background: false` keeps it in the foreground for its whole run. `title` (at most 256 bytes) labels the job.
+An `eval` cell moves to the background only when the `[shell] auto_background_secs` threshold is set above 0 (the default `0` keeps cells in the foreground until they finish or reach `timeout`) and the cell is still running after that many seconds. The threshold is measured from the start of the cell, including runtime startup. `background: true` starts the cell in the background at once; `background: false` keeps it in the foreground for its whole run. `title` (at most 256 bytes) labels the job.
 
 A moved cell is a `bg` job: read it with `output`, wait for it with `wait`, or stop it with `kill`, and it appears in `list`. Its runtime stays busy until the cell finishes; a foreground `eval` on the same runtime is refused with `runtime busy in background job <id>`. Host tool callbacks from a moved cell are refused with "this cell was moved to the background; host tool calls are unavailable there — rerun with `background:false` to keep it in the foreground". Killing the job stops the cell and discards its namespace.
 
@@ -57,20 +117,27 @@ If the background table already holds its maximum of running processes, a cell t
 A `bash` command that names a session (`session`) may move to the background under the same threshold. While the job runs, the session name is busy: a foreground command for it is refused with `session busy in background job <id>; wait or kill it`. When the job exits cleanly, the shell state it published (working directory and exported variables) is applied on the session's next use. A failed, timed-out, or killed job discards the session state, and killing a job releases the name.
 
 
-`eval` with `language: "py"` supports macOS process-fork containment and the Windows native no-child-process mitigation;
-Windows additionally requires the explicit unsandboxed setting because filesystem/network isolation
-is unavailable. `eval` with `language: "js"` supports macOS only. **Both fail closed on Linux**, even when Bubblewrap is
-available or filesystem sandboxing is disabled: Bubblewrap is not the mandatory process-creation
-fence. No Linux or unsandboxed fallback is provided. Tool discovery and `status` expose the same
-platform availability and reason used at startup; this describes platform support, not approval or
-the availability of the configured Python/Node executable. Reset, cancel and status remain usable
-on unsupported platforms.
+`eval` supports Python and JavaScript on macOS and on Linux x86_64/aarch64. Linux requires a real
+kernel seccomp probe: `no_new_privs`, denial of process fork/vfork and non-thread clones, forced
+`clone3` fallback to checked thread creation, and denial of session/process-group changes. The
+mandatory fence remains active with filesystem sandboxing explicitly off. With sandboxing enabled,
+Bubblewrap still supplies filesystem/network containment; it applies the fence after its own
+namespace setup. A trusted network bridge fences the final interpreter rather than its own startup.
+Missing kernel support or failed installation refuses execution; there is no uncontained fallback.
+Python on Windows retains the native no-child-process mitigation and requires the explicit
+unsandboxed setting because filesystem/network isolation is unavailable. JavaScript on Windows
+remains unsupported. Discovery and `status` report platform support, not approval or interpreter
+availability. Reset, cancel and status remain usable on unsupported platforms.
 
 JavaScript eval requires an operator-installed Node 22 or newer. It uses Node's persistent REPL
 evaluator for lexical declarations and top-level `await`; runtime and syntax failures are reported
 as cell errors without discarding an otherwise healthy namespace. Node 26 uses the public REPL
 error hook, while earlier supported releases use the legacy REPL error path. Strings crossing the
 JSON transport are normalized to well-formed Unicode, including truncated output and nested values.
+
+Both eval runtimes must resolve outside the editable workspace. Dial compares canonical
+workspace and executable identities, including when the workspace has symlinked ancestors;
+an alias cannot make a workspace-planted interpreter count as operator-installed.
 
 Computer helpers in JavaScript and Python consume the host's raw structured tool data. Returned
 values, display text, and screenshot artifacts remain available through the same approval-gated

@@ -21,6 +21,8 @@ pub struct Launch {
     pub tools: Option<BTreeSet<String>>,
     /// Candidate provider names to validate against the actual startup registry.
     pub deferred_tools: BTreeSet<String>,
+    /// `--read-only-dir`: process-local native read/search grants, never shell write grants.
+    pub read_only_dirs: Vec<std::path::PathBuf>,
     /// `--skills` / `--no-skills`: visible skill names. `None` leaves skills unrestricted;
     /// `Some(empty)` withholds the catalog and the skill tools.
     pub skills: Option<BTreeSet<String>>,
@@ -101,6 +103,10 @@ impl Agent<'_> {
             "unknown tool(s) for --tools after provider registration: {}",
             unknown.join(", ")
         );
+        let workspace = self
+            .workspace
+            .clone()
+            .with_read_only_roots(&launch.read_only_dirs)?;
         if let Some(text) = &launch.system_prompt {
             self.parts.overrides.0 = Some(text.clone());
         }
@@ -113,6 +119,7 @@ impl Agent<'_> {
         if let Some(path) = &launch.system_prompt_template {
             self.set_system_prompt_template(std::path::Path::new(path))?;
         }
+        self.workspace = workspace;
         self.modes.launch = launch;
         self.rebuild_system();
         Ok(())

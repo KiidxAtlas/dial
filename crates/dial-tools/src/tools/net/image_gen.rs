@@ -46,15 +46,24 @@ const MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ERROR_CHARS: usize = 300;
 const PNG_SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-const DESCRIPTION: &str = "Generate one image, or edit an existing workspace image passed as \
+/// GPT Image 2.6 is the first OpenAI family with animated GIF output (Images API and the
+/// Responses image tool). Flare is the fast variant, used when no GIF-capable model was chosen.
+const GIF_MODEL: &str = "gpt-image-2.6-flare";
+const GIF_FRAMES: std::ops::RangeInclusive<u64> = 2..=16;
+const GIF_FRAME_MS: std::ops::RangeInclusive<u64> = 20..=2000;
+/// Frames decoded to validate a returned GIF; more than the API documents is refused.
+const MAX_GIF_FRAMES: usize = 64;
+const DESCRIPTION: &str = "Generate one image or animated GIF, or edit an existing workspace image passed as \
     `image`, through the resolved image service, independently of the main chat model's \
     image-output capability, and write it to a new workspace file. Explicit image settings/role \
     win; otherwise available configured routes are selected automatically. ChatGPT hosted-image \
     support may be unverified for the model/account; provider rejection is reported without \
-    retrying another billing route. Output is PNG, JPEG, or WebP, chosen by the output extension; \
+    retrying another billing route. Output is PNG, JPEG, WebP or GIF, chosen by the output extension; \
     valid provider images are converted locally when needed (JPEG is lossy and drops transparency). \
-    Existing files are never overwritten and the source image is only read. The image is \
-    attached for vision-capable models to inspect and revise into a new file. Requires approval.";
+    A `.gif` output asks for an animation (OpenAI GPT Image 2.6 through the Images API or the \
+    Responses image tool); describe the subject, motion and loop, and optionally set frame_count \
+    and frame_duration_ms. Existing files are never overwritten and the source image is only read. \
+    The image is attached for vision-capable models to inspect and revise into a new file. Requires approval.";
 
 /// Hosted session providers whose `images/generations` route returns base64 images:
 /// (API host, default image model, request shape).
@@ -495,11 +504,23 @@ impl Tool for ImageGen {
                 },
                 "output": {
                     "type": "string",
-                    "description": "Workspace-relative file to create: .png, .jpg/.jpeg, or .webp. Valid provider images are converted locally to this format when needed; JPEG is lossy and drops transparency."
+                    "description": "Workspace-relative file to create: .png, .jpg/.jpeg, .webp, or .gif for an animation. Valid provider images are converted locally to this format when needed; JPEG is lossy and drops transparency. GIFs are never converted."
                 },
                 "image": {
                     "type": "string",
-                    "description": "Optional workspace image (PNG, JPEG or WebP) to edit instead of generating from scratch. It is only read; the result goes to output."
+                    "description": "Optional workspace image (PNG, JPEG or WebP) to edit instead of generating from scratch, or to guide a GIF animation. It is only read; the result goes to output."
+                },
+                "frame_count": {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 16,
+                    "description": "GIF output only: number of animation frames (provider default 9)."
+                },
+                "frame_duration_ms": {
+                    "type": "integer",
+                    "minimum": 20,
+                    "maximum": 2000,
+                    "description": "GIF output only: milliseconds per frame, rounded to 10 (provider default 200)."
                 }
             }),
             &["prompt", "output"],
@@ -544,8 +565,11 @@ impl ImageGen {
                     &written.path,
                 );
                 ToolOutput::ok(format!(
-                    "Wrote {} image ({} bytes) from {} to {}{}.{}",
+                    "Wrote {} {} ({} bytes) from {} to {}{}.{}",
                     written.format.name(),
+                    written
+                        .frames
+                        .map_or_else(|| "image".to_owned(), |n| format!("animation, {n} frames,")),
                     written.bytes,
                     written.model,
                     written.relative,
@@ -571,6 +595,28 @@ struct Request<'a> {
     output: &'a str,
     /// The image to edit; `None` generates from the prompt alone.
     source: Option<Source>,
+    /// Set when the output is a `.gif`: an animation request.
+    animation: Option<Animation>,
+}
+
+/// Animated GIF controls; `None` leaves the provider default.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Animation {
+    frame_count: Option<u64>,
+    frame_duration_ms: Option<u64>,
+}
+
+impl Animation {
+    /// Adds `output_format: gif` and the chosen frame controls to a request or tool object.
+    fn apply(self, object: &mut Value) {
+        object["output_format"] = json!("gif");
+        if let Some(count) = self.frame_count {
+            object["frame_count"] = json!(count);
+        }
+        if let Some(duration) = self.frame_duration_ms {
+            object["frame_duration_ms"] = json!(duration);
+        }
+    }
 }
 
 /// A workspace image an edit starts from.
@@ -631,6 +677,7 @@ fn read_source(ctx: &ToolContext, relative: &str) -> Result<Source> {
         MAX_SOURCE_BYTES / (1024 * 1024)
     );
     let format = Format::detect(&bytes)
+        .filter(|format| *format != Format::Gif)
         .ok_or_else(|| anyhow!("source image {relative} is not a PNG, JPEG, or WebP file"))?;
     decode_bounded(&bytes).with_context(|| format!("decoding source image {relative}"))?;
     Ok(Source {
@@ -645,12 +692,16 @@ fn decode_bounded(bytes: &[u8]) -> Result<image::DynamicImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .context("detecting image format")?;
+    reader.limits(decode_limits());
+    reader.decode().context("decoding image")
+}
+
+fn decode_limits() -> image::Limits {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16_384);
     limits.max_image_height = Some(16_384);
     limits.max_alloc = Some(512 * 1024 * 1024);
-    reader.limits(limits);
-    reader.decode().context("decoding image")
+    limits
 }
 
 fn parse_request(args: &Value) -> Result<Request<'_>> {
@@ -675,12 +726,99 @@ fn parse_request(args: &Value) -> Result<Request<'_>> {
     };
     let output = args["output"].as_str().map_or("", str::trim);
     ensure!(!output.is_empty(), "image_gen requires an output path");
+    let gif = std::path::Path::new(output)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"));
+    let frame_arg = |name: &str, range: std::ops::RangeInclusive<u64>| -> Result<Option<u64>> {
+        let Some(value) = args.get(name).filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        ensure!(gif, "image_gen {name} applies only to .gif output");
+        let value = value
+            .as_u64()
+            .filter(|value| range.contains(value))
+            .ok_or_else(|| {
+                anyhow!(
+                    "image_gen {name} must be an integer from {} to {}",
+                    range.start(),
+                    range.end()
+                )
+            })?;
+        Ok(Some(value))
+    };
+    let frame_count = frame_arg("frame_count", GIF_FRAMES)?;
+    let frame_duration_ms = frame_arg("frame_duration_ms", GIF_FRAME_MS)?;
     Ok(Request {
         prompt,
         size,
         output,
         source: None,
+        animation: gif.then_some(Animation {
+            frame_count,
+            frame_duration_ms,
+        }),
     })
+}
+
+/// Whether `model` returns animated GIFs (GPT Image 2.6 and its snapshots).
+fn supports_gif(model: &str) -> bool {
+    model.starts_with("gpt-image-2.6")
+}
+
+/// Points `target` at a GIF-capable model before any request. The Responses image tool names
+/// [`GIF_MODEL`] in its request; OpenAI Images keeps a chosen 2.6 model and replaces only the
+/// built-in default. Every other route, or a chosen non-GIF model, is refused before spending quota.
+fn prepare_gif(config: &Config, target: &mut Target) -> Result<()> {
+    match target.wire {
+        Wire::Responses => Ok(()),
+        Wire::OpenAi if supports_gif(&target.model) => Ok(()),
+        Wire::OpenAi
+            if !customized(&config.image)
+                && config.role_selection("image").is_none()
+                && target.model == ImageConfig::default().model =>
+        {
+            target.model = GIF_MODEL.to_owned();
+            target.settings = config
+                .image
+                .settings_for(GIF_MODEL)
+                .cloned()
+                .unwrap_or_default();
+            if target.settings != ImageModelSettings::default() {
+                target.settings.validate()?;
+            }
+            Ok(())
+        }
+        Wire::OpenAi => bail!(
+            "{} cannot produce animated GIFs; choose gpt-image-2.6-flare or gpt-image-2.6-sunburst as the image model",
+            target.model
+        ),
+        _ => bail!(
+            "animated GIF output needs OpenAI GPT Image 2.6 through the Images API or the Responses image tool; {}'s image route cannot produce one",
+            target.model
+        ),
+    }
+}
+
+/// Counts the frames of a returned GIF, decoding each under the same limits as still images.
+fn gif_frames(bytes: &[u8]) -> Result<usize> {
+    use image::{AnimationDecoder, ImageDecoder};
+    let mut decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
+        .context("decoding generated GIF")?;
+    decoder
+        .set_limits(decode_limits())
+        .context("decoding generated GIF")?;
+    let mut count = 0;
+    for frame in decoder.into_frames().take(MAX_GIF_FRAMES + 1) {
+        frame.context("decoding generated GIF frame")?;
+        count += 1;
+    }
+    ensure!(count > 0, "image API returned a GIF without frames");
+    ensure!(
+        count <= MAX_GIF_FRAMES,
+        "image API returned a GIF with more than {MAX_GIF_FRAMES} frames"
+    );
+    Ok(count)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -688,6 +826,7 @@ enum Format {
     Png,
     Jpeg,
     Webp,
+    Gif,
 }
 
 impl Format {
@@ -698,6 +837,8 @@ impl Format {
             Some(Self::Jpeg)
         } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
             Some(Self::Webp)
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            Some(Self::Gif)
         } else {
             None
         }
@@ -708,6 +849,7 @@ impl Format {
             Self::Png => "PNG",
             Self::Jpeg => "JPEG",
             Self::Webp => "WebP",
+            Self::Gif => "GIF",
         }
     }
 
@@ -716,6 +858,7 @@ impl Format {
             Self::Png => &["png"],
             Self::Jpeg => &["jpg", "jpeg"],
             Self::Webp => &["webp"],
+            Self::Gif => &["gif"],
         }
     }
 
@@ -724,6 +867,7 @@ impl Format {
             Self::Png => "image/png",
             Self::Jpeg => "image/jpeg",
             Self::Webp => "image/webp",
+            Self::Gif => "image/gif",
         }
     }
 }
@@ -734,6 +878,7 @@ impl From<Format> for image::ImageFormat {
             Format::Png => Self::Png,
             Format::Jpeg => Self::Jpeg,
             Format::Webp => Self::WebP,
+            Format::Gif => Self::Gif,
         }
     }
 }
@@ -745,6 +890,8 @@ struct Written {
     bytes: u64,
     model: String,
     source: Option<String>,
+    /// Frame count of an animated GIF.
+    frames: Option<usize>,
 }
 
 fn generate(
@@ -774,11 +921,14 @@ fn generate(
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    let format = [Format::Png, Format::Jpeg, Format::Webp]
+    let format = [Format::Png, Format::Jpeg, Format::Webp, Format::Gif]
         .into_iter()
         .find(|format| format.extensions().contains(&extension.as_str()))
-        .context("image_gen output extension must be .png, .jpg/.jpeg, or .webp")?;
-    let target = resolve(ctx.config)?;
+        .context("image_gen output extension must be .png, .jpg/.jpeg, .webp, or .gif")?;
+    let mut target = resolve(ctx.config)?;
+    if request.animation.is_some() {
+        prepare_gif(ctx.config, &mut target)?;
+    }
     if let Some(source) = source_arg(args)? {
         if let Some(reason) = edit_unsupported(&target) {
             bail!("{reason}");
@@ -786,9 +936,12 @@ fn generate(
         request.source = Some(read_source(ctx, source)?);
     }
     // An explicit size wins; otherwise the model's configured default replaces the built-in one,
-    // and edits keep the source's shape.
+    // and edits keep the source's shape. GIF frames default to `auto`, which keeps the whole
+    // animation inside the provider's pixel budget.
     if args.get("size").is_none_or(Value::is_null) {
-        if let Some(size) = configured_size(&target) {
+        if request.animation.is_some() {
+            request.size = "auto";
+        } else if let Some(size) = configured_size(&target) {
             request.size = size;
         } else if request.source.is_some()
             || !supported(target.wire, &target.model).contains(&"size")
@@ -807,12 +960,25 @@ fn generate(
     let bytes = request_image(&target, ctx.config, &request, &client)
         .map_err(|error| client.redact(error))?;
     let native_format = Format::detect(&bytes)
-        .ok_or_else(|| anyhow!("image API returned data that is not PNG, JPEG, or WebP"))?;
-    let decoded = decode_bounded(&bytes).context("decoding generated image")?;
-    if native_format == format {
+        .ok_or_else(|| anyhow!("image API returned data that is not PNG, JPEG, WebP, or GIF"))?;
+    let mut frames = None;
+    if format == Format::Gif || native_format == Format::Gif {
+        // Animations are never synthesized from a still image, nor flattened into one.
+        ensure!(
+            native_format == format,
+            "image API returned {} data for a {} request",
+            native_format.name(),
+            format.name()
+        );
+        frames = Some(gif_frames(&bytes)?);
+        file.write_all(&bytes)
+            .with_context(|| format!("writing {}", request.output))?;
+    } else if native_format == format {
+        decode_bounded(&bytes).context("decoding generated image")?;
         file.write_all(&bytes)
             .with_context(|| format!("writing {}", request.output))?;
     } else {
+        let decoded = decode_bounded(&bytes).context("decoding generated image")?;
         // JPEG cannot encode alpha; the caller chose that loss of transparency via the extension.
         let decoded = if format == Format::Jpeg {
             image::DynamicImage::ImageRgb8(decoded.into_rgb8())
@@ -840,6 +1006,7 @@ fn generate(
         bytes: written_bytes,
         model: target.model,
         source: request.source.map(|source| source.relative),
+        frames,
     })
 }
 
@@ -869,6 +1036,9 @@ fn request_body(target: &Target, request: &Request) -> Value {
                 body["image"] = json!(source.base64());
             }
             apply_settings(target, &mut body, request.source.is_some());
+            if let Some(animation) = request.animation {
+                animation.apply(&mut body);
+            }
         }
         Wire::Xai => {
             body["aspect_ratio"] = json!(match request.size {

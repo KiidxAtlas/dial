@@ -4,12 +4,14 @@
 //! commands qualify only when every output-producing segment is `cd` or a recognized command that
 //! selects the same filter (for example `cd web && npm install`).
 //! Arbitrary program stdout and pipelines never select a Cargo filter. Filters are deterministic
-//! line classifiers (drop, keep, or passing results that collapse in runs). Three rules hold:
+//! line classifiers (drop, keep, or passing results that collapse in runs). Four rules hold:
 //!
 //! - a line that mentions an error, warning, panic, failure, traceback, exception or fatal condition
 //!   is always kept ([`is_diagnostic`]);
 //! - the result is accepted only if it still holds exactly as many such lines as its input, and only
 //!   when it is meaningfully smaller ([`MIN_SAVED_BYTES`] and a tenth of the output);
+//! - the one exception: a test run whose only diagnostic lines are passing runner summaries becomes
+//!   a single `test result: ok.` line with the summed counts ([`passing_summary`]);
 //! - the caller applies it only when the complete raw output is recoverable from an artifact.
 //!
 //! Terminal escape sequences and carriage-return redraws are stripped for every command.
@@ -54,11 +56,16 @@ pub fn minimize(command: &str, text: &str) -> Option<Minimized> {
     }
     let cleaned = clean_terminal(text);
     let filter = filter_for(command);
-    let text_out = match filter {
-        Some(filter) => apply(&cleaned, filter.classify),
-        None => cleaned.clone(),
+    // A fully passing test run becomes one summary line: every diagnostic line in it was a passing
+    // result count, so nothing reportable is lost. Anything else keeps the line-by-line filter.
+    let summary = filter.and_then(|filter| passing_summary(&cleaned, filter));
+    let summarized = summary.is_some();
+    let text_out = match (summary, filter) {
+        (Some(summary), _) => summary,
+        (None, Some(filter)) => apply(&cleaned, filter.classify),
+        (None, None) => cleaned.clone(),
     };
-    if diagnostic_lines(&text_out) != diagnostic_lines(&cleaned) {
+    if !summarized && diagnostic_lines(&text_out) != diagnostic_lines(&cleaned) {
         return None;
     }
     let saved = text.len().saturating_sub(text_out.len());
@@ -290,6 +297,11 @@ fn filter_for(command: &str) -> Option<&'static Filter> {
             "test" => Some(&GO_TEST),
             _ => None,
         },
+        "apt-get" | "apt" => match *args.iter().find(|arg| !arg.starts_with('-'))? {
+            "install" | "update" | "upgrade" | "dist-upgrade" | "full-upgrade" | "remove"
+            | "purge" | "reinstall" | "autoremove" => Some(&APT),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -346,6 +358,10 @@ static PIP_INSTALL: Filter = Filter {
 static JS_TEST: Filter = Filter {
     name: "js test",
     classify: classify_js_test,
+};
+static APT: Filter = Filter {
+    name: "apt",
+    classify: classify_apt,
 };
 
 macro_rules! pattern {
@@ -415,6 +431,21 @@ fn classify_package_install(line: &str) -> Class {
     }
 }
 
+// Per-package fetch/unpack/configure progress and the package-name lists; the
+// `N upgraded, N newly installed` summary and every diagnostic line stay.
+pattern!(
+    APT_PROGRESS,
+    r"^(Get|Hit|Ign):\d+ |^Fetched |^Reading (package lists|state information)|^Building dependency tree|^\(Reading database|^Selecting previously unselected package|^Preparing to unpack|^Unpacking |^Setting up |^Processing triggers for|^update-alternatives: using|^Created symlink|^(Suggested|Recommended) packages:$|^The following (additional|NEW) packages will be installed:$|^  [a-z0-9][a-z0-9.+:~-]*( [a-z0-9][a-z0-9.+:~-]*)*\s*$|^Need to get |^After this operation|^debconf: (delaying|falling back|\(Dialog|\(No usable)|^\s*\d+%\s"
+);
+
+fn classify_apt(line: &str) -> Class {
+    if APT_PROGRESS.is_match(line) {
+        Class::Drop
+    } else {
+        Class::Keep
+    }
+}
+
 pattern!(
     PYTEST_HEADER,
     r"^(platform|rootdir|plugins|cachedir|configfile|testpaths) ?[:=]?\s"
@@ -473,47 +504,183 @@ fn classify_js_test(line: &str) -> Class {
     }
 }
 
+// ------------------------------------------------------------------------------ passing summary
+
+pattern!(
+    CARGO_RESULT,
+    r"^test result: ok\. (\d+) passed; 0 failed; (\d+) ignored\b"
+);
+pattern!(
+    NEXTEST_RESULT,
+    r"^\s*Summary \[[^\]]*\]\s+\d+ tests? run: (\d+) passed(?:, (\d+) skipped)?\s*$"
+);
+pattern!(
+    PYTEST_RESULT,
+    r"^=+ (\d+) passed(?:, (\d+) (?:skipped|deselected))? in [\d.]+s(?: \([^)]*\))? =+$"
+);
+pattern!(GO_RESULT, r"^ok\s+\S+\s");
+pattern!(
+    JEST_RESULT,
+    r"^Tests:\s+(?:(\d+) skipped, )?(\d+) passed, \d+ total$"
+);
+pattern!(
+    VITEST_RESULT,
+    r"^\s*Tests\s+(\d+) passed(?: \| (\d+) skipped)? \(\d+\)$"
+);
+
+/// Passed and ignored counts from one passing runner summary line, or `None` for any other line.
+fn passing_counts(filter: &Filter, line: &str) -> Option<(u64, u64)> {
+    let count = |caps: &regex::Captures<'_>, i: usize| {
+        caps.get(i)
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    match filter.name {
+        "cargo" => CARGO_RESULT
+            .captures(line)
+            .or_else(|| NEXTEST_RESULT.captures(line))
+            .map(|caps| (count(&caps, 1), count(&caps, 2))),
+        "pytest" => PYTEST_RESULT
+            .captures(line)
+            .map(|caps| (count(&caps, 1), count(&caps, 2))),
+        // `go test` reports packages, not tests; each `ok` line is one passing package.
+        "go test" => GO_RESULT.is_match(line).then_some((1, 0)),
+        "js test" => JEST_RESULT
+            .captures(line)
+            .map(|caps| (count(&caps, 2), count(&caps, 1)))
+            .or_else(|| {
+                VITEST_RESULT
+                    .captures(line)
+                    .map(|caps| (count(&caps, 1), count(&caps, 2)))
+            }),
+        _ => None,
+    }
+}
+
+/// One line for a test run that fully passed: at least one runner summary, every summary passing,
+/// and no diagnostic line other than those summaries (no warning, error, panic or failure). The
+/// line keeps libtest's `test result:` shape so readers parse one format. `None` otherwise.
+fn passing_summary(text: &str, filter: &Filter) -> Option<String> {
+    let (mut passed, mut ignored, mut suites) = (0u64, 0u64, 0u64);
+    for line in text.lines() {
+        match passing_counts(filter, line.trim_end()) {
+            Some((p, i)) => {
+                passed += p;
+                ignored += i;
+                suites += 1;
+            }
+            None if is_diagnostic(line) => return None,
+            None => {}
+        }
+    }
+    if suites == 0 {
+        return None;
+    }
+    let unit = if filter.name == "go test" {
+        "package"
+    } else {
+        "suite"
+    };
+    let plural = if suites == 1 { "" } else { "s" };
+    Some(format!(
+        "test result: ok. {passed} passed; 0 failed; {ignored} ignored ({suites} {unit}{plural}; passing run summarized by the output filter)\n"
+    ))
+}
+
 // -------------------------------------------------------------------------------- failure digest
 
-/// Outputs shorter than this already show their first error near the top.
+/// Outputs shorter than this are shown whole, so they need no digest.
 const DIGEST_MIN_BYTES: usize = 4 * 1024;
 /// A first error this close to the start is visible without a digest.
 const DIGEST_VISIBLE_BYTES: usize = 1024;
 const DIGEST_LINES: usize = 12;
 const DIGEST_LINE_CHARS: usize = 200;
+/// Failing tests reported with their failure detail; later ones are counted, not shown.
+const DIGEST_TESTS: usize = 10;
+/// Detail lines kept under each failing test's header.
+const DIGEST_TEST_LINES: usize = 8;
 
 pattern!(
     FAILURE_HEAD,
     r"^(error(\[E\d+\])?:|thread '.*' panicked at |test \S.* \.\.\. FAILED$|FAILED |E {3}|--- FAIL: |FAIL\s+\S+|npm (ERR!|error) |\S+\.\w+:\d+(:\d+)?: (fatal )?error)"
 );
 pattern!(LOCATION, r"^\s*--> \S+:\d+(:\d+)?\s*$");
+// One failing test's report: libtest's captured-output block, pytest's section rule, Go's
+// `--- FAIL:` (subtests indented) and Jest/Vitest's bullet.
+pattern!(
+    TEST_BLOCK,
+    r"^(---- \S.* std(out|err) ----$|_{3,} \S.* _{3,}$|\s*--- FAIL: \S|\s*● \S)"
+);
+pattern!(
+    TEST_NOISE,
+    r"^(note: run with `RUST_BACKTRACE|stack backtrace:|-+ Captured )|^\s*● Console"
+);
+// Ends the failing-test section: libtest's name list and pytest's closing rules.
+pattern!(TEST_END, r"^(failures:$|=+ )");
+pattern!(
+    TEST_RESULT_FAILED,
+    r"^(test result: FAILED\.|=+ .*\bfailed\b.* in [\d.]+s|Tests:\s+\d+ failed|\s*Tests\s+\d+ failed|FAIL\s+\S+\s+[\d.]+s$)"
+);
 
-/// For a failed build or test run of a recognized command (cargo, pytest, go test, package
-/// installs), its first error lines with their `file:line` locations, to show before output
-/// whose first error sits far below the start. `None` for other commands, short outputs, an
-/// error already near the top, or no recognizable error line.
-pub fn failure_digest(command: &str, text: &str) -> Option<String> {
-    digest_from(command, text, DIGEST_VISIBLE_BYTES)
-}
-
-/// Like [`failure_digest`], for a reader that does not see the start of `text` (a capped tail
-/// view of a background job), so an error near the start still needs a digest.
-pub fn failure_digest_of_unseen(command: &str, text: &str) -> Option<String> {
-    digest_from(command, text, 0)
-}
-
-fn digest_from(command: &str, text: &str, visible: usize) -> Option<String> {
-    if text.len() < DIGEST_MIN_BYTES {
+/// The failing tests of a test run, each header with its first detail lines (panic message and
+/// location, assertion values, pytest `E` lines), then the runner's failed summary lines. `None`
+/// when the output holds no recognizable failing-test report.
+fn failing_test_blocks(text: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut summaries = Vec::new();
+    let (mut tests, mut detail, mut inside) = (0usize, 0usize, false);
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if TEST_RESULT_FAILED.is_match(trimmed) {
+            summaries.push(clip(trimmed));
+            inside = false;
+            continue;
+        }
+        if TEST_BLOCK.is_match(trimmed) && !TEST_NOISE.is_match(trimmed) {
+            tests += 1;
+            inside = tests <= DIGEST_TESTS;
+            detail = 0;
+            if inside {
+                out.push(clip(trimmed));
+            }
+            continue;
+        }
+        if TEST_END.is_match(trimmed) {
+            inside = false;
+            continue;
+        }
+        if !inside || trimmed.is_empty() || TEST_NOISE.is_match(trimmed) {
+            continue;
+        }
+        if detail < DIGEST_TEST_LINES {
+            out.push(clip(trimmed));
+            detail += 1;
+        }
+    }
+    if tests == 0 {
         return None;
     }
-    filter_for(command)?;
-    let cleaned = clean_terminal(text);
-    let mut digest = String::new();
-    let mut lines = 0;
+    if tests > DIGEST_TESTS {
+        out.push(format!(
+            "[{} more failing tests not shown]",
+            tests - DIGEST_TESTS
+        ));
+    }
+    out.extend(summaries);
+    Some(out)
+}
+
+fn clip(line: &str) -> String {
+    line.chars().take(DIGEST_LINE_CHARS).collect()
+}
+
+/// The first error lines with their `file:line` locations, and the byte offset of the first.
+fn error_lines(text: &str) -> Option<(Vec<String>, usize)> {
+    let mut lines = Vec::new();
     let mut offset = 0;
     let mut first = None;
     let mut after_head = false;
-    for line in cleaned.lines() {
+    for line in text.lines() {
         let start = offset;
         offset += line.len() + 1;
         let head = FAILURE_HEAD.is_match(line);
@@ -523,15 +690,42 @@ fn digest_from(command: &str, text: &str, visible: usize) -> Option<String> {
             continue;
         }
         first.get_or_insert(start);
-        let shown: String = line.chars().take(DIGEST_LINE_CHARS).collect();
-        digest.push_str(&shown);
-        digest.push('\n');
-        lines += 1;
-        if lines == DIGEST_LINES {
+        lines.push(clip(line));
+        if lines.len() == DIGEST_LINES {
             break;
         }
     }
-    (first? >= visible).then_some(digest)
+    Some((lines, first?))
+}
+
+/// For a failed build or test run of a recognized command (cargo, pytest, go test, jest, package
+/// installs), a digest to show before `shown`, the text the reader sees: each failing test with
+/// its failure detail, or else the first error lines with their `file:line` locations. `complete`
+/// is the whole output when it is available (`shown` may be a filtered or head-and-tail view).
+/// `None` for other commands, short outputs, or when everything in the digest is already
+/// visible in `shown` with its first line near the top.
+pub fn failure_digest(command: &str, complete: &str, shown: &str) -> Option<String> {
+    let lines = digest_lines(command, complete)?;
+    let visible = lines.iter().all(|line| shown.contains(line.trim()))
+        && shown
+            .find(lines[0].trim())
+            .is_some_and(|at| at < DIGEST_VISIBLE_BYTES);
+    (!visible).then(|| lines.join("\n") + "\n")
+}
+
+/// Like [`failure_digest`], for a reader that does not see the start of `text` (a capped tail
+/// view of a background job), so an error near the start still needs a digest.
+pub fn failure_digest_of_unseen(command: &str, text: &str) -> Option<String> {
+    Some(digest_lines(command, text)?.join("\n") + "\n")
+}
+
+fn digest_lines(command: &str, text: &str) -> Option<Vec<String>> {
+    if text.len() < DIGEST_MIN_BYTES {
+        return None;
+    }
+    filter_for(command)?;
+    let cleaned = clean_terminal(text);
+    failing_test_blocks(&cleaned).or_else(|| Some(error_lines(&cleaned)?.0))
 }
 
 /// The conventional meaning of a nonzero exit `code` that printed nothing, for simple commands

@@ -42,6 +42,17 @@ fn push_bounded<T>(list: &mut Vec<T>, item: T) {
     list.push(item);
 }
 
+/// The tree a `bash` call runs against; `None` for other tools or outside git.
+/// Used to expire stale recovery feedback, never to grant access or verification credit.
+pub(in crate::agent) fn shell_tree(workspace: &Workspace, call: &ToolCall) -> Option<String> {
+    (call.name == "bash").then_some(())?;
+    tree_fingerprint(
+        workspace.root(),
+        call.arguments["command"].as_str().unwrap_or_default(),
+        call.arguments["cwd"].as_str().unwrap_or_default(),
+    )
+}
+
 /// Identity of `command` run in `cwd` against the current tree: HEAD and the content of every
 /// changed or untracked file. `None` (no sharing) outside git or when any file cannot be hashed.
 pub(in crate::agent) fn tree_fingerprint(root: &Path, command: &str, cwd: &str) -> Option<String> {

@@ -11,10 +11,36 @@ pub(in crate::agent) struct CheckRun {
     pub(in crate::agent) diagnoses: Vec<String>,
 }
 
+/// Why a declared input witness could not be observed. Never a code-failure diagnosis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckInputError {
+    AmbiguousContract,
+    DeclaredInputsUnavailable,
+    PlanMode,
+    BackgroundJobs,
+    WorkersUnavailable,
+    WorkersRunning,
+}
+
+impl CheckInputError {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::AmbiguousContract => {
+                "configured check does not uniquely match its input contract"
+            }
+            Self::DeclaredInputsUnavailable => "declared input contract could not be captured",
+            Self::PlanMode => "plan mode prevents input capture",
+            Self::BackgroundJobs => "background jobs may still change inputs",
+            Self::WorkersUnavailable => "worker state could not be observed",
+            Self::WorkersRunning => "running workers may still change inputs",
+        }
+    }
+}
+
 /// One bounded verification process, owned until its actual result is settled.
 pub(in crate::agent) struct PendingCheck {
     check: verify::verification::FocusedCheck,
-    inputs: Result<Option<verify::inputs::Snapshot>, ()>,
+    inputs: Result<Option<verify::inputs::Snapshot>, CheckInputError>,
     revision: verify::evidence::Revision,
     started: Instant,
     cancel: Arc<AtomicBool>,
@@ -32,11 +58,11 @@ impl Drop for PendingCheck {
 
 impl<'a> Agent<'a> {
     /// Capture a complete contract separately from whether a usable witness is available.
-    /// `Err` means a contract exists but could not be captured; `Ok(None)` is undeclared.
+    /// An error explains why a witness is unavailable; `Ok(None)` is undeclared.
     fn capture_check_inputs(
         &self,
         check: &verify::verification::FocusedCheck,
-    ) -> Result<Option<verify::inputs::Snapshot>, ()> {
+    ) -> Result<Option<verify::inputs::Snapshot>, CheckInputError> {
         self.capture_check_inputs_sharing(check, &mut None)
     }
 
@@ -46,7 +72,7 @@ impl<'a> Agent<'a> {
         &self,
         check: &verify::verification::FocusedCheck,
         runtime: &mut Option<Option<verify::inputs::PythonRuntime>>,
-    ) -> Result<Option<verify::inputs::Snapshot>, ()> {
+    ) -> Result<Option<verify::inputs::Snapshot>, CheckInputError> {
         let started = Instant::now();
         let result = self.capture_check_inputs_inner(check, runtime);
         self.efficiency_metrics
@@ -58,7 +84,7 @@ impl<'a> Agent<'a> {
         &self,
         check: &verify::verification::FocusedCheck,
         runtime: &mut Option<Option<verify::inputs::PythonRuntime>>,
-    ) -> Result<Option<verify::inputs::Snapshot>, ()> {
+    ) -> Result<Option<verify::inputs::Snapshot>, CheckInputError> {
         if self.step_checks.evidence.is_repro(&check.command) {
             return Ok(None);
         }
@@ -77,12 +103,12 @@ impl<'a> Agent<'a> {
                 || custom.command != check.command
                 || custom.timeout_secs != check.timeout_secs
             {
-                return Err(());
+                return Err(CheckInputError::AmbiguousContract);
             }
             return self.capture_check_inputs_when_idle(|| {
                 verify::inputs::capture(&self.workspace, contract)
                     .map(Some)
-                    .ok_or(())
+                    .ok_or(CheckInputError::DeclaredInputsUnavailable)
             });
         }
         let python = if self.config.python.is_file() {
@@ -111,19 +137,25 @@ impl<'a> Agent<'a> {
 
     fn capture_check_inputs_when_idle(
         &self,
-        capture: impl FnOnce() -> Result<Option<verify::inputs::Snapshot>, ()>,
-    ) -> Result<Option<verify::inputs::Snapshot>, ()> {
-        if self.plan_mode || !self.awaited_background_jobs().is_empty() {
-            return Err(());
+        capture: impl FnOnce() -> Result<Option<verify::inputs::Snapshot>, CheckInputError>,
+    ) -> Result<Option<verify::inputs::Snapshot>, CheckInputError> {
+        if self.plan_mode {
+            return Err(CheckInputError::PlanMode);
         }
-        let jobs = self.live_tasks.status(None).map_err(|_| ())?;
+        if !self.awaited_background_jobs().is_empty() {
+            return Err(CheckInputError::BackgroundJobs);
+        }
+        let jobs = self
+            .live_tasks
+            .status(None)
+            .map_err(|_| CheckInputError::WorkersUnavailable)?;
         if jobs
             .as_array()
-            .ok_or(())?
+            .ok_or(CheckInputError::WorkersUnavailable)?
             .iter()
             .any(|job| job["status"] == "running")
         {
-            return Err(());
+            return Err(CheckInputError::WorkersRunning);
         }
         capture()
     }
@@ -336,7 +368,7 @@ impl<'a> Agent<'a> {
         let captured = (|| -> Result<()> {
             let mut changes = checkpoints.repair_changes(turn)?;
             // Private checkpoint files are outside the read tool's workspace. Publish immutable
-            // source bytes through artifact_read rather than hand the model unusable filesystem paths.
+            // source bytes through read artifact:// URIs rather than hand the model unusable filesystem paths.
             for change in &mut changes {
                 for reference in [&mut change.before_ref, &mut change.after_ref]
                     .into_iter()
@@ -513,7 +545,7 @@ impl<'a> Agent<'a> {
     fn settle_focused_check(
         &mut self,
         check: &verify::verification::FocusedCheck,
-        inputs_before: Result<Option<verify::inputs::Snapshot>, ()>,
+        inputs_before: Result<Option<verify::inputs::Snapshot>, CheckInputError>,
         revision_before: verify::evidence::Revision,
         started: Instant,
         mut output: ToolOutput,
@@ -522,17 +554,24 @@ impl<'a> Agent<'a> {
         let args = json!({"command":check.command,"timeout":check.timeout_secs});
         let call_id = format!("focused-check:{}", check.name);
         let inputs_after = self.capture_check_inputs(check);
-        let inputs_stale = inputs_before.is_err()
-            || inputs_after.is_err()
-            || inputs_before != inputs_after
-            || (inputs_before.as_ref().is_ok_and(|inputs| inputs.is_some())
-                && self.step_checks.revision() != revision_before);
-        let unverified = inputs_stale && output.process_outcome().is_some_and(|p| p.started);
+        let freshness_problem = match (&inputs_before, &inputs_after) {
+            (Err(reason), _) => Some(format!("{} before execution", reason.reason())),
+            (_, Err(reason)) => Some(format!("{} after execution", reason.reason())),
+            (before, after) if before != after => Some(
+                "source, runtime or environment identity changed or became unavailable across execution".into(),
+            ),
+            (Ok(Some(_)), _) if self.step_checks.revision() != revision_before => {
+                Some("controller revision changed during execution".into())
+            }
+            _ => None,
+        };
+        let unverified =
+            freshness_problem.is_some() && output.process_outcome().is_some_and(|p| p.started);
         if unverified {
             // Preserve process and effect facts: freshness is a verification verdict, not a
             // claim that the subprocess failed, was cancelled, or had unknown effects.
             output = output.with_status(crate::tools::ToolStatus::Error);
-            output.text.push_str("\n[Verification unverified: declared inputs changed during the check or could not be captured completely. Rerun against stable inputs; this result earns neither pass nor code-failure repair credit.]");
+            output.text.push_str(&format!("\n[Verification unverified: {}. No pass or code-failure repair credit. Resolve the input-capture prerequisite before rerunning the same check; exit status alone does not establish freshness.]", freshness_problem.as_deref().unwrap_or("input identity unavailable")));
         }
         if !matches!(&inputs_before, Ok(Some(_)))
             && output.process_outcome().is_some_and(|p| p.started)
@@ -1044,8 +1083,13 @@ impl<'a> Agent<'a> {
                         CheckStatus::Unverified | CheckStatus::Passed => "Verification evidence is incomplete; inspect the run and rerun the same acceptance check when its prerequisites are met.",
                     }
                 };
+                let label = if status == CheckStatus::Unverified {
+                    "unverified"
+                } else {
+                    "failed"
+                };
                 let message = format!(
-                    "{} failed:\n{description}\nCommand: {}\n{}",
+                    "{} {label}:\n{description}\nCommand: {}\n{}",
                     check.name,
                     check.command,
                     crate::agent::safety::guard::clip_evidence(&output.text, 4096)

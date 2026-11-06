@@ -103,7 +103,17 @@ impl Agent<'_> {
             && call.arguments["command"]
                 .as_str()
                 .is_some_and(is_check_command);
-        let mut shell_check_passed = false;
+        // A passing cell that asserted its own results already verified them; a failed assert makes
+        // the cell an error, so only success is credited, like a passing shell check.
+        let asserted_eval = call.name == "eval"
+            && !output.is_error
+            && call.arguments["code"]
+                .as_str()
+                .is_some_and(crate::agent::verify::completion::asserting_eval);
+        if asserted_eval {
+            turn.reliability.passing_checks += 1;
+        }
+        let mut shell_check_passed = asserted_eval;
         if is_check {
             if output.is_error
                 || output.process_outcome().is_none_or(|process| {
@@ -132,7 +142,7 @@ impl Agent<'_> {
             }
             outcome.failing_tests.extend(failing);
         }
-        if self.advisor_enabled() || self.config.escalation.enabled {
+        if self.completion_review_active() || self.config.escalation.enabled {
             let label = if call.name == "bash" {
                 format!(
                     "bash {}",
@@ -166,29 +176,38 @@ impl Agent<'_> {
         if !output.is_error {
             outcome.succeeded = true;
         }
-        // Close this call's per-file revisions so `revert_edit` can detect later outside edits.
-        if let Some(checkpoints) = &self.checkpoints {
-            checkpoints.settle_changes();
-        }
-        // Committed facts decide: any tool whose transaction committed paths (LSP rename, code
-        // actions, checkpointed edits) advances the mutation epoch, even when it failed after
-        // a partial commit. The name list covers writers that commit without reporting paths.
-        let mut repro_advice = None;
+        // Opted mutations already settled before running the attached check.
+        // Do not immediately stale that evidence by advancing the revision a second time.
+        let attached_check = matches!(call.name.as_str(), "edit" | "write")
+            .then(|| crate::agent::verify::check_tool::post_mutation_check(&output))
+            .flatten();
+        let repro_advice = if attached_check.is_some() {
+            None
+        } else {
+            self.settle_tool_mutation(call, &output)
+        };
         let committed = !output.execution.changed_paths.is_empty();
-        if committed
-            || (!output.is_error
-                && output.execution.effects != tools::surface::outcome::Effects::None
-                && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve"))
-        {
-            self.step_checks.mutations += 1;
-            if self.repro_first_fires(call, crate::config::types::ReproFirst::Advise) {
-                repro_advice = Some(crate::agent::verify::repro_first::ADVICE);
-            }
-            self.behavioral_checks.clear();
-            if !self.hermetic
-                && let Some(path) = call.arguments["path"].as_str()
+        if let Some(check) = attached_check {
+            outcome.checked = true;
+            if check["is_error"] == true {
+                outcome.execution_failed = true;
+                outcome.observed_check_failure |=
+                    check["data"]["results"].as_array().is_some_and(|results| {
+                        results
+                            .iter()
+                            .any(|result| result["status"] == "code_failed")
+                    });
+                outcome.last_tool_failure = Some(format!(
+                    "Post-{} verification failed; mutation remains applied:\n{}",
+                    call.name,
+                    check["text"].as_str().unwrap_or_default()
+                ));
+                turn.reliability.failing_checks += 1;
+            } else if check["data"]["results"]
+                .as_array()
+                .is_some_and(|results| !results.is_empty())
             {
-                self.step_checks.visual.changed(Path::new(path));
+                turn.reliability.passing_checks += 1;
             }
         }
         if call.name == "bash" {
@@ -281,14 +300,38 @@ impl Agent<'_> {
         // The catalog identifies the name; shell prose alone cannot invent a tool or
         // authorize a replacement action. Shared foreground/worker settlement keeps the
         // original failure and unchanged-retry barrier intact.
-        if call.name == "bash"
-            && let Some(advice) = crate::agent::run::failure_guidance::shell_tool_recovery(
+        if call.name == "bash" {
+            let advice = crate::agent::run::failure_guidance::shell_tool_recovery(
                 call,
                 &mut output,
                 |name| self.recovery_capability(name, &turn.names),
             )
+            .or_else(|| {
+                crate::agent::run::failure_guidance::missing_program_recovery(call, &output)
+            });
+            if let Some(advice) = advice {
+                output.text.push_str(&advice);
+            }
+        }
+        // A command that outlived its bash call is only reachable through `bg`. Load it for the
+        // next request instead of asking the model to spend a round on `tool_load`.
+        if call.name == "bash"
+            && output
+                .data
+                .as_ref()
+                .is_some_and(|data| data["background_job"].is_string())
+            && output
+                .text
+                .contains(crate::tools::exec::shell::BG_LOAD_HINT)
+            && self.bg_loadable()
+            && self.activate_tools(&["bg".to_owned()]).is_ok()
+            && self.offered().iter().any(|name| name == "bg")
         {
-            output.text.push_str(&advice);
+            output.text = output.text.replacen(
+                crate::tools::exec::shell::BG_LOAD_HINT,
+                crate::tools::exec::shell::BG_OFFERED_HINT,
+                1,
+            );
         }
         if matches!(call.name.as_str(), "bash" | "bg") {
             let capabilities = self.launch_recovery_capabilities(&turn.names);
@@ -448,5 +491,35 @@ impl Agent<'_> {
             search_note,
             repro_advice,
         })
+    }
+
+    /// Close committed effects exactly once, before any verification consumes their revision.
+    pub(in crate::agent) fn settle_tool_mutation(
+        &mut self,
+        call: &ToolCall,
+        output: &ToolOutput,
+    ) -> Option<&'static str> {
+        if let Some(checkpoints) = &self.checkpoints {
+            checkpoints.settle_changes();
+        }
+        // Committed paths count even after partial failure. The name list covers writers
+        // that commit without reporting paths.
+        if !output.execution.changed_paths.is_empty()
+            || (!output.is_error
+                && output.execution.effects != tools::surface::outcome::Effects::None
+                && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve"))
+        {
+            self.step_checks.mutations += 1;
+            self.behavioral_checks.clear();
+            if !self.hermetic
+                && let Some(path) = call.arguments["path"].as_str()
+            {
+                self.step_checks.visual.changed(Path::new(path));
+            }
+            if self.repro_first_fires(call, crate::config::types::ReproFirst::Advise) {
+                return Some(crate::agent::verify::repro_first::ADVICE);
+            }
+        }
+        None
     }
 }

@@ -104,7 +104,7 @@ pub(in crate::tools) fn read_streaming(
         Err(error) => return Some(Err(error)),
     };
     let input = expanded.as_str();
-    let resolved = ws.resolve(input);
+    let resolved = ws.resolve_read(input);
     if resolved.as_ref().is_ok_and(|p| p.is_dir()) {
         return None;
     }
@@ -116,7 +116,8 @@ pub(in crate::tools) fn read_streaming(
             .char_indices()
             .filter(|(_, c)| *c == '?')
             .find(|(i, _)| {
-                json::is_json(&input[..*i]) && ws.resolve(&input[..*i]).is_ok_and(|p| p.is_file())
+                json::is_json(&input[..*i])
+                    && ws.resolve_read(&input[..*i]).is_ok_and(|p| p.is_file())
             })
             .or_else(|| {
                 input
@@ -131,7 +132,7 @@ pub(in crate::tools) fn read_streaming(
                 {
                     return Err("JSON queries use zero-based ?offset=N and ?limit=N; do not combine them with source-line offset/limit arguments".into());
                 }
-                let path = ws.resolve(&input[..i])?;
+                let path = ws.resolve_read(&input[..i])?;
                 let opened = cache::Opened::open(ws, &path)?;
                 let text = isolate::run(
                     "JSON query",
@@ -157,7 +158,7 @@ pub(in crate::tools) fn read_streaming(
             Err(e) => return Some(Err(e)),
         }
     };
-    let (base, member) = if literal || ws.resolve(target).is_ok_and(|p| p.is_file()) {
+    let (base, member) = if literal || ws.resolve_read(target).is_ok_and(|p| p.is_file()) {
         (target, None)
     } else {
         target
@@ -166,7 +167,7 @@ pub(in crate::tools) fn read_streaming(
             .filter(|(_, c)| *c == ':')
             .find_map(|(i, _)| {
                 let base = &target[..i];
-                (kind(base).is_some() && ws.resolve(base).is_ok_and(|p| p.is_file()))
+                (kind(base).is_some() && ws.resolve_read(base).is_ok_and(|p| p.is_file()))
                     .then_some((base, Some(&target[i + 1..])))
             })
             .unwrap_or_else(|| {
@@ -185,7 +186,7 @@ pub(in crate::tools) fn read_streaming(
         if args.get("offset").is_some_and(|v| !v.is_null()) && selector.selects_lines() {
             return Err("use offset or a line selector, not both".into());
         }
-        let path = ws.resolve(base)?;
+        let path = ws.resolve_read(base)?;
         if cancel.load(Ordering::Acquire) {
             return Err("document read cancelled".into());
         }

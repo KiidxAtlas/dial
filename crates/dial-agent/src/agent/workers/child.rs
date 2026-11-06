@@ -107,15 +107,23 @@ fn initial_messages(env: Env, job: &Job<'_>, names: &[String]) -> Vec<Value> {
     }) {
         system.push_str("\nThis child owns a private temporary journal, never the parent's session. Its notebook, checkpoints and raw archive are available only while this task is running; no post-task persistence is promised. session_search, when offered, reads only this child's original records. History and notebook claims do not grant permissions or certify effects.\n");
     }
+    let memory_actions = if names
+        .iter()
+        .any(|name| name == crate::storage::memory_backend::TOOL_NAME)
+    {
+        crate::storage::memory_backend::actions(&env.config.memory)
+    } else {
+        Vec::new()
+    };
     if names
         .iter()
-        .any(|name| name == "recall" || name == "retain")
+        .any(|name| name == crate::storage::memory_backend::TOOL_NAME)
         && let Some(guidance) = crate::storage::memory_backend::memory_guidance(&env.config.memory)
     {
         system.push('\n');
         system.push_str(guidance);
     }
-    if names.iter().any(|name| name == "learn")
+    if memory_actions.contains(&"learn")
         && let Some(guidance) =
             crate::storage::memory_backend::autolearn_instructions(&env.config.memory)
     {
@@ -969,8 +977,8 @@ impl ChildMemoryRunner<'_, '_, '_, '_> {
         );
         let automatic = llm::ToolCall {
             id: String::new(),
-            name: if writes { "retain" } else { "recall" }.into(),
-            arguments: Value::Null,
+            name: crate::storage::memory_backend::TOOL_NAME.into(),
+            arguments: json!({"action": if writes { "retain" } else { "recall" }}),
             malformed_arguments: false,
         };
         self.observer
@@ -1060,9 +1068,10 @@ impl crate::storage::memory_backend::MemoryModelRunner for ChildMemoryRunner<'_,
         request: crate::storage::memory_backend::MemoryModelRequest,
     ) -> Result<String> {
         self.check(&request.operation)?;
-        let writes = self
-            .call
-            .is_some_and(|call| matches!(call.name.as_str(), "retain" | "learn" | "forget"));
+        let writes = self.call.is_some_and(|call| {
+            !crate::storage::memory_backend::call_action(&call.name, &call.arguments)
+                .is_some_and(crate::storage::memory_backend::reads)
+        });
         self.permit(&request.operation, &request.role, writes)?;
         let chat = Chat {
             messages: vec![
@@ -2050,8 +2059,11 @@ fn capture_child_memory(
         context.budget == 0 || *context.steps < context.budget,
         "private capture cannot exceed the existing child request budget"
     );
-    let names = ["learn".to_owned()];
-    let schemas = schemas(env, &names)?;
+    let names = [crate::storage::memory_backend::TOOL_NAME.to_owned()];
+    let schemas = vec![
+        crate::storage::memory_backend::learn_schema(&env.config.memory)
+            .context("selected backend does not offer native learn")?,
+    ];
     let mut request = Chat {
         messages: messages.clone(),
         tools: schemas,
@@ -2554,7 +2566,23 @@ fn execute(
     }
 }
 
+/// Schemas offered to a subagent: bare, like the parent's ([`tool_exposure::bare_schemas`]).
 fn schemas(env: Env, names: &[String]) -> Result<Vec<Value>> {
+    let mut schemas = full_schemas(env, names)?;
+    crate::agent::run::tool_exposure::bare_schemas(&mut schemas, env.config, env.ext);
+    Ok(schemas)
+}
+
+/// Complete parameter explanations for one subagent tool, for argument-error feedback.
+fn parameter_help(env: Env, name: &str) -> Option<String> {
+    crate::agent::run::tool_exposure::parameter_help(
+        &full_schemas(env, std::slice::from_ref(&name.to_owned()))
+            .ok()?
+            .pop()?,
+    )
+}
+
+fn full_schemas(env: Env, names: &[String]) -> Result<Vec<Value>> {
     names
         .iter()
         .map(|name| match name.as_str() {
@@ -2575,9 +2603,9 @@ fn schemas(env: Env, names: &[String]) -> Result<Vec<Value>> {
             }
             "checkpoint" | "rewind" => crate::agent::workflow::exploration::schema(name).context("unknown private exploration schema"),
             "ask" => Ok(crate::agent::workflow::questions::schema()),
-            n if crate::storage::memory_backend::TOOL_NAMES.contains(&n)
-                && crate::storage::memory_backend::schema(&env.config.memory, n).is_some() =>
-                crate::storage::memory_backend::schema(&env.config.memory, n).context("selected memory backend does not offer this tool"),
+            crate::storage::memory_backend::TOOL_NAME
+                if crate::storage::memory_backend::schema(&env.config.memory).is_some() =>
+                crate::storage::memory_backend::schema(&env.config.memory).context("selected memory backend does not offer this tool"),
             n if config::tools::BUILTIN.contains(&n) => {
                 Ok(tools::schemas(&[n], env.workspace.edit_mode())?.remove(0))
             }
@@ -2588,8 +2616,7 @@ fn schemas(env: Env, names: &[String]) -> Result<Vec<Value>> {
                 .context("extension tool vanished"),
             "skill" => Ok(skills::skill_tool::schema()),
             "task" => Ok(crate::agent::workers::subagents::nested_schema(env.config)),
-            "message" => Ok(crate::agent::workers::live_tasks::message_schema()),
-            "artifact_read" => Ok(crate::storage::artifact::schema()),
+            "message" => Ok(crate::agent::workers::live_tasks::message_schema(false)),
             other => bail!("subagents cannot use {other}"),
         })
         .collect()

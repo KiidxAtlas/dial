@@ -69,6 +69,48 @@ pub(super) struct Ring {
     read_failed: bool,
     /// Terminal emulator for PTY output; `None` for pipes and adopted processes.
     screen: Option<vt100::Parser>,
+    /// Structured tools are not processes; retain their original receipt independently of display.
+    pub(super) tool_job: bool,
+    pub(super) tool_result: Option<crate::tools::ToolOutput>,
+}
+
+/// Serialize by reference for both the bounded size check and the existing artifact spool.
+pub(super) fn write_tool_result(
+    writer: impl Write,
+    output: &crate::tools::ToolOutput,
+) -> serde_json::Result<()> {
+    #[derive(serde::Serialize)]
+    struct Receipt<'a> {
+        text: &'a str,
+        is_error: bool,
+        data: &'a Option<serde_json::Value>,
+        execution: &'a crate::runtime::execution::Execution,
+    }
+    serde_json::to_writer(
+        writer,
+        &Receipt {
+            text: &output.text,
+            is_error: output.is_error,
+            data: &output.data,
+            execution: &output.execution,
+        },
+    )
+}
+
+struct ResultLimit(usize);
+impl Write for ResultLimit {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.0 {
+            return Err(io::Error::other(
+                "structured result retention limit exceeded",
+            ));
+        }
+        self.0 -= bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Ring {
@@ -85,6 +127,8 @@ impl Ring {
             elided_bytes: 0,
             read_failed: false,
             screen: None,
+            tool_job: false,
+            tool_result: None,
         }
     }
 
@@ -670,6 +714,26 @@ impl Proc {
         if !self.is_running() {
             return;
         }
+        if lock(&self.ring).tool_job {
+            if !self.group.exited().unwrap_or(false) {
+                return;
+            }
+            let failed = lock(&self.ring)
+                .tool_result
+                .as_ref()
+                .is_none_or(|out| out.is_error);
+            self.state = State::Exited {
+                at: Instant::now(),
+                detail: if failed {
+                    "tool failed"
+                } else {
+                    "tool completed"
+                }
+                .into(),
+                status: None,
+            };
+            return;
+        }
         let capture_error = {
             let ring = lock(&self.ring);
             if ring.read_failed {
@@ -1188,6 +1252,93 @@ impl Table {
         Ok(name)
     }
 
+    /// Own finite, controller-authorized tool work in the same bounded job table.
+    pub(super) fn adopt_tool(&mut self, job: super::ToolJob) -> Result<String, String> {
+        self.refresh();
+        let name = match job.name {
+            Some(name) => {
+                validate_name(&name)?;
+                name
+            }
+            None => self.fresh_name(),
+        };
+        if self
+            .position(&name)
+            .is_some_and(|i| self.procs[i].is_running())
+        {
+            return Err(format!("a job named {name:?} is already running"));
+        }
+        if self.running() >= MAX_PROCESSES {
+            return Err(format!(
+                "{MAX_PROCESSES} background jobs are already running"
+            ));
+        }
+        let mut display = Ring::new(MAX_BUFFER);
+        display.tool_job = true;
+        let ring = Arc::new(Mutex::new(display));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker = (job.work, ring.clone(), cancel.clone(), done.clone());
+        let reader = std::thread::Builder::new()
+            .name("dial-bg-tool".into())
+            .spawn(move || {
+                let (work, ring, cancel, done) = worker;
+                let mut result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(cancel)))
+                        .unwrap_or_else(|_| {
+                            crate::tools::ToolOutput::err("background tool panicked")
+                                .with_effects(crate::tools::surface::outcome::Effects::Unknown)
+                        });
+                if let Err(error) = write_tool_result(ResultLimit(super::MAX_TOOL_RESULT_BYTES), &result) {
+                    result = crate::tools::ToolOutput::err(format!(
+                        "background tool result exceeds retention limit ({} bytes) or could not be serialized: {error}; full result unavailable",
+                        super::MAX_TOOL_RESULT_BYTES
+                    )).with_effects(crate::tools::surface::outcome::Effects::Unknown);
+                }
+                {
+                    let mut ring = lock(&ring);
+                    ring.push(result.text.as_bytes());
+                    ring.tool_result = Some(result);
+                    ring.reached_eof = true;
+                    ring.closed = true;
+                }
+                done.store(true, Ordering::Release);
+                wake::notify();
+            })
+            .map_err(|error| format!("starting background tool: {error}"))?;
+        if let Some(i) = self.position(&name) {
+            self.discard(i);
+        }
+        self.prune_finished();
+        self.procs.push(Proc {
+            name: name.clone(),
+            command: job.command,
+            pid: 0,
+            group: ManagedProcess::Cell { cancel, done },
+            ring,
+            started: Instant::now(),
+            state: State::Running,
+            stop: Arc::new(AtomicBool::new(false)),
+            reader: Some(reader),
+            input: None,
+            terminal: false,
+            shell_launch: None,
+            network: false,
+            minimize_output: false,
+            notice_cursor: 0,
+            completion_notified: false,
+            adopted: true,
+            session: None,
+        });
+        self.notice(ToolEvent {
+            kind: "start".into(),
+            name: name.clone(),
+            text: "started tool job".into(),
+            artifact: None,
+        });
+        Ok(name)
+    }
+
     /// Current state of `name` for use outside the lock.
     pub(super) fn snapshot(&mut self, name: &str) -> Result<Snapshot, String> {
         self.refresh();
@@ -1258,15 +1409,26 @@ impl Table {
     fn detach_all(&mut self) -> (usize, Vec<Killed>) {
         self.refresh();
         let running = self.running();
+        let mut retained = Vec::new();
         let killed = self
             .procs
             .drain(..)
+            .filter_map(|mut proc| {
+                if proc.is_running() && lock(&proc.ring).tool_job {
+                    proc.group.terminate();
+                    retained.push(proc);
+                    None
+                } else {
+                    Some(proc)
+                }
+            })
             .map(|mut proc| {
                 let previous = proc.state.clone();
                 proc.signal_stop();
                 Killed { previous, proc }
             })
             .collect();
+        self.procs = retained;
         (running, killed)
     }
 
@@ -1290,6 +1452,17 @@ impl Table {
 /// Kill `name` and forget it; returns what state it was in. The table lock is held only to
 /// detach the entry and to record its notices, never while the reader drains.
 pub(super) fn kill_entry(table: &Mutex<Table>, name: &str) -> Result<State, String> {
+    {
+        let mut table = lock(table);
+        table.refresh();
+        if let Some(i) = table.position(name)
+            && table.procs[i].is_running()
+            && lock(&table.procs[i].ring).tool_job
+        {
+            table.procs[i].group.terminate();
+            return Ok(State::Running);
+        }
+    }
     let killed = lock(table).detach(name)?;
     let (previous, events) = killed.finish();
     lock(table).record(events);

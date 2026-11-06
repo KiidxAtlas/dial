@@ -144,7 +144,28 @@ fn read_redirect_gives_up_on_a_client_that_dribbles_bytes() {
 fn callback_cancel_and_deadline_take_precedence_over_pending_connections() {
     for cancelled in [false, true] {
         let listener = bind_callback("127.0.0.1", 0).unwrap();
-        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // connect() can return before the server queues the connection for accept(), notably
+        // on macOS. Establish readiness without consuming it before testing priority.
+        #[cfg(unix)]
+        assert!(
+            dial_core::platform::io::wait_readable(&listener, Duration::from_secs(10)).unwrap(),
+            "callback connection did not become pending"
+        );
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, WSAPOLLFD, WSAPoll};
+
+            let mut poll = WSAPOLLFD {
+                fd: listener.as_raw_socket() as _,
+                events: POLLRDNORM,
+                revents: 0,
+            };
+            // SAFETY: one initialized WSAPOLLFD borrows the live listener; finite timeout.
+            assert_eq!(unsafe { WSAPoll(&mut poll, 1, 10_000) }, 1);
+            assert_ne!(poll.revents & POLLRDNORM, 0);
+        }
         let cancel = AtomicBool::new(cancelled);
         let deadline = if cancelled {
             Instant::now() + Duration::from_secs(10)
@@ -164,6 +185,7 @@ fn callback_cancel_and_deadline_take_precedence_over_pending_connections() {
         } else {
             assert_eq!(error.to_string(), "callback deadline expired");
         }
-        assert!(listener.accept().is_ok(), "pending connection was consumed");
+        let (_, peer) = listener.accept().expect("pending connection was consumed");
+        assert_eq!(peer, client.local_addr().unwrap());
     }
 }

@@ -8,6 +8,14 @@ Commands are placed in a dedicated process group. The tool combines stdout and s
 
 The sandbox may deny network access or writes outside the project. Use the command's `$TMPDIR` for temporary files. Do not retry a denied command unchanged; adapt it to the sandbox or explain the limitation.
 
+System Bash enriches missing-command diagnostics for known Python, pip and Node alternatives using
+builtin lookup in the failing command's current PATH/cwd; it never runs a candidate to probe it.
+Availability is not compatibility. Existing operator missing-command handlers and ERR traps are
+preserved. Bash 3 uses a conservative simple-command fallback, so conditional failures and complex
+syntax can omit the hint. Embedded, in-process and PowerShell backends do not invent host-PATH
+evidence for their results. Recovery guidance uses supplied availability instead of probing again;
+when no evidence is present, alternatives should be checked together once after correcting the cause.
+
 Dev-policy and unsandboxed child environments use an explicit runtime/toolchain allowlist,
 rather than guessing secrets from variable names. Unknown inherited variables and credential-
 bearing URL values are excluded. MCP operator-configured `env` entries are applied separately
@@ -108,7 +116,7 @@ With `shell.minimize_output = true` (default), foreground `bash` output of a rec
 
 For every command, ANSI escape sequences are stripped and carriage-return progress redraws are reduced to their last frame.
 
-Guarantees: a line mentioning error, warning, panic, fail, traceback, exception or fatal is never dropped or collapsed (a frame overwritten by a carriage return that carries one is kept on its own line); the exit status and the `[exit code: N]` line are untouched; the result is used only if it saves at least 256 bytes and a tenth of the output. The text gains a line `[output filtered (cargo): 41230 -> 3810 bytes; ...]` and the `[complete output: artifact://...]` link still holds the raw output, readable with `artifact_read`. Output longer than the inline head-and-tail view (about 20 KB) is filtered from the complete copy in its artifact (up to 4 MiB) when nothing was elided, and the filtered text is used only if it fits the inline view; otherwise the head-and-tail view, with its middle diagnostics, is shown as before. Without an artifact store (so the raw output could not be recovered), or after a capture or artifact error, nothing is filtered. Background (`bg`) output is minimized only when a finished job's complete output is read at once. When a failed recognised command's first error lines are no longer in the capped read, they are shown first as a failure digest.
+Guarantees: a line mentioning error, warning, panic, fail, traceback, exception or fatal is never dropped or collapsed by the minimizer (a frame overwritten by a carriage return that carries one is kept on its own line), with one exception: a test run (`cargo test`/`nextest`, `pytest`, `jest`/`vitest`, `go test`) whose only such lines are passing runner summaries is replaced by one line, for example `test result: ok. 412 passed; 0 failed; 3 ignored (9 suites; passing run summarized by the output filter)`. Any warning, failure, panic or error keeps the line-by-line filter. The exit status and the `[exit code: N]` line are untouched; the result is used only if it saves at least 256 bytes and a tenth of the output. The text gains a line `[output filtered (cargo): 41230 -> 3810 bytes; ...]` and the `[complete output: artifact://...]` link still holds the raw output, readable with `read`. The foreground shell's inline preview keeps 4 KiB from the beginning and 4 KiB from the end, plus bounded middle diagnostics and explicit omission counts. Complete artifact spooling is independent of this preview bound. Longer output is filtered from the complete copy in its artifact (up to 4 MiB) when nothing was elided, and the filtered text is used only if it fits the inline view; otherwise the head-and-tail view, with its middle diagnostics, is shown. Without an artifact store (so the raw output could not be recovered), or after a capture or artifact error, nothing is filtered. Background (`bg`) output is minimized only when a finished job's complete output is read at once. A failed recognised command starts with a `[failure digest: …]` block: for test runs, each failing test (up to 10) with up to 8 lines of its panic or assertion detail, otherwise the first error lines with their locations. The digest is omitted only when every one of its lines is already visible near the top of the shown output.
 
 ## Git guard
 

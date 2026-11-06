@@ -21,7 +21,7 @@ the scan, not an atomic snapshot of the entire filesystem and not edit authority
 
 ### Semantic facts backend
 
-`memory.backend = "semantic"` keeps facts in private SQLite stores outside the repository: one per project, plus a user-wide bank shared by every project. It offers the `retain`, `recall`, `memory_update` and `forget` tools, with the same names and arguments as provenance memory; `retain` takes `scope: "project" | "global"` to choose the bank. It needs no configuration: recall is keyword search (FTS5 BM25). Assigning an embedding-capable model to the `embedding` model role (Alt+M, `/setup embeddings`, or `[model_roles.embedding]`) adds meaning-based search through that role's endpoint, model and key. The two rankings are fused with reciprocal-rank fusion, so recall degrades to keyword search when the service is unavailable or slower than the recall deadline, and `/memory` reports why. Alt+M lists embedding-capable models for this role, and also models whose kind the server does not declare, labelled "unclassified". Assigning the role or finishing `/setup embeddings` while another backend is selected offers to switch to semantic; it never switches silently.
+`memory.backend = "semantic"` keeps facts in private SQLite stores outside the repository: one per project, plus a user-wide bank shared by every project. It offers the `memory` tool with the `retain`, `recall`, `update` and `forget` actions, with the same arguments as provenance memory; `retain` takes `scope: "project" | "global"` to choose the bank. It needs no configuration: recall is keyword search (FTS5 BM25). Assigning an embedding-capable model to the `embedding` model role (Alt+M, `/setup embeddings`, or `[model_roles.embedding]`) adds meaning-based search through that role's endpoint, model and key. The two rankings are fused with reciprocal-rank fusion, so recall degrades to keyword search when the service is unavailable or slower than the recall deadline, and `/memory` reports why. Alt+M lists embedding-capable models for this role, and also models whose kind the server does not declare, labelled "unclassified". Assigning the role or finishing `/setup embeddings` while another backend is selected offers to switch to semantic; it never switches silently.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -32,7 +32,7 @@ the scan, not an atomic snapshot of the entire filesystem and not edit authority
 | `memory.semantic.embedding_timeout_secs` | 20 | Per-request timeout, 1–120. |
 | `memory.semantic.recall_limit` | 8 | Most facts per query, 1–50. |
 | `memory.semantic.token_budget` | 1500 | Recall text budget in tokens, 64–16000. |
-| `memory.semantic.auto_retain` | `true` | Queue each completed turn and extract durable facts with the `memory` role between turns. It pauses while the `memory` role is unassigned (it never falls back to the main model); recall and the `retain` tool keep working. Assign the role with Alt+M to save facts automatically. Malformed model output drops the turn; an unreachable model keeps it queued. A failing extraction does not block duplicate merging. |
+| `memory.semantic.auto_retain` | `true` | Queue each completed turn and extract durable facts with the `memory` role between turns. It pauses while the `memory` role is unassigned (it never falls back to the main model); recall and the `memory` tool's `retain` action keep working. Assign the role with Alt+M to save facts automatically. Malformed model output drops the turn; an unreachable model keeps it queued. A failing extraction does not block duplicate merging. |
 | `memory.semantic.consolidate_interval_minutes` | 60 | How often near-duplicate facts are merged (token-overlap ≥ 0.8; the newer copy is forgotten). Facts whose numbers differ are never merged. `0` disables consolidation. Range 0–10080. |
 
 Privacy: with no endpoint configured, nothing leaves the machine. With an endpoint, fact content and recall queries are sent to that service for embedding. Embedding requests send only the URL, model and bearer key; custom provider headers and `allow_insecure` are not applied to them. Facts are re-embedded only when their content changes or after `/memory rebuild`. Recalled facts are advisory, untrusted text.
@@ -44,7 +44,7 @@ Automatic recall is optional task context, not a reason to attach the nearest fa
 relevance. Semantic/Hindsight automatic recall and compaction memory require lexical support in the
 current user subject; a conversational continuation may inherit the most recent substantive user
 subject, not arbitrary prior assistant discussion. Longer prompts need several distinct matches.
-This conservative admission can omit synonym-only matches; explicit `recall` keeps the backend's
+This conservative admission can omit synonym-only matches; an explicit `memory` `recall` keeps the backend's
 full lexical/embedding search. Rejected facts are not marked shown and can attach to a later relevant
 request. Provenance/codebase automatic context similarly abstains on incidental overlap and admits
 unchanged individual records only once while they remain in the visible branch.
@@ -343,8 +343,10 @@ completed turn, and yields when queued coding arrives. It receives bounded workf
 creates executable steps or checks, and never loads another local model. Local teacher roles are
 skipped to preserve coding compute. No teacher call occurs by default.
 
-All controls are available in `/improve settings` under Local model assistance, and in `/settings` under Tools →
-Verification. Assign the coach role in `/roles`.
+Local model assistance is off by default (`assistance.enabled = false`); with it off, the syntax
+guard, related-test selection and learned-experience recall are inactive regardless of their own
+switches. All controls are available in `/improve settings` under Local model assistance, and in
+`/settings` under Tools → Verification. Assign the coach role in `/roles`.
 
 ```toml
 [assistance]

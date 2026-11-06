@@ -17,6 +17,44 @@ fn stream(events: &[&str]) -> Reply {
 }
 
 #[test]
+fn keepalives_count_as_progress_only_while_a_tool_call_is_open_and_within_patience() {
+    let ping = r#"{"type":"ping"}"#;
+    let start = std::time::Instant::now();
+    let at = |secs| start + std::time::Duration::from_secs(secs);
+    let mut progress = ReplyProgress::default();
+    assert!(progress.advances_at(START, at(0)));
+    assert!(!progress.advances_at(ping, at(1)), "no open tool call");
+    assert!(progress.advances_at(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        at(2)
+    ));
+    assert!(
+        !progress.advances_at(ping, at(3)),
+        "a text block is not a tool call"
+    );
+    assert!(progress.advances_at(
+        r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"a","name":"write","input":{}}}"#,
+        at(4)
+    ));
+    assert!(progress.advances_at(ping, at(34)));
+    assert!(progress.advances_at(ping, at(4 + OPEN_TOOL_CALL_PATIENCE.as_secs() - 1)));
+    assert!(
+        !progress.advances_at(ping, at(4 + OPEN_TOOL_CALL_PATIENCE.as_secs())),
+        "keep-alives cannot hold an open call forever"
+    );
+    assert!(progress.advances_at(
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+        at(700)
+    ));
+    assert!(
+        progress.advances_at(ping, at(701)),
+        "real progress restarts the bound"
+    );
+    assert!(progress.advances_at(r#"{"type":"content_block_stop","index":1}"#, at(702)));
+    assert!(!progress.advances_at(ping, at(703)), "the call is closed");
+}
+
+#[test]
 fn stream_reports_both_cache_ttl_buckets_from_message_start() {
     let reply = stream(&[START, DELTA, STOP]);
     assert_eq!(reply.cache_creation_tokens, Some(10));

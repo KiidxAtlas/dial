@@ -54,26 +54,44 @@ fn optional_progress_does_not_force_bookkeeping_rounds() {
 }
 
 #[test]
-fn unverified_edits_earn_one_reminder_then_a_disclosure() {
+fn unverified_edits_are_disclosed_and_only_an_observed_failure_is_reminded_once() {
     let mut guard = CompletionGuard::default();
-    assert_eq!(guard.evidence(None, true), EvidenceGate::Accept);
+    assert_eq!(guard.evidence(None, &[], true), EvidenceGate::Accept);
     let checks = ["cargo-check".to_owned()];
-    match guard.evidence(Some(&checks), true) {
-        EvidenceGate::Remind(note) => assert!(note.contains("cargo-check"), "{note}"),
-        other => panic!("first unverified answer is reminded: {other:?}"),
+    match guard.evidence(Some(&checks), &[], true) {
+        EvidenceGate::Disclose(text) => assert!(text.contains("Unverified"), "{text}"),
+        other => panic!("a missing check is disclosed, never demanded: {other:?}"),
     }
-    match guard.evidence(Some(&checks), true) {
+    let failures = ["cargo-check failed: boom".to_owned()];
+    match guard.evidence(Some(&checks), &failures, true) {
+        EvidenceGate::Remind(note) => {
+            assert!(
+                note.contains("cargo-check") && note.contains("boom"),
+                "{note}"
+            );
+        }
+        other => panic!("an observed failure is reminded: {other:?}"),
+    }
+    match guard.evidence(Some(&checks), &failures, true) {
         EvidenceGate::Disclose(text) => assert!(text.contains("Unverified"), "{text}"),
         other => panic!("the reminder is sent once: {other:?}"),
     }
     let mut limited = CompletionGuard::default();
     assert!(
         matches!(
-            limited.evidence(Some(&checks), false),
+            limited.evidence(Some(&checks), &failures, false),
             EvidenceGate::Disclose(_)
         ),
         "past a limit the gap is disclosed without another request"
     );
+}
+
+#[test]
+fn only_successful_asserting_eval_code_counts_as_a_check() {
+    assert!(asserting_eval("assert out == expected"));
+    assert!(asserting_eval("assert.deepStrictEqual(a, b)"));
+    assert!(!asserting_eval("print(total)"));
+    assert!(!asserting_eval("reassert = 1"));
 }
 
 #[test]

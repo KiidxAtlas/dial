@@ -28,6 +28,23 @@ fn cwd_argument_and_leading_cd_are_confined_to_workspace() {
 }
 
 #[test]
+fn bash_names_entries_a_command_left_in_its_working_directory() {
+    let (dir, ws) = workspace();
+    fs::write(dir.path().join("kept.txt"), "x").unwrap();
+    let note = created_entries_note(directory_entries(dir.path()).as_ref(), dir.path());
+    assert_eq!(note, None, "an unchanged directory adds no note");
+    let before = directory_entries(dir.path());
+    fs::write(dir.path().join("cmain"), "binary").unwrap();
+    let note = created_entries_note(before.as_ref(), dir.path()).unwrap();
+    assert!(
+        note.contains("cmain") && !note.contains("kept.txt"),
+        "{note}"
+    );
+    assert_eq!(created_entries_note(None, dir.path()), None);
+    drop(ws);
+}
+
+#[test]
 fn cwd_may_be_an_added_root_but_not_an_undeclared_directory_or_a_file() {
     let (dir, mut ws) = workspace();
     let added = tempfile::tempdir().unwrap();
@@ -139,7 +156,7 @@ fn explicit_background_and_threshold_both_adopt_with_a_notice() {
 
 #[cfg(unix)]
 #[test]
-fn an_explicit_timeout_does_not_keep_a_long_command_in_the_foreground() {
+fn an_explicit_timeout_keeps_the_command_in_the_foreground_until_it_passes() {
     let (_dir, ws) = workspace();
     let ws = ws.without_sandbox();
     let cancel = AtomicBool::new(false);
@@ -148,10 +165,10 @@ fn an_explicit_timeout_does_not_keep_a_long_command_in_the_foreground() {
         *adopted.lock() += 1;
         Ok("bg7".to_owned())
     };
-    // Finishes inside the 1s threshold: the result returns in this one call.
+    // Runs past the 1s threshold but inside its 10s timeout: the result returns in this one call.
     let finished = bash_tool_streaming_with_adopter(
         &ws,
-        &json!({"command": "sleep 0.2; echo built", "timeout": 10}),
+        &json!({"command": "sleep 1.5; echo built", "timeout": 10}),
         0,
         1,
         &|_: &[u8]| {},
@@ -165,10 +182,10 @@ fn an_explicit_timeout_does_not_keep_a_long_command_in_the_foreground() {
         finished.text
     );
     assert_eq!(*adopted.lock(), 0);
-    // Still running past the 1s threshold though its timeout is 10s: moved to bg at the threshold.
+    // Without a timeout it moves to bg at the threshold.
     let long = bash_tool_streaming_with_adopter(
         &ws,
-        &json!({"command": "sleep 5", "timeout": 10}),
+        &json!({"command": "sleep 5"}),
         0,
         1,
         &|_: &[u8]| {},
@@ -240,21 +257,23 @@ fn hard_cancel_with_steering_kills_the_command_instead_of_adopting_it() {
 #[test]
 fn named_sessions_get_the_same_adoption_deadline() {
     let threshold = Duration::from_secs(5);
-    assert_eq!(adoption_deadline(threshold), Some(threshold));
-    assert_eq!(adoption_deadline(Duration::ZERO), None);
+    assert_eq!(adoption_deadline(threshold, None), Some(threshold));
+    assert_eq!(adoption_deadline(Duration::ZERO, None), None);
 }
 
 #[test]
-fn an_explicit_timeout_never_postpones_adoption() {
+fn a_longer_explicit_timeout_postpones_adoption_and_never_kills() {
     let threshold = Duration::from_secs(15);
     let long = Duration::from_secs(600);
-    // The threshold is the deadline whatever the timeout; a long timeout does not move it.
-    assert_eq!(adoption_deadline(threshold), Some(threshold));
+    let short = Duration::from_secs(5);
+    assert_eq!(adoption_deadline(threshold, Some(long)), Some(long));
+    // A shorter timeout does not move the deadline earlier, and disabled backgrounding stays off.
+    assert_eq!(adoption_deadline(threshold, Some(short)), Some(threshold));
+    assert_eq!(adoption_deadline(Duration::ZERO, Some(long)), None);
     // A timeout at or after the deadline never kills: adoption happens first.
-    assert!(!timeout_kills(long, long, Some(threshold)));
+    assert!(!timeout_kills(long, long, Some(long)));
     assert!(!timeout_kills(threshold, threshold, Some(threshold)));
     // A timeout shorter than the threshold still kills, and so does any timeout without backgrounding.
-    let short = Duration::from_secs(5);
     assert!(timeout_kills(short, short, Some(threshold)));
     assert!(timeout_kills(short, short, None));
     assert!(!timeout_kills(Duration::ZERO, long, None));
@@ -592,7 +611,7 @@ fn failed_builds_lead_with_a_digest_and_silent_grep_misses_are_explained() {
     assert!(out.is_error, "{}", out.text);
     assert!(
         out.text.starts_with(
-            "[failure digest: first error lines; the full output follows]\nerror[E0425]: cannot find value `y`\n --> src/main.rs:4:13\n[end of digest]\n"
+            "[failure digest: failing tests and first errors; the output follows]\nerror[E0425]: cannot find value `y`\n --> src/main.rs:4:13\n[end of digest]\n"
         ),
         "{}",
         &out.text[..out.text.len().min(400)]
@@ -956,6 +975,22 @@ fn fake_cargo(dir: &Path) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+#[test]
+fn fully_inline_output_drops_the_redundant_artifact_link_but_keeps_it_structured() {
+    let (_dir, ws, _artifacts) = with_artifacts(false);
+    let short = bash(&ws, "echo hi");
+    assert!(short.text.contains("hi\n[exit code: 0]"), "{}", short.text);
+    assert!(!short.text.contains("[complete output:"), "{}", short.text);
+    let integrity = short.execution.output.as_ref().unwrap();
+    assert!(integrity.artifact.is_some(), "{integrity:?}");
+    let long = bash(&ws, "seq 1 200000");
+    assert!(
+        long.text.contains("[complete output: artifact://"),
+        "{}",
+        long.text
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn minimized_output_keeps_status_diagnostics_and_a_raw_artifact() {
@@ -1234,7 +1269,11 @@ fn launch_zero_exit_after_terminal_diagnostic_preserves_exit_and_launch_facts() 
                 }),
                 "{label}"
             );
-            assert!(out.text.contains("[shell launch:"), "{label}: {}", out.text);
+            assert!(
+                !out.text.contains("[shell launch:"),
+                "{label}: {}",
+                out.text
+            );
         }
     }
 }
@@ -1351,7 +1390,7 @@ fn a_command_past_the_threshold_keeps_running_when_no_background_owner_can_take_
 
 #[test]
 fn captured_output_never_splits_a_character_at_the_head_cut() {
-    // Fits entirely: one box-drawing character straddles the 6 KiB head boundary.
+    // Fits entirely: one box-drawing character straddles the head boundary.
     let mut capture = Capture::new();
     let mut bytes = vec![b'a'; BASH_HEAD - 1];
     bytes.extend_from_slice("─".repeat(200).as_bytes());

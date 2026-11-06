@@ -313,7 +313,7 @@ fn listing_reports_status_and_never_activates_or_grants_eligibility() {
             let name = entry["name"].as_str().unwrap();
             let loaded = offered_before.iter().any(|offered| offered == name);
             let (status, next) = if loaded {
-                ("loaded_next_request", "exact name on the next request")
+                ("offered", "exact name")
             } else {
                 ("not_loaded", "tool_load")
             };
@@ -330,7 +330,7 @@ fn listing_reports_status_and_never_activates_or_grants_eligibility() {
             .into_iter()
             .find(|entry| entry["name"] == "listprobe_07")
             .unwrap();
-        assert_eq!(entry["status"], "loaded_next_request");
+        assert_eq!(entry["status"], "offered");
         assert_eq!(entry["enabled_next_round"], true);
     });
 }

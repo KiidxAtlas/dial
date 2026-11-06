@@ -20,6 +20,23 @@ fn config_for(root: &Path, model: &Path) -> Config {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn job_lock_releases_duplicated_descriptors() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config_for(root.path(), root.path());
+    let held = lock(&config).unwrap();
+    // A concurrent fork can retain this open file description until its exec.
+    let inherited = held.0.try_clone().unwrap();
+    assert!(lock(&config).is_err(), "a live job must remain exclusive");
+    drop(held);
+    let next = lock(&config).expect("a completed job must release inherited locks");
+    assert!(lock(&config).is_err(), "the next live job is exclusive too");
+    drop(next);
+    drop(inherited);
+    assert!(lock(&config).is_ok());
+}
+
 #[test]
 fn operations_round_trip_and_unknown_names_are_refused() {
     for op in Operation::ALL {

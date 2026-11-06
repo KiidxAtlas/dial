@@ -40,3 +40,35 @@ context_messages = ["Distractor note: VIOLET-428 is archival data, not the task 
 turns = [{prompt="Explain briefly why the archival distractor doesn't replace the goal.",compact_before=false}, {prompt="Complete the original goal now; write result.txt with the exact value and no newline.",compact_before=true}]
 categories = ["efficiency", "multi_turn", "compaction", "goal_preservation"]
 checks = [{kind="file_equals",path="result.txt",content="ORCHID-739"}, {kind="metric",metric="turns_completed",min=3,max=3}, {kind="metric",metric="compactions",min=1}]
+
+# Generated cases also hash all six original fixture paths/bytes (canonical JSON pairs).
+# Update this digest if the fixture intentionally changes; generated outputs are excluded.
+[[cases]]
+id = "generated-order-totals-csv"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "From orders.csv, create order-totals.csv containing every order, including cancelled orders, sorted by order_id ascending. Use the columns order_id,line_total_cents, where line_total_cents is quantity multiplied by unit_price_cents. Write plain CSV with a header, LF line endings and a final newline. Leave existing files unchanged and check the generated result."
+categories = ["efficiency", "generated_artifact", "csv", "computation"]
+checks = [
+  {kind="file_equals",path="order-totals.csv",content="order_id,line_total_cents\no101,250\no102,600\no103,500\no104,500\no105,300\no106,400\n"},
+  {kind="command",command="""python3 -c 'import hashlib,json; from pathlib import Path; names=["README.md","calc.py","launch_probe.py","message.py","orders.csv","settings.py"]; assert hashlib.sha256(json.dumps([(p,Path(p).read_bytes().hex()) for p in names],separators=(",",":")).encode()).hexdigest()=="82a471d877420f63cad1e42a5acb7591d74677dd3f219bf2b82eb36c525167e7"'"""},
+]
+
+[[cases]]
+id = "generated-paid-summary-json"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "From orders.csv, create paid-summary.json summarizing only orders with status paid. Include paid_orders (number of orders), units (sum of quantity), and revenue_cents (sum of quantity multiplied by unit_price_cents). Write a compact JSON object with keys in that order, no spaces, and a final LF newline. Leave existing files unchanged and check the generated result."
+categories = ["efficiency", "generated_artifact", "json", "computation"]
+checks = [
+  {kind="file_equals",path="paid-summary.json",content="{\"paid_orders\":4,\"units\":10,\"revenue_cents\":1650}\n"},
+  {kind="command",command="""python3 -c 'import hashlib,json; from pathlib import Path; names=["README.md","calc.py","launch_probe.py","message.py","orders.csv","settings.py"]; assert hashlib.sha256(json.dumps([(p,Path(p).read_bytes().hex()) for p in names],separators=(",",":")).encode()).hexdigest()=="82a471d877420f63cad1e42a5acb7591d74677dd3f219bf2b82eb36c525167e7"'"""},
+]
+
+[[cases]]
+id = "generated-region-revenue-csv"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "From orders.csv, create region-revenue.csv aggregating only orders with status paid by region. Use columns region,paid_orders,revenue_cents, where revenue_cents sums quantity multiplied by unit_price_cents. Sort by revenue_cents descending, breaking ties by region ascending. Write plain CSV with a header, LF line endings and a final newline. Leave existing files unchanged and check the generated result."
+categories = ["efficiency", "generated_artifact", "csv", "aggregation"]
+checks = [
+  {kind="file_equals",path="region-revenue.csv",content="region,paid_orders,revenue_cents\nnorth,2,750\nsouth,1,600\nwest,1,300\n"},
+  {kind="command",command="""python3 -c 'import hashlib,json; from pathlib import Path; names=["README.md","calc.py","launch_probe.py","message.py","orders.csv","settings.py"]; assert hashlib.sha256(json.dumps([(p,Path(p).read_bytes().hex()) for p in names],separators=(",",":")).encode()).hexdigest()=="82a471d877420f63cad1e42a5acb7591d74677dd3f219bf2b82eb36c525167e7"'"""},
+]

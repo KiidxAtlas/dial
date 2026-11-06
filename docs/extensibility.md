@@ -285,6 +285,7 @@ remain readable and conservatively cause one change observation.
 (no approval) and `add`, `unstage`, `commit`, `branch_create`, `switch`, `push`, `pr_create` (approval),
 plus `pr_view`, `pr_checks`, `issue_view` through the `gh` CLI. Arguments are validated and never pass
 through a shell; external diff drivers and textconv are disabled, read actions run without repository hooks, and approved `commit` and `push` run repository hooks unless `git.bypass_hooks` is set; push never forces.
+Host-side reads refuse configured textconv drivers. `status`, `diff` and `blame` also refuse configured clean/smudge/process filters (for example git-lfs), because they convert working-tree files. `log`, `reflog`, `show` and `branches` read only objects and refs, so they still run with filters configured; use sandboxed `bash` for the refused reads.
 Path permission rules apply to `git` `paths`. Default prompt commands `/review`, `/commit-work` and `/pr` use
 it; a file in `.dial/commands/` with the same name replaces them. The former `commit` prompt command is now `/commit-work`, since `/commit` is the commit command that generates the message and commits.
 

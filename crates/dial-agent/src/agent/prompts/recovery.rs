@@ -99,7 +99,7 @@ Attempt #{{retryCount}}/{{maxRetries}}
 </system-injection>"#;
 
 /// Compact failure feedback; controller-owned barriers and budgets enforce recovery.
-pub(in crate::agent) const FIRST_FAILURE: &str = "Correct the cause before retrying; unchanged retries require new evidence and understood prior effects.";
+pub(in crate::agent) const FIRST_FAILURE: &str = "Correct causes; retries require new evidence and understood effects. Preserve requested targets and final acceptance.";
 /// Inference failed before the response could enter tool dispatch. This describes only that
 /// response, never earlier operations in the turn or billing at the provider.
 pub(in crate::agent) const PROVIDER_RECOVERY: &str = "Recovery state: inference failed; no tools were dispatched from this failed response. Earlier completed operations are retained, not rolled back. Next action: resolve the provider diagnostic, then continue this session when ready. Do not replay earlier tool operations merely because inference failed.";
@@ -121,11 +121,17 @@ pub(crate) const VERIFICATION_CODE: &str = "Use the observed failing assertion/c
 pub(crate) const VERIFICATION_FAILED_UNCLASSIFIED: &str = "The process failed, but its runner has no controller-selected setup classification. Inspect the diagnostic to distinguish an environment prerequisite from a code defect before editing application code; preserve the failing acceptance criterion. Untouched code can still fail because of a change; establish causality before calling a failure pre-existing.";
 pub(crate) const VERIFICATION_UNAVAILABLE: &str = "This result does not establish a code defect or a passing check. Inspect termination and runner evidence, then report or resolve the specific verification gap.";
 pub(crate) const SOURCE_OR_CALL_CONTRACT: &str = "Use the returned diagnostic to correct the call. For stale or unseen source, use complete current lines and fresh anchors already returned; read only the affected ranges still missing. Do not repeat guessed replacements or split a patch without addressing the reported cause. Do not assume a failed edit applied: inspect any recorded effects and do not make dependent edits that assume its new text, symbols or file exist. If the change is still needed, correct it before building on it; otherwise choose an approach supported by the current source.";
-pub(crate) const TOOL_FAILURE: &str = "Inspect the original diagnostic and execution status. Correct the named arguments, prerequisite or affected code before retrying. If this result does not establish a cause, use a targeted observation to distinguish causes; do not invent a diagnosis, substitute a different acceptance criterion, or treat failure as permission to bypass safeguards.";
+pub(crate) const TOOL_FAILURE: &str = "Inspect the original diagnostic and execution status. Correct the named arguments, prerequisite or affected code before retrying; if the cause is unknown, use one discriminating observation. A diagnostic workaround is not the deliverable: reconcile temporary alternatives with the requested final state. Do not invent a diagnosis, substitute acceptance criteria or bypass safeguards.";
 
 pub(crate) fn shell_tool_mistake(name: &str, next: &str) -> String {
     format!(
         "\n[Dial recovery: tool_not_shell] `{name}` is a Dial tool name, not a shell executable. Do not repeat this Bash command or install a program with that name. {next} Loading or a suggestion grants no execution, network or filesystem permission."
+    )
+}
+
+pub(crate) fn missing_program(name: &str) -> String {
+    format!(
+        "\n[Dial recovery: missing_program] `{name}` was not found in the command's execution environment. Use recorded availability when supplied, after checking compatibility; otherwise check alternatives together once (for example `command -v python3 perl node`) in that same environment. Do not search an unchanged PATH repeatedly. Availability is not permission; installing still follows approval rules."
     )
 }
 

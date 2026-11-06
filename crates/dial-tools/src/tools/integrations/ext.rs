@@ -151,6 +151,20 @@ pub trait Tool: Send + Sync {
     fn may_modify_workspace(&self, args: &Value) -> bool {
         self.needs_approval(args)
     }
+    /// Explicit opt-in for a finite, nonmutating native operation to run as an owned `bg` job.
+    /// The controller still validates and authorizes the exact call. Implementations must not
+    /// require live controller callbacks; mutable cancellation state must be session-forkable.
+    fn supports_background(&self, _args: &Value) -> bool {
+        false
+    }
+    /// Fork owned background cancellation state, where needed. A shared immutable implementation
+    /// may return `None`; this is called only after explicit background admission.
+    fn fork_background(
+        &self,
+        _cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<Arc<dyn Tool>> {
+        self.fork_session()
+    }
     /// Owns the workspace mutation barrier internally. The controller must not
     /// acquire the same non-reentrant lock around this tool's operation.
     fn manages_workspace_serialization(&self) -> bool {

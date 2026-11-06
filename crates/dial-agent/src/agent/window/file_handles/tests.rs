@@ -328,6 +328,18 @@ fn discovery_labels_do_not_depend_on_another_worker_registering_the_path() {
 }
 
 #[test]
+fn glob_preview_separators_are_not_labeled_as_the_workspace_root() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(root.path()).unwrap();
+    std::fs::write(root.path().join("file.rs"), "code").unwrap();
+    let text = "file.rs\n[coverage: results=1; walk complete]\n\n   \nSource excerpts\n";
+    assert_eq!(
+        model_result(&ws, &call("glob", json!({"preview": true})), text),
+        "@f1(file.rs)\n[coverage: results=1; walk complete]\n\n   \nSource excerpts\n"
+    );
+}
+
+#[test]
 fn recorded_call_projection_is_stable_after_new_registry_allocations() {
     let root = tempfile::tempdir().unwrap();
     let ws = Workspace::new(root.path()).unwrap();

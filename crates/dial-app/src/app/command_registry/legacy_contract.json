@@ -61,7 +61,7 @@
     ["tools", "", "list the tools offered to the agent and those available"],
     ["extensions", "", "browse and install MCP servers and skills (/status shows the configuration)"],
     ["graphify", "[tree|html|callflow]", "open the project's Graphify knowledge graph in the browser (default: tree)"],
-    ["image", "generate <prompt> | edit <file> <prompt> | settings", "generate or edit an image with image_gen (asks for approval) or tune the model"],
+    ["image", "generate <prompt> | gif <prompt> | edit <file> <prompt> | settings", "generate, animate (GIF) or edit an image with image_gen (asks for approval) or tune the model"],
     ["evidence", "inspect <citation> | lineage <citation>... | compare <left> <right> | correct <citation> <text>", "inspect citations, lineage, revisions, gaps and append a correction"],
     ["fast", "[on|ultra|off|status]", "priority service tier: on, ultra (OpenAI ultrafast), off, status"],
     ["slow", "[on|off|status]", "flex service tier for lower cost: on, off, status"],

@@ -118,13 +118,19 @@ pub struct PlatformAvailability {
     pub reason: Option<String>,
 }
 pub fn execution_platform(name: &str) -> PlatformAvailability {
-    let reason = if cfg!(target_os = "macos") || (cfg!(windows) && name == "eval") {
+    let linux_eval = name == "eval"
+        && cfg!(all(
+            target_os = "linux",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ));
+    let reason = if cfg!(target_os = "macos") || (cfg!(windows) && name == "eval") || linux_eval {
         None // Actual launch still requires the runtime's containment check.
     } else {
         Some(format!(
             "{name} requires OS process-fork containment; {}",
             if name == "eval" {
-                "only macOS and Windows are supported"
+                "only macOS, Windows and native x86_64/aarch64 Linux are supported"
             } else {
                 "no unsandboxed or Linux fallback is provided"
             }

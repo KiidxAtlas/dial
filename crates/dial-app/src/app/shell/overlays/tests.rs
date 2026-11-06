@@ -542,7 +542,7 @@ fn busy_back_keeps_settings_search_but_refreshes_saved_values() {
 }
 
 #[test]
-fn settings_model_review_returns_to_retained_editor_after_save_or_cancel() {
+fn settings_model_choice_saves_directly_and_keeps_the_editor() {
     use crate::llm::model_config::ModelSelection;
     use crate::ui::overlay::settings::{ChoiceAction, ValueChoice};
     fn press(shell: &mut Shell, app: &App, code: KeyCode) {
@@ -555,75 +555,51 @@ fn settings_model_review_returns_to_retained_editor_after_save_or_cancel() {
                 .unwrap()
         );
     }
-    for save in [false, true] {
-        let (_home, _project, app, mut shell) = shell();
-        let before = app.reload().unwrap().selection();
-        shell.composer.set_draft("keep draft through model review");
-        shell.start_busy_overlay(&app, Which::Settings).unwrap();
-        let ActiveOverlay::Settings(settings) = &mut shell.busy_overlay.as_mut().unwrap().overlay
-        else {
-            panic!("settings")
-        };
-        assert!(settings.focus_path("model"));
-        settings.set_value_choices(std::collections::BTreeMap::from([(
-            "model".into(),
-            vec![ValueChoice {
-                value: "gpt-4.1".into(),
-                label: "gpt-4.1".into(),
-                action: ChoiceAction::Assign {
-                    role: "main".into(),
-                    selection: ModelSelection::new("openai", "gpt-4.1"),
-                },
-            }],
-        )]));
-        press(&mut shell, &app, KeyCode::Enter);
-        for c in "gpt-4.1".chars() {
-            press(&mut shell, &app, KeyCode::Char(c));
-        }
-        press(&mut shell, &app, KeyCode::Enter);
-        let state = shell.busy_overlay.as_ref().unwrap();
-        assert!(
-            matches!(state.overlay, ActiveOverlay::Models(_)),
-            "selection must be reviewed, never saved directly"
-        );
-        assert!(matches!(
-            state.history.last(),
-            Some(ActiveOverlay::Settings(_))
-        ));
-        assert_eq!(
-            app.reload().unwrap().selection(),
-            before,
-            "review must not publish"
-        );
-        shell.step_busy_overlay(&app, None).unwrap();
-        if save {
-            press(&mut shell, &app, KeyCode::Enter);
-            assert_eq!(app.reload().unwrap().selection().model, "gpt-4.1");
-        } else {
-            press(&mut shell, &app, KeyCode::Esc);
-            shell
-                .step_busy_overlay(
-                    &app,
-                    Some(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT))),
-                )
-                .unwrap();
-            assert_eq!(app.reload().unwrap().selection(), before);
-        }
-        let state = shell.busy_overlay.as_mut().unwrap();
-        assert!(state.history.is_empty());
-        let ActiveOverlay::Settings(settings) = &mut state.overlay else {
-            panic!("return to originating Settings, not an unrelated Models browser")
-        };
-        // The original model row remains selected, rather than resetting the category/editor.
-        assert!(matches!(
-            settings.handle(
-                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                &shell.keys
-            ),
-            crate::ui::overlay::OverlayEvent::None
-        ));
-        assert_eq!(shell.composer.draft(), "keep draft through model review");
+    let (_home, _project, app, mut shell) = shell();
+    shell
+        .composer
+        .set_draft("keep draft through model selection");
+    shell.start_busy_overlay(&app, Which::Settings).unwrap();
+    let ActiveOverlay::Settings(settings) = &mut shell.busy_overlay.as_mut().unwrap().overlay
+    else {
+        panic!("settings")
+    };
+    assert!(settings.focus_path("model"));
+    settings.set_value_choices(std::collections::BTreeMap::from([(
+        "model".into(),
+        vec![ValueChoice {
+            value: "gpt-4.1".into(),
+            label: "gpt-4.1".into(),
+            action: ChoiceAction::Assign {
+                role: "main".into(),
+                selection: ModelSelection::new("openai", "gpt-4.1"),
+            },
+        }],
+    )]));
+    press(&mut shell, &app, KeyCode::Enter);
+    for c in "gpt-4.1".chars() {
+        press(&mut shell, &app, KeyCode::Char(c));
     }
+    press(&mut shell, &app, KeyCode::Enter);
+    assert_eq!(
+        app.reload().unwrap().selection().model,
+        "gpt-4.1",
+        "choosing a model saves it without a confirmation screen"
+    );
+    let state = shell.busy_overlay.as_mut().unwrap();
+    assert!(state.history.is_empty(), "no review overlay was pushed");
+    let ActiveOverlay::Settings(settings) = &mut state.overlay else {
+        panic!("stays in the originating Settings, not a Models review")
+    };
+    // The original model row remains selected, rather than resetting the category/editor.
+    assert!(matches!(
+        settings.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &shell.keys
+        ),
+        crate::ui::overlay::OverlayEvent::None
+    ));
+    assert_eq!(shell.composer.draft(), "keep draft through model selection");
 }
 
 #[test]

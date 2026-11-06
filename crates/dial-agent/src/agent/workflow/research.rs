@@ -53,8 +53,12 @@ fn normalized(text: &str) -> String {
 /// Calls whose successful result can supply evidence, shared with execution progress accounting.
 pub(in crate::agent) fn is_observation(call: &ToolCall) -> bool {
     match call.name.as_str() {
-        "read" | "grep" | "glob" | "find" | "ast_search" | "dep_source" | "artifact_read"
-        | "web_search" | "web_fetch" | "lsp" | "bash" | "skill" | "recall" | "tool_search" => true,
+        "read" | "grep" | "glob" | "find" | "ast_search" | "dep_source" | "web_search"
+        | "web_fetch" | "lsp" | "bash" | "skill" | "tool_search" => true,
+        "memory" => matches!(
+            call.arguments["action"].as_str(),
+            Some("recall" | "reflect" | "history")
+        ),
         "codebase_memory" => matches!(
             call.arguments["action"].as_str(),
             Some("recall" | "architecture" | "impact" | "refresh")

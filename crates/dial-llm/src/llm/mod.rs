@@ -55,6 +55,7 @@ pub mod model_config;
 pub mod model_sampling;
 pub mod oauth;
 pub mod ollama;
+pub mod openrouter;
 pub mod policy;
 pub mod profiles;
 pub mod prompt;
@@ -658,6 +659,7 @@ fn chat_at_controlled(
     if let Some(profile) = profile {
         profile.validate_request(req, false)?;
         profile.apply_openai(&mut body);
+        openrouter::apply(&mut body, profile)?;
     }
     let mut response = send_with_headers(url, auth, &body, timeout_secs, None, interrupt, headers)?;
     let status = response.status().as_u16();
@@ -749,6 +751,7 @@ fn chat_stream_at_controlled(
     if let Some(profile) = profile {
         profile.validate_request(req, false)?;
         profile.apply_openai(&mut body);
+        openrouter::apply(&mut body, profile)?;
     }
     let mut response = send_with_headers(
         url,

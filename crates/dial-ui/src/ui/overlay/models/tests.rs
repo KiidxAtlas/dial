@@ -2268,7 +2268,7 @@ fn selected_tuning_carries_identity_without_reassigning_conversation() {
 }
 
 #[test]
-fn reviewed_assignment_requires_confirmation_and_cancels_without_mutation() {
+fn reviewed_role_removal_requires_confirmation_and_cancels_without_mutation() {
     let rig = Rig::new();
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -2285,14 +2285,12 @@ fn reviewed_assignment_requires_confirmation_and_cancels_without_mutation() {
     )
     .unwrap();
     let mut o = overlay();
-    o.discovery.as_mut().unwrap().models[0].metadata.tools = Some(false);
     let main = o.role_selection("main").cloned();
     for confirm in [false, true] {
         o.review_assignment(
             transaction.clone(),
-            OverlayEvent::AssignModel {
+            OverlayEvent::ClearRole {
                 role: "main".into(),
-                selection: selection.clone(),
                 scope: Scope::Global,
             },
             "main".into(),
@@ -2301,8 +2299,6 @@ fn reviewed_assignment_requires_confirmation_and_cancels_without_mutation() {
         assert!(o.take_confirmed_assignment().is_none());
         let shown = draw(&mut o, &rig, 180, 35);
         assert!(shown.contains("global SAVE: model"), "{shown}");
-        assert!(shown.contains("unknown (not reported)"), "{shown}");
-        assert!(shown.contains("tools: unsupported"), "{shown}");
         assert!(
             !shown.contains("http://ollama"),
             "no endpoint values rendered: {shown}"
@@ -2316,7 +2312,7 @@ fn reviewed_assignment_requires_confirmation_and_cancels_without_mutation() {
                 KeyCode::Esc
             }),
         );
-        assert_eq!(matches!(event, OverlayEvent::AssignModel { .. }), confirm);
+        assert_eq!(matches!(event, OverlayEvent::ClearRole { .. }), confirm);
         assert_eq!(o.take_confirmed_assignment().is_some(), confirm);
         assert_eq!(o.role_selection("main"), main.as_ref());
         assert!(

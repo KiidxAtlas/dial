@@ -28,6 +28,9 @@ pub struct Inputs<'a> {
     /// Lean local profile: omits the visual-verification section unless a browser or computer tool is
     /// offered, and the skills catalog unless `skill` is offered.
     pub lean: bool,
+    /// Context overflow fallback: keep deferred capabilities by name, without expanding previews.
+    /// Normal lean-local requests retain the bounded capability hints for small models.
+    pub context_overflow: bool,
     /// Compact built-in guidance and searchable MCP inventory without narrowing tool access.
     pub concise_guidance: bool,
     /// Prefer specialist delegation; false keeps coupled work and focused testing inline.
@@ -103,7 +106,7 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
             LEAN_BATCHING
         });
     }
-    let optional: Vec<&str> = [
+    let mut optional: Vec<&str> = [
         ("skill", SKILL_RULE),
         ("codebase_memory", PROJECT_MAP_RULE),
         ("lsp", LSP_RULE),
@@ -113,6 +116,9 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     .filter(|(tool, _)| has(tool))
     .map(|(_, rule)| rule)
     .collect();
+    if EVIDENCE_DATA_TOOLS.iter().any(|tool| has(tool)) {
+        optional.push(EVIDENCE_DATA_RULE);
+    }
     if !optional.is_empty() {
         policy.push_str("\n- ");
         policy.push_str(&optional.join(" "));
@@ -351,7 +357,11 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
         out.push_str("- Loadable tools, not in the schema yet: call `tool_load` with the exact name and use the tool next round. NEVER call one before loading it.\n");
         // Names alone suffice when `tool_search` can describe them on demand.
         let names_only = compact && i.tools.iter().any(|tool| tool == "tool_search");
-        if i.lean || i.one_call {
+        if i.context_overflow && i.template.is_none() && i.overrides.0.is_none() {
+            // Overflow must not turn an already compact names-only inventory into longer
+            // per-tool hints. Discovery still returns the descriptions and exact callable set.
+            out.push_str(&loadable_names(i.discoverable.iter()));
+        } else if i.lean || i.one_call {
             // Small models invent what a bare name does, so native tools get one bounded line
             // each; MCP names stay on the `Names:` line with the bounded hints below.
             // Descriptions are third-party data, not instructions or permission grants.

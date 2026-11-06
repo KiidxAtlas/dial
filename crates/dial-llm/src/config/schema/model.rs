@@ -149,7 +149,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Roles & Sampling",
         "Remote idle timeout (s)",
-        "Remote model stream silence limit: waits for the first event and for silence between events. Defaults to 300 s, so a stalled connection fails and retries. 0 means unlimited; keep-alives do not reset a configured positive deadline. Local model servers are not limited.",
+        "Remote model stream silence limit: waits for the first event and for silence between events. Defaults to 60 s, so a stalled connection fails and retries. 0 means unlimited. Keep-alives do not reset a positive limit, except while a tool call is open (Anthropic may stream only keep-alives while it writes a large call), for at most 10 minutes after the last real progress. Local model servers are not limited.",
         Kind::Int {
             min: 0,
             max: 86400,
@@ -355,7 +355,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Project understanding",
         "Ambient codebase context",
-        "Attach a bounded brief of fresh saved architecture notes, findings and source outlines relevant to each user message (no extra model request; stale findings are only named). Off leaves retrieval to the codebase_memory tool, which the model calls when it needs the saved understanding.",
+        "Attach a bounded brief of fresh saved architecture notes, findings and source outlines relevant to each user message (no extra model request; stale findings are only named). Off by default; retrieval is then left to the loadable codebase_memory tool.",
         Kind::Bool,
         true
     ),

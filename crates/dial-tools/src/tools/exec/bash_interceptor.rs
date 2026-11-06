@@ -40,6 +40,21 @@ pub fn check(
     available_tools: &[&str],
     command: &str,
 ) -> Option<Verdict> {
+    check_in(config, available_tools, command, &|_| true)
+}
+
+/// Workspace-scoped file tools: they refuse paths outside the workspace roots.
+const WORKSPACE_FILE_TOOLS: &[&str] = &["read", "grep", "glob"];
+
+/// [`check`] where `in_workspace` reports whether an absolute path lies in the workspace. A hint
+/// toward `read`/`grep`/`glob` is withheld when the command names an absolute path outside it:
+/// following the hint would only be refused and cost a further round trip.
+pub fn check_in(
+    config: &BashInterceptorConfig,
+    available_tools: &[&str],
+    command: &str,
+    in_workspace: &dyn Fn(&str) -> bool,
+) -> Option<Verdict> {
     if !config.enabled {
         return None;
     }
@@ -64,6 +79,12 @@ pub fn check(
         }
         for candidate in &candidates {
             if compiled.matches(candidate) {
+                if config.mode == InterceptMode::Hint
+                    && WORKSPACE_FILE_TOOLS.contains(&compiled.tool.as_str())
+                    && absolute_operands(command).any(|path| !in_workspace(path))
+                {
+                    return None;
+                }
                 return Some(match config.mode {
                     InterceptMode::Block => Verdict::Block(format!(
                         "Blocked: {}\n\nOriginal command: {command}",
@@ -75,6 +96,14 @@ pub fn check(
         }
     }
     None
+}
+
+/// Words of `command` that are absolute paths, with surrounding quotes removed.
+fn absolute_operands(command: &str) -> impl Iterator<Item = &str> {
+    command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')'))
+        .map(|word| word.trim_matches(['\'', '"']))
+        .filter(|word| word.starts_with('/') && word.len() > 1)
 }
 
 /// Stages that reduce their input; a `head`/`tail` after one selects a result (top-N), not a trim.
@@ -96,6 +125,11 @@ pub fn trim_hint(config: &BashInterceptorConfig, command: &str) -> Option<String
         if !(stage.piped_stdin && is_trim(&stage.text) && ends_pipeline) {
             return false;
         }
+        // `head -1` / `tail -n 3` pick a line or two (a version, a result row); the hint only
+        // pays off when a real block of output is cut.
+        if trim_count(&stage.text) <= SELECTION_LINES {
+            return false;
+        }
         let start = segments[..index]
             .iter()
             .rposition(|s| !s.piped_stdin)
@@ -109,7 +143,39 @@ pub fn trim_hint(config: &BashInterceptorConfig, command: &str) -> Option<String
         })
     });
     trims.then(|| {
-        "[hint] `bash` already bounds long output (it keeps the start and end), so `| head`/`| tail` only hides lines you may rerun the command to see. Drop the output trim unless it selects part of the result required by the task.".to_owned()
+        "[hint] bash already keeps the start and end of long output; this `| head`/`| tail` only hides lines.".to_owned()
+    })
+}
+
+/// One line for a command that only prints text the model wrote itself: comment-only lines,
+/// `echo`/`printf` of literal text, or a `cat <<EOF` heredoc to stdout. Such a call runs no
+/// program and changes nothing, yet costs a round trip and re-sends the notes with every later
+/// request. Expansion, redirection, pipes and command separators make it real shell work.
+pub fn notes_hint(config: &BashInterceptorConfig, command: &str) -> Option<String> {
+    if !config.enabled {
+        return None;
+    }
+    let lines: Vec<&str> = command
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let first = lines.first()?;
+    let literal = |text: &str| !text.contains(['$', '`', '>', '<', '|', ';', '&', '(', ')']);
+    let printed = |line: &str| {
+        line.starts_with('#')
+            || ["echo", "printf"].iter().any(|word| {
+                line.strip_prefix(word)
+                    .is_some_and(|rest| (rest.is_empty() || rest.starts_with(' ')) && literal(rest))
+            })
+    };
+    let heredoc = first
+        .strip_prefix("cat <<")
+        .map(|rest| rest.trim().trim_matches(['\'', '"']))
+        .filter(|tag| !tag.is_empty() && tag.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .is_some_and(|tag| lines.len() > 2 && lines.last() == Some(&tag));
+    (heredoc || lines.iter().all(|line| printed(line))).then(|| {
+        "[hint] This command only printed text you wrote; it ran no program and changed nothing. Keep reasoning in your reply, not in tool calls.".to_owned()
     })
 }
 
@@ -413,6 +479,35 @@ fn is_trim(stage: &str) -> bool {
         && words.all(|word| !matches!(word, "-f" | "-F" | "--follow"))
 }
 
+/// A trim keeping at most this many lines selects a value rather than hiding output.
+const SELECTION_LINES: usize = 5;
+
+/// Lines kept by a `head`/`tail` stage (`-n N`, `-nN`, `-N`, `--lines=N`; default 10). Byte
+/// counts (`-c`) and unparsable forms count as unbounded so they keep the hint.
+fn trim_count(stage: &str) -> usize {
+    let words: Vec<&str> = stage.split_whitespace().skip(1).collect();
+    let number = |text: &str| text.trim_start_matches('+').parse::<usize>().ok();
+    for (index, word) in words.iter().enumerate() {
+        let count = if *word == "-n" || *word == "--lines" {
+            words.get(index + 1).and_then(|next| number(next))
+        } else if let Some(rest) = word.strip_prefix("--lines=") {
+            number(rest)
+        } else if word.starts_with("-c") || word.starts_with("--bytes") {
+            return usize::MAX;
+        } else if let Some(rest) = word.strip_prefix("-n") {
+            number(rest)
+        } else if let Some(rest) = word.strip_prefix('-') {
+            number(rest)
+        } else {
+            None
+        };
+        if let Some(count) = count {
+            return count;
+        }
+    }
+    10
+}
+
 /// One flat command segment with whether its stdin is fed by a preceding `|` / `|&`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FlatSegment {
@@ -572,9 +667,10 @@ fn extract_flat_shell_command_segments(command: &str) -> Vec<FlatSegment> {
 }
 
 /// Flat sequential commands for output classification. Reject pipes and asynchronous jobs: their
-/// interleaved output cannot be attributed to a recognized producer.
+/// interleaved output cannot be attributed to a recognized producer. `2>&1` merges streams of the
+/// same command and is not a job, as in [`sole_command`].
 pub(super) fn output_commands(command: &str) -> Option<Vec<String>> {
-    if command.replace("&&", "").contains('&') {
+    if command.replace("&&", "").replace("2>&1", "").contains('&') {
         return None;
     }
     let segments = extract_flat_shell_command_segments(command);

@@ -1,4 +1,4 @@
-//! Automatic inputs for the exact built-in `python -I -S` AST check, not arbitrary Python code.
+//! Automatic inputs for the exact built-in `python -I -S -B` AST check, not arbitrary Python code.
 //! Unknown interpreter layouts, wrappers and oversized installations fall back to real execution.
 use super::*;
 use std::path::PathBuf;

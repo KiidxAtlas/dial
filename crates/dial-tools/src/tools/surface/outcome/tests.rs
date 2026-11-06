@@ -87,6 +87,24 @@ fn edit_projection_is_named_digest_bound_and_never_applied_to_errors() {
 }
 
 #[test]
+fn appended_controller_text_keeps_a_valid_edit_projection() {
+    let model = "[a.txt#ABCD]\nupdated (+1 -1 lines)\n1:new\n";
+    let raw = format!("{model}\nchange preview (+1 -1 lines)\n-old\n+new\n");
+    let mut output = edit_projection(raw.clone(), model.into());
+    let check = "\n\n[Post-edit check; edit remains applied]\npassed: unit\n";
+    append_text(&mut output, check);
+    // A post-edit check no longer exposes the duplicate diff to the model.
+    let content = message_for("edit", "id", &output)["content"].clone();
+    assert_eq!(content, format!("{model}{check}"));
+    assert_eq!(message("id", &output)["content"], format!("{raw}{check}"));
+    // A projection that was already stale stays stale.
+    let mut stale = edit_projection(raw, model.into());
+    stale.text.push_str("\nhook annotation");
+    append_text(&mut stale, check);
+    assert_eq!(message_for("edit", "id", &stale)["content"], stale.text);
+}
+
+#[test]
 fn recovery_annotation_is_additive_and_only_present_when_recovery_is_needed() {
     let blocked = ToolOutput::err("denied").with_status(ToolStatus::Blocked);
     let blocked_message = message("id", &blocked);

@@ -98,7 +98,7 @@ pub fn scheme(input: &str) -> Result<Scheme, String> {
             "issue" => Ok(Scheme::Issue),
             "conflict" => Ok(Scheme::Conflict),
             "artifact" => {
-                artifact_id(input)?;
+                artifact_target(input)?;
                 Ok(Scheme::Artifact)
             }
             _ => Err(format!(
@@ -107,6 +107,73 @@ pub fn scheme(input: &str) -> Result<Scheme, String> {
         };
     }
     Ok(Scheme::File)
+}
+
+/// What `read` returns for an `artifact://` target, chosen by a path suffix: lines (`:A-B`, `:A+C`,
+/// `:A-`, `:A`; default from line 1), `:info` (retention and availability), `:annotations` (human
+/// feedback bound to the artifact) or `:bytes=O[+N]` (exact base64 bytes from offset O).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactView {
+    Lines { start: u64, count: Option<u64> },
+    Info,
+    Annotations,
+    Bytes { offset: u64, count: u64 },
+}
+
+/// Split an `artifact://` read target into its canonical URI and the selected view.
+pub fn artifact_target(input: &str) -> Result<(String, ArtifactView), String> {
+    let rest = input
+        .strip_prefix("artifact://")
+        .ok_or("expected artifact:// identifier")?;
+    let (id, selector) = match rest.split_once(':') {
+        Some((id, selector)) => (id, Some(selector)),
+        None => (rest, None),
+    };
+    let uri = format!("artifact://{id}");
+    artifact_id(&uri)?;
+    let number = |text: &str| -> Result<u64, String> {
+        text.parse()
+            .map_err(|_| format!("invalid artifact selector `:{}`", selector.unwrap_or("")))
+    };
+    let view = match selector {
+        None => ArtifactView::Lines {
+            start: 1,
+            count: None,
+        },
+        Some("info") => ArtifactView::Info,
+        Some("annotations") => ArtifactView::Annotations,
+        Some(selector) => {
+            if let Some(bytes) = selector.strip_prefix("bytes=") {
+                let (offset, count) = match bytes.split_once('+') {
+                    Some((offset, count)) => (number(offset)?, number(count)?),
+                    None => (number(bytes)?, 8192),
+                };
+                ArtifactView::Bytes { offset, count }
+            } else {
+                let (start, count) = if let Some((start, count)) = selector.split_once('+') {
+                    (number(start)?, Some(number(count)?))
+                } else if let Some((start, end)) = selector.split_once('-') {
+                    let start = number(start)?;
+                    if end.is_empty() {
+                        (start, None)
+                    } else {
+                        let end = number(end)?;
+                        if end < start {
+                            return Err("artifact line range end precedes its start".into());
+                        }
+                        (start, Some(end - start + 1))
+                    }
+                } else {
+                    (number(selector)?, Some(1))
+                };
+                if start == 0 || count == Some(0) {
+                    return Err("artifact lines are 1-based and a count must be at least 1".into());
+                }
+                ArtifactView::Lines { start, count }
+            }
+        }
+    };
+    Ok((uri, view))
 }
 
 pub fn path_from_uri(uri: &str) -> Option<PathBuf> {

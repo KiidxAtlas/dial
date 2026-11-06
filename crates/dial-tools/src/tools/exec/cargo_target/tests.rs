@@ -166,7 +166,9 @@ fn nested_cross_target_build_locks_prevent_adoption_and_pruning() {
 #[test]
 fn session_leases_protect_idle_targets_until_all_workspaces_release_them() {
     let project = tempfile::tempdir().unwrap();
-    let ws = Workspace::new(project.path())
+    // The workspace canonicalizes its root (macOS temp dirs live under /private/var).
+    let root = std::fs::canonicalize(project.path()).unwrap();
+    let ws = Workspace::new(&root)
         .unwrap()
         .with_cargo_session("live")
         .unwrap();
@@ -174,13 +176,10 @@ fn session_leases_protect_idle_targets_until_all_workspaces_release_them() {
     let dir = ws.cargo_target_dir().unwrap();
     std::fs::create_dir_all(dir.join("debug")).unwrap();
     drop(ws);
-    assert!(prune_stale(project.path(), "fresh", Duration::ZERO).is_empty());
-    assert_eq!(adopt_idle(project.path(), "fresh", Duration::ZERO), None);
+    assert!(prune_stale(&root, "fresh", Duration::ZERO).is_empty());
+    assert_eq!(adopt_idle(&root, "fresh", Duration::ZERO), None);
     drop(clone);
-    assert_eq!(
-        adopt_idle(project.path(), "fresh", Duration::ZERO),
-        Some(dir)
-    );
+    assert_eq!(adopt_idle(&root, "fresh", Duration::ZERO), Some(dir));
 }
 
 #[test]

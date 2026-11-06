@@ -18,7 +18,7 @@ fn a_server_on_a_reused_port_is_probed_afresh() {
     let address = first.url.trim_start_matches("http://");
     let listener = TcpListener::bind(address).expect("rebind the released port");
     let not_found = || super::json(404, &json!({}));
-    let second = serve_on(listener, vec![not_found(), not_found()]);
+    let second = serve_on(listener, vec![not_found()]);
     assert_eq!(second.url, first.url);
     assert_eq!(
         local_server::facts("llama-cpp", "m", Some(&base), None, &[]).slots,
@@ -27,8 +27,8 @@ fn a_server_on_a_reused_port_is_probed_afresh() {
     assert!(!catalog::is_llama_server(&base, None, &[]));
     assert_eq!(
         second.requests().len(),
-        2,
-        "both lookups asked the new server"
+        1,
+        "the new server was asked, and its /props 404 answered the second lookup"
     );
 }
 

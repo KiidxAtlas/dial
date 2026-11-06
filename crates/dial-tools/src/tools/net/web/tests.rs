@@ -817,3 +817,154 @@ fn markdown_discovery_bounds_requests_and_aggregate_bodies() {
         );
     }
 }
+
+#[test]
+fn background_cancellation_is_not_reset_or_shared_with_foreground_clients() {
+    let cancel = Arc::new(AtomicBool::new(true));
+    let client = Client::with_cancel(cancel.clone());
+    client.reset_interrupt();
+    assert!(client.is_interrupted());
+    assert!(client.for_discovery().is_interrupted());
+    assert_eq!(
+        client
+            .send_limited("https://example.com", "text/plain", &[], None, 1024)
+            .err()
+            .as_deref(),
+        Some("web request cancelled")
+    );
+    let foreground = Client::new();
+    assert!(!foreground.is_interrupted());
+    cancel.store(false, Ordering::Release);
+    assert!(!client.is_interrupted());
+    foreground.interrupt();
+    assert!(!client.is_interrupted());
+}
+
+#[test]
+fn search_fetch_top_is_opt_in_ordered_bounded_and_keeps_partial_failures() {
+    let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requested = paths.clone();
+    let pages = serve(move |path, headers| {
+        requested.lock().unwrap().push(path.to_owned());
+        assert!(!headers.iter().any(|(name, _)| name == "authorization"));
+        match path {
+            "/first" => Reply::ok("text/plain", "é".repeat(7_000)),
+            "/second" => Reply::status(503),
+            "/third" => Reply::redirect("/final"),
+            "/final" => Reply::ok("text/plain", "third page body"),
+            _ => panic!("unexpected fetched page {path}"),
+        }
+    });
+    let base = pages.base.clone();
+    let search = serve(move |_, _| {
+        Reply::ok(
+            "application/json",
+            json!({"results": [
+                {"title": "First", "url": format!("{base}/first")},
+                {"title": "Second", "url": format!("{base}/second")},
+                {"title": "Third", "url": format!("{base}/third")},
+                {"title": "Fourth", "url": format!("{base}/fourth")}
+            ]})
+            .to_string(),
+        )
+    });
+    let config = search_config(format!("{}/?q={{query}}", search.base));
+    let default = run(&search_tool(), &config, json!({"query": "x"}));
+    let disabled = run(
+        &search_tool(),
+        &config,
+        json!({"query": "x", "fetch_top": 0}),
+    );
+    assert!(!default.is_error, "{}", default.text);
+    assert_eq!(default.text, disabled.text);
+    assert_eq!(pages.hits.load(Ordering::SeqCst), 0);
+    for count in 1..=3 {
+        paths.lock().unwrap().clear();
+        let out = run(
+            &search_tool(),
+            &config,
+            json!({"query": "x", "fetch_top": count}),
+        );
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.starts_with(&default.text),
+            "search results retained"
+        );
+        assert!(
+            out.text.contains("showing 6000 of 7000 characters"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.chars().count() <= 100_000, "output bounded");
+        let expected = match count {
+            1 => vec!["/first"],
+            2 => vec!["/first", "/second"],
+            _ => vec!["/first", "/second", "/third", "/final"],
+        };
+        assert_eq!(*paths.lock().unwrap(), expected, "fetch_top={count}");
+        if count >= 2 {
+            assert!(out.text.contains("Fetch failed: HTTP 503"), "{}", out.text);
+        }
+        if count == 3 {
+            assert!(out.text.contains("third page body"), "{}", out.text);
+            assert!(out.text.contains("requested URL"), "{}", out.text);
+        }
+    }
+}
+
+#[test]
+fn search_fetch_top_rejects_invalid_bounds_before_network() {
+    let server = serve(|_, _| panic!("invalid fetch_top must not reach network"));
+    let config = search_config(format!("{}/?q={{query}}", server.base));
+    for value in [json!(-1), json!(4), json!(1.5), json!("1"), json!(true)] {
+        let out = run(
+            &search_tool(),
+            &config,
+            json!({"query": "x", "fetch_top": value}),
+        );
+        assert!(out.is_error, "{}", out.text);
+        assert!(
+            out.text
+                .contains("fetch_top must be an integer from 0 to 3"),
+            "{}",
+            out.text
+        );
+    }
+    assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn search_fetch_results_reuses_shipping_guards_and_does_not_scrape_answer_links() {
+    let (_dir, workspace) = testkit::workspace();
+    let config = Config::default();
+    let ctx = ToolContext {
+        workspace: &workspace,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    let tool = WebSearch {
+        client: Arc::new(Client::new()),
+    };
+    assert!(tool.needs_approval(&json!({"fetch_top": 3})));
+    for url in [
+        "http://127.0.0.1/private",
+        "http://169.254.169.254/latest",
+        "https://user:password@example.com/",
+        "file:///etc/passwd",
+    ] {
+        let results = vec![search::SearchResult {
+            title: "Kept".into(),
+            url: url.into(),
+            snippet: String::new(),
+        }];
+        let out = tool.fetch_results(&ctx, "original search".into(), &results, 1);
+        assert!(out.starts_with("original search"), "{out}");
+        assert!(out.contains("Fetch failed:"), "{url}: {out}");
+        assert!(out.contains(url), "{out}");
+    }
+    let answer = "Grounded answer with https://example.com/ in prose";
+    let out = tool.fetch_results(&ctx, answer.into(), &[], 3);
+    assert!(out.starts_with(answer), "{out}");
+    assert!(out.contains("No eligible structured result URLs"), "{out}");
+}

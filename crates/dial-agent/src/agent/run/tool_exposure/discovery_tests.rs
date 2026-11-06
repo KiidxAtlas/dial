@@ -78,7 +78,7 @@ fn rejected_arguments_route_to_the_unoffered_tool_that_declares_them() {
 /// `tool_load` is.
 #[test]
 fn bash_description_says_to_load_bg_only_when_it_is_loadable() {
-    const NOTE: &str = "`bg` is a Dial tool, not a shell command, and is not loaded yet";
+    const NOTE: &str = "`bg` is a Dial tool, not a shell command. It is not loaded yet";
     let description = |agent: &Agent<'_>| {
         let schemas = agent.schemas(&["bash".to_owned()]).unwrap();
         schemas[0]["function"]["description"]

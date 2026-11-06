@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 /// Distinct failing test names in common runner formats (Rust/libtest, pytest, Go, Jest/Vitest).
 /// Unrecognized output contributes nothing; the score then rests on failing checks alone.
-pub(in crate::agent) fn failing_tests(text: &str) -> BTreeSet<String> {
+pub fn failing_tests(text: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for line in text.lines() {
         let line = line.trim();

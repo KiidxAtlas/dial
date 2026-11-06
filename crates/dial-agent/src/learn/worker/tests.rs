@@ -524,7 +524,7 @@ fn user_requested_calls_ignore_the_background_improvement_stop() {
     std::fs::create_dir_all(&config.state_dir).unwrap();
     std::fs::write(
         &config.worker,
-        "import json\nprint(json.dumps({'ok': True}))\n",
+        "import json,sys\nrequest=json.load(sys.stdin)\nassert request['op']=='weights_map'\nprint(json.dumps({'ok': True}))\n",
     )
     .unwrap();
     std::fs::write(config.state_dir.join("improvement.stop"), "stop").unwrap();

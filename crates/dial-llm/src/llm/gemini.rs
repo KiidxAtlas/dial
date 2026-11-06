@@ -13,6 +13,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod cache;
 pub(crate) const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const MAX_TOOL_CALLS: usize = 128;
 const MAX_PARTS: usize = 65_536;
@@ -205,7 +206,7 @@ fn request(
         );
         ensure!(
             profile.prompt_cache != Some(true) && profile.cache_retention == CacheRetention::Auto,
-            "Gemini does not implement caller-owned context-cache resources; remove prompt_cache/cache_retention overrides"
+            "Gemini uses gemini_cache for explicit resources; remove prompt_cache/cache_retention overrides"
         );
         ensure!(
             profile.capabilities.tools != Some(false) || req.tools.is_empty(),
@@ -916,7 +917,48 @@ pub(super) fn exchange_at(
         endpoint.auth,
         endpoint.headers,
     );
-    let body = request(&endpoint, req, profile, &scope)?;
+    let mut body = request(&endpoint, req, profile, &scope)?;
+    if let Some(key) = endpoint.auth {
+        ensure!(
+            !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_graphic()),
+            "invalid Gemini API key"
+        );
+    }
+    let cached = cache::prepare(
+        &endpoint,
+        &mut body,
+        profile.and_then(|profile| profile.gemini_cache.as_ref()),
+        &scope,
+        &interrupt,
+        timeout_secs,
+    )?;
+    let result = exchange_stream(
+        &endpoint,
+        body,
+        scope,
+        timeout_secs,
+        interrupt,
+        on_text,
+        on_event,
+    );
+    if result.is_err()
+        && let Some(cached) = &cached
+    {
+        cache::invalidate(&endpoint, cached);
+    }
+    result
+}
+
+fn exchange_stream(
+    endpoint: &Endpoint<'_>,
+    body: Value,
+    scope: String,
+    timeout_secs: u64,
+    interrupt: Arc<AtomicBool>,
+    on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
+    on_event: &mut dyn FnMut(&StreamEvent) -> bool,
+) -> Result<Reply> {
+    let url = endpoint.url;
     let patience = Patience::for_stream(
         timeout_secs,
         super::host_of(url).is_some_and(|host| super::is_local_host(&host)),
@@ -1022,7 +1064,7 @@ pub(super) fn exchange_at(
             return Err(super::response_error(error, endpoint.auth));
         }
     }
-    accumulator.finish(&endpoint, scope)
+    accumulator.finish(endpoint, scope)
 }
 #[cfg(test)]
 mod tests;

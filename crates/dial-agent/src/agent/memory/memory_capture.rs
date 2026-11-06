@@ -78,7 +78,11 @@ impl Agent<'_> {
             || self.interrupt.load(Ordering::SeqCst)
             || self.session.paired_tool_calls_since(predecessor)
                 < self.config.memory.autolearn_min_tool_calls
-            || !self.catalog().iter().any(|name| name == "learn")
+            || !self
+                .catalog()
+                .iter()
+                .any(|name| name == crate::storage::memory_backend::TOOL_NAME)
+            || crate::storage::memory_backend::learn_schema(&self.config.memory).is_none()
         {
             return;
         }
@@ -148,7 +152,7 @@ impl Agent<'_> {
         let base = capture.messages.len();
         let mut accepted = 0usize;
         let result = (|| -> Result<()> {
-            let schema = crate::storage::memory_backend::schema(&capture.config.memory, "learn")
+            let schema = crate::storage::memory_backend::learn_schema(&capture.config.memory)
                 .context("selected backend does not offer native learn")?;
             let mut config = capture.config.clone();
             config.provider_cache_namespace = Some(compaction_runtime::side_request_namespace(
@@ -254,7 +258,11 @@ impl Agent<'_> {
                             );
                             for call in &reply.tool_calls {
                                 ensure!(
-                                    call.name == "learn" && !call.malformed_arguments,
+                                    crate::storage::memory_backend::call_action(
+                                        &call.name,
+                                        &call.arguments
+                                    ) == Some("learn")
+                                        && !call.malformed_arguments,
                                     "native capture requested an unoffered or malformed tool"
                                 );
                                 crate::agent::run::calls::validate(

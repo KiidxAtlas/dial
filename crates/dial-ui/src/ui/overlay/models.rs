@@ -1409,36 +1409,8 @@ impl ModelOverlay {
         transaction: crate::config::settings_store::ModelConfigReview,
         event: OverlayEvent,
         title: String,
-        mut notes: Vec<String>,
+        notes: Vec<String>,
     ) {
-        if let OverlayEvent::AssignModel { selection, .. } = &event {
-            if let Some(entry) = self
-                .all_entries()
-                .find(|entry| same_model(&entry.selection, selection))
-            {
-                notes.push(
-                    capabilities(entry)
-                        .into_iter()
-                        .map(|(_, name, supported)| {
-                            format!(
-                                "{name}: {}",
-                                match supported {
-                                    Some(true) => "supported",
-                                    Some(false) => "unsupported",
-                                    None => "unknown (not reported)",
-                                }
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" · "),
-                );
-            } else {
-                notes.push(
-                    "Capabilities unknown (no catalog metadata); unknown does not mean supported."
-                        .into(),
-                );
-            }
-        }
         self.review = Some(AssignmentReview {
             transaction,
             event: Some(event),
@@ -1465,10 +1437,7 @@ impl ModelOverlay {
         if let Some(review) = &mut self.review {
             if keys.matches(Action::SelectCancel, key) {
                 self.review = None;
-                self.set_status(
-                    "Model selection cancelled; no settings saved.".into(),
-                    false,
-                );
+                self.set_status("Cancelled; no settings saved.".into(), false);
             } else if keys.matches(Action::SelectConfirm, key) {
                 review.confirmed = true;
                 return review.event.take().unwrap_or(OverlayEvent::None);

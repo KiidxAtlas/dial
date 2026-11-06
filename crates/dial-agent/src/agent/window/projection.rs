@@ -99,6 +99,13 @@ impl<'a> Agent<'a> {
                     .min(context_bytes),
             )
         };
+        // The optimizer's reviewed draft is the model-facing instruction. Keep originals in
+        // durable provenance, but do not bypass that boundary through a raw request-tail note.
+        let latest_request = if self.hermetic || self.turn_optimizer_enabled() {
+            None
+        } else {
+            crate::agent::run::intent::request_context(&control, messages)
+        };
         if !self.hermetic {
             crate::agent::window::file_handles::project(&self.workspace, messages);
         }
@@ -113,13 +120,6 @@ impl<'a> Agent<'a> {
             .filter(|m| m["role"] == "tool")
             .filter(|_| packet.is_none())
             .and_then(|_| self.todo.focus());
-        // The optimizer's reviewed draft is the model-facing instruction. Keep originals in
-        // durable provenance, but do not bypass that boundary through a raw request-tail note.
-        let latest_request = if self.hermetic || self.turn_optimizer_enabled() {
-            None
-        } else {
-            crate::agent::run::intent::request_context(&control)
-        };
         // Keep a bare todo focus advisory even when admitted user context is also present.
         if let Some(focus) = focus {
             let mut message = json!({"role":"user","content":focus,"dial_transient":true,"dial_task_context":true});

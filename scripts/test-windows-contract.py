@@ -51,6 +51,22 @@ class WindowsContractTests(unittest.TestCase):
                                        "cmd::update::tests::", "--"])
         self.assertNotIn("--lib", command)
 
+    def test_package_library_selects_only_its_owner(self):
+        tests, _ = self.parse("test-lib dial-llm config::paths::tests::\n")
+        self.assertEqual(tests, [(["--package", "dial-llm", "--lib"], "config::paths::tests::")])
+        result, run, _, _ = self.run_fixture(summary(7), tests=tests)
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_args.args[0], ["cargo", "test", "--locked", "--profile", "ci",
+                                              "--package", "dial-llm", "--lib",
+                                              "config::paths::tests::", "--"])
+
+    def test_repository_filters_never_build_all_workspace_test_harnesses(self):
+        tests, _ = contract.parse(contract.CONTRACT)
+        for target, name in tests:
+            with self.subTest(filter=name):
+                self.assertNotIn("--workspace", target)
+                self.assertEqual(target[0], "--package")
+
     def test_skips_are_reported_and_applied_before_counting(self):
         tests, skips = self.parse("test platform::\nskip platform::unix # POSIX only\n")
         result, run, output, _ = self.run_fixture(summary(1), tests=tests, skips=skips)
@@ -95,7 +111,8 @@ class WindowsContractTests(unittest.TestCase):
 
     def test_invalid_or_empty_contracts_are_rejected(self):
         for text in ("", "skip x # reason", "test-bin dial dial", "test-bin dial dial x extra",
-                     "test-bin --workspace dial x", "test x extra", "skip x", "unknown x"):
+                     "test-bin --workspace dial x", "test x extra", "skip x", "unknown x",
+                     "test-lib dial-llm", "test-lib dial-llm x extra", "test-lib --workspace x"):
             with self.subTest(text=text), self.assertRaises(SystemExit):
                 self.parse(text)
 

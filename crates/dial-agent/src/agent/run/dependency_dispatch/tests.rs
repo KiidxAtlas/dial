@@ -138,7 +138,7 @@ fn disjoint_native_writes_keep_order_and_denials_have_no_effects() {
     });
     let probe = ProbeScope;
     let calls = [call("write", "a.txt"), call("write", "b.txt")];
-    let results = agent.dispatch_dependency_wave(&mut backend(), &calls, &mut NullUi);
+    let results = agent.dispatch_dependency_wave(&mut backend(), &calls, &mut NullUi, None);
     drop(probe);
     assert_eq!(arrivals.0.lock().unwrap().len(), 2);
     assert_eq!(results.len(), 2);
@@ -167,6 +167,7 @@ fn disjoint_native_writes_keep_order_and_denials_have_no_effects() {
         &mut backend(),
         &[next, call("write", "c.txt")],
         &mut NullUi,
+        None,
     );
     assert!(
         results.iter().all(|(output, _)| !output.is_error),
@@ -195,7 +196,7 @@ fn disjoint_native_writes_keep_order_and_denials_have_no_effects() {
     );
     agent.plan_mode = true;
     let denied = call("write", "denied.txt");
-    let results = agent.dispatch_dependency_wave(&mut backend(), &[denied], &mut NullUi);
+    let results = agent.dispatch_dependency_wave(&mut backend(), &[denied], &mut NullUi, None);
     assert!(results[0].0.is_error);
     assert!(!root.path().join("denied.txt").exists());
 }
@@ -249,4 +250,21 @@ fn failed_mutations_skip_only_dependent_or_opaque_work_not_diagnostics() {
             .rejection(&workspace, mode, &registry, &call("write", "a"))
             .is_none()
     );
+}
+
+#[test]
+fn an_edit_with_checks_is_a_resource_wave_barrier() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a"), "before").unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let mode = crate::config::types::EditMode::Replace;
+    let mut edit = call("edit", "a");
+    edit.arguments = json!({"path":"a","old_string":"before","new_string":"after","check":false});
+    assert!(footprint(&workspace, mode, &edit).is_some());
+    edit.arguments["check"] = json!(true);
+    assert!(footprint(&workspace, mode, &edit).is_none());
+    let mut write = call("write", "a");
+    assert!(footprint(&workspace, mode, &write).is_some());
+    write.arguments["check"] = json!(true);
+    assert!(footprint(&workspace, mode, &write).is_none());
 }

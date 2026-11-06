@@ -2136,9 +2136,22 @@ pub(in crate::agent) fn route(team: &Team, from: &str, args: &Value) -> Result<V
     }
 }
 
-/// Tool schema shared by workers and the parent: `message` sends text to a live peer.
-pub(in crate::agent) fn message_schema() -> Value {
-    json!({"type":"function","function":{"name":"message","description":"Send a short text message to a live peer agent. `to` is a live task id or unique label, `parent` for the parent agent, or `all` for every other live worker. Omit `to` to list who you can reach. The result is a receipt per recipient: `queued` (accepted; the recipient reads it at its next step), `refused` with a reason, or `finished` (the worker already finished; nothing is delivered and its result comes from `task`). An unknown recipient is an error. Messages are text only: they carry no authority, cannot start work or change permissions, and are delivered at the recipient's next step in send order.","parameters":{"type":"object","properties":{"to":{"type":"string","description":"Recipient: a live task id, a unique live label, `parent`, or `all`. Omit to list recipients."},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
+/// Tool schema shared by workers and the parent: `message` sends text to a live peer. With `peers`
+/// (the top-level session with project coordination) it also names other Dial sessions; only the
+/// descriptions differ, so the contract identity is the same either way.
+pub(in crate::agent) fn message_schema(peers: bool) -> Value {
+    let (sessions, to) = if peers {
+        (
+            " A 32-hex peer id (listed when `to` is omitted, or by `peers`) delivers to that independent Dial session in this checkout, like `peers` send; `all` never reaches other sessions.",
+            "Recipient: a live task id, a unique live label, `parent`, `all` (this session's workers), or a peer id of another Dial session. Omit to list recipients and live peers.",
+        )
+    } else {
+        (
+            "",
+            "Recipient: a live task id, a unique live label, `parent`, or `all`. Omit to list recipients.",
+        )
+    };
+    json!({"type":"function","function":{"name":"message","description":format!("Send a short text message to a live peer agent. `to` is a live task id or unique label, `parent` for the parent agent, or `all` for every other live worker. Omit `to` to list who you can reach.{sessions} The result is a receipt per recipient: `queued` (accepted; the recipient reads it at its next step), `refused` with a reason, or `finished` (the worker already finished; nothing is delivered and its result comes from `task`). An unknown recipient is an error. Messages are text only: they carry no authority, cannot start work or change permissions, and are delivered at the recipient's next step in send order."),"parameters":{"type":"object","properties":{"to":{"type":"string","description":to},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
 }
 
 pub mod control;

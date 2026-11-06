@@ -97,6 +97,15 @@ fn resolve_chain(
     selected: &ModelSelection,
     fresh_window: bool,
 ) -> Vec<ModelSelection> {
+    // Exact-model routing constraints cannot be carried safely to another model/provider.
+    // Do not silently discard an operator's privacy, allowlist or price policy during recovery.
+    if config.active_model_profile().is_some_and(|profile| {
+        profile.provider == selected.provider
+            && profile.model == selected.model
+            && profile.openrouter_routing.is_some()
+    }) {
+        return Vec::new();
+    }
     let mut result = Vec::new();
     for item in chain {
         let Some(mut candidate) = resolve_selector(config, selected, item) else {

@@ -639,7 +639,6 @@ const CALL_TOOLS: &[&str] = &[
     "grep",
     "ast_edit",
     "ast_search",
-    "artifact_read",
 ];
 /// The same tool failing this many calls in a row, whatever its arguments, earns a warning. The warning
 /// repeats with stronger wording at each further multiple of this count. Failures never end the turn.
@@ -728,7 +727,10 @@ impl StallGuard {
 }
 
 /// Single lookups in a row, each its own model round, before the model is told to batch them.
-const SERIAL_WARN: u32 = 5;
+/// Read/search alternation is the common waste, so the advice comes early and repeats per streak.
+const SERIAL_WARN: u32 = 3;
+/// Session-state calls that ride along with real work; they do not make a lone lookup a batch.
+const BOOKKEEPING_TOOLS: &[&str] = &["todo", "working_state"];
 /// Tools that only observe the project: they neither change what a command would print nor
 /// depend on one another unless the model chooses so.
 const OBSERVING_TOOLS: &[&str] = &[
@@ -738,18 +740,23 @@ const OBSERVING_TOOLS: &[&str] = &[
     "find",
     "ast_search",
     "dep_source",
-    "artifact_read",
     "todo",
     "skill",
-    "recall",
 ];
 
-/// Wasted motion that is not a failure: asking the shell again for a result the project has not
-/// changed under, and spending one model round per lookup that could have shared a round. Both
-/// only advise; neither blocks a call.
+/// Whether `call` only observes the project ([`OBSERVING_TOOLS`] or a memory read).
+fn observing(call: &ToolCall) -> bool {
+    OBSERVING_TOOLS.contains(&call.name.as_str())
+        || crate::storage::memory_backend::call_action(&call.name, &call.arguments)
+            .is_some_and(crate::storage::memory_backend::reads)
+}
+
+/// Wasted motion: repeating a shell command without an observed intervening mutation, or spending
+/// one model round per independent lookup. Guidance is advisory: the guard cannot certify external
+/// state or reuse a check pass from command identity alone.
 #[derive(Default)]
 pub struct PaceGuard {
-    /// Shell pipelines that finished since the project last (possibly) changed.
+    /// Complete shell call identities that finished since the project last (possibly) changed.
     current: std::collections::HashSet<String>,
     serial: u32,
 }
@@ -762,20 +769,28 @@ impl PaceGuard {
         output: &crate::runtime::tool_output::ToolOutput,
     ) -> Option<String> {
         use crate::runtime::execution::ToolStatus;
-        let observing = OBSERVING_TOOLS.contains(&call.name.as_str());
+        let observing = observing(call);
         if call.name != "bash" {
             if !observing || !output.execution.changed_paths.is_empty() {
                 self.current.clear();
             }
             return None;
         }
-        let heads = crate::tools::exec::bash_interceptor::pipeline_heads(
-            call.arguments["command"].as_str().unwrap_or_default(),
-        );
-        let repeated = heads
-            .iter()
-            .find(|(head, _)| !only_sets_shell_state(head) && self.current.contains(head))
-            .map(|(head, _)| head.clone());
+        let command = call.arguments["command"]
+            .as_str()
+            .unwrap_or_default()
+            .trim();
+        let heads = crate::tools::exec::bash_interceptor::pipeline_heads(command);
+        // A shared producer, separator or directory prefix is not a repeated observation:
+        // downstream filters and preceding shell state can change the result. Keep the complete
+        // command, working directory and named session rather than matching individual heads.
+        let identity = serde_json::json!({
+            "command": command,
+            "cwd": call.arguments.get("cwd"),
+            "session": call.arguments.get("session"),
+        })
+        .to_string();
+        let repeated = self.current.contains(&identity);
         // Only commands known not to write can leave earlier results current.
         if heads.is_empty()
             || !output.execution.changed_paths.is_empty()
@@ -791,24 +806,25 @@ impl PaceGuard {
         ) && output
             .process_outcome()
             .is_none_or(|p| p.started && !p.timed_out && !p.cancelled && p.output_complete);
-        if complete {
-            // A run that was cut by a trailing filter still ran to completion, so rerunning it
-            // unfiltered is exactly the wasted second run this exists to catch.
-            self.current.extend(heads.into_iter().map(|(head, _)| head));
+        if complete && heads.iter().any(|(head, _)| !only_sets_shell_state(head)) {
+            self.current.insert(identity);
         }
-        repeated.map(|head| {
+        repeated.then(|| {
             format!(
-                "[`{head}` already ran earlier this turn and nothing has changed the project since, so that result is still current. Use it (its complete output is behind the `[complete output: artifact://…]` link when it was long, readable with `artifact_read` by line range) instead of running the command again.]"
+                "[`{command}` already ran earlier this turn with no observed intervening mutation. Inspect its recorded outcome and captured output (`read` can read a retained artifact:// URI) instead of rerunning solely to reconfirm. Filters may have discarded producer output; repeat for a different projection, changed inputs/environment or a specific unresolved requirement. This advisory does not certify a passing or still-current check and does not waive required gates.]"
             )
         })
     }
 
-    /// One round of tool calls finished. After `SERIAL_WARN` rounds that each held a single lookup,
-    /// the model is told to share rounds between independent lookups; once per streak.
+    /// One round of tool calls finished. After every `SERIAL_WARN` consecutive rounds that each
+    /// held a single lookup (bookkeeping calls aside), the model is told to batch lookups.
     pub fn round(&mut self, calls: &[ToolCall]) -> Option<String> {
-        let lookup = match calls {
-            [only] => {
-                OBSERVING_TOOLS.contains(&only.name.as_str())
+        let mut work = calls
+            .iter()
+            .filter(|call| !BOOKKEEPING_TOOLS.contains(&call.name.as_str()));
+        let lookup = match (work.next(), work.next()) {
+            (Some(only), None) => {
+                observing(only)
                     || (only.name == "bash"
                         && only.arguments["command"]
                             .as_str()
@@ -821,19 +837,21 @@ impl PaceGuard {
             return None;
         }
         self.serial += 1;
-        (self.serial == SERIAL_WARN).then(|| {
+        self.serial.is_multiple_of(SERIAL_WARN).then(|| {
             format!(
-                "[{SERIAL_WARN} rounds in a row each made a single lookup. When the next lookups do not depend on each other's results, issue them together in one response (several `read` paths, `grep`, `glob`, safe `bash`): they run concurrently and cost one round.]"
+                "[{} rounds in a row each made a single lookup. Batch lookups whose arguments you already know in one response: they run concurrently and cost one round. Read every relevant search hit together (owner, tests, callers), add the next searches to that same response, and pass several `read` paths at once. Keep only result-dependent lookups for later.]",
+                self.serial
             )
         })
     }
 }
 
-/// Heads that only change the shell's own state (`cd crates/x`, `export A=1`, `A=1`) print
-/// nothing worth reusing; repeating them as the prefix of a new command is not a rerun.
+/// Heads that only change the shell's own state (`cd crates/x`, `export A=1`, `A=1`) or close a
+/// compound command (`done`, `fi`) print nothing worth reusing; repeating them is not a rerun.
 fn only_sets_shell_state(head: &str) -> bool {
     const STATE: &[&str] = &[
         "cd", "pushd", "popd", "export", "unset", "set", "shopt", "alias", "umask", "true", ":",
+        "done", "fi", "esac", "then", "else", "do",
     ];
     let mut words = head.split_whitespace();
     let Some(first) = words.next() else {

@@ -74,6 +74,44 @@ fn read_and_write_flow() {
 }
 
 #[test]
+fn reflog_finds_abandoned_head_without_mutating_history() {
+    let (dir, ws) = repo();
+    for args in [
+        vec!["checkout", "--detach", "HEAD"],
+        vec!["commit", "--allow-empty", "--no-verify", "-m", "lost work"],
+        vec!["checkout", "main"],
+    ] {
+        let output = Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(&args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+    let log_path = dir.path().join(".git/logs/HEAD");
+    let before = std::fs::read(&log_path).unwrap();
+    let history = call(&ws, json!({"action":"log"}));
+    assert!(!history.is_error, "{}", history.text);
+    assert!(!history.text.contains("lost work"), "{}", history.text);
+
+    let reflog = call(&ws, json!({"action":"reflog"}));
+    assert!(!reflog.is_error, "{}", reflog.text);
+    assert!(reflog.text.contains("HEAD@{1}"), "{}", reflog.text);
+    assert!(reflog.text.contains("commit: lost work"), "{}", reflog.text);
+    let recovered = call(&ws, json!({"action":"show","rev":"HEAD@{1}"}));
+    assert!(!recovered.is_error, "{}", recovered.text);
+    assert!(recovered.text.contains("lost work"), "{}", recovered.text);
+
+    let latest = call(&ws, json!({"action":"reflog","limit":1}));
+    assert!(!latest.is_error, "{}", latest.text);
+    assert_eq!(latest.text.lines().count(), 1, "{}", latest.text);
+    assert!(latest.text.contains("HEAD@{0}"), "{}", latest.text);
+    assert_eq!(std::fs::read(log_path).unwrap(), before);
+    assert!(!Git::default().needs_approval(&json!({"action":"reflog"})));
+}
+
+#[test]
 fn hostile_arguments_are_refused() {
     let (_dir, ws) = repo();
     for rev in ["--output=/tmp/x", "-p", "a..b", "x y", ""] {
@@ -472,6 +510,50 @@ fn host_reads_refuse_executable_filters_without_running_them() {
 }
 
 #[test]
+fn object_only_reads_run_with_filter_drivers_configured_without_executing_them() {
+    // A git-lfs style driver blocked even `log` and `branches`, which never convert
+    // working-tree files. Those reads now run; worktree reads stay refused.
+    let (dir, ws) = repo();
+    let canary = dir.path().join("filter-ran");
+    for key in [
+        "filter.audit.clean",
+        "filter.audit.smudge",
+        "filter.audit.process",
+    ] {
+        assert!(
+            Command::new("git")
+                .args(["config", key, "touch filter-ran; cat"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(dir.path().join(".gitattributes"), "* filter=audit\n").unwrap();
+    for args in [
+        json!({"action":"log","limit":1}),
+        json!({"action":"reflog","limit":1}),
+        json!({"action":"branches"}),
+        json!({"action":"show","rev":"HEAD"}),
+    ] {
+        let result = call(&ws, args.clone());
+        assert!(!result.is_error, "{args}: {}", result.text);
+        assert!(!canary.exists(), "{args} executed a filter");
+    }
+    let refused = call(&ws, json!({"action":"status"}));
+    assert!(refused.is_error && refused.text.contains("filter configuration"));
+    // The refusal names the active keys, never the configured command text.
+    assert!(
+        refused.text.contains("filter.audit.clean")
+            && refused.text.contains("filter.audit.process")
+            && !refused.text.contains("touch filter-ran"),
+        "{}",
+        refused.text
+    );
+    assert!(!canary.exists());
+}
+
+#[test]
 fn host_diff_and_show_refuse_text_conversion_without_running_it() {
     let (dir, ws) = repo();
     assert!(
@@ -638,10 +720,10 @@ fn included_filter_and_textconv_config_is_refused_until_explicitly_disabled() {
         std::fs::write(dir.path().join(".gitattributes"), attributes).unwrap();
         std::fs::write(dir.path().join("a.txt"), "modified\n").unwrap();
         assert!(call(&ws, json!({"action":"status"})).is_error, "{key}");
-        assert!(
-            run_checked(ws.root(), &["show", "HEAD"], false).is_err(),
-            "{key}"
-        );
+        // `show` reads objects only: a filter driver never runs for it, so only textconv
+        // configuration refuses it. The canary below proves no driver executed either way.
+        let show = run_checked(ws.root(), &["show", "HEAD"], false);
+        assert_eq!(show.is_err(), key.starts_with("diff."), "{key}: {show:?}");
         assert!(!dir.path().join("included-ran").exists(), "{key}");
         assert!(
             Command::new("git")
@@ -740,7 +822,7 @@ fn global_filter_activated_by_untracked_attributes_is_never_run_by_inspection() 
         );
     }
     std::fs::remove_file(&canary).unwrap();
-    let mut query = filter_config_query(dir.path());
+    let mut query = filter_config_query(dir.path(), FILTER_OR_TEXTCONV_CONFIG);
     query
         .env("GIT_CONFIG_GLOBAL", &global)
         .env("GIT_CONFIG_NOSYSTEM", "1");
@@ -749,7 +831,7 @@ fn global_filter_activated_by_untracked_attributes_is_never_run_by_inspection() 
     assert!(!canary.exists());
     // The same global include does not activate for a different repository root.
     let (other, _) = repo();
-    let mut query = filter_config_query(other.path());
+    let mut query = filter_config_query(other.path(), FILTER_OR_TEXTCONV_CONFIG);
     query
         .env("GIT_CONFIG_GLOBAL", &global)
         .env("GIT_CONFIG_NOSYSTEM", "1");

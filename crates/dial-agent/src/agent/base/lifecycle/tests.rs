@@ -9,10 +9,7 @@ fn capability_prose_names_only_tools_that_are_offered_or_loadable() {
     assert_eq!(capability_prose(&[], &[]), "");
     // Tools whose own descriptions carry their mechanics add no system prose.
     assert_eq!(
-        capability_prose(
-            &names(&["working_state", "artifact_read", "task", "todo"]),
-            &[]
-        ),
+        capability_prose(&names(&["working_state", "task", "todo"]), &[]),
         ""
     );
     let all = capability_prose(&names(&["tool_search", "web_search", "web_fetch"]), &[]);

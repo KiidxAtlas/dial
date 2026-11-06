@@ -144,15 +144,15 @@ fn tombstones_are_bounded_and_a_live_label_wins() {
 }
 
 #[test]
-fn a_project_peer_id_is_pointed_at_the_peers_tool() {
+fn a_project_peer_id_is_explained_and_not_delivered_by_the_team() {
     let team = Team::open(8);
     let why = team
         .send(PARENT, "0f8ff1c13599ab16e96186a98ae2a128", "hi")
         .unwrap_err();
     assert!(why.contains("project peer id"), "{why}");
-    assert!(why.contains("`peers` tool"), "{why}");
+    assert!(why.contains("only from the top-level session"), "{why}");
     let broadcast = team.send(PARENT, ALL, "hi").unwrap_err();
-    assert!(broadcast.contains("`peers` tool"), "{broadcast}");
+    assert!(broadcast.contains("32-hex peer id"), "{broadcast}");
 }
 
 #[test]

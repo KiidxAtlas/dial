@@ -107,6 +107,30 @@ pub(crate) fn edit_projection(raw: String, model: String) -> ToolOutput {
     output
 }
 
+/// Append controller text (post-edit checks, mutation advice) to a result. A valid edit
+/// projection receives the same text and a renewed digest, so the model keeps the anchored view
+/// instead of the raw diff; a projection that was already stale stays stale.
+pub fn append_text(output: &mut ToolOutput, suffix: &str) {
+    use sha2::{Digest, Sha256};
+    let before = format!("{:x}", Sha256::digest(output.text.as_bytes()));
+    output.text.push_str(suffix);
+    let Some(projection) = output
+        .data
+        .as_mut()
+        .and_then(|data| data.get_mut(EDIT_PROJECTION))
+    else {
+        return;
+    };
+    if projection["raw_sha256"].as_str() != Some(before.as_str()) {
+        return;
+    }
+    if let Some(model) = projection["anchored_text"].as_str() {
+        projection["anchored_text"] = serde_json::json!(format!("{model}{suffix}"));
+        projection["raw_sha256"] =
+            serde_json::json!(format!("{:x}", Sha256::digest(output.text.as_bytes())));
+    }
+}
+
 /// Model history projection for a known tool. Unnamed results, errors and stale projections stay raw.
 pub fn message_for(name: &str, id: &str, output: &ToolOutput) -> Value {
     use sha2::{Digest, Sha256};

@@ -164,6 +164,41 @@ pub(in crate::agent) fn report(
     let Some(recovery) = output.recovery() else {
         return format!("\n{}", feedback(kind, advice, consecutive));
     };
+    // An ordinary nonzero shell exit (missing program, failed build step) whose process ran to
+    // completion is routine: the exit code and output above already say what happened. The full
+    // recovery block cost about 900 bytes of history on every such failure in benchmark runs, so
+    // the first one gets a compact line; repeats, uncertain effects, commits, partial capture and
+    // other kinds keep the full report.
+    let routine_exit = kind == "tool_failure"
+        && call.name == "bash"
+        && consecutive == 1
+        && output.execution.effects != Effects::Unknown
+        && recovery.committed_paths == 0
+        && recovery.retry == Retry::AfterCorrection
+        && output.process_outcome().is_some_and(|p| {
+            p.started && !p.timed_out && !p.cancelled && p.signal.is_none() && p.output_complete
+        });
+    if routine_exit {
+        return format!(
+            "\n[Dial recovery: {kind}] Command failed; no committed file paths recorded (not proof that nothing changed). Correct the named cause before retrying; a workaround must still deliver the requested final state."
+        );
+    }
+    // Any other first failure with known effects, no committed work, complete capture and a plain
+    // correct-then-retry decision gets the same one line: the diagnostic above plus the
+    // cause-specific advice. The multi-line state block is kept for cases where it adds facts.
+    let clean_first = consecutive == 1
+        && output.execution.effects != Effects::Unknown
+        && recovery.committed_paths == 0
+        && recovery.retry == Retry::AfterCorrection
+        && output.process_outcome().is_none_or(|p| {
+            p.started && !p.timed_out && !p.cancelled && p.signal.is_none() && p.output_complete
+        });
+    if clean_first {
+        return format!(
+            "\n{} No committed file paths recorded (not proof that nothing changed).",
+            feedback(kind, advice, 1)
+        );
+    }
     let changed = match recovery.committed_paths {
         0 => "No committed file paths recorded (not proof that nothing changed).".to_owned(),
         n => format!(
@@ -340,6 +375,38 @@ pub(in crate::agent) fn shell_tool_recovery(
     advisory.candidates.push(candidate);
     advisory.attach(output);
     Some(policy::shell_tool_mistake(&name, &next))
+}
+
+/// A completed shell command whose program is missing (exit 127 "command not found").
+/// Advice only: reuse recorded availability or batch one same-environment probe; result text
+/// remains diagnostic data and grants no installation or permission.
+pub(in crate::agent) fn missing_program_recovery(
+    call: &ToolCall,
+    output: &ToolOutput,
+) -> Option<String> {
+    if call.name != "bash"
+        || ToolStatus::from_output(output) != ToolStatus::Error
+        || output.execution.effects == Effects::Unknown
+    {
+        return None;
+    }
+    let process = output.execution.process.as_ref()?;
+    if !process.started || process.exit_code != Some(127) || !process.output_complete {
+        return None;
+    }
+    let program = output.text.lines().find_map(|line| {
+        let line = line.trim();
+        let name = match line.strip_suffix(": command not found") {
+            Some(prefix) => prefix.rsplit(": ").next()?,
+            None => line.rsplit_once("command not found: ")?.1,
+        };
+        let valid = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._+-/".contains(c));
+        valid.then(|| name.to_owned())
+    })?;
+    Some(policy::missing_program(&program))
 }
 
 #[cfg(test)]

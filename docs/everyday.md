@@ -23,8 +23,8 @@ don't commit.” Use **Esc** to interrupt when you need to stop rather than adju
 
 ## Review
 
-After edits, the compact turn report summarizes changed files, checks, unfinished tasks,
-and whether checkpoint undo is available. **Ctrl+O** expands the report along with tool details.
+After edits, the compact turn report summarizes changed files, check state (passed, failed, stale
+or unverified), unfinished tasks and effects outside `/undo`. **Ctrl+O** expands the report along with tool details.
 The muted next-step line suggests useful actions; plain answers do not add one.
 
 Use `/review` for a review of your changes. Read failures and stale-check notices before treating

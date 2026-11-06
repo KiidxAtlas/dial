@@ -12,7 +12,6 @@ pub fn legacy_tool_presentation(
         "bash" => serde_json::json!({"command":summary}),
         "grep" | "glob" => serde_json::json!({"pattern":summary}),
         "todo" => serde_json::json!({"op":summary}),
-        "artifact_read" => serde_json::json!({"uri":summary}),
         "read" | "write" | "edit" => serde_json::json!({"path":summary}),
         _ => serde_json::json!({"query":summary}),
     });
@@ -85,7 +84,6 @@ pub fn describe_call(name: &str, a: &Value) -> String {
                     .join(", ")
             })
             .unwrap_or_default(),
-        "artifact_read" => s("uri").to_owned(),
         "working_state" => s("action").to_owned(),
         _ if a.is_null() => String::new(),
         _ => a.to_string(),

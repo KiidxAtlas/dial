@@ -1057,11 +1057,22 @@ impl LspTool {
                     .map_err(io)?;
                 format::locations(&mut lines, &result, "reference")
             }
-            Action::Hover => format::hover(
-                &client
+            Action::Hover => {
+                let result = client
                     .request("textDocument/hover", at.unwrap_or_default())
-                    .map_err(io)?,
-            ),
+                    .map_err(io)?;
+                let text = format::hover(&result);
+                // An empty answer while the server reports progress is usually "not indexed
+                // yet", not "nothing to show"; say so instead of implying the symbol has no info.
+                if format::hover_is_empty(&result) && client.is_busy() {
+                    format!(
+                        "no hover information yet: the {} language server is still indexing; try again shortly",
+                        server.language
+                    )
+                } else {
+                    text
+                }
+            }
             Action::DocumentSymbols => {
                 let result = client
                     .request(

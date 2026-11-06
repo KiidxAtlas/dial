@@ -63,7 +63,8 @@ pub(super) fn preview(before: &str, after: &str) -> String {
             }
         }
     }
-    if before.ends_with('\n') != after.ends_with('\n') {
+    // Emptying or creating a file already shows every line; a newline note would only mislead.
+    if !before.is_empty() && !after.is_empty() && before.ends_with('\n') != after.ends_with('\n') {
         out.push_str(if after.ends_with('\n') {
             "[final newline added]\n"
         } else {

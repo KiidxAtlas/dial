@@ -50,6 +50,9 @@ enum Phase {
 #[derive(Debug, Default)]
 pub(in crate::agent) struct Repair {
     phase: Phase,
+    /// The endpoint failed the constrained request itself (for example a local server that cannot
+    /// compile the `oneOf` tool schema into a grammar). No further retries are offered this turn.
+    unsupported: bool,
 }
 
 impl Repair {
@@ -61,7 +64,7 @@ impl Repair {
         schemas: &[Value],
         names: &[String],
     ) -> Option<&'static str> {
-        if !enabled || self.phase != Phase::Idle {
+        if !enabled || self.unsupported || self.phase != Phase::Idle {
             return None;
         }
         if reply.dropped_tool_call() {
@@ -81,6 +84,13 @@ impl Repair {
 
     pub(in crate::agent) fn request(&mut self) {
         self.phase = Phase::Requested;
+    }
+
+    /// The constrained request failed at the provider. The turn continues with ordinary requests
+    /// and does not offer the constrained retry again.
+    pub(in crate::agent) fn reject(&mut self) {
+        self.phase = Phase::Idle;
+        self.unsupported = true;
     }
 
     /// True when the request about to be sent is the constrained retry. Consumes the request.

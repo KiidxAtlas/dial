@@ -21,10 +21,11 @@ impl std::error::Error for IncompleteStream {}
 /// Usage updates, keepalives, unknown extensions and empty deltas are not output.
 /// Lifecycle events are bounded by the accumulator's duplicate/block checks.
 pub(super) fn advances_reply(data: &str) -> bool {
-    let Ok(event) = serde_json::from_str::<Value>(data) else {
-        // The accumulator still reports malformed input; do not hide it as a stall.
-        return false;
-    };
+    // The accumulator still reports malformed input; do not hide it as a stall.
+    serde_json::from_str::<Value>(data).is_ok_and(|event| advances_event(&event))
+}
+
+fn advances_event(event: &Value) -> bool {
     match event["type"].as_str() {
         Some("message_start" | "content_block_start" | "content_block_stop" | "message_stop") => {
             true
@@ -41,6 +42,55 @@ pub(super) fn advances_reply(data: &str) -> bool {
             delta[field].as_str().is_some_and(|piece| !piece.is_empty())
         }
         _ => false,
+    }
+}
+
+/// Longest span after the last real progress that keep-alives may cover while a tool call is open.
+pub(super) const OPEN_TOOL_CALL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The transport idle clock's progress policy for one Anthropic stream. Anthropic may buffer a tool
+/// call's input while the model writes it, sending only `ping` keep-alives (every 30 s) for minutes
+/// before the arguments arrive in one burst. While a tool call is open those keep-alives show the
+/// generation is alive, bounded by [`OPEN_TOOL_CALL_PATIENCE`] since the last real progress;
+/// otherwise only [`advances_reply`] events count, so keep-alives cannot hold an idle reply open.
+#[derive(Default)]
+pub(super) struct ReplyProgress {
+    open_tool_calls: std::collections::BTreeSet<u64>,
+    last_progress: Option<std::time::Instant>,
+}
+
+impl ReplyProgress {
+    pub(super) fn advances(&mut self, data: &str) -> bool {
+        self.advances_at(data, std::time::Instant::now())
+    }
+
+    fn advances_at(&mut self, data: &str, now: std::time::Instant) -> bool {
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            return false;
+        };
+        match (event["type"].as_str(), event["index"].as_u64()) {
+            (Some("content_block_start"), Some(index))
+                if matches!(
+                    event["content_block"]["type"].as_str(),
+                    Some("tool_use" | "server_tool_use")
+                ) =>
+            {
+                self.open_tool_calls.insert(index);
+            }
+            (Some("content_block_stop"), Some(index)) => {
+                self.open_tool_calls.remove(&index);
+            }
+            _ => {}
+        }
+        if advances_event(&event) {
+            self.last_progress = Some(now);
+            return true;
+        }
+        event["type"] == "ping"
+            && !self.open_tool_calls.is_empty()
+            && self
+                .last_progress
+                .is_some_and(|last| now.duration_since(last) < OPEN_TOOL_CALL_PATIENCE)
     }
 }
 
@@ -110,7 +160,6 @@ pub(super) const CLAUDE_BILLING_PREFIX: &str = "x-anthropic-billing-header:";
 pub(super) const CCH_PLACEHOLDER: &str = "cch=00000";
 pub(super) const CCH_SEED: u64 = 0x4d659218e32a3268;
 pub(super) const BILLING_SALT: &str = "59cf53e54c78";
-pub(super) const SUBSCRIPTION_WARNING: &str = "Claude subscription access uses Claude Code compatibility headers and billing identity. This unofficial integration may break when upstream changes and may carry provider-terms or account risk; use an API key if you do not accept that risk.";
 
 /// Claude OAuth requests use Anthropic's native CLI authentication headers.
 /// Never forward subscription credentials to a proxy or custom endpoint.

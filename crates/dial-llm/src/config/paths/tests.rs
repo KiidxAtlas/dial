@@ -109,10 +109,8 @@ fn grouped_records_copy_without_removing_legacy_and_new_wins() {
         assert_eq!(grouped_file(&layout.user_dir, group, "record.json"), target);
         assert_eq!(fs::read(&target).unwrap(), b"old");
         assert_eq!(fs::read(&legacy).unwrap(), b"old");
-        assert_eq!(
-            crate::platform::fs::mode(&fs::metadata(&target).unwrap()) & 0o777,
-            0o600
-        );
+        let migrated = fs::File::open(&target).unwrap();
+        assert!(crate::platform::fs::is_owner_only(&migrated).unwrap());
         fs::write(&target, b"new").unwrap();
         assert_eq!(grouped_file(&layout.user_dir, group, "record.json"), target);
         assert_eq!(fs::read(&target).unwrap(), b"new");

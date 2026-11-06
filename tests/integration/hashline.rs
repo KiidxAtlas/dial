@@ -1076,8 +1076,7 @@ fn an_off_by_one_range_reports_the_neighbouring_line_it_deleted() {
     );
     assert!(!out.is_error, "{}", out.text);
     assert!(
-        out.text
-            .contains("removed lines not present in your new text"),
+        out.text.contains("removed lines not in your new text"),
         "{}",
         out.text
     );

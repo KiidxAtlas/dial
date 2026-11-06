@@ -411,6 +411,60 @@ async function transferDownload(tab,scope,request) {
     }
   }
 }
+// Validation also runs in Rust before startup, including for non-Chromium backends.
+const OBSERVE_ACTIONS = new Set(['open','navigate','back','forward','reload','click','dblclick','fill','type','press','select','check','uncheck','hover','focus','upload','scroll','drag','click_at','mouse_move','mouse_down','mouse_up','wheel','key_down','key_up','clipboard_paste']);
+function validateObserve(request) {
+  if (request.observe === undefined) return;
+  const options = request.observe;
+  if (!OBSERVE_ACTIONS.has(request.action)) throw new Error(`observe is not supported for action=${request.action}`);
+  if (!options || typeof options !== 'object' || Array.isArray(options)) throw new Error('observe must be an object');
+  for (const [key,value] of Object.entries(options)) {
+    if (['snapshot','screenshot','events'].includes(key) && typeof value === 'boolean') continue;
+    if (key === 'max_nodes' && Number.isInteger(value) && value >= 1 && value <= 1000) continue;
+    throw new Error(`invalid observe option ${key}`);
+  }
+}
+// Separate bounded observations never call run(), so a failed capture cannot replay an action.
+async function observeResult(request, result, cursors) {
+  const options = request.observe;
+  if (!options || !['snapshot','screenshot','events'].some(key => options[key])) return result;
+  const observations = {};
+  result.observations = observations;
+  const end = Math.min(Date.now() + 3000, operationDeadline ?? Infinity);
+  for (const kind of ['snapshot','screenshot','events']) {
+    if (!options[kind]) continue;
+    try {
+      const selected = {tab:result.tab ?? request.tab};
+      const tab = tabFor(selected);
+      const tabId = selected.tab;
+      const timeout = Math.max(1, Math.min(1000, end - Date.now()));
+      if (Date.now() >= end) throw new Error('observation budget exhausted');
+      if (kind === 'events') {
+        const events = tabEvents(tab, cursors.get(tabId) ?? 0);
+        const failures = event => (event.channel === 'console' && ['error','pageerror','bridge-error'].includes(event.type))
+          || (event.channel === 'network' && (['failed','blocked'].includes(event.kind) || event.status >= 400));
+        const combined = [...events.events.filter(failures), ...events.network_failures.map(event=>({channel:'network',...event}))];
+        const unique = [...new Map(combined.map(event=>[event.seq,event])).values()].sort((a,b)=>a.seq-b.seq);
+        observations.events = {events:unique.slice(-100),last_seq:events.last_seq,truncated:unique.length > 100};
+      } else {
+        let timer;
+        try {
+          const capture = kind === 'snapshot'
+            ? snapshot(scopeFor(tab, request), {max_nodes:options.max_nodes})
+            : captureModule.run({action:'screenshot',tab:tabId,timeout_ms:timeout},{tab,page:tab.page});
+          const value = await Promise.race([capture,new Promise((_,reject)=>{ timer=setTimeout(()=>reject(new Error('observation timed out')),timeout); })]);
+          if (kind === 'screenshot' && value.artifact) {
+            result.artifact = value.artifact;
+            delete value.artifact;
+            value.image = 'native attachment';
+          }
+          observations[kind] = value;
+        } finally { clearTimeout(timer); }
+      }
+    } catch (error) { observations[kind] = {error:clip(error.message || error)}; }
+  }
+  return result;
+}
 async function run(request) {
   wsEndpoints = Array.isArray(request.websocket_endpoints) ? request.websocket_endpoints.map(String) : wsEndpoints;
   if (request.action === 'initialize') return initialize(request);
@@ -686,7 +740,9 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     operationId = request.id;
     const deadline = request.timeout_ms ? Date.now()+request.timeout_ms : null;
     operationDeadline = deadline;
+    const cursors = new Map([...tabs].map(([id,tab])=>[id,tab.seq]));
     try {
+      validateObserve(request);
       const result = await run(request);
       if (request.action !== 'initialize') {
         const navigation = ['open','navigate','reload','back','forward'].includes(request.action);
@@ -701,6 +757,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
           if (failures.length) result.network_failures = failures.slice(-10);
         }
       }
+      await observeResult(request, result, cursors);
       await send({id:request.id,result});
     }
     catch (error) {

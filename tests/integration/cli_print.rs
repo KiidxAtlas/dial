@@ -97,7 +97,8 @@ fn respond(
             length = v.trim().parse().unwrap();
         }
     }
-    if first.starts_with("GET ") {
+    // Only chat requests advance the script; context metadata can use POST too.
+    if first.starts_with("GET ") || first.starts_with("POST /api/show ") {
         let _ = write!(
             stream,
             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

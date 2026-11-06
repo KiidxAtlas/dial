@@ -44,9 +44,9 @@ fn recognized_noise_is_removed_but_counts_and_unknown_lines_remain() {
         assert!(result.contains("custom important observation"));
         assert!(result.contains("2 passed; 0 failed"));
         assert!(result.contains("[exit code: 0]"));
-        assert!(result.contains(
-            "[Complete tool evidence: artifact://complete; retrieve with artifact_read]"
-        ));
+        assert!(
+            result.contains("[Complete tool evidence: artifact://complete; retrieve with read]")
+        );
     }
 }
 

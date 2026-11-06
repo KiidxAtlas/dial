@@ -322,7 +322,9 @@ fn documented_image_generation(
             | "gpt-image-1.5"
             | "gpt-image-2"
             | "gpt-image-2.5-flare"
-            | "gpt-image-2.5-sunburst",
+            | "gpt-image-2.5-sunburst"
+            | "gpt-image-2.6-flare"
+            | "gpt-image-2.6-sunburst",
         ) => Some(ImageGenerationApi::Images),
         // xAI Grok Imagine on `/v1/images/generations` (OpenAI-compatible request shape).
         ("xai", "grok-imagine-image-2.0") => Some(ImageGenerationApi::Images),
@@ -1378,11 +1380,18 @@ fn probe_models_inner(probe: &Probe) -> (ProviderStatus, Vec<ModelEntry>) {
         }
         let mut seen = BTreeSet::new();
         models.retain(|entry| seen.insert(entry.selection.model.clone()));
-        if protocol == ApiProtocol::Ollama {
-            annotate_ollama(
+        if protocol == ApiProtocol::Ollama
+            || (probe.id == "osaurus" && protocol == ApiProtocol::ChatCompletions)
+        {
+            annotate_show_metadata(
                 &mut models,
                 &agent,
-                url.strip_suffix("/api/tags").unwrap_or(&url),
+                url.strip_suffix("/api/tags").unwrap_or_else(|| {
+                    url.strip_suffix("/models")
+                        .unwrap_or(&url)
+                        .trim_end_matches("/api")
+                        .trim_end_matches("/v1")
+                }),
                 probe.token.as_deref(),
                 &resolved_headers,
             );
@@ -1548,9 +1557,89 @@ pub struct LmStudioModel {
     pub tool_use: bool,
     pub loaded: bool,
     pub loaded_context: Option<u32>,
+    /// Explicit v1 capability flags; absent or malformed fields remain unknown.
+    pub vision: Option<bool>,
+    pub native_tools: Option<bool>,
+    /// Public reasoning controls advertised by v1, never inferred from a model name.
+    pub reasoning_options: Vec<String>,
+    pub reasoning_default: Option<String>,
 }
 
 fn parse_lmstudio(value: &Value) -> Vec<LmStudioModel> {
+    if let Some(rows) = value.get("models").and_then(Value::as_array) {
+        let mut found = Vec::new();
+        for row in rows.iter().take(MAX_MODELS) {
+            if found.len() >= MAX_MODELS {
+                break;
+            }
+            let Some(key) = row["key"].as_str().filter(|id| valid_model_id(id)) else {
+                continue;
+            };
+            let instances: Vec<_> = row["loaded_instances"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|instance| instance["id"].as_str().is_some_and(valid_model_id))
+                .take(MAX_MODELS.saturating_sub(found.len()))
+                .collect();
+            let context = |instance: &Value| {
+                instance
+                    .pointer("/config/context_length")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| *n > 0)
+            };
+            // Requests using the key may reach any instance. Unknown capacity on any one of
+            // them must not be replaced with another instance's (or the trained) maximum.
+            let loaded_context = instances
+                .iter()
+                .map(|instance| context(instance))
+                .collect::<Option<Vec<_>>>()
+                .and_then(|contexts| contexts.into_iter().min());
+            let reasoning_options: Vec<String> = row
+                .pointer("/capabilities/reasoning/allowed_options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|option| matches!(*option, "off" | "on" | "low" | "medium" | "high"))
+                .map(str::to_owned)
+                .collect();
+            let reasoning_default = row
+                .pointer("/capabilities/reasoning/default")
+                .and_then(Value::as_str)
+                .filter(|default| reasoning_options.iter().any(|option| option == default))
+                .map(str::to_owned);
+            let model = LmStudioModel {
+                id: key.to_owned(),
+                kind: row["type"].as_str().unwrap_or("unknown").to_owned(),
+                tool_use: row
+                    .pointer("/capabilities/trained_for_tool_use")
+                    .and_then(Value::as_bool)
+                    == Some(true),
+                native_tools: row
+                    .pointer("/capabilities/trained_for_tool_use")
+                    .and_then(Value::as_bool),
+                vision: row.pointer("/capabilities/vision").and_then(Value::as_bool),
+                loaded: !instances.is_empty(),
+                loaded_context,
+                reasoning_options,
+                reasoning_default,
+            };
+            // Exact instance identifiers take precedence over their key's aggregate metadata.
+            for instance in &instances {
+                let mut alias = model.clone();
+                alias.id = instance["id"].as_str().unwrap_or_default().to_owned();
+                alias.loaded_context = context(instance);
+                found.push(alias);
+            }
+            if !instances.iter().any(|instance| instance["id"] == key) {
+                found.push(model);
+            }
+        }
+        found.truncate(MAX_MODELS);
+        return found;
+    }
     value
         .get("data")
         .and_then(Value::as_array)
@@ -1577,6 +1666,16 @@ fn parse_lmstudio(value: &Value) -> Vec<LmStudioModel> {
                             .is_some_and(|caps| caps.iter().any(|c| c == "tool_use")),
                         loaded,
                         loaded_context,
+                        vision: match row["type"].as_str() {
+                            Some("llm") => Some(false),
+                            Some("vlm") => Some(true),
+                            _ => None,
+                        },
+                        native_tools: row["capabilities"]
+                            .as_array()
+                            .map(|caps| caps.iter().any(|c| c == "tool_use")),
+                        reasoning_options: Vec::new(),
+                        reasoning_default: None,
                     })
                 })
                 .take(MAX_MODELS)
@@ -1585,8 +1684,34 @@ fn parse_lmstudio(value: &Value) -> Vec<LmStudioModel> {
         .unwrap_or_default()
 }
 
+/// A native route a local server answered 404 for is not asked again for this long. The answer
+/// says the server has no such API (an OpenAI-compatible server is not llama.cpp, Ollama or LM
+/// Studio), and the probes run on every request; the bound lets a server replaced on the same port,
+/// or a model downloaded later, be recognised without restarting Dial.
+const ABSENT_ROUTE_TTL: Duration = Duration::from_secs(300);
+
+/// GET URLs (`origin` + path) that answered 404, with when. Transport failures are not stored, so
+/// a server that is still starting is probed again.
+static ABSENT_ROUTES: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn route_known_absent(url: &str) -> bool {
+    let Ok(mut absent) = ABSENT_ROUTES.lock() else {
+        return false;
+    };
+    match absent.get(url) {
+        Some(at) if at.elapsed() < ABSENT_ROUTE_TTL => true,
+        Some(_) => {
+            absent.remove(url);
+            false
+        }
+        None => false,
+    }
+}
+
 /// GET a native (non-OpenAI) endpoint of a local server. Only ever asked of loopback/private hosts; a
-/// hosted API is never sent these probes.
+/// hosted API is never sent these probes. A route that answered 404 is not asked again for
+/// [`ABSENT_ROUTE_TTL`].
 pub(crate) fn local_get(
     base_url: &str,
     path: &str,
@@ -1596,7 +1721,8 @@ pub(crate) fn local_get(
     local_request(base_url, path, None, token, headers)
 }
 
-/// [`local_get`], or a JSON POST when `body` is set (Ollama's `/api/show` is POST-only).
+/// [`local_get`], or a JSON POST when `body` is set (Ollama's `/api/show` is POST-only). Only GET
+/// answers are remembered as absent: a POST 404 can be about its body (an unknown model).
 pub(crate) fn local_request(
     base_url: &str,
     path: &str,
@@ -1604,13 +1730,45 @@ pub(crate) fn local_request(
     token: Option<&str>,
     headers: &super::model_config::ResolvedHeaders<'_>,
 ) -> Option<Value> {
-    let uri = validated_url(base_url, true).ok()?;
-    if !crate::llm::is_local_host(uri.host()?) {
-        return None;
+    local_request_remembering(base_url, path, body, token, headers, body.is_none())
+}
+
+/// [`local_request`]; `remember_404` also records a POST 404 as an absent route, for callers that
+/// already know the server is not the one whose POST 404 can mean an unknown model.
+fn local_request_remembering(
+    base_url: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+    headers: &super::model_config::ResolvedHeaders<'_>,
+    remember_404: bool,
+) -> Option<Value> {
+    local_request_outcome(base_url, path, body, token, headers, remember_404).ok()
+}
+
+// Preserve the HTTP status for native API version negotiation. None is transport/invalid data.
+fn local_request_outcome(
+    base_url: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+    headers: &super::model_config::ResolvedHeaders<'_>,
+    remember_404: bool,
+) -> std::result::Result<Value, Option<u16>> {
+    let uri = validated_url(base_url, true).map_err(|_| None)?;
+    if !crate::llm::is_local_host(uri.host().ok_or(None)?) {
+        return Err(None);
     }
-    let origin = format!("{}://{}", uri.scheme_str()?, uri.authority()?);
+    let origin = format!(
+        "{}://{}",
+        uri.scheme_str().ok_or(None)?,
+        uri.authority().ok_or(None)?
+    );
     let agent = super::agent_with(1, false, None, None);
     let url = format!("{origin}{path}");
+    if remember_404 && route_known_absent(&url) {
+        return Err(Some(404));
+    }
     let mut response = match body {
         None => {
             let mut request = agent.get(&url);
@@ -1618,10 +1776,12 @@ pub(crate) fn local_request(
                 request = request.header("Authorization", format!("Bearer {token}"));
             }
             for (name, value) in headers.pairs() {
-                request =
-                    request.header(name, super::model_config::private_header_value(value).ok()?);
+                request = request.header(
+                    name,
+                    super::model_config::private_header_value(value).map_err(|_| None)?,
+                );
             }
-            request.call().ok()?
+            request.call().map_err(|_| None)?
         }
         Some(body) => {
             let mut request = agent.post(&url);
@@ -1629,14 +1789,22 @@ pub(crate) fn local_request(
                 request = request.header("Authorization", format!("Bearer {token}"));
             }
             for (name, value) in headers.pairs() {
-                request =
-                    request.header(name, super::model_config::private_header_value(value).ok()?);
+                request = request.header(
+                    name,
+                    super::model_config::private_header_value(value).map_err(|_| None)?,
+                );
             }
-            request.send_json(body).ok()?
+            request.send_json(body).map_err(|_| None)?
         }
     };
+    if remember_404 && response.status() == 404 {
+        if let Ok(mut absent) = ABSENT_ROUTES.lock() {
+            absent.insert(url, Instant::now());
+        }
+        return Err(Some(404));
+    }
     if !response.status().is_success() {
-        return None;
+        return Err(Some(response.status().as_u16()));
     }
     let mut bytes = Vec::new();
     response
@@ -1644,11 +1812,11 @@ pub(crate) fn local_request(
         .as_reader()
         .take(MAX_RESPONSE + 1)
         .read_to_end(&mut bytes)
-        .ok()?;
+        .map_err(|_| None)?;
     if bytes.len() as u64 > MAX_RESPONSE {
-        return None;
+        return Err(None);
     }
-    serde_json::from_slice(&bytes).ok()
+    serde_json::from_slice(&bytes).map_err(|_| None)
 }
 
 /// A model name that is safe in a URL path segment or query value: non-empty, short, with no control
@@ -1661,13 +1829,50 @@ pub(crate) fn valid_model_id(model: &str) -> bool {
             .any(|c| c.is_control() || c == '?' || c == '#' || c == '%')
 }
 
-fn lmstudio_models_with_headers(
+pub(crate) fn lmstudio_models_with_headers(
     base_url: &str,
     token: Option<&str>,
     headers: &super::model_config::ResolvedHeaders<'_>,
 ) -> Option<Vec<LmStudioModel>> {
-    let found = parse_lmstudio(&local_get(base_url, "/api/v0/models", token, headers)?);
-    (!found.is_empty()).then_some(found)
+    lmstudio_metadata(base_url, None, token, headers)
+}
+
+pub(crate) fn lmstudio_model_with_headers(
+    base_url: &str,
+    model: &str,
+    token: Option<&str>,
+    headers: &super::model_config::ResolvedHeaders<'_>,
+) -> Option<LmStudioModel> {
+    lmstudio_metadata(base_url, Some(model), token, headers)?
+        .into_iter()
+        .find(|known| known.id == model)
+}
+
+fn lmstudio_metadata(
+    base_url: &str,
+    model: Option<&str>,
+    token: Option<&str>,
+    headers: &super::model_config::ResolvedHeaders<'_>,
+) -> Option<Vec<LmStudioModel>> {
+    let value = match local_request_outcome(base_url, "/api/v1/models", None, token, headers, true)
+    {
+        Ok(value) => value,
+        Err(Some(404 | 405 | 501)) => {
+            if let Some(model) = model.filter(|model| valid_model_id(model) && !model.contains('/'))
+            {
+                let row = local_get(base_url, &format!("/api/v0/models/{model}"), token, headers)?;
+                serde_json::json!({"data": [row]})
+            } else {
+                local_get(base_url, "/api/v0/models", token, headers)?
+            }
+        }
+        // Authentication, transport and malformed replies do not mean an older server.
+        Err(_) => return None,
+    };
+    if !value["models"].is_array() && !value["data"].is_array() {
+        return None;
+    }
+    Some(parse_lmstudio(&value))
 }
 
 /// What a llama.cpp `llama-server` reports about itself in `/props`.
@@ -1706,8 +1911,8 @@ fn llama_props_key(base_url: &str) -> String {
     base_url.trim_end_matches('/').to_owned()
 }
 
-/// Forgets the `/props` answers cached for every base URL on `origin` (`scheme://host:port`): a
-/// test server bound to a port an earlier one used is a different server.
+/// Forgets the `/props` answers and absent native routes cached for every base URL on `origin`
+/// (`scheme://host:port`): a test server bound to a port an earlier one used is a different server.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn forget_llama_props(origin: &str) {
     if let Ok(mut known) = LLAMA_PROPS.lock() {
@@ -1715,6 +1920,9 @@ pub(crate) fn forget_llama_props(origin: &str) {
     }
     if let Ok(mut known) = OPENAI_RUNTIME.lock() {
         known.retain(|key, _| !super::same_origin(key, origin));
+    }
+    if let Ok(mut absent) = ABSENT_ROUTES.lock() {
+        absent.retain(|url, _| !super::same_origin(url, origin));
     }
 }
 
@@ -1853,7 +2061,9 @@ fn served_model_len(models: &Value, model: &str) -> Option<u32> {
 /// Context window the local server is serving `model` with right now: LM Studio's loaded size,
 /// llama.cpp's per-slot `n_ctx` (`-c` divided by `--parallel`), or the `context_length` Ollama loaded
 /// the model with (its default is far below Dial's, and it truncates silently rather than failing).
-/// `None` for hosted APIs, other servers, or a model that is not loaded yet.
+/// Servers without a fixed served size that still answer Ollama's `/api/show` (Osaurus) are bounded
+/// by the model's trained context. `None` for hosted APIs, other servers, or a model that is not
+/// loaded yet.
 pub fn loaded_context(
     base_url: &str,
     model: &str,
@@ -1870,27 +2080,8 @@ pub fn loaded_context(
             .and_then(|n| u32::try_from(n).ok())
             .filter(|n| *n > 0)
     };
-    let listed = if model.contains('/') {
-        local_get(base_url, "/api/v0/models", token, &resolved)
-            .map(|list| parse_lmstudio(&list))
-            .and_then(|found| found.into_iter().find(|m| m.id == model))
-            .map(|m| m.loaded_context)
-    } else {
-        local_get(
-            base_url,
-            &format!("/api/v0/models/{model}"),
-            token,
-            &resolved,
-        )
-        .map(|value| {
-            parse_lmstudio(&serde_json::json!({"data":[value]}))
-                .into_iter()
-                .find(|m| m.id == model)
-                .and_then(|m| m.loaded_context)
-        })
-    };
-    if let Some(loaded) = listed {
-        return loaded;
+    if let Some(found) = lmstudio_model_with_headers(base_url, model, token, &resolved) {
+        return found.loaded_context;
     }
     if let Some(props) = local_get(base_url, "/props", token, &resolved) {
         return positive(props.pointer("/default_generation_settings/n_ctx"));
@@ -1914,22 +2105,44 @@ pub fn loaded_context(
         }
         // Not loaded yet: the model's trained context bounds the window it can usefully serve once
         // Dial's first request loads it with the planned window as `num_ctx`.
-        let shown = local_request(
-            base_url,
-            "/api/show",
-            Some(&serde_json::json!({ "model": model })),
-            token,
-            &resolved,
-        )?;
-        return shown["model_info"].as_object().and_then(|info| {
-            info.iter()
-                .find(|(key, _)| key.ends_with(".context_length"))
-                .and_then(|(_, value)| positive(Some(value)))
-        });
+        return trained_context(base_url, model, token, &resolved, false);
     }
     // vLLM and SGLang: the model list carries the length the server accepts.
     local_get(base_url, "/v1/models", token, &resolved)
         .and_then(|models| served_model_len(&models, model))
+        // OpenAI-compatible servers that also answer `/api/show` without `/api/ps` (Osaurus). With
+        // no `/api/ps` this is not Ollama, so a 404 means the route is absent, not the model.
+        .or_else(|| trained_context(base_url, model, token, &resolved, true))
+}
+
+/// The `*.context_length` a server's Ollama-style `/api/show` reports in `model_info`.
+fn trained_context(
+    base_url: &str,
+    model: &str,
+    token: Option<&str>,
+    headers: &super::model_config::ResolvedHeaders<'_>,
+    remember_404: bool,
+) -> Option<u32> {
+    let shown = local_request_remembering(
+        base_url,
+        "/api/show",
+        Some(&serde_json::json!({ "model": model })),
+        token,
+        headers,
+        remember_404,
+    )?;
+    shown_context(&shown)
+}
+
+/// Trained context declared by an Ollama-compatible metadata response.
+fn shown_context(shown: &Value) -> Option<u32> {
+    shown["model_info"].as_object().and_then(|info| {
+        info.iter()
+            .find(|(key, _)| key.ends_with(".context_length"))
+            .and_then(|(_, value)| value.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+    })
 }
 
 /// Explicit purpose tokens a row declares (`type`, `pipeline_tag`, `task`). Matching is exact: an
@@ -1975,12 +2188,11 @@ fn declared_kind(row: &Value) -> ModelKind {
         .unwrap_or_default()
 }
 
-/// Ollama's `/api/tags` states no purpose; its `/api/show` reports `capabilities` (`embedding`,
-/// `completion`, `tools`, `vision`, `thinking`, ...). Asked only for rows still `Unknown`, at most
-/// `CONCURRENCY` at a time, through the probe's agent, headers and key. Optional enrichment has
-/// one shared deadline and a request cap; failures or exhausted budget leave rows listed with
-/// unknown capabilities rather than withholding the basic catalog.
-fn annotate_ollama(
+/// Ollama and Osaurus expose purpose and capabilities through `/api/show`. Optional enrichment
+/// uses the probe's agent, headers and key with bounded concurrency, deadline and request count.
+/// Osaurus also exposes its trained context here; Ollama's served context is resolved separately.
+/// Failures leave the basic listing available with unknown metadata.
+fn annotate_show_metadata(
     models: &mut [ModelEntry],
     agent: &ureq::Agent,
     base: &str,
@@ -1991,7 +2203,14 @@ fn annotate_ollama(
     let pending: Vec<(usize, String)> = models
         .iter()
         .enumerate()
-        .filter(|(_, entry)| entry.metadata.kind == ModelKind::Unknown)
+        .filter(|(_, entry)| {
+            entry.metadata.kind == ModelKind::Unknown
+                || (entry.selection.provider == "osaurus"
+                    && (entry.selection.context_window.is_none()
+                        || entry.metadata.vision.is_none()
+                        || entry.metadata.tools.is_none()
+                        || entry.metadata.reasoning.is_none()))
+        })
         .take(MAX_ENRICHMENTS)
         .map(|(index, entry)| (index, entry.selection.model.clone()))
         .collect();
@@ -2017,7 +2236,14 @@ fn annotate_ollama(
                 .collect()
         });
         for (index, shown) in shown {
-            apply_ollama_capabilities(&mut models[index].metadata, &shown);
+            let entry = &mut models[index];
+            apply_ollama_capabilities(&mut entry.metadata, &shown);
+            if entry.selection.provider == "osaurus" {
+                entry.selection.context_window = entry
+                    .selection
+                    .context_window
+                    .or_else(|| shown_context(&shown));
+            }
         }
     }
 }
@@ -2066,7 +2292,9 @@ fn ollama_show(
 /// declaration (Ollama refuses tools or images for a model that lacks them), so a listed name is
 /// `Some(true)` and an absent one `Some(false)`; without a list everything stays unknown.
 fn apply_ollama_capabilities(metadata: &mut ModelMetadata, shown: &Value) {
-    metadata.kind = ollama_capability_kind(shown);
+    if metadata.kind == ModelKind::Unknown {
+        metadata.kind = ollama_capability_kind(shown);
+    }
     let Some(capabilities) = shown["capabilities"].as_array() else {
         return;
     };
@@ -2099,13 +2327,14 @@ fn annotate_lmstudio(models: &mut [ModelEntry], info: &[LmStudioModel]) {
         if entry.metadata.kind == ModelKind::Unknown {
             entry.metadata.kind = kind_from_declared(&known.kind);
         }
-        // LM Studio's OpenAI-compatible list omits image input; its native `type` declares it:
-        // `vlm` models load a vision encoder, `llm` models do not. Other metadata wins.
-        if entry.metadata.vision.is_none() && matches!(known.kind.as_str(), "llm" | "vlm") {
-            entry.metadata.vision = Some(known.kind == "vlm");
-        }
+        entry.metadata.vision = entry.metadata.vision.or(known.vision);
         if entry.metadata.tools.is_none() && known.tool_use {
+            // Not trained for tools is not a refusal: LM Studio also prompts tools to those models.
             entry.metadata.tools = Some(true);
+        }
+        if !known.reasoning_options.is_empty() {
+            entry.metadata.reasoning =
+                Some(known.reasoning_options.iter().any(|option| option != "off"));
         }
         if entry.metadata.kind == ModelKind::Embedding {
             entry.source = format!("{} · embedding model", entry.source);
@@ -3011,6 +3240,12 @@ pub fn discover(
             "Docker Model Runner",
             "DOCKER_MODEL_RUNNER_BASE_URL",
             "http://127.0.0.1:12434/engines/v1",
+        ),
+        (
+            "osaurus",
+            "Osaurus",
+            "OSAURUS_BASE_URL",
+            "http://127.0.0.1:1337/v1",
         ),
     ] {
         let override_url = std::env::var(variable)

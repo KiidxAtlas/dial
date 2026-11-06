@@ -622,7 +622,7 @@ fn repeated_directory_and_variable_prefixes_are_not_reruns() {
     assert!(
         pace.call(&shell("cd crates/x && git status"), &ok_output())
             .unwrap()
-            .contains("`git status`")
+            .contains("`cd crates/x && git status`")
     );
     pace.call(&shell("export RUST_LOG=debug; ls src"), &ok_output());
     assert!(
@@ -636,15 +636,97 @@ fn repeated_directory_and_variable_prefixes_are_not_reruns() {
 }
 
 #[test]
-fn a_long_run_of_single_lookups_is_told_once_per_streak_to_batch() {
+fn pace_does_not_confuse_different_pipeline_projections_or_shared_separators() {
+    for (first, second) in [
+        ("ls /app/logs/ | head -5", "ls /app/logs/ | wc -l"),
+        ("ls /app/logs/ | head -5", "ls /app/logs/"),
+        ("ls /app/logs/", "ls /app/logs/ | wc -l"),
+        ("ls debian/patches; echo '---'", "ls src; echo '---'"),
+        ("printf '---'; ls src", "printf '---'; ls docs"),
+        ("cd src && ls", "cd docs && ls"),
+        ("A=1 cargo test", "A=2 cargo test"),
+    ] {
+        let mut pace = PaceGuard::default();
+        assert!(pace.call(&shell(first), &ok_output()).is_none());
+        assert!(
+            pace.call(&shell(second), &ok_output()).is_none(),
+            "{second:?} is not a redundant execution of {first:?}"
+        );
+    }
+}
+
+#[test]
+fn pace_never_suggests_reusing_output_from_incomplete_processes() {
+    use crate::runtime::execution::ProcessOutcome;
+    for (started, output_complete, cancelled, timed_out) in [
+        (false, false, false, false),
+        (true, false, false, false),
+        (true, true, true, false),
+        (true, true, false, true),
+    ] {
+        let process = ProcessOutcome {
+            started,
+            output_complete,
+            cancelled,
+            timed_out,
+            exit_code: Some(0),
+            signal: None,
+        };
+        let mut pace = PaceGuard::default();
+        let mut output = ok_output();
+        output.execution.process = Some(process);
+        pace.call(&shell("ls src"), &output);
+        assert!(pace.call(&shell("ls src"), &ok_output()).is_none());
+    }
+}
+
+#[test]
+fn a_repeated_state_changing_command_is_not_called_current() {
+    let mut pace = PaceGuard::default();
+    // Seen in a benchmark run: an install retried after `apt-get update`, and a new patch loop
+    // sharing only its closing `done` with an earlier loop, were both told their earlier result
+    // was still current.
+    pace.call(&shell("apt-get install -y xz-utils"), &ok_output());
+    assert!(
+        pace.call(
+            &shell("apt-get update -qq && apt-get install -y xz-utils"),
+            &ok_output()
+        )
+        .is_none()
+    );
+    pace.call(&shell("for f in a b; do cat $f; done"), &ok_output());
+    assert!(
+        pace.call(
+            &shell("for p in c d; do patch -p1 < $p; done"),
+            &ok_output()
+        )
+        .is_none()
+    );
+    // A read-only rerun is still flagged.
+    pace.call(&shell("ls src"), &ok_output());
+    assert!(pace.call(&shell("ls src"), &ok_output()).is_some());
+}
+
+#[test]
+fn a_long_run_of_single_lookups_is_told_each_streak_interval_to_batch() {
     let mut pace = PaceGuard::default();
     let lookup = [call("read", json!({"path": "a"}))];
     for round in 1..SERIAL_WARN {
         assert!(pace.round(&lookup).is_none(), "round {round}");
     }
     assert!(pace.round(&lookup).unwrap().contains("one response"));
-    assert!(pace.round(&lookup).is_none());
-    // A batch or a change of kind starts the count over.
+    // An ignored nudge repeats after another interval rather than going silent.
+    for _ in 1..SERIAL_WARN {
+        assert!(pace.round(&lookup).is_none());
+    }
+    assert!(pace.round(&lookup).is_some());
+    // Bookkeeping beside a lone lookup does not make it a batch.
+    let with_todo = [call("todo", json!({"op": "view"})), lookup[0].clone()];
+    for _ in 1..SERIAL_WARN {
+        assert!(pace.round(&with_todo).is_none());
+    }
+    assert!(pace.round(&with_todo).is_some());
+    // A real batch or a change of kind starts the count over.
     let batch = [lookup[0].clone(), call("grep", json!({"pattern": "x"}))];
     assert!(pace.round(&batch).is_none());
     for _ in 1..SERIAL_WARN {

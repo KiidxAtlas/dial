@@ -84,7 +84,7 @@ fn lexical_prefilter_keeps_literal_only_and_multiline_phrase_matches() {
     let (dir, ws) = crate::tools::testkit::workspace();
     fs::write(dir.path().join("literal.txt"), "a\r\nb\r\n").unwrap();
     for args in [
-        json!({"query":"unmatched", "grep_keywords":["a\nb"]}),
+        json!({"query":"unmatched", "keywords":["a\nb"]}),
         json!({"query":"\"a\nb\""}),
     ] {
         let retrieval = retrieve(&ws, &args, false).unwrap();
@@ -124,7 +124,7 @@ fn related_reference_quota_stops_unusable_syntax_work() {
         end: 1,
         sha256: format!("{:x}", Sha256::digest(source)),
     }];
-    let (out, work) = capture_work(|| related::render(&ws, ws.root(), &targets, 6 * 1024));
+    let (out, work) = capture_work(|| related::render(&ws, ws.root(), &targets, 6 * 1024).text);
     assert!(out.contains("call-site caller_00.rs"), "{out}");
     assert!(out.contains("call-site caller_03.rs"), "{out}");
     assert!(!out.contains("call-site caller_04.rs"), "{out}");
@@ -157,6 +157,39 @@ fn protected_trees_are_not_retrieved_from_warm_cache() {
         .is_err()
     );
 }
+#[test]
+fn find_read_only_roots_admit_sources_but_exclude_private_paths() {
+    let (_dir, ws) = crate::tools::testkit::workspace();
+    let extra = tempfile::tempdir().unwrap();
+    let root = extra.path().canonicalize().unwrap();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(
+        root.join("nested/public.rs"),
+        "pub fn readable_canary() {}\n",
+    )
+    .unwrap();
+    let private = root.join("private");
+    fs::create_dir(&private).unwrap();
+    fs::write(
+        private.join("secret.rs"),
+        "pub fn readable_canary_secret() {}\n",
+    )
+    .unwrap();
+    let args = json!({"query": "readable_canary", "path": root, "mode": "exact"});
+    assert!(find(&ws, &args).is_err());
+    let ws = ws
+        .with_protected_paths(&[private])
+        .with_read_only_roots(std::slice::from_ref(&root))
+        .unwrap();
+    let text = find(&ws, &args).unwrap();
+    assert!(text.contains("public.rs"), "{text}");
+    assert!(!text.contains("secret.rs"), "{text}");
+    assert!(
+        ws.resolve(root.join("nested/public.rs").to_str().unwrap())
+            .is_err()
+    );
+}
+
 #[test]
 fn finds_declarations_and_literal_multiline_deterministically() {
     let (dir, ws) = crate::tools::testkit::workspace();
@@ -251,6 +284,183 @@ fn automatic_excerpt_does_not_disclose_or_witness_screened_source() {
         fs::read_to_string(dir.path().join("calc.py")).unwrap(),
         source
     );
+}
+
+fn discovery_fixture(root: &Path) {
+    fs::write(
+        root.join("network.rs"),
+        "pub fn reconnect_network() {\n    // anchor behavior\n    retry();\n}\n",
+    )
+    .unwrap();
+    for index in 0..6 {
+        fs::write(
+            root.join(format!("caller_{index}.rs")),
+            format!("fn caller_{index}() {{ reconnect_network(); }}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("test_network.py"),
+        format!(
+            "def verify_network():\n    reconnect_network()\n{}",
+            "    value = 1\n".repeat(44)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("settings.json"),
+        "{\"handler\": \"reconnect_network\"}\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn related_discovery_previews_test_and_supported_config_with_resume_witnesses() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let ws = ws.with_edit_mode(crate::config::types::EditMode::Hashline);
+    discovery_fixture(dir.path());
+    let args = json!({"query":"\"anchor behavior\"", "limit":1});
+    let result = find(&ws, &args).unwrap();
+    let (ranked, excerpts) = result.split_once(SOURCE_SECTION).unwrap();
+    assert!(ranked.contains("network.rs:1-4 score="), "{ranked}");
+    assert!(!ranked.contains("test_network.py:1-46 score="), "{ranked}");
+    assert!(ranked.contains("provenance=lexical"), "{ranked}");
+    assert_eq!(
+        source_paths(&ws, &result),
+        ["network.rs", "test_network.py", "settings.json"]
+    );
+    assert!(excerpts.contains("2:    reconnect_network()"), "{excerpts}");
+    assert!(
+        excerpts.contains("1:{\"handler\": \"reconnect_network\"}"),
+        "{excerpts}"
+    );
+    assert!(excerpts.contains("40:    value = 1"), "{excerpts}");
+    assert!(!excerpts.contains("41:    value = 1"), "{excerpts}");
+    assert!(excerpts.len() <= SOURCE_BYTES);
+    // The same files may also be ranked hits; each file still receives only one excerpt.
+    let overlapping = find(&ws, &json!({"query":"reconnect_network", "limit":100})).unwrap();
+    let paths = source_paths(&ws, &overlapping);
+    assert_eq!(paths.len(), 3);
+    assert_eq!(paths.iter().collect::<BTreeSet<_>>().len(), paths.len());
+    let resumed = Workspace::new(dir.path()).unwrap();
+    crate::tools::edit::hashline::rehydrate(&resumed, [("find", &args, result.as_str())]);
+    let test_source = fs::read_to_string(dir.path().join("test_network.py")).unwrap();
+    let tag = crate::tools::edit::hashline::tag_of(&test_source);
+    let error = crate::tools::edit::hashline::edit(
+        &resumed,
+        &format!("[test_network.py#{tag}]\nPUT 41.=41:\n+    value = 2\n"),
+    )
+    .unwrap_err();
+    assert!(error.contains("have not been shown"), "{error}");
+    for (path, line, replacement) in [
+        ("test_network.py", 2, "    reconnect_network(2)"),
+        ("settings.json", 1, "{\"handler\": \"other\"}"),
+    ] {
+        let source = fs::read_to_string(dir.path().join(path)).unwrap();
+        let tag = crate::tools::edit::hashline::tag_of(&source);
+        crate::tools::edit::hashline::edit(
+            &resumed,
+            &format!("[{path}#{tag}]\nPUT {line}.={line}:\n+{replacement}\n"),
+        )
+        .unwrap();
+        assert!(
+            fs::read_to_string(dir.path().join(path))
+                .unwrap()
+                .contains(replacement)
+        );
+    }
+    // Disabling related discovery, or exact mode's default, keeps the old ranked-hit previews.
+    for args in [
+        json!({"query":"\"anchor behavior\"", "limit":1, "related":false}),
+        json!({"query":"anchor behavior", "limit":1, "mode":"exact"}),
+    ] {
+        let plain = find(&ws, &args).unwrap();
+        assert_eq!(source_paths(&ws, &plain), ["network.rs"]);
+    }
+}
+
+#[test]
+fn related_preview_witnesses_refuse_stale_screened_sensitive_and_unsupported_sources() {
+    for path in ["test_network.py", "settings.json"] {
+        let (dir, ws) = crate::tools::testkit::workspace();
+        let ws = ws.with_edit_mode(crate::config::types::EditMode::Hashline);
+        discovery_fixture(dir.path());
+        let args = json!({"query":"\"anchor behavior\"", "limit":1});
+        let source = fs::read_to_string(dir.path().join(path)).unwrap();
+        let result = find(&ws, &args).unwrap();
+        fs::write(dir.path().join(path), format!("{source}\n")).unwrap();
+        let resumed = Workspace::new(dir.path()).unwrap();
+        crate::tools::edit::hashline::rehydrate(&resumed, [("find", &args, result.as_str())]);
+        let tag = crate::tools::edit::hashline::tag_of(&source);
+        let error = crate::tools::edit::hashline::edit(
+            &resumed,
+            &format!("[{path}#{tag}]\nPUT 1.=1:\n+changed\n"),
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown snapshot tag"), "{path}: {error}");
+
+        // Screening checks the whole snapshot, including a secret beyond the excerpt window.
+        let screened = format!(
+            "{source}{}\n# key = 'sk-abcdefghijklmnopqrstuvwxyz123456'\n",
+            "\n".repeat(45)
+        );
+        fs::write(dir.path().join(path), &screened).unwrap();
+        fs::write(
+            dir.path().join("settings.cfg"),
+            "handler = reconnect_network\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("secrets.json"),
+            "{\"handler\":\"reconnect_network\"}\n",
+        )
+        .unwrap();
+        let result = find(&ws, &args).unwrap();
+        let paths = source_paths(&ws, &result);
+        for omitted in [path, "settings.cfg", "secrets.json"] {
+            assert!(!paths.iter().any(|shown| shown == omitted), "{paths:?}");
+        }
+        let tag = crate::tools::edit::hashline::tag_of(&screened);
+        assert!(
+            crate::tools::edit::hashline::edit(
+                &ws,
+                &format!("[{path}#{tag}]\nPUT 1.=1:\n+changed\n")
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn related_preview_truncated_rows_are_not_edit_witnesses() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let ws = ws.with_edit_mode(crate::config::types::EditMode::Hashline);
+    discovery_fixture(dir.path());
+    let source = format!(
+        "def verify_network():\n    reconnect_network()\n    # {}\n    value = 1\n",
+        "x".repeat(2100)
+    );
+    fs::write(dir.path().join("test_network.py"), &source).unwrap();
+    let args = json!({"query":"\"anchor behavior\"", "limit":1});
+    let result = find(&ws, &args).unwrap();
+    let excerpts = result.split_once(SOURCE_SECTION).unwrap().1;
+    assert!(excerpts.contains("[line truncated]"), "{excerpts}");
+    let tag = crate::tools::edit::hashline::tag_of(&source);
+    for resumed in [false, true] {
+        let restored = Workspace::new(dir.path()).unwrap();
+        let target = if resumed {
+            crate::tools::edit::hashline::rehydrate(&restored, [("find", &args, result.as_str())]);
+            &restored
+        } else {
+            &ws
+        };
+        let error = crate::tools::edit::hashline::edit(
+            target,
+            &format!("[test_network.py#{tag}]\nPUT 3.=3:\n+    value = 2\n"),
+        )
+        .unwrap_err();
+        assert!(error.contains("have not been shown"), "{error}");
+    }
 }
 
 #[test]
@@ -400,6 +610,129 @@ fn related_bundle_states_provenance_and_is_bounded() {
     let exact = find(&ws, &json!({"query":"reconnect_network(","mode":"exact"})).unwrap();
     assert!(exact.contains("via=exact-text") && !exact.contains("Related evidence"));
     assert!(find(&ws, &json!({"query":"reconnect","related":"yes"})).is_err());
+}
+
+#[test]
+fn related_maps_literal_contracts_across_layers_without_extra_searches() {
+    for source in [
+        "impl Tool for Memory {\n    // memory contract anchor\n    fn name(&self) -> &str { \"recall\" }\n}\n",
+        "// memory contract anchor\nfn migrate_memory_tool_names() { const REPLACEMENTS: &[&str] = &[\"recall\"]; }\n",
+    ] {
+        let (dir, ws) = crate::tools::testkit::workspace();
+        fs::write(dir.path().join("memory.rs"), source).unwrap();
+        for layer in [
+            "a_callers",
+            "config",
+            "storage",
+            "tools",
+            "agent",
+            "history",
+        ] {
+            fs::create_dir(dir.path().join(layer)).unwrap();
+            for index in 0..10 {
+                fs::write(
+                    dir.path().join(format!("{layer}/use_{index:02}.rs")),
+                    "fn dispatch() { route(\"recall\"); }\n",
+                )
+                .unwrap();
+            }
+        }
+        fs::write(
+            dir.path().join("noise.rs"),
+            "fn recall() {} // recall is an ordinary identifier here\n",
+        )
+        .unwrap();
+        for index in 0..20 {
+            let nested = dir.path().join(format!("a_callers/nested_{index:02}"));
+            fs::create_dir(&nested).unwrap();
+            fs::write(
+                nested.join("use.rs"),
+                "fn route() { dispatch(\"recall\"); }\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            dir.path().join("config/settings.toml"),
+            "tool = \"recall\"\n",
+        )
+        .unwrap();
+        let args = json!({"query":"\"memory contract anchor\"", "limit":1});
+        let out = find(&ws, &args).unwrap();
+        let related = out
+            .split("Related evidence")
+            .nth(1)
+            .unwrap()
+            .split(SOURCE_SECTION)
+            .next()
+            .unwrap();
+        assert!(related.contains("contract names: recall"), "{out}");
+        for layer in [
+            "a_callers",
+            "config",
+            "storage",
+            "tools",
+            "agent",
+            "history",
+        ] {
+            let count = related
+                .matches(&format!("contract-reference {layer}/"))
+                .count();
+            assert_eq!(count, if layer == "a_callers" { 4 } else { 1 }, "{out}");
+        }
+        assert!(related.contains("not confirmed owners"), "{out}");
+        assert!(!related.contains("contract-reference noise.rs"), "{out}");
+        assert!(related.contains("scan truncated=false"), "{out}");
+        let scoped = find(
+            &ws,
+            &json!({"query":"\"memory contract anchor\"", "path":"memory.rs"}),
+        )
+        .unwrap();
+        assert!(!scoped.contains("contract-reference"), "{scoped}");
+        let disabled = find(
+            &ws,
+            &json!({"query":"\"memory contract anchor\"", "related":false}),
+        )
+        .unwrap();
+        assert!(!disabled.contains("contract-reference"), "{disabled}");
+        let ws = ws.with_protected_paths(&[dir.path().join("history")]);
+        let protected = find(&ws, &args).unwrap();
+        assert!(!protected.contains("history/"), "{protected}");
+    }
+}
+
+#[test]
+fn contract_discovery_does_not_invent_computed_names() {
+    for body in [
+        "format!(\"recall\")",
+        "lookup(\"recall\")",
+        "if yes { \"recall\" } else { \"retain\" }",
+    ] {
+        let text = format!("impl Tool for Memory {{ fn name(&self) -> &str {{ {body} }} }}");
+        assert!(
+            related::contract_names(Path::new("memory.rs"), &text, 1, 1).is_empty(),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn contract_discovery_maps_name_registries_and_bounds_expansion() {
+    let source = "pub const TOOL_NAMES: &[&str] = &[\"retain\", \"recall\", computed(\"not_a_literal_name\")];";
+    assert_eq!(
+        related::contract_names(Path::new("memory.rs"), source, 1, 1),
+        ["retain", "recall"]
+    );
+    let source = format!(
+        "const TOOL_NAMES: &[&str] = &[{}];",
+        (0..20)
+            .map(|i| format!("\"tool_{i}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert_eq!(
+        related::contract_names(Path::new("memory.rs"), &source, 1, 1).len(),
+        8
+    );
 }
 
 #[test]

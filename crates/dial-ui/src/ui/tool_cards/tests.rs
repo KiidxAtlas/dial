@@ -159,7 +159,7 @@ fn result_previews_wrap_on_word_boundaries() {
     let ui = UiConfig::default();
     let t = settled(
         "bash",
-        r#"{"command":"cargo test"}"#,
+        r#"{"command":"./report.sh"}"#,
         "test result: ok. 18 passed; 0 failed",
         false,
         1.2,

@@ -67,6 +67,44 @@ impl WriteObserver for Recorder {
 }
 
 #[test]
+fn ast_search_read_only_roots_do_not_authorize_ast_edits_or_private_reads() {
+    let (_dir, ws) = workspace();
+    let extra = tempfile::tempdir().unwrap();
+    let public = put(
+        &extra,
+        "nested/public.rs",
+        "fn public() { readable_canary(); }\n",
+    );
+    let private = put(
+        &extra,
+        "private/secret.rs",
+        "fn secret() { readable_canary(); }\n",
+    );
+    let args = json!({"pattern": "readable_canary()", "path": extra.path()});
+    assert!(search(&ws, args.clone()).is_error);
+    let ws = ws
+        .with_protected_paths(&[private.parent().unwrap().to_path_buf()])
+        .with_read_only_roots(&[extra.path().to_path_buf()])
+        .unwrap();
+    let output = search(&ws, args.clone());
+    assert!(
+        !output.is_error && output.text.contains("public.rs"),
+        "{}",
+        output.text
+    );
+    assert!(!output.text.contains("secret.rs"), "{}", output.text);
+    let output = edit(
+        &ws,
+        json!({"pattern": "readable_canary()", "rewrite": "changed()", "path": extra.path(), "dry_run": false}),
+    );
+    assert!(output.is_error, "{}", output.text);
+    assert_eq!(
+        fs::read_to_string(public).unwrap(),
+        "fn public() { readable_canary(); }\n"
+    );
+}
+
+#[test]
 fn search_infers_language_per_file_and_reports_position_and_captures() {
     let (dir, ws) = workspace();
     put(&dir, "a.rs", "fn main() {\n    let x = add(1, 2);\n}\n");

@@ -561,12 +561,15 @@ impl Agent<'_> {
             let can_remind = self.stop_boundary().is_none();
             let run = can_remind && !turn.completion.reminder_spent();
             let (unverified, failures) = self.gate_unverified_edits(run, ui);
-            match turn.completion.evidence(unverified.as_deref(), can_remind) {
+            match turn
+                .completion
+                .evidence(unverified.as_deref(), &failures, can_remind)
+            {
                 crate::agent::verify::completion::EvidenceGate::Accept => {}
                 crate::agent::verify::completion::EvidenceGate::Remind(note) => {
                     turn.pending_nudges.push(crate::agent::run::guidance::note(
                         crate::agent::run::guidance::Priority::Review,
-                        crate::agent::verify::completion::with_gate_failures(note, &failures),
+                        note,
                     ));
                     return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
                 }

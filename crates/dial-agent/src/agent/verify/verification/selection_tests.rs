@@ -37,6 +37,51 @@ fn python_checks_share_project_runner_without_sync_or_fallback() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn isolated_ast_check_does_not_write_cold_runtime_bytecode_or_execute_source() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = root.path().join("cold-cache");
+    fs::write(
+        root.path().join("app.py"),
+        "raise RuntimeError('must not execute')\n",
+    )
+    .unwrap();
+    // A fresh bytecode prefix exercises cold stdlib imports without changing the host runtime.
+    let runner = vec![
+        "python3".into(),
+        "-X".into(),
+        format!("pycache_prefix={}", cache.display()),
+    ];
+    let check = plan_with_runner(
+        root.path(),
+        Path::new("python3"),
+        &["app.py".into()],
+        &runner,
+    )
+    .remove(0);
+    for valid in [true, false] {
+        if !valid {
+            fs::write(root.path().join("app.py"), "invalid syntax !!!\n").unwrap();
+        }
+        let output = std::process::Command::new("sh")
+            .args(["-c", &check.command])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !cache.exists(),
+            "a syntax check must not change its installed-runtime inputs"
+        );
+    }
+}
+
 #[test]
 fn automatic_inputs_require_the_exact_isolated_builtin_and_a_direct_runner() {
     let root = tempfile::tempdir().unwrap();

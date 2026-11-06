@@ -201,8 +201,7 @@ impl Agent<'_> {
         let tool_round_failed = progress == crate::agent::run::engine::RoundProgress::Stalled
             || !form_kinds.is_empty()
             || execution_failed
-            || observed_check_failure
-            || self.request_phase.phase == crate::config::adaptive::Phase::Recovery;
+            || observed_check_failure;
         if !self.hermetic {
             let mut control = self.session.control_state();
             settle_reliability(
@@ -334,6 +333,12 @@ impl Agent<'_> {
                 }
             }
         }
+        if continuing
+            && let Some(note) =
+                self.prepare_completion_reconciliation(&mut turn.coach_turn, step)?
+        {
+            turn.pending_nudges.push(note);
+        }
         // Live advisor: the coach reviews this round; its note reaches the next request. An
         // ending turn has no next request, so it is not charged for a live review.
         if continuing
@@ -457,12 +462,15 @@ impl Agent<'_> {
             if finish.outcome == TurnOutcome::Completed {
                 let run = reviewable && !turn.completion.reminder_spent();
                 let (unverified, failures) = self.gate_unverified_edits(run, ui);
-                match turn.completion.evidence(unverified.as_deref(), reviewable) {
+                match turn
+                    .completion
+                    .evidence(unverified.as_deref(), &failures, reviewable)
+                {
                     crate::agent::verify::completion::EvidenceGate::Accept => {}
                     crate::agent::verify::completion::EvidenceGate::Remind(note) => {
                         turn.pending_nudges.push(crate::agent::run::guidance::note(
                             crate::agent::run::guidance::Priority::Review,
-                            crate::agent::verify::completion::with_gate_failures(note, &failures),
+                            note,
                         ));
                         return Ok(crate::agent::run::engine::Tick::Again);
                     }

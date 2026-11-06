@@ -153,14 +153,24 @@ pub(super) fn body(target: &Target, request: &Request) -> Value {
                 Some("jpg" | "jpeg") => "jpeg", Some("webp") => "webp", _ => "png"
             }});
             super::apply_settings(target, &mut tool, request.source.is_some());
+            if let Some(animation) = request.animation {
+                // The hosted tool picks its own image model unless told; GIF needs GPT Image 2.6.
+                tool["model"] = json!(super::GIF_MODEL);
+                animation.apply(&mut tool);
+            }
             let mut content = vec![json!({"type":"input_text", "text":request.prompt})];
             if let Some(source) = &request.source {
                 content.push(json!({"type":"input_image", "image_url":source.data_url()}));
             }
-            let instructions = if request.source.is_some() {
-                "Edit the provided image as the user requests and return exactly one image."
-            } else {
-                "Generate exactly one image matching the user's request."
+            let instructions = match (&request.source, request.animation) {
+                (Some(_), Some(_)) => {
+                    "Animate the provided image as the user requests and return exactly one animated GIF."
+                }
+                (None, Some(_)) => "Generate exactly one animated GIF matching the user's request.",
+                (Some(_), None) => {
+                    "Edit the provided image as the user requests and return exactly one image."
+                }
+                (None, None) => "Generate exactly one image matching the user's request.",
             };
             json!({
                 "model": target.model,

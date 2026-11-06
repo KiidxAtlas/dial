@@ -1533,7 +1533,7 @@ fn productive_rounds_aggregate_batches_without_bookkeeping_forgiving_failure() {
 
 #[test]
 fn productive_rounds_accept_new_observations_not_replayed_or_compacted_receipts() {
-    for name in ["read", "dep_source", "web_search", "artifact_read"] {
+    for name in ["read", "dep_source", "web_search"] {
         let mut edits = Edits::new();
         for (text, expected) in [
             ("first finding", RoundProgress::Productive),
@@ -1968,5 +1968,56 @@ fn external_source_repair_releases_only_the_matching_failed_operation() {
     assert!(edits.engine.rejection_at(&edits.workspace, &read).is_none());
     // A second failure against the new source is a new barrier, not a blanket retry grant.
     edits.settle(&read, vec![], ToolOutput::err("still fails"));
+    assert!(edits.engine.rejection_at(&edits.workspace, &read).is_some());
+}
+
+#[test]
+fn a_successful_state_changing_shell_command_releases_unknown_dependency_shell_barriers() {
+    let mut edits = Edits::new();
+    let build = edits.call("bash", serde_json::json!({"command":"make"}));
+    edits.settle(
+        &build,
+        vec![],
+        ToolOutput::err("stdio.h: No such file or directory"),
+    );
+    let read = edits.call("read", serde_json::json!({"path":"missing.txt"}));
+    edits.settle(&read, vec![], ToolOutput::err("missing file"));
+    // A plain inspection changes nothing, so the build stays withheld.
+    let look = edits.call("bash", serde_json::json!({"command":"ls /usr/include"}));
+    edits.settle(&look, vec![], ToolOutput::ok("stdio.h".into()));
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &build)
+            .is_some()
+    );
+    // A failed install is not a repair.
+    let failed = edits.call(
+        "bash",
+        serde_json::json!({"command":"apt-get install -y libc6-dev"}),
+    );
+    edits.settle(&failed, vec![], ToolOutput::err("E: Unmet dependencies"));
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &build)
+            .is_some()
+    );
+    let install = edits.call(
+        "bash",
+        serde_json::json!({"command":"apt-get update && apt-get install -y libc6-dev"}),
+    );
+    edits.settle(
+        &install,
+        vec![],
+        ToolOutput::ok("Setting up libc6-dev".into()),
+    );
+    assert!(
+        edits
+            .engine
+            .rejection_at(&edits.workspace, &build)
+            .is_none()
+    );
+    // A failure tied to a known file still waits for that file to change.
     assert!(edits.engine.rejection_at(&edits.workspace, &read).is_some());
 }

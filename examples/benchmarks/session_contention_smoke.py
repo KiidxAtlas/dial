@@ -111,10 +111,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if unsupported_probe(self):
+            return
         if self.path != CHAT_PATH:
             self.fail(f"unexpected POST {self.path}", 404)
             return
-        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if request.get("stream") is not True:
             self.fail("fixture requires streamed chat requests")
             return

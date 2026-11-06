@@ -14,6 +14,7 @@ pub struct State {
     pub phase: Phase,
     pub reason: String,
     mutated: bool,
+    resume_phase: Phase,
 }
 impl State {
     pub fn begin(kind: Kind, objective: &str) -> Self {
@@ -32,9 +33,13 @@ impl State {
             phase,
             reason: format!("initial {} task", kind.label()),
             mutated: false,
+            resume_phase: phase,
         }
     }
     pub fn recover(&mut self, reason: &str) {
+        if self.phase != Phase::Recovery {
+            self.resume_phase = self.phase;
+        }
         self.phase = Phase::Recovery;
         self.reason = reason.into();
     }
@@ -62,6 +67,11 @@ impl State {
                 "a source observation succeeded"
             }
             .into();
+        } else if name == "bash" && self.phase == Phase::Recovery {
+            // A successful shell operation need not be an edit or a recognized check.
+            // Resume the prior work instead of keeping a stale failure label.
+            self.phase = self.resume_phase;
+            self.reason = "a shell operation succeeded; resume the prior task phase".into();
         }
     }
 }

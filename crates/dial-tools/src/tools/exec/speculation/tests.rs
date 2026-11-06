@@ -196,7 +196,7 @@ fn native_read_and_grep_reuse_exact_rows_only_after_delivery() {
         ("read", json!({"path":"a.rs","limit":10})),
         (
             "grep",
-            json!({"path":"a.rs","pattern":"old","fixed_string":true}),
+            json!({"path":"a.rs","pattern":"old","literal":true}),
         ),
     ] {
         let (_root, workspace, config, registry) = setup();

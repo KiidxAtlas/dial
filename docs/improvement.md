@@ -161,7 +161,7 @@ quality merely because training ran.
 - **Executable repair evidence.** In recorded live sessions, the same declared check must fail, a
   checkpointed file must change, and the check must subsequently pass. Dial retains the command,
   objective, exit results, immutable output, and before/after source bytes with hashes. Sources and
-  outputs are retrievable through `artifact_read`, including after undo. Related records are retrieved
+  outputs are retrievable by reading their `artifact://` URI with `read`, including after undo. Related records are retrieved
   within the same project; exact failed-state applicability is checked with a bounded hash scan.
   An unchanged flaky pass, timeout, missing snapshot, or changed command cannot establish a repair.
   Changed tests or environment can still explain a pass: this evidence never sets a trajectory success
@@ -497,6 +497,10 @@ Only Dial-owned MLX safetensors checkpoints are supported: GGUF files, hosted pr
 endpoints are refused. Head tracing needs a standard attention layer; linear-attention layers of
 hybrid models (for example some Qwen3.5 layers) report that they have no heads to remove. Stored
 tensor rows are capped at 4096; per-layer aggregates always cover the whole checkpoint.
+
+Weights jobs and ledger changes share one exclusive project lock. It is released when the operation
+ends, including on errors; descriptors inherited during concurrent process spawning do not prolong
+a completed job's lock. Another operation is still refused while the owning job is active.
 
 ### Evaluation-gated weight edits
 

@@ -35,6 +35,14 @@ impl InvestigationGuard {
             "write" | "edit" | "ast_edit" => {
                 return None;
             }
+            // Reading an archived artifact:// recovers earlier output; it is not a new observation.
+            "read"
+                if call.arguments["path"]
+                    .as_str()
+                    .is_some_and(|path| path.starts_with("artifact://")) =>
+            {
+                return None;
+            }
             "read" | "grep" | "glob" | "find" | "ast_search" | "bash" => {}
             // Polls, artifact recovery and control calls are not duplicate observations.
             _ => return None,
@@ -175,11 +183,31 @@ pub(in crate::agent) struct ReturnedReads {
     seen: std::collections::HashMap<String, (u64, String)>,
     /// Line runs shown in full by earlier reads, per `path#TAG`, with the call that returned them.
     shown: std::collections::HashMap<String, Vec<(Run, String)>>,
+    native: ReadReuse,
 }
 
 impl ReturnedReads {
     const MAX_FILES: usize = 256;
     const MAX_RUNS_PER_FILE: usize = 64;
+
+    /// Freeze only coverage whose original complete result is still in this controller's context.
+    pub fn reusable(&self, still_full: impl Fn(&str) -> bool) -> ReadReuse {
+        ReadReuse {
+            files: self
+                .native
+                .files
+                .iter()
+                .filter_map(|(key, runs)| {
+                    let runs: Vec<_> = runs
+                        .iter()
+                        .filter(|(_, id)| still_full(id))
+                        .cloned()
+                        .collect();
+                    (!runs.is_empty()).then(|| (key.clone(), runs))
+                })
+                .collect(),
+        }
+    }
 
     /// Pointer text to send instead of `text`, or None when the full result must be sent (and is recorded).
     /// A read is also answered by a pointer when every line it shows lies inside lines an earlier
@@ -194,7 +222,14 @@ impl ReturnedReads {
         if is_error {
             return None;
         }
-        if matches!(call.name.as_str(), "edit" | "write" | "glob" | "find") {
+        if is_unchanged_read(text) {
+            return Some(text.to_owned());
+        }
+        if matches!(
+            call.name.as_str(),
+            "edit" | "write" | "glob" | "find" | "grep"
+        ) {
+            self.native.remember(call, text);
             self.remember(shown_runs(text), &call.id);
             return None;
         }
@@ -229,6 +264,7 @@ impl ReturnedReads {
         }
         self.seen.insert(target, (key, call.id.clone()));
         self.remember(sections, &call.id);
+        self.native.remember(call, text);
         None
     }
 
@@ -278,6 +314,208 @@ impl ReturnedReads {
         }
         Some(ids)
     }
+}
+
+/// Visible, complete source rows, indexed by canonical display path and full raw-file SHA-256.
+/// No shell results, short tags, missing rows or hidden/pruned results confer coverage.
+#[derive(Clone, Default)]
+pub(in crate::agent) struct ReadReuse {
+    files: std::collections::BTreeMap<(String, String), Vec<(Run, String)>>,
+}
+
+impl ReadReuse {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    fn remember(&mut self, call: &ToolCall, text: &str) {
+        for (header, runs) in shown_runs(text) {
+            let Some((path, _)) = header.rsplit_once('#') else {
+                continue;
+            };
+            let marker = format!("[{header}]\n[Source raw SHA256:");
+            let Some(revision) = text
+                .split_once(&marker)
+                .and_then(|(_, rest)| rest.split_once(']').map(|(digest, _)| digest))
+            else {
+                continue;
+            };
+            if revision.len() != 64 || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let path = if path.starts_with('"') {
+                let Ok(path) = serde_json::from_str::<String>(path) else {
+                    continue;
+                };
+                path
+            } else {
+                path.to_owned()
+            };
+            let key = (path, revision.to_owned());
+            if self.files.len() >= ReturnedReads::MAX_FILES && !self.files.contains_key(&key) {
+                self.files.clear();
+            }
+            let known = self.files.entry(key).or_default();
+            known.extend(runs.into_iter().map(|run| (run, call.id.clone())));
+            if known.len() > ReturnedReads::MAX_RUNS_PER_FILE {
+                known.drain(..known.len() - ReturnedReads::MAX_RUNS_PER_FILE);
+            }
+        }
+    }
+
+    /// Execute an already-admitted native read, replacing covered ranges with evidence links.
+    /// Source hashing is still performed; a reused receipt is not a new file observation/check.
+    pub fn execute(
+        &self,
+        workspace: &crate::tools::Workspace,
+        args: &serde_json::Value,
+        mut read: impl FnMut(&serde_json::Value) -> crate::runtime::tool_output::ToolOutput,
+    ) -> crate::runtime::tool_output::ToolOutput {
+        use crate::runtime::tool_output::ToolOutput;
+        use serde_json::json;
+        if self.is_empty() {
+            return read(args);
+        }
+        let Some(selection) = workspace.native_read_selection(args) else {
+            return read(args);
+        };
+        let Some(known) = self
+            .files
+            .get(&(selection.path.clone(), selection.revision.clone()))
+        else {
+            return read(args);
+        };
+        let mut missing = Vec::new();
+        let mut covered = Vec::new();
+        for &(first, last) in &selection.ranges {
+            let mut next = first;
+            while next <= last {
+                if let Some(((.., end), id)) = known
+                    .iter()
+                    .filter(|((start, end), _)| *start <= next && next <= *end)
+                    .max_by_key(|((_, end), _)| *end)
+                {
+                    let end = (*end).min(last);
+                    // A pointer must not trap edit recovery after its source witness was evicted.
+                    if !selection
+                        .witnessed_ranges
+                        .iter()
+                        .any(|&(from, to)| from <= next && end <= to)
+                    {
+                        return read(args);
+                    }
+                    covered.push(json!({"range":[next,end],"call_id":id}));
+                    next = end + 1;
+                } else {
+                    let end = known
+                        .iter()
+                        .filter(|((start, _), _)| *start > next)
+                        .map(|((start, _), _)| start - 1)
+                        .min()
+                        .unwrap_or(last)
+                        .min(last);
+                    missing.push((next, end));
+                    next = end + 1;
+                }
+            }
+        }
+        if covered.is_empty() {
+            return read(args);
+        }
+        let ids = covered
+            .iter()
+            .filter_map(|part| part["call_id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let fully_reused = missing.is_empty();
+        let pointer = format!(
+            "{UNCHANGED_READ} Source SHA-256 revalidated; requested rows are already in visible tool call(s) {ids}. No native read executed; reuse that evidence."
+        );
+        // Reusing tiny rows must not cost more than returning them. The native read always emits
+        // its revision header and the requested source rows, a lower bound on its rendered size.
+        let header = format!("[Source raw SHA256:{}]\n", selection.revision).len();
+        if fully_reused
+            && workspace
+                .resolve_read_target(&selection.path)
+                .ok()
+                .and_then(|path| std::fs::read(path).ok())
+                .is_none_or(|source| {
+                    pointer.len() >= header + requested_bytes(&source, &selection.ranges)
+                })
+        {
+            return read(args);
+        }
+        let mut output = if fully_reused {
+            ToolOutput::ok(pointer)
+        } else {
+            let ranges = missing
+                .iter()
+                .map(|(first, last)| format!("{first}-{last}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut narrowed = args.clone();
+            let object = narrowed.as_object_mut().expect("validated read arguments");
+            object.remove("offset");
+            object.remove("limit");
+            object.insert("path".into(), json!(format!("{}:{ranges}", selection.path)));
+            // Literal colon-containing filenames win over selectors in the native parser.
+            // Never let narrowing accidentally change the requested target.
+            if workspace
+                .resolve_read_target(narrowed["path"].as_str().expect("read path"))
+                .ok()
+                != workspace.resolve_read_target(&selection.path).ok()
+            {
+                return read(args);
+            }
+            let mut output = read(&narrowed);
+            let expected = format!("[Source raw SHA256:{}]", selection.revision);
+            if !output.is_error && output.text.lines().nth(1) != Some(expected.as_str()) {
+                // Only the native section header authenticates its revision, never source content.
+                // An external edit raced the narrowed read. Deliver the original selection of
+                // the new version rather than mixing old coverage with its missing rows.
+                return read(args);
+            }
+            if output.is_error {
+                return output;
+            }
+            let reused = covered
+                .iter()
+                .map(|part| {
+                    format!(
+                        "{}-{} (call {})",
+                        part["range"][0],
+                        part["range"][1],
+                        part["call_id"].as_str().expect("coverage call ID")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            output.text.push_str(&format!("\n[Read reuse] Requested ranges {reused} are already visible; only missing ranges {ranges} were sent to the native read renderer."));
+            output
+        };
+        output.data = Some(json!({"read_reuse":{
+            "path":selection.path,"source_sha256":selection.revision,
+            "covered":covered,"executed_ranges":missing,"fully_reused":fully_reused
+        }}));
+        output
+    }
+}
+
+/// Bytes of the requested 1-based inclusive line ranges in `source`.
+fn requested_bytes(source: &[u8], ranges: &[(u32, u32)]) -> usize {
+    source
+        .split_inclusive(|&byte| byte == b'\n')
+        .enumerate()
+        .filter(|(index, _)| {
+            let line = *index as u32 + 1;
+            ranges
+                .iter()
+                .any(|&(first, last)| first <= line && line <= last)
+        })
+        .map(|(_, line)| line.len())
+        .sum()
 }
 
 #[cfg(test)]

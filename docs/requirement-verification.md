@@ -126,9 +126,35 @@ sensitive_paths = ["src/auth", "crates/protocol"] # component prefixes, not glob
 max_rounds = 1 # repair opportunities, 1..3
 ```
 
-When `enabled` is unset, review runs only if a `coach` model role is assigned and its route passes the escalation privacy gate (a loopback endpoint, or `escalation.allow_remote = true` for a hosted one). Without a usable coach it stays off and emits no skipped-review notices. An explicit `enabled = false` always disables it, and `enabled = true` always requests it. Reuses the existing configured coach/advisor and escalation privacy/approval path, not another agent framework. Review is selected for the changed-file threshold, sensitive path prefixes, or uncheckpointed effects. It is disabled in hermetic and plan mode and cannot expand the launch tool allowlist. The repair/review allowance is persisted per external instruction so stop hooks cannot reset it. A new user instruction gets a fresh allowance. Refusals or malformed reviews are disclosed and do not retry automatically. `strict_requirements` stays off by default.
+When `enabled` is unset, configured coach review remains selective for changed-file thresholds,
+sensitive prefixes, uncheckpointed effects, or a changed artifact without current observed
+operator-declared requirement evidence. Its route must pass the escalation privacy gate
+(loopback, or `escalation.allow_remote = true` for hosted). Without a usable coach, one
+**in-context self-review** can accompany an already-needed request after the first produced
+artifact. It asks which concrete requirement remains unverified and reuses current evidence;
+it is skipped when declared coverage is current and no concrete gap is recorded. Artifact
+detection includes checkpointed edits and files modified this turn after opaque shell commands
+(bounded, ignore-aware modification-time scan). Up to three small produced files (4 KiB total)
+and bounded declared requirement statuses accompany the reminder to avoid ceremonial rereads.
+If no early reminder occurred, a completion-only self-review is requested only for a concrete
+controller-observed gap: uncovered declarations, open obligations, or failed/stale/unavailable
+check evidence. Missing English coverage alone is unassessed, not a reason for another model
+request or a claim of success. Input identities are refreshed through the existing check owner
+before deciding; no review creates or refreshes a passing check. Existing verification and
+obligation gates still apply. `enabled = false` disables automatic review; `enabled = true`
+explicitly requests independent coach review, retaining its prerequisites. Explicit launch
+advisor flags retain their existing opt-in behavior.
 
-The reviewer receives a bounded proposed reply, recent evidence, declared-check coverage and up to two **partial scoped checkpoint diffs**. It does not run tools or certify the full patch. Findings remain unverified suggestions; local executable checks are authoritative, and unresolved findings stay disclosed. This is selective independent judgment, not measured proof of better real-model outcomes.
+Review is disabled in hermetic and plan mode and cannot expand the launch tool allowlist. The instruction-scoped allowance survives stop-hook continuations; the self-review spends it once. A new user instruction gets a fresh allowance. Coach refusals or malformed reviews are disclosed without automatic retries. `strict_requirements` stays off by default.
+
+Independent review and the completion fallback receive a bounded proposed reply, recent evidence,
+declared-check coverage and up to two **partial scoped checkpoint diffs**. The earlier reminder
+reuses the conversation plus bounded current requirement evidence and produced artifact text.
+Review checks request/artifact consistency, including whether corrected derived values reached
+regenerated outputs, and asks for a brief final outcome/checks/gaps report. It does not run tools
+or certify the full patch. Findings remain unverified suggestions; local executable checks are
+authoritative, and unresolved findings stay disclosed. Self-review creates no passing evidence.
+This is bounded judgment, not measured proof of better real-model outcomes.
 
 ## Tool discovery
 

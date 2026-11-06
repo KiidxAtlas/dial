@@ -67,17 +67,74 @@ fn a_cargo_failure_buried_under_progress_gets_a_digest_of_its_first_errors() {
     text.push_str("warning: unused variable: `x`\n --> src/lib.rs:3:9\n");
     text.push_str("error[E0308]: mismatched types\n --> src/main.rs:7:5\n  |\n7 |     1u8\n");
     text.push_str("error: could not compile `app` (bin \"app\") due to 1 previous error\n");
-    let digest = failure_digest("cargo build", &text).expect("digest");
+    let digest = failure_digest("cargo build", &text, &text).expect("digest");
     assert_eq!(
         digest,
         "error[E0308]: mismatched types\n --> src/main.rs:7:5\nerror: could not compile `app` (bin \"app\") due to 1 previous error\n"
     );
     // Warnings' locations are not errors; unknown commands and visible errors get none.
     assert!(!digest.contains("src/lib.rs"));
-    assert!(failure_digest("./run.sh", &text).is_none());
-    let top = format!("error: bad flag\n{text}");
-    assert!(failure_digest("cargo build", &top).is_none());
-    assert!(failure_digest("cargo build", "error: short\n").is_none());
+    assert!(failure_digest("./run.sh", &text, &text).is_none());
+    let top = format!(
+        "error[E0308]: mismatched types\n --> src/main.rs:7:5\nerror: could not compile `app` (bin \"app\") due to 1 previous error\n{text}"
+    );
+    assert!(failure_digest("cargo build", &top, &top).is_none());
+    assert!(failure_digest("cargo build", "error: short\n", "error: short\n").is_none());
+}
+
+#[test]
+fn failing_tests_are_digested_with_their_panic_detail() {
+    let mut text = big((0..100).map(|i| format!("   Compiling crate{i} v0.{i}.0")));
+    text.push_str(&big(
+        (0..80).map(|i| format!("test module::case_{i} ... ok"))
+    ));
+    text.push_str(concat!(
+        "test module::broken ... FAILED\n\nfailures:\n\n",
+        "---- module::broken stdout ----\n",
+        "thread 'module::broken' panicked at src/lib.rs:42:9:\n",
+        "assertion `left == right` failed\n  left: 1\n right: 2\n",
+        "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\n",
+        "failures:\n    module::broken\n\n",
+        "test result: FAILED. 80 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n",
+    ));
+    // The shown text is a filtered view that lost nothing, but the failure sits far down.
+    let digest = failure_digest("cargo test", &text, &text).expect("digest");
+    assert_eq!(
+        digest,
+        "---- module::broken stdout ----\nthread 'module::broken' panicked at src/lib.rs:42:9:\nassertion `left == right` failed\n  left: 1\n right: 2\ntest result: FAILED. 80 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
+    );
+    // A head-and-tail view that cut the panic out still gets it from the complete output.
+    let shown = "running 81 tests\n[40000 bytes of output omitted]\ntest result: FAILED. 80 passed; 1 failed\n";
+    let digest = failure_digest("cargo test", &text, shown).expect("digest");
+    assert!(digest.contains("panicked at src/lib.rs:42:9"), "{digest}");
+
+    let mut pytest = big((0..200).map(|i| format!("tests/test_{i}.py ....  [{i:>3}%]")));
+    pytest.push_str(concat!(
+        "=================================== FAILURES ===================================\n",
+        "_________________________________ test_parse _________________________________\n\n",
+        "    def test_parse():\n>       assert parse('x') == 2\nE       AssertionError: assert 1 == 2\n\n",
+        "tests/test_parse.py:7: AssertionError\n",
+        "=========================== short test summary info ============================\n",
+        "FAILED tests/test_parse.py::test_parse - AssertionError: assert 1 == 2\n",
+        "========================= 1 failed, 319 passed in 2.10s =========================\n",
+    ));
+    let digest = failure_digest("pytest", &pytest, &pytest).expect("digest");
+    assert!(
+        digest.starts_with("_________________________________ test_parse"),
+        "{digest}"
+    );
+    assert!(
+        digest.contains("E       AssertionError: assert 1 == 2"),
+        "{digest}"
+    );
+    assert!(
+        digest.contains("tests/test_parse.py:7: AssertionError"),
+        "{digest}"
+    );
+    assert!(
+        digest.ends_with("1 failed, 319 passed in 2.10s =========================\n"),
+        "{digest}"
+    );
 }
 
 #[test]
@@ -203,6 +260,31 @@ fn package_install_noise_is_dropped() {
     }
     assert!(minimize("npm run build", &text).is_none());
     assert!(minimize("yarn test", &text).is_none());
+}
+
+#[test]
+fn apt_progress_is_dropped_but_summary_and_errors_stay() {
+    let mut text = String::from(
+        "Reading package lists...\nBuilding dependency tree...\nThe following NEW packages will be installed:\n  binutils gcc gcc-13 make\n0 upgraded, 4 newly installed, 0 to remove and 0 not upgraded.\nNeed to get 30.1 MB of archives.\n",
+    );
+    for i in 0..40 {
+        text.push_str(&format!(
+            "Get:{i} http://archive.ubuntu.com/ubuntu noble/main amd64 pkg{i} 1.0 [100 kB]\nSelecting previously unselected package pkg{i}.\nPreparing to unpack .../pkg{i}_1.0_amd64.deb ...\nUnpacking pkg{i} (1.0) ...\nSetting up pkg{i} (1.0) ...\n"
+        ));
+    }
+    text.push_str("E: Unable to locate package nosuch\n");
+    for command in [
+        "apt-get install -y gcc make",
+        "apt-get update -qq && apt-get install -y gcc make 2>&1",
+        "DEBIAN_FRONTEND=noninteractive apt install -y gcc",
+    ] {
+        let out = minimize(command, &text).unwrap_or_else(|| panic!("{command}"));
+        assert_eq!(out.filter, "apt", "{command}");
+        assert!(out.text.contains("4 newly installed") && out.text.contains("E: Unable to locate"));
+        assert!(!out.text.contains("Unpacking") && !out.text.contains("  binutils"));
+    }
+    assert!(minimize("apt-cache show gcc", &text).is_none());
+    assert!(minimize("apt list --installed", &text).is_none());
 }
 
 #[test]
@@ -337,4 +419,63 @@ fn pip_install_and_js_test_noise_is_filtered_behind_a_cd() {
     }
     // Different recognized tools in one compound command keep their raw output.
     assert!(minimize("pip install x && npx jest", &jest).is_none());
+}
+
+#[test]
+fn a_fully_passing_test_run_becomes_one_summary_line() {
+    let mut text = big((0..30).map(|i| format!("   Compiling crate{i} v0.{i}.0")));
+    text.push_str("    Finished `test` profile [unoptimized] target(s) in 9.1s\n     Running unittests src/lib.rs (target/debug/deps/a-1)\n\nrunning 40 tests\n");
+    text.push_str(&big(
+        (0..40).map(|i| format!("test module::case_{i} ... ok"))
+    ));
+    text.push_str("\ntest result: ok. 40 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n   Doc-tests a\n\nrunning 1 test\ntest src/lib.rs - f (line 3) ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s\n");
+    let out = minimize("cargo test -p a", &text).expect("summarized");
+    assert_eq!(out.filter, "cargo");
+    assert_eq!(
+        out.text,
+        "test result: ok. 41 passed; 0 failed; 2 ignored (2 suites; passing run summarized by the output filter)\n"
+    );
+
+    let mut pytest = big((0..40).map(|i| format!("tests/test_{i}.py ....  [{i:>3}%]")));
+    pytest.push_str("============ 160 passed, 3 skipped in 4.21s ============\n");
+    let out = minimize("python -m pytest", &pytest).expect("summarized");
+    assert!(
+        out.text
+            .starts_with("test result: ok. 160 passed; 0 failed; 3 ignored (1 suite;"),
+        "{}",
+        out.text
+    );
+
+    let mut jest = big((0..60).map(|i| format!("PASS src/module{i}.test.ts")));
+    jest.push_str("Tests:       2 skipped, 118 passed, 120 total\n");
+    let out = minimize("npx jest", &jest).expect("summarized");
+    assert!(
+        out.text
+            .starts_with("test result: ok. 118 passed; 0 failed; 2 ignored"),
+        "{}",
+        out.text
+    );
+}
+
+#[test]
+fn runs_with_any_other_diagnostic_keep_the_line_filter() {
+    let passing = big((0..40).map(|i| format!("test module::case_{i} ... ok")));
+    let summary = "test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured\n";
+    for extra in [
+        "warning: unused variable: `x`\n --> src/lib.rs:3:9\n",
+        "test module::broken ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n",
+        "test module::handles_failure ... ok\n",
+    ] {
+        let text = format!("{passing}{extra}{summary}");
+        let out = minimize("cargo test", &text).expect("still filtered");
+        assert!(
+            !out.text.contains("summarized by the output filter"),
+            "{extra}"
+        );
+        assert!(out.text.contains(extra.lines().next().unwrap()), "{extra}");
+    }
+    // No runner summary at all (a build) is never summarized as a test pass.
+    let build = big((0..60).map(|i| format!("   Compiling crate{i} v1.0.{i}")));
+    let out = minimize("cargo build", &build).unwrap();
+    assert!(!out.text.contains("test result"), "{}", out.text);
 }

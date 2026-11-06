@@ -270,7 +270,6 @@ pub(in crate::agent) fn compact(
         "check",
         "tool_search",
         "tool_load",
-        "artifact_read",
         "working_state",
         "codebase_memory",
         "task",

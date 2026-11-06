@@ -437,6 +437,7 @@ fn image_capable_session_provider_supplies_endpoint_model_and_key() {
     let body = request_body(
         &target,
         &Request {
+            animation: None,
             prompt: "a fox",
             size: "1536x1024",
             output: "fox.png",
@@ -686,6 +687,7 @@ fn responses_body_selects_the_user_model_and_forces_image_generation() {
     let body = request_body(
         &target,
         &Request {
+            animation: None,
             prompt: "dog",
             size: "1024x1536",
             output: "dog.png",
@@ -714,6 +716,7 @@ fn hosted_image_format_matches_destination_before_spending_quota() {
         let body = request_body(
             &target,
             &Request {
+                animation: None,
                 prompt: "dog",
                 output,
                 size: "auto",
@@ -1303,6 +1306,7 @@ fn settings_for_other_models_are_ignored_and_responses_tool_gets_quality() {
         .models
         .insert("other".into(), image_settings("another-model"));
     let request = Request {
+        animation: None,
         prompt: "dog",
         size: "auto",
         output: "dog.png",
@@ -1419,6 +1423,7 @@ fn responses_edit_attaches_the_source_as_an_input_image() {
     let body = request_body(
         &resolve(&config).unwrap(),
         &Request {
+            animation: None,
             prompt: "add a hat",
             size: "auto",
             output: "hat.png",
@@ -1653,4 +1658,146 @@ fn interrupted_generation_never_submits_or_publishes() {
         out.text
     );
     assert_eq!(std::fs::read_dir(ws.root()).unwrap().count(), 0);
+}
+
+fn animated_gif(frames: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+        for index in 0..frames {
+            let shade = u8::try_from(index * 40).unwrap();
+            let buffer = image::RgbaImage::from_pixel(2, 2, image::Rgba([shade, 0, 0, 255]));
+            encoder.encode_frame(image::Frame::new(buffer)).unwrap();
+        }
+    }
+    bytes
+}
+
+#[test]
+fn gif_output_requests_an_animation_and_writes_it_unconverted() {
+    let (_dir, ws) = testkit::workspace();
+    let gif = animated_gif(3);
+    let (base, server) = serve_once(200, ok_body(&gif));
+    let user_dir = user_dir_with_key(&base);
+    let mut config = config_for(&base, user_dir.path());
+    config.image.model = "gpt-image-2.6-sunburst".into();
+
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt": "a waving cat", "output": "cat.gif", "frame_count": 3, "frame_duration_ms": 120}),
+    );
+
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("GIF animation, 3 frames"), "{}", out.text);
+    assert_eq!(std::fs::read(ws.root().join("cat.gif")).unwrap(), gif);
+    let request = server.join().unwrap();
+    let (_, payload) = request.split_once("\r\n\r\n").expect("request body");
+    let body: Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(body["model"], "gpt-image-2.6-sunburst", "{request}");
+    assert_eq!(body["output_format"], "gif", "{request}");
+    assert_eq!(body["frame_count"], 3, "{request}");
+    assert_eq!(body["frame_duration_ms"], 120, "{request}");
+    // Frames default to `auto` so the animation fits the provider's pixel budget.
+    assert_eq!(body["size"], "auto", "{request}");
+}
+
+#[test]
+fn gif_output_refuses_still_images_and_non_gif_models_before_or_after_the_request() {
+    let (_dir, ws) = testkit::workspace();
+    // A chosen non-GIF model is refused without a request (no server is listening).
+    let user_dir = user_dir_with_key("http://127.0.0.1:9/v1");
+    let config = config_for("http://127.0.0.1:9/v1", user_dir.path());
+    let out = run(&ws, &config, json!({"prompt": "cat", "output": "cat.gif"}));
+    assert!(
+        out.is_error && out.text.contains("cannot produce animated GIFs"),
+        "{}",
+        out.text
+    );
+    // Frame controls belong to GIF output only.
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt": "cat", "output": "cat.png", "frame_count": 4}),
+    );
+    assert!(
+        out.is_error && out.text.contains("applies only to .gif"),
+        "{}",
+        out.text
+    );
+    let out = run(
+        &ws,
+        &config,
+        json!({"prompt": "cat", "output": "cat.gif", "frame_count": 40}),
+    );
+    assert!(
+        out.is_error && out.text.contains("from 2 to 16"),
+        "{}",
+        out.text
+    );
+    // A still image is never passed off as an animation.
+    let (base, server) = serve_once(200, ok_body(&image_bytes(image::ImageFormat::Png)));
+    let user_dir = user_dir_with_key(&base);
+    let mut config = config_for(&base, user_dir.path());
+    config.image.model = "gpt-image-2.6-flare".into();
+    let out = run(&ws, &config, json!({"prompt": "cat", "output": "cat.gif"}));
+    server.join().unwrap();
+    assert!(
+        out.is_error && out.text.contains("returned PNG data for a GIF request"),
+        "{}",
+        out.text
+    );
+    assert!(!ws.root().join("cat.gif").exists());
+}
+
+#[test]
+fn gif_replaces_only_the_built_in_default_image_model() {
+    let config = Config::default();
+    let mut target = super::Target {
+        base_url: "https://api.openai.com/v1".into(),
+        model: crate::config::image::ImageConfig::default().model,
+        wire: Wire::OpenAi,
+        key: String::new(),
+        account_id: None,
+        headers: Vec::new(),
+        settings: Default::default(),
+    };
+    super::prepare_gif(&config, &mut target).unwrap();
+    assert_eq!(target.model, super::GIF_MODEL);
+    target.wire = Wire::Xai;
+    let error = super::prepare_gif(&config, &mut target).unwrap_err();
+    assert!(error.to_string().contains("cannot produce one"), "{error}");
+}
+
+#[test]
+fn responses_gif_names_a_gif_capable_image_model_in_the_hosted_tool() {
+    use crate::llm::profiles::ImageGenerationApi;
+    let user = user_dir_with_key(XAI_BASE);
+    let config = selected_config(XAI_BASE, user.path(), ImageGenerationApi::Responses);
+    let target = resolve(&config).unwrap();
+    let body = request_body(
+        &target,
+        &Request {
+            animation: Some(super::Animation {
+                frame_count: Some(6),
+                frame_duration_ms: None,
+            }),
+            prompt: "dog",
+            size: "auto",
+            output: "dog.gif",
+            source: None,
+        },
+    );
+    let tool = &body["tools"][0];
+    assert_eq!(body["model"], "selected-image-model");
+    assert_eq!(tool["model"], super::GIF_MODEL);
+    assert_eq!(tool["output_format"], "gif");
+    assert_eq!(tool["frame_count"], 6);
+    assert!(tool.get("frame_duration_ms").is_none());
+    assert!(
+        body["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("animated GIF")
+    );
 }

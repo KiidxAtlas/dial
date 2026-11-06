@@ -17,7 +17,7 @@ const MIN_STEPS: u32 = 8;
 const MAX_STEPS: u32 = 64;
 const TEMPERATURES: [f64; 3] = [0.0, 0.2, 0.5];
 /// Tools whose removal can help a small model that misuses or over-calls them.
-const ABLATABLE: [&str; 5] = ["task", "todo", "skill_manage", "session_search", "recall"];
+const ABLATABLE: [&str; 5] = ["task", "todo", "skill_manage", "session_search", "memory"];
 
 pub struct Mutation {
     pub name: &'static str,

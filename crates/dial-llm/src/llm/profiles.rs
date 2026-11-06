@@ -288,6 +288,26 @@ fn valid_keep_alive(value: &str) -> bool {
     true
 }
 
+/// Opt-in Gemini explicit caching. Cached storage is billed until the bounded TTL expires.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GeminiCache {
+    pub ttl_secs: u64,
+    pub min_tokens: u32,
+    pub max_entries: usize,
+    pub max_prefix_bytes: usize,
+}
+impl Default for GeminiCache {
+    fn default() -> Self {
+        Self {
+            ttl_secs: 300,
+            min_tokens: 4096,
+            max_entries: 4,
+            max_prefix_bytes: 1_048_576,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelProfile {
@@ -308,10 +328,16 @@ pub struct ModelProfile {
     /// Declared native caching: Anthropic cache anchors or Responses session routing key.
     pub prompt_cache: Option<bool>,
     pub cache_retention: CacheRetention,
+    /// Explicit billed Gemini cache lifecycle; absent means off (implicit caching is unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_cache: Option<GeminiCache>,
     /// Local request controls. Never forwarded to cloud providers.
     pub local_sampling: Option<super::local_sampling::LocalSampling>,
     /// Speculative-decoding and KV-cache overrides for this MLX model; replaces the global `local_runtime` when set.
     pub local_runtime: Option<super::local_runtime::LocalRuntime>,
+    /// OpenRouter only: explicit upstream routing, privacy and price preferences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openrouter_routing: Option<super::openrouter::Routing>,
     /// Ollama only: how long the server keeps the model loaded after a request (`"30m"`, `"-1"` for
     /// always). Unset leaves Ollama's own default, which unloads idle models after a few minutes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,6 +385,31 @@ impl ModelProfile {
             !self.provider.trim().is_empty() && !self.model.trim().is_empty(),
             "model profile requires exact provider and model identifiers"
         );
+        if let Some(cache) = &self.gemini_cache {
+            ensure!(
+                self.provider == "gemini",
+                "gemini_cache requires the gemini provider"
+            );
+            ensure!(
+                (30..=3600).contains(&cache.ttl_secs),
+                "Gemini cache ttl_secs must be 30..3600"
+            );
+            ensure!(
+                (2048..=1_048_576).contains(&cache.min_tokens),
+                "Gemini cache min_tokens must be 2048..1048576"
+            );
+            ensure!(
+                (1..=32).contains(&cache.max_entries),
+                "Gemini cache max_entries must be 1..32"
+            );
+            ensure!(
+                (1024..=4_194_304).contains(&cache.max_prefix_bytes),
+                "Gemini cache max_prefix_bytes must be 1024..4194304"
+            );
+        }
+        if let Some(routing) = &self.openrouter_routing {
+            routing.validate(&self.provider)?;
+        }
         if let Some(local) = &self.local_sampling {
             ensure!(
                 matches!(self.provider.as_str(), "mlx" | "lm-studio" | "ollama"),

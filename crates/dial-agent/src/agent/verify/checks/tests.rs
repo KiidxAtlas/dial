@@ -674,6 +674,17 @@ fn failed_contract_capture_is_unverified_in_gate_and_check_tool() {
         assert_eq!(run.failures.len(), 1);
         assert!(run.actionable.is_empty());
         assert!(run.failures[0].contains("Verification unverified"));
+        assert!(
+            run.failures[0].contains("contract unverified:"),
+            "{}",
+            run.failures[0]
+        );
+        assert!(
+            run.failures[0]
+                .contains("declared input contract could not be captured before execution"),
+            "{}",
+            run.failures[0]
+        );
         let output = agent.check_tool(&json!({"names":["contract"]}), &mut NullUi);
         assert!(output.is_error);
         assert!(
@@ -767,28 +778,52 @@ fn subset_checks_preserve_unrelated_obligations_across_pass_reuse_and_cancellati
 }
 
 #[test]
-fn real_shell_empty_suite_hidden_in_clipped_output_is_unverified() {
+fn real_shell_incomplete_check_hidden_in_clipped_output_is_unverified() {
+    for diagnostic in [
+        "Ran 0 tests",
+        "<stdin>:3: RuntimeWarning: coroutine 'check' was never awaited",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let artifact_root = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let mut agent = hermetic_agent(&config, root.path());
+        agent.workspace = agent.workspace.clone().with_artifacts(
+            crate::storage::artifact::ArtifactStore::new(artifact_root.path()).unwrap(),
+        );
+        let padding = "padding diagnostic\n".repeat(10000);
+        std::fs::write(
+            root.path().join("output"),
+            format!("{padding}{diagnostic}\n{padding}"),
+        )
+        .unwrap();
+        let check = verify::verification::FocusedCheck {
+            name: "incomplete check".into(),
+            command: "cat output".into(),
+            timeout_secs: 5,
+        };
+        let output = agent.run_focused_check(&check, &mut NullUi);
+        assert_eq!(output.process_outcome().unwrap().exit_code, Some(0));
+        assert!(!output.text.contains(diagnostic));
+        assert_eq!(
+            agent.step_checks.evidence.latest_status(&check.command),
+            Some(verify::verification::CheckStatus::Unverified)
+        );
+    }
+}
+
+#[test]
+fn a_python_check_that_never_awaits_its_coroutine_is_unverified() {
     let root = tempfile::tempdir().unwrap();
-    let artifact_root = tempfile::tempdir().unwrap();
     let config = Config::default();
     let mut agent = hermetic_agent(&config, root.path());
-    agent.workspace = agent.workspace.clone().with_artifacts(
-        crate::storage::artifact::ArtifactStore::new(artifact_root.path()).unwrap(),
-    );
-    let padding = "padding diagnostic\n".repeat(10000);
-    std::fs::write(
-        root.path().join("output"),
-        format!("{padding}Ran 0 tests\n{padding}"),
-    )
-    .unwrap();
     let check = verify::verification::FocusedCheck {
-        name: "empty suite".into(),
-        command: "cat output".into(),
+        name: "async behavior".into(),
+        command: "python3 - <<'PY'\nasync def regression():\n    raise AssertionError('must execute')\nregression()\nPY".into(),
         timeout_secs: 5,
     };
     let output = agent.run_focused_check(&check, &mut NullUi);
     assert_eq!(output.process_outcome().unwrap().exit_code, Some(0));
-    assert!(!output.text.contains("Ran 0 tests"));
+    assert!(output.text.contains("was never awaited"), "{}", output.text);
     assert_eq!(
         agent.step_checks.evidence.latest_status(&check.command),
         Some(verify::verification::CheckStatus::Unverified)

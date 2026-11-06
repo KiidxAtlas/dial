@@ -71,7 +71,7 @@ pub(in crate::tools) fn try_read(
     limit: usize,
     budget: usize,
 ) -> Option<String> {
-    let abs = ws.resolve(path_text).ok()?;
+    let abs = ws.resolve_read(path_text).ok()?;
     let meta = std::fs::metadata(&abs).ok()?;
     let lang = SupportLang::from_path(&abs)?;
     if !meta.is_file() || meta.len() > hashline::MAX_FILE {

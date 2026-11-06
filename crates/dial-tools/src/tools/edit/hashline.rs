@@ -1937,14 +1937,27 @@ const DROPPED_LINE_CAP: usize = 160;
 /// Tell the model which existing lines its replacements deleted. `PUT N.=M` replaces N through M
 /// inclusive, and an off-by-one silently destroys a neighbouring line; seeing the loss in the very
 /// result of the edit lets the model repair it in one step instead of discovering it at the next build.
-/// Lines whose text survives in the replacement (moved or re-indented) are not reported.
+/// Lines whose text survives in the replacement (moved or re-indented) are not reported. A rewrite
+/// of three or more lines that keeps none of them is deliberate, so it is not reported either: the
+/// report is for short ranges (an insert written as a replace) and partial overlaps (an edge line
+/// lost while its neighbours were kept).
 fn dropped_report(cur: &[String], edits: &[Edit]) -> String {
     let mut rows: Vec<String> = Vec::new();
     let mut total = 0;
     for edit in edits.iter().filter(|e| !e.insert) {
-        for n in edit.lo..=edit.hi.min(cur.len()) {
+        let hi = edit.hi.min(cur.len());
+        let range = edit.lo..=hi;
+        let survives = |old: &String| {
+            old.trim().is_empty() || edit.lines.iter().any(|new| new.trim() == old.trim())
+        };
+        let kept = range.clone().filter(|&n| survives(&cur[n - 1])).count();
+        let short = (hi + 1).saturating_sub(edit.lo) <= 2;
+        if kept == 0 && !short {
+            continue;
+        }
+        for n in range {
             let old = &cur[n - 1];
-            if old.trim().is_empty() || edit.lines.iter().any(|new| new.trim() == old.trim()) {
+            if survives(old) {
                 continue;
             }
             total += 1;
@@ -1958,7 +1971,7 @@ fn dropped_report(cur: &[String], edits: &[Edit]) -> String {
         return String::new();
     }
     let mut out = String::from(
-        "removed lines not present in your new text (old numbering; `PUT N.=M` replaces N through M inclusive - if you only meant to add lines, use `PUT >N:`/`PUT <N:`):\n",
+        "removed lines not in your new text (old numbering; `PUT N.=M` is inclusive, use `PUT >N:` to only add):\n",
     );
     rows.iter().for_each(|row| out.push_str(row));
     if total > rows.len() {
@@ -2765,9 +2778,12 @@ fn describe(p: &Prepared, include_diff: bool) -> String {
     }
     out.push_str(&p.dropped);
     out.push_str(&p.preview);
+    // The model sees the numbered preview (fresh anchors) and the removed-lines report; the diff
+    // repeats the same change, so it is kept for the UI unless it carries something the preview
+    // cannot show: no preview at all, a line cut short, or a final-newline change. A preview cut
+    // after its row limit names the omitted count, and the region can be read.
     if include_diff
         || p.preview.is_empty()
-        || p.preview.contains("[preview truncated;")
         || p.preview.contains("[line truncated]")
         || p.diff.contains("[final newline ")
     {
@@ -2811,6 +2827,9 @@ pub(crate) fn read_navigation(
     )
 }
 
+/// Smallest clipped first row worth showing when one line alone exceeds the read budget.
+const MIN_CLIPPED_ROW: usize = 80;
+
 fn read_impl(
     ws: &Workspace,
     path_text: &str,
@@ -2820,7 +2839,7 @@ fn read_impl(
     budget: usize,
     screen: bool,
 ) -> Result<String, String> {
-    let abs = ws.resolve(path_text)?;
+    let abs = ws.resolve_read(path_text)?;
     let meta = fs::metadata(&abs).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => format!("reading {path_text:?}: no such file or directory"),
         std::io::ErrorKind::PermissionDenied => format!("reading {path_text:?}: permission denied"),
@@ -2867,19 +2886,38 @@ fn read_impl(
     let mut shown: Vec<(usize, usize)> = Vec::new();
     let mut witnessed = Vec::new();
     let mut stopped_at = None;
-    for span in &spans {
+    let mut clipped = false;
+    'spans: for span in &spans {
         let mut last = None;
         for n in span.start..=span.end {
             let (text, cut) = truncate_chars(lines[n - 1], MAX_READ_LINE);
             let suffix = if cut { " …[line truncated]" } else { "" };
-            let row = if sel.raw {
-                format!("{text}{suffix}\n")
+            let prefix = if sel.raw {
+                String::new()
             } else {
-                format!("{n}:{text}{suffix}\n")
+                format!("{n}:")
             };
+            let row = format!("{prefix}{text}{suffix}\n");
             if out.len() + row.len() > row_limit {
-                stopped_at = Some(n);
-                break;
+                // A first row that alone exceeds the budget is clipped rather than dropped, so
+                // the read never claims the range is empty. A clipped row is not an edit witness.
+                const MARKER: &str = " …[line truncated]\n";
+                let room = row_limit.saturating_sub(prefix.len() + MARKER.len());
+                if out.is_empty() && room >= MIN_CLIPPED_ROW {
+                    let end = text
+                        .char_indices()
+                        .map(|(index, c)| index + c.len_utf8())
+                        .take_while(|end| *end <= room)
+                        .last()
+                        .unwrap_or(0);
+                    out.push_str(&format!("{prefix}{}{MARKER}", &text[..end]));
+                    shown.push((n, n));
+                    clipped = true;
+                    stopped_at = (n < len).then_some(n + 1);
+                } else {
+                    stopped_at = Some(n);
+                }
+                break 'spans;
             }
             if last.is_none() && !shown.is_empty() && !sel.raw {
                 out.push_str("…\n");
@@ -2893,10 +2931,8 @@ fn read_impl(
         if let Some(end) = last {
             shown.push((span.start, end));
         }
-        if stopped_at.is_some() {
-            break;
-        }
     }
+    let capped = stopped_at.is_some() || clipped;
 
     let next = stopped_at.or_else(|| {
         spans
@@ -2904,10 +2940,17 @@ fn read_impl(
             .filter(|s| s.bounded && s.end < len)
             .map(|s| s.end + 1)
     });
-    let footer = select::footer(&rel, sel, &shown, len, next, stopped_at.is_some());
+    let footer = select::footer(&rel, sel, &shown, len, next, capped);
+    // Nothing fit at all: say why instead of claiming the range holds no lines.
+    let empty = match stopped_at {
+        Some(n) if shown.is_empty() => format!(
+            "(line {n} does not fit the remaining output budget; read `{rel}:{n}` directly)"
+        ),
+        _ => empty_read(len),
+    };
     if sel.raw {
         return Ok(if shown.is_empty() {
-            empty_read(len)
+            empty
         } else {
             out + &footer
         });
@@ -2929,7 +2972,7 @@ fn read_impl(
         }
     );
     if shown.is_empty() {
-        text.push_str(&empty_read(len));
+        text.push_str(&empty);
         text.push('\n');
     }
     text.push_str(&out);
@@ -2994,6 +3037,7 @@ pub fn rehydrate<'a>(
             }
             "find" => crate::tools::code::navigation::source_targets(ws, args, text),
             "glob" => crate::tools::fs::search::glob_source_targets(ws, args, text),
+            "grep" => crate::tools::fs::search::grep_source_targets(ws, args, text),
             "write" => {
                 let Some(path) = args["path"].as_str() else {
                     continue;
@@ -3018,8 +3062,8 @@ pub fn rehydrate<'a>(
         requested.sort();
         requested.dedup();
         let mut current = None;
-        let multiple =
-            matches!(tool, "find" | "glob") || (tool == "read" && args["paths"].is_array());
+        let multiple = matches!(tool, "find" | "glob" | "grep")
+            || (tool == "read" && args["paths"].is_array());
         if tool == "read"
             && !multiple
             && !text

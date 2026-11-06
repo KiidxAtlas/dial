@@ -7,14 +7,15 @@ const vm = require('node:vm');
 const source = fs.readFileSync(require('node:path').join(__dirname,'driver.cjs'),'utf8');
 function harness({realTimers = false} = {}) {
   const timers = new Set(), frames = [];
+  let onLine;
   const stdout = { writableNeedDrain:false,writableLength:0,write(line,callback) { frames.push(JSON.parse(line));callback();return true; } };
   const context = vm.createContext({ Buffer, setTimeout: realTimers ? setTimeout : (fn) => {timers.add(fn);return fn;},clearTimeout: realTimers ? clearTimeout : (fn) => {timers.delete(fn);},
-    require(name) { return name === 'node:readline' ? {createInterface(){return {on(){}};}} : {chromium:{}}; },
+    require(name) { return name === 'node:readline' ? {createInterface(){return {on(event,callback){if(event === 'line') onLine=callback;}};}} : {chromium:{}}; },
     process:{env:{DIAL_PLAYWRIGHT:'external-operator-module'},stdout,stderr:{write(){}},on(){},stdin:{on(){}},exit(){}},
   });
   vm.runInContext(source,context);
   context.fakeRequest = {postDataBuffer(){return null;},url(){return 'https://example.com/flood';},method(){return 'GET';},headers(){return {};} };
-  return {run(code){return vm.runInContext(code,context);},timers,frames,stdout};
+  return {run(code){return vm.runInContext(code,context);},dispatch(request){onLine(JSON.stringify(request));return vm.runInContext('queue',context);},timers,frames,stdout};
 }
 test('post-action settlement is bounded even with unlimited action time', async () => {
   const h = harness({realTimers:true});
@@ -296,4 +297,83 @@ test('clipboard cancellation closes the isolated grant without changing user per
   assert(h.closed.length >= 1);
   assert(h.revoked.length >= 1);
   assert.deepEqual(h.grants.map(grant=>grant.permissions), [['clipboard-read']]);
+});
+
+test('observations preserve one successful action despite partial capture failure', async () => {
+  const h = harness({realTimers:true});
+  h.run(`
+    let actionCount=0, shotCount=0;
+    tabs.set(1,{seq:0,console:[],network:[],dialogs:[],downloads:[],navigation:[],page:{url:()=> 'http://localhost:3000/'}});
+    run=async request=>{
+      actionCount++;
+      const tab=tabs.get(1);
+      record(tab,'console',{type:'log',text:'ignored'});
+      record(tab,'console',{type:'error',text:'new failure'});
+      record(tab,'network',{kind:'response',status:503});
+      return {tab:1,completed:true,action:request.action};
+    };
+    scopeFor=()=>({});
+    snapshot=async()=>{throw new Error('detached frame');};
+    captureModule={run:async()=>{shotCount++;return {url:'http://localhost:3000/after',artifact:{encoding:'base64',media_type:'image/png',data:'cGl4ZWxz'}};}};
+    record(tabs.get(1),'console',{type:'error',text:'old error'});
+  `);
+  await h.dispatch({id:1,action:'click',tab:1,observe:{snapshot:true,screenshot:true,events:true}});
+  const result=h.frames.at(-1).result;
+  assert.equal(h.run('actionCount'),1);
+  assert.equal(h.run('shotCount'),1);
+  assert.equal(result.completed,true);
+  assert.equal(result.action,'click');
+  assert.equal(result.browser_error,undefined);
+  assert.equal(result.observations.snapshot.error,'detached frame');
+  assert.equal(result.observations.screenshot.image,'native attachment');
+  assert.equal(result.observations.screenshot.artifact,undefined);
+  assert.equal(result.artifact.data,'cGl4ZWxz');
+  assert.deepEqual(result.observations.events.events.map(event=>event.text || event.status),['new failure',503]);
+});
+
+test('invalid observation options prevent the action and absent options preserve receipts', async () => {
+  const h=harness({realTimers:true});
+  h.run('let actionCount=0; run=async()=>{actionCount++;return {completed:true};};');
+  for (const observe of [null,[],{screenshot:'yes'},{max_nodes:1001},{unknown:true}]) {
+    await h.dispatch({id:1,action:'click',observe});
+    assert.match(h.frames.at(-1).result.browser_error,/observe/);
+  }
+  assert.equal(h.run('actionCount'),0);
+  await h.dispatch({id:2,action:'click'});
+  assert.equal(h.run('actionCount'),1);
+  assert.deepEqual(h.frames.at(-1).result,{completed:true});
+});
+
+test('failed or expired screenshots do not replay or relabel completed actions', async () => {
+  for (const failure of ['throw', 'expired']) {
+    const h=harness({realTimers:true});
+    h.run(`
+      let actionCount=0, shotCount=0;
+      tabs.set(1,{seq:0,console:[],network:[],dialogs:[],downloads:[],navigation:[],page:{url:()=> 'http://localhost/'}});
+      run=async()=>{actionCount++;return {tab:1,completed:true};};
+      captureModule={run:async()=>{shotCount++;throw new Error('screenshot unavailable');}};
+      if (${JSON.stringify(failure)} === 'expired') settleRequests=async()=>{operationDeadline=Date.now()-1;return {settled:true};};
+    `);
+    await h.dispatch({id:1,action:'click',tab:1,observe:{screenshot:true}});
+    const result=h.frames.at(-1).result;
+    assert.equal(h.run('actionCount'),1);
+    assert.equal(h.run('shotCount'),failure === 'throw' ? 1 : 0);
+    assert.equal(result.completed,true);
+    assert.equal(result.browser_error,undefined);
+    assert.equal(result.artifact,undefined);
+    assert.match(result.observations.screenshot.error,/screenshot unavailable|observation budget exhausted/);
+  }
+});
+
+test('implicit sole-tab observations exclude old failures even without a tab in the receipt', async () => {
+  const h=harness({realTimers:true});
+  h.run(`
+    tabs.set(7,{seq:0,console:[],network:[],dialogs:[],downloads:[],navigation:[],page:{url:()=> 'http://localhost/'}});
+    record(tabs.get(7),'console',{type:'error',text:'old'});
+    run=async()=>{record(tabs.get(7),'console',{type:'error',text:'new'});return {completed:true};};
+  `);
+  await h.dispatch({id:1,action:'click',observe:{events:true}});
+  const result=h.frames.at(-1).result;
+  assert.equal(result.completed,true);
+  assert.deepEqual(result.observations.events.events.map(event=>event.text),['new']);
 });

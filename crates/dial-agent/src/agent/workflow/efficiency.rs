@@ -360,7 +360,6 @@ pub(in crate::agent) fn preview_limit(
             "read"
                 | "edit"
                 | "write"
-                | "artifact_read"
                 | "edit_preview"
                 | "tool_load"
                 | "tool_search"
@@ -399,7 +398,7 @@ pub(in crate::agent) fn visible_result(
 pub(in crate::agent) fn evidence_link(body: &mut String, uri: &str, dropped: bool) {
     if dropped || body.starts_with("[Investigation check") {
         body.push_str(&format!(
-            "\n[Complete tool evidence: {uri}; retrieve with artifact_read]"
+            "\n[Complete tool evidence: {uri}; retrieve with read]"
         ));
     }
 }

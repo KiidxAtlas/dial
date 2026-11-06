@@ -161,7 +161,9 @@ generation, provider retry backoff, and cancellation in milliseconds, with reque
 counts. Each inference runtime result also retains its own latency breakdown and nullable
 `first_generation_ms`. These are harness-observed wall times, not provider compute or exact token
 timestamps: a provider that sends no progress events leaves network, queueing and prefill combined
-under response wait. Generation includes reasoning and tool arguments. Concurrent worker timings
+under response wait. Generation includes reasoning and tool arguments. `generation_stall_ms` is the
+part of `generation_ms` spent in silent stream gaps of at least 10 seconds; it is already included in
+generation and totals, not added to them. Concurrent worker timings
 must not be added to estimate turn duration; compare the report's `duration_ms` separately.
 The status distinguishes **waiting for first response** from **provider retry backoff**.
 
@@ -279,7 +281,7 @@ Values set for another API are kept but not sent. A LoRA `path` is absolute, or 
 ## Example configuration
 
 ```toml
-remote_model_idle_timeout_secs = 300         # 0 disables; local model servers are never limited
+remote_model_idle_timeout_secs = 60          # 0 disables; local model servers are never limited
 
 [reasoning_guard]          # operator-owned; not mutated by harness improvement
 enabled = true
@@ -357,7 +359,7 @@ base_url = "http://127.0.0.1:1234/v1"
 api_key_env = "LMSTUDIO_KEY"
 [harness]                 # the part the improvement loop is allowed to change
 system_prompt = "Work in small verified steps."
-tools = ["read","edit","write","glob","grep","bash","todo","tool_search","tool_load","artifact_read","working_state"]
+tools = ["read","edit","write","glob","grep","bash","todo","tool_search","tool_load","working_state"]
 [bash_interceptor]        # bash commands that duplicate a dedicated tool
 mode = "hint"             # hint (default): run it and add a one-line pointer | block: refuse it
 # enabled = false         # turn it off; patterns = [...] replaces the built-in rules

@@ -135,7 +135,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Configuration",
         "Model profiles",
-        "Exact-model capabilities, sampling and reasoning profiles keyed by profile name."
+        "Exact-model capabilities, sampling and reasoning profiles keyed by profile name, including optional OpenRouter routing preferences and billed Gemini explicit-cache settings."
     ),
     structured!(
         "model_presets",

@@ -43,7 +43,9 @@ pub enum ShellBackend {
 pub struct ShellConfig {
     /// Maximum bash timeout in seconds; zero disables the deadline.
     pub bash_timeout_secs: u64,
-    /// Transfer a still-running foreground command to `bg` after this duration; zero disables.
+    /// Opt-in: transfer a still-running foreground command to `bg` after this duration. Zero (the
+    /// default) keeps foreground commands in the call until they finish or reach their timeout,
+    /// so a long command costs no extra `tool_load`/`bg wait` model rounds.
     pub auto_background_secs: u64,
     /// `--no-pty`: background commands run without a pseudo-terminal.
     pub no_pty: bool,
@@ -59,7 +61,7 @@ impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             bash_timeout_secs: 300,
-            auto_background_secs: 15,
+            auto_background_secs: 0,
             no_pty: false,
             backend: ShellBackend::Auto,
             minimize_output: true,

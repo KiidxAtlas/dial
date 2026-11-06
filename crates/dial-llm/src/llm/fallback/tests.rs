@@ -2,6 +2,49 @@ use super::*;
 use crate::llm::errors::ErrorClass;
 
 #[test]
+fn explicit_routing_policy_blocks_automatic_model_switches_but_not_user_selection() {
+    let mut config: Config = toml::from_str(
+        r#"
+provider = "openrouter"
+model = "test/primary"
+model_profile = "private"
+[model_profiles.private]
+provider = "openrouter"
+model = "test/primary"
+[model_profiles.private.openrouter_routing]
+only = ["deepinfra"]
+data_collection = "deny"
+zdr = true
+"#,
+    )
+    .unwrap();
+    let selected = config.selection();
+    let chain = vec!["next-model".into(), "openai/other".into()];
+    config
+        .retry
+        .fallback_chains
+        .insert("task".into(), chain.clone());
+    config
+        .compaction
+        .promotion
+        .targets
+        .insert("task".into(), chain);
+    assert!(fallback_models(&config, "task", &selected).is_empty());
+    assert!(promotion_targets(&config, "task", &selected).is_empty());
+    let explicit = config.with_selection(&sel("openai", "other"));
+    assert_eq!(explicit.selection().provider, "openai");
+    assert!(explicit.active_model_profile().is_none());
+    config.model_profile = None;
+    assert!(
+        config.active_model_profile().is_some(),
+        "a unique exact-model profile is selected automatically"
+    );
+    config.model_profiles.clear();
+    assert_eq!(fallback_models(&config, "task", &selected).len(), 2);
+    assert_eq!(promotion_targets(&config, "task", &selected).len(), 2);
+}
+
+#[test]
 fn only_recoverable_provider_classes_trigger_model_fallback() {
     let error = anyhow::anyhow!(errors::Classified::new(
         ErrorClass::QuotaExhausted { reset_at: None },

@@ -486,7 +486,7 @@ fn wait_reports_timeout_and_early_exit_as_not_ready() {
         timed.text
     );
 
-    start(&tool, &ws, "dies", "echo nothing useful");
+    start(&tool, &ws, "dies", "echo nothing useful; exit 3");
     let early = bg(
         &tool,
         &ws,
@@ -496,6 +496,26 @@ fn wait_reports_timeout_and_early_exit_as_not_ready() {
         early.is_error && early.text.contains("before /listening/"),
         "{}",
         early.text
+    );
+}
+
+#[test]
+fn wait_treats_clean_exit_before_pattern_as_finished_not_failed() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    start(&tool, &ws, "suite", "echo 32 passed");
+    let done = bg(
+        &tool,
+        &ws,
+        json!({"action": "wait", "name": "suite", "until": "exit", "timeout": 10}),
+    );
+    assert!(!done.is_error, "{}", done.text);
+    assert!(
+        done.text
+            .starts_with("finished: suite exited (exit code 0) without matching /exit/")
+            && done.text.contains("32 passed"),
+        "{}",
+        done.text
     );
 }
 

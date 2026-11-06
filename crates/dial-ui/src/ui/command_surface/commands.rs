@@ -1156,15 +1156,15 @@ pub const COMMANDS: &[CommandSpec] = &[
         )
     },
     CommandSpec {
-        subcommands: &["generate", "edit", "settings"],
+        subcommands: &["generate", "gif", "edit", "settings"],
         live_forms: &[LiveForm {
             args: "settings",
             order: 44,
         }],
         ..CommandSpec::new(
             "image",
-            "generate <prompt> | edit <file> <prompt> | settings",
-            "generate or edit an image with image_gen (asks for approval) or tune the model",
+            "generate <prompt> | gif <prompt> | edit <file> <prompt> | settings",
+            "generate, animate (GIF) or edit an image with image_gen (asks for approval) or tune the model",
             Category::Integrations,
             Surface::Group,
         )

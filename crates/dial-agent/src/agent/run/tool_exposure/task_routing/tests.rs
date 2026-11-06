@@ -187,7 +187,7 @@ fn source_investigations_offer_eligible_native_tools_for_formats_and_task_verbs(
     ] {
         assert_eq!(
             select(query, &BTreeSet::new(), &candidates),
-            [specialist, "evidence", "evidence_search"],
+            [specialist],
             "{query}"
         );
     }
@@ -237,6 +237,20 @@ fn source_routing_ignores_incidental_module_names_and_format_mentions_without_in
             "{query}"
         );
     }
+    // Benchmark task wordings: "report" as a verb and Debian package sources are not
+    // document inputs or dependency-source reads.
+    let dep = [("dep_source".to_owned(), "Capability".to_owned())];
+    for query in [
+        "Analyze all logs and count severities. Each row should report the total count",
+        "Get the source from Debian packages instead and build it",
+        // Full benchmark instructions, verbatim apart from line joins.
+        "Build pMARS (http://www.koth.org/pmars/) from source with no X server. Since koth.org is unreliable, get the source from Debian packages instead. Extract the source to `/app` and build without X11 support. Install the binary to `/usr/local/bin/pmars`. You can test your build with this command: `pmars -b -r 50 -f flashpaper.red rave.red | tail -n 1` This should output \"Results: X Y Z\" where X, Y, Z are integers. We'll verify the binary has no X11 dependencies, uses Debian sources, and that the debugger works properly.",
+        "You are given multiple log files stored in /app/logs. Your task is to analyze all logs and count how many times each severity appears within the following date ranges. Write a CSV file /app/summary.csv with the following structure (including the header): period,severity,count. Each row should report the total count of each severity for the corresponding date range. The current date is 2025-08-12.",
+    ] {
+        let routed = select(query, &BTreeSet::new(), &candidates);
+        assert!(routed.is_empty(), "{query}: {routed:?}");
+        assert!(select(query, &BTreeSet::new(), &dep).is_empty(), "{query}");
+    }
 }
 
 #[test]
@@ -270,7 +284,7 @@ fn output_only_formats_do_not_route_source_specialists() {
             &BTreeSet::new(),
             &candidates
         ),
-        ["data", "evidence", "evidence_search"]
+        ["data"]
     );
     assert_eq!(
         select(
@@ -278,7 +292,7 @@ fn output_only_formats_do_not_route_source_specialists() {
             &BTreeSet::new(),
             &candidates
         ),
-        ["document", "evidence", "evidence_search"]
+        ["document"]
     );
     // An explicit tool request still routes when the named file is an output.
     assert!(
@@ -309,7 +323,7 @@ fn output_clauses_and_input_clauses_are_routed_independently() {
             &BTreeSet::new(),
             &candidates
         ),
-        ["data", "evidence", "evidence_search"]
+        ["data"]
     );
     // Case does not change which file is the input and which is the output.
     assert_eq!(
@@ -318,7 +332,7 @@ fn output_clauses_and_input_clauses_are_routed_independently() {
             &BTreeSet::new(),
             &candidates
         ),
-        ["data", "evidence", "evidence_search"]
+        ["data"]
     );
     // Sentence and semicolon boundaries end the output clause, so a following inspection keeps its own format.
     let documents = select(
@@ -344,14 +358,14 @@ fn output_clauses_and_input_clauses_are_routed_independently() {
         )
         .is_empty()
     );
-    // A supplied source named after a creation verb is still an input when it follows `from`.
-    assert_eq!(
+    // A generated JSON target with a plain CSV input stays on the computation path.
+    assert!(
         select(
             "Write summary.json from sales.csv",
             &BTreeSet::new(),
             &candidates
-        ),
-        ["data", "evidence", "evidence_search"]
+        )
+        .is_empty()
     );
     for query in [
         "Analyze the export of sales.csv",
@@ -361,7 +375,7 @@ fn output_clauses_and_input_clauses_are_routed_independently() {
     ] {
         assert_eq!(
             select(query, &BTreeSet::new(), &candidates),
-            ["data", "evidence", "evidence_search"],
+            ["data"],
             "{query}"
         );
     }
@@ -371,7 +385,7 @@ fn output_clauses_and_input_clauses_are_routed_independently() {
             &BTreeSet::new(),
             &candidates
         ),
-        ["document", "evidence", "evidence_search"]
+        ["document"]
     );
     let runtime = [("runtime_inspect".to_owned(), "Capability".to_owned())];
     assert_eq!(
@@ -455,7 +469,7 @@ fn system_sources_route_to_eligible_read_only_specialists_not_incidental_code_na
     ] {
         assert_eq!(
             select(query, &BTreeSet::new(), &candidates),
-            [specialist, "evidence", "evidence_search"],
+            [specialist],
             "{query}"
         );
     }
@@ -1194,7 +1208,7 @@ fn comma_separated_output_formats_preserve_inputs() {
             &BTreeSet::new(),
             &candidates
         ),
-        ["data", "evidence", "evidence_search"]
+        ["data"]
     );
     assert_eq!(
         select(
@@ -1202,7 +1216,7 @@ fn comma_separated_output_formats_preserve_inputs() {
             &BTreeSet::new(),
             &candidates
         ),
-        ["data", "evidence", "evidence_search"]
+        ["data"]
     );
     assert_eq!(
         select(
@@ -1210,7 +1224,7 @@ fn comma_separated_output_formats_preserve_inputs() {
             &BTreeSet::new(),
             &candidates
         ),
-        ["document", "evidence", "evidence_search"]
+        ["document"]
     );
     // A comma inside a filename or quoted name is part of the name, not a clause boundary.
     assert_eq!(
@@ -1219,7 +1233,7 @@ fn comma_separated_output_formats_preserve_inputs() {
             &BTreeSet::new(),
             &candidates
         ),
-        ["data", "evidence", "evidence_search"]
+        ["data"]
     );
     assert_eq!(
         select(
@@ -1227,7 +1241,7 @@ fn comma_separated_output_formats_preserve_inputs() {
             &BTreeSet::new(),
             &candidates
         ),
-        ["data", "evidence", "evidence_search"]
+        ["data"]
     );
     // A comma inside a quoted name is part of the name, even when the quoted text holds a creation
     // verb and a deliverable-looking filename. The quoted file is still the genuine input.
@@ -1247,7 +1261,7 @@ fn comma_separated_output_formats_preserve_inputs() {
     ] {
         assert_eq!(
             select(query, &BTreeSet::new(), &candidates),
-            ["data", "evidence", "evidence_search"],
+            ["data"],
             "{query}"
         );
     }
@@ -1262,7 +1276,7 @@ fn comma_separated_output_formats_preserve_inputs() {
     ] {
         assert_eq!(
             select(query, &BTreeSet::new(), &candidates),
-            ["data", "evidence", "evidence_search"],
+            ["data"],
             "{query}"
         );
     }
@@ -1438,4 +1452,80 @@ fn routed_tools_stay_offered_across_requests_once_the_session_has_history() {
                 .contains(&"mcp__nuxt__list-documentation-pages".into())
         );
     });
+}
+
+#[test]
+fn ordinary_english_tool_names_need_explicit_intent_to_route() {
+    let candidates = ["check", "find", "finish", "memory"]
+        .map(|name| (name.to_owned(), "Capability".to_owned()));
+    // Benchmark wording: "check the result" must not override the unattended `check` deferral.
+    for query in [
+        "Fix the arithmetic bug in calc.add. Preserve the public API; check the result.",
+        "find the bug and finish the fix",
+        "Leave existing files unchanged and check the generated result.",
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &candidates).is_empty(),
+            "{query}"
+        );
+    }
+    assert_eq!(
+        select("Run the `check` tool", &BTreeSet::new(), &candidates),
+        ["check"]
+    );
+    assert_eq!(select("check", &BTreeSet::new(), &candidates), ["check"]);
+}
+
+#[test]
+fn tabular_deliverables_use_computation_routing_in_interactive_and_unattended_runs() {
+    let query = "From orders.csv, create paid-summary.json summarizing only orders with status paid. Leave existing files unchanged and check the generated result.";
+    for unattended in [false, true] {
+        with_agent("[assistance]\nlean_local=false", |agent| {
+            agent.modes.launch.unattended = unattended;
+            agent.begin_tool_routing(query);
+            for name in ["data", "evidence", "evidence_search"] {
+                assert!(
+                    !selected(agent, name),
+                    "{name}: {:?}",
+                    agent.tool_routing.selected
+                );
+            }
+            assert!(agent.catalog().iter().any(|name| name == "data"));
+        });
+        for query in [
+            "Use the `data` tool to profile orders.csv",
+            "Analyze sales.csv and write summary.json",
+            "Inspect orders.csv",
+            "Profile a large dataset in orders.csv and save summary.json",
+            "Summarize workbook sales.xlsx and write summary.json",
+        ] {
+            with_agent("[assistance]\nlean_local=false", |agent| {
+                agent.modes.launch.unattended = unattended;
+                agent.begin_tool_routing(query);
+                assert!(
+                    selected(agent, "data"),
+                    "{query}: {:?}",
+                    agent.tool_routing.selected
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn generated_tabular_output_does_not_imply_an_analysis_tool() {
+    let candidates = [("data".to_owned(), "Capability".to_owned())];
+    for query in [
+        "From orders.csv, create paid-summary.json summarizing only paid orders",
+        "Compute totals from orders.csv and write totals.csv",
+        "Create summary.json from orders.csv",
+        "Create summary.json using orders.jsonl",
+        "Compute totals from orders.csv; generate totals.json",
+        "Write `paid summary.json` from `sales input.csv`",
+    ] {
+        assert!(
+            select(query, &BTreeSet::new(), &candidates).is_empty(),
+            "{query}"
+        );
+    }
 }

@@ -95,13 +95,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if unsupported_probe(self):
+            return
         messages = body.get("messages", [])
         marker, position = find_marker(messages)
         with self.server.lock:
             self.server.chat_requests += 1
             index = self.server.chat_requests
         if marker is None:
-            self.server.fail(f"unrecognized chat request {index}")
+            self.server.fail(f"unrecognized chat request {index}: {self.path}, fields={sorted(body)}")
             self.send_json({"error": "unrecognized fixture request"}, 500)
             return
         with self.server.lock:
@@ -212,9 +214,14 @@ def tree_case(server, binary, captures, root):
 
         terminal.draft("PARKED-DRAFT-MARKER")
         terminal.key("C-p")
-        type_text(terminal, "tree")
+        # /tree is a hidden compatibility command, not a searchable palette entry.
+        type_text(terminal, "sessions")
+        # tmux otherwise collapses S-Enter to plain Enter; encode the modified key explicitly.
+        terminal.run("send-keys", "-t", "smoke", "-l", "\x1b[13;2u")
+        terminal.wait("Type the arguments", history=False)
+        type_text(terminal, "this")
         terminal.key("Enter")
-        terminal.wait("PTY-SURF-SECOND")
+        terminal.wait("Session tree", history=False)
         terminal.key("C-Up")
         terminal.key("C-Down")
         terminal.key("C-Left")
@@ -284,8 +291,9 @@ def write_cancel_case(server, binary, captures, root):
         terminal.wait("cancel-target.txt", timeout=15)
         terminal.wait("PARTIAL-WRITE-MARKER", timeout=15)
         terminal.capture("write-preview-incomplete")
-        terminal.key("Escape")
-        time.sleep(1.5)
+        # Escape dismisses local UI; the configured interrupt stops the running turn.
+        terminal.key("C-c")
+        terminal.wait("interrupted")
         assert not (project / "cancel-target.txt").exists(), "incomplete write arguments were dispatched"
         server.cancel_release.set()
         terminal.capture("write-cancelled")

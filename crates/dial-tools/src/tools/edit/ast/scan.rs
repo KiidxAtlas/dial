@@ -30,6 +30,22 @@ impl Target {
             Some(input) => ws.resolve(input)?,
             None => ws.root().to_owned(),
         };
+        Self::at(ws, start, lang)
+    }
+
+    pub fn resolve_read(
+        ws: &Workspace,
+        path: Option<&str>,
+        lang: Option<&str>,
+    ) -> Result<Target, String> {
+        let start = path
+            .map(|input| ws.resolve_read(input))
+            .transpose()?
+            .unwrap_or_else(|| ws.root().to_owned());
+        Self::at(ws, start, lang)
+    }
+
+    fn at(ws: &Workspace, start: PathBuf, lang: Option<&str>) -> Result<Target, String> {
         let meta =
             fs::metadata(&start).map_err(|e| io_message("searching", &ws.rel(&start), &e))?;
         let lang = lang.map(parse_lang).transpose()?;

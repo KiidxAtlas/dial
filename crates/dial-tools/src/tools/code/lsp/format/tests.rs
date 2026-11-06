@@ -88,10 +88,11 @@ fn hover_flattens_every_contents_shape() {
         "one\n\ntwo"
     );
     assert_eq!(hover(&Value::Null), "no hover information");
-    assert_eq!(
-        hover(&json!({"contents": {"kind": "markdown", "value": "  "}})),
-        "no hover information"
-    );
+    assert!(hover_is_empty(&Value::Null));
+    let blank = json!({"contents": {"kind": "markdown", "value": "  "}});
+    assert_eq!(hover(&blank), "no hover information");
+    assert!(hover_is_empty(&blank));
+    assert!(!hover_is_empty(&json!({"contents": "plain"})));
     assert!(hover(&json!({"contents": "x".repeat(MAX_HOVER * 2)})).ends_with('…'));
 }
 

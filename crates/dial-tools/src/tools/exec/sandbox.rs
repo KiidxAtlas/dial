@@ -75,6 +75,8 @@
 //! * Hard links: creating one to a denied file is refused (needs read access),
 //!   but a hard link made before the sandbox started is a distinct path.
 
+#[cfg(target_os = "linux")]
+pub mod fork_fence;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod linux;
 pub mod netproxy;
@@ -93,6 +95,14 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+
+/// Execution-owner-only launch restrictions, separate from filesystem trust policy.
+#[derive(Clone, Copy, Default)]
+pub(super) struct CommandMode {
+    #[cfg(not(windows))]
+    pub owned_terminal: Option<i32>,
+    pub fork_fence: bool,
+}
 
 #[cfg(not(target_os = "linux"))]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -181,7 +191,14 @@ impl Sandbox {
             allow_network,
             extra_write: Vec::new(),
         };
-        self.command_mode(workspace, &policy, program, args, None, None)
+        self.command_mode(
+            workspace,
+            &policy,
+            program,
+            args,
+            CommandMode::default(),
+            None,
+        )
     }
 
     fn command_mode(
@@ -190,22 +207,17 @@ impl Sandbox {
         policy: &Policy,
         program: &str,
         args: &[&str],
-        owned_terminal: Option<i32>,
+        mode: CommandMode,
         proxy: ProxyRef<'_>,
     ) -> Result<Command, String> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = mode.fork_fence;
         self.available()?;
         #[cfg(target_os = "linux")]
-        return linux::command_mode(
-            workspace,
-            policy,
-            program,
-            args,
-            owned_terminal.is_some(),
-            proxy,
-        );
+        return linux::command_mode(workspace, policy, program, args, mode, proxy);
         #[cfg(windows)]
         {
-            let _ = (workspace, policy, program, args, owned_terminal, proxy);
+            let _ = (workspace, policy, program, args, mode, proxy);
             Err(
                 "Windows command isolation is unavailable; refusing to run a sandboxed command"
                     .into(),
@@ -232,7 +244,7 @@ impl Sandbox {
                 profile.push_str(&proxy_rule(proxy.port()));
             }
             profile.push_str(&program_rule(program)?);
-            if let Some(fd) = owned_terminal {
+            if let Some(fd) = mode.owned_terminal {
                 profile.push_str(&owned_terminal_rule(fd)?);
             }
             append_denials(&mut profile, deny_read)?;
@@ -274,7 +286,7 @@ impl Sandbox {
         proxy: ProxyRef<'_>,
         program: &str,
         args: &[&str],
-        owned_terminal: Option<i32>,
+        mode: CommandMode,
     ) -> Result<Command, String> {
         self.dev_command_mode(
             workspace,
@@ -282,7 +294,7 @@ impl Sandbox {
             program,
             args,
             std::env::vars_os(),
-            owned_terminal,
+            mode,
             proxy,
         )
     }
@@ -295,7 +307,15 @@ impl Sandbox {
         args: &[&str],
         env: impl Iterator<Item = (OsString, OsString)>,
     ) -> Result<Command, String> {
-        self.dev_command_mode(workspace, policy, program, args, env, None, None)
+        self.dev_command_mode(
+            workspace,
+            policy,
+            program,
+            args,
+            env,
+            CommandMode::default(),
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -306,13 +326,13 @@ impl Sandbox {
         program: &str,
         args: &[&str],
         env: impl Iterator<Item = (OsString, OsString)>,
-        owned_terminal: Option<i32>,
+        mode: CommandMode,
         proxy: ProxyRef<'_>,
     ) -> Result<Command, String> {
         self.available()?;
         let (allow_network, deny_read, extra_write) = match policy {
             Policy::Strict { .. } => {
-                return self.command_mode(workspace, policy, program, args, owned_terminal, proxy);
+                return self.command_mode(workspace, policy, program, args, mode, proxy);
             }
             Policy::Dev {
                 deny_read,
@@ -367,17 +387,10 @@ impl Sandbox {
             std::fs::create_dir_all(&scratch)
                 .map_err(|e| format!("creating scratch directory: {e}"))?;
             #[cfg(target_os = "linux")]
-            let mut command = linux::command_mode(
-                workspace,
-                policy,
-                program,
-                args,
-                owned_terminal.is_some(),
-                proxy,
-            )?;
+            let mut command = linux::command_mode(workspace, policy, program, args, mode, proxy)?;
             #[cfg(not(target_os = "linux"))]
             let mut command = {
-                if let Some(fd) = owned_terminal {
+                if let Some(fd) = mode.owned_terminal {
                     profile.push_str(&owned_terminal_rule(fd)?);
                 }
                 append_denials(&mut profile, deny_read)?;

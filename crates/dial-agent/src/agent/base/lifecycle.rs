@@ -489,12 +489,12 @@ impl<'a> Agent<'a> {
             task_packet: Default::default(),
         };
         if let Some(memory) = &agent.memory {
-            for tool in crate::tools::knowledge::provenance::tools(
-                memory.clone(),
-                agent.session.id().to_owned(),
-            ) {
-                agent.ext.register(tool);
-            }
+            agent
+                .ext
+                .register(crate::tools::knowledge::provenance::tool(
+                    memory.clone(),
+                    agent.session.id().to_owned(),
+                ));
         }
         if let Some(cache) = &agent.codebase {
             agent.ext.register(crate::tools::knowledge::codebase::tool(
@@ -709,6 +709,7 @@ impl<'a> Agent<'a> {
                 discoverable: &discoverable,
                 template: self.parts.system_template.as_ref(),
                 lean,
+                context_overflow: self.lean_tools,
                 concise_guidance: self.config.efficiency.enabled && !self.hermetic,
                 prefer_subagents: self.config.task.prefer_subagents,
                 one_call: self.local_one_call(),
@@ -821,7 +822,7 @@ impl<'a> Agent<'a> {
         }
         let migrated = crate::config::types::migrate_memory_tools(&mut active.harness);
         if migrated {
-            ui.diagnostic("Migrated legacy memory tool selection to provenance memory tools for this runtime; admitted history is unchanged.");
+            ui.diagnostic("Migrated legacy split memory tool selection to the single memory tool for this runtime; admitted history is unchanged.");
         }
         self.config.validate_harness(&active.harness)?;
         active.harness = self.config.effective_harness(&active.harness)?;

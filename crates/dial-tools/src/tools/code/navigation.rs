@@ -43,13 +43,13 @@ impl Tool for Find {
     fn schema(&self) -> Value {
         tool_schema(
             "find",
-            "Locate code from a behavior description (mode=behavior, default) or literal text (mode=exact). Rows state lexical/syntax provenance, not resolved symbols. Top code hits may include bounded, freshly read source excerpts: complete numbered rows are editable without another read; summaries and related aids are not. ranking=semantic adds one model rerank request; lsp_path adds real language-server symbols.",
+            "Locate code by behavior (default) or exact text. Related evidence automatically maps literal name methods and string-array constants across source groups; bounded lexical references, not confirmed owners. Complete numbered excerpts are editable. ranking=semantic adds one model rerank; lsp_path adds language-server symbols.",
             json!({
                 "query": {"type":"string", "description":"Behavior description, quoted mandatory phrases, or exact text"},
                 "path": {"type":"string", "description":"File/directory scope, default workspace"},
                 "mode": {"type":"string", "enum":["behavior", "exact"]},
-                "ranking": {"type":"string", "enum":["lexical", "semantic"], "description":"Behavior mode defaults to lexical; semantic adds one configured-model reranking request. Exact mode is always deterministic."},
-                "grep_keywords": {"type":"array", "items":{"type":"string"}, "description":"Optional known literal terms to boost in behavior mode"},
+                "ranking": {"type":"string", "enum":["lexical", "semantic"], "description":"Behavior mode only (default lexical)."},
+                "keywords": {"type":"array", "items":{"type":"string"}, "description":"Optional known literal terms to boost in behavior mode"},
                 "lsp_path": {"type":"string", "description":"Source file selecting a language server for symbol metadata; startup needs approval"},
                 "lsp_query": {"type":"string", "description":"Exact symbol for language-server metadata (default query)"},
                 "related": {"type":"boolean", "description":"Include related evidence (default true in behavior mode, false in exact)"},
@@ -418,7 +418,7 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
     }
     let terms = tokens(query);
     let phrases = if exact { vec![] } else { quoted(query)? };
-    let keywords: Vec<String> = match args.get("grep_keywords") {
+    let keywords: Vec<String> = match args.get("keywords") {
         None | Some(Value::Null) => vec![],
         Some(Value::Array(items)) if items.len() <= 32 => items
             .iter()
@@ -426,17 +426,15 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
                 v.as_str()
                     .filter(|s| !s.is_empty() && s.len() <= 256)
                     .map(str::to_owned)
-                    .ok_or(
-                        "grep_keywords must contain nonempty strings up to 256 bytes".to_string(),
-                    )
+                    .ok_or("keywords must contain nonempty strings up to 256 bytes".to_string())
             })
             .collect::<Result<_, _>>()?,
-        _ => return Err("grep_keywords must be an array of at most 32 strings".into()),
+        _ => return Err("keywords must be an array of at most 32 strings".into()),
     };
     if !semantic && !exact && terms.is_empty() && phrases.is_empty() && keywords.is_empty() {
         return Err("behavior query contains no searchable terms".into());
     }
-    let start = ws.resolve(opt_str(args, "path")?.unwrap_or("."))?;
+    let start = ws.resolve_read(opt_str(args, "path")?.unwrap_or("."))?;
     if !start.exists() {
         return Err("search scope does not exist".into());
     }
@@ -456,7 +454,7 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
         if !meta.is_file()
             || meta.file_type().is_symlink()
             || !ws
-                .resolve(&ws.rel(path))
+                .resolve_read(&ws.rel(path))
                 .is_ok_and(|resolved| resolved == path)
             || meta.len() > MAX_FILE
         {
@@ -493,7 +491,7 @@ fn retrieve(ws: &Workspace, args: &Value, semantic: bool) -> Result<Retrieval, S
                 !meta.file_type().is_symlink() && cache::Identity::of(&meta) == identity
             })
             && ws
-                .resolve(&ws.rel(path))
+                .resolve_read(&ws.rel(path))
                 .is_ok_and(|resolved| resolved == path);
         if !stable {
             invalidate(path);
@@ -762,23 +760,18 @@ fn find(ws: &Workspace, args: &Value) -> Result<String, String> {
         chosen.len(),
         retrieved.coverage
     ));
-    out.push_str(&related_section(
+    let related = related_section(
         ws,
         args,
         retrieved.exact,
         &targets,
         MAX_OUTPUT.saturating_sub(out.len() + SOURCE_BYTES),
-    )?);
-    out.push_str(&source_section(
-        ws,
-        &targets,
-        MAX_OUTPUT.saturating_sub(out.len()),
-    ));
+    )?;
+    append_sections(ws, &mut out, &targets, related);
     Ok(out)
 }
 
-const SOURCE_SECTION: &str =
-    "\nSource excerpts (fresh reads; only complete numbered rows are edit witnesses):\n";
+const SOURCE_SECTION: &str = "\nSource excerpts (fresh reads that count as read: do not read these rows again; only complete numbered rows are edit witnesses):\n";
 const SOURCE_FILES: usize = 3;
 const SOURCE_BYTES: usize = 6 * 1024;
 const SOURCE_LINES: usize = 40;
@@ -828,15 +821,45 @@ pub(in crate::tools) fn source_section(
     out
 }
 
+/// Allocate the existing read budget to the top hit, then discovered test/config candidates,
+/// then remaining hits. Ranking and summary provenance are independent of this read order.
+fn append_sections(
+    ws: &Workspace,
+    out: &mut String,
+    hits: &[(&str, usize, usize, &str)],
+    related: related::Bundle,
+) {
+    out.push_str(&related.text);
+    let mut previews = Vec::new();
+    previews.extend(hits.first().copied());
+    previews.extend(related.previews.iter().map(|target| {
+        (
+            target.path.as_str(),
+            target.start,
+            target.end,
+            target.sha256.as_str(),
+        )
+    }));
+    previews.extend(hits.iter().skip(1).copied());
+    out.push_str(&source_section(
+        ws,
+        &previews,
+        MAX_OUTPUT.saturating_sub(out.len()),
+    ));
+}
+
 /// Source-excerpt files in an authentic retained find result, bounded to the original search
 /// scope. The hashline rehydrator still verifies the raw digest, tag and every numbered row.
 pub(crate) fn source_targets(ws: &Workspace, args: &Value, text: &str) -> Vec<String> {
-    let Ok(scope) = ws.resolve(args["path"].as_str().unwrap_or(".")) else {
+    let Ok(scope) = ws.resolve_read(args["path"].as_str().unwrap_or(".")) else {
         return Vec::new();
     };
     source_paths(ws, text)
         .into_iter()
-        .filter(|path| ws.resolve(path).is_ok_and(|path| path.starts_with(&scope)))
+        .filter(|path| {
+            ws.resolve_read(path)
+                .is_ok_and(|path| path.starts_with(&scope))
+        })
         .collect()
 }
 
@@ -854,7 +877,7 @@ pub(in crate::tools) fn source_paths(ws: &Workspace, text: &str) -> Vec<String> 
                 .strip_suffix(']')?
                 .rsplit_once('#')?;
             let path = serde_json::from_str::<String>(path).unwrap_or_else(|_| path.to_owned());
-            let resolved = ws.resolve(&path).ok()?;
+            let resolved = ws.resolve_read(&path).ok()?;
             (!related::sensitive_path(&path) && SupportLang::from_path(&resolved).is_some())
                 .then_some(path)
         })
@@ -876,11 +899,11 @@ fn related_section(
     exact: bool,
     hits: &[(&str, usize, usize, &str)],
     budget: usize,
-) -> Result<String, String> {
+) -> Result<related::Bundle, String> {
     if !related_enabled(args, exact)? || hits.is_empty() {
-        return Ok(String::new());
+        return Ok(related::Bundle::default());
     }
-    let scope = ws.resolve(opt_str(args, "path")?.unwrap_or("."))?;
+    let scope = ws.resolve_read(opt_str(args, "path")?.unwrap_or("."))?;
     Ok(related_for(ws, &scope, hits, budget))
 }
 fn related_for(
@@ -888,7 +911,7 @@ fn related_for(
     scope: &Path,
     hits: &[(&str, usize, usize, &str)],
     budget: usize,
-) -> String {
+) -> related::Bundle {
     let targets: Vec<related::Target> = hits
         .iter()
         .take(related::MAX_TARGETS)

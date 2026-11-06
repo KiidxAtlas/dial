@@ -53,6 +53,91 @@ fn set_control(agent: &mut Agent<'_>, control: Value) {
 }
 
 #[test]
+fn a_visible_single_request_is_not_reissued_after_each_tool_round() {
+    with_agent("", |agent| {
+        let request = "Write summary.csv from the logs and verify its counts.";
+        let mut control = json!({});
+        record(&mut control, request, json!("entry-request"), Kind::Turn);
+        set_control(agent, control);
+        let history = vec![
+            json!({"role":"user","content":request,"dial_context_request":true}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"verify","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"verify","content":"All requested counts match."}),
+        ];
+        for _ in 0..2 {
+            let mut messages = history.clone();
+            project(agent, &mut messages);
+            assert!(
+                messages.iter().all(|message| {
+                    message["dial_task_context"] != true
+                        || intent_payload(message["content"].as_str().unwrap_or_default()).is_none()
+                }),
+                "the already visible request must not look like a new instruction after verification: {messages:#?}"
+            );
+            assert_eq!(messages[0]["content"], request);
+        }
+
+        // Losing the original during compaction must restore the admitted request context.
+        let mut compacted = vec![json!({"role":"user","content":"Earlier work was summarized."})];
+        project(agent, &mut compacted);
+        let payload =
+            intent_payload(task_context(&compacted)["content"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["text"], request);
+    });
+}
+
+#[test]
+fn matching_tool_text_does_not_suppress_the_admitted_request() {
+    with_agent("", |agent| {
+        let request = "Fix the requested application.";
+        let mut control = json!({});
+        record(&mut control, request, json!("entry-request"), Kind::Turn);
+        set_control(agent, control);
+        let mut messages =
+            vec![json!({"role":"tool","content":request,"dial_context_request":true})];
+        project(agent, &mut messages);
+        let payload = intent_payload(task_context(&messages)["content"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["text"], request);
+    });
+}
+
+#[test]
+fn a_visible_latest_turn_is_not_reissued_even_after_earlier_turns() {
+    with_agent("", |agent| {
+        let mut control = json!({});
+        record(
+            &mut control,
+            "Build the sample editor app.",
+            json!("entry-old"),
+            Kind::Turn,
+        );
+        record(
+            &mut control,
+            CORRECTION,
+            json!("entry-correction"),
+            Kind::Turn,
+        );
+        set_control(agent, control);
+        let mut messages = history_after_correction();
+        messages[3]["dial_context_request"] = json!(true);
+        project(agent, &mut messages);
+        assert!(
+            messages.iter().all(|message| {
+                message["dial_task_context"] != true
+                    || intent_payload(message["content"].as_str().unwrap_or_default()).is_none()
+            }),
+            "{messages:#?}"
+        );
+        // Once compaction removes it, the reminder returns.
+        let mut compacted = vec![json!({"role":"user","content":"Earlier work was summarized."})];
+        project(agent, &mut compacted);
+        let payload =
+            intent_payload(task_context(&compacted)["content"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["text"], CORRECTION);
+    });
+}
+
+#[test]
 fn ordinary_correction_after_tools_is_the_explicit_request_tail() {
     with_agent("", |agent| {
         let mut control = json!({

@@ -336,12 +336,19 @@ fn commit_git_reads_refuse_executable_conversion_config_for_both_indexes() {
                 &["status", "--porcelain"][..],
                 &["log", "-1", "--format=%s"][..],
             ] {
-                let error = git_output_indexed(root, index, args, "Commit read failed")
-                    .expect_err("executable conversion configuration must fail closed");
-                assert!(
-                    matches!(&error, CommitError::Git(message) if message.contains("host-side Git inspection refused")),
-                    "{key} {args:?}: {error}"
-                );
+                let result = git_output_indexed(root, index, args, "Commit read failed");
+                // `log` only reads objects, so clean/smudge/process drivers cannot run and it is
+                // allowed; textconv configuration is still refused for every read.
+                if args[0] == "log" && key.starts_with("filter.") {
+                    assert!(result.is_ok(), "{key} {args:?}: {result:?}");
+                } else {
+                    let error =
+                        result.expect_err("executable conversion configuration must fail closed");
+                    assert!(
+                        matches!(&error, CommitError::Git(message) if message.contains("host-side Git inspection refused")),
+                        "{key} {args:?}: {error}"
+                    );
+                }
                 assert!(!marker.exists(), "{key} ran during {args:?}");
             }
         }
