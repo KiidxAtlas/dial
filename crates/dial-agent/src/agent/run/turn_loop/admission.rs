@@ -94,7 +94,7 @@ impl Agent<'_> {
 
     fn prepare_turn_runtime(&mut self, user_text: &str, ui: &mut dyn Ui) -> Result<()> {
         if std::mem::take(&mut self.legacy_memory_migrated) {
-            ui.diagnostic("Migrated legacy memory tool selection to provenance memory tools for this runtime; admitted history is unchanged.");
+            ui.diagnostic("Migrated legacy split memory tool selection to the single memory tool for this runtime; admitted history is unchanged.");
         }
         self.task_policy = crate::learn::task_policy::Policy::for_prompt(
             user_text,
@@ -192,6 +192,7 @@ impl Agent<'_> {
         message["dial_checkpoint"] = json!({"session": self.session.id(), "turn": checkpoint_turn});
         self.step_checks = StepChecks {
             turn: checkpoint_turn,
+            started: std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(2)),
             visual: if self.hermetic {
                 crate::agent::verify::visual::Review::default()
             } else {

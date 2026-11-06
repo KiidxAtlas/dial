@@ -425,17 +425,20 @@ pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
         "context_notes" => crate::agent::window::context_notes::readonly(name, args),
         "new_context" => false,
         "checkpoint" | "rewind" => true,
-        "ask" | "finish" | "goal" | "tool_search" | "tool_load" | "artifact_read"
-        | "working_state" => true,
+        "ask" | "finish" | "goal" | "tool_search" | "tool_load" | "working_state" => true,
         // Each selected command passes the automatic-check gate itself (`run_focused_check`).
         "check" => true,
         // Project coordination changes only bounded advisory metadata, never workspace authority.
         "peers" => true,
-        "recall" | "reflect" => true,
-        "retain" => !args["items"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["scope"] == "global")),
-        "learn" => args.get("skill").is_none() && args["scope"] != "global",
+        // Provenance registers `memory` as an extension tool and decides for itself below.
+        "memory" if !ext.contains(name) => match args["action"].as_str().unwrap_or("") {
+            "recall" | "reflect" => true,
+            "retain" => !args["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["scope"] == "global")),
+            "learn" => args.get("skill").is_none() && args["scope"] != "global",
+            _ => false,
+        },
         n if READ_ONLY.contains(&n) => true,
         _ => ext.get(name).is_some_and(|tool| !tool.needs_approval(args)),
     }
@@ -449,11 +452,10 @@ pub fn needs_approval(ext: &Registry, call: &ToolCall) -> bool {
 /// Stateful reads (background output cursors, memory, todo) remain serial barriers.
 pub fn parallel_read(ext: &Registry, name: &str, args: &Value) -> bool {
     // Read-only shell commands join parallel groups unless they name a stateful or managed form:
-    // a retained `session` (cwd and exports), terminal or background/async job is a serial barrier.
+    // a retained `session` (cwd and exports), terminal or background job is a serial barrier.
     if name == "bash" {
         let flag_off = |key| matches!(args.get(key), None | Some(Value::Null | Value::Bool(false)));
         return flag_off("background")
-            && flag_off("async")
             && flag_off("pty")
             && args["session"].is_null()
             && is_read_only(ext, name, args);

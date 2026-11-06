@@ -208,7 +208,7 @@ state, requests report `registry_default` routing.
 ## Remote idle limits and prompt-cache keys
 
 - Eligible direct HTTP connections are shared across per-request agents after the previous response is fully consumed. The pool keeps at most four idle connections per origin and rejects connections idle for 30 seconds or more when borrowing them. Each request rebinds cancellation and silence controls. Loopback/LAN targets, proxies, and caller-supplied guarded resolvers do not share this pool. This is reuse after traffic, not a hosted-model startup ping or preconnect.
-- `remote_model_idle_timeout_secs` defaults to 300 seconds for remote routes (ChatGPT, Anthropic, and OpenAI-compatible hosts that are not localhost or LAN). It bounds the wait for the first event and silence between events. Only actual stream progress resets it; keep-alives do not.
+- `remote_model_idle_timeout_secs` defaults to 60 seconds for remote routes (ChatGPT, Anthropic, and OpenAI-compatible hosts that are not localhost or LAN). It bounds the wait for the first event and silence between events. Only actual stream progress resets it; keep-alives do not, with one exception: while a native Anthropic tool call is open, `ping` events reset it for up to 10 minutes after the last real progress. Anthropic may buffer a large tool call's arguments and send only pings (every 30 seconds) until the call is complete, so a long `write` must not be cut off and replayed identically.
 - A stall maps to an incomplete stream, which is transient. It retries under `retry.max_attempts`, and the partial reply and its tool calls are discarded before the retry.
 - Sockets opened by the cancellable HTTP transport and WebSocket TCP connector enable TCP keepalive probes after 30 seconds of silence (every 10 seconds, 3 probes). For WebSockets this includes the socket underneath an HTTP CONNECT tunnel. A path that dies while the model is silent (sleep/wake, a network or VPN switch, an expired NAT mapping) can fail sooner than the model idle limit and retry on a fresh connection. A live server answers probes however long the model takes, so slow replies keep the full limit. These are kernel probes, not billed requests or prompt-cache refreshes, and they do not renew model-progress deadlines. Retry notices show how long the failed attempt ran.
 - Local model servers (localhost or LAN) keep an unlimited first-event wait. `worker_timeout_secs` (default `0`) still governs local workers. `0` on `remote_model_idle_timeout_secs` is an explicit opt-out.
@@ -401,3 +401,91 @@ increased request budget.
 Completion is the model's call: Dial does not add a review round after edits or shell commands.
 When a turn ends, changed files are listed for the user. Approval, todo, and configured focused
 verification gates remain.
+
+### Provider-specific routing and explicit caching
+
+These settings extend the existing `model_profiles` contract: select the provider/model normally,
+and use an exact matching profile (`--profile name`, `/profile name`, or `model_profile` in TOML)
+when opting into these controls. A unique exact-model profile is also resolved automatically.
+No extra agent tool calls or provider-owned agent loops are introduced. Dial still executes tools
+and enforces approvals, history and cancellation.
+
+**OpenRouter.** Only the `openrouter` provider with Chat Completions or Responses accepts
+`openrouter_routing`. Omitting it leaves OpenRouter/account defaults unchanged:
+
+```toml
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4.5" # replace with your chosen exact OpenRouter model
+model_profile = "private"
+
+[model_profiles.private]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4.5"
+
+[model_profiles.private.openrouter_routing]
+sort = "latency"                   # price | latency | throughput
+only = ["anthropic"]               # hard provider allowlist; use current upstream slugs
+allow_fallbacks = false
+require_parameters = true
+data_collection = "deny"           # allow | deny
+zdr = true
+
+[model_profiles.private.openrouter_routing.max_price]
+prompt = 3.0                       # USD per million input tokens
+completion = 15.0                  # USD per million output tokens
+```
+
+Optional `order` prefers provider slugs in order; `ignore` excludes slugs. Optional `max_price.request`
+and `.image` are USD per unit. Unknown fields, malformed/empty slug lists and nonfinite/negative prices
+are rejected. Preferences, including explicit `false`, remain on each retry; they are never stripped
+to recover a failed request. An active routing profile disables Dial's automatic model fallback and
+compaction promotion, because those exact-model constraints cannot safely transfer to another route.
+An explicit user model selection remains available. OpenRouter enforces upstream eligibility;
+`zdr` is not an unconditional no-retention guarantee (account safety-retention policies still apply).
+See [OpenRouter routing](https://openrouter.ai/docs/guides/routing/provider-selection).
+
+**Gemini explicit caches.** Implicit caching is unchanged. Explicit caching is **off by default**;
+it creates billed server-side storage and may cost more for short or infrequently reused prompts.
+Enable it only for a suitable exact native-Gemini model profile, after checking current cache prices:
+
+```toml
+provider = "gemini"
+model = "gemini-2.5-pro"
+model_profile = "cached"
+
+[model_profiles.cached]
+provider = "gemini"
+model = "gemini-2.5-pro"
+
+[model_profiles.cached.gemini_cache]
+ttl_secs = 300
+min_tokens = 4096
+max_entries = 4
+max_prefix_bytes = 1048576
+```
+
+Supported identifiers are `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`,
+`gemini-3-pro-preview`, `gemini-3-flash-preview` and `gemini-3.1-pro-preview` (also with `models/`).
+Unknown/custom and Gemini 4+ identifiers bypass explicit caching. This conservative allowlist is not
+a promise that a retired model is still available. Native Gemini protocol is required; use
+`gemini_cache`, not generic `prompt_cache` or `cache_retention` overrides.
+
+Dial first observes a prefix without creating storage. A repeated stable prefix is admitted only
+after an automatic `countTokens` request confirms at least `max(min_tokens, 4096)` tokens. The
+prefix contains stable instructions/tool policy and eligible immutable first-user text when followed
+by later conversation; current tails, model thoughts, tool results and media are not frozen.
+Changing instructions, tools, endpoint, credentials or model isolates the cache. Cache preparation
+adds backend HTTP requests, not model-visible tool calls; preparation errors surface instead of
+silently changing the cache policy.
+
+TTL must be 30–3600 seconds, `min_tokens` 2048–1048576, `max_entries` 1–32, and the byte bound
+1024–4194304. There are at most 32 process-local slots globally, also bounded per endpoint/auth/model
+scope. Busy/full/small or nearly expired entries use ordinary inference. Successful resources remain
+reusable until TTL, without renewal; local state is not persisted. Failure/cancellation deletes a
+known resource with an independent two-second best-effort cleanup budget and no detached task.
+Unknown create outcomes, failed deletion and process exit rely on the requested server TTL; storage
+may remain billed until expiry. A tombstone prevents immediate recreation after an ambiguous create.
+Cache rejection surfaces the original generation error, not an uncached replay. Cached token usage
+continues through the normal usage parser; the usage ledger is not a full storage-charge invoice.
+See the [Gemini cache API](https://ai.google.dev/api/caching) and current provider pricing before
+opting in. No cache-hit, latency or cost improvement is guaranteed.

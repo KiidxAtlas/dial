@@ -126,6 +126,12 @@ impl Participant {
             .collect())
     }
 
+    /// This instance's own published record (summary, phase and claimed scopes).
+    pub fn own(&self) -> Result<Peer> {
+        let _transaction = transaction(&self.dir)?;
+        Ok(load(&self.dir, &self.id)?.peer)
+    }
+
     /// Address an exact live instance id. Full or malformed inboxes fail without eviction.
     pub fn send(&self, to: &str, text: &str) -> Result<()> {
         ensure!(valid_id(to), "recipient must be an exact peer instance id");

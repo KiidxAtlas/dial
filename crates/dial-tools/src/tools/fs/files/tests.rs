@@ -274,6 +274,14 @@ fn write_creates_parents_and_enforces_limit() {
     let (dir, ws) = workspace();
     let out = run(&ws, "write", json!({"path": "a/b/c.txt", "content": "hi"}));
     assert!(!out.is_error, "{}", out.text);
+    // The receipt carries size, line count and the on-disk hash, so no reread is needed.
+    assert!(
+        out.text.contains("created 2 supplied bytes (1 lines)")
+            && out.text.contains("[Source raw SHA256:")
+            && out.text.contains("rereading it adds nothing"),
+        "{}",
+        out.text
+    );
     assert_eq!(
         fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
         "hi"
@@ -615,4 +623,19 @@ fn a_crlf_file_is_edited_with_lf_text_and_stays_crlf() {
         fs::read_to_string(&file).unwrap(),
         "1\r\n2\r\n2b\r\nthree\r\n"
     );
+}
+
+#[test]
+fn rewrite_advice_flags_mostly_unchanged_overwrites_of_non_trivial_files() {
+    let old: String = (0..60).map(|i| format!("line {i}\n")).collect();
+    let mostly_same = old.replace("line 7\n", "changed\n");
+    assert!(
+        rewrite_advice(&old, &mostly_same)
+            .unwrap()
+            .contains("59 of 60 lines were unchanged")
+    );
+    let replaced: String = (0..60).map(|i| format!("new {i}\n")).collect();
+    assert_eq!(rewrite_advice(&old, &replaced), None);
+    // Small files are cheap to regenerate; no advice.
+    assert_eq!(rewrite_advice("a\nb\n", "a\nc\n"), None);
 }

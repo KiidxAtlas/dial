@@ -133,7 +133,7 @@ fn builtin_and_extra_tools_are_selectable_but_cannot_be_shadowed() {
     assert!(f.config.validate().is_err());
     f.config.tools.clear();
     f.config.tools.insert(
-        "retain".into(),
+        "memory".into(),
         ToolConfig {
             program: "/bin/echo".into(),
             args: vec![],

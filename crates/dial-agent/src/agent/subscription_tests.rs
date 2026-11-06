@@ -155,7 +155,8 @@ fn subscription_provider_recovers_disconnection_runs_real_tools_and_replays_resu
     let layout =
         crate::config::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
     llm::chatgpt::test_account(&layout.user_dir, false);
-    let overlay:toml::Table=toml::from_str("model='account-model'\nprovider='chatgpt'\napproval='auto'\nintegrations=[]\n[sandbox]\nmode='off'\n[improve]\nenabled=false").unwrap();
+    // This fixture isolates provider disconnection/replay, not completion policy.
+    let overlay:toml::Table=toml::from_str("model='account-model'\nprovider='chatgpt'\napproval='auto'\nintegrations=[]\n[sandbox]\nmode='off'\n[improve]\nenabled=false\n[verification.review]\nenabled=false").unwrap();
     let config = crate::config::types::Config::load(&layout, Some(overlay)).unwrap();
     assert_eq!(
         config.endpoint.as_ref().unwrap().base_url,

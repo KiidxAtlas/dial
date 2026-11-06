@@ -1,8 +1,8 @@
-//! `/image generate <prompt>` and `/image edit <file> <prompt>`: run `image_gen` with the typed
-//! prompt directly, without a model turn. Approval, plan mode and mutation authority are the
-//! agent's (`Agent::generate_image`); the output is a new file named from the prompt (in the
-//! workspace root, or beside the edited source), never an existing one, and an edited source is
-//! only read.
+//! `/image generate <prompt>`, `/image gif <prompt>` and `/image edit <file> <prompt>`: run
+//! `image_gen` with the typed prompt directly, without a model turn. Approval, plan mode and
+//! mutation authority are the agent's (`Agent::generate_image`); the output is a new file named
+//! from the prompt (in the workspace root, or beside the edited source), never an existing one,
+//! and an edited source is only read. `gif` asks the same tool for an animated `.gif`.
 use crate::agent::Agent;
 use crate::app::{App, Bridge, PAINT_EVERY, Shell, Step};
 use crate::storage::redact::redact_text;
@@ -13,8 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-const USAGE: &str =
-    "Usage: /image generate <prompt> · /image edit <file> <prompt> · /image settings";
+const USAGE: &str = "Usage: /image generate <prompt> · /image gif <prompt> · /image edit <file> <prompt> · /image settings";
 /// Prompt words used in the output file name, and that name's maximum slug length.
 const SLUG_WORDS: usize = 6;
 const SLUG_CHARS: usize = 48;
@@ -36,22 +35,26 @@ pub(super) fn run(
     Some(generate(shell, app, agent, request))
 }
 
-/// A parsed `/image generate` or `/image edit` request.
+/// A parsed `/image generate`, `/image gif` or `/image edit` request.
 #[derive(Debug, PartialEq)]
 struct ImageRequest<'a> {
     prompt: &'a str,
-    /// The workspace image to edit; `None` for `generate`.
+    /// The workspace image to edit; `None` for `generate` and `gif`.
     source: Option<&'a str>,
+    /// `gif`: an animated GIF instead of the route's still-image format.
+    gif: bool,
 }
 
-/// `generate <prompt>` or `edit <file> <prompt>`, or `None` for any other or incomplete form.
+/// `generate <prompt>`, `gif <prompt>` or `edit <file> <prompt>`, or `None` for any other or
+/// incomplete form.
 fn parse(args: &str) -> Option<ImageRequest<'_>> {
     let (action, rest) = args.trim().split_once(char::is_whitespace)?;
     let rest = rest.trim();
     match action {
-        "generate" => (!rest.is_empty()).then_some(ImageRequest {
+        "generate" | "gif" => (!rest.is_empty()).then_some(ImageRequest {
             prompt: rest,
             source: None,
+            gif: action == "gif",
         }),
         "edit" => {
             let (source, prompt) = rest.split_once(char::is_whitespace)?;
@@ -59,6 +62,7 @@ fn parse(args: &str) -> Option<ImageRequest<'_>> {
             (!prompt.is_empty()).then_some(ImageRequest {
                 prompt,
                 source: Some(source),
+                gif: false,
             })
         }
         _ => None,
@@ -71,8 +75,13 @@ fn generate(
     agent: &mut Agent<'_>,
     request: ImageRequest<'_>,
 ) -> Result<Step> {
-    let ImageRequest { prompt, source } = request;
+    let ImageRequest {
+        prompt,
+        source,
+        gif,
+    } = request;
     let extension = match image_gen::output_extension(agent.effective_config()) {
+        Ok(_) if gif => "gif",
         Ok(extension) => extension,
         Err(error) => {
             shell.note("Image", redact_text(&format!("{error:#}")));
@@ -82,6 +91,7 @@ fn generate(
     let output = output_name(agent.workspace().root(), prompt, extension, source);
     let typed = match source {
         Some(source) => format!("/image edit {source} {prompt}"),
+        None if gif => format!("/image gif {prompt}"),
         None => format!("/image generate {prompt}"),
     };
     app.interrupt.store(false, Ordering::SeqCst);
@@ -108,6 +118,7 @@ fn generate(
         Ok(output) => {
             let ran = match source {
                 Some(source) => format!("`/image edit` on {source:?}"),
+                None if gif => "`/image gif`".to_owned(),
                 None => "`/image generate`".to_owned(),
             };
             agent.session_mut().append(json!({

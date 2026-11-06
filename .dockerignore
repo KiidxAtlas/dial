@@ -3,6 +3,7 @@
 .tmp
 bin
 target
+benchmarks
 python/.venv
 python/.pytest_cache
 **/__pycache__

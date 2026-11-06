@@ -24,6 +24,49 @@ fn printed_success_cannot_replace_observed_process_termination() {
 }
 
 #[test]
+fn unawaited_coroutines_cannot_pass_but_ordinary_warnings_can() {
+    use crate::runtime::{execution::ProcessOutcome, tool_output::ToolOutput};
+    for (text, expected) in [
+        (
+            "<stdin>:54: RuntimeWarning: coroutine 'test_cleanup' was never awaited\n1 passed",
+            CheckStatus::Unverified,
+        ),
+        (
+            "C:\\tests\\test_app.py:12: RuntimeWarning: coroutine 'check' was never awaited",
+            CheckStatus::Unverified,
+        ),
+        (
+            "test_app.py:12: DeprecationWarning: deprecated API\n1 passed",
+            CheckStatus::Passed,
+        ),
+        (
+            "Example: RuntimeWarning: coroutine 'check' was never awaited",
+            CheckStatus::Passed,
+        ),
+    ] {
+        let output = ToolOutput::ok(text.into()).with_process(ProcessOutcome {
+            started: true,
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            output_complete: true,
+        });
+        let verdict = classify_output(None, &output, false);
+        assert_eq!(verdict, expected, "{text}");
+        assert_eq!(
+            check_failed(&output),
+            expected == CheckStatus::Unverified,
+            "{text}"
+        );
+        assert_eq!(
+            verdict.repair_exit_code(&output),
+            (expected == CheckStatus::Passed).then_some(0)
+        );
+    }
+}
+
+#[test]
 fn repair_exits_use_typed_completion_and_invalidate_unknown_runs() {
     use crate::runtime::execution::ProcessOutcome;
     use crate::runtime::tool_output::ToolOutput;

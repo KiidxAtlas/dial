@@ -178,3 +178,44 @@ fn streams_tool_calls_from_the_real_server() {
     assert!(!streamed.tool_calls[0].malformed_arguments);
     backend.release();
 }
+
+#[test]
+#[ignore = "requires running Osaurus; loads DIAL_TEST_OSAURUS_MODEL for streaming and cancellation"]
+fn osaurus_live_streams_and_cancels_through_dial_backend() {
+    let model = std::env::var("DIAL_TEST_OSAURUS_MODEL").expect("installed Osaurus model id");
+    let base_url =
+        std::env::var("OSAURUS_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1337/v1".into());
+    let profile = llm::profiles::ModelProfile::minimal("osaurus", &model);
+    let mut backend = Backend::new(
+        ProviderKind::Endpoint {
+            base_url,
+            model,
+            api_key: None,
+        },
+        PathBuf::new(),
+        90,
+    )
+    .with_profile(profile);
+    let request = ask("Say hello in one short sentence.", vec![], 32);
+    let mut text = String::new();
+    let reply = backend
+        .chat(
+            None,
+            &request,
+            90,
+            Some(&mut |piece| {
+                text.push_str(piece);
+                true
+            }),
+        )
+        .unwrap();
+    assert!(!text.trim().is_empty(), "no streamed text");
+    assert_eq!(
+        reply.text, text,
+        "streamed deltas match the accumulated reply"
+    );
+    let error = backend
+        .chat(None, &request, 90, Some(&mut |_| false))
+        .unwrap_err();
+    assert!(error.is::<llm::Interrupted>(), "{error:#}");
+}

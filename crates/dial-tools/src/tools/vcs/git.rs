@@ -29,8 +29,8 @@ const HOOKS_SKIPPED: &str =
     "[repository hooks and commit signing were skipped because git.bypass_hooks = true]";
 
 const DESCRIPTION: &str = "Git, jj (jujutsu) and GitHub operations without shell quoting. Read actions: `status` \
-(optional `path`; large git status returns counts and samples, complete output via artifact_read), `diff` \
-(optional `staged`, `base` ref, `path`), `log` (`limit` ≤ 50, optional `path`), `show` (`rev`), `blame` (`path`, optional \
+(optional `path`; large git status returns counts and samples, complete output via read), `diff` \
+(optional `staged`, `base` ref, `path`), `log` (`limit` ≤ 50, optional `path`), `reflog` (`limit` ≤ 50; start here for lost work: recent HEAD movements), `show` (`rev`), `blame` (`path`, optional \
 `start`/`end` lines, `rev`), `branches`, `pr_view`/`pr_checks`/`issue_view` (`number`; need the `gh` CLI). Changing actions \
 (ask approval): `add` (`paths`), `unstage` (`paths`), `commit` (`message`; commits what is staged, or every tracked change \
 with `all`), `branch_create` (`name`, optional `from`; switches to it), `switch` (`name`), `push` (optional `remote`, \
@@ -54,6 +54,7 @@ const READS: &[&str] = &[
     "status",
     "diff",
     "log",
+    "reflog",
     "show",
     "blame",
     "branches",
@@ -165,22 +166,32 @@ struct Invocation<'a> {
 
 /// A read-only Git operation can still execute clean/process filters or text-conversion
 /// drivers. Query effective configuration using Git itself (includes and worktree config
-/// apply), but never run configured programs on this host-side read path.
-fn refuse_read_filters(root: &Path, cancel: &AtomicBool) -> Result<(), String> {
-    inspect_filter_config(filter_config_query(root), cancel)
+/// apply), but never run configured programs on this host-side read path. Object-only reads
+/// still refuse textconv drivers as a second guard behind `--no-textconv`.
+fn refuse_read_filters(root: &Path, cancel: &AtomicBool, object_only: bool) -> Result<(), String> {
+    let pattern = if object_only {
+        TEXTCONV_CONFIG
+    } else {
+        FILTER_OR_TEXTCONV_CONFIG
+    };
+    inspect_filter_config(filter_config_query(root, pattern), cancel)
 }
 
-fn filter_config_query(root: &Path) -> Command {
+const FILTER_OR_TEXTCONV_CONFIG: &str =
+    r"^(filter\..*\.(clean|smudge|process)|diff\..*\.textconv)$";
+const TEXTCONV_CONFIG: &str = r"^diff\..*\.textconv$";
+
+/// Read subcommands that only load commits, trees and refs from the object database. Git runs
+/// clean/smudge filters only when converting working-tree files, so configured filter drivers
+/// (for example git-lfs) cannot execute for them.
+const OBJECT_ONLY_READS: &[&str] = &["log", "reflog", "show", "branch", "rev-parse"];
+
+fn filter_config_query(root: &Path, pattern: &str) -> Command {
     let mut query = Command::new("git");
     query
         .args(hooks_off_args())
         .args(SAFE_GIT_ARGS)
-        .args([
-            "config",
-            "--null",
-            "--get-regexp",
-            r"^(filter\..*\.(clean|smudge|process)|diff\..*\.textconv)$",
-        ])
+        .args(["config", "--null", "--get-regexp", pattern])
         .current_dir(root)
         .env_clear()
         .envs(
@@ -234,8 +245,18 @@ fn inspect_filter_config(query: Command, cancel: &AtomicBool) -> Result<(), Stri
                 "Git returned incomplete filter configuration; host-side read refused".into(),
             );
         }
-        if effective.values().any(|command| !command.is_empty()) {
-            return Err("host-side Git inspection refused because executable filter configuration or text-conversion configuration is present; run the operation with approved sandboxed bash instead".into());
+        let active: Vec<String> = effective
+            .iter()
+            .filter(|(_, command)| !command.is_empty())
+            .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
+            .collect();
+        if !active.is_empty() {
+            // Name the keys (never their commands) so the refusal is actionable: a global
+            // git-lfs install is the common cause, and object-only reads still run.
+            return Err(format!(
+                "host-side Git inspection refused because executable filter configuration or text-conversion configuration is present ({}); Dial never runs those programs on this read path. log, reflog, show and branches still work here; run worktree reads such as status or diff with approved sandboxed bash instead",
+                active.join(", ")
+            ));
         }
         return Ok(());
     }
@@ -262,7 +283,10 @@ fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
     } = inv;
     let mut command = Command::new(program);
     if program == "git" && !may_mutate {
-        refuse_read_filters(root, cancel)?;
+        let object_only = args
+            .first()
+            .is_some_and(|arg| OBJECT_ONLY_READS.contains(&arg.as_str()));
+        refuse_read_filters(root, cancel, object_only)?;
         command.env_clear().envs(
             std::env::vars().filter(|(name, value)| {
                 crate::tools::exec::sandbox::child_env_allowed(name, value)
@@ -850,7 +874,7 @@ fn status_output(ws: &Workspace, text: &str) -> String {
         out.push_str("Additional diagnostics are included in complete output.\n");
     }
     out.push_str(&format!(
-        "Complete status ({} bytes): {uri}; retrieve with artifact_read.",
+        "Complete status ({} bytes): {uri}; retrieve with read.",
         text.len()
     ));
     out.push_str("\nSample only; use git status with `path` to inspect a scope.");
@@ -955,6 +979,20 @@ fn dispatch(
                     a.push(one_path(ws, path)?);
                 }
                 git(a, LOCAL_TIMEOUT)?
+            }
+            "reflog" => {
+                let n = opt_u64(args, "limit")?.unwrap_or(20).clamp(1, 50);
+                git(
+                    vec![
+                        "reflog".into(),
+                        "show".into(),
+                        "--no-color".into(),
+                        format!("-n{n}"),
+                        "--format=%h %gd %gs".into(),
+                        "HEAD".into(),
+                    ],
+                    LOCAL_TIMEOUT,
+                )?
             }
             "show" => git(
                 vec![
@@ -1096,7 +1134,7 @@ impl Tool for Git {
             "git",
             DESCRIPTION,
             json!({
-                "action": {"type": "string", "enum": ["status", "diff", "log", "show", "blame", "branches", "add", "unstage", "commit", "branch_create", "switch", "push", "pr_create", "pr_view", "pr_checks", "issue_view"]},
+                "action": {"type": "string", "enum": ["status", "diff", "log", "reflog", "show", "blame", "branches", "add", "unstage", "commit", "branch_create", "switch", "push", "pr_create", "pr_view", "pr_checks", "issue_view"]},
                 "vcs": {"type": "string", "enum": ["git", "jj"], "description": "status/diff/log/commit: force git or jj (default: jj when .jj/ exists)"},
                 "start": {"type": "integer", "minimum": 1, "description": "blame: first line"},
                 "end": {"type": "integer", "minimum": 1, "description": "blame: last line"},
@@ -1105,7 +1143,7 @@ impl Tool for Git {
                 "staged": {"type": "boolean", "description": "diff: staged changes"},
                 "base": {"type": "string", "description": "diff: compare the working tree to this ref; pr_create: base branch"},
                 "rev": {"type": "string", "description": "show: commit, tag or ref; blame: blame as of this revision"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "log: commits to show (default 20)"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "log/reflog: entries to show (default 20)"},
                 "message": {"type": "string", "description": "commit: message"},
                 "all": {"type": "boolean", "description": "commit: include every tracked change"},
                 "name": {"type": "string", "description": "branch_create/switch: branch name"},

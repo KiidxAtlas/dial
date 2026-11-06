@@ -633,7 +633,9 @@ impl<'a> Agent<'a> {
             })();
             match saved {
                 Ok(path) => {
-                    ui.notice(&format!("Accepted handoff document saved privately at {path}; retrieve with artifact_read."));
+                    ui.notice(&format!(
+                        "Accepted handoff document saved privately at {path}; retrieve with read."
+                    ));
                     prepared.outcome.handoff_path = Some(path);
                 }
                 Err(error) => {
@@ -729,7 +731,7 @@ impl<'a> Agent<'a> {
             .path()
             .map(|path| path.to_string_lossy().into_owned());
         format!(
-            "{}\n\nRetained evidence (read and mutation results): {}\nFull conversation archive: session {} ({}); {archived_note}retrieve omitted details with session_search; retrieve evidence with artifact_read. Exact current request, state and todos are carried separately in the machine contract.",
+            "{}\n\nRetained evidence (read and mutation results): {}\nFull conversation archive: session {} ({}); {archived_note}retrieve omitted details with session_search; retrieve evidence by reading its artifact:// URI with read. Exact current request, state and todos are carried separately in the machine contract.",
             summary.trim(),
             shown,
             self.session.id(),

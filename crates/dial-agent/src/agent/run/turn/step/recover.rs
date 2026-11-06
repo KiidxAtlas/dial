@@ -278,6 +278,23 @@ impl Agent<'_> {
                 turn.budget.give_back();
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
             }
+            // The constrained retry is an optional aid. A local server that rejects its schema
+            // (grammar compilation, unsupported `response_format`) must not end the session: drop
+            // the aid for this turn and resend an ordinary request.
+            Err(error) if sent.repairing && !self.hermetic => {
+                turn.repair.reject();
+                self.record(
+                    sent.step,
+                    "constrained_repair",
+                    json!({"phase":"result","outcome":"provider_rejected","error":format!("{error:#}")}),
+                )?;
+                ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                    crate::agent::ui::ui_event::EventKind::Recovery,
+                    "The server rejected the constrained tool-call retry; continuing without it",
+                ));
+                turn.budget.give_back();
+                return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
+            }
             Err(error) => {
                 self.save_request_policy(
                     None,

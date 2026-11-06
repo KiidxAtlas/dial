@@ -125,6 +125,7 @@ fn shared_wait_receives_steering_without_losing_the_queued_instruction() {
         },
         &[call],
         None,
+        None,
     );
     assert!(!results[0].0.is_error);
     assert_eq!(queued, ["new instruction"]);
@@ -195,6 +196,7 @@ fn ordinary_queued_input_ends_a_shared_wait_without_consuming_the_message() {
         },
         &[call],
         None,
+        None,
     );
     assert!(
         !results[0].0.is_error,
@@ -233,6 +235,7 @@ fn parallel_hooks_run_per_call_and_block_before_file_reads() {
             pending_steering: &mut Vec::new(),
         },
         &calls,
+        None,
         None,
     );
     assert_eq!(
@@ -316,6 +319,7 @@ fn independent_slow_reads_overlap_and_results_stay_ordered() {
         },
         &calls,
         None,
+        None,
     );
     assert_eq!(
         read.entered.load(Ordering::SeqCst),
@@ -372,6 +376,7 @@ fn batched_read_only_bash_runs_through_parallel_tools_in_call_order() {
             pending_steering: &mut Vec::new(),
         },
         &calls,
+        None,
         None,
     );
     assert_eq!(
@@ -440,6 +445,7 @@ fn parallel_hook_refusals_report_policy_for_each_call_without_execution() {
                 pending_steering: &mut Vec::new(),
             },
             &calls,
+            None,
             None,
         );
         assert!(outputs.iter().all(|(output, _)| output.is_error

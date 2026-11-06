@@ -107,7 +107,7 @@ impl ArtifactStore {
         if !source_dir.exists() {
             return Ok(());
         }
-        // Validate every feedback record using the same bounded reader as artifact_read.
+        // Validate every feedback record using the same bounded reader as read artifact:// URIs.
         let mut start = 1;
         loop {
             let page = crate::storage::annotations::read(&annotations, &id, start, 500)?;

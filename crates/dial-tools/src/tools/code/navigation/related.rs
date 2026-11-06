@@ -6,6 +6,7 @@
 //! optional language-server section of `find` is resolved), and no row is an edit witness.
 use super::{MAX_FILE, Workspace, declarations};
 use crate::tools::fs::walk::Walk;
+use ast_grep_core::{AstGrep, Language};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Read, path::Path};
 
@@ -15,6 +16,7 @@ const MAX_SPAN: usize = 60;
 const MAX_REFS: usize = 4;
 const MAX_CONFIG: usize = 2;
 const MAX_TYPES: usize = 2;
+const MAX_CONTRACT_REFS: usize = 12;
 pub(super) const MAX_TARGETS: usize = 3;
 const GENERIC_NAMES: &[&str] = &[
     "main", "test", "tests", "new", "default", "from", "into", "run", "get", "set", "init", "name",
@@ -31,6 +33,12 @@ pub(super) struct Target {
     pub start: usize,
     pub end: usize,
     pub sha256: String,
+}
+
+#[derive(Default)]
+pub(super) struct Bundle {
+    pub text: String,
+    pub previews: Vec<Target>,
 }
 
 struct Row {
@@ -64,6 +72,8 @@ struct Plan {
     owner: Option<Row>,
     name: Option<String>,
     types: Vec<String>,
+    contracts: Vec<String>,
+    contract_refs: Vec<Row>,
     refs: Vec<Row>,
     config: Vec<Row>,
     type_defs: Vec<(usize, Row)>,
@@ -75,7 +85,7 @@ fn read_source(ws: &Workspace, path: &Path) -> Option<(String, String)> {
         return None;
     }
     if !ws
-        .resolve(&ws.rel(path))
+        .resolve_read(&ws.rel(path))
         .is_ok_and(|resolved| resolved == path)
     {
         return None;
@@ -144,6 +154,75 @@ fn declared_name(line: &str) -> Option<String> {
         (!matches!(word, "if" | "for" | "while" | "switch" | "match" | "return")).then_some(word)
     })?;
     (name.len() >= 4 && !GENERIC_NAMES.contains(&name)).then(|| name.to_owned())
+}
+
+/// Literal public names in name methods and string-array constants inside a ranked
+/// span. These are lexical search seeds, not resolved symbols or computed values.
+pub(super) fn contract_names(path: &Path, text: &str, start: usize, end: usize) -> Vec<String> {
+    let Some(lang) = super::SupportLang::from_path(path) else {
+        return Vec::new();
+    };
+    let Ok(tree) = AstGrep::try_new(text, lang) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for node in tree.root().dfs() {
+        if node.start_pos().line() + 1 < start || node.end_pos().line() + 1 > end {
+            continue;
+        }
+        let Some(name) = node.field("name") else {
+            continue;
+        };
+        let registry = node.kind() == "const_item";
+        let value = if registry {
+            node.field("value")
+        } else if name.text() == "name" {
+            node.field("body")
+        } else {
+            None
+        };
+        let Some(value) = value else { continue };
+        let value_text = value.text();
+        let expression = value_text
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .trim();
+        let expression = expression
+            .strip_prefix("return ")
+            .unwrap_or(expression)
+            .trim_end_matches(';')
+            .trim();
+        for literal in value.dfs().filter(|node| node.kind() == "string_literal") {
+            let direct = if registry {
+                literal
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "array_expression")
+            } else {
+                expression == literal.text()
+            };
+            if direct
+                && let Ok(name) = serde_json::from_str::<String>(&literal.text())
+                && (3..=64).contains(&name.len())
+                && name.chars().all(ident)
+                && crate::storage::memory::screen(&name).is_ok()
+                && !names.contains(&name)
+            {
+                names.push(name);
+                if names.len() == 8 {
+                    return names;
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Coarse source groups keep one crate/module's many directories from dominating.
+fn contract_group(path: &str) -> &str {
+    let start = path.find("/src/").map_or(0, |at| at + 5);
+    let end = path[start..].find('/').map_or(path.len(), |at| start + at);
+    &path[..end]
 }
 fn signature_types(lines: &[&str], start: usize) -> Vec<String> {
     let mut types: Vec<String> = Vec::new();
@@ -260,14 +339,14 @@ fn span_row(
 }
 
 /// Build the bundle for at most [`MAX_TARGETS`] hits. `scope` bounds the lexical search like `find`.
-pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes: usize) -> String {
+pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes: usize) -> Bundle {
     let targets = &targets[..targets.len().min(MAX_TARGETS)];
     if targets.is_empty() || max_bytes < 512 {
-        return String::new();
+        return Bundle::default();
     }
     let mut plans: Vec<Plan> = targets.iter().map(|_| Plan::default()).collect();
     for (plan, target) in plans.iter_mut().zip(targets) {
-        let Ok(abs) = ws.resolve(&target.path) else {
+        let Ok(abs) = ws.resolve_read(&target.path) else {
             plan.stale = true;
             continue;
         };
@@ -277,6 +356,7 @@ pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
+        plan.contracts = contract_names(&abs, &text, target.start, target.end);
         let decls = declarations(&abs, &text);
         let mut chain: Vec<_> = decls
             .iter()
@@ -306,11 +386,13 @@ pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes
             plan.types = signature_types(&lines, *s);
         }
     }
-    let wanted: Vec<&Plan> = plans.iter().filter(|p| p.name.is_some()).collect();
+    let wanted = plans
+        .iter()
+        .any(|p| p.name.is_some() || !p.contracts.is_empty());
     let mut scanned = 0usize;
     let mut bytes = 0u64;
     let mut truncated = false;
-    if !wanted.is_empty() {
+    if wanted {
         let mut walk = Walk::new(ws);
         walk.run(scope, &mut |path| {
             if scanned >= MAX_FILES || bytes >= MAX_BYTES {
@@ -332,6 +414,42 @@ pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes
             for (plan, target) in plans.iter_mut().zip(targets) {
                 if plan.stale {
                     continue;
+                }
+                // Keep one contract reference per directory so a dense group of local
+                // callers cannot crowd out config, persistence, dispatch or history.
+                if !plan.contracts.is_empty()
+                    && (is_config || super::SupportLang::from_path(path).is_some())
+                    && plan.contract_refs.len() < 40
+                    && plan
+                        .contract_refs
+                        .iter()
+                        .filter(|row| contract_group(&row.path) == contract_group(&rel))
+                        .count()
+                        < 4
+                    && !plan
+                        .contract_refs
+                        .iter()
+                        .any(|row| Path::new(&row.path).parent() == Path::new(&rel).parent())
+                {
+                    let all = lines.get_or_insert_with(|| text.lines().collect());
+                    if let Some((index, _)) = all.iter().enumerate().find(|(index, line)| {
+                        !(rel == target.path && target.start <= index + 1 && *index < target.end)
+                            && plan.contracts.iter().any(|name| {
+                                line.contains(&format!("\"{name}\""))
+                                    || line.contains(&format!("'{name}'"))
+                            })
+                    }) {
+                        let spans = decls.get_or_insert_with(|| declarations(path, &text));
+                        plan.contract_refs.push(span_row(
+                            &rel,
+                            &sha256,
+                            spans,
+                            index + 1,
+                            all,
+                            "contract-reference",
+                            false,
+                        ));
+                    }
                 }
                 let mut hits = Vec::new();
                 let has_room = if is_config {
@@ -420,6 +538,25 @@ pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes
         });
         truncated |= walk.truncated;
     }
+    // Reuse the bounded discovery pool, before summary quotas drain it. No extra walk or
+    // relaxed format eligibility: unsupported config formats remain summary-only.
+    let eligible = |row: &&Row| super::SupportLang::from_path(Path::new(&row.path)).is_some();
+    let test = plans
+        .iter()
+        .flat_map(|plan| &plan.refs)
+        .filter(eligible)
+        .find(|row| crate::tools::fs::search::conventional_test(Path::new(&row.path)));
+    let config = plans.iter().flat_map(|plan| &plan.config).find(eligible);
+    let previews = test
+        .into_iter()
+        .chain(config)
+        .map(|row| Target {
+            path: row.path.clone(),
+            start: row.start,
+            end: row.end,
+            sha256: row.sha256.clone(),
+        })
+        .collect();
     let mut out = String::from(
         "Related evidence (bounded navigation aids, NOT edit witnesses: read the lines before editing). provenance=syntax is a tree-sitter declaration span; provenance=lexical is a whole-word text match in the searched scope, not a resolved symbol or call graph. Only the language-server section, when requested, is resolved.\n",
     );
@@ -431,9 +568,10 @@ pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes
         }
         out.push_str(&row);
     };
+    let mut shown_contracts = std::collections::BTreeSet::new();
     for (plan, target) in plans.iter_mut().zip(targets) {
-        // A hit that is not a named declaration (a config line, a text window) has no owner to relate.
-        if plan.name.is_none() && !plan.stale {
+        // Literal public contracts can be mapped even when the declaration name is generic.
+        if plan.name.is_none() && plan.contracts.is_empty() && !plan.stale {
             continue;
         }
         push(
@@ -450,8 +588,39 @@ pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes
             );
             continue;
         }
+        if !plan.contracts.is_empty() {
+            push(
+                &mut out,
+                format!(
+                    "  contract names: {} (literal declarations; lexical references, not confirmed owners)\n",
+                    plan.contracts.join(", ")
+                ),
+            );
+        }
         let mut rows = Vec::new();
         rows.extend(plan.owner.take());
+        let mut groups = std::collections::BTreeMap::new();
+        let mut contracts: Vec<_> = plan
+            .contract_refs
+            .drain(..)
+            .enumerate()
+            .map(|(index, row)| {
+                let count = groups
+                    .entry(contract_group(&row.path).to_owned())
+                    .or_insert(0);
+                let order = *count;
+                *count += 1;
+                (order, index, row)
+            })
+            .collect();
+        contracts.sort_by_key(|(order, index, _)| (*order, *index));
+        rows.extend(
+            contracts
+                .into_iter()
+                .map(|(_, _, row)| row)
+                .filter(|row| shown_contracts.insert((row.path.clone(), row.start, row.end)))
+                .take(MAX_CONTRACT_REFS),
+        );
         rows.extend(plan.type_defs.drain(..).take(MAX_TYPES).map(|(_, row)| row));
         plan.refs.sort_by_key(|row| !row.call);
         rows.extend(plan.refs.drain(..).take(MAX_REFS));
@@ -467,7 +636,10 @@ pub(super) fn render(ws: &Workspace, scope: &Path, targets: &[Target], max_bytes
         }
     }
     out.push_str(&format!(
-        "[related scan: {scanned} files, {bytes} bytes; scan truncated={truncated}; output clipped={clipped}; caps: {MAX_REFS} references, {MAX_TYPES} type definitions, {MAX_CONFIG} config rows per hit]\n"
+        "[related scan: {scanned} files, {bytes} bytes; scan truncated={truncated}; output clipped={clipped}; caps: {MAX_REFS} references, {MAX_TYPES} type definitions, {MAX_CONFIG} config rows, {MAX_CONTRACT_REFS} directory-diverse contract references per hit; contract discovery bounded to 8 literal names and 40 directories per hit, at most 4 directories per source group; source groups prioritized before extra directories; absence is not proof]\n"
     ));
-    out
+    Bundle {
+        text: out,
+        previews,
+    }
 }

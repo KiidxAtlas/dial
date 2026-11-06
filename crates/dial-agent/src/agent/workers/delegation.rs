@@ -71,7 +71,8 @@ impl<'a> Agent<'a> {
                         ui.tool_output(&event.name, &event.text);
                     } else if event.kind == "progress" {
                         ui.tool_progress(&event.name, &event.text);
-                    } else {
+                    } else if event.kind != "start" {
+                        // Job starts are already visible in the launching tool's card.
                         let suffix = event
                             .artifact
                             .as_ref()

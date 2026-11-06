@@ -100,12 +100,19 @@ failures (including checkpoint failures) are not reset by this recovery.
   reset works immediately during inference instead of waiting for the turn to finish.
 
 - A turn that edited files, was interrupted or failed ends with a compact **Turn report** line (for
-  example `3 files changed · checks current · 1 open task · /undo available`) and a muted next-step hint
-  (`/review · /undo` after edits, `continue · /undo` after a failure). The tool-expand key (`Ctrl+O`)
-  shows the full report: outcome, changed files, recorded checks (and whether they are current with the
-  final edits), open tasks, what `/undo` can revert, and which shell or extension calls ran outside
-  checkpoints and cannot be undone. Plain answers with no edits show no report. The summary is stored in
-  session control state as `turn_summary`.
+  example `3 files changed · checks passed · 1 open task`) and a muted next-step hint
+  (`/review · /undo` after edits, `continue · /undo` after a failure). The collapsed check state is
+  `checks failed`, `checks stale` (recorded before the final edits), `checks unverified`, `checks passed`
+  or `no recorded checks` (checks are optional; a shell or `eval` check is not listed here).
+  The tool-expand key (`Ctrl+O`) shows the full report: outcome, changed files, recorded checks, where
+  their logs can be opened with `/evidence check`, open tasks, shell or extension calls outside `/undo`,
+  and request timing. Empty sections are omitted, and plain answers with no edits show no report. The
+  summary is stored in session control state as `turn_summary`.
+- Settled test and build commands (`cargo test`, `cargo clippy`, `make test-*`, `pytest`, `tsc`, …)
+  show a **Test** or **Build** card instead of their raw log: counts at the right of the header, then
+  only failing test names or the first errors with their `file:line` locations. The expand key
+  (`Ctrl+O`) shows the ordinary card with the complete output. Output the card cannot attribute (a
+  crash with no test or error lines, a job moved to the background) keeps the ordinary card.
 - Resuming displays durable todos and recorded check statuses; these are history, not fresh test
   results. Completed tools are not replayed automatically. `/review` reviews a frozen local or GitHub
   PR scope with source-backed findings (the captured diff is split on `diff --git` file boundaries into

@@ -110,6 +110,9 @@ pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
     {
         return mcp_card(t, server, action, w as usize, ctx);
     }
+    if let Some(rows) = check::check_card(t, w as usize, ctx) {
+        return rows;
+    }
     if let Some(rows) = irc::irc_card(t, w as usize, ctx) {
         return rows;
     }
@@ -1145,6 +1148,7 @@ fn elapsed_label(secs: f64) -> String {
 /// Rows of a compact (one-line) tool's error shown before Ctrl+O expands it.
 const COMPACT_ERROR_ROWS: usize = 2;
 
+mod check;
 mod frame;
 mod irc;
 pub(super) use irc::incoming_notice;

@@ -68,9 +68,11 @@ pub(in crate::agent) fn record(control: &mut Value, text: &str, entry_id: Value,
     });
 }
 
-/// Render only admitted user provenance at the request tail, never an effective draft or a
-/// harness continuation. The excerpt bounds repeated context without hiding a suffix correction.
-pub(in crate::agent) fn request_context(control: &Value) -> Option<String> {
+/// Restore admitted user provenance when history no longer carries the latest request, as after
+/// compaction. A user turn still visible verbatim in history is not repeated: reissuing it at every
+/// tool boundary costs tokens and can look like a new turn, earlier turns or not. Steering keeps
+/// its explicit precedence reminder because it arrives mid-turn.
+pub(in crate::agent) fn request_context(control: &Value, messages: &[Value]) -> Option<String> {
     const MAX_TEXT_BYTES: usize = 4096;
     const OMITTED: &str =
         "\n[... middle omitted; full user message remains in session history ...]\n";
@@ -81,6 +83,17 @@ pub(in crate::agent) fn request_context(control: &Value) -> Option<String> {
     let text = latest["text"]
         .as_str()
         .filter(|text| !text.trim().is_empty())?;
+    if latest["kind"] == "user_turn"
+        && control["user_intent"]["legacy_context"].is_null()
+        && messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["dial_context_request"] == true
+                && message["dial_transient"] != true
+                && message["content"].as_str() == Some(text)
+        })
+    {
+        return None;
+    }
     let text_truncated = text.len() > MAX_TEXT_BYTES;
     let excerpt = if text_truncated {
         let retained = MAX_TEXT_BYTES - OMITTED.len();

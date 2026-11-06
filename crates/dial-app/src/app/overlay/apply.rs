@@ -103,88 +103,14 @@ impl OverlayEnv<'_> {
                 let embedding_role = role == "embedding";
                 let mut saved = false;
                 let outcome = (|| -> Result<String> {
-                    let review = if let ActiveOverlay::Models(models) = &mut *overlay {
-                        models.take_confirmed_assignment()
-                    } else {
-                        None
-                    };
-                    let review = if let Some(review) = review {
-                        review
-                    } else {
-                        let changes = selection_changes(&config, &selection, &role)?;
-                        let review = settings_store::review_model_config(
-                            &self.app.layout,
-                            scope,
-                            &changes,
-                            Some(&role),
-                        )?;
-                        let mut notes = vec![
-                            format!("This session: {role} → {}", selection.display_name()),
-                            format!("Saved: {scope:?}; other running sessions unchanged."),
-                            "Cancel leaves both saved settings and this session unchanged.".into(),
-                        ];
-                        if role == "main" {
-                            let follows = config
-                                .role_statuses()
-                                .into_iter()
-                                .filter(|status| {
-                                    status.source
-                                        == crate::llm::model_config::RoleSource::FollowsMain
-                                })
-                                .map(|status| status.role)
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            notes.push(format!("Roles following main also change: {follows}. Assigned roles unchanged."));
-                        } else {
-                            notes.push(
-                                "Main model and all other role assignments unchanged.".into(),
-                            );
-                        }
-                        if crate::config::selection::requires_local_preparation(&config, &selection)
-                        {
-                            notes.push("Installation: confirmation starts local model preparation; settings save only after success. Review itself downloads nothing.".into());
-                        } else {
-                            notes.push("Installation: none; no download from this review.".into());
-                        }
-                        if !matches!(overlay, ActiveOverlay::Models(_)) {
-                            let previous = std::mem::replace(
-                                overlay,
-                                ActiveOverlay::Models(Box::new(
-                                    crate::ui::overlay::models::ModelOverlay::new(
-                                        None,
-                                        config.role_statuses(),
-                                        scope,
-                                    )
-                                    .with_project_name(
-                                        &self
-                                            .app
-                                            .layout
-                                            .project_root
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy(),
-                                    ),
-                                )),
-                            );
-                            if self.history.len() == 16 {
-                                self.history.remove(0);
-                            }
-                            self.history.push(previous);
-                        }
-                        if let ActiveOverlay::Models(models) = &mut *overlay {
-                            models.review_assignment(
-                                review,
-                                OverlayEvent::AssignModel {
-                                    role: role.clone(),
-                                    selection: selection.clone(),
-                                    scope,
-                                },
-                                format!("{role} → {}", selection.display_name()),
-                                notes,
-                            );
-                        }
-                        return Ok("Review the exact model changes; confirm to save, or cancel without saving.".into());
-                    };
+                    // Selecting a model applies it directly; there is no confirmation screen.
+                    let changes = selection_changes(&config, &selection, &role)?;
+                    let review = settings_store::review_model_config(
+                        &self.app.layout,
+                        scope,
+                        &changes,
+                        Some(&role),
+                    )?;
                     let changes = review.changes().to_vec();
                     let message = if role == "main" {
                         format!("switched to {}", selection.display_name())

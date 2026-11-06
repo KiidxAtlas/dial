@@ -86,6 +86,10 @@ pub(in crate::agent) fn footprint(
     mode: crate::config::types::EditMode,
     call: &ToolCall,
 ) -> Option<Footprint> {
+    // Checks can consume the whole candidate tree, not only the mutation's literal targets.
+    if matches!(call.name.as_str(), "edit" | "write") && call.arguments["check"] == true {
+        return None;
+    }
     let (targets, writing) = match call.name.as_str() {
         "read" if call.arguments.get("paths").is_none() => {
             (vec![call.arguments["path"].as_str()?.to_owned()], false)
@@ -215,6 +219,7 @@ impl Agent<'_> {
         backend: &mut Backend,
         calls: &[ToolCall],
         ui: &mut dyn Ui,
+        read_reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
     ) -> Vec<(ToolOutput, f64)> {
         let blocked = |reason: &str| {
             ToolOutput::err(reason)
@@ -255,7 +260,7 @@ impl Agent<'_> {
         }
         if !ready.is_empty() {
             let outputs = self
-                .run_background_tools(&ready, ui, Some(backend))
+                .run_background_tools(&ready, ui, Some(backend), read_reuse)
                 .expect("admitted native tools");
             for (position, output) in positions.into_iter().zip(outputs) {
                 results[position] = Some(output);

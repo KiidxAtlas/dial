@@ -109,7 +109,7 @@ provider permission or live compatibility.
 The catalog finds cached Hugging Face snapshots and models downloaded by LM Studio (its
 `downloadsFolder`, default `~/.lmstudio/models`), listed under **Local models**: MLX checkpoints
 are served by dial's own MLX server (so LoRA training applies), and running LM Studio, Ollama and llama.cpp
-servers on their usual loopback ports, plus Docker Model Runner (`docker-model-runner`, `http://127.0.0.1:12434/engines/v1`, override with `DOCKER_MODEL_RUNNER_BASE_URL`; see [docker.md](docker.md)). It also discovers OpenAI-compatible endpoints and Anthropic's
+servers on their usual loopback ports, plus Docker Model Runner (`docker-model-runner`, `http://127.0.0.1:12434/engines/v1`, override with `DOCKER_MODEL_RUNNER_BASE_URL`; see [docker.md](docker.md)) and Osaurus (`osaurus`, `http://127.0.0.1:1337/v1`, override with `OSAURUS_BASE_URL`). It also discovers OpenAI-compatible endpoints and Anthropic's
 Messages API. OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, Mistral and DeepSeek have setup presets.
 
 Interactive refreshes keep one active discovery scan and coalesce pending refreshes to the latest
@@ -124,6 +124,54 @@ a one-second budget. Remaining models stay listed with unknown capabilities. Sin
 and context-window lookups share an immutable parsed catalog snapshot instead of copying unrelated
 rows; file-version invalidation is unchanged. These bounds and allocation changes are not measured
 latency or live-provider compatibility results.
+
+**LM Studio**
+
+Select the LM Studio provider/model as before. Native metadata now prefers
+[`GET /api/v1/models`](https://lmstudio.ai/docs/developer/rest/list-models), with legacy v0
+fallback only when the route is unsupported (404, 405 or 501). Authentication failures,
+malformed replies and transport errors are not treated as old-server detection.
+Declared vision/tool capabilities, model purpose and loaded-instance identifiers enrich the
+catalog. Context checks use the selected instance's configured context, or the smallest known
+loaded context when addressing a key with several instances; unknown capacity stays unknown.
+Dial does not reload models or change memory/context allocation. Advertised reasoning options
+are metadata, not an invented mapping to a different wire parameter. Inference retains the
+OpenAI-compatible transport and Dial-owned tools/approvals; LM Studio's autonomous integrations
+are not enabled.
+
+OpenRouter routing and optional Gemini explicit caching are configured through exact-model
+profiles; see [transport configuration](llm-transport.md#provider-specific-routing-and-explicit-caching).
+
+**Osaurus**
+
+Start Osaurus's server and select a model under the **Osaurus** provider in Models. Dial uses
+`http://127.0.0.1:1337/v1` by default; `OSAURUS_BASE_URL` overrides discovery, and an explicit
+provider configuration can supply an endpoint, API key and request headers as usual.
+
+Osaurus's sparse OpenAI model list is enriched from its Ollama-compatible `/api/show`: declared
+tool use, image input, reasoning, model purpose and trained context become catalog metadata.
+Explicit listing values take precedence. Enrichment shares the same 16-request, eight-concurrent,
+one-second budget as Ollama; missing, invalid or unavailable metadata does not hide models or
+invent capabilities. These are server declarations, not guarantees of model quality; for example,
+a model incorrectly advertised as chat by the server is not reclassified from its name.
+
+Normal inference stays on `/v1/chat/completions`. Dial owns tool execution, approvals, history,
+memory and cancellation; selecting Osaurus does not activate its autonomous `/agents/{id}/run`
+endpoint or implicitly import its memory or MCP tools. No extra agent tool calls are added.
+Vision metadata does not imply image generation.
+
+Osaurus documents automatic content-addressed prefix caching. Dial preserves unchanged initial
+instructions and tool schemas across otherwise unchanged turns, without speculative cache slots,
+warm-up requests or a session/cache key. Cache reuse depends on the actual prompt prefix and server
+version; it is not a promised speed advantage over LM Studio. See the
+[upstream API guide](https://github.com/osaurus-ai/osaurus/blob/main/docs/OpenAI_API_GUIDE.md).
+
+Optional live checks (the second loads the named model and performs inference):
+
+```sh
+DIAL_TEST_OSAURUS_MODEL="your-installed-model-id" cargo test --locked -p dial-llm --lib osaurus_live_discovery -- --ignored
+DIAL_TEST_OSAURUS_MODEL="your-installed-model-id" cargo test --locked -p dial-llm --lib osaurus_live_streams -- --ignored
+```
 
 SambaNova (`SAMBANOVA_API_KEY`, `https://api.sambanova.ai/v1`) and Inception (`INCEPTION_API_KEY`, `https://api.inceptionlabs.ai/v1`) are OpenAI-compatible chat-completions providers with bundled model cards (SambaNova `gpt-oss-120b`; Inception `mercury-2`, `mercury-2.5`, `mercury-3`). Inception's `minimal` reasoning rung is sent on the wire as `instant` (declared per model by the catalog's `m` effort-wire map); `low`, `medium` and `high` send their own names.
 

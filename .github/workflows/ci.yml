@@ -126,7 +126,8 @@ jobs:
         if: matrix.os != 'macos-15-intel'
         timeout-minutes: 10
         run: |
-          cargo install --locked --path . --profile ci --root target/installed
+          mkdir -p target/installed/bin
+          install -m755 "${CARGO_TARGET_DIR:-target}/ci/dial" target/installed/bin/dial
           make test-smoke DIAL=target/installed/bin/dial
       - name: Real terminal and crash lifecycle
         if: matrix.os != 'macos-15-intel'
@@ -276,39 +277,15 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: windows-contract
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Focused native suite with a tracked exclusion list: scripts/windows-contract.txt.
       - name: Run focused Windows contract suite
         run: python scripts/windows-contract.py --profile ci
 
   linux-features:
-    name: Linux feature powerset
+    name: Linux feature checks
     needs: validate
-    # libspa 0.9 needs PipeWire headers newer than Ubuntu 22.04's 0.3.48 (spa_video_info_raw.flags,
-    # u64 modifier); compile the PipeWire combinations against Ubuntu 24.04's PipeWire 1.0.
-    runs-on: ${{ matrix.wayland && 'ubuntu-24.04' || 'ubuntu-22.04' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        aws: ['', 'aws']
-        voice: ['', 'voice']
-        shell: ['', 'embedded-shell']
-        desktop: ['', 'desktop']
-        wayland: ['', 'wayland-pipewire']
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install native feature dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libspa-0.2-dev pkg-config
-      - name: Install pinned Rust
-        run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          # One cache per runner image, saved only by the all-features job. A cache per
-          # combination (32 entries, ~6.5 GB) filled the 10 GB quota and evicted the macOS test
-          # caches, so those jobs (the CI long pole, macos-15-intel most of all) rebuilt cold.
-          shared-key: features-${{ matrix.wayland && 'ubuntu-24.04' || 'ubuntu-22.04' }}
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.aws != '' && matrix.voice != '' && matrix.shell != '' && matrix.desktop != '' }}
-      - name: Compile feature combination
-        env:
-          CHECK_FEATURES: ${{ format('{0} {1} {2} {3} {4}', matrix.aws, matrix.voice, matrix.shell, matrix.desktop, matrix.wayland) }}
-        run: cargo check --locked --workspace --all-targets --no-default-features --features "$CHECK_FEATURES"
+    uses: ./.github/workflows/linux-features.yml
+    with:
+      exhaustive: false

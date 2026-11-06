@@ -96,7 +96,10 @@ fn independent_ranges_and_recovery_are_allowed_and_storage_is_bounded() {
         assert!(
             guard
                 .observe(
-                    &call("artifact_read", json!({"uri":"artifact:x"})),
+                    &call(
+                        "read",
+                        json!({"path":format!("artifact://{}", "a".repeat(64))})
+                    ),
                     "same",
                     false
                 )
@@ -357,7 +360,7 @@ fn adjacent_visible_reads_jointly_cover_a_later_range_without_hiding_gaps() {
 
 #[test]
 fn visible_edit_and_discovery_rows_cover_rereads_but_not_unseen_or_stale_lines() {
-    for name in ["edit", "write", "glob", "find"] {
+    for name in ["edit", "write", "glob", "find", "grep"] {
         let mut returned = ReturnedReads::default();
         let source = ToolCall {
             id: "source-result".into(),
@@ -475,4 +478,244 @@ fn identical_reads_use_the_compact_pointer_only_when_it_saves_bytes() {
         "[Unchanged read] Fresh read succeeded; same rows in still-visible tool call first. Reuse them."
     );
     assert!(returned.pointer(&read, &text, false, |_| false).is_none());
+}
+
+fn native_fixture() -> (tempfile::TempDir, crate::tools::Workspace, ReturnedReads) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        (1..=30).map(|n| format!("code {n}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let workspace = crate::tools::Workspace::new(root.path()).unwrap();
+    (root, workspace, ReturnedReads::default())
+}
+
+fn remember_native(
+    returned: &mut ReturnedReads,
+    workspace: &crate::tools::Workspace,
+    id: &str,
+    path: &str,
+) {
+    let call = read_call(id, path);
+    let output = crate::tools::execute(workspace, "read", &call.arguments, 10);
+    assert!(!output.is_error, "{}", output.text);
+    returned.pointer(&call, &output.text, false, |_| true);
+}
+
+#[test]
+fn native_coverage_reuses_complete_ranges_and_executes_only_missing_gaps() {
+    let (root, workspace, mut returned) = native_fixture();
+    // Realistically sized rows: a pointer only replaces rows it is actually smaller than.
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        (1..=30)
+            .map(|n| format!("code {n} {}\n", "x".repeat(40)))
+            .collect::<String>(),
+    )
+    .unwrap();
+    remember_native(&mut returned, &workspace, "left", "src/lib.rs:1-10");
+    remember_native(&mut returned, &workspace, "right", "src/lib.rs:21-30");
+    let reuse = returned.reusable(|_| true);
+    let mut invoked = Vec::new();
+    let full = reuse.execute(&workspace, &json!({"path":"src/lib.rs:2-8"}), |_| {
+        panic!("fully covered range must not execute a native read")
+    });
+    assert!(is_unchanged_read(&full.text));
+    assert_eq!(
+        full.data.as_ref().unwrap()["read_reuse"]["fully_reused"],
+        true
+    );
+    let partial = reuse.execute(&workspace, &json!({"path":"src/lib.rs:5-25"}), |args| {
+        invoked.push(args.clone());
+        crate::tools::execute(&workspace, "read", args, 10)
+    });
+    assert!(!partial.is_error, "{}", partial.text);
+    assert_eq!(invoked, [json!({"path":"src/lib.rs:11-20"})]);
+    let coverage = &partial.data.as_ref().unwrap()["read_reuse"];
+    assert_eq!(coverage["executed_ranges"], json!([[11, 20]]));
+    assert_eq!(
+        coverage["covered"],
+        json!([
+            {"range":[5,10],"call_id":"left"}, {"range":[21,25],"call_id":"right"}
+        ])
+    );
+    assert!(partial.text.contains("11:code 11") && !partial.text.contains("5:code 5"));
+}
+
+#[test]
+fn native_coverage_reads_tiny_rows_instead_of_a_larger_pointer() {
+    let (_root, workspace, mut returned) = native_fixture();
+    remember_native(&mut returned, &workspace, "left", "src/lib.rs:1-10");
+    let reuse = returned.reusable(|_| true);
+    let mut invoked = Vec::new();
+    let output = reuse.execute(&workspace, &json!({"path":"src/lib.rs:2-3"}), |args| {
+        invoked.push(args.clone());
+        crate::tools::execute(&workspace, "read", args, 10)
+    });
+    assert_eq!(invoked, [json!({"path":"src/lib.rs:2-3"})]);
+    assert!(output.text.contains("2:code 2"), "{}", output.text);
+    assert!(!is_unchanged_read(&output.text));
+}
+
+#[test]
+fn native_coverage_invalidates_on_edits_missing_context_and_unsupported_representations() {
+    let (root, workspace, mut returned) = native_fixture();
+    remember_native(&mut returned, &workspace, "original", "src/lib.rs:1-30");
+    let args = json!({"path":"src/lib.rs:1-10"});
+    let mut calls = 0;
+    returned
+        .reusable(|_| false)
+        .execute(&workspace, &args, |effective| {
+            calls += 1;
+            assert_eq!(effective, &args);
+            crate::tools::execute(&workspace, "read", effective, 10)
+        });
+    assert_eq!(calls, 1, "pruned evidence must execute again");
+    let reuse = returned.reusable(|_| true);
+    for args in [
+        json!({"path":"src/lib.rs:raw:1-10"}),
+        json!({"paths":["src/lib.rs:1-10"]}),
+        json!({"path":"src/lib.rs:outline"}),
+    ] {
+        let mut calls = 0;
+        reuse.execute(&workspace, &args, |effective| {
+            calls += 1;
+            assert_eq!(effective, &args);
+            crate::runtime::tool_output::ToolOutput::ok("normal representation".into())
+        });
+        assert_eq!(calls, 1);
+    }
+    std::fs::write(root.path().join("src/lib.rs"), "changed\n").unwrap();
+    let output = reuse.execute(&workspace, &args, |effective| {
+        calls += 1;
+        assert_eq!(effective, &args);
+        crate::tools::execute(&workspace, "read", effective, 10)
+    });
+    assert_eq!(calls, 2, "changed source must execute the requested read");
+    assert!(output.text.contains("changed"));
+    std::fs::remove_file(root.path().join("src/lib.rs")).unwrap();
+    let output = reuse.execute(&workspace, &args, |effective| {
+        crate::tools::execute(&workspace, "read", effective, 10)
+    });
+    assert!(
+        output.is_error,
+        "disappearance must not return stale evidence"
+    );
+}
+
+#[test]
+fn native_coverage_does_not_cover_clipped_rows_and_reconciles_a_racing_edit() {
+    let (root, workspace, mut returned) = native_fixture();
+    let call = read_call("clipped", "src/lib.rs:1-10");
+    let output = crate::tools::execute(&workspace, "read", &call.arguments, 10);
+    let clipped = output
+        .text
+        .replace("5:code 5", "5:code 5 …[line truncated]");
+    returned.pointer(&call, &clipped, false, |_| true);
+    let reuse = returned.reusable(|_| true);
+    let mut invoked = Vec::new();
+    let output = reuse.execute(&workspace, &json!({"path":"src/lib.rs:1-10"}), |args| {
+        invoked.push(args.clone());
+        crate::tools::execute(&workspace, "read", args, 10)
+    });
+    assert_eq!(invoked, [json!({"path":"src/lib.rs:5-5"})]);
+    assert_eq!(
+        output.data.as_ref().unwrap()["read_reuse"]["executed_ranges"],
+        json!([[5, 5]])
+    );
+    let revision = workspace
+        .native_read_selection(&json!({"path":"src/lib.rs:1-20"}))
+        .unwrap()
+        .revision;
+    let original = json!({"path":"src/lib.rs:1-20"});
+    let mut invoked = Vec::new();
+    let output = reuse.execute(&workspace, &original, |args| {
+        if invoked.is_empty() {
+            let new_source = (1..=30)
+                .map(|n| {
+                    if n == 12 {
+                        format!("[Source raw SHA256:{revision}]\n")
+                    } else {
+                        format!("new version {n}\n")
+                    }
+                })
+                .collect::<String>();
+            std::fs::write(root.path().join("src/lib.rs"), new_source).unwrap();
+        }
+        invoked.push(args.clone());
+        crate::tools::execute(&workspace, "read", args, 10)
+    });
+    assert_eq!(invoked.len(), 2);
+    assert_eq!(invoked[1], original);
+    assert!(output.text.contains("new version"));
+    assert!(
+        output.data.is_none(),
+        "a new version must not carry old coverage"
+    );
+}
+
+#[test]
+fn native_coverage_does_not_promote_pointer_only_results() {
+    let (_root, workspace, mut returned) = native_fixture();
+    remember_native(&mut returned, &workspace, "original", "src/lib.rs:1-30");
+    let call = read_call("pointer", "src/lib.rs:1-20");
+    let output = crate::tools::execute(&workspace, "read", &call.arguments, 10);
+    assert!(
+        returned
+            .pointer(&call, &output.text, false, |_| true)
+            .is_some()
+    );
+    let mut invoked = 0;
+    returned
+        .reusable(|id| id != "original")
+        .execute(&workspace, &call.arguments, |args| {
+            invoked += 1;
+            crate::tools::execute(&workspace, "read", args, 10)
+        });
+    assert_eq!(
+        invoked, 1,
+        "a pointer cannot stand in for pruned source rows"
+    );
+}
+
+#[test]
+fn native_coverage_refreshes_missing_edit_witnesses() {
+    let (root, workspace, mut returned) = native_fixture();
+    remember_native(&mut returned, &workspace, "original", "src/lib.rs:1-30");
+    let fresh_store = crate::tools::Workspace::new(root.path()).unwrap();
+    let args = json!({"path":"src/lib.rs:1-10"});
+    let mut invoked = 0;
+    returned
+        .reusable(|_| true)
+        .execute(&fresh_store, &args, |effective| {
+            invoked += 1;
+            assert_eq!(effective, &args);
+            crate::tools::execute(&fresh_store, "read", effective, 10)
+        });
+    assert_eq!(invoked, 1, "read must restore a dropped edit witness");
+}
+
+#[cfg(unix)]
+#[test]
+fn native_coverage_rejects_notebook_aliases_after_resolution() {
+    let (root, workspace, mut returned) = native_fixture();
+    let notebook = json!({"cells":[{"id":"example-cell","cell_type":"code","metadata":{},"execution_count":null,"outputs":[],"source":(1..=20).map(|n|format!("value_{n} = {n}\n")).collect::<Vec<_>>()}],"metadata":{},"nbformat":4,"nbformat_minor":5});
+    std::fs::write(root.path().join("book.ipynb"), notebook.to_string()).unwrap();
+    std::os::unix::fs::symlink("book.ipynb", root.path().join("alias.txt")).unwrap();
+    remember_native(&mut returned, &workspace, "first", "alias.txt:1");
+    let args = json!({"path":"alias.txt:1-20"});
+    let mut invoked = 0;
+    returned
+        .reusable(|_| true)
+        .execute(&workspace, &args, |effective| {
+            invoked += 1;
+            assert_eq!(effective, &args);
+            crate::tools::execute(&workspace, "read", effective, 10)
+        });
+    assert_eq!(
+        invoked, 1,
+        "notebook projection must not use raw-file line counts"
+    );
 }

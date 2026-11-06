@@ -6,7 +6,13 @@ use std::collections::BTreeMap;
 pub(in crate::agent) struct RecoveryCheckpoint {
     withheld: BTreeMap<String, Withheld>,
     cached_observations: BTreeMap<String, u64>,
-    source_versions: BTreeMap<String, Vec<Option<[u8; 32]>>>,
+    source_versions: BTreeMap<String, SourceVersion>,
+}
+
+#[derive(PartialEq, Eq)]
+enum SourceVersion {
+    Read(Vec<Option<[u8; 32]>>),
+    Shell(String),
 }
 
 /// One withheld call's feedback and the files it depends on. `None` means the dependency is not
@@ -20,7 +26,7 @@ struct Withheld {
 fn control(name: &str) -> bool {
     matches!(
         name,
-        "todo" | "finish" | "working_state" | "tool_search" | "tool_load" | "artifact_read"
+        "todo" | "finish" | "working_state" | "tool_search" | "tool_load"
     )
 }
 
@@ -73,12 +79,8 @@ impl RecoveryCheckpoint {
             let targets = declared_targets(ws, call);
             entry.targets = (!targets.is_empty()).then_some(targets);
         }
-        if call.name == "read"
-            && self
-                .withheld
-                .get(&key)
-                .is_some_and(|entry| entry.targets.is_some())
-            && let Some(version) = Self::read_versions(ws, call)
+        if self.withheld.contains_key(&key)
+            && let Some(version) = Self::source_version(ws, call)
         {
             self.source_versions.insert(key, version);
         }
@@ -92,7 +94,7 @@ impl RecoveryCheckpoint {
     ) -> Option<String> {
         let key = Self::key(call);
         if let Some(previous) = self.source_versions.get(&key)
-            && Self::read_versions(ws, call).as_ref() != Some(previous)
+            && Self::source_version(ws, call).is_some_and(|current| &current != previous)
         {
             self.withheld.remove(&key);
             self.cached_observations.remove(&key);
@@ -100,6 +102,16 @@ impl RecoveryCheckpoint {
         }
         self.rejection(call)
     }
+    fn source_version(ws: &crate::tools::Workspace, call: &ToolCall) -> Option<SourceVersion> {
+        match call.name.as_str() {
+            "read" => Self::read_versions(ws, call).map(SourceVersion::Read),
+            "bash" => {
+                crate::agent::verify::shared_runs::shell_tree(ws, call).map(SourceVersion::Shell)
+            }
+            _ => None,
+        }
+    }
+
     /// Keep every target in a batched read, including unavailable identities: a target becoming
     /// readable or disappearing must release the stale restriction too. These hashes only expire
     /// feedback; they never authorize access or establish verification evidence.

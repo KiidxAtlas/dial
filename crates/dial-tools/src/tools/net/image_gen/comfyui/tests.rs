@@ -49,6 +49,7 @@ fn comfy_target(base: &str, workflow: Value) -> Target {
 
 fn prompt_request(prompt: &str) -> Request<'_> {
     Request {
+        animation: None,
         prompt,
         size: "auto",
         output: "out.png",
@@ -385,6 +386,7 @@ fn explicit_sizes_and_image_edits_are_refused_before_any_submission() {
     let client = Client::new(&target, &config, idle_flag());
 
     let sized = Request {
+        animation: None,
         size: "1024x1024",
         ..prompt_request("a fox")
     };
@@ -395,6 +397,7 @@ fn explicit_sizes_and_image_edits_are_refused_before_any_submission() {
     );
 
     let edit = Request {
+        animation: None,
         source: Some(Source {
             relative: "fox.png".into(),
             bytes: PNG.to_vec(),

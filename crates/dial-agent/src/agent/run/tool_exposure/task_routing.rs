@@ -158,6 +158,7 @@ fn source_tools(query: &str) -> Vec<&'static str> {
     ];
     let mut source_file = false;
     let mut supplied_input = false;
+    let mut tabular_output = false;
     let mut text = Vec::new();
     // Inspection elsewhere in a request must not turn a deliverable's format into an input.
     // Keep this lexical and conservative: explicit tool names are handled separately by select.
@@ -241,7 +242,8 @@ fn source_tools(query: &str) -> Vec<&'static str> {
             // Suppress only an output target phrase, not the rest of a creation clause:
             // "write a script to parse sales.csv" must retain its genuine input.
             if output_only
-                && (format.is_some()
+                && (quoted
+                    || format.is_some()
                     || [
                         "a",
                         "an",
@@ -271,6 +273,7 @@ fn source_tools(query: &str) -> Vec<&'static str> {
                     ]
                     .contains(&word.as_str()))
             {
+                tabular_output |= matches!(format, Some("csv" | "json"));
                 if filename {
                     output_only = false;
                 }
@@ -320,23 +323,31 @@ fn source_tools(query: &str) -> Vec<&'static str> {
     {
         names.push("database");
     }
+    // A bare "report" is usually a verb or a deliverable ("each row should report", "write a
+    // report"), not a supplied document; a benchmark log-count task paid for `document` and
+    // the evidence pair on every request because of it. Formats and "document" still route.
     if inspect
         && any(
             &terms,
-            &[
-                "document",
-                "documents",
-                "pdf",
-                "docx",
-                "pptx",
-                "slides",
-                "report",
-            ],
+            &["document", "documents", "pdf", "docx", "pptx", "slides"],
         )
     {
         names.push("document");
     }
-    if inspect
+    if (inspect || terms.contains("profile"))
+        // A CSV/JSON deliverable is a computation workflow, not inherently an analysis request.
+        // Prefer the existing eval path without guessing the file's size or opening it here.
+        // Keep genuine analysis, workbook and explicitly large-data intent on the specialist path;
+        // explicit tool names are handled by select before these automatic intent rules.
+        && (!tabular_output
+            || any(
+                &terms,
+                &[
+                    "read", "analyze", "analyse", "inspect", "profile", "correlation", "histogram",
+                    "trend", "trends", "plot", "chart", "join", "xlsx", "workbook",
+                    "spreadsheet", "large", "million", "gigabyte", "gigabytes",
+                ],
+            ))
         && any(
             &terms,
             &[
@@ -381,12 +392,13 @@ fn source_tools(query: &str) -> Vec<&'static str> {
     {
         names.push("visual");
     }
-    if !names.is_empty()
-        || (inspect
-            && any(
-                &terms,
-                &["evidence", "citations", "citation", "sources", "quotes"],
-            ))
+    // The evidence pair answers citation intent. It used to ride along with every routed format
+    // tool, and unattended runs then spent requests on `evidence capture` for plain CSV deliverables.
+    // A bare "sources" is usually build or package sources ("uses Debian sources"); it routes
+    // the pair only alongside citation intent.
+    if inspect
+        && (any(&terms, &["evidence", "citations", "citation", "quotes"])
+            || (terms.contains("sources") && any(&terms, &["cite", "cited", "claim", "claims"])))
     {
         names.extend(["evidence", "evidence_search"]);
     }
@@ -432,8 +444,13 @@ fn native(query: &str, terms: &BTreeSet<String>) -> Vec<&'static str> {
     {
         names.push("browser");
     }
-    if any(terms, &["dependency", "crate", "package", "library", "sdk"])
-        && any(terms, &["source", "implementation", "internals"])
+    // "Debian packages ... get the source" or "build from source ... no X11 dependencies" names
+    // where to fetch or how to build code, not a request to read a dependency's implementation.
+    let read_intent = any(terms, &["implementation", "internals"]);
+    if (any(terms, &["dependency", "crate", "library", "sdk"])
+        && (read_intent
+            || (terms.contains("source") && any(terms, &["read", "inspect", "browse", "look"]))))
+        || (terms.contains("package") && read_intent)
     {
         names.push("dep_source");
     }
@@ -575,6 +592,51 @@ fn ranked(
         .collect()
 }
 
+/// Candidates the request names explicitly. Tool names that are ordinary English words ("check
+/// the result", "find the bug") route only with a backtick, the word "tool", or as the whole
+/// request; otherwise a phrase would override deferrals and add schemas no one asked for.
+fn explicit(query: &str, candidates: &[(String, String)]) -> Vec<String> {
+    let terms = words(query);
+    candidates
+        .iter()
+        .filter(|(name, _)| {
+            query.split_whitespace().any(|word| {
+                let matches = word.trim_matches(['`', ',', '.', '"', ';', ':']) == name;
+                let common_word = [
+                    "document",
+                    "data",
+                    "audio",
+                    "visual",
+                    "evidence",
+                    "database",
+                    "investigate",
+                    "research",
+                    "monitor",
+                    "timeline",
+                    "task",
+                    "message",
+                    "goal",
+                    "reality",
+                    "perception",
+                    "video",
+                    "workbench",
+                    "check",
+                    "find",
+                    "finish",
+                    "memory",
+                ]
+                .contains(&name.as_str());
+                matches
+                    && (!common_word
+                        || query.trim() == name
+                        || word.starts_with('`')
+                        || terms.contains("tool"))
+            })
+        })
+        .map(|entry| entry.0.clone())
+        .collect()
+}
+
 fn select(
     query: &str,
     context: &BTreeSet<String>,
@@ -584,42 +646,7 @@ fn select(
     let terms = words(query);
     let mut selected = Vec::new();
     // Explicit tool names are strong evidence even if no workflow rule covers that specialist.
-    selected.extend(
-        candidates
-            .iter()
-            .filter(|(name, _)| {
-                query.split_whitespace().any(|word| {
-                    let matches = word.trim_matches(['`', ',', '.', '"']) == name;
-                    // Tool names that are ordinary English words route only when explicit.
-                    let common_source_name = [
-                        "document",
-                        "data",
-                        "audio",
-                        "visual",
-                        "evidence",
-                        "database",
-                        "investigate",
-                        "research",
-                        "monitor",
-                        "timeline",
-                        "task",
-                        "message",
-                        "goal",
-                        "reality",
-                        "perception",
-                        "video",
-                        "workbench",
-                    ]
-                    .contains(&name.as_str());
-                    matches
-                        && (!common_source_name
-                            || query.trim() == name
-                            || word.starts_with('`')
-                            || terms.contains("tool"))
-                })
-            })
-            .map(|entry| entry.0.clone()),
-    );
+    selected.extend(explicit(query, candidates));
     selected.extend(
         native(query, &prose_words(query))
             .into_iter()

@@ -24,7 +24,7 @@ const REPRO_COMMAND_BYTES: usize = 4000;
 
 /// `predictions` adds the optional `expect` argument (`experimental.check_predictions`).
 pub(in crate::agent) fn schema(predictions: bool) -> Value {
-    let mut schema = json!({"type":"function","function":{"name":NAME,"description":"Run focused checks selected for this turn and report statuses, commands and diagnostics. Passes count toward final verification. Default calls may reuse passing evidence only when complete operator-declared inputs are revalidated unchanged; reuse is labeled, not reported as a new execution. `names` forces execution of a subset; `failed_only` reruns code failures. `repro` registers and runs a bug reproduction (nonzero before the fix, zero after), approved like bash and rerun by the final gate; max 4 per turn, same name replaces. Behavioral credit requires observed failure before the fix and passing after it.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":16,"items":{"type":"string"},"description":"Exact check names to execute; omit for all, allowing valid evidence reuse."},"failed_only":{"type":"boolean"},"repro":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string","description":"Exits non-zero while the bug is present, zero once fixed."}},"required":["name","command"],"additionalProperties":false}},"additionalProperties":false}}});
+    let mut schema = json!({"type":"function","function":{"name":NAME,"description":"check: run this turn's focused checks. Reports statuses and diagnostics; passes count toward final verification. A default call may reuse passes whose declared inputs are unchanged (labeled as reused); names forces a subset, failed_only reruns code failures. repro registers a bug reproduction (fails before the fix, passes after; max 4 per turn, same name replaces), approved like bash and rerun by the final gate; behavioral credit needs an observed failure, then a pass.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":16,"items":{"type":"string"},"description":"Exact check names to execute; omit for all, allowing valid evidence reuse."},"failed_only":{"type":"boolean"},"repro":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string","description":"Exits non-zero while the bug is present, zero once fixed."}},"required":["name","command"],"additionalProperties":false}},"additionalProperties":false}}});
     if predictions {
         schema["function"]["parameters"]["properties"]["expect"] =
             crate::tools::surface::contracts::check_prediction_property();
@@ -112,6 +112,32 @@ fn diagnostics(text: &str) -> String {
     kept
 }
 
+/// Preserve the native mutation's outcome and effects: verification failure is not refusal.
+pub(in crate::agent) fn attach_post_mutation_check(
+    output: &mut ToolOutput,
+    tool: &str,
+    check: ToolOutput,
+) {
+    crate::tools::surface::outcome::append_text(
+        output,
+        &format!(
+            "\n\n[Post-{tool} check; {tool} remains applied]\n{}",
+            check.text
+        ),
+    );
+    if !output.data.as_ref().is_some_and(Value::is_object) {
+        output.data = Some(json!({format!("{tool}_result"):output.data.take()}));
+    }
+    output.data.as_mut().expect("object mutation result")[format!("post_{tool}_check")] =
+        json!({"is_error":check.is_error,"text":check.text,"data":check.data});
+}
+
+pub(in crate::agent) fn post_mutation_check(output: &ToolOutput) -> Option<&Value> {
+    let data = output.data.as_ref()?;
+    data.get("post_edit_check")
+        .or_else(|| data.get("post_write_check"))
+}
+
 impl Agent<'_> {
     pub(in crate::agent) fn check_tool(&mut self, args: &Value, ui: &mut dyn Ui) -> ToolOutput {
         let predictions = self.config.experimental.check_predictions;
@@ -148,6 +174,19 @@ impl Agent<'_> {
         let mut candidates = self.current_focused_checks();
         self.step_checks
             .include_failed_checks(self.workspace.root(), &mut candidates);
+        // A reproduction is registered as `repro: <name>`; accept the short name it was given.
+        if let Some(names) = &mut names {
+            let known = |name: &str| {
+                candidates.iter().any(|check| check.name == name)
+                    || repro.as_ref().is_some_and(|check| check.name == name)
+            };
+            for name in names.iter_mut() {
+                let prefixed = format!("{REPRO_PREFIX}{}", name.trim());
+                if !known(name) && known(&prefixed) {
+                    *name = prefixed;
+                }
+            }
+        }
         let listed = |checks: &[FocusedCheck]| {
             checks
                 .iter()
@@ -179,6 +218,10 @@ impl Agent<'_> {
                 ));
             }
         }
+        // A registered reproduction runs with the rest of the gate's selection once the turn has
+        // changes, so one call reports every applicable check instead of prompting a second plain
+        // `check` for the ones still lacking a pass. Before any change it runs alone as a baseline.
+        let explicit_names = names.is_some();
         let mut registered = None;
         if let Some(check) = repro {
             if let Err(error) = self.register_repro(&check, &mut candidates) {
@@ -189,12 +232,10 @@ impl Agent<'_> {
         }
         let changed =
             self.step_checks.mutations > 0 || self.step_checks.has_uncheckpointed_operations();
-        let note = |text: String| ToolOutput {
-            execution: Default::default(),
-            data: None,
-            text,
-            is_error: false,
-        };
+        if registered.is_some() && changed && !explicit_names {
+            names = None;
+        }
+        let note = |text: String| self.check_receipt(ToolOutput::ok(text), &candidates);
         if candidates.is_empty() {
             return note(if changed {
                 "No focused check applies to this turn's changes; the completion gate has nothing to run. Verify behavior another way (for example a targeted test through bash).".into()
@@ -206,6 +247,9 @@ impl Agent<'_> {
         if let Some(names) = &names {
             selected.retain(|check| names.contains(&check.name));
         }
+        // A reproduction is opaque shell work that advances the effect revision. Running it
+        // first keeps the other checks' passes current at the revision this receipt reports.
+        selected.sort_by_key(|check| !self.step_checks.evidence.is_repro(&check.command));
         if failed_only {
             selected.retain(|check| {
                 self.step_checks.evidence.latest_status(&check.command)
@@ -232,7 +276,11 @@ impl Agent<'_> {
         let mut cancelled = false;
         let mut refused = None;
         for check in &selected {
-            let reused = names.is_none() && !failed_only && self.reuse_check(check);
+            // The reproduction just registered always executes; other checks may reuse passes.
+            let reused = names.is_none()
+                && !failed_only
+                && registered.as_ref() != Some(&check.name)
+                && self.reuse_check(check);
             let (status, output) = if self.interrupt.load(Ordering::SeqCst) {
                 self.step_checks.evidence.observe(
                     &check.command,
@@ -294,6 +342,7 @@ impl Agent<'_> {
                     && status == CheckStatus::Passed
                 {
                     self.step_checks.evidence.withdraw_repro(&check.command);
+                    candidates.retain(|candidate| candidate.command != check.command);
                     result["registration"] = json!("refused");
                     refused = Some(format!(
                         "Not registered: {} passed before any change, so it does not reproduce the bug. A reproduction must exit non-zero while the bug is present and zero once fixed; check its exit logic (for example an inverted assertion or a misplaced `||`/`&&`), then register a corrected command.",
@@ -353,12 +402,67 @@ impl Agent<'_> {
         if let Some(prediction) = prediction {
             data["prediction"] = prediction;
         }
-        ToolOutput {
-            execution: Default::default(),
-            data: Some(data),
-            text: text.join("\n"),
-            is_error: !all_passed || refused.is_some(),
+        self.check_receipt(
+            ToolOutput {
+                execution: Default::default(),
+                data: Some(data),
+                text: text.join("\n"),
+                is_error: !all_passed || refused.is_some(),
+            },
+            &candidates,
+        )
+    }
+
+    /// One revision-scoped view of execution and remaining applicable checks. Reporting scope
+    /// never runs a check, promotes stale evidence or treats an empty selection as verification.
+    fn check_receipt(&self, mut output: ToolOutput, candidates: &[FocusedCheck]) -> ToolOutput {
+        const MAX_PENDING: usize = 16;
+        const MAX_SUMMARY: usize = 4;
+        let revision = self.step_checks.revision();
+        let pending: Vec<_> = candidates
+            .iter()
+            .filter_map(|check| {
+                let status = self
+                    .step_checks
+                    .evidence
+                    .current_status(&check.command, revision);
+                (status != "passed").then_some((check.name.as_str(), status))
+            })
+            .collect();
+        let data = output
+            .data
+            .get_or_insert_with(|| json!({"revision":revision,"results":[]}));
+        data["scope"] = json!({
+            "applicable_checks":candidates.len(),
+            "pending_checks":pending.iter().take(MAX_PENDING)
+                .map(|(name,status)| json!({"name":name,"status":status})).collect::<Vec<_>>(),
+            "pending_count":pending.len(),
+            "omitted_pending_checks":pending.len().saturating_sub(MAX_PENDING),
+        });
+        if !pending.is_empty() {
+            let summary = pending
+                .iter()
+                .take(MAX_SUMMARY)
+                .map(|(name, status)| {
+                    format!(
+                        "{} ({status})",
+                        crate::agent::safety::guard::clip_evidence(name, 80)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let omitted = pending.len().saturating_sub(MAX_SUMMARY);
+            output.text.push_str(&format!(
+                "\nFocused scope: {} applicable check(s) lack a current pass: {summary}{}.",
+                pending.len(),
+                if omitted > 0 {
+                    format!("; {omitted} more")
+                } else {
+                    String::new()
+                },
+            ));
         }
+        output
     }
 
     /// `pre_tool_use` policy a model `bash` call of the same reproduction would meet. A block or

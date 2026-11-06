@@ -58,13 +58,76 @@ fn externally_changed_source_releases_only_its_read_feedback() {
 }
 
 #[test]
+fn externally_changed_tree_releases_a_repeated_successful_shell_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "init",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let ws = crate::tools::Workspace::new(root).unwrap();
+    std::fs::write(root.join("source.txt"), "original").unwrap();
+    let mut shell = call("bash");
+    shell.arguments = json!({"command":"cat source.txt"});
+    let mut checkpoint = RecoveryCheckpoint::default();
+    let mut investigation = crate::agent::workflow::investigation::InvestigationGuard::default();
+    let mut repeats = crate::agent::safety::guard::RepeatGuard::default();
+    for _ in 0..2 {
+        checkpoint.observe_at(
+            &ws,
+            &shell,
+            &crate::runtime::tool_output::ToolOutput::ok("original".into()),
+            &mut investigation,
+            &mut repeats,
+        );
+    }
+    assert!(
+        checkpoint.rejection_at(&ws, &shell).is_some(),
+        "unchanged successful observation stays withheld"
+    );
+    let oversized = root.join("unhashable.bin");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(65 * 1024 * 1024)
+        .unwrap();
+    assert!(crate::agent::verify::shared_runs::shell_tree(&ws, &shell).is_none());
+    assert!(
+        checkpoint.rejection_at(&ws, &shell).is_some(),
+        "an incomplete fingerprint is not a changed identity"
+    );
+    std::fs::remove_file(oversized).unwrap();
+    std::fs::write(root.join("source.txt"), "changed externally").unwrap();
+    assert!(
+        checkpoint.rejection_at(&ws, &shell).is_none(),
+        "new source state must release stale observation feedback"
+    );
+}
+
+#[test]
 fn only_meaningful_recovery_restores_tools() {
     let mut checkpoint = RecoveryCheckpoint::default();
     checkpoint.arm(&call("read"), "unchanged evidence");
     checkpoint.progress(&call("bash"), false, false, false, &[]);
     checkpoint.progress(&call("todo"), true, false, false, &[]);
     checkpoint.progress(&call("grep"), true, false, false, &[]);
-    checkpoint.progress(&call("artifact_read"), true, false, false, &[]);
     checkpoint.progress(&call("edit"), true, false, false, &[]);
     let mut task = call("todo");
     task.arguments = json!({"op":"set"});

@@ -63,6 +63,33 @@ fn journal_failure_stops_all_runtime_publication_and_preserves_saved_prose() {
     assert_eq!(recovered[0].result.text, "durable prefix");
 }
 #[test]
+fn a_retried_attempts_partial_answer_is_interrupted_not_continued() {
+    struct Quiet;
+    impl Ui for Quiet {}
+    let mut quiet = Quiet;
+    let tree = Tree::default();
+    let mut ui = StateUi::new(&mut quiet, tree.clone(), None);
+    ui.request_phase(crate::agent::RequestPhase::Waiting);
+    ui.text_delta("Let me write it now.");
+    ui.request_phase(crate::agent::RequestPhase::Backoff);
+    ui.request_phase(crate::agent::RequestPhase::Retrying);
+    ui.text_delta("Let me write it now.");
+    ui.finish(false);
+    let answers = tree
+        .snapshots()
+        .into_iter()
+        .filter(|node| node.label == "answer")
+        .map(|node| (node.result.text, node.result.phase))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        answers,
+        [
+            ("Let me write it now.".to_owned(), Phase::Interrupted),
+            ("Let me write it now.".to_owned(), Phase::Completed),
+        ]
+    );
+}
+#[test]
 fn coherent_runtime_extensions_own_call_and_result_presentation() {
     use crate::tools::{
         integrations::ext::{Registry, Tool, ToolContext},

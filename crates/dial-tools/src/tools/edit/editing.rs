@@ -54,30 +54,35 @@ pub fn instructions(mode: EditMode) -> &'static str {
 /// Optional on every grammar: commits an edit the lean local tiers would refuse for new parser errors.
 const ALLOW_SYNTAX_ERRORS: &str =
     "Set true only when valid code is refused for new syntax errors (parser dialect gap).";
+/// Optional foreground verification, shared by edits and whole-file writes.
+pub(in crate::tools) fn check_property() -> Value {
+    json!({"type":"boolean","description":"Set true when a coherent change is ready for verification, usually on its final edit or write—not after every intermediate mutation. Omit while still making related changes, or use false to only mutate. Runs the controller's focused checks after success (same selection, approvals and evidence as check). Check failures leave the mutation applied and are reported separately. Available in foreground controller calls, not child workers."})
+}
 pub fn schema(mode: EditMode) -> Value {
     let allow = json!({"type":"boolean","description":ALLOW_SYNTAX_ERRORS});
+    let check = check_property();
     match mode {
         EditMode::Replace => tool_schema(
             "edit",
             instructions(mode),
-            json!({"path":{"type":"string"},"old_string":{"type":"string","minLength":1},"new_string":{"type":"string"},"replace_all":{"type":"boolean"},"allow_syntax_errors":allow}),
+            json!({"path":{"type":"string"},"old_string":{"type":"string","minLength":1},"new_string":{"type":"string"},"replace_all":{"type":"boolean"},"allow_syntax_errors":allow,"check":check}),
             &["path", "old_string", "new_string"],
         ),
         EditMode::Patch => tool_schema(
             "edit",
             instructions(mode),
-            json!({"path":{"type":"string"},"edits":{"type":"array","minItems":1,"maxItems":128,"items":{"type":"object","properties":{"op":{"type":"string","enum":["create","update","delete"]},"rename":{"type":"string"},"diff":{"type":"string"}},"additionalProperties":false}},"allow_syntax_errors":allow}),
+            json!({"path":{"type":"string"},"edits":{"type":"array","minItems":1,"maxItems":128,"items":{"type":"object","properties":{"op":{"type":"string","enum":["create","update","delete"]},"rename":{"type":"string"},"diff":{"type":"string"}},"additionalProperties":false}},"allow_syntax_errors":allow,"check":check}),
             &["path", "edits"],
         ),
         _ => tool_schema(
             "edit",
             instructions(mode),
             json!({"input":{"type":"string","description":match mode {
-                EditMode::Hashline => "Hashline patch text; the tool description is the complete contract.",
+                EditMode::Hashline => "Hashline patch text: one or more `[PATH#TAG]` sections, each with any number of PUT/CUT operations; the tool description is the complete contract.",
                 EditMode::ApplyPatch => "Apply-patch text using *** Begin Patch and *** End Patch; follow the tool description.",
                 EditMode::Sloppy => "Sloppy patch text; the tool description is the complete contract.",
                 _ => unreachable!(),
-            }},"allow_syntax_errors":allow}),
+            }},"allow_syntax_errors":allow,"check":check}),
             &["input"],
         ),
     }
@@ -110,9 +115,10 @@ pub(crate) fn validate_shape(mode: EditMode, args: &Value) -> Result<(), String>
             "new_string",
             "replace_all",
             "allow_syntax_errors",
+            "check",
         ],
-        EditMode::Patch => &["path", "edits", "allow_syntax_errors"],
-        _ => &["input", "allow_syntax_errors"],
+        EditMode::Patch => &["path", "edits", "allow_syntax_errors", "check"],
+        _ => &["input", "allow_syntax_errors", "check"],
     };
     if object
         .iter()
@@ -120,6 +126,7 @@ pub(crate) fn validate_shape(mode: EditMode, args: &Value) -> Result<(), String>
     {
         return Err("edit arguments contain fields from another mode or unknown fields".into());
     }
+    opt_bool(args, "check")?;
     Ok(())
 }
 #[derive(Clone)]

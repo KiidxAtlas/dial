@@ -6,7 +6,131 @@ For the source directory map, offline checks and fixture ownership, start with
 [the benchmark tooling index](../examples/benchmarks/README.md). Runnable non-benchmark samples
 are listed in [the examples index](../examples/README.md).
 
+Local benchmark workspaces and reports live in `benchmarks/`, outside Cargo's disposable
+`target/`. See [the local workspace map](../benchmarks/README.md). Downloaded datasets,
+environments, binaries and private traces stay ignored by Git and Docker; committed tooling
+and fixture inputs remain in `examples/benchmarks/`. Historical records retain their original
+paths and bytes: resolve a recorded `target/harbor-*` path under `benchmarks/harbor-*` instead.
+
 **Invalid runs.** A benchmark run in which no case shows any model activity (for example, every case fails immediately with an agent error before a model request) is reported as an invalid run and fails the command, instead of being reported as a 0 score. The JSON report records the reason in `invalid_run`, and each case keeps its `evidence.agent_error_detail`; fix the setup problem before comparing results.
+
+## Harbor pilot diagnostic records
+
+The local Harbor comparison at `benchmarks/harbor-current/` attaches versioned `diagnostics` to
+each trial through `examples/benchmarks/harbor_diagnostics.py`. This is offline postprocessing
+of retained logs, not another model run, a changed score, or a replacement for the official verifier.
+Historical, supplemental evidence and three-way comparison batches remain separate.
+
+The records include:
+
+- Source byte counts, SHA-256 identities and relative-file/line retrieval pointers.
+- Deduplicated model requests, model/phase, numeric policy selection and usage fields, finish
+  reasons and available runtime latency measurements. Cache traffic retains producer semantics;
+  token totals are not inferred dollar costs.
+- Tool call/result links, argument/result hashes and byte counts, repeat-argument counts,
+  observed call-to-result intervals, execution/error status, process/capture metadata and
+  changed-path counts. Arguments and output bodies are not copied into the diagnostic export.
+  Dial's final execution ledger also supplies automatic focused-check completions that are not
+  model-message journal entries. Matching call identities are linked, not counted twice; runtime
+  checks are labelled separately. Ledger-only records keep unavailable bodies and call-to-result
+  intervals explicit, even when their status and execution duration are known.
+- Pattern observations for unchanged reads, withheld calls, permissions, missing artifacts,
+  disabled PTYs, missing dependencies, timeouts and provider retries. These labels and exact
+  argument repetitions are not proof of wasted work or causal attribution.
+- Separate environment setup, agent setup, agent execution and verifier intervals, plus official
+  CTRF per-test status/duration and available completion/reliability metadata. Agent-reported
+  completion does not override a failing official test.
+- Explicit missing/malformed/oversized-source, missing latency/result and aggregate-versus-trace
+  reconciliation gaps. Incomplete tool/error coverage leaves the diagnostic error total unknown,
+  not zero. This does not rewrite producer-reported aggregate counters.
+- A batch overview with a task/agent outcome matrix, failed official cases, excluded/missing/
+  duplicate/unexpected trials, and job-level completion/error/retry counters—even jobs without
+  trial results remain visible. Each attempt stays distinct; an empty selection is not a measured zero.
+- Recorded agent/model/provider identity, task-checksum compatibility, exit status, reported cost
+  and configured resource/timeout overrides. Overrides are not measurements of effective resources;
+  recorded agent identity is not proof of per-trial executable identity.
+- Per-agent timing, token/cache traffic, provider backoff, inference/storage/projection counters,
+  request phases and per-tool error/repetition summaries. Numeric summaries include samples,
+  expected samples, completeness, observed sum, total, minimum, median, nearest-rank p95 and maximum.
+  Incomplete totals stay null. Request latency coverage must reconcile within **each trial**:
+  extra traces in one trial cannot cancel missing traces in another. Overlapping request/tool sums
+  are not wall-clock controller overhead. Provider, Harbor and verifier retries remain separate.
+
+For the existing pilot, regenerate a **separate** supplemental report without agent execution:
+
+```sh
+python3 benchmarks/harbor-current/report.py --batch evidence \
+  --output benchmarks/harbor-current/report-evidence-diagnostics.json
+```
+
+Use the exact recorded batch prefix and matching manifest for a comparison, and a fresh output
+name rather than overwriting historical reports. The local runner/report and retained jobs are
+generated artifacts, not a portable committed Harbor installation. Postprocessing cannot recover
+events absent from older binaries or journals. OMP request latency/tool timing is unknown when
+its stream supplies no timestamps. Frozen live-batch binaries, adapters and inputs are unchanged.
+
+The JSON `overview` is also renderable as a readable Markdown companion through the same owner.
+For example, after generating a fresh `report-threeway-coverage-final.json` using `--batch threeway`
+and `--manifest benchmarks/harbor-current/comparison-manifest.json`:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, 'examples/benchmarks')
+from harbor_diagnostics import render_overview
+root = Path('benchmarks/harbor-current')
+report = json.loads((root / 'report-threeway-coverage-final.json').read_text())
+with (root / 'report-threeway-coverage-final.md').open('x') as output:
+    output.write(render_overview(report['overview']))
+PY
+```
+
+Expected task/agent pairs come from the selected comparison manifest: do not interpret a historical
+single-agent evidence batch as a missing three-way comparison. Costs, effective CPU/memory usage,
+per-trial executable hashes and missing wire payloads remain unknown when not recorded.
+
+Raw logs can contain credentials and private model/tool content. Keep both logs and derived
+reports private: metadata still contains model/tool/test labels, timing, relative paths and hashes;
+this is not an anonymization or public-export guarantee. The parser rejects source symlinks that
+resolve outside the trial, bounds source size/journal count, and restricts structured capture and
+verifier-duration values rather than copying arbitrary nested values.
+
+Offline regression checks (no models or services):
+
+```sh
+python3 -m unittest discover -s examples/benchmarks -p 'test_harbor_diagnostics.py'
+python3 benchmarks/harbor-current/test_threeway.py
+```
+
+### Retained cancellation failure and isolated repair
+
+The supplemental cancellation trial's generated `/app/run.py` cancelled children a second time
+after `gather` had already propagated cancellation. When a semaphore waiter exited before running
+children finished their awaited cleanup, the second cancellation interrupted that cleanup.
+Replacing that gather/manual-cancel block with a `TaskGroup`, retaining the semaphore and worker
+helper, repairs the exact generated deliverable. This is not a defect in Dial's own cancellation
+implementation and does not prove future model-generated solutions will be correct.
+
+The original journal-extracted source and corrected replay are retained separately under
+`benchmarks/harbor-current/fixes/cancel-async-tasks/{original,corrected}/run.py`. The original source
+hash is `220b01d72d2c215646bff3ff34e1cde639db152ea3cf4bed1950ae14517efa58`.
+An offline replay executed all six unchanged official test bodies and the unchanged helper:
+the original reproduced **5/6**, failing queued-task cancellation; the corrected source passed
+**6/6**. The host was Python **3.14.8**, not the task's Python 3.13 container. The replay explicitly
+maps only the `/app/run.py` existence lookup to the replay copy and aliases `python` to that host
+interpreter. This is host regression evidence, not exact container parity or a new agent score.
+
+```sh
+# Expected nonzero: demonstrates the original failure.
+PYTHONDONTWRITEBYTECODE=1 python3 benchmarks/harbor-current/fixes/cancel-async-tasks/replay.py original
+PYTHONDONTWRITEBYTECODE=1 python3 benchmarks/harbor-current/fixes/cancel-async-tasks/replay.py corrected
+```
+
+The separate reconciled report is `benchmarks/harbor-current/report-evidence-reconciled.json`:
+all **85 requests, 106 tool completions and 15 errors** match the retained aggregate counters.
+The two formerly unexplained calls were automatic focused checks, not lost model-issued calls.
+The historical supplemental result remains **2/3**; the repaired replay is not pooled into it.
 
 ## Using an existing subscription sign-in
 
@@ -66,7 +190,7 @@ are not cumulative totals. The runtime records first tool-result/known workspace
 latency and exact parent/worker inspection overlap, not semantic reuse or wasted work. A useful
 action's latency, missing counters and unavailable reports remain unknown rather than inferred.
 
-For evidence-led quality work, use `dial benchmark examples/benchmarks/quality.toml --report target/quality.json`.
+For evidence-led quality work, use `dial benchmark examples/benchmarks/quality.toml --report benchmarks/quality.json`.
 Its billing fixtures cover locating production code among archival decoys,
 quantity/empty-input boundaries, a rename through callers, environment-versus-code diagnosis,
 and rejecting stale historical discount advice. Two journey cases continue one session across
@@ -125,7 +249,7 @@ single-configuration `--checkpoint` / `--resume` behavior is unchanged.
 ### Offline long-history workloads
 
 ```sh
-cargo run --locked --profile local --example runtime_baseline -- target/runtime-baseline.json
+cargo run --locked --profile local --example runtime_baseline -- benchmarks/runtime-baseline.json
 ```
 
 The existing runtime baseline now emits schema version 2. It retains the streaming-journal and
@@ -616,7 +740,7 @@ and for follow-up turns that continue the session, plus a parser for the agent's
 ```sh
 python3 examples/benchmarks/cross_agent.py examples/benchmarks/quality.toml examples/benchmarks/efficiency.toml \
   --agents examples/benchmarks/cross-agent.toml --model claude-sonnet-4-6 --repetitions 3 \
-  --jobs 1 --seed 0 --report target/cross-agent/report.json
+  --jobs 1 --seed 0 --report benchmarks/cross-agent/report.json
 ```
 
 Each trial runs in a fresh fixture copy with the same prompt and model. The script copies the fixture,
@@ -743,7 +867,7 @@ python3 -m unittest discover -s examples/benchmarks -p test_offline_compare.py
 python3 examples/benchmarks/offline_compare.py \
   --baseline /path/to/dial-baseline --candidate /path/to/dial-candidate \
   --omp /path/to/omp --repetitions 5 --seed 0 --timeout 30 \
-  --report target/offline-comparison/results.json
+  --report benchmarks/offline-comparison/results.json
 ```
 
 The eight workloads cover a fixed answer, read/write, three Python-file mutations, positive/negative
@@ -783,9 +907,9 @@ This is a host-agent/Docker-test local experiment, not a leaderboard submission.
 Install dependencies into a project-local environment, then freeze a selection before running:
 
 ```sh
-uv venv --python 3.12 target/swebench-env
-uv pip install --python target/swebench-env/bin/python 'swebench==4.1.0'
-target/swebench-env/bin/python - <<'PY'
+uv venv --python 3.12 benchmarks/swebench-env
+uv pip install --python benchmarks/swebench-env/bin/python 'swebench==4.1.0'
+benchmarks/swebench-env/bin/python - <<'PY'
 import json, sys
 from pathlib import Path
 from datasets import load_dataset
@@ -795,7 +919,7 @@ from swe_bench import select_instances
 name = 'princeton-nlp/SWE-bench_Verified'
 revision = HfApi().dataset_info(name).sha
 rows = select_instances(list(load_dataset(name, revision=revision, split='test')), 10, 0)
-root = Path('target/swebench-selection')
+root = Path('benchmarks/swebench-selection')
 root.mkdir(mode=0o700, exist_ok=False)
 (root / 'selected.json').write_text(json.dumps(rows))
 (root / 'manifest.json').write_text(json.dumps({
@@ -803,11 +927,11 @@ root.mkdir(mode=0o700, exist_ok=False)
     'instances': [{k: r[k] for k in ('instance_id', 'repo', 'base_commit')} for r in rows],
 }))
 PY
-target/swebench-env/bin/python examples/benchmarks/swe_bench.py prepare \
-  --dataset target/swebench-selection/selected.json \
-  --manifest target/swebench-selection/manifest.json --output target/swebench-pilot
-target/swebench-env/bin/python examples/benchmarks/swe_bench.py run --output target/swebench-pilot
-target/swebench-env/bin/python examples/benchmarks/swe_bench.py grade --output target/swebench-pilot
+benchmarks/swebench-env/bin/python examples/benchmarks/swe_bench.py prepare \
+  --dataset benchmarks/swebench-selection/selected.json \
+  --manifest benchmarks/swebench-selection/manifest.json --output benchmarks/swebench-pilot
+benchmarks/swebench-env/bin/python examples/benchmarks/swe_bench.py run --output benchmarks/swebench-pilot
+benchmarks/swebench-env/bin/python examples/benchmarks/swe_bench.py grade --output benchmarks/swebench-pilot
 ```
 
 `prepare` downloads prebuilt AMD64 images, records image/executable identities and exports only

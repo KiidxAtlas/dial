@@ -403,11 +403,11 @@ fn preview(text: &str) -> String {
     out
 }
 
-/// `message` only reaches workers of this session; independent sessions use `peers`.
-const PEERS_HINT: &str = "Other Dial sessions in this checkout are reached with the `peers` tool (action=send, to=<peer id from action=list>), not `message`.";
+/// `message` only reaches workers of this session; the top-level session routes peer ids itself.
+const PEERS_HINT: &str = "Other Dial sessions in this checkout are addressed by their 32-hex peer id, and only from the top-level session.";
 
 /// Project peer instance ids are 32 lowercase hex digits; worker ids are `task-N`.
-fn is_peer_id(to: &str) -> bool {
+pub(in crate::agent) fn is_peer_id(to: &str) -> bool {
     to.len() == 32
         && to
             .bytes()

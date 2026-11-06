@@ -182,6 +182,23 @@ larger models. Cancellation before publication removes the staged file.
 Scaling tensors can worsen or break image generation. It is not training, does not guarantee better
 images, and does not change a model already loaded by MLX-Serve. Keep the original model available.
 
+## Animated GIFs
+
+`image_gen` writes an animated GIF when `output` ends in `.gif`; `/image gif <prompt>` does the same
+from the command line. Optional `frame_count` (2–16, provider default 9) and `frame_duration_ms`
+(20–2000, rounded by the provider to 10 ms, default 200) shape the animation and are refused for
+other extensions. `size` describes each frame and defaults to `auto` for GIFs. A source `image`
+guides the animation and must still be PNG, JPEG or WebP.
+
+Only OpenAI's GPT Image 2.6 models (`gpt-image-2.6-flare`, `gpt-image-2.6-sunburst`) produce GIFs,
+and OpenAI gates GIF output behind preview access. On the OpenAI Images API, an unchanged default
+image model is switched to `gpt-image-2.6-flare` for that call; any other explicitly chosen model is
+refused before a request. The Responses hosted tool (including ChatGPT sign-in) names
+`gpt-image-2.6-flare` in the tool. Other transports refuse GIF output without spending quota. Dial
+decodes every frame under the usual limits and refuses a still image returned for a GIF request;
+GIFs are never converted to or from still formats. Streaming, masks and partial previews are not
+used. Live GIF generation has not been tested against OpenAI from this repository.
+
 ## Submission, downloads and cancellation
 
 All generation remains approval-gated. `/image generate <prompt>` and the model-callable `image_gen`

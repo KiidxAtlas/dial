@@ -60,6 +60,17 @@ fn static_platform_support_does_not_replace_launch_containment() {
             crate::tools::exec::kernel::require_fork_containment(name).err(),
             expected
         );
+    } else if cfg!(all(
+        target_os = "linux",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )) {
+        assert!(platform.available);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            crate::tools::exec::kernel::require_fork_containment(name),
+            crate::tools::exec::sandbox::fork_fence::available()
+        );
     } else {
         assert_eq!(
             crate::tools::exec::kernel::require_fork_containment(name).err(),

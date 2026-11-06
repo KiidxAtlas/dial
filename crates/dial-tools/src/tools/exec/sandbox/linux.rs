@@ -264,7 +264,14 @@ pub(super) fn command(
     program: &str,
     args: &[&str],
 ) -> Result<Command, String> {
-    command_mode(workspace, policy, program, args, false, None)
+    command_mode(
+        workspace,
+        policy,
+        program,
+        args,
+        super::CommandMode::default(),
+        None,
+    )
 }
 
 /// Only a caller that first creates a fresh private PTY/session may retain that session.
@@ -274,7 +281,7 @@ pub(super) fn command_mode(
     policy: &Policy,
     program: &str,
     args: &[&str],
-    owned_terminal: bool,
+    mode: super::CommandMode,
     proxy: Option<&super::netproxy::Endpoint>,
 ) -> Result<Command, String> {
     if !Path::new(BWRAP).is_file() {
@@ -306,7 +313,7 @@ pub(super) fn command_mode(
     };
     let mut command = Command::new(BWRAP);
     command.arg("--die-with-parent");
-    if !owned_terminal {
+    if mode.owned_terminal.is_none() {
         command.arg("--new-session");
     }
     command.args([
@@ -362,13 +369,21 @@ pub(super) fn command_mode(
     command
         .args(["--remount-ro", "/", "--chdir"])
         .arg(workspace);
+    #[cfg(target_os = "linux")]
+    if mode.fork_fence && bridge.is_none() {
+        super::fork_fence::bubblewrap(&mut command)?;
+    }
     command.arg("--");
     if let Some((exe, socket)) = &bridge {
         command
             .arg(exe)
             .arg(super::netproxy::BRIDGE_ARG)
             .arg(socket)
-            .arg("--");
+            .arg(if mode.fork_fence {
+                super::netproxy::FENCED_SEPARATOR
+            } else {
+                "--"
+            });
     }
     command.arg(program).args(args);
     Ok(command)

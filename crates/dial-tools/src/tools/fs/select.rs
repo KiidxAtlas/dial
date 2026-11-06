@@ -148,7 +148,7 @@ pub(in crate::tools) fn split_target<'a>(
     ws: &Workspace,
     input: &'a str,
 ) -> Result<(&'a str, Selector), String> {
-    if ws.resolve(input).is_ok_and(|p| p.exists()) {
+    if ws.resolve_read(input).is_ok_and(|p| p.exists()) {
         return Ok((input, Selector::default()));
     }
     split_selector(input)

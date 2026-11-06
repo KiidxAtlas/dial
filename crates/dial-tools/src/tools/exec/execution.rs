@@ -235,8 +235,7 @@ fn native_with(
     emit: &(dyn Fn(ToolEvent) + Sync),
     cancel: &AtomicBool,
 ) -> Option<ToolOutput> {
-    if !crate::tools::BUILTIN.contains(&name) && name != "artifact_read" && !registry.contains(name)
-    {
+    if !crate::tools::BUILTIN.contains(&name) && !registry.contains(name) {
         return None;
     }
     Some(contained(cancel, panic_effects, || match name {
@@ -282,11 +281,6 @@ fn native_with(
             cancel,
             crate::tools::model_output_limit(context.config.context_window),
         ),
-        "artifact_read" => context
-            .workspace
-            .artifacts()
-            .map(|store| store.call(args))
-            .unwrap_or_else(|| ToolOutput::err("artifacts unavailable")),
         name if crate::tools::BUILTIN.contains(&name) => {
             crate::tools::execute(context.workspace, name, args, 120)
         }

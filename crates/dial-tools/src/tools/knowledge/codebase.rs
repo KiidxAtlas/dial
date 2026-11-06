@@ -43,6 +43,8 @@ const SCAN_TIME: Duration = Duration::from_secs(3);
 /// Ambient (per-message) brief bounds; explicit `codebase_memory recall` keeps the complete view.
 const AMBIENT_FINDINGS: usize = 4;
 const AMBIENT_SUMMARY_CHARS: usize = 700;
+/// Most records (findings and sources together) one ambient brief carries.
+const AMBIENT_RECORDS: usize = 6;
 
 #[cfg(test)]
 thread_local! {
@@ -1307,7 +1309,8 @@ impl Codebase {
         }
         // Task-relevant fresh records win the ambient budget over historical notices.
         if scoped {
-            for (_, row) in &candidates {
+            // A brief, not a map: the few best records; `codebase_memory recall` has the rest.
+            for (_, row) in candidates.iter().take(AMBIENT_RECORDS) {
                 if out.len() + row.len() <= max_bytes {
                     out.push_str(row);
                 }

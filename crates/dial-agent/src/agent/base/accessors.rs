@@ -192,6 +192,7 @@ impl<'a> Agent<'a> {
             }
         }
         workspace = workspace.with_additional_roots(&dirs)?;
+        workspace = workspace.with_read_only_roots(&self.modes.launch.read_only_dirs)?;
         let checkpoints = if let Some(layout) = &self.layout
             && self.checkpoints.is_some()
         {
@@ -301,12 +302,10 @@ impl<'a> Agent<'a> {
             backend.remember_session_error(error);
         }
         if let Some(memory) = &self.memory {
-            for tool in crate::tools::knowledge::provenance::tools(
+            self.ext.register(crate::tools::knowledge::provenance::tool(
                 memory.clone(),
                 self.session.id().to_owned(),
-            ) {
-                self.ext.register(tool);
-            }
+            ));
         }
         if let Some(cache) = &self.codebase {
             self.ext.register(crate::tools::knowledge::codebase::tool(
@@ -604,8 +603,12 @@ impl<'a> Agent<'a> {
             }
             names.push("request_directory".into());
         }
-        if let Some(memory) = &self.memory_runtime {
-            names.extend(memory.offered_names().into_iter().map(str::to_owned));
+        if self
+            .memory_runtime
+            .as_ref()
+            .is_some_and(|memory| memory.offers_tool())
+        {
+            names.push(crate::storage::memory_backend::TOOL_NAME.into());
         }
         names.retain(|n| {
             config::tools::BUILTIN.contains(&n.as_str())
@@ -619,7 +622,6 @@ impl<'a> Agent<'a> {
                         | "ask"
                         | "tool_search"
                         | "tool_load"
-                        | "artifact_read"
                         | "working_state"
                         | "tts"
                         | "check"
@@ -632,16 +634,17 @@ impl<'a> Agent<'a> {
                     ))
                 || self.ext.contains(n)
                 || self.config.tools.contains_key(n)
-                || self
-                    .memory_runtime
-                    .as_ref()
-                    .is_some_and(|memory| memory.offered_names().contains(&n.as_str()))
+                || (n == crate::storage::memory_backend::TOOL_NAME
+                    && self
+                        .memory_runtime
+                        .as_ref()
+                        .is_some_and(|memory| memory.offers_tool()))
         });
         names.retain(|name| name != "ask" || self.config.ask.enabled);
         // `check` runs the verification gate's selection; `revert_edit` needs the checkpoint journal.
         names.retain(|name| match name.as_str() {
             "check" => self.config.verification.enabled,
-            "peers" => !self.hermetic && self.config.coordination.enabled && self.layout.is_some(),
+            "peers" => self.coordination_enabled(),
             "side_request" => !self.hermetic,
             "revert_edit" => self.checkpoints.is_some(),
             _ => true,

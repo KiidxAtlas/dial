@@ -24,6 +24,7 @@ fn target(wire: Wire, model: &str, settings: ImageModelSettings) -> Target {
 
 fn request(size: &'static str) -> Request<'static> {
     Request {
+        animation: None,
         prompt: "a lighthouse at dusk",
         size,
         output: "out.png",
@@ -226,6 +227,7 @@ fn output_format_follows_each_routes_documented_extensions() {
         ImageModelSettings::default(),
     );
     let with_output = |output: &'static str| Request {
+        animation: None,
         prompt: "a lighthouse at dusk",
         size: "auto",
         output,
@@ -254,6 +256,7 @@ fn fal_refuses_webp_and_unknown_extensions_before_submission() {
     let fal = target(Wire::Fal, "fal-ai/flux/dev", ImageModelSettings::default());
     for output in ["a.webp", "a.gif", "a"] {
         let req = Request {
+            animation: None,
             prompt: "p",
             size: "auto",
             output,
@@ -390,6 +393,7 @@ fn submit_with(target: &Target, config: &Config, output: &str) -> Result<Vec<u8>
         &client,
         target,
         &Request {
+            animation: None,
             prompt: "a lighthouse at dusk",
             size: "auto",
             output,

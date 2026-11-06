@@ -107,7 +107,7 @@ const EXECUTION_TOOLS: &[&str] = &[
 /// protocol, bookkeeping preconditions and patch grammar. Debugging advice adds nothing there
 /// and pads every retry, so they get no checkpoint.
 fn mechanical(tool: &str, error: &str) -> bool {
-    matches!(tool, "todo" | "codebase_memory" | "memory" | "forget")
+    matches!(tool, "todo" | "codebase_memory" | "memory")
         || error.starts_with("invalid tool call")
         || [
             "missing required argument",

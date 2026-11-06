@@ -156,8 +156,8 @@ pub fn facts(
 }
 
 /// Whether `model` is loaded in memory on the server at `base_url`. Ollama reports `/api/ps`, LM
-/// Studio its `/api/v0/models` state, llama.cpp is loaded while it answers. `None` when the server
-/// cannot tell (not reachable, not the expected API, or not a local host).
+/// Studio its native model instances (or legacy state), llama.cpp is loaded while it answers.
+/// `None` when the server cannot tell.
 pub fn model_loaded(
     provider: &str,
     model: &str,
@@ -175,23 +175,8 @@ pub fn model_loaded(
             if !catalog::valid_model_id(model) {
                 return None;
             }
-            if model.contains('/') {
-                // A publisher-qualified id is not a single path segment: search the list instead.
-                let list = local_get(base_url, "/api/v0/models", token, &resolved)?;
-                let row = list["data"]
-                    .as_array()?
-                    .iter()
-                    .find(|row| row["id"].as_str() == Some(model));
-                Some(row.is_some_and(|row| row["state"].as_str() == Some("loaded")))
-            } else {
-                let row = local_get(
-                    base_url,
-                    &format!("/api/v0/models/{model}"),
-                    token,
-                    &resolved,
-                )?;
-                Some(row["state"].as_str() == Some("loaded"))
-            }
+            let info = catalog::lmstudio_model_with_headers(base_url, model, token, &resolved)?;
+            Some(info.loaded)
         }
         _ if catalog::is_llama_server(base_url, token, headers) => Some(true),
         _ => None,
@@ -358,23 +343,19 @@ fn ollama_facts(
     })
 }
 
-/// LM Studio `/api/v0/models`: the row's `capabilities` list says whether the model declares native
-/// tool use. LM Studio documents no template thinking switch and no sampling defaults to read. A row
-/// without a capability list, or no row for `model`, says nothing.
+/// LM Studio native capability metadata. Public reasoning controls are not the template's
+/// `enable_thinking` switch: keep that unknown rather than advertising the wrong request field.
 fn lm_studio_facts(
     base: &str,
     model: &str,
     token: Option<&str>,
     headers: &ResolvedHeaders<'_>,
 ) -> Option<ServerFacts> {
-    let list = local_get(base, "/api/v0/models", token, headers)?;
-    let capabilities = list["data"]
-        .as_array()?
-        .iter()
-        .find(|row| row["id"] == model)?["capabilities"]
-        .as_array()?;
+    let known = catalog::lmstudio_models_with_headers(base, token, headers)?
+        .into_iter()
+        .find(|known| known.id == model)?;
     Some(ServerFacts {
-        native_tools: Some(capabilities.iter().any(|c| c.as_str() == Some("tool_use"))),
+        native_tools: known.native_tools,
         ..ServerFacts::default()
     })
 }

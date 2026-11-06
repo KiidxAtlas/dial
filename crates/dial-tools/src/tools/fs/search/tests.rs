@@ -53,12 +53,12 @@ fn complete_walks_report_a_short_footer_and_limited_walks_keep_details() {
     let footer = text.split("[coverage:").nth(1).unwrap();
     assert!(footer.contains("walk complete"), "{text}");
     assert!(!footer.contains("directory_entry_limit"), "{text}");
-    assert!(footer.contains(r#""next_cursor":null"#), "{text}");
+    assert!(!text.contains("[page:"), "{text}");
     assert!(!footer.contains("order"), "{text}");
     for i in 0..3 {
         fs::write(dir.path().join(format!("m{i}.txt")), "needle\n").unwrap();
     }
-    let capped = grep(&ws, json!({"pattern": "needle", "max_results": 1}));
+    let capped = grep(&ws, json!({"pattern": "needle", "limit": 1}));
     let footer = capped.split("[coverage:").nth(1).unwrap();
     assert!(
         footer.contains("omitted coverage is not exhaustive"),
@@ -166,15 +166,15 @@ fn numbered_file(dir: &tempfile::TempDir, name: &str, lines: usize) {
 fn grep_fixed_string_treats_metacharacters_literally() {
     let (dir, ws) = workspace();
     fs::write(dir.path().join("a.txt"), "Hello World\nfn a(x) {}\nax\n").unwrap();
-    let literal = grep(&ws, json!({"pattern": "a(x)", "fixed_string": true}));
+    let literal = grep(&ws, json!({"pattern": "a(x)", "literal": true}));
     assert!(
         literal.contains("a.txt:2:fn a(x) {}") && !literal.contains("a.txt:3:"),
         "{literal}"
     );
-    assert!(grep(&ws, json!({"pattern": ".*", "fixed_string": true})).starts_with("no matches\n"));
+    assert!(grep(&ws, json!({"pattern": ".*", "literal": true})).starts_with("no matches\n"));
     let folded = grep(
         &ws,
-        json!({"pattern": "HELLO", "fixed_string": true, "ignore_case": true}),
+        json!({"pattern": "HELLO", "literal": true, "ignore_case": true}),
     );
     assert!(body(&folded).starts_with("a.txt:1:Hello World"), "{folded}");
 }
@@ -219,11 +219,11 @@ fn grep_reports_invalid_regex_without_panicking() {
     let bad = run(&ws, "grep", json!({"pattern": "x("}));
     assert!(bad.is_error, "{}", bad.text);
     // The same text is fine as a literal.
-    assert!(grep(&ws, json!({"pattern": "x(", "fixed_string": true})).contains("a.txt:1:x("));
+    assert!(grep(&ws, json!({"pattern": "x(", "literal": true})).contains("a.txt:1:x("));
     let huge = run(&ws, "grep", json!({"pattern": "((a{100}){100}){100}"}));
     assert!(huge.is_error, "{}", huge.text);
     assert!(run(&ws, "grep", json!({"pattern": ""})).is_error);
-    assert!(run(&ws, "grep", json!({"pattern": "x", "max_results": 0})).is_error);
+    assert!(run(&ws, "grep", json!({"pattern": "x", "limit": 0})).is_error);
 }
 
 #[test]
@@ -295,10 +295,7 @@ fn grep_context_separates_files_and_counts_only_matches() {
         "a.txt-1-l1\na.txt:2:l2\na.txt-3-l3\n--\nb.txt-1-l1\nb.txt:2:l2\nb.txt-3-l3\n"
     );
     // max_results limits matches, not the context rows around them.
-    let one = grep(
-        &ws,
-        json!({"pattern": "l2$", "context": 1, "max_results": 1}),
-    );
+    let one = grep(&ws, json!({"pattern": "l2$", "context": 1, "limit": 1}));
     assert!(
         body(&one).starts_with("a.txt-1-l1\na.txt:2:l2\na.txt-3-l3\n"),
         "{one}"
@@ -326,16 +323,16 @@ fn grep_caps_matches_and_bounds_each_line() {
         )),
         "{capped}"
     );
-    assert!(capped.contains("\"next_cursor\":null"), "{capped}");
+    assert!(!capped.contains("[page:"), "{capped}");
     let five = grep(
         &ws,
-        json!({"pattern": "hit", "path": "many.log", "max_results": 5}),
+        json!({"pattern": "hit", "path": "many.log", "limit": 5}),
     );
     assert_eq!(five.matches("many.log:").count(), 5);
     // An explicit max_results lifts the per-file cap; an oversized one is clamped, not refused.
     let raised = grep(
         &ws,
-        json!({"pattern": "hit", "path": "many.log", "max_results": 5000}),
+        json!({"pattern": "hit", "path": "many.log", "limit": 5000}),
     );
     assert_eq!(
         raised.matches("many.log:").count(),
@@ -442,7 +439,7 @@ fn grep_footer_names_the_files_a_capped_page_left_out() {
     assert!(!capped.contains("page_capped_by"), "{capped}");
     let whole = grep(
         &ws,
-        json!({"pattern": "hit", "path": "a_many.txt", "max_results": 5}),
+        json!({"pattern": "hit", "path": "a_many.txt", "limit": 5}),
     );
     assert!(whole.contains("page_capped_by=match limit of 5"), "{whole}");
     let small = grep(&ws, json!({"pattern": "NOPE_NEVER"}));
@@ -621,18 +618,20 @@ fn grep_cap_preserves_deterministic_depth_first_order() {
     let expected = "a/z.rs:1:hit first\n";
     for _ in 0..3 {
         assert_eq!(
-            body(&grep(&ws, json!({"pattern": "hit", "max_results": 1}))),
+            body(&grep(&ws, json!({"pattern": "hit", "limit": 1}))),
             expected
         );
     }
 }
 
+/// The page footer; a page without a continuation omits it, which reads as a null cursor.
 fn page(text: &str) -> Value {
-    let line = text
-        .lines()
+    text.lines()
         .find_map(|line| line.strip_prefix("[page: ")?.strip_suffix(']'))
-        .unwrap();
-    serde_json::from_str(line).unwrap()
+        .map_or_else(
+            || json!({"next_cursor": null, "remaining_skip": 0}),
+            |line| serde_json::from_str(line).unwrap(),
+        )
 }
 
 #[test]
@@ -681,7 +680,7 @@ fn grep_files_mode_pages_over_files_with_cursor_and_skip() {
     fs::write(dir.path().join("ignored/x.txt"), "hit\n").unwrap();
     let first = grep(
         &ws,
-        json!({"pattern": "hit", "output": "files", "max_results": 2}),
+        json!({"pattern": "hit", "output": "files", "limit": 2}),
     );
     assert_eq!(
         body(&first),
@@ -693,7 +692,7 @@ fn grep_files_mode_pages_over_files_with_cursor_and_skip() {
     assert_eq!(next["next_cursor"], json!({"path": "f2.txt", "match": 0}));
     let second = grep(
         &ws,
-        json!({"pattern": "hit", "output": "files", "max_results": 2,
+        json!({"pattern": "hit", "output": "files", "limit": 2,
             "cursor": next["next_cursor"], "skip": next["remaining_skip"]}),
     );
     assert_eq!(
@@ -717,7 +716,7 @@ fn capped_lines_pages_suggest_files_mode_and_default_output_is_unchanged() {
     assert_eq!(plain, explicit);
     assert_eq!(body(&plain), "a.txt:1:hit\nb.txt:1:hit\n");
     assert!(!plain.contains("output=\"files\""), "{plain}");
-    let capped = grep(&ws, json!({"pattern": "hit", "max_results": 1}));
+    let capped = grep(&ws, json!({"pattern": "hit", "limit": 1}));
     assert!(
         capped.contains("; output=\"files\" lists matching files with match counts"),
         "{capped}"
@@ -773,14 +772,14 @@ fn parallel_and_serial_grep_pages_are_byte_identical() {
     let cases = [
         json!({"pattern": "needle"}),
         json!({"pattern": "needle", "context": 2}),
-        json!({"pattern": "needle [0-3]-1", "max_results": 7}),
+        json!({"pattern": "needle [0-3]-1", "limit": 7}),
         json!({"pattern": "needle", "output": "files"}),
         json!({"pattern": "needle", "output": "count"}),
-        json!({"pattern": "needle", "output": "files", "max_results": 5, "skip": 3}),
-        json!({"pattern": "needle\\n", "multiline": true, "max_results": 40}),
+        json!({"pattern": "needle", "output": "files", "limit": 5, "skip": 3}),
+        json!({"pattern": "needle\\n", "multiline": true, "limit": 40}),
         json!({"pattern": "absent-token"}),
         json!({"pattern": "needle", "glob": "**/g*.txt", "skip": 11}),
-        json!({"pattern": "needle", "max_results": 1}),
+        json!({"pattern": "needle", "limit": 1}),
     ];
     for args in cases {
         let serial = grep_with_workers(&ws, &args, 1);
@@ -793,7 +792,7 @@ fn parallel_and_serial_grep_pages_are_byte_identical() {
 fn parallel_grep_cursors_resume_exactly_like_serial_ones() {
     let (dir, ws) = workspace();
     many_files(&dir);
-    let mut args = json!({"pattern": "needle", "max_results": 25});
+    let mut args = json!({"pattern": "needle", "limit": 25});
     let mut collected = Vec::new();
     for _ in 0..40 {
         let serial = grep_with_workers(&ws, &args, 1).unwrap();
@@ -806,8 +805,7 @@ fn parallel_grep_cursors_resume_exactly_like_serial_ones() {
         args["cursor"] = footer["next_cursor"].clone();
         args["skip"] = footer["remaining_skip"].clone();
     }
-    let total =
-        grep_with_workers(&ws, &json!({"pattern": "needle", "max_results": 1000}), 4).unwrap();
+    let total = grep_with_workers(&ws, &json!({"pattern": "needle", "limit": 1000}), 4).unwrap();
     let paged: usize = collected.iter().map(|page| page.lines().count()).sum();
     assert_eq!(
         paged,
@@ -847,6 +845,7 @@ fn search_state(mode: OutputMode, max_matches: usize) -> GrepState {
         mode,
         summary_files: 0,
         summary_rows: Vec::new(),
+        preview: false,
     }
 }
 
@@ -862,7 +861,7 @@ fn anchored_grep_prunes_unrelated_subtrees_on_complete_and_capped_pages() {
         fs::write(dir.path().join("src").join(name), "needle\n").unwrap();
     }
     for max in [1, 10] {
-        let mut args = json!({"pattern": "needle", "glob": "src/**/*.rs", "max_results": max});
+        let mut args = json!({"pattern": "needle", "glob": "src/**/*.rs", "limit": max});
         let serial = grep_with_workers(&ws, &args, 1).unwrap();
         assert!(!serial.contains("depth-capped directory"), "{serial}");
         assert_eq!(grep_with_workers(&ws, &args, 4).unwrap(), serial);
@@ -982,12 +981,12 @@ fn residual_batch_stops_preserve_serial_walk_coverage() {
         fs::create_dir(dir.path().join("zzz")).unwrap();
         fs::write(dir.path().join("zzz/.gitignore"), "*\n").unwrap();
         fs::write(dir.path().join("zzz/ignored.txt"), "needle\n").unwrap();
-        let args = json!({"pattern":"needle", "max_results":files * 2 - 1});
+        let args = json!({"pattern":"needle", "limit":files * 2 - 1});
         assert_eq!(
             grep_with_workers(&ws, &args, 4),
             grep_with_workers(&ws, &args, 1)
         );
-        let args = json!({"pattern":"needle", "path":"00.txt", "max_results":1});
+        let args = json!({"pattern":"needle", "path":"00.txt", "limit":1});
         assert_eq!(
             grep_with_workers(&ws, &args, 4),
             grep_with_workers(&ws, &args, 1)
@@ -1025,7 +1024,7 @@ fn retrieval_measurement_matrix() {
             (dir, ws, paths)
         };
         let (_dir, ws, paths) = make_fixture();
-        let mut args = json!({"pattern":"needle", "max_results":max_matches});
+        let mut args = json!({"pattern":"needle", "limit":max_matches});
         if resumed {
             let first = grep_with_workers(&ws, &args, 1).unwrap();
             let footer = page(&first);
@@ -1316,4 +1315,161 @@ fn glob_preview_recognizes_common_test_names_but_not_incidental_substrings() {
             "{name}: {text}"
         );
     }
+}
+
+#[test]
+fn grep_preview_encloses_retained_matches_and_restores_only_fresh_visible_rows() {
+    let (dir, ws) = workspace();
+    let ws = ws.with_edit_mode(crate::tools::EditMode::Hashline);
+    let source = format!(
+        "def unrelated():\n    return 0\n\ndef needle():\n{}",
+        "    value = 1\n".repeat(44)
+    );
+    fs::write(dir.path().join("calc.py"), &source).unwrap();
+    let plain = grep(&ws, json!({"pattern":"needle"}));
+    assert_eq!(
+        plain,
+        grep(&ws, json!({"pattern":"needle", "preview":false}))
+    );
+    let args = json!({"pattern":"needle", "preview":true});
+    let shown = grep(&ws, args.clone());
+    assert!(shown.starts_with(&plain), "{shown}");
+    assert!(shown.contains("4:def needle()"), "{shown}");
+    assert!(shown.contains("43:    value = 1"), "{shown}");
+    assert!(!shown.contains("44:    value = 1"), "{shown}");
+    assert!(!shown.contains("1:def unrelated"), "{shown}");
+    let tag = crate::tools::edit::hashline::tag_of(&source);
+    let resumed = Workspace::new(dir.path()).unwrap();
+    crate::tools::edit::hashline::rehydrate(&resumed, [("grep", &args, shown.as_str())]);
+    let unseen = format!("[calc.py#{tag}]\nPUT 44.=44:\n+    value = 9\n");
+    assert!(crate::tools::edit::hashline::edit(&resumed, &unseen).is_err());
+    let edit = format!("[calc.py#{tag}]\nPUT 5.=5:\n+    value = 2\n");
+    crate::tools::edit::hashline::edit(&resumed, &edit).unwrap();
+    let stale = Workspace::new(dir.path()).unwrap();
+    crate::tools::edit::hashline::rehydrate(&stale, [("grep", &args, shown.as_str())]);
+    assert!(crate::tools::edit::hashline::edit(&stale, &edit).is_err());
+}
+
+#[test]
+fn grep_preview_screens_source_and_reports_unavailable_modes() {
+    let (dir, ws) = workspace();
+    fs::create_dir(dir.path().join("private")).unwrap();
+    let ws = ws
+        .with_edit_mode(crate::tools::EditMode::Hashline)
+        .with_protected_paths(&[dir.path().join("private")]);
+    for (path, source) in [
+        (
+            "a.py",
+            "def needle():\n    key = 'sk-abcdefghijklmnopqrstuvwxyz123456'\n",
+        ),
+        ("b.txt", "needle\nnoncode-marker\n"),
+        ("c.py", "def needle():\n    safe = 1\n"),
+        (
+            "private/hidden.py",
+            "def needle():\n    private_marker = 1\n",
+        ),
+    ] {
+        fs::write(dir.path().join(path), source).unwrap();
+    }
+    let args = json!({"pattern":"needle", "preview":true});
+    let shown = grep(&ws, args.clone());
+    assert!(!shown.contains("abcdefghijklmnopqrstuvwxyz"), "{shown}");
+    assert!(!shown.contains("noncode-marker"), "{shown}");
+    assert!(!shown.contains("private_marker"), "{shown}");
+    assert_eq!(grep_source_targets(&ws, &args, &shown), vec!["c.py"]);
+    let secret = fs::read_to_string(dir.path().join("a.py")).unwrap();
+    let tag = crate::tools::edit::hashline::tag_of(&secret);
+    assert!(
+        crate::tools::edit::hashline::edit(
+            &ws,
+            &format!("[a.py#{tag}]\nPUT 2.=2:\n+    safe = 2\n")
+        )
+        .is_err()
+    );
+    for mode in ["files", "count"] {
+        let summary = grep(
+            &ws,
+            json!({"pattern":"needle", "preview":true, "output":mode}),
+        );
+        assert!(summary.contains("grep preview: unavailable"), "{summary}");
+        assert!(grep_source_targets(&ws, &args, &summary).is_empty());
+    }
+    assert!(grep_tool(&ws, &json!({"pattern":"needle", "preview":"yes"})).is_err());
+}
+
+#[test]
+fn grep_preview_bounds_files_and_preserves_continuation() {
+    let (dir, ws) = workspace();
+    for index in 0..18 {
+        fs::write(
+            dir.path().join(format!("a{index:02}.py")),
+            "def needle():\n    value = 1\n",
+        )
+        .unwrap();
+    }
+    let args = json!({"pattern":"needle", "preview":true, "limit":1});
+    let first = grep(&ws, args.clone());
+    assert_eq!(grep_source_targets(&ws, &args, &first), vec!["a00.py"]);
+    let next = grep(
+        &ws,
+        json!({"pattern":"needle", "preview":true, "limit":1,
+        "cursor":page(&first)["next_cursor"]}),
+    );
+    assert_eq!(grep_source_targets(&ws, &args, &next), vec!["a01.py"]);
+    let all = grep(&ws, json!({"pattern":"needle", "preview":true}));
+    assert_eq!(
+        grep_source_targets(&ws, &args, &all),
+        vec!["a00.py", "a01.py", "a02.py"]
+    );
+    assert!(all.len() <= MAX_GREP_OUTPUT);
+    assert!(
+        grep_source_targets(
+            &ws,
+            &json!({"pattern":"needle", "preview":true, "path":"a17.py"}),
+            &all
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn grep_preview_reports_budget_omissions_and_refuses_changed_locations() {
+    let (dir, ws) = workspace();
+    let source = format!(
+        "def needle():\n{}",
+        format!("    needle = '{}'\n", "x".repeat(260)).repeat(220)
+    );
+    fs::write(dir.path().join("calc.py"), &source).unwrap();
+    let args = json!({"pattern":"needle", "preview":true, "limit":1000});
+    let shown = grep(&ws, args.clone());
+    assert!(shown.len() <= MAX_GREP_OUTPUT, "{} bytes", shown.len());
+    assert!(
+        shown.contains("budget-limited declarations may be omitted"),
+        "{shown}"
+    );
+    assert!(!page(&shown)["next_cursor"].is_null(), "{shown}");
+    let next = grep(
+        &ws,
+        json!({"pattern":"needle", "preview":true, "limit":1000,
+        "cursor":page(&shown)["next_cursor"]}),
+    );
+    assert!(next.contains("calc.py:"), "{next}");
+    let mut state = search_state(OutputMode::Lines, 1000);
+    state.preview = true;
+    let mut bytes = source.as_bytes().to_vec();
+    state.absorb(
+        &ws,
+        &dir.path().join("calc.py"),
+        false,
+        Read::Text(bytes.len() as u64),
+        None,
+        &mut bytes,
+    );
+    fs::write(dir.path().join("calc.py"), "def changed():\n    return 1\n").unwrap();
+    let stale = state.finish(&ws, None, "walk complete", true).unwrap();
+    assert!(
+        grep_source_targets(&ws, &args, &stale).is_empty(),
+        "{stale}"
+    );
+    assert!(!stale.contains("1:def changed"), "{stale}");
 }

@@ -147,8 +147,7 @@ impl Shell {
     }
 
     /// Runs queued pane requests and republishes the dashboard when due. `agent` is `None` during a
-    /// turn: peer messages then go out through the turn's [`PeerSender`], and the peer board keeps
-    /// its last reading.
+    /// turn: peer messages and the peer board then go through the turn's [`PeerSender`].
     pub(in crate::app) fn sync_live_pane(&mut self, app: &App, mut agent: Option<&mut Agent<'_>>) {
         if self.session_id.is_empty() || !watch::enabled(&app.layout, &self.session_id) {
             return;
@@ -183,14 +182,24 @@ impl Shell {
         if !self.live_pane.check(&app.layout, &self.session_id) {
             return;
         }
-        if let Some(agent) = agent.as_mut()
-            && self
-                .live_pane
-                .peers_at
-                .is_none_or(|at| at.elapsed() >= PEERS_EVERY)
+        if self
+            .live_pane
+            .peers_at
+            .is_none_or(|at| at.elapsed() >= PEERS_EVERY)
         {
-            self.live_pane.peers_at = Some(Instant::now());
-            self.live_pane.peers = peers(agent);
+            let reading = match (agent.as_mut(), &self.peer_sender) {
+                (Some(agent), _) => {
+                    let board = agent.peer_board();
+                    Some(peers(board, agent.peer_messages()))
+                }
+                (None, Some(sender)) => Some(peers(sender.board(), sender.messages())),
+                // No registry handle during this turn; keep the last reading.
+                (None, None) => None,
+            };
+            if let Some(reading) = reading {
+                self.live_pane.peers_at = Some(Instant::now());
+                self.live_pane.peers = reading;
+            }
         }
         let due = self.live_pane.published_at;
         if due.is_some_and(|at| at.elapsed() < PUBLISH_EVERY) {
@@ -425,8 +434,11 @@ impl Shell {
     }
 }
 
-fn peers(agent: &mut Agent<'_>) -> Peers {
-    let board = match agent.peer_board() {
+fn peers(
+    board: anyhow::Result<crate::agent::PeerBoard>,
+    messages: anyhow::Result<Vec<crate::agent::PeerMessage>>,
+) -> Peers {
+    let board = match board {
         Ok(board) => board,
         Err(error) => {
             return Peers {
@@ -436,7 +448,7 @@ fn peers(agent: &mut Agent<'_>) -> Peers {
         }
     };
     // The board already reports an unavailable registry; a chat that cannot be read stays empty.
-    let messages = agent.peer_messages().unwrap_or_default();
+    let messages = messages.unwrap_or_default();
     Peers {
         error: None,
         scopes: board.scopes,

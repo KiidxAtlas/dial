@@ -56,6 +56,11 @@ impl Tool for Document {
     fn read_only_hint(&self) -> bool {
         true
     }
+    fn supports_background(&self, args: &Value) -> bool {
+        // PDF rendering needs a live confirmation callback. Retained references are safe;
+        // any newly discovered process prerequisite still refuses without that callback.
+        !self.needs_approval(args)
+    }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         self.call_streaming(ctx, args, &|_| {}, &AtomicBool::new(false))
     }

@@ -29,6 +29,9 @@ const MAX_CALLBACKS = 128;
 const operationStorage = new AsyncLocalStorage();
 const protocol = 3; // The trusted launcher preserves stdout here and routes native stdout to stderr.
 let callbackSequence = 0;
+// Accessing Node's stdin stream can put the shared fd into nonblocking mode. Synchronous
+// callbacks must still wait for the controller; OS-owned cancellation/deadlines remain active.
+const readWait = new Int32Array(new SharedArrayBuffer(4));
 let pending = Buffer.allocUnsafe(64 * 1024);
 let pendingStart = 0;
 let pendingEnd = 0;
@@ -87,7 +90,14 @@ function readFrame() {
         pending = grown;
       }
     }
-    const size = fs.readSync(0, pending, pendingEnd, Math.min(16384, pending.length - pendingEnd), null);
+    let size;
+    try {
+      size = fs.readSync(0, pending, pendingEnd, Math.min(16384, pending.length - pendingEnd), null);
+    } catch (error) {
+      if (error.code !== 'EAGAIN' && error.code !== 'EINTR') throw error;
+      Atomics.wait(readWait, 0, 0, 10);
+      continue;
+    }
     if (size === 0) {
       if (pendingEnd !== pendingStart) throw new Error('incomplete controller frame');
       return null;
@@ -213,6 +223,27 @@ function evaluate(code) {
   });
 }
 
+// Names the driver removes from the cell namespace (see above) and the import that replaces each.
+const WITHHELD_GLOBALS = {
+  process: "await import('node:process')", require: "await import('node:<module>')",
+  module: 'top-level declarations', exports: 'top-level declarations',
+  __filename: 'a workspace-relative path', __dirname: 'a workspace-relative path',
+};
+
+// Short guidance for the two cell failures that are features of this namespace, not user bugs.
+// Cell errors come from the vm context's realm, so match by name rather than `instanceof`.
+function evaluationHint(error) {
+  const message = String(error?.message ?? '');
+  const missing = error?.name === 'ReferenceError' && /^(\w+) is not defined$/.exec(message);
+  if (missing && Object.hasOwn(WITHHELD_GLOBALS, missing[1])) {
+    return `\n[dial] \`${missing[1]}\` is not a global in eval cells; use ${WITHHELD_GLOBALS[missing[1]]} instead.`;
+  }
+  if (error?.name === 'SyntaxError' && /^Identifier '[^']+' has already been declared$/.test(message)) {
+    return '\n[dial] Top-level declarations persist across cells in this namespace; reuse the existing binding, assign to it, or pick a new name.';
+  }
+  return '';
+}
+
 (async () => {
   for (;;) {
     let request;
@@ -238,7 +269,7 @@ function evaluate(code) {
         }
       });
     } catch (error) {
-      result.error = String(error?.stack || error).slice(-LIMIT);
+      result.error = (String(error?.stack || error) + evaluationHint(error)).slice(-LIMIT);
       if (error?.result !== undefined) result.tool_error = error.result;
     } finally {
       // Timers/promises from a previous cell retain this owner, never the next cell's permission.

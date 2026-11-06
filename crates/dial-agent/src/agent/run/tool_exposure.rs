@@ -68,12 +68,22 @@ impl<'a> Agent<'a> {
 
     /// Helpers for a long, steerable session that an unattended run (`Launch::unattended`) keeps
     /// loadable: delegation (`message` follows `task`), the compaction-surviving working record,
-    /// saved project understanding, progress bookkeeping and `find` (which `grep`/`glob` cover).
-    /// In a Terminal-Bench pilot, print runs never called `find`, and `todo` updates often took a
-    /// request of their own. Together about 13 KB of schemas and prompt sections per request; a
-    /// run that needs one pays a single `tool_load` round, as for other deferred tools.
-    const UNATTENDED_DEFERRED: &[&str] =
-        &["task", "working_state", "codebase_memory", "todo", "find"];
+    /// progress bookkeeping, `find` (which `grep`/`glob` cover), cross-session `memory`, background
+    /// job control (`bash` backgrounds on its own and names `bg` as loadable), the optional
+    /// structured `finish` (a plain answer ends the turn), on-demand `check` (the completion gate
+    /// still runs its checks) and `git` (`bash` covers it). In native Harbor print runs (94
+    /// requests) none of these was called. A run that needs one pays a single `tool_load` round.
+    const UNATTENDED_DEFERRED: &[&str] = &[
+        "task",
+        "working_state",
+        "todo",
+        "find",
+        "memory",
+        "bg",
+        "finish",
+        "check",
+        "git",
+    ];
 
     /// Lean local profile (`assistance.lean_local`): compact tool interface, a bounded initial tool
     /// budget, omitted optional prompt sections and, on a single-request server, no up-front delegation.
@@ -199,7 +209,7 @@ impl<'a> Agent<'a> {
     const ESSENTIAL_INTEGRATIONS: &'static [&'static str] = &[
         // Clarifying questions are in the catalog only when `ask` is enabled; when it is, the
         // model should not have to load it first (a failed call is a confusing card).
-        "ask", "find", "bg",
+        "ask", "find", "bg", "eval",
     ];
 
     /// Tools actually offered: the harness selection, explicitly loaded tools and the essential
@@ -294,6 +304,18 @@ impl<'a> Agent<'a> {
     }
 
     pub(in crate::agent) fn offered_with(&self, selection_only: bool) -> Vec<String> {
+        self.offered_with_eval_readiness(selection_only, || {
+            tools::exec::eval::prepare_containment().is_ok()
+                && !tools::exec::eval::installed_languages(self.workspace.root(), self.config)
+                    .is_empty()
+        })
+    }
+
+    fn offered_with_eval_readiness(
+        &self,
+        selection_only: bool,
+        prepare_eval: impl Fn() -> bool,
+    ) -> Vec<String> {
         let catalog = self.catalog();
         let discovery = self.tool_discovery();
         let request_tools: Vec<String> = if selection_only || self.lean_tools {
@@ -344,6 +366,16 @@ impl<'a> Agent<'a> {
                     .map(|tool| (*tool).to_owned()),
             );
         }
+        // Only automatic offers prepare containment and require an installed cell runtime.
+        // Explicit loads/discovery and operator/child selections retain the control actions even
+        // when new cell execution is unavailable. Apply this to retained task routing as well as
+        // the essential integration above.
+        if !(pinned || self.hermetic || selection_only)
+            && !self.enabled_tools.contains("eval")
+            && !discovered.iter().any(|name| name == "eval")
+        {
+            names.retain(|name| name != "eval" || prepare_eval());
+        }
         // `task` and `skill` are offered whenever the harness selects them; explicit profile
         // allowlists still gate them through the profile tool filter.
         for tool in ["find", "task", "skill"] {
@@ -370,15 +402,8 @@ impl<'a> Agent<'a> {
         if !self.hermetic && !pinned && catalog.iter().any(|name| name == "peers") {
             names.push("peers".into());
         }
-        if catalog.iter().any(|name| name == "codebase_memory") {
-            names.push("codebase_memory".into());
-        }
-        // Offered only while the operator has self-improvement on; otherwise not in the catalog.
-        for tool in ["experience", "edit_preview"] {
-            if catalog.iter().any(|n| n == tool) {
-                names.push(tool.into());
-            }
-        }
+        // `codebase_memory`, `experience` and `edit_preview` are never offered up front: they stay
+        // in the catalog as loadable specialists, so a turn that needs one pays one `tool_load`.
         // Specialists most turns never call stay loadable rather than costing schema bytes on every
         // request; an explicit load, a pinned selection, hermetic runs and the selection lent to
         // children keep them offered. An unattended run also defers the long-session helpers,
@@ -388,9 +413,23 @@ impl<'a> Agent<'a> {
                 && Self::UNATTENDED_DEFERRED.contains(&name)
                 && !(name == "task" && self.config.task.prefer_subagents)
         };
+        // Repository work should not spend a model request loading its native VCS tool.
+        // Respect pinned/hermetic selections and small-context budgets.
+        let repository_git = !pinned
+            && !self.hermetic
+            && !minimal
+            && self
+                .workspace
+                .root()
+                .ancestors()
+                .any(|dir| dir.join(".git").exists());
+        if repository_git && catalog.iter().any(|name| name == "git") {
+            names.push("git".into());
+        }
         let deferred = |name: &str| {
             !(pinned || self.hermetic || selection_only)
                 && (tools::DEFERRED_BY_DEFAULT.contains(&name) || unattended(name))
+                && !(name == "git" && repository_git && !unattended(name))
                 && !loaded.contains(name)
         };
         names.retain(|name| !deferred(name));
@@ -469,7 +508,10 @@ impl<'a> Agent<'a> {
         // `bg` is the only way to inspect or stop a command that outlived its bash call (and to run
         // servers). Re-add it after compaction so it is never dropped from the offer; exposing a
         // tool starts no process and integrations config still controls whether it is in the catalog.
-        if catalog.iter().any(|name| name == "bg") && !names.iter().any(|name| name == "bg") {
+        if catalog.iter().any(|name| name == "bg")
+            && !names.iter().any(|name| name == "bg")
+            && !deferred("bg")
+        {
             names.push("bg".into());
             names.sort();
         }
@@ -515,26 +557,38 @@ impl<'a> Agent<'a> {
         names
     }
 
-    /// The selected memory backend's canonical tools present in the catalog: the runtime's
-    /// `recall`/`retain`/`reflect`/`learn`, or provenance's registered `recall`/`retain`.
+    /// The selected memory backend's `memory` tool when it is in the catalog: the runtime's, or
+    /// provenance's registered one.
     fn memory_core_tools(&self, catalog: &[String]) -> Vec<String> {
-        let names: Vec<&str> = match (&self.memory_runtime, &self.memory) {
-            (Some(runtime), _) => runtime
-                .offered_names()
-                .into_iter()
-                .filter(|name| crate::storage::memory_backend::TOOL_NAMES.contains(name))
-                .collect(),
-            (None, Some(_)) => vec!["recall", "retain"],
-            (None, None) => Vec::new(),
+        let offered = match (&self.memory_runtime, &self.memory) {
+            (Some(runtime), _) => runtime.offers_tool(),
+            (None, Some(_)) => true,
+            (None, None) => false,
         };
-        names
-            .into_iter()
-            .filter(|name| catalog.iter().any(|entry| entry == name))
-            .map(str::to_owned)
-            .collect()
+        let name = crate::storage::memory_backend::TOOL_NAME;
+        if offered && catalog.iter().any(|entry| entry == name) {
+            vec![name.to_owned()]
+        } else {
+            Vec::new()
+        }
     }
 
+    /// Schemas offered to the model: every parameter with its name, type, enum and required
+    /// status, but without per-parameter explanations for Dial-owned tools. The explanations
+    /// return in the error of a call whose arguments do not fit ([`Self::parameter_help`]).
+    /// Contract identities ignore descriptions, so recorded sessions are unaffected.
     pub(in crate::agent) fn schemas(&self, names: &[String]) -> Result<Vec<Value>> {
+        let mut schemas = self.full_schemas(names)?;
+        bare_schemas(&mut schemas, self.config, &self.ext);
+        Ok(schemas)
+    }
+
+    /// Complete parameter explanations for one offered tool, for argument-error feedback.
+    pub(in crate::agent) fn parameter_help(&self, name: &str) -> Option<String> {
+        parameter_help(&self.full_schemas(&[name.to_owned()]).ok()?.pop()?)
+    }
+
+    pub(in crate::agent) fn full_schemas(&self, names: &[String]) -> Result<Vec<Value>> {
         let mode = self.edit_mode();
         let mut schemas = Vec::new();
         for name in names {
@@ -552,8 +606,9 @@ impl<'a> Agent<'a> {
                         }
                     ),
                 "session_search" if self.experimental_context_owner() || self.exploration_owner() => session::session_search_tool::schema_owned(),
-                n if crate::storage::memory_backend::schema(&self.config.memory, n).is_some() =>
-                    crate::storage::memory_backend::schema(&self.config.memory, n).expect("selected memory tool has a schema"),
+                crate::storage::memory_backend::TOOL_NAME if self.memory_runtime.is_some()
+                    && crate::storage::memory_backend::schema(&self.config.memory).is_some() =>
+                    crate::storage::memory_backend::schema(&self.config.memory).expect("selected memory tool has a schema"),
                 n if config::tools::BUILTIN.contains(&n) => tools::schemas(&[n], mode)?.remove(0),
                 n if self.ext.contains(n) => self.ext.get(n).map(|tool| tool.schema()).context("extension tool vanished")?,
                 "experience" => crate::agent::model::assistance::schema(),
@@ -567,14 +622,13 @@ impl<'a> Agent<'a> {
                 "ask" => crate::agent::workflow::questions::schema(),
                 "task" => crate::agent::workers::subagents::schema(self.config),
                 "side_request" => crate::agent::workers::side_questions::schema(),
-                "message" => crate::agent::workers::live_tasks::message_schema(),
+                "message" => crate::agent::workers::live_tasks::message_schema(self.coordination_enabled()),
                 "peers" => crate::agent::run::coordination::schema(),
                 "solve" => crate::agent::workflow::solve::schema(),
                 "escalate" => crate::agent::workflow::solve::escalation_schema(),
                 "skill" => skills::skill_tool::schema(),
                 "skill_manage" => skills::manage_tool::schema(),
                 "session_search" => session::session_search_tool::schema(),
-                "artifact_read" => crate::storage::artifact::schema(),
                 "working_state" => crate::agent::workflow::evidence::working_schema(),
                 "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Rank eligible tools by capability or exact name and enable up to three strongest matches for the next model round. Returns names, descriptions and activation status. Never executes tools, grants permission or enables same-batch calls; do not rediscover tools already offered. If nothing matches, the result is a bounded listing of eligible tools (page 0) with empty search_matches and a fallback_reason; nothing is enabled. Continue a listing with the returned next_query (\"*:N\", zero-based) while present. Listing pages show descriptions and status only and enable nothing.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
                 "tool_load" => json!({"type":"function","function":{"name":"tool_load","description":"Explicitly enable or unload exact eligible tool names. Search already enables its strongest matches; use this for exact control. Changes take effect next round, never in this batch, and grant no permissions.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":32,"items":{"type":"string"}},"unload":{"type":"array","maxItems":32,"items":{"type":"string"}}},"additionalProperties":false}}}),
@@ -623,8 +677,31 @@ impl<'a> Agent<'a> {
                     .unwrap_or_default()
                     .to_owned();
                 schema["function"]["description"] = json!(format!(
-                    "{description} `bg` is a Dial tool, not a shell command, and is not loaded yet: load it with `tool_load` to read, wait for or stop background jobs."
+                    "{description} `bg` is a Dial tool, not a shell command. It is not loaded yet; Dial loads it when a command moves to the background, or load it with `tool_load` to start a server."
                 ));
+            }
+            // An offered `eval` may have only one runtime installed (a Node-only or Python-only
+            // image). Name the missing one so the first cell does not discover it by failing.
+            if name == "eval" {
+                let installed =
+                    tools::exec::eval::installed_languages(self.workspace.root(), self.config);
+                let missing: Vec<&str> = [("js", "JavaScript"), ("py", "Python")]
+                    .into_iter()
+                    .filter(|(language, _)| !installed.contains(language))
+                    .map(|(_, label)| label)
+                    .collect();
+                if !missing.is_empty() && !installed.is_empty() {
+                    let schema = schemas.last_mut().expect("schema was just inserted");
+                    let description = schema["function"]["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    schema["function"]["description"] = json!(format!(
+                        "{description} Not installed here: {} cells; use language {:?}.",
+                        missing.join(", "),
+                        installed[0]
+                    ));
+                }
             }
             if self.plan_mode {
                 let schema = schemas.last_mut().expect("schema was just inserted");
@@ -715,11 +792,10 @@ impl<'a> Agent<'a> {
     /// Whether a read result is still shown in full: it exists in the session and was not superseded or pruned.
     pub(in crate::agent) fn holds_full_result(&self, call_id: &str) -> bool {
         self.superseded.holds_full(call_id)
-            && self
-                .session
-                .messages()
-                .iter()
-                .any(|message| message["tool_call_id"].as_str() == Some(call_id))
+            && self.session.messages().iter().any(|message| {
+                message["tool_call_id"].as_str() == Some(call_id)
+                    && message["dial_execution"]["output"]["presentation"] != "partial"
+            })
     }
 
     /// Append to the durable session; training capture happens at the inference boundary.
@@ -909,3 +985,41 @@ pub(crate) mod default_offer_tests;
 mod discovery_tests;
 #[cfg(test)]
 mod gap_tests;
+
+/// Tools whose parameter explanations may be their only documentation: MCP, configured and
+/// non-native extension tools. Their schemas are offered unchanged.
+fn foreign_tool(
+    name: &str,
+    config: &config::types::Config,
+    ext: &crate::tools::integrations::ext::Registry,
+) -> bool {
+    name.starts_with("mcp__")
+        || config.tools.contains_key(name)
+        || ext.contains(name)
+            && ext.origin(name) != Some(crate::tools::surface::catalog::Origin::Native)
+}
+
+/// Offer Dial-owned schemas bare: every parameter keeps its name, type, enum, bounds and required
+/// status, without per-parameter explanations. Shared by the parent loop and subagents; the
+/// explanations return in argument errors ([`parameter_help`]). Contract identities ignore
+/// descriptions, so recorded sessions are unaffected.
+pub(in crate::agent) fn bare_schemas(
+    schemas: &mut [Value],
+    config: &config::types::Config,
+    ext: &crate::tools::integrations::ext::Registry,
+) {
+    for schema in schemas {
+        let name = schema["function"]["name"].as_str().unwrap_or_default();
+        if !foreign_tool(name, config, ext)
+            && let Some(parameters) = schema.pointer_mut("/function/parameters")
+        {
+            crate::runtime::arguments::strip_property_descriptions(parameters);
+        }
+    }
+}
+
+/// Complete parameter explanations from one full schema, for an argument error.
+pub(in crate::agent) fn parameter_help(schema: &Value) -> Option<String> {
+    let help = crate::runtime::arguments::parameter_help(schema.pointer("/function/parameters")?);
+    (!help.is_empty()).then_some(help)
+}

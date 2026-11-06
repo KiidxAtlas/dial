@@ -12,6 +12,24 @@ mod working_state;
 #[cfg(test)]
 mod working_state_tests;
 
+mod background;
+enum DispatchMode {
+    Foreground,
+    Background { name: Option<String> },
+}
+
+struct DispatchAdmission<'a> {
+    provenance: crate::agent::safety::approval::CallProvenance,
+    arguments_changed: bool,
+    mode: DispatchMode,
+    read_reuse: Option<&'a crate::agent::workflow::investigation::ReadReuse>,
+}
+
+struct CallbackSource<'a> {
+    owner: &'a str,
+    provenance: crate::agent::safety::approval::CallProvenance,
+    mode: DispatchMode,
+}
 /// The request with its history replaced by a contract projection, or `None` when the projection
 /// changed nothing. Unchanged requests stay borrowed, so the common path copies no history.
 pub(in crate::agent) fn projected_request(
@@ -55,17 +73,27 @@ fn listing_request(query: &str) -> Result<Option<usize>, String> {
 }
 
 /// Status and the exact next action for one discovery entry. Discovery never grants permission.
-fn activation_status(loaded: bool) -> (&'static str, &'static str) {
-    if loaded {
-        (
-            "loaded_next_request",
-            "call this tool by its exact name on the next request",
-        )
-    } else {
-        (
+/// `offered_before` says whether the tool was already in the offer before this call changed it:
+/// `None` for read-only listings, which cannot tell a tool loaded earlier in this request apart
+/// from one the current request already offers.
+fn activation_status(loaded: bool, offered_before: Option<bool>) -> (&'static str, &'static str) {
+    match (loaded, offered_before) {
+        (false, _) => (
             "not_loaded",
             "call tool_load with this exact name; it is callable on the request after that",
-        )
+        ),
+        (true, Some(true)) => (
+            "already_offered",
+            "already offered in the current request; call it by its exact name",
+        ),
+        (true, Some(false)) => (
+            "loaded_next_request",
+            "call this tool by its exact name on the next request",
+        ),
+        (true, None) => (
+            "offered",
+            "call this tool by its exact name; a tool loaded during this request becomes callable on the next request",
+        ),
     }
 }
 
@@ -91,7 +119,7 @@ fn listing_output(
         .iter()
         .map(|name| {
             let loaded = offered.contains(*name);
-            let (status, next) = activation_status(loaded);
+            let (status, next) = activation_status(loaded, None);
             let description: String = descriptions[*name]
                 .chars()
                 .take(TOOL_LIST_DESCRIPTION_CHARS)
@@ -318,6 +346,7 @@ pub(in crate::agent) fn parallel_tools(
     ctx: ParallelToolContext<'_>,
     calls: &[ToolCall],
     already_started: Option<&str>,
+    read_reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
 ) -> Vec<(ToolOutput, f64)> {
     let ParallelToolContext {
         workspace,
@@ -388,10 +417,20 @@ pub(in crate::agent) fn parallel_tools(
                         }
                         _ => {}
                     }
-                    let mut output = crate::tools::exec::execution::native_read(
+                    let mut read = |args: &Value| crate::tools::exec::execution::native_read(
                         &ToolContext { workspace, config, mutation_authorizer: None, confirm: None },
-                        ext, &call.name, &call.arguments, &|_| {}, interrupt,
+                        ext, &call.name, args, &|_| {}, interrupt,
                     ).unwrap_or_else(|| ToolOutput::err("parallel tool unavailable"));
+                    let mut output = if call.name == "read"
+                        && !["pre_tool_use", "post_tool_use"].iter().any(|event| {
+                            crate::agent::safety::hooks::wanted_for_tool(&config.hooks, event, &call.name)
+                        })
+                        && let Some(reuse) = read_reuse
+                    {
+                        reuse.execute(workspace, &call.arguments, &mut read)
+                    } else {
+                        read(&call.arguments)
+                    };
                     crate::agent::safety::hooks::post_tool_with(&config.hooks, workspace.root(), &call.name, &call.arguments, &mut output, interrupt, &mut |notice| notices.push(notice.to_owned()));
                     output
                 }));
@@ -533,10 +572,12 @@ impl<'a> Agent<'a> {
                     && prepared.malformed_arguments == call.malformed_arguments
             })
             .map(|index| self.pending_batch_approvals.remove(index).1);
-        let local_memory_write = call.name == "learn"
-            && self.memory_runtime.as_ref().is_some_and(|memory| {
-                memory.id() == crate::config::memory_backend::MemoryBackendId::Local
-            });
+        let local_memory_write =
+            crate::storage::memory_backend::call_action(&call.name, &call.arguments)
+                == Some("learn")
+                && self.memory_runtime.as_ref().is_some_and(|memory| {
+                    memory.id() == crate::config::memory_backend::MemoryBackendId::Local
+                });
         let result = if crate::agent::safety::approval::denied_by_rule(
             &self.always,
             call,
@@ -682,7 +723,25 @@ impl<'a> Agent<'a> {
         provenance: crate::agent::safety::approval::CallProvenance,
         ui: &mut dyn Ui,
     ) -> ToolOutput {
-        let output = self.dispatch_call(backend, call, provenance, ui);
+        self.dispatch_from_reusing(backend, call, provenance, ui, None)
+    }
+
+    pub(in crate::agent) fn dispatch_from_reusing(
+        &mut self,
+        backend: &mut Backend,
+        call: &ToolCall,
+        provenance: crate::agent::safety::approval::CallProvenance,
+        ui: &mut dyn Ui,
+        read_reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
+    ) -> ToolOutput {
+        let output = self.dispatch_call_mode(
+            backend,
+            call,
+            provenance,
+            ui,
+            DispatchMode::Foreground,
+            read_reuse,
+        );
         modes::lifecycle::Lifecycle::dispatched(self, call, &output);
         output
     }
@@ -736,13 +795,25 @@ impl<'a> Agent<'a> {
         Ok(result?.text)
     }
 
-    pub(in crate::agent) fn dispatch_call(
+    fn dispatch_call_mode(
         &mut self,
         backend: &mut Backend,
         call: &ToolCall,
         provenance: crate::agent::safety::approval::CallProvenance,
         ui: &mut dyn Ui,
+        mode: DispatchMode,
+        read_reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
     ) -> ToolOutput {
+        if matches!(mode, DispatchMode::Background { .. })
+            && crate::agent::safety::hooks::wanted_for_tool(
+                self.tool_hooks(),
+                "post_tool_use",
+                &call.name,
+            )
+        {
+            return ToolOutput::err("background tool calls are unavailable with post_tool_use hooks; run the tool in the foreground so its completed result reaches the hook")
+                .with_effects(crate::tools::surface::outcome::Effects::None);
+        }
         let mut expanded = call.clone();
         if let Err(error) =
             crate::agent::window::file_handles::expand(&self.workspace, &mut expanded)
@@ -826,10 +897,14 @@ impl<'a> Agent<'a> {
         let mut out = self.dispatch_inner(
             backend,
             call,
-            provenance,
             ui,
             &mut approval_denied,
-            arguments_changed,
+            DispatchAdmission {
+                provenance,
+                arguments_changed,
+                mode,
+                read_reuse,
+            },
         );
         if call.name != "exit_plan"
             && !approval_denied
@@ -858,18 +933,35 @@ impl<'a> Agent<'a> {
             });
             self.queue_hook_context(context);
         }
+        if matches!(call.name.as_str(), "edit" | "write")
+            && call.arguments["check"] == true
+            && !out.is_error
+        {
+            if let Some(advice) = self.settle_tool_mutation(call, &out) {
+                crate::tools::surface::outcome::append_text(&mut out, &format!("\n\n{advice}"));
+            }
+            let check = self.check_tool(&json!({}), ui);
+            crate::agent::verify::check_tool::attach_post_mutation_check(
+                &mut out, &call.name, check,
+            );
+        }
         out
     }
 
-    pub(in crate::agent) fn dispatch_inner(
+    fn dispatch_inner(
         &mut self,
         backend: &mut Backend,
         call: &ToolCall,
-        provenance: crate::agent::safety::approval::CallProvenance,
         ui: &mut dyn Ui,
         approval_denied: &mut bool,
-        arguments_changed: bool,
+        admission: DispatchAdmission<'_>,
     ) -> ToolOutput {
+        let DispatchAdmission {
+            provenance,
+            arguments_changed,
+            mode,
+            read_reuse,
+        } = admission;
         let mut expanded = call.clone();
         if let Err(error) =
             crate::agent::window::file_handles::expand(&self.workspace, &mut expanded)
@@ -905,6 +997,26 @@ impl<'a> Agent<'a> {
             if let Some((_, why)) = call_form_error(call, &schemas, names) {
                 return denied(&format!("invalid tool call: {why}"));
             }
+        }
+        if matches!(mode, DispatchMode::Background { .. })
+            && !self.ext.get(&call.name).is_some_and(|tool| {
+                tool.supports_background(&call.arguments)
+                    && !tool.may_modify_workspace(&call.arguments)
+                    && !tool.supports_tool_dispatch()
+            })
+        {
+            return denied(
+                "this tool operation does not support background execution; run it in the foreground",
+            );
+        }
+        if matches!(call.name.as_str(), "edit" | "write")
+            && call.arguments["check"] == true
+            && !self.config.verification.enabled
+        {
+            return denied(&format!(
+                "{} check=true requires verification.enabled; no mutation was executed",
+                call.name
+            ));
         }
         if self.repro_first_fires(call, crate::config::types::ReproFirst::Gate) {
             return denied(crate::agent::verify::repro_first::GATE);
@@ -963,6 +1075,12 @@ impl<'a> Agent<'a> {
         }
         if self.interrupt.load(Ordering::SeqCst) {
             return interrupted_tool();
+        }
+        if let DispatchMode::Background { name } = mode {
+            return self.launch_background_tool(call, name);
+        }
+        if call.name == "bg" && call.arguments.get("call").is_some() {
+            return self.start_background_tool(backend, call, provenance, ui);
         }
         if let Some((path, question)) = image_question(call) {
             return self.answer_image_question(path, question);
@@ -1106,10 +1224,11 @@ impl<'a> Agent<'a> {
                 }
             }
         }
-        if self
-            .memory_runtime
-            .as_ref()
-            .is_some_and(|memory| memory.offered_names().contains(&name))
+        if name == crate::storage::memory_backend::TOOL_NAME
+            && self
+                .memory_runtime
+                .as_ref()
+                .is_some_and(|memory| memory.offers_tool())
         {
             backend.release();
             return match self.selected_memory_tool(call, ui) {
@@ -1129,7 +1248,8 @@ impl<'a> Agent<'a> {
             backend.release();
             return shared;
         }
-        if let Some(out) = self.run_background_tool_from(name, args, ui, Some(backend), provenance)
+        if let Some(out) =
+            self.run_background_tool_from(name, args, ui, Some(backend), provenance, read_reuse)
         {
             if name == "bash" {
                 self.shared_run_after(&out);
@@ -1146,8 +1266,20 @@ impl<'a> Agent<'a> {
         }
         if config::tools::BUILTIN.contains(&name) {
             let workspace = &self.workspace;
-            let out = blocking_with_heartbeat(ui, || tools::execute(workspace, name, args, 120))
-                .unwrap_or_else(|error| ToolOutput::err(format!("{error:#}")));
+            let reuse = read_reuse.filter(|_| {
+                name == "read"
+                    && provenance == crate::agent::safety::approval::CallProvenance::Structured
+                    && !["pre_tool_use", "post_tool_use"].iter().any(|event| {
+                        crate::agent::safety::hooks::wanted_for_tool(self.tool_hooks(), event, name)
+                    })
+            });
+            let out = blocking_with_heartbeat(ui, || match reuse {
+                Some(reuse) => reuse.execute(workspace, args, |effective| {
+                    tools::execute(workspace, name, effective, 120)
+                }),
+                None => tools::execute(workspace, name, args, 120),
+            })
+            .unwrap_or_else(|error| ToolOutput::err(format!("{error:#}")));
             if name == "bash" {
                 self.note_verification(call, &out, ui);
             }
@@ -1340,6 +1472,7 @@ impl<'a> Agent<'a> {
                     .filter(|entry| entry.2)
                     .map(|entry| entry.0.clone())
                     .collect();
+                let offered_before = self.offered();
                 if let Err(error) = self.activate_tools(&activated) {
                     return denied(&format!("persisting discovered tools: {error:#}"));
                 }
@@ -1351,7 +1484,8 @@ impl<'a> Agent<'a> {
                         let loaded = offered.contains(&name);
                         // Each entry states whether it is callable on the next request, and the exact
                         // action that makes it callable. Discovery never grants permission itself.
-                        let (status, next) = activation_status(loaded);
+                        let (status, next) =
+                            activation_status(loaded, Some(offered_before.contains(&name)));
                         let mut entry = json!({"name":name,"description":description,"status":status,"enabled_next_round":loaded,"next":next});
                         discovery_readiness(&mut entry, self.config, &self.ext);
                         entry
@@ -1409,6 +1543,7 @@ impl<'a> Agent<'a> {
                         "tool {name} is unavailable under the current mode or tool allowlist"
                     ));
                 }
+                let offered_before = self.offered();
                 let mut enabled = self.enabled_tools.clone();
                 enabled.extend(requested.iter().cloned());
                 for name in &unload {
@@ -1434,7 +1569,8 @@ impl<'a> Agent<'a> {
                 for (names, action) in [(&requested, "load"), (&unload, "unload")] {
                     for name in names {
                         let loaded = offered.contains(name);
-                        let (status, next) = activation_status(loaded);
+                        let (status, next) =
+                            activation_status(loaded, Some(offered_before.contains(name)));
                         let eligible = self.tool_eligible(name);
                         let next = if eligible {
                             next
@@ -1470,22 +1606,6 @@ impl<'a> Agent<'a> {
                     is_error: false,
                 }
             }
-            "artifact_read" => match self.workspace.artifacts() {
-                Some(store) => {
-                    let output = store.call(args);
-                    if !output.is_error {
-                        self.metrics.artifacts_retrieved += 1;
-                        if self.session.control_state()["truncated_artifacts"]
-                            .as_array()
-                            .is_some_and(|uris| uris.contains(&args["uri"]))
-                        {
-                            self.metrics.truncated_recoveries += 1;
-                        }
-                    }
-                    output
-                }
-                None => denied("artifacts are unavailable in hermetic runs"),
-            },
             "working_state" => self.working_state_tool(args, ui),
             "skill" | "skill_manage" | "session_search" => match &self.layout {
                 None => denied("unavailable here"),
@@ -1518,9 +1638,7 @@ impl<'a> Agent<'a> {
             },
             "task" => self.run_task(backend, args, ui),
             "side_request" => self.side_question_with_input(args, &mut || ui.pending_input()),
-            "message" => {
-                crate::agent::workers::live_tasks::output(self.live_tasks.message_call(args))
-            }
+            "message" => self.message_tool(args),
             "peers" => self.peer_coordination(args),
             "solve" => self.run_solve(backend, args, ui),
             "escalate" => {
@@ -1590,6 +1708,27 @@ impl<'a> Agent<'a> {
         gate: &mut crate::agent::safety::rules::CallbackGate<'_>,
         provenance: crate::agent::safety::approval::CallProvenance,
     ) -> ToolOutput {
+        self.code_callback_mode(
+            backend,
+            request,
+            ui,
+            gate,
+            CallbackSource {
+                owner,
+                provenance,
+                mode: DispatchMode::Foreground,
+            },
+        )
+    }
+
+    fn code_callback_mode(
+        &mut self,
+        backend: &mut Backend,
+        request: crate::tools::integrations::ext::ToolCallback,
+        ui: &mut dyn Ui,
+        gate: &mut crate::agent::safety::rules::CallbackGate<'_>,
+        source: CallbackSource<'_>,
+    ) -> ToolOutput {
         if self.interrupt.load(Ordering::SeqCst) {
             return interrupted_tool();
         }
@@ -1644,7 +1783,7 @@ impl<'a> Agent<'a> {
         if let Some((_, why)) = call_form_error(&call, &schemas, &names) {
             return ToolOutput::err(format!("invalid code-mode tool call: {why}"));
         }
-        self.execute_callback_from(backend, ui, &call, &schemas, (owner, provenance), gate)
+        self.execute_callback_from(backend, ui, &call, &schemas, source, gate)
     }
 
     fn execute_callback_from(
@@ -1653,10 +1792,14 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
         call: &ToolCall,
         schemas: &[Value],
-        source: (&str, crate::agent::safety::approval::CallProvenance),
+        source: CallbackSource<'_>,
         gate: &mut crate::agent::safety::rules::CallbackGate<'_>,
     ) -> ToolOutput {
-        let (owner, provenance) = source;
+        let CallbackSource {
+            owner,
+            provenance,
+            mode,
+        } = source;
         if self.interrupt.load(Ordering::SeqCst) {
             return interrupted_tool();
         }
@@ -1684,7 +1827,8 @@ impl<'a> Agent<'a> {
             return output;
         }
         let started = Instant::now();
-        let mut output = self.dispatch_from(backend, call, provenance, ui);
+        let mut output = self.dispatch_call_mode(backend, call, provenance, ui, mode, None);
+        modes::lifecycle::Lifecycle::dispatched(self, call, &output);
         let supplied = if call.name == "read" {
             call.arguments["path"]
                 .as_str()

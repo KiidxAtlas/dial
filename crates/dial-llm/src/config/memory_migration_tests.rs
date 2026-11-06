@@ -5,67 +5,48 @@ fn harness_migration_is_idempotent_and_keeps_unrelated_duplicates_for_validation
     let mut harness = Harness {
         tools: vec![
             "read".into(),
-            "memory".into(),
+            "recall".into(),
             "retain".into(),
             "read".into(),
-            "memory".into(),
+            "memory_update".into(),
+            "learn".into(),
         ],
         ..Default::default()
     };
     assert!(types::migrate_memory_tools(&mut harness));
-    assert!(!harness.tools.iter().any(|tool| tool == "memory"));
-    assert_eq!(
-        harness
-            .tools
-            .iter()
-            .filter(|tool| *tool == "retain")
-            .count(),
-        1
-    );
-    assert_eq!(
-        harness.tools.iter().filter(|tool| *tool == "read").count(),
-        2
-    );
-    for tool in [
-        "recall",
-        "retain",
-        "memory_update",
-        "forget",
-        "memory_history",
-        "memory_import",
-    ] {
-        assert!(harness.tools.iter().any(|selected| selected == tool));
-    }
+    assert_eq!(harness.tools, ["read", "memory", "read"]);
     let pointer = harness.tools.as_ptr();
     assert!(!types::migrate_memory_tools(&mut harness));
     assert_eq!(harness.tools.as_ptr(), pointer);
+    let mut present = vec!["memory".to_owned(), "forget".to_owned()];
+    assert!(types::migrate_memory_tool_names(&mut present));
+    assert_eq!(present, ["memory"]);
+    // artifact_read merged into the built-in read; a saved selection drops it.
+    let mut merged = vec!["artifact_read".to_owned(), "grep".to_owned()];
+    assert!(types::migrate_memory_tool_names(&mut merged));
+    assert_eq!(merged, ["grep"]);
+    assert!(!types::migrate_memory_tool_names(&mut merged));
 }
 
 #[test]
 fn toml_migration_changes_harness_and_profiles_not_other_values_or_invalid_arrays() {
-    let mut table: toml::Table = toml::from_str("[harness]\ntools=['memory','read']\n[model_profiles.deep]\ntools=['memory']\n[model_profiles.invalid]\ntools=['memory',17]\n[tools.operator]\nprogram='memory'\n").unwrap();
+    let mut table: toml::Table = toml::from_str("[harness]\ntools=['recall','read','retain']\n[model_profiles.deep]\ntools=['reflect']\n[model_profiles.invalid]\ntools=['recall',17]\n[tools.operator]\nprogram='recall'\n").unwrap();
     assert!(migrate_memory_tool_table(&mut table));
     assert_eq!(
         table["tools"]["operator"]["program"].as_str(),
-        Some("memory")
+        Some("recall")
     );
     assert_eq!(
         table["model_profiles"]["invalid"]["tools"][0].as_str(),
-        Some("memory")
+        Some("recall")
     );
-    assert!(
-        table["harness"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|tool| tool.as_str() != Some("memory"))
+    assert_eq!(
+        table["harness"]["tools"],
+        toml::Value::Array(vec!["memory".into(), "read".into()])
     );
-    assert!(
-        table["model_profiles"]["deep"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|tool| tool.as_str() != Some("memory"))
+    assert_eq!(
+        table["model_profiles"]["deep"]["tools"],
+        toml::Value::Array(vec!["memory".into()])
     );
     assert!(!migrate_memory_tool_table(&mut table));
 }
@@ -78,19 +59,16 @@ fn loading_persists_validated_memory_selector_cutover() {
     let path = layout.config_files()[0].clone();
     fs::write(
         &path,
-        "use_case='preserved'\n[harness]\ntools=['memory','read']\n",
+        "use_case='preserved'\n[harness]\ntools=['recall','read','retain']\n",
     )
     .unwrap();
     let config = Config::load(&layout, None).unwrap();
-    assert!(!config.harness.tools.iter().any(|tool| tool == "memory"));
+    assert_eq!(config.harness.tools, ["memory", "read"]);
     let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(saved["use_case"].as_str(), Some("preserved"));
-    assert!(
-        saved["harness"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|tool| tool.as_str() != Some("memory"))
+    assert_eq!(
+        saved["harness"]["tools"],
+        toml::Value::Array(vec!["memory".into(), "read".into()])
     );
     assert_eq!(
         Config::load(&layout, None).unwrap().harness.tools,
@@ -116,7 +94,7 @@ fn invalid_configuration_is_not_rewritten_during_migration() {
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
     let path = layout.config_files()[0].clone();
-    let original = "[harness]\ntools=['memory']\nmax_steps=65\n";
+    let original = "[harness]\ntools=['recall']\nmax_steps=65\n";
     fs::write(&path, original).unwrap();
     assert!(Config::load(&layout, None).is_err());
     assert_eq!(fs::read_to_string(path).unwrap(), original);

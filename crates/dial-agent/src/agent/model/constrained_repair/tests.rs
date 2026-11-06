@@ -106,6 +106,17 @@ fn at_most_one_retry_per_malformed_sequence() {
 }
 
 #[test]
+fn provider_rejection_disables_the_retry_for_the_turn() {
+    let mut repair = Repair::default();
+    repair.request();
+    assert!(repair.take_request());
+    repair.reject();
+    assert!(!repair.take_request());
+    repair.settle();
+    assert_eq!(repair.trigger(true, &dropped(), &[], &[]), None);
+}
+
+#[test]
 fn constrained_reply_converts_and_plain_text_is_rejected() {
     let offered = vec!["read".to_owned()];
     let mut ok = Reply {

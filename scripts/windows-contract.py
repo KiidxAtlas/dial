@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the focused Windows Rust contract listed in scripts/windows-contract.txt.
 
-Each `test` line selects workspace libraries; `test-bin` selects a package binary.
+Each `test-lib` selects a package library; `test-bin` selects a package binary.
 Every `skip` line is passed to libtest as `--skip` and printed with its reason.
 Successful Cargo exits with no executed tests are rejected, including ignored-only selections.
 `--print` shows the commands without running them (it does not verify selection).
@@ -31,6 +31,12 @@ def parse(path):
             if len(name.split()) != 1:
                 raise SystemExit(f"{path}:{number}: test needs one filter")
             tests.append((["--workspace", "--lib"], name))
+        elif kind == "test-lib":
+            parts = name.split()
+            if len(parts) != 2 or any(part.startswith("-") for part in parts):
+                raise SystemExit(f"{path}:{number}: test-lib needs <package> <filter>")
+            package, filter_name = parts
+            tests.append((["--package", package, "--lib"], filter_name))
         elif kind == "test-bin":
             parts = name.split()
             if len(parts) != 3 or any(part.startswith("-") for part in parts):

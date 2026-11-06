@@ -1,7 +1,7 @@
 //! Turn-loop reliability: delivery of one-shot notes, bounded recovery and graceful stops.
 use super::completion_tests::{completion_requests, connect, response};
 use super::*;
-use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+use crate::agent::run::tool_exposure::default_offer_tests::with_review_disabled as with_agent;
 
 fn mentions(request: &Value, needle: &str) -> bool {
     request["messages"]
@@ -149,6 +149,55 @@ fn calls(calls: &[(&str, Value)]) -> llm::fake::Script {
         .collect();
     let event = json!({"choices":[{"delta":{"content":"","tool_calls":calls},"finish_reason":"tool_calls"}]});
     llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
+}
+
+#[test]
+fn recovery_labels_do_not_invent_failed_rounds_and_shell_success_clears_them() {
+    // Missing reads are distinct real failures; bookkeeping between them is not work,
+    // but must not manufacture another failed round from the retained phase label.
+    let server = llm::fake::serve(vec![
+        calls(&[("read", json!({"path":"missing-one"}))]),
+        slots(),
+        calls(&[("working_state", json!({"action":"view"}))]),
+        calls(&[("read", json!({"path":"missing-two"}))]),
+        calls(&[("bash", json!({"command":"printf 'recovered\\n'"}))]),
+        response("Observed the shell result.", None),
+    ]);
+    with_agent(
+        "[compaction]\nenabled=false\n[harness]\ntools=['read','bash','working_state']\n",
+        |agent| {
+            connect(agent, &server.url);
+            let report = agent
+                .turn("Inspect available evidence", &mut NullUi)
+                .unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            let control = agent.session.control_state();
+            let initial_phase = control["adaptive_history"][0]["selection"]["phase"]
+                .as_str()
+                .unwrap();
+            let rounds: Vec<_> = control["adaptive_history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|policy| {
+                    let result = &policy["result"];
+                    Some((
+                        result["tool_round_failed"].as_bool()?,
+                        result["next_observed_phase"].as_str()?,
+                    ))
+                })
+                .collect();
+            assert_eq!(
+                rounds,
+                vec![
+                    (true, "recovery"),
+                    (false, "recovery"),
+                    (true, "recovery"),
+                    (false, initial_phase)
+                ]
+            );
+        },
+    );
 }
 
 #[test]
@@ -555,6 +604,32 @@ fn tool_results(request: &Value) -> Vec<String> {
 }
 
 #[test]
+fn repository_git_is_offered_without_loading_but_pinned_selections_stay_pinned() {
+    with_agent("[assistance]\nlean_local=false\n", |agent| {
+        assert!(
+            agent
+                .workspace
+                .root()
+                .ancestors()
+                .any(|dir| dir.join(".git").exists()),
+            "fixture repository: {}",
+            agent.workspace.root().display()
+        );
+        assert!(agent.offered().iter().any(|name| name == "git"));
+    });
+    with_agent("[harness]\ntools=['read','bash']\n", |agent| {
+        assert!(
+            agent
+                .workspace
+                .root()
+                .ancestors()
+                .any(|dir| dir.join(".git").exists())
+        );
+        assert!(!agent.offered().iter().any(|name| name == "git"));
+    });
+}
+
+#[test]
 fn a_valid_call_to_an_unloaded_deferred_tool_runs_in_the_same_round() {
     let server = llm::fake::serve(vec![
         calls(&[("git", json!({"action":"status"}))]),
@@ -608,7 +683,7 @@ fn an_invalid_call_to_an_unloaded_deferred_tool_is_refused_with_its_schema() {
 const FAILING_NOTE_CHECK: &str = "[compaction]\nenabled=false\n[[verification.commands]]\nname=\"notes\"\ncommand=\"echo note check failed; exit 1\"\nfile_extensions=[\"txt\"]\ntimeout_secs=5\n";
 
 #[test]
-fn an_edit_with_no_passing_check_is_reminded_once_then_disclosed() {
+fn an_edit_whose_gate_check_fails_is_reminded_once_then_disclosed() {
     let server = llm::fake::serve(vec![
         response(
             "",
@@ -630,12 +705,12 @@ fn an_edit_with_no_passing_check_is_reminded_once_then_disclosed() {
     );
     let requests = completion_requests(&server);
     assert_eq!(requests.len(), 3, "exactly one reminder round");
-    assert!(mentions(&requests[2], "no relevant check has passed"));
+    assert!(mentions(&requests[2], "they failed"));
     assert!(
         mentions(&requests[2], "note check failed"),
         "the reminder carries the gate's own check output"
     );
-    assert!(!mentions(&requests[1], "no relevant check has passed"));
+    assert!(!mentions(&requests[1], "they failed"));
 }
 
 #[test]
@@ -688,7 +763,7 @@ fn a_passing_check_after_the_edit_satisfies_the_evidence_gate() {
     assert!(
         !requests
             .iter()
-            .any(|request| mentions(request, "no relevant check has passed"))
+            .any(|request| mentions(request, "Run the relevant check"))
     );
 }
 
@@ -934,6 +1009,50 @@ fn a_failed_tool_cannot_execute_an_unchanged_retry_but_can_use_corrected_argumen
     };
     assert_eq!(tool_error(&requests[2]), Some(true));
     assert_eq!(tool_error(&requests[3]), Some(false));
+}
+
+#[test]
+fn an_auto_backgrounded_command_loads_bg_for_the_next_request() {
+    let server = llm::fake::serve(vec![
+        response("", Some(("bash", json!({"command":"sleep 3; echo done"})))),
+        slots(),
+        response("The command is running in the background.", None),
+        // The job finishes during the turn; Dial asks once more to inspect its terminal result.
+        response("The background command finished.", None),
+    ]);
+    with_agent(
+        "approval='auto'\n[compaction]\nenabled=false\n[verification]\nenabled=false\n[shell]\nauto_background_secs=1",
+        |agent| {
+            connect(agent, &server.url);
+            agent.modes.launch.unattended = true;
+            assert!(agent.bg_loadable(), "{:?}", agent.offered());
+            agent.turn("Start the slow command.", &mut NullUi).unwrap();
+            assert!(agent.offered().iter().any(|name| name == "bg"));
+        },
+    );
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 3);
+    let offers_bg = |request: &Value| {
+        request["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["function"]["name"] == "bg"))
+    };
+    assert!(!offers_bg(&requests[0]));
+    assert!(offers_bg(&requests[1]));
+    let result = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .to_string();
+    assert!(
+        result.contains("background job")
+            && result.contains("`bg wait` returns its output")
+            && !result.contains("tool_load"),
+        "{result}"
+    );
 }
 
 #[test]
@@ -1261,4 +1380,275 @@ fn discovery_recovery_uses_the_next_requests_policy_and_is_delivered_once() {
             "a delivered correction must retire"
         );
     }
+}
+
+#[test]
+fn turn_settlement_keeps_post_edit_evidence_current_without_a_check_request() {
+    let command = "grep -q after candidate.txt";
+    for tool in ["edit", "write"] {
+        let mutations = if tool == "edit" {
+            vec![
+                ("read", json!({"path":"candidate.txt"})),
+                (
+                    "edit",
+                    json!({"path":"candidate.txt","old_string":"before","new_string":"after","check":true}),
+                ),
+            ]
+        } else {
+            vec![(
+                "write",
+                json!({"path":"candidate.txt","content":"after\n","check":true}),
+            )]
+        };
+        let server = llm::fake::serve(vec![
+            calls(&mutations),
+            slots(),
+            response("The change and its focused check completed.", None),
+        ]);
+        let overlay = "approval='auto'\n[compaction]\nenabled=false\n[harness]\nedit_mode='replace'\n[edit]\nstreaming_abort=false\n[verification]\nautomatic_checks=false\n[[verification.commands]]\nname='candidate'\ncommand='grep -q after candidate.txt'\ntimeout_secs=5\n";
+        with_agent(overlay, |agent| {
+            if tool == "edit" {
+                std::fs::write(agent.workspace.root().join("candidate.txt"), "before\n").unwrap();
+            }
+            connect(agent, &server.url);
+            let report = agent
+                .turn("Apply and check the candidate", &mut NullUi)
+                .unwrap();
+            assert_eq!(
+                report.outcome,
+                TurnOutcome::Completed,
+                "{tool}: {}",
+                report.text
+            );
+            assert_eq!(
+                agent.step_checks.mutations, 1,
+                "settlement must not double-count {tool}"
+            );
+            assert_eq!(
+                agent
+                    .step_checks
+                    .evidence
+                    .current_status(command, agent.step_checks.revision()),
+                "passed"
+            );
+            let messages = agent.session.messages();
+            let results: Vec<_> = messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect();
+            assert_eq!(
+                results.len(),
+                mutations.len(),
+                "no separate check call: {results:?}"
+            );
+            assert!(
+                results.last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("passed: candidate"),
+                "{results:?}"
+            );
+        });
+        assert_eq!(
+            completion_requests(&server).len(),
+            2,
+            "one {tool} request and one final response; no separate check round"
+        );
+    }
+}
+
+#[test]
+fn failed_post_edit_check_blocks_same_batch_completion_without_refusing_the_edit() {
+    for tool in ["edit", "write"] {
+        let mut mutations = if tool == "edit" {
+            vec![
+                ("read", json!({"path":"candidate.txt"})),
+                (
+                    "edit",
+                    json!({"path":"candidate.txt","old_string":"before","new_string":"after","check":true}),
+                ),
+            ]
+        } else {
+            vec![(
+                "write",
+                json!({"path":"candidate.txt","content":"after\n","check":true}),
+            )]
+        };
+        let mutation_index = mutations.len() - 1;
+        mutations.push(("finish", json!({"outcome":"completed","summary":"Done"})));
+        let server = llm::fake::serve(vec![calls(&mutations), slots()]);
+        let overlay = "approval='auto'\n[compaction]\nenabled=false\n[harness]\nedit_mode='replace'\n[edit]\nstreaming_abort=false\n[verification]\nautomatic_checks=false\n[[verification.commands]]\nname='candidate'\ncommand='echo AssertionError: candidate failed; exit 1'\ntimeout_secs=5\n";
+        with_agent(overlay, |agent| {
+            let path = agent.workspace.root().join("candidate.txt");
+            if tool == "edit" {
+                std::fs::write(&path, "before\n").unwrap();
+            }
+            connect(agent, &server.url);
+            let report = agent
+                .turn("Apply and check the candidate", &mut NullUi)
+                .unwrap();
+            assert_ne!(
+                report.outcome,
+                TurnOutcome::Completed,
+                "{tool}: {}",
+                report.text
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "after\n");
+            let messages = agent.session.messages();
+            let results: Vec<_> = messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect();
+            assert_eq!(
+                results[mutation_index]["is_error"], false,
+                "the {tool} was applied: {results:?}"
+            );
+            assert!(
+                results[mutation_index]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("code_failed: candidate")
+            );
+            assert!(
+                results[mutation_index + 1]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Completion cannot follow a failed or refused call"),
+                "{results:?}"
+            );
+            assert!(agent.step_checks.failed);
+            assert_eq!(agent.step_checks.mutations, 1);
+        });
+        assert_eq!(
+            completion_requests(&server).len(),
+            1,
+            "same-batch finish is downgraded without another model request"
+        );
+    }
+}
+
+#[test]
+fn covered_native_reads_reuse_only_visible_rows_in_serial_and_parallel_turns() {
+    fn reads(id: &str, paths: &[&str]) -> llm::fake::Script {
+        let calls: Vec<Value> = paths.iter().enumerate().map(|(index, path)| {
+            json!({"index":index,"id":format!("{id}-{index}"),"type":"function","function":{"name":"read","arguments":json!({"path":path}).to_string()}})
+        }).collect();
+        let event = json!({"choices":[{"delta":{"content":"","tool_calls":calls},"finish_reason":"tool_calls"}]});
+        llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
+    }
+    for parallel in [false, true] {
+        for clipped in [false, true] {
+            let mut scripts = vec![reads("seed", &["source.txt:1-20"]), slots()];
+            if parallel {
+                scripts.push(reads("follow", &["source.txt:2-5", "source.txt:10-30"]));
+            } else {
+                scripts.push(reads("follow", &["source.txt:2-5"]));
+                scripts.push(reads("overlap", &["source.txt:10-30"]));
+            }
+            scripts.push(response("Inspection complete.", None));
+            let server = llm::fake::serve(scripts);
+            // Read previews retain the per-model limit rather than tool_preview_bytes.
+            let overlay = "context_window=32768\n[compaction]\nenabled=false\n[verification]\nenabled=false\n[harness]\nedit_mode='hashline'\n[experimental]\nstreaming_dispatch=false\n";
+            with_agent(overlay, |agent| {
+                let source = (1..=30)
+                    .map(|n| {
+                        format!(
+                            "source {n} {}\n",
+                            "x".repeat(if clipped { 900 } else { 80 })
+                        )
+                    })
+                    .collect::<String>();
+                std::fs::write(agent.workspace.root().join("source.txt"), source).unwrap();
+                connect(agent, &server.url);
+                let report = agent
+                    .turn(
+                        "Inspect these source ranges without changing the file",
+                        &mut NullUi,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    report.outcome,
+                    TurnOutcome::Completed,
+                    "parallel={parallel} clipped={clipped}: {}",
+                    report.text
+                );
+                let messages = agent.session.messages();
+                let result = |id: &str| {
+                    messages
+                        .iter()
+                        .find(|m| m["role"] == "tool" && m["tool_call_id"] == id)
+                        .unwrap()
+                };
+                let seed = result("seed-0");
+                let covered = result("follow-0")["content"].as_str().unwrap();
+                let overlap = result(if parallel { "follow-1" } else { "overlap-0" })["content"]
+                    .as_str()
+                    .unwrap();
+                assert!(
+                    covered.starts_with("[Unchanged read] Source SHA-256 revalidated"),
+                    "{covered}"
+                );
+                // Native output budgeting can omit whole rows without clipping any displayed row.
+                let first_missing = if clipped { 17 } else { 21 };
+                if clipped {
+                    assert!(
+                        seed["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("line 17 does not fit")
+                    );
+                }
+                assert!(
+                    overlap.contains(&format!("{first_missing}:source {first_missing}"))
+                        && !overlap.contains("10:source 10"),
+                    "{overlap}"
+                );
+                assert!(overlap.contains("[Read reuse]"), "{overlap}");
+            });
+        }
+    }
+}
+
+#[test]
+fn presentation_reduced_source_results_cannot_authorize_read_reuse() {
+    with_agent("", |agent| {
+        std::fs::write(
+            agent.workspace.root().join("source.txt"),
+            "source\n".repeat(30),
+        )
+        .unwrap();
+        let call = ToolCall {
+            id: "source-result".into(),
+            name: "read".into(),
+            arguments: json!({"path":"source.txt:1-30"}),
+            malformed_arguments: false,
+        };
+        let output = tools::execute(&agent.workspace, "read", &call.arguments, 10);
+        assert!(!output.is_error, "{}", output.text);
+        let mut returned = crate::agent::workflow::investigation::ReturnedReads::default();
+        assert!(
+            returned
+                .pointer(&call, &output.text, false, |_| true)
+                .is_none()
+        );
+        let mut message = crate::tools::surface::outcome::message(&call.id, &output);
+        message["content"] = json!("[source.txt#AAAA]\n1:source\n[output omitted]");
+        message["dial_execution"]["output"] = json!({"presentation":"partial"});
+        agent.push(message).unwrap();
+        assert!(!agent.holds_full_result(&call.id));
+        let mut invoked = 0;
+        returned.reusable(|id| agent.holds_full_result(id)).execute(
+            &agent.workspace,
+            &call.arguments,
+            |args| {
+                invoked += 1;
+                assert_eq!(args, &call.arguments);
+                tools::execute(&agent.workspace, "read", args, 10)
+            },
+        );
+        assert_eq!(
+            invoked, 1,
+            "presentation clipping must allow a fresh observation"
+        );
+    });
 }

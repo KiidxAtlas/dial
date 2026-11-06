@@ -17,8 +17,360 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
+### Changed
+
+- LM Studio metadata prefers the native v1 model API with bounded legacy fallback and loaded-instance
+  context/capability matching. Exact-model profiles can opt into typed OpenRouter routing/privacy/price
+  preferences or managed Gemini explicit prefix caching. Explicit Gemini cache storage is billed and
+  off by default; provider-side agents/tools remain disabled (`docs/llm-transport.md`,
+  `docs/provider-catalog.md`).
+
+- Osaurus model discovery now uses bounded `/api/show` metadata enrichment for declared tools,
+  vision, reasoning, purpose and context. Inference keeps Dial's tool/approval loop, with regression
+  coverage for streamed tool calls, stable request prefixes and cancellation; optional live checks
+  are documented in `docs/provider-catalog.md`.
+
+- Native Anthropic tool calls that take longer than the 60 s idle limit to generate are no longer cut
+  off and replayed identically: Anthropic may buffer a large call's arguments and send only `ping`
+  keep-alives, which now reset the idle clock while a tool call is open (for at most 10 minutes
+  after real progress). A retried attempt's streamed text is closed as interrupted instead of being
+  continued by the next attempt. Docs now state the actual 60 s default (`docs/llm-transport.md`).
+- Built-in full and compact prompts now ask the agent to check once after all edits settle, not
+  after each edit, and to fix every reported error before rerunning (`docs/agent-loop.md`).
+- Automatic backgrounding is off by default: `[shell] auto_background_secs` now defaults to `0`, so
+  foreground `bash` and `eval` calls return their result when they finish or reach `timeout`
+  instead of costing an adoption notice plus `bg wait` rounds. Set a positive value to opt back in
+  (`docs/tools.md`, `docs/execution-and-web.md`).
+- Overwriting a 40+ line file with `write` while keeping at least half of its lines now adds a
+  rewrite advisory recommending `edit`; the `write` descriptions reserve it for new or almost
+  entirely changed files.
+- The hashline `edit` description and `input` parameter show one call carrying several operations
+  and several file sections, and ask for every planned change in one call.
+- `grep` preview excerpts now count as read like `glob`/`find` previews, so rereading rows they
+  showed returns a pointer; the `read` description asks for `grep`/`:outline` and targeted ranges
+  instead of paging through large files.
+- A command that moves to the background loads `bg` for the next request when it is loadable but
+  not offered, and the adoption notice says `bg wait` instead of asking for `tool_load`. A clean
+  non-service exit before a `bg wait` `until` condition is reported as finished, not as a failed
+  wait (`docs/tools.md`).
+- `eval` is offered automatically only when containment is available and at least one
+  operator-installed runtime (`eval.node`, `kernel.python`) resolves; when only one does, its
+  description names the missing language.
+- Foreground `bash` results name entries the command created directly in its working directory,
+  so scratch build outputs left in a deliverable directory are visible (`docs/tools.md`).
+- `inference_latency` reports `generation_stall_ms`, the silent-stream part of generation time
+  (`docs/configuration.md`).
+- A fully covered repeat `read` is answered with a reuse pointer only when the pointer is smaller
+  than the rows it replaces; tiny ranges are read normally instead of costing more context.
+
+- The serial-lookup nudge now fires after three single-lookup rounds instead of five, repeats
+  every three rounds while the alternation continues instead of once per streak, ignores a
+  `todo`/`working_state` call beside the lone lookup, and tells the model to read every relevant
+  search hit and the next searches in the same response (`docs/agent-loop.md`).
+
+- Explicit native text reads reuse still-visible, complete source ranges after full SHA-256
+  revalidation. Covered selections return evidence links; partial overlaps read only missing
+  ranges and retain structured coverage receipts. Changed sources, incomplete coverage,
+  unsupported representations and hooked calls preserve normal execution and authorization.
+
+- Built-in full and compact prompts now explicitly encourage task-appropriate tools, batching
+  independent reads and searches, and reusing results instead of repeating discovery. Dependent
+  operations and one-call restrictions remain sequential (`docs/agent-loop.md`).
+
+- The top-level `message` tool now also reaches other Dial sessions in this checkout: a 32-hex
+  peer id is sent like `peers` `send` instead of being refused, and `message` without `to` lists
+  live peers beside workers. Worker ids and labels resolve first, `all` stays within the session,
+  workers still cannot address peers, and `peers` keeps list/claim/clear. The schema change is
+  description-only, so recorded sessions resume unchanged.
+
+- The `/watch` pane's Peers tab now refreshes during a turn from the turn's registry handle.
+  Before, a pane opened while the agent was working showed "No other Dial sessions" until the
+  turn ended, even with peers present.
+
+- Python `eval` tool-call results now tolerate an optional `await` without failing after a
+  successful write. Callbacks remain synchronous and authorization is unchanged; awaiting a
+  completed result returns the same dictionary without dispatching the tool again
+  (`docs/execution-and-web.md`).
+
+- Tool fixes from hands-on testing:
+  - `check` no longer reports a check as both `passed` and `stale` in one receipt: registered
+    reproductions now run before the other selected checks, so their shell effects precede those
+    observations.
+  - `check` `names` accepts the short name a reproduction was registered with (`bug` as well as
+    `repro: bug`). Unknown names are still refused.
+  - Anchored reads and `find` excerpts clip an oversized first line instead of reporting
+    "no lines in that range". If even a clipped row cannot fit, the result names the line and
+    the budget.
+  - `git` `log`, `reflog`, `show` and `branches` run in repositories with filter drivers such as
+    git-lfs. These commands only read objects, so filters cannot run. `status`, `diff` and
+    `blame` still refuse configured filters, and textconv configuration is still refused for every
+    host-side read (`docs/extensibility.md`).
+  - `edit` with `check: true` keeps the anchored result for the model instead of repeating the
+    change as a diff. Appended check text and mutation advice now update the projection digest.
+  - `ast_search` signature-style patterns written without a body, such as
+    `fn $NAME($$$ARGS) -> Result<$T>`, now also match definitions: a pattern that becomes a
+    function, method or declaration when ` { $$$ }` is appended also searches that completed form.
+    Matches are de-duplicated and the limit still applies. Rewrites never use the completed form,
+    so `ast_edit` cannot drop an unwritten body. `$$$` captures now show the original source span
+    instead of comma-joined fragments, so macro arguments keep their punctuation.
+  - `todo` says when archiving older closed tasks renumbers the list (`Archived 1 oldest closed
+    task(s) … remaining tasks are renumbered`), instead of silently shifting indices.
+  - `git` filter refusals name the active configuration keys (never their commands) and point to
+    the object-only reads that still work.
+  - `glob` with `preview` no longer labels blank separator lines as the workspace root (`@fN()`).
+  - `tool_search` and `tool_load` report `already_offered` for tools already in the current offer
+    instead of `loaded_next_request`; read-only `*` listings report `offered`
+    (`docs/agent-loop.md`).
+  - JavaScript `eval` explains failures caused by the cell namespace itself: a missing `process`
+    or `require` names the `await import('node:…')` replacement, and redeclaring a top-level
+    binding explains that declarations persist across cells.
+  - `edit` diff previews omit the final-newline note when a file is emptied, deleted or created.
+  - `lsp` `hover` that returns nothing while the server reports indexing progress says the server
+    is still indexing instead of "no hover information".
+
+- Generated-data guidance makes the existing foreground `eval` workflow explicit: carry computed
+  values into serialization and an approved write, validate the saved artifact in the same cell,
+  and return a short summary instead of transcribing results or displaying them again. Initial
+  inspections favor bounded samples; source/config checks and access controls remain unchanged
+  (`docs/execution-and-web.md`). The efficiency suite covers generated CSV/JSON outputs alongside
+  existing source-edit holdouts; live performance remains workload-dependent.
+- Generated CSV/JSON transformations now use the same intent-based routing in interactive and
+  print runs, rather than excluding `data` from all unattended work. Explicit analysis, inspection,
+  workbook and large-data requests still route the specialist. The producing `eval` example reads
+  original input files, preserves their bytes and serializes computed values without transcription.
+  Default completion self-review names concrete evidence gaps, reuses current declared coverage,
+  and avoids a completion-only model request for unassessed coverage alone. Explicit coach review
+  and existing verification/permission gates are unchanged (`docs/agent-loop.md`,
+  `docs/requirement-verification.md`).
+
+- `codebase_memory`, `experience` and `edit_preview` are no longer offered on every request; they stay in the catalog and load on demand with `tool_load`. The ambient "Saved codebase understanding" brief is now off by default (`codebase.ambient_context = true` opts back in) (`docs/tools.md`, `docs/agent-loop.md`).
+
+### Added
+
+- `image_gen` and `/image gif <prompt>` write animated GIFs with OpenAI GPT Image 2.6
+  (`gpt-image-2.6-flare`/`-sunburst`) when the output ends in `.gif`, with optional `frame_count`
+  and `frame_duration_ms`, on the OpenAI Images API and the Responses hosted tool. Both 2.6 models
+  are recognized as Images API models (`docs/image-generation.md`).
+
+- Opt-in tool bundles avoid intermediate observation requests: `grep(preview=true)` returns
+  bounded editable enclosing-source excerpts; `write(check=true)` shares foreground focused
+  verification with `edit`; browser navigation/input actions accept an `observe` bundle for
+  snapshots, screenshots and new error events; `web_search(fetch_top=1..3)` fetches leading
+  result pages through existing URL guards. Defaults and approval boundaries stay unchanged;
+  follow-up failures retain the original successful action (`docs/tools.md`).
+- `edit` accepts optional `check: true` to run foreground focused checks after a successful edit without another model request. Checks retain their approvals and verification evidence; failures are reported separately and never undo or misclassify the applied edit (`docs/tools.md`).
+- `find` automatically expands literal `name` methods and string-array constants into bounded,
+  directory-diverse contract references, helping expose string-based tool-name consumers across
+  layers in one call. References remain lexical candidates, not confirmed ownership or exhaustive
+  impact analysis (`docs/tools.md`).
+- `bg start` accepts structured tool calls alongside shell commands for explicitly opted-in finite
+  read operations. Nested calls retain schema/rule/approval checks; results preserve structured
+  data and failures, with bounded artifact delivery and cooperative cancellation. Initial support
+  covers data, web fetch/search and non-PDF document operations; unsupported hooks/controllers and
+  shell-only options fail closed (`docs/background-services.md`).
+- The in-context completion self-review reminder now waits for the first round that produces an
+  artifact: a checkpointed edit, or a workspace file modified during the turn after an opaque shell
+  command (bounded modification-time scan, so script-written files count too). It previously fired after read-only exploration whose shell pipeline
+  counted as an uncheckpointed effect, which primed a separate analyse/review/recheck cycle (extra
+  requests in the native OMP comparison). Up to three small produced files (4 KiB total) now ride
+  along with the reminder so reconciling them needs no reread, and it asks for a brief final reply.
+  Effect-only turns keep the completion fallback (`docs/requirement-verification.md`).
+- Offered tool schemas are bare: every parameter keeps its name, type, enum and required status,
+  but Dial-owned tools no longer send per-parameter explanations (core tools about 19.6 KB to
+  11.6 KB per request). A call whose arguments do not fit gets that tool's full parameter help in
+  the error. Core tool descriptions are shorter (`name: purpose`, then only rules the schema cannot
+  express). Contract identities ignore descriptions, so recorded sessions still resume.
+- Subagents get the same bare schemas and the same full parameter help on argument errors as the
+  main agent. Simpler parameter names: `grep` `fixed_string` → `literal` and `max_results` →
+  `limit`, `find` `grep_keywords` → `keywords`; the `bash` `async` alias of `background` is
+  removed. Sessions recorded with the old names resume (their calls are projected onto the new
+  names), and calls that still use an old name are mapped onto the new one.
+- The split memory tools (`recall`, `retain`, `memory_update`, `forget`, `memory_history`,
+  `memory_import`, and the backend-specific `reflect`/`learn`) are merged into one `memory` tool
+  with a required `action` (`recall`, `retain`, `update`, `forget`, `history`, `import`, `reflect`,
+  `learn`, depending on the backend), for both provenance and the selectable memory backends. The
+  split names are removed. Configured tool selections that name them are migrated to `memory`, and
+  recorded sessions that called them resume (each call is projected onto `memory` with its
+  action). Sessions recorded with the earlier monolithic `memory` tool are refused on resume. Print
+  runs defer `memory`; it stays loadable with `tool_load` (`docs/tools.md`,
+  `docs/memory-and-learning.md`, `docs/rpc-and-acp.md`).
+- `artifact_read` is merged into `read`: `read` on an `artifact://H` path returns retained lines
+  (`:50-60`, `:50+20`, `:50-`, `:7`; default from line 1), `:info` lifecycle records,
+  `:annotations` human feedback or `:bytes=O+N` exact base64 bytes. The separate tool is removed,
+  so every request carries one fewer schema. Configured tool selections that name `artifact_read`
+  drop it, and recorded sessions that called it resume (each call is projected onto the
+  equivalent `read` path selector). Reading an `artifact://` path is never pruned from context or
+  counted as a duplicate observation (`docs/tools.md`).
+- Print runs (`dial -p`, `dial review`) also defer `bg`, `finish`, `check` and `git`; each stays
+  loadable with `tool_load`. In native Harbor print runs (94 requests) the model never called any
+  of them: `bash` backgrounds long commands itself, a plain answer ends the turn, and the
+  completion gate still runs its checks (`docs/agent-loop.md`).
+- A successful `write` now reports the line count with its byte count and on-disk SHA-256, and
+  says that rereading the file adds nothing (it confirms the write, not that the content is
+  correct). Benchmark print runs spent a whole request reading back a file they had just written.
+- Print runs no longer pay for tools a request did not ask for. "check the result" (and other
+  ordinary words such as find, finish and memory) routes a tool only when it is named as a tool, so
+  the `check` deferral holds. `evidence`/`evidence_search` route only for citation intent, not with
+  every format tool. Generated tabular transformations favor `eval`, while actual analysis still
+  routes `data` in print runs as well as interactive runs. A matched
+  workflow benchmark spent requests on `data profile`/`aggregate` before the same `eval`, and on
+  `evidence capture` for a plain CSV (`docs/agent-loop.md`).
+- `check` with a new `repro` after a change also runs the remaining applicable checks, instead of
+  reporting them as lacking a pass and prompting a second plain `check` call.
+- The generated-data rule and the `eval` description now say to write the file in the same cell
+  that computes it and print only a summary. Benchmark runs printed counts in one cell, then
+  retyped them into a second cell that wrote the file. The `eval` description also asks for a
+  minimal cell (no banner comments or duplicate asserts) and says its asserts already cover the
+  saved bytes and unchanged inputs, so later calls need not re-hash or reread them. The completion
+  self-review asks for a few plain closing lines instead of a per-requirement checklist or table.
+  Benchmark runs spent about 800-1200 extra output tokens (9-14 s) on these.
+- Tests are no longer mandatory. The completion gate discloses edits that have no passing check
+  instead of sending a "run the relevant check now" reminder. Only a failure the gate observes
+  itself earns one reminder. A successful `eval` cell that asserts its results counts as a passing
+  check. The in-context self-review is skipped when a passing check already covers the delivery,
+  and it ignores `.tmp` scratch files such as cargo lease files. The system prompt's Prove step no
+  longer asks for a rerun once a passing check covers the final edit. The turn report says
+  `no recorded checks` / `Checks: none recorded` instead of `no checks` / `none run`.
+- Request-efficient guidance combines related inspections and artifact computation/serialization/
+  checking, and stops after requirements and owning checks pass without ceremonial rereads or
+  version probes. Duplicate-shell feedback now asks for recorded outcomes and a concrete reason
+  to rerun, rather than asserting a check is still current from command identity alone.
+- Shell pace feedback compares whole commands and execution locations, not shared pipeline heads
+  or separators. Different output projections no longer receive false duplicate-work advice;
+  filtered output is not represented as recoverable complete producer output.
+- Python `eval` tool shorthands accept an argument dictionary as well as existing keyword calls,
+  using the same validated controller dispatch. Generated-data guidance gives synchronous Python
+  and awaited JavaScript write-callback examples to avoid model-transcribed output handoffs.
+- Source/config tool preferences no longer compete with the generated-data single-run rule.
+  Foreground shell previews keep 4 KiB each of head and tail, with bounded middle diagnostics
+  and explicit omissions; complete artifact capture is unchanged.
+- Normal nonminimal offers include supported `eval` only after preparing its mandatory containment
+  gate; cached preparation failure also removes retained automatic offers. Passive readiness does
+  not spawn a probe. Explicit loads retain control operations; execution still fails closed.
+  Repository sessions offer `git` up front. Explicit harness/model selections, small-context
+  modes and authorization remain in force.
+- Python checks that exit zero while reporting an unawaited coroutine no longer receive passing
+  verification or repair credit, including diagnostics retained in clipped-output artifacts.
+  Compact testing guidance covers queued work, awaited cancellation cleanup, final file sets and
+  the expected caller/environment rather than test-only overrides. Generated-data guidance combines
+  computation, writing and assertions without relaxing source-edit boundaries.
+- System Bash failures for known Python, pip and Node names can report an executable alternative
+  from that command's actual PATH/cwd, using builtin lookup without running the alternative.
+  Operator handlers/traps are preserved. Embedded/PowerShell backends are unchanged; Bash 3's
+  conservative fallback can omit hints for conditional or complex commands. Compatibility is
+  not established by availability; recovery guidance reuses supplied evidence instead of probing again.
+- Successful non-check shell work resumes the phase before Recovery. A stale Recovery label no
+  longer counts as another failed tool round; actual failures still drive escalation.
+- Repeatable `--read-only-dir DIR` grants native read/search access outside the workspace for
+  the current launch only. It does not grant writes, persist writable session roots, widen shell
+  permissions or bypass private storage and symlink boundaries; filesystem roots are refused.
+- Linux x86_64/aarch64 `eval` uses a probed kernel seccomp fence for Python and JavaScript,
+  including explicit filesystem-sandbox opt-out. Process creation and process-group/session
+  escape are denied while checked runtime threads remain usable. Bubblewrap/proxy setup retains
+  its own trusted startup; the final interpreter receives the mandatory fence. Installation
+  failures refuse execution, with no uncontained fallback. macOS and Windows contracts remain.
+
+- `find` uses its existing source-preview budget for the top hit plus already discovered
+  conventional test/configuration candidates before additional ranked hits. Fresh screened
+  excerpts retain their ordinary edit-witness rules; lexical references do not prove ownership.
+- Focused `check` receipts now combine selected results with revision-scoped outstanding
+  applicable checks, including no-execution calls. Bounded summaries disclose stale, failed and
+  unobserved checks without rerunning unselected work or treating an empty scope as verification.
+- Shell results flag a command that only prints the model's own notes (comments, literal
+  `echo`/`printf`, a `cat <<EOF` heredoc to stdout) with a one-line hint to keep reasoning in
+  the reply instead of spending a tool round trip on it.
+- Local benchmark workspaces now live under `benchmarks/`, outside Cargo's disposable
+  `target/` tree; private artifacts remain excluded from Git and Docker build contexts.
+- Harbor pilot reports now attach offline per-request/tool diagnostics, source identities,
+  stage timings, official verifier cases and explicit trace-coverage/reconciliation gaps.
+  Raw prompts, arguments and output bodies remain in private logs; derived metadata is not
+  an anonymized public export. Historical and comparison batches remain separate.
+- Reconcile Harbor diagnostics with Dial's final execution ledger, including automatic focused
+  checks absent from model-message journals, without double-counting or inventing output bodies.
+- Harbor summaries now expose task/agent outcomes, input-checksum compatibility, job/retry layers,
+  inference/storage/projection counters and explicit per-measurement coverage, with a readable
+  Markdown companion. Per-trial trace reconciliation prevents pooled counts hiding missing latency.
+- **Osaurus** is discovered as the `osaurus` provider at `http://127.0.0.1:1337/v1`, its
+  OpenAI-compatible API (`OSAURUS_BASE_URL` overrides it). Its models appear in Models next to
+  LM Studio, Ollama and llama.cpp.
+- A local server that rejects Dial's constrained tool-call retry (its `oneOf` schema over the
+  offered tools) no longer ends the turn with "inference failed". The retry is dropped for the
+  rest of the turn and an ordinary request is sent instead.
+- An OpenAI-compatible local server (Osaurus, MLX servers) is no longer asked llama.cpp's
+  `/props`, Ollama's `/api/ps` and LM Studio's `/api/v0/models` before every request. A native
+  route that answers 404 is remembered for five minutes per server.
+- Osaurus models now get their real context window (from Osaurus's `/api/show`, e.g. 262K for
+  Gemma 4) instead of Dial's 32K default. Before, an ordinary turn crossed the 32K budget and
+  Dial kept compacting the conversation through the local model, which looked like endless
+  "generating" with no answer.
+- Picking a model in Models applies it immediately; the confirmation screen after selection is
+  gone. Clearing a role assignment still asks for confirmation.
+- Built-in tool descriptions are shorter (default tool schemas about 34.9 KB → 31.0 KB; `task`,
+  `bg`, `working_state`, `todo`, `grep`, `glob`, `bash`, `find` and `finish`). Parameter shapes and
+  contract identities are unchanged.
+- A failed shell command whose cause lies outside the checkout (missing headers, packages) can be
+  rerun after a successful state-changing shell command such as a package install. Previously the
+  failed-operation retry barrier refused it because the checkout tree had not changed. Barriers on
+  known missing files and access refusals are unchanged.
+- The system prompt now says a successful write/edit result is current (no confirming reread), and
+  that a package install failing on missing archives should refresh the index and retry rather
+  than force-install or skip dependencies.
+- A shell command that fails with "command not found" for an ordinary program now gets a short
+  hint to check all alternatives in one `command -v` call, instead of probing one at a time.
+- The built-in system prompt is plainer and shorter (full policy about 15.3 KB → 12.6 KB,
+  compact about 9.0 KB → 8.3 KB). It drops the RFC 2119 preamble and blanket MUST wording,
+  reserving NEVER for hard safety and honesty limits. Each rule now appears once, batching and
+  todo pairing state their reason, and lines that suppressed progress narration are gone. Testing,
+  reporting, monitoring and delegation sections are rewritten. A new rule says which guidance wins
+  a conflict (user, then operator, then project guidance such as AGENTS.md and skills, none
+  widening permissions). The data, document and media rule is included only when such a tool is
+  offered. Approval, sandbox, trust and verification-honesty contracts are unchanged.
+
 ### Reliability corrections
 
+- Shell results no longer repeat the launch receipt line, and omit the `[complete output: …]`
+  link when the whole output is already inline; launch facts and the artifact stay in the
+  structured execution record. A clean first failure (known effects, no committed paths,
+  complete capture, correct-then-retry) gets a one-line recovery note instead of the full
+  state block; repeats and uncertain cases keep it. Final reports are asked to stay terse.
+- `apt-get`/`apt` install, update, upgrade and remove output is filtered like other package
+  installs: per-package fetch/unpack/setup progress is dropped, while the install summary and
+  every diagnostic line stay and the complete output remains in the artifact. A `2>&1` stream
+  merge no longer stops a compound command from selecting its output filter.
+- Shell hints are quieter: the `| head`/`| tail` trim hint no longer fires for selections of
+  five lines or fewer (`gcc --version | head -1`), and `read`/`grep`/`glob` hints are withheld
+  when the command names an absolute path outside the workspace, where those tools would refuse.
+- Keep generated Python syntax checks from writing standard-library bytecode during cold imports,
+  preventing self-induced runtime-freshness failures without executing the checked source or
+  weakening identity checks. Report unavailable verification evidence as unverified, with the
+  input-capture stage/cause rather than a code-failure label.
+- Preserve requested targets and acceptance conditions through diagnostic workarounds, and
+  keep routine completion reports concise without hiding checks, blockers or coverage gaps.
+- Reconcile requested artifact layouts and derived values before completion, including small
+  changes lacking observed declared requirement coverage. Reuse the permitted coach, or one
+  instruction-bounded in-context self-review without remote disclosure; neither certifies correctness.
+  Piggyback its compact reminder on an already-needed request after an effectful tool round,
+  preserving the completion fallback without routinely adding a review-only inference.
+- Distinguish hand-authored source edits from generated artifacts in full and compact tool guidance:
+  permitted generators may compute and serialize requested outputs directly, without transcription
+  or any expansion of path access, approvals or source-edit authority.
+- Avoid reissuing a still-visible sole user request after each tool round, while preserving
+  correction/steering precedence and request restoration after compaction. Expire stale
+  duplicate-shell recovery feedback when its Git source-tree identity changes, without
+  relaxing permissions, verification requirements or unchanged-source retry barriers.
+- Cut per-request overhead seen in Harbor pilots: a first ordinary shell exit gets a one-line
+  recovery note instead of the full recovery block (repeats, uncertain effects, commits and
+  partial capture keep it), the retry-barrier note is shorter, and incidental task wording
+  ("each row should report", "source from Debian packages") no longer offers `document`,
+  `evidence`, `evidence_search` or `dep_source` schemas. A rerun after a possibly writing
+  command (`apt-get update && apt-get install …`), or a new loop sharing only `done`, is no
+  longer called "already ran". Lean workflow guidance now asks to regenerate stale outputs,
+  check delivered artifacts against every requirement and prefer platform package tooling.
+- Local model assistance (`assistance.enabled`) now defaults off: the syntax guard, related-test
+  selection and learned-experience recall stay inactive unless it is turned on in
+  `/improve settings` or config (`docs/memory-and-learning.md`). Lean local profiles are unchanged.
 - Exclude durable undo/checkpoint links from canonical inference and training messages while
   retaining them in session storage. Accepted request snapshots can be harvested without
   weakening strict message validation or losing earlier conversation context.
@@ -55,8 +407,50 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   gate, while still refusing matched crate directories with missing or invalid manifests.
 - Compile Unix-only weights-test helpers only where their owning tests run, keeping Windows
   Clippy's warnings-as-errors gate intact without suppressions or dropping portable tests.
+- Reduce push/PR Linux feature compilation from 32 combinations to eight representative
+  selections, sharing the same compile job with weekly and manually triggered exhaustive
+  coverage. Limit feature-job concurrency while preserving all other platform/release gates.
+- Scope Windows contract filters to their owning crates and preserve their build cache after
+  failures. Stage the already-built Unix CI executable for smoke checks instead of rebuilding
+  it with `cargo install`; keep artifact and recovery checks intact.
+- Check migrated-record privacy with native owner-only permissions on Windows and Unix. Fix
+  real-terminal fixtures to use the visible session-tree command and the configured interrupt,
+  retaining draft, branch-history, file-safety and partial-write cancellation assertions.
 
-## [0.3.0] - 2026-11-04
+### Shorter turn reports and final answers
+
+- The end-of-turn report is shorter: its collapsed line names the check state (`checks passed`,
+  `checks failed`, `checks stale`, `checks unverified`) instead of `checks current`, and the expanded
+  view omits empty sections and drops the fixed undo/resume/timing boilerplate.
+- The system prompt's delivery rules are shorter and ask for a few-line final answer (outcome,
+  checks, gaps) without chronology, headings or a restated plan, reducing per-request prompt tokens.
+- Test and build commands (`cargo test`/`clippy`/`check`, `make test-*`, `pytest`, `jest`/`vitest`,
+  `go test`, `tsc`, `npm run build`, …) render as a compact **Test**/**Build** card: pass/fail/ignored
+  or error/warning counts in the header, then only the failing tests or the first errors with their
+  locations. A clean pass is one row; the expand key shows the full log. Unrecognized or unattributed
+  failures keep the ordinary output card.
+- A fully passing test run (`cargo test`/`nextest`, `pytest`, `jest`/`vitest`, `go test`) with no
+  warning or other diagnostic now reaches the model as one `test result: ok. N passed; 0 failed; …`
+  line instead of its filtered log, saving context tokens; the complete output stays in its artifact.
+  Runs with a failure, warning or error keep the existing line filter and failure digest.
+- A failing test run's digest now names each failing test with its panic or assertion detail
+  (`cargo test`/`nextest`, `pytest`, `go test`, `jest`/`vitest`), so the model rarely needs to read
+  the output artifact. The digest is skipped only when every line is already visible near the top.
+- Edit results no longer repeat the changed lines as a second diff preview when the numbered excerpt
+  was only row-truncated, and the "removed lines" report is skipped for whole-block rewrites.
+- The saved codebase brief is capped to six rows, and common words no longer match unrelated topics.
+- Search and glob footers are shorter: a complete walk prints `walk complete` plus only the
+  non-default flags, and the `[page:]` line appears only when there is a next page. The `| head`
+  hint and the auto-background notice are shorter.
+- `bash` with an explicit `timeout` longer than `[shell] auto_background_secs` now stays in the
+  foreground until that timeout, so the result returns in the same call instead of needing a
+  `bg wait`; a command still running then moves to `bg` rather than being killed.
+- The latest-request reminder is no longer re-sent at every tool boundary while that request is
+  still visible in history; it returns after compaction removes it. Steering keeps its reminder.
+- The prompt asks the model to start large files with a `:outline` read.
+- Removed two noisy notices: the `Background` note when a job starts or a foreground command is
+  moved to the background (the launching card already shows it), and the one-time Claude
+  subscription compatibility notice.
 
 ### Bounded discovery and evidence reuse
 
@@ -394,6 +788,10 @@ Historical release sections remain unchanged.
 
 ### Fixed
 
+- Weights jobs explicitly release their project lock when the operation ends, including error
+  returns, so a descriptor inherited during concurrent process spawning cannot leave a completed
+  job appearing active. Live jobs and ledger changes remain mutually exclusive (`docs/improvement.md`).
+
 - Skill tool cards show the bundled reference-file path as well as the skill name, distinguishing
   chapter reads from repeated core-skill loads (`docs/terminal-interface.md`).
 
@@ -439,6 +837,17 @@ Historical release sections remain unchanged.
   `repeated_calls` workflow metric now also counts unchanged re-reads and loop-guard short circuits.
 
 ### Changed
+
+- Shorten shared full/compact prompt policy while preserving tool, trust, approval and verification
+  contracts. The owning rendered fixture measures policy bytes **12,805 → 9,528** (full) and
+  **8,535 → 6,245** (compact); lean/one-call and total message-text sizes are documented in
+  [agent-loop.md](docs/agent-loop.md). These are byte measurements, not live-model outcomes:
+  effects on correctness, requests, tokens and elapsed time remain unmeasured.
+
+- Artifact generators may serialize and verify their delivered output in the same invocation,
+  avoiding redundant check/readback calls without bypassing configured verification or approvals.
+- The Git tool exposes bounded, read-only HEAD reflog inspection so lost-work recovery can
+  identify recent abandoned commits without guessing from unrelated dangling history.
 
 - The shell output minimizer also filters outputs longer than the inline head-and-tail view, using
   the complete copy in the output artifact, and recognises `cd DIR && <command>` sequences,

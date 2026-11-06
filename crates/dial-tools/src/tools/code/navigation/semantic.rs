@@ -115,19 +115,17 @@ impl SemanticRequest {
         out.push_str(&format!("[{shown} results; {} source-grounded candidates submitted; candidates/model input bounded, not exhaustive semantic search]\n{}", self.candidates.len(), self.coverage));
         // Related evidence is computed locally from the already-selected, revalidated rows: no
         // extra model request, and attribution stays lexical/syntax rather than model-ranked.
-        if self.related && !top.is_empty() {
-            out.push_str(&super::related_for(
+        let related = if self.related && !top.is_empty() {
+            super::related_for(
                 &self.workspace,
                 &self.scope,
                 &top,
-                super::MAX_OUTPUT.saturating_sub(out.len()),
-            ));
-        }
-        out.push_str(&super::source_section(
-            &self.workspace,
-            &top,
-            super::MAX_OUTPUT.saturating_sub(out.len()),
-        ));
+                super::MAX_OUTPUT.saturating_sub(out.len() + super::SOURCE_BYTES),
+            )
+        } else {
+            super::related::Bundle::default()
+        };
+        super::append_sections(&self.workspace, &mut out, &top, related);
         Ok(out)
     }
 }
@@ -168,7 +166,7 @@ pub fn semantic_request(ws: &Workspace, args: &Value) -> Result<Option<SemanticR
     }
     let retrieved = retrieve(ws, args, true)?;
     let related = super::related_enabled(args, false)?;
-    let scope = ws.resolve(opt_str(args, "path")?.unwrap_or("."))?;
+    let scope = ws.resolve_read(opt_str(args, "path")?.unwrap_or("."))?;
     let query = req_str(args, "query")?;
     let mut candidates = Vec::new();
     let mut payload = Vec::new();

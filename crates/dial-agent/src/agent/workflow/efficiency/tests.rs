@@ -10,7 +10,6 @@ fn smaller_inspections_preserve_errors_snapshots_and_unretained_evidence() {
         ("grep", true, true),
         ("edit", false, true),
         ("read", false, true),
-        ("artifact_read", false, true),
         ("grep", false, false),
     ] {
         assert_eq!(

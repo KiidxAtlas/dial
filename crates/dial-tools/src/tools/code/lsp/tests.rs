@@ -107,6 +107,17 @@ fn serve_with_rename(stream: UnixStream, log: Log, mut rename: impl FnMut() -> V
             ("textDocument/references", Some(id)) => {
                 reply(&mut out, &id, json!([here.clone(), here]))
             }
+            ("textDocument/hover", Some(id))
+                if uri.as_str().is_some_and(|uri| uri.ends_with("busy.fk")) =>
+            {
+                // An indexing server: progress has begun and hover has nothing yet.
+                let _ = write_message(
+                    &mut out,
+                    &json!({"jsonrpc": "2.0", "method": "$/progress",
+                        "params": {"token": "index", "value": {"kind": "begin", "title": "indexing"}}}),
+                );
+                reply(&mut out, &id, Value::Null)
+            }
             ("textDocument/hover", Some(id)) => reply(
                 &mut out,
                 &id,
@@ -510,6 +521,17 @@ fn position_actions_send_utf16_columns_and_print_character_columns() {
     assert_eq!(
         h.ok(json!({"action": "hover", "path": "a.fk", "line": 1, "column": 1})),
         "hover!"
+    );
+}
+
+#[test]
+fn empty_hover_while_indexing_says_the_server_is_still_indexing() {
+    let h = Harness::new();
+    h.write("busy.fk", "x\n");
+    let text = h.ok(json!({"action": "hover", "path": "busy.fk", "line": 1, "column": 1}));
+    assert!(
+        text.starts_with("no hover information yet") && text.contains("still indexing"),
+        "{text}"
     );
 }
 

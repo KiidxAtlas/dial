@@ -121,6 +121,9 @@ fn request_api(
             body["top_p"] = json!(top_p);
         }
     }
+    if let Some(profile) = profile {
+        super::openrouter::apply(&mut body, profile)?;
+    }
     Ok(body)
 }
 

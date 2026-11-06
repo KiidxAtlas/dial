@@ -201,6 +201,52 @@ fn task_phase_follows_observed_work_and_recovery_is_not_a_quality_label() {
     s.observe("read", true, false);
     assert_eq!(s.phase, Phase::Editing);
 }
+
+#[test]
+fn successful_shell_work_resumes_the_phase_before_repeated_failures() {
+    for (kind, objective, work, expected) in [
+        (Kind::General, "Answer a question", None, Phase::General),
+        (
+            Kind::Editing,
+            "Compare approaches",
+            None,
+            Phase::Exploration,
+        ),
+        (
+            Kind::Editing,
+            "Implement change",
+            None,
+            Phase::Investigation,
+        ),
+        (
+            Kind::Editing,
+            "Implement change",
+            Some(("edit", false)),
+            Phase::Editing,
+        ),
+        (
+            Kind::Editing,
+            "Implement change",
+            Some(("bash", true)),
+            Phase::Verification,
+        ),
+    ] {
+        let mut state = State::begin(kind, objective);
+        if let Some((name, check)) = work {
+            state.observe(name, true, check);
+        }
+        for _ in 0..2 {
+            state.observe("bash", false, false);
+            assert_eq!(state.phase, Phase::Recovery, "{expected:?}");
+        }
+        for name in ["todo", "working_state", "tool_load"] {
+            state.observe(name, true, false);
+            assert_eq!(state.phase, Phase::Recovery, "{name} is bookkeeping");
+        }
+        state.observe("bash", true, false);
+        assert_eq!(state.phase, expected, "{kind:?}: {objective}");
+    }
+}
 #[test]
 fn default_output_budget_is_not_reduced_by_phase() {
     let c = config();

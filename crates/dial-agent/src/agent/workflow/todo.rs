@@ -507,7 +507,7 @@ impl TodoList {
         };
         // Prune before the cap check so accumulated closed work cannot crowd out new tasks; the
         // summary below renders the pruned list, keeping the numbering the model will cite next.
-        prune_closed(&mut next);
+        let archived = prune_closed(&mut next);
         if let Err(error) = check_tasks(&next) {
             return fail(error);
         }
@@ -522,6 +522,15 @@ impl TodoList {
             };
         }
         let mut text = event;
+        if !archived.is_empty() {
+            // The listed numbers shift when closed work is archived; say so, so the next call
+            // cites the renumbered list instead of the indices it used before this one.
+            text.push_str(&format!(
+                " Archived {} oldest closed task(s) from the list ({}); remaining tasks are renumbered.",
+                archived.len(),
+                archived.join("; ")
+            ));
+        }
         if let Some(slot) = started {
             text.push_str(&format!(" Started {}.", self.tasks[slot].label(slot + 1)));
         }
@@ -663,20 +672,24 @@ fn advance(tasks: &mut [Task]) -> Option<usize> {
 
 /// Drop the oldest closed tasks once more than [`KEEP_CLOSED`] are listed, so resolved work makes
 /// room for what is current. Open tasks are never touched; the newest closed tasks stay visible.
-fn prune_closed(tasks: &mut Vec<Task>) {
+/// Returns the content of each dropped task, oldest first.
+fn prune_closed(tasks: &mut Vec<Task>) -> Vec<String> {
     let closed = tasks.iter().filter(|t| !t.status.is_open()).count();
     if closed <= KEEP_CLOSED {
-        return;
+        return Vec::new();
     }
     let mut drop = closed - KEEP_CLOSED;
+    let mut archived = Vec::with_capacity(drop);
     tasks.retain(|t| {
         if t.status.is_open() || drop == 0 {
             true
         } else {
             drop -= 1;
+            archived.push(t.content.clone());
             false
         }
     });
+    archived
 }
 
 /// The operation a todo call requests, including the accepted `done: true` shorthand. Guards that
@@ -692,7 +705,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": "todo",
-            "description": "Track a numbered plan for substantial multi-step work. op: set (tasks replaces the plan), append, start (index; default first pending), done (closes the active task and starts the next), drop or block (reason), view. Mark progress with done, never by resending set. Indices are 1-based and shift when closed tasks are pruned. Send todo in the same response as a real call, never alone, and skip a closing update before the final answer: it closes only the in-progress task; pending tasks stay open.",
+            "description": "todo: plan substantial multi-step work. done closes the active item and starts the next; never resend set to mark progress. Indices are 1-based. Send with a real call, never alone; skip a closing update before the final answer.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -706,7 +719,7 @@ pub fn schema() -> Value {
                                 "content": {"type": "string"},
                                 "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "abandoned"]},
                                 "phase": {"type": "string"},
-                                "investigation": {"type": "boolean", "description": "Optional legacy investigation label; follows the same progress lifecycle as other tasks."}
+                                "investigation": {"type": "boolean", "description": "Legacy label; same lifecycle."}
                             }
                         }
                     },

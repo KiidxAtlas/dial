@@ -54,7 +54,7 @@ pub struct CompactionOutcome {
     pub summarized_messages: usize,
     pub continue_allowed: bool,
     pub native_usage: Option<Value>,
-    /// Private content-addressed disk artifact; retrieve with artifact_read.
+    /// Private content-addressed disk artifact; retrieve with read.
     pub handoff_path: Option<String>,
     pub handoff_error: Option<String>,
     pub reset_entry_id: Option<String>,
@@ -881,7 +881,7 @@ pub(in crate::agent) fn compact_history_with_execution(
                             continue;
                         };
                         message["content"] = json!(format!(
-                            "[Recoverable older tool evidence archived at {reference}; retrieve with artifact_read. Original result and mutation outcome remain in the immutable session archive.]"
+                            "[Recoverable older tool evidence archived at {reference}; retrieve with read. Original result and mutation outcome remain in the immutable session archive.]"
                         ));
                         elided += 1;
                     }

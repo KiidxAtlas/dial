@@ -34,6 +34,9 @@
 !.env.sample
 
 # Disposable experiments and benchmark output (fixtures remain tracked).
+# Benchmark workspaces contain private traces, downloaded datasets and binaries.
+/benchmarks/*
+!/benchmarks/README.md
 /scratch/
 /*-report.json
 /*-report-*.json

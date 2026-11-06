@@ -25,6 +25,9 @@ pub struct ToolFlagArgs {
     /// Additional directory the agent may access. Repeatable.
     #[arg(long = "add-dir", value_name = "DIR", help_heading = crate::cli::help_heading::SAFETY)]
     pub add_dir: Vec<PathBuf>,
+    /// Additional directory native file/search tools may read, but not write. Repeatable.
+    #[arg(long = "read-only-dir", value_name = "DIR", help_heading = crate::cli::help_heading::SAFETY)]
+    pub read_only_dir: Vec<PathBuf>,
     /// Replace the system prompt. A value containing a newline is literal text; otherwise it is a file path.
     #[arg(
         long,
@@ -74,6 +77,8 @@ pub struct EffectiveSettings {
     pub deferred_tools: Vec<String>,
     /// Resolved `--add-dir` paths, for the workspace once it accepts extra roots.
     pub add_dirs: Vec<PathBuf>,
+    /// Process-local native read/search roots; never persisted as writable session grants.
+    pub read_only_dirs: Vec<PathBuf>,
     /// Resolved `--system-prompt` text (file contents or literal).
     pub system_prompt: Option<String>,
     /// `--system-prompt-template` file path, unread until the agent loads it.
@@ -252,6 +257,7 @@ pub fn apply(
     };
 
     out.add_dirs = args.add_dir.clone();
+    out.read_only_dirs = args.read_only_dir.clone();
 
     if let Some(raw) = &args.system_prompt {
         out.system_prompt = Some(resolve_prompt_input(raw));

@@ -3,12 +3,11 @@ use crate::config::tools::eval::EvalConfig;
 
 use super::background::AdoptedJob;
 use super::kernel::{
-    ActiveGuard, BackgroundPolicy, CellOutcome, CellScope, Deadline, FORK_FENCE, Handoff, MAX_CODE,
+    ActiveGuard, BackgroundPolicy, CellOutcome, CellScope, Deadline, Handoff, MAX_CODE,
     NativeProcess, PythonRuntime, busy_job, cell_label, check_operation, code_output, deadline,
-    execution_deadline, guarded_operation, lock_session, native_cell, require_fork_containment,
-    resolve_operator_executable, shell_quote, strip_runtime_injection,
+    execution_deadline, fenced_command, guarded_operation, lock_session, native_cell,
+    require_fork_containment, resolve_operator_executable, shell_quote, strip_runtime_injection,
 };
-use super::shell::shell_command;
 use crate::config::tools::kernel::KernelConfig;
 use crate::config::types::Config;
 use crate::tools::integrations::ext::{Tool, ToolCallback, ToolContext, ToolEvent};
@@ -21,6 +20,28 @@ use std::sync::{
 };
 
 const DRIVER: &str = include_str!("eval/driver.cjs");
+
+use super::kernel::fork_fence_prefix;
+
+/// Explicitly prepare mandatory containment for an automatic offer, without starting an interpreter.
+/// Catalog/readiness queries only inspect the cached observation; they never call this hook.
+pub fn prepare_containment() -> Result<(), String> {
+    require_fork_containment("eval")
+}
+
+/// Cell languages whose configured launcher resolves to an operator-installed executable, in
+/// schema order. Only paths are inspected; no interpreter starts, so a resolved launcher can still
+/// fail its preflight when a cell runs.
+pub fn installed_languages(workspace: &std::path::Path, config: &Config) -> Vec<&'static str> {
+    [
+        ("js", config.eval.node.as_str(), "eval.node"),
+        ("py", config.kernel.python.as_str(), "kernel.python"),
+    ]
+    .into_iter()
+    .filter(|(_, program, label)| resolve_operator_executable(workspace, program, label).is_ok())
+    .map(|(language, _, _)| language)
+    .collect()
+}
 
 pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(EvalTool::new(
@@ -165,13 +186,12 @@ impl JsRuntime {
                         // The shell preserves only the trusted protocol on fd 3. Native stdout/stderr
                         // cannot be interpreted as controller callbacks or result frames.
                         let script = format!(
-                            "exec /usr/bin/sandbox-exec -p {} {} --no-addons -e {} 3>&1 1>&2",
-                            shell_quote(FORK_FENCE),
+                            "{} {} --no-addons -e {} 3>&1 1>&2",
+                            fork_fence_prefix(),
                             shell_quote(node.to_str().ok_or("Node executable path is not UTF-8")?),
                             shell_quote(DRIVER),
                         );
-                        let mut command =
-                            shell_command(ctx.workspace, &script, ctx.workspace.root())?;
+                        let mut command = fenced_command(ctx.workspace, &script)?;
                         // Even the explicit filesystem-sandbox opt-out cannot inject code before the fence.
                         strip_runtime_injection(&mut command);
                         check_operation(end, &self.interrupt, cancel)?;
@@ -210,7 +230,7 @@ impl Tool for EvalTool {
             "eval",
             &crate::tools::surface::catalog::execution_description(
                 "eval",
-                "Persistent per-language namespace: language js runs operator-installed Node 22+ JavaScript (not browser page evaluation); language py runs operator-installed Python 3.8+ with real top-level await. The two namespaces are independent. action defaults to eval; reset/cancel/status manage only this execution owner's session for the selected language (cancel without language cancels both). Lexical declarations and top-level bindings persist per language. Within a cell, tool.<name>(...), tool.call(name,args), and tool.schemas use the current controller's direct-tool authorization, approval, validation and observers; denied or malformed calls raise ToolError retaining result metadata. Results return bounded stdout/stderr/value/error; callback results retain text/data/is_error. Requires approval, macOS OS sandbox and mandatory process-fork containment, including when filesystem sandboxing is disabled. Subprocess creation and native addons are denied for js; py cells use the same process-creation fence and, on Windows, require explicit unsandboxed opt-in because filesystem/network isolation is unavailable. Timeout/cancel destroys the selected namespace; if a controller callback is pending its approval/nested operation is also cancelled. Host callback time is not charged to the cell timeout.",
+                "eval: run JavaScript (Node 22+) or Python 3.8+ cells in a persistent per-language namespace. Bindings persist per language; reset/cancel/status affect only this owner's session (cancel without language cancels both). Cells call tools with tool.<name>(...) or tool.call(name,args) under normal approval; denied or malformed calls raise ToolError. Python callbacks are synchronous: normally call tool.write({...}) without await. Their result dictionaries also tolerate await for compatibility; awaiting a completed result never calls the tool again or makes dispatch concurrent. JavaScript callbacks require await. For generated data, use one foreground cell (background:false) to read original input files programmatically, compute, serialize, write and validate the saved artifact. Never transcribe source rows or printed values into another cell. Python example (import csv, io, json and pathlib.Path first): original = Path(source).read_bytes(); computed = {'count': sum(1 for row in csv.DictReader(io.StringIO(original.decode('utf-8'))))}; content = json.dumps(computed); tool.write({'path': path, 'content': content}); saved = json.loads(Path(path).read_text()); assert saved == computed; assert Path(source).read_bytes() == original. Also assert task-specific shape/counts and independently expected results. Keep the cell minimal: no banner comments or duplicate asserts. Its asserts already cover the saved bytes and unchanged inputs, so do not re-hash, cat or reread them in later calls. Equality checks delivery, not the computation's correctness; stdout is not recorded check evidence. JavaScript writes use await tool.write({path, content}). Print only a short validation summary, not the dataset. Reuse namespace variables for corrections unless inputs changed; then reread and recompute. A later validation failure does not undo or authorize replaying the write. Source/config changes use write/edit. Requires approval and OS fork containment (macOS Seatbelt, Linux seccomp/bubblewrap); subprocesses and native js addons are denied; on Windows py needs explicit unsandboxed opt-in. Timeout/cancel destroys the namespace and any pending callback; callback time is not charged.",
             ),
             json!({
                 "language":{"type":"string","enum":["js","py"],"description":"Runtime for this cell; defaults to js."},
@@ -222,6 +242,14 @@ impl Tool for EvalTool {
             }),
             &[],
         )
+    }
+    fn readiness(&self, _: &Config) -> crate::tools::surface::catalog::Readiness {
+        use crate::tools::surface::catalog::Readiness;
+        match super::kernel::cached_fork_containment() {
+            Some(Err(reason)) => Readiness::MissingPrerequisite { reason },
+            // Containment alone does not verify an operator's interpreter installation.
+            Some(Ok(())) | None => Readiness::Unknown,
+        }
     }
     fn needs_approval(&self, _: &Value) -> bool {
         true
@@ -392,3 +420,6 @@ impl EvalTool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests;

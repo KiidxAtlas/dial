@@ -48,10 +48,10 @@ fn successful_edit_model_projection_keeps_fresh_anchors_and_raw_diff() {
 }
 
 #[test]
-fn incomplete_numbered_previews_keep_the_distinct_diff_evidence() {
-    for replacement in [
-        "x".repeat(PREVIEW_LINE_CAP + 1),
-        "x\n".repeat(PREVIEW_MAX_ROWS + 1),
+fn incomplete_numbered_previews_keep_only_distinct_diff_evidence() {
+    for (replacement, diff_for_model) in [
+        ("x".repeat(PREVIEW_LINE_CAP + 1), true),
+        ("x\n".repeat(PREVIEW_MAX_ROWS + 1), false),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
@@ -70,8 +70,14 @@ fn incomplete_numbered_previews_keep_the_distinct_diff_evidence() {
         )
         .unwrap();
         let history = crate::tools::surface::outcome::message_for("edit", "call", &output);
-        assert_eq!(history["content"], output.text);
+        let model = history["content"].as_str().unwrap();
         assert!(output.text.contains("change preview"));
+        // A cut line keeps the diff; a preview cut after its row limit names the omitted
+        // count instead of repeating the change as a diff.
+        assert_eq!(model.contains("change preview"), diff_for_model, "{model}");
+        if !diff_for_model {
+            assert!(model.contains("[preview truncated;"), "{model}");
+        }
     }
 }
 
@@ -969,4 +975,35 @@ fn a_wide_search_page_cannot_evict_the_files_the_model_read() {
     // Searching a file the model already read refreshes it like any other observation.
     store.record_search(&read, "fn read() {}\n", &[(1, 1)]);
     assert_eq!(store.lru.last(), Some(&read));
+}
+
+#[test]
+fn an_oversized_first_line_is_clipped_instead_of_reported_as_an_empty_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let long = "x".repeat(3000);
+    let text = format!("a\n{long}\nb\nc\n");
+    std::fs::write(dir.path().join("f.rs"), &text).unwrap();
+    let budget = crate::tools::fs::select::READ_FOOTER_RESERVE + 500;
+    let out = read_navigation(&ws, "f.rs", 2, 3, budget).unwrap();
+    assert!(!out.contains("no lines in that range"), "{out}");
+    assert!(out.contains("\n2:xxx"), "{out}");
+    assert!(out.contains("…[line truncated]"), "{out}");
+    assert!(out.contains("continue with `f.rs:3-`"), "{out}");
+    // A clipped row is not an edit witness.
+    let abs = ws.resolve("f.rs").unwrap();
+    assert!(!ws.store().witness_flags(&abs, &text)[1]);
+    // With no room for even a clipped row, the result says why rather than "empty range".
+    let tiny = read_navigation(
+        &ws,
+        "f.rs",
+        2,
+        3,
+        crate::tools::fs::select::READ_FOOTER_RESERVE + 10,
+    )
+    .unwrap();
+    assert!(
+        tiny.contains("line 2 does not fit the remaining output budget"),
+        "{tiny}"
+    );
 }

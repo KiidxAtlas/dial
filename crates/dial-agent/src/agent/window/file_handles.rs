@@ -155,7 +155,9 @@ pub(in crate::agent) fn model_result(workspace: &Workspace, call: &ToolCall, tex
                 .ok()
                 .and_then(|path| workspace.file_handle(&path).ok())
                 .map(|handle| format!("[{handle}#{tag}]"))
-        } else if name == "glob" && !body.starts_with('[') {
+        } else if name == "glob" && !body.trim().is_empty() && !body.starts_with('[') {
+            // Only listed paths are labeled; a blank separator line would otherwise resolve to
+            // the workspace root and render as an empty `@fN()` label.
             workspace
                 .resolve(body)
                 .ok()

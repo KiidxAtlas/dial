@@ -185,6 +185,10 @@ fn lmstudio_served_embedders_stay_available_for_embedding_roles() {
         tool_use: false,
         loaded: false,
         loaded_context: None,
+        vision: None,
+        native_tools: None,
+        reasoning_options: Vec::new(),
+        reasoning_default: None,
     };
     let mut models = vec![
         served("nomic-embed", true),
@@ -678,6 +682,135 @@ fn ollama_models_take_their_purpose_from_api_show_capabilities() {
         (None, None, None)
     );
 }
+
+#[test]
+fn osaurus_discovery_enriches_sparse_model_rows_without_changing_transport() {
+    let url = routed(vec![
+        ("/v1/models", r#"{"data":[{"id":"gemma","owned_by":"osaurus"}]}"#.into()),
+        ("/api/show", r#"{"capabilities":["completion","vision","tools","thinking"],"model_info":{"gemma4.context_length":262144}}"#.into()),
+    ]);
+    let (status, models) = probe_models(&test_probe(url, "osaurus"));
+    assert_eq!(status.state, "reachable");
+    let model = &models[0];
+    assert_eq!(model.selection.provider, "osaurus");
+    assert_eq!(model.selection.protocol, Some(ApiProtocol::ChatCompletions));
+    assert_eq!(model.selection.context_window, Some(262144));
+    assert_eq!(model.metadata.kind, ModelKind::Chat);
+    assert_eq!(
+        (
+            model.metadata.vision,
+            model.metadata.tools,
+            model.metadata.reasoning
+        ),
+        (Some(true), Some(true), Some(true))
+    );
+    assert_eq!(
+        model.metadata.image_generation, None,
+        "vision is not image generation"
+    );
+}
+
+#[test]
+fn osaurus_optional_metadata_failure_keeps_models_available_and_unknown() {
+    for shown in [
+        None,
+        Some("not json"),
+        Some(r#"{"model_info":{"x.context_length":0}}"#),
+    ] {
+        let mut routes = vec![("/v1/models", r#"{"data":[{"id":"m"}]}"#.into())];
+        if let Some(shown) = shown {
+            routes.push(("/api/show", shown.into()));
+        }
+        let (status, models) = probe_models(&test_probe(routed(routes), "osaurus"));
+        assert_eq!(status.state, "reachable");
+        assert_eq!(models.len(), 1);
+        assert!(models[0].available);
+        assert_eq!(models[0].selection.context_window, None);
+        assert_eq!(models[0].metadata.kind, ModelKind::Unknown);
+        assert_eq!(models[0].metadata.tools, None);
+    }
+}
+
+#[test]
+fn osaurus_enrichment_preserves_explicit_listing_metadata_and_is_provider_scoped() {
+    let routes = || {
+        vec![
+        ("/v1/models", r#"{"data":[{"id":"m","type":"llm","context_length":8192,"tools":false}]}"#.into()),
+        ("/api/show", r#"{"capabilities":["completion","vision","tools"],"model_info":{"x.context_length":262144}}"#.into()),
+    ]
+    };
+    let (_, models) = probe_models(&test_probe(routed(routes()), "osaurus"));
+    assert_eq!(models[0].selection.context_window, Some(8192));
+    assert_eq!(models[0].metadata.tools, Some(false));
+    assert_eq!(models[0].metadata.vision, Some(true));
+    assert_eq!(models[0].metadata.reasoning, Some(false));
+    let (_, models) = probe_models(&test_probe(routed(routes()), "custom"));
+    assert_eq!(
+        models[0].metadata.vision, None,
+        "other OpenAI servers are not sent Osaurus enrichment"
+    );
+}
+
+#[test]
+fn osaurus_metadata_requests_are_bounded_and_authenticated() {
+    let rows: Vec<_> = (0..40)
+        .map(|i| serde_json::json!({"id":format!("m-{i}")}))
+        .collect();
+    let mut responses = vec![serde_json::json!({"data":rows}).to_string()];
+    responses.extend(vec![
+            r#"{"capabilities":["completion"],"model_info":{"x.context_length":4096}}"#.into();
+            MAX_ENRICHMENTS
+        ]);
+    let (url, job) = listing_pages(responses);
+    let mut probe = test_probe(url, "osaurus");
+    probe.token = Some("test-osaurus-key".into());
+    let (status, models) = probe_models(&probe);
+    assert_eq!(status.state, "reachable");
+    assert_eq!(models.len(), 40);
+    assert_eq!(
+        models
+            .iter()
+            .filter(|m| m.selection.context_window == Some(4096))
+            .count(),
+        MAX_ENRICHMENTS
+    );
+    let requests = job.join().unwrap();
+    assert_eq!(requests.len(), MAX_ENRICHMENTS + 1);
+    assert!(requests.iter().all(|request| {
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-osaurus-key")
+    }));
+    assert!(
+        requests[1..]
+            .iter()
+            .all(|request| request.starts_with("POST /api/show "))
+    );
+}
+
+#[test]
+#[ignore = "requires running Osaurus and DIAL_TEST_OSAURUS_MODEL; metadata only, never loads weights"]
+fn osaurus_live_discovery_reports_capabilities_and_context() {
+    let model = std::env::var("DIAL_TEST_OSAURUS_MODEL").expect("installed Osaurus model id");
+    let base =
+        std::env::var("OSAURUS_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1337/v1".into());
+    let (status, models) = probe_models(&test_probe(base, "osaurus"));
+    assert_eq!(status.state, "reachable", "{status:?}");
+    let entry = models
+        .iter()
+        .find(|entry| entry.selection.model == model)
+        .expect("model is listed");
+    assert!(
+        entry.selection.context_window.is_some(),
+        "context metadata missing"
+    );
+    assert!(entry.metadata.tools.is_some(), "tool capability unknown");
+    assert!(entry.metadata.vision.is_some(), "vision capability unknown");
+    assert!(
+        entry.metadata.reasoning.is_some(),
+        "reasoning capability unknown"
+    );
+}
 #[test]
 fn auth_redirect_invalid_and_oversized_responses_are_explicit_failures() {
     for (code, body, expected) in [
@@ -1072,9 +1205,15 @@ fn failed_live_probe_retains_cached_and_configured_models_as_unverified() {
     )
     .unwrap();
     let mut configured = BTreeMap::new();
-    for id in ["lm-studio", "ollama", "llama-cpp", "docker-model-runner"]
-        .into_iter()
-        .chain(KNOWN.iter().map(|row| row.0))
+    for id in [
+        "lm-studio",
+        "ollama",
+        "llama-cpp",
+        "docker-model-runner",
+        "osaurus",
+    ]
+    .into_iter()
+    .chain(KNOWN.iter().map(|row| row.0))
     {
         configured.insert(
             id.into(),
@@ -1387,6 +1526,15 @@ fn malformed_credentials_fail_closed_without_echoing_content() {
 }
 /// Answers any number of requests by path; unknown paths get 404 like a server without the native API.
 pub(crate) fn routed(routes: Vec<(&'static str, String)>) -> String {
+    routed_responses(
+        routes
+            .into_iter()
+            .map(|(path, body)| (path, 200, body))
+            .collect(),
+    )
+}
+
+fn routed_responses(routes: Vec<(&'static str, u16, String)>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -1413,8 +1561,8 @@ pub(crate) fn routed(routes: Vec<(&'static str, String)>) -> String {
             let path = first.split_whitespace().nth(1).unwrap_or("").to_owned();
             let (code, body) = routes
                 .iter()
-                .find(|(route, _)| *route == path)
-                .map(|(_, body)| (200, body.clone()))
+                .find(|(route, _, _)| *route == path)
+                .map(|(_, code, body)| (*code, body.clone()))
                 .unwrap_or((404, "{}".into()));
             let _ = write!(
                 stream,
@@ -1423,7 +1571,48 @@ pub(crate) fn routed(routes: Vec<(&'static str, String)>) -> String {
             );
         }
     });
+    // Tests bind port 0, so an earlier test's cached answers for this port belong to another server.
+    forget_llama_props(&format!("http://{address}"));
     format!("http://{address}/v1")
+}
+#[test]
+fn a_native_route_that_answered_404_is_not_probed_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    forget_llama_props(&format!("http://{address}"));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 404 X\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+        }
+    });
+    let url = format!("http://{address}/v1");
+    assert_eq!(loaded_context(&url, "m", None, &[]), None);
+    assert!(!is_llama_server(&url, None, &[]));
+    let first = hits.load(Ordering::SeqCst);
+    assert!(first > 0, "the first lookup probes the native routes");
+    assert_eq!(loaded_context(&url, "m", None, &[]), None);
+    assert!(!is_llama_server(&url, None, &[]));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        first,
+        "routes that answered 404 are not asked again"
+    );
 }
 fn lm_studio_routes() -> Vec<(&'static str, String)> {
     let native = serde_json::json!({"data":[
@@ -1492,6 +1681,149 @@ fn lm_studio_native_metadata_declares_image_input_and_tool_use() {
         "text-only llm; no tool_use is not a refusal"
     );
     assert_eq!(meta("embedder"), (None, None), "embedders make no claim");
+}
+
+#[test]
+fn lmstudio_v1_discovery_and_context_match_keys_and_loaded_instance_aliases() {
+    let native = serde_json::json!({"models":[
+        {"key":"publisher/model", "type":"llm", "max_context_length":131072,
+         "loaded_instances":[
+            {"id":"small", "config":{"context_length":4096}},
+            {"id":"large", "config":{"context_length":16384}}],
+         "capabilities":{"vision":true, "trained_for_tool_use":true,
+            "reasoning":{"allowed_options":["off","low","high"],"default":"low"}}},
+        {"key":"cold", "type":"llm", "loaded_instances":[], "max_context_length":262144,
+         "capabilities":{"vision":false,"trained_for_tool_use":false}},
+        {"key":"embedder", "type":"embedding", "loaded_instances":[]}
+    ]});
+    let url = routed(vec![
+        ("/api/v1/models", native.to_string()),
+        ("/v1/models", serde_json::json!({"data":[
+            {"id":"publisher/model"},{"id":"small"},{"id":"large"},{"id":"cold"},{"id":"embedder"}
+        ]}).to_string()),
+        ("/api/v0/models", r#"{"data":[{"id":"small","state":"loaded","loaded_context_length":999}]}"#.into()),
+    ]);
+    let (status, models) = probe_models(&test_probe(url.clone(), "lm-studio"));
+    assert_eq!(status.state, "reachable");
+    for (id, expected) in [
+        ("publisher/model", Some(4096)),
+        ("small", Some(4096)),
+        ("large", Some(16384)),
+        ("cold", None),
+    ] {
+        let entry = models
+            .iter()
+            .find(|entry| entry.selection.model == id)
+            .unwrap();
+        assert_eq!(
+            entry.selection.context_window, expected,
+            "discovery for {id}"
+        );
+        assert_eq!(
+            loaded_context(&url, id, None, &[]),
+            expected,
+            "runtime for {id}"
+        );
+    }
+    let warm = &models
+        .iter()
+        .find(|entry| entry.selection.model == "small")
+        .unwrap()
+        .metadata;
+    assert_eq!(
+        (warm.vision, warm.tools, warm.reasoning),
+        (Some(true), Some(true), Some(true))
+    );
+    assert!(
+        models
+            .iter()
+            .find(|entry| entry.selection.model == "embedder")
+            .unwrap()
+            .is_embedding()
+    );
+    let headers = super::super::model_config::resolve_headers(&[]).unwrap();
+    let model = lmstudio_model_with_headers(&url, "large", None, &headers).unwrap();
+    assert_eq!(model.reasoning_options, ["off", "low", "high"]);
+    assert_eq!(model.reasoning_default.as_deref(), Some("low"));
+}
+
+#[test]
+fn lmstudio_v1_missing_or_malformed_metadata_remains_unknown() {
+    for context in [
+        Value::Null,
+        serde_json::json!(0),
+        serde_json::json!(-1),
+        serde_json::json!("8192"),
+        serde_json::json!(u64::MAX),
+    ] {
+        let parsed = parse_lmstudio(&serde_json::json!({"models":[
+            {"key":"model","type":"llm","max_context_length":131072,
+             "loaded_instances":[{"id":"known","config":{"context_length":8192}},
+                                 {"id":"unknown","config":{"context_length":context}}],
+             "capabilities":{"vision":"true", "trained_for_tool_use":null,
+                "reasoning":{"allowed_options":["future",3],"default":"on"}}}
+        ]}));
+        let model = parsed.iter().find(|model| model.id == "model").unwrap();
+        assert_eq!(model.loaded_context, None);
+        assert_eq!((model.vision, model.native_tools), (None, None));
+        assert!(model.reasoning_options.is_empty());
+        assert_eq!(model.reasoning_default, None);
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|model| model.id == "known")
+                .unwrap()
+                .loaded_context,
+            Some(8192)
+        );
+    }
+    assert!(parse_lmstudio(&serde_json::json!({"models":[{}, {"key":""}]})).is_empty());
+}
+
+#[test]
+fn lmstudio_version_fallback_is_only_for_unsupported_routes() {
+    let headers = super::super::model_config::resolve_headers(&[]).unwrap();
+    for code in [404, 405, 501, 401, 403, 500, 200] {
+        let url = routed_responses(vec![
+            ("/api/v1/models", code, "{}".into()),
+            (
+                "/api/v0/models",
+                200,
+                r#"{"data":[{"id":"legacy","state":"loaded","loaded_context_length":4096}]}"#
+                    .into(),
+            ),
+        ]);
+        let found = lmstudio_models_with_headers(&url, None, &headers);
+        if matches!(code, 404 | 405 | 501) {
+            assert_eq!(found.unwrap()[0].id, "legacy", "HTTP {code}");
+        } else {
+            assert!(
+                found.is_none(),
+                "HTTP {code} must not be hidden by legacy metadata"
+            );
+        }
+    }
+    let (url, job) = server(200, "not json".into());
+    assert!(lmstudio_models_with_headers(&url, None, &headers).is_none());
+    job.join().unwrap();
+}
+
+#[test]
+fn lmstudio_native_v1_forwards_configured_authentication_headers() {
+    let configured: Vec<super::super::model_config::RequestHeader> = serde_json::from_value(
+        serde_json::json!([{"name":"X-Test-Route", "value":{"literal":"local-metadata"}}]),
+    )
+    .unwrap();
+    let headers = super::super::model_config::resolve_headers(&configured).unwrap();
+    let (url, job) = server(200, r#"{"models":[]}"#.into());
+    assert_eq!(
+        lmstudio_models_with_headers(&url, Some("test-token"), &headers),
+        Some(Vec::new())
+    );
+    let request = job.join().unwrap().to_ascii_lowercase();
+    assert!(request.starts_with("get /api/v1/models "));
+    assert!(request.contains("authorization: bearer test-token\r\n"));
+    assert!(request.contains("x-test-route: local-metadata\r\n"));
 }
 #[test]
 fn llama_server_is_recognised_by_props_on_local_hosts_only() {
@@ -1673,6 +2005,21 @@ fn llama_cpp_and_ollama_report_the_context_they_actually_serve() {
         None,
         "a server with none of the native APIs"
     );
+    let osaurus = routed(vec![
+        (
+            "/v1/models",
+            r#"{"data":[{"id":"gemma","owned_by":"osaurus"}]}"#.into(),
+        ),
+        (
+            "/api/show",
+            r#"{"model_info":{"gemma4.context_length":262144}}"#.into(),
+        ),
+    ]);
+    assert_eq!(
+        loaded_context(&osaurus, "gemma", None, &[]),
+        Some(262144),
+        "an OpenAI-compatible server answering /api/show without /api/ps (Osaurus)"
+    );
 }
 
 #[test]
@@ -1793,13 +2140,15 @@ fn direct_image_providers_are_annotated_by_exact_documented_ids() {
             {"id":"gpt-image-1"},
             {"id":"gpt-image-2.5-flare"},
             {"id":"gpt-4o"},
-            {"id":"gpt-image-1-custom"}
+            {"id":"gpt-image-1-custom"},
+            {"id":"gpt-image-2.6-sunburst"}
         ]}),
         &openai,
     )
     .unwrap();
     let api = |i: usize| entries[i].metadata.image_generation;
     assert_eq!(api(0), Some(ImageGenerationApi::Images));
+    assert_eq!(api(4), Some(ImageGenerationApi::Images));
     assert_eq!(api(1), Some(ImageGenerationApi::Images));
     assert_eq!(api(2), None);
     assert_eq!(api(3), None);

@@ -37,6 +37,7 @@ mod emulation;
 mod external;
 mod init_scripts;
 mod network;
+mod observe;
 mod orphans;
 mod profile;
 mod requests;
@@ -184,6 +185,7 @@ impl Tool for BrowserTool {
                     "dialog_mode":{"type":"string","enum":["accept","dismiss"],"description":"dialog policy for the next dialog, or all dialogs with once=false; prompt reply uses text."},
                     "once":{"type":"boolean","description":"dialog policy applies once by default."},
                     "after":{"type":"integer","minimum":0,"description":"events: return tab events (console, network, dialogs, downloads, navigation) with seq greater than this; default 0."},
+                    "observe":observe::schema(),
                     "full_page":{"type":"boolean"}, "timeout":{"type":"integer","minimum":0,"maximum":3600},
                 }),
                 json!({
@@ -290,6 +292,7 @@ impl BrowserTool {
             .get("action")
             .and_then(Value::as_str)
             .ok_or("action is required")?;
+        observe::validate(action, args)?;
         let timeout = deadline(args, self.config.timeout_secs)?;
         let end = execution_deadline(timeout);
         // Never erase cancellation between active-tool registration and call entry.
@@ -431,7 +434,13 @@ impl BrowserTool {
             if external.is_none() {
                 *external = external::select(&self.config, |key| std::env::var(key).ok());
             }
-            external.as_mut().map(|backend| backend.run(action, args))
+            external.as_mut().map(|backend| {
+                if args.get("observe").is_some() {
+                    Err("observe is not supported by the cmux browser backend".into())
+                } else {
+                    backend.run(action, args)
+                }
+            })
         };
         if let Some(result) = external_result {
             return result;

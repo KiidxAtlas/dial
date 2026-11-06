@@ -71,6 +71,9 @@ impl Tool for DataTool {
     fn may_modify_workspace(&self, _: &Value) -> bool {
         false
     }
+    fn supports_background(&self, _: &Value) -> bool {
+        true
+    }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         self.call_streaming(ctx, args, &|_| {}, &AtomicBool::new(false))
     }

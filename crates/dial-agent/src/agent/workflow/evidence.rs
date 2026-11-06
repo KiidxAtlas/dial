@@ -186,7 +186,7 @@ pub fn reclaimable_tokens(messages: &[Value], memo: &Supersession, policy: &Poli
 }
 
 /// Tools whose results are observations of the project, not changes to it, and whose full text is retrievable from
-/// an artifact. Mutation results, todo and memory updates, and `artifact_read` itself are never dropped. Bounded
+/// an artifact. Mutation results, todo and memory updates, and artifact:// reads themselves are never dropped. Bounded
 /// read-only investigation tools (data, documents, media, traces, timelines) are observations too: their text is
 /// retained like any other result, so under pressure an old one is as recoverable as a `read`. Tools that also
 /// record state (`workbench correct`, `evidence`, `research`, `investigate`) are deliberately absent.
@@ -285,6 +285,15 @@ fn observation_calls(messages: &[Value]) -> HashMap<String, Value> {
         {
             continue;
         }
+        // An artifact:// read is the retrieval of already-archived evidence; pruning it would only point back
+        // at the archive the model just asked to see.
+        if name == "read"
+            && arguments["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("artifact://"))
+        {
+            continue;
+        }
         calls.insert(id.to_owned(), json!([name, arguments]));
     }
     calls
@@ -360,7 +369,7 @@ fn condense_resolved_failures(
                 return None;
             }
             let success = successes.get(&key)?;
-            Some(format!("[Historical failed read-only attempt {id}; exact retry succeeded in tool result {success}. This does not verify other work. Original diagnostic: {artifact}; retrieve with artifact_read]"))
+            Some(format!("[Historical failed read-only attempt {id}; exact retry succeeded in tool result {success}. This does not verify other work. Original diagnostic: {artifact}; retrieve with read]"))
         });
         let Some(placeholder) = placeholder else {
             continue;
@@ -437,7 +446,7 @@ fn prune(
 /// through `pruned_form`, so a pointer is never counted toward a batch that would not actually be written.
 fn prune_pointer(tool: &str, bytes: usize, artifact: &str) -> String {
     format!(
-        "[Older {tool} result omitted to save context ({bytes} bytes). Full output: {artifact}; retrieve with artifact_read]"
+        "[Older {tool} result omitted to save context ({bytes} bytes). Full output: {artifact}; retrieve with read]"
     )
 }
 

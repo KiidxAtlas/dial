@@ -1913,3 +1913,34 @@ fn child_reasoning_strategy_is_inherited_on_initial_and_resumed_requests_without
         }
     }
 }
+
+#[test]
+fn child_refuses_post_edit_checks_before_mutating_source() {
+    for tool in ["edit", "write"] {
+        let arguments = if tool == "edit" {
+            json!({"path":"source-0.txt","old_string":"source","new_string":"changed","check":true})
+        } else {
+            json!({"path":"source-0.txt","content":"changed","check":true})
+        };
+        let scripts = vec![
+            scripted_reply("", Some((tool, arguments))),
+            scripted_reply(
+                "The foreground controller must run focused checks; no mutation was applied.",
+                None,
+            ),
+        ];
+        let (_, requests, _, started) =
+            scripted_worker_with_config(&[tool], scripts, 0, vec![], |config| {
+                config.edit.mode = crate::config::types::EditMode::Replace;
+            });
+        assert!(
+            started.is_empty(),
+            "unsupported {tool} must not start: {started:?}"
+        );
+        assert!(
+            requests[1]["messages"]
+                .to_string()
+                .contains("foreground controller")
+        );
+    }
+}

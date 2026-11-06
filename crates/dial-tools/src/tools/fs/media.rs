@@ -61,7 +61,7 @@ pub(crate) fn read(
         return None;
     }
     // A literal file that exists wins over selector syntax.
-    let (file, selector) = if ws.resolve(path_text).is_ok_and(|p| p.is_file()) {
+    let (file, selector) = if ws.resolve_read(path_text).is_ok_and(|p| p.is_file()) {
         (path_text, "")
     } else {
         split(path_text)
@@ -181,7 +181,7 @@ fn pdf_page(selector: &str) -> Option<u32> {
 }
 
 fn resolve(ws: &Workspace, file: &str) -> Result<PathBuf> {
-    let path = ws.resolve(file).map_err(anyhow::Error::msg)?;
+    let path = ws.resolve_read(file).map_err(anyhow::Error::msg)?;
     ensure!(path.is_file(), "{file} is not a regular file");
     Ok(path)
 }

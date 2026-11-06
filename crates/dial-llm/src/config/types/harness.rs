@@ -57,36 +57,46 @@ impl Default for Harness {
     }
 }
 
-/// One-way migration of the removed monolithic memory tool selection.
+/// One-way migration of the removed split memory tool names onto the single `memory` tool.
 pub fn migrate_memory_tools(harness: &mut Harness) -> bool {
     migrate_memory_tool_names(&mut harness.tools)
 }
 
+/// Tool names replaced by `memory` and its `action` argument.
+pub(crate) const SPLIT_MEMORY_TOOLS: [&str; 8] = [
+    "recall",
+    "retain",
+    "memory_update",
+    "forget",
+    "memory_history",
+    "memory_import",
+    "reflect",
+    "learn",
+];
+
+/// `artifact_read` merged into the built-in `read` (`artifact://` paths), so a saved selection drops it.
+pub(crate) const MERGED_INTO_READ: &str = "artifact_read";
+
+/// Whether a saved tool name was retired by the memory or artifact merges.
+pub(crate) fn retired_tool_name(tool: &str) -> bool {
+    SPLIT_MEMORY_TOOLS.contains(&tool) || tool == MERGED_INTO_READ
+}
+
+/// Replace every split memory name with one `memory` at the first one's position and drop
+/// `artifact_read`; other entries, including unrelated duplicates, stay for validation.
 pub(crate) fn migrate_memory_tool_names(tools: &mut Vec<String>) -> bool {
-    const REPLACEMENTS: [&str; 6] = [
-        "recall",
-        "retain",
-        "memory_update",
-        "forget",
-        "memory_history",
-        "memory_import",
-    ];
-    if !tools.iter().any(|tool| tool == "memory") {
+    if !tools.iter().any(|tool| retired_tool_name(tool)) {
         return false;
     }
-    let present = REPLACEMENTS.map(|replacement| tools.iter().any(|tool| tool == replacement));
-    let mut added = [false; 6];
+    let mut placed = tools.iter().any(|tool| tool == "memory");
     let original = std::mem::take(tools);
-    tools.reserve(original.len().saturating_add(REPLACEMENTS.len()));
     for tool in original {
-        if tool == "memory" {
-            for (index, replacement) in REPLACEMENTS.iter().enumerate() {
-                if !present[index] && !added[index] {
-                    tools.push((*replacement).into());
-                    added[index] = true;
-                }
+        if SPLIT_MEMORY_TOOLS.contains(&tool.as_str()) {
+            if !placed {
+                tools.push("memory".into());
+                placed = true;
             }
-        } else {
+        } else if tool != MERGED_INTO_READ {
             tools.push(tool);
         }
     }

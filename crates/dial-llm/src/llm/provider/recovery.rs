@@ -71,7 +71,6 @@ impl Backend {
         &mut self,
         state: &mut RetryState,
         attempt: AuthAttempt<'a>,
-        on_notice: &mut dyn FnMut(&str),
     ) -> Result<PreparedAuth<'a>> {
         let AuthAttempt {
             attempt,
@@ -133,17 +132,6 @@ impl Backend {
             oauth_access,
             url: None,
         };
-        let auth = prepared.token();
-        if !self.subscription_noticed
-            && auth.is_some_and(llm::anthropic::subscription_token)
-            && matches!(
-                self.kind,
-                ProviderKind::AnthropicEndpoint { .. } | ProviderKind::AnthropicSubscription { .. }
-            )
-        {
-            on_notice(llm::anthropic::SUBSCRIPTION_WARNING);
-            self.subscription_noticed = true;
-        }
         let oauth_url = match prepared
             .oauth_access
             .as_ref()

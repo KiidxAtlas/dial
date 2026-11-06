@@ -616,7 +616,7 @@ fn screening_applies_to_content_provenance_corrections_and_external_changes() {
 fn tool_contract_approvals_confirm_scope_and_session_are_enforced() {
     let (_home, _project, layout) = layout();
     let memory = Arc::new(ProvenanceMemory::open(&layout).unwrap());
-    let tools = tools(memory.clone(), "real-session");
+    let tool = tool(memory.clone(), "real-session");
     let workspace = Workspace::new(&layout.project_root).unwrap();
     let config = Config::default();
     let context = ToolContext {
@@ -625,31 +625,31 @@ fn tool_contract_approvals_confirm_scope_and_session_are_enforced() {
         mutation_authorizer: None,
         confirm: None,
     };
-    for tool in &tools {
+    for action in ["recall", "retain", "update", "forget", "history", "import"] {
         assert_eq!(
-            tool.needs_approval(&json!({})),
-            !matches!(tool.name(), "recall" | "memory_history")
+            tool.needs_approval(&json!({"action":action})),
+            !matches!(action, "recall" | "history")
         );
-        assert_eq!(tool.schema()["function"]["name"], tool.name());
     }
-    let import = tools
-        .iter()
-        .find(|tool| tool.name() == "memory_import")
-        .unwrap();
-    assert!(import.call(&context, &json!({"scope":"project"})).is_error);
-    let retain = tools.iter().find(|tool| tool.name() == "retain").unwrap();
+    assert_eq!(tool.schema()["function"]["name"], tool.name());
+    assert!(
+        tool.call(&context, &json!({"action":"import","scope":"project"}))
+            .is_error
+    );
+    assert!(tool.call(&context, &json!({"action":"retire"})).is_error);
+    let retain = &tool;
     assert!(
         retain
             .call(
                 &context,
-                &json!({"scope":"other","content":"Clean fact","source":"user"})
+                &json!({"action":"retain","scope":"other","content":"Clean fact","source":"user"})
             )
             .is_error
     );
-    assert!(retain.call(&context, &json!({"scope":"project","content":"Clean fact","source":"user","expires_at":"tomorrow"})).is_error);
+    assert!(retain.call(&context, &json!({"action":"retain","scope":"project","content":"Clean fact","source":"user","expires_at":"tomorrow"})).is_error);
     let output = retain.call(
         &context,
-        &json!({"scope":"project","content":"Clean fact","source":"user","session_id":"forged"}),
+        &json!({"action":"retain","scope":"project","content":"Clean fact","source":"user","session_id":"forged"}),
     );
     assert!(!output.is_error, "{}", output.text);
     assert_eq!(
@@ -664,10 +664,10 @@ fn tool_contract_approvals_confirm_scope_and_session_are_enforced() {
         mutation_authorizer: None,
         confirm: None,
     };
-    let recall = tools.iter().find(|tool| tool.name() == "recall").unwrap();
+    let recall = &tool;
     assert!(
         recall
-            .call(&other_context, &json!({"query":"fact"}))
+            .call(&other_context, &json!({"action":"recall","query":"fact"}))
             .is_error
     );
     assert_eq!(

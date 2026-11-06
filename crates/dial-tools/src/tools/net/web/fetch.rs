@@ -60,6 +60,8 @@ struct DiscoveryRemaining {
 pub struct Client {
     agent: ureq::Agent,
     interrupt: Arc<AtomicBool>,
+    /// Job-owned cancellation is never cleared by reset_interrupt at operation start.
+    external_cancel: Option<Arc<AtomicBool>>,
     /// Total seconds one request may take, set from `web.timeout_secs` at each tool call.
     timeout_secs: AtomicU64,
     discovery: Option<Arc<Discovery>>,
@@ -68,6 +70,13 @@ pub struct Client {
 impl Client {
     pub fn new() -> Self {
         Self::with_resolver(GuardedResolver::new())
+    }
+
+    pub(super) fn with_cancel(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            external_cancel: Some(cancel),
+            ..Self::new()
+        }
     }
 
     #[cfg(test)]
@@ -85,6 +94,7 @@ impl Client {
         Self {
             agent: ureq::Agent::with_parts(config, DefaultConnector::new(), resolver),
             interrupt: Arc::new(AtomicBool::new(false)),
+            external_cancel: None,
             timeout_secs: AtomicU64::new(DEFAULT_WEB_TIMEOUT_SECS),
             discovery: None,
         }
@@ -107,6 +117,10 @@ impl Client {
 
     pub fn is_interrupted(&self) -> bool {
         self.interrupt.load(Ordering::Acquire)
+            || self
+                .external_cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(Ordering::Acquire))
     }
 
     /// A scoped client for optional discovery; ordinary fetches and document downloads keep their
@@ -117,6 +131,7 @@ impl Client {
         Self {
             agent: self.agent.clone(),
             interrupt: self.interrupt.clone(),
+            external_cancel: self.external_cancel.clone(),
             timeout_secs: AtomicU64::new(self.timeout_secs.load(Ordering::Acquire)),
             discovery: Some(Arc::new(Discovery {
                 deadline: Instant::now() + timeout,
@@ -172,7 +187,14 @@ impl Client {
         post: Option<(&str, &[u8])>,
         limit: usize,
     ) -> Result<Response, String> {
-        self.send_limited_until(url, accept, headers, post, limit, &self.interrupt)
+        self.send_limited_until(
+            url,
+            accept,
+            headers,
+            post,
+            limit,
+            self.external_cancel.as_deref().unwrap_or(&self.interrupt),
+        )
     }
 
     /// [`send_limited`](Self::send_limited) that stops when `cancel` is set instead of this

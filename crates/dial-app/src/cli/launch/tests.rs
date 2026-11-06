@@ -75,3 +75,38 @@ fn prompt_text_and_deadline_carry_through() {
     assert_eq!(launch.append_system_prompt.as_deref(), Some("cite sources"));
     assert!(launch.deadline.is_some());
 }
+
+#[test]
+fn read_only_directory_flags_are_repeatable_and_launch_local() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        tools: crate::cli::tool_flags::ToolFlagArgs,
+    }
+    let cli = Cli::try_parse_from([
+        "dial",
+        "--read-only-dir",
+        "/reference",
+        "--read-only-dir",
+        "/fixtures",
+    ])
+    .unwrap();
+    let mut overlay = toml::Table::new();
+    let settings = crate::cli::tool_flags::apply(&cli.tools, &mut overlay, &[], &[]).unwrap();
+    let launch = agent_launch(&settings, &ModelFlags::default());
+    assert_eq!(
+        launch.read_only_dirs,
+        [
+            std::path::PathBuf::from("/reference"),
+            std::path::PathBuf::from("/fixtures")
+        ]
+    );
+    assert!(settings.add_dirs.is_empty());
+    assert!(overlay.is_empty());
+    assert!(
+        agent_launch(&EffectiveSettings::default(), &ModelFlags::default())
+            .read_only_dirs
+            .is_empty()
+    );
+}

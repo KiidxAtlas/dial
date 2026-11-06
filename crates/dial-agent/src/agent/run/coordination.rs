@@ -59,8 +59,9 @@ fn remember(history: &History, peer: &str, outgoing: bool, text: &str) {
     });
 }
 
-/// Sends letters for this session while a turn holds the agent. Writing to a peer's inbox does
-/// not touch this session's work, so the terminal can send at once instead of at the turn's end.
+/// The registry handle a turn takes at its start. Writing to a peer's inbox or reading the registry
+/// does not touch this session's work, so the terminal can send and show peers at once instead of
+/// waiting for the turn's end.
 #[derive(Clone)]
 pub struct PeerSender {
     participant: Arc<Participant>,
@@ -74,6 +75,65 @@ impl PeerSender {
         remember(&self.history, to, true, text);
         Ok(())
     }
+
+    /// The peer board while a turn holds the agent. This session's summary, phase and scopes come
+    /// from its published record; letters already drained for the next request are not counted.
+    pub fn board(&self) -> Result<PeerBoard> {
+        let own = self.participant.own()?;
+        board(&self.participant, own.summary, own.phase, own.scopes, 0)
+    }
+
+    /// Same conversation as [`Agent::peer_messages`], readable while a turn holds the agent.
+    pub fn messages(&self) -> Result<Vec<PeerMessage>> {
+        messages(&self.participant, &self.history)
+    }
+}
+
+fn board(
+    participant: &Participant,
+    summary: String,
+    phase: String,
+    scopes: Vec<String>,
+    pending: usize,
+) -> Result<PeerBoard> {
+    let queued = participant.mail_count()? + pending;
+    let peers: Vec<BoardPeer> = participant
+        .peers()?
+        .into_iter()
+        .map(|peer| BoardPeer {
+            overlapping: overlapping(&peer.scopes, &scopes),
+            peer,
+        })
+        .collect();
+    let claimed: Vec<String> = peers
+        .iter()
+        .flat_map(|peer| peer.peer.scopes.iter().cloned())
+        .collect();
+    Ok(PeerBoard {
+        id: participant.id().to_owned(),
+        overlapping: overlapping(&scopes, &claimed),
+        summary,
+        phase,
+        scopes,
+        peers,
+        queued,
+    })
+}
+
+fn messages(participant: &Participant, history: &History) -> Result<Vec<PeerMessage>> {
+    let mut messages: Vec<PeerMessage> = history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect();
+    messages.extend(participant.queued()?.into_iter().map(|letter| PeerMessage {
+        peer: letter.from,
+        outgoing: false,
+        text: letter.text,
+        unread: true,
+    }));
+    Ok(messages)
 }
 
 /// Opaque process-owned presence carried across an interactive same-session rebuild.
@@ -273,6 +333,45 @@ impl Agent<'_> {
         }
     }
 
+    /// Whether this agent takes part in project coordination (the `peers` tool's eligibility).
+    pub(in crate::agent) fn coordination_enabled(&self) -> bool {
+        !self.hermetic && self.config.coordination.enabled && self.layout.is_some()
+    }
+
+    /// The top-level `message` tool: one recipient namespace for this session's workers and the
+    /// project's peers. Worker ids and labels resolve first; an unknown 32-hex peer id is sent like
+    /// `peers` send. `all` stays within this session. Omitting `to` adds live peers to the roster.
+    pub(in crate::agent) fn message_tool(&mut self, args: &Value) -> ToolOutput {
+        use crate::agent::workers::{live_tasks, mailbox};
+        let to = args.get("to").filter(|to| !to.is_null());
+        let result = self.live_tasks.message_call(args);
+        if !self.coordination_enabled() {
+            return live_tasks::output(result);
+        }
+        match (to, result) {
+            (None, Ok(mut roster)) => {
+                self.initialize_coordination();
+                if let Some(peers) = self
+                    .peer_state
+                    .participant
+                    .as_ref()
+                    .and_then(|participant| participant.peers().ok())
+                {
+                    roster["peers"] = json!(peers
+                        .iter()
+                        .map(|peer| json!({"id":peer.id,"phase":peer.phase,"summary":peer.summary}))
+                        .collect::<Vec<_>>());
+                }
+                live_tasks::output(Ok(roster))
+            }
+            (Some(Value::String(to)), Err(_)) if mailbox::is_peer_id(to.trim()) => self
+                .peer_coordination(
+                    &json!({"action":"send","to":to.trim(),"text":args.get("text")}),
+                ),
+            (_, result) => live_tasks::output(result),
+        }
+    }
+
     /// The `/peers` panel's snapshot. Like an explicit `/peers`, it retries a failed join at once.
     pub fn peer_board(&mut self) -> Result<PeerBoard> {
         if self.peer_state.participant.is_none() {
@@ -284,28 +383,13 @@ impl Agent<'_> {
             .participant
             .as_ref()
             .with_context(|| unavailable(state))?;
-        let queued = participant.mail_count()? + state.pending_letters.len();
-        let peers: Vec<BoardPeer> = participant
-            .peers()?
-            .into_iter()
-            .map(|peer| BoardPeer {
-                overlapping: overlapping(&peer.scopes, &state.scopes),
-                peer,
-            })
-            .collect();
-        let claimed: Vec<String> = peers
-            .iter()
-            .flat_map(|peer| peer.peer.scopes.iter().cloned())
-            .collect();
-        Ok(PeerBoard {
-            id: participant.id().to_owned(),
-            summary: state.summary.clone(),
-            phase: state.phase.clone(),
-            scopes: state.scopes.clone(),
-            overlapping: overlapping(&state.scopes, &claimed),
-            peers,
-            queued,
-        })
+        board(
+            participant,
+            state.summary.clone(),
+            state.phase.clone(),
+            state.scopes.clone(),
+            state.pending_letters.len(),
+        )
     }
 
     /// A handle for sending peer letters while a turn holds the agent; `None` when coordination is
@@ -352,20 +436,7 @@ impl Agent<'_> {
             .participant
             .as_ref()
             .with_context(|| unavailable(state))?;
-        let mut messages: Vec<PeerMessage> = state
-            .history
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned()
-            .collect();
-        messages.extend(participant.queued()?.into_iter().map(|letter| PeerMessage {
-            peer: letter.from,
-            outgoing: false,
-            text: letter.text,
-            unread: true,
-        }));
-        Ok(messages)
+        messages(participant, &state.history)
     }
 
     fn peer_coordination_inner(&mut self, args: &Value) -> Result<Value> {

@@ -45,6 +45,7 @@ pub mod vision;
 pub use edit::hashline;
 pub use exec::sandbox;
 pub use fs::documents;
+pub use fs::files::NativeReadSelection;
 pub use integrations::ext;
 pub use knowledge::{codebase, provenance};
 pub mod vcs;
@@ -64,18 +65,18 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// Selected tools withheld from the default per-request offer. They stay in the catalog, so the
 /// system prompt lists them under "Loadable tools" and `tool_load` (or `tool_search`) enables them
 /// for the next round; schemas and historical contracts are unchanged. Each is either an
-/// overlapping variant of a tool that stays offered (`memory_update` corrects a fact by the id and
-/// revision only `recall` supplies; `ast_search` is the structural variant of `grep`/`find`; `git`
-/// overlaps `bash`) or a specialist most turns never call (language servers, MCP runtime status,
-/// archived-session search, independent-session coordination and side questions). Two stay
-/// offered: `working_state`, the record that survives compaction, and `codebase_memory`, whose
-/// saved understanding feeds the ambient codebase context; a long task should not pay a discovery
-/// round to keep either. The deferred schemas cost about 10 KB on every request; a first use costs
+/// overlapping variant of a tool that stays offered (`ast_search` is the structural variant of
+/// `grep`/`find`; `git` overlaps `bash`) or a specialist most turns never call (language servers,
+/// MCP runtime status,
+/// archived-session search, independent-session coordination and side questions). `working_state`,
+/// the record that survives compaction, stays offered so a long task does not pay a discovery round
+/// to keep it. `codebase_memory`, `experience` and `edit_preview` are not in the default harness
+/// selection at all and are likewise loadable on demand. The deferred schemas cost about 10 KB on
+/// every request; a first use costs
 /// one `tool_load` round, after which the tool stays offered for the session. An operator-pinned
 /// `[harness] tools` list, a hermetic run and the selection lent to subagents keep every selected
 /// tool offered.
 pub const DEFERRED_BY_DEFAULT: &[&str] = &[
-    "memory_update",
     "ast_search",
     "lsp",
     "git",
@@ -192,6 +193,8 @@ pub struct Workspace {
     syntax_block: bool,
     root: PathBuf,
     additional_roots: Vec<PathBuf>,
+    /// Explicit process-local native read grants, never shell write grants.
+    read_only_roots: Vec<PathBuf>,
     /// Private application trees excluded independently of shell sandbox mode.
     protected_paths: Vec<PathBuf>,
     /// Explicit process-local native-file exceptions; never remove shell denies.
@@ -273,6 +276,7 @@ impl Workspace {
             syntax_block: false,
             root,
             additional_roots: Vec::new(),
+            read_only_roots: Vec::new(),
             protected_paths: Vec::new(),
             sensitive_roots: Vec::new(),
             credential_paths: Vec::new(),
@@ -692,6 +696,7 @@ impl Workspace {
                 .retired(),
         ));
         next.additional_roots.clear();
+        next.read_only_roots.clear();
         next.sensitive_roots.clear();
         if let Some(session) = &self.cargo_session {
             next = next.with_cargo_session(session)?;
@@ -739,7 +744,7 @@ impl Workspace {
         if source.len() > edit::hashline::MAX_FILE as usize {
             return Err("edit witness source exceeds 4 MiB".into());
         }
-        let resolved = self.resolve(&self.rel(path))?;
+        let resolved = self.resolve_read(&self.rel(path))?;
         if resolved != path {
             return Err("edit witness target is not a canonical workspace path".into());
         }
@@ -821,6 +826,11 @@ impl Workspace {
     pub fn roots(&self) -> impl Iterator<Item = &Path> {
         std::iter::once(self.root.as_path())
             .chain(self.additional_roots.iter().map(PathBuf::as_path))
+    }
+
+    fn read_roots(&self) -> impl Iterator<Item = &Path> {
+        self.roots()
+            .chain(self.read_only_roots.iter().map(PathBuf::as_path))
     }
 
     /// Exclude private trees from native tools, including when the shell sandbox is off.
@@ -916,6 +926,10 @@ impl Workspace {
     }
 
     fn check_protected_mutation(&self, path: &Path) -> Result<(), String> {
+        let canonical = Self::canonical_prefix(path);
+        if !self.roots().any(|root| canonical.starts_with(root)) {
+            return Err("mutation is outside writable workspace roots (read-only access does not grant writes)".into());
+        }
         // Git configuration and hooks are executed later by host-side Git. Native mutations
         // respect the same metadata boundary as sandboxed shell commands, including linked
         // worktrees, aliases, and deleting an ancestor of the metadata directory.
@@ -969,10 +983,10 @@ impl Workspace {
                 "read selectors are not accepted by path resolution",
             ));
         }
-        self.resolve_literal(&expanded)
+        self.resolve_literal(&expanded, false)
     }
 
-    fn resolve_literal(&self, input: &str) -> io::Result<PathBuf> {
+    fn resolve_literal(&self, input: &str, read_only: bool) -> io::Result<PathBuf> {
         if input.contains('\0') {
             return Err(io::Error::other("path contains a NUL byte"));
         }
@@ -982,12 +996,18 @@ impl Workspace {
         if !path.is_absolute() && !self.sensitive_roots.is_empty() {
             let absolute = Self::canonical_prefix(&self.root.join(path));
             if self.sensitive_access(&absolute) {
-                return self.resolve_literal(&absolute.to_string_lossy());
+                return self.resolve_literal(&absolute.to_string_lossy(), read_only);
             }
         }
         let (root, relative): (&Path, PathBuf) = if path.is_absolute() {
             let within = |candidate: &Path| {
                 self.roots()
+                    .chain(
+                        self.read_only_roots
+                            .iter()
+                            .map(PathBuf::as_path)
+                            .filter(|_| read_only),
+                    )
                     .filter_map(|root| {
                         candidate
                             .strip_prefix(root)
@@ -1120,6 +1140,39 @@ impl Workspace {
         Ok(self)
     }
 
+    /// Grant native read/search access to existing directories for this process only.
+    /// Relative directories resolve against the primary workspace. Private storage and symlink
+    /// checks still apply. This never changes shell access or writable roots.
+    ///
+    /// # Errors
+    /// Refuses missing directories, filesystem roots and protected Dial storage.
+    pub fn with_read_only_roots(mut self, dirs: &[PathBuf]) -> Result<Self> {
+        self.read_only_roots.clear();
+        for dir in dirs {
+            let canonical = self.directory_request(dir, false)?;
+            ensure!(
+                !self.is_protected(&canonical),
+                "read-only directory enters protected Dial storage"
+            );
+            if !self.read_only_roots.contains(&canonical) {
+                self.read_only_roots.push(canonical);
+            }
+        }
+        Ok(self)
+    }
+
+    /// Resolve a native read/search path without granting mutation authority.
+    pub fn resolve_read(&self, input: &str) -> Result<PathBuf, String> {
+        let expanded = self
+            .expand_file_handle_checked(input)
+            .map_err(|e| e.to_string())?;
+        if file_handles::is_handle_with_selector(input) {
+            return Err("read selectors are not accepted by path resolution".into());
+        }
+        self.resolve_literal(&expanded, true)
+            .map_err(|e| e.to_string())
+    }
+
     /// Extra roots attached to this workspace, in the order they were added.
     pub fn additional_roots(&self) -> &[PathBuf] {
         &self.additional_roots
@@ -1197,7 +1250,7 @@ impl Workspace {
     /// Missing targets remain confined paths; this does not grant read access or a witness.
     pub fn resolve_read_target(&self, input: &str) -> Result<PathBuf, String> {
         let (path, _) = fs::select::split_target(self, input)?;
-        self.resolve(path)
+        self.resolve_read(path)
     }
 
     /// Bounded, workspace-confined identity for a read observation, including selectors.
@@ -1222,7 +1275,7 @@ impl Workspace {
         use sha2::{Digest, Sha256};
         use std::io::Read;
         const LIMIT: u64 = 16 * 1024 * 1024;
-        let path = self.resolve(input.to_str()?).ok()?;
+        let path = self.resolve_read(input.to_str()?).ok()?;
         let file = edit::edit_transaction::open_read(self, &path).ok()?;
         let metadata = file.metadata().ok()?;
         if !metadata.is_file() || metadata.len() > LIMIT {
@@ -1244,47 +1297,52 @@ impl Workspace {
     /// The workspace root that contains `path` (already resolved by [`Self::resolve`]), preferring
     /// the deepest one when an added root sits inside another. `None` when no root contains it.
     pub(crate) fn root_containing(&self, path: &Path) -> Option<&Path> {
-        self.roots()
+        self.read_roots()
             .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.components().count())
     }
 }
 
-const HASHLINE_READ_DESC: &str = "Read a text file or list a directory. Output starts with a `[PATH#TAG]` \
-header, then `LINE:TEXT` rows; `edit` needs that TAG and may only touch lines a read has shown. Select lines \
-with a path suffix: `:50-100`, `:50+20` (20 from 50), `:50-`, `:-30` (last 30), `:5-16,960-973`; or \
-offset/limit (not both). `:outline` lists declarations with line ranges; `:raw` returns unanchored, \
-non-editable text. Unranged output stops at 48 KiB and the footer names the next range.";
+const HASHLINE_READ_DESC: &str = "read: view a file or directory in any format (text, CSV, PDF, Office, \
+images, video, notebooks, archives). Ranges as a path suffix: `:50-100`, `:50+20`, `:50-`, `:-30`, \
+`:5-16,960-973`; `:outline` lists declarations, `:raw` is non-editable text; `paths` reads up to 16 targets at once. \
+Also `ssh://host/path`, `http(s)://`, `pr://N`, `issue://N`, `conflict://` and `artifact://H` (lines, `:info`, \
+`:annotations`, `:bytes=O+N`). Output is \
+a `[PATH#TAG]` header then `LINE:TEXT` rows; edit needs that TAG and may touch only shown lines. Stops at \
+48 KiB; the footer names the next range. Large or unfamiliar files: `grep` or `:outline` first, then read only the needed ranges, never page through. Excerpts already shown by glob/grep previews or earlier reads stay current: reuse them instead of rereading.";
 
-const HASHLINE_WRITE_DESC: &str = "Create a new file or replace a whole file (max 1 MiB). BEFORE replacing an existing file, read its complete current contents; prefer edit for changes, especially to large files. The whole call must fit your output budget: keep each call coherent and complete, never a placeholder, and do not also paste the file into chat. Missing parent directories are created. Notebook content is literal JSON, not the editable # %% source projection. In hashline mode, complete copied read headers/numbered prefixes are stripped; incomplete/truncated projections reject. Existing files require complete source witnesses unless the operator disables the seen-line guard. Returns the fresh `[PATH#TAG]` header.";
+const HASHLINE_WRITE_DESC: &str = "write: create a new file or replace one whose content changes almost entirely. Max 1 MiB; parent directories are created. Replacing an existing file requires reading all of it first; for changes to an existing file use edit (one call carries every operation) instead of regenerating it. Content must be complete, never a placeholder; do not also paste it into chat. Notebooks take literal JSON. Copied read prefixes are stripped; truncated projections are refused. Returns the fresh `[PATH#TAG]`.";
 
 const HASHLINE_EDIT_DESC: &str = notebook_edit_description!(
-    r#"Edit existing files with a line-anchored patch (use `write` to create or overwrite whole files).
-`input` holds one or more sections, each a header `[PATH#TAG]` followed by operations. TAG is the 4-hex tag from the latest `read`, `edit` or `write` result for that file. Line numbers always refer to THAT snapshot, never to earlier operations in the same call, and you may only touch lines a read has shown you.
-Operations (N and M are line numbers):
-PUT N.=M:   replace lines N..M with the `+` rows that follow (N.=N for one line)
-PUT <N:     insert the `+` rows before line N   (PUT <1: = top of file)
-PUT >N:     insert after line N                  (PUT >$: = end of file)
-CUT N.=M    delete lines N..M
-PUT N*:     replace the whole block that starts at line N (function, class, { } or [ ] body, indented body, markdown section)
-PUT >N*:    insert after that block;   CUT N* deletes it
-REM         delete the file;   MV new/path   move/rename it (after any edits)
-Body rows: every row starts with `+` followed by the exact text including indentation. A lone `+` is a blank line. Text that itself starts with + or - is written `++x` or `+-x`. Rows are the final text, not a diff; never write `-` rows.
-Moving code: `CUT 3.=5 @tmp` then `PUT >9 @tmp` (works across files in one call; `PUT N.=M @tmp` replaces with it; without @name one anonymous register is used).
-Example:
+    r#"edit: change existing files with a line-anchored patch in `input`; whole files use write.
+`input` holds sections: a header `[PATH#TAG]` (TAG from that file's latest read, edit or write), then operations. Line numbers refer to THAT snapshot, never to earlier operations in the call; touch only lines a read has shown.
+PUT N.=M:  replace lines N..M with the `+` rows that follow (N.=N for one line)
+PUT <N:    insert before line N (PUT <1: = top of file)
+PUT >N:    insert after line N (PUT >$: = end of file)
+CUT N.=M   delete lines N..M
+PUT N*:    replace the block starting at line N (function, class, { } or [ ] body, indented body, markdown section)
+PUT >N*:   insert after that block;  CUT N* deletes it
+REM        delete the file;  MV new/path  move/rename it (after any edits)
+Rows: `+` then the exact text with indentation; a lone `+` is a blank line; text starting with + or - is `++x`/`+-x`. Rows are final text; never write `-` rows.
+Move code: `CUT 3.=5 @tmp` then `PUT >9 @tmp` (across files too; `PUT N.=M @tmp` replaces; without @name one anonymous register).
+Example (one call, several operations and files):
 [src/main.rs#3FA9]
 PUT 4.=4:
 +    let total = a + b;
 CUT 10.=12
-PUT >$:
-+// end
-Put all changes to one file in one section. On success you get the fresh [PATH#TAG] and the changed lines; use that tag next time. If the file changed since your read, the edit is re-anchored only when the lines it touches are unchanged; otherwise you receive the current lines so you can retry."#
+PUT >20:
++    log(total);
+[src/lib.rs#81C2]
+PUT <1:
++use std::fmt;
+One section per file; put every planned change to every file in one call. Success returns the fresh [PATH#TAG] and changed lines. If the file changed since your read, edits re-anchor when their lines are unchanged; otherwise you get the current lines to retry."#
 );
 
-const REPLACE_READ_DESC: &str = "Read a text file with line numbers, or list a directory. Select lines \
-with a path suffix: `:50-100`, `:50+150` (150 from 50), `:50-`, `:-60` (last 60), `:5-16,960-973`; or \
-offset/limit (not both). `:outline` lists declarations with line ranges. Unranged output stops at 48 KiB \
-and the footer names the next range.";
+const REPLACE_READ_DESC: &str = "read: view a file or directory in any format (text, CSV, PDF, Office, \
+images, video, notebooks, archives). Ranges as a path suffix: `:50-100`, `:50+150`, `:50-`, `:-60`, \
+`:5-16,960-973`; `:outline` lists declarations; `paths` reads up to 16 targets. Also `artifact://H` (lines, \
+`:info`, `:annotations`, `:bytes=O+N`). Lines are numbered. Stops at \
+48 KiB; the footer names the next range. Large or unfamiliar files: `grep` or `:outline` first, then read only the needed ranges, never page through.";
 
 fn schema(name: &str, mode: EditMode) -> Option<Value> {
     let hashline = mode == EditMode::Hashline;
@@ -1298,7 +1356,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                     REPLACE_READ_DESC
                 },
                 json!({
-                    "path": {"type": "string", "description": "Workspace path with an optional selector. Also: `ssh://host/path` and `http(s)://` URLs (approval required; archives take `:member`), `pr://N[/diff]` and `issue://N` (GitHub via gh), `conflict://` (unmerged paths) or `conflict://PATH` (merge hunks with edit anchors)."},
+                    "path": {"type": "string", "description": "Workspace path with an optional selector. Also: `ssh://host/path` and `http(s)://` URLs (approval required; archives take `:member`), `pr://N[/diff]` and `issue://N` (GitHub via gh), `conflict://` (unmerged paths) or `conflict://PATH` (merge hunks with edit anchors), `artifact://H` retained output (line ranges, `:info` retention, `:annotations` human feedback, `:bytes=O+N` exact base64 bytes)."},
                     "offset": {"type": "integer", "minimum": 1, "description": "1-based line to start at (default 1); not together with a path selector."},
                     "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of lines (default 2000)."},
                     "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Several targets, each with its own selector, read in one call; use instead of path."},
@@ -1314,33 +1372,32 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
             if hashline {
                 HASHLINE_WRITE_DESC
             } else {
-                "Create or overwrite a file in the workspace with the given content (max 1 MiB). \
-                 Prefer edit for changes to existing files, especially large ones; the whole call \
-                 must fit your output budget, so keep it complete, never a placeholder, and do not \
-                 also paste the file into chat. Missing parent directories are created."
+                "write: create a new file or replace one whose content changes almost entirely. Max 1 MiB; \
+                 parent directories are created. For changes to an existing file use edit instead of \
+                 regenerating it. Content must be complete, never a placeholder; do not also \
+                 paste it into chat."
             },
             json!({
                 "path": {"type": "string", "description": "Workspace-relative file path or an `ssh://host/path` remote file (requires approval)."},
                 "content": {"type": "string", "description": "Full file content."},
                 "allow_syntax_errors": {"type": "boolean", "description": "Set true only when valid code is refused for new syntax errors (parser dialect gap)."},
+                "check": edit::editing::check_property(),
             }),
             &["path", "content"],
         ),
         "edit" => edit::editing::schema(mode),
         "glob" => tool_schema(
             "glob",
-            "List workspace paths matching a glob (`*`, `?`, `[a-z]`, `{a,b}`, `**`; a bare pattern \
-             matches names at any depth), sorted, at most 500 per page. The footer reports coverage and \
-             next_cursor/remaining_skip to continue. .git, scratch and symlinks are never listed. \
-             Use preview=true when you need source contents next: adds bounded, screened code \
-             excerpts with editable numbered rows, avoiding a separate read for those rows.",
+            "glob: list paths matching a pattern such as `src/**/*.rs`. A bare pattern matches names at any depth; sorted, at most 500 \
+             per page, the footer gives next_cursor. .git, scratch and symlinks are never listed; preview \
+             adds editable excerpts of a few code files.",
             json!({
                 "pattern": {"type": "string", "description": "Glob such as `src/**/*.rs` or `*.py`, relative to the workspace root."},
                 "path": {"type": "string", "description": "Scope: file, directory or semicolon-separated scopes (default workspace root). Scopes inside .git or the workspace scratch directory are refused."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},
                 "gitignore": {"type": "boolean", "description": "Honor ignore rules and skip dependency/build directories (default true)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Paths per page (default 500)."},
-                "preview": {"type": "boolean", "description": "Include source previews for up to 3 code files among the first 16 listed paths (40 lines each, 6 KiB total). Default false: paths only. Sensitive, non-code and credential-bearing files are not previewed; only returned rows are edit witnesses."},
+                "preview": {"type": "boolean", "description": "Excerpts of up to 3 code files among the first 16 paths (default false). Only returned rows are edit witnesses."},
                 "skip": {"type": "integer", "minimum": 0, "description": "Paths to skip; resume with remaining_skip."},
                 "cursor": {"type": "object", "properties": {"path": {"type": "string"}, "match": {"type": "integer", "minimum": 0, "maximum": 0}}, "required": ["path", "match"], "additionalProperties": false, "description": "next_cursor from the previous page, unchanged."},
             }),
@@ -1348,17 +1405,17 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         ),
         "grep" => tool_schema(
             "grep",
-            "Search file contents with a Rust regex (no lookaround/backreferences) or fixed_string. Returns \
-             path:line:text (context rows path-line-text; multiline matches path:start:end:text). The footer \
-             names anything skipped or capped and gives next_cursor/remaining_skip to continue.",
+            "grep: search file contents with a Rust regex (no lookaround or backreferences). `path` \
+             takes files, directories or `;`-separated scopes. Returns path:line:text; the footer names skipped or capped scopes and next_cursor.",
             json!({
-                "pattern": {"type": "string", "description": "Non-empty Rust regex such as `fn \\w+\\(` or `TODO|FIXME`; set fixed_string for literal text."},
-                "fixed_string": {"type": "boolean", "description": "Treat pattern as literal text (default false)."},
-                "path": {"type": "string", "description": "File, directory or semicolon-separated scopes, or one `ssh://host/path` file (approval required). Scopes inside .git or the workspace scratch directory are refused."},
+                "pattern": {"type": "string", "description": "Non-empty Rust regex such as `fn \\w+\\(` or `TODO|FIXME`; set literal for literal text."},
+                "literal": {"type": "boolean", "description": "Treat pattern as literal text (default false)."},
+                "path": {"type": "string", "description": "File, directory or semicolon-separated scopes, or one `ssh://host/path` file (approval required)."},
                 "glob": {"type": "string", "description": "Only files whose workspace-relative path matches this glob."},
                 "ignore_case": {"type": "boolean", "description": "Case-insensitive (default false)."},
                 "context": {"type": "integer", "minimum": 0, "description": "Lines before and after each match (default 0, max 10)."},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Most matching lines (default 400). Without it each file shows at most 20 and the footer names the rest."},
+                "preview": {"type": "boolean", "description": "Append bounded enclosing-source previews for the first matching code files (default false). Complete fresh numbered rows are editable; omitted ranges still need a read."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Most matching lines (default 400; otherwise at most 20 per file)."},
                 "output": {"type": "string", "enum": ["lines", "files", "count"], "description": "lines (default); files lists matching files with counts; count gives totals."},
                 "multiline": {"type": "boolean", "description": "Match across lines (automatic when the pattern has \\n); use (?s) for dot to match newline."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},
@@ -1371,18 +1428,17 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         "bash" => tool_schema(
             "bash",
             if cfg!(windows) {
-                "Run a bash command in the workspace root, or in `cwd`. It runs in Git for Windows bash when installed, otherwise in Dial's built-in bash-compatible shell; only with `shell.backend = \"powershell\"` is it PowerShell source. Windows has no filesystem/network isolation: execution requires `sandbox.mode = \"off\"` and runs with the user's privileges. stdout and stderr are merged; long output keeps its start and end. No terminal by default; `pty=true` immediately starts a managed terminal job controlled with `bg`. A pipe command still running after `shell.auto_background_secs` (default 15) becomes a `bg` job whatever its timeout: do independent work, then `bg wait` for the result."
+                "bash: run a shell command. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. Uses Git for Windows bash when installed, otherwise Dial's built-in bash-compatible shell (PowerShell only with `shell.backend = \"powershell\"`). Windows has no isolation: execution requires `sandbox.mode = \"off\"` and runs with the user's privileges. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside."
             } else {
-                "Run a command with `/bin/bash -c` in the workspace root, or in `cwd`. It may be sandboxed: writes confined to the project and added directories, some outside paths unreadable, network possibly blocked; temporary files go in `$TMPDIR`. stdout and stderr are merged; long output keeps its start and end. No terminal by default; `pty=true` immediately starts a managed terminal job controlled with `bg`. GUI programs still open on the user's desktop (macOS, or Linux with a display), so run the real command before concluding otherwise. A pipe command still running after `shell.auto_background_secs` (default 15) becomes a `bg` job whatever its timeout: do independent work, then `bg wait` for the result."
+                "bash: run a shell command with `/bin/bash -c`. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. May be sandboxed: writes confined to the project, network possibly blocked, temp files in `$TMPDIR`. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside."
             },
             json!({
                 "command": {"type": "string", "description": "Shell command to run."},
                 "cwd": {"type": "string", "description": "Working directory: relative to the workspace root, or absolute in an added root. Defaults to the root; do not prefix `cd <root> &&`."},
-                "session": {"type":"string", "description":"Embedded backend only: keep cwd and exported string variables across completed foreground commands with the same session name. A cancelled or timed-out command resets it."},
-                "pty": {"type": "boolean", "description": "Allocate a terminal at launch and return a managed bg job immediately (default false). Use bg input/output/wait/resize/kill with the returned name. Incompatible with session and timeout; respects --no-pty."},
-                "timeout": {"type": "integer", "minimum": 1, "description": "Seconds before the command is killed: an upper bound, not a way to stay in the foreground."},
-                "background": {"type": "boolean", "description": "Start as a `bg` job immediately (servers, watchers, work to overlap)."},
-                "async": {"type": "boolean", "description": "Alias of background."},
+                "session": {"type":"string", "description":"Embedded backend only: keep cwd and exported variables across commands with the same session name."},
+                "pty": {"type": "boolean", "description": "Start as a terminal `bg` job (default false). Incompatible with session and timeout."},
+                "timeout": {"type": "integer", "minimum": 1, "description": "Seconds to wait before the command is killed (or moved to `bg` when `shell.auto_background_secs` is enabled and shorter)."},
+                "background": {"type": "boolean", "description": "Start as a `bg` job immediately (servers, watchers)."},
             }),
             &["command"],
         ),

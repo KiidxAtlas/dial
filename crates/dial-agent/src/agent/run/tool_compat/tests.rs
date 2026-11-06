@@ -59,16 +59,34 @@ fn aliases_and_scalars_preserve_conflicts_and_bounds() {
 }
 
 #[test]
-fn grep_limit_is_read_as_max_results_unless_both_are_given() {
-    let parameters = &json!({"type":"object","properties":{"pattern":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":1000}},"required":["pattern"],"additionalProperties":false});
-    let mut args = json!({"pattern":"fn","limit":5});
-    normalize("grep", parameters, &mut args);
-    assert_eq!(args, json!({"pattern":"fn","max_results":5}));
-    assert!(crate::agent::run::calls::validate(parameters, &args).is_ok());
+fn grep_old_parameter_names_map_onto_the_simpler_ones() {
+    let parameters = &json!({"type":"object","properties":{"pattern":{"type":"string"},"literal":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["pattern"],"additionalProperties":false});
+    for old in ["max_results", "max_matches"] {
+        let mut args = json!({"pattern":"fn","fixed_string":true});
+        args[old] = json!(5);
+        normalize("grep", parameters, &mut args);
+        assert_eq!(
+            args,
+            json!({"pattern":"fn","literal":true,"limit":5}),
+            "{old}"
+        );
+        assert!(crate::agent::run::calls::validate(parameters, &args).is_ok());
+    }
+    // An explicit current name wins; the stale duplicate is dropped, not merged.
     let mut both = json!({"pattern":"fn","limit":5,"max_results":7});
     normalize("grep", parameters, &mut both);
-    assert_eq!(both["max_results"], 7);
-    assert!(crate::agent::run::calls::validate(parameters, &both).is_err());
+    assert_eq!(both, json!({"pattern":"fn","limit":5}));
+}
+
+#[test]
+fn bash_async_alias_maps_onto_background() {
+    let parameters = &json!({"type":"object","properties":{"command":{"type":"string"},"background":{"type":"boolean"}},"required":["command"],"additionalProperties":false});
+    let mut args = json!({"command":"sleep 1","async":true});
+    normalize("bash", parameters, &mut args);
+    assert_eq!(args, json!({"command":"sleep 1","background":true}));
+    let mut off = json!({"command":"ls","async":false});
+    normalize("bash", parameters, &mut off);
+    assert_eq!(off, json!({"command":"ls"}));
 }
 
 #[test]
@@ -138,11 +156,11 @@ fn common_client_spellings_map_only_onto_declared_properties() {
 
 #[test]
 fn a_list_without_brackets_is_decoded_but_other_tools_strings_stay_errors() {
-    let schema = json!({"type":"object","properties":{"query":{"type":"string"},"grep_keywords":{"type":"array","items":{"type":"string"}},"ids":{"type":"array","items":{"type":"integer"}}},"required":["query"],"additionalProperties":false});
+    let schema = json!({"type":"object","properties":{"query":{"type":"string"},"keywords":{"type":"array","items":{"type":"string"}},"ids":{"type":"array","items":{"type":"integer"}}},"required":["query"],"additionalProperties":false});
     // The JSON text of `["calc", "add"]` without its brackets, as Claude sent it to `find`.
-    let mut args = json!({"query":"q","grep_keywords":"calc\", \"add"});
+    let mut args = json!({"query":"q","keywords":"calc\", \"add"});
     normalize("find", &schema, &mut args);
-    assert_eq!(args["grep_keywords"], json!(["calc", "add"]));
+    assert_eq!(args["keywords"], json!(["calc", "add"]));
     assert!(crate::agent::run::calls::validate(&schema, &args).is_ok());
     // Outside find's singleton-keyword compatibility, other strings remain errors.
     for text in [
@@ -151,9 +169,9 @@ fn a_list_without_brackets_is_decoded_but_other_tools_strings_stay_errors() {
         "say \"hi\"",
         "a\\nb\", 1",
     ] {
-        let mut args = json!({"query":"q","grep_keywords":text});
+        let mut args = json!({"query":"q","keywords":text});
         normalize("extension", &schema, &mut args);
-        assert_eq!(args["grep_keywords"], json!(text), "{text}");
+        assert_eq!(args["keywords"], json!(text), "{text}");
         assert!(crate::agent::run::calls::validate(&schema, &args).is_err());
     }
     // A list of non-strings is not decoded this way.
@@ -166,7 +184,7 @@ fn a_list_without_brackets_is_decoded_but_other_tools_strings_stay_errors() {
 fn find_single_keyword_is_one_literal_not_a_split_list() {
     let schema = json!({"type":"object","properties":{
         "query":{"type":"string"},
-        "grep_keywords":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":256}},
+        "keywords":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":256}},
         "paths":{"type":"array","items":{"type":"string"}}
     },"required":["query"],"additionalProperties":false});
     for keyword in [
@@ -175,24 +193,24 @@ fn find_single_keyword_is_one_literal_not_a_split_list() {
         "say \"hi\"",
         "距離",
     ] {
-        let mut args = json!({"query":"units", "grep_keywords":keyword});
+        let mut args = json!({"query":"units", "keywords":keyword});
         normalize("find", &schema, &mut args);
-        assert_eq!(args["grep_keywords"], json!([keyword]));
+        assert_eq!(args["keywords"], json!([keyword]));
         assert!(crate::agent::run::calls::validate(&schema, &args).is_ok());
     }
     for keyword in [String::new(), "a".repeat(257)] {
-        let mut args = json!({"query":"units", "grep_keywords":keyword});
+        let mut args = json!({"query":"units", "keywords":keyword});
         normalize("find", &schema, &mut args);
         assert!(crate::agent::run::calls::validate(&schema, &args).is_err());
     }
-    let mut args = json!({"query":"units", "grep_keywords":"SI"});
+    let mut args = json!({"query":"units", "keywords":"SI"});
     normalize("extension", &schema, &mut args);
-    assert_eq!(args["grep_keywords"], "SI");
+    assert_eq!(args["keywords"], "SI");
     let mut args = json!({"query":"units", "paths":"SI"});
     normalize("find", &schema, &mut args);
     assert_eq!(args["paths"], "SI");
-    let string_schema = json!({"type":"object","properties":{"grep_keywords":{"type":"string"}}});
-    let mut args = json!({"grep_keywords":"SI"});
+    let string_schema = json!({"type":"object","properties":{"keywords":{"type":"string"}}});
+    let mut args = json!({"keywords":"SI"});
     normalize("find", &string_schema, &mut args);
-    assert_eq!(args["grep_keywords"], "SI");
+    assert_eq!(args["keywords"], "SI");
 }

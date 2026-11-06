@@ -287,7 +287,7 @@ pub struct AssistanceConfig {
 impl Default for AssistanceConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             syntax_guard: true,
             selective_verification: true,
             compact_tools: false,
@@ -347,8 +347,8 @@ pub struct CodebaseConfig {
     pub enabled: bool,
     pub context_max_bytes: usize,
     /// Attach a bounded, task-relevant brief of fresh saved codebase context (architecture notes,
-    /// findings, source outlines) to every user turn; no model request. Off leaves retrieval to the
-    /// explicit `codebase_memory` tool.
+    /// findings, source outlines) to every user turn; no model request. Off by default to keep
+    /// per-turn context small; retrieval is left to the loadable `codebase_memory` tool.
     pub ambient_context: bool,
     /// Build a bounded architecture synthesis after successful interactive turns.
     pub synthesize_architecture: bool,
@@ -362,7 +362,7 @@ impl Default for CodebaseConfig {
         Self {
             enabled: true,
             context_max_bytes: 0,
-            ambient_context: true,
+            ambient_context: false,
             synthesize_architecture: false,
             history: true,
             architecture_model: "mlx-community/Qwen2.5-3B-Instruct-4bit".into(),

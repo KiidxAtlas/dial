@@ -31,6 +31,12 @@ Keep shared rules there; retain deliberately shorter wording in the full/lean wo
 delivery and delegation sections rather than silently expanding the lean budget. Whole-file
 write witness mechanics stay in the native validator and tool description, not system policy.
 
+The full and compact prose is compressed at these owners, not by stripping operator/project
+content or changing tool contracts. Compact delivery omits the optional diagram style hint.
+The existing byte-budget test renders full, compact, lean and one-call message bands and logs
+UTF-8 byte counts; [agent-loop.md](../../../../../docs/agent-loop.md) records the comparison and
+its measurement limits. A smaller policy is not evidence of better live-model outcomes.
+
 The existing adjustments are named below by their selection inputs. They are not family
 classifications, and each can be removed at its selection/assembly boundary without copying
 the common policy into model code.

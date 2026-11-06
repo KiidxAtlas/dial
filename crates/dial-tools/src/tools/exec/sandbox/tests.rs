@@ -256,7 +256,7 @@ fn filtered_network_allows_only_proxied_permitted_hosts() {
                 Some(&endpoint),
                 "/bin/bash",
                 &["-c", &script],
-                None,
+                CommandMode::default(),
             )
             .unwrap();
         command

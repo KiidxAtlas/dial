@@ -1584,6 +1584,94 @@ fn local_endpoint_chat_projects_system_messages_on_plain_and_streaming_requests(
     }
 }
 
+#[test]
+fn osaurus_streamed_tools_keep_dial_in_control_and_preserve_cache_prefix() {
+    let frames = [
+        json!({"choices":[{"delta":{"role":"assistant"}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function"}]}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup"}}]}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"key\":"}}]}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+    ];
+    let stream = frames
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect::<String>()
+        + "data: [DONE]\n\n";
+    let server = fake::serve(vec![Script::Sse(stream), ok("done")]);
+    let mut remote = backend(endpoint(&format!("{}/v1", server.url)))
+        .with_profile(llm::profiles::ModelProfile::minimal("osaurus", "gpt-x"));
+    let mut req = request();
+    req.messages = vec![
+        json!({"role":"system","content":"Stable policy"}),
+        json!({"role":"developer","content":"Stable workspace"}),
+        json!({"role":"user","content":"Look up x"}),
+    ];
+    req.tools = vec![json!({"type":"function","function":{"name":"lookup",
+        "parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})];
+    let original = req.messages.clone();
+    let reply = remote.chat(None, &req, 5, Some(&mut |_| true)).unwrap();
+    assert_eq!(reply.tool_calls.len(), 1);
+    let call = &reply.tool_calls[0];
+    assert_eq!(call.name, "lookup");
+    assert_eq!(call.arguments, json!({"key":"x"}));
+    assert!(!call.malformed_arguments);
+    assert_eq!(req.messages, original);
+    req.messages.push(json!({"role":"assistant","content":null,"tool_calls":[{
+        "id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments.to_string()}
+    }]}));
+    req.messages
+        .push(json!({"role":"tool","tool_call_id":call.id,"content":"Dial-approved result"}));
+    assert_eq!(remote.chat(None, &req, 5, None).unwrap().text, "done");
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one dispatch per Dial turn, no autonomous tool loop"
+    );
+    for request in &requests {
+        assert!(request_line(request).starts_with("POST /v1/chat/completions "));
+        let body = fake::body(request);
+        for extension in [
+            "session_id",
+            "cache_prompt",
+            "id_slot",
+            "chat_template_kwargs",
+            "ttl",
+        ] {
+            assert!(body.get(extension).is_none(), "no speculative {extension}");
+        }
+    }
+    let first = fake::body(&requests[0]);
+    let second = fake::body(&requests[1]);
+    assert_eq!(first["tools"], second["tools"]);
+    let prefix = first["messages"].as_array().unwrap();
+    assert_eq!(
+        second["messages"].as_array().unwrap()[..prefix.len()],
+        prefix[..]
+    );
+}
+
+#[test]
+fn osaurus_stream_callback_cancellation_is_not_replayed() {
+    let server = fake::serve(vec![Script::Sse(format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]})
+    ))]);
+    let mut remote = backend(endpoint(&format!("{}/v1", server.url)))
+        .with_profile(llm::profiles::ModelProfile::minimal("osaurus", "gpt-x"));
+    let error = remote
+        .chat(None, &request(), 5, Some(&mut |_| false))
+        .unwrap_err();
+    assert!(error.is::<llm::Interrupted>(), "{error:#}");
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "cancellation must not replay inference"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn managed_mlx_template_thinking_reaches_chat_without_local_hints() {
@@ -2640,6 +2728,41 @@ fn native_anthropic_stalls_and_ping_only_streams_retry() {
         assert_eq!(reply.tool_calls[0].arguments, json!({"path":"a.rs"}));
         assert_eq!(server.requests().len(), 2);
     }
+}
+
+#[test]
+fn native_anthropic_keepalives_hold_an_open_tool_call_past_the_idle_limit() {
+    // Anthropic may buffer a large tool call's input and send only pings until it is complete.
+    Patience::with_test_idle_limit(Duration::from_millis(200));
+    let events = thinking_tool_events();
+    let ping = anthropic_sse(&[json!({"type":"ping"})]);
+    let mut pieces = vec![anthropic_sse(&events[..11])];
+    // About 1.2 s of ping-only silence, six times the idle limit, with the call open.
+    pieces.extend(std::iter::repeat_n(ping, 12));
+    pieces.push(anthropic_sse(&events[11..]));
+    let server = fake::serve(vec![Script::SseSlow {
+        pieces,
+        pause: Duration::from_millis(100),
+    }]);
+    let mut remote = backend(anthropic_endpoint(&server.url));
+    let mut notices = Vec::new();
+    let reply = remote
+        .chat_with_control(
+            None,
+            &request(),
+            1,
+            Some(&mut |_| true),
+            &mut |n| notices.push(n.to_owned()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+    assert_eq!(reply.tool_calls[0].arguments, json!({"path":"a.rs"}));
+    assert!(notices.is_empty(), "{notices:?}");
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "an open tool call is not retried"
+    );
 }
 
 #[test]

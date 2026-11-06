@@ -91,6 +91,11 @@ impl<'a> StateUi<'a> {
             self.publish(|ui| ui.result_node(&body));
         }
     }
+    fn note_delta(&mut self) {
+        if let Some(clock) = &mut self.request_clock {
+            clock.delta(Instant::now());
+        }
+    }
     fn start_tool(&mut self, name: &str, call_id: Option<&str>) {
         self.settle_inference(Phase::Completed);
         self.close_prose();
@@ -152,6 +157,12 @@ impl<'a> StateUi<'a> {
         });
     }
     fn discard_inference(&mut self) {
+        self.discard_partial_output();
+        self.settle_inference(Phase::Interrupted);
+    }
+    /// A discarded attempt's streamed prose and reasoning end as interrupted, so a retry starts a
+    /// fresh answer instead of appending to the abandoned one.
+    fn discard_partial_output(&mut self) {
         for body in [self.prose.take(), self.reasoning.take()]
             .into_iter()
             .flatten()
@@ -160,7 +171,6 @@ impl<'a> StateUi<'a> {
             body.settle(node.result.text, node.result.data, Phase::Interrupted);
             self.publish(|ui| ui.result_node(&body));
         }
-        self.settle_inference(Phase::Interrupted);
     }
     pub fn finish(&mut self, interrupted: bool) {
         self.settle_inference(if interrupted {
@@ -208,6 +218,7 @@ impl Ui for StateUi<'_> {
         self.publish(|ui| ui.result_node(body))
     }
     fn text_delta(&mut self, text: &str) {
+        self.note_delta();
         if self.reasoning.is_some() {
             self.close_prose();
         }
@@ -222,6 +233,7 @@ impl Ui for StateUi<'_> {
         });
     }
     fn reasoning_delta(&mut self, text: &str) {
+        self.note_delta();
         if self.prose.is_some() {
             self.close_prose();
         }
@@ -349,6 +361,7 @@ impl Ui for StateUi<'_> {
         self.inner.model_progress(p)
     }
     fn tool_arguments_delta(&mut self, i: u64, id: &str, n: &str, d: &str) {
+        self.note_delta();
         self.inner.tool_arguments_delta(i, id, n, d)
     }
     fn cached_usage(&mut self, r: Option<u64>, w: Option<u64>) {
@@ -452,6 +465,10 @@ impl Ui for StateUi<'_> {
                 self.parent.clone(),
             ));
             self.timing_body = self.inference.clone();
+        }
+        // Backoff follows a failed attempt whose partial reply the provider discarded.
+        if phase == RequestPhase::Backoff {
+            self.discard_partial_output();
         }
         if let Some(clock) = &mut self.request_clock {
             clock.phase(phase, Instant::now());

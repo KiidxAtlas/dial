@@ -369,6 +369,83 @@ fn a_sender_handle_delivers_without_the_agent_and_keeps_the_chat_history() {
 }
 
 #[test]
+fn a_sender_handle_reads_the_board_and_chat_without_the_agent() {
+    with_agent("", |agent| {
+        let layout = agent.layout().unwrap().clone();
+        let peer = Participant::join(&layout, "other-session").unwrap();
+        peer.publish("api work", "working", &["src/api".into()])
+            .unwrap();
+        agent.coordination_phase("working", Some("touch api"));
+        let claimed = agent.peer_coordination(&json!({"action": "claim", "scopes": ["src"]}));
+        assert!(!claimed.is_error, "{}", claimed.text);
+        let sender = agent.peer_sender().expect("coordination is enabled");
+        peer.send(sender.board().unwrap().id.as_str(), "hello")
+            .unwrap();
+        // A turn holds the agent; the handle alone must match the idle board.
+        let board = sender.board().unwrap();
+        assert_eq!(board, agent.peer_board().unwrap());
+        assert_eq!(board.peers.len(), 1);
+        assert_eq!(board.peers[0].peer.id, peer.id());
+        assert_eq!(board.peers[0].overlapping, ["src/api"]);
+        assert_eq!(board.scopes, ["src"]);
+        assert_eq!(board.queued, 1);
+        let chat = sender.messages().unwrap();
+        assert_eq!(chat, agent.peer_messages().unwrap());
+        assert!(chat[0].unread && chat[0].text == "hello");
+    });
+}
+
+#[test]
+fn message_reaches_a_project_peer_by_id_and_lists_live_peers() {
+    with_agent("", |agent| {
+        let layout = agent.layout().unwrap().clone();
+        let peer = Participant::join(&layout, "other-session").unwrap();
+        peer.publish("api work", "working", &[]).unwrap();
+        let roster = agent.message_tool(&json!({}));
+        assert!(!roster.is_error, "{}", roster.text);
+        let data = roster.data.unwrap();
+        assert_eq!(data["peers"][0]["id"], peer.id());
+        assert_eq!(data["peers"][0]["summary"], "api work");
+
+        let sent = agent.message_tool(&json!({"to": peer.id(), "text": "hold off on src"}));
+        assert!(!sent.is_error, "{}", sent.text);
+        assert_eq!(peer.drain().unwrap()[0].text, "hold off on src");
+        let chat = agent.peer_messages().unwrap();
+        assert!(chat[0].outgoing && chat[0].peer == peer.id());
+
+        // `all` stays within this session; an unknown non-peer name keeps the worker error.
+        assert!(
+            agent
+                .message_tool(&json!({"to": "all", "text": "x"}))
+                .is_error
+        );
+        assert!(peer.drain().unwrap().is_empty());
+        assert!(
+            agent
+                .message_tool(&json!({"to": "nobody", "text": "x"}))
+                .is_error
+        );
+        // A peer id that is no longer live reports the registry's refusal.
+        let gone = agent.message_tool(&json!({"to": "0".repeat(32), "text": "x"}));
+        assert!(
+            gone.is_error && gone.text.contains("no longer live"),
+            "{}",
+            gone.text
+        );
+    });
+}
+
+#[test]
+fn message_without_coordination_keeps_the_worker_only_namespace() {
+    with_agent("[coordination]\nenabled=false", |agent| {
+        let roster = agent.message_tool(&json!({})).data.unwrap();
+        assert!(roster.get("peers").is_none());
+        let refused = agent.message_tool(&json!({"to": "0".repeat(32), "text": "x"}));
+        assert!(refused.is_error && refused.text.contains("project peer id"));
+    });
+}
+
+#[test]
 fn disabled_coordination_offers_no_sender() {
     with_agent("[coordination]\nenabled=false", |agent| {
         assert!(agent.peer_sender().is_none());

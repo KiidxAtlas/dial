@@ -131,8 +131,7 @@ fn clear_resets_shown_facts_and_keeps_the_user_bank() {
     let saved = runtime
         .execute_tool(
             &auth,
-            "retain",
-            &json!({"items":[
+            &json!({"action":"retain","items":[
                 {"content":"the build cache lives in target dir"},
                 {"content":"the user prefers terse build answers","scope":"global"}
             ]}),
@@ -142,7 +141,11 @@ fn clear_resets_shown_facts_and_keeps_the_user_bank() {
     assert_eq!(saved["results"][0]["ref"], "1");
     assert_eq!(saved["results"][1]["ref"], "user:1");
     let recalled = runtime
-        .execute_tool(&auth, "recall", &json!({"query":"build"}), &mut runner)
+        .execute_tool(
+            &auth,
+            &json!({"action":"recall","query":"build"}),
+            &mut runner,
+        )
         .unwrap();
     let refs: Vec<&str> = recalled["items"]
         .as_array()
@@ -188,8 +191,7 @@ fn bank_qualified_refs_target_the_right_bank() {
     runtime
         .execute_tool(
             &auth,
-            "retain",
-            &json!({"items":[
+            &json!({"action":"retain","items":[
                 {"content":"project fact about the parser"},
                 {"content":"user fact about the parser","scope":"global"}
             ]}),
@@ -218,28 +220,25 @@ fn bank_qualified_refs_target_the_right_bank() {
         .unwrap();
     assert_eq!(updated["revision"], 2);
     // The model's correction tools take provenance's id, scope and revision arguments.
-    let names = runtime.offered_names();
-    assert!(names.contains(&"memory_update") && names.contains(&"forget"));
+    let actions = runtime.actions();
+    assert!(actions.contains(&"update") && actions.contains(&"forget"));
     let stale = runtime.execute_tool(
         &auth,
-        "forget",
-        &json!({"id":1,"scope":"project","expected_revision":1}),
+        &json!({"action":"forget","id":1,"scope":"project","expected_revision":1}),
         &mut runner,
     );
     assert!(stale.is_err(), "a stale revision must not forget");
     runtime
         .execute_tool(
             &auth,
-            "memory_update",
-            &json!({"id":1,"scope":"project","expected_revision":2,"content":"project fact about the tokenizer"}),
+            &json!({"action":"update","id":1,"scope":"project","expected_revision":2,"content":"project fact about the tokenizer"}),
             &mut runner,
         )
         .unwrap();
     runtime
         .execute_tool(
             &auth,
-            "forget",
-            &json!({"id":1,"scope":"project","expected_revision":3}),
+            &json!({"action":"forget","id":1,"scope":"project","expected_revision":3}),
             &mut runner,
         )
         .unwrap();
@@ -280,13 +279,16 @@ fn auto_retain_pauses_without_a_memory_role_but_recall_and_retain_work() {
     runtime
         .execute_tool(
             &auth,
-            "retain",
-            &json!({"items":[{"content":"staging database is orchid"}]}),
+            &json!({"action":"retain","items":[{"content":"staging database is orchid"}]}),
             &mut runner,
         )
         .unwrap();
     let recalled = runtime
-        .execute_tool(&auth, "recall", &json!({"query":"staging"}), &mut runner)
+        .execute_tool(
+            &auth,
+            &json!({"action":"recall","query":"staging"}),
+            &mut runner,
+        )
         .unwrap();
     assert_eq!(recalled["items"].as_array().unwrap().len(), 1);
 }
@@ -585,8 +587,7 @@ fn automatic_recall_filters_incidental_words_and_old_assistant_subjects() {
     let explicit = runtime
         .execute_tool(
             &auth,
-            "recall",
-            &json!({"query":"image generation"}),
+            &json!({"action":"recall","query":"image generation"}),
             &mut runner,
         )
         .unwrap();

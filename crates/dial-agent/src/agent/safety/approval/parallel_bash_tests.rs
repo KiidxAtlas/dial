@@ -16,7 +16,6 @@ fn only_stateless_read_only_bash_joins_parallel_groups() {
         json!({"command":"rm -rf target"}),
         json!({"command":"ls > out.txt"}),
         json!({"command":"ls","background":true}),
-        json!({"command":"ls","async":true}),
         json!({"command":"ls","session":"review"}),
         json!({"command":"ls","background":"yes"}),
         json!({"command":"ls","pty":true}),

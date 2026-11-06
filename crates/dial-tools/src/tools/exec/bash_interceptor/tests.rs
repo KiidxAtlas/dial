@@ -38,6 +38,25 @@ fn hinted_tool(command: &str) -> Option<String> {
         .map(|r| r.tool)
 }
 
+#[test]
+fn file_tool_hints_are_withheld_for_paths_outside_the_workspace() {
+    let inside = |path: &str| path.starts_with("/app");
+    let hint = |c: &str| check_in(&hint_mode(), TOOLS, c, &inside);
+    for c in [
+        "cat /etc/apt/sources.list.d/debian.sources",
+        "grep -n main /usr/include/stdio.h",
+        "find /usr -name 'python*' -type f",
+        "cat /app/a.txt /etc/hosts",
+    ] {
+        assert_eq!(hint(c), None, "{c}");
+    }
+    for c in ["cat /app/summary.csv", "cat notes.txt", "grep -rn todo src"] {
+        assert!(matches!(hint(c), Some(Verdict::Hint(_))), "{c}");
+    }
+    let block = check_in(&on(), TOOLS, "cat /etc/hosts", &inside);
+    assert!(matches!(block, Some(Verdict::Block(_))));
+}
+
 /// Tool of the default rule that blocked `command`, exactly matched by message.
 fn blocked_tool_with(
     config: &BashInterceptorConfig,
@@ -541,6 +560,9 @@ fn trim_hint_flags_a_head_tail_over_a_plain_command_even_in_a_batch() {
         "cargo clippy --all-targets 2>&1 | tail -30",
         "cat package.json | head -50; ls",
         "ls; make lint 2>&1 | tail -15; cargo fmt --check 2>&1 | head -20",
+        "make 2>&1 | tail",
+        "dpkg -l | grep gcc | head -n 20",
+        "./run.sh | head -c 400",
     ] {
         let line = trim_hint(&config, c).unwrap_or_else(|| panic!("expected a hint: {c}"));
         assert!(
@@ -561,6 +583,10 @@ fn trim_hint_leaves_selection_followed_streams_and_untrimmed_commands_alone() {
         "tail -f app.log",
         "tail -f app.log | grep ERROR",
         "echo $(date) | head",
+        "gcc --version | head -1",
+        "pmars -b -r 50 -f a.red b.red | tail -n 1",
+        "make install 2>&1 | tail -n5",
+        "apt-get install -y gcc 2>&1 | tail --lines=3",
     ] {
         assert_eq!(trim_hint(&config, c), None, "{c}");
     }
@@ -569,6 +595,40 @@ fn trim_hint_leaves_selection_followed_streams_and_untrimmed_commands_alone() {
         ..hint_mode()
     };
     assert_eq!(trim_hint(&off, "make 2>&1 | tail -5"), None);
+}
+
+#[test]
+fn notes_hint_flags_only_commands_that_print_the_models_own_text() {
+    let config = hint_mode();
+    for c in [
+        "# plan: build the C side first\n# then the python wrapper",
+        "echo \"Step 1: compile\"\necho 'Step 2: test'",
+        "cat << 'EOF'\nAnalysis: the fib must work in both\nEOF",
+    ] {
+        let line = notes_hint(&config, c).unwrap_or_else(|| panic!("expected a hint: {c}"));
+        assert!(
+            line.starts_with("[hint] ") && !line.contains('\n'),
+            "{line}"
+        );
+    }
+    for c in [
+        "echo $PATH",
+        "echo hi > out.txt",
+        "echo hi; make",
+        "cat <<EOF > main.c\nint main(){}\nEOF",
+        "cat <<EOF | python3\nprint(1)\nEOF",
+        "printf '%s' \"$(date)\"",
+        "# build\nmake",
+        "python3 -c 'print(1)'",
+        "echo `id`",
+    ] {
+        assert_eq!(notes_hint(&config, c), None, "{c}");
+    }
+    let off = BashInterceptorConfig {
+        enabled: false,
+        ..hint_mode()
+    };
+    assert_eq!(notes_hint(&off, "# just notes"), None);
 }
 
 #[test]

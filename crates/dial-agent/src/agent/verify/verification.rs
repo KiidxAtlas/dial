@@ -108,7 +108,7 @@ pub(in crate::agent) fn classify_with_artifacts(
     let Some(text) = classification_text(output, artifacts) else {
         return CheckStatus::Unverified;
     };
-    let empty = zero_tests(&text);
+    let incomplete = zero_tests(&text) || unawaited_coroutine(&text);
     let complete = process
         .as_ref()
         .is_some_and(|process| process.started && process.output_complete)
@@ -118,7 +118,7 @@ pub(in crate::agent) fn classify_with_artifacts(
         && process
             .as_ref()
             .is_some_and(|process| process.exit_code == Some(0))
-        && !empty
+        && !incomplete
     {
         return CheckStatus::Passed;
     }
@@ -136,7 +136,7 @@ pub(in crate::agent) fn classify_with_artifacts(
     let Some(process) = process.filter(|_| complete) else {
         return CheckStatus::Unverified;
     };
-    if empty || process.exit_code.is_none() || process.exit_code == Some(0) {
+    if incomplete || process.exit_code.is_none() || process.exit_code == Some(0) {
         return CheckStatus::Unverified;
     }
     if code_failure_diagnostic(&text) {
@@ -356,8 +356,8 @@ fn scoped_python(root: &Path, owner: &Path, fallback: &Path, override_argv: &[St
     }
 }
 
-/// A shell check that failed: a nonzero exit, a timeout, a kill by signal, or an explicitly
-/// empty suite. A user cancellation, or a run adopted into the background, settles nothing.
+/// A shell check that failed or did not execute its tests, even if its exit was zero.
+/// A user cancellation, or a run adopted into the background, settles nothing.
 pub(in crate::agent) fn check_failed(output: &crate::runtime::tool_output::ToolOutput) -> bool {
     output.process_outcome().is_some_and(|process| {
         !process.cancelled
@@ -365,6 +365,23 @@ pub(in crate::agent) fn check_failed(output: &crate::runtime::tool_output::ToolO
                 || process.signal.is_some()
                 || process.exit_code.is_some_and(|code| code != 0))
     }) || zero_tests(&output.text)
+        || unawaited_coroutine(&output.text)
+}
+
+/// Python can exit zero after creating, but never running, an async test coroutine.
+/// Require its located runtime diagnostic, not ordinary prose mentioning async warnings.
+fn unawaited_coroutine(output: &str) -> bool {
+    output.lines().any(|line| {
+        let Some((location, warning)) = line.trim().split_once(": RuntimeWarning: coroutine ")
+        else {
+            return false;
+        };
+        location
+            .rsplit_once(':')
+            .is_some_and(|(_, number)| number.parse::<u64>().is_ok())
+            && warning.starts_with('\'')
+            && warning.ends_with("' was never awaited")
+    })
 }
 
 /// Recognize explicit empty-suite outcomes. A successful exit alone does not prove tests executed.
@@ -433,15 +450,11 @@ pub(in crate::agent) fn runner_problem(
     }
     // A launch failure has one diagnostic, not an application traceback/assertion plus a
     // missing dependency somewhere in its log. Ambiguous mixed output remains actionable.
-    // The exit-code and shell launch notes are Dial's annotations, not program output.
+    // The exit-code note is Dial's annotation, not program output.
     let diagnostics: Vec<_> = output
         .lines()
         .map(str::trim)
-        .filter(|line| {
-            !line.is_empty()
-                && !line.starts_with("[exit code: ")
-                && *line != crate::tools::exec::shell::LAUNCH_NOTE
-        })
+        .filter(|line| !line.is_empty() && !line.starts_with("[exit code: "))
         .collect();
     if diagnostics.len() != 1 {
         return None;
@@ -636,6 +649,8 @@ pub fn plan_with_runner(
                 scoped_python(root, &owner, python, override_argv),
                 shell_quote("-I"),
                 shell_quote("-S"),
+                // Cold stdlib imports must not mutate the runtime identity around this check.
+                shell_quote("-B"),
                 shell_quote("-c"),
                 shell_quote(python_code),
                 shell_quote(&relative.to_string_lossy()),

@@ -99,7 +99,7 @@ impl Workspace {
     /// Validate and register a path, returning its stable session-local `@fN` identity.
     /// Existing handles are accepted; read selectors are not. No access is granted by registration.
     pub fn file_handle(&self, path: &str) -> Result<String, String> {
-        let absolute = self.resolve(path)?;
+        let absolute = self.resolve_read(path)?;
         let normalized = self.handle_path(&absolute)?;
         self.file_handles
             .lock()
@@ -111,7 +111,7 @@ impl Workspace {
     /// for literal filenames containing colons. Raw output and unavailable targets stay literal.
     pub fn read_file_handle(&self, input: &str) -> Result<String, String> {
         let (path, selector) = super::fs::select::split_target(self, input)?;
-        if selector.raw || !self.resolve(path)?.exists() {
+        if selector.raw || !self.resolve_read(path)?.exists() {
             return Err("read target does not support compact references".into());
         }
         self.file_handle(path)
@@ -119,7 +119,7 @@ impl Workspace {
 
     /// Look up a registered path without allocating a handle or changing session state.
     pub fn existing_file_handle(&self, path: &str) -> Option<String> {
-        let absolute = self.resolve(path).ok()?;
+        let absolute = self.resolve_read(path).ok()?;
         let normalized = self.handle_path(&absolute).ok()?;
         let registry = self
             .file_handles
@@ -171,7 +171,7 @@ impl Workspace {
             .lookup(token)
             .map_err(std::io::Error::other)?;
         // Validate current confinement too: roots may have detached and symlinks may have changed.
-        self.resolve_literal(&path)?;
+        self.resolve_literal(&path, true)?;
         Ok(format!("{path}{suffix}"))
     }
 

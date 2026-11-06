@@ -174,6 +174,14 @@ namespace["__dial_prelude__"] = __dial_prelude__
 namespace["__dial_display__"] = __dial_display__
 
 
+class _ToolResult(dict):
+    """A synchronous callback receipt; awaiting it never dispatches the tool again."""
+
+    def __await__(self):
+        yield from ()
+        return self
+
+
 class ToolProxy:
     @property
     def schemas(self):
@@ -190,12 +198,17 @@ class ToolProxy:
             args = {}
         if not isinstance(args, dict):
             raise ToolError("tool arguments must be an object")
-        return callback("tool", name=name, arguments=args)
+        return _ToolResult(callback("tool", name=name, arguments=args))
 
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
-        return lambda **kwargs: self.call(name, kwargs)
+        def invoke(arguments=None, /, **kwargs):
+            if arguments is not None and kwargs:
+                raise ToolError("pass tool arguments as an object or keyword arguments, not both")
+            return self.call(name, kwargs if arguments is None else arguments)
+
+        return invoke
 
 
 tool = ToolProxy()

@@ -10,7 +10,7 @@ This index explains ownership; existing paths remain stable for suites, CI and i
 | Offline evaluator contracts | `make test-bench-offline` | Graders, fixture acceptance, report analysis and runner contracts; no model or built Dial required. |
 | Scripted real-binary recovery | `make test-smoke DIAL=target/debug/dial` | Runs the selected existing artifact against a scripted local provider and real tools; does not measure model quality. |
 | Real terminal lifecycle | `interactive_smoke.py`, `interactive_surfaces.py`, `session_contention_smoke.py`, `side_lifecycle_smoke.py` | CI/preflight probes using an existing binary and terminal prerequisites such as tmux. Captures are text, not screenshot verification. |
-| Live-model evaluation | `dial benchmark <suite.toml> --profiles <profiles.toml> --report target/report.json` | Independently graded cases with supplied model/provider configuration; can consume quota. |
+| Live-model evaluation | `dial benchmark <suite.toml> --profiles <profiles.toml> --report benchmarks/report.json` | Independently graded cases with supplied model/provider configuration; can consume quota. |
 
 ## Directory map
 
@@ -35,7 +35,9 @@ This index explains ownership; existing paths remain stable for suites, CI and i
 
 ## Reports and comparisons
 
-Write reports and terminal captures under `target/` or `scratch/`, not beside fixture inputs.
+Write reports, downloaded datasets, benchmark environments and terminal captures under
+`benchmarks/`, not Cargo's disposable `target/` or beside fixture inputs. This local workspace
+is ignored by Git and Docker (except its README); traces and derived metadata may be private.
 Compare matching suite/fixture revisions, model configuration and repetitions. Check correctness
 before latency, tokens or cost; retain failed and invalid runs. Unknown usage is not zero usage.
 See the owning measurement guide for exact invocation, dependencies and interpretation limits.

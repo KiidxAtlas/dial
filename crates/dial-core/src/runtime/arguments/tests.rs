@@ -81,3 +81,32 @@ fn argument_guide_is_bounded_for_large_schemas() {
     assert!(guide.contains("more fields"));
     assert!(argument_guide(&json!({})).is_empty());
 }
+
+#[test]
+fn bare_schemas_keep_every_parameter_and_help_restores_explanations() {
+    let full = json!({"type":"object","properties":{
+        "action":{"type":"string","enum":["start","wait"],"description":"what to do"},
+        "ready":{"type":"object","description":"readiness","properties":{"log":{"type":"string","description":"regex"}}},
+        "tasks":{"type":"array","items":{"type":"object","description":"one task","properties":{"content":{"type":"string","description":"text"}}}}
+    },"required":["action"]});
+    let mut bare = full.clone();
+    strip_property_descriptions(&mut bare);
+    assert!(!bare.to_string().contains("description"), "{bare}");
+    assert_eq!(
+        bare["properties"].as_object().unwrap().len(),
+        3,
+        "nothing hidden"
+    );
+    assert_eq!(
+        bare["properties"]["action"]["enum"],
+        json!(["start", "wait"])
+    );
+    assert_eq!(bare["required"], json!(["action"]));
+    let help = parameter_help(&full);
+    assert!(
+        help.contains("- action (string, required) one of \"start\"|\"wait\": what to do"),
+        "{help}"
+    );
+    assert!(help.contains("- ready (object): readiness"), "{help}");
+    assert!(parameter_help(&json!({})).is_empty());
+}

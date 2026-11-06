@@ -18,6 +18,7 @@ pub fn agent_launch(settings: &EffectiveSettings, model: &ModelFlags) -> Launch 
             .as_ref()
             .map(|names| names.iter().cloned().collect::<BTreeSet<_>>()),
         deferred_tools: settings.deferred_tools.iter().cloned().collect(),
+        read_only_dirs: settings.read_only_dirs.clone(),
         skills: settings
             .skills
             .as_ref()

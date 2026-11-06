@@ -24,12 +24,12 @@ pub struct HistoricalCall {
 /// history recorded before them stays valid. Removing a pinned property recovers that identity.
 const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("bash", &["session", "pty"]),
-    ("bg", &["persist", "lifetime"]),
+    ("bg", &["persist", "lifetime", "call"]),
     ("monitor", &["run"]),
-    ("grep", &["output"]),
+    ("grep", &["output", "preview"]),
     ("glob", &["preview"]),
-    ("edit", &["allow_syntax_errors"]),
-    ("write", &["allow_syntax_errors"]),
+    ("edit", &["allow_syntax_errors", "check"]),
+    ("write", &["allow_syntax_errors", "check"]),
     ("ast_edit", &["allow_syntax_errors"]),
     (
         "task",
@@ -44,12 +44,12 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("find", &["related"]),
     ("lsp", &["payload"]),
     ("eval", &["background", "title"]),
-    ("web_search", &["domains", "exclude_domains"]),
+    ("web_search", &["domains", "exclude_domains", "fetch_top"]),
     (
         "session_search",
         &["view", "layer", "record", "offset", "start", "format"],
     ),
-    ("image_gen", &["image"]),
+    ("image_gen", &["image", "frame_count", "frame_duration_ms"]),
     (
         "data",
         &[
@@ -128,6 +128,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
             "operation",
             "value",
             "description",
+            "observe",
         ],
     ),
 ];
@@ -135,6 +136,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
 /// Enum values added after release. History recorded before them stays valid because the old
 /// schema is the current one with exactly these values removed.
 const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
+    ("git", "action", &["reflog"]),
     ("eval", "language", &["py"]),
     ("task", "action", &["verify"]),
     ("lsp", "action", &["request"]),
@@ -231,6 +233,180 @@ const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
 /// about the old contract is reinterpreted; an unrecognised legacy shape is refused.
 const RENAMED_TOOLS: &[(&str, &str, &str, &str)] = &[("kernel", "eval", "language", "py")];
 
+/// Memory tools merged into `memory`: (recorded tool, the `action` that now selects it). A recorded
+/// call projects onto `memory` with that action added; its other arguments keep their names.
+const MERGED_MEMORY_TOOLS: &[(&str, &str)] = &[
+    ("recall", "recall"),
+    ("retain", "retain"),
+    ("memory_update", "update"),
+    ("forget", "forget"),
+    ("memory_history", "history"),
+    ("memory_import", "import"),
+    ("reflect", "reflect"),
+    ("learn", "learn"),
+];
+
+/// The successor of a removed tool: (successor, field, value) for [`RENAMED_TOOLS`] and
+/// [`MERGED_MEMORY_TOOLS`].
+fn successor(name: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    RENAMED_TOOLS
+        .iter()
+        .find(|(from, ..)| *from == name)
+        .map(|&(_, successor, field, value)| (successor, field, value))
+        .or_else(|| {
+            MERGED_MEMORY_TOOLS
+                .iter()
+                .find(|(from, _)| *from == name)
+                .map(|&(_, action)| ("memory", "action", action))
+        })
+}
+
+/// `artifact_read` merged into `read`: a recorded call's arguments become the equivalent
+/// `artifact://` path selector. `None` for any shape the old tool would not have accepted.
+fn artifact_read_path(arguments: &Value) -> Option<String> {
+    let object = arguments.as_object()?;
+    let known = [
+        "uri",
+        "info",
+        "annotations",
+        "start",
+        "count",
+        "offset",
+        "bytes",
+    ];
+    if object.keys().any(|key| !known.contains(&key.as_str())) {
+        return None;
+    }
+    let uri = object.get("uri")?.as_str()?;
+    let number = |key: &str| match object.get(key) {
+        None => Some(None),
+        Some(value) => value.as_u64().map(Some),
+    };
+    let (start, count) = (number("start")?, number("count")?);
+    let selector = if object.get("annotations").and_then(Value::as_bool) == Some(true) {
+        // Annotation paging has no selector form; only the default first page projects.
+        if start.is_some() || count.is_some() {
+            return None;
+        }
+        "annotations".to_owned()
+    } else if object.get("info").and_then(Value::as_bool) == Some(true) {
+        "info".to_owned()
+    } else if let Some(offset) = number("offset")? {
+        format!("bytes={offset}+{}", number("bytes")?.unwrap_or(8192))
+    } else {
+        format!("{}+{}", start.unwrap_or(1), count.unwrap_or(100))
+    };
+    Some(format!("{uri}:{selector}"))
+}
+
+/// Parameters renamed to simpler names: (tool, recorded name, current name). History recorded under
+/// the old name projects onto the new one by moving the key; nothing else is reinterpreted. Live
+/// calls that still use the old name are normalized the same way ([`legacy_arguments`]).
+const RENAMED_PROPERTIES: &[(&str, &str, &str)] = &[
+    ("grep", "fixed_string", "literal"),
+    ("grep", "max_results", "limit"),
+    ("find", "grep_keywords", "keywords"),
+];
+
+/// Removed boolean aliases: (tool, recorded alias, the property it duplicated). A recorded
+/// `alias: true` meant `property: true`; any other value meant nothing.
+const REMOVED_ALIASES: &[(&str, &str, &str)] = &[("bash", "async", "background")];
+
+fn has_legacy_names(tool: &str) -> bool {
+    RENAMED_PROPERTIES.iter().any(|(t, ..)| *t == tool)
+        || REMOVED_ALIASES.iter().any(|(t, ..)| *t == tool)
+}
+
+/// The schema as recorded before the renames: current names moved back, removed aliases restored.
+fn legacy_schema(schema: &mut Value) {
+    let Some(name) = schema
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some(properties) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for (tool, recorded, current) in RENAMED_PROPERTIES {
+        if *tool == name
+            && let Some(value) = properties.remove(*current)
+        {
+            properties.insert((*recorded).into(), value);
+        }
+    }
+    for (tool, alias, canonical) in REMOVED_ALIASES {
+        if *tool == name
+            && let Some(value) = properties.get(*canonical).cloned()
+        {
+            properties.insert((*alias).into(), value);
+        }
+    }
+}
+
+/// Move recorded or habitual old parameter names of `tool` onto the current names in `parameters`
+/// (the tool's current parameter schema). An explicit current-name value wins over a renamed one.
+pub fn legacy_arguments(tool: &str, parameters: &Value, arguments: &mut Value) {
+    let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(object) = arguments.as_object_mut() else {
+        return;
+    };
+    for (owner, recorded, current) in RENAMED_PROPERTIES {
+        if *owner == tool
+            && properties.contains_key(*current)
+            && !properties.contains_key(*recorded)
+            && let Some(value) = object.remove(*recorded)
+            && !object.contains_key(*current)
+        {
+            object.insert((*current).into(), value);
+        }
+    }
+    for (owner, alias, canonical) in REMOVED_ALIASES {
+        if *owner == tool
+            && properties.contains_key(*canonical)
+            && !properties.contains_key(*alias)
+            && let Some(value) = object.remove(*alias)
+            && value == Value::Bool(true)
+        {
+            object.insert((*canonical).into(), value);
+        }
+    }
+}
+
+/// History recorded before [`RENAMED_PROPERTIES`] / [`REMOVED_ALIASES`]: the old identity matches
+/// the current schema with those names restored, under the same revision and additive rules.
+fn legacy_compatible(
+    old: &Identity,
+    new: &Identity,
+    schemas: &[Value],
+    registry: &Registry,
+) -> bool {
+    if !has_legacy_names(&old.name) {
+        return false;
+    }
+    if crate::tools::BUILTIN.contains(&old.name.as_str()) {
+        return old.revision == 1
+            && new.revision == 1
+            && registry.get(&old.name).is_none()
+            && native_identities(&old.name, true).contains(old)
+            && native_identities(&old.name, false).contains(new);
+    }
+    let mut legacy = schemas.to_vec();
+    for schema in &mut legacy {
+        if schema.pointer("/function/name").and_then(Value::as_str) == Some(&old.name) {
+            legacy_schema(schema);
+        }
+    }
+    identities(&legacy, registry).get(&old.name) == Some(old)
+        || registry_additive_compatible(old, new, &legacy, registry)
+}
+
 /// Positions of call `id` in the assistant message at `index` and of its tool result.
 fn paired_call(messages: &[Value], index: usize, id: &str) -> Option<(usize, usize)> {
     let call_index = messages[index]["tool_calls"]
@@ -294,14 +470,21 @@ fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> boo
     {
         return false;
     }
+    let known = native_identities(&old.name, false);
+    known.contains(old) && known.contains(new)
+}
+
+/// Every recognized identity of a file/shell built-in across editor dialects and additive releases;
+/// `legacy` restores names renamed since release ([`legacy_schema`]).
+fn native_identities(name: &str, legacy: bool) -> Vec<Identity> {
     // Editor dialects are current-call contracts, not instructions to reinterpret old effects.
     // Recognize their exact identities while leaving old arguments/results as inert history.
     use crate::config::types::EditMode;
     let additive = ADDITIVE_PROPERTIES
         .iter()
-        .find(|(name, _)| *name == old.name)
+        .find(|(tool, _)| *tool == name)
         .map_or(&[][..], |(_, properties)| *properties);
-    let known: Vec<_> = [
+    [
         EditMode::Hashline,
         EditMode::Replace,
         EditMode::Patch,
@@ -309,8 +492,11 @@ fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> boo
         EditMode::Sloppy,
     ]
     .into_iter()
-    .filter_map(|mode| crate::tools::schema(&old.name, mode))
-    .flat_map(|schema| {
+    .filter_map(|mode| crate::tools::schema(name, mode))
+    .flat_map(|mut schema| {
+        if legacy {
+            legacy_schema(&mut schema);
+        }
         let mut before = schema.clone();
         if let Some(properties) = before
             .pointer_mut("/function/parameters/properties")
@@ -329,7 +515,7 @@ fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> boo
             for (tool, property, values) in ADDITIVE_ENUM_VALUES {
                 let Some(options) = properties
                     .get_mut(*property)
-                    .filter(|_| *tool == old.name)
+                    .filter(|_| *tool == name)
                     .and_then(|property| property.get_mut("enum"))
                     .and_then(Value::as_array_mut)
                 else {
@@ -357,9 +543,8 @@ fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> boo
         variants.push(narrowed);
         variants
     })
-    .filter_map(|schema| identities(&[schema], &Registry::new()).remove(&old.name))
-    .collect();
-    known.contains(old) && known.contains(new)
+    .filter_map(|schema| identities(&[schema], &Registry::new()).remove(name))
+    .collect()
 }
 
 /// The additive tables for tools that are not file/shell built-ins (registry tools such as `eval`,
@@ -569,10 +754,40 @@ pub fn project_history(
         };
         let recorded: BTreeMap<String, Identity> = serde_json::from_value(recorded.clone())?;
         for (id, old) in &recorded {
-            if let Some(&(_, successor, field, value)) = RENAMED_TOOLS
-                .iter()
-                .find(|(from, ..)| *from == old.name)
-                .filter(|_| !current.contains_key(&old.name))
+            if old.name == "artifact_read" && !current.contains_key("artifact_read") {
+                if id.starts_with("callback:") {
+                    continue;
+                }
+                let target = current.get("read").ok_or_else(|| {
+                    anyhow::anyhow!("tool artifact_read was merged into read, which is unavailable")
+                })?;
+                ensure!(
+                    old.revision == 1,
+                    "tool artifact_read contract revision {} has no merge projection",
+                    old.revision
+                );
+                let (call_index, _) = paired_call(messages, index, id).ok_or_else(|| {
+                    anyhow::anyhow!("tool artifact_read history is unpaired; no merge projection")
+                })?;
+                let raw = &message["tool_calls"][call_index]["function"]["arguments"];
+                let arguments: Value = match raw.as_str() {
+                    Some(text) => serde_json::from_str(text)?,
+                    None => raw.clone(),
+                };
+                let path = artifact_read_path(&arguments).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tool artifact_read history has an unrecognised legacy shape; no merge projection"
+                    )
+                })?;
+                let projected = projected.get_or_insert_with(|| messages.to_vec());
+                projected[index]["tool_calls"][call_index]["function"]["name"] = json!("read");
+                projected[index]["tool_calls"][call_index]["function"]["arguments"] =
+                    json!(json!({ "path": path }).to_string());
+                projected[index]["dial_tool_contracts"][id] = json!(target);
+                continue;
+            }
+            if let Some((successor, field, value)) =
+                successor(&old.name).filter(|_| !current.contains_key(&old.name))
             {
                 // Catalog-level callback identities are never replayed, so they stay inert.
                 if id.starts_with("callback:") {
@@ -602,11 +817,17 @@ pub fn project_history(
                     None => raw.clone(),
                 };
                 let action = arguments.get("action").and_then(Value::as_str);
-                // Legacy calls only selected the Python runtime; any other shape is refused.
-                ensure!(
+                // Legacy kernel calls only selected the Python runtime and merged memory calls had
+                // no action; any other shape is refused.
+                let recognised = if successor == "memory" {
+                    arguments.is_object() && arguments.get(field).is_none()
+                } else {
                     arguments.get(field).is_none()
                         && action
-                            .is_some_and(|a| matches!(a, "eval" | "reset" | "cancel" | "status")),
+                            .is_some_and(|a| matches!(a, "eval" | "reset" | "cancel" | "status"))
+                };
+                ensure!(
+                    recognised,
                     "tool {} history has an unrecognised legacy shape; no rename projection",
                     old.name
                 );
@@ -629,6 +850,30 @@ pub fn project_history(
                     .get(&old.name)
                     .is_some_and(|tool| tool.accepts_historical_contract(old))
             {
+                continue;
+            }
+            if legacy_compatible(old, new, schemas, registry) {
+                // Rewrite only the paired call's argument keys; callback catalogs stay inert.
+                let parameters = schemas
+                    .iter()
+                    .find(|schema| schema["function"]["name"] == old.name.as_str())
+                    .map(|schema| schema["function"]["parameters"].clone())
+                    .unwrap_or(Value::Null);
+                if let Some(call_index) = message["tool_calls"]
+                    .as_array()
+                    .and_then(|calls| calls.iter().position(|call| call["id"] == *id))
+                {
+                    let raw = &message["tool_calls"][call_index]["function"]["arguments"];
+                    let mut arguments: Value = match raw.as_str() {
+                        Some(text) => serde_json::from_str(text)?,
+                        None => raw.clone(),
+                    };
+                    legacy_arguments(&old.name, &parameters, &mut arguments);
+                    let projected = projected.get_or_insert_with(|| messages.to_vec());
+                    projected[index]["tool_calls"][call_index]["function"]["arguments"] =
+                        json!(arguments.to_string());
+                    projected[index]["dial_tool_contracts"][id] = json!(new);
+                }
                 continue;
             }
             let tool = registry.get(&old.name).ok_or_else(|| {

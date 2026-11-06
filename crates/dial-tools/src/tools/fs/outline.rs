@@ -18,7 +18,7 @@ const MAX_SIGNATURE: usize = 120;
 /// The plain path of an outline request, unless a file literally named `…:outline` exists.
 pub(in crate::tools) fn target<'a>(ws: &Workspace, input: &'a str) -> Option<&'a str> {
     let path = input.strip_suffix(SELECTOR).filter(|p| !p.is_empty())?;
-    (!ws.resolve(input).is_ok_and(|literal| literal.exists())).then_some(path)
+    (!ws.resolve_read(input).is_ok_and(|literal| literal.exists())).then_some(path)
 }
 
 /// `rust:function_item` → `function`.
@@ -31,7 +31,7 @@ fn kind_label(kind: &str) -> &str {
 }
 
 pub(in crate::tools) fn read(ws: &Workspace, input: &str, budget: usize) -> Result<String, String> {
-    let path = ws.resolve(input)?;
+    let path = ws.resolve_read(input)?;
     let meta = std::fs::metadata(&path).map_err(|e| io_message("reading", input, &e))?;
     if meta.is_dir() {
         return Err(format!(

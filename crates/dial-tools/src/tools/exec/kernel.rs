@@ -8,8 +8,6 @@ use crate::config::tools::kernel::KernelConfig;
 use super::background::{AdoptedJob, CellJob};
 #[cfg(windows)]
 use super::sandbox::Sandbox;
-#[cfg(not(windows))]
-use super::shell::shell_command;
 use crate::tools::integrations::ext::{ToolCallback, ToolContext};
 use crate::tools::{ToolOutput, Workspace, exec::preludes};
 use parking_lot::Mutex;
@@ -29,7 +27,7 @@ pub(crate) const MAX_CODE: usize = 64 * 1024;
 pub(crate) use crate::runtime::json_transport::{INTERRUPT_GRACE, execution_deadline};
 // No descendant can detach: even with the operator's filesystem sandbox opt-out, fork/spawn is denied.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(super) const FORK_FENCE: &str = "(version 1)(allow default)(deny process-fork)";
+const FORK_FENCE: &str = "(version 1)(allow default)(deny process-fork)";
 const PYTHON_PREFLIGHT: &str = "import sys,json\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'result':{'executable':sys.executable,'version':list(sys.version_info[:2])}}),flush=True)";
 
 pub(crate) struct ActiveGuard<'a>(&'a AtomicUsize);
@@ -232,8 +230,8 @@ impl PythonRuntime {
                                 None => String::new(),
                             };
                             let script = format!(
-                                "exec /usr/bin/sandbox-exec -p {} {} {flags} {} {sites}",
-                                shell_quote(FORK_FENCE),
+                                "{} {} {flags} {} {sites}",
+                                fork_fence_prefix(),
                                 shell_quote(
                                     launch
                                         .python
@@ -242,7 +240,7 @@ impl PythonRuntime {
                                 ),
                                 shell_quote(PYTHON_DRIVER),
                             );
-                            shell_command(ctx.workspace, &script, ctx.workspace.root())?
+                            fenced_command(ctx.workspace, &script)?
                         };
                         strip_runtime_injection(&mut command);
                         require_fork_containment("eval")?;
@@ -539,7 +537,20 @@ pub(crate) fn code_output(result: Result<Value, String>) -> ToolOutput {
     }
 }
 
+// Advisory metadata is separate from static platform support. Reading it must never run the probe.
+static FORK_CONTAINMENT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+
+pub(super) fn cached_fork_containment() -> Option<Result<(), String>> {
+    FORK_CONTAINMENT.get().cloned()
+}
+
 pub(crate) fn require_fork_containment(label: &str) -> Result<(), String> {
+    FORK_CONTAINMENT
+        .get_or_init(|| probe_fork_containment(label))
+        .clone()
+}
+
+fn probe_fork_containment(label: &str) -> Result<(), String> {
     if let Some(reason) = crate::tools::surface::catalog::execution_platform(label).reason {
         return Err(reason);
     }
@@ -550,7 +561,29 @@ pub(crate) fn require_fork_containment(label: &str) -> Result<(), String> {
             format!("{label} requires OS process-fork containment even with filesystem sandboxing disabled: {error}")
         })?;
     }
+    #[cfg(target_os = "linux")]
+    super::sandbox::fork_fence::available()?;
     Ok(())
+}
+
+pub(super) fn fork_fence_prefix() -> String {
+    #[cfg(target_os = "linux")]
+    return "exec".into();
+    #[cfg(not(target_os = "linux"))]
+    format!("exec /usr/bin/sandbox-exec -p {}", shell_quote(FORK_FENCE))
+}
+
+#[cfg(not(windows))]
+pub(super) fn fenced_command(workspace: &Workspace, script: &str) -> Result<Command, String> {
+    #[cfg(target_os = "linux")]
+    return super::shell::shell_command_fenced(workspace, script, workspace.root());
+    #[cfg(not(target_os = "linux"))]
+    super::shell::shell_command(workspace, script, workspace.root())
+}
+
+#[cfg(windows)]
+pub(super) fn fenced_command(workspace: &Workspace, script: &str) -> Result<Command, String> {
+    super::shell::shell_command(workspace, script, workspace.root())
 }
 
 /// Cell deadline with host-callback time excluded. A controller callback runs on the caller's

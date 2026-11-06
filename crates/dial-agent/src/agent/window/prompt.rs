@@ -103,7 +103,7 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
             LEAN_BATCHING
         });
     }
-    let optional: Vec<&str> = [
+    let mut optional: Vec<&str> = [
         ("skill", SKILL_RULE),
         ("codebase_memory", PROJECT_MAP_RULE),
         ("lsp", LSP_RULE),
@@ -113,6 +113,9 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     .filter(|(tool, _)| has(tool))
     .map(|(_, rule)| rule)
     .collect();
+    if EVIDENCE_DATA_TOOLS.iter().any(|tool| has(tool)) {
+        optional.push(EVIDENCE_DATA_RULE);
+    }
     if !optional.is_empty() {
         policy.push_str("\n- ");
         policy.push_str(&optional.join(" "));

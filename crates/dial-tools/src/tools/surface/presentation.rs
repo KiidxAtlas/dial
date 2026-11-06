@@ -27,7 +27,7 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
     use BodyStyle::*;
     use Tone::*;
     let (label, tone, body) = match name {
-        "read" | "artifact_read" => ("Read", Tools, Quiet),
+        "read" => ("Read", Tools, Quiet),
         "grep" | "ast_search" => ("Search", Tools, Quiet),
         "glob" | "find" => ("Find", Tools, Quiet),
         "write" => ("Write", Edit, Write),

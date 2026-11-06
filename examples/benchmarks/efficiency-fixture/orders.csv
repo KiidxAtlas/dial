@@ -1,0 +1,7 @@
+order_id,region,status,quantity,unit_price_cents
+o101,north,paid,2,125
+o102,south,paid,3,200
+o103,north,cancelled,1,500
+o104,north,paid,4,125
+o105,west,paid,1,300
+o106,south,cancelled,2,200

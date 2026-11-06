@@ -187,8 +187,19 @@ fn prepare_child_call(
     if preview_abort.is_some_and(std::cell::Cell::get) {
         return ControlFlow::Break(refuse("This call was not executed: an authorized completed edit preview failed earlier in this assistant batch.".into()));
     }
-    if let Some((_, why)) = call_form_error(call, schemas, names) {
-        return ControlFlow::Break(refuse(format!("invalid tool call: {why}")));
+    if let Some((kind, why)) = call_form_error(call, schemas, names) {
+        let help = (kind == "schema")
+            .then(|| parameter_help(env, &call.name))
+            .flatten()
+            .map(|help| format!("\nThis call was not executed. {help}"))
+            .unwrap_or_default();
+        return ControlFlow::Break(refuse(format!("invalid tool call: {why}{help}")));
+    }
+    if matches!(call.name.as_str(), "edit" | "write") && call.arguments["check"] == true {
+        return ControlFlow::Break(refuse(format!(
+            "{} check=true requires the foreground controller's focused-check runner; no mutation was executed. Child workers can run their scoped checks through bash.",
+            call.name
+        )));
     }
     if let Some(context) = rerank.as_ref() {
         let journal = context.children.journal.borrow();
@@ -265,10 +276,11 @@ fn prepare_child_call(
         call.name.as_str(),
         "context_notes" | "new_context" | "checkpoint" | "rewind"
     );
-    // Provenance children (no selected runtime) run their recall/retain as extension tools.
-    let memory_tool = crate::storage::memory_backend::TOOL_NAMES.contains(&call.name.as_str())
-        && children.is_none_or(|children| children.memory.is_some());
-    if memory_tool && !matches!(call.name.as_str(), "recall" | "reflect") {
+    // Provenance children (no selected runtime) run `memory` as an extension tool.
+    let memory_action = crate::storage::memory_backend::call_action(&call.name, &call.arguments)
+        .filter(|_| children.is_none_or(|children| children.memory.is_some()));
+    let memory_tool = memory_action.is_some();
+    if memory_action.is_some_and(|action| !crate::storage::memory_backend::reads(action)) {
         if env.plan_mode || !job.spec.mutates {
             return ControlFlow::Break(refuse("denied: selected memory mutation is unavailable during plan review or to a read-only child".into()));
         }
@@ -289,7 +301,7 @@ fn prepare_child_call(
     }
     let needs_approval = !private_control
         && if memory_tool {
-            matches!(call.name.as_str(), "retain" | "learn")
+            matches!(memory_action, Some("retain" | "learn"))
         } else {
             approval::needs_approval(env.ext, call)
         };
@@ -859,7 +871,7 @@ fn execute_child_call(
                 context.capture,
             );
             *context.children.memory_pending.borrow_mut() = Some(call.clone());
-            let data = memory.execute_tool(&authority, &call.name, &call.arguments, &mut runner)?;
+            let data = memory.execute_tool(&authority, &call.arguments, &mut runner)?;
             Ok(ToolOutput {
                 execution: Default::default(),
                 text: serde_json::to_string_pretty(&data)?,

@@ -113,28 +113,27 @@ impl<'a> ChildTurn<'a> {
         if env.config.ask.enabled && env.harness.tools.iter().any(|name| name == "ask") {
             names.push("ask".into());
         }
-        // A selected runtime serves the canonical memory tools itself. Without one, provenance's own
-        // registered recall/retain stay available to the child like any other extension tool.
+        // A selected runtime serves `memory` itself. Without one, provenance's own registered
+        // `memory` stays available to the child like any other extension tool; a read-only child
+        // is refused its mutating actions when it calls them.
         names.retain(|name| {
-            !crate::storage::memory_backend::TOOL_NAMES.contains(&name.as_str())
-                || (children.memory.is_none()
-                    && env.ext.contains(name)
-                    && (job.spec.mutates || !matches!(name.as_str(), "retain" | "learn")))
+            name != crate::storage::memory_backend::TOOL_NAME
+                || (children.memory.is_none() && env.ext.contains(name))
         });
         if let Some(memory) = &children.memory {
-            // Mirror the root offer: the runtime's tools unless an operator pinned the harness list.
+            // Mirror the root offer unless an operator pinned the harness list.
             let pinned = env.config.harness.tools != config::tools::default_tools();
-            names.extend(
-                memory
-                    .offered_names()
-                    .into_iter()
-                    .filter(|name| {
-                        crate::storage::memory_backend::TOOL_NAMES.contains(name)
-                            && (job.spec.mutates || !matches!(*name, "retain" | "learn"))
-                            && (!pinned || env.harness.tools.iter().any(|loaded| loaded == name))
-                    })
-                    .map(str::to_owned),
-            );
+            let name = crate::storage::memory_backend::TOOL_NAME;
+            let readable = memory
+                .actions()
+                .iter()
+                .any(|action| crate::storage::memory_backend::reads(action));
+            if memory.offers_tool()
+                && (job.spec.mutates || readable)
+                && (!pinned || env.harness.tools.iter().any(|loaded| loaded == name))
+            {
+                names.push(name.to_owned());
+            }
         }
         let checkpoint = env.config.checkpoint.enabled
             && job.allowed_tools.is_some_and(|tools| {
@@ -175,7 +174,7 @@ impl<'a> ChildTurn<'a> {
         rule_state.begin(rule_root, &job.prompt);
         let rule_regenerations = 0u32;
         if let Some(allowed) = job.allowed_tools {
-            names.retain(|name| allowed.contains(name) || name == "artifact_read");
+            names.retain(|name| allowed.contains(name));
         }
         if checkpoint {
             for name in crate::agent::workflow::exploration::TOOL_NAMES {
@@ -1579,7 +1578,12 @@ impl<'a> ChildTurn<'a> {
                         && !env.plan_mode
                         && !summary_step
                         && job.spec.mutates
-                        && self.names.iter().any(|name| name == "learn")
+                        && self
+                            .names
+                            .iter()
+                            .any(|name| name == crate::storage::memory_backend::TOOL_NAME)
+                        && crate::storage::memory_backend::actions(&env.config.memory)
+                            .contains(&"learn")
                         && !phase.exploration.busy()
                         && !phase.exploration.completed
                         && phase.pending.is_none();
@@ -2008,6 +2012,14 @@ impl<'a> ChildTurn<'a> {
                     // completion as parallel_tools emits them, so the parent's agent tree counts
                     // and names them like any other call.
                     let observer = std::cell::RefCell::new(&mut *approver);
+                    let read_reuse = engine.reusable_reads(|id| {
+                        self.superseded.holds_full(id)
+                            && self.messages.iter().any(|message| {
+                                message["tool_call_id"].as_str() == Some(id)
+                                    && message["dial_execution"]["output"]["presentation"]
+                                        != "partial"
+                            })
+                    });
                     parallel = crate::agent::parallel_tools(
                         crate::agent::ParallelToolContext {
                             workspace: env.workspace,
@@ -2025,6 +2037,7 @@ impl<'a> ChildTurn<'a> {
                         },
                         &reply.tool_calls[index..index + count],
                         None,
+                        Some(&read_reuse),
                     )
                     .into();
                 }
@@ -2092,10 +2105,7 @@ impl<'a> ChildTurn<'a> {
             if !blocked {
                 prerequisites.observe(env.workspace, env.workspace.edit_mode(), call, &output);
             }
-            if matches!(
-                call.name.as_str(),
-                "recall" | "retain" | "memory_update" | "forget" | "reflect" | "learn"
-            ) {
+            if call.name == crate::storage::memory_backend::TOOL_NAME {
                 self.cached_memory_prompt = None;
             }
             if !blocked && !output.is_error {
@@ -2114,7 +2124,10 @@ impl<'a> ChildTurn<'a> {
                         env.ext,
                     )
                 },
-            ) {
+            )
+            .or_else(|| {
+                crate::agent::run::failure_guidance::missing_program_recovery(call, &output)
+            }) {
                 output.text.push_str(&advice);
             }
             if matches!(call.name.as_str(), "bash" | "bg") {
@@ -2144,10 +2157,10 @@ impl<'a> ChildTurn<'a> {
                 },
                 |id| {
                     self.superseded.holds_full(id)
-                        && self
-                            .messages
-                            .iter()
-                            .any(|message| message["tool_call_id"].as_str() == Some(id))
+                        && self.messages.iter().any(|message| {
+                            message["tool_call_id"].as_str() == Some(id)
+                                && message["dial_execution"]["output"]["presentation"] != "partial"
+                        })
                 },
             );
             if let Some(reason) = stop {

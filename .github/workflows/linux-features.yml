@@ -1,0 +1,68 @@
+name: Linux feature coverage
+
+on:
+  workflow_call:
+    inputs:
+      exhaustive:
+        description: Check all 32 feature combinations
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      exhaustive:
+        description: Check all 32 feature combinations
+        type: boolean
+        default: true
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: Select feature coverage
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Test matrix selection
+        run: python3 scripts/test-ci-features.py
+      - name: Select representative or exhaustive matrix
+        id: select
+        env:
+          EXHAUSTIVE: ${{ github.event_name == 'schedule' || inputs.exhaustive }}
+        run: |
+          set -euo pipefail
+          flags=()
+          if [[ "$EXHAUSTIVE" == true ]]; then flags+=(--exhaustive); fi
+          echo "matrix=$(python3 scripts/ci-features.py "${flags[@]}")" >> "$GITHUB_OUTPUT"
+
+  check:
+    name: Linux features (${{ matrix.name }})
+    needs: matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Leave runner capacity for platform tests instead of flooding the queue.
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install native feature dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libspa-0.2-dev pkg-config
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # Share per runner image; only its largest selection saves a cache.
+          shared-key: features-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix['save-cache'] }}
+      - name: Compile feature combination
+        env:
+          CHECK_FEATURES: ${{ matrix.features }}
+        run: cargo check --locked --workspace --all-targets --no-default-features --features "$CHECK_FEATURES"

@@ -20,6 +20,8 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+mod preview;
+
 const DEFAULT_GREP_MATCHES: usize = 400;
 const MAX_GREP_MATCHES: usize = 1000;
 const MAX_GREP_CONTEXT: usize = 10;
@@ -30,8 +32,8 @@ const MAX_PATTERN: usize = 512;
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
 const REGEX_DFA_LIMIT: usize = 8 << 20;
 const MAX_GREP_BYTES: u64 = 64 * 1024 * 1024;
-/// Matching lines one file may add to a page when `max_results` is defaulted. An explicit
-/// `max_results` lifts it; otherwise the rest of that file is named in the footer.
+/// Matching lines one file may add to a page when `limit` is defaulted. An explicit
+/// `limit` lifts it; otherwise the rest of that file is named in the footer.
 const GREP_PER_FILE: usize = 20;
 /// Files handed to worker threads at a time, the smallest batch worth the threads, and their cap.
 const PARALLEL_BATCH: usize = 64;
@@ -116,7 +118,7 @@ enum Stat {
 /// Confinement and type checks repeated immediately before opening a file.
 fn stat_file(ws: &Workspace, path: &Path) -> Stat {
     if path.to_str().is_none()
-        || ws.resolve(&ws.rel(path)).is_err()
+        || ws.resolve_read(&ws.rel(path)).is_err()
         || fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
     {
         return Stat::Unreadable;
@@ -251,7 +253,7 @@ fn bool_default(args: &Value, key: &str, default: bool) -> Result<bool, String> 
 /// Literal filenames win over semicolon splitting; validate every scope before searching.
 fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
     let input = opt_str(args, "path")?.unwrap_or(".");
-    let literal = ws.resolve(input)?;
+    let literal = ws.resolve_read(input)?;
     let inputs = if literal.exists() {
         vec![input]
     } else {
@@ -262,7 +264,7 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
     }
     let mut paths = Vec::new();
     for input in inputs {
-        let path = ws.resolve(input)?;
+        let path = ws.resolve_read(input)?;
         // Reject even in-workspace symlink scopes rather than silently changing their identity.
         let original = if Path::new(input).is_absolute() {
             PathBuf::from(input)
@@ -310,7 +312,7 @@ fn cursor(args: &Value, ws: &Workspace) -> Result<Option<(PathBuf, usize)>, Stri
     let Some(value) = args.get("cursor").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
-    let path = ws.resolve(req_str(value, "path")?)?;
+    let path = ws.resolve_read(req_str(value, "path")?)?;
     let consumed = opt_u64(value, "match")?.unwrap_or(0);
     let consumed = usize::try_from(consumed).map_err(|_| "cursor.match is too large")?;
     Ok(Some((path, consumed)))
@@ -332,13 +334,12 @@ fn page_footer(
         })
         .transpose()?;
     // The traversal order is part of the tool description; repeat it only when there is a
-    // continuation to copy, which is when it matters.
-    let page = if next.is_none() && remaining_skip == 0 {
-        serde_json::json!({"next_cursor": null, "remaining_skip": 0})
-    } else {
-        serde_json::json!({"next_cursor": next, "remaining_skip": remaining_skip,
-            "order": "sorted component/depth-first; unchanged query and workspace required"})
-    };
+    // continuation to copy, which is when it matters. Without one the page line says nothing.
+    if next.is_none() && remaining_skip == 0 {
+        return Ok(format!("[coverage: {coverage}]\n"));
+    }
+    let page = serde_json::json!({"next_cursor": next, "remaining_skip": remaining_skip,
+        "order": "sorted component/depth-first; unchanged query and workspace required"});
     Ok(format!("[coverage: {coverage}]\n[page: {page}]\n"))
 }
 
@@ -354,6 +355,15 @@ fn finish_page(
     }
     text.push_str(&page_footer(ws, next.as_ref(), remaining_skip, coverage)?);
     Ok(text)
+}
+
+/// Skipped binary files matter only when there were some.
+fn binary_note(binary: usize) -> String {
+    if binary == 0 {
+        String::new()
+    } else {
+        format!("; binary_files={binary}")
+    }
 }
 
 fn expand_braces(pattern: &str, out: &mut Vec<String>) -> Result<(), String> {
@@ -563,6 +573,24 @@ impl Glob {
     }
 }
 
+/// Filename conventions shared by bounded discovery previews; not proof of test ownership.
+pub(in crate::tools) fn conventional_test(path: &std::path::Path) -> bool {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    path.components().any(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some("test" | "tests" | "spec" | "specs")
+        )
+    }) || stem
+        .split(['_', '-', '.'])
+        .any(|part| matches!(part, "test" | "tests" | "spec" | "specs"))
+        || stem.ends_with("Test")
+        || stem.ends_with("Tests")
+}
+
 pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
     let pattern = req_str(args, "pattern")?;
     let glob = Glob::new(pattern)?;
@@ -587,12 +615,17 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
     let mut next = None;
     let mut unrepresentable = 0;
     for root in roots {
-        walk.run_with_prefix(&root, &ws.root.join(&glob.prefix), &mut |path| {
+        let pattern_root = ws.root_containing(&root).unwrap_or(ws.root());
+        walk.run_with_prefix(&root, &pattern_root.join(&glob.prefix), &mut |path| {
             if path.to_str().is_none() {
                 unrepresentable += 1;
                 return true;
             }
-            if !glob.matches(&ws.rel(path)) {
+            let relative = path
+                .strip_prefix(pattern_root)
+                .unwrap_or(path)
+                .to_string_lossy();
+            if !glob.matches(&relative) {
                 return true;
             }
             if skip > 0 {
@@ -641,23 +674,7 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
         // already on this page. Keep the sorted path listing and the 16-candidate cap intact.
         if let Some(index) = preview_paths.iter().position(|path| {
             let path = std::path::Path::new(path);
-            if ast_grep_language::SupportLang::from_path(path).is_none() {
-                return false;
-            }
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            path.components().any(|part| {
-                matches!(
-                    part.as_os_str().to_str(),
-                    Some("test" | "tests" | "spec" | "specs")
-                )
-            }) || stem
-                .split(['_', '-', '.'])
-                .any(|part| matches!(part, "test" | "tests" | "spec" | "specs"))
-                || stem.ends_with("Test")
-                || stem.ends_with("Tests")
+            ast_grep_language::SupportLang::from_path(path).is_some() && conventional_test(path)
         }) {
             preview_paths[..=index].rotate_right(1);
         }
@@ -696,14 +713,22 @@ pub(in crate::tools) fn glob_source_targets(
         .filter(|path| {
             glob.matches(path)
                 && ws
-                    .resolve(path)
+                    .resolve_read(path)
                     .is_ok_and(|path| roots.iter().any(|root| path.starts_with(root)))
         })
         .collect()
 }
+/// Restore only fresh numbered grep previews, constrained to the original scope and glob.
+pub(in crate::tools) fn grep_source_targets(
+    ws: &Workspace,
+    args: &Value,
+    text: &str,
+) -> Vec<String> {
+    preview::source_targets(ws, args, text)
+}
 
 /// Compile once for bounded byte matching, on lines or whole files.
-/// `fixed_string` escapes all metacharacters. Anchors work at line boundaries;
+/// `literal` escapes all metacharacters. Anchors work at line boundaries;
 /// regex compile memory and per-call input work are bounded separately.
 fn build_matcher(pattern: &str, fixed_string: bool, ignore_case: bool) -> Result<Regex, String> {
     let source = if fixed_string {
@@ -717,7 +742,7 @@ fn build_matcher(pattern: &str, fixed_string: bool, ignore_case: bool) -> Result
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_DFA_LIMIT)
         .build()
-        .map_err(|e| format!("invalid or unsupported Rust regex: {e}\nLookaround and backreferences are unsupported; simplify the pattern or use `fixed_string: true`."))
+        .map_err(|e| format!("invalid or unsupported Rust regex: {e}\nLookaround and backreferences are unsupported; simplify the pattern or use `literal: true`."))
 }
 
 fn trim_eol(line: &[u8]) -> &[u8] {
@@ -810,7 +835,7 @@ struct GrepState {
     blocked_row: bool,
     /// Why this page stopped before the scan ended; named in the footer when a continuation exists.
     cap: Option<String>,
-    /// The most matching lines one file may add to this page; unbounded when max_results is explicit.
+    /// The most matching lines one file may add to this page; unbounded when limit is explicit.
     per_file: usize,
     /// Files whose matches were held back by `per_file`, in walk order (one entry per file).
     capped_files: Vec<PathBuf>,
@@ -818,6 +843,7 @@ struct GrepState {
     /// Summary modes: matching files counted on this page, and the listed `(path, matches)` rows.
     summary_files: usize,
     summary_rows: Vec<(PathBuf, usize)>,
+    preview: bool,
 }
 
 impl GrepState {
@@ -1178,8 +1204,10 @@ impl GrepState {
                 )
             } else {
                 format!(
-                    "files={}; matches={}; scanned_files={}; binary_files={}; {walk_coverage}",
-                    self.summary_files, self.matches, self.scanned, self.binary,
+                    "files={}; matches={}{}; {walk_coverage}",
+                    self.summary_files,
+                    self.matches,
+                    binary_note(self.binary),
                 )
             };
             let footer = page_footer(ws, next.as_ref(), self.skip, &coverage)?;
@@ -1204,7 +1232,12 @@ impl GrepState {
             } else {
                 std::mem::take(&mut self.out)
             };
-            if body.len() + footer.len() <= MAX_GREP_OUTPUT {
+            let reserve = if self.preview {
+                preview::UNAVAILABLE.len()
+            } else {
+                0
+            };
+            if body.len() + footer.len() + reserve <= MAX_GREP_OUTPUT {
                 return Ok(body + &footer);
             }
             // Only a files page can shrink: drop its last row and resume at that file.
@@ -1499,7 +1532,7 @@ impl GrepState {
                     String::new()
                 };
                 omitted.push_str(&format!(
-                    "; per_file_cap={} reached in: {}{more}; rows past it are not shown; repeat with path=<file> and an explicit max_results (which lifts the per-file cap) to see them",
+                    "; per_file_cap={} reached in: {}{more}; rows past it are not shown; repeat with path=<file> and an explicit limit (which lifts the per-file cap) to see them",
                     self.per_file,
                     listed.join(", "),
                 ));
@@ -1522,13 +1555,18 @@ impl GrepState {
                 )
             } else {
                 format!(
-                    "results={}; scanned_files={}; binary_files={}; {walk_coverage}",
-                    self.matches, self.scanned, self.binary,
+                    "results={}{}; {walk_coverage}",
+                    self.matches,
+                    binary_note(self.binary),
                 )
             };
             let footer = page_footer(ws, next.as_ref(), self.skip, &coverage)?;
             let budget = MAX_GREP_OUTPUT
-                .checked_sub(footer.len() + GREP_WITNESS_WARNING.len())
+                .checked_sub(
+                    footer.len()
+                        + GREP_WITNESS_WARNING.len()
+                        + if self.preview { preview::RESERVE } else { 0 },
+                )
                 .ok_or_else(too_large)?;
             let body_len = if self.out.is_empty() {
                 "no matches\n".len()
@@ -1577,11 +1615,11 @@ impl GrepState {
         // Footer validation and all row removals precede any witness publication.
         // The fixed warning reserve cannot evict a row after it has been recorded.
         let mut witness_failed = false;
-        for file in self.files {
-            let Some(source) = file.source else { continue };
+        for file in &self.files {
+            let Some(source) = &file.source else { continue };
             let mut numbers: Vec<_> = file
                 .rows
-                .into_iter()
+                .iter()
                 .filter(|row| row.end <= returned_body)
                 .map(|row| row.number)
                 .collect();
@@ -1599,7 +1637,7 @@ impl GrepState {
                 }
             }
             if ws
-                .record_search_witnesses(&file.path, &source, &ranges)
+                .record_search_witnesses(&file.path, source, &ranges)
                 .is_err()
             {
                 witness_failed = true;
@@ -1609,6 +1647,10 @@ impl GrepState {
             self.out.push_str(GREP_WITNESS_WARNING);
         }
         self.out.push_str(&footer);
+        if self.preview {
+            let excerpts = preview::render(ws, &self.files, &self.out, returned_body);
+            self.out.push_str(&excerpts);
+        }
         Ok(self.out)
     }
 }
@@ -1626,7 +1668,8 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     if pattern.is_empty() || pattern.len() > MAX_PATTERN {
         return Err(format!("pattern must be 1..={MAX_PATTERN} bytes"));
     }
-    let fixed = opt_bool(args, "fixed_string")?;
+    let preview = opt_bool(args, "preview")?;
+    let fixed = opt_bool(args, "literal")?;
     let escaped_newline = !fixed
         && pattern.as_bytes().windows(2).enumerate().any(|(i, pair)| {
             pair == b"\\n"
@@ -1658,11 +1701,11 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         )
         .expect("ssh:// scheme checked above")?;
         let skip = opt_u64(args, "skip")?.unwrap_or(0) as usize;
-        let max = opt_u64(args, "max_results")?
+        let max = opt_u64(args, "limit")?
             .unwrap_or(DEFAULT_GREP_MATCHES as u64)
             .min(MAX_GREP_MATCHES as u64) as usize;
         if max == 0 {
-            return Err(format!("max_results must be 1..={MAX_GREP_MATCHES}"));
+            return Err(format!("limit must be 1..={MAX_GREP_MATCHES}"));
         }
         if opt_u64(args, "context")?.unwrap_or(0) != 0 {
             return Err("context lines are not supported for ssh:// grep".into());
@@ -1701,6 +1744,9 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         } else if capped {
             out.push_str("[results capped; increase skip to continue]\n");
         }
+        if preview {
+            out.push_str(preview::UNAVAILABLE);
+        }
         return Ok(out);
     }
     let mode = OutputMode::parse(args)?;
@@ -1712,20 +1758,14 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     let context = opt_u64(args, "context")?
         .unwrap_or(0)
         .min(MAX_GREP_CONTEXT as u64) as usize;
-    let max_matches = opt_u64(args, "max_results")?
+    let max_matches = opt_u64(args, "limit")?
         .unwrap_or(DEFAULT_GREP_MATCHES as u64)
         .min(MAX_GREP_MATCHES as u64);
     if max_matches == 0 {
-        return Err(format!("max_results must be 1..={MAX_GREP_MATCHES}"));
+        return Err(format!("limit must be 1..={MAX_GREP_MATCHES}"));
     }
     let glob = opt_str(args, "glob")?.map(Glob::new).transpose()?;
-    let prefix = glob
-        .as_ref()
-        .map_or_else(|| ws.root.clone(), |g| ws.root.join(&g.prefix));
-    let per_file = if args
-        .get("max_results")
-        .is_some_and(|value| !value.is_null())
-    {
+    let per_file = if args.get("limit").is_some_and(|value| !value.is_null()) {
         usize::MAX
     } else {
         GREP_PER_FILE
@@ -1773,15 +1813,24 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         mode,
         summary_files: 0,
         summary_rows: Vec::new(),
+        preview,
     };
     let mut bytes = Vec::new();
     let mut batch: Vec<PathBuf> = Vec::new();
     let batch_size = if batched { PARALLEL_BATCH } else { 1 };
     let workers = if batched { workers } else { 1 };
     for root in &roots {
+        let pattern_root = ws.root_containing(root).unwrap_or(ws.root());
+        let prefix = glob.as_ref().map_or_else(
+            || pattern_root.to_path_buf(),
+            |g| pattern_root.join(&g.prefix),
+        );
         walk.run_with_prefix(root, &prefix, &mut |path| {
-            if glob.as_ref().is_none_or(|g| g.matches(&ws.rel(path))) && !state.before_resume(path)
-            {
+            let relative = path
+                .strip_prefix(pattern_root)
+                .unwrap_or(path)
+                .to_string_lossy();
+            if glob.as_ref().is_none_or(|g| g.matches(&relative)) && !state.before_resume(path) {
                 batch.push(path.to_path_buf());
                 if batch.len() >= batch_size {
                     state.search_batch(ws, &mut batch, &mut bytes, workers);
@@ -1805,6 +1854,11 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         );
         let mut reached = false;
         for root in &roots {
+            let pattern_root = ws.root_containing(root).unwrap_or(ws.root());
+            let prefix = glob.as_ref().map_or_else(
+                || pattern_root.to_path_buf(),
+                |g| pattern_root.join(&g.prefix),
+            );
             walk.run_with_prefix(root, &prefix, &mut |path| {
                 reached = path == stop;
                 !reached
@@ -1822,7 +1876,11 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     if mode == OutputMode::Lines {
         state.finish(ws, next, &coverage, complete)
     } else {
-        state.finish_summary(ws, next, &coverage, complete)
+        let mut page = state.finish_summary(ws, next, &coverage, complete)?;
+        if preview {
+            page.push_str(preview::UNAVAILABLE);
+        }
+        Ok(page)
     }
 }
 

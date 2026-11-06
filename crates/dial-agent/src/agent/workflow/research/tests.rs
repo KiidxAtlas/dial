@@ -220,7 +220,10 @@ fn a_full_window_of_distinct_successful_read_rounds_requires_synthesis() {
 fn successful_lookup_rounds_count_toward_synthesis() {
     let lookups = [
         ("skill", json!({"name":"rust-best-practices"})),
-        ("recall", json!({"query":"research checkpoint"})),
+        (
+            "memory",
+            json!({"action":"recall","query":"research checkpoint"}),
+        ),
         ("tool_search", json!({"query":"web"})),
         (
             "codebase_memory",
@@ -255,7 +258,7 @@ fn successful_lookup_rounds_count_toward_synthesis() {
 fn each_counted_lookup_variant_advances_one_round() {
     let variants = [
         ("skill", json!({"name":"test-runner"})),
-        ("recall", json!({"query":"loop guard"})),
+        ("memory", json!({"action":"recall","query":"loop guard"})),
         ("tool_search", json!({"query":"github"})),
         ("codebase_memory", json!({"action":"recall"})),
         ("codebase_memory", json!({"action":"architecture"})),

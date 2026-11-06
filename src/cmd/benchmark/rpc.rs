@@ -155,7 +155,14 @@ fn observe(m: &mut RunMetrics, event: &Value) {
                 m.tool_errors += 1;
             }
             match event["name"].as_str() {
-                Some("artifact_read") | Some("artifact_search") => m.artifacts_retrieved += 1,
+                Some("artifact_search") => m.artifacts_retrieved += 1,
+                Some("read")
+                    if event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("[artifact://")) =>
+                {
+                    m.artifacts_retrieved += 1
+                }
                 Some("tool_load") => m.dynamic_tools_used += 1,
                 _ => {}
             }

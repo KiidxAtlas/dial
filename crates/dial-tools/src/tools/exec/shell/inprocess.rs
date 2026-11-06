@@ -53,6 +53,7 @@ pub(super) fn run(
 ) -> Result<ToolOutput, String> {
     let scratch = ws.root.join(SCRATCH_DIR);
     fs::create_dir_all(&scratch).map_err(|e| format!("creating scratch directory: {e}"))?;
+    let entries_before = super::directory_entries(cwd);
     let mut spool = ws
         .artifacts()
         .map(|store| store.spool())
@@ -139,6 +140,9 @@ pub(super) fn run(
         && let Some(code) = code
     {
         text.push_str(&format!("[exit code: {code}]\n"));
+    }
+    if !cancelled && let Some(note) = super::created_entries_note(entries_before.as_ref(), cwd) {
+        text.push_str(&note);
     }
     let artifact = append_output_notes(&mut text, spool, &capture_error, &mut artifact_error);
     let minimized = minimize_body(

@@ -68,7 +68,7 @@ pub(in crate::agent) fn compact_command(
         return None;
     }
     let compact = format!(
-        "[Command exited 0; omitted {removed} recognized progress/test-success lines]\n{preserved}\n[Complete tool evidence: {artifact}; retrieve with artifact_read]"
+        "[Command exited 0; omitted {removed} recognized progress/test-success lines]\n{preserved}\n[Complete tool evidence: {artifact}; retrieve with read]"
     );
     (compact.len() < output.text.len()).then_some(compact)
 }

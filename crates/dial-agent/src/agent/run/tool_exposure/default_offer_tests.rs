@@ -43,6 +43,15 @@ pub(crate) fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) 
     f(&mut agent)
 }
 
+/// Fixed-request reliability fixtures opt out of completion reconciliation explicitly.
+/// Default-policy continuation behavior is exercised by the owning completion/advisor tests.
+pub(crate) fn with_review_disabled<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) -> T {
+    with_agent(
+        &format!("{overlay}\n[verification.review]\nenabled=false\n"),
+        f,
+    )
+}
+
 fn schema_bytes(agent: &Agent<'_>, names: &[String]) -> usize {
     serde_json::to_string(&agent.schemas(names).unwrap())
         .unwrap()
@@ -56,6 +65,66 @@ fn system_text(agent: &Agent<'_>) -> String {
     serde_json::to_string(&agent.system_messages())
         .unwrap()
         .replace(&root, "<project>")
+}
+
+#[test]
+fn normal_offer_includes_supported_eval_without_overriding_operator_choices() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        assert_eq!(
+            agent.offered().iter().any(|name| name == "eval"),
+            crate::tools::exec::eval::prepare_containment().is_ok(),
+        );
+    });
+    with_agent(
+        "[assistance]\nlean_local=false\n[harness]\ntools=['read','bash']",
+        |agent| {
+            assert!(!agent.offered().iter().any(|name| name == "eval"));
+        },
+    );
+}
+
+#[test]
+fn automatic_eval_offer_requires_containment_but_explicit_selections_do_not() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        for ready in [false, true] {
+            let offered = agent.offered_with_eval_readiness(false, || ready);
+            assert_eq!(offered.iter().any(|name| name == "eval"), ready);
+        }
+        agent.tool_routing.retained.push("eval".into());
+        assert!(
+            !agent
+                .offered_with_eval_readiness(false, || false)
+                .iter()
+                .any(|name| name == "eval"),
+            "an earlier automatic selection must not outlive failed containment"
+        );
+        agent.enabled_tools.insert("eval".into());
+        assert!(
+            agent
+                .offered_with_eval_readiness(false, || false)
+                .iter()
+                .any(|name| name == "eval")
+        );
+        assert!(
+            agent
+                .offered_with_eval_readiness(true, || panic!("child selection must not probe"))
+                .iter()
+                .any(|name| name == "eval")
+        );
+    });
+    with_agent(
+        "[assistance]\nlean_local=false\n[harness]\ntools=['read','eval']",
+        |agent| {
+            assert!(
+                agent
+                    .offered_with_eval_readiness(false, || panic!(
+                        "pinned selection must not probe"
+                    ))
+                    .iter()
+                    .any(|name| name == "eval")
+            );
+        },
+    );
 }
 
 #[test]
@@ -220,9 +289,7 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
             "find",
             "bg",
             "task",
-            "recall",
-            "retain",
-            "codebase_memory",
+            "memory",
             "working_state",
             "tool_load",
             "tool_search",
@@ -232,11 +299,36 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
                 "{core}: {offered:?}"
             );
         }
+        // Saved project understanding and the self-improvement helpers stay loadable only.
+        let discoverable_now = agent.discoverable_tools(&offered);
+        for loadable in ["codebase_memory", "experience", "edit_preview"] {
+            assert!(
+                !offered.iter().any(|name| name == loadable),
+                "{loadable}: {offered:?}"
+            );
+            if catalog.iter().any(|name| name == loadable) {
+                assert!(
+                    discoverable_now.iter().any(|(name, _)| name == loadable),
+                    "{loadable}: {discoverable_now:?}"
+                );
+            }
+        }
         let discoverable = agent.discoverable_tools(&offered);
         let prompt = serde_json::to_string(&agent.system_messages()).unwrap();
         assert!(prompt.contains("Loadable tools, not in the schema yet"));
         for deferred in tools::DEFERRED_BY_DEFAULT {
             assert!(catalog.iter().any(|name| name == deferred), "{deferred}");
+            if *deferred == "git" && offered.iter().any(|name| name == "git") {
+                assert!(
+                    agent
+                        .workspace
+                        .root()
+                        .ancestors()
+                        .any(|dir| dir.join(".git").exists())
+                );
+                assert!(!discoverable.iter().any(|(name, _)| name == "git"));
+                continue;
+            }
             assert!(!offered.iter().any(|name| name == deferred), "{offered:?}");
             assert!(
                 discoverable.iter().any(|(name, _)| name == deferred),
@@ -257,6 +349,7 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
                 .map(|name| (*name).to_owned()),
         );
         before.sort();
+        before.dedup();
         let (before, after) = (schema_bytes(agent, &before), schema_bytes(agent, &offered));
         eprintln!("default tool schemas: {before} -> {after} bytes");
         assert!(after < before);
@@ -265,14 +358,7 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
 
 #[test]
 fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
-    let helpers = [
-        "task",
-        "message",
-        "working_state",
-        "codebase_memory",
-        "todo",
-        "find",
-    ];
+    let helpers = ["task", "message", "working_state", "todo", "find"];
     with_agent("[assistance]\nlean_local=false", |agent| {
         let attended = agent.offered();
         for helper in helpers {
@@ -284,27 +370,32 @@ fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
         for helper in helpers {
             assert!(!offered.iter().any(|name| name == helper), "{offered:?}");
         }
-        for loadable in ["task", "working_state", "codebase_memory", "todo", "find"] {
+        for loadable in [
+            "task",
+            "working_state",
+            "todo",
+            "find",
+            "bg",
+            "finish",
+            "check",
+        ] {
+            assert!(
+                !offered.iter().any(|name| name == loadable),
+                "{loadable}: {offered:?}"
+            );
             assert!(
                 discoverable.iter().any(|(name, _)| name == loadable),
                 "{discoverable:?}"
             );
         }
-        for core in [
-            "read",
-            "edit",
-            "bash",
-            "bg",
-            "grep",
-            "glob",
-            "check",
-            "tool_load",
-        ] {
+        for core in ["read", "edit", "write", "bash", "grep", "glob", "tool_load"] {
             assert!(
                 offered.iter().any(|name| name == core),
                 "{core}: {offered:?}"
             );
         }
+        // With `bg` deferred, the shell text says it is a Dial tool to load, not a shell builtin.
+        assert!(agent.bg_loadable());
         let (before, after) = (
             schema_bytes(agent, &attended),
             schema_bytes(agent, &offered),
@@ -323,6 +414,27 @@ fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
             assert!(!offered.iter().any(|name| name == "working_state"));
         },
     );
+}
+
+#[test]
+fn unattended_launch_defers_memory_tools_but_keeps_them_loadable() {
+    let memory = "[memory]\nbackend='semantic'\n[memory.semantic]\nembedding='off'\n[assistance]\nlean_local=false";
+    with_agent(memory, |agent| {
+        let attended = agent.offered();
+        assert!(attended.iter().any(|name| name == "memory"), "{attended:?}");
+        agent.modes.launch.unattended = true;
+        let offered = agent.offered();
+        let discoverable = agent.discoverable_tools(&offered);
+        assert!(!offered.iter().any(|name| name == "memory"), "{offered:?}");
+        assert!(
+            discoverable.iter().any(|(name, _)| name == "memory"),
+            "{discoverable:?}"
+        );
+        assert!(
+            offered.iter().any(|name| name == "tool_load"),
+            "{offered:?}"
+        );
+    });
 }
 
 pub(in crate::agent) fn load_tools(agent: &mut Agent<'_>, arguments: Value) -> ToolOutput {
@@ -363,23 +475,19 @@ fn tool_load_offers_a_deferred_tool_next_round_and_unload_defers_it_again() {
             assert!(offered.iter().any(|name| name == deferred), "{offered:?}");
         }
         let prompt = serde_json::to_string(&agent.system_messages()).unwrap();
-        assert!(!prompt.contains("  - memory_update: "), "{prompt}");
-        let out = load_tools(agent, json!({"unload": ["memory_update"]}));
+        assert!(!prompt.contains("  - lsp: "), "{prompt}");
+        let out = load_tools(agent, json!({"unload": ["lsp"]}));
         assert!(!out.is_error, "{}", out.text);
         let entry = &out.data.as_ref().unwrap()["tools"][0];
-        assert_eq!(entry["name"], "memory_update");
+        assert_eq!(entry["name"], "lsp");
         assert_eq!(entry["action"], "unload");
         assert_eq!(entry["enabled_next_round"], false);
         assert_eq!(entry["status"], "not_loaded");
         assert_eq!(entry["retained_by_policy"], false);
         assert!(entry["next"].as_str().unwrap().contains("tool_load"));
-        assert!(
-            out.text.contains("not offered [memory_update]"),
-            "{}",
-            out.text
-        );
+        assert!(out.text.contains("not offered [lsp]"), "{}", out.text);
         let offered = agent.offered();
-        assert!(!offered.iter().any(|name| name == "memory_update"));
+        assert!(!offered.iter().any(|name| name == "lsp"));
         assert!(offered.iter().any(|name| name == "ast_search"));
     });
 }
@@ -404,7 +512,7 @@ fn tool_load_reports_core_retention_and_deduplicates_selection_receipts() {
             assert_eq!(entries[0]["name"], "ast_search");
             assert_eq!(entries[0]["enabled_next_round"], false);
             assert_eq!(entries[1]["name"], "read");
-            assert_eq!(entries[1]["status"], "loaded_next_request");
+            assert_eq!(entries[1]["status"], "already_offered");
             assert_eq!(entries[1]["enabled_next_round"], true);
             assert_eq!(entries[1]["retained_by_policy"], true);
             assert!(
@@ -496,11 +604,11 @@ fn tool_load_can_unload_ineligible_activation_without_promising_a_reload() {
 #[test]
 fn pinned_harness_selection_keeps_deferred_tools_offered() {
     with_agent(
-        "[harness]\ntools=['read','edit','bash','recall','retain','memory_update']\n[assistance]\nlean_local=false",
+        "[harness]\ntools=['read','edit','bash','memory','ast_search']\n[assistance]\nlean_local=false",
         |agent| {
             let offered = agent.offered();
             assert!(
-                offered.iter().any(|name| name == "memory_update"),
+                offered.iter().any(|name| name == "ast_search"),
                 "{offered:?}"
             );
         },
@@ -517,34 +625,29 @@ fn selected_memory_tools_stay_in_compact_lean_and_fallback_offers() {
         with_agent(&format!("{memory}{profile}"), |agent| {
             assert!(agent.tool_discovery(), "{profile}");
             let offered = agent.offered();
-            for tool in ["recall", "retain"] {
-                assert!(
-                    offered.iter().any(|name| name == tool),
-                    "{profile}: {offered:?}"
-                );
-            }
-            // The fallback used when the full set does not fit the window keeps them too.
+            assert!(
+                offered.iter().any(|name| name == "memory"),
+                "{profile}: {offered:?}"
+            );
+            // The fallback used when the full set does not fit the window keeps it too.
             agent.lean_tools = true;
             let offered = agent.offered();
-            for tool in ["recall", "retain"] {
-                assert!(
-                    offered.iter().any(|name| name == tool),
-                    "{profile}: {offered:?}"
-                );
+            assert!(
+                offered.iter().any(|name| name == "memory"),
+                "{profile}: {offered:?}"
+            );
+            // The obsolete split tool names are gone from the catalog.
+            for obsolete in ["recall", "retain", "memory_update", "forget"] {
+                assert!(!agent.catalog().iter().any(|name| name == obsolete));
             }
-            // Corrections stay loadable, like provenance's.
-            assert!(!offered.iter().any(|name| name == "forget"));
-            assert!(agent.catalog().iter().any(|name| name == "forget"));
             agent.schemas(&offered).unwrap();
         });
     }
-    // Provenance's own recall/retain are protected the same way.
+    // Provenance's own memory tool is protected the same way.
     with_agent("[assistance]\ncompact_tools=true", |agent| {
         agent.lean_tools = true;
         let offered = agent.offered();
-        for tool in ["recall", "retain"] {
-            assert!(offered.iter().any(|name| name == tool), "{offered:?}");
-        }
+        assert!(offered.iter().any(|name| name == "memory"), "{offered:?}");
     });
 }
 
@@ -554,7 +657,7 @@ fn autolearn_offers_learn_up_front_and_guides_the_root_agent() {
         "[memory]\nbackend='local'\nautolearn=true\n[assistance]\nlean_local=false",
         |agent| {
             let offered = agent.offered();
-            assert!(offered.iter().any(|name| name == "learn"), "{offered:?}");
+            assert!(offered.iter().any(|name| name == "memory"), "{offered:?}");
             assert!(system_text(agent).contains("Auto-learn is enabled"));
         },
     );
@@ -566,19 +669,19 @@ fn autolearn_offers_learn_up_front_and_guides_the_root_agent() {
 #[test]
 fn memory_guidance_follows_the_tools_the_backend_offers() {
     with_agent("[assistance]\nlean_local=false", |agent| {
-        assert!(system_text(agent).contains("`recall` searches facts"));
+        assert!(system_text(agent).contains("action recall searches facts"));
     });
     with_agent("[memory]\nbackend='semantic'", |agent| {
-        assert!(system_text(agent).contains("`retain` saves a durable fact"));
+        assert!(system_text(agent).contains("Action retain saves a durable fact"));
     });
     with_agent("[memory]\nbackend='sharpshooter'", |agent| {
         let text = system_text(agent);
         assert!(text.contains("saved project decisions"), "{text}");
-        assert!(!text.contains("`retain` saves"));
+        assert!(!text.contains("Action retain saves"));
     });
     for off in ["[memory]\nbackend='off'", "[memory]\nbackend='local'"] {
         with_agent(off, |agent| {
-            assert!(!system_text(agent).contains("Memory: `recall`"), "{off}");
+            assert!(!system_text(agent).contains("Memory: `memory`"), "{off}");
         });
     }
 }
@@ -807,10 +910,9 @@ fn lean_multi_slot_server_keeps_delegation_offered() {
 fn local_small_tier_offers_the_minimal_set_only_where_it_applies() {
     use crate::agent::model::local_profile::Tier;
     let minimal = |offered: &[String]| {
-        offered.iter().all(|name| {
-            Agent::LEAN_TOOLS.contains(&name.as_str())
-                || matches!(name.as_str(), "recall" | "retain")
-        })
+        offered
+            .iter()
+            .all(|name| Agent::LEAN_TOOLS.contains(&name.as_str()) || name == "memory")
     };
     with_agent("context_window=16384", |agent| {
         assert_eq!(agent.local_tier(), Some(Tier::Small));
@@ -1406,4 +1508,40 @@ impl crate::tools::integrations::ext::Tool for WebCapability {
     fn call(&self, _: &crate::tools::integrations::ext::ToolContext, _: &Value) -> ToolOutput {
         panic!("schema measurement must not execute a tool")
     }
+}
+
+#[test]
+fn offered_native_schemas_are_bare_and_argument_help_restores_explanations() {
+    with_agent("", |agent| {
+        let names: Vec<String> = [
+            "read", "write", "edit", "glob", "grep", "bash", "bg", "eval", "todo", "check", "task",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .filter(|name| agent.full_schemas(std::slice::from_ref(name)).is_ok())
+        .collect();
+        let bare = serde_json::to_string(&agent.schemas(&names).unwrap()).unwrap();
+        let full = serde_json::to_string(&agent.full_schemas(&names).unwrap()).unwrap();
+        eprintln!(
+            "core tool schemas: {} bytes full, {} bytes bare",
+            full.len(),
+            bare.len()
+        );
+        assert!(bare.len() < full.len());
+        for schema in agent.schemas(&names).unwrap() {
+            let parameters = &schema["function"]["parameters"];
+            assert!(
+                !parameters.to_string().contains("\"description\""),
+                "{schema}"
+            );
+        }
+        // Nothing is hidden: the bare grep schema still offers every parameter.
+        let grep = &agent.schemas(&["grep".to_owned()]).unwrap()[0];
+        assert!(grep["function"]["parameters"]["properties"]["cursor"].is_object());
+        let help = agent.parameter_help("grep").unwrap();
+        assert!(
+            help.contains("- pattern (string, required): Non-empty Rust regex"),
+            "{help}"
+        );
+    });
 }

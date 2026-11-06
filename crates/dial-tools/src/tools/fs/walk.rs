@@ -63,7 +63,7 @@ impl<'a> Walk<'a> {
     /// Visit every regular file under `start`. `visit` returns false to stop.
     pub fn run(&mut self, start: &Path, visit: &mut dyn FnMut(&Path) -> bool) {
         let ws = self.ws;
-        self.run_with_prefix(start, &ws.root, visit);
+        self.run_with_prefix(start, ws.root_containing(start).unwrap_or(&ws.root), visit);
     }
 
     /// Keep only directories on the way to, or below, `prefix`. Start at the original root so
@@ -144,7 +144,7 @@ impl<'a> Walk<'a> {
         }
         if !self
             .ws
-            .resolve(&self.ws.rel(path))
+            .resolve_read(&self.ws.rel(path))
             .is_ok_and(|resolved| resolved == path)
         {
             self.truncated = true;
@@ -364,7 +364,7 @@ impl<'a> SearchWalk<'a> {
         }
         if !self
             .ws
-            .resolve(&self.ws.rel(path))
+            .resolve_read(&self.ws.rel(path))
             .is_ok_and(|resolved| resolved == path)
         {
             self.unreadable += 1;
@@ -425,13 +425,21 @@ impl<'a> SearchWalk<'a> {
             && self.omissions.is_empty()
     }
 
-    /// Full counters only when something limited the walk; a complete walk gets one short line.
+    /// Full counters only when something limited the walk; a complete walk gets one short line
+    /// that names only non-default settings and ignored entries.
     pub fn coverage(&self) -> String {
         if self.is_complete() {
-            return format!(
-                "walk complete; excluded_by_ignore_or_policy={}; hidden={}; gitignore={}",
-                self.excluded, self.hidden, self.gitignore
-            );
+            let mut line = String::from("walk complete");
+            if self.excluded > 0 {
+                line.push_str(&format!("; excluded_by_ignore_or_policy={}", self.excluded));
+            }
+            if !self.hidden {
+                line.push_str("; hidden=false");
+            }
+            if !self.gitignore {
+                line.push_str("; gitignore=false");
+            }
+            return line;
         }
         format!(
             "walk_entries={}; directory_entries_read={}; directory_entry_limit={}; oversized_directories={}; unreadable_directories={}; unreadable_entries_or_ignore_rules={}; excluded_hidden_policy_or_ignore_entries={}; symlinks={}; depth_capped_directories={}; hidden={}; gitignore={}; ignored_subtrees={} (not enumerated); local_ignore_limit=1MiB/file,4MiB/call; truncated={}; omitted_paths={}",

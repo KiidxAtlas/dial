@@ -591,15 +591,25 @@ fn progress_path(config: &Config) -> PathBuf {
     directory(config).join("progress.json")
 }
 
+struct JobLock(std::fs::File);
+
+impl Drop for JobLock {
+    fn drop(&mut self) {
+        // Concurrent spawning can inherit the descriptor until exec; end this job's
+        // lock explicitly so those copies cannot keep a finished job looking active.
+        let _ = std::fs::File::unlock(&self.0);
+    }
+}
+
 /// The project's weights job lock: one job (or ledger change) at a time.
-fn lock(config: &Config) -> Result<std::fs::File> {
+fn lock(config: &Config) -> Result<JobLock> {
     let dir = directory(config);
     private_dir(&dir)?;
     let lock = auto::lock_file(&dir.join("job.lock"))?;
     std::fs::File::try_lock(&lock)
         .map_err(std::io::Error::from)
         .context("another weights job is running for this project")?;
-    Ok(lock)
+    Ok(JobLock(lock))
 }
 
 /// Run `work` holding the job lock and, from the CLI (`layout`), foreground compute. An

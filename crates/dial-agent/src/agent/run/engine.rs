@@ -163,6 +163,9 @@ impl std::fmt::Display for StalledRefusal {
 impl std::error::Error for StalledRefusal {}
 
 impl Engine {
+    pub fn reusable_reads(&self, visible: impl Fn(&str) -> bool) -> investigation::ReadReuse {
+        self.returned_reads.reusable(visible)
+    }
     pub fn research_prompt(&self) -> Option<serde_json::Value> {
         self.research.prompt()
     }
@@ -340,7 +343,7 @@ impl Engine {
                 .map(|error| format!(" Its original error was: {error}"))
                 .unwrap_or_default();
             return Some(format!(
-                "Failed-operation retry barrier: this unchanged `{}` call already failed and was not executed again.{original} Inspect the retained diagnostic, use a different targeted observation, correct the arguments or repair the source before retrying. Todo updates and compaction do not release this barrier.",
+                "Failed-operation retry barrier: this unchanged `{}` call already failed and was not executed again.{original} Inspect the retained diagnostic, use a different targeted observation, correct the arguments, or repair the source or environment (a successful state-changing command releases it) before retrying. Todo updates and compaction do not release this barrier.",
                 call.name
             ));
         }
@@ -388,7 +391,8 @@ impl Engine {
         let Some(before) = self.failed_trees.get(&identity) else {
             return false;
         };
-        let changed = shell_tree(workspace, call).is_some_and(|now| &now != before);
+        let changed = crate::agent::verify::shared_runs::shell_tree(workspace, call)
+            .is_some_and(|now| &now != before);
         if changed {
             self.forget_failure(&identity);
         }
@@ -487,8 +491,14 @@ impl Engine {
             mutated,
             &output.execution.changed_paths,
         );
-        if mutated && !output.is_error && !check_failed {
+        let succeeded = !output.is_error && !check_failed;
+        if mutated && succeeded {
             self.release_for_change(&output.execution.changed_paths);
+        } else if succeeded && status_is_ok(output) && environment_changing_shell(call) {
+            // Installing a package or a header changes state no tracked path records. A failed
+            // command with unknown dependencies may then succeed, so its barrier is released;
+            // failures tied to known files still wait for those files to change.
+            self.release_for_change(&[]);
         }
         // Native refusals can themselves return complete source rows. Reuse those witnesses;
         // neither a marker in prose nor a successful read receipt grants retry readiness.
@@ -520,10 +530,10 @@ impl Engine {
                     crate::agent::window::prompt::truncate_chars(line, 300),
                 );
             }
-            if let Some(tree) = shell_tree(workspace, call) {
+            if let Some(tree) = crate::agent::verify::shared_runs::shell_tree(workspace, call) {
                 self.failed_trees.insert(identity, tree);
             }
-            output.text.push_str("\nFailed-operation retry barrier: unchanged arguments are now withheld. Correct the arguments, inspect a different source, or repair the source before retrying; completed effects are retained.");
+            output.text.push_str("\nRetry barrier: this exact call is withheld until its arguments or inputs change.");
             let targets = recovery_checkpoint::declared_targets(workspace, call);
             if !targets.is_empty() {
                 self.failed_versions.insert(
@@ -781,15 +791,18 @@ pub(in crate::agent) fn failed_identity(call: &ToolCall) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(call_identity(call).as_bytes()).into()
 }
+/// A successful `bash` command that is not a plain inspection may change environment state
+/// (installed packages, headers, services) that no tracked path records.
+fn environment_changing_shell(call: &ToolCall) -> bool {
+    call.name == "bash"
+        && call.arguments["command"]
+            .as_str()
+            .is_some_and(crate::agent::safety::approval::opaque_shell_effect)
+}
 
-/// The tree a `bash` call runs against; `None` for other tools or outside git.
-fn shell_tree(workspace: &Workspace, call: &ToolCall) -> Option<String> {
-    (call.name == "bash").then_some(())?;
-    crate::agent::verify::shared_runs::tree_fingerprint(
-        workspace.root(),
-        call.arguments["command"].as_str().unwrap_or_default(),
-        call.arguments["cwd"].as_str().unwrap_or_default(),
-    )
+fn status_is_ok(output: &ToolOutput) -> bool {
+    crate::runtime::execution::ToolStatus::from_output(output)
+        == crate::runtime::execution::ToolStatus::Ok
 }
 
 #[cfg(test)]

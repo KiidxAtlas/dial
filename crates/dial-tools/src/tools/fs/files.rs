@@ -14,6 +14,103 @@ use std::path::Path;
 const MAX_WRITE: usize = 1024 * 1024;
 const MAX_EDIT_FILE: u64 = 4 * 1024 * 1024;
 
+/// A bounded native text read's current source identity and requested inclusive line ranges.
+/// This describes coverage only; callers must still perform ordinary tool admission.
+#[derive(Debug)]
+pub struct NativeReadSelection {
+    pub path: String,
+    pub revision: String,
+    pub ranges: Vec<(u32, u32)>,
+    /// Current edit-witness coverage; absent witnesses require a real read to restore them.
+    pub witnessed_ranges: Vec<(u32, u32)>,
+}
+
+impl Workspace {
+    /// Resolve an explicit native text selection using the same parser and source projection as
+    /// `read`. Unsupported representations and uncertain identities fall back to ordinary reads.
+    pub fn native_read_selection(&self, args: &Value) -> Option<NativeReadSelection> {
+        if self.edit_mode != EditMode::Hashline || present(args, "paths") {
+            return None;
+        }
+        let input = req_str(args, "path").ok()?;
+        let input = self.expand_file_handle(input).ok()?;
+        if input.contains("://") || super::outline::target(self, &input).is_some() {
+            return None;
+        }
+        let (path_text, selector) = select::split_target(self, &input).ok()?;
+        let offset = opt_u64(args, "offset").ok()?;
+        let limit = opt_u64(args, "limit").ok()?;
+        if selector.raw
+            || offset == Some(0)
+            || limit == Some(0)
+            || (offset.is_some() && selector.selects_lines())
+            // Whole-file reads may intentionally return a structural summary.
+            || (offset.is_none() && limit.is_none() && !selector.selects_lines())
+            || super::documents::kind(path_text).is_some()
+            || crate::tools::edit::edit_source::notebook_path(Path::new(path_text))
+            || crate::llm::images::is_image(Path::new(path_text))
+        {
+            return None;
+        }
+        let path = self.resolve_read(path_text).ok()?;
+        if super::documents::kind(&path.to_string_lossy()).is_some()
+            || crate::tools::edit::edit_source::notebook_path(&path)
+            || crate::llm::images::is_image(&path)
+        {
+            return None;
+        }
+        let mut file = crate::tools::edit::edit_transaction::open_read(self, &path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > hashline::MAX_FILE {
+            return None;
+        }
+        use std::io::Read as _;
+        let mut raw = String::new();
+        (&mut file)
+            .take(hashline::MAX_FILE + 1)
+            .read_to_string(&mut raw)
+            .ok()?;
+        if raw.len() as u64 > hashline::MAX_FILE || raw.contains('\0') {
+            return None;
+        }
+        let source = crate::tools::edit::edit_source::Source::plain(&raw);
+        let len = hashline::split_lines(&source.text).len();
+        let offset = usize::try_from(offset.unwrap_or(1)).ok()?;
+        let limit = usize::try_from(limit.unwrap_or(DEFAULT_READ_LINES as u64))
+            .ok()?
+            .min(MAX_READ_LINES);
+        let ranges = plan_spans(&selector, offset, limit, len)
+            .into_iter()
+            .map(|span| {
+                Some((
+                    u32::try_from(span.start).ok()?,
+                    u32::try_from(span.end).ok()?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let flags = self
+            .store()
+            .witness_flags_version(&path, &source.text, source.raw_revision);
+        let mut witnessed_ranges: Vec<(u32, u32)> = Vec::new();
+        for (index, seen) in flags.into_iter().enumerate() {
+            if !seen {
+                continue;
+            }
+            let line = u32::try_from(index + 1).ok()?;
+            match witnessed_ranges.last_mut() {
+                Some((_, last)) if *last + 1 == line => *last = line,
+                _ => witnessed_ranges.push((line, line)),
+            }
+        }
+        Some(NativeReadSelection {
+            path: self.rel(&path),
+            revision: crate::tools::edit::edit_source::revision_hex(&raw),
+            ranges,
+            witnessed_ranges,
+        })
+    }
+}
+
 /// Read one line, keeping at most `cap` bytes of it. `None` at EOF; otherwise
 /// whether the line was truncated. Memory stays bounded for any input.
 fn read_line_capped(
@@ -248,16 +345,34 @@ fn read_target(
         return read_tool_streaming(ws, &args, cancel, budget);
     }
     if scheme == crate::tools::integrations::resources::Scheme::Artifact {
+        use crate::tools::integrations::resources::{ArtifactView, artifact_target};
         let store = ws
             .artifacts()
             .ok_or("artifact resources are unavailable in this workspace")?;
-        let start = opt_u64(args, "offset")?.unwrap_or(1);
-        let count = opt_u64(args, "limit")?.unwrap_or(100);
-        if start == 0 || count == 0 {
-            return Err("artifact line offset/limit must be positive".into());
+        let (uri, view) = artifact_target(input)?;
+        let (offset, limit) = (opt_u64(args, "offset")?, opt_u64(args, "limit")?);
+        if (offset.is_some() || limit.is_some()) && input != uri {
+            return Err(
+                "use either offset/limit or an artifact selector (`:50+20`, `:info`, `:bytes=0+4096`), not both"
+                    .into(),
+            );
         }
-        let output =
-            store.call(&serde_json::json!({"uri":input, "start":start, "count":count.min(500)}));
+        let request = match view {
+            ArtifactView::Lines { start, count } => {
+                let start = offset.unwrap_or(start);
+                let count = limit.or(count).unwrap_or(100);
+                if start == 0 || count == 0 {
+                    return Err("artifact line offset/limit must be positive".into());
+                }
+                serde_json::json!({"uri":uri, "start":start, "count":count.min(500)})
+            }
+            ArtifactView::Info => serde_json::json!({"uri":uri, "info":true}),
+            ArtifactView::Annotations => serde_json::json!({"uri":uri, "annotations":true}),
+            ArtifactView::Bytes { offset, count } => {
+                serde_json::json!({"uri":uri, "offset":offset, "bytes":count})
+            }
+        };
+        let output = store.call(&request);
         return if output.is_error {
             Err(output.text)
         } else {
@@ -342,7 +457,7 @@ fn read_target(
         if offset.is_some() || sel.selects_lines() || sel.raw {
             return Err("images do not support line selectors, offsets, or raw text output".into());
         }
-        let path = ws.resolve(path_text)?;
+        let path = ws.resolve_read(path_text)?;
         let meta = fs::metadata(&path).map_err(|e| io_message("reading image", input, &e))?;
         if !meta.is_file() || meta.len() > crate::llm::images::MAX_IMAGE_SOURCE_BYTES {
             return Err("image must be a regular file no larger than 64 MiB".into());
@@ -452,7 +567,7 @@ pub(in crate::tools) fn read_plain(
     limit: usize,
     budget: usize,
 ) -> Result<String, String> {
-    let path = ws.resolve(input)?;
+    let path = ws.resolve_read(input)?;
     let meta = fs::metadata(&path).map_err(|e| io_message("reading", input, &e))?;
     if meta.is_dir() {
         return list_dir(ws, &path);
@@ -632,22 +747,65 @@ pub(crate) fn write_plan(
         }
     }
     change.authored_whole = true;
+    let after = change.after.as_ref().unwrap();
     change.report = Some(format!(
-        "{} {} supplied bytes to {}{}",
+        "{} {} supplied bytes ({} lines) to {}{}",
         if change.before.is_some() {
             "overwrote"
         } else {
             "created"
         },
-        change.after.as_ref().unwrap().len(),
+        after.len(),
+        hashline::split_lines(&hashline::normalize(after)).len(),
         crate::tools::edit::edit_source::display_path(ws.rel(&change.path)),
         if cleaned.is_some() {
             "\nStripped genuine complete hashline display prefixes before writing."
         } else {
-            ""
+            // The header carries the on-disk SHA-256, so reading the bytes back proves nothing more.
+            // Whether the content is correct is a separate question for real validation.
+            "\nThe file holds exactly the supplied bytes (SHA-256 above); rereading it adds nothing. This confirms the write, not that the content is correct."
         }
     ));
+    if let (Some(before), Some(report)) = (&change.before, change.report.as_mut())
+        && let Some(advice) = rewrite_advice(&before.text, after)
+    {
+        report.push_str(&advice);
+    }
     Ok(vec![change])
+}
+
+/// Whole-file rewrites of a mostly unchanged file cost a full regeneration each time; once the
+/// overwrite kept most of a non-trivial file, point the model at a targeted `edit` instead.
+fn rewrite_advice(before: &str, after: &str) -> Option<String> {
+    const MIN_LINES: usize = 40;
+    let old = hashline::normalize(before);
+    let new = hashline::normalize(after);
+    let old_lines = hashline::split_lines(&old);
+    let new_lines = hashline::split_lines(&new);
+    if old_lines.len() < MIN_LINES || new_lines.len() < MIN_LINES {
+        return None;
+    }
+    let mut remaining = std::collections::HashMap::<&str, usize>::new();
+    for line in &old_lines {
+        *remaining.entry(&line[..]).or_default() += 1;
+    }
+    let kept = new_lines
+        .iter()
+        .filter(|line| {
+            remaining.get_mut(&line[..]).is_some_and(|count| {
+                *count > 0 && {
+                    *count -= 1;
+                    true
+                }
+            })
+        })
+        .count();
+    (kept * 2 >= new_lines.len()).then(|| {
+        format!(
+            "\nRewrite advisory: {kept} of {} lines were unchanged. For further changes to this file, use `edit` on the lines that change (several operations and files fit in one call) instead of regenerating it with `write`.",
+            new_lines.len()
+        )
+    })
 }
 
 /// A refused overwrite of a small file shows it whole, so recovery needs no separate read round.
@@ -686,6 +844,12 @@ pub(crate) fn write_with(
     args: &Value,
     execution: &crate::tools::edit::editing::Execution<'_>,
 ) -> Result<String, String> {
+    if args
+        .get("check")
+        .is_some_and(|value| !value.is_null() && !value.is_boolean())
+    {
+        return Err("check must be a boolean".into());
+    }
     let execution = crate::tools::edit::editing::Execution {
         refuse_syntax_errors: crate::tools::edit::editing::syntax_gate(ws, args)?,
         ..*execution

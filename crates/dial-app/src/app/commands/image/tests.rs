@@ -7,7 +7,8 @@ fn generate_and_edit_need_a_prompt() {
         parse("generate  a red fox at dusk "),
         Some(ImageRequest {
             prompt: "a red fox at dusk",
-            source: None
+            source: None,
+            gif: false
         })
     );
     assert_eq!(parse("generate"), None);
@@ -17,13 +18,23 @@ fn generate_and_edit_need_a_prompt() {
         parse("edit fox.png  make it snow "),
         Some(ImageRequest {
             prompt: "make it snow",
-            source: Some("fox.png")
+            source: Some("fox.png"),
+            gif: false
         })
     );
     assert_eq!(parse("edit fox.png"), None);
     assert_eq!(parse("edit fox.png   "), None);
     assert_eq!(parse("edit"), None);
     assert_eq!(parse("settings now"), None);
+    assert_eq!(
+        parse("gif  a waving cat "),
+        Some(ImageRequest {
+            prompt: "a waving cat",
+            source: None,
+            gif: true
+        })
+    );
+    assert_eq!(parse("gif"), None);
 }
 
 #[test]

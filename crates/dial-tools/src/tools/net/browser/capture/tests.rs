@@ -94,3 +94,31 @@ fn screenshot_receipt_binds_native_bytes_and_exact_url_not_evaluation_payload() 
     unknown.as_object_mut().unwrap().remove("artifact");
     assert!(native_receipt(&json!({"action":"screenshot"}), &unknown).is_none());
 }
+
+#[test]
+fn observed_screenshot_receipt_uses_native_url_and_never_page_data() {
+    use base64::Engine;
+    let bytes = b"observed pixels";
+    let result = json!({
+        "url":"http://localhost/before",
+        "observations":{"screenshot":{"url":"http://localhost/after"}},
+        "artifact":{"encoding":"base64","media_type":"image/png",
+            "data":base64::engine::general_purpose::STANDARD.encode(bytes)}
+    });
+    let receipt = native_receipt(
+        &json!({"action":"click","observe":{"screenshot":true}}),
+        &result,
+    )
+    .unwrap();
+    assert!(receipt.matches(bytes, "image/png"));
+    assert_eq!(
+        receipt.target.as_deref(),
+        Some("url:http://localhost/after")
+    );
+    for args in [
+        json!({"action":"click"}),
+        json!({"action":"evaluate","observe":{"screenshot":true}}),
+    ] {
+        assert!(native_receipt(&args, &result).is_none(), "{args}");
+    }
+}

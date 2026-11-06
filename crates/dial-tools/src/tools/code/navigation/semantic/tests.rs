@@ -152,6 +152,46 @@ fn exact_and_explicit_lexical_never_request_a_model_and_empty_is_honest() {
     assert!(limited.render_response("{\"indices\":[0,1]}").is_err());
     assert!(limited.prompt.len() <= MAX_PROMPT);
 }
+
+#[test]
+fn semantic_related_previews_use_the_same_local_discovery_budget() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    fs::write(dir.path().join("network.rs"), "fn reconnect_network() {}\n").unwrap();
+    fs::write(
+        dir.path().join("test_network.py"),
+        "def verify_network():\n    reconnect_network()\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("settings.json"),
+        "{\"handler\":\"reconnect_network\"}\n",
+    )
+    .unwrap();
+    for related in [true, false] {
+        let args = json!({"query":"reconnect network", "ranking":"semantic", "limit":1, "related":related});
+        let request = semantic_request(&ws, &args).unwrap().unwrap();
+        let payload: Value = serde_json::from_str(&request.prompt).unwrap();
+        let hit = payload["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["path"] == "network.rs")
+            .unwrap();
+        // Rendering is local: consume one response, without a provider/server fixture.
+        let rendered = request
+            .render_response(&json!({"indices":[hit["index"]]}).to_string())
+            .unwrap();
+        let paths = super::super::source_paths(&ws, &rendered);
+        let expected = if related {
+            vec!["network.rs", "test_network.py", "settings.json"]
+        } else {
+            vec!["network.rs"]
+        };
+        assert_eq!(paths, expected);
+        let excerpts = rendered.split_once(super::super::SOURCE_SECTION).unwrap().1;
+        assert!(excerpts.len() <= super::super::SOURCE_BYTES);
+    }
+}
 #[test]
 #[ignore = "requires explicit DIAL_SEMANTIC_SMOKE_BASE_URL and DIAL_SEMANTIC_SMOKE_MODEL real endpoint configuration"]
 fn configured_model_semantic_smoke() {

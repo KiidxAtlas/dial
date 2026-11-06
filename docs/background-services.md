@@ -10,6 +10,42 @@ Readers settle for at most 300 ms after leader exit. On cleanup they drain for a
 
 PTY starts without explicit `ready` automatically observe the newly started job for up to one second after spawn, returning its rendered initial screen and controller-owned process/capture status. Observed exit ends the observation sooner; a nonzero or signal exit is reported as an error while retaining the job handle for inspection. The existing reader-settlement allowance can add up to 300 ms, plus spawn/scheduling overhead. The wait is interruptible and never sends input or starts a replacement process. A running screen is neither explicit readiness nor behavioral verification. Explicit readiness retains its existing wait path; ordinary pipe starts remain asynchronous. The same observation applies to `bash` with `pty: true`.
 
+## Structured tool jobs
+
+The main controller also accepts an explicitly selected finite tool operation instead of a shell
+command. Supply exactly one of `command` and `call`:
+
+```json
+{"action":"start","name":"stats","call":{"name":"data","arguments":{"path":"measurements.csv","action":"aggregate","columns":["duration"]}}}
+{"action":"wait","name":"stats","timeout":30}
+```
+
+The nested tool must already be offered. Its schema, file handles, portable rules, pre-tool hooks
+and exact-call approvals are checked before work starts; approval of `bg` never grants the nested
+call permission. Initial eligible operations are `data`, `web_fetch`, `web_search`, and `document`
+operations without PDF process prerequisites. Eligibility is an explicit implementation opt-in,
+not an MCP read-only hint. Workspace mutations, recursive jobs, controller/interactive operations,
+and unknown tools are refused. Child-worker controllers do not yet admit tool-backed launches.
+If a matching `post_tool_use` hook needs the completed nested result, run that operation in the
+foreground: background admission refuses rather than skipping the hook. Newly discovered process
+or confirmation prerequisites also fail closed, without a stored approval callback.
+
+Use the existing `list`, `output`, `wait` and `kill` controls. These are completion-blocking finite
+jobs, unlike shell services; a turn cannot claim completion while they are running. Tool jobs
+have no process exit code. `wait`/`output` retain the original structured data, failure flag and
+execution facts; results above the 32 KiB inline data limit point to a structured JSON artifact.
+The job retains at most 8 MiB per serialized result. Larger results fail explicitly. Artifact
+capture happens when reading the result; missing or partial storage is disclosed, and omitted
+structured data without a complete artifact is a delivery error. Finished records remain subject
+to the ordinary job-table retention limit.
+
+`kill` requests cooperative cancellation. A running tool remains managed and keeps its name and
+capacity slot until it actually returns; an ignored cancellation request is not a stopped thread.
+Session shutdown requests cancellation but cannot forcibly terminate a native callback. Web jobs
+use independent clients and job-owned cancellation so cancelling one cannot reset or cancel another.
+Tool launches reject shell-only options, including `cwd`, PTY/stdin/dimensions, readiness and
+persistence/lifetime. Tool waits support completion only, not regex/port readiness.
+
 ## Explicit restart-surviving pipe jobs (Unix only)
 
 No saved setting is changed or enabled. On Unix, an explicitly approved start can instead use:

@@ -399,7 +399,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         TO,
         "Verification",
         "Independent completion review",
-        "Bounded review for changes meeting min_changed_files or sensitive_paths prefixes. Unset enabled reviews when a coach role is assigned and its route is allowed (local, or escalation.allow_remote); true/false is explicit. Uses the existing advisor/coach review; findings are advisory evidence, not execution authority or proof.",
+        "Bounded review for changed-file thresholds, sensitive prefixes, uncheckpointed effects or artifact work lacking observed declared requirements. Unset enabled uses a privacy-permitted coach, or one in-context self-review if unavailable; true explicitly requests coach review, false disables. Findings are advisory, not execution authority or proof.",
         Kind::Table,
     ),
     def!(

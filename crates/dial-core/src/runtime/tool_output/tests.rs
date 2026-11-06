@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::execution::ProcessOutcome;
+use crate::runtime::execution::{ProcessOutcome, ShellStdin};
 
 fn outcome(code: i32) -> ProcessOutcome {
     ProcessOutcome {
@@ -46,10 +46,10 @@ fn recovery_is_derived_from_execution_facts_not_a_payload_claim() {
 
 #[test]
 fn launch_receipts_preserve_data_and_do_not_claim_success_or_termination() {
-    for (stdin, terminal_allocated, label) in [
-        (ShellStdin::Eof, false, "EOF"),
-        (ShellStdin::Pipe, false, "pipe"),
-        (ShellStdin::Terminal, true, "terminal"),
+    for (stdin, terminal_allocated) in [
+        (ShellStdin::Eof, false),
+        (ShellStdin::Pipe, false),
+        (ShellStdin::Terminal, true),
     ] {
         let launch = ShellLaunch {
             stdin,
@@ -74,11 +74,10 @@ fn launch_receipts_preserve_data_and_do_not_claim_success_or_termination() {
             terminal_allocated
         );
         assert!(
-            output.text.contains(&format!("stdin={label};")),
-            "{}",
+            !output.text.contains("[shell launch:"),
+            "launch facts stay structured: {}",
             output.text
         );
-        assert_eq!(output.text.matches("[shell launch:").count(), 1);
         assert_eq!(output.process_outcome(), Some(outcome(0)));
         assert_eq!(ToolStatus::from_output(&output), ToolStatus::Error);
     }
