@@ -1,169 +1,88 @@
 <div align="center">
 
----
+# dial
 
-## Why dial
+**A coding agent for your terminal that runs on your own models, or anyone else's.**
 
-- **Local-first, no lock-in.** You can run entirely on your own machine with MLX on Apple Silicon or
-  GGUF through llama.cpp. Or point Dial at any OpenAI-compatible endpoint, a hosted provider, or a
-  Claude or ChatGPT/Codex subscription. Dial does not depend on any external agent harness or hosted service.
-- **Safe by default.** Edits and commands go through approval modes (`ask`, `write`, `auto`, `readonly`)
-  and an OS sandbox. Checkpoints let you review and undo changes. Hashline edits refuse to change
-  lines the agent has not read.
-- **Verified work.** Dial runs focused checks after changes. It reports what failed and why before
-  retrying, and keeps the evidence (commands, results, diffs) in the transcript.
-- **Keyboard-driven terminal UI.** Steer or queue messages while the agent works, browse its work
-  plan, open the action palette with `Ctrl-P`, and change settings without leaving the session.
-- **Delegation and integrations.** Subagents with typed roles, MCP servers, skills, hooks, SSH,
-  browser and `eval` (JavaScript/Python) tools, an RPC/ACP interface for editors, and a one-shot print mode for scripts.
-- **Optional learning.** `dial improve` runs verified practice, harness proposals and local LoRA
-  training behind an external evaluation gate. This stays off unless you turn on **Teach this model**
-  for a local model (`/settings` → Model → Learning). Ordinary sessions never open a learning store
-  or collect training data.
+[![CI](https://github.com/KiidxAtlas/dial/actions/workflows/ci.yml/badge.svg)](https://github.com/KiidxAtlas/dial/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/KiidxAtlas/dial?sort=semver)](https://github.com/KiidxAtlas/dial/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## A look around
+<img src="docs/images/home.png" alt="Dial's home screen: the dial wordmark, a centered composer asking what are we building, and the active model, project and branch" width="640">
+
+</div>
+
+```sh
+curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | bash
+cd your-project && dial
+```
+
+On first launch Dial asks which model to use. Then you tell it what you want.
+
+## What it's good at
+
+- **Any model.** Use MLX on Apple Silicon, GGUF through llama.cpp, LM Studio, Ollama, any
+  OpenAI-compatible endpoint, a hosted API key, or your Claude or ChatGPT/Codex subscription.
+- **Changes you can undo.** Edits and commands go through your chosen approval mode and an OS
+  sandbox. Every change is checkpointed, so you can review, keep or revert it.
+- **Work it checks.** After making changes, Dial runs the relevant tests and shows you the
+  commands and results. You get evidence, not just "done".
+- **Interruptible.** You can send a message while it works and choose whether to steer the current
+  task or queue the message for later.
 
 <table>
 <tr>
-<td width="50%"><img src="docs/images/work-evidence.png" alt="A turn showing the user's request, a cargo test run with 18 passed, and the agent's verified answer"><br><sub><b>Evidence in the transcript</b>: commands, results and the conclusion they support.</sub></td>
-<td width="50%"><img src="docs/images/steering.png" alt="While Dial is working, a picker asks whether a new message should steer the task or be queued for after the turn"><br><sub><b>Steer or queue while it works</b>: messages never interrupt a running turn by accident.</sub></td>
-</tr>
-<tr>
-<td><img src="docs/images/work-plan.png" alt="The interactive work plan listing steps with their status"><br><sub><b>Work plan</b>: browse each step's status, blockers and findings (<code>/todo</code>).</sub></td>
-<td><img src="docs/images/palette.png" alt="The action palette listing commands with fuzzy search"><br><sub><b>Action palette</b>: every command, searchable (<code>Ctrl-P</code>).</sub></td>
-</tr>
-<tr>
-<td colspan="2" align="center"><img src="docs/images/settings.png" alt="The settings hub with tabs for Appearance, Interaction, Model, Memory, Tools, Experimental, Voice and Setup" width="720"><br><sub><b>Settings hub</b>: every option, saved globally or per project (<code>/settings</code>, <code>Ctrl-S</code> switches scope).</sub></td>
+<td width="50%"><img src="docs/images/work-evidence.png" alt="A turn showing the user's request, a cargo test run with 18 passed, and the agent's verified answer"><br><sub>Test results in the transcript</sub></td>
+<td width="50%"><img src="docs/images/steering.png" alt="While Dial is working, a picker asks whether a new message should steer the task or be queued for after the turn"><br><sub>Steer or queue while it works</sub></td>
 </tr>
 </table>
 
-<sub></sub>These screenshots come from Dial's real terminal components, rendered with sample data
-(<code>). Fonts and colors depend on your terminal and theme.cargo run -p dial-ui --example ux_gallery</sub>
-
 ## `Install`
 
-`Prebuilt releases target `
+| Platform                              | Command                                                                                     |
+| ------------------------------------- | ------------------------------------------------------------------------------------------- |
+| macOS 13+, Linux (x86-64/arm64), WSL2 | `curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh \| bash` |
+| Windows (PowerShell)                  | `irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 \| iex`        |
 
-`strong`
+You don't need Rust. The installer checks release signatures. Homebrew, Nix, Docker and source
+builds are also supported. To update, run `dial update`. Linux needs `bubblewrap` for the sandbox.
+For all options and requirements, see [docs/release-and-install.md](docs/release-and-install.md).
 
-```
-curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | bash
-```
+## Use it
 
-`The installer adds `
-
-`strong`
-
-```
-irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 | iex
-```
-
-`You can also run the Linux commands inside WSL2. `
-
-`strong`
-
-`strong`
-
-<details>
-<summary><b>Platform requirements</b></summary>
-
-- `strong`
-- `strong`
-- `strong`
-
-`a`
-
-</details>
-
-## `Quick start`
-
-```
-cd ~/code/my-project
-dial                                        # terminal UI; the first run opens model/provider setup
-dial "fix the failing test in src/lib.rs"   # interactive, starting with a message
-dial -p -y "summarize this repo"            # one-shot; prints the answer (-y or --approval auto to allow changes)
-dial -c                                     # continue the latest session (-r <id-prefix> picks one)
+```sh
+dial                                  # open the terminal UI
+dial "fix the failing test"           # start with a task
+dial -p -y "summarize this repo"      # one-shot, prints the answer (for scripts)
+dial -c                               # continue your last session
 ```
 
-`Useful first commands in the UI:`
+Inside Dial:
 
-| Command             | What it does                                                                      |
-| ------------------- | --------------------------------------------------------------------------------- |
-| `/providers`        | Sign in or add an endpoint, including a Claude or ChatGPT/Codex subscription      |
-| `/models`, `/roles` | Choose the main model and helper-role models                                      |
-| `/settings`         | Configuration hub                                                                 |
-| `Ctrl-P`            | Action palette                                                                    |
-| `/todo`             | Browse the current work plan                                                      |
-| `/review-file`      | Review checkpoint changes by writer group or file, then keep, revert or undo them |
-| `/help`, `/hotkeys` | Commands and shortcuts                                                            |
+| Key or command          | What it does                 |
+| ----------------------- | ---------------------------- |
+| `/providers`, `/models` | Sign in and pick a model     |
+| `/settings`             | Configure everything         |
+| `Ctrl-P`                | Search every command         |
+| `/review-file`          | Review, keep or undo changes |
+| `/help`                 | Commands and shortcuts       |
 
-`a`
+The approval mode sets how much Dial does without asking: `ask`, `write` (the default), `auto` or
+`readonly`. See [configuration](docs/configuration.md).
 
-`To check which build you are running, use `
+## Learn more
 
-## `Configuration essentials`
+- [Everyday Dial](docs/everyday.md): start, steer, review, undo and resume
+- [Configuration](docs/configuration.md) and [choosing a model](docs/provider-catalog.md)
+- [Tools](docs/tools.md), [subagents](docs/subagents.md), and [MCP, hooks and skills](docs/extensibility.md)
+- [Editor integration (RPC/ACP)](docs/rpc-and-acp.md)
+- [All documentation](docs/README.md)
 
-`Configuration is layered TOML, applied in this order: `
+Small local models (under about 7B parameters) often produce broken tool calls. If results are
+poor, try a larger model.
 
-```
-model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
-approval = "write"        # ask | write | auto | readonly
-[sandbox]
-mode = "dev"              # dev | strict | off
-[endpoint]                # optional: OpenAI-compatible server instead of local MLX
-base_url = "http://127.0.0.1:1234/v1"
-api_key_env = "LMSTUDIO_KEY"
-[model_roles.small]       # helper roles fall back to the main model when unassigned
-provider = "openai"
-model = "gpt-4o-mini"
-```
+## Contributing
 
-`Most execution limits default to `
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## `Documentation`
-
-`Start with `
-
-- `a`
-- `a`
-- `a`
-- `a`
-- `a`
-
-`Contributors: start with `
-
-## `Known limits`
-
-- `Tool-calling quality depends on the model. 7B-class instruct models handle the tool set; sub-1B models often emit unreadable calls (which become training signal rather than being hidden).`
-- `Local MLX inference and training require Apple Silicon. Intel Macs and Linux/WSL2 use hosted or OpenAI-compatible providers, or GGUF through llama.cpp.`
-- `By default, local compute is serialized across projects. Turning off `
-- `The TUI is keyboard-driven, and not every terminal supports modified Enter keys. `
-- `Live memory and skill edits are your working state and are not gated; only the admitted harness is.`
-- `Operator tools are trusted programs and are not sandboxed during live work; they are excluded from automatic evaluation. Outside macOS, `
-
-## `Source layout`
-
-`Dial is a Cargo workspace. The Rust control plane and tools live in these crates; Python handles
-local MLX inference and training (`
-
-`The root package `
-
-```
-crates/dial-build-info/  build_info
-crates/dial-core/        runtime, platform, output, workspace_copy
-crates/dial-llm/         config, llm (backends, providers, catalog, auth, local model servers)
-crates/dial-storage/     storage (sessions, memory, skills, checkpoints, SQLite store, settings)
-crates/dial-tools/       tools (workspace and built-ins, sandbox, extension registry), security, setup, voice
-crates/dial-computer/    computer (desktop capture, accessibility, input)
-crates/dial-agent/       agent (agent loop, subagents, approvals), learn, commit, steering
-crates/dial-ui/          ui (terminal renderer, composer, overlays), git_panel; themes in `crates/dial-ui/themes/`
-crates/dial-app/         app (including app/commands), cli, benchmark, repl, rpc, acp, schedule, collab
-```
-
-`To build, test and lint the whole workspace, use `
-
-`To add a tool, implement `
-
-## `License`
-
-`MIT; see `
+MIT licensed; see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
