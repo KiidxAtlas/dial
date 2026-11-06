@@ -25,6 +25,7 @@ use std::net::{IpAddr, Ipv4Addr};
 pub const BRIDGE_ARG: &str = "--dial-net-bridge";
 
 /// Private bridge launch mode: install eval's process fence only in the command child.
+#[cfg(unix)]
 pub(super) const FENCED_SEPARATOR: &str = "--eval-fenced";
 
 /// Port the Linux bridge listens on inside the sandbox's private network namespace.

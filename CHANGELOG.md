@@ -330,6 +330,9 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Reliability corrections
 
+- Context-overflow fallback no longer expands an already compact deferred-tool inventory into
+  longer capability previews. It retains exact tool names and normal local-model hints outside
+  overflow, without replacing operator prompt templates or narrowing discovery.
 - Runtime containment compares canonical workspace and executable paths, so symlinked
   workspace ancestors cannot disguise a workspace-planted eval interpreter. Search scope
   checks stop at authorized read roots: OS aliases above a root no longer cause false

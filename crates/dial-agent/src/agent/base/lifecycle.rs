@@ -709,6 +709,7 @@ impl<'a> Agent<'a> {
                 discoverable: &discoverable,
                 template: self.parts.system_template.as_ref(),
                 lean,
+                context_overflow: self.lean_tools,
                 concise_guidance: self.config.efficiency.enabled && !self.hermetic,
                 prefer_subagents: self.config.task.prefer_subagents,
                 one_call: self.local_one_call(),

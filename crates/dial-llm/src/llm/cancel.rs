@@ -31,6 +31,42 @@ thread_local! {
     static TEST_IDLE_LIMIT_MILLIS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// Captured by each Patience, so a controlled stream can cross idle deadlines without wall-clock
+// sleeps. Install only on a dedicated test thread; other requests retain the real clock.
+#[cfg(test)]
+thread_local! {
+    static TEST_CLOCK: std::cell::RefCell<Option<TestClock>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestClock {
+    now: Arc<parking_lot::Mutex<Instant>>,
+    progress: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl TestClock {
+    pub(crate) fn new() -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (progress, receiver) = std::sync::mpsc::channel();
+        (
+            Self {
+                now: Arc::new(parking_lot::Mutex::new(Instant::now())),
+                progress,
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn advance(&self, duration: Duration) {
+        *self.now.lock() += duration;
+    }
+
+    pub(crate) fn install(self) {
+        TEST_CLOCK.with(|clock| *clock.borrow_mut() = Some(self));
+    }
+}
+
 /// Pre-progress budget under the test seam: connect, request write, response head, and the wait for the
 /// first meaningful event. Generous on purpose: a loaded machine can delay the scripted server's head past
 /// the 200 ms idle limit, which then fails as a setup timeout rather than a stalled body. Silence after
@@ -76,6 +112,8 @@ pub struct Patience {
     pub idle: Duration,
     pub(super) seen: Arc<AtomicBool>,
     clock: Arc<parking_lot::Mutex<ProgressClock>>,
+    #[cfg(test)]
+    test_clock: Option<TestClock>,
 }
 
 #[derive(Debug)]
@@ -86,14 +124,24 @@ struct ProgressClock {
 
 impl Patience {
     pub(crate) fn new(first_event: Option<Duration>, idle: Duration) -> Self {
+        #[cfg(test)]
+        let test_clock = TEST_CLOCK.with(|clock| clock.borrow().clone());
+        #[cfg(test)]
+        let now = test_clock
+            .as_ref()
+            .map_or_else(Instant::now, |clock| *clock.now.lock());
+        #[cfg(not(test))]
+        let now = Instant::now();
         Patience {
             first_event,
             idle,
             seen: Arc::new(AtomicBool::new(false)),
             clock: Arc::new(parking_lot::Mutex::new(ProgressClock {
-                last_event: Instant::now(),
+                last_event: now,
                 terminal_deadline: None,
             })),
+            #[cfg(test)]
+            test_clock,
         }
     }
 
@@ -114,18 +162,30 @@ impl Patience {
         TEST_IDLE_LIMIT_MILLIS.with(|millis| millis.set(limit.as_millis() as u64));
     }
 
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.test_clock {
+            return *clock.now.lock();
+        }
+        Instant::now()
+    }
+
     pub(super) fn first_event_seen(&self) -> bool {
         self.seen.load(Ordering::SeqCst)
     }
     pub(super) fn mark_event(&self) {
-        self.clock.lock().last_event = Instant::now();
+        self.clock.lock().last_event = self.now();
         self.seen.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        if let Some(clock) = &self.test_clock {
+            let _ = clock.progress.send(());
+        }
     }
 
     /// Bound draining optional trailing usage after the provider commits a reply.
     /// A later call may shorten this terminal grace window but never extend it.
     pub(super) fn finish_within(&self, grace: Duration) {
-        let deadline = Instant::now() + grace;
+        let deadline = self.now() + grace;
         let mut clock = self.clock.lock();
         clock.terminal_deadline = Some(
             clock
@@ -141,12 +201,13 @@ impl Patience {
         } else {
             self.first_event
         };
-        let remaining = limit.map(|limit| limit.saturating_sub(clock.last_event.elapsed()));
+        let remaining =
+            limit.map(|limit| limit.saturating_sub(self.now().duration_since(clock.last_event)));
         match (remaining, clock.terminal_deadline) {
             (Some(remaining), Some(deadline)) => {
-                Some(remaining.min(deadline.saturating_duration_since(Instant::now())))
+                Some(remaining.min(deadline.saturating_duration_since(self.now())))
             }
-            (None, Some(deadline)) => Some(deadline.saturating_duration_since(Instant::now())),
+            (None, Some(deadline)) => Some(deadline.saturating_duration_since(self.now())),
             (remaining, None) => remaining,
         }
     }
@@ -158,7 +219,7 @@ impl Patience {
         self.clock
             .lock()
             .terminal_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .map(|deadline| deadline.saturating_duration_since(self.now()))
     }
 }
 /// Test-only: the thread-local idle limit set for one model call, restored when the call returns. A backend

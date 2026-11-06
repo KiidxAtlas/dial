@@ -99,6 +99,7 @@ use std::time::{Duration, Instant};
 /// Execution-owner-only launch restrictions, separate from filesystem trust policy.
 #[derive(Clone, Copy, Default)]
 pub(super) struct CommandMode {
+    #[cfg(not(windows))]
     pub owned_terminal: Option<i32>,
     pub fork_fence: bool,
 }

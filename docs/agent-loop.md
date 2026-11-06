@@ -115,6 +115,9 @@ leave API cost unknown instead of producing a guessed or inflated charge.
 When a request overflows even after ordinary maintenance, the existing lean-tool fallback also
 uses the lean instruction variants. It does not keep paying for full workflow prose after reducing
 the schemas; configured rules, project context, safety boundaries and explicitly loaded tools remain.
+The built-in overflow environment keeps deferred tools listed by exact name without expanding
+their capability previews. Ordinary lean-local prompts retain their bounded capability hints;
+operator replacement prompts and templates retain their existing inventory behavior.
 With efficiency enabled, non-hermetic sessions use compact built-in engineering, execution,
 workflow, delivery and delegation prose, including hosted models. Full specialized-tool rules,
 visual-verification guidance and the callable schemas stay in place; this does not enable the

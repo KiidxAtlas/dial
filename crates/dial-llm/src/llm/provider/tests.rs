@@ -2733,29 +2733,57 @@ fn native_anthropic_stalls_and_ping_only_streams_retry() {
 #[test]
 fn native_anthropic_keepalives_hold_an_open_tool_call_past_the_idle_limit() {
     // Anthropic may buffer a large tool call's input and send only pings until it is complete.
-    Patience::with_test_idle_limit(Duration::from_millis(200));
-    let events = thinking_tool_events();
-    let ping = anthropic_sse(&[json!({"type":"ping"})]);
-    let mut pieces = vec![anthropic_sse(&events[..11])];
-    // About 1.2 s of ping-only silence, six times the idle limit, with the call open.
-    pieces.extend(std::iter::repeat_n(ping, 12));
-    pieces.push(anthropic_sse(&events[11..]));
-    let server = fake::serve(vec![Script::SseSlow {
-        pieces,
-        pause: Duration::from_millis(100),
-    }]);
-    let mut remote = backend(anthropic_endpoint(&server.url));
-    let mut notices = Vec::new();
-    let reply = remote
-        .chat_with_control(
-            None,
-            &request(),
-            1,
-            Some(&mut |_| true),
-            &mut |n| notices.push(n.to_owned()),
-            Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
+    // Advance the request's clock only after the parser acknowledges the previous event: scheduler
+    // delays and TCP packet coalescing must not compete with a 200 ms wall-clock idle deadline.
+    let idle = Duration::from_millis(200);
+    let (clock, progress) = llm::cancel::TestClock::new();
+    let (send, pieces) = std::sync::mpsc::channel();
+    let server = fake::serve(vec![Script::SseControlled(pieces)]);
+    let url = server.url.clone();
+    let (reply, notices) = std::thread::scope(move |scope| {
+        let request_clock = clock.clone();
+        let call = scope.spawn(move || {
+            Patience::with_test_idle_limit(idle);
+            request_clock.install();
+            let mut remote = backend(anthropic_endpoint(&url));
+            let mut notices = Vec::new();
+            let reply = remote.chat_with_control(
+                None,
+                &request(),
+                1,
+                Some(&mut |_| true),
+                &mut |n| notices.push(n.to_owned()),
+                Arc::new(AtomicBool::new(false)),
+            );
+            (reply, notices)
+        });
+        let events = thinking_tool_events();
+        let acknowledge = || {
+            progress
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the stream parser must acknowledge progress before the next clock step");
+        };
+        for event in &events[..11] {
+            send.send(anthropic_sse(std::slice::from_ref(event)))
+                .unwrap();
+            acknowledge();
+        }
+        let step = Duration::from_millis(100);
+        let pings = 12;
+        assert!(
+            step * pings > idle,
+            "ping-only silence must cross the idle limit"
+        );
+        for _ in 0..pings {
+            clock.advance(step);
+            send.send(anthropic_sse(&[json!({"type":"ping"})])).unwrap();
+            acknowledge();
+        }
+        send.send(anthropic_sse(&events[11..])).unwrap();
+        drop(send);
+        call.join().expect("provider call thread")
+    });
+    let reply = reply.unwrap_or_else(|error| panic!("{error:#}; notices: {notices:?}"));
     assert_eq!(reply.tool_calls[0].arguments, json!({"path":"a.rs"}));
     assert!(notices.is_empty(), "{notices:?}");
     assert_eq!(

@@ -219,7 +219,9 @@ fn window_overflow_uses_the_lean_prompt_even_without_the_local_profile() {
         let lean = system_text(agent);
         assert!(
             lean.len() < full.len(),
-            "Overflow must reduce instruction overhead as well as schemas"
+            "Overflow must reduce instruction overhead as well as schemas: {} -> {} bytes",
+            full.len(),
+            lean.len()
         );
         assert!(!lean.contains("# Visual verification"));
         for tool in ["read", "edit", "finish", "tool_load"] {
