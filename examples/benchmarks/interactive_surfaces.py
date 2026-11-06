@@ -95,13 +95,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if unsupported_probe(self):
+            return
         messages = body.get("messages", [])
         marker, position = find_marker(messages)
         with self.server.lock:
             self.server.chat_requests += 1
             index = self.server.chat_requests
         if marker is None:
-            self.server.fail(f"unrecognized chat request {index}")
+            self.server.fail(f"unrecognized chat request {index}: {self.path}, fields={sorted(body)}")
             self.send_json({"error": "unrecognized fixture request"}, 500)
             return
         with self.server.lock:

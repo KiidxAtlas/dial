@@ -16,7 +16,7 @@ import shlex
 import tempfile
 import threading
 
-from interactive_smoke import Handler as BaseHandler, Terminal, fixture
+from interactive_smoke import Handler as BaseHandler, Terminal, fixture, unsupported_probe
 
 
 class Provider(http.server.ThreadingHTTPServer):
@@ -38,6 +38,8 @@ class Handler(BaseHandler):
     def do_POST(self):
         try:
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if unsupported_probe(self):
+                return
             messages = request["messages"]
             self.server.requests += 1
             start = next(i for i in range(len(messages) - 1, -1, -1)

@@ -120,14 +120,17 @@ class ScriptedServerTests(unittest.TestCase):
 
     def test_supported_local_discovery_probes_are_accounted_separately_from_messages(self):
         self.server.begin([[oc.text("4")]])
-        for path in ("/props", "/api/ps", "/v1/models", f"/api/v0/models/{oc.MODEL}"):
+        for path in ("/props", "/api/ps", "/v1/models", "/api/v1/models", "/api/v0/models",
+                     f"/api/v0/models/{oc.MODEL}"):
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 urllib.request.urlopen(self.server.origin + path, timeout=10)
             with caught.exception as error:
                 self.assertEqual(error.code, 404)
+        status, _ = post(self.server.origin, {"model": oc.MODEL}, path="/api/show")
+        self.assertEqual(status, 404)
         post(self.server.origin, prompt_body("go", [("read", ["path"])]))
         transport = oc.transport_record(self.server.end())
-        self.assertEqual(len(transport["probes"]), 4)
+        self.assertEqual(len(transport["probes"]), 7)
         self.assertEqual(transport["turn_requests"], 1)
         self.assertEqual(transport["failures"], [])
 

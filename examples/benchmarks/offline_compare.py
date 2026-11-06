@@ -472,8 +472,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _serve(self, arrival, raw):
         owner = self.server.owner
-        if self.command == "GET" and self.path in (
-                "/props", "/api/ps", "/v1/models", f"/api/v0/models/{MODEL}"):
+        if (self.command == "GET" and self.path in (
+                "/props", "/api/ps", "/v1/models", "/api/v1/models", "/api/v0/models",
+                f"/api/v0/models/{MODEL}")) or (self.command == "POST" and self.path == "/api/show"):
             # Dial probes localhost capabilities even for an explicit Anthropic endpoint. A normal
             # unsupported discovery response is not a failed Messages request; retain it separately.
             if owner.probe(self.command, self.path, arrival, self.client_address[1]):

@@ -109,11 +109,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         server = self.server
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if smoke.unsupported_probe(self):
+            return
         if not self.path.rstrip("/").endswith("/chat/completions"):
             server.error(f"unexpected POST {self.path}")
             self.respond({"error": "fixture endpoint not found"}, 404)
             return
-        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         messages = request.get("messages", [])
         # The request-tail latest-user note is runtime context, not the scenario prompt.
         last = next((text_of(m.get("content")) for m in reversed(messages) if m.get("role") == "user" and "[Latest admitted user request" not in text_of(m.get("content"))), "")
