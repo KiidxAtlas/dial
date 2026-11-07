@@ -1,4 +1,43 @@
 use super::*;
+
+#[test]
+fn answered_is_a_delivery_outcome_not_a_completion_or_input_claim() {
+    let finish =
+        Finish::parse(&json!({"outcome":"answered","summary":"Here is the explanation."})).unwrap();
+    assert_eq!(finish.outcome, TurnOutcome::Answered);
+    assert_eq!(finish.text, "Here is the explanation.");
+    assert!(finish.question.is_none());
+    assert!(finish.options.is_empty());
+    assert!(Finish::parse(&json!({"outcome":"answered","summary":" "})).is_err());
+    let report = crate::agent::TurnReport {
+        text: finish.text,
+        outcome: finish.outcome,
+        steps: 1,
+        interrupted: false,
+        trajectory: None,
+    };
+    assert!(report.halts_automation());
+}
+
+#[test]
+fn outstanding_notice_is_bounded_and_does_not_promote_follow_ups_to_requirements() {
+    let mut todo = todo();
+    assert!(!todo.call(&json!({"op":"append","tasks":[{"content":"Optional live check","kind":"follow_up"}]})).is_error);
+    assert!(
+        !todo
+            .call(&json!({"op":"block","index":2,"reason":"x".repeat(4000)}))
+            .is_error
+    );
+    let notice = outstanding_notice(&todo, &json!({}), TurnOutcome::Answered).unwrap();
+    assert!(
+        notice.contains("1 execution step(s), 0 required deliverable(s), 1 optional follow-up(s)"),
+        "{notice}"
+    );
+    assert!(notice.contains("does not mark that work complete"));
+    assert!(notice.len() < 1000);
+    assert!(todo.blocked_steps().next().is_none());
+    assert!(outstanding_notice(&TodoList::new(), &json!({}), TurnOutcome::Answered).is_none());
+}
 #[test]
 fn coherent_runtime_plain_reports_preserve_declared_terminal_outcomes() {
     for (text, phase) in [
@@ -27,10 +66,10 @@ fn coherent_runtime_plain_reports_preserve_declared_terminal_outcomes() {
 }
 
 #[test]
-fn consistent_ux_completed_finish_rejects_a_promise_but_accepts_a_report() {
+fn finish_parsing_validates_shape_and_leaves_completion_to_the_controller() {
     assert!(
         Finish::parse(&json!({"outcome":"completed","summary":"I will run the tests next."}))
-            .is_err()
+            .is_ok()
     );
     assert!(Finish::parse(&json!({"outcome":"completed","summary":"The tests passed and the parser fix is complete."})).is_ok());
 }
@@ -47,43 +86,7 @@ fn todo() -> TodoList {
 
 #[test]
 fn optional_progress_does_not_force_bookkeeping_rounds() {
-    assert!(matches!(
-        CompletionGuard::default().stopped(&todo()),
-        StopAction::Accept
-    ));
-}
-
-#[test]
-fn unverified_edits_are_disclosed_and_only_an_observed_failure_is_reminded_once() {
-    let mut guard = CompletionGuard::default();
-    assert_eq!(guard.evidence(None, &[], true), EvidenceGate::Accept);
-    let checks = ["cargo-check".to_owned()];
-    match guard.evidence(Some(&checks), &[], true) {
-        EvidenceGate::Disclose(text) => assert!(text.contains("Unverified"), "{text}"),
-        other => panic!("a missing check is disclosed, never demanded: {other:?}"),
-    }
-    let failures = ["cargo-check failed: boom".to_owned()];
-    match guard.evidence(Some(&checks), &failures, true) {
-        EvidenceGate::Remind(note) => {
-            assert!(
-                note.contains("cargo-check") && note.contains("boom"),
-                "{note}"
-            );
-        }
-        other => panic!("an observed failure is reminded: {other:?}"),
-    }
-    match guard.evidence(Some(&checks), &failures, true) {
-        EvidenceGate::Disclose(text) => assert!(text.contains("Unverified"), "{text}"),
-        other => panic!("the reminder is sent once: {other:?}"),
-    }
-    let mut limited = CompletionGuard::default();
-    assert!(
-        matches!(
-            limited.evidence(Some(&checks), &failures, false),
-            EvidenceGate::Disclose(_)
-        ),
-        "past a limit the gap is disclosed without another request"
-    );
+    assert!(todo().blocked_steps().next().is_none());
 }
 
 #[test]
@@ -102,13 +105,12 @@ fn stopping_with_only_blocked_tasks_reports_the_blockers() {
             .call(&json!({"op":"block","reason":"needs the staging password"}))
             .is_error
     );
-    match CompletionGuard::default().stopped(&todo) {
-        StopAction::Blocked(text) => assert!(
-            text.contains("1. write code (blocked: needs the staging password)"),
-            "{text}"
-        ),
-        _ => panic!("only blocked work remains"),
-    }
+    assert_eq!(todo.blocked_steps().count(), 1);
+    let text = outstanding_notice(&todo, &json!({}), TurnOutcome::Answered).unwrap();
+    assert!(
+        text.contains("1. write code (blocked: needs the staging password)"),
+        "{text}"
+    );
     assert!(
         open_work(&todo).contains("write code"),
         "finish completed must still refuse blocked work"

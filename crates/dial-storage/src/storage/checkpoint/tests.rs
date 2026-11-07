@@ -879,3 +879,41 @@ fn conversation_rollback_retry_does_not_replay_completed_newer_turn() {
             .is_err()
     );
 }
+
+#[test]
+fn rollback_refuses_saved_content_truncated_before_its_background_flush() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "original a");
+    let cp = fx.open();
+    let turn = cp.begin_turn("t").unwrap();
+    modify(&cp, &fx, "a.txt", "changed a");
+    // A power loss before the flush may leave the published record partial.
+    fs::write(turn_dir(&cp.dir, turn).join("files").join("0"), "orig").unwrap();
+    let report = cp.rollback(1).unwrap();
+    assert!(report.restored.is_empty(), "{report:?}");
+    assert!(
+        report.warnings.iter().any(|w| w.contains("incomplete")),
+        "{report:?}"
+    );
+    assert_eq!(fx.read("a.txt").as_deref(), Some("changed a"));
+    // The checkpoint is kept rather than consumed.
+    assert_eq!(cp.list().len(), 1);
+}
+
+#[test]
+fn checkpoints_recorded_without_a_saved_length_still_restore() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "original a");
+    let cp = fx.open();
+    let turn = cp.begin_turn("t").unwrap();
+    modify(&cp, &fx, "a.txt", "changed a");
+    let manifest_path = turn_dir(&cp.dir, turn).join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let entry = manifest["entries"][0].as_object_mut().unwrap();
+    assert_eq!(entry.remove("len"), Some(serde_json::json!(10)));
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let report = cp.rollback(1).unwrap();
+    assert_eq!(report.restored, ["a.txt"], "{report:?}");
+    assert_eq!(fx.read("a.txt").as_deref(), Some("original a"));
+}

@@ -22,7 +22,7 @@ pub fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
         if let Some(mode) = mode {
             file.set_permissions(mode)?;
         }
-        file.sync_all()?;
+        platform_fs::sync_file(&file)?;
         publish(&file, &temp, &target, DirectorySync::BestEffort).map_err(io::Error::other)
     })();
     if result.is_err() {
@@ -39,8 +39,50 @@ pub fn write_checkpoint(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(dir)?;
     temp.write_all(bytes)?;
     platform_fs::set_mode(temp.path(), mode)?;
-    temp.as_file().sync_all()?;
+    platform_fs::sync_file(temp.as_file())?;
     publish(temp.as_file(), temp.path(), path, DirectorySync::BestEffort)
+}
+
+/// [`write_checkpoint`] that publishes before flushing, so the caller can flush off its hot path.
+/// A process crash still leaves either the previous or the complete new file; a power or kernel
+/// failure before [`DeferredSync::finish`] may leave the new file truncated or missing, so
+/// callers must detect incomplete records (checkpoints record each saved length or digest).
+pub fn write_checkpoint_deferred(path: &Path, bytes: &[u8], mode: u32) -> Result<DeferredSync> {
+    let dir = path.parent().context("path has no parent directory")?;
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.write_all(bytes)?;
+    platform_fs::set_mode(temp.path(), mode)?;
+    publish(temp.as_file(), temp.path(), path, DirectorySync::Deferred)?;
+    let (file, _published) = temp.into_parts();
+    Ok(DeferredSync {
+        file,
+        path: path.to_path_buf(),
+    })
+}
+
+/// The pending flush of one [`write_checkpoint_deferred`] publication.
+#[derive(Debug)]
+pub struct DeferredSync {
+    file: File,
+    path: PathBuf,
+}
+
+impl DeferredSync {
+    /// The published path, for diagnostics.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Flush the published file, then best-effort its directory entry (as `write_checkpoint`).
+    pub fn finish(self) -> io::Result<()> {
+        platform_fs::sync_file(&self.file)?;
+        #[cfg(unix)]
+        if let Some(dir) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = File::open(dir).and_then(|directory| platform_fs::sync_file(&directory));
+        }
+        Ok(())
+    }
 }
 
 /// Validate ancestors without creating directories or changing permissions (also used for reads).
@@ -69,6 +111,16 @@ pub(crate) const PRIVATE_LIMIT: usize = 8 * 1024 * 1024;
 /// Owner-private publication rejects links and foreign owners. It never creates parent directories
 /// or acquires a lock: the transaction owner must prepare the private directory and hold its lock.
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_private_with(path, bytes, true)
+}
+
+/// [`write_private`] for advisory live state that is worthless after a crash (its owner is then
+/// gone): atomic for concurrent readers, with the same link and owner checks, but no flushes.
+pub fn write_private_volatile(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_private_with(path, bytes, false)
+}
+
+fn write_private_with(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
     ensure!(
         bytes.len() <= PRIVATE_LIMIT,
         "private storage file exceeds size limit"
@@ -95,13 +147,24 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(dir)?;
     platform_fs::set_owner_only(temp.path())?;
     temp.write_all(bytes)?;
-    temp.as_file().sync_all()?;
-    publish(temp.as_file(), temp.path(), path, DirectorySync::Required)
+    if durable {
+        platform_fs::sync_file(temp.as_file())?;
+    }
+    let sync = if durable {
+        DirectorySync::Required
+    } else {
+        DirectorySync::Skip
+    };
+    publish(temp.as_file(), temp.path(), path, sync)
 }
 
 enum DirectorySync {
     BestEffort,
     Required,
+    /// The caller flushes the file and directory later ([`DeferredSync::finish`]).
+    Deferred,
+    /// No flush at all ([`write_private_volatile`]).
+    Skip,
 }
 
 /// Only publication mechanics are shared: callers retain their durability contracts too.
@@ -114,7 +177,10 @@ fn publish(staged: &File, temp: &Path, target: &Path, sync: DirectorySync) -> Re
     {
         let _ = staged;
         fs::rename(temp, target).with_context(|| format!("replacing {}", target.display()))?;
-        let result = File::open(dir).and_then(|directory| directory.sync_all());
+        let result = match sync {
+            DirectorySync::Deferred | DirectorySync::Skip => Ok(()),
+            _ => File::open(dir).and_then(|directory| platform_fs::sync_file(&directory)),
+        };
         if matches!(sync, DirectorySync::Required) {
             result?;
         }

@@ -23,6 +23,8 @@ pub struct GateConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct TrainingConfig {
     pub enabled: bool,
+    /// Retain completed coding requests for later explicit teaching; retention is not approval.
+    pub retain_session_requests: bool,
     /// Defaults to `<state>/grounded/train.jsonl` when empty.
     pub train_data: PathBuf,
     pub valid_data: PathBuf,
@@ -48,6 +50,7 @@ impl Default for TrainingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            retain_session_requests: false,
             train_data: PathBuf::new(),
             valid_data: PathBuf::new(),
             iters: 32,

@@ -379,7 +379,7 @@ fn action_palette_uses_registered_commands_and_real_turn_policies() {
     assert_eq!(find("rename").command.args_hint.as_deref(), Some("<title>"));
     assert_eq!(
         find("model").command.args_hint.as_deref(),
-        Some("[settings|defaults|local]")
+        Some("[settings|defaults|local|backups]")
     );
     // Hidden aliases resolve at dispatch but never appear as palette rows.
     assert!(entries.iter().all(|e| e.command.name != "jobs"));

@@ -70,6 +70,7 @@ fn phase_glyph(state: ToolState, ctx: &TranscriptCtx) -> (String, Style) {
                 .patch(crate::ui::fx::pulse(theme, ctx.tick)),
         ),
         ToolState::Completed => (theme.sym(Sym::Dot).to_owned(), theme.fg(Tok::Dim)),
+        ToolState::Answered => (theme.sym(Sym::Dot).to_owned(), theme.fg(Tok::Muted)),
         ToolState::Failed => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Error)),
         ToolState::Interrupted => (
             if theme.ascii() { "-" } else { "⊘" }.to_owned(),

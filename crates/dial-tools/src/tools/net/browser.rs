@@ -621,7 +621,7 @@ impl BrowserTool {
                 .map_err(|e| format!("staging browser download: {e}"))?;
             staged
                 .write_all(&bytes)
-                .and_then(|()| staged.as_file().sync_all())
+                .and_then(|()| crate::platform::fs::sync_file(staged.as_file()))
                 .map_err(|e| format!("staging browser download: {e}"))?;
             staged
                 .persist(&path)

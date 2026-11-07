@@ -610,7 +610,7 @@ pub(in crate::agent) fn install(path: &Path, state: Option<&FileState>) -> Resul
             let mut file = tempfile::NamedTempFile::new_in(dir)?;
             file.write_all(&state.bytes)?;
             crate::platform::fs::set_mode(file.path(), state.mode)?;
-            file.as_file().sync_all()?;
+            crate::platform::fs::sync_file(file.as_file())?;
             file.persist(path).map_err(|e| e.error)?;
         }
         None => fs::remove_file(path)?,

@@ -290,7 +290,7 @@ impl ChildTranscript {
             .with_context(|| format!("writing {}", self.path.display()))?;
         file.flush()?;
         // Persist call intent before effects, and completed results before continuation.
-        file.sync_data()?;
+        crate::platform::fs::sync_file_data(&file)?;
         Ok(())
     }
 }
@@ -631,6 +631,7 @@ pub fn format_lines(messages: &[Value]) -> Vec<String> {
                     .unwrap_or(crate::runtime::Phase::Failed);
                 let glyph = match phase {
                     crate::runtime::Phase::Completed => "✓",
+                    crate::runtime::Phase::Answered => "·",
                     crate::runtime::Phase::Failed | crate::runtime::Phase::Interrupted => "✗",
                     _ => "!",
                 };

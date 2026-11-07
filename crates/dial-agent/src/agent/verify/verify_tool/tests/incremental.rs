@@ -39,7 +39,7 @@ fn complete_inputs_reuse_across_unrelated_edits_in_check_and_gate_without_fabric
         .clone()
         .with_artifacts(crate::storage::artifact::ArtifactStore::new(state.path()).unwrap());
     agent.step_checks.mutations = 1;
-    let first = agent.check_tool(&json!({}), &mut NullUi);
+    let first = agent.verify_tool(&json!({}), &mut NullUi);
     assert!(!first.is_error, "{}", first.text);
     assert_eq!(first.data.as_ref().unwrap()["results"][0]["ran"], true);
     assert_eq!(agent.verifications.len(), 1);
@@ -54,7 +54,7 @@ fn complete_inputs_reuse_across_unrelated_edits_in_check_and_gate_without_fabric
 
     std::fs::write(root.path().join("README.md"), "unrelated").unwrap();
     agent.step_checks.mutations += 1;
-    let reused = agent.check_tool(&json!({}), &mut NullUi);
+    let reused = agent.verify_tool(&json!({}), &mut NullUi);
     assert!(!reused.is_error, "{}", reused.text);
     assert_eq!(reused.data.as_ref().unwrap()["results"][0]["reused"], true);
     assert_eq!(reused.data.as_ref().unwrap()["results"][0]["ran"], false);
@@ -88,7 +88,7 @@ fn complete_inputs_reuse_across_unrelated_edits_in_check_and_gate_without_fabric
     );
     // A changed declared input forces a new execution whose log must not inherit the old ref.
     std::fs::write(root.path().join("inputs/value"), "good\n").unwrap();
-    let explicit = agent.check_tool(&json!({"names":["contract"]}), &mut NullUi);
+    let explicit = agent.verify_tool(&json!({"targets":["contract"]}), &mut NullUi);
     assert!(!explicit.is_error, "{}", explicit.text);
     assert_eq!(
         agent.verifications.len(),
@@ -126,7 +126,7 @@ fn user_changes_invalidate_reused_evidence_even_without_an_effect_counter_change
     let config = incremental_config(command);
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
+    assert!(!agent.verify_tool(&json!({}), &mut NullUi).is_error);
     agent.step_checks.record_checked();
     assert!(agent.step_checks.checks_current());
     std::fs::write(root.path().join("inputs/value"), "bad!").unwrap();
@@ -146,10 +146,10 @@ fn user_changes_invalidate_reused_evidence_even_without_an_effect_counter_change
             .passing_behavioral(agent.step_checks.revision()),
         0
     );
-    let failed = agent.check_tool(&json!({}), &mut NullUi);
+    let failed = agent.verify_tool(&json!({}), &mut NullUi);
     assert!(failed.is_error, "{}", failed.text);
     assert_eq!(agent.verifications.len(), 2);
-    assert!(agent.check_tool(&json!({}), &mut NullUi).is_error);
+    assert!(agent.verify_tool(&json!({}), &mut NullUi).is_error);
     assert_eq!(agent.verifications.len(), 3, "failures are never reused");
 }
 
@@ -160,15 +160,15 @@ fn opaque_effects_and_missing_inputs_force_execution() {
     let config = incremental_config("test -d inputs");
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
+    assert!(!agent.verify_tool(&json!({}), &mut NullUi).is_error);
     agent.step_checks.uncheckpointed_shell_commands += 1;
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
+    assert!(!agent.verify_tool(&json!({}), &mut NullUi).is_error);
     assert_eq!(agent.verifications.len(), 2);
     agent.step_checks.uncheckpointed_extension_calls += 1;
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
+    assert!(!agent.verify_tool(&json!({}), &mut NullUi).is_error);
     assert_eq!(agent.verifications.len(), 3);
     std::fs::remove_dir(root.path().join("inputs")).unwrap();
-    assert!(agent.check_tool(&json!({}), &mut NullUi).is_error);
+    assert!(agent.verify_tool(&json!({}), &mut NullUi).is_error);
     assert_eq!(agent.verifications.len(), 4);
 }
 
@@ -180,7 +180,7 @@ fn a_check_that_changes_its_own_inputs_cannot_supply_a_reuse_witness() {
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
     for _ in 0..2 {
-        let output = agent.check_tool(&json!({}), &mut NullUi);
+        let output = agent.verify_tool(&json!({}), &mut NullUi);
         assert!(output.is_error);
         assert_eq!(output.data.unwrap()["results"][0]["status"], "unverified");
     }
@@ -198,9 +198,9 @@ fn undeclared_check_execution_and_directory_membership_changes_invalidate_reuse(
     let config = incremental_config("test -d inputs");
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
+    assert!(!agent.verify_tool(&json!({}), &mut NullUi).is_error);
     std::fs::write(root.path().join("inputs/new-fixture"), "added").unwrap();
-    let changed = agent.check_tool(&json!({}), &mut NullUi);
+    let changed = agent.verify_tool(&json!({}), &mut NullUi);
     assert_eq!(changed.data.unwrap()["results"][0]["reused"], false);
     assert_eq!(agent.verifications.len(), 2);
     agent.run_focused_check(
@@ -212,7 +212,7 @@ fn undeclared_check_execution_and_directory_membership_changes_invalidate_reuse(
         &mut NullUi,
     );
     assert_eq!(agent.verifications.len(), 3);
-    let fresh = agent.check_tool(&json!({}), &mut NullUi);
+    let fresh = agent.verify_tool(&json!({}), &mut NullUi);
     assert_eq!(fresh.data.unwrap()["results"][0]["reused"], false);
     assert_eq!(agent.verifications.len(), 4);
 }
@@ -225,14 +225,14 @@ fn interruption_does_not_reuse_a_pass_and_reproductions_never_inherit_a_witness(
     let config = incremental_config(command);
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
+    assert!(!agent.verify_tool(&json!({}), &mut NullUi).is_error);
     agent.interrupt.store(true, Ordering::SeqCst);
-    let interrupted = agent.check_tool(&json!({}), &mut NullUi);
+    let interrupted = agent.verify_tool(&json!({}), &mut NullUi);
     assert!(interrupted.is_error);
     assert_eq!(interrupted.data.unwrap()["results"][0]["reused"], false);
     assert_eq!(agent.verifications.len(), 1);
     agent.interrupt.store(false, Ordering::SeqCst);
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
+    assert!(!agent.verify_tool(&json!({}), &mut NullUi).is_error);
     agent
         .step_checks
         .evidence
@@ -242,8 +242,8 @@ fn interruption_does_not_reuse_a_pass_and_reproductions_never_inherit_a_witness(
             timeout_secs: 30,
         })
         .unwrap();
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
-    assert!(!agent.check_tool(&json!({}), &mut NullUi).is_error);
+    assert!(!agent.verify_tool(&json!({}), &mut NullUi).is_error);
+    assert!(!agent.verify_tool(&json!({}), &mut NullUi).is_error);
     assert_eq!(agent.verifications.len(), 4);
 }
 
@@ -254,7 +254,7 @@ fn built_in_python_reuses_without_input_declarations_and_tracks_external_edits()
     // environment in a child rather than mutating the environment of parallel tests.
     if std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH").is_some() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "agent::verify::check_tool::tests::incremental::built_in_python_reuses_without_input_declarations_and_tracks_external_edits", "--nocapture"])
+            .args(["--exact", "agent::verify::verify_tool::tests::incremental::built_in_python_reuses_without_input_declarations_and_tracks_external_edits", "--nocapture"])
             .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
             .output().unwrap();
         assert!(
@@ -358,7 +358,7 @@ fn built_in_python_without_a_runtime_snapshot_executes_without_reuse() {
     // child process so parallel tests never observe a modified process environment. This is also
     // the setup-python CI case (LD_LIBRARY_PATH), without depending on a particular installation.
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "agent::verify::check_tool::tests::incremental::built_in_python_reuses_without_input_declarations_and_tracks_external_edits", "--nocapture"])
+        .args(["--exact", "agent::verify::verify_tool::tests::incremental::built_in_python_reuses_without_input_declarations_and_tracks_external_edits", "--nocapture"])
         .env("LD_DIAL_TEST_UNKNOWN_RUNTIME", "1")
         .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
         .output()

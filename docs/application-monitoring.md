@@ -83,7 +83,8 @@ a job-aware relay with bounded descendant drain; no unbounded blocking fallback 
 
 Capture is owner-private under the project's external Dial state, not in the checkout.
 It keeps at most the latest 256 KiB per run, up to 32 live wrappers, plus bounded protocol
-overhead. Each chunk atomically replaces a snapshot; lifetime locks, random generation and
+overhead. Output is coalesced: the snapshot is atomically replaced (unflushed, since it is
+useless once the wrapper is gone) at most every 25 ms and on completion; lifetime locks, random generation and
 kernel process-start identity detect stale records and restarts. Old inactive captures are
 removed on a later launch, so this is not an archival log service. Overruns, missing/corrupt
 storage, wrapper disappearance and publication failure stop observation explicitly. Slow

@@ -208,6 +208,8 @@ pub fn activity_row(
         "Compacting".into()
     } else if data.phase == super::status::Phase::WaitingCompute {
         "Waiting · local compute".into()
+    } else if data.background_wait.is_some() || data.provider_retry.is_some() {
+        data.activity_label()
     } else if let Some(progress) = &data.model_progress {
         use crate::llm::InferencePhase;
         match progress.phase {
@@ -240,7 +242,11 @@ pub fn activity_row(
     } else {
         format!("Working · {}", data.activity_label())
     };
-    if data.elapsed_secs.is_finite() && data.elapsed_secs >= 0.0 {
+    if data.background_wait.is_none()
+        && data.provider_retry.is_none()
+        && data.elapsed_secs.is_finite()
+        && data.elapsed_secs >= 0.0
+    {
         let (phase, detail) = label.split_once(" · ").unwrap_or((&label, ""));
         label = format!(
             "{phase} {}{}",
@@ -252,7 +258,12 @@ pub fn activity_row(
             }
         );
     }
-    let silence = if data.model_progress.is_some() && data.model_silence_secs >= 15 && !waiting {
+    let silence = if data.background_wait.is_none()
+        && data.provider_retry.is_none()
+        && data.model_progress.is_some()
+        && data.model_silence_secs >= 15
+        && !waiting
+    {
         format!(" · no progress for {}s", data.model_silence_secs)
     } else {
         String::new()

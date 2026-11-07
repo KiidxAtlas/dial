@@ -22,6 +22,28 @@ and context-window override so the old route cannot mask the new choice.
 
 The main session returns to its primary model once the fallback's cooldown (the server's retry-after, else 5 minutes) elapses, when `retry.fallback_revert` is `cooldown-expiry` (the default). With `never`, it stays on the fallback until you switch models with `/model`. A request already in flight is never switched; the return happens at the next request boundary, and both the fallback's first reply and the return to the primary are announced. Delegated workers consult the chain for their role after their configured routes. A worker moves to a fallback model only when its provider failed before it did any work, and is never restarted partway through a job; it does not return to the primary because each worker is a single job. A worker pinned to a named model profile is not substituted.
 
+### Guided backup models
+
+`/model backups` opens an offline draft editor for this same retry policy. Choose cached chat
+models, saved favorites/profiles or role references; type on the model-choice row to filter,
+use Left/Right to browse, and Enter to append. On the ordered-backups row, Ctrl+Left/Right
+selects an entry, Alt+Left/Right reorders it, and Ctrl+Delete removes it. Direct comma-separated
+selectors remain available for endpoints/models that are not cached. On the key row, Enter
+loads the existing chain for `default`, a helper role, `provider/model`, or `provider/*`.
+
+The preview uses runtime precedence and selector resolution, including suppression of unsafe
+substitution by exact-model privacy policies. Choose Global or Project before review; Project
+overrides continue to win over a Global save. Only the edited chain key is changed in the chosen
+layer. Trigger and return policy are shared by all chains. The cooldown is still the server's
+retry-after or five minutes, not a new configurable timer.
+
+Nothing is saved until **Review changes** and the explicit `y` confirmation. Review warns that
+conversation/source/tool data may reach a different provider with different pricing and retention.
+No provider requests, credential tests, downloads or model discovery run here. Escape returns
+from review to the draft, then closes without saving. Concurrent settings changes reject a stale
+review; close and reopen to refresh it. Saves follow existing request-boundary adoption, never
+switching a request already in flight.
+
 Cross-provider fallback and context-promotion selectors resolve the configured provider's endpoint,
 authentication variable, protocol, headers and URL templates before using bundled defaults. A
 private gateway configured for a provider is not replaced with that provider's public API URL.

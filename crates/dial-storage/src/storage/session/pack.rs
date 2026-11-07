@@ -314,7 +314,7 @@ fn write_members(
     zip.start_file(MANIFEST, options)?;
     zip.write_all(&serde_json::to_vec_pretty(manifest)?)?;
     let file = zip.finish()?;
-    file.sync_all()?;
+    crate::platform::fs::sync_file(&file)?;
     Ok(())
 }
 
@@ -627,7 +627,7 @@ fn install_file(src: &Path, dst: &Path, created: &mut Vec<PathBuf>) -> Result<()
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     platform_fs::set_owner_only(tmp.path())?;
     io::copy(&mut File::open(src)?, tmp.as_file_mut())?;
-    tmp.as_file().sync_all()?;
+    crate::platform::fs::sync_file(tmp.as_file())?;
     match tmp.persist_noclobber(dst) {
         Ok(_) => created.push(dst.to_path_buf()),
         Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
@@ -636,7 +636,7 @@ fn install_file(src: &Path, dst: &Path, created: &mut Vec<PathBuf>) -> Result<()
         Err(error) => return Err(error.error.into()),
     }
     #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
+    crate::platform::fs::sync_file(&File::open(dir)?)?;
     Ok(())
 }
 

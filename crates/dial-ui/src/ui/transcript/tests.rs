@@ -1774,6 +1774,7 @@ fn unnamed_turn_outcome_is_unknown_not_failed() {
         status: "unknown".into(),
         changed_files: 0,
         open_tasks: 0,
+        ..TurnOutcome::default()
     });
     t.turn_stats(TurnStats {
         clock: String::new(),
@@ -2310,4 +2311,93 @@ fn streaming_render_bracket_measurement() {
         }
         eprintln!("{label}: 20KB / 40-byte deltas: {:?}", before.elapsed());
     }
+}
+
+#[test]
+fn recorded_handoff_footer_is_bounded_sanitized_and_width_safe() {
+    let mut env = Env::new();
+    env.ui.show_turn_stats = false;
+    for width in [0, 1, 4, 16, 36, 40, 60, 100] {
+        let stats = TurnStats {
+            clock: String::new(),
+            elapsed_secs: 1.0,
+            prompt_tokens: None,
+            output_tokens: None,
+            tokens_per_second: None,
+            outcome: Some(TurnOutcome {
+                status: "interrupted".into(),
+                handoff: [
+                    "Checks: stale · failed — cargo test --package example\u{1b}[31m".to_owned(),
+                    "Blocked: Signing unavailable — Publish package".to_owned(),
+                ]
+                .into_iter()
+                .chain((2..20).map(|i| format!("Detail {i}")))
+                .collect(),
+                ..TurnOutcome::default()
+            }),
+        };
+        let rows = stats_rows(&stats, width, &env.ctx());
+        assert!(rows.len() <= 12, "unbounded footer at width {width}");
+        for line in plain(&rows) {
+            assert!(
+                text::width(&line) <= width as usize,
+                "width {width}: {line:?}"
+            );
+            assert!(!line.contains('\u{1b}'), "{line:?}");
+        }
+        if width >= 36 {
+            let text = text_of(&rows);
+            assert!(
+                text.contains("stale · failed") && text.contains("Signing unavailable"),
+                "{text}"
+            );
+            assert!(text.contains("interrupted"), "{text}");
+            assert!(!text.contains("Detail 11"), "{text}");
+        }
+    }
+}
+
+#[test]
+fn completed_answer_without_handoff_preserves_single_closing_line() {
+    let env = Env::new();
+    let stats = TurnStats {
+        clock: String::new(),
+        elapsed_secs: 1.0,
+        prompt_tokens: None,
+        output_tokens: None,
+        tokens_per_second: None,
+        outcome: Some(TurnOutcome {
+            status: "completed".into(),
+            ..TurnOutcome::default()
+        }),
+    };
+    assert_eq!(stats_rows(&stats, 80, &env.ctx()).len(), 1);
+}
+
+#[test]
+fn answered_footer_is_neutral_and_keeps_open_work_visible() {
+    let env = Env::new();
+    let stats = TurnStats {
+        clock: String::new(),
+        elapsed_secs: 1.0,
+        prompt_tokens: None,
+        output_tokens: None,
+        tokens_per_second: None,
+        outcome: Some(TurnOutcome {
+            status: "answered".into(),
+            open_tasks: 2,
+            ..TurnOutcome::default()
+        }),
+    };
+    let rows = stats_rows(&stats, 100, &env.ctx());
+    let text = text_of(&rows);
+    assert!(
+        text.contains("answered") && text.contains("2 open"),
+        "{text}"
+    );
+    assert!(!text.contains("unknown"), "{text}");
+    let mark = &rows[0].spans[0];
+    assert_eq!(mark.style, env.ctx().theme.fg(Tok::Muted));
+    assert!(mark.content.contains(env.ctx().theme.sym(Sym::Dot)));
+    assert!(!mark.content.contains(env.ctx().theme.sym(Sym::Check)));
 }

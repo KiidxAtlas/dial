@@ -338,7 +338,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         cli: Some("models"),
         ..CommandSpec::new(
             "model",
-            "[settings|defaults|local]",
+            "[settings|defaults|local|backups]",
             "choose the main model and assign roles",
             Category::Model,
             Surface::Builtin,
@@ -765,8 +765,28 @@ pub const COMMANDS: &[CommandSpec] = &[
         help_order: Some(15),
         ..CommandSpec::new(
             "search",
-            "<query>",
-            "search past sessions",
+            "<query>|results|open <id>|back",
+            "search, inspect and open past conversations",
+            Category::Session,
+            Surface::Builtin,
+        )
+    },
+    CommandSpec {
+        during_turn: DuringTurn::Now,
+        ..CommandSpec::new(
+            "attachments",
+            "[inspect|remove <number>]",
+            "inspect or remove draft attachments",
+            Category::Context,
+            Surface::Builtin,
+        )
+    },
+    CommandSpec {
+        during_turn: DuringTurn::Now,
+        ..CommandSpec::new(
+            "draft",
+            "[restore|replace|discard|resume|status]",
+            "restore or discard saved unsent input",
             Category::Session,
             Surface::Builtin,
         )
@@ -777,7 +797,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "context",
             "",
-            "show token usage",
+            "review last and estimated next request budgets",
             Category::Context,
             Surface::Builtin,
         )

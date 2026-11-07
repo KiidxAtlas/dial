@@ -765,7 +765,7 @@ fn primary_hints_follow_context_and_effective_bindings() {
     env.keys.rebind(Action::Interrupt, &["F4"]).unwrap();
     assert_eq!(
         &c.hint(&env.ctx())[..3],
-        ["Esc close", "F4 stop", "F2 send now or later"]
+        ["Esc close", "F4 stop", "F2 choose send action"]
     );
     env.keys.rebind(Action::Interrupt, &[]).unwrap();
     assert!(!c.hint(&env.ctx()).iter().any(|h| h.ends_with(" stop")));
@@ -843,7 +843,7 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
     assert!(
         c.hint(&env.ctx())
             .iter()
-            .any(|h| h == &format!("{} send now or later", env.keys.label(Action::Submit)))
+            .any(|h| h == &format!("{} choose send action", env.keys.label(Action::Submit)))
     );
     key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
     assert!(
@@ -1274,7 +1274,7 @@ fn busy_hints_follow_the_draft_and_queue() {
         hints(&c)
     );
     typed(&mut c, &env, "later");
-    assert!(hints(&c).contains(&format!("{submit} send now or later")));
+    assert!(hints(&c).contains(&format!("{submit} choose send action")));
     assert!(hints(&c).contains(&format!("{follow_up} send after turn")));
     c.set_draft("");
     c.queued.push_back(("oldest".into(), false));
@@ -3167,12 +3167,16 @@ fn busy_enter_offers_automatic_routing_or_queue_and_waits_for_a_choice() {
     assert!(c.queued_messages().is_empty());
     let rows = screen(&c, &env, 100).join("\n");
     assert!(
-        rows.contains("Steer") && rows.contains("After this turn"),
+        rows.contains("Let Dial choose (auto)")
+            && rows.contains("Redirect current task now")
+            && rows.contains("After this turn")
+            && rows.contains("Run independently"),
         "{rows}"
     );
     assert_eq!(press(&mut c, &env, KeyCode::Up), ComposerEvent::None);
     assert_eq!(c.draft(), "change the plan", "navigation keeps the draft");
     assert!(c.choice_open());
+    press(&mut c, &env, KeyCode::Down);
     press(&mut c, &env, KeyCode::Down);
     assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
     assert!(!c.choice_open());
@@ -3190,6 +3194,7 @@ fn the_default_choice_routes_automatically_and_explicit_queue_stays_queued() {
     press(&mut c, &env, KeyCode::Enter);
     typed(&mut c, &env, "second");
     press(&mut c, &env, KeyCode::Enter);
+    press(&mut c, &env, KeyCode::Down);
     press(&mut c, &env, KeyCode::Down);
     press(&mut c, &env, KeyCode::Enter);
     assert_eq!(
@@ -3232,6 +3237,9 @@ fn escape_closes_the_chooser_and_keeps_the_draft_pastes_and_history_exactly() {
     let history = c.history();
     press(&mut c, &env, KeyCode::Enter);
     assert!(c.choice_open());
+    press(&mut c, &env, KeyCode::Down);
+    press(&mut c, &env, KeyCode::Down);
+    press(&mut c, &env, KeyCode::Down);
     assert_eq!(
         press(&mut c, &env, KeyCode::Esc),
         ComposerEvent::None,
@@ -3356,6 +3364,7 @@ fn chooser_keys_and_hints_follow_remapping() {
     assert!(hints.contains(&"F2 confirm".to_owned()), "{hints:?}");
     assert!(hints.contains(&"Esc cancel".to_owned()), "{hints:?}");
     assert!(hints.iter().any(|h| h.ends_with("F5 select")), "{hints:?}");
+    press(&mut c, &env, KeyCode::F(5));
     press(&mut c, &env, KeyCode::F(5));
     assert_eq!(press(&mut c, &env, KeyCode::F(2)), ComposerEvent::None);
     assert_eq!(c.queued_messages(), vec![("remap".into(), true)]);
@@ -3497,7 +3506,8 @@ fn the_band_send_choice_is_its_own_panel_with_whole_labels_at_every_width() {
                 "{width}: {rows:?}"
             );
             // Labels are never cut; details yield first.
-            for label in [BusyChoice::Auto.label(), BusyChoice::AfterTurn.label()] {
+            for option in DRAFT_CHOICES {
+                let label = option.label();
                 assert!(
                     rows.iter().any(|row| row.contains(label)),
                     "{width}: {rows:?}"
@@ -4002,6 +4012,193 @@ fn chooser_advanced_shortcuts_have_plain_terminal_fallbacks() {
 }
 
 #[test]
+fn arrow_navigation_selects_each_intent_without_mixing_routes() {
+    let env = Env::new();
+    for steps in 0..4 {
+        let mut c = composer();
+        let mut history = c.history();
+        history.extend(["already queued".to_owned(), "new intent".to_owned()]);
+        c.set_busy(true);
+        c.set_draft("already queued");
+        key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
+        c.set_draft("new intent");
+        press(&mut c, &env, KeyCode::Enter);
+        for _ in 0..steps {
+            press(&mut c, &env, KeyCode::Down);
+        }
+        assert_eq!(c.draft(), "new intent", "selection {steps}");
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+        assert!(!c.choice_open());
+        assert_eq!(c.draft(), "");
+        assert_eq!(c.history(), history);
+        assert_eq!(
+            c.take_steering(),
+            if steps == 0 {
+                vec!["new intent"]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(
+            c.take_explicit_steering(),
+            if steps == 1 {
+                vec!["new intent"]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(
+            c.take_explicit_independent(),
+            if steps == 3 {
+                vec!["new intent"]
+            } else {
+                vec![]
+            }
+        );
+        let mut expected = vec![("already queued".into(), true)];
+        if steps == 2 {
+            expected.push(("new intent".into(), true));
+        }
+        assert_eq!(c.queued_messages(), expected, "selection {steps}");
+    }
+}
+
+#[test]
+fn busy_send_preferences_use_existing_routes_without_learning_from_choices() {
+    let env = Env::new();
+    for (preference, hint) in [
+        (BusySend::Choose, "choose send action"),
+        (BusySend::Redirect, "redirect task"),
+        (BusySend::AfterTurn, "send after turn"),
+        (BusySend::Independent, "run independently"),
+        (BusySend::Auto, "route automatically"),
+    ] {
+        let mut c = composer();
+        c.set_busy_send(preference);
+        c.set_busy(true);
+        assert!(
+            c.hint(&env.ctx()).iter().any(|h| h.contains(hint)),
+            "{preference:?}"
+        );
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+        assert!(
+            !c.choice_open(),
+            "empty Enter must not send: {preference:?}"
+        );
+        c.set_draft("message");
+        assert!(c.hint(&env.ctx()).contains(&format!("Enter {hint}")));
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+        if preference == BusySend::Choose {
+            assert!(c.choice_open());
+            assert_eq!(c.draft(), "message");
+            press(&mut c, &env, KeyCode::Char('r'));
+        } else {
+            assert!(!c.choice_open());
+        }
+        assert_eq!(c.draft(), "");
+        assert_eq!(
+            c.take_explicit_steering(),
+            if matches!(preference, BusySend::Choose | BusySend::Redirect) {
+                vec!["message"]
+            } else {
+                vec![]
+            },
+            "{preference:?}"
+        );
+        assert_eq!(
+            c.take_explicit_independent(),
+            if preference == BusySend::Independent {
+                vec!["message"]
+            } else {
+                vec![]
+            },
+            "{preference:?}"
+        );
+        assert_eq!(
+            c.take_steering(),
+            if preference == BusySend::Auto {
+                vec!["message"]
+            } else {
+                vec![]
+            },
+            "{preference:?}"
+        );
+        assert_eq!(
+            c.take_follow_up(),
+            (preference == BusySend::AfterTurn).then(|| "message".to_owned())
+        );
+        // Confirming a different chooser action never becomes a remembered preference.
+        c.set_draft("next");
+        press(&mut c, &env, KeyCode::Enter);
+        assert_eq!(c.choice_open(), preference == BusySend::Choose);
+    }
+}
+
+#[test]
+fn busy_send_preferences_leave_commands_queue_edits_and_stop_confirmation_unchanged() {
+    let env = Env::new();
+    for preference in [
+        BusySend::Choose,
+        BusySend::Redirect,
+        BusySend::AfterTurn,
+        BusySend::Independent,
+        BusySend::Auto,
+    ] {
+        let mut c = composer();
+        c.set_busy_send(preference);
+        c.set_busy(true);
+        c.set_draft("/help");
+        assert_eq!(
+            press(&mut c, &env, KeyCode::Enter),
+            ComposerEvent::Submit("/help".into())
+        );
+        c.set_draft("queued");
+        key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
+        assert!(c.edit_queued(0));
+        // Mutate the editor as typing does; set_draft intentionally cancels a queued edit.
+        c.editor.set("edited");
+        press(&mut c, &env, KeyCode::Enter);
+        assert_eq!(
+            c.queued_messages(),
+            [("edited".into(), true)],
+            "{preference:?}"
+        );
+        press(&mut c, &env, KeyCode::Enter);
+        assert!(c.choice_open());
+        press(&mut c, &env, KeyCode::Enter);
+        assert_eq!(
+            c.queued_messages(),
+            [("edited".into(), true)],
+            "default stop choice keeps working"
+        );
+        assert!(c.take_explicit_steering().is_empty());
+        assert!(c.take_explicit_independent().is_empty());
+    }
+}
+
+#[test]
+fn queue_chooser_does_not_offer_or_accept_draft_route_shortcuts() {
+    let env = Env::new();
+    for shortcut in ['r', 'w'] {
+        let mut c = composer();
+        c.set_busy(true);
+        c.set_draft("queued");
+        key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
+        press(&mut c, &env, KeyCode::Enter);
+        let shown = screen(&c, &env, 100).join("\n");
+        assert!(shown.contains("Keep working") && shown.contains("Stop and send oldest"));
+        assert!(
+            !shown.contains("Redirect current task now") && !shown.contains("Run independently")
+        );
+        press(&mut c, &env, KeyCode::Char(shortcut));
+        assert_eq!(c.draft(), shortcut.to_string());
+        assert_eq!(c.queued_messages(), [("queued".into(), true)]);
+        assert!(c.take_explicit_steering().is_empty());
+        assert!(c.take_explicit_independent().is_empty());
+    }
+}
+
+#[test]
 fn session_controls_focus_is_rebindable_and_never_consumes_the_draft() {
     let mut env = Env::new();
     env.keys.rebind(Action::StatusFocus, &["F1"]).unwrap();
@@ -4027,4 +4224,30 @@ fn session_controls_focus_is_rebindable_and_never_consumes_the_draft() {
         );
         assert_eq!(composer.draft(), "keep this draft");
     }
+}
+
+#[test]
+fn deferred_independent_is_enqueued_once_when_the_turn_settles() {
+    let mut c = composer();
+    c.set_busy(true);
+    assert!(c.request_worker("independent request"));
+    assert!(c.request_worker("independent request"));
+    assert_eq!(
+        c.take_explicit_independent(),
+        ["independent request", "independent request"]
+    );
+    c.mark_explicit("independent request", SteerStage::Received);
+    c.mark_explicit("independent request", SteerStage::Received);
+    c.defer_messages(vec![
+        "independent request".into(),
+        "independent request".into(),
+    ]);
+    c.set_busy(false);
+    assert_eq!(
+        c.queued_messages(),
+        [
+            ("independent request".into(), true),
+            ("independent request".into(), true)
+        ]
+    );
 }

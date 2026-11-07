@@ -18,6 +18,22 @@ fn tool(name: &str, state: ToolState) -> Tool {
 }
 
 #[test]
+fn answered_work_rows_are_neutral_not_success_or_warning() {
+    let theme = Theme::builtin("dial-dark").unwrap();
+    let ui = UiConfig::default();
+    let ctx = TranscriptCtx {
+        theme: &theme,
+        ui: &ui,
+        tick: 0,
+        tools_expanded: false,
+        expand_key: "ctrl+o",
+    };
+    let (glyph, style) = phase_glyph(ToolState::Answered, &ctx);
+    assert_eq!(glyph, theme.sym(Sym::Dot));
+    assert_eq!(style, theme.fg(Tok::Muted));
+}
+
+#[test]
 fn mcp_identity_status_evidence_and_bounds() {
     for theme_name in ["dial-dark", "dial", "mono"] {
         for ascii in [false, true] {

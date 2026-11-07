@@ -533,6 +533,16 @@ impl Driver for Hindsight {
         }
         Ok(())
     }
+    fn maintenance_due(&mut self, op: &Operation) -> Result<bool> {
+        if self.config.mental_models_enabled && !self.models_loaded {
+            return Ok(true);
+        }
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending WHERE endpoint=?1 AND bank=?2 AND state='queued')",
+            params![self.config.endpoint, op.scope.retain_bank],
+            |row| row.get(0),
+        )?)
+    }
     fn enqueue(&mut self, op: &Operation, model: &mut dyn MemoryModelRunner) -> Result<Value> {
         self.queue_transcript(op, true)?;
         let sent = self.flush(op, model, true)?;

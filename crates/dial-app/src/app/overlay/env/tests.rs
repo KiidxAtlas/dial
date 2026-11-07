@@ -397,3 +397,82 @@ fn returning_from_provider_configuration_refreshes_the_retained_endpoint() {
     assert!(!shown.contains("127.0.0.1:8000"), "{shown}");
     assert_eq!(files(&app), before, "Back refresh is read-only");
 }
+
+#[test]
+fn history_panel_actions_close_and_reach_the_shell_controller() {
+    use crate::storage::session::SearchHit;
+    use crate::ui::overlay::history_search::HistorySearchOverlay;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    let (_home, _project, app) = app();
+    let before = files(&app);
+    let mut keys = Keymap::defaults();
+    let mut themes = ThemeManager::new(&app.layout.user_dir, &app.config.ui, None);
+    let mut catalog = Catalog::new();
+    let runtime = crate::runtime::Tree::default();
+    let status = StatusData::default();
+    let mut history = Vec::new();
+    let mut auth_job = None;
+    let mut extensions_pending = None;
+    let mut extensions_job = None;
+    let mut scope = Scope::Project;
+    let mut env = OverlayEnv {
+        history: &mut history,
+        runtime: &runtime,
+        todo: &Default::default(),
+        model_downloads: None,
+        compute_monitor: None,
+        live_tasks: None,
+        verify_lora: None,
+        auth_job: &mut auth_job,
+        last_setup_failure: &mut None,
+        extensions_pending: &mut extensions_pending,
+        extensions_job: &mut extensions_job,
+        background_control: None,
+        pty_approval: Approval::Readonly,
+        app: &app,
+        themes: &mut themes,
+        keys: &mut keys,
+        status: &status,
+        catalog: &mut catalog,
+        scope: &mut scope,
+        dark: None,
+        latest: None,
+        next: None,
+        seen_generation: 0,
+        release_compute: None,
+        peer_source: None,
+    };
+    for (key, expected) in [
+        (KeyCode::Enter, "history-open:conversation"),
+        (KeyCode::Char('b'), "history-return"),
+    ] {
+        let mut panel = HistorySearchOverlay::new(
+            "needle".into(),
+            vec![SearchHit {
+                session_id: "conversation".into(),
+                entry_id: "entry".into(),
+                preview: "needle in original message".into(),
+                role: "user".into(),
+                snippet: "needle".into(),
+                when: String::new(),
+            }],
+            true,
+        );
+        let event = panel.handle(
+            &Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            env.keys,
+        );
+        let mut overlay = ActiveOverlay::HistorySearch(Box::new(panel));
+        assert!(
+            env.apply(event, &mut overlay),
+            "{expected} must close the panel"
+        );
+        assert_eq!(env.next.take().as_deref(), Some(expected));
+    }
+    assert_eq!(
+        files(&app),
+        before,
+        "forwarding navigation never changes settings"
+    );
+}

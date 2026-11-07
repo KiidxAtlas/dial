@@ -147,6 +147,20 @@ fn activity_row_fits_all_widths_and_preserves_silence_and_custom_preferences() {
     assert!(activity_row(&custom, &status, &Theme::dark(), 80).is_none());
     status.phase = Phase::Idle;
     assert!(activity_row(&UiConfig::default(), &status, &Theme::dark(), 80).is_none());
+    status.phase = Phase::Working;
+    status.activity.clear();
+    status.background_wait = Some(super::super::status::WorkWait {
+        label: "jobs test-42; workers review".into(),
+        started: std::time::Instant::now(),
+    });
+    for width in 8..160 {
+        let row = activity_row(&UiConfig::default(), &status, &Theme::dark(), width).unwrap();
+        assert_eq!(row.width(), usize::from(width));
+        assert!(!plain(&row).contains("Processing"));
+    }
+    let row = activity_row(&UiConfig::default(), &status, &Theme::dark(), 160).unwrap();
+    assert!(plain(&row).contains("results resume automatically"));
+    assert!(!plain(&row).contains("no progress"));
 }
 
 #[test]

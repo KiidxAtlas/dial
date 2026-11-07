@@ -116,81 +116,87 @@ fn parameter_capabilities_are_searchable_without_changing_display_or_executing()
 
 #[test]
 fn exact_name_beats_parameter_matches_and_activation_stays_bounded() {
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        for name in [
-            "fluorometryquux",
-            "mcp__lab__operate",
-            "native_probe",
-            "other_probe",
-            "last_probe",
-        ] {
-            agent.ext.try_register(Arc::new(Probe(name))).unwrap();
-        }
-        let exact = search(agent, "  FLUOROMETRYQUUX  ");
-        assert_eq!(exact.len(), 1);
-        assert_eq!(exact[0]["name"], "fluorometryquux");
-        let matches = search(agent, "spectrographyquux");
-        assert_eq!(matches.len(), 5);
-        assert_eq!(
-            matches
-                .iter()
-                .map(|entry| entry["name"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            [
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            for name in [
                 "fluorometryquux",
-                "last_probe",
                 "mcp__lab__operate",
                 "native_probe",
-                "other_probe"
-            ]
-        );
-        assert_eq!(agent.discovered_tools().len(), 3);
-        assert_eq!(
-            matches
-                .iter()
-                .filter(|entry| entry["enabled_next_round"] == true)
-                .count(),
-            3
-        );
-    });
+                "other_probe",
+                "last_probe",
+            ] {
+                agent.ext.try_register(Arc::new(Probe(name))).unwrap();
+            }
+            let exact = search(agent, "  FLUOROMETRYQUUX  ");
+            assert_eq!(exact.len(), 1);
+            assert_eq!(exact[0]["name"], "fluorometryquux");
+            let matches = search(agent, "spectrographyquux");
+            assert_eq!(matches.len(), 5);
+            assert_eq!(
+                matches
+                    .iter()
+                    .map(|entry| entry["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "fluorometryquux",
+                    "last_probe",
+                    "mcp__lab__operate",
+                    "native_probe",
+                    "other_probe"
+                ]
+            );
+            assert_eq!(agent.discovered_tools().len(), 3);
+            assert_eq!(
+                matches
+                    .iter()
+                    .filter(|entry| entry["enabled_next_round"] == true)
+                    .count(),
+                3
+            );
+        },
+    );
 }
 
 #[test]
 fn discovery_results_state_load_status_and_the_exact_next_action() {
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        for name in [
-            "fluorometryquux",
-            "mcp__lab__operate",
-            "native_probe",
-            "other_probe",
-            "last_probe",
-        ] {
-            agent.ext.try_register(Arc::new(Probe(name))).unwrap();
-        }
-        let matches = search(agent, "spectrographyquux");
-        assert_eq!(matches.len(), 5);
-        for entry in &matches {
-            let (status, next) = if entry["enabled_next_round"] == true {
-                ("loaded_next_request", "exact name on the next request")
-            } else {
-                ("not_loaded", "tool_load")
-            };
-            assert_eq!(entry["status"], status, "{entry:?}");
-            assert!(
-                entry["next"]
-                    .as_str()
-                    .is_some_and(|text| text.contains(next)),
-                "{entry:?}"
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            for name in [
+                "fluorometryquux",
+                "mcp__lab__operate",
+                "native_probe",
+                "other_probe",
+                "last_probe",
+            ] {
+                agent.ext.try_register(Arc::new(Probe(name))).unwrap();
+            }
+            let matches = search(agent, "spectrographyquux");
+            assert_eq!(matches.len(), 5);
+            for entry in &matches {
+                let (status, next) = if entry["enabled_next_round"] == true {
+                    ("loaded_next_request", "exact name on the next request")
+                } else {
+                    ("not_loaded", "tool_load")
+                };
+                assert_eq!(entry["status"], status, "{entry:?}");
+                assert!(
+                    entry["next"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(next)),
+                    "{entry:?}"
+                );
+            }
+            assert_eq!(
+                matches
+                    .iter()
+                    .filter(|e| e["status"] == "loaded_next_request")
+                    .count(),
+                3
             );
-        }
-        assert_eq!(
-            matches
-                .iter()
-                .filter(|e| e["status"] == "loaded_next_request")
-                .count(),
-            3
-        );
-    });
+        },
+    );
 }
 
 #[test]
@@ -240,99 +246,108 @@ fn schema_index_is_bounded_and_ignores_unrelated_metadata() {
 
 #[test]
 fn listing_pages_cover_the_eligible_catalog_once_in_sorted_order() {
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        register_probes(agent, "listprobe_", 20);
-        let expected: std::collections::BTreeSet<String> = agent
-            .catalog()
-            .into_iter()
-            .filter(|name| agent.tool_eligible(name))
-            .collect();
-        let pages = listing_pages(agent);
-        assert!(pages.len() > 1, "fixture must span several pages");
-        assert_eq!(pages.len(), expected.len().div_ceil(16));
-        let mut seen = Vec::new();
-        for (index, page) in pages.iter().enumerate() {
-            assert_eq!(page["page"].as_u64(), Some(index as u64));
-            assert_eq!(page["total"].as_u64(), Some(expected.len() as u64));
-            let tools = page["tools"].as_array().unwrap();
-            assert!(!tools.is_empty() && tools.len() <= 16, "page {index}");
-            seen.extend(
-                tools
-                    .iter()
-                    .map(|tool| tool["name"].as_str().unwrap().to_owned()),
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            register_probes(agent, "listprobe_", 20);
+            let expected: std::collections::BTreeSet<String> = agent
+                .catalog()
+                .into_iter()
+                .filter(|name| agent.tool_eligible(name))
+                .collect();
+            let pages = listing_pages(agent);
+            assert!(pages.len() > 1, "fixture must span several pages");
+            assert_eq!(pages.len(), expected.len().div_ceil(16));
+            let mut seen = Vec::new();
+            for (index, page) in pages.iter().enumerate() {
+                assert_eq!(page["page"].as_u64(), Some(index as u64));
+                assert_eq!(page["total"].as_u64(), Some(expected.len() as u64));
+                let tools = page["tools"].as_array().unwrap();
+                assert!(!tools.is_empty() && tools.len() <= 16, "page {index}");
+                seen.extend(
+                    tools
+                        .iter()
+                        .map(|tool| tool["name"].as_str().unwrap().to_owned()),
+                );
+            }
+            assert!(
+                seen.windows(2).all(|pair| pair[0] < pair[1]),
+                "pages must be sorted with no overlap: {seen:?}"
             );
-        }
-        assert!(
-            seen.windows(2).all(|pair| pair[0] < pair[1]),
-            "pages must be sorted with no overlap: {seen:?}"
-        );
-        assert_eq!(seen.len(), expected.len());
-        assert_eq!(
-            seen.iter()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>(),
-            expected
-        );
-    });
+            assert_eq!(seen.len(), expected.len());
+            assert_eq!(
+                seen.iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected
+            );
+        },
+    );
 }
 
 #[test]
 fn malformed_or_out_of_range_listing_cursors_are_refused_without_activation() {
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        register_probes(agent, "listprobe_", 20);
-        let total = listing(agent, "*")["total"].as_u64().unwrap();
-        let past_end = format!("*:{}", total.div_ceil(16));
-        for query in [
-            "*:",
-            "*:x",
-            "*:-1",
-            "*: 1",
-            "*:1x",
-            "*:+1",
-            "*:99999999999999999999999999",
-            past_end.as_str(),
-        ] {
-            let output = dispatch_query(agent, query);
-            assert!(output.is_error, "{query}: {}", output.text);
-            assert!(
-                output.text.contains("listing cursor"),
-                "{query}: {}",
-                output.text
-            );
-        }
-        assert!(agent.discovered_tools().is_empty());
-    });
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            register_probes(agent, "listprobe_", 20);
+            let total = listing(agent, "*")["total"].as_u64().unwrap();
+            let past_end = format!("*:{}", total.div_ceil(16));
+            for query in [
+                "*:",
+                "*:x",
+                "*:-1",
+                "*: 1",
+                "*:1x",
+                "*:+1",
+                "*:99999999999999999999999999",
+                past_end.as_str(),
+            ] {
+                let output = dispatch_query(agent, query);
+                assert!(output.is_error, "{query}: {}", output.text);
+                assert!(
+                    output.text.contains("listing cursor"),
+                    "{query}: {}",
+                    output.text
+                );
+            }
+            assert!(agent.discovered_tools().is_empty());
+        },
+    );
 }
 
 #[test]
 fn listing_reports_status_and_never_activates_or_grants_eligibility() {
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        register_probes(agent, "listprobe_", 20);
-        let offered_before = agent.offered();
-        for entry in all_entries(agent) {
-            let name = entry["name"].as_str().unwrap();
-            let loaded = offered_before.iter().any(|offered| offered == name);
-            let (status, next) = if loaded {
-                ("offered", "exact name")
-            } else {
-                ("not_loaded", "tool_load")
-            };
-            assert_eq!(entry["enabled_next_round"], loaded, "{entry:?}");
-            assert_eq!(entry["status"], status, "{entry:?}");
-            assert!(entry["next"].as_str().unwrap().contains(next), "{entry:?}");
-        }
-        assert!(agent.discovered_tools().is_empty());
-        assert_eq!(agent.offered(), offered_before);
-        // An exact search activates one tool; the later listing must report exactly that state.
-        let matched = search(agent, "listprobe_07");
-        assert_eq!(matched[0]["name"], "listprobe_07");
-        let entry = all_entries(agent)
-            .into_iter()
-            .find(|entry| entry["name"] == "listprobe_07")
-            .unwrap();
-        assert_eq!(entry["status"], "offered");
-        assert_eq!(entry["enabled_next_round"], true);
-    });
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            register_probes(agent, "listprobe_", 20);
+            let offered_before = agent.offered();
+            for entry in all_entries(agent) {
+                let name = entry["name"].as_str().unwrap();
+                let loaded = offered_before.iter().any(|offered| offered == name);
+                let (status, next) = if loaded {
+                    ("offered", "exact name")
+                } else {
+                    ("not_loaded", "tool_load")
+                };
+                assert_eq!(entry["enabled_next_round"], loaded, "{entry:?}");
+                assert_eq!(entry["status"], status, "{entry:?}");
+                assert!(entry["next"].as_str().unwrap().contains(next), "{entry:?}");
+            }
+            assert!(agent.discovered_tools().is_empty());
+            assert_eq!(agent.offered(), offered_before);
+            // An exact search activates one tool; the later listing must report exactly that state.
+            let matched = search(agent, "listprobe_07");
+            assert_eq!(matched[0]["name"], "listprobe_07");
+            let entry = all_entries(agent)
+                .into_iter()
+                .find(|entry| entry["name"] == "listprobe_07")
+                .unwrap();
+            assert_eq!(entry["status"], "offered");
+            assert_eq!(entry["enabled_next_round"], true);
+        },
+    );
 }
 
 #[test]
@@ -385,48 +400,54 @@ fn ordinary_queries_that_resemble_listing_syntax_still_search() {
 
 #[test]
 fn search_miss_returns_bounded_eligible_catalog_without_loading_tools() {
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        register_probes(agent, "fallback_probe_", 20);
-        let before = agent.offered();
-        // Use an absent token: words like "no" or "such" legitimately rank catalog prose.
-        let page = listing(agent, "zqjxvnomatchzz");
-        assert_eq!(page["search_matches"], json!([]));
-        assert_eq!(page["listing"], true);
-        assert_eq!(page["page"], 0);
-        assert!(page["tools"].as_array().unwrap().len() <= TOOL_LIST_PAGE);
-        assert!(page["next_query"].is_string());
-        for entry in page["tools"].as_array().unwrap() {
-            assert!(agent.tool_eligible(entry["name"].as_str().unwrap()));
-        }
-        assert_eq!(agent.offered(), before);
-        assert!(agent.discovered_tools().is_empty());
-    });
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            register_probes(agent, "fallback_probe_", 20);
+            let before = agent.offered();
+            // Use an absent token: words like "no" or "such" legitimately rank catalog prose.
+            let page = listing(agent, "zqjxvnomatchzz");
+            assert_eq!(page["search_matches"], json!([]));
+            assert_eq!(page["listing"], true);
+            assert_eq!(page["page"], 0);
+            assert!(page["tools"].as_array().unwrap().len() <= TOOL_LIST_PAGE);
+            assert!(page["next_query"].is_string());
+            for entry in page["tools"].as_array().unwrap() {
+                assert!(agent.tool_eligible(entry["name"].as_str().unwrap()));
+            }
+            assert_eq!(agent.offered(), before);
+            assert!(agent.discovered_tools().is_empty());
+        },
+    );
 }
 
 #[test]
 fn discovery_reports_readiness_without_executing_or_hiding_unknown_tools() {
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        agent
-            .ext
-            .try_register(Arc::new(Probe("mcp__lab__operate")))
-            .unwrap();
-        let before = agent.offered();
-        let entries = all_entries(agent);
-        assert_eq!(agent.offered(), before);
-        let probe = entries
-            .iter()
-            .find(|entry| entry["name"] == "mcp__lab__operate")
-            .unwrap();
-        assert_eq!(probe["readiness"]["state"], "unknown");
-        let read = entries
-            .iter()
-            .find(|entry| entry["name"] == "read")
-            .unwrap();
-        assert_eq!(read["readiness"]["state"], "ready");
-        let matches = search(agent, "mcp__lab__operate");
-        assert_eq!(matches[0]["readiness"]["state"], "unknown");
-        assert_eq!(matches[0]["enabled_next_round"], true);
-    });
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            agent
+                .ext
+                .try_register(Arc::new(Probe("mcp__lab__operate")))
+                .unwrap();
+            let before = agent.offered();
+            let entries = all_entries(agent);
+            assert_eq!(agent.offered(), before);
+            let probe = entries
+                .iter()
+                .find(|entry| entry["name"] == "mcp__lab__operate")
+                .unwrap();
+            assert_eq!(probe["readiness"]["state"], "unknown");
+            let read = entries
+                .iter()
+                .find(|entry| entry["name"] == "read")
+                .unwrap();
+            assert_eq!(read["readiness"]["state"], "ready");
+            let matches = search(agent, "mcp__lab__operate");
+            assert_eq!(matches[0]["readiness"]["state"], "unknown");
+            assert_eq!(matches[0]["enabled_next_round"], true);
+        },
+    );
 }
 
 struct ReadinessProbe(&'static str, crate::tools::surface::catalog::Readiness);
@@ -451,46 +472,49 @@ impl Tool for ReadinessProbe {
 #[test]
 fn capability_search_prefers_ready_ties_before_activation_and_result_caps() {
     use crate::tools::surface::catalog::Readiness;
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        for index in 0..10 {
-            let name = Box::leak(format!("cap_{index:02}").into_boxed_str());
-            let readiness = if index == 9 {
-                Readiness::Ready
-            } else {
-                Readiness::MissingPrerequisite {
-                    reason: "fixture prerequisite missing".into(),
-                }
-            };
-            agent
-                .ext
-                .try_register(Arc::new(ReadinessProbe(name, readiness)))
-                .unwrap();
-        }
-        let entries = search(agent, "spectrographyquux");
-        assert_eq!(entries.len(), 8);
-        assert_eq!(entries[0]["name"], "cap_09");
-        assert_eq!(entries[0]["readiness"]["state"], "ready");
-        assert_eq!(entries[0]["enabled_next_round"], true);
-        assert_eq!(entries[1]["name"], "cap_00");
-        assert_eq!(entries[1]["readiness"]["state"], "missing_prerequisite");
-        assert_eq!(entries[2]["name"], "cap_01");
-        assert_eq!(
-            entries
-                .iter()
-                .filter(|entry| entry["enabled_next_round"] == true)
-                .count(),
-            3
-        );
-        assert_eq!(agent.discovered_tools(), ["cap_09", "cap_00", "cap_01"]);
-        let listed = all_entries(agent);
-        assert_eq!(
-            listed
-                .iter()
-                .filter(|entry| entry["name"].as_str().unwrap().starts_with("cap_"))
-                .count(),
-            10
-        );
-    });
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            for index in 0..10 {
+                let name = Box::leak(format!("cap_{index:02}").into_boxed_str());
+                let readiness = if index == 9 {
+                    Readiness::Ready
+                } else {
+                    Readiness::MissingPrerequisite {
+                        reason: "fixture prerequisite missing".into(),
+                    }
+                };
+                agent
+                    .ext
+                    .try_register(Arc::new(ReadinessProbe(name, readiness)))
+                    .unwrap();
+            }
+            let entries = search(agent, "spectrographyquux");
+            assert_eq!(entries.len(), 8);
+            assert_eq!(entries[0]["name"], "cap_09");
+            assert_eq!(entries[0]["readiness"]["state"], "ready");
+            assert_eq!(entries[0]["enabled_next_round"], true);
+            assert_eq!(entries[1]["name"], "cap_00");
+            assert_eq!(entries[1]["readiness"]["state"], "missing_prerequisite");
+            assert_eq!(entries[2]["name"], "cap_01");
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| entry["enabled_next_round"] == true)
+                    .count(),
+                3
+            );
+            assert_eq!(agent.discovered_tools(), ["cap_09", "cap_00", "cap_01"]);
+            let listed = all_entries(agent);
+            assert_eq!(
+                listed
+                    .iter()
+                    .filter(|entry| entry["name"].as_str().unwrap().starts_with("cap_"))
+                    .count(),
+                10
+            );
+        },
+    );
 }
 
 #[test]
@@ -510,49 +534,55 @@ fn exact_blocked_name_remains_discoverable_but_cannot_bypass_eligibility() {
             "unsupported",
         ),
     ] {
-        with_agent("[assistance]\ncompact_tools=true", |agent| {
-            agent
-                .ext
-                .try_register(Arc::new(ReadinessProbe("blocked_probe", readiness)))
-                .unwrap();
-            let entries = search(agent, "  BLOCKED_PROBE  ");
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0]["name"], "blocked_probe");
-            assert_eq!(entries[0]["readiness"]["state"], expected);
-            assert_eq!(entries[0]["enabled_next_round"], true);
-            assert!(agent.offered().contains(&"blocked_probe".to_owned()));
-            agent.modes.launch.tools = Some(["tool_search".to_owned()].into());
-            assert!(!agent.tool_eligible("blocked_probe"));
-            let entries = search(agent, "blocked_probe");
-            assert!(
-                entries.iter().all(|entry| {
-                    let name = entry["name"].as_str().unwrap();
-                    name != "blocked_probe" && agent.tool_eligible(name)
-                }),
-                "{entries:?}"
-            );
-            assert!(!agent.offered().contains(&"blocked_probe".to_owned()));
-        });
+        with_agent(
+            "[assistance]\ncompact_tools=false\nlean_local=true",
+            |agent| {
+                agent
+                    .ext
+                    .try_register(Arc::new(ReadinessProbe("blocked_probe", readiness)))
+                    .unwrap();
+                let entries = search(agent, "  BLOCKED_PROBE  ");
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0]["name"], "blocked_probe");
+                assert_eq!(entries[0]["readiness"]["state"], expected);
+                assert_eq!(entries[0]["enabled_next_round"], true);
+                assert!(agent.offered().contains(&"blocked_probe".to_owned()));
+                agent.modes.launch.tools = Some(["tool_search".to_owned()].into());
+                assert!(!agent.tool_eligible("blocked_probe"));
+                let entries = search(agent, "blocked_probe");
+                assert!(
+                    entries.iter().all(|entry| {
+                        let name = entry["name"].as_str().unwrap();
+                        name != "blocked_probe" && agent.tool_eligible(name)
+                    }),
+                    "{entries:?}"
+                );
+                assert!(!agent.offered().contains(&"blocked_probe".to_owned()));
+            },
+        );
     }
 }
 
 #[test]
 fn explicit_loading_keeps_large_eligible_selections_and_complete_receipts() {
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        register_probes(agent, "many_", 70);
-        let names: Vec<_> = (0..70).map(|index| format!("many_{index:02}")).collect();
-        let output = crate::agent::run::tool_exposure::default_offer_tests::load_tools(
-            agent,
-            json!({"names":names}),
-        );
-        assert!(!output.is_error, "{}", output.text);
-        let entries = output.data.as_ref().unwrap()["tools"].as_array().unwrap();
-        assert_eq!(entries.len(), names.len());
-        let offered = agent.offered();
-        for (entry, name) in entries.iter().zip(&names) {
-            assert_eq!(entry["name"], *name);
-            assert_eq!(entry["enabled_next_round"], true);
-            assert!(offered.contains(name), "{name}");
-        }
-    });
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            register_probes(agent, "many_", 70);
+            let names: Vec<_> = (0..70).map(|index| format!("many_{index:02}")).collect();
+            let output = crate::agent::run::tool_exposure::default_offer_tests::load_tools(
+                agent,
+                json!({"names":names}),
+            );
+            assert!(!output.is_error, "{}", output.text);
+            let entries = output.data.as_ref().unwrap()["tools"].as_array().unwrap();
+            assert_eq!(entries.len(), names.len());
+            let offered = agent.offered();
+            for (entry, name) in entries.iter().zip(&names) {
+                assert_eq!(entry["name"], *name);
+                assert_eq!(entry["enabled_next_round"], true);
+                assert!(offered.contains(name), "{name}");
+            }
+        },
+    );
 }

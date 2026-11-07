@@ -64,9 +64,7 @@ pub(super) fn save(path: &Path, state: &Value) -> Result<(), String> {
     }
     let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
     file.write_all(&bytes).map_err(|error| error.to_string())?;
-    file.as_file()
-        .sync_all()
-        .map_err(|error| error.to_string())?;
+    crate::platform::fs::sync_file(file.as_file()).map_err(|error| error.to_string())?;
     file.persist(path)
         .map_err(|error| error.error.to_string())?;
     Ok(())

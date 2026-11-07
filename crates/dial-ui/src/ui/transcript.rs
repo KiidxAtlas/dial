@@ -48,12 +48,15 @@ pub struct TurnStats {
 }
 
 /// The agent's own account of how a turn ended.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TurnOutcome {
     /// `completed`, `incomplete`, `failed`, `interrupted`, …
     pub status: String,
     pub changed_files: usize,
     pub open_tasks: usize,
+    /// Bounded, recorded handoff details projected by the application report owner.
+    /// Empty for plain completed answers; these are information, never replay instructions.
+    pub handoff: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -808,6 +811,7 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
                 | "pending"
                 | "done"
                 | "completed"
+                | "answered"
                 | "blocked"
                 | "needs_input"
                 | "incomplete"
@@ -821,6 +825,7 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
         let (tok, mark) = match phase {
             _ if !known => (Tok::Warning, Sym::Warn),
             crate::runtime::Phase::Completed => (Tok::Success, Sym::Check),
+            crate::runtime::Phase::Answered => (Tok::Muted, Sym::Dot),
             crate::runtime::Phase::Failed => (Tok::Error, Sym::Cross2),
             crate::runtime::Phase::Interrupted => (Tok::Muted, Sym::Cross2),
             crate::runtime::Phase::Running => (Tok::Accent, Sym::Working),
@@ -892,7 +897,21 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
         left.extend(right);
         left.push(Span::raw(" "));
     }
-    vec![fitted(left, w, theme)]
+    let mut rows = vec![fitted(left, w, theme)];
+    if let Some(outcome) = &s.outcome {
+        for detail in outcome.handoff.iter().take(11) {
+            let detail = text::one_line(detail);
+            rows.push(fitted(
+                vec![
+                    Span::raw(in_gutter("")),
+                    Span::styled(detail, theme.fg(Tok::Muted)),
+                ],
+                w,
+                theme,
+            ));
+        }
+    }
+    rows
 }
 
 // ---------------------------------------------------------------------------------------------

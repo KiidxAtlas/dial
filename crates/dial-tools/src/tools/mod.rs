@@ -1325,16 +1325,7 @@ PUT >N*:   insert after that block;  CUT N* deletes it
 REM        delete the file;  MV new/path  move/rename it (after any edits)
 Rows: `+` then the exact text with indentation; a lone `+` is a blank line; text starting with + or - is `++x`/`+-x`. Rows are final text; never write `-` rows.
 Move code: `CUT 3.=5 @tmp` then `PUT >9 @tmp` (across files too; `PUT N.=M @tmp` replaces; without @name one anonymous register).
-Example (one call, several operations and files):
-[src/main.rs#3FA9]
-PUT 4.=4:
-+    let total = a + b;
-CUT 10.=12
-PUT >20:
-+    log(total);
-[src/lib.rs#81C2]
-PUT <1:
-+use std::fmt;
+Example: `[src/main.rs#3FA9]` then `PUT 4.=4:` and `+    let total = a + b;` on separate lines.
 One section per file; put every planned change to every file in one call. Success returns the fresh [PATH#TAG] and changed lines. If the file changed since your read, edits re-anchor when their lines are unchanged; otherwise you get the current lines to retry."#
 );
 
@@ -1381,7 +1372,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "path": {"type": "string", "description": "Workspace-relative file path or an `ssh://host/path` remote file (requires approval)."},
                 "content": {"type": "string", "description": "Full file content."},
                 "allow_syntax_errors": {"type": "boolean", "description": "Set true only when valid code is refused for new syntax errors (parser dialect gap)."},
-                "check": edit::editing::check_property(),
+                "verify": edit::editing::verify_property(),
             }),
             &["path", "content"],
         ),
@@ -1410,7 +1401,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
             json!({
                 "pattern": {"type": "string", "description": "Non-empty Rust regex such as `fn \\w+\\(` or `TODO|FIXME`; set literal for literal text."},
                 "literal": {"type": "boolean", "description": "Treat pattern as literal text (default false)."},
-                "path": {"type": "string", "description": "File, directory or semicolon-separated scopes, or one `ssh://host/path` file (approval required)."},
+                "path": {"type": "string", "description": "File, directory or semicolon-separated scopes, one `artifact://<hash>` retained output, or one `ssh://host/path` file (approval required)."},
                 "glob": {"type": "string", "description": "Only files whose workspace-relative path matches this glob."},
                 "ignore_case": {"type": "boolean", "description": "Case-insensitive (default false)."},
                 "context": {"type": "integer", "minimum": 0, "description": "Lines before and after each match (default 0, max 10)."},

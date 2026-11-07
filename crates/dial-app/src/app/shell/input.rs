@@ -86,6 +86,7 @@ impl Shell {
         mut next: impl FnMut(Duration) -> std::io::Result<Option<Event>>,
     ) {
         while busy() {
+            self.checkpoint_input(false);
             let animating = self.home.as_ref().is_some_and(welcome::Home::animating);
             let frame = if animating {
                 crate::ui::fx::FRAME

@@ -342,11 +342,37 @@ pub(in crate::agent) struct ParallelToolContext<'a> {
 }
 
 /// Run only a prevalidated consecutive group. No agent/session/UI state enters a worker.
+#[cfg(test)]
 pub(in crate::agent) fn parallel_tools(
     ctx: ParallelToolContext<'_>,
     calls: &[ToolCall],
     already_started: Option<&str>,
+    reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
+) -> Vec<(ToolOutput, f64)> {
+    parallel_tools_with_mutations(ctx, calls, already_started, reuse, None, None, None)
+}
+
+pub(in crate::agent) fn parallel_tools_with_reads(
+    ctx: ParallelToolContext<'_>,
+    calls: &[ToolCall],
+    already_started: Option<&str>,
+    reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
+    streamed: Option<&mut crate::agent::run::streaming_dispatch::StreamingDispatch>,
+) -> Vec<(ToolOutput, f64)> {
+    parallel_tools_with_mutations(ctx, calls, already_started, reuse, None, None, streamed)
+}
+
+type GroupMutationController<'a> =
+    &'a mut dyn FnMut(&ToolCall, &str, &[PathBuf], bool) -> std::result::Result<(), String>;
+
+pub(in crate::agent) fn parallel_tools_with_mutations(
+    ctx: ParallelToolContext<'_>,
+    calls: &[ToolCall],
+    already_started: Option<&str>,
     read_reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
+    mut mutation_controller: Option<GroupMutationController<'_>>,
+    turn_cancel: Option<&crate::runtime::cancellation::TurnCancellation>,
+    mut streamed: Option<&mut crate::agent::run::streaming_dispatch::StreamingDispatch>,
 ) -> Vec<(ToolOutput, f64)> {
     let ParallelToolContext {
         workspace,
@@ -359,6 +385,15 @@ pub(in crate::agent) fn parallel_tools(
     let signals = crate::tools::exec::signals::CallSignals::new();
     thread::scope(|scope| {
         let (completed, completions) = mpsc::channel();
+        type Mutation = (
+            usize,
+            String,
+            Vec<PathBuf>,
+            bool,
+            mpsc::SyncSender<std::result::Result<(), String>>,
+        );
+        let (mutations, requests) = mpsc::channel::<Mutation>();
+        let mutating = mutation_controller.is_some();
         let mut unique: HashMap<(&str, String), usize> = HashMap::new();
         let mut sources = Vec::with_capacity(calls.len());
         let mut remaining = Vec::new();
@@ -372,6 +407,7 @@ pub(in crate::agent) fn parallel_tools(
                 crate::agent::safety::guard::normalized_arguments(call).to_string(),
             );
             if let Some(&source) = unique.get(&key)
+                && !mutating
                 && !["pre_tool_use", "post_tool_use"].iter().any(|event| {
                     crate::agent::safety::hooks::wanted_for_tool(&config.hooks, event, &call.name)
                 })
@@ -390,6 +426,8 @@ pub(in crate::agent) fn parallel_tools(
             remaining.push(1usize);
             first_calls.push(index);
             let completed = completed.clone();
+            let mutations = mutations.clone();
+            let mutation_scope = turn_cancel.map(|turn| turn.mutation());
             if let Some(error) = ui.execution_error() {
                 let output = ToolOutput::err(error)
                     .with_status(tools::ToolStatus::Blocked)
@@ -397,8 +435,13 @@ pub(in crate::agent) fn parallel_tools(
                 let _ = completed.send((source, (output, 0.0), Vec::new(), None));
                 continue;
             }
+            let early = streamed.as_mut().and_then(|stream| stream.extract(call));
             let signals = signals.clone();
             scope.spawn(move || {
+                if let Some(outcome) = early.and_then(|early| early.receive()) {
+                    let _ = completed.send((source,outcome,Vec::new(),None));
+                    return;
+                }
                 let started = Instant::now();
                 let mut notices = Vec::new();
                 let mut policy_reason = None;
@@ -417,10 +460,28 @@ pub(in crate::agent) fn parallel_tools(
                         }
                         _ => {}
                     }
-                    let mut read = |args: &Value| crate::tools::exec::execution::native_read(
-                        &ToolContext { workspace, config, mutation_authorizer: None, confirm: None },
-                        ext, &call.name, args, &|_| {}, interrupt,
-                    ).unwrap_or_else(|| ToolOutput::err("parallel tool unavailable"));
+                    let authorize = |tool: &str, paths: &[PathBuf], unbounded: bool| {
+                        if interrupt.load(Ordering::SeqCst) { return Err("native group cancelled before authorization".into()); }
+                        let (sender,receiver) = mpsc::sync_channel(1);
+                        mutations.send((index,tool.to_owned(),paths.to_vec(),unbounded,sender))
+                            .map_err(|_| "native group owner disconnected".to_owned())?;
+                        loop { match receiver.recv_timeout(Duration::from_millis(80)) {
+                            Ok(result) => return result,
+                            Err(RecvTimeoutError::Timeout) if !interrupt.load(Ordering::SeqCst) => {},
+                            _ => return Err("native group authorization cancelled or disconnected".into()),
+                        }}
+                    };
+                    let mut read = |args: &Value| {
+                        let ctx = ToolContext { workspace, config, mutation_authorizer: mutating.then_some(&authorize as crate::tools::integrations::ext::MutationAuthorizer<'_>), confirm: None };
+                        let execute = || if mutating {
+                            crate::tools::exec::execution::native(&ctx,ext,&call.name,args,&|_|{},interrupt)
+                        } else { crate::tools::exec::execution::native_read(&ctx,ext,&call.name,args,&|_|{},interrupt) };
+                        let output = match &mutation_scope {
+                            Some(scope) => crate::tools::exec::execution::mutation_scope(scope,execute),
+                            None => execute(),
+                        };
+                        output.unwrap_or_else(|| ToolOutput::err("parallel tool unavailable"))
+                    };
                     let mut output = if call.name == "read"
                         && !["pre_tool_use", "post_tool_use"].iter().any(|event| {
                             crate::agent::safety::hooks::wanted_for_tool(&config.hooks, event, &call.name)
@@ -443,6 +504,13 @@ pub(in crate::agent) fn parallel_tools(
         let mut outstanding = results.len();
         let mut input_signalled = false;
         while outstanding > 0 {
+            while let Ok((index, tool, paths, unbounded, reply)) = requests.try_recv() {
+                let result = match mutation_controller.as_deref_mut() {
+                    Some(authorize) => authorize(&calls[index], &tool, &paths, unbounded),
+                    None => Err("parallel reads have no mutation authority".into()),
+                };
+                let _ = reply.send(result);
+            }
             let steering = ui.take_steering();
             if !steering.is_empty() {
                 signals.request_steering();
@@ -470,28 +538,29 @@ pub(in crate::agent) fn parallel_tools(
                     }
                 }
             }
-            let (source, result, notices, policy_reason) =
-                match completions.recv_timeout(Duration::from_millis(80)) {
-                    Ok(completion) => completion,
-                    Err(RecvTimeoutError::Timeout) => {
-                        ui.heartbeat();
-                        continue;
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        for (source, result) in results.iter_mut().enumerate() {
-                            if result.is_none() {
-                                let output = ToolOutput::err("tool worker disconnected");
-                                for (index, call) in calls.iter().enumerate() {
-                                    if sources[index] == source {
-                                        ui.tool_result_with_id(&call.id, &call.name, &output);
-                                    }
+            let (source, result, notices, policy_reason) = match completions
+                .recv_timeout(Duration::from_millis(if mutating { 5 } else { 80 }))
+            {
+                Ok(completion) => completion,
+                Err(RecvTimeoutError::Timeout) => {
+                    ui.heartbeat();
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    for (source, result) in results.iter_mut().enumerate() {
+                        if result.is_none() {
+                            let output = ToolOutput::err("tool worker disconnected");
+                            for (index, call) in calls.iter().enumerate() {
+                                if sources[index] == source {
+                                    ui.tool_result_with_id(&call.id, &call.name, &output);
                                 }
-                                *result = Some((output, 0.0));
                             }
+                            *result = Some((output, 0.0));
                         }
-                        break;
                     }
-                };
+                    break;
+                }
+            };
             if let Some(reason) = policy_reason {
                 crate::agent::safety::approval::explain(ui, &calls[first_calls[source]], reason);
             }
@@ -933,19 +1002,42 @@ impl<'a> Agent<'a> {
             });
             self.queue_hook_context(context);
         }
-        if matches!(call.name.as_str(), "edit" | "write")
-            && call.arguments["check"] == true
-            && !out.is_error
-        {
-            if let Some(advice) = self.settle_tool_mutation(call, &out) {
-                crate::tools::surface::outcome::append_text(&mut out, &format!("\n\n{advice}"));
-            }
-            let check = self.check_tool(&json!({}), ui);
-            crate::agent::verify::check_tool::attach_post_mutation_check(
-                &mut out, &call.name, check,
-            );
-        }
+        self.post_mutation_verification(call, &mut out, ui);
         out
+    }
+
+    pub(in crate::agent) fn post_mutation_verification(
+        &mut self,
+        call: &ToolCall,
+        out: &mut ToolOutput,
+        ui: &mut dyn Ui,
+    ) {
+        if matches!(call.name.as_str(), "edit" | "write") {
+            use crate::agent::verify::verify_tool::VerifyStep;
+            match self.verify_batch.mutation_finished(call, !out.is_error) {
+                VerifyStep::Nothing => {}
+                VerifyStep::Deferred => crate::tools::surface::outcome::append_text(
+                    out,
+                    "\n\n[verify deferred: runs once after this response's last edit]",
+                ),
+                VerifyStep::Skipped(count) => crate::tools::surface::outcome::append_text(
+                    out,
+                    &format!(
+                        "\n\n[verify not run: this {} failed, so {count} requested test target(s) did not run]",
+                        call.name
+                    ),
+                ),
+                VerifyStep::Run(targets) => {
+                    if let Some(advice) = self.settle_tool_mutation(call, out) {
+                        crate::tools::surface::outcome::append_text(out, &format!("\n\n{advice}"));
+                    }
+                    let verify = self.verify_tool(&json!({"targets": targets}), ui);
+                    crate::agent::verify::verify_tool::attach_post_mutation_verify(
+                        out, &call.name, verify,
+                    );
+                }
+            }
+        }
     }
 
     fn dispatch_inner(
@@ -971,6 +1063,17 @@ impl<'a> Agent<'a> {
         }
         let arguments_changed = arguments_changed || expanded.arguments != call.arguments;
         let call = &expanded;
+        if call.name == "bash"
+            && let Some(command) = call.arguments["command"].as_str()
+        {
+            let key = format!(
+                "{}\0{command}",
+                call.arguments["cwd"].as_str().unwrap_or_default()
+            );
+            if self.step_checks.slow_checks.get(&key) == Some(&self.step_checks.mutations) {
+                ui.notice("Repeating a slow check with no intervening native source edit observed. Prefer the retained output or a scoped check; external input changes may still require a rerun.");
+            }
+        }
         let denied = |why: &str| {
             ToolOutput {
                 execution: Default::default(),
@@ -1010,11 +1113,13 @@ impl<'a> Agent<'a> {
             );
         }
         if matches!(call.name.as_str(), "edit" | "write")
-            && call.arguments["check"] == true
+            && call.arguments["verify"]
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty())
             && !self.config.verification.enabled
         {
             return denied(&format!(
-                "{} check=true requires verification.enabled; no mutation was executed",
+                "{} verify requires verification.enabled; no mutation was executed",
                 call.name
             ));
         }
@@ -1109,6 +1214,13 @@ impl<'a> Agent<'a> {
                 Ok(request) => request,
                 Err(error) => return ToolOutput::err(error),
             };
+            match self.completion_decision(TurnOutcome::NeedsInput, &args.to_string(), ui) {
+                crate::agent::verify::completion::Decision::Continue(note)
+                | crate::agent::verify::completion::Decision::Incomplete(note) => {
+                    return ToolOutput::err(note);
+                }
+                crate::agent::verify::completion::Decision::Accept(_) => {}
+            }
             let outcome = ui.ask_questions(&request, self.interrupt.as_ref());
             return crate::agent::workflow::questions::output(
                 &request,
@@ -1353,13 +1465,41 @@ impl<'a> Agent<'a> {
                 },
                 Err(error) => denied(&error),
             },
-            "check" => self.check_tool(args, ui),
+            crate::agent::verify::verify_tool::NAME => self.verify_tool(args, ui),
             "revert_edit" => self.revert_edit_tool(call),
             "finish" => {
                 let finish = match crate::agent::verify::completion::Finish::parse(args) {
                     Ok(finish) => finish,
                     Err(error) => return denied(&error),
                 };
+                if finish.outcome == TurnOutcome::Completed && !self.hermetic {
+                    match self.wait_for_background_event(ui) {
+                        Ok(true) => {
+                            return ToolOutput::ok("Completion deferred: running work produced an event, new input arrived, or a stop boundary was reached. Incorporate worker findings and current user direction; fetch background job output or its artifact if only a terminal notice was delivered. Waiting does not establish success.".into())
+                                .with_effects(crate::tools::surface::outcome::Effects::None);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            return ToolOutput::err(format!("waiting for running work: {error:#}"))
+                                .with_effects(crate::tools::surface::outcome::Effects::None);
+                        }
+                    }
+                }
+
+                match self.completion_decision(finish.outcome, &finish.summary, ui) {
+                    crate::agent::verify::completion::Decision::Continue(note) => {
+                        return ToolOutput::ok(note)
+                            .with_effects(crate::tools::surface::outcome::Effects::None);
+                    }
+                    crate::agent::verify::completion::Decision::Incomplete(reason) => {
+                        self.step_checks.finish_accepted = true;
+                        return ToolOutput::structured(json!({
+                            "accepted_outcome": "incomplete", "candidate_summary":finish.summary,
+                            "reason":reason,
+                        }));
+                    }
+                    crate::agent::verify::completion::Decision::Accept(_) => {}
+                }
                 if finish.outcome == TurnOutcome::NeedsInput {
                     let question = finish.question.as_deref().unwrap_or_default();
                     return match ui.ask_user(&finish.summary, question, &finish.options) {
@@ -1382,31 +1522,6 @@ impl<'a> Agent<'a> {
                             "The input request was cancelled; continue without it or ask again interactively.",
                         ),
                     };
-                }
-                if finish.outcome == TurnOutcome::Completed && !self.hermetic {
-                    match self.wait_for_background_event(ui) {
-                        Ok(true) => {
-                            return ToolOutput::ok("Completion deferred: running work produced an event, new input arrived, or a stop boundary was reached. Incorporate worker findings and current user direction; fetch background job output or its artifact if only a terminal notice was delivered. Waiting does not establish success.".into())
-                                .with_effects(crate::tools::surface::outcome::Effects::None);
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            return ToolOutput::err(format!("waiting for running work: {error:#}"))
-                                .with_effects(crate::tools::surface::outcome::Effects::None);
-                        }
-                    }
-                }
-                if finish.outcome == TurnOutcome::Completed
-                    && let Err(reason) = self.validate_completion(ui)
-                {
-                    // The candidate is retained, but the controller does not accept completion.
-                    // Ending honestly avoids another inference/retry loop against the same gate.
-                    self.step_checks.finish_accepted = true;
-                    return ToolOutput::structured(json!({
-                        "accepted_outcome": self.completion_rejection_outcome(),
-                        "candidate_summary": finish.summary,
-                        "reason": reason,
-                    }));
                 }
 
                 self.step_checks.finish_accepted = true;
@@ -1473,7 +1588,9 @@ impl<'a> Agent<'a> {
                     .map(|entry| entry.0.clone())
                     .collect();
                 let offered_before = self.offered();
-                if let Err(error) = self.activate_tools(&activated) {
+                if !self.stable_tool_offer()
+                    && let Err(error) = self.activate_tools(&activated)
+                {
                     return denied(&format!("persisting discovered tools: {error:#}"));
                 }
                 let offered = self.offered();

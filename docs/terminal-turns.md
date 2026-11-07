@@ -45,20 +45,21 @@ failures (including checkpoint failures) are not reset by this recovery.
   instead of presenting an old snapshot as current; the existing todo browser remains available.
   Todo findings and references are labelled as agent observations, not verification.
 
-- While a turn runs, submitting a non-command draft opens **a message-intent chooser**. Nothing is
-  sent just by opening it; Escape returns to the unchanged draft. The options are **Steer** (by default
-  steers this task with no model call; `[message_routing] route = "classify"` lets a routing judge decide
-  between steering and an independent worker, and a failed decision steers) and **After this turn**
-  (queued, unchanged). Two advanced keys are shown in the chooser footer:
-  `r` (or `Ctrl+Enter` where the terminal reports it) is a hard redirect: it cancels the pending model
-  request or discards its stale response before any of its tool calls run. A tool already running may
-  finish (only waits that are safe to interrupt are interrupted); unstarted actions are skipped and
-  completed results are retained. The latest instruction takes precedence over conflicting older plans.
-  `w` (or `Ctrl+W`), like `/worker <message>`, starts a separate worker for exactly that message right
-  away (even mid-reply or while tools run) while the current task continues; it never steers the running
-  task and no model classifies it. If a worker cannot start (spawning disabled, capacity, interruption)
-  the message is queued as a follow-up instead. With no turn running, `/worker` says so and sends the
-  message as a normal task.
+- While a turn runs, submitting a non-command draft opens **a send-action chooser** by default.
+  Nothing is sent merely by opening it; Escape preserves the draft. Arrow keys and Enter select:
+  **Let Dial choose (auto)** (uses configured routing; may redirect or request a worker),
+  **Redirect current task now** (explicit steering at the next safe point), **After this turn**
+  (queued follow-up that leaves the current task unchanged), or **Run independently** (requests a
+  separate worker and falls back to an after-turn follow-up if it cannot start). The footer states
+  what Enter will do. In `/settings` → Input, **Enter while working** explicitly saves `ui.busy_send`:
+  `choose` (default), `redirect`, `after_turn`, `independent`, or `auto`. Choices other than `choose`
+  send directly on Enter; selecting a chooser action never changes this preference. Empty Enter
+  with queued work still asks before stopping, regardless of preference. Automatic routing defaults
+  to steering without an extra model call; `[message_routing] route = "classify"` opts into a routing
+  judge, and a failed decision steers. `r`/`Ctrl+Enter` and `w`/`Ctrl+W` remain direct redirect/worker shortcuts.
+  Redirect cancels the pending model request or discards its stale response before its tool calls
+  run; an already running tool may finish. Completed results are retained and unstarted actions
+  skipped. `/worker <message>` uses the same independent route; while idle it submits a normal task.
   Explicit messages are shown above the composer, one row each (`○ Steer  pending · acts at the
   next safe point  “message”`, with ● received and ✓ applied), with the stage Dial actually reported:
   *pending* (typed, not yet read by the agent; it acts at the next safe point), *received*
@@ -99,15 +100,13 @@ failures (including checkpoint failures) are not reset by this recovery.
   dismisses a local completion/search/send chooser; `Ctrl+C` (or `/cancel`) cancels the wait. Screen
   reset works immediately during inference instead of waiting for the turn to finish.
 
-- A turn that edited files, was interrupted or failed ends with a compact **Turn report** line (for
-  example `3 files changed · checks passed · 1 open task`) and a muted next-step hint
-  (`/review · /undo` after edits, `continue · /undo` after a failure). The collapsed check state is
-  `checks failed`, `checks stale` (recorded before the final edits), `checks unverified`, `checks passed`
-  or `no recorded checks` (checks are optional; a shell or `eval` check is not listed here).
-  The tool-expand key (`Ctrl+O`) shows the full report: outcome, changed files, recorded checks, where
-  their logs can be opened with `/evidence check`, open tasks, shell or extension calls outside `/undo`,
-  and request timing. Empty sections are omitted, and plain answers with no edits show no report. The
-  summary is stored in session control state as `turn_summary`.
+- Edited, blocked, interrupted and failed turns end with an **actionable completion footer** from
+  the existing recorded turn report: changed files, named checks and their freshness/verdicts,
+  outstanding obligations, effects outside `/undo`, and a safe next action. Check freshness alone
+  never means passing. Missing freshness/verdicts remain unverified; recorded shell tests are not
+  silently promoted to configured checks. Detail is bounded; `/evidence check`, `/todo` and
+  `/review-file` expose the owning evidence. Plain completed answers remain quiet. These are
+  observations from `turn_summary`, not permission to retry or replay completed work.
 - Settled test and build commands (`cargo test`, `cargo clippy`, `make test-*`, `pytest`, `tsc`, …)
   show a **Test** or **Build** card instead of their raw log: counts at the right of the header, then
   only failing test names or the first errors with their `file:line` locations. The expand key
@@ -121,10 +120,16 @@ failures (including checkpoint failures) are not reset by this recovery.
   merged, exact duplicates (path, range, title) dropped, and sorted by priority then confidence. The report
   shows target identity, an unchanged/stale line, a verdict (`do not ship` for any P0/P1; else `inconclusive`
   if any chunk failed or was inconclusive; else `ship with fixes` for P2/P3 only; else `ship`), counts per
-  priority, and findings grouped P0..P3, followed by the same data as machine-readable JSON); `/review-file` lists checkpoint turns, then groups the turn's changes by writer
-  (`main` or a worker label; checkpoints from before attribution show as `unattributed`).
-  A group offers **Review files** and **Revert unshared files**. Unshared files were changed only
-  by that writer and in no later checkpointed turn. Group revert first shows the combined diff
+  priority, and findings grouped P0..P3, followed by the same data as machine-readable JSON);
+  `/review-file` opens the latest changed turn's file browser directly. Every row shows its writers
+  (`main` or a worker label; older checkpoints show `unattributed`), overlap signals and whether that
+  exact version was kept as reviewed. Selection, writer/overlap filters and review marks survive
+  returning to the browser and reopening it in the session; later edits invalidate review marks.
+  **Choose turn** explicitly opens older turns. File previews offer **Next file / Previous file**
+  within the filtered list without returning through menus. Reviewing is not testing or acceptance.
+  Filter to a writer to offer **Revert writer's unshared files**. Unshared files were changed only
+  by that writer and in no later checkpointed turn; overlap files stay excluded regardless of filters.
+  Group revert first shows the combined diff
   (including your own later edits; above 24 KiB it is refused and files must be reverted one at a
   time). Each file is compared with its reviewed version right before it is written. This is not a
   transaction: if one file fails or changed, the revert stops, files it already wrote are put back
@@ -135,7 +140,7 @@ failures (including checkpoint failures) are not reset by this recovery.
   of a group revert and a single-file revert asks for separate confirmation. No recorded overlap
   does not prove a file is
   independent of other code (a renamed function and its callers). `/review-file <turn> [path]`
-  previews one file with **Keep / Revert file / Cancel**. The review also says how many shell
+  previews one file with **Keep reviewed version / Revert file / Next file / Previous file / Back to files**. The review also says how many shell
   commands and extension calls in the latest turn were not checkpointed: their effects cannot be
   shown or reverted here. Files too large to checkpoint are listed as not reviewable.
   A revert includes all changes shown for that file, including your own edits: review carefully.
@@ -147,6 +152,12 @@ failures (including checkpoint failures) are not reset by this recovery.
   filesystem-atomic: avoid editing the selected files concurrently with a revert.
 - Request status distinguishes waiting, model loading, prompt processing, generation, retry and
   cancellation. Time without a worker progress event is separate from total task elapsed time.
+  Owned-work waits instead name awaited jobs/workers/questions and show a separate elapsed wait
+  clock, with no invented job percentage or ETA. Results or messages resume the turn without model
+  polling; new input changes direction. Interrupting ends the agent turn, not the background job.
+  Use Activity (`/activity`) to inspect and explicitly cancel owned work. Provider retry status shows
+  its observed attempt and monotonic delay until the next request; `/retry` skips that delay,
+  while the interrupt key stops the agent request. Neither operation replays completed tools.
   `/model restart` explicitly confirms unloading only Dial's managed local main model, which reloads
   with the same selection next request. Busy turns, running children and external endpoints are
   refused; the command never switches models or kills external servers. Failed/cancelled inference
@@ -155,6 +166,12 @@ failures (including checkpoint failures) are not reset by this recovery.
   before enabling edits. `/permissions` lists scoped rules; for example,
   `/permissions allow --persist bash cargo test` persists a project rule outside the workspace.
   Deny rules take precedence, including in automatic approval mode.
+  Approval prompts show the exact policy-derived reusable matcher and lifetime before consent.
+  Shell rules match the displayed normalized argv prefix; later arguments may vary, while
+  destructive forms remain excluded. Session grants are not saved; project grants persist into
+  future sessions until revoked. Unsupported shell shapes, destructive commands, directory-access
+  expansion and application-watch starts offer one-time approval rather than a fictitious reusable
+  grant. Capability expansion still requires its existing explicit consent.
 
 ## Workspace rail and live worker cards
 

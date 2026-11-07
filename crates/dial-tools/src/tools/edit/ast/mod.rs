@@ -53,6 +53,16 @@ fn pattern_arg(args: &Value) -> Result<&str, String> {
 }
 
 impl Tool for AstSearch {
+    fn resources(
+        &self,
+        _workspace: &Workspace,
+        args: &Value,
+    ) -> Option<crate::tools::surface::resources::Access> {
+        Some(crate::tools::surface::resources::Access {
+            reads: vec![args["path"].as_str().unwrap_or(".").into()],
+            writes: Vec::new(),
+        })
+    }
     fn name(&self) -> &str {
         "ast_search"
     }
@@ -100,6 +110,33 @@ impl Tool for AstSearch {
 }
 
 impl Tool for AstEdit {
+    fn manages_workspace_serialization(&self) -> bool {
+        true
+    }
+    fn resources(
+        &self,
+        workspace: &Workspace,
+        args: &Value,
+    ) -> Option<crate::tools::surface::resources::Access> {
+        let writes = if let Some(token) = args["apply_token"].as_str() {
+            workspace
+                .staged_rewrites()
+                .get(token)?
+                .0
+                .iter()
+                .map(|file| file.change.abs.clone())
+                .collect()
+        } else if args["dry_run"] == false {
+            vec![args["path"].as_str()?.into()]
+        } else {
+            // Preview receipts mutate the bounded token cache, not just the searched files.
+            return None;
+        };
+        Some(crate::tools::surface::resources::Access {
+            reads: Vec::new(),
+            writes,
+        })
+    }
     fn name(&self) -> &str {
         "ast_edit"
     }

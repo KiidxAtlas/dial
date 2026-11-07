@@ -723,7 +723,15 @@ fn digest_lines(command: &str, text: &str) -> Option<Vec<String>> {
     if text.len() < DIGEST_MIN_BYTES {
         return None;
     }
-    filter_for(command)?;
+    // A diagnostic digest can inspect a recognized build at the head of a pipeline without
+    // filtering or reinterpreting the pipeline's actual output or exit status.
+    if filter_for(command).is_none()
+        && !bash_interceptor::pipeline_heads(command)
+            .iter()
+            .any(|(head, _)| filter_for(head).is_some())
+    {
+        return None;
+    }
     let cleaned = clean_terminal(text);
     failing_test_blocks(&cleaned).or_else(|| Some(error_lines(&cleaned)?.0))
 }

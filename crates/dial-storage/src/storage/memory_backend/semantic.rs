@@ -1079,6 +1079,42 @@ impl Driver for Semantic {
         retained.and(embedded).and(consolidated)
     }
 
+    fn maintenance_due(&mut self, _: &Operation) -> Result<bool> {
+        let at = now();
+        if self.auto_retain
+            && self
+                .store
+                .next_turns(TURNS_PER_PASS + self.turn_failures.len())?
+                .iter()
+                .any(|(id, _, _)| {
+                    self.turn_failures
+                        .get(id)
+                        .is_none_or(|(_, retry)| *retry <= at)
+                })
+        {
+            return Ok(true);
+        }
+        let model = self.embedder.as_ref().map(|embedder| embedder.model());
+        let (facts, _, embedded) = self.store.counts(model)?;
+        let (user, _, user_embedded) = self.user.counts(model)?;
+        if model.is_some() && (facts > embedded || user > user_embedded) {
+            return Ok(true);
+        }
+        let last = self
+            .store
+            .meta(LAST_CONSOLIDATED)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok((facts > 1 || user > 1)
+            && self.consolidate_interval_secs > 0
+            && consolidation_due(last, at, self.consolidate_interval_secs))
+    }
+
+    fn degradation_notice(&self) -> Option<String> {
+        self.recall_note.as_ref().or(self.embed_error.as_ref()).or(self.embedding_note.as_ref())
+            .map(|reason| format!("Semantic memory embeddings are unavailable: {reason}. Recall is using keyword search; check the embedding endpoint in Memory settings."))
+    }
+
     fn status(&mut self, _: &Operation) -> Result<Value> {
         let model = self
             .embedder

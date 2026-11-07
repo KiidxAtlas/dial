@@ -160,8 +160,29 @@ impl Agent<'_> {
                     }
                     admitted += 1;
                 }
+                if admitted < group.len() {
+                    self.efficiency_metrics.scheduling.barrier("admission");
+                }
                 group.truncate(admitted);
-                if group.len() > 1 {
+                if !streamed
+                    .as_ref()
+                    .is_some_and(|s| group.first().is_some_and(|call| s.has(call)))
+                    && group
+                        .iter()
+                        .filter(|call| !crate::agent::run::dependency_dispatch::bookkeeping(call))
+                        .count()
+                        > 1
+                    && group.iter().any(|call| {
+                        crate::agent::run::dependency_dispatch::bookkeeping(call)
+                            || crate::agent::run::dependency_dispatch::footprint_for(
+                                &self.workspace,
+                                self.edit_mode(),
+                                &self.ext,
+                                call,
+                            )
+                            .is_some_and(|f| f.writes())
+                    })
+                {
                     self.drain_background_check(ui, true);
                     if let Some(streamed) = streamed.as_mut() {
                         streamed.invalidate();
@@ -237,67 +258,43 @@ impl Agent<'_> {
                     })
                     .count();
                 let group = &reply.tool_calls[index..index + count];
-                let mut early: Vec<Option<(ToolOutput, f64)>> = match streamed.as_mut() {
-                    Some(streamed) => group.iter().map(|c| streamed.take(c, ui)).collect(),
-                    None => vec![None; count],
-                };
-                let reused = early.iter().flatten().count();
-                if count > 1 || reused > 0 {
-                    for (position, (batched, result)) in group.iter().zip(&early).enumerate() {
-                        if let Some((output, seconds)) = result {
-                            if position > 0 {
-                                ui.tool_call_with_args(
-                                    &batched.id,
-                                    &batched.name,
-                                    &summarize(batched),
-                                    &batched.arguments,
-                                );
-                            }
-                            ui.tool_timing(&batched.id, &batched.name, *seconds);
-                            ui.tool_result_with_id(&batched.id, &batched.name, output);
-                        }
-                    }
-                    let rest: Vec<ToolCall> = group
-                        .iter()
-                        .zip(&early)
-                        .filter(|(_, result)| result.is_none())
-                        .map(|(c, _)| c.clone())
-                        .collect();
+                if count > 0 {
+                    let group_started = Instant::now();
+                    let reused_before = streamed.as_ref().map_or(0, |s| s.statistics().1);
                     let mut steering = Vec::new();
                     let read_reuse = engine.reusable_reads(|id| self.holds_full_result(id));
-                    let mut ran = if rest.is_empty() {
-                        Vec::new()
-                    } else {
-                        parallel_tools(
-                            ParallelToolContext {
-                                workspace: &self.workspace,
-                                config: self.effective_config(),
-                                ext: &self.ext,
-                                interrupt: &self.interrupt,
-                                ui,
-                                pending_steering: &mut steering,
-                            },
-                            &rest,
-                            Some(&call.id),
-                            Some(&read_reuse),
-                        )
-                    }
-                    .into_iter();
+                    let outputs = crate::agent::run::dispatch::parallel_tools_with_reads(
+                        ParallelToolContext {
+                            workspace: &self.workspace,
+                            config: self.effective_config(),
+                            ext: &self.ext,
+                            interrupt: &self.interrupt,
+                            ui,
+                            pending_steering: &mut steering,
+                        },
+                        group,
+                        Some(&call.id),
+                        Some(&read_reuse),
+                        streamed.as_mut(),
+                    );
+                    self.efficiency_metrics.scheduling.group(
+                        "reads",
+                        count,
+                        group_started.elapsed(),
+                        outputs.iter().map(|(_, seconds)| *seconds),
+                    );
                     self.pending_tool_steering.extend(steering);
-                    *parallel = early
-                        .iter_mut()
-                        .map(|result| {
-                            result
-                                .take()
-                                .or_else(|| ran.next())
-                                .expect("one result per grouped call")
-                        })
-                        .collect();
+                    *parallel = outputs.into();
+                    let reused = streamed
+                        .as_ref()
+                        .map_or(0, |s| s.statistics().1)
+                        .saturating_sub(reused_before);
                     if reused > 0 {
                         ui.diagnostic(&format!("Streaming dispatch: {reused} of {count} grouped read(s) reused results started while the reply streamed."));
                     }
                 }
             }
+
             let result_presented = !parallel.is_empty();
             let (mut out, seconds, executed) = match parallel.pop_front() {
                 Some(result) => {

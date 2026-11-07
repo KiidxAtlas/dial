@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 /// An interactive (non-hermetic) agent over default configuration plus `overlay` and an
 /// unreachable endpoint; these tests inspect the offer and prompt only, so no request is made.
-pub(crate) fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) -> T {
+pub(crate) fn with_default_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) -> T {
     crate::llm::fake::raise_fd_limit();
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
@@ -13,6 +13,15 @@ pub(crate) fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) 
     let mut overlay: toml::Table =
         toml::from_str(&format!("{overlay}\n[improve]\nenabled=false")).unwrap();
     overlay.entry("model").or_insert_with(|| "test".into());
+    // Unscripted requests are fixture failures, not transport-retry experiments. Retry-owner
+    // tests set their own explicit limits and retain those values.
+    overlay
+        .entry("retry")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .unwrap()
+        .entry("max_attempts")
+        .or_insert(toml::Value::Integer(1));
     let config = Config::load(&layout, Some(overlay)).unwrap();
     let backend = Backend::new(
         ProviderKind::Endpoint {
@@ -41,6 +50,20 @@ pub(crate) fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) 
     )
     .unwrap();
     f(&mut agent)
+}
+
+/// Historical routing fixtures explicitly exercise the retained noncompact configuration.
+/// New default-policy regressions use `with_default_agent` instead.
+pub(crate) fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) -> T {
+    let mut values: toml::Table = toml::from_str(overlay).unwrap();
+    values
+        .entry("assistance")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .unwrap()
+        .entry("compact_tools")
+        .or_insert(toml::Value::Boolean(false));
+    with_default_agent(&toml::to_string(&values).unwrap(), f)
 }
 
 /// Fixed-request reliability fixtures opt out of completion reconciliation explicitly.
@@ -379,7 +402,7 @@ fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
             "find",
             "bg",
             "finish",
-            "check",
+            "verify",
         ] {
             assert!(
                 !offered.iter().any(|name| name == loadable),
@@ -533,7 +556,7 @@ fn tool_load_reports_core_retention_and_deduplicates_selection_receipts() {
 #[test]
 fn tool_load_refuses_overlap_before_changing_pins_discovery_or_routing() {
     with_agent("[assistance]\ncompact_tools=true", |agent| {
-        agent.activate_tools(&["ast_search".into()]).unwrap();
+        assert!(!load_tools(agent, json!({"names":["ast_search"]})).is_error);
         let before = agent.session.control_state();
         let offered = agent.offered();
         for arguments in [
@@ -559,7 +582,7 @@ fn tool_load_refuses_overlap_before_changing_pins_discovery_or_routing() {
 #[test]
 fn tool_load_persistence_failure_cannot_report_success_or_change_effective_offer() {
     with_agent("[assistance]\ncompact_tools=true", |agent| {
-        agent.activate_tools(&["ast_search".into()]).unwrap();
+        assert!(!load_tools(agent, json!({"names":["ast_search"]})).is_error);
         let path = agent.session.path().unwrap().to_owned();
         let snapshot = crate::storage::session::Session::read(&path).unwrap();
         agent.session = snapshot;
@@ -626,6 +649,10 @@ fn selected_memory_tools_stay_in_compact_lean_and_fallback_offers() {
     ] {
         with_agent(&format!("{memory}{profile}"), |agent| {
             assert!(agent.tool_discovery(), "{profile}");
+            if agent.stable_tool_offer() {
+                assert!(!agent.offered().contains(&"memory".to_owned()));
+                assert!(!load_tools(agent, json!({"names":["memory"]})).is_error);
+            }
             let offered = agent.offered();
             assert!(
                 offered.iter().any(|name| name == "memory"),
@@ -647,6 +674,7 @@ fn selected_memory_tools_stay_in_compact_lean_and_fallback_offers() {
     }
     // Provenance's own memory tool is protected the same way.
     with_agent("[assistance]\ncompact_tools=true", |agent| {
+        assert!(!load_tools(agent, json!({"names":["memory"]})).is_error);
         agent.lean_tools = true;
         let offered = agent.offered();
         assert!(offered.iter().any(|name| name == "memory"), "{offered:?}");
@@ -690,66 +718,72 @@ fn memory_guidance_follows_the_tools_the_backend_offers() {
 
 #[test]
 fn discovered_working_set_is_bounded_persisted_and_separate_from_pins() {
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        let base = agent.offered();
-        let limit = Agent::DISCOVERED_TOOL_LIMIT;
-        let candidates: Vec<String> = agent
-            .catalog()
-            .into_iter()
-            .filter(|name| {
-                !base.contains(name) && !matches!(name.as_str(), "tool_search" | "tool_load")
-            })
-            .collect();
-        assert!(candidates.len() > limit, "{candidates:?}");
-        for name in &candidates {
-            agent.activate_tools(std::slice::from_ref(name)).unwrap();
-        }
-        let working = agent.discovered_tools();
-        assert_eq!(working.len(), limit);
-        assert_eq!(working, candidates[candidates.len() - limit..].to_vec());
-        let offered = agent.offered();
-        assert!(working.iter().all(|name| offered.contains(name)));
-        assert!(
-            !offered.contains(&candidates[0]),
-            "evicted tools stop being offered"
-        );
-        // Persisted in the session control state, which a resumed session restores from.
-        assert_eq!(
-            agent.session.control_state()["discovered_tools"],
-            json!(working)
-        );
-        // A pinned tool is never recorded as discovered and survives discovery eviction.
-        let pin = candidates[0].clone();
-        agent.enabled_tools.insert(pin.clone());
-        agent.activate_tools(std::slice::from_ref(&pin)).unwrap();
-        assert_eq!(agent.discovered_tools(), working);
-        assert!(agent.offered().contains(&pin));
-    });
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            let base = agent.offered();
+            let limit = Agent::DISCOVERED_TOOL_LIMIT;
+            let candidates: Vec<String> = agent
+                .catalog()
+                .into_iter()
+                .filter(|name| {
+                    !base.contains(name) && !matches!(name.as_str(), "tool_search" | "tool_load")
+                })
+                .collect();
+            assert!(candidates.len() > limit, "{candidates:?}");
+            for name in &candidates {
+                agent.activate_tools(std::slice::from_ref(name)).unwrap();
+            }
+            let working = agent.discovered_tools();
+            assert_eq!(working.len(), limit);
+            assert_eq!(working, candidates[candidates.len() - limit..].to_vec());
+            let offered = agent.offered();
+            assert!(working.iter().all(|name| offered.contains(name)));
+            assert!(
+                !offered.contains(&candidates[0]),
+                "evicted tools stop being offered"
+            );
+            // Persisted in the session control state, which a resumed session restores from.
+            assert_eq!(
+                agent.session.control_state()["discovered_tools"],
+                json!(working)
+            );
+            // A pinned tool is never recorded as discovered and survives discovery eviction.
+            let pin = candidates[0].clone();
+            agent.enabled_tools.insert(pin.clone());
+            agent.activate_tools(std::slice::from_ref(&pin)).unwrap();
+            assert_eq!(agent.discovered_tools(), working);
+            assert!(agent.offered().contains(&pin));
+        },
+    );
 }
 
 #[test]
 fn compact_discovery_pins_and_unloads_do_not_leave_hidden_activation_state() {
-    with_agent("[assistance]\ncompact_tools=true", |agent| {
-        struct Quiet;
-        impl Ui for Quiet {}
-        let name = "ast_search".to_owned();
-        agent.activate_tools(std::slice::from_ref(&name)).unwrap();
-        let mut backend = agent.backend.take().unwrap();
-        for arguments in [json!({"names":[name]}), json!({"unload":[name]})] {
-            let call = ToolCall {
-                id: "pin-discovered".into(),
-                name: "tool_load".into(),
-                arguments,
-                malformed_arguments: false,
-            };
-            let output = agent.dispatch(&mut backend, &call, &mut Quiet);
-            assert!(!output.is_error, "{}", output.text);
-            assert!(!agent.discovered_tools().contains(&name));
-        }
-        assert!(!agent.offered().contains(&name));
-        assert!(!agent.enabled_tools.contains(&name));
-        assert_eq!(agent.session.control_state()["discovered_tools"], json!([]));
-    });
+    with_agent(
+        "[assistance]\ncompact_tools=false\nlean_local=true",
+        |agent| {
+            struct Quiet;
+            impl Ui for Quiet {}
+            let name = "ast_search".to_owned();
+            agent.activate_tools(std::slice::from_ref(&name)).unwrap();
+            let mut backend = agent.backend.take().unwrap();
+            for arguments in [json!({"names":[name]}), json!({"unload":[name]})] {
+                let call = ToolCall {
+                    id: "pin-discovered".into(),
+                    name: "tool_load".into(),
+                    arguments,
+                    malformed_arguments: false,
+                };
+                let output = agent.dispatch(&mut backend, &call, &mut Quiet);
+                assert!(!output.is_error, "{}", output.text);
+                assert!(!agent.discovered_tools().contains(&name));
+            }
+            assert!(!agent.offered().contains(&name));
+            assert!(!agent.enabled_tools.contains(&name));
+            assert_eq!(agent.session.control_state()["discovered_tools"], json!([]));
+        },
+    );
 }
 
 #[test]
@@ -1516,7 +1550,7 @@ impl crate::tools::integrations::ext::Tool for WebCapability {
 fn offered_native_schemas_are_bare_and_argument_help_restores_explanations() {
     with_agent("", |agent| {
         let names: Vec<String> = [
-            "read", "write", "edit", "glob", "grep", "bash", "bg", "eval", "todo", "check", "task",
+            "read", "write", "edit", "glob", "grep", "bash", "bg", "eval", "todo", "verify", "task",
         ]
         .into_iter()
         .map(str::to_owned)

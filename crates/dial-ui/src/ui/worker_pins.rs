@@ -34,6 +34,7 @@ const MIN_WIDTH: usize = 24;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Outcome {
     Finished,
+    Answered,
     Failed,
     NeedsInput,
     Interrupted,
@@ -113,6 +114,7 @@ impl WorkerBoard {
             }
             let outcome = match agent.status {
                 AgentStatus::Done => Outcome::Finished,
+                AgentStatus::Answered => Outcome::Answered,
                 AgentStatus::Failed => Outcome::Failed,
                 AgentStatus::Interrupted => Outcome::Interrupted,
                 AgentStatus::Waiting => Outcome::NeedsInput,
@@ -132,6 +134,7 @@ impl WorkerBoard {
             .map(|(name, outcome)| {
                 let verb = match outcome {
                     Outcome::Finished => "finished",
+                    Outcome::Answered => "replied",
                     Outcome::Failed => "failed",
                     Outcome::NeedsInput => "needs input",
                     Outcome::Interrupted => "interrupted",

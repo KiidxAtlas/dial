@@ -132,3 +132,62 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   numbered, coloured diff (separate hunks with two lines of context, per file); the anchored preview rows
   and removed-lines report the model gets are left out. Each todo call renders the list as it now stands,
   with the steps that call closed struck through and emphasized. Passing automatic checks are one line.
+
+## Context decisions and manual compaction
+
+`/context` separates the **last sent request** from an **estimated next request** for the
+selected model, including queued input and the current non-command draft. It shows the usable
+prompt budget, response reserve and effective automatic-compaction trigger, rather than treating
+the whole model window as available prompt space. Fixed overhead is an empty-history projection;
+the remaining history/input estimate is not a promise of reclaimable tokens. Images, native replay,
+attachment expansion, request-time guidance and routing can change the actual request.
+
+`/compact [method] [focus]` first previews the selected/fallback method order and the eligible
+older history versus recent tail. Summary methods may make local or hosted requests, including
+fallback attempts; exact cost and savings are unknown. Hooks and execution-time checks can refuse
+the operation or leave history unchanged. Canceling the preview does not start inference or change
+history. Pending queue entries and the composer draft are not compacted. If fixed instructions,
+context or tool overhead exhaust the prompt budget, reduce that overhead or select a larger-window
+model with `/model`; compacting history alone cannot solve that capacity problem.
+
+## Attachment preflight
+
+Drafts containing `@path`, `@diff`, `@staged` or pasted image paths receive a bounded background
+preview using the same expansion rules as submission. The composer summarizes included, truncated
+and skipped attachments. Text-token counts are estimates; image tokens vary by provider. Pending
+previews keep the draft in place. Missing, unreadable, truncated or otherwise skipped input requires
+a second deliberate submission; holding Enter does not acknowledge the warning.
+
+To inspect an existing draft without replacing it, open the command palette and choose
+**attachments**. Select a reference, then **Keep** (default) or **Remove reference**. Removal edits
+only the mention in the draft, never the underlying file. `/attachments inspect` prints the cached
+report and `/attachments remove <number>` removes an indexed mention when invoked with a retained
+draft. These previews are not frozen send payloads: files are read again at submission and can
+change between the preview and the actual request.
+
+During a running turn `/context` labels the last observed request separately and explicitly says
+that a fresh next-request projection is unavailable. Run it after the turn for the selected-model
+budget and recommendations. Use the command palette to inspect context or compact while preserving
+an existing draft.
+
+## Recovering unsent input
+
+Dial periodically checkpoints the draft, collapsed paste payloads, queued messages and their
+routes/order in private project/session-bound recovery state. Clipboard image payloads use
+integrity-checked private sidecar files; ordinary project attachments remain file references.
+This is crash recovery, not a secure vault or a guarantee that the very latest keystroke survived
+a sudden crash. Sensitive pasted material is stored locally until removed; no secure-erasure claim
+is made, and unreferenced image sidecars may remain after a saved record is discarded.
+
+When saved input is found, Dial offers `/draft restore` and `/draft discard`. `/draft` (also in
+the palette) opens explicit **Keep working**, **Restore**, **Discard saved** and **Release held
+queue** choices. Restore refuses to overwrite an existing draft/queue. `/draft replace` asks for
+confirmation before replacing current input. `/draft status` reports saved records.
+
+Restoration never submits a prompt: restored queues stay held until you deliberately send one or
+use `/draft resume`. Discard removes saved records, not the current editor or queue. Conversation
+switches first preserve their own input; a save failure keeps the original editor and blocks the
+switch. Recovery is bounded (four retained records, 2 MiB text per snapshot and an 8 MiB serialized
+record cap, with bounded image sidecars). Capacity, corrupt-record and concurrent-writer errors
+are shown rather than silently dropping saved input. Use the explicit saved-record discard action
+or reduce input to resolve capacity errors.

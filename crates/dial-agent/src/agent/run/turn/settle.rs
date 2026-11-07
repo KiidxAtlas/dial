@@ -333,12 +333,6 @@ impl Agent<'_> {
                 }
             }
         }
-        if continuing
-            && let Some(note) =
-                self.prepare_completion_reconciliation(&mut turn.coach_turn, step)?
-        {
-            turn.pending_nudges.push(note);
-        }
         // Live advisor: the coach reviews this round; its note reaches the next request. An
         // ending turn has no next request, so it is not charged for a live review.
         if continuing
@@ -460,24 +454,6 @@ impl Agent<'_> {
             // Past a deadline or cost cap the answer is delivered without another coach call.
             let reviewable = self.stop_boundary().is_none();
             if finish.outcome == TurnOutcome::Completed {
-                let run = reviewable && !turn.completion.reminder_spent();
-                let (unverified, failures) = self.gate_unverified_edits(run, ui);
-                match turn
-                    .completion
-                    .evidence(unverified.as_deref(), &failures, reviewable)
-                {
-                    crate::agent::verify::completion::EvidenceGate::Accept => {}
-                    crate::agent::verify::completion::EvidenceGate::Remind(note) => {
-                        turn.pending_nudges.push(crate::agent::run::guidance::note(
-                            crate::agent::run::guidance::Priority::Review,
-                            note,
-                        ));
-                        return Ok(crate::agent::run::engine::Tick::Again);
-                    }
-                    crate::agent::verify::completion::EvidenceGate::Disclose(disclosure) => {
-                        finish.text.push_str(&disclosure);
-                    }
-                }
                 if reviewable
                     && let Some(message) = self.coach_completion(
                         &mut turn.coach_turn,

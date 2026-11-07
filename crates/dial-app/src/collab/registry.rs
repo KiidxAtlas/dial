@@ -40,7 +40,7 @@ pub fn write(user_dir: &Path, record: &HostRecord) -> Result<PathBuf> {
         platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), &tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
     out.write_all(&body)?;
-    out.sync_all()?;
+    platform_fs::sync_file(&out)?;
     drop(out);
     fs::rename(&tmp, &path).with_context(|| format!("publishing {}", path.display()))?;
     Ok(path)

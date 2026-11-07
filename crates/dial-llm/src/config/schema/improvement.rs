@@ -317,7 +317,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Compact tool interfaces",
-        "Discovery mode for small local models: concise built-in descriptions and a bounded initial tool set, with specialists loaded through tool_search/tool_load. Off offers the whole catalog from the first request.",
+        "Stable core under a 12 KiB schema budget on hosted/local routes; specialists load only through tool_load. Off retains legacy automatic discovery/routing.",
         Kind::Bool,
     ),
     field!(
@@ -326,7 +326,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Initial tool budget",
-        "Initial tool count limit; 0 means unlimited. Core and explicitly loaded tools remain available.",
+        "Initial core count limit; 0 removes the count limit, not the schema byte ceiling. Discovery controls and explicitly loaded tools remain available.",
         Kind::Int {
             min: 0,
             max: 64,
@@ -974,5 +974,14 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Weight edit target",
         "Local MLX model (id or path) that `dial weights`, /weights and the model_weights tool inspect and edit. Empty uses the main model, which must then be local MLX. Set it to let a hosted frontier main model drive edits to a different local model; promoting an edit then replaces this setting, not the main model.",
         Kind::Text,
+    ),
+    field!(
+        "training.retain_session_requests",
+        training.retain_session_requests,
+        IM,
+        "Training",
+        "Retain session requests",
+        "Save bounded completed requests for later explicit teaching. Off by default; retention never approves training.",
+        Kind::Bool,
     ),
 ];

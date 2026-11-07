@@ -549,7 +549,7 @@ fn menu_offers_actions_that_fit_the_provider() {
     let shown = draw(&mut o, &rig, 100, 24);
     for needle in [
         "Choose a model",
-        "Test connection",
+        "Check metadata connection",
         "Replace API key",
         "Remove API key",
         "Disable provider",
@@ -567,7 +567,7 @@ fn menu_offers_actions_that_fit_the_provider() {
     }
     // Test connection sits right under Choose a model and starts a check.
     send(&mut o, &rig, key(KeyCode::Enter));
-    pick(&mut o, "Test connection");
+    pick(&mut o, "Check metadata connection (no inference)");
     match send(&mut o, &rig, key(KeyCode::Enter)) {
         OverlayEvent::Action(a) => assert!(a.starts_with("test:"), "{a}"),
         other => panic!("{other:?}"),
@@ -634,7 +634,7 @@ fn endpoint_configuration_opens_the_canonical_settings_collection() {
         let label = "Edit configuration / endpoint → Settings providers";
         let shown = draw(&mut o, &rig, 120, 30);
         assert!(shown.contains(label), "{id}: {shown}");
-        assert!(shown.contains("Test connection"), "{id}: {shown}");
+        assert!(shown.contains("Check metadata connection"), "{id}: {shown}");
         assert!(shown.contains("API key"), "{id}: {shown}");
         assert!(shown.contains("Headers"), "{id}: {shown}");
         pick(&mut o, label);
@@ -1329,5 +1329,32 @@ fn named_scope_and_connection_actions_separate_endpoint_credentials_and_status()
             .iter()
             .any(|(action, label)| matches!(action, ProviderAction::Headers)
                 && label.contains("masked; inherit or clear"))
+    );
+}
+
+#[test]
+fn response_verification_is_a_separate_explicit_selected_model_action() {
+    let rig = Rig::new();
+    let mut d = discovery();
+    d.providers.insert(
+        0,
+        provider(
+            "fixture",
+            "Fixture",
+            "ready",
+            1,
+            Some("http://127.0.0.1:1/v1"),
+        ),
+    );
+    let mut overlay =
+        ProviderOverlay::new(Some(d), BTreeMap::new(), Box::new(|_| false), Scope::Global);
+    select(&mut overlay, "fixture");
+    assert!(matches!(
+        send(&mut overlay, &rig, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    pick(&mut overlay, "Verify selected chat model response…");
+    assert!(
+        matches!(send(&mut overlay, &rig, key(KeyCode::Enter)), OverlayEvent::Action(action) if action == "command:setup choose verify-model")
     );
 }

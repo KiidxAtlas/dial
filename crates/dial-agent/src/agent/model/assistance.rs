@@ -267,7 +267,7 @@ pub(in crate::agent) fn compact(
         "glob",
         "todo",
         "finish",
-        "check",
+        "verify",
         "tool_search",
         "tool_load",
         "working_state",

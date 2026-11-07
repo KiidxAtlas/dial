@@ -1,5 +1,26 @@
 use super::*;
 
+#[test]
+fn active_follow_up_stays_in_completion_evidence_without_becoming_a_requirement() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    assert!(
+        !agent
+            .todo
+            .call(
+                &json!({"op":"set","tasks":[{"content":"Optional experiment", "kind":"follow_up"}]})
+            )
+            .is_error
+    );
+    assert!(!agent.todo.call(&json!({"op":"start","index":1})).is_error);
+    let evidence = agent.completion_evidence(TurnOutcome::Completed);
+    assert_eq!(evidence["outstanding_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(evidence["optional_follow_ups"].as_array().unwrap().len(), 1);
+    assert_ne!(evidence["deliverable_coverage"], "open_obligations");
+    assert!(agent.completion_blockers().is_ok());
+}
+
 fn hermetic_agent<'a>(config: &'a Config, root: &Path) -> Agent<'a> {
     // Construction only: hermetic agents make no provider request and write no session state.
     let backend = Backend::new(
@@ -323,8 +344,8 @@ fn completion_outcome_does_not_claim_unobserved_deliverable_or_test_coverage() {
     ]}));
     assert!(!output.is_error, "{}", output.text);
     let evidence = agent.completion_evidence(TurnOutcome::Completed);
-    assert_eq!(evidence["outstanding_tasks"].as_array().unwrap().len(), 1);
-    assert_eq!(evidence["outstanding_tasks"][0]["content"], "still owed");
+    assert_eq!(evidence["outstanding_tasks"].as_array().unwrap().len(), 2);
+    assert_eq!(evidence["outstanding_tasks"][0]["content"], "current");
     assert_eq!(evidence["deliverable_coverage"], "open_obligations");
     let incomplete = agent.completion_evidence(TurnOutcome::Incomplete);
     assert_eq!(incomplete["outstanding_tasks"].as_array().unwrap().len(), 2);
@@ -664,7 +685,7 @@ fn concurrent_input_changes_withhold_pass_and_failure_credit_but_preserve_proces
 }
 
 #[test]
-fn failed_contract_capture_is_unverified_in_gate_and_check_tool() {
+fn failed_contract_capture_is_unverified_in_gate_and_verify_tool() {
     for exit in [0, 1] {
         let root = tempfile::tempdir().unwrap();
         let command = format!("echo 'assertion diagnostic'; exit {exit}");
@@ -685,7 +706,7 @@ fn failed_contract_capture_is_unverified_in_gate_and_check_tool() {
             "{}",
             run.failures[0]
         );
-        let output = agent.check_tool(&json!({"names":["contract"]}), &mut NullUi);
+        let output = agent.verify_tool(&json!({"targets":["contract"]}), &mut NullUi);
         assert!(output.is_error);
         assert!(
             output.text.contains("unverified: contract"),

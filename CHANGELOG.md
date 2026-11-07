@@ -17,6 +17,146 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Changed
+
+- Completion now reconciles plain replies and `finish` against controller obligations and evidence,
+  with one shared investigation/check nudge and no repeated-answer acceptance or automatic todo
+  closure. Default completion self-review is removed; explicit coach/advisor review remains.
+- Ordinary hosted/local requests use a stable core under 12 KiB of schemas. Specialists and MCP
+  tools require explicit loading; the cached system policy does not enumerate the offer. Base
+  rules now prioritize investigation, coherent action and scoped checks. Slow check repeats are
+  flagged, captured pipeline diagnostics are retained, and provider retries have a 60-second
+  elapsed allowance after failure (`retry.max_elapsed_secs`, 0 disables it).
+- Exact teaching snapshots are opt-in and deduplicate schema arrays across the session. Runtime persistence
+  uses boundary snapshots plus incremental recovery frames, empty state patches emit no record,
+  and idle memory starts workers only for due work. Failed embeddings report keyword fallback once.
+- Substantive task roles no longer implicitly fall back to the small model; read-only auditors can
+  attach exact private snapshots of selected session and worker records without directory grants. Added deterministic lifecycle regressions, behavior counters
+  and a live benchmark slice; live performance/quality improvement remains unmeasured.
+- Per-call write overhead is lower: native edits, checkpoint records, session journals and
+  tool-output artifacts use plain `fsync` (macOS no longer issues `F_FULLFSYNC`), and checkpoint snapshot, manifest and
+  revision flushes run in the background, drained before the next turn and before `/undo` or
+  `/rollback`. Restores refuse truncated snapshots by recorded length or digest. In a fake-model
+  release benchmark, a turn of 8 small writes dropped from 340 ms to 103 ms (`docs/tools.md`).
+  Worker transcripts and other private records also use plain `fsync`. `dial run` publishes its
+  capture at most every 25 ms (base64, unflushed) instead of rewriting a JSON number array with
+  two flushes on every output read; older captures still read (`docs/application-monitoring.md`).
+
+
+- Resource scheduling and read-prefix streaming are enabled by default. Independent native
+  calls now include multi-path reads, scoped searches and bounded AST applies; parent progress
+  bookkeeping can join groups, and inline verification can close a group after source epochs
+  settle. Workers share the resource planner, overlapping preparation, live effect authorization
+  and early-read observer. Git inspections join read groups. Extensions can declare trusted
+  bounded resources without granting permission. Both dispatch settings remain individually
+  disableable; batch approvals remain opt-in. Stop and steer apply between groups.
+  Efficiency reports include group sizes, barriers, timing and early-read reuse, with separate
+  worker totals. `replay_scheduling` compares recorded call ordering without executing effects;
+  these structural opportunities do not predict end-to-end speedup (`docs/async-execution.md`).
+
+- The `check` tool is now `verify`, and `edit`/`write` replace `check: true` with an optional
+  `verify: [...]` list (up to 16 test files, `file::test` names or configured check names). Dial
+  picks the runner (pytest, unittest, cargo, go, jest/vitest), runs the entries once after the
+  last successful mutation of a response, and reports `Verify: Passed N, Failed M` with trimmed
+  failure traces on the shared evidence ledger. The tool's `names`/`failed_only` become `targets`
+  (including `failed`). A plain Python script runs on exit status only and is labelled weaker
+  evidence. Sessions recorded with the old `check` tool or option are not resumable.
+
+- Answer delivery is separate from work completion: `finish` outcome `answered` preserves
+  outstanding work. Plain replies with blocked steps or unmet durable deliverables keep their
+  report text and use a separate post-turn outstanding-work notice, not a rejected-candidate
+  wrapper. Todo `kind=follow_up` records optional future work
+  without starting it automatically or making it a completion prerequisite; existing/default
+  todos remain steps. Shared full/compact prompts distinguish these from required durable
+  deliverables and keep optional or unapproved live checks out of delivery prerequisites.
+  Explicit completed claims still enforce blockers and configured/user gates. Live-model effects
+  remain unmeasured ([agent loop](docs/agent-loop.md#answer-delivery-and-work-completion)).
+- An `eval` cell that moves to the background now returns a normal launch receipt naming its
+  `bg` job, like a backgrounded `bash` command. It no longer reports uncertain effects, which
+  stopped the turn and refused further calls even though the job was still managed by `bg`.
+- `eval` works on macOS with the workspace sandbox on (the default `dev` mode). It used to apply
+  its process-fork fence as a second `sandbox-exec` profile inside the workspace one, which
+  Seatbelt refuses, so every launch failed with `sandbox_apply: Operation not permitted`. The
+  fence is now a rule in the workspace profile itself.
+- A fresh `eval` interpreter must answer a no-op request before the cell counts as started, so
+  a launch that never ran code is an ordinary "eval interpreter did not start" error instead of
+  an uncertain-effects stop.
+- Built-in system prompts now set an explicit order of work: frame the outcome, acceptance and unknowns; gather with one planned batch of the most precise offered tools; then decide, act, verify and report. "Evidence suffices" is defined: each project claim (exists, missing, works) rests on a lookup or is marked [INFERENCE], so advice no longer reports features as missing without searching for them. Overlapping wording was removed to pay for it: compact/lean policy is 6,490 bytes (was 6,486), one-call 6,450 (was 6,423), full 9,926 (was 9,957). Effect on model outcomes is unmeasured; see [agent loop](docs/agent-loop.md#efficient-tool-use).
+- Everyday UX adds explicit busy-send preferences with visible delivery behavior, separately approved
+  tool-compatibility diagnostics, retained Stop outcomes and reviewed saved-input previews. Offline
+  journey checks and live-service acceptance remain separate (`docs/ux-journeys.md`).
+- Model download guidance distinguishes closing Models from explicitly cancelling session-owned
+  downloads, and downloading weights from preparing or assigning a role (`docs/model-downloads.md`).
+
+- Unsent drafts and queued requests have private, bounded, project/session-bound recovery with
+  explicit Restore/Discard. Restored queues stay held until explicitly released; recovery never
+  executes input (`docs/terminal-composer.md`).
+- Changed-file review opens the latest changed turn directly, retains selection/review marks,
+  and supports continuous next/previous previews with writer and overlap context while keeping
+  stale-content checks and explicit revert consent (`docs/terminal-turns.md`).
+- Full-text session search offers selectable bounded matching-message previews, normal conversation
+  opening and return to the origin without rewinding history (`docs/terminal-sessions.md`).
+- Attachment drafts show a canonical included/truncated/skipped preflight, with inspection/removal
+  and explicit acknowledgement of material problems before sending (`docs/terminal-composer.md`).
+- Context reports separate last-sent estimates from prospective queued/draft input, usable budget,
+  response reserve and compaction triggers. Manual compaction previews method/fallback and history
+  boundaries before explicit confirmation (`docs/terminal-composer.md`).
+- `/model backups` guides ordered fallback configuration, scope, trigger and return policy using
+  cached choices, with effective-chain and data/cost review before saving (`docs/model-routing.md`).
+- Automatic language-server installation now finds rustup components such as rust-analyzer through
+  `rustup which`, so an installed or newly added component works with Homebrew's rustup, whose
+  toolchain bin directory is not on `PATH`. Previously the install reported "installed but no
+  program was found".
+- Host-side `git` `status` and `diff` no longer refuse repositories with filter drivers configured
+  (for example a global git-lfs install). The drivers are disabled for that read, never run, and
+  the output names them. Text-conversion drivers are still refused (`docs/extensibility.md`).
+- An `edit` section header whose tag is malformed (not four hex characters) now gets the same
+  answer as an empty tag: the error quotes the current `[path#TAG]` header when the file is
+  unchanged since its latest read. The edit is still never applied with a guessed tag.
+- Peer `send` to a session that has ended names the recipient and says to list live peers again.
+- A model request ended by a user interrupt is now recorded in stats as `error:interrupted`
+  instead of `error:fatal`, so `error:fatal` counts only real provider or request failures.
+- `dial gc` has two opt-in sweeps that delete history: `--subagents` removes worker transcript
+  directories and `--orphaned-projects` removes other projects' Dial state whose project directory
+  no longer exists, each only when nothing in it changed for `--prune-after-days` (default 30).
+  Like every sweep they only report until `--apply`; the default selection is unchanged.
+- Network outages are retried instead of failing the turn: DNS lookup failures, "can't assign
+  requested address" (common after sleep/wake or a network switch), unreachable networks and a
+  bare `terminated` stream error are now transient. Stats rows for failed requests also record a
+  content-free `failure` kind (`http_400`, `transport_connection`, `stream_error`, ...).
+- `grep` searches a retained `artifact://<hash>` output directly (line numbers from the artifact's
+  start) instead of failing with "no such file". When one of several `;`-separated scopes is
+  missing, the error names that scope and says to keep the others, and "Did you mean" now also
+  suggests a sibling whose name contains or is contained in the missing one
+  (`tool_dispatch.rs` → `dispatch.rs`).
+- The system prompt's "Loadable tools" list no longer names tools that cannot run here: a tool
+  whose readiness reports a missing prerequisite or unsupported host is omitted (for example
+  `image_gen` when no image route resolves, or `computer` in a build without a desktop backend).
+  `tool_search` still finds it and shows the reason.
+- Resuming a session no longer fails with "tool task history needs a revision projector" when the
+  `task` tool changed between turns. The `verify` action, the `contract` field and the
+  config-dependent `work_packet` and `model_profile` fields are now recognized as additive. The
+  `task` contract identity also no longer includes the list of configured profile names, so adding
+  or renaming a profile mid-session keeps history resumable. History recorded under the old
+  identity format is still accepted.
+- Long-running turns now distinguish parked background work from model inference, show observed
+  wait duration and provider retry attempt/countdown, and explain that ending a wait or interrupting
+  the agent does not cancel background jobs (`docs/terminal-turns.md`).
+- The busy composer offers four selectable intents: automatic task update, explicit redirect,
+  after-turn follow-up and independent work, retaining the existing routes and shortcuts
+  (`docs/composer.md`).
+- Completion footers surface recorded changes, check freshness/verdicts, outstanding obligations,
+  non-checkpointed effects and next actions without replaying work (`docs/terminal-turns.md`).
+- Approval prompts preview the policy-owned reusable matcher and session/project lifetime before
+  consent; commands without a safe reusable scope offer one-time approval only
+  (`docs/terminal-turns.md`).
+- First launch explicitly offers hosted-provider or local-model setup. Doctor leads with core model
+  readiness and separates saved configuration, cached catalog reachability and an opt-in, bounded
+  text-response test, with network/cost disclosure (`docs/setup.md`).
+- The README is now a short landing page: install, what Dial does, basic usage and doc links.
+  Build-identity details moved to `docs/release-and-install.md`, known limits to `docs/README.md`,
+  and the add-a-tool note to `CONTRIBUTING.md`.
+
 ## [0.3.0] - 2026-11-05
 
 ### Changed

@@ -2,6 +2,22 @@
 
 Benchmark suites, efficiency measurement, workflow regression checks, configuration comparisons and assistance ablation.
 
+The `examples/benchmarks/lifecycle-efficiency.toml` slice covers a self-contained answer, a read-only
+workspace investigation and a completed calculator fix. Run it deliberately with a configured model:
+
+```sh
+dial benchmark examples/benchmarks/lifecycle-efficiency.toml --report benchmarks/lifecycle.json
+```
+
+Compare provider-reported input/cache tokens, requests and per-turn efficiency counters:
+`questions_before_investigation`, `completion_nudges`, `incomplete_stops`, `full_builds` and
+`delivered_answer_bytes`. Missing counters in older reports remain unknown rather than becoming
+zero. A completion nudge or incomplete stop is a controller observation, not an English-promise
+classifier or proof of task quality. Independent outcome checks remain necessary. Deterministic
+`llm::fake` lifecycle tests cover both completion surfaces, premature questions, unchanged schema
+and system bytes, settled check reuse and zero default self-review. They establish controller
+behavior, not live-model improvement. No live baseline result is implied by the suite's presence.
+
 For the source directory map, offline checks and fixture ownership, start with
 [the benchmark tooling index](../examples/benchmarks/README.md). Runnable non-benchmark samples
 are listed in [the examples index](../examples/README.md).
@@ -653,13 +669,13 @@ listed context-economy levers to `Config::default()` rather than your config fil
 shared across the matrix and are subject to benchmark isolation. Each variant changes exactly one lever
 from `dial`:
 
-- `enable-compact_tools` and `enable-repair_hints` turn on features that ship off;
+- `ablate-compact_tools` disables the stable tool core; `enable-repair_hints` enables repair hints;
 - `ablate-initial_tool_limit`, `ablate-tool_grammar`, `ablate-edit_mode`, `ablate-reliability_gate`,
   `ablate-lean_local` and `ablate-local_profile` turn off or change features that ship on.
   `ablate-local_profile` sets `assistance.local.enabled = false`; see the local profile in `agent-loop.md`.
 - `enable-strict_requirements` and `enable-independent_review` turn on the shipped-default-off
   outcome/review policies; their baseline settings and effective values are recorded as above.
-- `ablate-structured_tools` pins `harness.tools` to the bash-only roster (`bash`, `todo`, `check`, `finish`),
+- `ablate-structured_tools` pins `harness.tools` to the bash-only roster (`bash`, `todo`, `verify`, `finish`),
   so the shell does the reading, searching and editing. The `dial` row restores the default roster. Published
   harness ablations (Fan et al., arXiv 2609.20804) found bash-capable models matched or beat the structured
   tools at lower cost while weaker models fell sharply, so read this row per model.
@@ -715,7 +731,7 @@ The matrix does not gate on correctness, so a negative delta is measurement rath
 `tool_grammar` is also a user-level setting, `assistance.tool_grammar` (default `true`). It enables the
 MLX tool-call grammar only for tokenizers whose parser is one of the formats listed under *Schema-constrained tool calls* in [improvement.md](improvement.md#fast-weight-candidates-without-long-training-runs); disabling it sets `DIAL_TOOL_GRAMMAR=0`
 for the spawned server. `assistance.repair_hints` (default `false`) gates verified repair hints and verified
-examples from prior successful repairs. `assistance.compact_tools` ships `false`.
+examples from prior successful repairs. `assistance.compact_tools` ships `true`; disabling it measures legacy automatic discovery/routing.
 
 `assistance.constrained_repair` (default `true`) allows one constrained retry for local endpoints after a
 malformed or schema-invalid tool call. The retry asks the endpoint for JSON that names one offered tool and

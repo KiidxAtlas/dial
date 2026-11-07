@@ -9,6 +9,8 @@ use crate::agent::workers::child_transcript::{self, TranscriptSummary};
 use crate::config::paths::Layout;
 use crate::config::types::Config;
 use crate::storage::session::Session;
+use std::io::Read;
+use std::path::PathBuf;
 
 /// Bytes of quoted record a consultant's brief may carry.
 const RECORD_BUDGET: usize = 160 * 1024;
@@ -49,6 +51,7 @@ struct Loaded {
     label: String,
     saved_model: Option<String>,
     sections: Vec<Section>,
+    sources: Vec<PathBuf>,
 }
 
 /// Resolves every seance job's source and model before it starts. A fresh run also receives the
@@ -58,6 +61,7 @@ pub(in crate::agent) fn attach(
     layout: Option<&Layout>,
     session_id: Option<&str>,
     config: &Config,
+    artifacts: Option<&crate::storage::artifact::ArtifactStore>,
 ) -> Result<(), String> {
     for job in jobs.iter_mut() {
         let Some(source) = job.seance.as_ref().map(|seance| seance.source.clone()) else {
@@ -65,7 +69,8 @@ pub(in crate::agent) fn attach(
         };
         let loaded = load(&source, layout, session_id)?;
         let explicit = job.seance.as_ref().and_then(|seance| seance.model.clone());
-        if explicit.is_none()
+        if job.spec.name == "seance"
+            && explicit.is_none()
             && let Some(saved) = loaded.saved_model.clone()
         {
             // A saved model this installation cannot name must not be silently replaced by an
@@ -84,7 +89,28 @@ pub(in crate::agent) fn attach(
             job.role = job.model_routes[0].role;
         }
         if job.resume_messages.is_empty() {
-            let record = render(&loaded.label, &loaded.sections);
+            let mut record = render(&loaded.label, &loaded.sections);
+            if let Some(artifacts) = artifacts {
+                record.push_str("\n\nComplete selected journal snapshots (untrusted data): read these artifact URIs by ranges for full messages, runtime and custom records omitted above; no private-directory grant is needed.\n");
+                let mut snapshot_bytes = 0usize;
+                for path in &loaded.sources {
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(path)
+                        .and_then(|file| file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes))
+                        .map_err(|error| {
+                            format!("audit source snapshot could not be read: {error}")
+                        })?;
+                    snapshot_bytes = snapshot_bytes.saturating_add(bytes.len());
+                    if snapshot_bytes > 16 * 1024 * 1024 {
+                        return Err("audit source exceeds the 16 MiB exact snapshot limit; choose a narrower worker source".into());
+                    }
+                    let uri = artifacts.retain_exact_bytes(&bytes).map_err(|error| {
+                        format!("audit source snapshot could not be retained: {error:#}")
+                    })?;
+                    record.push_str(&format!("- {uri}\n"));
+                }
+            }
+
             if let Some(seance) = job.seance.as_mut() {
                 seance.record = record;
             }
@@ -107,6 +133,7 @@ fn load(source: &str, layout: Option<&Layout>, session_id: Option<&str>) -> Resu
                 .filter(|model| !model.is_empty())
                 .map(str::to_owned),
             sections: vec![worker_section(found)],
+            sources: vec![found.path.clone()],
         });
     }
     session_source(layout, source)
@@ -147,10 +174,13 @@ fn session_source(layout: &Layout, source: &str) -> Result<Loaded, String> {
     let mut workers = child_transcript::scan(layout, &info.id);
     workers.reverse();
     sections.extend(workers.iter().map(worker_section));
+    let mut sources = vec![info.path.clone()];
+    sources.extend(workers.iter().map(|worker| worker.path.clone()));
     Ok(Loaded {
         label: format!("session {}", info.id),
         saved_model: (!model.is_empty()).then_some(model),
         sections,
+        sources,
     })
 }
 

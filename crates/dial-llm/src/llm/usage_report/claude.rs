@@ -99,6 +99,7 @@ fn fetch_json(url: &str, token: &str, cancel: &Arc<AtomicBool>) -> Result<Option
     let policy = crate::llm::retry::Policy {
         max_attempts: MAX_ATTEMPTS,
         max_delay: Duration::from_secs(10),
+        max_elapsed: None,
         wait_for_quota_reset: false,
         rotate_accounts: false,
         backoff: Duration::from_millis(500),

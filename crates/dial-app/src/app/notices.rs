@@ -233,13 +233,21 @@ pub(super) fn memory_age(then: i64) -> String {
 pub(super) struct RetryNotice {
     pub(super) cause: String,
     pub(super) max: String,
+    pub(super) attempt: u32,
+    pub(super) delay: std::time::Duration,
 }
 
 impl RetryNotice {
     pub(super) fn parse(message: &str) -> Option<Self> {
         let (head, tail) = message.rsplit_once("; retrying in ")?;
-        let attempts = tail.rsplit_once("(attempt ")?.1.strip_suffix(')')?;
-        let (_, max) = attempts.split_once('/')?;
+        let (delay, attempts) = tail.split_once("s (attempt ")?;
+        let delay = std::time::Duration::try_from_secs_f64(delay.parse().ok()?).ok()?;
+        let (attempt, max) = attempts.strip_suffix(')')?.split_once('/')?;
+        let attempt = attempt.parse::<u32>().ok()?;
+        let maximum = max.trim().parse::<u32>().ok()?;
+        if attempt == 0 || maximum == 0 || attempt > maximum {
+            return None;
+        }
         let cause = head
             .split_once(": ")
             .map_or(head, |(_, cause)| cause)
@@ -247,6 +255,8 @@ impl RetryNotice {
         Some(Self {
             cause: cause.to_owned(),
             max: max.trim().to_owned(),
+            attempt,
+            delay,
         })
     }
 }

@@ -1,8 +1,8 @@
-# Opt-in candidate and read overlap
+# Candidate and read overlap
 
-These paths do not turn themselves on or update saved settings. `solve.enabled`,
-`experimental.streaming_dispatch` and `experimental.tool_speculation` retain their
-existing disabled defaults.
+`solve.enabled` and `experimental.tool_speculation` remain opt-in. Admitted read-prefix
+streaming is enabled by default; `experimental.streaming_dispatch = false` disables it.
+See [execution and scheduling](async-execution.md) for approval, ordering and metrics.
 
 ## Solve candidates
 

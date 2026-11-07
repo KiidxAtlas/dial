@@ -85,6 +85,27 @@ fn a_rejected_answer_gets_bounded_corrections_then_fails_without_an_answer() {
 }
 
 #[test]
+fn answered_output_is_delivered_only_when_it_validates() {
+    for (text, valid) in [(r#"{"answer":"ok"}"#, true), ("invalid", false)] {
+        let report = TurnReport {
+            outcome: TurnOutcome::Answered,
+            ..turn(text)
+        };
+        match enforce(report, &answer_schema(), 0, |_| panic!("no retries")).unwrap() {
+            Checked::Valid(report, _) => {
+                assert!(valid);
+                assert_eq!(report.outcome, TurnOutcome::Answered);
+            }
+            Checked::Rejected(report, _) => {
+                assert!(!valid);
+                assert!(report.text.is_empty());
+                assert_eq!(report.outcome, TurnOutcome::Incomplete);
+            }
+        }
+    }
+}
+
+#[test]
 fn a_correction_that_fixes_the_answer_is_accepted_as_compact_json() {
     let schema = answer_schema();
     let checked = enforce(turn("nope"), &schema, 1, |_| {

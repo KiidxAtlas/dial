@@ -679,6 +679,52 @@ fn token_of(preview: &str) -> String {
         .to_owned()
 }
 
+#[cfg(unix)]
+#[test]
+fn scheduling_uses_exact_direct_or_retained_targets_and_keeps_previews_serial() {
+    use crate::tools::{integrations::ext::Registry, surface::resources::resolve};
+    let (dir, ws) = workspace();
+    put(&dir, "a.rs", "fn main() { old(1); }\n");
+    put(&dir, "b.rs", "fn other() { old(2); }\n");
+    let mut registry = Registry::new();
+    for tool in tools(&Config::default()) {
+        registry.register(tool);
+    }
+    let get = |args: &Value| {
+        resolve(
+            &ws,
+            crate::config::types::EditMode::default(),
+            &registry,
+            "ast_edit",
+            args,
+        )
+    };
+    let preview = json!({"pattern":"old($A)","rewrite":"new($A)"});
+    assert!(get(&preview).is_none());
+    assert!(get(&json!({"path":".","dry_run":false})).is_none());
+    assert!(
+        get(&json!({"path":"a.rs","dry_run":false}))
+            .unwrap()
+            .permits(&[ws.root().join("a.rs")], false, false)
+    );
+    let planned = edit(&ws, preview);
+    assert!(!planned.is_error, "{}", planned.text);
+    let token = token_of(&planned.text);
+    let resources = get(&json!({"apply_token":token})).unwrap();
+    assert!(resources.permits(
+        &[ws.root().join("a.rs"), ws.root().join("b.rs")],
+        false,
+        false
+    ));
+    assert!(!resources.permits(&[ws.root().join("new.rs")], false, false));
+    assert!(get(&json!({"apply_token":"missing"})).is_none());
+    assert!(
+        fs::read_to_string(dir.path().join("a.rs"))
+            .unwrap()
+            .contains("old(1)")
+    );
+}
+
 #[test]
 fn apply_token_applies_exactly_the_previewed_rewrite() {
     let (dir, ws) = workspace();

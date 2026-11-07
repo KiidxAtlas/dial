@@ -568,6 +568,23 @@ pub enum ComposerShape {
     Line,
 }
 
+/// Explicit Enter behavior for a draft submitted while a turn is running.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BusySend {
+    /// Ask for the route without sending on the first Enter.
+    #[default]
+    Choose,
+    /// Redirect the current task at the next safe point.
+    Redirect,
+    /// Queue until the running turn finishes.
+    AfterTurn,
+    /// Request a separate worker.
+    Independent,
+    /// Use the configured automatic message router.
+    Auto,
+}
+
 /// Everything about how the terminal UI looks and behaves that a user may tailor. All of it is
 /// editable in `/settings`, stored in the same layered config as everything else.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -619,6 +636,8 @@ pub struct UiConfig {
     /// Rows in the slash and file menus before they scroll.
     pub autocomplete_items: usize,
     pub history_limit: usize,
+    /// Busy Enter preference; changed only through explicit configuration, never learned from sends.
+    pub busy_send: BusySend,
     /// Desktop/terminal notification (OSC 9, OSC 777 or OSC 99, else BEL) when a turn finishes
     /// and when a question or approval waits for you.
     pub notify: bool,
@@ -673,6 +692,7 @@ impl Default for UiConfig {
             word_completion: true,
             autocomplete_items: 12,
             history_limit: 0,
+            busy_send: BusySend::Choose,
             notify: true,
             notify_errors: true,
             mouse: true,

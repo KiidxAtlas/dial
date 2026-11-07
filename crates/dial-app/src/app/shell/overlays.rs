@@ -89,6 +89,21 @@ impl Shell {
                 };
                 continue;
             }
+            if let Some(action) = outcome.next.as_deref() {
+                let command = if let Some(id) = action.strip_prefix("history-open:") {
+                    Some(format!("/search open {id}"))
+                } else if action == "history-return" {
+                    Some("/search back".to_owned())
+                } else {
+                    None
+                };
+                if let Some(command) = command {
+                    return Ok(match self.command(app, agent, &command)? {
+                        Step::Done => carried,
+                        step => step,
+                    });
+                }
+            }
             // `/peers` panel requests run against the agent, then the panel reopens fresh.
             if let Some((action, selected)) = outcome
                 .next
@@ -114,8 +129,8 @@ impl Shell {
                 // The catalog scan probes each provider's endpoint; the reopened page shows the result.
                 self.catalog.refresh_config(app, &app.reload()?);
                 self.note(
-                    "Connection test",
-                    format!("Checking {id}. Its status appears in the provider list when the check finishes."),
+                    "Metadata connection check",
+                    format!("Checking {id}. Cached endpoint metadata appears in Providers; this does not verify a model response."),
                 );
                 which = Which::Providers;
                 continue;
@@ -166,6 +181,7 @@ impl Shell {
         self.ui = fresh.ui.clone();
         self.composer.set_history_limit(fresh.ui.history_limit);
         self.composer.set_word_completion(fresh.ui.word_completion);
+        self.composer.set_busy_send(fresh.ui.busy_send);
         let themes = ThemeManager::new(&app.layout.user_dir, &fresh.ui, self.dark);
         if let Some(error) = themes.last_error() {
             self.note("Theme", format!("{error}; keeping last good theme"));
@@ -233,6 +249,20 @@ impl Shell {
                 ActiveOverlay::Palette(PaletteOverlay::choice(spec))
             }
             Which::Choice(spec) => ActiveOverlay::Palette(PaletteOverlay::choice(*spec)),
+            Which::HistorySearch(panel) => ActiveOverlay::HistorySearch(Box::new(panel)),
+            Which::BackupModels => {
+                let mut panel =
+                    crate::app::overlay::backup::BackupOverlay::new(&effective, self.scope);
+                let project = crate::config::settings_store::load_layer(
+                    &app.layout,
+                    crate::config::settings_store::Scope::Project,
+                )?;
+                panel.set_project_layer(project);
+                if let Some(discovery) = discovery.as_ref() {
+                    panel.set_choices(discovery);
+                }
+                ActiveOverlay::BackupModels(Box::new(panel))
+            }
             Which::Controls => {
                 ActiveOverlay::Palette(PaletteOverlay::choice(self.controls_picker(&effective)))
             }
@@ -852,8 +882,8 @@ impl Shell {
         {
             self.catalog.refresh_config(app, &app.reload()?);
             self.note(
-                "Connection test",
-                format!("Checking {id}. Its status appears in the provider list when the check finishes."),
+                "Metadata connection check",
+                format!("Checking {id}. Cached endpoint metadata appears in Providers; this does not verify a model response."),
             );
             self.start_busy_overlay(app, Which::Providers)?;
         } else if let Some(payload) = state

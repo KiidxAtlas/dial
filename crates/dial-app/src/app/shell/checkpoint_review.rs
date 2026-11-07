@@ -46,11 +46,97 @@ fn recorded_checks(agent: &Agent<'_>) -> String {
 /// Largest combined diff a group revert will show for one confirmation.
 const GROUP_DIFF_LIMIT: usize = 24 * 1024;
 
-fn file_label(file: &ReviewFile) -> String {
-    match file.overlap() {
-        Some(reason) => format!("{} [overlap: {reason}]", file.path),
-        None => format!("{} [{}]", file.path, file.writers.join(", ")),
+fn file_label(file: &ReviewFile, reviewed: bool) -> String {
+    let mut label = format!(
+        "{} [{}] · {}",
+        file.path,
+        file.writers.join(", "),
+        if reviewed { "reviewed" } else { "not reviewed" }
+    );
+    if let Some(reason) = file.overlap() {
+        label.push_str(&format!(" [overlap: {reason}]"));
     }
+    label
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ReviewBrowser {
+    paths: std::collections::BTreeMap<u64, String>,
+    owner: Option<String>,
+    overlap_only: bool,
+    reviewed: std::collections::BTreeMap<String, String>,
+}
+
+impl ReviewBrowser {
+    fn key(turn: u64, path: &str) -> String {
+        format!("{turn}:{path}")
+    }
+
+    fn visible<'a>(&self, review: &'a TurnReview) -> Vec<&'a ReviewFile> {
+        review
+            .files
+            .iter()
+            .filter(|file| {
+                self.owner
+                    .as_ref()
+                    .is_none_or(|owner| file.writers.contains(owner))
+                    && (!self.overlap_only || file.overlap().is_some())
+            })
+            .collect()
+    }
+
+    fn selected(&self, turn: u64, files: &[&ReviewFile]) -> usize {
+        self.paths
+            .get(&turn)
+            .and_then(|path| files.iter().position(|file| &file.path == path))
+            .unwrap_or(0)
+    }
+
+    fn adjacent(&mut self, turn: u64, files: &[&ReviewFile], next: bool) -> Option<String> {
+        if files.is_empty() {
+            return None;
+        }
+        let selected = self.selected(turn, files);
+        let index = if next {
+            (selected + 1) % files.len()
+        } else {
+            (selected + files.len() - 1) % files.len()
+        };
+        let path = files[index].path.clone();
+        self.paths.insert(turn, path.clone());
+        Some(path)
+    }
+
+    fn save(&self, agent: &mut Agent<'_>) -> Result<()> {
+        let mut state = agent.session().control_state();
+        state["review_browser"] = serde_json::to_value(self)?;
+        agent.session_mut().set_control_state(state)
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum FileNavigation {
+    Back,
+    Next,
+    Previous,
+}
+
+fn latest_changed(checkpoints: &Checkpoints) -> Option<u64> {
+    checkpoints
+        .list()
+        .iter()
+        .filter(|turn| turn.files > 0)
+        .map(|turn| turn.turn)
+        .max()
+}
+
+fn validate_preview(checkpoints: &Checkpoints, turn: u64, path: &str, token: &str) -> Result<()> {
+    anyhow::ensure!(
+        checkpoints.review_file(turn, path)?.1 == token,
+        "File changed after preview. Review the new version before keeping it."
+    );
+    Ok(())
 }
 
 impl Shell {
@@ -65,106 +151,33 @@ impl Shell {
             .checkpoints()
             .cloned()
             .context("No checkpoints are available for this session")?;
+        let args = args.trim();
         let (turn_text, requested_path) = args.split_once(' ').unwrap_or((args, ""));
         let turn = if args.is_empty() {
-            let turns = checkpoints.list();
-            if turns.is_empty() {
+            let Some(turn) = latest_changed(&checkpoints) else {
                 let mut text = "No checkpoint changes to review. No files changed.".to_string();
                 if let Some(extra) = uncheckpointed(agent) {
-                    text = format!("{text}\n{extra}");
+                    text.push_str(&format!("\n{extra}"));
                 }
                 self.note("Review", text);
                 return Ok(());
-            }
-            let labels: Vec<_> = turns
-                .iter()
-                .map(|entry| format!("{}: {} ({} files)", entry.turn, entry.label, entry.files))
-                .collect();
-            let choices: Vec<_> = labels.iter().map(|label| (label.as_str(), ' ')).collect();
-            let Some(selected) = self.ask(
-                "Review checkpoints",
-                "Choose a turn. Esc returns to your draft without changing files.",
-                &choices,
-            ) else {
-                return Ok(());
             };
-            turns[selected].turn
+            turn
         } else {
             turn_text
                 .parse::<u64>()
                 .context("Expected a checkpoint turn number")?
         };
+        let state = agent.session().control_state();
+        let mut browser: ReviewBrowser =
+            serde_json::from_value(state["review_browser"].clone()).unwrap_or_default();
         if !requested_path.trim().is_empty() {
-            return self.review_one(agent, &checkpoints, turn, requested_path.trim());
-        }
-        loop {
             let review = checkpoints.review_turn(turn)?;
-            if review.files.is_empty() && review.skipped.is_empty() {
-                self.note(
-                    "Review",
-                    "No readable changed-file inventory. No files changed.",
-                );
-                return Ok(());
-            }
-            let groups = review.groups();
-            let mut labels: Vec<String> = groups
-                .iter()
-                .map(|(name, files)| format!("{name}: {} file(s)", files.len()))
-                .collect();
-            labels.push(format!("All files ({})", review.files.len()));
-            let mut body = format!(
-                "Turn {}: {}\nChanges are grouped by who wrote them. A file written by several groups, or changed again in a later turn, is marked overlap: reverting it may discard work built on it, so it is always reviewed on its own.",
-                review.turn, review.label
-            );
-            if !review.skipped.is_empty() {
-                body.push_str(&format!(
-                    "\nToo large to checkpoint (not reviewable or revertible here): {}",
-                    review.skipped.join(", ")
-                ));
-            }
-            if let Some(extra) = uncheckpointed(agent) {
-                body.push('\n');
-                body.push_str(&extra);
-            }
-            let choices: Vec<_> = labels.iter().map(|label| (label.as_str(), ' ')).collect();
-            let Some(selected) = self.ask("Review changes by group", &body, &choices) else {
-                return Ok(());
-            };
-            if selected == groups.len() {
-                if !self.review_files(agent, &checkpoints, &review, None)? {
-                    return Ok(());
-                }
-                continue;
-            }
-            let (owner, _) = &groups[selected];
-            let plan = checkpoints.group_plan(turn, owner)?;
-            let mut text = format!(
-                "{owner}: {} file(s) with no recorded overlap, {} held for individual review.",
-                plan.safe.len(),
-                plan.held.len()
-            );
-            for path in &plan.safe {
-                text.push_str(&format!("\n  revert  {path}"));
-            }
-            for (path, why) in &plan.held {
-                text.push_str(&format!("\n  held    {path} ({why})"));
-            }
-            text.push_str("\nNo recorded overlap does not prove files are independent of other code. The revert has one checkpoint for /undo files.");
-            let mut options = vec![("Review files", 'f'), ("Back", 'b')];
-            if !plan.safe.is_empty() {
-                options.insert(1, ("Revert unshared files", 'r'));
-            }
-            let pick = self.ask("Group", &text, &options);
-            match pick.map(|i| options[i].0) {
-                Some("Review files") => {
-                    if !self.review_files(agent, &checkpoints, &review, Some(owner))? {
-                        return Ok(());
-                    }
-                }
-                Some("Revert unshared files") => self.revert_group(&checkpoints, turn, &plan.safe),
-                _ => {}
-            }
+            let files: Vec<_> = review.files.iter().collect();
+            browser.paths.insert(turn, requested_path.trim().to_owned());
+            self.review_sequence(agent, &checkpoints, &mut browser, turn, &files)?;
         }
+        self.review_files(agent, &checkpoints, turn, &mut browser)
     }
 
     fn revert_group(&mut self, checkpoints: &Arc<Checkpoints>, turn: u64, safe: &[String]) {
@@ -228,35 +241,157 @@ impl Shell {
         }
     }
 
-    /// File browser for a turn (all files or one writer's). `Ok(false)` ends the whole review.
+    /// Direct file browser; selection, filters and version-specific review marks survive return.
     fn review_files(
         &mut self,
         agent: &mut Agent<'_>,
         checkpoints: &Arc<Checkpoints>,
-        review: &TurnReview,
-        owner: Option<&str>,
-    ) -> Result<bool> {
+        mut turn: u64,
+        browser: &mut ReviewBrowser,
+    ) -> Result<()> {
         loop {
-            let review = checkpoints.review_turn(review.turn)?;
-            let files: Vec<&ReviewFile> = review
-                .files
-                .iter()
-                .filter(|f| owner.is_none_or(|o| f.writers.iter().any(|w| w == o)))
-                .collect();
-            if files.is_empty() {
-                return Ok(true);
+            let review = checkpoints.review_turn(turn)?;
+            let files = browser.visible(&review);
+            let labels: Vec<_> =
+                files
+                    .iter()
+                    .map(|file| {
+                        let reviewed = checkpoints.review_file(turn, &file.path).ok().is_some_and(
+                            |(_, token)| {
+                                browser.reviewed.get(&ReviewBrowser::key(turn, &file.path))
+                                    == Some(&token)
+                            },
+                        );
+                        file_label(file, reviewed)
+                    })
+                    .collect();
+            let mut choices: Vec<_> = labels.iter().map(|label| (label.as_str(), ' ')).collect();
+            choices.extend([("Filter writers / overlap", 'f'), ("Choose turn", 't')]);
+            if browser.owner.is_some() {
+                choices.push(("Revert writer's unshared files", 'r'));
             }
-            let labels: Vec<_> = files.iter().map(|f| file_label(f)).collect();
-            let choices: Vec<_> = labels.iter().map(|label| (label.as_str(), ' ')).collect();
-            let Some(selected) = self.ask(
+            let mut body = format!(
+                "Turn {}: {}\n{} of {} files · writer: {} · overlap only: {}\nReviewed means this exact version was kept, not tested or accepted. Select a file to preview; Esc returns to your draft without changing files.",
+                turn,
+                review.label,
+                files.len(),
+                review.files.len(),
+                browser.owner.as_deref().unwrap_or("all"),
+                browser.overlap_only
+            );
+            if !review.skipped.is_empty() {
+                body.push_str(&format!(
+                    "\nToo large to checkpoint (not reviewable or revertible here): {}",
+                    review.skipped.join(", ")
+                ));
+            }
+            if let Some(extra) = uncheckpointed(agent) {
+                body.push_str(&format!("\n{extra}"));
+            }
+            let Some(selected) = self.ask_selected(
                 "Changed files",
-                "Choose a file. Reviewed, tested and accepted are separate states; file preview shows recorded checks, not new verification. Esc goes back.",
+                &body,
                 &choices,
+                browser.selected(turn, &files),
             ) else {
-                return Ok(true);
+                return Ok(());
             };
-            let path = files[selected].path.clone();
-            self.review_one(agent, checkpoints, review.turn, &path)?;
+            if selected < files.len() {
+                browser.paths.insert(turn, files[selected].path.clone());
+                self.review_sequence(agent, checkpoints, browser, turn, &files)?;
+            } else if selected == files.len() {
+                let groups = review.groups();
+                let mut filters = vec![("All writers", 'a')];
+                filters.extend(groups.iter().map(|(name, _)| (name.as_str(), ' ')));
+                filters.push(("Toggle overlap-only", 'o'));
+                if let Some(index) = self.ask(
+                    "Review filter",
+                    "Writer and overlap filters combine. Filtering never changes files.",
+                    &filters,
+                ) {
+                    if index == filters.len() - 1 {
+                        browser.overlap_only = !browser.overlap_only;
+                    } else {
+                        browser.owner = index.checked_sub(1).map(|i| groups[i].0.clone());
+                    }
+                    browser.save(agent)?;
+                }
+            } else if selected == files.len() + 1 {
+                let turns = checkpoints.list();
+                let labels: Vec<_> = turns
+                    .iter()
+                    .map(|entry| format!("{}: {} ({} files)", entry.turn, entry.label, entry.files))
+                    .collect();
+                let options: Vec<_> = labels.iter().map(|label| (label.as_str(), ' ')).collect();
+                let current = turns
+                    .iter()
+                    .position(|entry| entry.turn == turn)
+                    .unwrap_or(0);
+                if let Some(index) = self.ask_selected(
+                    "Choose checkpoint turn",
+                    "Esc keeps the current turn and selection.",
+                    &options,
+                    current,
+                ) {
+                    turn = turns[index].turn;
+                }
+            } else if let Some(owner) = &browser.owner {
+                let plan = checkpoints.group_plan(turn, owner)?;
+                let mut body = format!(
+                    "{owner}: {} unshared file(s). No recorded overlap does not prove files are independent. Overlap files are excluded even if hidden by the filter.",
+                    plan.safe.len()
+                );
+                for (path, reason) in &plan.held {
+                    body.push_str(&format!("\nHeld: {path} ({reason})"));
+                }
+                if !plan.safe.is_empty()
+                    && self.ask(
+                        "Writer revert",
+                        &body,
+                        &[("Preview revert", 'p'), ("Cancel", 'n')],
+                    ) == Some(0)
+                {
+                    self.revert_group(checkpoints, turn, &plan.safe);
+                } else if plan.safe.is_empty() {
+                    self.note("Review", body);
+                }
+            }
+        }
+    }
+
+    fn review_sequence(
+        &mut self,
+        agent: &mut Agent<'_>,
+        checkpoints: &Arc<Checkpoints>,
+        browser: &mut ReviewBrowser,
+        turn: u64,
+        files: &[&ReviewFile],
+    ) -> Result<()> {
+        let mut path = browser
+            .paths
+            .get(&turn)
+            .cloned()
+            .context("No selected file")?;
+        loop {
+            browser.paths.insert(turn, path.clone());
+            browser.save(agent)?;
+            match self.review_one(agent, checkpoints, browser, turn, &path) {
+                Ok(FileNavigation::Next) => {
+                    path = browser
+                        .adjacent(turn, files, true)
+                        .context("No next file")?
+                }
+                Ok(FileNavigation::Previous) => {
+                    path = browser
+                        .adjacent(turn, files, false)
+                        .context("No previous file")?
+                }
+                Ok(FileNavigation::Back) => return Ok(()),
+                Err(error) => {
+                    self.note("Review", format!("{error:#}"));
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -264,18 +399,19 @@ impl Shell {
         &mut self,
         agent: &mut Agent<'_>,
         checkpoints: &Arc<Checkpoints>,
+        browser: &mut ReviewBrowser,
         turn: u64,
         path: &str,
-    ) -> Result<()> {
+    ) -> Result<FileNavigation> {
         let (diff, token) = checkpoints.review_file(turn, path)?;
-        let signal = checkpoints
+        let file = checkpoints
             .review_turn(turn)?
             .files
             .into_iter()
-            .find(|f| f.path == path)
-            .and_then(|f| f.overlap());
-        let state = agent.session().control_state();
-        let reviewed = state["reviewed_file"]["identity"].as_str() == Some(token.as_str());
+            .find(|file| file.path == path);
+        let signal = file.as_ref().and_then(ReviewFile::overlap);
+        let key = ReviewBrowser::key(turn, path);
+        let reviewed = browser.reviewed.get(&key) == Some(&token);
         let mut body = format!(
             "{} · {}\n{}\nRecorded checks (not file-specific proof):\n{}\n",
             path,
@@ -287,6 +423,12 @@ impl Shell {
             diff,
             recorded_checks(agent)
         );
+        if let Some(file) = file {
+            body.push_str(&format!("Writers: {}\n", file.writers.join(", ")));
+        }
+        if let Some(extra) = uncheckpointed(agent) {
+            body.push_str(&format!("{extra}\n"));
+        }
         if let Some(signal) = &signal {
             body.push_str(&format!(
                 "Overlap: {signal}. Reverting restores the pre-turn content and may discard that other work.\n"
@@ -296,17 +438,18 @@ impl Shell {
         match self.ask(
             "Review file",
             &body,
-            &[("Keep", 'k'), ("Revert file", 'r'), ("Cancel", 'n')],
+            &[
+                ("Keep reviewed version", 'k'),
+                ("Revert file", 'r'),
+                ("Next file", 'j'),
+                ("Previous file", 'u'),
+                ("Back to files", 'b'),
+            ],
         ) {
             Some(0) => {
-                anyhow::ensure!(
-                    checkpoints.review_file(turn, path)?.1 == token,
-                    "File changed after preview. Review the new version before keeping it."
-                );
-                let mut state = agent.session().control_state();
-                state["reviewed_file"] =
-                    serde_json::json!({"turn":turn,"path":path,"identity":token});
-                agent.session_mut().set_control_state(state)?;
+                validate_preview(checkpoints, turn, path, &token)?;
+                browser.reviewed.insert(key, token);
+                browser.save(agent)?;
                 self.note(
                     "Review",
                     "Kept the reviewed version; review is not test verification.",
@@ -320,16 +463,26 @@ impl Shell {
                         &[("Revert anyway", 'r'), ("Cancel", 'n')],
                     ) != Some(0)
                 {
-                    return Ok(());
+                    return Ok(FileNavigation::Back);
+                }
+                if self.ask("Revert file?", &format!("Restore {path} to its pre-turn content, including overwriting any user edits shown in the preview? This creates an /undo files checkpoint."), &[("Revert", 'r'), ("Cancel", 'n')]) != Some(0) {
+                    return Ok(FileNavigation::Back);
                 }
                 checkpoints.restore_files(turn, &[(path.to_owned(), token)], true)?;
+                browser.reviewed.remove(&key);
+                browser.save(agent)?;
                 self.note(
                     "Review",
                     "Restored only the selected file. The revert has its own checkpoint for /undo files.",
                 );
             }
+            Some(2) => return Ok(FileNavigation::Next),
+            Some(3) => return Ok(FileNavigation::Previous),
             _ => {}
         }
-        Ok(())
+        Ok(FileNavigation::Back)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -139,11 +139,19 @@ Changing a rule means editing that test and stating why here.
 
 ## Invariants
 
+- `agent::verify::completion` owns one state-based decision for plain replies, `finish` and
+  clarification. Execution obligations and current evidence, not candidate phrasing or repetition,
+  determine acceptance. One instruction-scoped recovery allowance survives inner-loop reentry;
+  accepted text cannot auto-close execution todos. Optional follow-ups remain separate.
+- Default tool exposure selects a stable core under a serialized byte budget for hosted/local
+  routes; only explicit tool loading adds specialist schemas. System policy does not enumerate
+  the changing offer. Explicit harnesses and legacy opt-out configurations retain their contracts.
+
 - The session owns the active branch and execution tree. Conversation records are immutable;
   in-flight assistant, reasoning, tool and worker nodes have shared mutable result bodies.
   `crates/dial-agent/src/agent/ui/state_ui.rs` reduces execution callbacks into these bodies before notifying views.
   The terminal binds to the bodies, RPC projects revisioned updates, and request/tool boundaries
-  journal changed snapshots as `runtime` records in the existing branch-aware JSONL file.
+  journal initial running and settled snapshots as `runtime` records in the existing branch-aware JSONL file; incremental stream-journal frames retain intervening revisions for recovery. Without an incremental journal, each changed snapshot remains persisted.
   Recovery marks unfinished nodes interrupted; rewind and fork restore only the active branch.
   These records never become provider chat roles. Structured tool data stays separate from its
   model-facing text, so protocol clients do not reconstruct objects from rendered summaries.
@@ -164,6 +172,11 @@ Changing a rule means editing that test and stating why here.
   Resize, scrollback commits and image placement force a full repaint. Git status and per-file
   numstat queries run on cache workers, outside rendering.
 
+- `dial-tools::tools::surface::resources` owns trusted lexical resource declarations, confined
+  resolution and conflicts. Parent and child controllers share the prefix planner in
+  `agent::run::dependency_dispatch`; runtime policy and computed-effect authorization remain
+  with each controller. Native preparation can overlap; transactional commits retain the shared
+  workspace lock. Recorded-call analysis invokes that planner without executing tools.
 - Tool execution always passes through schemas, approvals, workspace confinement and the
   checkpoint observer: schema validation (`crates/dial-agent/src/agent/verify/repair.rs`, `call_form_error`) precedes approval
   (`crates/dial-agent/src/agent/run/dispatch.rs`, `dispatch_inner` → `crates/dial-agent/src/agent/safety/approval.rs`), and confinement and checkpointing

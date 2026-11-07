@@ -150,7 +150,7 @@ fn version_one_index_without_prefix_digest_discards_stale_rows_on_first_search()
         "the journal is rebuilt from source"
     );
     let conn = Connection::open(&db).unwrap();
-    assert_eq!(crate::storage::sqlite::check_version(&conn, 2).unwrap(), 2);
+    assert_eq!(crate::storage::sqlite::check_version(&conn, 3).unwrap(), 3);
 }
 
 #[test]

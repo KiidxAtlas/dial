@@ -142,7 +142,7 @@ fn delete_current(shell: &mut Shell, app: &App, agent: &mut Agent<'_>) -> Result
         },
     )?;
     let fresh_id = fresh.id().to_owned();
-    let old = app.swap_agent_session(agent, fresh)?;
+    let old = shell.swap_agent_session(app, agent, fresh)?;
     agent.set_plan_mode(false);
     shell.stop_loop_for_session_change();
     shell.set_session_id(&fresh_id);
@@ -534,6 +534,8 @@ fn branch(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Re
         shell.note("Branch", "Rewind cancelled; the conversation is unchanged.");
         return Ok(Step::Done);
     }
+    shell.poll_input_recovery(app);
+    shell.prepare_input_session_change()?;
     agent.cancel_background_compaction();
     match super::branch::rewind(app, agent, n) {
         Ok(rewound) => {

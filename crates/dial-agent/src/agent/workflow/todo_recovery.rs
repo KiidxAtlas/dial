@@ -89,7 +89,7 @@ pub(in crate::agent) fn solo_update_note(
         && !calls.is_empty()
         && calls.iter().all(|call| call.name == "todo"))
     .then_some(
-        "[Dial] This response held only `todo`, which costs a full request. Send todo updates in the same response as real work: set with the first reads, done with the next step's first call. Skip closing updates before the final answer; an accepted answer closes only the in-progress task and leaves pending tasks open.",
+        "[Dial] This response held only `todo`, which costs a full request. Send todo updates in the same response as real work: set with the first reads, done with the next step's first call. Close completed execution steps explicitly, paired with finish when possible; a final answer does not close tasks automatically.",
     )
 }
 

@@ -54,6 +54,10 @@ impl TerminalFailure {
             _ => super::errors::ErrorClass::Fatal,
         }
     }
+    /// `<event kind>:<code>`; both are fixed protocol identifiers, never provider text.
+    pub(super) fn kind_label(&self) -> String {
+        format!("{}:{}", self.kind, self.code)
+    }
 }
 impl std::fmt::Display for TerminalFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

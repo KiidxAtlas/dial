@@ -392,7 +392,7 @@ pub struct TurnEndNotice {
 /// - `NeedsInput` → question, subject to `notify`: the agent is waiting for the user.
 /// - `Failed`, `Blocked`, `Incomplete` → error, subject to `notify` and `notify_errors`. Blocked
 ///   and incomplete work did not finish, so they count as failures for this policy.
-/// - `Interrupted` and `Running` → silent; the user stopped the turn or it has not ended.
+/// - `Answered`, `Interrupted` and `Running` → silent; reply delivery is not work completion.
 pub fn turn_end_notice(
     outcome: crate::runtime::Phase,
     notify: bool,
@@ -405,7 +405,7 @@ pub fn turn_end_notice(
         Phase::Failed => (NotifyKind::Error, "Turn failed", true),
         Phase::Blocked => (NotifyKind::Error, "Turn blocked", true),
         Phase::Incomplete => (NotifyKind::Error, "Turn incomplete", true),
-        Phase::Running | Phase::Interrupted => return None,
+        Phase::Running | Phase::Interrupted | Phase::Answered => return None,
     };
     (notify && (!failure || notify_errors)).then_some(TurnEndNotice { kind, body })
 }

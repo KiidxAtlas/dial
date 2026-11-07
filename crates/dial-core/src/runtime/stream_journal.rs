@@ -351,7 +351,7 @@ impl Journal {
             file.set_len(offset)?;
             // Probe actual publication, not merely opening a descriptor after ENOSPC.
             file.write_all(b"\n")?;
-            file.sync_all()?;
+            crate::platform::fs::sync_file(&file)?;
             Ok(file)
         })();
         writer.file = result.with_context(|| format!("{error}; retrying stream journal write"))?;
@@ -361,11 +361,8 @@ impl Journal {
     }
     /// Makes the frames written so far durable. Relocation syncs before it retires the source.
     pub fn sync(&self) -> std::io::Result<()> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .file
-            .sync_all()
+        let writer = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        crate::platform::fs::sync_file(&writer.file)
     }
     pub fn needs_reclamation(&self) -> bool {
         let writer = self.0.lock().unwrap_or_else(|poison| poison.into_inner());

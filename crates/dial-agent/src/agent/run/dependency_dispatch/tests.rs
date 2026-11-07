@@ -61,7 +61,6 @@ fn native_footprints_reject_conflicts_and_unknown_or_aliased_resources() {
     assert!(!write.conflicts(&footprint(&workspace, mode, &call("write", "b")).unwrap()));
     for (name, path) in [
         ("bash", "a"),
-        ("read", "."),
         ("write", "../outside"),
         ("edit", "a"),
         ("write", "missing/child"),
@@ -213,6 +212,7 @@ fn failed_mutations_skip_only_dependent_or_opaque_work_not_diagnostics() {
         mode,
         &call("write", "a"),
         &ToolOutput::err("refused").with_effects(tools::surface::outcome::Effects::None),
+        &registry,
     );
     for (name, args, skipped) in [
         ("write", json!({"path":"a","content":"x"}), true),
@@ -221,7 +221,7 @@ fn failed_mutations_skip_only_dependent_or_opaque_work_not_diagnostics() {
         ("grep", json!({"pattern":"cause"}), false),
         ("bash", json!({"command":"python3 a"}), true),
         ("bash", json!({"command":"python3 --version"}), false),
-        ("check", json!({"names":["build"]}), true),
+        ("verify", json!({"targets":["build"]}), true),
         ("bg", json!({"action":"start","command":"python3 a"}), true),
         ("bg", json!({"action":"output","name":"job"}), false),
         ("tool_search", json!({"query":"debugger"}), false),
@@ -253,18 +253,90 @@ fn failed_mutations_skip_only_dependent_or_opaque_work_not_diagnostics() {
 }
 
 #[test]
-fn an_edit_with_checks_is_a_resource_wave_barrier() {
+fn checks_close_the_wave_after_the_verified_mutation() {
     let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("a"), "before").unwrap();
-    let workspace = Workspace::new(root.path()).unwrap();
-    let mode = crate::config::types::EditMode::Replace;
-    let mut edit = call("edit", "a");
-    edit.arguments = json!({"path":"a","old_string":"before","new_string":"after","check":false});
-    assert!(footprint(&workspace, mode, &edit).is_some());
-    edit.arguments["check"] = json!(true);
-    assert!(footprint(&workspace, mode, &edit).is_none());
-    let mut write = call("write", "a");
-    assert!(footprint(&workspace, mode, &write).is_some());
-    write.arguments["check"] = json!(true);
-    assert!(footprint(&workspace, mode, &write).is_none());
+    let config = Config::default();
+    let mut agent = agent(&config, root.path());
+    let mut last = call("write", "b");
+    last.arguments["verify"] = json!(["candidate"]);
+    let calls = [call("write", "a"), last, call("write", "c")];
+    assert_eq!(agent.dependency_wave(&calls).len(), 2);
+    assert_eq!(
+        agent.efficiency_metrics.scheduling.barriers["verification"],
+        1
+    );
+}
+
+#[test]
+fn bookkeeping_and_scoped_reads_join_native_groups_but_deliverable_changes_stay_boundaries() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("a"), "evidence").unwrap();
+    std::fs::write(root.path().join("b"), "evidence").unwrap();
+    let mut config = Config::default();
+    config.task.max_concurrency = 8;
+    let mut agent = agent(&config, root.path());
+    let mut read = call("read", "unused");
+    read.arguments = json!({"paths":["a","b"]});
+    let mut search = call("grep", "src");
+    search.arguments["pattern"] = json!("source");
+    let mut todo = call("todo", "unused");
+    todo.arguments = json!({"op":"view"});
+    let calls = [call("write", "new"), todo, read, search];
+    assert_eq!(agent.dependency_wave(&calls).len(), 4);
+    let mut scope = call("working_state", "unused");
+    scope.arguments = json!({"action":"patch","deliverables":[]});
+    assert_eq!(
+        agent
+            .dependency_wave(&[calls[0].clone(), scope, calls[2].clone()])
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn grouped_verification_runs_once_after_all_source_epochs_and_bookkeeping_settle() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.task.max_concurrency = 4;
+    let command = "test -f a && test -f b && printf 'checked\\n' >> checks";
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "candidate".into(),
+            command: command.into(),
+            file_extensions: vec![],
+            timeout_secs: 5,
+        });
+    let mut agent = agent(&config, root.path());
+    agent.hermetic = false;
+    let mut todo = call("todo", "todo");
+    todo.arguments = json!({"op":"view"});
+    let mut last = call("write", "b");
+    last.arguments["verify"] = json!(["candidate"]);
+    let calls = [call("write", "a"), todo, last];
+    agent.verify_batch.begin(&calls);
+    assert_eq!(agent.dependency_wave(&calls).len(), 3);
+    let results = agent.dispatch_dependency_wave(&mut backend(), &calls, &mut NullUi, None);
+    for (call, (out, _)) in calls.iter().zip(&results) {
+        assert!(!out.is_error, "{}: {}", call.name, out.text);
+        agent.settle_tool_mutation(call, out); // ordinary settlement must not stale the checks
+    }
+    assert_eq!(agent.step_checks.mutations, 2);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("checks")).unwrap(),
+        "checked\n"
+    );
+    assert_eq!(
+        agent
+            .step_checks
+            .evidence
+            .current_status(command, agent.step_checks.revision()),
+        "passed"
+    );
+    assert_eq!(
+        agent.efficiency_metrics.scheduling.groups["native"].sizes[&2],
+        1
+    );
 }

@@ -187,7 +187,7 @@ impl JsRuntime {
                         // cannot be interpreted as controller callbacks or result frames.
                         let script = format!(
                             "{} {} --no-addons -e {} 3>&1 1>&2",
-                            fork_fence_prefix(),
+                            fork_fence_prefix(ctx.workspace),
                             shell_quote(node.to_str().ok_or("Node executable path is not UTF-8")?),
                             shell_quote(DRIVER),
                         );
@@ -206,8 +206,14 @@ impl JsRuntime {
                     check_operation(end, &self.interrupt, cancel)?;
                     slot.as_mut().unwrap().prelude_language =
                         Some(crate::tools::exec::preludes::PreludeLanguage::Js);
-                    effect_started.store(true, Ordering::Release);
-                    native_cell(slot.as_mut().unwrap(), &scope, code, dispatch, &handoff)
+                    native_cell(
+                        slot.as_mut().unwrap(),
+                        &scope,
+                        code,
+                        dispatch,
+                        &handoff,
+                        effect_started,
+                    )
                 })();
                 if result.is_err() {
                     slot.take();
@@ -230,7 +236,7 @@ impl Tool for EvalTool {
             "eval",
             &crate::tools::surface::catalog::execution_description(
                 "eval",
-                "eval: run JavaScript (Node 22+) or Python 3.8+ cells in a persistent per-language namespace. Bindings persist per language; reset/cancel/status affect only this owner's session (cancel without language cancels both). Cells call tools with tool.<name>(...) or tool.call(name,args) under normal approval; denied or malformed calls raise ToolError. Python callbacks are synchronous: normally call tool.write({...}) without await. Their result dictionaries also tolerate await for compatibility; awaiting a completed result never calls the tool again or makes dispatch concurrent. JavaScript callbacks require await. For generated data, use one foreground cell (background:false) to read original input files programmatically, compute, serialize, write and validate the saved artifact. Never transcribe source rows or printed values into another cell. Python example (import csv, io, json and pathlib.Path first): original = Path(source).read_bytes(); computed = {'count': sum(1 for row in csv.DictReader(io.StringIO(original.decode('utf-8'))))}; content = json.dumps(computed); tool.write({'path': path, 'content': content}); saved = json.loads(Path(path).read_text()); assert saved == computed; assert Path(source).read_bytes() == original. Also assert task-specific shape/counts and independently expected results. Keep the cell minimal: no banner comments or duplicate asserts. Its asserts already cover the saved bytes and unchanged inputs, so do not re-hash, cat or reread them in later calls. Equality checks delivery, not the computation's correctness; stdout is not recorded check evidence. JavaScript writes use await tool.write({path, content}). Print only a short validation summary, not the dataset. Reuse namespace variables for corrections unless inputs changed; then reread and recompute. A later validation failure does not undo or authorize replaying the write. Source/config changes use write/edit. Requires approval and OS fork containment (macOS Seatbelt, Linux seccomp/bubblewrap); subprocesses and native js addons are denied; on Windows py needs explicit unsandboxed opt-in. Timeout/cancel destroys the namespace and any pending callback; callback time is not charged.",
+                "Persistent JavaScript (Node 22+) or Python 3.8+ cells, with separate namespaces. Call tool.<name>(args) or tool.call(name,args) under normal approval: JS requires await; Python callbacks are synchronous dictionaries (also await-compatible, without replay). Denied or malformed callbacks raise ToolError. For generated data use one foreground cell (background:false): read original inputs programmatically, compute, serialize, write through tool.write, then assert saved bytes, unchanged inputs, expected shape and independently expected results. Do not transcribe source rows or printed values. Reuse namespace variables until inputs change; then reread and recompute. Print a short validation summary. Assertions cover the saved artifact; stdout alone is not check evidence, and equality alone does not prove the computation. A failed assertion does not undo or authorize replaying a write. Source/config changes use write/edit. reset/status/cancel are owner-scoped; cancel without language affects both. Timeout/cancel destroys the namespace and pending callbacks; callback time is excluded. Requires approval and OS containment; subprocesses/native JS addons are denied, and Windows Python requires explicit unsandboxed opt-in.",
             ),
             json!({
                 "language":{"type":"string","enum":["js","py"],"description":"Runtime for this cell; defaults to js."},
@@ -336,10 +342,15 @@ impl Tool for EvalTool {
         let uncertain = result.is_err() && started.load(Ordering::Acquire);
         let mut output = match result {
             Ok(CellOutcome::Value(value)) => code_output(Ok(value)),
-            Ok(CellOutcome::Moved(job)) => ToolOutput::ok(format!(
-                "eval cell moved to the background as job {job}; this runtime stays busy until it finishes. Use the bg tool to read its output, wait for it, or kill it."
-            ))
-            .with_effects(crate::tools::surface::outcome::Effects::Unknown),
+            // Like a `bash` hand-off, a move is a launch receipt: `bg` owns the job from here and
+            // reports its settlement, so the hand-off itself must not stop the turn as uncertain.
+            Ok(CellOutcome::Moved(job)) => {
+                let mut output = ToolOutput::ok(format!(
+                    "eval cell moved to the background as job {job}; this runtime stays busy until it finishes. Use the bg tool to read its output, wait for it, or kill it."
+                ));
+                output.data = Some(json!({"background_job": job}));
+                output
+            }
             Err(error) => {
                 let output = code_output(Err(error));
                 if uncertain {

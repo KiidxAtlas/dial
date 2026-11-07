@@ -68,6 +68,11 @@ pub enum ObservedMetric {
     DynamicToolsUsed,
     TruncatedRecoveries,
     TurnsCompleted,
+    QuestionsBeforeInvestigation,
+    CompletionNudges,
+    IncompleteStops,
+    FullBuilds,
+    DeliveredAnswerBytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -505,8 +510,19 @@ pub struct RegressionThresholds {
 }
 
 impl RunMetrics {
-    pub fn observed(&self, metric: ObservedMetric) -> u64 {
-        match metric {
+    pub fn observed(&self, metric: ObservedMetric) -> Option<u64> {
+        let counter = match metric {
+            ObservedMetric::QuestionsBeforeInvestigation => Some("questions_before_investigation"),
+            ObservedMetric::CompletionNudges => Some("completion_nudges"),
+            ObservedMetric::IncompleteStops => Some("incomplete_stops"),
+            ObservedMetric::FullBuilds => Some("full_builds"),
+            ObservedMetric::DeliveredAnswerBytes => Some("delivered_answer_bytes"),
+            _ => None,
+        };
+        if let Some(key) = counter {
+            return self.efficiency.as_ref()?.get(key)?.as_u64();
+        }
+        Some(match metric {
             ObservedMetric::ToolCalls => self.tool_calls,
             ObservedMetric::ToolErrors => self.tool_errors,
             ObservedMetric::ToolContractErrors => self.tool_contract_errors,
@@ -515,7 +531,8 @@ impl RunMetrics {
             ObservedMetric::DynamicToolsUsed => self.dynamic_tools_used,
             ObservedMetric::TruncatedRecoveries => self.truncated_recoveries,
             ObservedMetric::TurnsCompleted => self.turns_completed,
-        }
+            _ => return None,
+        })
     }
 }
 
@@ -1338,10 +1355,15 @@ impl BenchmarkSuite {
                             false
                         }
                     },
-                    Assertion::Metric { metric, min, max } => {
-                        let value = metrics.observed(*metric);
-                        min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
-                    }
+                    Assertion::Metric { metric, min, max } => match metrics.observed(*metric) {
+                        Some(value) => {
+                            min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
+                        }
+                        None => {
+                            unavailable_check_indices.push(index);
+                            false
+                        }
+                    },
                     Assertion::ResponseEquals { content } => {
                         if metrics.response_sha256.is_none() {
                             unavailable_check_indices.push(index);

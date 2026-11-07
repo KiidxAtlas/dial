@@ -171,6 +171,7 @@ fn coherent_runtime_completion_keeps_every_terminal_phase() {
     let mut ui = StateUi::new(&mut sink, tree.clone(), None);
     for phase in [
         Phase::Completed,
+        Phase::Answered,
         Phase::Blocked,
         Phase::NeedsInput,
         Phase::Incomplete,

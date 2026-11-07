@@ -74,6 +74,9 @@ pub struct RequestRecord {
     pub first_output_ms: Option<u64>,
     /// Reasoning effort the request asked for; `None` when the provider default applied.
     pub effort: Option<String>,
+    /// For failed requests, a content-free failure kind (`http_400`, `transport_connection`,
+    /// `response.failed:server_error`, ...); `None` on success or for untyped errors.
+    pub failure: Option<String>,
 }
 
 /// Cache diagnostics for one request: `invalidation` is `none`/`transport_changed` when the
@@ -372,7 +375,7 @@ fn private_dir(dir: &Path) -> Result<()> {
 }
 
 /// Columns added after the first release; NULL (or the default) on rows recorded before them.
-const ADDED_COLUMNS: [(&str, &str, &str); 9] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 10] = [
     ("requests", "transport", "TEXT"),
     ("requests", "invalidation", "TEXT"),
     ("requests", "common_prompt_bytes", "INTEGER"),
@@ -381,6 +384,7 @@ const ADDED_COLUMNS: [(&str, &str, &str); 9] = [
     ("requests", "first_output_ms", "INTEGER"),
     ("requests", "effort", "TEXT"),
     ("requests", "changed_part", "TEXT"),
+    ("requests", "failure", "TEXT"),
     (
         "request_hourly",
         "subscription",
@@ -502,8 +506,8 @@ impl Db {
         let subscription = r.billing.as_deref() == Some("subscription");
         tx.execute(
             "INSERT INTO requests(ts, session, project, model, input, output, cache_read, cache_write, reasoning, reported, cost, duration_ms, finish, error,
-               transport, invalidation, common_prompt_bytes, prompt_bytes, billing, first_output_ms, effort, changed_part)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+               transport, invalidation, common_prompt_bytes, prompt_bytes, billing, first_output_ms, effort, changed_part, failure)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![r.ts_ms, r.session, r.project, r.model, sql_u64(r.input), sql_u64(r.output),
                 sql_u64(r.cache_read), sql_u64(r.cache_write), sql_u64(r.reasoning), r.reported,
                 cost, sql_u64(r.duration_ms), r.finish_reason, r.error,
@@ -511,7 +515,7 @@ impl Db {
                 r.wire.as_ref().map(|w| sql_u64(w.common_prompt_bytes)),
                 r.wire.as_ref().map(|w| sql_u64(w.prompt_bytes)), r.billing,
                 r.first_output_ms.map(sql_u64), r.effort,
-                r.wire.as_ref().and_then(|w| w.changed_part.as_ref())],
+                r.wire.as_ref().and_then(|w| w.changed_part.as_ref()), r.failure],
         )?;
         tx.execute(
             "INSERT INTO request_hourly(hour, project, model, requests, errors, reported, input, output,

@@ -620,7 +620,7 @@ pub(crate) fn record_blackbox(ws: &crate::tools::Workspace, record: &Value) -> R
         .open(path)
         .map_err(|e| e.to_string())?;
     file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
+        .and_then(|_| crate::platform::fs::sync_file(&file))
         .map_err(|e| e.to_string())
 }
 #[cfg(windows)]
@@ -658,7 +658,7 @@ pub(crate) fn record_blackbox(ws: &crate::tools::Workspace, record: &Value) -> R
     let mut file =
         crate::platform::fs::create_new_beneath(&root, &name, true).map_err(|e| e.to_string())?;
     file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
+        .and_then(|_| crate::platform::fs::sync_file(&file))
         .map_err(|e| e.to_string())
 }
 

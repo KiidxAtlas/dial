@@ -121,7 +121,8 @@ impl Checkpoints {
                 .join("revisions")
                 .join(journal.next_blob.to_string());
             journal.next_blob += 1;
-            atomic_write(&blob, &bytes, 0o600).ok().map(|()| blob)
+            // Flushed in the background; a revert verifies the saved digest (`revert_plan`).
+            self.write_deferred(&blob, &bytes).ok().map(|()| blob)
         });
         let before = if matches!(before, State::Present(_)) && blob.is_none() {
             State::Unavailable
@@ -171,6 +172,7 @@ impl Checkpoints {
             existed: false,
             mode: 0,
             writers: Vec::new(),
+            len: None,
         }
         .display();
         let mut inner = self.lock();
@@ -212,12 +214,8 @@ impl Checkpoints {
                 })?;
             if entry.existed {
                 Some(
-                    fs::read(
-                        turn_dir(&self.dir, turn)
-                            .join("files")
-                            .join(index.to_string()),
-                    )
-                    .with_context(|| format!("reading saved content of {shown}"))?,
+                    read_saved(&self.dir, turn, index, entry)
+                        .with_context(|| format!("reading saved content of {shown}"))?,
                 )
             } else {
                 None
@@ -225,9 +223,15 @@ impl Checkpoints {
         } else {
             match (revision.before, &revision.blob) {
                 (State::Absent, _) => None,
-                (State::Present(_), Some(blob)) => Some(
-                    fs::read(blob).with_context(|| format!("reading saved content of {shown}"))?,
-                ),
+                (State::Present(digest), Some(blob)) => {
+                    let bytes = fs::read(blob)
+                        .with_context(|| format!("reading saved content of {shown}"))?;
+                    ensure!(
+                        <[u8; 32]>::from(Sha256::digest(&bytes)) == digest,
+                        "{shown}: the saved content before its last change is incomplete; nothing restored. Use /undo"
+                    );
+                    Some(bytes)
+                }
                 _ => bail!(
                     "{shown}: the content before its last change was not saved (oversized or not a regular file); use /undo"
                 ),

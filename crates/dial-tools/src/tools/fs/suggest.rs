@@ -5,7 +5,8 @@
 //! dependency/build paths are filtered as well. The search is bounded by files and time so a
 //! failed call stays cheap in a huge repository. Ranking is deterministic:
 //! case-only difference, small whole-path typo, same file name elsewhere, same name ignoring
-//! case or extension, a close name in the nearest existing directory, then a close name anywhere.
+//! case or extension, a close name in the nearest existing directory, a name there that contains
+//! (or is contained in) the missing stem, then a close name anywhere.
 
 use super::walk::SearchWalk;
 use crate::tools::Workspace;
@@ -185,6 +186,16 @@ fn rank(
     let wanted_name_chars: Vec<char> = wanted_name_lower.chars().collect();
     let wanted_stem = stem_of(&wanted_name_lower).to_owned();
     let component_chars: Vec<char> = missing_component.chars().collect();
+    let component_stem = stem_of(missing_component);
+    // `tool_dispatch.rs` for `dispatch.rs`, `dispatch_test.rs` for `dispatch.rs`.
+    let overlaps = |stem: &str| {
+        let (short, long) = if stem.len() <= component_stem.len() {
+            (stem, component_stem)
+        } else {
+            (component_stem, stem)
+        };
+        short.len() >= 4 && short != long && long.contains(short)
+    };
     let name_budget = |len: usize| (len / 4).clamp(1, 3);
     let path_budget = (wanted_chars.len() / 10).clamp(2, 6);
     let mut ranked = Vec::new();
@@ -216,6 +227,8 @@ fn rank(
             .is_some()
         {
             4
+        } else if in_ancestor && overlaps(stem_of(&name_lower)) {
+            5
         } else if levenshtein_within(
             &wanted_name_chars,
             &name_chars,
@@ -223,7 +236,7 @@ fn rank(
         )
         .is_some()
         {
-            5
+            6
         } else {
             continue;
         };

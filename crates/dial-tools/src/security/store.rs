@@ -93,7 +93,7 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .open(&temp)
             .with_context(|| format!("creating {}", temp.display()))?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        crate::platform::fs::sync_file(&file)?;
         drop(file);
         fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))?;
         Ok(())

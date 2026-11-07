@@ -105,6 +105,8 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
         } else {
             LEAN_BATCHING
         });
+    } else {
+        policy.push_str(LEAN_BATCHING);
     }
     let mut optional: Vec<&str> = [
         ("skill", SKILL_RULE),
@@ -127,7 +129,7 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     policy.push_str(CALL_CONTRACT_PRECEDENCE);
     if !compact {
         return format!(
-            "{HEADER}{policy}\n\n# Execution\n{FOCUSED_WORK}{RULES}{TESTING_DECISIONS}{visual}{DELIVERY}"
+            "{HEADER}{policy}\n\n# Execution\n{FOCUSED_WORK}{LEAN_WAITING}{RULES}{TESTING_DECISIONS}{visual}{DELIVERY}"
         );
     }
     let mut focused = String::from(LEAN_FOCUSED_WORK);
@@ -190,16 +192,18 @@ fn scoped_guidance(offer: &Offer<'_>, concise: bool, prefer_subagents: bool) -> 
 }
 
 /// One compact loop for the small local tier: targeted lookup, one edit in the active grammar, a
-/// focused check and a short report. The check step uses `check` when offered, so the model runs
-/// what the completion gate runs; otherwise `bash`. Fixed text per grammar and offer, so the prompt
-/// stays byte-stable. `None` unless every tool it shows is offered.
+/// focused check and a short report. With `verify` offered the edit names the tests to run, so
+/// the check costs no extra request and lands where the completion gate reads it; otherwise
+/// `bash`. Fixed text per grammar and offer, so the prompt stays byte-stable. `None` unless every
+/// tool it shows is offered.
 fn worked_example(offer: &Offer<'_>, mode: EditMode) -> Option<String> {
+    let verify = crate::agent::verify::verify_tool::NAME;
     if !["grep", "read", "edit"].iter().all(|tool| offer.has(tool))
-        || !(offer.has("check") || offer.has("bash"))
+        || !(offer.has(verify) || offer.has("bash"))
     {
         return None;
     }
-    let edit = example_edit(mode);
+    let mut edit = example_edit(mode);
     let header = if mode == EditMode::Hashline {
         "header [src/pager.rs#A1B2]; "
     } else {
@@ -207,8 +211,9 @@ fn worked_example(offer: &Offer<'_>, mode: EditMode) -> Option<String> {
     };
     let read = serde_json::json!({"path": "src/pager.rs:40-50"});
     let grep = serde_json::json!({"pattern": "fn page_count", "path": "src"});
-    let check = if offer.has("check") {
-        "check {} → pager tests passed".to_owned()
+    let check = if offer.has(verify) {
+        edit["verify"] = serde_json::json!(["src/pager.rs"]);
+        "the edit result ends `Verify: Passed 3, Failed 0`".to_owned()
     } else {
         let bash = serde_json::json!({"command": "cargo test pager", "timeout": 600});
         format!("bash {bash} → passed")
@@ -339,15 +344,7 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
         i.cwd.display(),
         std::env::consts::OS,
     ));
-    if compact {
-        // Names already travel in the callable schemas; keep only the authority boundary.
-        out.push_str("- Tools: supplied schemas define the callable set.\n");
-    } else {
-        out.push_str(&format!(
-            "- Tools: {} (the supplied schemas are the callable set)\n",
-            i.tools.join(", ")
-        ));
-    }
+    out.push_str("- Tools: supplied schemas define the callable set; use tool_search and tool_load for other capabilities.\n");
     out.push_str(crate::agent::window::file_handles::GUIDANCE);
     out.push('\n');
     if i.tools.iter().any(|tool| tool == "tool_search") {

@@ -37,6 +37,8 @@ pub(super) struct ChildTurn<'a> {
     )>,
     cached_memory_prompt: Option<(String, String)>,
     inspections: crate::agent::workflow::efficiency::Inspections,
+    scheduling: crate::agent::workflow::efficiency::Scheduling,
+    streamed: Option<crate::agent::run::streaming_dispatch::StreamingDispatch>,
     rule_catalog: crate::agent::safety::rules::Catalog,
     rule_agent: String,
     rule_regenerations: u32,
@@ -335,6 +337,8 @@ impl<'a> ChildTurn<'a> {
             active_settings,
             cached_memory_prompt,
             inspections,
+            scheduling: Default::default(),
+            streamed: None,
             rule_catalog,
             rule_agent,
             rule_regenerations,
@@ -349,7 +353,7 @@ impl<'a> ChildTurn<'a> {
             ControlFlow::Continue(request) => request,
             ControlFlow::Break(tick) => return Ok(tick),
         };
-        let generated = match self.request_reply(request, &prepared)? {
+        let generated = match self.request_reply(engine, request, &prepared)? {
             ControlFlow::Continue(generated) => generated,
             ControlFlow::Break(tick) => return Ok(tick),
         };
@@ -801,6 +805,7 @@ impl<'a> ChildTurn<'a> {
     }
     fn request_reply(
         &mut self,
+        engine: &Engine,
         request: Chat,
         prepared: &PreparedStep,
     ) -> Result<ControlFlow<Tick<Outcome>, GeneratedReply>> {
@@ -960,7 +965,39 @@ impl<'a> ChildTurn<'a> {
             },
         );
         backend.next_request_profile(profile);
-        let result = crate::agent::chat_with_ui_inner(
+        if let Some(stream) = self.streamed.take() {
+            let (started, reused) = stream.statistics();
+            self.scheduling.stream(started, reused);
+        }
+        let mut streamed = (config.experimental.streaming_dispatch && !text_only && !research_step)
+            .then(|| {
+                crate::agent::run::streaming_dispatch::StreamingDispatch::new(
+                    env.workspace.clone(),
+                    config.clone(),
+                    env.ext.clone(),
+                    env.interrupt.clone(),
+                    crate::agent::run::streaming_dispatch::Admission {
+                        hooks: config.hooks.clone(),
+                        always: Vec::new(),
+                        schemas: provider_request.tools.clone(),
+                        names: self.names.clone(),
+                        failed_calls: engine.failed_calls(),
+                    },
+                )
+            });
+        let mut authorize = |call: &llm::ToolCall| {
+            observer
+                .borrow_mut()
+                .authorize_with_cancel(call, &summarize(call), false, env.interrupt)
+                .is_ok()
+        };
+        let mut authorized = streamed
+            .as_mut()
+            .map(|stream| super::streaming::Authorized {
+                stream,
+                authorize: &mut authorize,
+            });
+        let result = crate::agent::ui::chat::chat_with_ui_streaming(
             backend,
             adapter,
             provider_request,
@@ -984,8 +1021,14 @@ impl<'a> ChildTurn<'a> {
                     }
                 },
             },
-            Some(&mut rule_monitor),
+            crate::agent::ChatMonitors {
+                rules: Some(&mut rule_monitor),
+                stream: authorized.as_mut().map(|stream| {
+                    stream as &mut dyn crate::agent::run::streaming_dispatch::ToolStream
+                }),
+            },
         );
+        self.streamed = streamed;
         // Matches whose interruptMode let this reply proceed; journaled once the reply is accepted.
         let rule_deferred = std::mem::take(&mut rule_monitor.deferred);
         stream_ui.finish(result.is_err());
@@ -1667,6 +1710,7 @@ impl<'a> ChildTurn<'a> {
                             steps: self.steps,
                             retryable_provider: false,
                             model_route: None,
+                            scheduling: Default::default(),
                             inspections: Default::default(),
                             conversation: None,
                         }),
@@ -1990,6 +2034,95 @@ impl<'a> ChildTurn<'a> {
                 }
             }
             if parallel.is_empty()
+                && env.config.experimental.dependency_dispatch
+                && !reply.text_calls_lifted
+            {
+                let plan = crate::agent::run::dependency_dispatch::plan_prefix(
+                    &reply.tool_calls[index..],
+                    env.config.task.dependency_wave_limit(),
+                    |candidate| {
+                        if crate::agent::run::dependency_dispatch::bookkeeping(candidate)
+                            || ["pre_tool_use", "post_tool_use"].iter().any(|event| {
+                                crate::agent::safety::hooks::wanted_for_tool(
+                                    &env.config.hooks,
+                                    event,
+                                    &candidate.name,
+                                )
+                            })
+                            || candidate.arguments["verify"]
+                                .as_array()
+                                .is_some_and(|v| !v.is_empty())
+                            || call_form_error(candidate, &self.schemas, &self.names).is_some()
+                            || engine.rejection_at(env.workspace, candidate).is_some()
+                            || child_speculation_key(env, job, candidate, &children.namespace)
+                                .is_some_and(|key| {
+                                    env.workspace
+                                        .speculation
+                                        .pending(&key, &candidate.arguments)
+                                })
+                        {
+                            return Err("worker_admission");
+                        }
+                        let footprint = crate::agent::run::dependency_dispatch::footprint_for(
+                            env.workspace,
+                            env.workspace.edit_mode(),
+                            env.ext,
+                            candidate,
+                        )
+                        .ok_or("unknown_resources")?;
+                        Ok((candidate.clone(), footprint))
+                    },
+                );
+                self.scheduling.barrier(plan.barrier);
+                let group = plan.calls;
+                if group.len() > 1
+                    && plan.writes
+                    && !self
+                        .streamed
+                        .as_ref()
+                        .is_some_and(|s| group.first().is_some_and(|call| s.has(call)))
+                {
+                    if let Some(stream) = self.streamed.as_mut() {
+                        stream.invalidate();
+                    }
+                    let callback_gate =
+                        std::sync::Mutex::new(crate::agent::safety::rules::CallbackGate::new(
+                            crate::agent::safety::rules::CallbackRules {
+                                catalog: &self.rule_catalog,
+                                state: rule_state,
+                                agent: &self.rule_agent,
+                                regenerations: &mut self.rule_regenerations,
+                                max_regenerations: env.config.portable_rules.max_regenerations,
+                            },
+                        ));
+                    let started = std::time::Instant::now();
+                    let outputs = super::call::run_group(
+                        env,
+                        job,
+                        ToolSurface {
+                            schemas: &self.schemas,
+                            names: &self.names,
+                            provenance: approval::CallProvenance::from_reply(&reply),
+                        },
+                        &group,
+                        approver,
+                        super::call::GroupContext {
+                            children,
+                            callback_gate: Some(&callback_gate),
+                            pending: &mut round_messages,
+                            steps: self.steps,
+                        },
+                    );
+                    self.scheduling.group(
+                        "native",
+                        group.len(),
+                        started.elapsed(),
+                        outputs.iter().map(|(_, seconds)| *seconds),
+                    );
+                    parallel = outputs.into();
+                }
+            }
+            if parallel.is_empty()
                 && !reply.text_calls_lifted
                 && !child_speculation_key(env, job, call, &children.namespace)
                     .is_some_and(|key| env.workspace.speculation.pending(&key, &call.arguments))
@@ -2020,26 +2153,36 @@ impl<'a> ChildTurn<'a> {
                                         != "partial"
                             })
                     });
-                    parallel = crate::agent::parallel_tools(
+                    let mut ui = RuleUi {
+                        observer: &observer,
+                        steps: self.steps,
+                        stream: children.transcript.clone(),
+                        stream_error: None,
+                        registry: env.ext,
+                    };
+                    let group = &reply.tool_calls[index..index + count];
+                    let started = std::time::Instant::now();
+                    let outputs = crate::agent::run::dispatch::parallel_tools_with_reads(
                         crate::agent::ParallelToolContext {
                             workspace: env.workspace,
                             config: env.config,
                             ext: env.ext,
                             interrupt: env.interrupt,
-                            ui: &mut RuleUi {
-                                observer: &observer,
-                                steps: self.steps,
-                                stream: children.transcript.clone(),
-                                stream_error: None,
-                                registry: env.ext,
-                            },
+                            ui: &mut ui,
                             pending_steering: &mut round_messages,
                         },
-                        &reply.tool_calls[index..index + count],
+                        group,
                         None,
                         Some(&read_reuse),
-                    )
-                    .into();
+                        self.streamed.as_mut(),
+                    );
+                    self.scheduling.group(
+                        "reads",
+                        count,
+                        started.elapsed(),
+                        outputs.iter().map(|(_, seconds)| *seconds),
+                    );
+                    parallel = outputs.into();
                 }
             }
             let rejection = engine.rejection_at(env.workspace, call);
@@ -2060,6 +2203,9 @@ impl<'a> ChildTurn<'a> {
                 .with_status(tools::ToolStatus::Blocked)
                 .with_effects(tools::surface::outcome::Effects::None),
                 None => {
+                    if let Some(stream) = self.streamed.as_mut() {
+                        stream.invalidate();
+                    }
                     let callback_gate =
                         std::sync::Mutex::new(crate::agent::safety::rules::CallbackGate::new(
                             crate::agent::safety::rules::CallbackRules {
@@ -2103,7 +2249,13 @@ impl<'a> ChildTurn<'a> {
             };
             // A controller retry/loop refusal did not attempt a native mutation.
             if !blocked {
-                prerequisites.observe(env.workspace, env.workspace.edit_mode(), call, &output);
+                prerequisites.observe(
+                    env.workspace,
+                    env.workspace.edit_mode(),
+                    call,
+                    &output,
+                    env.ext,
+                );
             }
             if call.name == crate::storage::memory_backend::TOOL_NAME {
                 self.cached_memory_prompt = None;
@@ -2589,7 +2741,7 @@ impl<'a> ChildTurn<'a> {
         }
         Ok(ControlFlow::Continue(()))
     }
-    pub(super) fn finish(self, driven: Result<Option<Outcome>>) -> Outcome {
+    pub(super) fn finish(mut self, driven: Result<Option<Outcome>>) -> Outcome {
         let job = self.job;
         let mut outcome = match driven {
             Ok(Some(outcome)) => outcome,
@@ -2607,6 +2759,11 @@ impl<'a> ChildTurn<'a> {
                 Outcome::incomplete(self.steps, reason)
             }
         };
+        if let Some(stream) = self.streamed.take() {
+            let (started, reused) = stream.statistics();
+            self.scheduling.stream(started, reused);
+        }
+        outcome.scheduling = self.scheduling;
         outcome.inspections = self.inspections;
         // Moved out once: every finish path, including provider and budget exhaustion, keeps its history.
         outcome.conversation = Some(ChildConversation {

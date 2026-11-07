@@ -28,18 +28,24 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+mod attachments;
 pub(in crate::app) mod busy;
 mod checkpoint_review;
 pub(in crate::app) mod command;
+mod context_decision;
 mod controls;
 mod file_discovery;
 pub(in crate::app) mod frame_pacing;
 pub(in crate::app) mod help;
+mod history_navigation;
 pub(in crate::app) mod improve;
 pub(in crate::app) mod input;
+mod input_recovery;
+mod input_recovery_controls;
 pub(in crate::app) mod lifecycle;
 mod live;
 pub(in crate::app) mod live_pane;
+pub(in crate::app) mod model_verification;
 pub(in crate::app) mod notes;
 pub(in crate::app) mod overlays;
 pub(in crate::app) mod paint;
@@ -97,6 +103,10 @@ pub(super) struct Shell {
     pub(super) shared_prose: bool,
     pub(super) auth_job: Option<AuthJob>,
     pub(in crate::app) last_setup_failure: Option<crate::app::overlay::auth::SetupFailure>,
+    /// Explicit inference-test result bound to the selected configuration identity.
+    pub(in crate::app) model_verification: Option<(u64, bool)>,
+    pub(in crate::app) coding_verification:
+        Option<(u64, Option<model_verification::coding::Outcome>)>,
     /// Session owner: closing Models releases only its view handle, not active downloads.
     pub(in crate::app) model_downloads: Option<crate::ui::overlay::models::SharedModelDownloads>,
     /// `/extensions` intent waiting for the main loop to start it.
@@ -119,6 +129,7 @@ pub(super) struct Shell {
     pub(super) themes: ThemeManager,
     pub(super) keys: Keymap,
     pub(super) composer: Composer,
+    input_recovery: input_recovery::InputRecovery,
     pub(super) paste_guard: crate::ui::input::PasteGuard,
     pub(super) transcript: Transcript,
     pub(super) status: StatusData,

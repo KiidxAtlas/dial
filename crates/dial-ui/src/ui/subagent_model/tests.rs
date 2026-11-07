@@ -87,6 +87,17 @@ fn status_mapping_covers_every_phase() {
         AgentStatus::Waiting
     );
     assert_eq!(AgentStatus::from_phase(Phase::Completed), AgentStatus::Done);
+    assert_eq!(
+        AgentStatus::from_phase(Phase::Answered),
+        AgentStatus::Answered
+    );
+    assert_eq!(AgentStatus::from_wire("answered"), AgentStatus::Answered);
+    assert_eq!(AgentStatus::Answered.label(), "answered");
+    assert!(AgentStatus::Answered.is_finished());
+    assert_eq!(
+        AgentStatus::Answered.attention(),
+        AgentStatus::Done.attention()
+    );
     assert_eq!(AgentStatus::from_phase(Phase::Failed), AgentStatus::Failed);
     assert_eq!(
         AgentStatus::from_phase(Phase::Incomplete),

@@ -34,55 +34,67 @@ impl Agent<'_> {
                 "jobs":jobs,"workers":workers,"side_questions":questions
             }),
         )?;
-        ui.notice(&format!(
-            "Waiting for running work without model polling: {}. New input interrupts the wait.",
-            jobs.iter()
-                .chain(&workers)
-                .chain(&questions)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        let reason = loop {
-            // User input wins even when completion arrives in the same wake. It is not consumed
-            // here; ordinary step admission routes it before any further inference or effects.
-            if self.interrupt.load(Ordering::Acquire) {
-                break "interrupted";
-            }
-            if !self.pending_tool_steering.is_empty() || ui.pending_input() {
-                break "user_input";
-            }
-            if self.stop_boundary().is_some() {
-                break "stop_boundary";
-            }
-            self.pump_subagents(ui);
-            if self.background_result_ready() {
-                break "result_or_message";
-            }
-            // The wait parks the turn at a request boundary, so mail can be surfaced right away.
-            if self.peer_mail_ready() {
-                break "peer_message";
-            }
-            if self.awaited_background_jobs().is_empty()
-                && self.live_tasks.running_ids().is_empty()
-                && self.side_questions.running_ids().is_empty()
-            {
-                // Work may have finished after the pump above; deliver that result, not a bare
-                // "no longer running" note.
+        use crate::agent::ui::ui_event::{BackgroundWait, EventKind, UiEvent};
+        ui.event(&UiEvent::new(EventKind::Wait, format!(
+            "Waiting for running work without model polling: {}. Results resume the turn; new input changes direction. Interrupting the turn does not cancel these jobs; use Activity to cancel owned work.",
+            jobs.iter().chain(&workers).chain(&questions).cloned().collect::<Vec<_>>().join(", ")
+        )).with_background_wait(BackgroundWait::Started { jobs, workers, questions }));
+        let result = (|| -> Result<&str> {
+            Ok(loop {
+                // User input wins even when completion arrives in the same wake. It is not consumed
+                // here; ordinary step admission routes it before any further inference or effects.
+                if self.interrupt.load(Ordering::Acquire) {
+                    break "interrupted";
+                }
+                if !self.pending_tool_steering.is_empty() || ui.pending_input() {
+                    break "user_input";
+                }
+                if self.stop_boundary().is_some() {
+                    break "stop_boundary";
+                }
                 self.pump_subagents(ui);
                 if self.background_result_ready() {
                     break "result_or_message";
                 }
-                // A provider may settle work without a notification. Never turn its disappearance
-                // into proof of success; the next request must inspect the actual result.
-                self.background_notices.push("[Awaited work is no longer running] Inspect its terminal results before reporting success; the end of a wait is not verification.".into());
-                break "settled";
-            }
-            let timeout = self.modes.launch.deadline.map_or(HOST_TICK, |deadline| {
-                HOST_TICK.min(deadline.saturating_duration_since(Instant::now()))
-            });
-            waiter.wait::<std::io::PipeReader>(None, None, Some(timeout))?;
-        };
+                // The wait parks the turn at a request boundary, so mail can be surfaced right away.
+                if self.peer_mail_ready() {
+                    break "peer_message";
+                }
+                if self.awaited_background_jobs().is_empty()
+                    && self.live_tasks.running_ids().is_empty()
+                    && self.side_questions.running_ids().is_empty()
+                {
+                    // Work may have finished after the pump above; deliver that result, not a bare
+                    // "no longer running" note.
+                    self.pump_subagents(ui);
+                    if self.background_result_ready() {
+                        break "result_or_message";
+                    }
+                    // A provider may settle work without a notification. Never turn its disappearance
+                    // into proof of success; the next request must inspect the actual result.
+                    self.background_notices.push("[Awaited work is no longer running] Inspect its terminal results before reporting success; the end of a wait is not verification.".into());
+                    break "settled";
+                }
+                let timeout = self.modes.launch.deadline.map_or(HOST_TICK, |deadline| {
+                    HOST_TICK.min(deadline.saturating_duration_since(Instant::now()))
+                });
+                waiter.wait::<std::io::PipeReader>(None, None, Some(timeout))?;
+            })
+        })();
+        let reason = result.as_ref().copied().unwrap_or("wait_failed");
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        ui.event(
+            &UiEvent::new(
+                EventKind::Wait,
+                format!(
+                    "Work wait ended: {reason}. Inspect delivered results before reporting success."
+                ),
+            )
+            .with_background_wait(BackgroundWait::Ended {
+                reason: reason.into(),
+                elapsed_ms,
+            }),
+        );
         self.record(
             self.cur_step,
             "background_wait_ended",
@@ -90,7 +102,7 @@ impl Agent<'_> {
                 "reason":reason,"elapsed_ms":started.elapsed().as_millis()
             }),
         )?;
-        Ok(true)
+        result.map(|_| true)
     }
 
     fn background_result_ready(&mut self) -> bool {

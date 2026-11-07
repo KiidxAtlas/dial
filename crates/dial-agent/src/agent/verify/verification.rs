@@ -1512,3 +1512,5 @@ mod infrastructure_tests;
 
 #[cfg(test)]
 mod rust_selection_tests;
+
+pub mod test_targets;

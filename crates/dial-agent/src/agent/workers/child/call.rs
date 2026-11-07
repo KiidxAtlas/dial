@@ -1,5 +1,7 @@
 //! Child call admission, hook rewriting, execution and settlement.
 use super::*;
+use crate::llm::ToolCall;
+use std::path::PathBuf;
 use std::{
     cell::{Cell, RefCell},
     ops::ControlFlow,
@@ -154,7 +156,128 @@ pub(super) fn run(
         return crate::agent::interrupted_tool();
     }
     let output = execute_child_call(&context, original, call, &prepared, &mut rerank, code_tool);
+    approver.borrow_mut().tool_finished(&call.id);
     finish_child_call(&context, call, output)
+}
+
+pub(super) struct GroupContext<'a, 'rules> {
+    pub children: &'a ChildBackends,
+    pub callback_gate: Option<&'a CallbackGate<'rules>>,
+    pub pending: &'a mut Vec<String>,
+    pub steps: u32,
+}
+
+/// Run an admitted native resource wave through the existing parallel executor. All policy and
+/// computed-path callbacks remain on this child controller, including the live parent approver.
+pub(super) fn run_group(
+    env: Env<'_>,
+    job: &Job<'_>,
+    surface: ToolSurface<'_>,
+    calls: &[ToolCall],
+    approver: &mut dyn Approver,
+    context: GroupContext<'_, '_>,
+) -> Vec<(ToolOutput, f64)> {
+    let GroupContext {
+        children,
+        callback_gate,
+        pending,
+        steps,
+    } = context;
+    let approver = RefCell::new(approver);
+    let preview_abort = Cell::new(false);
+    let contexts: Vec<_> = calls
+        .iter()
+        .map(|_| CallContext {
+            env,
+            job,
+            surface,
+            approver: &approver,
+            children: Some(children),
+            preview_abort: Some(&preview_abort),
+            callback_gate,
+            approval_denied: Cell::new(false),
+        })
+        .collect();
+    let mut results = vec![None; calls.len()];
+    let mut ready = Vec::new();
+    let mut positions = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        match prepare_child_call(&contexts[index], call, &mut None) {
+            ControlFlow::Break(output) => results[index] = Some((output, 0.0)),
+            ControlFlow::Continue(prepared) => {
+                if call.name == "edit"
+                    && env.workspace.edit_settings().streaming_abort
+                    && preview_reads_authorized(env, call, &approver)
+                {
+                    let preview = tools::preview_edit(env.workspace, &call.arguments);
+                    if tools::preview_edit_should_abort(&preview) {
+                        return calls.iter().map(|_| (refuse(format!("Native child wave not started: completed edit preview failed: {}",preview.text)),0.0)).collect();
+                    }
+                }
+                ready.push(prepared.call);
+                positions.push(index);
+            }
+        }
+    }
+    let bounds: Vec<_> = ready
+        .iter()
+        .map(|call| {
+            crate::agent::run::dependency_dispatch::footprint_for(
+                env.workspace,
+                env.workspace.edit_mode(),
+                env.ext,
+                call,
+            )
+        })
+        .collect();
+    let mut authorize = |call: &ToolCall, tool: &str, paths: &[PathBuf], unbounded: bool| {
+        let ready_index = ready
+            .iter()
+            .position(|c| c.id == call.id)
+            .ok_or("unknown native child call")?;
+        let source_read = matches!(call.name.as_str(), "edit" | "write") && tool == "read";
+        if (tool != call.name && !source_read)
+            || !bounds[ready_index]
+                .as_ref()
+                .is_some_and(|b| b.permits(paths, unbounded, source_read))
+        {
+            return Err("native child effect exceeded its admitted resource contract".into());
+        }
+        contexts[positions[ready_index]].authorize_mutation(call, tool, paths, unbounded)
+    };
+    let mut ui = RuleUi {
+        observer: &approver,
+        steps,
+        stream: children.transcript.clone(),
+        stream_error: None,
+        registry: env.ext,
+    };
+    let outputs = crate::agent::run::dispatch::parallel_tools_with_mutations(
+        crate::agent::ParallelToolContext {
+            workspace: env.workspace,
+            config: env.config,
+            ext: env.ext,
+            interrupt: env.interrupt,
+            ui: &mut ui,
+            pending_steering: pending,
+        },
+        &ready,
+        None,
+        None,
+        Some(&mut authorize),
+        Some(&children.cancellation.turn(env.interrupt.clone())),
+        None,
+    );
+    for (index, (output, seconds)) in positions.into_iter().zip(outputs) {
+        results[index] = Some((
+            finish_child_call(&contexts[index], &calls[index], output),
+            seconds,
+        ));
+    }
+    results
+        .into_iter()
+        .map(|r| r.expect("every admitted child call settled"))
+        .collect()
 }
 
 fn prepare_child_call(
@@ -187,6 +310,16 @@ fn prepare_child_call(
     if preview_abort.is_some_and(std::cell::Cell::get) {
         return ControlFlow::Break(refuse("This call was not executed: an authorized completed edit preview failed earlier in this assistant batch.".into()));
     }
+    if matches!(call.name.as_str(), "edit" | "write")
+        && call.arguments["verify"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty())
+    {
+        return ControlFlow::Break(refuse(format!(
+            "{} verify requires the foreground controller's test runner; no mutation was executed. Child workers can run their scoped tests through bash.",
+            call.name
+        )));
+    }
     if let Some((kind, why)) = call_form_error(call, schemas, names) {
         let help = (kind == "schema")
             .then(|| parameter_help(env, &call.name))
@@ -194,12 +327,6 @@ fn prepare_child_call(
             .map(|help| format!("\nThis call was not executed. {help}"))
             .unwrap_or_default();
         return ControlFlow::Break(refuse(format!("invalid tool call: {why}{help}")));
-    }
-    if matches!(call.name.as_str(), "edit" | "write") && call.arguments["check"] == true {
-        return ControlFlow::Break(refuse(format!(
-            "{} check=true requires the foreground controller's focused-check runner; no mutation was executed. Child workers can run their scoped checks through bash.",
-            call.name
-        )));
     }
     if let Some(context) = rerank.as_ref() {
         let journal = context.children.journal.borrow();
@@ -909,7 +1036,6 @@ fn finish_child_call(
         output.is_error = true;
         output.text.push_str("\n[An authorized completed edit preview failed; further callbacks and unstarted batch actions were refused.]");
     }
-    approver.borrow_mut().tool_finished(&call.id);
     if !approval_denied.get() {
         crate::agent::safety::hooks::post_tool_with(
             &env.config.hooks,

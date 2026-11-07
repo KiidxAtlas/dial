@@ -26,7 +26,7 @@ fn default_hook_timeout() -> u64 {
 }
 
 /// An MCP server: a stdio program or a streamable-HTTP endpoint. Like `[tools.*]` it
-/// is a trusted program: it runs unsandboxed. See the "HTTP MCP" section of README.md.
+/// is a trusted program: it runs unsandboxed. See the HTTP MCP section of `docs/extensibility.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServerConfig {

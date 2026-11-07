@@ -186,6 +186,9 @@ fn turn_notices_follow_the_authoritative_outcome() {
             Some((NotifyKind::Error, "Turn incomplete")),
         ),
         (Phase::Incomplete, true, false, None),
+        (Phase::Answered, true, true, None),
+        (Phase::Answered, true, false, None),
+        (Phase::Answered, false, true, None),
         (Phase::Interrupted, true, true, None),
         (Phase::Running, true, true, None),
     ];

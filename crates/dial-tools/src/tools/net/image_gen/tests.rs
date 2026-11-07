@@ -928,6 +928,11 @@ fn chatgpt_unknown_metadata_offers_hosted_images_without_an_api_key() {
     assert_eq!(target.wire, Wire::Responses);
     assert_eq!(target.account_id.as_deref(), Some("oaiapp_test"));
     assert!(target.key.is_empty());
+    use crate::tools::surface::catalog::Readiness;
+    assert!(matches!(
+        ImageGen.readiness(&config),
+        Readiness::ApprovalRequired { .. }
+    ));
 
     let mut profile = crate::llm::profiles::ModelProfile::minimal(chatgpt::PROVIDER, "chat-model");
     profile.capabilities.image_generation = Some(ImageGenerationApi::Disabled);
@@ -938,6 +943,14 @@ fn chatgpt_unknown_metadata_offers_hosted_images_without_an_api_key() {
     assert!(
         auto_tools(&config).is_err(),
         "explicitly disabled image roles must not fall back"
+    );
+    assert!(
+        matches!(
+            ImageGen.readiness(&config),
+            Readiness::MissingPrerequisite { ref reason } if reason.starts_with("no usable image route")
+        ),
+        "{:?}",
+        ImageGen.readiness(&config)
     );
 }
 

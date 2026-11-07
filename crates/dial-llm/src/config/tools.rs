@@ -100,7 +100,7 @@ pub const BUILTIN: &[&str] = &["read", "write", "edit", "glob", "grep", "bash"];
 /// Roster for the bash-only action space: a shell plus the planning, verification and completion
 /// tools the loop relies on. Used by `dial benchmark --ablate-assistance` to measure whether a
 /// capable model does as well without the structured file and search tools.
-pub const BASH_ONLY: &[&str] = &["bash", "todo", "check", "finish"];
+pub const BASH_ONLY: &[&str] = &["bash", "todo", "verify", "finish"];
 
 /// dial's own tools beyond the file/shell built-ins.
 pub const EXTRA_TOOLS: &[&str] = &[
@@ -125,7 +125,7 @@ pub const EXTRA_TOOLS: &[&str] = &[
     "rewind",
     "ask",
     "tts",
-    "check",
+    "verify",
     "revert_edit",
 ];
 

@@ -1,18 +1,25 @@
-//! `check`: run, on demand, the focused checks the completion gate would select right now.
+//! `verify`: run named tests, or the focused checks the completion gate would select right now.
 //!
-//! Selection is the gate's (`focused_checks` plus retained failures) and every run goes through
-//! `run_focused_check`, so approvals, the sandbox, classification and the evidence ledger are the
-//! ones final verification reads. Passing controller observations can be reused only with a
-//! complete operator-declared input contract; explicit named requests always execute.
+//! Targets are test files or `file::test` entries (the runner is chosen by
+//! `verification::test_targets`), names of gate checks, or `failed` for the latest code failures.
+//! Without targets the selection is the gate's (`focused_checks` plus retained failures). Every
+//! run goes through `run_focused_check`, so approvals, the sandbox, classification and the
+//! evidence ledger are the ones final verification reads. Passing controller observations can be
+//! reused only with a complete operator-declared input contract; explicit targets always execute.
+//! `edit`/`write` `verify` entries run through the same path once per assistant batch.
 //!
 //! `repro` registers a model-written reproduction for this turn only. It joins the gate's
 //! selection, is approved like a `bash` call, and earns behavioral credit only after a code
 //! failure at an earlier effect revision and a pass at the final one (`evidence::ReproState`).
 use crate::agent::verify::evidence::{MAX_REPROS, ReproState};
+use crate::agent::verify::verification::test_targets::{self, TestCounts};
 use crate::agent::verify::verification::{CheckStatus, FocusedCheck};
 use crate::agent::*;
+use crate::tools::edit::editing::MAX_VERIFY_TARGETS;
 
-pub(in crate::agent) const NAME: &str = "check";
+pub(in crate::agent) const NAME: &str = "verify";
+/// The target that reruns every check whose latest result is a code failure.
+const FAILED: &str = "failed";
 
 /// Kept diagnostic bytes per non-passing check.
 const DIAGNOSTIC_BYTES: usize = 1500;
@@ -24,12 +31,55 @@ const REPRO_COMMAND_BYTES: usize = 4000;
 
 /// `predictions` adds the optional `expect` argument (`experimental.check_predictions`).
 pub(in crate::agent) fn schema(predictions: bool) -> Value {
-    let mut schema = json!({"type":"function","function":{"name":NAME,"description":"check: run this turn's focused checks. Reports statuses and diagnostics; passes count toward final verification. A default call may reuse passes whose declared inputs are unchanged (labeled as reused); names forces a subset, failed_only reruns code failures. repro registers a bug reproduction (fails before the fix, passes after; max 4 per turn, same name replaces), approved like bash and rerun by the final gate; behavioral credit needs an observed failure, then a pass.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":16,"items":{"type":"string"},"description":"Exact check names to execute; omit for all, allowing valid evidence reuse."},"failed_only":{"type":"boolean"},"repro":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string","description":"Exits non-zero while the bug is present, zero once fixed."}},"required":["name","command"],"additionalProperties":false}},"additionalProperties":false}}});
+    let mut schema = json!({"type":"function","function":{"name":NAME,"description":"verify: run tests and this turn's focused checks; reports Passed/Failed with failure traces, and passes count toward final verification. targets: test files or `file::test` (Dial picks pytest, unittest, cargo, go, jest or vitest), check names from an earlier result, or `failed` to rerun code failures. Omit targets to run every check the completion gate selects (passes whose declared inputs are unchanged may be reused). repro registers a bug reproduction (fails before the fix, passes after; max 4 per turn, same name replaces), approved like bash and rerun by the final gate; behavioral credit needs an observed failure, then a pass.","parameters":{"type":"object","properties":{"targets":{"type":"array","maxItems":MAX_VERIFY_TARGETS,"items":{"type":"string"},"description":"Test files, `file::test`, check names or `failed`; omit for the gate's selection."},"repro":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string","description":"Exits non-zero while the bug is present, zero once fixed."}},"required":["name","command"],"additionalProperties":false}},"additionalProperties":false}}});
     if predictions {
         schema["function"]["parameters"]["properties"]["expect"] =
             crate::tools::surface::contracts::check_prediction_property();
     }
     schema
+}
+
+/// The `targets` argument: `None` when omitted, an error for a non-list or non-string entry.
+fn requested_targets(args: &Value) -> Result<Option<Vec<String>>, String> {
+    let entries = match args.get("targets") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err("targets must be an array of test files, check names or `failed`".into());
+        }
+    };
+    if entries.len() > MAX_VERIFY_TARGETS {
+        return Err(format!(
+            "targets accepts at most {MAX_VERIFY_TARGETS} entries"
+        ));
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .map(|entry| entry.trim().to_owned())
+                .filter(|entry| !entry.is_empty())
+                .ok_or_else(|| "targets entries must be non-empty strings".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Runner totals for one result: the summary's test counts, else the check itself as one.
+fn result_counts(status: CheckStatus, output: Option<&ToolOutput>) -> TestCounts {
+    let passed = status == CheckStatus::Passed;
+    let mut counts = output
+        .and_then(|output| test_targets::test_counts(&output.text))
+        .unwrap_or(TestCounts {
+            passed: u64::from(passed),
+            failed: u64::from(!passed),
+        });
+    // A failed run whose summary shows no failure (a build error, a timeout) is still a failure.
+    if !passed && counts.failed == 0 {
+        counts.failed = 1;
+    }
+    counts
 }
 
 /// Compare a declared `expect` with the observed outcome. `None` without a prediction (or when
@@ -89,6 +139,88 @@ fn requested_repro(args: &Value) -> Option<Result<FocusedCheck, String>> {
     )
 }
 
+/// `verify` entries of the `edit`/`write` calls in one assistant batch. They run once, after the
+/// batch's last mutation, so a test written earlier in the same response is on disk first.
+#[derive(Default)]
+pub(in crate::agent) struct VerifyBatch {
+    /// Ids of the batch's `edit`/`write` calls, in order. A mutation outside them (a direct or
+    /// callback dispatch) is its own batch.
+    mutations: Vec<String>,
+    pending: Vec<String>,
+    calls: std::collections::HashSet<String>,
+    settled: std::collections::HashSet<String>,
+}
+
+/// What a finished mutation means for the batch's `verify` entries.
+pub(in crate::agent) enum VerifyStep {
+    /// Not the last mutation and nothing requested: nothing to report.
+    Nothing,
+    /// Requested entries wait for the batch's last mutation.
+    Deferred,
+    /// The batch's last mutation succeeded: run these entries now.
+    Run(Vec<String>),
+    /// The batch's last mutation failed: the requested entries are not run.
+    Skipped(usize),
+}
+
+impl VerifyBatch {
+    pub(in crate::agent) fn begin(&mut self, calls: &[ToolCall]) {
+        self.mutations = calls
+            .iter()
+            .filter(|call| matches!(call.name.as_str(), "edit" | "write"))
+            .map(|call| call.id.clone())
+            .collect();
+        self.pending.clear();
+        self.calls = calls.iter().map(|call| call.id.clone()).collect();
+        self.settled.clear();
+    }
+
+    pub(in crate::agent) fn settle_once(&mut self, id: &str) -> bool {
+        !self.calls.contains(id) || self.settled.insert(id.to_owned())
+    }
+
+    pub(in crate::agent) fn end(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Record a finished `edit`/`write`. Entries of a failed call are not collected.
+    pub(in crate::agent) fn mutation_finished(
+        &mut self,
+        call: &ToolCall,
+        succeeded: bool,
+    ) -> VerifyStep {
+        let requested =
+            crate::tools::edit::editing::verify_targets(&call.arguments).unwrap_or_default();
+        let in_batch = self.mutations.contains(&call.id);
+        let mut pending = if in_batch {
+            std::mem::take(&mut self.pending)
+        } else {
+            Vec::new()
+        };
+        if succeeded {
+            for entry in &requested {
+                if !pending.contains(entry) {
+                    pending.push(entry.clone());
+                }
+            }
+        }
+        if in_batch && self.mutations.last() != Some(&call.id) {
+            self.pending = pending;
+            return if succeeded && !requested.is_empty() {
+                VerifyStep::Deferred
+            } else {
+                VerifyStep::Nothing
+            };
+        }
+        match (succeeded, pending.is_empty()) {
+            (true, false) => VerifyStep::Run(pending),
+            (false, false) => VerifyStep::Skipped(pending.len()),
+            (false, true) if !requested.is_empty() => VerifyStep::Skipped(requested.len()),
+            _ => VerifyStep::Nothing,
+        }
+    }
+}
+
 fn status_name(status: CheckStatus) -> String {
     serde_json::to_value(status)
         .ok()
@@ -113,33 +245,33 @@ fn diagnostics(text: &str) -> String {
 }
 
 /// Preserve the native mutation's outcome and effects: verification failure is not refusal.
-pub(in crate::agent) fn attach_post_mutation_check(
+pub(in crate::agent) fn attach_post_mutation_verify(
     output: &mut ToolOutput,
     tool: &str,
-    check: ToolOutput,
+    verify: ToolOutput,
 ) {
     crate::tools::surface::outcome::append_text(
         output,
         &format!(
-            "\n\n[Post-{tool} check; {tool} remains applied]\n{}",
-            check.text
+            "\n\n[verify after this response's edits; the {tool} remains applied]\n{}",
+            verify.text
         ),
     );
     if !output.data.as_ref().is_some_and(Value::is_object) {
         output.data = Some(json!({format!("{tool}_result"):output.data.take()}));
     }
-    output.data.as_mut().expect("object mutation result")[format!("post_{tool}_check")] =
-        json!({"is_error":check.is_error,"text":check.text,"data":check.data});
+    output.data.as_mut().expect("object mutation result")[format!("post_{tool}_verify")] =
+        json!({"is_error":verify.is_error,"text":verify.text,"data":verify.data});
 }
 
-pub(in crate::agent) fn post_mutation_check(output: &ToolOutput) -> Option<&Value> {
+pub(in crate::agent) fn post_mutation_verify(output: &ToolOutput) -> Option<&Value> {
     let data = output.data.as_ref()?;
-    data.get("post_edit_check")
-        .or_else(|| data.get("post_write_check"))
+    data.get("post_edit_verify")
+        .or_else(|| data.get("post_write_verify"))
 }
 
 impl Agent<'_> {
-    pub(in crate::agent) fn check_tool(&mut self, args: &Value, ui: &mut dyn Ui) -> ToolOutput {
+    pub(in crate::agent) fn verify_tool(&mut self, args: &Value, ui: &mut dyn Ui) -> ToolOutput {
         let predictions = self.config.experimental.check_predictions;
         if predictions
             && let Some(expect) = args.get("expect").filter(|value| !value.is_null())
@@ -149,18 +281,22 @@ impl Agent<'_> {
         }
         if args.get("repro").is_none_or(Value::is_null) && args.get("command").is_some() {
             return ToolOutput::err(
-                "check takes no top-level `command`. To register a bug reproduction, call check with repro: {\"name\": \"<short-name>\", \"command\": \"<shell command>\"}; the command must exit non-zero while the bug is present and zero once fixed. To run the selected checks, call check with no arguments.",
+                "verify takes no top-level `command`. To register a bug reproduction, call verify with repro: {\"name\": \"<short-name>\", \"command\": \"<shell command>\"}; the command must exit non-zero while the bug is present and zero once fixed. To run tests, list them in targets.",
             );
         }
+        let targets = match requested_targets(args) {
+            Ok(targets) => targets,
+            Err(error) => return ToolOutput::err(error),
+        };
         self.refresh_check_inputs();
-        let mut names: Option<Vec<String>> = args["names"].as_array().map(|names| {
-            names
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        });
-        let failed_only = args["failed_only"].as_bool().unwrap_or(false);
+        let failed_only = targets.iter().flatten().any(|target| target == FAILED);
+        let mut names: Option<Vec<String>> = targets
+            .as_ref()
+            .map(|targets| targets.iter().filter(|t| *t != FAILED).cloned().collect());
+        // `failed` alone reruns every code failure, not an empty subset.
+        if failed_only && names.as_ref().is_some_and(Vec::is_empty) {
+            names = None;
+        }
         let repro = match requested_repro(args) {
             Some(Err(error)) => return ToolOutput::err(error),
             Some(Ok(check)) => Some(check),
@@ -168,25 +304,12 @@ impl Agent<'_> {
         };
         if repro.is_some() && failed_only {
             return ToolOutput::err(
-                "repro cannot be combined with failed_only: register and run it first without failed_only, then use names or failed_only to rerun it",
+                "repro cannot be combined with `failed`: register and run it first, then name it or `failed` in targets to rerun it",
             );
         }
         let mut candidates = self.current_focused_checks();
         self.step_checks
             .include_failed_checks(self.workspace.root(), &mut candidates);
-        // A reproduction is registered as `repro: <name>`; accept the short name it was given.
-        if let Some(names) = &mut names {
-            let known = |name: &str| {
-                candidates.iter().any(|check| check.name == name)
-                    || repro.as_ref().is_some_and(|check| check.name == name)
-            };
-            for name in names.iter_mut() {
-                let prefixed = format!("{REPRO_PREFIX}{}", name.trim());
-                if !known(name) && known(&prefixed) {
-                    *name = prefixed;
-                }
-            }
-        }
         let listed = |checks: &[FocusedCheck]| {
             checks
                 .iter()
@@ -196,31 +319,26 @@ impl Agent<'_> {
         };
         // Selection errors must not replace a reproduction or clear its failed evidence.
         // Registration adds only its own name; replacing a name keeps that name selectable.
-        if let Some(names) = &names {
+        if let Some(names) = &mut names {
             if names.is_empty() && repro.is_none() {
                 return ToolOutput::err(
-                    "names must select at least one check; omit names to run all applicable checks, or provide exact check names",
+                    "targets must name at least one test or check; omit targets to run every applicable check",
                 );
             }
-            let unknown: Vec<&str> = names
-                .iter()
-                .filter(|name| {
-                    !candidates.iter().any(|check| &check.name == *name)
-                        && !repro.as_ref().is_some_and(|check| &check.name == *name)
-                })
-                .map(String::as_str)
-                .collect();
-            if !unknown.is_empty() {
+            if let Err(error) = self.resolve_targets(names, &mut candidates, repro.as_ref()) {
                 return ToolOutput::err(format!(
-                    "unknown check name(s): {}. Available: {}",
-                    unknown.join("; "),
-                    listed(&candidates)
+                    "{error}. Check names: {}",
+                    if candidates.is_empty() {
+                        "none apply yet".to_owned()
+                    } else {
+                        listed(&candidates)
+                    }
                 ));
             }
         }
         // A registered reproduction runs with the rest of the gate's selection once the turn has
         // changes, so one call reports every applicable check instead of prompting a second plain
-        // `check` for the ones still lacking a pass. Before any change it runs alone as a baseline.
+        // `verify` for the ones still lacking a pass. Before any change it runs alone as a baseline.
         let explicit_names = names.is_some();
         let mut registered = None;
         if let Some(check) = repro {
@@ -238,7 +356,7 @@ impl Agent<'_> {
         let note = |text: String| self.check_receipt(ToolOutput::ok(text), &candidates);
         if candidates.is_empty() {
             return note(if changed {
-                "No focused check applies to this turn's changes; the completion gate has nothing to run. Verify behavior another way (for example a targeted test through bash).".into()
+                "No focused check applies to this turn's changes; the completion gate has nothing to run. Name the tests that cover the change in targets.".into()
             } else {
                 "No changes yet and no focused check applies; nothing run.".into()
             });
@@ -265,13 +383,14 @@ impl Agent<'_> {
         // The gate runs nothing before the first change; an explicit subset is a baseline request.
         if !changed && names.is_none() && !failed_only {
             return note(format!(
-                "No changes yet, so the completion gate runs nothing. Checks that would apply now: {}. Pass `names` to run a baseline.",
+                "No changes yet, so the completion gate runs nothing. Checks that would apply now: {}. Name them in targets to run a baseline.",
                 listed(&candidates)
             ));
         }
 
         let mut results = Vec::new();
         let mut text = Vec::new();
+        let mut counts = TestCounts::default();
         let mut all_passed = true;
         let mut cancelled = false;
         let mut refused = None;
@@ -287,10 +406,7 @@ impl Agent<'_> {
                     &format!("focused-check:{}", check.name),
                     CheckStatus::Cancelled,
                     self.step_checks.revision(),
-                    self.config
-                        .verification
-                        .behavioral_checks
-                        .contains(&check.name),
+                    self.behavioral_check(&check.name),
                 );
                 cancelled = true;
                 (CheckStatus::Cancelled, None)
@@ -306,6 +422,11 @@ impl Agent<'_> {
                     .unwrap_or(CheckStatus::Unverified);
                 (status, Some(output))
             };
+            if status != CheckStatus::Cancelled {
+                let ran = result_counts(status, output.as_ref());
+                counts.passed += ran.passed;
+                counts.failed += ran.failed;
+            }
             // Same bookkeeping as a gate pass: a check's most recent non-pass is retained.
             self.step_checks
                 .failed_checks
@@ -329,6 +450,9 @@ impl Agent<'_> {
                 }
             }
             let mut result = json!({"name":check.name,"command":check.command,"status":name,"reused":reused,"ran":output.is_some(),"evidence_ref":self.step_checks.evidence.evidence_ref(&check.command)});
+            if test_targets::exit_status_target(&check.name) {
+                result["evidence"] = json!("exit_status_only");
+            }
             if reused {
                 result["observed_revision"] =
                     json!(self.step_checks.evidence.observed_revision(&check.command));
@@ -376,14 +500,33 @@ impl Agent<'_> {
             .map(PathBuf::from)
             .collect();
         let limits = self.related_test_plan(&changed_paths).limits;
+        text.insert(
+            0,
+            format!(
+                "Verify: Passed {}, Failed {}{}",
+                counts.passed,
+                counts.failed,
+                if cancelled {
+                    " (cancelled before every check ran)"
+                } else {
+                    ""
+                }
+            ),
+        );
+        if selected
+            .iter()
+            .any(|check| test_targets::exit_status_target(&check.name))
+        {
+            text.push("A plain script is judged only by its exit status; it asserts only what it checks itself.".into());
+        }
         text.push(if let Some(refused) = &refused {
             refused.clone()
         } else if all_passed {
             "Passes count toward final verification. Later changes stale evidence unless complete declared inputs are revalidated unchanged.".into()
         } else if registered.is_some() && selected.len() == 1 {
-            "Reproduction registered. Fix the code, then rerun it with `names` or failed_only; the final gate reruns it.".into()
+            "Reproduction registered. Fix the code, then rerun it by name or with targets [\"failed\"]; the final gate reruns it.".into()
         } else {
-            "Repair confirmed code failures, then rerun with failed_only. Environment, permission and timeout results are not code defects.".into()
+            "Repair confirmed code failures, then rerun with targets [\"failed\"]. Environment, permission and timeout results are not code defects.".into()
         });
         if !limits.is_empty() {
             text.push(format!("Coverage gaps: {}", limits.join("; ")));
@@ -398,7 +541,7 @@ impl Agent<'_> {
                 prediction["observed"].as_str().unwrap_or_default()
             ));
         }
-        let mut data = json!({"revision":self.step_checks.revision(),"results":results,"coverage_limits":limits});
+        let mut data = json!({"revision":self.step_checks.revision(),"counts":{"passed":counts.passed,"failed":counts.failed},"results":results,"coverage_limits":limits});
         if let Some(prediction) = prediction {
             data["prediction"] = prediction;
         }
@@ -411,6 +554,53 @@ impl Agent<'_> {
             },
             &candidates,
         )
+    }
+
+    /// Map each requested name to a selectable check: an exact or `repro:`-prefixed check name,
+    /// else a test-file entry added to `candidates` (reusing a candidate with the same command).
+    /// Every entry is resolved before any is reported, so one error lists all refusals.
+    fn resolve_targets(
+        &self,
+        names: &mut [String],
+        candidates: &mut Vec<FocusedCheck>,
+        repro: Option<&FocusedCheck>,
+    ) -> Result<(), String> {
+        let python = self.check_python();
+        let known = |name: &str, candidates: &[FocusedCheck]| {
+            candidates.iter().any(|check| check.name == name)
+                || repro.is_some_and(|check| check.name == name)
+        };
+        let mut refused = Vec::new();
+        for name in names.iter_mut() {
+            if known(name, candidates) {
+                continue;
+            }
+            let prefixed = format!("{REPRO_PREFIX}{name}");
+            if known(&prefixed, candidates) {
+                *name = prefixed;
+                continue;
+            }
+            match test_targets::target_check(
+                self.workspace.root(),
+                &python,
+                &self.config.verification.python_command,
+                name,
+            ) {
+                Ok(check) => match candidates.iter().find(|c| c.command == check.command) {
+                    Some(existing) => *name = existing.name.clone(),
+                    None => {
+                        *name = check.name.clone();
+                        candidates.push(check);
+                    }
+                },
+                Err(reason) => refused.push(reason),
+            }
+        }
+        if refused.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("not run: {}", refused.join("; ")))
+        }
     }
 
     /// One revision-scoped view of execution and remaining applicable checks. Reporting scope
@@ -518,7 +708,7 @@ impl Agent<'_> {
                 && (candidate.name == check.name || candidate.command == check.command)
         }) {
             return Err(format!(
-                "{} is already a selected check; run it with names instead",
+                "{} is already a selected check; name it in targets instead",
                 selected.name
             ));
         }
@@ -530,7 +720,7 @@ impl Agent<'_> {
             .any(|configured| configured.command == check.command)
         {
             return Err(
-                "that command is a configured verification command; run it with names instead"
+                "that command is a configured verification command; name it in targets instead"
                     .into(),
             );
         }

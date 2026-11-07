@@ -297,7 +297,7 @@ fn bash_only_override_pins_the_roster_in_the_isolated_config_and_is_recorded() {
     configuration.assistance.bash_only = Some(true);
     let (selected, settings) =
         select_configuration(&layout, &base, &mut configuration, &policy).unwrap();
-    assert_eq!(selected.harness.tools, ["bash", "todo", "check", "finish"]);
+    assert_eq!(selected.harness.tools, ["bash", "todo", "verify", "finish"]);
     assert_eq!(settings["assistance"]["bash_only"], true);
     // `false` restores the shipped roster; unset keeps the operator's.
     configuration.assistance.bash_only = Some(false);

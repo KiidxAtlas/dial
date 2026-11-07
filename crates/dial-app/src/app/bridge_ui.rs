@@ -34,6 +34,33 @@ fn request_settings_change(
     crate::adaptive::render_request_settings(settings, false)
 }
 
+struct ApprovalPrompt {
+    body: String,
+    options: Vec<(&'static str, char, Decision)>,
+}
+
+/// Choices reflect only scopes the policy owner can actually store.
+fn approval_prompt(
+    summary: &str,
+    preview: &agent::safety::approval::ApprovalPreview,
+) -> ApprovalPrompt {
+    let mut body = format!("{summary}\n\nOnce: {}", preview.once);
+    let mut options = vec![("Allow once", 'y', Decision::Allow)];
+    if let Some(scope) = &preview.session {
+        body.push_str(&format!("\n\nSession: {scope}"));
+        options.push(("Allow for this session", 'a', Decision::AllowAlways));
+    }
+    if let Some(scope) = &preview.project {
+        body.push_str(&format!("\n\nProject: {scope}"));
+        options.push(("Allow for this project", 'p', Decision::AllowProject));
+    }
+    if let Some(reason) = &preview.unavailable_reason {
+        body.push_str(&format!("\n\nReusable approval unavailable: {reason}"));
+    }
+    options.push(("Deny", 'n', Decision::Deny));
+    ApprovalPrompt { body, options }
+}
+
 impl Ui for Bridge<'_> {
     fn renders_workers(&self) -> bool {
         true
@@ -149,6 +176,7 @@ impl Ui for Bridge<'_> {
             .filter(|p| !p.estimated)
             .and_then(|p| p.tokens_per_second);
         status.model_silence_secs = 0;
+        status.provider_retry = None;
         if let Some(tokens) = output {
             self.shell.turn_output_tokens = self.shell.turn_output_tokens.saturating_add(tokens);
             status.output_tokens = self.shell.turn_output_tokens;
@@ -164,6 +192,7 @@ impl Ui for Bridge<'_> {
         }
         self.shell.status.model_progress = Some(progress.clone());
         self.shell.status.model_silence_secs = 0;
+        self.shell.status.provider_retry = None;
         self.repaint(false);
     }
 
@@ -210,6 +239,36 @@ impl Ui for Bridge<'_> {
     }
 
     fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
+        use crate::agent::ui::ui_event::BackgroundWait;
+        match &event.background_wait {
+            Some(BackgroundWait::Started {
+                jobs,
+                workers,
+                questions,
+            }) => {
+                let mut parts = Vec::new();
+                if !jobs.is_empty() {
+                    parts.push(format!("jobs {}", jobs.join(", ")));
+                }
+                if !workers.is_empty() {
+                    parts.push(format!("workers {}", workers.join(", ")));
+                }
+                if !questions.is_empty() {
+                    parts.push(format!("questions {}", questions.join(", ")));
+                }
+                self.shell.status.background_wait = Some(crate::ui::status::WorkWait {
+                    label: parts.join("; "),
+                    started: Instant::now(),
+                });
+                self.shell.status.model_progress = None;
+                self.shell.status.model_silence_secs = 0;
+            }
+            Some(BackgroundWait::Ended { .. }) => {
+                self.shell.status.background_wait = None;
+                self.set_activity("resuming after work wait");
+            }
+            None => {}
+        }
         self.shell.transcript.event(event);
         self.repaint(true);
     }
@@ -386,6 +445,14 @@ impl Ui for Bridge<'_> {
         // Provider retries arrive once per attempt. The first one is explained in plain words;
         // later attempts stay off the transcript (the status line already shows the wait).
         if let Some(retry) = RetryNotice::parse(message) {
+            self.shell.status.provider_retry =
+                Instant::now().checked_add(retry.delay).map(|ready_at| {
+                    crate::ui::status::ProviderRetry {
+                        attempt: retry.attempt,
+                        maximum: retry.max.clone(),
+                        ready_at,
+                    }
+                });
             if !std::mem::replace(&mut self.shell.retry_noted, true) {
                 self.shell.note(
                     "Retrying",
@@ -492,16 +559,14 @@ impl Ui for Bridge<'_> {
         self.repaint(false);
     }
 
-    /// The turn's outcome joins its closing rule in the transcript; changed files are already in
-    /// the session rail and `/review-file` lists them.
+    /// The existing report owner projects the same recorded evidence into the closing footer.
     fn completion(&mut self, summary: &Value) {
         self.shell
             .transcript
-            .completion(crate::ui::transcript::TurnOutcome {
-                status: summary["outcome"].as_str().unwrap_or("unknown").to_owned(),
-                changed_files: summary["changed_files"].as_array().map_or(0, Vec::len),
-                open_tasks: summary["open_tasks"].as_u64().unwrap_or(0) as usize,
-            });
+            .completion(crate::app::shell::turn_report::outcome(
+                summary,
+                &Value::Null,
+            ));
         self.repaint(true);
     }
 
@@ -512,6 +577,12 @@ impl Ui for Bridge<'_> {
     fn request_phase(&mut self, phase: agent::RequestPhase) {
         let changed = phase != self.shell.request_phase;
         self.shell.request_phase = phase;
+        if !matches!(
+            phase,
+            agent::RequestPhase::Backoff | agent::RequestPhase::Retrying
+        ) {
+            self.shell.status.provider_retry = None;
+        }
         if matches!(
             phase,
             agent::RequestPhase::Waiting
@@ -592,25 +663,43 @@ impl Ui for Bridge<'_> {
                 Decision::Deny
             };
         }
+        // A direct legacy/capability prompt has no policy-owned reusable matcher.
         let choice = self.shell.ask_with_cancel(
             &format!("Allow {tool}?"),
-            summary,
-            &[
-                ("Allow once", 'y'),
-                ("Allow for this session", 'a'),
-                ("Allow for this project", 'p'),
-                ("Deny", 'n'),
-            ],
+            &format!("{summary}\n\nOnly this call is approved; no reusable permission is created."),
+            &[("Allow once", 'y'), ("Deny", 'n')],
             Some(cancel),
         );
-        let decision = match choice {
-            Some(0) => Decision::Allow,
-            Some(1) => Decision::AllowAlways,
-            Some(2) => Decision::AllowProject,
-            _ => Decision::Deny,
+        let decision = if choice == Some(0) {
+            Decision::Allow
+        } else {
+            Decision::Deny
         };
         self.repaint(true);
         decision
+    }
+
+    fn approve_call_with_preview(
+        &mut self,
+        _call_id: &str,
+        tool: &str,
+        summary: &str,
+        preview: &agent::safety::approval::ApprovalPreview,
+        cancel: Option<&AtomicBool>,
+    ) -> Decision {
+        let prompt = approval_prompt(summary, preview);
+        let choices: Vec<_> = prompt
+            .options
+            .iter()
+            .map(|(label, key, _)| (*label, *key))
+            .collect();
+        let choice =
+            self.shell
+                .ask_with_cancel(&format!("Allow {tool}?"), &prompt.body, &choices, cancel);
+        self.repaint(true);
+        choice
+            .and_then(|index| prompt.options.get(index))
+            .map_or(Decision::Deny, |(_, _, decision)| *decision)
     }
 
     fn interactive_input(&self) -> bool {
@@ -871,3 +960,6 @@ impl Ui for Bridge<'_> {
 
 #[cfg(test)]
 mod request_settings_tests;
+
+#[cfg(test)]
+mod approval_tests;

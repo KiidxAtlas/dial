@@ -3,6 +3,46 @@
 Optional features (voice, language servers, the JavaScript and browser runtimes, embeddings) need
 outside software. Dial sets it up on request, never at startup.
 
+## First launch and model readiness
+
+First launch offers **Hosted provider** and **Local model** explicitly. Hosted opens the existing
+Providers panel for sign-in/API keys; Local opens Models for a running endpoint or downloaded model.
+Esc backs out of a panel to the path choice; Esc or Cancel at the choice exits without selecting a
+model. Browsing is not permission to install software, download weights, or send an inference request.
+Provider/model panels may discover endpoint metadata using their existing catalog checks.
+
+Interactive **`/doctor`** leads with core model readiness, then optional capabilities. It distinguishes
+configuration, cached/unknown endpoint metadata, and session-only response evidence. Open Models to
+change the selection or Providers to inspect the credential source and check metadata. A configured
+model or successful catalog response is **not** proof that inference works.
+
+**Verify selected model response** is available in Doctor, the local-model checklist and Providers
+(it always tests the current chat selection, not merely the highlighted provider). It first shows a
+default-Cancel confirmation: one tiny prompt, no tools or conversation history, up to 32 output tokens
+and a 20-second diagnostic budget. Hosted requests use the network and may incur provider charges;
+local requests may load weights/use compute. Only explicit confirmation sends the request. The normal
+interrupt key cancels a running check; no request is queued during another turn. Failure, cancellation
+or an empty response never count as verified. A nonempty response verifies text inference only, not
+tool support or quality. Evidence is in-memory for this session and exact configuration; changing the
+model, endpoint or configuration makes old evidence unknown. Provider errors are reduced to actionable
+categories rather than exposing raw server bodies, endpoint credentials or authentication headers.
+
+Managed-local checks reuse Dial's existing compute owner. After confirmation, idle resident models
+are released before the diagnostic acquires the existing compute lock exclusively. Active child
+agents, another session/worker holding compute, or disabled compute locking cause a refusal rather
+than a competing model load. Wait for the owner to finish, then explicitly retry from Doctor.
+This path has isolated endpoint tests; it is not a claim that every installed local runtime was tested.
+
+**Check coding/tool compatibility** is a separate opt-in action in Doctor, the local-model checklist
+and Providers. Its default-Cancel review discloses up to two requests, 128 output tokens each and a
+20-second overall budget, with the same hosted charges/local compute warning. It sends only synthetic
+messages and an echo schema: no conversation history, project files or real tool execution. Outcomes
+distinguish text-only replies, invalid invocations, structured versus text-parsed invocations, and
+whether the model consumed a synthetic result and returned its receipt. An invocation without a
+successful continuation is not a verified roundtrip. Evidence is session-only and bound to the exact
+configuration, separate from the existing text-response test. Interrupt cancels; busy sessions do not
+queue requests. Passing this small protocol check is not a coding-quality or universal tool guarantee.
+
 ## Where setup happens
 
 - **Settings** (`/settings`): a row whose program is missing shows a muted `○ available` line with
@@ -18,8 +58,8 @@ outside software. Dial sets it up on request, never at startup.
   the background job. Esc, Ctrl+C, or Cancel before installation changes nothing. Browsing
   never downloads software or models. Provider selection opens the existing Providers panel.
 - **Text and direct commands**: `/setup list` lists installed and missing capabilities as text.
-  `/doctor` is an alias for the same guided `/setup` flow. `/setup <id>` still only previews;
-  `/setup <id> yes` explicitly runs it.
+  `/doctor` opens core readiness followed by the same optional-capability diagnostics.
+  `/setup <id>` still only previews; `/setup <id> yes` explicitly runs it.
   `/setup embeddings` still prints the model catalog; `/setup embeddings:<model>` previews,
   and `/setup embeddings:<model> yes` pulls and assigns that model. Custom Ollama model names
   remain supported through these direct commands. `/setup grounding` and

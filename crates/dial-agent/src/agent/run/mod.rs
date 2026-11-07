@@ -15,6 +15,7 @@ pub(in crate::agent) mod intent;
 pub(in crate::agent) mod monitoring;
 pub mod outcome_gradient;
 pub(in crate::agent) mod reply_triage;
+pub mod scheduling_replay;
 pub(in crate::agent) mod search_frontier;
 pub(in crate::agent) mod steering;
 pub(in crate::agent) mod streaming_dispatch;

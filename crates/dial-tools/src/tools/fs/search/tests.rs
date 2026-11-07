@@ -163,6 +163,56 @@ fn numbered_file(dir: &tempfile::TempDir, name: &str, lines: usize) {
 }
 
 #[test]
+fn grep_searches_a_retained_artifact_body_and_refuses_selectors() {
+    let (_dir, ws) = workspace();
+    let state = tempfile::tempdir().unwrap();
+    let ws = ws.with_artifacts(crate::storage::artifact::ArtifactStore::new(state.path()).unwrap());
+    let uri = ws
+        .artifacts()
+        .unwrap()
+        .retain("compiling a\nwarning: unused x\nfinished\nwarning: unused y\n")
+        .unwrap();
+    let found = grep(&ws, json!({"pattern": "^warning", "path": uri}));
+    assert!(
+        found.contains(&format!("{uri}:2:warning: unused x"))
+            && found.contains(&format!("{uri}:4:warning: unused y"))
+            && !found.contains("compiling"),
+        "{found}"
+    );
+    let selected = grep(&ws, json!({"pattern": "x", "path": format!("{uri}:1+2")}));
+    assert!(selected.contains("without a selector"), "{selected}");
+    let context = grep(&ws, json!({"pattern": "x", "path": uri, "context": 1}));
+    assert!(
+        context.contains("not supported for artifact:// grep"),
+        "{context}"
+    );
+}
+
+#[test]
+fn a_missing_scope_among_several_is_named_with_suggestions() {
+    let (dir, ws) = workspace();
+    fs::create_dir_all(dir.path().join("src/agent")).unwrap();
+    fs::write(dir.path().join("src/agent/dispatch.rs"), "fn tool() {}\n").unwrap();
+    fs::write(dir.path().join("src/agent/turn.rs"), "fn turn() {}\n").unwrap();
+    let out = grep(
+        &ws,
+        json!({"pattern": "fn", "path": "src/agent/dispatch.rs;src/agent/tool_dispatch.rs"}),
+    );
+    assert!(
+        out.contains("searching \"src/agent/tool_dispatch.rs\"")
+            && out.contains("Did you mean")
+            && out.contains("src/agent/dispatch.rs")
+            && out.contains("Only scope \"src/agent/tool_dispatch.rs\" is missing"),
+        "{out}"
+    );
+    let single = grep(
+        &ws,
+        json!({"pattern": "fn", "path": "src/agent/tool_dispatch.rs"}),
+    );
+    assert!(!single.contains("Only scope"), "{single}");
+}
+
+#[test]
 fn grep_fixed_string_treats_metacharacters_literally() {
     let (dir, ws) = workspace();
     fs::write(dir.path().join("a.txt"), "Hello World\nfn a(x) {}\nax\n").unwrap();

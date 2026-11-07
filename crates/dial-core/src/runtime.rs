@@ -29,6 +29,8 @@ pub enum Phase {
     Running,
     #[serde(alias = "done")]
     Completed,
+    /// A delivered answer, not acceptance that outstanding work is complete.
+    Answered,
     Blocked,
     NeedsInput,
     Incomplete,
@@ -42,6 +44,7 @@ impl Phase {
         match status {
             "running" | "pending" => Self::Running,
             "done" | "completed" => Self::Completed,
+            "answered" => Self::Answered,
             "blocked" => Self::Blocked,
             "needs_input" => Self::NeedsInput,
             "incomplete" => Self::Incomplete,
@@ -53,6 +56,7 @@ impl Phase {
         match self {
             Self::Running => "running",
             Self::Completed => "completed",
+            Self::Answered => "answered",
             Self::Blocked => "blocked",
             Self::NeedsInput => "needs input",
             Self::Incomplete => "incomplete",
@@ -512,6 +516,21 @@ impl Tree {
     }
     pub fn pending_settled(&self) -> Vec<Node> {
         self.pending_where(true)
+    }
+    /// With an incremental stream journal, the main journal needs one initial running snapshot
+    /// and the settled result. Intermediate revisions remain recoverable in the stream journal.
+    pub fn pending_boundary_snapshots(&self) -> Vec<Node> {
+        let pending = self.pending();
+        let tree = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if tree.journal.is_none() {
+            return pending;
+        }
+        pending
+            .into_iter()
+            .filter(|node| {
+                node.result.phase != Phase::Running || !tree.persisted.contains_key(&node.id)
+            })
+            .collect()
     }
     /// Visits only bodies whose revision may be unpersisted, not every node. A clean body leaves
     /// the dirty set while holding its own lock, so a concurrent change re-marks it atomically.

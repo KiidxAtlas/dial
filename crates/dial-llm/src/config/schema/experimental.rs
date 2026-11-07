@@ -42,7 +42,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         EX,
         "Execution",
         "Dependency dispatch",
-        "Overlap operations only where trusted native resource contracts prove independence. Unknown effects, hooks and shell commands remain barriers.",
+        "Overlap operations only where trusted native resource contracts prove independence. On by default; turn off for strictly serial dispatch. Interrupts and steering take effect between groups, not between calls already started together. Unknown effects, hooks and shell commands remain barriers.",
         Kind::Bool,
     ),
     field!(
@@ -168,7 +168,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         EX,
         "Execution",
         "Streaming dispatch",
-        "Start admitted read-only calls at explicit provider completion or the next call index, before the reply ends; results are delivered in call order afterwards and discarded if the reply fails. Disabled for forced single-call and hermetic turns.",
+        "Enabled by default. Start admitted read-prefix calls at explicit provider completion or the next call index, before the reply ends; results are delivered in call order afterwards and discarded if the reply fails. Disabled for forced single-call and hermetic turns.",
         Kind::Bool,
     ),
     field!(
@@ -177,7 +177,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         EX,
         "Verification",
         "Check predictions",
-        "Offer an optional `expect` (pass or fail) on `check`. A mismatch is reported as a fact and the next request asks the model to explain it before editing again. Predictions never skip a check.",
+        "Offer an optional `expect` (pass or fail) on `verify`. A mismatch is reported as a fact and the next request asks the model to explain it before editing again. Predictions never skip a check.",
         Kind::Bool,
     ),
 ];

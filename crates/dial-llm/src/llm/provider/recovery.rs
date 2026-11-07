@@ -24,6 +24,7 @@ pub(super) struct FailedAttempt<'a> {
     pub attempt: usize,
     pub retry_policy: &'a llm::retry::Policy,
     pub attempt_started: Instant,
+    pub request_started: Instant,
     pub interrupt: &'a Arc<AtomicBool>,
 }
 
@@ -173,8 +174,17 @@ impl Backend {
             attempt,
             retry_policy,
             attempt_started,
+            request_started,
             interrupt,
         } = failure;
+        if retry_policy
+            .remaining(request_started.elapsed())
+            .is_some_and(|left| left.is_zero())
+        {
+            return Err(error.context(
+                "provider retry elapsed-time budget exhausted; the request was not replayed",
+            ));
+        }
         let class = llm::errors::classify(&error);
         if !state.reasoning_stripped
             && attempt < retry_policy.attempts(&class)
@@ -338,7 +348,18 @@ impl Backend {
         if !on_event(&llm::StreamEvent::Retry { waiting: true }) {
             return Err(llm::Interrupted.into());
         }
-        pending.wait(delay, interrupt)?;
+        let bounded_wait = retry_policy
+            .remaining(request_started.elapsed())
+            .map_or(delay, |left| delay.min(left));
+        pending.wait(bounded_wait, interrupt)?;
+        if retry_policy
+            .remaining(request_started.elapsed())
+            .is_some_and(|left| left.is_zero())
+        {
+            return Err(error.context(
+                "provider retry elapsed-time budget exhausted; the request was not replayed",
+            ));
+        }
         Ok(())
     }
     fn failover_chatgpt_account(

@@ -107,6 +107,11 @@ pub(super) struct CommandMode {
 #[cfg(not(target_os = "linux"))]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
+/// Eval's process-fork fence inside the command's own profile; Seatbelt cannot nest a second one.
+/// Last matching rule wins, so this overrides the profile's `(allow process-fork)`.
+#[cfg(all(unix, not(target_os = "linux")))]
+const FORK_FENCE_RULE: &str = "(deny process-fork)\n";
+
 /// System locations a command may read (never write) to start up and run.
 const SYSTEM_READ: &[&str] = &[
     "/usr",
@@ -210,8 +215,6 @@ impl Sandbox {
         mode: CommandMode,
         proxy: ProxyRef<'_>,
     ) -> Result<Command, String> {
-        #[cfg(not(target_os = "linux"))]
-        let _ = mode.fork_fence;
         self.available()?;
         #[cfg(target_os = "linux")]
         return linux::command_mode(workspace, policy, program, args, mode, proxy);
@@ -246,6 +249,9 @@ impl Sandbox {
             profile.push_str(&program_rule(program)?);
             if let Some(fd) = mode.owned_terminal {
                 profile.push_str(&owned_terminal_rule(fd)?);
+            }
+            if mode.fork_fence {
+                profile.push_str(FORK_FENCE_RULE);
             }
             append_denials(&mut profile, deny_read)?;
             let mut command = Command::new(SANDBOX_EXEC);
@@ -392,6 +398,9 @@ impl Sandbox {
             let mut command = {
                 if let Some(fd) = mode.owned_terminal {
                     profile.push_str(&owned_terminal_rule(fd)?);
+                }
+                if mode.fork_fence {
+                    profile.push_str(FORK_FENCE_RULE);
                 }
                 append_denials(&mut profile, deny_read)?;
                 let mut command = Command::new(SANDBOX_EXEC);

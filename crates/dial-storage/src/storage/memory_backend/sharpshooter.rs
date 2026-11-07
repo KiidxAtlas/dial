@@ -465,6 +465,10 @@ impl Driver for Sharpshooter {
         }
         result
     }
+    fn maintenance_due(&mut self, _: &Operation) -> Result<bool> {
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM envelopes WHERE processed=0 AND lease_until<=?1) OR EXISTS(SELECT 1 FROM deltas,state WHERE state.id=1 AND deltas.created>state.last_consolidated AND state.lease_until<=?1 AND state.last_consolidated<=?2)",
+            params![now(), now()-self.config.interval_minutes as i64*60], |row| row.get(0))?)
+    }
     fn enqueue(&mut self, op: &Operation, model: &mut dyn MemoryModelRunner) -> Result<Value> {
         ensure!(
             op.authority.task_depth == 0,

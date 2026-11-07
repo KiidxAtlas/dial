@@ -173,6 +173,61 @@ pub fn classify(err: &anyhow::Error) -> ErrorClass {
     classify_text(None, &format!("{err:#}"), None, None)
 }
 
+/// A content-free name for how a request failed, for stats rows: the HTTP status, the Responses
+/// failure code, or the typed transport/stream failure. `None` for untyped errors, whose text may
+/// carry provider or conversation content.
+pub fn failure_kind(err: &anyhow::Error) -> Option<String> {
+    for cause in err.chain() {
+        if cause.downcast_ref::<super::Interrupted>().is_some() {
+            return Some("interrupted".into());
+        }
+        if let Some(http) = cause.downcast_ref::<super::HttpError>() {
+            return Some(format!("http_{}", http.status));
+        }
+        if let Some(failure) = cause.downcast_ref::<super::responses::TerminalFailure>() {
+            return Some(failure.kind_label());
+        }
+        if let Some(transport) = cause.downcast_ref::<super::TransportError>() {
+            return Some(
+                if transport.connection {
+                    "transport_connection"
+                } else {
+                    "transport"
+                }
+                .into(),
+            );
+        }
+        if cause.downcast_ref::<ThinkingLoop>().is_some() {
+            return Some("thinking_loop".into());
+        }
+        if cause
+            .downcast_ref::<super::stream::StalledStream>()
+            .is_some()
+        {
+            return Some("stream_stalled".into());
+        }
+        if cause
+            .downcast_ref::<super::stream::IncompleteStream>()
+            .is_some()
+            || cause
+                .downcast_ref::<super::anthropic::IncompleteStream>()
+                .is_some()
+        {
+            return Some("stream_incomplete".into());
+        }
+        if cause.downcast_ref::<Classified>().is_some() {
+            return Some("stream_error".into());
+        }
+    }
+    None
+}
+
+/// Operating-system wording for a missing or changing network (DNS lookup failure, no usable
+/// local address after sleep/wake or a network switch). Retrying later can succeed.
+pub(super) fn is_network_outage_text(text: &str) -> bool {
+    NETWORK_OUTAGE.is_match(text)
+}
+
 /// Classify an HTTP failure from its status and the full (untruncated, unredacted) body text.
 pub(super) fn classify_http(
     status: u16,
@@ -207,6 +262,10 @@ pub(super) fn classify_stream_error(kinds: &[&str], message: &str) -> ErrorClass
             | "timeout" => return ErrorClass::Transient,
             _ => {}
         }
+    }
+    // Undici/Node servers report a dropped upstream socket as the bare message "terminated".
+    if message.trim().eq_ignore_ascii_case("terminated") {
+        return ErrorClass::Transient;
     }
     text_class
 }
@@ -278,7 +337,7 @@ fn classify_text(
     if THROTTLE.is_match(text) {
         return ErrorClass::RateLimited { retry_after };
     }
-    if TRANSIENT_TEXT.is_match(text)
+    if (TRANSIENT_TEXT.is_match(text) || NETWORK_OUTAGE.is_match(text))
         && !LLAMA_TOOL_PARSE.is_match(text)
         && !LLAMA_NO_JINJA.is_match(text)
     {
@@ -439,6 +498,11 @@ static THROTTLE: LazyLock<Regex> = LazyLock::new(|| {
 static TRANSIENT_TEXT: LazyLock<Regex> = LazyLock::new(|| {
     one(
         r"(?i)service.?unavailable|internal.?server.?error|\binternal error\b|bad gateway|gateway time-?out|upstream.?connect|upstream.?request.?failed|reset before headers|stream stall|stream[_ -]?read[_ -]?error|connection (?:reset|refused|closed)|other side closed|socket hang up|timed? out\b",
+    )
+});
+static NETWORK_OUTAGE: LazyLock<Regex> = LazyLock::new(|| {
+    one(
+        r"(?i)failed to lookup address information|temporary failure in name resolution|can'?t assign requested address|cannot assign requested address|network is (?:unreachable|down)|no route to host",
     )
 });
 static LLAMA_TOOL_PARSE: LazyLock<Regex> = LazyLock::new(|| {

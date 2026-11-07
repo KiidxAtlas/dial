@@ -1,5 +1,25 @@
 use super::*;
 
+#[test]
+fn inspections_share_read_groups_and_mutations_keep_the_exclusive_boundary() {
+    use crate::tools::integrations::ext::Concurrency;
+    let git = Git::default();
+    for action in READS {
+        assert_eq!(
+            git.concurrency(&json!({"action":action})),
+            Concurrency::Shared,
+            "{action}"
+        );
+    }
+    for action in ["add", "commit", "push", "fetch", "unknown"] {
+        assert_eq!(
+            git.concurrency(&json!({"action":action})),
+            Concurrency::Exclusive,
+            "{action}"
+        );
+    }
+}
+
 fn repo() -> (tempfile::TempDir, Workspace) {
     let dir = tempfile::tempdir().unwrap();
     let sh = |args: &[&str]| {
@@ -474,7 +494,7 @@ fn capped_status_artifact_keeps_complete_evidence_inline() {
 }
 
 #[test]
-fn host_reads_refuse_executable_filters_without_running_them() {
+fn host_worktree_reads_disable_executable_filters_without_running_them() {
     for (key, attributes) in [
         ("filter.audit.clean", false),
         ("filter.audit.clean", true),
@@ -491,19 +511,34 @@ fn host_reads_refuse_executable_filters_without_running_them() {
                 .unwrap()
                 .success()
         );
+        // `required` would make Git fail when the driver is unavailable; the override clears it.
+        assert!(
+            Command::new("git")
+                .args(["config", "filter.audit.required", "true"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         if attributes {
             std::fs::write(dir.path().join(".gitattributes"), "* filter=audit\n").unwrap();
         }
         std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
         for action in ["status", "diff"] {
             let result = call(&ws, json!({"action":action}));
+            assert!(!result.is_error, "{key} {action}: {}", result.text);
             assert!(
-                result.is_error && result.text.contains("filter configuration"),
+                result.text.contains("a.txt")
+                    && result
+                        .text
+                        .contains("filter drivers not run on this read: audit"),
                 "{key} {action}: {}",
                 result.text
             );
+            // The note names the driver, never the configured command text.
+            assert!(!result.text.contains("touch filter-ran"), "{}", result.text);
             assert!(!canary.exists(), "{key} executed during {action}");
-            assert!(run_checked(ws.root(), &[action], false).is_err());
+            assert!(run_checked(ws.root(), &[action], false).is_ok());
             assert!(!canary.exists());
         }
     }
@@ -511,8 +546,6 @@ fn host_reads_refuse_executable_filters_without_running_them() {
 
 #[test]
 fn object_only_reads_run_with_filter_drivers_configured_without_executing_them() {
-    // A git-lfs style driver blocked even `log` and `branches`, which never convert
-    // working-tree files. Those reads now run; worktree reads stay refused.
     let (dir, ws) = repo();
     let canary = dir.path().join("filter-ran");
     for key in [
@@ -540,17 +573,28 @@ fn object_only_reads_run_with_filter_drivers_configured_without_executing_them()
         assert!(!result.is_error, "{args}: {}", result.text);
         assert!(!canary.exists(), "{args} executed a filter");
     }
-    let refused = call(&ws, json!({"action":"status"}));
-    assert!(refused.is_error && refused.text.contains("filter configuration"));
-    // The refusal names the active keys, never the configured command text.
-    assert!(
-        refused.text.contains("filter.audit.clean")
-            && refused.text.contains("filter.audit.process")
-            && !refused.text.contains("touch filter-ran"),
-        "{}",
-        refused.text
+}
+
+#[test]
+fn filter_driver_names_are_parsed_and_unsafe_names_are_refused() {
+    assert_eq!(filter_driver("filter.lfs.clean").as_deref(), Some("lfs"));
+    assert_eq!(filter_driver("filter.a.b.process").as_deref(), Some("a.b"));
+    assert_eq!(filter_driver("diff.lfs.textconv"), None);
+    assert_eq!(filter_driver("filter.x=y.clean"), None);
+    assert_eq!(filter_driver("filter..clean"), None);
+    assert_eq!(
+        disabled_filter_args(&["lfs".into()]),
+        [
+            "-c",
+            "filter.lfs.clean=",
+            "-c",
+            "filter.lfs.smudge=",
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.required=false"
+        ]
     );
-    assert!(!canary.exists());
 }
 
 #[test]
@@ -691,7 +735,7 @@ fn invalid_git_configuration_fails_closed_on_host_reads() {
 }
 
 #[test]
-fn included_filter_and_textconv_config_is_refused_until_explicitly_disabled() {
+fn included_textconv_config_is_refused_and_included_filters_are_disabled() {
     for (key, config, attributes) in [
         (
             "filter.included.clean",
@@ -719,7 +763,14 @@ fn included_filter_and_textconv_config_is_refused_until_explicitly_disabled() {
         );
         std::fs::write(dir.path().join(".gitattributes"), attributes).unwrap();
         std::fs::write(dir.path().join("a.txt"), "modified\n").unwrap();
-        assert!(call(&ws, json!({"action":"status"})).is_error, "{key}");
+        // Included filter drivers are disabled for the read; textconv configuration is refused.
+        let status = call(&ws, json!({"action":"status"}));
+        assert_eq!(
+            status.is_error,
+            key.starts_with("diff."),
+            "{key}: {}",
+            status.text
+        );
         // `show` reads objects only: a filter driver never runs for it, so only textconv
         // configuration refuses it. The canary below proves no driver executed either way.
         let show = run_checked(ws.root(), &["show", "HEAD"], false);
@@ -826,8 +877,11 @@ fn global_filter_activated_by_untracked_attributes_is_never_run_by_inspection() 
     query
         .env("GIT_CONFIG_GLOBAL", &global)
         .env("GIT_CONFIG_NOSYSTEM", "1");
-    let error = inspect_filter_config(query, &NEVER_CANCELLED).unwrap_err();
-    assert!(error.contains("filter configuration"), "{error}");
+    let active = inspect_filter_config(query, &NEVER_CANCELLED).unwrap();
+    assert!(
+        active.iter().any(|key| key.starts_with("filter.")),
+        "{active:?}"
+    );
     assert!(!canary.exists());
     // The same global include does not activate for a different repository root.
     let (other, _) = repo();
@@ -835,7 +889,11 @@ fn global_filter_activated_by_untracked_attributes_is_never_run_by_inspection() 
     query
         .env("GIT_CONFIG_GLOBAL", &global)
         .env("GIT_CONFIG_NOSYSTEM", "1");
-    assert!(inspect_filter_config(query, &NEVER_CANCELLED).is_ok());
+    assert!(
+        inspect_filter_config(query, &NEVER_CANCELLED)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

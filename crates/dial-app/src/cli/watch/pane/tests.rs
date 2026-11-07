@@ -15,6 +15,7 @@ fn state() -> Snapshot {
         plan: vec![Task {
             content: "Wire the publisher".into(),
             status: Status::InProgress,
+            kind: crate::agent::workflow::todo::Kind::Step,
             phase: None,
             note: None,
             investigation: false,

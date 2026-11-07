@@ -71,15 +71,24 @@ this does not turn a chat-only model into an image-generation endpoint.
 | Enter (picker) | Download the chosen quantization (with its projector, when the repository has one) |
 | Enter (discovered embedding model) | Assign it to the `embedding` role |
 | Enter (curated embedding model) | Set it up as `/setup embeddings:<model> yes` does; see [model-embeddings.md](model-embeddings.md) |
-| Esc | Cancel a running download, close the picker or clear the query; otherwise back to the groups column (closes `/models` when that column is hidden) |
-| Left (or Ctrl+Left) | Move to the groups column; Up/Down there switch groups. Downloads keep running |
+| Esc (Get models content) | Explicitly cancel a running download; otherwise close the picker, stop listing, or clear the query before returning to groups |
+| Left (or Ctrl+Left) | Move to the groups column; Up/Down there switch groups. Downloads keep running; Esc from groups closes Models without cancelling them |
 
 A download runs in the background. The status line shows the repository, the bytes fetched so far
-against the expected total, the elapsed time and the latest step. Downloads keep running while you
-browse other groups in `/models`. Closing `/models` cancels a running download. When a download
-finishes, Dial rescans the models (F5 does the same), and the new model is selected on its shelf. Enter
-then assigns chat to main or memory. Image downloads require serving/importing before selecting
-the endpoint in Images. Downloading alone never assigns a model.
+against the expected total, the elapsed time and the latest step. Get models and Activity → Downloads
+share the session's download manager: browsing another group or closing `/models` from the groups
+column does **not** cancel an explicitly started weight download. Reopen Models or Activity to
+inspect it. Esc while focused on Get models content explicitly requests cancellation instead of
+closing the panel; ending the session releases its final owner and requests cancellation too.
+Cancellation can leave already cached files; it is not a rollback of downloaded bytes.
+
+When a download finishes, Dial rescans the models (F5 does the same), and the new model is selected
+on its shelf. Enter then assigns chat to main or memory. Image downloads require serving/importing
+before selecting the endpoint in Images. Downloading alone never assigns a model.
+
+This differs from **preparing a role assignment**: cancelling that pending preparation keeps the
+previous selection and does not save the new role. Browsing, downloading weights, preparing an
+assignment, saving it, and explicitly cancelling work are separate actions.
 
 Selecting a GGUF quantization sends exactly its files to the download (`hf_hub_download`), so the
 other quantizations in the repository are neither listed for choice nor fetched. Check the file sizes
@@ -114,8 +123,9 @@ Not supported and rejected with an explanation before anything is downloaded:
 
 ## Limitations
 
-- A download runs up to one hour. Esc cancels it; the cancelled attempt is reported as such and the
-  next attempt reuses whatever Hugging Face already cached.
+- A download runs up to one hour. Esc in Get models content explicitly cancels it; closing the
+  Models browser from groups does not. The cancelled attempt is reported as such, and the next
+  attempt reuses whatever Hugging Face already cached.
 - A split GGUF set is downloaded shard by shard. Interrupted sets are not considered usable cached
   models; retry the same repository to fetch missing shards.
 - Progress is measured from the Hugging Face cache, so the bytes shown can lag a moment behind.

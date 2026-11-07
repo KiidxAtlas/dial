@@ -2,7 +2,6 @@
 
 pub(in crate::agent) mod auto_escalation;
 pub(in crate::agent) mod caller_obligations;
-pub(in crate::agent) mod check_tool;
 pub(in crate::agent) mod checks;
 pub(in crate::agent) mod completion;
 pub(in crate::agent) mod counterfactual;
@@ -20,5 +19,6 @@ pub(in crate::agent) mod targets;
 pub(in crate::agent) mod verification;
 pub(in crate::agent) mod verification_receipts;
 pub(in crate::agent) mod verified_examples;
+pub(in crate::agent) mod verify_tool;
 pub(in crate::agent) mod visual;
 pub(in crate::agent) mod worker_acceptance;

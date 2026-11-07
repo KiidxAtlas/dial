@@ -21,7 +21,10 @@ use crate::agent::base::helpers::byte_prefix;
 use crate::config::paths::Layout;
 use crate::runtime::arguments::split_words;
 
+mod attachments;
 mod imports;
+
+pub use attachments::{Attachment, AttachmentKind, AttachmentState, PreparedMessage};
 mod sources;
 
 pub(in crate::agent) use sources::copilot_instruction_dirs;
@@ -561,12 +564,32 @@ pub fn system_overrides(layout: &Layout) -> (Option<String>, Option<String>) {
 /// as typed; a warning is produced only when the token looks like a path, so `a@b.com` and
 /// `@someone` pass silently.
 pub fn expand_references(root: &Path, text: &str, interrupt: &AtomicBool) -> (String, Vec<String>) {
+    let prepared = prepare_references(root, text, interrupt);
+    (prepared.content, prepared.warnings)
+}
+
+/// Cheap candidate detection shared with the draft preview; it never reads files.
+pub fn has_attachment_candidates(text: &str) -> bool {
+    !reference_tokens(text).is_empty() || !pasted_image_tokens(text).is_empty()
+}
+
+/// Remove every exact parsed occurrence of an attachment reference, preserving all other text.
+/// This uses the same lexical spans as expansion and performs no filesystem access.
+pub fn remove_attachment_reference(text: &str, reference: &str) -> Option<String> {
+    attachments::remove_reference(text, reference)
+}
+
+fn prepare_references(
+    root: &Path,
+    text: &str,
+    interrupt: &AtomicBool,
+) -> attachments::PreparedReferences {
     let mut warnings = Vec::new();
-    let mut blocks: Vec<String> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut attachments = Vec::new();
+    let mut blocks = Vec::new();
+    let mut seen = HashSet::new();
     let mut total = 0usize;
     let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-
     for token in reference_tokens(text) {
         if interrupt.load(Ordering::Relaxed) {
             warnings
@@ -584,26 +607,115 @@ pub fn expand_references(root: &Path, text: &str, interrupt: &AtomicBool) -> (St
         }
         let block = match token {
             _ if crate::llm::images::is_image(Path::new(token)) => None,
-            "diff" => git_block(&canonical_root, false, &mut warnings, interrupt),
-            "staged" => git_block(&canonical_root, true, &mut warnings, interrupt),
-            _ => path_block(&canonical_root, token, &mut warnings, interrupt),
+            "diff" => git_block(
+                &canonical_root,
+                false,
+                &mut warnings,
+                &mut attachments,
+                interrupt,
+            ),
+            "staged" => git_block(
+                &canonical_root,
+                true,
+                &mut warnings,
+                &mut attachments,
+                interrupt,
+            ),
+            _ => path_block(
+                &canonical_root,
+                token,
+                &mut warnings,
+                &mut attachments,
+                interrupt,
+            ),
         };
         if let Some(block) = block {
             if total + block.len() > REF_TOTAL_CAP {
-                warnings.push(format!(
+                let warning = format!(
                     "@{token} skipped: references exceed {} KiB in total",
                     REF_TOTAL_CAP / 1024
-                ));
+                );
+                warnings.push(warning.clone());
+                if let Some(item) = attachments.last_mut() {
+                    item.state = AttachmentState::Skipped;
+                    item.text_bytes = 0;
+                    item.detail = warning;
+                }
                 continue;
             }
             total += block.len();
             blocks.push(block);
         }
     }
-    if blocks.is_empty() {
-        return (text.to_string(), warnings);
+    attachments::PreparedReferences {
+        content: if blocks.is_empty() {
+            text.to_owned()
+        } else {
+            format!("{text}\n\n{}", blocks.join("\n\n"))
+        },
+        warnings,
+        attachments,
     }
-    (format!("{text}\n\n{}", blocks.join("\n\n")), warnings)
+}
+
+/// Prepare input and preview metadata with one authoritative bounded expansion.
+pub fn prepare_message(root: &Path, text: &str, interrupt: &AtomicBool) -> PreparedMessage {
+    let references = prepare_references(root, text, interrupt);
+    let mut warnings = references.warnings;
+    let mut attachments = references.attachments;
+    let mut images = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, token) in reference_tokens(text)
+        .into_iter()
+        .chain(pasted_image_tokens(text))
+        .filter(|token| seen.insert(*token))
+        .take(MAX_REFS + 1)
+        .enumerate()
+    {
+        if index == MAX_REFS {
+            if !warnings
+                .iter()
+                .any(|warning| warning.starts_with("more than"))
+            {
+                warnings.push(format!(
+                    "more than {MAX_REFS} attachment candidates; remaining images not attached"
+                ));
+            }
+            break;
+        }
+        if interrupt.load(Ordering::Relaxed) {
+            if !warnings
+                .iter()
+                .any(|warning| warning.contains("interrupted"))
+            {
+                warnings.push("image expansion interrupted; remaining images not attached".into());
+            }
+            break;
+        }
+        if !crate::llm::images::is_image(Path::new(token)) {
+            continue;
+        }
+        match crate::llm::images::user_attachment(root, Path::new(token)) {
+            Ok(image) => {
+                images.push(image);
+                attachments.push(Attachment::included(token, AttachmentKind::Image, 0));
+            }
+            Err(error) => {
+                let warning = format!("@{token} skipped: {error}");
+                warnings.push(warning.clone());
+                attachments.push(Attachment::skipped(token, AttachmentKind::Image, warning));
+            }
+        }
+    }
+    let mut message = serde_json::json!({"role":"user","content":references.content});
+    if !images.is_empty() {
+        message["dial_images"] = serde_json::Value::Array(images);
+    }
+    PreparedMessage {
+        message,
+        warnings,
+        attachments,
+    }
 }
 
 /// Expand text references and retain compact image attachments for provider encoding.
@@ -612,36 +724,25 @@ pub fn expand_message(
     text: &str,
     interrupt: &AtomicBool,
 ) -> (serde_json::Value, Vec<String>) {
-    let (content, mut warnings) = expand_references(root, text, interrupt);
-    let mut images = Vec::new();
-    let mut seen = HashSet::new();
-    for token in reference_tokens(text)
-        .into_iter()
-        .chain(pasted_image_tokens(text))
-        .filter(|token| seen.insert(*token))
-        .take(MAX_REFS)
-    {
-        if interrupt.load(Ordering::Relaxed) {
-            break;
-        }
-        if !crate::llm::images::is_image(Path::new(token)) {
-            continue;
-        }
-        match crate::llm::images::user_attachment(root, Path::new(token)) {
-            Ok(image) => images.push(image),
-            Err(error) => warnings.push(format!("@{token} skipped: {error}")),
-        }
-    }
-    let mut message = serde_json::json!({"role":"user","content":content});
-    if !images.is_empty() {
-        message["dial_images"] = serde_json::Value::Array(images);
-    }
-    (message, warnings)
+    let prepared = prepare_message(root, text, interrupt);
+    (prepared.message, prepared.warnings)
 }
 
 /// Terminal drag/drop and clipboard paths need no @ prefix. Only standalone local image paths
 /// in the human's message are eligible; ordinary prose, URLs and non-image files stay untouched.
 fn pasted_image_tokens(text: &str) -> Vec<&str> {
+    pasted_image_spans(text)
+        .into_iter()
+        .map(|item| item.token)
+        .collect()
+}
+
+struct AttachmentToken<'a> {
+    token: &'a str,
+    span: std::ops::Range<usize>,
+}
+
+fn pasted_image_spans(text: &str) -> Vec<AttachmentToken<'_>> {
     let mut out = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
@@ -649,6 +750,7 @@ fn pasted_image_tokens(text: &str) -> Vec<&str> {
         if rest.is_empty() {
             break;
         }
+        let start = text.len() - rest.len();
         let (token, consumed) = if let Some(quote @ ('\'' | '"' | '`')) = rest.chars().next() {
             match rest[1..].find(quote) {
                 Some(end) => (&rest[1..end + 1], end + 2),
@@ -662,7 +764,11 @@ fn pasted_image_tokens(text: &str) -> Vec<&str> {
         if (token.starts_with('/') || token.starts_with("~/") || token.starts_with("./"))
             && crate::llm::images::is_image(Path::new(token))
         {
-            out.push(token);
+            let quoted = rest.starts_with(['\'', '"', '`']);
+            out.push(AttachmentToken {
+                token,
+                span: start..start + if quoted { consumed } else { token.len() },
+            });
         }
         rest = &rest[consumed..];
     }
@@ -671,6 +777,13 @@ fn pasted_image_tokens(text: &str) -> Vec<&str> {
 
 /// Tokens following an `@` that starts a word (so `user@host` is skipped), minus trailing punctuation.
 fn reference_tokens(text: &str) -> Vec<&str> {
+    reference_spans(text)
+        .into_iter()
+        .map(|item| item.token)
+        .collect()
+}
+
+fn reference_spans(text: &str) -> Vec<AttachmentToken<'_>> {
     let mut out = Vec::new();
     let mut consumed_until = 0;
     for (i, _) in text.match_indices('@') {
@@ -690,7 +803,10 @@ fn reference_tokens(text: &str) -> Vec<&str> {
                 consumed_until = i + 3 + end;
                 let token = &rest[1..1 + end];
                 if !token.is_empty() {
-                    out.push(token);
+                    out.push(AttachmentToken {
+                        token,
+                        span: i..consumed_until,
+                    });
                 }
             }
             continue;
@@ -701,7 +817,10 @@ fn reference_tokens(text: &str) -> Vec<&str> {
         let token = rest[..end]
             .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'', '`']);
         if !token.is_empty() {
-            out.push(token);
+            out.push(AttachmentToken {
+                token,
+                span: i..i + 1 + token.len(),
+            });
         }
     }
     out
@@ -726,6 +845,7 @@ fn path_block(
     root: &Path,
     token: &str,
     warnings: &mut Vec<String>,
+    attachments: &mut Vec<Attachment>,
     interrupt: &AtomicBool,
 ) -> Option<String> {
     let rel = Path::new(token);
@@ -735,9 +855,13 @@ fn path_block(
         || rel
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)));
+    let mut skipped = |warning: String| {
+        warnings.push(warning.clone());
+        attachments.push(Attachment::skipped(token, AttachmentKind::File, warning));
+    };
     if escapes {
         if path_like {
-            warnings.push(format!(
+            skipped(format!(
                 "@{token} ignored: references must stay inside the project"
             ));
         }
@@ -745,24 +869,40 @@ fn path_block(
     }
     let Ok(real) = fs::canonicalize(root.join(rel)) else {
         if path_like {
-            warnings.push(format!("@{token} not found"));
+            skipped(format!("@{token} not found"));
         }
         return None;
     };
     if !real.starts_with(root) {
-        warnings.push(format!("@{token} ignored: it resolves outside the project"));
+        skipped(format!("@{token} ignored: it resolves outside the project"));
         return None;
     }
     let shown = xml_attr(token);
     if real.is_dir() {
-        let listing = match dir_listing(&real, interrupt) {
-            Ok(listing) => listing,
+        let listing = dir_listing(&real, interrupt);
+        let (listing, problem) = match listing {
+            Ok(listing) => (listing, None),
             Err(reason) => {
-                warnings.push(format!("@{token}: {reason}"));
-                format!("[directory listing omitted: {reason}; use a narrower @path]\n")
+                let warning = format!("@{token}: {reason}");
+                warnings.push(warning.clone());
+                (
+                    format!("[directory listing omitted: {reason}; use a narrower @path]\n"),
+                    Some(warning),
+                )
             }
         };
-        return Some(format!("<dir path=\"{shown}\">\n{listing}</dir>"));
+        let block = format!("<dir path=\"{shown}\">\n{listing}</dir>");
+        attachments.push(match problem {
+            Some(problem) => Attachment {
+                reference: token.to_owned(),
+                kind: AttachmentKind::Directory,
+                state: AttachmentState::Truncated,
+                text_bytes: block.len(),
+                detail: problem,
+            },
+            None => Attachment::included(token, AttachmentKind::Directory, block.len()),
+        });
+        return Some(block);
     }
     match read_text(&real, REF_FILE_CAP) {
         Some((body, cut)) => {
@@ -772,10 +912,17 @@ fn path_block(
             } else {
                 String::new()
             };
-            Some(format!("<file path=\"{shown}\">\n{body}{marker}\n</file>"))
+            let block = format!("<file path=\"{shown}\">\n{body}{marker}\n</file>");
+            let mut item = Attachment::included(token, AttachmentKind::File, block.len());
+            if cut {
+                item.state = AttachmentState::Truncated;
+                item.detail = format!("@{token}: truncated at {} KiB", REF_FILE_CAP / 1024);
+            }
+            attachments.push(item);
+            Some(block)
         }
         None => {
-            warnings.push(format!("@{token} skipped: not a readable text file"));
+            skipped(format!("@{token} skipped: not a readable text file"));
             None
         }
     }
@@ -852,12 +999,15 @@ fn git_block(
     root: &Path,
     staged: bool,
     warnings: &mut Vec<String>,
+    attachments: &mut Vec<Attachment>,
     interrupt: &AtomicBool,
 ) -> Option<String> {
     let label = if staged { "staged" } else { "diff" };
     match run_git_diff(root, staged, interrupt) {
         Ok((out, _)) if out.trim().is_empty() => {
-            warnings.push(format!("@{label}: no changes"));
+            let warning = format!("@{label}: no changes");
+            warnings.push(warning.clone());
+            attachments.push(Attachment::skipped(label, AttachmentKind::Changes, warning));
             None
         }
         Ok((out, cut)) => {
@@ -867,10 +1017,19 @@ fn git_block(
                 String::new()
             };
             let out = out.replace("</diff>", "<\\/diff>");
-            Some(format!("<diff kind=\"{label}\">\n{out}{marker}\n</diff>"))
+            let block = format!("<diff kind=\"{label}\">\n{out}{marker}\n</diff>");
+            let mut item = Attachment::included(label, AttachmentKind::Changes, block.len());
+            if cut {
+                item.state = AttachmentState::Truncated;
+                item.detail = format!("@{label}: truncated at {} KiB", GIT_OUTPUT_CAP / 1024);
+            }
+            attachments.push(item);
+            Some(block)
         }
         Err(why) => {
-            warnings.push(format!("@{label}: {why}"));
+            let warning = format!("@{label}: {why}");
+            warnings.push(warning.clone());
+            attachments.push(Attachment::skipped(label, AttachmentKind::Changes, warning));
             None
         }
     }

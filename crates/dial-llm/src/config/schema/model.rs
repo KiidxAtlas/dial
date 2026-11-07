@@ -440,4 +440,18 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Replays the settled prefix shortly before the provider's cache lifetime ends, when the saved cache read is worth more than the replay. Off never replays. Streaming replays only while a run is active. Idle also replays after the run ends, for up to an hour. Applies to native Anthropic endpoints only.",
         Kind::Enum(CACHE_WARM)
     ),
+    field!(
+        "retry.max_elapsed_secs",
+        retry.max_elapsed_secs,
+        MO,
+        "Roles & Sampling",
+        "Retry elapsed budget (s)",
+        "Stop starting or waiting for retries after this elapsed request time; 0 is unlimited. A successful first attempt keeps its model timeout.",
+        Kind::Int {
+            min: 0,
+            max: 3600,
+            step: 10
+        },
+        true
+    ),
 ];

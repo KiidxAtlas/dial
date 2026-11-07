@@ -52,13 +52,15 @@ impl Agent<'_> {
                         parameters,
                         &mut call.arguments,
                     );
-                    if !sent.planning_required
+                    if !self.stable_tool_offer()
+                        && !sent.planning_required
                         && !self.plan_mode
                         && let Some(route) = self.argument_owners(call, &sent.offer)
                     {
                         argument_routes.insert(call.id.clone(), route);
                     }
-                } else if !sent.planning_required
+                } else if !self.stable_tool_offer()
+                    && !sent.planning_required
                     && !self.plan_mode
                     && engine.rejection_at(&self.workspace, call).is_none()
                     && catalog.contains(&call.name)

@@ -1003,6 +1003,21 @@ impl Agent<'_> {
         {
             let authority = memory_authority(&self.session, 0);
             memory.bind(authority.clone());
+            controller.last_start = Some(Instant::now());
+            match memory.maintenance_due(&authority) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.memory_controller = controller;
+                    return;
+                }
+                Err(error) => {
+                    ui.diagnostic(&format!(
+                        "Cannot inspect memory maintenance queue: {error:#}"
+                    ));
+                    self.memory_controller = controller;
+                    return;
+                }
+            }
             let scope = self
                 .usage_scope
                 .worker()

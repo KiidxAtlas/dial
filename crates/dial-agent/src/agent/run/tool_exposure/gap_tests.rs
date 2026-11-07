@@ -184,3 +184,41 @@ fn gap_prefers_ready_equivalents_and_unknown_remains_a_candidate() {
         assert!(!activated.contains(&"dap_a_missing".into()));
     });
 }
+
+/// The prompt's loadable list leaves out tools with a known blocker, while discovery and an
+/// explicit load still reach them so the model can read the setup reason.
+#[test]
+fn loadable_list_omits_known_blockers_but_discovery_keeps_them() {
+    with_agent("", |agent| {
+        let state = Arc::new(AtomicU8::new(2));
+        agent.ext.register(Arc::new(Capability {
+            name: "dap_blocked".into(),
+            description: "Debugger runtime diagnostics".into(),
+            readiness: state.clone(),
+        }));
+        let listed = |agent: &Agent<'_>| {
+            let offered = agent.offered();
+            agent
+                .discoverable_tools(&offered)
+                .iter()
+                .any(|(name, description)| {
+                    name == "dap_blocked" || description.contains("dap_blocked")
+                })
+        };
+        assert!(!listed(agent));
+        assert!(
+            agent
+                .eligible_candidates()
+                .iter()
+                .any(|entry| entry.0 == "dap_blocked")
+        );
+        for usable in [0, 1, 4] {
+            state.store(usable, Ordering::Relaxed);
+            assert!(listed(agent), "readiness {usable}");
+        }
+        state.store(3, Ordering::Relaxed);
+        assert!(!listed(agent));
+        agent.activate_tools(&["dap_blocked".into()]).unwrap();
+        assert!(agent.offered().contains(&"dap_blocked".into()));
+    });
+}

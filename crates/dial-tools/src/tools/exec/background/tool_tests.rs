@@ -72,13 +72,14 @@ fn cancellation_keeps_uncompleted_tools_owned_for_named_and_all_kills() {
         let tool = owner();
         let (release, released) = mpsc::channel();
         let (requested, observed) = mpsc::channel();
+        let (admit, admitted) = mpsc::channel();
         tool.adopt_job(AdoptedJob::Tool(ToolJob {
             name: Some("slow".into()),
             command: "delayed".into(),
             work: Box::new(move |cancel| {
-                while !cancel.load(Ordering::Acquire) {
-                    std::thread::yield_now();
-                }
+                // Keep the work queued until after Stop, then observe the retained request.
+                admitted.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(cancel.load(Ordering::Acquire));
                 requested.send(()).unwrap();
                 released.recv().unwrap();
                 ToolOutput::err("cancelled after actual completion")
@@ -91,7 +92,6 @@ fn cancellation_keeps_uncompleted_tools_owned_for_named_and_all_kills() {
             json!({"action":"kill", "name":"slow"})
         };
         let output = run(&tool, &ws, args);
-        observed.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
             output.text.contains("cancellation requested"),
             "{}",
@@ -100,6 +100,15 @@ fn cancellation_keeps_uncompleted_tools_owned_for_named_and_all_kills() {
         assert!(tool.has_live_work());
         assert_eq!(tool.awaited_work().len(), 1);
         assert!(tool.session_work().is_empty());
+        let view = tool.jobs_view(None);
+        assert!(view.jobs[0].running && view.jobs[0].stop_requested);
+        assert!(
+            tool.dismiss_job("slow")
+                .unwrap_err()
+                .contains("still running")
+        );
+        admit.send(()).unwrap();
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
             !tool
                 .drain_notifications()
@@ -122,6 +131,10 @@ fn cancellation_keeps_uncompleted_tools_owned_for_named_and_all_kills() {
         );
         assert!(result.is_error, "{}", result.text);
         assert!(!tool.has_live_work());
+        assert!(tool.awaited_work().is_empty());
+        assert!(!tool.jobs_view(None).jobs[0].running);
+        tool.dismiss_job("slow").unwrap();
+        assert!(tool.jobs_view(None).jobs.is_empty());
     }
 }
 

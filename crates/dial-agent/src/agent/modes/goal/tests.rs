@@ -220,6 +220,7 @@ fn accepted_finish_skips_live_advice_but_keeps_completion_review() {
         let mut agent = new_agent(&config, &server.url, dir.path());
         // Exercise the live advisor, which is intentionally disabled in hermetic mode.
         agent.hermetic = false;
+        agent.step_checks.observations = 1; // This fixture begins after the inspection.
         agent.set_advisor(true);
         agent
             .push(json!({"role":"user","content":"Inspect notes"}))

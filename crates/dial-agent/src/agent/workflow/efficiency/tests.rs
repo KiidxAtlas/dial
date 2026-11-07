@@ -1,4 +1,27 @@
 use super::*;
+
+#[test]
+fn scheduling_records_sizes_barriers_and_delivered_worker_metrics_once() {
+    let mut scheduling = Scheduling::default();
+    scheduling.group(
+        "native",
+        2,
+        std::time::Duration::from_micros(10),
+        [0.000006, 0.000007].into_iter(),
+    );
+    scheduling.barrier("resource_conflict");
+    scheduling.stream(3, 2);
+    let mut metrics = Metrics::default();
+    let worker = serde_json::json!({"id":"worker-1","status":"done","scheduling":scheduling});
+    metrics.worker_results(&worker);
+    metrics.worker_results(&worker);
+    assert_eq!(metrics.worker_scheduling.groups["native"].groups, 1);
+    assert_eq!(metrics.worker_scheduling.groups["native"].sizes[&2], 1);
+    assert_eq!(metrics.worker_scheduling.groups["native"].work_us, 13);
+    assert_eq!(metrics.worker_scheduling.groups["native"].elapsed_us, 10);
+    assert_eq!(metrics.worker_scheduling.barriers["resource_conflict"], 1);
+    assert_eq!(metrics.worker_scheduling.early_reads_discarded, 1);
+}
 #[test]
 fn smaller_inspections_preserve_errors_snapshots_and_unretained_evidence() {
     let config = EfficiencyConfig {

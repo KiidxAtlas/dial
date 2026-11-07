@@ -152,3 +152,27 @@ fn modal_attention_projects_pending_prompt_without_dispatch_or_draft_changes() {
         KeyModifiers::NONE
     )));
 }
+
+#[test]
+fn cancelled_restored_selection_preserves_draft_and_waiting_state() {
+    let (_home, _project, _app, mut shell) = shell();
+    shell.composer.set_draft("unfinished review follow-up");
+    let cancel = AtomicBool::new(true);
+    assert_eq!(
+        shell.ask_with_selection(
+            "Changed files",
+            "preview",
+            &[("a.rs", ' '), ("b.rs", ' ')],
+            Some(&cancel),
+            1
+        ),
+        None
+    );
+    assert_eq!(shell.composer.draft(), "unfinished review follow-up");
+    assert!(!shell.awaiting_user);
+    assert_eq!(
+        shell.ask_selected("Changed files", "empty", &[], usize::MAX),
+        None
+    );
+    assert_eq!(shell.composer.draft(), "unfinished review follow-up");
+}

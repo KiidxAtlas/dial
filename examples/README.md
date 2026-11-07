@@ -8,6 +8,7 @@ Run commands from the repository root. These are source inputs, not generated re
 | [skills/](skills/) | Example agent skills, with instructions in each skill's `SKILL.md`. |
 | [clients/rpc-v1.jsonl](clients/rpc-v1.jsonl) | Sample RPC client messages; see [RPC/ACP](../docs/rpc-and-acp.md). |
 | [benchmarks/](benchmarks/README.md) | Evaluation suites, graders, scripted regression probes and committed fixtures—not just user demos. |
+| [replay_scheduling.rs](replay_scheduling.rs) | Read-only grouping comparison: `cargo run --locked --example replay_scheduling -- WORKSPACE SESSION.jsonl`. |
 | [runtime_baseline.rs](runtime_baseline.rs) | Runtime overhead measurement: `cargo run --locked --example runtime_baseline -- target/runtime-baseline.json`. |
 | [snapcompact_demo.rs](snapcompact_demo.rs) | Synthetic visual frames: `cargo run --locked --example snapcompact_demo -- scratch/snapcompact-preview`. No model or private sessions. |
 

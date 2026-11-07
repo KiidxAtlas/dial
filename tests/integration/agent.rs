@@ -349,22 +349,24 @@ fn consistent_ux_promised_actions_stop_incomplete_after_bounded_recovery() {
         Reply::Text("I will check the result."),
     ]);
     let e = env(&server.url, "auto");
+    std::fs::write(e.project.path().join("parser.rs"), "broken source").unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("Fix the parser", &mut Recorder::default()).unwrap();
     assert_eq!(report.outcome, TurnOutcome::Incomplete);
     assert_eq!(a.metrics().turns_completed, 0);
-    assert_eq!(server.requests.lock().len(), 4);
+    assert_eq!(server.requests.lock().len(), 2);
 }
 
 #[test]
 fn stats_session_announcements_continue_into_real_work() {
     let server = serve(vec![
+        open_todo(),
         Reply::Text("Now the full Stats page:"),
-        Reply::Text("Writing the complete page now."),
         Reply::Call(
             "write",
             json!({"path":"stats.txt", "content":"implemented\n"}),
         ),
+        close_todo(),
         Reply::Text("Created stats.txt."),
     ]);
     let mut e = env(&server.url, "auto");
@@ -374,7 +376,7 @@ fn stats_session_announcements_continue_into_real_work() {
         .turn("Create stats.txt", &mut Recorder::default())
         .unwrap();
     assert_eq!(report.outcome, TurnOutcome::Completed);
-    assert_eq!(server.requests.lock().len(), 4);
+    assert_eq!(server.requests.lock().len(), 5);
     assert_eq!(
         std::fs::read_to_string(e.project.path().join("stats.txt")).unwrap(),
         "implemented\n"
@@ -384,6 +386,7 @@ fn stats_session_announcements_continue_into_real_work() {
 #[test]
 fn stats_session_announcements_exhaust_recovery_without_false_completion() {
     let server = serve(vec![
+        open_todo(),
         Reply::Text("Now the Stats page itself. It gets the new tabs and charts:"),
         Reply::Text("Now the full Stats page:"),
         Reply::Text("Writing the complete page now."),
@@ -396,7 +399,7 @@ fn stats_session_announcements_exhaust_recovery_without_false_completion() {
         .turn("Create stats.txt", &mut Recorder::default())
         .unwrap();
     assert_eq!(report.outcome, TurnOutcome::Incomplete);
-    assert_eq!(server.requests.lock().len(), 4);
+    assert_eq!(server.requests.lock().len(), 3);
     assert_eq!(agent.metrics().turns_completed, 0);
     assert!(!e.project.path().join("stats.txt").exists());
 }
@@ -1032,7 +1035,8 @@ fn capability_search_enables_real_history_retrieval_in_the_next_round() {
         Reply::Text("Retrieved the current session."),
     ]);
     let mut e = env(&server.url, "auto");
-    e.config.assistance.compact_tools = true;
+    e.config.assistance.compact_tools = false;
+    e.config.assistance.lean_local = dial::config::types::LeanLocal::On;
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     let report = a
@@ -1069,7 +1073,8 @@ fn discovery_and_a_valid_call_to_the_absent_tool_run_in_the_same_batch() {
         Reply::Text("Retrieved in the same round."),
     ]);
     let mut e = env(&server.url, "auto");
-    e.config.assistance.compact_tools = true;
+    e.config.assistance.compact_tools = false;
+    e.config.assistance.lean_local = dial::config::types::LeanLocal::On;
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     a.turn("Retrieve DISCOVERY-KEY from session history", &mut ui)
@@ -1112,7 +1117,7 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
             .collect::<Vec<_>>()
     };
     let initial = names(0);
-    // Core tools are always offered, including `task`, `skill`, `message`, `check`,
+    // Core tools are always offered, including `task`, `skill`, `message`, `verify`,
     // `working_state` and the memory tools, so the initial set is the core, not
     // `initial_tool_limit`. Specialists such as `side_request` and `git` are loadable.
     assert!(initial.len() <= 21, "{initial:?}");
@@ -1121,19 +1126,21 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
         "edit",
         "write",
         "grep",
-        "find",
-        "glob",
         "bash",
-        "todo",
         "finish",
-        "check",
         "tool_load",
         "tool_search",
-        "working_state",
     ] {
         assert!(initial.contains(&core), "{core}");
     }
-    for deferred in ["side_request", "git", "lsp", "peers"] {
+    for deferred in [
+        "find",
+        "working_state",
+        "side_request",
+        "git",
+        "lsp",
+        "peers",
+    ] {
         assert!(!initial.contains(&deferred), "{deferred}");
     }
     assert!(!initial.contains(&"web_fetch"));
@@ -1331,11 +1338,13 @@ fn architecture_uses_its_selected_model_and_restores_coding() {
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     assert_eq!(
-        a.turn("Explain routing", &mut ui).unwrap().text,
+        a.turn("Summarize the supplied routing notes", &mut ui)
+            .unwrap()
+            .text,
         "First answer."
     );
     assert_eq!(
-        a.turn("Explain again", &mut ui).unwrap().text,
+        a.turn("Summarize again", &mut ui).unwrap().text,
         "Second answer."
     );
     assert_eq!(main.requests.lock().len(), 2);
@@ -1385,7 +1394,8 @@ fn architecture_is_built_after_the_task_and_reused_without_extra_generations() {
     .unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
-    a.turn("Explain routing", &mut ui).unwrap();
+    a.turn("Summarize the supplied routing notes", &mut ui)
+        .unwrap();
     assert_eq!(server.requests.lock().len(), 2);
     assert!(
         !server.requests.lock()[0]["messages"][0]["content"]
@@ -1395,7 +1405,9 @@ fn architecture_is_built_after_the_task_and_reused_without_extra_generations() {
     );
     drop(a);
     let mut restarted = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
-    restarted.turn("Explain routing again", &mut ui).unwrap();
+    restarted
+        .turn("Summarize the supplied routing notes again", &mut ui)
+        .unwrap();
     let requests = server.requests.lock();
     assert_eq!(
         requests.len(),
@@ -1483,7 +1495,7 @@ fn malformed_architecture_does_not_fail_the_task_or_repeat_automatically() {
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     assert_eq!(
-        a.turn("Explain", &mut ui).unwrap().outcome,
+        a.turn("Summarize", &mut ui).unwrap().outcome,
         dial::agent::TurnOutcome::Completed
     );
     assert!(
@@ -1491,7 +1503,7 @@ fn malformed_architecture_does_not_fail_the_task_or_repeat_automatically() {
             .iter()
             .any(|n| n.contains("Architecture update deferred"))
     );
-    a.turn("Explain again", &mut ui).unwrap();
+    a.turn("Summarize again", &mut ui).unwrap();
     // A malformed synthesis is deferred, not recorded as attempted, so the next completed turn
     // retries it once (see `defer_architecture_attempt_on_failure`); the task itself never fails.
     assert_eq!(server.requests.lock().len(), 4);
@@ -1511,7 +1523,7 @@ fn queued_work_skips_architecture_maintenance_without_consuming_model_calls() {
     e.config.codebase.ambient_context = true;
     std::fs::write(e.project.path().join("main.rs"), "fn main() {}\n").unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
-    a.turn("Explain", &mut QueuedUi).unwrap();
+    a.turn("Summarize", &mut QueuedUi).unwrap();
     assert_eq!(server.requests.lock().len(), 1);
     let cache = dial::tools::codebase::Codebase::open(&e.layout).unwrap();
     assert!(cache.architecture_synthesis(8000, false).unwrap().is_some());
@@ -1553,6 +1565,7 @@ fn synthesis_step_closes_after_text_without_a_dummy_tool_call() {
             "todo",
             json!({"op":"set","tasks":[{"content":"Provide synthesis"}]}),
         ),
+        close_todo(),
         Reply::Text(synthesis),
     ]);
     let e = env(&server.url, "auto");
@@ -1565,8 +1578,8 @@ fn synthesis_step_closes_after_text_without_a_dummy_tool_call() {
     assert!(!agent.todo().has_open());
     assert_eq!(
         server.requests.lock().len(),
-        2,
-        "No dummy read, todo completion round or duplicate report"
+        3,
+        "Explicit todo settlement needs no dummy read or duplicate report"
     );
 }
 
@@ -1586,9 +1599,9 @@ fn repeated_todo_rejections_stop_despite_reworded_claims() {
     let report = agent
         .turn("Inspect the source", &mut Recorder::default())
         .unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
     let requests = server.requests.lock();
-    assert_eq!(requests.len(), 6);
+    assert_eq!(requests.len(), 7);
     assert!(
         requests.last().unwrap()["messages"]
             .to_string()
@@ -1672,9 +1685,9 @@ fn todo_recovery_bounds_alternating_operations_despite_successful_reads_and_view
     let report = agent
         .turn("Inspect source", &mut Recorder::default())
         .unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
     let requests = server.requests.lock();
-    assert_eq!(requests.len(), 14);
+    assert_eq!(requests.len(), 15);
     assert!(
         requests.last().unwrap()["messages"]
             .to_string()
@@ -1744,8 +1757,8 @@ fn identical_rejected_todo_updates_stop_even_when_the_plan_changes_between_them(
         .turn("Inspect source", &mut Recorder::default())
         .unwrap();
     // A successful plan change resets the rejection history, so nothing escalates or stops.
-    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
-    assert_eq!(report.text, "should not be reached");
+    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+    assert!(report.text.contains("Execution steps remain open"));
     assert!(
         server.requests.lock().last().unwrap()["messages"]
             .to_string()
@@ -1838,11 +1851,11 @@ fn repeated_invalid_plans_stop_despite_reworded_tasks_and_interleaved_reads() {
 }
 
 #[test]
-fn final_report_reconciles_optional_progress_without_extra_requests() {
+fn final_report_retains_optional_follow_ups_without_extra_requests() {
     let server = serve(vec![
         Reply::Call(
             "todo",
-            json!({"op":"set","tasks":[{"content":"Architecture report"},{"content":"Test report"}]}),
+            json!({"op":"set","tasks":[{"content":"Architecture report","kind":"follow_up"},{"content":"Test report","kind":"follow_up"}]}),
         ),
         Reply::Text(
             "Architecture: UI and inference boundaries stay separate. Tests: exercise failure recovery and completion review.",
@@ -2076,7 +2089,7 @@ fn repeated_reads_across_failed_checks_stop_and_keep_compact_evidence() {
     let report = a
         .turn("Inspect the current code and fix the build", &mut ui)
         .unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
     let requests = server.requests.lock();
     assert!(
         requests[5]["tools"]
@@ -2178,7 +2191,7 @@ fn repeated_successful_shell_inspections_withhold_bash_and_stop_without_step_lim
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     let report = a.turn("Verify the package version", &mut ui).unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
     assert_eq!(
         ui.results
             .iter()
@@ -2801,7 +2814,8 @@ fn explicit_completion_records_its_actual_request_for_training() {
         "finish",
         json!({"outcome":"completed","summary":"Evidence checked."}),
     )]);
-    let e = env(&server.url, "auto");
+    let mut e = env(&server.url, "auto");
+    e.config.training.retain_session_requests = true;
     let store = Store::open(&e.layout.state_dir, "scripted", "t", &e.config.harness).unwrap();
     let mut a = agent_with(&e, Some(&store), Arc::new(AtomicBool::new(false)));
     let report = a
@@ -2936,12 +2950,12 @@ fn text_only_acknowledgements_do_not_repeat_completion_reminders() {
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("create marker", &mut Recorder::default()).unwrap();
     assert!(
-        report.text.contains("Stopped with incomplete work"),
+        report.text.contains("Execution steps remain open"),
         "{}",
         report.text
     );
     assert_eq!(report.outcome, TurnOutcome::Incomplete);
-    assert_eq!(server.requests.lock().len(), 5);
+    assert_eq!(server.requests.lock().len(), 3);
     assert_eq!(a.metrics().turns_completed, 0);
     assert_eq!(
         a.todo().tasks()[0].status,
@@ -3053,10 +3067,11 @@ fn plain_clarification_preserves_todos_without_continuation_or_false_completion(
 }
 
 #[test]
-fn explicit_finish_closes_optional_progress_in_the_same_batch() {
+fn explicit_finish_requires_explicit_execution_step_settlement() {
     let server = serve(vec![
         open_todo(),
         Reply::Call("write", json!({"path":"marker.txt","content":"done"})),
+        close_todo(),
         Reply::Call(
             "finish",
             json!({"outcome":"completed","summary":"Marker created."}),
@@ -3071,7 +3086,7 @@ fn explicit_finish_closes_optional_progress_in_the_same_batch() {
         "done"
     );
     assert!(!a.todo().has_open());
-    assert_eq!(server.requests.lock().len(), 3);
+    assert_eq!(server.requests.lock().len(), 4);
 }
 
 #[test]
@@ -3865,7 +3880,7 @@ fn delegated_task_uses_its_role_and_returns_to_the_main_model() {
     let main = serve(vec![
         Reply::Call(
             "task",
-            json!({"task":"Inspect this project.","solution_space":"s"}),
+            json!({"agent":"scout","task":"Inspect this project.","solution_space":"s"}),
         ),
         Reply::Text("main finished"),
     ]);
@@ -4013,7 +4028,7 @@ fn task_items_receive_shared_context_goal_and_their_skill_body() {
             "task",
             json!({
                 "context": "SHARED_CONTEXT_MARKER: the parser lives in src/parse.rs",
-                "tasks": [{
+                "tasks": [{"agent":"scout",
                     "task": "Inspect the parser.",
                     "solution_space": "read-only survey",
                     "skills": ["evidence"]
@@ -4558,7 +4573,7 @@ fn small_window_refuses_to_spend_response_reserve_or_drop_a_pinned_tool() {
     e.config
         .harness
         .system_prompt
-        .push_str(&"immutable project requirement ".repeat(250));
+        .push_str(&"immutable project requirement ".repeat(600));
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None); // Explicitly pins task for delegation.
     let error = a
@@ -4677,7 +4692,7 @@ fn roomy_window_keeps_the_full_tool_set_without_notice() {
         ui.notices
     );
     let names = tool_names(&server.requests.lock()[0]);
-    for tool in ["task", "find", "skill"] {
+    for tool in ["task", "read", "tool_load"] {
         assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");
     }
 }
@@ -5174,7 +5189,7 @@ fn a_batch_runs_read_only_agents_concurrently_and_reports_in_input_order() {
             .unwrap_or_else(|| panic!("{needle:?} missing from:\n{result}"))
     };
     assert!(
-        at("## 1. alpha (scout, role small, model reviewer/side-model) - ok")
+        at("## 1. alpha (scout, role main, model reviewer/side-model) - ok")
             < at("answer to first")
     );
     assert!(
@@ -5209,7 +5224,7 @@ fn a_batch_runs_read_only_agents_concurrently_and_reports_in_input_order() {
         "{:?}",
         ui.notices
     );
-    assert_eq!(ui.roles, ["small", "tester", "coach", "main"]);
+    assert_eq!(ui.roles, ["main", "tester", "coach", "main"]);
     // Each child ran as its own conversation: a system prompt and one brief. The parent's goal is
     // passed only as labelled background; the assignment itself is the child's own task.
     let prompts: Vec<String> = side.requests.lock().iter().map(prompt_of).collect();
@@ -5395,7 +5410,10 @@ fn a_worker_edits_through_the_parents_approval_and_checkpoints() {
         reason: dial::agent::safety::approval::PolicyReason::PromptRequired,
         rule_scope: None,
     };
-    assert_eq!(ui.summaries[1], format!("[worker] f.txt\n{policy}"));
+    assert!(ui.summaries[1].starts_with(&format!("[worker] f.txt\n{policy}")));
+    for choice in ["Once:", "Session:", "Project:"] {
+        assert!(ui.summaries[1].contains(choice));
+    }
     assert_eq!(task_result(&main), "changed f.txt");
     assert_eq!(
         std::fs::read_to_string(e.project.path().join("f.txt")).unwrap(),
@@ -6089,7 +6107,7 @@ fn codebase_understanding_is_saved_across_new_sessions_and_invalidated_by_edits(
     assert_ne!(first_id, second.session().id());
     assert_eq!(
         second
-            .turn("change request routing", &mut Recorder::default())
+            .turn("summarize request routing", &mut Recorder::default())
             .unwrap()
             .text,
         "reused"
@@ -6101,7 +6119,7 @@ fn codebase_understanding_is_saved_across_new_sessions_and_invalidated_by_edits(
     .unwrap();
     assert_eq!(
         second
-            .turn("change request routing again", &mut Recorder::default())
+            .turn("summarize request routing again", &mut Recorder::default())
             .unwrap()
             .text,
         "refreshed"
@@ -6479,7 +6497,10 @@ fn interrupt_repairs_all_unanswered_calls_and_resume_keeps_them() {
         ("write", json!({"path":"never.txt","content":"no"})),
         ("read", json!({"path":"a.txt"})),
     ])]);
-    let e = env(&server.url, "auto");
+    let mut e = env(&server.url, "auto");
+    // Per-call interrupt granularity; dependency dispatch would run the independent write in the
+    // first wave, so the interrupt only takes effect at the wave boundary.
+    e.config.experimental.dependency_dispatch = false;
     std::fs::write(e.project.path().join("a.txt"), "hello").unwrap();
     let flag = Arc::new(AtomicBool::new(false));
     let mut a = agent_with(&e, None, flag.clone());
@@ -6656,7 +6677,10 @@ fn steering_between_tools_skips_unstarted_calls_and_keeps_completed_results() {
             json!({"outcome":"blocked","summary":"Stopped after the first file","reason":"What should I do next?"}),
         ),
     ]);
-    let e = env(&server.url, "auto");
+    let mut e = env(&server.url, "auto");
+    // Per-call steering granularity; dependency dispatch would run both disjoint writes in one
+    // wave, so steering only takes effect at the wave boundary.
+    e.config.experimental.dependency_dispatch = false;
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a
         .turn("Create first.txt and stale.txt", &mut SteeringUi::default())
@@ -6994,12 +7018,12 @@ fn user_supplied_external_image_reaches_the_model_with_unknown_capabilities() {
 }
 
 #[test]
-fn loading_browser_exposes_managed_preview_tools_without_starting_a_service() {
+fn explicit_browser_and_process_tools_load_without_starting_a_service() {
     if skip_without_sandbox() {
         return;
     }
     let server = serve(vec![
-        Reply::Call("tool_load", json!({"names":["browser"]})),
+        Reply::Call("tool_load", json!({"names":["browser","bg"]})),
         Reply::Call("bg", json!({"action":"list"})),
         Reply::Call(
             "bg",
@@ -7042,8 +7066,8 @@ fn loading_browser_exposes_managed_preview_tools_without_starting_a_service() {
     );
     let requests = server.requests.lock();
     assert!(
-        tool_names(&requests[0]).contains(&"bg".into()),
-        "process controls are core tools"
+        !tool_names(&requests[0]).contains(&"bg".into()),
+        "process controls load only after explicit browser loading"
     );
     assert!(
         requests[1]["tools"]
@@ -7064,7 +7088,14 @@ fn loading_browser_exposes_managed_preview_tools_without_starting_a_service() {
         "loading browser starts no server"
     );
     assert!(results[2].1.starts_with("ready:"));
-    assert!(results[3].1.contains("killed preview"));
+    assert!(
+        results[3].1.contains("preview:")
+            && results[3]
+                .1
+                .contains("terminal history and output retained"),
+        "{}",
+        results[3].1
+    );
 }
 
 #[test]
@@ -7865,7 +7896,8 @@ fn known_unoffered_tools_load_and_a_valid_call_runs_through_approval_in_the_same
     let mut e = env(&server.url, "ask");
     e.config.integrations = vec!["web_search".into()];
     e.config.sandbox.allow_network = false;
-    e.config.assistance.compact_tools = true;
+    e.config.assistance.compact_tools = false;
+    e.config.assistance.lean_local = dial::config::types::LeanLocal::On;
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     // A research prompt now routes web tools eagerly; keep this test on the deferred path.
@@ -7909,11 +7941,7 @@ fn web_search_is_discoverable_loadable_and_respects_network_restrictions() {
     a.turn("Inspect a deferred integration", &mut ui).unwrap();
     assert_eq!(ui.approvals, ["web_search"]);
     let requests = server.requests.lock();
-    assert!(
-        requests[0]["messages"]
-            .to_string()
-            .contains("For live web research, load web_search and web_fetch first")
-    );
+    assert!(!tool_names(&requests[0]).contains(&"web_search".to_owned()));
     assert!(
         !requests[0]["tools"]
             .to_string()
@@ -7942,7 +7970,7 @@ fn web_search_is_discoverable_loadable_and_respects_network_restrictions() {
 }
 
 #[test]
-fn a_tool_loaded_and_called_in_one_batch_runs_and_invalid_load_names_are_rejected_atomically() {
+fn explicit_loading_affects_the_next_request_and_invalid_names_are_rejected_atomically() {
     let server = serve(vec![
         Reply::Calls(vec![
             ("tool_load", json!({"names":["web_fetch"]})),
@@ -7958,14 +7986,14 @@ fn a_tool_loaded_and_called_in_one_batch_runs_and_invalid_load_names_are_rejecte
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     a.turn("discover specialist tools", &mut Recorder::default())
         .unwrap();
-    // The web_fetch call matched its newly loaded schema, so it is not a contract error.
-    assert_eq!(a.metrics().tool_contract_errors, 0);
+    // Loading takes effect on the next request; the unoffered same-batch call is refused.
+    assert_eq!(a.metrics().tool_contract_errors, 1);
     assert!(a.tool_names().iter().any(|n| n == "web_fetch"));
     assert!(!a.tool_names().iter().any(|n| n == "web_search"));
     assert!(
         server.requests.lock()[1]["messages"]
             .to_string()
-            .contains("network access is disabled")
+            .contains("unknown or unavailable tool: web_fetch")
     );
 }
 
@@ -8839,6 +8867,7 @@ fn live_training_targets_match_actual_requests_across_turns_and_harvest_final_so
         Reply::Text("continued answer"),
     ]);
     let mut e = env(&server.url, "auto");
+    e.config.training.retain_session_requests = true;
     e.config.memory.backend = dial::config::memory_backend::MemoryBackendId::Provenance;
     e.config.training.max_seq_length = 131072;
     std::fs::write(e.project.path().join("facts.txt"), "SQLite evidence").unwrap();
@@ -9070,6 +9099,7 @@ fn repair_hints_ride_with_the_user_turn_so_the_system_prompt_never_changes() {
     let server = serve(vec![
         Reply::Call("read", json!({"path":"notes.txt"})),
         Reply::Text("first"),
+        Reply::Call("read", json!({"path":"notes.txt"})),
         Reply::Text("second"),
     ]);
     let mut e = env(&server.url, "auto");
@@ -9083,7 +9113,7 @@ fn repair_hints_ride_with_the_user_turn_so_the_system_prompt_never_changes() {
     a.turn("Fix the parser and emoji filenames once more", &mut ui)
         .unwrap();
     let requests = server.requests.lock();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     let system = requests[0]["messages"][0]["content"].as_str().unwrap();
     assert!(
         !system.contains("verified repair patterns"),
@@ -10262,9 +10292,9 @@ fn reliability_stops_different_contract_failures_without_executing_them() {
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("Fix a fixture", &mut Recorder::default()).unwrap();
     // Contract failures escalate; the turn is no longer ended for them.
-    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
     assert!(!e.project.path().join("must-not-exist.txt").exists());
-    assert_eq!(server.requests.lock().len(), 4);
+    assert_eq!(server.requests.lock().len(), 5);
     let control = a.session().control_state();
     assert_eq!(control["reliability"]["interface"], "compact single call");
     assert_eq!(control["reliability"]["stats"]["successes"], 0);
@@ -10926,20 +10956,21 @@ fn completion_evidence_keeps_pending_obligations_without_claiming_test_coverage(
             ]}),
         ),
         Reply::Text("The investigation found the owning implementation."),
+        Reply::Text("The investigation found the owning implementation."),
     ]);
     let e = env(&server.url, "auto");
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a
         .turn("Investigate the implementation", &mut Recorder::default())
         .unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Completed);
-    assert!(report.text.contains("progress item(s) remain open"));
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert!(report.text.contains("Execution steps remain open"));
     let control = a.session().control_state();
     let evidence = &control["completion_evidence"];
-    assert_eq!(evidence["execution_outcome"], "completed");
+    assert_eq!(evidence["execution_outcome"], "incomplete");
     assert_eq!(evidence["verification_coverage"], "not_observed");
     assert_eq!(evidence["deliverable_coverage"], "open_obligations");
-    assert_eq!(evidence["outstanding_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(evidence["outstanding_tasks"].as_array().unwrap().len(), 2);
     assert_eq!(control["efficiency"]["completion_evidence"], *evidence);
     assert!(a.turn("", &mut Recorder::default()).is_err());
     assert!(a.session().control_state()["completion_evidence"].is_null());

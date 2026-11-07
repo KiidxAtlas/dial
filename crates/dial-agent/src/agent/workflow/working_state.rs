@@ -22,7 +22,7 @@ const ORIGIN_TRUST: &str = "model_interpretation";
 pub(in crate::agent) const CHECK_REF_PREFIX: &str = "check:";
 
 pub(super) fn schema() -> Value {
-    json!({"type":"function","function":{"name":"working_state","description":"Durable working state that survives compaction: view, update (replace) or patch (needs expected_revision from view; omitted fields kept). Claims are your assertions, not proof or permission; retract or supersede them explicitly. Deliverables are completion obligations: open, in_progress and blocked block completion; satisfied needs evidence_refs, and only check:<name> naming a currently passing check counts as verified. Cancelling, removing or redefining a deliverable waits for user confirmation. Send deliverables with only id, description, status and evidence_refs. Max 32768 bytes.","parameters":{"type":"object","properties":{
+    json!({"type":"function","function":{"name":"working_state","description":"Durable state: view, update (replace), or patch with expected_revision from view (omitted fields kept). Claims are assertions, not proof or permission. Open/in_progress/blocked deliverables prevent completion; satisfied requires evidence_refs, and only check:<name> for a currently passing check verifies it. Cancel/remove/redefine requires user confirmation. Max 32768 bytes.","parameters":{"type":"object","properties":{
         "action":{"type":"string","enum":["view","update","patch"]},
         "expected_revision":{"type":"integer","minimum":0},
         "goal":{"type":"string"},

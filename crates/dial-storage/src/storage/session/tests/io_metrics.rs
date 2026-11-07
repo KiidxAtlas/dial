@@ -25,10 +25,10 @@ fn control_publications_count_attempts_equal_states_and_changes_without_extra_st
         "an equal publication uses the same timing sample as its parent operation"
     );
     assert_eq!(session.control_state()["mode"], "a");
-    assert_ne!(
+    assert_eq!(
         session.memory_revision(),
         previous_revision.as_deref(),
-        "equal-state publications must retain their memory-authority event"
+        "equal-state publications must not create a memory-authority event"
     );
 
     // The changed state still persists and replays after reopen.

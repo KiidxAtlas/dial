@@ -180,7 +180,7 @@ fn cut_with(messages: &[Value], budget: u64, weigh: impl Fn(&Value) -> u64) -> O
 }
 
 /// Use the same image policy for selecting a tail as for validating the candidate request.
-fn cut_with_policy(
+pub(in crate::agent) fn cut_with_policy(
     messages: &[Value],
     budget: u64,
     policy: &CompactionConfig,

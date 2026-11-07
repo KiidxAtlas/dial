@@ -84,3 +84,74 @@ fn out_of_order_same_tool_results_keep_their_own_timing_and_failure() {
         .collect::<Vec<_>>();
     assert_eq!(results, [("slow", 2.0, false), ("fast", 0.25, true)]);
 }
+
+#[test]
+fn delivered_answer_succeeds_without_completed_work_but_not_when_rejected_or_denied() {
+    for (outcome, text, interrupted, denied, error, expected) in [
+        (
+            crate::agent::TurnOutcome::Answered,
+            "reply",
+            false,
+            false,
+            None,
+            0,
+        ),
+        (
+            crate::agent::TurnOutcome::Answered,
+            "",
+            false,
+            false,
+            None,
+            2,
+        ),
+        (
+            crate::agent::TurnOutcome::Answered,
+            "reply",
+            true,
+            false,
+            None,
+            2,
+        ),
+        (
+            crate::agent::TurnOutcome::Answered,
+            "reply",
+            false,
+            true,
+            None,
+            3,
+        ),
+        (
+            crate::agent::TurnOutcome::Answered,
+            "reply",
+            false,
+            false,
+            Some("failed"),
+            1,
+        ),
+        (
+            crate::agent::TurnOutcome::Incomplete,
+            "reply",
+            false,
+            false,
+            None,
+            2,
+        ),
+    ] {
+        let mut ui = PrintUi::new(OutputFormat::Json, vec![]);
+        ui.set_completed(false);
+        ui.denied = denied;
+        let report = crate::agent::TurnReport {
+            outcome,
+            text: text.into(),
+            interrupted,
+            steps: 1,
+            trajectory: None,
+        };
+        assert_eq!(
+            ui.finish(Some(&report), error, None, std::time::Duration::ZERO)
+                .unwrap(),
+            expected,
+            "{outcome:?} text={text:?} interrupted={interrupted} denied={denied} error={error:?}"
+        );
+    }
+}

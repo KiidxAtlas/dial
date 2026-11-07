@@ -527,6 +527,19 @@ impl Tool for ImageGen {
         )
     }
 
+    /// A route that cannot resolve from local state (no key, explicitly disabled, invalid settings)
+    /// is a known blocker; a resolved route is still unverified until the provider answers.
+    fn readiness(&self, config: &Config) -> crate::tools::surface::catalog::Readiness {
+        match resolve(config) {
+            Ok(_) => crate::tools::surface::catalog::Readiness::ApprovalRequired {
+                reason: "image generation is billed by the provider and requires approval".into(),
+            },
+            Err(error) => crate::tools::surface::catalog::Readiness::MissingPrerequisite {
+                reason: format!("no usable image route: {error:#}; run /image to configure one"),
+            },
+        }
+    }
+
     fn needs_approval(&self, _args: &Value) -> bool {
         true
     }

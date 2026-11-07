@@ -4,6 +4,80 @@ use super::*;
 
 const READS: usize = 8;
 
+fn mutation_turn(grouped: bool) -> (Duration, Value) {
+    let calls = (0..READS)
+        .map(|index| {
+            (
+                "write",
+                json!({"path":format!("output-{index}.txt"),"content":format!("result-{index}\n")}),
+            )
+        })
+        .collect();
+    let server = serve(vec![Reply::Calls(calls), Reply::Text("Done.")]);
+    let mut e = env(&server.url, "auto");
+    e.config.experimental.dependency_dispatch = grouped;
+    e.config.task.max_concurrency = 4;
+    e.config.verification.enabled = false;
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let started = Instant::now();
+    let report = agent
+        .turn("Create the independent output files.", &mut ui)
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(
+        server.requests.lock().len(),
+        2,
+        "identical model round trips in both modes"
+    );
+    assert_eq!(
+        ui.results
+            .iter()
+            .filter(|(name, _, _)| name == "write")
+            .count(),
+        READS
+    );
+    for index in 0..READS {
+        assert_eq!(
+            std::fs::read_to_string(e.project.path().join(format!("output-{index}.txt"))).unwrap(),
+            format!("result-{index}\n")
+        );
+    }
+    let metrics = agent.efficiency_report()["scheduling"].clone();
+    if grouped {
+        assert_eq!(metrics["groups"]["native"]["calls"], READS);
+        assert_eq!(metrics["groups"]["native"]["sizes"]["4"], 2);
+    } else {
+        assert!(metrics["groups"]["native"].is_null());
+    }
+    (elapsed, metrics)
+}
+
+#[test]
+fn serial_and_grouped_native_mutations_preserve_all_outputs_with_the_same_round_trips() {
+    mutation_turn(false);
+    mutation_turn(true);
+}
+
+#[test]
+#[ignore = "opt-in actual local write timing; no CI speed threshold"]
+fn measure_serial_vs_grouped_native_mutations() {
+    for sample in 0..5 {
+        for grouped in if sample % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let (elapsed, metrics) = mutation_turn(grouped);
+            eprintln!(
+                "local scripted-provider actual native-write turn: sample={sample} grouped={grouped} files={READS} requests=2 elapsed_ms={:.3} scheduling={metrics}",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
+
 fn read_turn(batched: bool) -> (Duration, usize) {
     let calls: Vec<_> = (0..READS)
         .map(|i| ("read", json!({"path":format!("input-{i}.txt")})))

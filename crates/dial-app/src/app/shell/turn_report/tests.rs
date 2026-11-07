@@ -13,8 +13,10 @@ fn line<'a>(text: &'a str, prefix: &str) -> &'a str {
 
 #[test]
 fn plain_answer_has_no_report() {
-    let summary = json!({"outcome": "completed", "changed_files": [], "recorded_checks": [], "open_tasks": 0});
-    assert_eq!(render(&summary, &no_timing()), None);
+    for outcome in ["completed", "answered"] {
+        let summary = json!({"outcome": outcome, "changed_files": [], "recorded_checks": [], "open_tasks": 0});
+        assert_eq!(render(&summary, &no_timing()), None);
+    }
 }
 
 #[test]
@@ -38,10 +40,10 @@ fn completed_edit_is_short_and_omits_empty_sections() {
         text,
         "Outcome: completed\n\
          Changed: src/a.rs\n\
-         Checks: cargo test passed\n\
+         Checks: current · passed — cargo test passed\n\
          Evidence: no retained log for cargo test\n\
-         Next: /review · /undo\n\
-         Summary: 1 file changed · checks passed"
+         Next: /review-file · /undo (checkpointed edits only)\n\
+         Summary: 1 file changed · checks passed (current)"
     );
 }
 
@@ -103,7 +105,7 @@ fn stale_checks_and_long_file_lists_are_marked() {
     assert!(line(&text, "Changed:").ends_with("f7.rs +2 more"), "{text}");
     assert_eq!(
         line(&text, "Checks:"),
-        "Checks: lint passed — stale: predates the final edits"
+        "Checks: stale · passed — lint passed"
     );
     assert_eq!(
         line(&text, "Summary:"),
@@ -188,15 +190,15 @@ fn next_steps_follow_turn_outcome_without_suggesting_unavailable_undo() {
     for (summary, expected) in [
         (
             json!({"outcome":"completed", "changed_files":["a.rs"]}),
-            "Next: /review · /undo",
+            "Next: /review-file · /undo (checkpointed edits only)",
         ),
         (
             json!({"outcome":"failed", "changed_files":["a.rs"]}),
-            "Next: continue · /undo",
+            "Next: send a follow-up message · /review-file · /undo (checkpointed edits only)",
         ),
         (
             json!({"outcome":"failed", "changed_files":[]}),
-            "Next: continue",
+            "Next: send a follow-up message to continue",
         ),
     ] {
         let report = render(&summary, &no_timing()).unwrap();
@@ -215,10 +217,182 @@ fn check_evidence_and_reuse_are_disclosed() {
     let report = render(&summary, &no_timing()).unwrap();
     assert_eq!(
         line(&report, "Checks:"),
-        "Checks: test passed (reused), lint passed"
+        "Checks: current · passed — test passed (reused), lint passed"
     );
     assert_eq!(
         line(&report, "Evidence:"),
         "Evidence: /evidence check test · no retained log for lint"
     );
+}
+
+#[test]
+fn transcript_handoff_reuses_recorded_results_without_promoting_freshness() {
+    for (freshness, status, expected) in [
+        (json!(true), "passed", "current · passed — test passed"),
+        (json!(true), "failed", "current · failed — test failed"),
+        (json!(false), "passed", "stale · passed — test passed"),
+        (
+            Value::Null,
+            "passed",
+            "freshness unknown · passed — test passed",
+        ),
+        (
+            json!(true),
+            "skipped",
+            "current · unverified — test skipped",
+        ),
+    ] {
+        let summary = json!({"outcome":"completed", "changed_files":["src/a.rs"],
+            "checks_current":freshness, "recorded_checks":[{"name":"test", "status":status}]});
+        let outcome = super::outcome(&summary, &Value::Null);
+        let handoff = outcome.handoff.join("\n");
+        assert!(handoff.contains(expected), "{handoff}");
+        assert!(handoff.contains("src/a.rs"), "{handoff}");
+        assert!(!handoff.contains("rerun"), "{handoff}");
+    }
+}
+
+#[test]
+fn blocked_handoff_names_specific_recorded_obligations_and_effect_limits() {
+    let summary = json!({"outcome":"incomplete", "changed_files":["src/a.rs"], "open_tasks":1,
+    "uncheckpointed_shell_commands":1, "evidence":{
+        "deliverable_coverage":"open_obligations",
+        "outstanding_tasks":[{"content":"Publish package", "status":"blocked", "note":"Signing identity unavailable"}],
+        "outstanding_deliverables":[{"description":"Release artifact", "status":"open"}]
+    }});
+    let handoff = super::outcome(&summary, &Value::Null).handoff.join("\n");
+    for expected in [
+        "Publish package (blocked)",
+        "Signing identity unavailable",
+        "Release artifact (open)",
+        "Checks: none recorded",
+        "Outside /undo: 1 shell command",
+        "checkpointed edits only",
+        "follow-up message",
+    ] {
+        assert!(handoff.contains(expected), "missing {expected}: {handoff}");
+    }
+    assert!(!handoff.contains("running"), "{handoff}");
+}
+
+#[test]
+fn completion_without_edits_is_quiet_unless_obligations_remain() {
+    let mut summary = json!({"outcome":"completed", "changed_files":[], "open_tasks":0});
+    assert!(super::outcome(&summary, &Value::Null).handoff.is_empty());
+    summary["evidence"] = json!({"deliverable_coverage":"open_obligations"});
+    let handoff = super::outcome(&summary, &Value::Null).handoff.join("\n");
+    assert!(handoff.contains("recorded open obligations"), "{handoff}");
+    assert!(!handoff.contains("/undo"), "{handoff}");
+}
+
+#[test]
+fn answered_handoff_retains_open_work_and_effect_warnings() {
+    for extra in [
+        json!({"open_tasks":2}),
+        json!({"evidence":{"deliverable_coverage":"open_obligations"}}),
+        json!({"uncheckpointed_shell_commands":1}),
+        json!({"changed_files":["src/a.rs"]}),
+    ] {
+        let mut summary = json!({"outcome":"answered", "changed_files":[], "open_tasks":0});
+        summary
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let rendered = render(&summary, &Value::Null).expect("open work stays visible");
+        assert_eq!(line(&rendered, "Outcome:"), "Outcome: answered");
+        assert!(!line(&rendered, "Summary:").contains("answered"));
+        let outcome = super::outcome(&summary, &Value::Null);
+        assert_eq!(outcome.status, "answered");
+        assert_eq!(
+            outcome.open_tasks,
+            summary["open_tasks"].as_u64().unwrap() as usize
+        );
+        let handoff = outcome.handoff.join("\n");
+        if summary["open_tasks"] == 2 {
+            assert!(handoff.contains("Open tasks: 2"));
+        } else if summary["evidence"].is_object() {
+            assert!(handoff.contains("recorded open obligations"));
+        } else if summary["uncheckpointed_shell_commands"] == 1 {
+            assert!(handoff.contains("Outside /undo: 1 shell command"));
+        } else {
+            assert!(handoff.contains("src/a.rs"));
+        }
+    }
+}
+
+#[test]
+fn handoff_sanitizes_redacts_and_bounds_recorded_labels() {
+    let summary = json!({"outcome":"interrupted", "changed_files":["src/\u{1b}[31ma.rs\nINJECTED"],
+        "evidence":{"outstanding_tasks":[{"content":"x".repeat(1000), "status":"blocked", "note":"Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345"}]}});
+    let outcome = super::outcome(&summary, &Value::Null);
+    let handoff = outcome.handoff.join("\n");
+    assert!(!handoff.contains('\u{1b}'), "{handoff}");
+    assert!(
+        !handoff.contains("abcdefghijklmnopqrstuvwxyz012345"),
+        "{handoff}"
+    );
+    assert!(!handoff.contains(&"x".repeat(241)), "{handoff}");
+    assert!(outcome.handoff.iter().all(|line| !line.contains('\n')));
+    assert!(handoff.contains("follow-up message"), "{handoff}");
+}
+
+#[test]
+fn completed_shell_effect_is_not_hidden_as_a_plain_answer() {
+    let summary = json!({"outcome":"completed", "changed_files":[], "open_tasks":0,
+        "uncheckpointed_shell_commands":1});
+    let handoff = super::outcome(&summary, &Value::Null).handoff.join("\n");
+    assert!(
+        handoff.contains("Outside /undo: 1 shell command"),
+        "{handoff}"
+    );
+    assert!(
+        handoff.contains("inspect shell/extension effects"),
+        "{handoff}"
+    );
+    assert!(!handoff.contains("checkpointed edits only"), "{handoff}");
+}
+
+#[test]
+fn many_obligations_keep_next_action_and_a_pointer_to_omitted_evidence() {
+    let tasks: Vec<_> = (0..20)
+        .map(|i| json!({"content":format!("Task {i}"), "status":"pending"}))
+        .collect();
+    let summary = json!({"outcome":"incomplete", "changed_files":["src/a.rs"], "open_tasks":20,
+        "uncheckpointed_shell_commands":1, "checks_current":false,
+        "recorded_checks":[{"name":"test", "status":"failed", "evidence_ref":"artifact://test"}],
+        "evidence":{"outstanding_tasks":tasks}});
+    let outcome = super::outcome(&summary, &Value::Null);
+    assert_eq!(outcome.handoff.len(), 10);
+    assert!(outcome.handoff.last().unwrap().starts_with("Next:"));
+    let handoff = outcome.handoff.join("\n");
+    assert!(handoff.contains("+17 more; /evidence"), "{handoff}");
+    assert!(handoff.contains("Checks: stale · failed"), "{handoff}");
+}
+
+#[test]
+fn measured_latency_refresh_keeps_a_single_handoff_with_next_action_last() {
+    let summary = json!({"outcome":"completed", "changed_files":["src/a.rs"]});
+    let initial = super::outcome(&summary, &Value::Null);
+    assert!(
+        !initial
+            .handoff
+            .iter()
+            .any(|line| line.starts_with("Timing:"))
+    );
+    let refreshed = super::outcome(&summary, &json!({"requests":2,"generation_ms":1500}));
+    assert_eq!(
+        refreshed
+            .handoff
+            .iter()
+            .filter(|line| line.starts_with("Timing:"))
+            .count(),
+        1
+    );
+    assert!(
+        refreshed
+            .handoff
+            .iter()
+            .any(|line| line.contains("generation 1.5 s over 2 requests"))
+    );
+    assert!(refreshed.handoff.last().unwrap().starts_with("Next:"));
 }

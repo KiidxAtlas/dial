@@ -69,11 +69,25 @@ pub fn approve(config: &Config, store: &Store, session: &Session) -> Result<Sess
         // Compatibility for sessions recorded by the pre-snapshot local teaching path.
         return store.approve_session(session.id());
     }
+    let mut tool_sets = serde_json::Map::new();
+    for (_, record) in session.custom_records("training_tool_sets") {
+        let sets = record["tool_sets"]
+            .as_object()
+            .context("invalid retained session schema table")?;
+        for (key, tools) in sets {
+            if let Some(previous) = tool_sets.insert(key.clone(), tools.clone()) {
+                ensure!(
+                    previous == *tools,
+                    "conflicting retained session schema identity"
+                );
+            }
+        }
+    }
     let mut report = SessionApproval::default();
     let mut examples = Vec::new();
     for (_, record) in records {
-        let example: SessionTrainingExample =
-            serde_json::from_value(record).context("invalid retained session training snapshot")?;
+        let example = SessionTrainingExample::from_retained_with_tools(record, &tool_sets)
+            .context("invalid retained session training snapshot")?;
         if source_approved(config, &example)? {
             examples.push(example);
         } else {

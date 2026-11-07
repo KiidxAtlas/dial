@@ -256,11 +256,11 @@ fn advisor_goal_review_falls_back_to_legacy_instruction_and_shows_original_plus_
 }
 
 #[test]
-fn unset_completion_review_uses_in_context_fallback_without_remote_disclosure() {
+fn unset_completion_review_requires_a_permitted_coach_route() {
     const LOCAL_COACH: &str = "[model_roles.coach]\nprovider='endpoint'\nmodel='coach'\nbase_url='http://127.0.0.1:9/v1'\n";
     const REMOTE_COACH: &str = "[model_roles.coach]\nprovider='endpoint'\nmodel='coach'\nbase_url='https://coach.example.com/v1'\n";
     with_agent("", |agent| {
-        assert!(agent.completion_review_enabled());
+        assert!(!agent.completion_review_enabled());
         assert!(!solve::coach_route_allowed(&agent.auth_config));
     });
     with_agent(LOCAL_COACH, |agent| {
@@ -268,7 +268,7 @@ fn unset_completion_review_uses_in_context_fallback_without_remote_disclosure() 
         assert!(solve::coach_route_allowed(&agent.auth_config));
     });
     with_agent(REMOTE_COACH, |agent| {
-        assert!(agent.completion_review_enabled());
+        assert!(!agent.completion_review_enabled());
         assert!(!solve::coach_route_allowed(&agent.auth_config));
     });
     with_agent(
@@ -300,30 +300,16 @@ fn completion_review_receives_reconciliation_without_promoting_claims() {
 }
 
 #[test]
-fn in_context_reconciliation_is_bounded_guidance_not_a_verification_result() {
-    let state = CoachTurn::default();
-    let question = state.question(
-        "write result.csv",
-        "Done",
-        &json!({"semantic_coverage":"unassessed"}),
-    );
-    let message = state.reconcile(&question, &json!({"semantic_coverage":"unassessed"}));
-    assert_eq!(message["dial_transient"], true);
-    assert_eq!(message["dial_guidance"], "review");
-    let content = message["content"].as_str().unwrap();
-    assert!(content.contains("write result.csv"));
-    assert!(content.contains("unassessed"));
-    assert!(content.contains("not independent verification"));
-    assert!(state.completion_note().is_empty());
-}
-
-#[test]
-fn in_context_review_spends_instruction_allowance_without_calling_a_coach() {
+fn default_completion_review_never_starts_an_independent_self_review() {
     with_agent("", |agent| {
-        let mut control = agent.session.control_state();
-        control["current_instruction_entry_id"] = json!("first");
-        agent.session.set_control_state(control).unwrap();
         agent.step_checks.uncheckpointed_shell_commands = 1;
+        agent.step_checks.evidence.observe(
+            "validate-artifact",
+            "observed-check",
+            crate::agent::verify::verification::CheckStatus::CodeFailed,
+            agent.step_checks.revision(),
+            false,
+        );
         let mut backend = crate::llm::provider::Backend::new(
             crate::llm::provider::ProviderKind::Endpoint {
                 base_url: "http://127.0.0.1:9/v1".into(),
@@ -333,255 +319,26 @@ fn in_context_review_spends_instruction_allowance_without_calling_a_coach() {
             std::path::PathBuf::new(),
             5,
         );
+        let before = agent.completion_evidence(crate::agent::TurnOutcome::Completed);
         let mut state = CoachTurn::default();
-        let call = |agent: &mut Agent<'_>,
-                    state: &mut CoachTurn,
-                    backend: &mut crate::llm::provider::Backend| {
+        assert!(
             agent
                 .coach_completion(
-                    state,
-                    backend,
+                    &mut state,
+                    &mut backend,
                     "write result.csv",
                     "Done",
                     0,
-                    &mut crate::agent::NullUi,
+                    &mut crate::agent::NullUi
                 )
                 .unwrap()
-        };
-        assert!(
-            call(agent, &mut state, &mut backend).is_none(),
-            "opaque effects without a concrete gap do not add a completion-only self-review"
+                .is_none()
         );
         assert_eq!(state.reviews, 0);
-        agent.step_checks.evidence.observe(
-            "validate-artifact",
-            "observed-check",
-            crate::agent::verify::verification::CheckStatus::CodeFailed,
-            agent.step_checks.revision(),
-            false,
-        );
-        let before = agent.completion_evidence(crate::agent::TurnOutcome::Completed);
-        // The shared owner must not request a continuation after either caller hits its deadline.
-        agent.modes.launch.deadline = Some(std::time::Instant::now());
-        assert!(call(agent, &mut state, &mut backend).is_none());
-        assert_eq!(state.reviews, 0);
-        agent.modes.launch.deadline = None;
-        assert!(
-            !agent.advisor_enabled(),
-            "automatic reconciliation is not live advisor mode"
-        );
-        assert!(call(agent, &mut state, &mut backend).is_some());
-        assert_eq!(
-            agent.completion_evidence(crate::agent::TurnOutcome::Completed),
-            before,
-            "self-review must not create passing evidence"
-        );
-        let refreshes =
-            agent.efficiency_metrics.backend_operations.borrow()["check_input_refresh"].calls;
-        assert!(call(agent, &mut state, &mut backend).is_none());
-        assert!(call(agent, &mut CoachTurn::default(), &mut backend).is_none());
-        assert_eq!(
-            agent.efficiency_metrics.backend_operations.borrow()["check_input_refresh"].calls,
-            refreshes,
-            "spent completion allowance must not refresh inputs again"
-        );
-        let mut control = agent.session.control_state();
-        control["current_instruction_entry_id"] = json!("second");
-        agent.session.set_control_state(control).unwrap();
-        assert!(call(agent, &mut state, &mut backend).is_some());
-    });
-}
-
-#[test]
-fn early_reconciliation_is_effect_scoped_and_survives_fresh_inner_loops() {
-    with_agent("", |agent| {
-        let mut control = agent.session.control_state();
-        control["current_instruction_entry_id"] = json!("first");
-        agent.session.set_control_state(control).unwrap();
-        let mut state = CoachTurn::default();
-        assert!(
-            agent
-                .prepare_completion_reconciliation(&mut state, 0)
-                .unwrap()
-                .is_none()
-        );
-        // Exploration through an opaque shell pipeline is not a delivered artifact yet.
-        agent.step_checks.uncheckpointed_shell_commands = 1;
-        assert!(
-            agent
-                .prepare_completion_reconciliation(&mut state, 0)
-                .unwrap()
-                .is_none()
-        );
-        agent.step_checks.mutations = 1;
-        let before = agent.completion_evidence(crate::agent::TurnOutcome::Completed);
-        agent.modes.launch.deadline = Some(std::time::Instant::now());
-        assert!(
-            agent
-                .prepare_completion_reconciliation(&mut state, 0)
-                .unwrap()
-                .is_none()
-        );
-        agent.modes.launch.deadline = None;
-        let note = agent
-            .prepare_completion_reconciliation(&mut state, 0)
-            .unwrap()
-            .unwrap();
-        assert_eq!(note["dial_transient"], true);
         assert_eq!(
             agent.completion_evidence(crate::agent::TurnOutcome::Completed),
             before
         );
-        let refreshes =
-            agent.efficiency_metrics.backend_operations.borrow()["check_input_refresh"].calls;
-        assert!(
-            agent
-                .prepare_completion_reconciliation(&mut state, 1)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            agent
-                .prepare_completion_reconciliation(&mut CoachTurn::default(), 1)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            agent.efficiency_metrics.backend_operations.borrow()["check_input_refresh"].calls,
-            refreshes,
-            "spent early allowance must not refresh inputs again"
-        );
-        let mut control = agent.session.control_state();
-        control["current_instruction_entry_id"] = json!("second");
-        agent.session.set_control_state(control).unwrap();
-        assert!(
-            agent
-                .prepare_completion_reconciliation(&mut state, 2)
-                .unwrap()
-                .is_some()
-        );
+        assert!(agent.session.control_state()["completion_review"].is_null());
     });
-}
-
-#[test]
-fn early_reconciliation_respects_opt_out_modes_and_coach_selection() {
-    for overlay in [
-        "[verification.review]\nenabled=false",
-        "[verification.review]\nenabled=true",
-        "[model_roles.coach]\nprovider='endpoint'\nmodel='coach'\nbase_url='http://127.0.0.1:9/v1'",
-    ] {
-        with_agent(overlay, |agent| {
-            agent.step_checks.mutations = 1;
-            assert!(
-                agent
-                    .prepare_completion_reconciliation(&mut CoachTurn::default(), 0)
-                    .unwrap()
-                    .is_none()
-            );
-        });
-    }
-    with_agent("", |agent| {
-        agent.step_checks.mutations = 1;
-        for mode in 0..3 {
-            agent.hermetic = mode == 0;
-            agent.plan_mode = mode == 1;
-            agent.modes.launch.advisor = mode == 2;
-            assert!(
-                agent
-                    .prepare_completion_reconciliation(&mut CoachTurn::default(), 0)
-                    .unwrap()
-                    .is_none()
-            );
-        }
-    });
-}
-
-#[test]
-fn early_reconciliation_fires_for_shell_written_artifacts_and_carries_small_content() {
-    with_agent("", |agent| {
-        let root = agent.workspace.root().to_path_buf();
-        std::fs::write(root.join("old.txt"), "before the turn").unwrap();
-        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(root.join("old.txt"))
-            .unwrap()
-            .set_modified(past)
-            .unwrap();
-        agent.step_checks.started =
-            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60));
-        // Written without any redirection, as a script's `open()` would.
-        std::fs::write(root.join("summary.csv"), "period,count\ntoday,3\n").unwrap();
-        std::fs::write(
-            root.join("big.bin"),
-            vec![b'x'; MAX_SHOWN_ARTIFACT_BYTES + 1],
-        )
-        .unwrap();
-        agent.step_checks.uncheckpointed_shell_commands = 1;
-        let note = agent
-            .prepare_completion_reconciliation(&mut CoachTurn::default(), 0)
-            .unwrap()
-            .unwrap();
-        let content = note["content"].as_str().unwrap();
-        assert!(content.starts_with(crate::agent::prompts::modes::advisor::RECONCILE));
-        assert!(content.contains("Current content of summary.csv"));
-        assert!(content.contains("today,3"));
-        assert!(
-            !content.contains("big.bin"),
-            "oversized files stay with normal tools"
-        );
-        assert!(
-            !content.contains("old.txt"),
-            "files untouched this turn are not artifacts"
-        );
-    });
-}
-
-#[test]
-fn early_reconciliation_reuses_current_requirement_evidence_but_names_stale_gaps() {
-    with_agent(
-        "[[verification.commands]]\nname='artifact'\ncommand='validate-artifact'\n\
-         [verification.requirements.saved-artifact]\nchecks=['artifact']",
-        |agent| {
-            agent.step_checks.mutations = 1;
-            agent.step_checks.evidence.observe(
-                "validate-artifact",
-                "observed-check",
-                crate::agent::verify::verification::CheckStatus::Passed,
-                agent.step_checks.revision(),
-                false,
-            );
-            let mut state = CoachTurn::default();
-            let before = agent.completion_evidence(crate::agent::TurnOutcome::Completed);
-            assert_eq!(
-                before["requirements"]["coverage"],
-                "declared_requirements_observed"
-            );
-            assert!(
-                agent
-                    .prepare_completion_reconciliation(&mut state, 0)
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(state.reviews, 0, "reuse is not a new review or check run");
-            assert_eq!(
-                agent.completion_evidence(crate::agent::TurnOutcome::Completed),
-                before
-            );
-            agent.step_checks.mutations += 1;
-            let note = agent
-                .prepare_completion_reconciliation(&mut state, 1)
-                .unwrap()
-                .unwrap();
-            let content = note["content"].as_str().unwrap();
-            assert!(content.contains("saved-artifact"));
-            assert!(content.contains("uncovered"));
-            assert!(content.contains("stale"));
-            assert_eq!(
-                agent.completion_evidence(crate::agent::TurnOutcome::Completed)["requirements"]["observed"],
-                0,
-                "a review request cannot refresh check evidence"
-            );
-        },
-    );
 }

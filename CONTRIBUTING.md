@@ -13,6 +13,10 @@ design and [`AGENTS.md`](AGENTS.md) lists the rules the build enforces.
 
 `make build` builds the binary; `make update` installs your checkout's build as the active `dial`.
 
+To add a built-in tool, implement `tools::ext::Tool` in its own module, return it from a `tools()`
+constructor, and list it in `Registry::standard`. Crate layout and module ownership are in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ## Before opening a pull request
 
 ```sh

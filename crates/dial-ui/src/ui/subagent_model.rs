@@ -46,6 +46,8 @@ pub enum AgentStatus {
     /// Blocked on an approval or a question.
     Waiting,
     Done,
+    /// A reply was delivered without claiming completed work.
+    Answered,
     Failed,
     Cancelled,
     /// Work ended without an explicit cancellation receipt.
@@ -58,6 +60,7 @@ impl AgentStatus {
             Self::Running => "running",
             Self::Waiting => "waiting",
             Self::Done => "completed",
+            Self::Answered => "answered",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Interrupted => "interrupted",
@@ -67,7 +70,7 @@ impl AgentStatus {
     pub fn is_finished(self) -> bool {
         matches!(
             self,
-            Self::Done | Self::Failed | Self::Cancelled | Self::Interrupted
+            Self::Done | Self::Answered | Self::Failed | Self::Cancelled | Self::Interrupted
         )
     }
 
@@ -78,7 +81,7 @@ impl AgentStatus {
             Self::Waiting => 0,
             Self::Failed | Self::Interrupted => 1,
             Self::Running => 2,
-            Self::Done => 3,
+            Self::Done | Self::Answered => 3,
             Self::Cancelled => 4,
         }
     }
@@ -98,6 +101,7 @@ impl AgentStatus {
             Phase::Running => Self::Running,
             Phase::Blocked | Phase::NeedsInput => Self::Waiting,
             Phase::Completed => Self::Done,
+            Phase::Answered => Self::Answered,
             Phase::Failed | Phase::Incomplete => Self::Failed,
             Phase::Interrupted => Self::Interrupted,
         }

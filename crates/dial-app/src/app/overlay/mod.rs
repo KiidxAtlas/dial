@@ -17,6 +17,7 @@ use std::time::Instant;
 pub(in crate::app) mod activity;
 pub(in crate::app) mod apply;
 pub(in crate::app) mod auth;
+pub(in crate::app) mod backup;
 pub(in crate::app) mod compute;
 pub(in crate::app) mod env;
 pub(in crate::app) mod run;
@@ -58,6 +59,8 @@ pub(super) enum Which {
     SettingsAt(String),
     ImageSettings,
     ContextDefaults,
+    BackupModels,
+    HistorySearch(crate::ui::overlay::history_search::HistorySearchOverlay),
     Models,
     ModelRoles,
     ModelRole(String),
@@ -116,6 +119,7 @@ pub(super) fn overlay_destination(action: &str) -> Option<Which> {
         "open:providers" => Some(Which::Providers),
         "open:settings" => Some(Which::Settings),
         "open:model-settings" => Some(Which::ModelSettings),
+        "open:backup-models" => Some(Which::BackupModels),
         "open:context-defaults" => Some(Which::ContextDefaults),
         "open:shortcuts" => Some(Which::Shortcuts),
         "open:compute" => Some(Which::Compute),
@@ -170,6 +174,8 @@ pub(super) enum ActiveOverlay {
     Stats(Box<crate::ui::overlay::stats::StatsOverlay>),
     Settings(Box<SettingsOverlay>),
     ModelSettings(Box<crate::ui::overlay::model_settings::ModelSettingsOverlay>),
+    BackupModels(Box<backup::BackupOverlay>),
+    HistorySearch(Box<crate::ui::overlay::history_search::HistorySearchOverlay>),
     ImageSettings(Box<crate::ui::overlay::image_settings::ImageSettingsOverlay>),
     Models(Box<ModelOverlay>),
     Providers(ProviderOverlay),
@@ -206,6 +212,8 @@ impl ActiveOverlay {
             Self::Palette(o) => o.draw(frame, ctx),
             Self::Settings(o) => o.draw(frame, ctx),
             Self::ModelSettings(o) => o.draw(frame, ctx),
+            Self::BackupModels(o) => o.draw(frame, ctx),
+            Self::HistorySearch(o) => o.draw(frame, ctx),
             Self::ImageSettings(o) => o.draw(frame, ctx),
             Self::Compute(o) => o.draw(frame, ctx),
             Self::Improve(o) => o.draw(frame, ctx),
@@ -244,6 +252,8 @@ impl ActiveOverlay {
             Self::Palette(o) => o.handle(event, keys),
             Self::Settings(o) => o.handle(event, keys),
             Self::ModelSettings(o) => o.event(event, keys),
+            Self::BackupModels(o) => o.handle(event, keys),
+            Self::HistorySearch(o) => o.handle(event, keys),
             Self::ImageSettings(o) => o.event(event, keys),
             Self::Compute(o) => o.handle(event, keys),
             Self::Improve(o) => o.handle(event, keys),
@@ -302,13 +312,18 @@ impl ActiveOverlay {
             Self::Extensions(o) => o.banner(message, is_error),
             Self::Providers(o) => o.set_status(message, is_error),
             Self::ModelSettings(o) => o.banner(message, is_error),
+            Self::BackupModels(o) => o.banner(message, is_error),
             Self::ImageSettings(o) => o.banner(message, is_error),
             Self::Subagents(o) => o.banner(message, is_error),
             Self::SubagentViewer(o) => o.set_notice(message),
             Self::Jobs(o) => o.banner(message, is_error),
             Self::Peers(o) => o.banner(message, is_error),
             Self::Settings(o) => o.banner(message, is_error),
-            Self::Palette(_) | Self::Shortcuts(_) | Self::Git(_) | Self::Stats(_) => {}
+            Self::Palette(_)
+            | Self::Shortcuts(_)
+            | Self::Git(_)
+            | Self::Stats(_)
+            | Self::HistorySearch(_) => {}
         }
     }
 }

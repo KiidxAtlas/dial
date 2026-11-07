@@ -551,7 +551,7 @@ impl ArtifactSpool {
     pub fn finish(mut self) -> Result<String> {
         self.close_tail()?;
         self.file.flush()?;
-        self.file.sync_all()?;
+        crate::platform::fs::sync_file(&self.file)?;
         let id = format!("{:x}", self.hash.clone().finalize());
         let destination = self.root.join(&id);
         // hard_link is create-only: existing content-addressed blobs are never rewritten.

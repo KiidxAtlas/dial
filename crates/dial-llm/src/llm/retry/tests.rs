@@ -15,6 +15,31 @@ fn policy() -> Policy {
 }
 
 #[test]
+fn elapsed_retry_budget_is_shared_by_all_attempts_and_can_be_disabled() {
+    let policy = policy();
+    assert_eq!(
+        policy.remaining(Duration::from_secs(0)),
+        Some(Duration::from_secs(60))
+    );
+    assert_eq!(
+        policy.remaining(Duration::from_secs(59)),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        policy.remaining(Duration::from_secs(61)),
+        Some(Duration::ZERO)
+    );
+    let unlimited = crate::config::types::RetryConfig {
+        max_elapsed_secs: 0,
+        ..Default::default()
+    };
+    assert_eq!(
+        Policy::new(&unlimited, Duration::ZERO).remaining(Duration::MAX),
+        None
+    );
+}
+
+#[test]
 fn explicit_delay_headers_are_parsed() {
     let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
     for (header, value, expected) in [

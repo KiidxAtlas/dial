@@ -76,6 +76,24 @@ impl Shell {
             self.queue_command(&text);
             return false;
         }
+        if name == "attachments" {
+            self.attachments_command(args);
+            return false;
+        }
+        if name == "draft" {
+            self.draft_command(app, args);
+            return false;
+        }
+        if name == "search" && args == "results" {
+            if let Some(panel) = self.take_search_panel() {
+                if let Err(error) = self.start_busy_overlay(app, Which::HistorySearch(panel)) {
+                    self.note("Search", format!("{error:#}"));
+                }
+            } else {
+                self.note("Search", "No ready matches. Run /search <query> first.");
+            }
+            return false;
+        }
         if policy == DuringTurn::Unavailable {
             self.note("Model", "Finish or cancel the current turn before restarting its managed model. No server was stopped.");
             return false;
@@ -262,8 +280,8 @@ impl Shell {
                 self.note(
                     "Context",
                     format!(
-                        "last prompt: {used} tokens (window {})",
-                        self.status.context_window
+                        "Last sent request estimate: {used} tokens (window {}). Estimated next request unavailable while a turn is running. {} queued messages and the current draft remain pending; use /context after the turn for a fresh selected-model budget, reserve and compaction recommendation.",
+                        self.status.context_window, self.composer.queued_messages().len()
                     ),
                 );
             }

@@ -134,3 +134,43 @@ fn live_run_capacity_and_publication_failure_are_explicit() {
     fs::create_dir(&next.path).unwrap();
     assert!(next.append(b"must not silently lose output").is_err());
 }
+
+#[test]
+fn buffered_output_is_published_once_due_and_completion_publishes_the_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(&dir);
+    let mut capture = Capture::start(&layout, "web").unwrap();
+    let mut reader = Reader::attach(&layout, "web").unwrap();
+    // Deterministic clock: a publication "in the future" is never due, one interval ago is.
+    capture.published = Instant::now() + Duration::from_secs(3600);
+    capture.append_buffered(b"first ").unwrap();
+    capture.append_buffered(b"second").unwrap();
+    capture.publish_due().unwrap();
+    assert_eq!(reader.poll(100).unwrap(), (Vec::new(), false));
+    capture.published = Instant::now() - PUBLISH_INTERVAL;
+    capture.publish_due().unwrap();
+    assert_eq!(reader.poll(100).unwrap(), (b"first second".to_vec(), false));
+    capture.published = Instant::now() + Duration::from_secs(3600);
+    capture.append_buffered(b" tail").unwrap();
+    capture.finish(None).unwrap();
+    assert_eq!(reader.poll(100).unwrap(), (b" tail".to_vec(), true));
+    let saved = String::from_utf8(fs::read(&capture.path).unwrap()).unwrap();
+    assert!(
+        saved.contains(r#""bytes":"Zmlyc3Qgc2Vjb25kIHRhaWw=""#),
+        "{saved}"
+    );
+}
+
+#[test]
+fn version_one_snapshots_with_numeric_bytes_still_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(&dir);
+    let capture = Capture::start(&layout, "web").unwrap();
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&fs::read(&capture.path).unwrap()).unwrap();
+    legacy["version"] = 1.into();
+    legacy["total"] = 2.into();
+    legacy["bytes"] = serde_json::json!([104, 105]);
+    atomic::write_private(&capture.path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert_eq!(read(&capture.path).unwrap().bytes, b"hi");
+}

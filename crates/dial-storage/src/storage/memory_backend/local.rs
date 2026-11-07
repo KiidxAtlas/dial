@@ -120,6 +120,11 @@ pub fn open(layout: &Layout, config: &LocalConfig) -> Result<Box<dyn Driver>> {
     }))
 }
 impl Local {
+    fn consolidation_rows(&self) -> Result<Vec<(String, String, String)>> {
+        Ok(self.db.prepare("SELECT id,raw,summary FROM threads WHERE raw!='' AND summary!='' AND processed_digest=digest ORDER BY updated DESC LIMIT ?1")?
+            .query_map([self.config.max_raw_memories as i64], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
     fn upsert(&self, session: &str, branch: &str, updated: i64, messages: &[Value]) -> Result<()> {
         let items: Vec<Value> = messages
             .iter()
@@ -303,7 +308,7 @@ impl Local {
         force: bool,
     ) -> Result<bool> {
         op.check()?;
-        let rows:Vec<(String,String,String)>=self.db.prepare("SELECT id,raw,summary FROM threads WHERE raw!='' AND summary!='' AND processed_digest=digest ORDER BY updated DESC LIMIT ?1")?.query_map([self.config.max_raw_memories as i64],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        let rows = self.consolidation_rows()?;
         let watermark = format!("{:x}", Sha256::digest(serde_json::to_vec(&rows)?));
         let token = format!("{:016x}", rand::random::<u64>());
         let tx = self
@@ -519,6 +524,23 @@ impl Driver for Local {
         self.extract(op, model, false)?;
         self.consolidate(op, model, false)?;
         Ok(())
+    }
+    fn maintenance_due(&mut self, op: &Operation) -> Result<bool> {
+        self.collect(op)?;
+        let at = now();
+        let extract: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM threads WHERE session!=?1 AND updated>=?2 AND updated<=?3 AND (processed_digest IS NULL OR processed_digest!=digest) AND lease_until<=?4 AND retry_at<=?4)",
+            params![op.authority.session_id, at-self.config.max_rollout_age_days as i64*86400,
+                at-self.config.min_rollout_idle_hours as i64*3600, at], |row| row.get(0))?;
+        if extract {
+            return Ok(true);
+        }
+        let rows = self.consolidation_rows()?;
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        let watermark = format!("{:x}", Sha256::digest(serde_json::to_vec(&rows)?));
+        Ok(self.db.query_row("SELECT watermark!=?1 AND lease_until<=?2 AND retry_at<=?2 FROM consolidation WHERE id=1",
+            params![watermark, at], |row| row.get(0))?)
     }
     fn enqueue(&mut self, op: &Operation, model: &mut dyn MemoryModelRunner) -> Result<Value> {
         ensure!(

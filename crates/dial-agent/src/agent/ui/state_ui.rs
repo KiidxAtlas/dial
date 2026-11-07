@@ -400,6 +400,17 @@ impl Ui for StateUi<'_> {
     ) -> Decision {
         self.inner.approve_call(call_id, t, s, c)
     }
+    fn approve_call_with_preview(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        summary: &str,
+        preview: &crate::agent::safety::approval::ApprovalPreview,
+        cancel: Option<&AtomicBool>,
+    ) -> Decision {
+        self.inner
+            .approve_call_with_preview(call_id, tool, summary, preview, cancel)
+    }
     fn approve_batch(&mut self, calls: &[crate::llm::ToolCall], cancel: &AtomicBool) -> Vec<bool> {
         self.inner.approve_batch(calls, cancel)
     }

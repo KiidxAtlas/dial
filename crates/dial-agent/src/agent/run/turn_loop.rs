@@ -159,18 +159,15 @@ impl<'a> Agent<'a> {
         if let Err(error) = self.flush_local_evidence() {
             observed.diagnostic(&format!("Local model evidence not saved: {error:#}"));
         }
-        if result
-            .as_ref()
-            .is_ok_and(|report| report.outcome == TurnOutcome::Completed)
-        {
-            // Goal mode keeps todos as the deliverable audit, so an accepted report never closes them there.
-            if !self.modes.goal.tool_offered() {
-                self.todo.complete_reported_work();
+        if let Ok(report) = &result {
+            let control = self.session.control_state();
+            if let Some(notice) = crate::agent::verify::completion::outstanding_notice(
+                &self.todo,
+                &control["working_state"],
+                report.outcome,
+            ) {
+                observed.notice(&notice);
             }
-            let mut control = self.session.control_state();
-            control["todo"] = self.todo.snapshot();
-            self.session.set_control_state(control)?;
-            observed.todo(&self.todo);
         }
         // Observe after the final control append: it changes the branch revision that the
         // observation is bound to, so an earlier capture would be discarded as stale.

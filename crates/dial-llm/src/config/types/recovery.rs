@@ -51,6 +51,9 @@ pub struct RetryConfig {
     pub max_attempts: u32,
     /// Longest single server-requested or backoff wait honoured before giving up (1..=3600 s).
     pub max_delay_secs: u64,
+    /// Elapsed request time beyond which no retry may start or wait; 0 is unlimited.
+    /// Successful first attempts keep the ordinary model timeout.
+    pub max_elapsed_secs: u64,
     /// Wait for a usage-quota window to reset (bounded by `max_delay_secs`) instead of failing fast.
     pub wait_for_quota_reset: bool,
     /// After a refreshed subscription credential is still rejected (or its quota is exhausted), retry
@@ -94,6 +97,7 @@ impl Default for RetryConfig {
         Self {
             max_attempts: 10,
             max_delay_secs: 300,
+            max_elapsed_secs: 60,
             wait_for_quota_reset: false,
             rotate_accounts: true,
             fallback_chains: std::collections::BTreeMap::new(),

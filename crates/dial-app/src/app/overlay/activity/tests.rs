@@ -131,6 +131,7 @@ fn attention_aggregates_available_inputs_without_replaying_work() {
         }),
         command: "check".into(),
         running: false,
+        stop_requested: false,
         terminal: false,
         mode: "session".into(),
     })

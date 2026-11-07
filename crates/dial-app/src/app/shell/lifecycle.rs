@@ -61,6 +61,8 @@ impl Shell {
             shared_prose: false,
             auth_job: None,
             last_setup_failure: None,
+            model_verification: None,
+            coding_verification: None,
             model_downloads: None,
             extensions_pending: None,
             extensions_job: None,
@@ -80,13 +82,16 @@ impl Shell {
                     &app.layout.user_dir,
                 ));
                 composer.set_word_completion(app.config.ui.word_completion);
+                composer.set_busy_send(app.config.ui.busy_send);
                 composer.set_project_root(app.layout.project_root.clone());
                 composer.load_learned_words(crate::config::paths::learned_words_file(
                     &app.layout.user_dir,
                 ));
+                super::attachments::install(&mut composer, &app.layout.project_root);
                 composer
             },
             paste_guard: Default::default(),
+            input_recovery: Default::default(),
             transcript: Transcript::new(),
             inbox: Default::default(),
             status: StatusData::default(),
@@ -179,7 +184,7 @@ impl Shell {
 
     /// Observe disk on a bounded timer. A running agent only receives a pending snapshot.
     pub(in crate::app) fn refresh_resources(&mut self, app: &App, force: bool, busy: bool) -> bool {
-        let mut files_changed = false;
+        let mut files_changed = self.poll_input_recovery(app);
         if let Some(downloads) = &self.model_downloads {
             let rescan = {
                 let mut downloads = downloads.borrow_mut();
@@ -351,6 +356,7 @@ impl Shell {
     /// Home screen and, for a resumed session, its earlier conversation.
     pub(in crate::app) fn begin(&mut self, app: &App, session: &Session, resumed: bool) {
         self.set_session_id(session.id());
+        self.poll_input_recovery(app);
         self.set_scope(&session.title());
         if self.ui.welcome {
             let (sessions, recent): (Vec<String>, Vec<(String, String)>) =
@@ -468,6 +474,7 @@ impl Shell {
         self.composer
             .set_project_root(app.layout.project_root.clone());
         self.composer.set_files(Vec::new());
+        super::attachments::install(&mut self.composer, &app.layout.project_root);
         self.git = Git::default();
         self.status.branch.clear();
         self.title = format!(
@@ -485,6 +492,7 @@ impl Shell {
 
     pub(in crate::app) fn after_adopt(&mut self, app: &App) {
         super::paint::update_model_status(&mut self.status, &mut self.home, &app.config);
+        super::attachments::install(&mut self.composer, &app.layout.project_root);
         self.teach_changed(app);
         self.ui = app.config.ui.clone();
         self.cfg_approval = app.config.approval;
@@ -500,6 +508,7 @@ impl Shell {
     }
 
     pub(in crate::app) fn finish(&mut self) -> Option<String> {
+        self.checkpoint_input(true);
         self.files.stop();
         self.auth_job.take();
         // A read-out or microphone capture must not outlive the shell.

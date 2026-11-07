@@ -1,4 +1,23 @@
 use super::*;
+
+#[test]
+fn broad_check_costs_distinguish_packages_and_pipeline_filters() {
+    for command in [
+        "cargo build --workspace",
+        "cargo test",
+        "cargo build 2>&1 | rg failure",
+    ] {
+        assert!(broad_check(command), "{command}");
+    }
+    for command in [
+        "cargo check -p dial-agent",
+        "cargo test --package=dial-core",
+        "cargo check --manifest-path crates/a/Cargo.toml",
+        "echo 'cargo build'",
+    ] {
+        assert!(!broad_check(command), "{command}");
+    }
+}
 use crate::runtime::execution::{OutputIntegrity, ProcessOutcome};
 use serde_json::json;
 

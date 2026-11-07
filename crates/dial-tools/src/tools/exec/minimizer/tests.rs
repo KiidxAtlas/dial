@@ -80,6 +80,10 @@ fn a_cargo_failure_buried_under_progress_gets_a_digest_of_its_first_errors() {
     );
     assert!(failure_digest("cargo build", &top, &top).is_none());
     assert!(failure_digest("cargo build", "error: short\n", "error: short\n").is_none());
+    let piped = failure_digest("cargo build | rg result", &text, "no matches")
+        .expect("captured pipeline diagnostics");
+    assert!(piped.contains("error[E0308]"));
+    assert!(piped.contains("src/main.rs:7:5"));
 }
 
 #[test]

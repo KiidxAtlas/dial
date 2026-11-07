@@ -1589,7 +1589,7 @@ fn productive_rounds_require_new_actual_verification_not_reuse_or_claims() {
         (true, false, "passed", RoundProgress::Productive),
         (true, false, "passed", RoundProgress::Neutral),
     ] {
-        let call = edits.call("check", serde_json::json!({}));
+        let call = edits.call("verify", serde_json::json!({}));
         let mut output = ToolOutput::ok("check receipt".into());
         output.data = Some(serde_json::json!({"results": [{
             "command": "cargo test", "status": status, "ran": ran, "reused": reused
@@ -1599,7 +1599,7 @@ fn productive_rounds_require_new_actual_verification_not_reuse_or_claims() {
     }
     edits.commit("a.txt", "fixed");
     edits.engine.take_round_progress();
-    let call = edits.call("check", serde_json::json!({}));
+    let call = edits.call("verify", serde_json::json!({}));
     let mut output = ToolOutput::ok("check receipt".into());
     output.data = Some(serde_json::json!({"results": [{
         "command": "cargo test", "status": "passed", "ran": true, "reused": false

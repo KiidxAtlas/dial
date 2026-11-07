@@ -30,6 +30,22 @@ fn plans_the_latest_change_and_the_turn_start() {
 }
 
 #[test]
+fn a_revision_record_truncated_before_its_background_flush_is_refused() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "A0");
+    let cp = fx.open();
+    let turn = cp.begin_turn("t").unwrap();
+    change(&cp, &fx, "a.txt", "A1");
+    change(&cp, &fx, "a.txt", "A2");
+    for blob in fs::read_dir(turn_dir(&cp.dir, turn).join("revisions")).unwrap() {
+        fs::write(blob.unwrap().path(), "A").unwrap();
+    }
+    let error = cp.revert_plan(&fx.path("a.txt"), false).unwrap_err();
+    assert!(error.to_string().contains("incomplete"), "{error:#}");
+    assert_eq!(fx.read("a.txt").as_deref(), Some("A2"));
+}
+
+#[test]
 fn a_call_that_writes_twice_is_one_revision_and_a_no_op_keeps_the_previous_one() {
     let fx = Fixture::new();
     fx.write("a.txt", "A0");

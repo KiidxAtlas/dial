@@ -454,8 +454,8 @@ workspace-relative with no globs; a directory is hashed recursively (contents an
 including ignored files); symlinks and special files are unsupported. For configured commands, an
 absent declaration means the inputs are unknown and the check is never reused; empty `paths` is invalid.
 When the declaration holds, a passing
-controller-run result may be reused within the same turn by the default `check` and the completion
-gate (never by `check` with `names`, which always runs, and never for reproductions) if fresh bounded
+controller-run result may be reused within the same turn by the default `verify` and the completion
+gate (never by `verify` naming `targets`, which always runs, and never for reproductions) if fresh bounded
 snapshots show the inputs unchanged and no shell or extension effect occurred since; the result is
 labeled reused (`ran: false`). Missing, unreadable or oversized inputs disable reuse and the check
 runs normally. Keep toolchains and external resources stable, and do not declare checks that depend
@@ -465,3 +465,20 @@ any limit falls back to execution. Checks without a supported input snapshot als
 The example is illustrative, not a dependency list for every Cargo project: include build scripts,
 workspace crates, configuration and fixtures that your command consumes. File timestamps and other
 unlisted filesystem metadata are not tracked; do not opt in checks whose results depend on them.
+
+### Request and persistence economy
+
+`assistance.compact_tools` defaults to `true` on ordinary hosted and local routes. It applies a
+12 KiB core-schema ceiling as well as `initial_tool_limit`; only explicit `tool_load` adds specialists.
+Setting it to `false` retains legacy automatic discovery/routing. Lean local count limits remain.
+
+`retry.max_elapsed_secs` defaults to 60 (0 disables this limit, maximum 3600). After a failed
+provider attempt, retry waits are bounded by the remaining allowance before stopping; a pending
+manual retry can skip the wait while time remains;
+retry transport timeouts use the remaining allowance. It does not cancel an otherwise healthy
+first stream or replace the task deadline, silence watchdog or attempt limit.
+
+`training.retain_session_requests` defaults to `false`. Enable it before a session whose exact
+requests you intend to approve later for teaching. This does not approve training or enable event
+logging. Retained records deduplicate exact schema arrays across the session and retain historical
+source identities. Ordinary transcripts and execution recovery remain available without snapshots.

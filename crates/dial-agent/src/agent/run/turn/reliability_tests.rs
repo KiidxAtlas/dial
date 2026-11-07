@@ -204,7 +204,7 @@ fn recovery_labels_do_not_invent_failed_rounds_and_shell_success_clears_them() {
 fn a_deadline_passing_during_a_tool_round_skips_the_unstarted_calls_and_stops() {
     let server = llm::fake::serve(vec![
         calls(&[
-            ("check", json!({"names":["slow"]})),
+            ("verify", json!({"targets":["slow"]})),
             ("write", json!({"path":"after","content":"x\n"})),
         ]),
         llm::fake::json(200, &json!({"total_slots":1})),
@@ -254,7 +254,10 @@ fn an_interrupt_keeps_finished_parallel_reads_and_marks_the_rest_not_run() {
         ]),
         slots(),
     ]);
-    let (report, results, wrote) = with_agent("[compaction]\nenabled=false\n", |agent| {
+    // Per-call interrupt granularity: with dependency dispatch the independent write would join
+    // the read wave and run before the interrupt can take effect (documented wave boundary).
+    let overlay = "[compaction]\nenabled=false\n[experimental]\ndependency_dispatch=false\n";
+    let (report, results, wrote) = with_agent(overlay, |agent| {
         connect(agent, &server.url);
         for (name, text) in [("a.txt", "alpha\n"), ("b.txt", "bravo\n")] {
             std::fs::write(agent.workspace.root().join(name), text).unwrap();
@@ -465,7 +468,7 @@ fn a_native_write_refusal_skips_dependent_work_but_keeps_completed_reads_and_dis
                 json!({"path":"source.txt","content":"dependent overwrite\n"}),
             ),
             ("bash", json!({"command":"printf ran > run-started.txt"})),
-            ("check", json!({"names":["candidate"]})),
+            ("verify", json!({"targets":["candidate"]})),
             (
                 "write",
                 json!({"path":"independent.txt","content":"independent change\n"}),
@@ -486,7 +489,7 @@ fn a_native_write_refusal_skips_dependent_work_but_keeps_completed_reads_and_dis
         "approval='auto'\n[compaction]\nenabled=false\n[verification]\nenabled=false\n[[verification.commands]]\nname='candidate'\ncommand='printf ran > check-started.txt'\n[edit]\nenforce_seen_lines=true\n[harness]\nedit_mode='hashline'\n[experimental]\ndependency_dispatch=true\n[task]\nmax_concurrency=4\n",
         |agent| {
             connect(agent, &server.url);
-            agent.activate_tools(&["check".into()]).unwrap();
+            agent.activate_tools(&["verify".into()]).unwrap();
             let root = agent.workspace.root().to_path_buf();
             std::fs::write(root.join("source.txt"), "original source\n").unwrap();
             std::fs::write(root.join("evidence.txt"), "completed sibling evidence\n").unwrap();
@@ -699,20 +702,22 @@ fn an_edit_whose_gate_check_fails_is_reminded_once_then_disclosed() {
         connect(agent, &server.url);
         agent.turn("Write the note", &mut NullUi).unwrap()
     });
-    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
     assert!(
-        report.text.contains("Unverified") && report.text.contains("notes"),
-        "the accepted answer discloses the missing evidence: {}",
+        report.text.contains("no passing applicable check")
+            && report.text.contains("notes")
+            && report.text.contains("note check failed"),
+        "the rejected candidate retains the observed check failure: {}",
         report.text
     );
     let requests = completion_requests(&server);
     assert_eq!(requests.len(), 3, "exactly one reminder round");
-    assert!(mentions(&requests[2], "they failed"));
+    assert!(mentions(&requests[2], "no passing applicable check"));
     assert!(
         mentions(&requests[2], "note check failed"),
         "the reminder carries the gate's own check output"
     );
-    assert!(!mentions(&requests[1], "they failed"));
+    assert!(!mentions(&requests[1], "no passing applicable check"));
 }
 
 #[test]
@@ -751,7 +756,7 @@ fn a_passing_check_after_the_edit_satisfies_the_evidence_gate() {
             Some(("write", json!({"path":"note.txt","content":"x\n"}))),
         ),
         slots(),
-        response("", Some(("check", json!({"names":["notes"]})))),
+        response("", Some(("verify", json!({"targets":["notes"]})))),
         response("The note is written and its check passed.", None),
     ]);
     let report = with_agent(NOTE_CHECK, |agent| {
@@ -1015,8 +1020,26 @@ fn a_failed_tool_cannot_execute_an_unchanged_retry_but_can_use_corrected_argumen
 
 #[test]
 fn an_auto_backgrounded_command_loads_bg_for_the_next_request() {
+    struct ReleaseOnReply {
+        path: PathBuf,
+        released: bool,
+    }
+    impl Ui for ReleaseOnReply {
+        fn text_delta(&mut self, text: &str) {
+            if text.contains("running in the background") {
+                std::fs::write(&self.path, "release").unwrap();
+                self.released = true;
+            }
+        }
+    }
     let server = llm::fake::serve(vec![
-        response("", Some(("bash", json!({"command":"sleep 3; echo done"})))),
+        response(
+            "",
+            Some((
+                "bash",
+                json!({"command":"until test -f release-job; do sleep 0.01; done; echo done"}),
+            )),
+        ),
         slots(),
         response("The command is running in the background.", None),
         // The job finishes during the turn; Dial asks once more to inspect its terminal result.
@@ -1028,7 +1051,13 @@ fn an_auto_backgrounded_command_loads_bg_for_the_next_request() {
             connect(agent, &server.url);
             agent.modes.launch.unattended = true;
             assert!(agent.bg_loadable(), "{:?}", agent.offered());
-            agent.turn("Start the slow command.", &mut NullUi).unwrap();
+            // Keep the job alive until the second reply instead of depending on host speed.
+            let mut ui = ReleaseOnReply {
+                path: agent.workspace.root().join("release-job"),
+                released: false,
+            };
+            agent.turn("Start the slow command.", &mut ui).unwrap();
+            assert!(ui.released);
             assert!(agent.offered().iter().any(|name| name == "bg"));
         },
     );
@@ -1053,6 +1082,50 @@ fn an_auto_backgrounded_command_loads_bg_for_the_next_request() {
         result.contains("background job")
             && result.contains("`bg wait` returns its output")
             && !result.contains("tool_load"),
+        "{result}"
+    );
+}
+
+#[test]
+fn an_auto_backgrounded_eval_cell_does_not_stop_the_turn_as_uncertain() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some((
+                "eval",
+                json!({"language":"js","code":"await new Promise(r => setTimeout(r, 3000)); 'done'"}),
+            )),
+        ),
+        slots(),
+        response("The cell is running in the background.", None),
+        response("The background cell finished.", None),
+    ]);
+    let report = with_agent(
+        "approval='auto'\n[compaction]\nenabled=false\n[verification]\nenabled=false\n[shell]\nauto_background_secs=1",
+        |agent| {
+            connect(agent, &server.url);
+            agent.modes.launch.unattended = true;
+            agent.activate_tools(&["eval".into()]).unwrap();
+            agent.turn("Run the slow cell.", &mut NullUi).unwrap()
+        },
+    );
+    assert!(
+        !report.text.contains("uncertain effects"),
+        "{}",
+        report.text
+    );
+    let requests = completion_requests(&server);
+    assert!(requests.len() >= 2, "the turn ended after the hand-off");
+    let result = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .to_string();
+    assert!(
+        result.contains("moved to the background as job"),
         "{result}"
     );
 }
@@ -1393,13 +1466,13 @@ fn turn_settlement_keeps_post_edit_evidence_current_without_a_check_request() {
                 ("read", json!({"path":"candidate.txt"})),
                 (
                     "edit",
-                    json!({"path":"candidate.txt","old_string":"before","new_string":"after","check":true}),
+                    json!({"path":"candidate.txt","old_string":"before","new_string":"after","verify":["candidate"]}),
                 ),
             ]
         } else {
             vec![(
                 "write",
-                json!({"path":"candidate.txt","content":"after\n","check":true}),
+                json!({"path":"candidate.txt","content":"after\n","verify":["candidate"]}),
             )]
         };
         let server = llm::fake::serve(vec![
@@ -1467,13 +1540,13 @@ fn failed_post_edit_check_blocks_same_batch_completion_without_refusing_the_edit
                 ("read", json!({"path":"candidate.txt"})),
                 (
                     "edit",
-                    json!({"path":"candidate.txt","old_string":"before","new_string":"after","check":true}),
+                    json!({"path":"candidate.txt","old_string":"before","new_string":"after","verify":["candidate"]}),
                 ),
             ]
         } else {
             vec![(
                 "write",
-                json!({"path":"candidate.txt","content":"after\n","check":true}),
+                json!({"path":"candidate.txt","content":"after\n","verify":["candidate"]}),
             )]
         };
         let mutation_index = mutations.len() - 1;

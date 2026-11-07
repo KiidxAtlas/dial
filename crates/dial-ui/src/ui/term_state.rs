@@ -44,7 +44,7 @@ impl Activity {
             Phase::Completed => Activity::Done,
             Phase::NeedsInput => Activity::Waiting,
             Phase::Failed | Phase::Blocked | Phase::Incomplete => Activity::Failed,
-            Phase::Running | Phase::Interrupted => Activity::Idle,
+            Phase::Running | Phase::Interrupted | Phase::Answered => Activity::Idle,
         }
     }
 

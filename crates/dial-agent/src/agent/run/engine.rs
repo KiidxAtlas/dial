@@ -22,7 +22,7 @@ fn progress_observation(
     use crate::tools::integrations::ext::{Concurrency, Tool};
     if matches!(
         call.name.as_str(),
-        "todo" | "working_state" | "finish" | "check" | "tool_load" | "task" | "message"
+        "todo" | "working_state" | "finish" | "verify" | "tool_load" | "task" | "message"
     ) {
         return false;
     }
@@ -626,7 +626,7 @@ impl Engine {
         // Only the focused-check owner's actual passing runs count, not a no-op selection or
         // reused receipt. Changing prediction arguments or prose cannot make the same check new.
         let mut verified = false;
-        if successful && call.name == crate::agent::verify::check_tool::NAME {
+        if successful && call.name == crate::agent::verify::verify_tool::NAME {
             for result in output
                 .data
                 .as_ref()

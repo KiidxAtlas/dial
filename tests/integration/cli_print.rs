@@ -179,7 +179,7 @@ impl Env {
         };
         std::fs::write(
             env.home.path().join("config.toml"),
-            "integrations = []\n[improve]\nenabled = false\n",
+            "integrations = []\n[assistance]\ncompact_tools=false\n[improve]\nenabled = false\n",
         )
         .unwrap();
         env
@@ -267,10 +267,10 @@ fn print_results_distinguish_completed_blocked_and_unfinished_work() {
         result["text"]
             .as_str()
             .unwrap()
-            .contains("Stopped with incomplete work")
+            .contains("Execution steps remain open")
     );
     // Tool call, one actionable promise, then a vague final reply with an unfinished plan.
-    assert_eq!(server.requests.lock().len(), 5);
+    assert_eq!(server.requests.lock().len(), 3);
 }
 
 #[test]

@@ -201,8 +201,8 @@ fn unavailable_sandbox_never_runs_model_code() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn cancellation_interrupts_an_inflight_kernel_without_session_lock() {
-    // Retain the original macOS explicit-off transport test: nested Seatbelt profiles are
-    // refused by sandbox-exec. Linux's new fence must work with and without bubblewrap.
+    // Linux's fence must work with and without bubblewrap. macOS sandboxed eval is covered with
+    // the default dev policy in eval tests; strict mode cannot load interpreters outside system paths.
     let modes: &[bool] = if cfg!(target_os = "linux") {
         &[false, true]
     } else {

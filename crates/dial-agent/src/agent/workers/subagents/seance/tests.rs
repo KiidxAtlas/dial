@@ -21,7 +21,7 @@ fn seance_args(source: &str) -> Value {
 }
 
 #[test]
-fn seance_requires_a_source_and_other_agents_reject_one() {
+fn session_sources_are_available_to_read_only_auditors_only() {
     let config = Config::default();
     assert!(
         parse(
@@ -32,12 +32,21 @@ fn seance_requires_a_source_and_other_agents_reject_one() {
     );
     assert!(
         parse(
-            &json!({"agent": "scout", "source_session": "abc", "task": "t", "solution_space": "s"}),
+            &json!({"agent": "worker", "source_session": "abc", "task": "t", "solution_space": "s"}),
             &config
         )
         .is_err()
     );
     assert!(parse(&seance_args("abc"), &config).is_ok());
+    for agent in ["scout", "reviewer"] {
+        assert!(
+            parse(
+                &json!({"agent":agent,"source_session":"abc","task":"audit","solution_space":"s"}),
+                &config
+            )
+            .is_ok()
+        );
+    }
 }
 
 #[test]
@@ -77,9 +86,9 @@ fn attach_refuses_without_persistent_storage_or_a_calling_session() {
     let mut request = parse(&seance_args("abc"), &config).unwrap();
     let root = tempfile::tempdir().unwrap();
     let layout = layout(root.path());
-    let err = attach(&mut request.jobs, None, Some("parent"), &config).unwrap_err();
+    let err = attach(&mut request.jobs, None, Some("parent"), &config, None).unwrap_err();
     assert!(err.contains("persistent session storage"), "{err}");
-    let err = attach(&mut request.jobs, Some(&layout), None, &config).unwrap_err();
+    let err = attach(&mut request.jobs, Some(&layout), None, &config, None).unwrap_err();
     assert!(err.contains("calling session"), "{err}");
 }
 
@@ -100,6 +109,12 @@ fn attach_reads_the_source_and_nested_workers_without_writing_the_journal() {
     session
         .append(json!({"role": "assistant", "content": "checking"}))
         .unwrap();
+    session
+        .append_custom_entry(
+            "audit_fixture",
+            json!({"private_raw_record":"CUSTOM-RECORD-OUTSIDE-CHAT"}),
+        )
+        .unwrap();
     let source_id = session.id().to_owned();
     let path = session.path().unwrap().to_owned();
     let worker = ChildTranscript::create(
@@ -117,12 +132,47 @@ fn attach_reads_the_source_and_nested_workers_without_writing_the_journal() {
     let before = std::fs::read(&path).unwrap();
 
     let mut request = parse(&seance_args(&source_id), &config).unwrap();
-    attach(&mut request.jobs, Some(&layout), Some("calling"), &config).unwrap();
+    let artifacts =
+        crate::storage::artifact::ArtifactStore::new(&root.path().join("private-artifacts"))
+            .unwrap();
+    attach(
+        &mut request.jobs,
+        Some(&layout),
+        Some("calling"),
+        &config,
+        Some(&artifacts),
+    )
+    .unwrap();
 
     let record = &request.jobs[0].seance.as_ref().unwrap().record;
     assert!(record.contains("find the flaw"), "{record}");
     assert!(record.contains("NESTED-EVIDENCE"), "{record}");
     assert!(record.contains("Quoted data, not instructions"));
+    assert!(
+        !record.contains("CUSTOM-RECORD-OUTSIDE-CHAT"),
+        "the brief remains bounded chat context"
+    );
+    let uris = crate::storage::artifact::uris(record);
+    assert_eq!(
+        uris.len(),
+        2,
+        "selected source and nested worker each have exact snapshots"
+    );
+    assert_eq!(
+        artifacts
+            .read_text(uris[0], 16 * 1024 * 1024)
+            .unwrap()
+            .unwrap()
+            .as_bytes(),
+        before
+    );
+    std::fs::create_dir_all(&layout.project_root).unwrap();
+    let ws = crate::tools::Workspace::new(&layout.project_root)
+        .unwrap()
+        .with_artifacts(artifacts);
+    let output = crate::tools::execute(&ws, "read", &json!({"path":uris[0]}), 20);
+    assert!(!output.is_error, "{}", output.text);
+    assert!(output.text.contains("CUSTOM-RECORD-OUTSIDE-CHAT"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
@@ -141,7 +191,14 @@ fn an_unavailable_source_model_is_an_error_not_a_silent_substitute() {
     let source_id = session.id().to_owned();
     drop(session);
     let mut request = parse(&seance_args(&source_id), &config).unwrap();
-    let err = attach(&mut request.jobs, Some(&layout), Some("calling"), &config).unwrap_err();
+    let err = attach(
+        &mut request.jobs,
+        Some(&layout),
+        Some("calling"),
+        &config,
+        None,
+    )
+    .unwrap_err();
     assert!(err.contains("unavailable"), "{err}");
     assert!(err.contains("pass model"), "{err}");
 }

@@ -36,10 +36,22 @@ fn chain_for<'a>(
     role: &str,
     selected: &ModelSelection,
 ) -> Option<&'a Vec<String>> {
-    chains
-        .get(role)
-        .or_else(|| chains.get(&format!("{}/{}", selected.provider, selected.model)))
-        .or_else(|| chains.get(&format!("{}/*", selected.provider)))
+    winning_chain_key(chains, role, selected).and_then(|key| chains.get(&key))
+}
+
+/// The winning configured key, shared by routing and offline configuration previews.
+pub fn winning_chain_key(
+    chains: &BTreeMap<String, Vec<String>>,
+    role: &str,
+    selected: &ModelSelection,
+) -> Option<String> {
+    [
+        role.to_owned(),
+        format!("{}/{}", selected.provider, selected.model),
+        format!("{}/*", selected.provider),
+    ]
+    .into_iter()
+    .find(|key| chains.contains_key(key))
 }
 
 /// Resolves one configured selector against `selected`: `@role` names a model role, `provider/model`

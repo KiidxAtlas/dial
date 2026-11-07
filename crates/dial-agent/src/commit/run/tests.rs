@@ -337,9 +337,9 @@ fn commit_git_reads_refuse_executable_conversion_config_for_both_indexes() {
                 &["log", "-1", "--format=%s"][..],
             ] {
                 let result = git_output_indexed(root, index, args, "Commit read failed");
-                // `log` only reads objects, so clean/smudge/process drivers cannot run and it is
-                // allowed; textconv configuration is still refused for every read.
-                if args[0] == "log" && key.starts_with("filter.") {
+                // Filter drivers are disabled with `-c` overrides, so every read runs without
+                // executing them; textconv configuration is still refused for every read.
+                if key.starts_with("filter.") {
                     assert!(result.is_ok(), "{key} {args:?}: {result:?}");
                 } else {
                     let error =

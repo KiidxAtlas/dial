@@ -179,7 +179,7 @@ pub fn write_har(result: &Value, artifacts: &Path) -> Result<Value, String> {
         .open(&path)
         .map_err(|e| format!("creating HAR file: {e}"))?;
     file.write_all(document.to_string().as_bytes())
-        .and_then(|()| file.sync_all())
+        .and_then(|()| crate::platform::fs::sync_file(&file))
         .map_err(|e| format!("writing HAR file: {e}"))?;
     Ok(json!({
         "path": path.display().to_string(),

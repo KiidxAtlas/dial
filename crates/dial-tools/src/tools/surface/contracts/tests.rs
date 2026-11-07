@@ -297,7 +297,7 @@ fn edit_history_recorded_before_allow_syntax_errors_stays_valid() {
 }
 
 #[test]
-fn edit_history_before_optional_check_stays_valid_in_every_grammar() {
+fn edit_history_before_optional_verify_stays_valid_in_every_grammar() {
     use crate::config::types::EditMode;
     let registry = Registry::new();
     for mode in [
@@ -313,9 +313,9 @@ fn edit_history_before_optional_check_stays_valid_in_every_grammar() {
             before["function"]["parameters"]["properties"]
                 .as_object_mut()
                 .unwrap()
-                .remove("check")
+                .remove("verify")
                 .unwrap()["type"],
-            "boolean"
+            "array"
         );
         let old = identities(&[before], &registry)["edit"].clone();
         let history = vec![json!({"role":"assistant","dial_tool_contracts":{"edit":old}})];
@@ -353,19 +353,18 @@ fn write_and_ast_history_before_syntax_override_remains_compatible() {
 
 // The controller owns this schema (dial-agent cannot be a dial-tools dependency). Keep the
 // predecessor literal so changes to existing fields cannot silently redefine compatibility.
-fn check_schema_before_repro() -> Value {
-    json!({"type":"function","function":{"name":"check","parameters":{
+fn verify_schema_before_repro() -> Value {
+    json!({"type":"function","function":{"name":"verify","parameters":{
         "type":"object",
         "properties":{
-            "names":{"type":"array","maxItems":16,"items":{"type":"string"}},
-            "failed_only":{"type":"boolean"}
+            "targets":{"type":"array","maxItems":16,"items":{"type":"string"}}
         },
         "additionalProperties":false
     }}})
 }
 
-fn check_schema_with_repro() -> Value {
-    let mut schema = check_schema_before_repro();
+fn verify_schema_with_repro() -> Value {
+    let mut schema = verify_schema_before_repro();
     schema["function"]["parameters"]["properties"]["repro"] = json!({
         "type":"object",
         "properties":{"name":{"type":"string"},"command":{"type":"string"}},
@@ -376,20 +375,20 @@ fn check_schema_with_repro() -> Value {
 }
 
 #[test]
-fn check_history_before_repro_preserves_saved_calls_and_callback_catalogs() {
+fn verify_history_before_repro_preserves_saved_calls_and_callback_catalogs() {
     let registry = Registry::new();
-    let old = identities(&[check_schema_before_repro()], &registry)["check"].clone();
+    let old = identities(&[verify_schema_before_repro()], &registry)["verify"].clone();
     let histories = [
         vec![
-            json!({"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"check","arguments":"{\"failed_only\":true}"}}],"dial_tool_contracts":{"call":old}}),
-            json!({"role":"tool","tool_call_id":"call","content":"recorded check result"}),
+            json!({"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"verify","arguments":"{\"targets\":[\"failed\"]}"}}],"dial_tool_contracts":{"call":old}}),
+            json!({"role":"tool","tool_call_id":"call","content":"recorded verify result"}),
         ],
-        vec![json!({"role":"assistant","dial_tool_contracts":{"callback:check":old}})],
+        vec![json!({"role":"assistant","dial_tool_contracts":{"callback:verify":old}})],
     ];
     for history in histories {
         let original = history.clone();
         assert!(
-            project_history(&history, &[check_schema_with_repro()], &registry)
+            project_history(&history, &[verify_schema_with_repro()], &registry)
                 .unwrap()
                 .is_none(),
             "compatible history needs no projection copy"
@@ -479,28 +478,28 @@ fn task_history_before_isolation_backend_resumes() {
     assert!(project_history(&history, &[current], &registry).is_err());
 }
 
-/// `check.expect` comes and goes with `experimental.check_predictions`; history recorded on
+/// `verify.expect` comes and goes with `experimental.check_predictions`; history recorded on
 /// either side of the flag stays valid, while other changes are still refused.
 #[test]
-fn check_prediction_property_is_compatible_in_both_directions() {
+fn verify_prediction_property_is_compatible_in_both_directions() {
     let registry = Registry::new();
-    let mut with_expect = check_schema_with_repro();
+    let mut with_expect = verify_schema_with_repro();
     with_expect["function"]["parameters"]["properties"]["expect"] = check_prediction_property();
     let schemas = [
-        check_schema_before_repro(),
-        check_schema_with_repro(),
+        verify_schema_before_repro(),
+        verify_schema_with_repro(),
         with_expect.clone(),
     ];
     for recorded in &schemas {
-        let old = identities(std::slice::from_ref(recorded), &registry)["check"].clone();
+        let old = identities(std::slice::from_ref(recorded), &registry)["verify"].clone();
         let history =
-            vec![json!({"role":"assistant","dial_tool_contracts":{"callback:check":old}})];
-        for current in [check_schema_with_repro(), with_expect.clone()] {
+            vec![json!({"role":"assistant","dial_tool_contracts":{"callback:verify":old}})];
+        for current in [verify_schema_with_repro(), with_expect.clone()] {
             assert!(validate_history(&history, &[current], &registry).is_ok());
         }
     }
-    let old = identities(&[with_expect.clone()], &registry)["check"].clone();
-    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"callback:check":old}})];
+    let old = identities(&[with_expect.clone()], &registry)["verify"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"callback:verify":old}})];
     let mut changed = with_expect;
     changed["function"]["parameters"]["properties"]["expect"]["enum"] = json!(["pass"]);
     assert!(
@@ -510,14 +509,14 @@ fn check_prediction_property_is_compatible_in_both_directions() {
 }
 
 #[test]
-fn check_repro_compatibility_rejects_nonadditive_contract_changes() {
+fn verify_repro_compatibility_rejects_nonadditive_contract_changes() {
     let registry = Registry::new();
-    let old = identities(&[check_schema_before_repro()], &registry)["check"].clone();
-    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"callback:check":old}})];
-    let current = check_schema_with_repro();
+    let old = identities(&[verify_schema_before_repro()], &registry)["verify"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"callback:verify":old}})];
+    let current = verify_schema_with_repro();
     let mut changes = Vec::new();
     let mut changed = current.clone();
-    changed["function"]["parameters"]["properties"]["names"]["items"]["type"] = json!("integer");
+    changed["function"]["parameters"]["properties"]["targets"]["items"]["type"] = json!("integer");
     changes.push(changed);
     let mut changed = current.clone();
     changed["function"]["parameters"]["required"] = json!(["repro"]);
@@ -535,7 +534,7 @@ fn check_repro_compatibility_rejects_nonadditive_contract_changes() {
         assert!(validate_history(&history, &[changed], &registry).is_err());
     }
     let mut unknown_revision = history.clone();
-    unknown_revision[0]["dial_tool_contracts"]["callback:check"]["revision"] = json!(2);
+    unknown_revision[0]["dial_tool_contracts"]["callback:verify"]["revision"] = json!(2);
     assert!(validate_history(&unknown_revision, &[current], &registry).is_err());
 }
 
@@ -1079,7 +1078,7 @@ fn optional_tool_bundles_preserve_prior_history_and_validate_shapes() {
     for current in schemas {
         let name = current["function"]["name"].as_str().unwrap();
         let property = match name {
-            "write" => "check",
+            "write" => "verify",
             "grep" => "preview",
             "web_search" => "fetch_top",
             "browser" => "observe",
@@ -1105,5 +1104,177 @@ fn optional_tool_bundles_preserve_prior_history_and_validate_shapes() {
             validate_history(&history, std::slice::from_ref(&current), &registry).is_err(),
             "changed {name}.{property} is not additive"
         );
+    }
+}
+
+/// A minimal current `task` schema with the pool and `verify` actions and the profile list.
+fn profiled_task_schema(profiles: &[&str]) -> Value {
+    json!({"type":"function","function":{"name":"task","parameters":{"type":"object","additionalProperties":false,"properties":{
+        "action":{"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close","verify"]},
+        "concurrency":{"type":"integer"},
+        "contract":{"type":"object"},
+        "model_profile":{"type":"string","enum":profiles},
+        "tasks":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"}}}}
+    }}}})
+}
+
+#[test]
+fn task_identity_ignores_the_profile_list_and_accepts_history_hashed_with_it() {
+    let registry = Registry::new();
+    let current = profiled_task_schema(&["deep", "fast"]);
+    // New identities no longer depend on which profiles are configured.
+    assert_eq!(
+        identities(&[profiled_task_schema(&["fast"])], &registry)["task"],
+        identities(std::slice::from_ref(&current), &registry)["task"]
+    );
+    let recorded = |hash: String| {
+        vec![
+            json!({"role":"assistant","dial_tool_contracts":{"c":{"name":"task","revision":1,"schema_sha256":hash}}}),
+        ]
+    };
+    // Older history hashed the list in (as the current list), or predates `verify`/`contract`.
+    let mut old = profiled_task_schema(&["deep", "fast"]);
+    validate_history(
+        &recorded(shape_sha256(&old)),
+        std::slice::from_ref(&current),
+        &registry,
+    )
+    .unwrap();
+    old["function"]["parameters"]["properties"]["action"]["enum"] = json!([
+        "run", "start", "resume", "status", "wait", "cancel", "create", "push", "peek", "close"
+    ]);
+    old["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("contract");
+    validate_history(
+        &recorded(shape_sha256(&old)),
+        std::slice::from_ref(&current),
+        &registry,
+    )
+    .unwrap();
+    // A changed type is not an additive difference.
+    old["function"]["parameters"]["properties"]["concurrency"]["type"] = json!("string");
+    assert!(
+        validate_history(
+            &recorded(shape_sha256(&old)),
+            std::slice::from_ref(&current),
+            &registry
+        )
+        .is_err()
+    );
+}
+
+// Controller schema stubs avoid a dependency on the higher-layer dial-agent crate.
+fn completion_controller_schema(name: &str) -> Value {
+    let properties = match name {
+        "todo" => json!({"tasks":{"type":"array","items":{
+            "type":"object","additionalProperties":false,
+            "properties":{"text":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},
+            "required":["text","status"]
+        }}}),
+        "finish" => {
+            json!({"outcome":{"type":"string","enum":["completed","blocked","needs_input"]},"summary":{"type":"string"}})
+        }
+        _ => unreachable!(),
+    };
+    json!({"type":"function","function":{"name":name,"parameters":{
+        "type":"object","additionalProperties":false,"properties":properties
+    }}})
+}
+
+#[test]
+fn todo_kind_and_finish_answered_preserve_calls_and_callback_catalogs_without_rewriting() {
+    let registry = Registry::new();
+    for name in ["todo", "finish"] {
+        let before = completion_controller_schema(name);
+        let mut current = before.clone();
+        if name == "todo" {
+            current["function"]["parameters"]["properties"]["tasks"]["items"]["properties"]["kind"] = json!({"type":"string","enum":["step","follow_up"],"description":"Optional; defaults to step."});
+        } else {
+            current["function"]["parameters"]["properties"]["outcome"]["enum"] =
+                json!(["completed", "answered", "blocked", "needs_input"]);
+        }
+        let old = identities(std::slice::from_ref(&before), &registry)[name].clone();
+        let histories = [
+            old_names_history(name, before, "{}"),
+            vec![
+                json!({"role":"assistant","dial_tool_contracts":{format!("callback:{name}"):old}}),
+            ],
+        ];
+        for history in histories {
+            let original = history.clone();
+            assert!(
+                project_history(&history, std::slice::from_ref(&current), &registry)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(history, original);
+        }
+    }
+}
+
+#[test]
+fn completion_controller_additions_reject_other_contract_changes() {
+    let registry = Registry::new();
+    for name in ["todo", "finish"] {
+        let before = completion_controller_schema(name);
+        let mut current = before.clone();
+        let addition = if name == "todo" {
+            "/function/parameters/properties/tasks/items/properties/kind"
+        } else {
+            "/function/parameters/properties/outcome"
+        };
+        if name == "todo" {
+            current["function"]["parameters"]["properties"]["tasks"]["items"]["properties"]["kind"] =
+                json!({"type":"string","enum":["step","follow_up"]});
+        } else {
+            current["function"]["parameters"]["properties"]["outcome"]["enum"] =
+                json!(["completed", "answered", "blocked", "needs_input"]);
+        }
+        let history = old_names_history(name, before, "{}");
+        let changes = [
+            (
+                "/function/parameters/additionalProperties".to_owned(),
+                json!(true),
+            ),
+            (format!("{addition}/type"), json!("integer")),
+            (
+                format!("{addition}/enum"),
+                json!(["completed", "answered", "blocked", "needs_input", "unknown"]),
+            ),
+            (
+                "/function/parameters/properties/extra".to_owned(),
+                json!({"type":"boolean"}),
+            ),
+            (
+                if name == "todo" {
+                    "/function/parameters/properties/tasks/items/required"
+                } else {
+                    "/function/parameters/required"
+                }
+                .to_owned(),
+                if name == "todo" {
+                    json!(["text", "status", "kind"])
+                } else {
+                    json!(["outcome"])
+                },
+            ),
+        ];
+        for (pointer, value) in changes {
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            let mut changed = current.clone();
+            changed.pointer_mut(parent).unwrap()[key] = value;
+            assert!(
+                validate_history(&history, &[changed], &registry).is_err(),
+                "{name}: {pointer}"
+            );
+        }
+        let mut strict = current.clone();
+        strict["function"]["strict"] = json!(true);
+        assert!(validate_history(&history, &[strict], &registry).is_err());
+        let mut unknown_revision = history.clone();
+        unknown_revision[0]["dial_tool_contracts"]["c"]["revision"] = json!(2);
+        assert!(validate_history(&unknown_revision, &[current], &registry).is_err());
     }
 }

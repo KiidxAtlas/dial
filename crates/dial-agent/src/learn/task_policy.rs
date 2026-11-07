@@ -33,9 +33,20 @@ impl Kind {
         .any(|w| words.contains(w))
         {
             Self::Editing
-        } else if ["explain", "investigate", "locate", "find", "why", "trace"]
-            .iter()
-            .any(|w| words.contains(w))
+        } else if [
+            "explain",
+            "investigate",
+            "diagnose",
+            "inspect",
+            "read",
+            "audit",
+            "locate",
+            "find",
+            "why",
+            "trace",
+        ]
+        .iter()
+        .any(|w| words.contains(w))
         {
             Self::Investigation
         } else {

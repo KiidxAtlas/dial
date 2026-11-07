@@ -1226,7 +1226,7 @@ fn append(path: &Path, lines: &str) -> Result<()> {
         }
     }
     file.write_all(lines.as_bytes())?;
-    file.sync_all()?;
+    crate::platform::fs::sync_file(&file)?;
     Ok(())
 }
 

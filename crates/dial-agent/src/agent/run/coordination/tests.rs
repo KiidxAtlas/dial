@@ -106,7 +106,13 @@ fn coordination_never_enters_worker_offer_or_changes_stable_prefix() {
         // Loadable by default; once loaded it is offered to the foreground agent only.
         assert!(agent.catalog().iter().any(|name| name == "peers"));
         assert!(!agent.offered().iter().any(|name| name == "peers"));
-        agent.activate_tools(&["peers".into()]).unwrap();
+        assert!(
+            !crate::agent::run::tool_exposure::default_offer_tests::load_tools(
+                agent,
+                json!({"names":["peers"]})
+            )
+            .is_error
+        );
         assert!(agent.offered().iter().any(|name| name == "peers"));
         assert!(
             !agent

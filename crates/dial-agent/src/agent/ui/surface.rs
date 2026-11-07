@@ -158,6 +158,28 @@ pub trait Ui {
             None => self.approve(tool, summary),
         }
     }
+    /// Ask with policy-derived scope and lifetime descriptions. The default retains
+    /// legacy client behavior; only the policy owner can create a reusable rule.
+    fn approve_call_with_preview(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        summary: &str,
+        preview: &crate::agent::safety::approval::ApprovalPreview,
+        cancel: Option<&AtomicBool>,
+    ) -> Decision {
+        let mut summary = format!("{summary}\nOnce: {}", preview.once);
+        if let Some(scope) = &preview.session {
+            summary.push_str(&format!("\nSession: {scope}"));
+        }
+        if let Some(scope) = &preview.project {
+            summary.push_str(&format!("\nProject: {scope}"));
+        }
+        if let Some(reason) = &preview.unavailable_reason {
+            summary.push_str(&format!("\nReusable approval unavailable: {reason}"));
+        }
+        self.approve_call(call_id, tool, &summary, cancel)
+    }
     /// Approve only these exact calls, once. No response can create a reusable grant.
     /// Adapters may return per-call choices; missing choices deny. The default presents
     /// one all-or-nothing prompt on the real approval surface.

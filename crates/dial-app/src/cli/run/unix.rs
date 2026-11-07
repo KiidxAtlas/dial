@@ -211,8 +211,9 @@ fn pump(
                 Ok(n) => {
                     io::stdout().write_all(&buffer[..n])?;
                     io::stdout().flush()?;
+                    // Coalesced: a fast producer must not pay one publication per read.
                     capture
-                        .append(&buffer[..n])
+                        .append_buffered(&buffer[..n])
                         .context("publishing run output; capture is incomplete")?;
                 }
                 Err(e)
@@ -229,6 +230,9 @@ fn pump(
                 Err(e) => return Err(e.into()),
             }
         }
+        capture
+            .publish_due()
+            .context("publishing run output; capture is incomplete")?;
         if eof {
             std::thread::sleep(Duration::from_millis(10));
         }

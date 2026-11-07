@@ -139,7 +139,10 @@ impl Participant {
         bounded_text(text, MAX_TEXT, "message")?;
         ensure!(!text.trim().is_empty(), "message must not be empty");
         let _transaction = transaction(&self.dir)?;
-        ensure!(is_live(&self.dir, to)?, "recipient is no longer live");
+        ensure!(
+            is_live(&self.dir, to)?,
+            "recipient {to} is no longer live: that Dial session has ended or stopped publishing; list live peers again before sending"
+        );
         let mut record = load(&self.dir, to)?;
         ensure!(record.inbox.len() < MAX_MESSAGES, "recipient inbox is full");
         record.inbox.push(Letter {

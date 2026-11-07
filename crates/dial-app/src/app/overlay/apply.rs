@@ -8,7 +8,7 @@ use crate::app::selection::{clear_role_changes, provider_changes};
 use crate::app::shell::Shell;
 use crate::config::selection::changes as selection_changes;
 use crate::config::settings_store::{self, Change};
-use crate::config::types::Approval;
+use crate::config::types::{Approval, Config};
 use crate::llm::catalog;
 use crate::ui::overlay::OverlayEvent;
 use anyhow::{Result, ensure};
@@ -32,6 +32,22 @@ impl OverlayEnv<'_> {
             }
             OverlayEvent::None => {}
             OverlayEvent::SetupDep { id } => self.start_setup(overlay, id),
+            OverlayEvent::JobStop { name } => {
+                let outcome = self
+                    .background_control
+                    .ok_or_else(|| anyhow::anyhow!("background job control is unavailable"))
+                    .and_then(|background| background.kill_job(&name).map_err(anyhow::Error::msg));
+                self.report(overlay, outcome);
+            }
+            OverlayEvent::JobDismiss { name } => {
+                let outcome = self
+                    .background_control
+                    .ok_or_else(|| anyhow::anyhow!("background job control is unavailable"))
+                    .and_then(|background| {
+                        background.dismiss_job(&name).map_err(anyhow::Error::msg)
+                    });
+                self.report(overlay, outcome);
+            }
             OverlayEvent::JobInput { name, bytes } => {
                 let outcome = if matches!(self.pty_approval, Approval::Readonly) {
                     Err(anyhow::anyhow!(
@@ -569,6 +585,40 @@ impl OverlayEnv<'_> {
                 }
             }
             OverlayEvent::Action(action) => {
+                if action == "backup-models:save" {
+                    if let ActiveOverlay::BackupModels(panel) = overlay {
+                        let outcome = (|| -> Result<Config> {
+                            let layer =
+                                settings_store::load_layer(&self.app.layout, panel.scope())?;
+                            let changes = panel.changes(&layer)?;
+                            self.app
+                                .save_settings_checked(panel.scope(), &changes, |_| {
+                                    ensure!(
+                                        settings_store::load_layer(
+                                            &self.app.layout,
+                                            panel.scope()
+                                        )? == layer,
+                                        "Backup settings changed; review again"
+                                    );
+                                    panel.check_unchanged(&self.app.reload()?)
+                                })?;
+                            self.reload_saved()
+                        })();
+                        match outcome {
+                            Ok(config) => {
+                                if let Ok(project) = settings_store::load_layer(
+                                    &self.app.layout,
+                                    settings_store::Scope::Project,
+                                ) {
+                                    panel.set_project_layer(project);
+                                }
+                                panel.saved(config);
+                            }
+                            Err(error) => panel.banner(format!("{error:#}"), true),
+                        }
+                    }
+                    return false;
+                }
                 if let Some(payload) = action.strip_prefix("extensions:") {
                     Shell::queue_extensions(self.extensions_pending, *self.scope, payload, overlay);
                 } else if let Some(payload) = action.strip_prefix("compute:") {
@@ -638,6 +688,8 @@ impl OverlayEnv<'_> {
                     || action.starts_with("command:")
                     || action.starts_with("test:")
                     || action.starts_with("peers:")
+                    || action.starts_with("history-open:")
+                    || action == "history-return"
                 {
                     self.next = Some(action);
                     return true;

@@ -435,6 +435,7 @@ impl<'a> Agent<'a> {
             edit_preview_intercepted: false,
             pending_batch_approvals: Vec::new(),
             pending_check: None,
+            verify_batch: Default::default(),
             cur_step: 0,
             last_prompt_tokens: 0,
             context_meter: crate::agent::window::context_meter::ContextMeter::default(),
@@ -591,6 +592,7 @@ impl<'a> Agent<'a> {
             edit_preview_intercepted: false,
             pending_batch_approvals: Vec::new(),
             pending_check: None,
+            verify_batch: Default::default(),
             cur_step: 0,
             last_prompt_tokens: 0,
             context_meter: crate::agent::window::context_meter::ContextMeter::default(),
@@ -686,7 +688,17 @@ impl<'a> Agent<'a> {
             .clone()
             .with_bash_interceptor(self.config.bash_interceptor.clone(), offered.clone())
             .with_syntax_block(syntax_block);
-        let discoverable = self.discoverable_tools(&offered);
+        let stable = self.stable_tool_offer() && self.parts.system_template.is_none();
+        let policy_tools = if stable {
+            self.stable_core_tools()
+        } else {
+            offered.clone()
+        };
+        let discoverable = if stable {
+            Vec::new()
+        } else {
+            self.discoverable_tools(&offered)
+        };
         // A window-overflow fallback needs the lean instructions as well as lean schemas.
         let lean = self.lean_tools || self.lean_local() || self.local_escalated();
         let built =
@@ -705,7 +717,7 @@ impl<'a> Agent<'a> {
                     self.parts.skills.clone()
                 },
                 memory: self.parts.memory.clone(),
-                tools: &offered,
+                tools: &policy_tools,
                 discoverable: &discoverable,
                 template: self.parts.system_template.as_ref(),
                 lean,
@@ -733,13 +745,17 @@ impl<'a> Agent<'a> {
         };
         let mut system = String::new();
         if !self.hermetic {
-            system.push_str(&capability_prose(&offered, &discoverable));
+            if stable {
+                system.push_str("\nSpecialist and MCP tools are available through tool_search and tool_load; only explicit loads change the callable offer. Catalog results describe current readiness.");
+            } else {
+                system.push_str(&capability_prose(&offered, &discoverable));
+            }
             if self.catalog().iter().any(|name| name == "mcp_servers") {
                 // Trust and approval boundaries are stated once in the tool policy; this adds
                 // only what the MCP catalog index does not: configuration is not a connection.
                 system.push_str("\nConfigured MCP servers are not connection evidence; mcp_servers reports actual runtime status and registered tools.");
             }
-            if let Some(servers) = self.ext.mcp_connecting() {
+            if !stable && let Some(servers) = self.ext.mcp_connecting() {
                 system.push_str(&format!("\nMCP servers still connecting: {}. Their tools are not listed yet; tool_search and mcp_servers wait for them.", servers.join(", ")));
             }
         }

@@ -52,16 +52,43 @@ impl Capture {
     pub fn payload(&self) -> Value {
         json!({"examples":self.examples})
     }
+
+    /// Keep each exact wire schema list once; descriptions can change without changing a tool
+    /// contract, so its complete wire hash is the lossless reference identity.
+    fn retained_payload(&self) -> Value {
+        use sha2::{Digest, Sha256};
+        let mut tools = serde_json::Map::new();
+        let examples: Vec<_> = self
+            .examples
+            .iter()
+            .cloned()
+            .map(|mut example| {
+                if let Some(schema) = example
+                    .as_object_mut()
+                    .and_then(|item| item.remove("tools"))
+                {
+                    let key = crate::hex(&Sha256::digest(schema.to_string().as_bytes()));
+                    tools.entry(key.clone()).or_insert(schema);
+                    example["tools_ref"] = json!(key);
+                }
+                example
+            })
+            .collect();
+        json!({"examples":examples,"tool_sets":tools})
+    }
 }
 
 impl crate::agent::Agent<'_> {
-    /// Preserve the existing logging policy, adding only ordinary durable session snapshots.
+    /// Capture opt-in durable teaching requests or explicit hermetic learning logs.
     pub(in crate::agent) fn capture_training_requests(&self) -> bool {
-        self.logging || self.retain_training_requests()
+        self.retain_training_requests() || (self.hermetic && self.logging)
     }
 
     fn retain_training_requests(&self) -> bool {
-        !self.hermetic && self.domain_override.is_none() && self.session.owns_journal()
+        self.config.training.retain_session_requests
+            && !self.hermetic
+            && self.domain_override.is_none()
+            && self.session.owns_journal()
     }
 
     /// Retention is an observation, not a quality verdict or permission to train.
@@ -81,13 +108,46 @@ impl crate::agent::Agent<'_> {
         let Some(source_turn) = self.training_capture.source_turn.as_deref() else {
             return;
         };
+        let mut payload = self.training_capture.retained_payload();
+        let sets = payload
+            .as_object_mut()
+            .and_then(|payload| payload.remove("tool_sets"))
+            .and_then(|sets| sets.as_object().cloned())
+            .unwrap_or_default();
+        let previous = self.session.custom_records("training_tool_sets");
+        let fresh: serde_json::Map<String, Value> = sets
+            .into_iter()
+            .filter(|(key, tools)| {
+                !previous
+                    .iter()
+                    .any(|(_, record)| record["tool_sets"].get(key) == Some(tools))
+            })
+            .collect();
+        if !fresh.is_empty() {
+            match self
+                .session
+                .append_custom_entry("training_tool_sets", json!({"version":1,"tool_sets":fresh}))
+            {
+                Ok(commit) if commit.durability_error.is_none() => {}
+                Ok(commit) => {
+                    ui.diagnostic(&format!("Training schemas were appended but durable acknowledgement failed: {:?}. No turn snapshot was saved.", commit.durability_error));
+                    return;
+                }
+                Err(error) => {
+                    ui.diagnostic(&format!(
+                        "Training schemas were not saved: {error:#}. No turn snapshot was saved."
+                    ));
+                    return;
+                }
+            }
+        }
         let selection = self.effective_config().selection();
         let mut record = json!({
-            "version": 1,
+            "version": 3,
             "source_session": self.session.id(),
             "source_turn": source_turn,
             "source_model": format!("{}/{}", selection.provider, selection.model),
-            "payload": self.training_capture.payload(),
+            "payload": payload,
             "prompt": prompt,
         });
         if let (Some(_), Some(trajectory)) = (self.store, report.trajectory) {

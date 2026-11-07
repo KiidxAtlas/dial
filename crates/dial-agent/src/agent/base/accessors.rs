@@ -351,7 +351,7 @@ impl<'a> Agent<'a> {
             .as_ref()
             .and_then(|runtime| runtime.open_error().map(str::to_owned))
     }
-    /// One-time plain-words notice when the selected Hindsight service did not answer its startup probe.
+    /// One-time notice for selected memory-service or semantic-embedding degradation.
     pub fn memory_reachability_notice(&self) -> Option<String> {
         self.memory_runtime
             .as_ref()
@@ -624,7 +624,7 @@ impl<'a> Agent<'a> {
                         | "tool_load"
                         | "working_state"
                         | "tts"
-                        | "check"
+                        | "verify"
                         | "revert_edit"
                 )
                 || (self.layout.is_some()
@@ -641,9 +641,9 @@ impl<'a> Agent<'a> {
                         .is_some_and(|memory| memory.offers_tool()))
         });
         names.retain(|name| name != "ask" || self.config.ask.enabled);
-        // `check` runs the verification gate's selection; `revert_edit` needs the checkpoint journal.
+        // `verify` runs the verification gate's selection; `revert_edit` needs the checkpoint journal.
         names.retain(|name| match name.as_str() {
-            "check" => self.config.verification.enabled,
+            "verify" => self.config.verification.enabled,
             "peers" => self.coordination_enabled(),
             "side_request" => !self.hermetic,
             "revert_edit" => self.checkpoints.is_some(),

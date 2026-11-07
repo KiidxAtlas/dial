@@ -427,7 +427,7 @@ pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
         "checkpoint" | "rewind" => true,
         "ask" | "finish" | "goal" | "tool_search" | "tool_load" | "working_state" => true,
         // Each selected command passes the automatic-check gate itself (`run_focused_check`).
-        "check" => true,
+        "verify" => true,
         // Project coordination changes only bounded advisory metadata, never workspace authority.
         "peers" => true,
         // Provenance registers `memory` as an extension tool and decides for itself below.
@@ -967,7 +967,7 @@ pub fn save(path: &Path, rules: &[PermissionRule]) -> Result<()> {
         })?
         .as_bytes(),
     )?;
-    file.as_file().sync_all()?;
+    crate::platform::fs::sync_file(file.as_file())?;
     file.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
@@ -1235,6 +1235,102 @@ fn workspace_write(call: &ToolCall) -> bool {
     }
 }
 
+/// Policy-derived descriptions shown before consent. Text is masked for display only;
+/// this metadata is never accepted back as authority to create a permission rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalPreview {
+    pub once: String,
+    pub session: Option<String>,
+    pub project: Option<String>,
+    pub unavailable_reason: Option<String>,
+}
+
+struct ApprovalGrant {
+    rule: Option<PermissionRule>,
+    preview: ApprovalPreview,
+}
+
+/// Derive the proposed matcher once, then use that same rule after consent.
+fn approval_grant(call: &ToolCall) -> ApprovalGrant {
+    let candidate = (|| -> Result<PermissionRule, &'static str> {
+        if matches!(
+            call.name.as_str(),
+            "request_directory" | "request_sensitive_directory"
+        ) {
+            return Err(
+                "Directory access changes require one-time approval for the exact requested scope.",
+            );
+        }
+        if call.name == "monitor" && call.arguments["action"] == "start" {
+            return Err("Application watches require fresh, one-shot approval.");
+        }
+        let command_prefix = if call.name == "bash" {
+            let command = call.arguments["command"]
+                .as_str()
+                .ok_or("No reusable matcher is available for this command shape.")?;
+            if destructive_bash(command) {
+                return Err("Destructive or privileged shell commands are approved one at a time.");
+            }
+            let words = shell_words(command).ok_or(
+                "Compound commands, expansions and redirections cannot create reusable permissions.",
+            )?;
+            if words.first().is_none_or(|word| is_assignment(word))
+                || words.get(1).is_some_and(|word| word.starts_with('-'))
+            {
+                return Err(
+                    "Assignments and flag-first commands cannot create reusable permissions.",
+                );
+            }
+            let (argvs, complete) = shell_argvs(command);
+            let [argv] = argvs.as_slice() else {
+                return Err("Wrappers and compound commands cannot create reusable permissions.");
+            };
+            if !complete
+                || CODE_RUNNERS.contains(&argv[0].as_str())
+                || WRAPPERS.contains(&argv[0].as_str())
+                || argv.get(1).is_some_and(|word| word.starts_with('-'))
+            {
+                return Err(
+                    "Code runners, wrappers and unsupported command shapes require one-time approval.",
+                );
+            }
+            argv.iter().take(2).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        Ok(PermissionRule {
+            effect: Effect::Allow,
+            tool: call.name.clone(),
+            command_prefix,
+            paths: Vec::new(),
+        })
+    })();
+    let (rule, matcher, unavailable_reason) = match candidate {
+        Ok(rule) => {
+            let matcher = if rule.command_prefix.is_empty() {
+                format!("Every {} call, with any arguments and paths.", rule.tool)
+            } else {
+                format!(
+                    "{} normalized argv starts with {:?}; remaining arguments may vary. Destructive forms remain excluded.",
+                    rule.tool, rule.command_prefix
+                )
+            };
+            let matcher = crate::storage::redact::redact_text(&matcher).into_owned();
+            (Some(rule), Some(matcher), None)
+        }
+        Err(reason) => (None, None, Some(reason.to_owned())),
+    };
+    ApprovalGrant {
+        rule,
+        preview: ApprovalPreview {
+            once: "Only this exact tool call, once; no reusable permission is created.".into(),
+            session: matcher.as_ref().map(|text| format!("{text} Lifetime: rest of this session only; not saved.")),
+            project: matcher.map(|text| format!("{text} Lifetime: saved for this project, including future sessions, until revoked.")),
+            unavailable_reason,
+        },
+    }
+}
+
 /// `Ok(true)` when the user chose "Always allow in this project" and the caller should save the rules.
 pub fn authorize(
     approval: Approval,
@@ -1385,7 +1481,9 @@ fn authorize_inner(
         let summary = format!(
             "{summary}\nApprove this one-shot application watch? New matching output may wake Dial to diagnose and fix within the current task and existing permissions. No additional process control is granted. This approval is not reusable."
         );
-        let decision = ui.approve_call(&call.id, &call.name, &summary, cancel);
+        let grant = approval_grant(call);
+        let decision =
+            ui.approve_call_with_preview(&call.id, &call.name, &summary, &grant.preview, cancel);
         if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
             return Err(Denial::User);
         }
@@ -1432,7 +1530,14 @@ fn authorize_inner(
                     rule_scope: None
                 }
             );
-            let decision = ui.approve_call(&call.id, &call.name, &summary, cancel);
+            let grant = approval_grant(call);
+            let decision = ui.approve_call_with_preview(
+                &call.id,
+                &call.name,
+                &summary,
+                &grant.preview,
+                cancel,
+            );
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
                 explain(ui, call, PolicyReason::Cancelled);
                 return Err(Denial::User);
@@ -1450,39 +1555,14 @@ fn authorize_inner(
                 Decision::Allow => Ok(false),
                 Decision::AllowAlways | Decision::AllowProject => {
                     let persist = decision == Decision::AllowProject;
-                    let command_prefix = if call.name == "bash" {
-                        if call.arguments["command"]
-                            .as_str()
-                            .is_some_and(destructive_bash)
-                        {
-                            ui.notice("Not saved as a reusable rule: destructive shell commands are approved one at a time.");
-                            return Ok(false);
-                        }
-                        // Only one plain program grants a reusable prefix. Wrappers, shell bodies, code
-                        // runners and flag-first invocations would authorize far more than the approved command.
-                        let (argvs, complete) = call.arguments["command"]
-                            .as_str()
-                            .map_or((Vec::new(), false), shell_argvs);
-                        let [argv] = argvs.as_slice() else {
-                            return Ok(false);
-                        };
-                        if !complete
-                            || CODE_RUNNERS.contains(&argv[0].as_str())
-                            || argv.get(1).is_some_and(|s| s.starts_with('-'))
-                        {
-                            return Ok(false);
-                        }
-                        argv.iter().take(2).cloned().collect()
-                    } else {
-                        Vec::new()
+                    let Some(rule) = grant.rule else {
+                        ui.notice("Not saved as a reusable rule: this call supports one-time approval only.");
+                        return Ok(false);
                     };
-                    let rule = PermissionRule {
-                        effect: Effect::Allow,
-                        tool: call.name.clone(),
-                        command_prefix,
-                        paths: Vec::new(),
-                    };
-                    ui.notice(&format!("Reusable permission: {}", rule.scope()));
+                    ui.notice(&crate::storage::redact::redact_text(&format!(
+                        "Reusable permission: {}",
+                        rule.scope()
+                    )));
                     rules.push(rule);
                     Ok(persist)
                 }
@@ -1502,3 +1582,6 @@ mod parallel_bash_tests;
 
 #[cfg(test)]
 mod risk_tests;
+
+#[cfg(test)]
+mod preview_tests;

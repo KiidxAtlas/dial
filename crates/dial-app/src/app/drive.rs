@@ -7,7 +7,6 @@ use crate::app::overlay::{OverlayOutcome, Which, overlay_destination};
 use crate::app::shell::Shell;
 use crate::config::types::Config;
 use crate::storage::session::{Session, SessionMeta};
-use crate::ui::keys::Action;
 use anyhow::Result;
 use serde_json::Value;
 
@@ -133,6 +132,7 @@ pub(super) fn drive(
             (step, agent.layout().cloned())
         };
         shell.set_session_id(session.id());
+        shell.poll_input_recovery(app);
         match step? {
             Step::Quit | Step::Done => break,
             Step::Rebuild(config) => {
@@ -158,6 +158,7 @@ pub(super) fn drive(
             }
         }
     }
+    shell.checkpoint_input(true);
     Ok(())
 }
 
@@ -173,6 +174,8 @@ pub(super) fn sign_in_still_pending(warned: &mut bool) -> bool {
 pub(super) enum OnboardingFlow {
     Navigate(Which),
     TestConnection(String),
+    VerifySelectedModel,
+    VerifyCodingModel,
     Unsupported(String),
     Saved,
     Cancel,
@@ -184,6 +187,10 @@ pub(super) fn onboarding_flow(outcome: &OverlayOutcome) -> OnboardingFlow {
             OnboardingFlow::Navigate(destination)
         } else if let Some(id) = action.strip_prefix("test:") {
             OnboardingFlow::TestConnection(id.to_owned())
+        } else if action == "command:setup choose verify-model" {
+            OnboardingFlow::VerifySelectedModel
+        } else if action == "command:setup choose verify-coding" {
+            OnboardingFlow::VerifyCodingModel
         } else {
             OnboardingFlow::Unsupported(action.to_owned())
         }
@@ -194,33 +201,54 @@ pub(super) fn onboarding_flow(outcome: &OverlayOutcome) -> OnboardingFlow {
     }
 }
 
+/// The default/escape result is cancellation, never an implicit local-model selection.
+fn onboarding_destination(choice: Option<usize>) -> Option<Which> {
+    match choice {
+        Some(1) => Some(Which::Providers),
+        Some(2) => Some(Which::Models),
+        _ => None,
+    }
+}
+
 /// First run (or a provider that cannot be used): let the user pick a model before any agent exists.
 fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Result<bool> {
-    // First run starts on provider setup (sign in or add a key for a hosted model); Esc there
-    // moves to the discovered local model list once before quitting.
-    let mut providers_first = app.config.model.trim().is_empty();
     let mut auth_warned = false;
     let mut destination = None;
     loop {
-        let ready = !app.config.model.trim().is_empty()
-            && match session {
-                Some(session) => crate::agent::make_session_backend(&app.config, session).is_ok(),
-                None => make_backend(&app.config).is_ok(),
-            };
-        if ready && destination.is_none() {
+        let backend = match session {
+            Some(session) => crate::agent::make_session_backend(&app.config, session),
+            None => make_backend(&app.config),
+        };
+        if backend.is_ok() && destination.is_none() {
             return Ok(true);
         }
-        shell.note("Welcome to dial", if app.config.model.trim().is_empty() {
-            "Sign in to a provider or add an API key to start with a hosted model. Esc shows local models instead: running LM Studio or Ollama servers (and MLX models on Apple Silicon) are found automatically."
+        if !app.config.model.trim().is_empty() {
+            let message = backend
+                .as_ref()
+                .err()
+                .map(crate::app::shell::model_verification::failure_hint)
+                .unwrap_or(
+                    "Model configuration is ready; response verification is separate in /doctor.",
+                );
+            shell.note("Model setup", message);
+        }
+        let which = if let Some(which) = destination.take() {
+            which
         } else {
-            "The selected provider cannot be used yet (missing credentials?). Set it up in Providers."
-        });
-        let which = destination.take().unwrap_or(if providers_first {
-            Which::Providers
-        } else {
-            Which::Models
-        });
-        let secondary_panel = !providers_first && !matches!(which, Which::Models);
+            match onboarding_destination(shell.ask(
+                "Welcome to dial · choose a model path",
+                "Hosted: sign in or add an API key. Local: choose a running Ollama/LM Studio endpoint or a downloaded local model. Browsing never installs or downloads a model. Esc cancels; Esc in a panel returns here.",
+                &[("Cancel", 'c'), ("Hosted provider", 'h'), ("Local model", 'l')],
+            )) {
+                Some(which) => which,
+                None => {
+                    if let Some(job) = shell.auth_job.take() {
+                        job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Ok(false);
+                }
+            }
+        };
         let outcome = shell.run_overlay(app, None, which)?;
         let flow = onboarding_flow(&outcome);
         if let Some(config) = outcome.latest {
@@ -229,17 +257,22 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
         }
         match flow {
             OnboardingFlow::Navigate(which) => {
-                // Once the user explicitly navigates, Esc returns to models rather than
-                // replaying the initial provider prompt or quitting a secondary panel.
-                providers_first = false;
                 destination = Some(which);
             }
             OnboardingFlow::TestConnection(id) => {
                 shell.catalog.refresh(app);
                 shell.note(
-                    "Connection test",
-                    format!("Checking {id}. Its status appears in the provider list when the check finishes."),
+                    "Metadata connection check",
+                    format!("Checking {id}. Cached endpoint metadata appears in Providers; this does not verify a model response."),
                 );
+                destination = Some(Which::Providers);
+            }
+            OnboardingFlow::VerifySelectedModel => {
+                shell.verify_selected_model(app, None)?;
+                destination = Some(Which::Providers);
+            }
+            OnboardingFlow::VerifyCodingModel => {
+                shell.verify_coding_model(app, None)?;
                 destination = Some(Which::Providers);
             }
             OnboardingFlow::Unsupported(action) => {
@@ -250,41 +283,19 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
                 if shell.auth_job.is_some() {
                     if sign_in_still_pending(&mut auth_warned) {
                         let label = shell.auth_job.as_ref().map_or("Sign-in", |job| job.label);
-                        shell.note(label, format!("{label} is still waiting for your browser. Esc again quits and cancels it; select a model after sign-in completes."));
+                        shell.note(label, format!("{label} is still waiting for your browser. Esc backs out to model-path choice; Cancel there quits and cancels sign-in. Select a model after sign-in completes."));
                         continue;
                     }
                     if let Some(job) = shell.auth_job.take() {
                         job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                if secondary_panel {
-                    destination = Some(Which::Models);
-                    continue;
-                }
-                if providers_first {
-                    providers_first = false;
-                    shell.note(
-                        "No model yet",
-                        "Pick a discovered local model here (LM Studio, Ollama, MLX). Esc again quits.",
-                    );
-                    continue;
-                }
-                // `dial setup -m` installs the MLX runtime, which exists only on Apple Silicon Macs.
-                let local = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                    ", or download a local model with `dial setup -m <mlx-model>`"
-                } else {
-                    ""
-                };
-                shell.note(
-                    "No model selected",
-                    format!(
-                        "Run dial again to pick a model or sign in to a provider{local}. Inside dial, {} opens the model list and /providers sets up sign-in and API keys.",
-                        shell.keys.label(Action::ModelSelect)
-                    ),
-                );
-                shell.flush()?;
-                return Ok(false);
+                // Escape backs out of setup; choosing Cancel at the path picker exits.
+                continue;
             }
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

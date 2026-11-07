@@ -12,7 +12,7 @@ use crate::config::types::ReproFirst;
 use crate::learn::task_policy::Kind;
 use crate::llm::ToolCall;
 
-pub(in crate::agent) const GATE: &str = "Not applied (repro_first gate): this debugging request asks for verification and no reproduction has failed yet this turn. Reproduce the bug first, for example with `check` `repro` (a command that fails while the bug is present) or a failing test, then edit. This refusal happens once per turn; the next edit attempt proceeds.";
+pub(in crate::agent) const GATE: &str = "Not applied (repro_first gate): this debugging request asks for verification and no reproduction has failed yet this turn. Reproduce the bug first, for example with `verify` `repro` (a command that fails while the bug is present) or a failing test, then edit. This refusal happens once per turn; the next edit attempt proceeds.";
 pub(in crate::agent) const ADVICE: &str = "\n[repro_first: this debugging fix was applied before any reproduction failed this turn. Confirm it with a focused check of the reported behavior, such as one command asserting the expected result; reproducing the failure after the fix is not required.]";
 
 /// Docs, notes and test files do not count as fixing source.

@@ -41,6 +41,8 @@ pub enum EventKind {
     ContextReset,
     /// The experimental turn optimizer rewrote a user message before the main model saw it.
     Draft,
+    /// The controller parked or resumed a turn at an owned-work boundary.
+    Wait,
 }
 
 /// Where a surface should place an event.
@@ -84,8 +86,24 @@ impl EventKind {
             Self::Compaction => "compacted",
             Self::ContextReset => "new context",
             Self::Draft => "draft",
+            Self::Wait => "wait",
         }
     }
+}
+
+/// Observed wait transitions, not a claim that the underlying work succeeded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BackgroundWait {
+    Started {
+        jobs: Vec<String>,
+        workers: Vec<String>,
+        questions: Vec<String>,
+    },
+    Ended {
+        reason: String,
+        elapsed_ms: u64,
+    },
 }
 
 /// One controller event.
@@ -97,6 +115,8 @@ pub struct UiEvent {
     /// Context tokens before and after, for dividers that shrink the window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<(u64, u64)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_wait: Option<BackgroundWait>,
 }
 
 impl UiEvent {
@@ -105,11 +125,17 @@ impl UiEvent {
             kind,
             text: text.into(),
             tokens: None,
+            background_wait: None,
         }
     }
 
     pub fn with_tokens(mut self, before: u64, after: u64) -> Self {
         self.tokens = Some((before, after));
+        self
+    }
+
+    pub fn with_background_wait(mut self, wait: BackgroundWait) -> Self {
+        self.background_wait = Some(wait);
         self
     }
 }

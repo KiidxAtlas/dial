@@ -186,6 +186,7 @@ impl Agent<'_> {
         };
         let step = request.step;
         let reply = request.reply;
+        self.verify_batch.begin(&reply.tool_calls);
         for (index, call) in reply.tool_calls.iter().enumerate() {
             let engine = &mut *context.engine;
             let ui = &mut *context.ui;
@@ -368,6 +369,11 @@ impl Agent<'_> {
                 &mut outcome,
             )?;
             self.publish_call_result(turn, &mut context, step, settled)?;
+        }
+        self.verify_batch.end();
+        if let Some(stream) = round.streamed.take() {
+            let (started, reused) = stream.statistics();
+            self.efficiency_metrics.scheduling.stream(started, reused);
         }
         round.outcome = outcome;
         Ok(ControlFlow::Continue(()))

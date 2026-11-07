@@ -7,6 +7,28 @@ use std::sync::LazyLock;
 /// Smaller outputs are already cheap; avoid adding an evidence header to them.
 const MIN_COMMAND_BYTES: usize = 4096;
 
+/// Recognized unscoped Cargo checks. This is a cost observation, never verification credit.
+pub(in crate::agent) fn broad_check(command: &str) -> bool {
+    crate::tools::exec::bash_interceptor::pipeline_heads(command)
+        .iter()
+        .any(|(head, _)| {
+            let words = crate::runtime::arguments::split_words(head);
+            words
+                .first()
+                .is_some_and(|word| word.rsplit('/').next() == Some("cargo"))
+                && words.get(1).is_some_and(|word| {
+                    matches!(word.as_str(), "build" | "check" | "test" | "clippy")
+                })
+                && (words.iter().any(|word| word == "--workspace")
+                    || !words.iter().any(|word| {
+                        word == "-p"
+                            || word == "--package"
+                            || word.starts_with("--package=")
+                            || word.starts_with("--manifest-path")
+                    }))
+        })
+}
+
 /// Remove only recognized progress, never infer success from printed prose.
 /// `artifact` must identify the caller-retained complete result. Partial presentations cannot be
 /// filtered here because this helper has no artifact store with which to recover missing lines.

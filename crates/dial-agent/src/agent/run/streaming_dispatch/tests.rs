@@ -1,5 +1,34 @@
 use super::*;
 
+#[test]
+fn an_effect_closes_the_read_prefix_and_live_denials_never_start_work() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    let mut stream = dispatch(dir.path());
+    let mut approvals = Vec::new();
+    stream.completed_if(0, "denied", "read", r#"{"path":"a.txt"}"#, &mut |call| {
+        approvals.push(call.id.clone());
+        false
+    });
+    assert_eq!(stream.statistics(), (0, 0));
+    stream.completed_if(1, "allowed", "read", r#"{"path":"a.txt"}"#, &mut |_| true);
+    stream.completed(2, "effect", "edit", r#"{"path":"other"}"#);
+    stream.completed(3, "later", "read", r#"{"path":"other"}"#);
+    assert_eq!(approvals, vec!["denied"]);
+    assert_eq!(stream.statistics(), (1, 0));
+    assert!(
+        stream
+            .take(&call("read", json!({"path":"other"})), &mut NullUi)
+            .is_none()
+    );
+    assert!(
+        stream
+            .take(&call("read", json!({"path":"a.txt"})), &mut NullUi)
+            .is_some()
+    );
+    assert_eq!(stream.statistics(), (1, 1));
+}
+
 fn dispatch(dir: &std::path::Path) -> StreamingDispatch {
     let read = json!({"type":"function","function":{"name":"read","parameters":{
         "type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}});

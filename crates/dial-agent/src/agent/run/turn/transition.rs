@@ -103,7 +103,6 @@ impl TurnState<'_> {
             reliability,
             stall,
             edit_churn,
-            completion,
             completion_candidate,
             capability_search,
             enrichment_epoch,
@@ -121,7 +120,6 @@ impl TurnState<'_> {
         if steering || resumed {
             // The rejected or replaced answer's completion attempt and recovery rounds end. A
             // resumed round keeps the advice already delivered and the coach's repair history.
-            completion.reset_for_steering();
             *completion_candidate = None;
             *capability_search = Default::default();
             *pending = None;

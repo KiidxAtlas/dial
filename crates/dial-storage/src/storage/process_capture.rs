@@ -3,14 +3,17 @@
 use crate::config::paths::Layout;
 use crate::platform::{atomic, fs as platform_fs, procinfo::ProcId};
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub const CAPACITY: usize = 256 * 1024;
 const MAX_RECORD: usize = CAPACITY * 5 + 2048;
+/// Buffered output is published at most this often ([`Capture::append_buffered`]).
+const PUBLISH_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,9 +23,32 @@ struct Snapshot {
     owner: ProcId,
     slot: u8,
     total: u64,
+    /// Version 2 writes base64; version 1 wrappers wrote a JSON array of numbers.
+    #[serde(serialize_with = "bytes_base64", deserialize_with = "bytes_any")]
     bytes: Vec<u8>,
     closed: bool,
     error: Option<String>,
+}
+
+fn bytes_base64<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    use base64::Engine;
+    serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn bytes_any<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    use base64::Engine;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Bytes {
+        Encoded(String),
+        Raw(Vec<u8>),
+    }
+    match Bytes::deserialize(deserializer)? {
+        Bytes::Encoded(text) => base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map_err(serde::de::Error::custom),
+        Bytes::Raw(bytes) => Ok(bytes),
+    }
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -45,7 +71,7 @@ fn read(path: &Path) -> Result<Snapshot> {
     ensure!(bytes.len() <= MAX_RECORD, "oversized run capture");
     let record: Snapshot = serde_json::from_slice(&bytes)?;
     ensure!(
-        record.version == 1
+        (record.version == 1 || record.version == 2)
             && record.slot < 32
             && record.bytes.len() <= CAPACITY
             && record.total >= record.bytes.len() as u64
@@ -61,6 +87,9 @@ pub struct Capture {
     path: PathBuf,
     snapshot: Snapshot,
     _live: File,
+    /// Output appended since the last publication.
+    dirty: bool,
+    published: Instant,
 }
 
 impl Capture {
@@ -112,7 +141,7 @@ impl Capture {
         let (slot, mut live) = selected.context("at most 32 foreground runs per project")?;
         let path = dir.join(format!("{name}.json"));
         let snapshot = Snapshot {
-            version: 1,
+            version: 2,
             generation: crate::storage::session::random_hex(16),
             owner: ProcId::current().context("cannot establish wrapper process identity")?,
             slot,
@@ -123,21 +152,53 @@ impl Capture {
         };
         live.set_len(0)?;
         live.write_all(snapshot.generation.as_bytes())?;
-        live.sync_all()?;
+        crate::platform::fs::sync_file(&live)?;
         let capture = Self {
             path,
             snapshot,
             _live: live,
+            dirty: false,
+            published: Instant::now(),
         };
         capture.save()?;
         Ok(capture)
     }
 
+    /// Readers are concurrent processes and the record is worthless once its owner is gone, so
+    /// publication is atomic but unflushed.
     fn save(&self) -> Result<()> {
-        atomic::write_private(&self.path, &serde_json::to_vec(&self.snapshot)?)
+        atomic::write_private_volatile(&self.path, &serde_json::to_vec(&self.snapshot)?)
     }
 
+    /// Append and publish before returning.
     pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        self.record(bytes)?;
+        self.publish()
+    }
+
+    /// Append, publishing only if [`PUBLISH_INTERVAL`] has passed; the caller must call
+    /// [`Capture::publish_due`] regularly so a quiet tail is still published.
+    pub fn append_buffered(&mut self, bytes: &[u8]) -> Result<()> {
+        self.record(bytes)?;
+        self.publish_due()
+    }
+
+    /// Publish buffered output once [`PUBLISH_INTERVAL`] has passed since the last publication.
+    pub fn publish_due(&mut self) -> Result<()> {
+        if self.dirty && self.published.elapsed() >= PUBLISH_INTERVAL {
+            self.publish()?;
+        }
+        Ok(())
+    }
+
+    fn publish(&mut self) -> Result<()> {
+        self.save()?;
+        self.dirty = false;
+        self.published = Instant::now();
+        Ok(())
+    }
+
+    fn record(&mut self, bytes: &[u8]) -> Result<()> {
         self.snapshot.total = self
             .snapshot
             .total
@@ -153,13 +214,14 @@ impl Capture {
             self.snapshot.bytes.drain(..excess);
             self.snapshot.bytes.extend_from_slice(bytes);
         }
-        self.save()
+        self.dirty = true;
+        Ok(())
     }
 
     pub fn finish(&mut self, error: Option<&str>) -> Result<()> {
         self.snapshot.closed = true;
         self.snapshot.error = error.map(|e| e.chars().take(256).collect());
-        self.save()
+        self.publish()
     }
 }
 

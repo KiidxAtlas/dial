@@ -46,6 +46,29 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   same-size, same-inode rewrites with restored timestamps invalidate old message text. Appends
   are parsed incrementally, but verification still reads prior indexed bytes; its cost grows with
   history size. No search-latency improvement is asserted.
+  Results retain their text transcript summary and can be inspected with `/search results`: use
+  **Up/Down** to select a hit, **PageUp/PageDown** to read the full bounded matching message,
+  and **Enter** to open its conversation through normal safe resume. The preview identifies the
+  immutable matching entry; inspecting it never rewinds or appends branch markers, including for
+  matches on abandoned branches. **Esc** closes the panel without touching the composer.
+  `/search open <id>` opens a conversation directly; `/search back` returns to the conversation
+  where the search excursion started. Drafts stay bound to their conversations, not to search hits.
+  The first index query after upgrading rebuilds the advisory full-text cache to retain entry IDs.
+- `/draft` (also `/draft preview`, `/draft restore` or `/draft replace`) opens a read-only,
+  scrollable review of this session's oldest saved unsent draft and queue beside current input.
+  Queue labels distinguish automatic steering, follow-ups, steer-now and independent requests;
+  collapsed text pastes are expanded in the preview, long text is explicitly abbreviated and
+  clipboard images are counted without displaying their payloads. **PageUp/PageDown** scroll.
+  **Keep current** (the default) or **Esc** cancels without changing saved input. **Restore held**
+  refuses a nonempty editor or queue; **Replace reviewed input** explicitly replaces only the
+  current input shown in the review. **Discard saved** removes all saved records (the panel shows
+  their count), keeping the current editor and queue. If input, saved records or session ownership
+  changes during review, the action is refused: reopen `/draft` to review again. Restoration never
+  sends a request, and recovered queues remain held until you explicitly `/draft resume`.
+  `/draft status` reports availability; `/draft discard` explicitly discards saved records without
+  clearing current input and can reset corrupt recovery data only when this process owns the
+  session's recovery writer lease. Input recovery is private and session-scoped; it never takes
+  over another process's writer or automatically replaces a newer draft.
 - Session moves keep the source journal until the destination and workspace switch are accepted.
   Failed moves settle the copied journals and transfer-ledger state together; an uncertain
   publication or cleanup is reported rather than described as a successful rollback. Workspace-root

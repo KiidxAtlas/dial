@@ -289,6 +289,44 @@ fn text_only_stream_errors_classify() {
 }
 
 #[test]
+fn network_outages_and_dropped_upstreams_are_transient() {
+    for text in [
+        "chat request to https://chatgpt.com/backend-api/codex/responses failed: io: failed to lookup address information: nodename nor servname provided, or not known",
+        "chat request to https://api.anthropic.com/v1/messages failed: io: Can't assign requested address (os error 49)",
+        "reading chat stream: gzip decompression failed: Can't assign requested address (os error 49)",
+        "chat request failed: io: Network is unreachable (os error 51)",
+    ] {
+        assert_eq!(
+            classify(&anyhow::anyhow!("{text}")),
+            ErrorClass::Transient,
+            "{text}"
+        );
+    }
+    assert_eq!(
+        classify_stream_error(&[], "terminated"),
+        ErrorClass::Transient
+    );
+    assert_eq!(
+        classify_stream_error(&[], "Model unloaded by user or API request."),
+        ErrorClass::Fatal
+    );
+}
+
+#[test]
+fn failure_kind_names_typed_failures_without_their_text() {
+    let interrupted = anyhow::Error::new(super::super::Interrupted).context("request");
+    assert_eq!(failure_kind(&interrupted).as_deref(), Some("interrupted"));
+    let stream = anyhow::Error::new(Classified::new(ErrorClass::Fatal, "secret body"));
+    assert_eq!(failure_kind(&stream).as_deref(), Some("stream_error"));
+    let looped = anyhow::Error::new(ThinkingLoop("cycle".into()));
+    assert_eq!(failure_kind(&looped).as_deref(), Some("thinking_loop"));
+    assert_eq!(
+        failure_kind(&anyhow::anyhow!("untyped provider text")),
+        None
+    );
+}
+
+#[test]
 fn class_survives_context_and_redaction_wrappers() {
     let error = anyhow::Error::new(Classified::new(
         ErrorClass::ContextOverflow,

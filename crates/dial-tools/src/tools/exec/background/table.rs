@@ -72,6 +72,8 @@ pub(super) struct Ring {
     /// Structured tools are not processes; retain their original receipt independently of display.
     pub(super) tool_job: bool,
     pub(super) tool_result: Option<crate::tools::ToolOutput>,
+    /// Explicit user stop request, independent of observed completion.
+    pub(super) stop_requested: bool,
 }
 
 /// Serialize by reference for both the bounded size check and the existing artifact spool.
@@ -129,6 +131,7 @@ impl Ring {
             screen: None,
             tool_job: false,
             tool_result: None,
+            stop_requested: false,
         }
     }
 
@@ -920,32 +923,6 @@ impl Drop for Proc {
     }
 }
 
-/// An entry removed by a kill. Its group is already signalled; [`Killed::finish`] waits for the
-/// output reader with the table lock released.
-pub(super) struct Killed {
-    previous: State,
-    proc: Proc,
-}
-
-impl Killed {
-    /// Waits (bounded by [`SETTLE`]) for the reader to drain, then returns the state the entry had
-    /// before the kill and its final notifications. Must run without the table lock.
-    fn finish(mut self) -> (State, Vec<ToolEvent>) {
-        if let Some(reader) = self.proc.reader.take() {
-            finish_reader(&self.proc.ring, reader);
-        }
-        if self.proc.is_running() {
-            self.proc.state = State::Exited {
-                at: Instant::now(),
-                detail: "killed; process group stopped".into(),
-                status: None,
-            };
-        }
-        let events = self.proc.drain_notifications();
-        (self.previous, events)
-    }
-}
-
 /// What a caller needs from an entry without holding the table lock.
 pub(super) struct Snapshot {
     pub(super) name: String,
@@ -1009,6 +986,11 @@ pub(super) struct Table {
 impl Table {
     pub(super) fn refresh(&mut self) {
         self.procs.iter_mut().for_each(Proc::refresh);
+        while self.procs.iter().filter(|proc| !proc.is_running()).count() > MAX_FINISHED {
+            if let Some(index) = self.procs.iter().position(|proc| !proc.is_running()) {
+                self.discard(index);
+            }
+        }
     }
 
     fn notice(&mut self, event: ToolEvent) {
@@ -1392,44 +1374,17 @@ impl Table {
             .ok_or_else(|| "stdin is disabled; start with stdin=true or pty=true".into())
     }
 
-    /// Remove `name` and signal its group. The caller finishes the returned entry without the
-    /// table lock (see [`kill_entry`]).
-    fn detach(&mut self, name: &str) -> Result<Killed, String> {
+    /// Forget only observed terminal history; never detach live cooperative work.
+    pub(super) fn dismiss(&mut self, name: &str) -> Result<(), String> {
         self.snapshot(name)?;
-        let i = self
-            .position(name)
-            .ok_or_else(|| format!("no background process named {name:?}"))?;
-        let mut proc = self.procs.remove(i);
-        let previous = proc.state.clone();
-        proc.signal_stop();
-        Ok(Killed { previous, proc })
-    }
-
-    /// Remove every entry and signal every group; returns how many were running.
-    fn detach_all(&mut self) -> (usize, Vec<Killed>) {
-        self.refresh();
-        let running = self.running();
-        let mut retained = Vec::new();
-        let killed = self
-            .procs
-            .drain(..)
-            .filter_map(|mut proc| {
-                if proc.is_running() && lock(&proc.ring).tool_job {
-                    proc.group.terminate();
-                    retained.push(proc);
-                    None
-                } else {
-                    Some(proc)
-                }
-            })
-            .map(|mut proc| {
-                let previous = proc.state.clone();
-                proc.signal_stop();
-                Killed { previous, proc }
-            })
-            .collect();
-        self.procs = retained;
-        (running, killed)
+        let index = self.position(name).ok_or("job no longer exists")?;
+        if self.procs[index].is_running() {
+            return Err(format!(
+                "{name} is still running; stop it and await completion first"
+            ));
+        }
+        self.discard(index);
+        Ok(())
     }
 
     fn record(&mut self, events: Vec<ToolEvent>) {
@@ -1449,36 +1404,49 @@ impl Table {
     }
 }
 
-/// Kill `name` and forget it; returns what state it was in. The table lock is held only to
-/// detach the entry and to record its notices, never while the reader drains.
+/// Request stop without forgetting the owner or inventing a termination receipt.
+/// Readers drain outside the table lock; cooperative tool work remains owned until done.
 pub(super) fn kill_entry(table: &Mutex<Table>, name: &str) -> Result<State, String> {
-    {
+    let (previous, reader, ring) = {
         let mut table = lock(table);
-        table.refresh();
-        if let Some(i) = table.position(name)
-            && table.procs[i].is_running()
-            && lock(&table.procs[i].ring).tool_job
-        {
-            table.procs[i].group.terminate();
-            return Ok(State::Running);
+        table.snapshot(name)?;
+        let index = table.position(name).ok_or("job no longer exists")?;
+        let proc = &mut table.procs[index];
+        let previous = proc.state.clone();
+        if proc.is_running() {
+            lock(&proc.ring).stop_requested = true;
+            if lock(&proc.ring).tool_job {
+                proc.group.terminate();
+                return Ok(previous);
+            }
+            proc.signal_stop();
+            proc.input.take();
         }
+        (previous, proc.reader.take(), proc.ring.clone())
+    };
+    if let Some(reader) = reader {
+        finish_reader(&ring, reader);
     }
-    let killed = lock(table).detach(name)?;
-    let (previous, events) = killed.finish();
-    lock(table).record(events);
+    lock(table).refresh();
     Ok(previous)
 }
 
-/// Kill everything and clear the table; returns how many entries were running. As with
-/// [`kill_entry`], readers drain with the table lock released.
+/// Request stop for every live job, retaining bounded terminal history and output.
 pub(super) fn kill_all_entries(table: &Mutex<Table>) -> usize {
-    let (running, killed) = lock(table).detach_all();
-    let mut events = Vec::new();
-    for entry in killed {
-        events.extend(entry.finish().1);
+    let names: Vec<_> = {
+        let mut table = lock(table);
+        table.refresh();
+        table
+            .procs
+            .iter()
+            .filter(|proc| proc.is_running())
+            .map(|proc| proc.name.clone())
+            .collect()
+    };
+    for name in &names {
+        let _ = kill_entry(table, name);
     }
-    lock(table).record(events);
-    running
+    names.len()
 }
 
 #[cfg(test)]

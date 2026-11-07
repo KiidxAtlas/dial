@@ -739,6 +739,21 @@ static UI: &[SettingDef] = &[
             step: 100
         },
     ),
+    field!(
+        "ui.busy_send",
+        ui.busy_send,
+        IN,
+        "Input",
+        "Enter while working",
+        "Choose opens a send-action chooser without sending. Other choices send directly: redirect at a safe point, queue after the turn, request a worker, or use automatic routing. Never learned from previous sends.",
+        Kind::Enum(&[
+            ("choose", "Choose each time"),
+            ("redirect", "Redirect current task"),
+            ("after_turn", "Send after turn"),
+            ("independent", "Run independently"),
+            ("auto", "Let Dial choose (auto)"),
+        ]),
+    ),
 ];
 static REGISTRY: &[SettingDef] = &[
     UI[0],
@@ -811,6 +826,7 @@ static REGISTRY: &[SettingDef] = &[
     model::DECLARATIONS[36],
     model::DECLARATIONS[37],
     model::DECLARATIONS[38],
+    model::DECLARATIONS[39],
     memory::DECLARATIONS[0],
     memory::DECLARATIONS[1],
     memory::DECLARATIONS[2],
@@ -879,6 +895,7 @@ static REGISTRY: &[SettingDef] = &[
     memory::DECLARATIONS[65],
     UI[31],
     UI[32],
+    UI[33],
     tools::DECLARATIONS[0],
     improvement::DECLARATIONS[0],
     improvement::DECLARATIONS[1],
@@ -1042,6 +1059,7 @@ static REGISTRY: &[SettingDef] = &[
     improvement::DECLARATIONS[75],
     improvement::DECLARATIONS[76],
     improvement::DECLARATIONS[77],
+    improvement::DECLARATIONS[87],
     experimental::DECLARATIONS[0],
     experimental::DECLARATIONS[1],
     experimental::DECLARATIONS[2],

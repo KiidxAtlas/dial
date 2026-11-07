@@ -1,7 +1,7 @@
 //! Shared recovery and verification instruction text.
 //! Runtime classifiers, priorities, retry limits and admission remain with their owners.
 
-pub(crate) const RESEARCH_WARNING: &str = "[Research progress checkpoint] Many observation rounds have run without a novel committed change or resolved task. Different successful lookups alone do not establish delivery progress. Synthesize the findings and remaining question now; implement if supported, or deliver the requested read-only findings. Further research is allowed when needed. Do not make a dummy edit or close unfinished work to reset this checkpoint.";
+pub(crate) const RESEARCH_WARNING: &str = "[Research progress checkpoint] Many observation rounds have run without a novel committed change or resolved task. Different successful lookups alone do not establish delivery progress. For an implementation request, use the evidence to continue the authorized implementation and checks; for read-only research, answer when the requested findings are supported. Investigate further when a concrete gap remains. Do not make a dummy edit or close unfinished work to reset this checkpoint.";
 
 pub(crate) const RESEARCH_SYNTHESIS: &str = r#"[Research synthesis required by Dial]
 This request is a tool-free checkpoint, not task completion. Tool schemas may remain for provider-history compatibility; no tools requested in this response will execute.

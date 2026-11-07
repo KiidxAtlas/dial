@@ -270,7 +270,7 @@ impl Directory {
         let (name, mut file) = self.temp_file(permissions, kind)?;
         if let Err(error) = file
             .write_all(content.as_bytes())
-            .and_then(|_| file.sync_all())
+            .and_then(|_| crate::platform::fs::sync_file(&file))
         {
             let _ = self.unlink(&name);
             return Err(format!("staging edit: {error}"));
@@ -653,7 +653,7 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
                     .display()
             ));
         }
-        if let Err(e) = stage.dir.file.sync_all() {
+        if let Err(e) = crate::platform::fs::sync_file(&stage.dir.file) {
             warnings.push(format!(
                 "Edits committed, but syncing directory failed: {e}"
             ));

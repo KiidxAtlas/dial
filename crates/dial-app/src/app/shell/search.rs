@@ -59,6 +59,8 @@ pub(in crate::app) struct Search {
     running: Option<Running>,
     queued: Option<Request>,
     runner: Runner,
+    ready: Option<(String, Vec<SearchHit>)>,
+    origin: Option<String>,
 }
 
 impl Default for Search {
@@ -79,6 +81,8 @@ impl Search {
             running: None,
             queued: None,
             runner,
+            ready: None,
+            origin: None,
         }
     }
 
@@ -91,12 +95,20 @@ impl Search {
     /// shell switches back before the next poll.
     pub(in crate::app) fn invalidate(&mut self) {
         self.revision += 1;
+        self.ready = None;
     }
 
     /// Records the context a request or poll sees; a difference counts as a change.
     fn sync(&mut self, layout: &Layout, session: &str) {
         let context = (layout.state_dir.clone(), session.to_owned());
         if self.context.as_ref() != Some(&context) {
+            if self
+                .context
+                .as_ref()
+                .is_some_and(|(state, _)| state != &layout.state_dir)
+            {
+                self.origin = None;
+            }
             self.context = Some(context);
             self.invalidate();
         }
@@ -105,6 +117,7 @@ impl Search {
     /// Makes `query` the latest request in the current context and returns at once.
     pub(in crate::app) fn request(&mut self, layout: &Layout, session: &str, query: &str) {
         self.sync(layout, session);
+        self.ready = None;
         self.next_id += 1;
         self.latest = self.next_id;
         // Replaces any waiting request: only the latest query is worth running.
@@ -199,6 +212,19 @@ impl Search {
         }
         outcomes
     }
+
+    /// First conversation in a search excursion; repeated opens do not replace it.
+    pub(in crate::app) fn remember_origin(&mut self, session: &str) {
+        self.origin.get_or_insert_with(|| session.to_owned());
+    }
+
+    pub(in crate::app) fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+
+    pub(in crate::app) fn clear_origin(&mut self) {
+        self.origin = None;
+    }
 }
 
 /// The `/search` transcript text for a finished search. Errors stay visible with their full chain.
@@ -219,6 +245,9 @@ impl Shell {
     /// when the shell later switches back.
     pub(in crate::app) fn set_session_id(&mut self, id: &str) {
         if self.session_id != id {
+            if !self.session_id.is_empty() && !self.recovery_session_changed(id) {
+                return;
+            }
             self.session_id = id.to_owned();
             self.search.invalidate();
         }
@@ -229,6 +258,21 @@ impl Shell {
         self.search.request(layout, &self.session_id, query);
     }
 
+    /// Consume only the latest valid result. Call through ordinary overlay admission so a
+    /// late result cannot steal focus from a newly started draft or a running turn.
+    pub(in crate::app) fn take_search_panel(
+        &mut self,
+    ) -> Option<crate::ui::overlay::history_search::HistorySearchOverlay> {
+        let (query, hits) = self.search.ready.take()?;
+        Some(
+            crate::ui::overlay::history_search::HistorySearchOverlay::new(
+                query,
+                hits,
+                self.search.origin.is_some(),
+            ),
+        )
+    }
+
     /// Notes finished searches. Returns whether anything was published.
     pub(super) fn poll_search(&mut self, layout: &Layout) -> bool {
         let outcomes = self.search.poll(layout, &self.session_id);
@@ -236,6 +280,15 @@ impl Shell {
         for outcome in outcomes {
             let text = search_text(&outcome.query, &outcome.result);
             self.note("Search", text);
+            if let Ok(hits) = outcome.result
+                && !hits.is_empty()
+            {
+                self.search.ready = Some((outcome.query, hits));
+                self.note(
+                    "Search",
+                    "Use /search results to inspect matches and open a conversation.",
+                );
+            }
         }
         handled
     }

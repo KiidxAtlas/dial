@@ -499,34 +499,51 @@ impl Agent<'_> {
                     }),
                 ));
             }
-            if let Some(outcome) = crate::agent::verify::completion::declared_outcome(&reply.text)
-                && (outcome != TurnOutcome::Completed || !self.advisor_enabled())
-            {
-                self.disclose_turn_changes(ui);
-                return Ok(ControlFlow::Break(
-                    crate::agent::run::engine::Tick::Finished(TurnReport {
-                        text: reply.text,
-                        outcome,
-                        steps: sent.step + 1,
-                        interrupted: false,
-                        trajectory: None,
-                    }),
-                ));
-            }
-            if !self.hermetic && crate::agent::verify::completion::awaiting_input(&reply.text) {
-                ui.notice("Waiting for your answer; unfinished todos are preserved.");
-                return Ok(ControlFlow::Break(
-                    crate::agent::run::engine::Tick::Finished(TurnReport {
-                        text: reply.text,
-                        outcome: TurnOutcome::NeedsInput,
-                        steps: sent.step + 1,
-                        interrupted: false,
-                        trajectory: None,
-                    }),
-                ));
-            }
-            if self.await_background_jobs(ui) {
+            let requested = crate::agent::verify::completion::declared_outcome(&reply.text)
+                .unwrap_or_else(|| {
+                    if crate::agent::verify::completion::awaiting_input(&reply.text) {
+                        TurnOutcome::NeedsInput
+                    } else {
+                        TurnOutcome::Completed
+                    }
+                });
+            if requested == TurnOutcome::Completed && self.await_background_jobs(ui) {
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
+            }
+            match self.completion_decision(requested, &reply.text, ui) {
+                crate::agent::verify::completion::Decision::Continue(note) => {
+                    turn.completion_candidate = Some(reply.text.clone());
+                    turn.pending_nudges.push(crate::agent::run::guidance::note(
+                        crate::agent::run::guidance::Priority::Review,
+                        note,
+                    ));
+                    return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
+                }
+                crate::agent::verify::completion::Decision::Incomplete(reason) => {
+                    let text = crate::agent::verify::completion::rejected_report(
+                        &reply.text,
+                        &reason,
+                        TurnOutcome::Incomplete,
+                    );
+                    return self.stop_turn(ui, text, sent.step + 1).map(|mut report| {
+                        report.outcome = TurnOutcome::Incomplete;
+                        ControlFlow::Break(crate::agent::run::engine::Tick::Finished(report))
+                    });
+                }
+                crate::agent::verify::completion::Decision::Accept(outcome)
+                    if outcome != TurnOutcome::Completed =>
+                {
+                    return Ok(ControlFlow::Break(
+                        crate::agent::run::engine::Tick::Finished(TurnReport {
+                            text: reply.text,
+                            outcome,
+                            steps: sent.step + 1,
+                            interrupted: false,
+                            trajectory: None,
+                        }),
+                    ));
+                }
+                crate::agent::verify::completion::Decision::Accept(_) => {}
             }
             let route = self.route.generation();
             if self.before_yield(backend, &turn.names, &mut turn.pending_nudges, ui)? {
@@ -534,71 +551,6 @@ impl Agent<'_> {
                     turn.max_tokens = backend.output_budget(turn.harness.max_tokens);
                 }
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
-            }
-            match turn.completion.stopped(&self.todo) {
-                crate::agent::verify::completion::StopAction::Accept => {}
-                crate::agent::verify::completion::StopAction::Blocked(blockers) => {
-                    self.disclose_turn_changes(ui);
-                    let outcome = TurnOutcome::Blocked;
-                    return self
-                        .stop_turn(
-                            ui,
-                            crate::agent::verify::completion::rejected_report(
-                                &reply.text,
-                                &blockers,
-                                outcome,
-                            ),
-                            sent.step + 1,
-                        )
-                        .map(|mut report| {
-                            report.outcome = outcome;
-                            crate::agent::run::engine::Tick::Finished(report)
-                        })
-                        .map(ControlFlow::Break);
-                }
-            }
-            // Past a deadline or cost cap the answer is delivered without another request.
-            let can_remind = self.stop_boundary().is_none();
-            let run = can_remind && !turn.completion.reminder_spent();
-            let (unverified, failures) = self.gate_unverified_edits(run, ui);
-            match turn
-                .completion
-                .evidence(unverified.as_deref(), &failures, can_remind)
-            {
-                crate::agent::verify::completion::EvidenceGate::Accept => {}
-                crate::agent::verify::completion::EvidenceGate::Remind(note) => {
-                    turn.pending_nudges.push(crate::agent::run::guidance::note(
-                        crate::agent::run::guidance::Priority::Review,
-                        note,
-                    ));
-                    return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
-                }
-                crate::agent::verify::completion::EvidenceGate::Disclose(disclosure) => {
-                    reply.text.push_str(&disclosure);
-                    ui.text_delta(&disclosure);
-                }
-            }
-            if let Err(reason) = self.validate_completion(ui) {
-                // Completion is a controller verdict, not another model-repair loop. Preserve
-                // the candidate and the exact failed prerequisite without recording success or
-                // spending another inference on a repeated rejection instruction.
-                self.disclose_turn_changes(ui);
-                let outcome = self.completion_rejection_outcome();
-                return self
-                    .stop_turn(
-                        ui,
-                        crate::agent::verify::completion::rejected_report(
-                            &reply.text,
-                            &reason,
-                            outcome,
-                        ),
-                        sent.step + 1,
-                    )
-                    .map(|mut report| {
-                        report.outcome = outcome;
-                        crate::agent::run::engine::Tick::Finished(report)
-                    })
-                    .map(ControlFlow::Break);
             }
             // A small model that denies a capability without looking for a tool gets one
             // reminder; the catalog often holds it (an interactive terminal is `bg pty`).

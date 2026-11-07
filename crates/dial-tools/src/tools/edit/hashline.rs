@@ -755,12 +755,13 @@ fn parse_header(t: &str, line_no: usize) -> Result<Section, String> {
         ));
     };
     let tag = tag.trim();
-    // An empty tag passes the parser; the edit refuses it once it can quote the latest read's tag.
-    if !tag.is_empty() && (tag.len() != 4 || !tag.chars().all(|c| c.is_ascii_hexdigit())) {
-        return Err(format!(
-            "line {line_no}: tag {tag:?} is not four hex characters; copy it from the [PATH#TAG] header"
-        ));
-    }
+    // An empty or malformed tag passes the parser; the edit refuses it once it can quote the
+    // latest read's tag, so the retry needs no extra read.
+    let tag = if tag.len() == 4 && tag.chars().all(|c| c.is_ascii_hexdigit()) {
+        tag
+    } else {
+        ""
+    };
     let path = path.trim();
     let path = if path.starts_with('"') {
         serde_json::from_str::<String>(path)
@@ -1722,14 +1723,14 @@ fn load_job(
             .and_then(|snaps| snaps.iter().max_by_key(|s| s.observation_id));
         return Err(match latest {
             Some(snap) if snap.tag == cur_tag => format!(
-                "{rel}: the section header has an empty tag; the latest read of this file returned [{rel}#{cur_tag}] and the file is unchanged, so resend the edit with that header"
+                "{rel}: the section header has an empty or malformed tag (a tag is four hex characters); the latest read of this file returned [{rel}#{cur_tag}] and the file is unchanged, so resend the edit with that header"
             ),
             Some(snap) => format!(
-                "{rel}: the section header has an empty tag; the latest read returned #{} but the file has changed since (current {cur_tag}); read the affected lines with `{rel}:START-END` and use the fresh [path#TAG] header",
+                "{rel}: the section header has an empty or malformed tag (a tag is four hex characters); the latest read returned #{} but the file has changed since (current {cur_tag}); read the affected lines with `{rel}:START-END` and use the fresh [path#TAG] header",
                 snap.tag
             ),
             None => format!(
-                "{rel}: the section header has an empty tag and no read of this file is recorded; read the affected lines with `{rel}:START-END`, then use the [path#TAG] header that read returns"
+                "{rel}: the section header has an empty or malformed tag and no read of this file is recorded; read the affected lines with `{rel}:START-END`, then use the [path#TAG] header that read returns"
             ),
         });
     }

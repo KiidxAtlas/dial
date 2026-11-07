@@ -319,6 +319,21 @@ pub(crate) fn standard_location(target: &Recipe, env: &Env) -> Result<Option<Pat
                     PathBuf::from(gobin)
                 }
             }
+            super::Method::Rustup(_) => {
+                let Some(rustup) = env.find("rustup") else {
+                    continue;
+                };
+                // Rustup installs components into the active toolchain. Homebrew's rustup puts no
+                // proxy for them on PATH, so ask rustup where the program is; `rustup which`
+                // fails while the component is not installed, which means "not found" here.
+                let Ok(program) = probe(&rustup, &["which", target.program]) else {
+                    continue;
+                };
+                match Path::new(&program).parent() {
+                    Some(bin) => bin.to_path_buf(),
+                    None => continue,
+                }
+            }
             _ => continue,
         };
         anyhow::ensure!(
@@ -482,7 +497,7 @@ pub(super) fn download_to(
             next_report += step;
         }
     }
-    file.sync_all()?;
+    crate::platform::fs::sync_file(&file)?;
     Ok(())
 }
 

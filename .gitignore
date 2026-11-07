@@ -48,3 +48,8 @@
 *.swp
 *.swo
 benchmarks/
+
+# Source benchmark cases belong in version control; generated benchmark runs stay ignored.
+!examples/benchmarks/
+examples/benchmarks/*
+!examples/benchmarks/lifecycle-efficiency.toml

@@ -226,7 +226,7 @@ fn extract() -> Result<PathBuf> {
         .open(&staging)
         .context("writing the helper")?;
     file.write_all(HELPER)?;
-    file.sync_all()?;
+    crate::platform::fs::sync_file(&file)?;
     drop(file);
     std::fs::rename(&staging, &path).context("installing the helper")?;
     Ok(path)

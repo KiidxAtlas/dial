@@ -21,7 +21,7 @@ impl ArtifactStore {
         let mut tmp = tempfile::NamedTempFile::new_in(&self.root)?;
         crate::platform::fs::set_owner_only(tmp.path())?;
         std::io::copy(&mut File::open(staged)?, tmp.as_file_mut())?;
-        tmp.as_file().sync_all()?;
+        crate::platform::fs::sync_file(tmp.as_file())?;
         match tmp.persist_noclobber(self.path(uri)?) {
             Ok(_) => {}
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -33,7 +33,7 @@ impl ArtifactStore {
             Err(error) => return Err(error.error.into()),
         }
         #[cfg(unix)]
-        File::open(&self.root)?.sync_all()?;
+        crate::platform::fs::sync_file(&File::open(&self.root)?)?;
         Ok(())
     }
 
@@ -60,7 +60,7 @@ impl ArtifactStore {
             format!("{:x}", hash.finalize()) == id,
             "referenced artifact {uri} has corrupt content"
         );
-        staged.as_file().sync_all()?;
+        crate::platform::fs::sync_file(staged.as_file())?;
         match staged.persist_noclobber(target.path(uri)?) {
             Ok(_) => {}
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -82,7 +82,7 @@ impl ArtifactStore {
             Err(error) => return Err(error.error.into()),
         }
         #[cfg(unix)]
-        File::open(&target.root)?.sync_all()?;
+        crate::platform::fs::sync_file(&File::open(&target.root)?)?;
         if let Some(mut record) = self.retention(uri)? {
             let path = target.lifecycle_path(uri)?;
             crate::platform::atomic::private_dir(path.parent().unwrap())?;
@@ -145,7 +145,7 @@ impl ArtifactStore {
             let mut staged = tempfile::NamedTempFile::new_in(&destination)?;
             crate::platform::fs::set_owner_only(staged.path())?;
             staged.write_all(&bytes)?;
-            staged.as_file().sync_all()?;
+            crate::platform::fs::sync_file(staged.as_file())?;
             match staged.persist_noclobber(&dest) {
                 Ok(_) => {}
                 Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -159,7 +159,7 @@ impl ArtifactStore {
             }
         }
         #[cfg(unix)]
-        File::open(&destination)?.sync_all()?;
+        crate::platform::fs::sync_file(&File::open(&destination)?)?;
         Ok(())
     }
 }

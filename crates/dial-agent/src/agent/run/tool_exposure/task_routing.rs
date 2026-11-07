@@ -620,7 +620,7 @@ fn explicit(query: &str, candidates: &[(String, String)]) -> Vec<String> {
                     "perception",
                     "video",
                     "workbench",
-                    "check",
+                    "verify",
                     "find",
                     "finish",
                     "memory",
@@ -942,6 +942,7 @@ impl Agent<'_> {
 
     fn automatic_tool_routing(&self) -> bool {
         !self.hermetic
+            && !self.stable_tool_offer()
             && !self.lean_tools
             && self.config.harness.tools == config::tools::default_tools()
     }

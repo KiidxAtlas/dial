@@ -35,6 +35,7 @@ fn icon(kind: EventKind, ascii: bool) -> &'static str {
         (Continue, false) => "↻",
         (Compaction | ContextReset, false) => "⟲",
         (Draft, false) => "✎",
+        (Wait, false) => "◷",
         (Recovery, true) => "!",
         (Steering, true) => ">",
         (Compaction | ContextReset, true) => "~",

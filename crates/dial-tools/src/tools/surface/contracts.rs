@@ -28,8 +28,8 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("monitor", &["run"]),
     ("grep", &["output", "preview"]),
     ("glob", &["preview"]),
-    ("edit", &["allow_syntax_errors", "check"]),
-    ("write", &["allow_syntax_errors", "check"]),
+    ("edit", &["allow_syntax_errors", "verify"]),
+    ("write", &["allow_syntax_errors", "verify"]),
     ("ast_edit", &["allow_syntax_errors"]),
     (
         "task",
@@ -422,16 +422,16 @@ fn paired_call(messages: &[Value], index: usize, id: &str) -> Option<(usize, usi
     Some((call_index, result_index))
 }
 
-/// `check.expect`, offered only under `experimental.check_predictions`. The controller owns the
-/// `check` schema; this shape lives here so history recorded with or without it stays valid when
+/// `verify.expect`, offered only under `experimental.check_predictions`. The controller owns the
+/// `verify` schema; this shape lives here so history recorded with or without it stays valid when
 /// the flag changes between runs.
 pub fn check_prediction_property() -> Value {
     json!({"type":"string","enum":["pass","fail"],"description":"Optional prediction of the overall outcome before running: pass (every selected check passes) or fail. A mismatch is reported."})
 }
 
-/// Every additive variant of the current `check` schema: with or without `repro` (added after
-/// release) and with or without `expect` (experimental). `None` unless the current schema has `repro`.
-fn check_variants(schema: &Value) -> Option<Vec<Value>> {
+/// Every additive variant of the current `verify` schema: with or without `repro` and with or
+/// without `expect` (experimental). `None` unless the current schema has `repro`.
+fn verify_variants(schema: &Value) -> Option<Vec<Value>> {
     let properties = schema.pointer("/function/parameters/properties")?;
     // Only the canonical `expect` shape is the additive property; any other shape is a change.
     if properties.get("repro").is_none()
@@ -622,8 +622,10 @@ fn controller_compatible(
     schemas: &[Value],
     registry: &Registry,
 ) -> bool {
-    if !matches!(old.name.as_str(), "working_state" | "check" | "task")
-        || new.name != old.name
+    if !matches!(
+        old.name.as_str(),
+        "working_state" | "verify" | "task" | "todo" | "finish"
+    ) || new.name != old.name
         || old.revision != 1
         || new.revision != 1
         || registry.get(&old.name).is_some()
@@ -636,18 +638,21 @@ fn controller_compatible(
     else {
         return false;
     };
-    if old.name == "check" {
-        return check_variants(schema).is_some_and(|variants| {
+    if old.name == "verify" {
+        return verify_variants(schema).is_some_and(|variants| {
             variants
                 .into_iter()
                 .any(|variant| identities(&[variant], &Registry::new()).get(&old.name) == Some(old))
         });
     }
     if old.name == "task" {
+        // Recorded before identities ignored the profile list, or after: accept either hash.
         return task_variants(schema).is_some_and(|variants| {
-            variants
-                .into_iter()
-                .any(|variant| identities(&[variant], &Registry::new()).get(&old.name) == Some(old))
+            variants.iter().any(|variant| {
+                shape_sha256(variant) == old.schema_sha256
+                    || stable_schema("task", variant)
+                        .is_some_and(|stable| shape_sha256(&stable) == old.schema_sha256)
+            })
         });
     }
     let mut before = schema.clone();
@@ -672,6 +677,38 @@ fn controller_compatible(
         return false;
     };
     match old.name.as_str() {
+        "todo" => {
+            let Some(items) = properties
+                .get_mut("tasks")
+                .and_then(|tasks| tasks.get_mut("items"))
+            else {
+                return false;
+            };
+            if items["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "kind"))
+            {
+                return false;
+            }
+            let Some(kind) = items
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+                .and_then(|properties| properties.remove("kind"))
+            else {
+                return false;
+            };
+            if parameter_shape(&kind) != json!({"type":"string","enum":["step","follow_up"]}) {
+                return false;
+            }
+        }
+        "finish" => {
+            if properties["outcome"]["enum"]
+                != json!(["completed", "answered", "blocked", "needs_input"])
+            {
+                return false;
+            }
+            properties["outcome"]["enum"] = json!(["completed", "blocked", "needs_input"]);
+        }
         "working_state" => {
             if properties.remove("expected_revision").is_none()
                 || properties.remove("claims").is_none()
@@ -686,41 +723,58 @@ fn controller_compatible(
     identities(&[before], &Registry::new()).get(&old.name) == Some(old)
 }
 
-/// Optional `task` properties added since the prior release, each present at the top level and in
-/// `tasks[]` items. Their absence keeps the old meaning.
-const TASK_ADDITIVE: &[&[&str]] = &[
+/// Optional `task` properties added since release or enabled by configuration (`work_packet`,
+/// `model_profile`), each removed at the top level and in `tasks[]` items. Their absence keeps
+/// the old meaning.
+const TASK_OPTIONAL: &[&[&str]] = &[
     &["source_session", "model"],
     &["isolation_backend"],
     &["acceptance_checks"],
+    &["contract"],
+    &["work_packet"],
+    &["model_profile"],
 ];
+const TASK_RELEASED_ACTIONS: &[&str] = &["run", "start", "resume", "status", "wait", "cancel"];
+const TASK_POOL_ACTIONS: &[&str] = &["create", "push", "peek", "close"];
 
 /// Every prior shape of the current `task` schema: with or without the pool actions and
-/// `concurrency`, and with or without each group in [`TASK_ADDITIVE`]. `None` unless the current
-/// schema has the pool actions, the only shape these variants are derived from.
+/// `concurrency`, with or without the `verify` action, and with or without each group in
+/// [`TASK_OPTIONAL`]. `None` unless the current schema has the pool actions (optionally followed
+/// by `verify`), the only shape these variants are derived from.
 fn task_variants(schema: &Value) -> Option<Vec<Value>> {
     let properties = schema.pointer("/function/parameters/properties")?;
+    let pooled: Vec<&str> = TASK_RELEASED_ACTIONS
+        .iter()
+        .chain(TASK_POOL_ACTIONS)
+        .copied()
+        .collect();
+    let mut verified = pooled.clone();
+    verified.push("verify");
+    let actions = &properties["action"]["enum"];
     if properties.get("concurrency").is_none()
-        || properties["action"]["enum"]
-            != json!([
-                "run", "start", "resume", "status", "wait", "cancel", "create", "push", "peek",
-                "close"
-            ])
+        || (*actions != json!(pooled) && *actions != json!(verified))
     {
         return None;
     }
     let mut variants = Vec::new();
-    for mask in 0..(1u32 << (TASK_ADDITIVE.len() + 1)) {
+    for mask in 0..(1u32 << (TASK_OPTIONAL.len() + 2)) {
         let mut variant = schema.clone();
         let properties = variant
             .pointer_mut("/function/parameters/properties")
             .and_then(Value::as_object_mut)?;
+        let mut removed_actions: Vec<&str> = Vec::new();
         if mask & 1 != 0 {
             properties.remove("concurrency");
-            properties["action"]["enum"] =
-                json!(["run", "start", "resume", "status", "wait", "cancel"]);
+            removed_actions.extend(TASK_POOL_ACTIONS);
         }
-        for (bit, group) in TASK_ADDITIVE.iter().enumerate() {
-            if mask & (2 << bit) == 0 {
+        if mask & 2 != 0 {
+            removed_actions.push("verify");
+        }
+        if let Some(options) = properties["action"]["enum"].as_array_mut() {
+            options.retain(|value| !value.as_str().is_some_and(|a| removed_actions.contains(&a)));
+        }
+        for (bit, group) in TASK_OPTIONAL.iter().enumerate() {
+            if mask & (4 << bit) == 0 {
                 continue;
             }
             for property in *group {
@@ -736,6 +790,8 @@ fn task_variants(schema: &Value) -> Option<Vec<Value>> {
         }
         variants.push(variant);
     }
+    variants.sort_by_cached_key(Value::to_string);
+    variants.dedup();
     Some(variants)
 }
 
@@ -748,6 +804,8 @@ pub fn project_history(
 ) -> Result<Option<Vec<Value>>> {
     let current = identities(schemas, registry);
     let mut projected: Option<Vec<Value>> = None;
+    // Compatibility is a pure function of (old, current); decide each recorded identity once.
+    let mut accepted: Vec<Identity> = Vec::new();
     for (index, message) in messages.iter().enumerate() {
         let Some(recorded) = message.get("dial_tool_contracts") else {
             continue;
@@ -842,6 +900,9 @@ pub fn project_history(
             let Some(new) = current.get(&old.name) else {
                 continue;
             };
+            if accepted.contains(old) {
+                continue;
+            }
             if old == new
                 || native_compatible(old, new, registry)
                 || registry_additive_compatible(old, new, schemas, registry)
@@ -850,6 +911,7 @@ pub fn project_history(
                     .get(&old.name)
                     .is_some_and(|tool| tool.accepts_historical_contract(old))
             {
+                accepted.push(old.clone());
                 continue;
             }
             if legacy_compatible(old, new, schemas, registry) {
@@ -993,19 +1055,47 @@ fn sort_object_keys(value: &mut Value) {
 }
 
 pub fn identities(schemas: &[Value], registry: &Registry) -> BTreeMap<String, Identity> {
-    schemas.iter().filter_map(|schema| {
-        let name = schema.pointer("/function/name")?.as_str()?;
-        // Documentation/presentation changes do not alter the executable contract. Parameters,
-        // strictness and the tool-owned semantic revision do. Sort explicitly even when a
-        // downstream dependency enables serde_json's preserve_order feature.
-        let mut shape = json!({"parameters":parameter_shape(&schema["function"]["parameters"]), "strict":schema["function"]["strict"]});
-        sort_object_keys(&mut shape);
-        Some((name.to_owned(), Identity {
-            name: name.to_owned(),
-            revision: registry.get(name).map_or(1, |tool| tool.contract_revision()),
-            schema_sha256: format!("{:x}", Sha256::digest(shape.to_string().as_bytes())),
-        }))
-    }).collect()
+    schemas
+        .iter()
+        .filter_map(|schema| {
+            let name = schema.pointer("/function/name")?.as_str()?;
+            let stable = stable_schema(name, schema);
+            Some((
+                name.to_owned(),
+                Identity {
+                    name: name.to_owned(),
+                    revision: registry
+                        .get(name)
+                        .map_or(1, |tool| tool.contract_revision()),
+                    schema_sha256: shape_sha256(stable.as_ref().unwrap_or(schema)),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Hash of a schema's executable contract. Documentation/presentation changes do not alter it;
+/// parameters and strictness do (the tool-owned semantic revision is recorded beside it). Keys
+/// are sorted explicitly even when a dependency enables serde_json's preserve_order feature.
+fn shape_sha256(schema: &Value) -> String {
+    let mut shape = json!({"parameters":parameter_shape(&schema["function"]["parameters"]), "strict":schema["function"]["strict"]});
+    sort_object_keys(&mut shape);
+    format!("{:x}", Sha256::digest(shape.to_string().as_bytes()))
+}
+
+/// `task.model_profile` enumerates the configured profile names, which change with settings and
+/// the model catalog rather than with the tool's contract. Its identity omits that list, so adding
+/// a profile mid-session no longer makes recorded `task` history unresumable.
+fn stable_schema(name: &str, schema: &Value) -> Option<Value> {
+    if name != "task" {
+        return None;
+    }
+    let mut stable = schema.clone();
+    stable
+        .pointer_mut("/function/parameters/properties/model_profile")
+        .and_then(Value::as_object_mut)
+        .and_then(|property| property.remove("enum"))
+        .map(|_| stable)
 }
 
 pub fn assistant_message(

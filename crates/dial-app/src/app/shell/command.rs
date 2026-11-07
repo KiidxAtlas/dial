@@ -5,7 +5,7 @@ use crate::agent::{Agent, Ui};
 use crate::app::bridge::Bridge;
 use crate::app::command_registry::{canonical_command, command_panel, turn_count};
 use crate::app::core::App;
-use crate::app::display::{group_digits, short};
+use crate::app::display::short;
 use crate::app::drive::Step;
 use crate::app::notices::memory_status_text;
 use crate::app::overlay::Which;
@@ -190,6 +190,16 @@ impl Shell {
         if let Some(panel) = command_panel(name, args) {
             return self.open(app, agent, panel);
         }
+        let changes_session = matches!(name, "new" | "clear" | "fork" | "move" | "undo")
+            || (name == "wt"
+                && matches!(args.split_whitespace().next(), Some("create" | "switch")));
+        if changes_session {
+            self.poll_input_recovery(app);
+            if let Err(error) = self.prepare_input_session_change() {
+                self.note("Input recovery", format!("{error:#}"));
+                return Ok(Step::Done);
+            }
+        }
         if let Some(result) = crate::app::commands::run(self, app, agent, name, args) {
             return result.or_else(|error| {
                 self.note(&format!("/{name}"), format!("{error:#}"));
@@ -260,7 +270,7 @@ impl Shell {
             }) {
                 Ok(session) => {
                     let id = session.id().to_owned();
-                    app.swap_agent_session(agent, session)?;
+                    self.swap_agent_session(app, agent, session)?;
                     agent.set_plan_mode(false);
                     self.stop_loop_for_session_change();
                     self.show_session(agent.session());
@@ -287,7 +297,7 @@ impl Shell {
                             self.note("Resume", reason);
                             return Ok(Step::Done);
                         }
-                        app.swap_agent_session(agent, session)?;
+                        self.swap_agent_session(app, agent, session)?;
                         self.show_session(agent.session());
                         agent.set_plan_mode(false);
                         self.stop_loop_for_session_change();
@@ -387,7 +397,7 @@ impl Shell {
             "fork" => match agent.gate_session_change("session_before_branch", serde_json::json!({"reason":"fork"})).map_err(anyhow::Error::msg).and_then(|()| agent.layout().context("agent has no project layout")).and_then(|layout| agent.session().fork(layout)) {
                 Ok(session) => {
                     let id = session.id().to_owned();
-                    app.swap_agent_session(agent, session)?;
+                    self.swap_agent_session(app, agent, session)?;
                     agent.set_plan_mode(false);
                     self.stop_loop_for_session_change();
                     self.set_session_id(&id);
@@ -518,11 +528,9 @@ impl Shell {
                 };
                 self.note("Commands", text);
             }
-            "search" if args.trim().is_empty() => self.note("Search", Self::SEARCH_USAGE),
-            "search" => match agent.layout() {
-                Some(layout) => self.start_search(layout, args.trim()),
-                None => self.note("Search", "error: agent has no project layout"),
-            },
+            "search" => return self.search_command(app, agent, args),
+            "attachments" => self.attachments_command(args),
+            "draft" => self.draft_command(app, args),
             "context" => return self.context_command(agent),
             "approval" => {
                 match args {
@@ -931,6 +939,22 @@ impl Shell {
     }
 
     fn compact_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        self.compact_command_review(app, agent, args, |shell, preview| {
+            shell.ask(
+                "Compact context?",
+                preview,
+                &[("Cancel", 'c'), ("Compact", 's')],
+            ) == Some(1)
+        })
+    }
+
+    fn compact_command_review(
+        &mut self,
+        app: &App,
+        agent: &mut Agent<'_>,
+        args: &str,
+        review: impl FnOnce(&mut Self, &str) -> bool,
+    ) -> Result<Step> {
         let mut options = match crate::config::compaction::CompactionOptions::from_args(args) {
             Ok(options) => options,
             Err(error) => {
@@ -939,6 +963,19 @@ impl Shell {
             }
         };
         options.suppress_continuation = true;
+        let preview = match super::context_decision::render_compaction_preflight(agent, &options) {
+            Ok(preview) => preview,
+            Err(error) => {
+                self.note(
+                    "Context",
+                    format!("Compaction preview unavailable: {error:#}. Nothing changed."),
+                );
+                return Ok(Step::Done);
+            }
+        };
+        if !review(self, &preview) {
+            return Ok(Step::Done);
+        }
         if !self.wait_compute(app)? {
             return Ok(Step::Done);
         }
@@ -1193,32 +1230,18 @@ impl Shell {
     }
 
     fn context_command(&mut self, agent: &Agent<'_>) -> Result<Step> {
-        let used = agent.last_prompt_tokens;
-        let window = u64::from(agent.context_window());
-        let percent = (used * 100).checked_div(window).unwrap_or(0);
-        let mut text = format!(
-            "used: {} of {} tokens ({percent}%) · messages: {}\n/compact summarizes older turns to free room; /new starts fresh.",
-            group_digits(used),
-            group_digits(window),
-            agent.session().messages().len()
-        );
-        if let Some(breakdown) = agent.last_request_breakdown() {
-            text.push_str(
-                "\n\nLast request, estimated tokens (bytes ÷ 4; images at a fixed cost):",
-            );
-            for row in breakdown.rows() {
-                text.push_str(&format!(
-                    "\n  {:<32} {:>12}",
-                    row.label,
-                    group_digits(row.tokens)
-                ));
-            }
-            text.push_str(&format!(
-                "\n  {:<32} {:>12}",
-                "total",
-                group_digits(breakdown.total_tokens())
-            ));
+        let mut pending: Vec<Value> = self
+            .composer
+            .queued_messages()
+            .into_iter()
+            .map(|(text, _)| serde_json::json!({"role":"user","content":text}))
+            .collect();
+        let draft = self.composer.expanded_draft();
+        if !draft.trim().is_empty() {
+            pending.push(serde_json::json!({"role":"user","content":draft}));
         }
+        let text = super::context_decision::render_context(agent, &pending)
+            .unwrap_or_else(|error| format!("Estimated next request unavailable: {error:#}. Prior usage is not a next-request estimate."));
         self.note("Context", text);
         Ok(Step::Done)
     }

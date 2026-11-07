@@ -36,6 +36,7 @@ pub use model::backend::{Runtime, make_backend, make_session_backend};
 pub use model::laya;
 pub use run::call_summary::{legacy_tool_presentation, legacy_tool_result, summarize_call};
 pub use run::coordination::{BoardPeer, CoordinationCarry, PeerBoard, PeerMessage, PeerSender};
+pub use run::scheduling_replay::{SchedulingReplay, replay_scheduling};
 pub use safety::approval;
 pub use ui::surface::{Decision, NullUi, RequestPhase, Ui};
 pub use workflow::todo;
@@ -104,7 +105,8 @@ impl TurnReport {
         self.interrupted
             || matches!(
                 self.outcome,
-                TurnOutcome::NeedsInput
+                TurnOutcome::Answered
+                    | TurnOutcome::NeedsInput
                     | TurnOutcome::Blocked
                     | TurnOutcome::Failed
                     | TurnOutcome::Interrupted
@@ -159,6 +161,12 @@ pub struct AgentMetrics {
 /// Per-turn bookkeeping for what `todo done` checks at step boundaries.
 #[derive(Default)]
 struct StepChecks {
+    /// Actual non-bookkeeping tool attempts in this user turn, including failed investigations.
+    observations: u64,
+    /// Peer/monitor callbacks carry observations from their existing task, not a fresh work request.
+    autonomous_continuation: bool,
+    /// Slow check commands and the last observed native-edit count; hints never authorize reuse.
+    slow_checks: std::collections::BTreeMap<String, u64>,
     /// Consultation allowance and failure ledger span all repair reentries in this user turn.
     auto_escalation: verify::auto_escalation::AutoEscalation,
     visual: verify::visual::Review,
@@ -174,13 +182,6 @@ struct StepChecks {
     /// Non-read-only shell attempts outside checkpoint observation.
     uncheckpointed_shell_commands: u64,
     disclosed_shell_commands: u64,
-    /// Files modified since `started` that a bounded workspace scan found after opaque effects:
-    /// delivered artifacts outside checkpoint observation, for completion review.
-    shell_outputs: std::collections::BTreeSet<std::path::PathBuf>,
-    /// Opaque-effect count at the last scan, so an unchanged state is not rescanned.
-    shell_scan_epoch: u64,
-    /// Turn admission time less a margin for coarse filesystem timestamps; `None` disables scans.
-    started: Option<std::time::SystemTime>,
     /// Approval-requiring extension attempts that may have effects outside checkpoint observation.
     uncheckpointed_extension_calls: u64,
     disclosed_extension_calls: u64,
@@ -394,6 +395,8 @@ pub struct Agent<'a> {
     /// Round-local exact one-shot choices, never permission rules.
     pending_batch_approvals: Vec<(ToolCall, bool)>,
     pending_check: Option<verify::checks::PendingCheck>,
+    /// `edit`/`write` `verify` entries of the current assistant batch.
+    verify_batch: verify::verify_tool::VerifyBatch,
     cur_step: u32,
     pub last_prompt_tokens: u64,
     context_meter: window::context_meter::ContextMeter,

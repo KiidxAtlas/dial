@@ -51,6 +51,8 @@ pub struct Request {
     pub first_output: Option<Duration>,
     /// Reasoning effort the request asked for; `None` keeps the provider default.
     pub effort: Option<String>,
+    /// Content-free failure kind of a failed request (see `llm::errors::failure_kind`).
+    pub failure: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +165,7 @@ pub fn request(
             billing: reply.billing,
             first_output: reply.first_output,
             effort: reply.requested_effort.clone(),
+            failure: None,
         })),
     );
 }
@@ -193,7 +196,7 @@ pub fn request_failed(
             reasoning: None,
             cost_usd: None,
             duration: elapsed,
-            finish_reason: format!("error:{}", crate::llm::errors::classify(error).label()),
+            finish_reason: failure_finish_reason(error),
             tool_calls: 0,
             error: true,
             end: SystemTime::now(),
@@ -201,8 +204,21 @@ pub fn request_failed(
             billing: None,
             first_output: None,
             effort: None,
+            failure: crate::llm::errors::failure_kind(error),
         })),
     );
+}
+
+/// `error:<class>` for a failed request. A user interrupt is recorded as `error:interrupted`: the
+/// retry classifier treats it as fatal (never resend), but it is not a provider failure.
+fn failure_finish_reason(error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<crate::llm::Interrupted>().is_some())
+    {
+        return "error:interrupted".into();
+    }
+    format!("error:{}", crate::llm::errors::classify(error).label())
 }
 
 /// One executed tool call.
@@ -550,6 +566,7 @@ fn record_stats(db: &mut crate::stats::Db, event: &Event) -> Result<()> {
             billing: r.billing.map(|billing| billing.label().to_owned()),
             first_output_ms: r.first_output.map(|d| d.as_millis() as u64),
             effort: r.effort.clone(),
+            failure: r.failure.clone(),
         }),
         Event::Tool(t) => db.record_tool(&crate::stats::ToolRecord {
             facts: t.facts.clone(),

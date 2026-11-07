@@ -54,24 +54,52 @@ pub fn instructions(mode: EditMode) -> &'static str {
 /// Optional on every grammar: commits an edit the lean local tiers would refuse for new parser errors.
 const ALLOW_SYNTAX_ERRORS: &str =
     "Set true only when valid code is refused for new syntax errors (parser dialect gap).";
-/// Optional foreground verification, shared by edits and whole-file writes.
-pub(in crate::tools) fn check_property() -> Value {
-    json!({"type":"boolean","description":"Set true when a coherent change is ready for verification, usually on its final edit or write—not after every intermediate mutation. Omit while still making related changes, or use false to only mutate. Runs the controller's focused checks after success (same selection, approvals and evidence as check). Check failures leave the mutation applied and are reported separately. Available in foreground controller calls, not child workers."})
+/// Most `verify` entries one mutation (or one `verify` call) may name.
+pub const MAX_VERIFY_TARGETS: usize = 16;
+/// Optional post-mutation verification, shared by edits and whole-file writes.
+pub(in crate::tools) fn verify_property() -> Value {
+    json!({"type":"array","maxItems":MAX_VERIFY_TARGETS,"items":{"type":"string"},"description":"Tests to run once this change succeeds: files or `file::test` (pytest node, unittest Class::method, Rust/Go filter, jest name). Dial picks the runner and reports Passed/Failed with failure traces. Edits in one response that name tests run them once, after the last. Omit while making related changes."})
+}
+/// The `verify` entries of an `edit`/`write` call; empty when absent or null.
+pub fn verify_targets(args: &Value) -> Result<Vec<String>, String> {
+    let entries = match args.get("verify") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err("verify must be an array of test files or `file::test` names".into());
+        }
+    };
+    if entries.len() > MAX_VERIFY_TARGETS {
+        return Err(format!(
+            "verify accepts at most {MAX_VERIFY_TARGETS} entries"
+        ));
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| "verify entries must be non-empty strings".to_owned())
+        })
+        .collect()
 }
 pub fn schema(mode: EditMode) -> Value {
     let allow = json!({"type":"boolean","description":ALLOW_SYNTAX_ERRORS});
-    let check = check_property();
+    let verify = verify_property();
     match mode {
         EditMode::Replace => tool_schema(
             "edit",
             instructions(mode),
-            json!({"path":{"type":"string"},"old_string":{"type":"string","minLength":1},"new_string":{"type":"string"},"replace_all":{"type":"boolean"},"allow_syntax_errors":allow,"check":check}),
+            json!({"path":{"type":"string"},"old_string":{"type":"string","minLength":1},"new_string":{"type":"string"},"replace_all":{"type":"boolean"},"allow_syntax_errors":allow,"verify":verify}),
             &["path", "old_string", "new_string"],
         ),
         EditMode::Patch => tool_schema(
             "edit",
             instructions(mode),
-            json!({"path":{"type":"string"},"edits":{"type":"array","minItems":1,"maxItems":128,"items":{"type":"object","properties":{"op":{"type":"string","enum":["create","update","delete"]},"rename":{"type":"string"},"diff":{"type":"string"}},"additionalProperties":false}},"allow_syntax_errors":allow,"check":check}),
+            json!({"path":{"type":"string"},"edits":{"type":"array","minItems":1,"maxItems":128,"items":{"type":"object","properties":{"op":{"type":"string","enum":["create","update","delete"]},"rename":{"type":"string"},"diff":{"type":"string"}},"additionalProperties":false}},"allow_syntax_errors":allow,"verify":verify}),
             &["path", "edits"],
         ),
         _ => tool_schema(
@@ -82,7 +110,7 @@ pub fn schema(mode: EditMode) -> Value {
                 EditMode::ApplyPatch => "Apply-patch text using *** Begin Patch and *** End Patch; follow the tool description.",
                 EditMode::Sloppy => "Sloppy patch text; the tool description is the complete contract.",
                 _ => unreachable!(),
-            }},"allow_syntax_errors":allow,"check":check}),
+            }},"allow_syntax_errors":allow,"verify":verify}),
             &["input"],
         ),
     }
@@ -115,10 +143,10 @@ pub(crate) fn validate_shape(mode: EditMode, args: &Value) -> Result<(), String>
             "new_string",
             "replace_all",
             "allow_syntax_errors",
-            "check",
+            "verify",
         ],
-        EditMode::Patch => &["path", "edits", "allow_syntax_errors", "check"],
-        _ => &["input", "allow_syntax_errors", "check"],
+        EditMode::Patch => &["path", "edits", "allow_syntax_errors", "verify"],
+        _ => &["input", "allow_syntax_errors", "verify"],
     };
     if object
         .iter()
@@ -126,7 +154,7 @@ pub(crate) fn validate_shape(mode: EditMode, args: &Value) -> Result<(), String>
     {
         return Err("edit arguments contain fields from another mode or unknown fields".into());
     }
-    opt_bool(args, "check")?;
+    verify_targets(args)?;
     Ok(())
 }
 #[derive(Clone)]

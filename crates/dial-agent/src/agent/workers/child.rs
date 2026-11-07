@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use std::{path::Path, sync::atomic::Ordering};
 
 mod call;
+mod streaming;
 mod turn;
 
 struct RuleUi<'a, 'b, 'c> {

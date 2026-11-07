@@ -1,5 +1,19 @@
 use super::*;
 
+#[test]
+fn lifecycle_counters_are_unknown_for_legacy_reports_and_the_live_slice_parses() {
+    let mut metrics = RunMetrics::default();
+    assert_eq!(metrics.observed(ObservedMetric::CompletionNudges), None);
+    metrics.efficiency = Some(serde_json::json!({"completion_nudges":0,"full_builds":1}));
+    assert_eq!(metrics.observed(ObservedMetric::CompletionNudges), Some(0));
+    assert_eq!(metrics.observed(ObservedMetric::FullBuilds), Some(1));
+    let suite = BenchmarkSuite::parse_toml(include_str!(
+        "../../../../examples/benchmarks/lifecycle-efficiency.toml"
+    ))
+    .unwrap();
+    assert_eq!(suite.cases.len(), 3);
+}
+
 fn case(passed: bool, outcome_checks: usize, tokens: u64) -> CaseResult {
     CaseResult {
         id: "case".into(),

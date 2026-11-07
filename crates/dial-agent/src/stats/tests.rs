@@ -91,6 +91,25 @@ fn legacy_request_table_gains_wire_columns_and_records_them() {
             ),
         ]
     );
+    db.record_request(&RequestRecord {
+        error: true,
+        finish_reason: "error:transient".into(),
+        failure: Some("transport_connection".into()),
+        ..request(3, "m", 0, 0, 0, None, 5)
+    })
+    .unwrap();
+    let failures: Vec<Option<String>> = db
+        .conn
+        .prepare("SELECT failure FROM requests ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        failures,
+        vec![None, None, Some("transport_connection".into())]
+    );
 }
 
 #[test]

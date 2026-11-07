@@ -376,6 +376,35 @@ jobs:
           gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/SHA256SUMS.sig dist/SHA256SUMS.sshsig dist/install.sh dist/install.ps1 \
             --verify-tag --notes-file "$RUNNER_TEMP/release-notes.md" --latest="$IS_LATEST" --title "Dial $RELEASE_TAG"
 
+  website:
+    name: Show the new release on dial.rootatlas.dev
+    needs: publish
+    if: needs.publish.outputs.latest == 'true'
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - name: Refresh the site's cached release
+        # dial-web caches GitHub's latest release for an hour; this replaces it at once.
+        # The token matches NUXT_RELEASE_REFRESH_TOKEN on the dial-web Railway service.
+        env:
+          DIAL_WEB_REFRESH_TOKEN: ${{ secrets.DIAL_WEB_REFRESH_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DIAL_WEB_REFRESH_TOKEN" ]; then
+            echo "::warning title=Website not refreshed::DIAL_WEB_REFRESH_TOKEN is not set; dial.rootatlas.dev shows $RELEASE_TAG within an hour."
+            exit 0
+          fi
+          curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors --max-time 30 \
+            -X POST -H "Authorization: Bearer $DIAL_WEB_REFRESH_TOKEN" \
+            https://dial.rootatlas.dev/release/refresh > "$RUNNER_TEMP/release.json"
+          version="$(jq -r .version "$RUNNER_TEMP/release.json")"
+          if [ "$version" != "$RELEASE_TAG" ]; then
+            echo "::error title=Website shows $version::dial.rootatlas.dev returned $version after refreshing, expected $RELEASE_TAG." >&2
+            exit 1
+          fi
+          echo "dial.rootatlas.dev now shows $RELEASE_TAG"
+
   packaging:
     name: Propose package metadata update
     needs: publish

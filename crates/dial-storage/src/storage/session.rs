@@ -255,6 +255,10 @@ pub fn latest_conversation(sessions: &[SessionInfo]) -> Option<&SessionInfo> {
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub session_id: String,
+    /// Immutable journal entry identity. Empty for legacy records without an id.
+    pub entry_id: String,
+    /// Bounded full matching message for read-only inspection, never a rewind target.
+    pub preview: String,
     pub role: String,
     pub snippet: String,
     pub when: String,
@@ -641,10 +645,10 @@ fn copy_side_thread(src: &Path, dst: &Path) -> Result<bool> {
             .with_context(|| format!("creating {}", to.display()))?;
     let written = (|| -> io::Result<()> {
         io::copy(&mut input, &mut out)?;
-        out.sync_all()?;
+        crate::platform::fs::sync_file(&out)?;
         #[cfg(unix)]
         if let Some(dir) = to.parent() {
-            fs::File::open(dir)?.sync_all()?;
+            crate::platform::fs::sync_file(&fs::File::open(dir)?)?;
         }
         Ok(())
     })();
@@ -667,7 +671,7 @@ fn remove_side_thread(session: &Path) -> io::Result<()> {
 fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        fs::File::open(dir)?.sync_all()
+        crate::platform::fs::sync_file(&fs::File::open(dir)?)
     }
     #[cfg(not(unix))]
     {
@@ -726,7 +730,7 @@ fn truncate_torn_tail(file: &File) -> io::Result<()> {
         }
     };
     file.set_len(cut)?;
-    file.sync_data()
+    crate::platform::fs::sync_file_data(file)
 }
 
 fn read_bounded_line<R: BufRead>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<Option<RawLine>> {
@@ -1727,12 +1731,13 @@ impl Session {
             out.write_all(header.to_string().as_bytes())?;
             out.write_all(b"\n")?;
             io::copy(&mut src_reader, &mut out)?;
-            out.sync_all()
+            crate::platform::fs::sync_file(&out)
         })();
         drop(out);
         // The caller deletes the old session next, so the new directory entry must be durable.
         #[cfg(unix)]
-        let written = written.and_then(|()| fs::File::open(&dir).and_then(|d| d.sync_all()));
+        let written = written
+            .and_then(|()| fs::File::open(&dir).and_then(|d| crate::platform::fs::sync_file(&d)));
         if let Err(err) = written {
             discard_moved_copy(&dst, CreatedCompanions::default());
             return Err(err).context("writing moved session");
@@ -1922,7 +1927,7 @@ impl Session {
             out.write_all(header.to_string().as_bytes())?;
             out.write_all(b"\n")?;
             let copied = io::copy(&mut src_reader, &mut out)?;
-            out.sync_all()?;
+            crate::platform::fs::sync_file(&out)?;
             Ok(copied)
         })();
         drop(src_reader);
@@ -2455,7 +2460,7 @@ impl Session {
         let sync_error = match self.file.as_ref() {
             Some(file) => {
                 let started = Instant::now();
-                let synced = file.sync_data();
+                let synced = crate::platform::fs::sync_file_data(file);
                 bump(&mut self.io.context_sync_attempts);
                 add_elapsed(&mut self.io.context_sync_micros, started);
                 if synced.is_err() {
@@ -3222,7 +3227,7 @@ impl Session {
         self.runtime
             .check_persistence()
             .map_err(anyhow::Error::msg)?;
-        for node in self.runtime.pending() {
+        for node in self.runtime.pending_boundary_snapshots() {
             self.push(Kind::Runtime(Box::new(node.clone())))?;
             self.runtime.persisted(&node);
         }
@@ -3250,7 +3255,7 @@ impl Session {
             return Ok(());
         };
         let started = Instant::now();
-        let synced = file.sync_data();
+        let synced = crate::platform::fs::sync_file_data(file);
         bump(&mut self.io.runtime_reclaim_sync_attempts);
         add_elapsed(&mut self.io.runtime_reclaim_sync_micros, started);
         if synced.is_err() {
@@ -3383,6 +3388,12 @@ impl Session {
                     }
                 }
                 equal = patch.is_empty();
+                if equal {
+                    // Runtime changes still cross the persistence boundary; identical control
+                    // data does not create a new context node or invalidate memory authority.
+                    self.flush_runtime()?;
+                    return Ok(true);
+                }
                 message["patch"] = Value::Object(patch);
             }
             _ => message["state"] = state,
@@ -4046,7 +4057,7 @@ impl Session {
                 .collect::<Vec<_>>()
                 .join(joiner);
             let mut stmt = conn.prepare(
-                "SELECT session_id, role, snippet(msgs, 0, '', '', '…', 24), ts FROM msgs WHERE msgs MATCH ?1 ORDER BY rank LIMIT ?2",
+                "SELECT session_id, role, snippet(msgs, 0, '', '', '…', 24), ts, entry_id, text FROM msgs WHERE msgs MATCH ?1 ORDER BY rank LIMIT ?2",
             )?;
             let hits = stmt
                 .query_map(params![q, limit as i64], |r| {
@@ -4055,6 +4066,8 @@ impl Session {
                         role: r.get(1)?,
                         snippet: r.get(2)?,
                         when: r.get(3)?,
+                        entry_id: r.get(4)?,
+                        preview: r.get(5)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4292,7 +4305,7 @@ impl Session {
         }
         self.pending_newline = false;
         let entry_id = parent.context("context transition wrote no records")?;
-        let durability_error = file.sync_data().err().map(|error|
+        let durability_error = crate::platform::fs::sync_file_data(file).err().map(|error|
             format!("context transition {entry_id} was appended but durable acknowledgement failed: {error}"));
         for entry in entries {
             self.by_id.insert(entry.id.clone(), self.entries.len());
@@ -4337,6 +4350,9 @@ fn open_index(layout: &Layout) -> Result<Connection> {
          CREATE VIRTUAL TABLE IF NOT EXISTS msgs USING fts5(text, session_id UNINDEXED, role UNINDEXED, ts UNINDEXED, tokenize='porter unicode61');
          ALTER TABLE indexed ADD COLUMN identity TEXT NOT NULL DEFAULT '';",
         "ALTER TABLE indexed ADD COLUMN prefix_digest TEXT NOT NULL DEFAULT '';",
+        "DROP TABLE msgs;
+         DELETE FROM indexed;
+         CREATE VIRTUAL TABLE msgs USING fts5(text, session_id UNINDEXED, role UNINDEXED, ts UNINDEXED, entry_id UNINDEXED, tokenize='porter unicode61');",
     ])
     .context("creating the session search index (SQLite without FTS5?)")?;
     Ok(conn)
@@ -4481,8 +4497,14 @@ fn index_session(conn: &mut Connection, sid: &str, path: &Path) -> Result<()> {
             };
             let ts = v.get("ts").and_then(Value::as_str).unwrap_or("");
             tx.execute(
-                "INSERT INTO msgs(text, session_id, role, ts) VALUES(?1, ?2, ?3, ?4)",
-                params![text, sid, role, ts],
+                "INSERT INTO msgs(text, session_id, role, ts, entry_id) VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![
+                    text,
+                    sid,
+                    role,
+                    ts,
+                    v.get("id").and_then(Value::as_str).unwrap_or("")
+                ],
             )?;
         }
     }

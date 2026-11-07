@@ -486,7 +486,9 @@ fn write_atomic(target: &Path, data: &[u8]) -> Result<()> {
     let mut file =
         platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), &tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
-    let written = file.write_all(data).and_then(|()| file.sync_all());
+    let written = file
+        .write_all(data)
+        .and_then(|()| platform_fs::sync_file(&file));
     drop(file);
     if let Err(e) = written.and_then(|()| fs::rename(&tmp, target)) {
         let _ = fs::remove_file(&tmp);

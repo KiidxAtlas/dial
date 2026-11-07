@@ -262,6 +262,7 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
     if inputs.len() > 64 || inputs.iter().any(|s| s.is_empty()) {
         return Err("path accepts at most 64 non-empty semicolon-separated scopes".into());
     }
+    let multiple = inputs.len() > 1;
     let mut paths = Vec::new();
     for input in inputs {
         let path = ws.resolve_read(input)?;
@@ -297,7 +298,14 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
             ));
         }
         fs::metadata(&path).map_err(|e| {
-            super::suggest::annotate(ws, io_message("searching", input, &e), &[input])
+            let mut message =
+                super::suggest::annotate(ws, io_message("searching", input, &e), &[input]);
+            if multiple {
+                message.push_str(&format!(
+                    "\nOnly scope {input:?} is missing; correct or drop it and keep the other scopes."
+                ));
+            }
+            message
         })?;
         paths.push(path);
     }
@@ -310,6 +318,11 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(roots)
+}
+
+/// Scheduling uses the same whole search scopes, including directory membership, as execution.
+pub(crate) fn scheduling_scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
+    scopes(ws, args)
 }
 
 fn cursor(args: &Value, ws: &Workspace) -> Result<Option<(PathBuf, usize)>, String> {
@@ -1687,23 +1700,31 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         });
     let multiline = opt_bool(args, "multiline")? || pattern.contains('\n') || escaped_newline;
     let matcher = build_matcher(pattern, fixed, opt_bool(args, "ignore_case")?)?;
-    if let Some(path) = args
-        .get("path")
-        .and_then(Value::as_str)
-        .filter(|path| crate::tools::integrations::ssh::url::is_ssh_url(path))
-    {
-        if multiline {
-            return Err("multiline grep is unavailable for ssh:// paths".into());
+    // One remote or retained text (an ssh:// file or an artifact:// body) is matched line by line.
+    let single = match args.get("path").and_then(Value::as_str) {
+        Some(path) if crate::tools::integrations::ssh::url::is_ssh_url(path) => {
+            Some((path, "ssh://"))
         }
-        let user_dir = crate::tools::integrations::ssh::user_dir()?;
-        let text = crate::tools::integrations::ssh::read_url(
-            path,
-            &user_dir,
-            ws.ssh_config(),
-            ws.ssh_hosts(),
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .expect("ssh:// scheme checked above")?;
+        Some(path) if path.starts_with("artifact://") => Some((path, "artifact://")),
+        _ => None,
+    };
+    if let Some((path, scheme)) = single {
+        if multiline {
+            return Err(format!("multiline grep is unavailable for {scheme} paths"));
+        }
+        let text = if scheme == "ssh://" {
+            let user_dir = crate::tools::integrations::ssh::user_dir()?;
+            crate::tools::integrations::ssh::read_url(
+                path,
+                &user_dir,
+                ws.ssh_config(),
+                ws.ssh_hosts(),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .expect("ssh:// scheme checked above")?
+        } else {
+            artifact_text(ws, path)?
+        };
         let skip = opt_u64(args, "skip")?.unwrap_or(0) as usize;
         let max = opt_u64(args, "limit")?
             .unwrap_or(DEFAULT_GREP_MATCHES as u64)
@@ -1712,7 +1733,7 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
             return Err(format!("limit must be 1..={MAX_GREP_MATCHES}"));
         }
         if opt_u64(args, "context")?.unwrap_or(0) != 0 {
-            return Err("context lines are not supported for ssh:// grep".into());
+            return Err(format!("context lines are not supported for {scheme} grep"));
         }
         let mut out = String::new();
         let mut seen = 0usize;
@@ -1886,6 +1907,32 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         }
         Ok(page)
     }
+}
+
+/// Largest retained artifact `grep` loads whole.
+const MAX_ARTIFACT_GREP_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The whole body of an `artifact://<hash>` for a line search; selectors are refused because the
+/// result lines are numbered from the start of the artifact.
+fn artifact_text(ws: &Workspace, input: &str) -> Result<String, String> {
+    let store = ws
+        .artifacts()
+        .ok_or("artifact resources are unavailable in this workspace")?;
+    let (uri, _) = crate::tools::integrations::resources::artifact_target(input)?;
+    if uri != input {
+        return Err(format!(
+            "grep searches a whole artifact; use path {uri:?} without a selector, then `read` the matching lines"
+        ));
+    }
+    store
+        .read_text(&uri, MAX_ARTIFACT_GREP_BYTES)
+        .map_err(|error| format!("{error:#}"))?
+        .ok_or_else(|| {
+            format!(
+                "{uri} is larger than {} MiB; read it in ranges with `read` ({uri}:1+500)",
+                MAX_ARTIFACT_GREP_BYTES / (1024 * 1024)
+            )
+        })
 }
 
 #[cfg(test)]

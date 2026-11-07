@@ -230,7 +230,7 @@ impl Shell {
             Request::StopProcess { name } => match &self.background_control {
                 Some(background) => background
                     .kill_job(&name)
-                    .map(|done| format!("Stopped from the side pane: {done}"))
+                    .map(|done| format!("Side-pane stop receipt: {done}"))
                     .unwrap_or_else(|error| format!("Could not stop {name}: {error}")),
                 None => "Background job control is unavailable".into(),
             },

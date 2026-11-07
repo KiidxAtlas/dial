@@ -13,6 +13,21 @@ fn policies_replace_without_leaving_temporary_files() {
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
+#[test]
+fn deferred_checkpoint_writes_are_published_before_their_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record");
+    write_checkpoint(&path, b"old", 0o600).unwrap();
+    let pending = write_checkpoint_deferred(&path, b"new", 0o600).unwrap();
+    // Readers (and a restarted process) already see the complete record; no staging file remains.
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(pending.path(), path);
+    pending.finish().unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+    platform_fs::sync_file(&File::open(&path).unwrap()).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn workspace_preserves_symlinks_but_private_storage_rejects_links() {

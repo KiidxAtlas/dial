@@ -103,6 +103,21 @@ impl Lora {
     }
 }
 
+/// Live parked-work status. The clock measures waiting, never estimated job progress.
+#[derive(Clone, Debug)]
+pub struct WorkWait {
+    pub label: String,
+    pub started: std::time::Instant,
+}
+
+/// Provider-owned retry attempt and monotonic next-transition time.
+#[derive(Clone, Debug)]
+pub struct ProviderRetry {
+    pub attempt: u32,
+    pub maximum: String,
+    pub ready_at: std::time::Instant,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StatusData {
     pub provider: String,
@@ -153,6 +168,9 @@ pub struct StatusData {
     pub activity: String,
     pub model_progress: Option<crate::llm::ModelProgress>,
     pub model_silence_secs: u64,
+    /// Controller-owned wait; independent of model progress and inference timers.
+    pub background_wait: Option<WorkWait>,
+    pub provider_retry: Option<ProviderRetry>,
     /// Monotonic animation counter (about 12 per second) for spinners.
     pub tick: u64,
     pub mode: InputMode,
@@ -180,6 +198,25 @@ impl StatusData {
         let activity = crate::ui::text::one_line(&self.activity);
         if self.stopping() {
             return activity;
+        }
+        if let Some(wait) = &self.background_wait {
+            return format!(
+                "waiting for {} · {}s · results resume automatically",
+                crate::ui::text::one_line(&wait.label),
+                wait.started.elapsed().as_secs()
+            );
+        }
+        if let Some(retry) = &self.provider_retry {
+            let remaining = retry
+                .ready_at
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs_f64()
+                .ceil() as u64;
+            return format!(
+                "provider retry {}/{} · next attempt in {remaining}s · /retry now · interrupt to stop",
+                retry.attempt,
+                crate::ui::text::one_line(&retry.maximum)
+            );
         }
         match self.phase {
             Phase::Compacting => return "compacting context".into(),

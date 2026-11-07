@@ -38,6 +38,18 @@ pub(crate) fn open_resumed(
 }
 
 impl Shell {
+    /// Preserve the current editor immediately before the authoritative session swap.
+    pub(in crate::app) fn swap_agent_session(
+        &mut self,
+        app: &App,
+        agent: &mut Agent<'_>,
+        session: Session,
+    ) -> Result<Session> {
+        self.poll_input_recovery(app);
+        self.prepare_input_session_change()?;
+        app.swap_agent_session(agent, session)
+    }
+
     /// Refresh the listing index off the UI thread, so the first `/resume` after new or changed
     /// journals reads cached summaries instead of parsing every journal while the user waits.
     pub(in crate::app) fn warm_session_index(layout: &Layout) {

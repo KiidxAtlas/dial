@@ -519,7 +519,7 @@ impl Store {
         let value = change(&mut entries)?;
         let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
         file.write_all(toml::to_string(&File { entries })?.as_bytes())?;
-        file.as_file().sync_all()?;
+        crate::platform::fs::sync_file(file.as_file())?;
         file.persist(self.path()).map_err(|e| e.error)?;
         Ok(value)
     }
@@ -603,7 +603,7 @@ impl Store {
         fs::create_dir_all(&self.dir)?;
         let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
         file.write_all(text.as_bytes())?;
-        file.as_file().sync_all()?;
+        crate::platform::fs::sync_file(file.as_file())?;
         file.persist(path).map_err(|e| e.error)?;
         Ok(())
     }

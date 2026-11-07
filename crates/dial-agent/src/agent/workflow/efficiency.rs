@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod commands;
+pub(in crate::agent) use commands::broad_check;
 pub(in crate::agent) use commands::compact_command;
 
 /// Bounded controller-observed call identities, not evidence freshness or model comprehension.
@@ -55,8 +56,91 @@ pub(in crate::agent) struct OperationTiming {
     pub elapsed_us: u64,
 }
 
+/// Controller scheduling observations. Work time is inclusive, not elapsed speedup.
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub(in crate::agent) struct Scheduling {
+    pub groups: BTreeMap<String, GroupTiming>,
+    pub barriers: BTreeMap<String, u64>,
+    pub early_reads_started: u64,
+    pub early_reads_reused: u64,
+    pub early_reads_discarded: u64,
+}
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub(in crate::agent) struct GroupTiming {
+    pub groups: u64,
+    pub calls: u64,
+    pub sizes: BTreeMap<usize, u64>,
+    pub elapsed_us: u64,
+    pub work_us: u64,
+}
+impl Scheduling {
+    pub fn group(
+        &mut self,
+        kind: &str,
+        size: usize,
+        elapsed: std::time::Duration,
+        seconds: impl Iterator<Item = f64>,
+    ) {
+        let group = self.groups.entry(kind.to_owned()).or_default();
+        group.groups += 1;
+        group.calls += size as u64;
+        *group.sizes.entry(size).or_default() += 1;
+        group.elapsed_us = group
+            .elapsed_us
+            .saturating_add(elapsed.as_micros().min(u128::from(u64::MAX)) as u64);
+        group.work_us = group.work_us.saturating_add(
+            seconds
+                .map(|s| (s.max(0.0) * 1_000_000.0) as u64)
+                .fold(0_u64, u64::saturating_add),
+        );
+    }
+    pub fn extend(&mut self, other: Self) {
+        for (kind, timing) in other.groups {
+            let group = self.groups.entry(kind).or_default();
+            group.groups = group.groups.saturating_add(timing.groups);
+            group.calls = group.calls.saturating_add(timing.calls);
+            group.elapsed_us = group.elapsed_us.saturating_add(timing.elapsed_us);
+            group.work_us = group.work_us.saturating_add(timing.work_us);
+            for (size, count) in timing.sizes {
+                let entry = group.sizes.entry(size).or_default();
+                *entry = entry.saturating_add(count);
+            }
+        }
+        for (reason, count) in other.barriers {
+            let entry = self.barriers.entry(reason).or_default();
+            *entry = entry.saturating_add(count);
+        }
+        self.early_reads_started = self
+            .early_reads_started
+            .saturating_add(other.early_reads_started);
+        self.early_reads_reused = self
+            .early_reads_reused
+            .saturating_add(other.early_reads_reused);
+        self.early_reads_discarded = self
+            .early_reads_discarded
+            .saturating_add(other.early_reads_discarded);
+    }
+    pub fn barrier(&mut self, reason: &str) {
+        *self.barriers.entry(reason.to_owned()).or_default() += 1;
+    }
+    pub fn stream(&mut self, started: u64, reused: u64) {
+        self.early_reads_started += started;
+        self.early_reads_reused += reused;
+        self.early_reads_discarded += started.saturating_sub(reused);
+    }
+}
+
 #[derive(Default, Serialize)]
 pub(in crate::agent) struct Metrics {
+    #[serde(skip)]
+    pub scheduling: Scheduling,
+    #[serde(skip)]
+    pub worker_scheduling: Scheduling,
+    pub questions_before_investigation: u64,
+    pub completion_nudges: u64,
+    pub incomplete_stops: u64,
+    pub full_builds: u64,
+    pub delivered_answer_bytes: u64,
     pub requests: u64,
     pub lightweight_requests: u64,
     /// Observed controller phases, not a judgment that a request was avoidable.
@@ -146,6 +230,12 @@ impl Metrics {
             self.delivered_worker_ids.insert(id.to_owned());
         }
         self.delivered_worker_results += 1;
+        if let Some(scheduling) = value
+            .get("scheduling")
+            .and_then(|value| serde_json::from_value::<Scheduling>(value.clone()).ok())
+        {
+            self.worker_scheduling.extend(scheduling);
+        }
         if let Some(inspections) = value
             .get("inspections")
             .and_then(|value| serde_json::from_value::<Inspections>(value.clone()).ok())

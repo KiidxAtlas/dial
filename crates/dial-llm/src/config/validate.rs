@@ -279,8 +279,9 @@ impl Config {
         );
         ensure!(
             (1..=50).contains(&self.retry.max_attempts)
-                && (1..=3600).contains(&self.retry.max_delay_secs),
-            "retry.max_attempts must be 1..50 and retry.max_delay_secs 1..3600"
+                && (1..=3600).contains(&self.retry.max_delay_secs)
+                && self.retry.max_elapsed_secs <= 3600,
+            "retry.max_attempts must be 1..50, retry.max_delay_secs 1..3600 and retry.max_elapsed_secs 0..3600"
         );
         ensure!(
             self.codebase.context_max_bytes == 0

@@ -76,6 +76,7 @@ impl Agent<'_> {
         });
         self.session.repair_incomplete_tools()?;
         if let Ok(report) = &result {
+            self.efficiency_metrics.delivered_answer_bytes += report.text.len() as u64;
             let mut state = self.session.control_state();
             state["turn_outcome"] = json!(report.outcome);
             state["completion_evidence"] = completion_evidence.clone().unwrap_or(Value::Null);
@@ -119,6 +120,8 @@ impl Agent<'_> {
             "usage":usage,
             "completion_evidence":completion_evidence,
             "projection_bytes":self.efficiency_metrics,
+            "scheduling":self.efficiency_metrics.scheduling,
+            "worker_scheduling":self.efficiency_metrics.worker_scheduling,
             "storage_io":self.session.io_metrics().since(&storage_before),
             "note":"Usage is provider-reported and may be partial; cache semantics vary by protocol. Projection bytes are not billed tokens. Completion is not independent correctness proof."
         });

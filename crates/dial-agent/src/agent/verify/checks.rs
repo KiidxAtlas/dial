@@ -275,7 +275,12 @@ impl<'a> Agent<'a> {
                 .verification
                 .behavioral_checks
                 .contains(&check.name)
-        }) {
+        }) || (configured.is_none()
+            && call
+                .id
+                .strip_prefix("focused-check:")
+                .is_some_and(crate::agent::verify::verification::test_targets::behavioral_target))
+        {
             crate::storage::repair_evidence::CheckKind::Behavioral
         } else {
             crate::storage::repair_evidence::CheckKind::SyntaxOnly
@@ -447,6 +452,7 @@ impl<'a> Agent<'a> {
         // configured command (and a model `bash` call) takes, never the generated-check boundary.
         let repro = self.step_checks.evidence.is_repro(&check.command);
         let configured = repro
+            || crate::agent::verify::verification::test_targets::exit_status_target(&check.name)
             || self
                 .config
                 .verification
@@ -807,16 +813,32 @@ impl<'a> Agent<'a> {
         }
     }
 
+    /// Interpreter for generated Python checks. Endpoint users may never have run `dial setup`;
+    /// a missing interpreter must not read as broken code.
+    pub(in crate::agent) fn check_python(&self) -> PathBuf {
+        if self.config.python.is_file() {
+            self.config.python.clone()
+        } else {
+            PathBuf::from("python3")
+        }
+    }
+
+    /// Whether a check's result is behavioral evidence: an operator-declared behavioral check or
+    /// a test runner selected for a `verify` target.
+    pub(in crate::agent) fn behavioral_check(&self, name: &str) -> bool {
+        self.config
+            .verification
+            .behavioral_checks
+            .iter()
+            .any(|behavioral| behavioral == name)
+            || crate::agent::verify::verification::test_targets::behavioral_target(name)
+    }
+
     fn focused_checks_for(
         &self,
         paths: &[PathBuf],
     ) -> Vec<crate::agent::verify::verification::FocusedCheck> {
-        // Endpoint users may never have run `dial setup`; a missing interpreter must not read as broken code.
-        let python = if self.config.python.is_file() {
-            self.config.python.clone()
-        } else {
-            PathBuf::from("python3")
-        };
+        let python = self.check_python();
         let mut checks = crate::agent::verify::verification::plan_with_runner(
             self.workspace.root(),
             &python,
@@ -990,10 +1012,7 @@ impl<'a> Agent<'a> {
                         &format!("focused-check:{}", skipped.name),
                         crate::agent::verify::verification::CheckStatus::Cancelled,
                         self.step_checks.revision(),
-                        self.config
-                            .verification
-                            .behavioral_checks
-                            .contains(&skipped.name),
+                        self.behavioral_check(&skipped.name),
                     );
                     outcomes.push(crate::agent::verify::verification_receipts::Outcome {
                         name: skipped.name.clone(),
@@ -1023,6 +1042,17 @@ impl<'a> Agent<'a> {
                 continue;
             }
             let output = self.run_focused_check(check, ui);
+            if output
+                .execution
+                .process
+                .as_ref()
+                .is_some_and(|process| process.started)
+            {
+                self.step_checks.observations += 1;
+                self.efficiency_metrics.full_builds += u64::from(
+                    crate::agent::workflow::efficiency::broad_check(&check.command),
+                );
+            }
             let runner =
                 self.config
                     .verification
@@ -1188,11 +1218,7 @@ impl<'a> Agent<'a> {
     /// A recorded external prerequisite halts automation; missing evidence alone is incomplete.
     /// Classify from controller state rather than a model's explanation or diagnostic prose.
     pub(in crate::agent) fn completion_rejection_outcome(&self) -> TurnOutcome {
-        let blocked_task = self
-            .todo
-            .tasks()
-            .iter()
-            .any(|task| task.status == crate::agent::workflow::todo::Status::Blocked);
+        let blocked_task = self.todo.blocked_steps().next().is_some();
         let control = self.session.control_state();
         let blocked_deliverable = control["working_state"]["deliverables"]
             .as_array()
@@ -1210,9 +1236,7 @@ impl<'a> Agent<'a> {
     pub(in crate::agent) fn completion_blockers(&self) -> Result<(), String> {
         let blocked: Vec<_> = self
             .todo
-            .tasks()
-            .iter()
-            .filter(|task| task.status == crate::agent::workflow::todo::Status::Blocked)
+            .blocked_steps()
             .map(|task| {
                 format!(
                     "{}: {}",
@@ -1227,6 +1251,21 @@ impl<'a> Agent<'a> {
             return Err(format!(
                 "Explicitly blocked tasks remain. Resolve their prerequisites or report outcome=blocked.\n{}",
                 blocked.join("\n")
+            ));
+        }
+        let open = self
+            .todo
+            .tasks()
+            .iter()
+            .filter(|task| {
+                task.status.is_open() && task.kind == crate::agent::workflow::todo::Kind::Step
+            })
+            .map(|task| task.content.as_str())
+            .collect::<Vec<_>>();
+        if !open.is_empty() {
+            return Err(format!(
+                "Execution steps remain open: {}. Complete or explicitly block them; a final reply does not close them.",
+                open.join("; ")
             ));
         }
         let control = self.session.control_state();
@@ -1437,12 +1476,7 @@ impl<'a> Agent<'a> {
             .todo
             .tasks()
             .iter()
-            .filter(|task| {
-                task.status.is_open()
-                    && !(accepted
-                        && !self.modes.goal.tool_offered()
-                        && task.status == crate::agent::workflow::todo::Status::InProgress)
-            })
+            .filter(|task| task.status.is_open())
             .collect::<Vec<_>>();
         let working = self.session.control_state();
         let declared_open =
@@ -1473,8 +1507,10 @@ impl<'a> Agent<'a> {
         json!({
             "version": 1,
             "execution_outcome": outcome,
-            "deliverable_coverage": if !remaining.is_empty() || declared_blocker.is_some() || !unpassed_links.is_empty() { "open_obligations" } else { requirements["coverage"].as_str().unwrap_or("not_independently_assessed") },
+            "work_completion_accepted": accepted,
+            "deliverable_coverage": if remaining.iter().any(|task| task.kind == crate::agent::workflow::todo::Kind::Step) || declared_blocker.is_some() || !unpassed_links.is_empty() { "open_obligations" } else { requirements["coverage"].as_str().unwrap_or("not_independently_assessed") },
             "outstanding_tasks": remaining,
+            "optional_follow_ups": remaining.iter().filter(|task| task.kind == crate::agent::workflow::todo::Kind::FollowUp).collect::<Vec<_>>(),
             "declared_deliverables": working["working_state"]["deliverables"],
             "outstanding_deliverables": declared_open,
             "deliverable_claim_policy":"model_reported_not_independent_verification",

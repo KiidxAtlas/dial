@@ -372,16 +372,20 @@ fn start_output_wait_and_kill() {
 
     let killed = bg(&tool, &ws, json!({"action": "kill", "name": "ticker"}));
     assert!(
-        !killed.is_error && killed.text.contains("killed ticker"),
+        !killed.is_error && killed.text.contains("terminal history and output retained"),
         "{}",
         killed.text
     );
-    let gone = bg(&tool, &ws, json!({"action": "output", "name": "ticker"}));
-    assert!(
-        gone.is_error && gone.text.contains("no background process"),
-        "{}",
-        gone.text
-    );
+    let retained = bg(&tool, &ws, json!({"action": "output", "name": "ticker"}));
+    assert!(!retained.is_error, "{}", retained.text);
+    let view = tool.jobs_view(Some("ticker"));
+    assert_eq!(view.jobs.len(), 1);
+    assert!(view.jobs[0].stop_requested);
+    assert!(!view.jobs[0].running);
+    assert!(!view.jobs[0].process_outcome.as_ref().unwrap().cancelled);
+    assert!(view.screen.iter().any(|line| line.contains("tick 1")));
+    tool.dismiss_job("ticker").unwrap();
+    assert!(tool.jobs_view(None).jobs.is_empty());
 }
 
 #[test]
@@ -775,12 +779,15 @@ fn process_cap_and_unique_names_are_enforced() {
         auto.text
     );
     let killed = bg(&tool, &ws, json!({"action": "kill", "all": true}));
-    assert!(killed.text.contains("killed 8 running"), "{}", killed.text);
     assert!(
-        bg(&tool, &ws, json!({"action": "list"}))
-            .text
-            .contains("no background processes")
+        killed.text.contains("stop requested for 8 running"),
+        "{}",
+        killed.text
     );
+    assert!(!tool.has_live_work());
+    let jobs = tool.jobs_view(None).jobs;
+    assert!(jobs.len() <= 8);
+    assert!(jobs.iter().all(|job| !job.running && job.stop_requested));
 }
 
 #[test]

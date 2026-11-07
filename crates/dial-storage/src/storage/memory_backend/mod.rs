@@ -278,6 +278,13 @@ pub trait Driver: Send {
     fn maintain(&mut self, _: &Operation, _: &mut dyn MemoryModelRunner) -> Result<()> {
         Ok(())
     }
+    /// Readiness is a local queue/deadline observation, never a model or network request.
+    fn maintenance_due(&mut self, _: &Operation) -> Result<bool> {
+        Ok(false)
+    }
+    fn degradation_notice(&self) -> Option<String> {
+        None
+    }
     fn forget_fact(&mut self, _: &Operation, _: FactRef, _: i64) -> Result<Value> {
         Err(self.unsupported("forget"))
     }
@@ -662,8 +669,12 @@ impl MemoryRuntime {
     pub fn reachability(&self) -> Reachability {
         self.reachability.lock().clone()
     }
-    /// One-time notice for a failed Hindsight probe; `None` once shown or when reachable.
+    /// One-time Hindsight reachability or semantic embedding degradation notice.
     pub fn take_reachability_notice(&self) -> Option<String> {
+        if self.id() == MemoryBackendId::Semantic {
+            let notice = self.driver.try_lock()?.degradation_notice()?;
+            return (!self.reachability_announced.swap(true, Ordering::SeqCst)).then_some(notice);
+        }
         let Reachability::Unreachable(error) = self.reachability() else {
             return None;
         };
@@ -835,6 +846,17 @@ impl MemoryRuntime {
         if let Some(cancel) = self.maintenance_cancel.lock().as_ref() {
             cancel.store(true, Ordering::SeqCst);
         }
+    }
+    /// Poll queued observations and backend-owned work before creating a runtime worker node.
+    pub fn maintenance_due(&self, authority: &MemoryAuthority) -> Result<bool> {
+        let op = self.operation(authority)?;
+        if !self.pending_observation.lock().is_empty() {
+            return Ok(true);
+        }
+        let Some(mut driver) = self.driver.try_lock() else {
+            return Ok(false);
+        };
+        driver.maintenance_due(&op)
     }
     pub fn maintain(
         &self,

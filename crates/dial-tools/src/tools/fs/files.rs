@@ -844,12 +844,7 @@ pub(crate) fn write_with(
     args: &Value,
     execution: &crate::tools::edit::editing::Execution<'_>,
 ) -> Result<String, String> {
-    if args
-        .get("check")
-        .is_some_and(|value| !value.is_null() && !value.is_boolean())
-    {
-        return Err("check must be a boolean".into());
-    }
+    crate::tools::edit::editing::verify_targets(args)?;
     let execution = crate::tools::edit::editing::Execution {
         refuse_syntax_errors: crate::tools::edit::editing::syntax_gate(ws, args)?,
         ..*execution

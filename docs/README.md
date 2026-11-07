@@ -6,6 +6,7 @@ not by crate ownership. In the terminal, `/help <topic>` prints a focused docume
 ## Everyday
 
 - [Everyday Dial](everyday.md) — Start, steer, review, undo and resume ordinary coding work.
+- [Everyday UX acceptance](ux-journeys.md) — Offline journey coverage, measurement boundaries and the separately approved real-service test plan.
 - [Release and installation](release-and-install.md) — Install Dial, build from source and check or publish releases.
 - [Running Dial in Docker](docker.md) — Run Dial with Docker, Compose and Docker Model Runner.
 - [Windows](windows.md) — Set up and use Dial on Windows and WSL.
@@ -70,6 +71,21 @@ not by crate ownership. In the terminal, `/help <topic>` prints a focused docume
 - [Experimental system investigations](system-investigation.md) — Investigate runtime behavior and cross-system boundaries.
 - [Tool-effectiveness evaluation](tool-effectiveness.md) — Interpret tool usage, effectiveness and reliability signals.
 - [TUI rendering](tui-rendering.md) — Understand terminal rendering, frame pacing and transcript updates.
+
+## Known limits
+
+- Tool-calling quality depends on the model. 7B-class instruct models handle the tool set; sub-1B
+  models often emit unreadable calls (which become training signal rather than being hidden).
+- Local MLX inference and training require Apple Silicon. Intel Macs and Linux/WSL2 use hosted or
+  OpenAI-compatible providers, or GGUF through llama.cpp.
+- Local compute is serialized across projects by default; see **Compute locks** in
+  [Provider and model catalog](provider-catalog.md). Dial makes no claim of zero-downtime training.
+- Not every terminal supports modified Enter keys. `dial schedule` handles scheduling but does not
+  install a daemon. The browser and `eval` tools require OS containment and fail closed without it.
+- Live memory and skill edits are your working state and are not gated; only the admitted harness is.
+- Operator tools are trusted programs and are not sandboxed during live work; they are excluded from
+  automatic evaluation. Outside macOS, `bash` is unavailable for live use unless
+  `sandbox.mode = "off"`, while generated evaluations still require the strict sandbox.
 
 See also [Architecture](../ARCHITECTURE.md) for crate ownership and invariants, and
 [contributor notes](../AGENTS.md) for repository conventions and checks.

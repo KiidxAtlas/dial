@@ -262,7 +262,7 @@ pub struct AssistanceConfig {
     pub syntax_guard: bool,
     pub selective_verification: bool,
     pub compact_tools: bool,
-    /// Core and explicitly loaded tools are never hidden by this budget.
+    /// Initial core count limit; discovery controls and explicit pins remain available.
     pub initial_tool_limit: usize,
     pub context_max_bytes: usize,
     /// Requires an explicitly assigned experience model role; no implicit downloads or calls.
@@ -290,7 +290,7 @@ impl Default for AssistanceConfig {
             enabled: false,
             syntax_guard: true,
             selective_verification: true,
-            compact_tools: false,
+            compact_tools: true,
             initial_tool_limit: 16,
             context_max_bytes: 0,
             teacher_enabled: false,

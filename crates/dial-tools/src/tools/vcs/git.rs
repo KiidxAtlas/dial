@@ -28,16 +28,7 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
 const HOOKS_SKIPPED: &str =
     "[repository hooks and commit signing were skipped because git.bypass_hooks = true]";
 
-const DESCRIPTION: &str = "Git, jj (jujutsu) and GitHub operations without shell quoting. Read actions: `status` \
-(optional `path`; large git status returns counts and samples, complete output via read), `diff` \
-(optional `staged`, `base` ref, `path`), `log` (`limit` ≤ 50, optional `path`), `reflog` (`limit` ≤ 50; start here for lost work: recent HEAD movements), `show` (`rev`), `blame` (`path`, optional \
-`start`/`end` lines, `rev`), `branches`, `pr_view`/`pr_checks`/`issue_view` (`number`; need the `gh` CLI). Changing actions \
-(ask approval): `add` (`paths`), `unstage` (`paths`), `commit` (`message`; commits what is staged, or every tracked change \
-with `all`), `branch_create` (`name`, optional `from`; switches to it), `switch` (`name`), `push` (optional `remote`, \
-`branch`; never forces), `pr_create` (`title`, `body`, optional `base`, `draft`). In a jj repository (`.jj/`) status, diff, \
-log and commit use jj unless `vcs` is \"git\"; jj has no staging area. Repository hooks and signing apply to commit/push \
-unless the operator set git.bypass_hooks. Long output is cut with the full text kept as an artifact:// link. For reset, \
-rebase, force-push or anything else, use bash.";
+const DESCRIPTION: &str = "Structured Git/jj and GitHub operations. Read actions need no approval; mutations need approval. commit uses staged changes unless all=true; branch_create also switches branches; push never forces. In .jj repositories status/diff/log/commit use jj unless vcs=git; jj has no staging. GitHub actions require gh. Hooks and signing apply unless git.bypass_hooks is configured. Truncated output links to complete retained text via read; status may show counts/samples. Use reflog to investigate lost work. Other operations use bash under normal approval.";
 
 #[derive(Default)]
 pub struct Git {
@@ -168,13 +159,74 @@ struct Invocation<'a> {
 /// drivers. Query effective configuration using Git itself (includes and worktree config
 /// apply), but never run configured programs on this host-side read path. Object-only reads
 /// still refuse textconv drivers as a second guard behind `--no-textconv`.
-fn refuse_read_filters(root: &Path, cancel: &AtomicBool, object_only: bool) -> Result<(), String> {
+///
+/// Worktree reads do not refuse filter drivers (a global git-lfs install configures one for
+/// every repository); they return the driver names so the read can disable them with
+/// command-line overrides. Text-conversion drivers are still refused.
+fn read_filter_drivers(
+    root: &Path,
+    cancel: &AtomicBool,
+    object_only: bool,
+) -> Result<Vec<String>, String> {
     let pattern = if object_only {
         TEXTCONV_CONFIG
     } else {
         FILTER_OR_TEXTCONV_CONFIG
     };
-    inspect_filter_config(filter_config_query(root, pattern), cancel)
+    let active = inspect_filter_config(filter_config_query(root, pattern), cancel)?;
+    let mut drivers = Vec::new();
+    let mut refused = Vec::new();
+    for key in active {
+        match filter_driver(&key) {
+            Some(driver) => {
+                if !drivers.contains(&driver) {
+                    drivers.push(driver);
+                }
+            }
+            None => refused.push(key),
+        }
+    }
+    if !refused.is_empty() {
+        // Name the keys (never their commands) so the refusal is actionable.
+        return Err(format!(
+            "host-side Git inspection refused because executable text-conversion or filter configuration Dial cannot disable is present ({}); Dial never runs those programs on this read path. log, reflog, show and branches still work here; run reads that need it with approved sandboxed bash instead",
+            refused.join(", ")
+        ));
+    }
+    Ok(drivers)
+}
+
+/// The driver name of a `filter.<name>.(clean|smudge|process)` key that can be overridden
+/// safely with `-c`; `None` for text-conversion keys and names `-c` cannot express.
+fn filter_driver(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("filter.")?;
+    let (name, field) = rest.rsplit_once('.')?;
+    (matches!(field, "clean" | "smudge" | "process")
+        && !name.is_empty()
+        && !name.contains(['=', '\0', '\n']))
+    .then(|| name.to_owned())
+}
+
+/// `-c` overrides that disable the named filter drivers for one Git invocation. An empty
+/// command disables a driver, and `required=false` lets Git read the file unconverted.
+fn disabled_filter_args(drivers: &[String]) -> Vec<String> {
+    drivers
+        .iter()
+        .flat_map(|name| {
+            ["clean", "smudge", "process"]
+                .iter()
+                .map(move |field| format!("filter.{name}.{field}="))
+                .chain(std::iter::once(format!("filter.{name}.required=false")))
+        })
+        .flat_map(|setting| ["-c".to_owned(), setting])
+        .collect()
+}
+
+fn disabled_filter_note(drivers: &[String]) -> String {
+    format!(
+        "[filter drivers not run on this read: {}. Files they track are compared unconverted, so they may appear modified or show raw content; run git through approved bash when the converted view matters]",
+        drivers.join(", ")
+    )
 }
 
 const FILTER_OR_TEXTCONV_CONFIG: &str =
@@ -205,7 +257,8 @@ fn filter_config_query(root: &Path, pattern: &str) -> Command {
     query
 }
 
-fn inspect_filter_config(query: Command, cancel: &AtomicBool) -> Result<(), String> {
+/// The effective, non-empty executable filter/textconv keys matching the query.
+fn inspect_filter_config(query: Command, cancel: &AtomicBool) -> Result<Vec<String>, String> {
     let output = crate::runtime::process::run_with_policy(
         query,
         None,
@@ -245,27 +298,18 @@ fn inspect_filter_config(query: Command, cancel: &AtomicBool) -> Result<(), Stri
                 "Git returned incomplete filter configuration; host-side read refused".into(),
             );
         }
-        let active: Vec<String> = effective
+        return Ok(effective
             .iter()
             .filter(|(_, command)| !command.is_empty())
             .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
-            .collect();
-        if !active.is_empty() {
-            // Name the keys (never their commands) so the refusal is actionable: a global
-            // git-lfs install is the common cause, and object-only reads still run.
-            return Err(format!(
-                "host-side Git inspection refused because executable filter configuration or text-conversion configuration is present ({}); Dial never runs those programs on this read path. log, reflog, show and branches still work here; run worktree reads such as status or diff with approved sandboxed bash instead",
-                active.join(", ")
-            ));
-        }
-        return Ok(());
+            .collect());
     }
     if output.status.and_then(|status| status.code()) != Some(1) {
         return Err(
             "Git configuration could not be inspected safely; host-side read refused".into(),
         );
     }
-    Ok(())
+    Ok(Vec::new())
 }
 
 /// Run `program` with a bounded time. Returns (success, stdout, stderr), each complete up to
@@ -282,11 +326,12 @@ fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
         may_mutate,
     } = inv;
     let mut command = Command::new(program);
+    let mut disabled_drivers = Vec::new();
     if program == "git" && !may_mutate {
         let object_only = args
             .first()
             .is_some_and(|arg| OBJECT_ONLY_READS.contains(&arg.as_str()));
-        refuse_read_filters(root, cancel, object_only)?;
+        disabled_drivers = read_filter_drivers(root, cancel, object_only)?;
         command.env_clear().envs(
             std::env::vars().filter(|(name, value)| {
                 crate::tools::exec::sandbox::child_env_allowed(name, value)
@@ -299,6 +344,7 @@ fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
             command.args(hooks_off_args());
         }
         command.args(SAFE_GIT_ARGS);
+        command.args(disabled_filter_args(&disabled_drivers));
     } else if program == "jj" {
         command.args(["--no-pager", "--color=never"]);
     }
@@ -343,11 +389,14 @@ fn run_streams(inv: Invocation<'_>) -> Result<(bool, String, String), String> {
     {
         return Err("status output exceeded the capture limit or was incomplete; exact counts and full retention are unavailable. Retry with `path` to narrow the scope.".into());
     }
-    Ok((
-        output.success(),
-        output.stdout_text(),
-        output.text(crate::runtime::process::Stream::Stderr),
-    ))
+    let mut stderr = output.text(crate::runtime::process::Stream::Stderr);
+    if !disabled_drivers.is_empty() {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&disabled_filter_note(&disabled_drivers));
+    }
+    Ok((output.success(), output.stdout_text(), stderr))
 }
 
 /// Run `program` with a bounded time. Returns (success, stdout+stderr combined), complete up to
@@ -1125,6 +1174,14 @@ fn dispatch(
 }
 
 impl Tool for Git {
+    fn concurrency(&self, args: &Value) -> crate::tools::integrations::ext::Concurrency {
+        if self.needs_approval(args) {
+            crate::tools::integrations::ext::Concurrency::Exclusive
+        } else {
+            crate::tools::integrations::ext::Concurrency::Shared
+        }
+    }
+
     fn name(&self) -> &str {
         "git"
     }

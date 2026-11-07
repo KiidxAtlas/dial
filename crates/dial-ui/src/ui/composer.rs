@@ -12,7 +12,7 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::llm::model_config::{ComposerShape, UiConfig};
+use crate::llm::model_config::{BusySend, ComposerShape, UiConfig};
 
 use super::word_complete::{WordIndex, WordModel, build_vocabulary, completion_from_project};
 use super::{
@@ -23,6 +23,9 @@ use super::{
     statusline, text,
     theme::{Sym, Theme, Tok},
 };
+
+pub mod attachments;
+pub mod recovery;
 
 /// Pastes longer than this many lines or characters collapse to a placeholder.
 const PASTE_COLLAPSE_LINES: usize = 20;
@@ -168,6 +171,10 @@ struct QueuedEdit {
 enum BusyChoice {
     /// Let the agent decide whether this changes the current task or starts independent work.
     Auto,
+    /// Explicitly redirect the running task at its next safe point.
+    Redirect,
+    /// Request separate work without redirecting the running task.
+    Independent,
     /// Send the draft after the running turn finishes.
     AfterTurn,
     /// Leave the queue alone and let the turn finish.
@@ -204,8 +211,10 @@ struct Explicit {
 impl BusyChoice {
     fn label(self) -> &'static str {
         match self {
-            BusyChoice::Auto => "Steer",
+            BusyChoice::Auto => "Let Dial choose (auto)",
+            BusyChoice::Redirect => "Redirect current task now",
             BusyChoice::AfterTurn => "After this turn",
+            BusyChoice::Independent => "Run independently",
             BusyChoice::KeepWorking => "Keep working",
             BusyChoice::StopAndSend => "Stop and send oldest",
         }
@@ -213,8 +222,12 @@ impl BusyChoice {
 
     fn detail(self) -> &'static str {
         match self {
-            BusyChoice::Auto => "steers this task unless [message_routing] classifies",
-            BusyChoice::AfterTurn => "waits until Dial finishes",
+            BusyChoice::Auto => "uses configured routing; may redirect or request a worker",
+            BusyChoice::Redirect => "changes this task at a safe point; running tools finish",
+            BusyChoice::AfterTurn => "queues this message; leaves the current task unchanged",
+            BusyChoice::Independent => {
+                "requests a separate worker; otherwise queues after this turn"
+            }
             BusyChoice::KeepWorking => "the queue waits for this turn",
             BusyChoice::StopAndSend => "ends this turn now",
         }
@@ -279,7 +292,12 @@ const PLACEHOLDERS: [&str; 3] = [
 const LANDING_PLACEHOLDERS: [&str; 2] = ["What are we building?", "Ask anything"];
 
 /// Offered for a non-empty draft while busy. Automatic routing is the default.
-const DRAFT_CHOICES: &[BusyChoice] = &[BusyChoice::Auto, BusyChoice::AfterTurn];
+const DRAFT_CHOICES: &[BusyChoice] = &[
+    BusyChoice::Auto,
+    BusyChoice::Redirect,
+    BusyChoice::AfterTurn,
+    BusyChoice::Independent,
+];
 /// Offered for an empty Enter with queued work. Stopping the turn is never the default.
 const QUEUE_CHOICES: &[BusyChoice] = &[BusyChoice::KeepWorking, BusyChoice::StopAndSend];
 
@@ -320,6 +338,7 @@ impl HistoryLookup {
 
 pub struct Composer {
     editor: Editor,
+    attachments: attachments::Preflight,
     double_left: DoubleTap,
     history: Vec<String>,
     history_limit: usize,
@@ -345,7 +364,10 @@ pub struct Composer {
     dismissed: Option<String>,
     search: Option<Search>,
     busy: bool,
+    busy_send: BusySend,
     queued: std::collections::VecDeque<(String, bool)>,
+    recovery_held: bool,
+    recovery_sink: Option<recovery::RecoverySink>,
     /// Explicit steer / independent messages sent this turn, shown with their stage. Not part of the queue.
     explicit: Vec<Explicit>,
     /// The queued message currently loaded into the draft. Cancelling or replacing the draft restores it
@@ -384,6 +406,7 @@ impl Composer {
         let (vocab_tx, vocab_rx) = std::sync::mpsc::channel();
         let mut composer = Composer {
             editor: Editor::default(),
+            attachments: Default::default(),
             history: Vec::new(),
             history_limit,
             history_index: None,
@@ -394,6 +417,7 @@ impl Composer {
             dismissed: None,
             search: None,
             busy: false,
+            busy_send: BusySend::Choose,
             recording: None,
             exit_armed: false,
             pastes: Vec::new(),
@@ -401,6 +425,8 @@ impl Composer {
             paste_count: 0,
             pasted_images: Vec::new(),
             queued: std::collections::VecDeque::new(),
+            recovery_held: false,
+            recovery_sink: None,
             explicit: Vec::new(),
             editing_queue: None,
             choice: None,
@@ -616,8 +642,25 @@ impl Composer {
         self.refresh();
     }
 
-    /// While busy, Enter asks whether to route automatically or queue (empty Enter asks before stopping),
-    /// Alt-Enter queues a follow-up directly, and Esc interrupts. Ending the turn closes any open
+    /// Apply the explicitly saved busy-send preference. Sending never changes this preference.
+    pub fn set_busy_send(&mut self, preference: BusySend) {
+        if self.busy_send != preference {
+            self.busy_send = preference;
+            self.choice = None;
+        }
+    }
+    fn busy_send_hint(&self) -> &'static str {
+        match self.busy_send {
+            BusySend::Choose => "choose send action",
+            BusySend::Redirect => "redirect task",
+            BusySend::AfterTurn => "send after turn",
+            BusySend::Independent => "run independently",
+            BusySend::Auto => "route automatically",
+        }
+    }
+
+    /// While busy, Enter uses the explicitly saved preference (a chooser by default).
+    /// Alt-Enter queues a follow-up directly. Ending the turn closes any open
     /// choice and leaves the draft as it was.
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
@@ -628,7 +671,7 @@ impl Composer {
         // Anything the agent never took before the turn ended is not lost: it is sent next, after
         // the messages already queued ahead of it.
         let mut leftover = Vec::new();
-        if !busy {
+        if !busy && !self.recovery_held {
             for item in self.explicit.drain(..) {
                 // Pending or received but never journaled (the turn ended or was stopped first):
                 // keep it as a follow-up instead of losing it. Applied ones are already recorded.
@@ -690,6 +733,12 @@ impl Composer {
     }
 
     pub fn take_steering(&mut self) -> Vec<String> {
+        if self.recovery_held
+            || !self.queued.iter().any(|(_, follow_up)| !follow_up)
+            || !self.recovery_before_take(recovery::Take::Steering)
+        {
+            return Vec::new();
+        }
         let mut steering = Vec::new();
         for _ in 0..self.queued.len() {
             if let Some((text, follow_up)) = self.queued.pop_front() {
@@ -714,6 +763,15 @@ impl Composer {
     }
 
     fn take_explicit(&mut self, kind: SteerKind) -> Vec<String> {
+        if self.recovery_held
+            || !self
+                .explicit
+                .iter()
+                .any(|item| item.kind == kind && item.untaken)
+            || !self.recovery_before_take(recovery::Take::Explicit(kind))
+        {
+            return Vec::new();
+        }
         self.explicit
             .iter_mut()
             .filter(|item| item.kind == kind && item.untaken)
@@ -761,6 +819,16 @@ impl Composer {
     /// turn; they are never turned into steering of the running task.
     pub fn defer_messages(&mut self, messages: Vec<String>) {
         for message in messages.into_iter().rev() {
+            // Deferral transfers ownership to the follow-up queue. It was not applied, but
+            // must no longer also be recovered from the explicit strip at turn end.
+            if let Some(index) = self.explicit.iter().position(|item| {
+                item.kind == SteerKind::Independent
+                    && !item.untaken
+                    && item.stage != SteerStage::Applied
+                    && item.text == message
+            }) {
+                self.explicit.remove(index);
+            }
             self.queued.push_front((message, true));
         }
     }
@@ -779,6 +847,9 @@ impl Composer {
         true
     }
     fn send_explicit(&mut self, kind: SteerKind) -> ComposerEvent {
+        if !self.attachment_send_allowed() {
+            return ComposerEvent::None;
+        }
         if self.editor.text.trim().is_empty() {
             return ComposerEvent::None;
         }
@@ -811,15 +882,24 @@ impl Composer {
     }
 
     pub fn take_follow_up(&mut self) -> Option<String> {
+        if self.recovery_held
+            || self.queued.is_empty()
+            || !self.recovery_before_take(recovery::Take::FollowUp)
+        {
+            return None;
+        }
         self.queued.pop_front().map(|(text, _)| text)
     }
     pub fn has_queued_work(&self) -> bool {
-        !self.queued.is_empty()
+        !self.recovery_held && !self.queued.is_empty()
     }
 
     /// Busy input the agent will take at its next step boundary: routable queued messages and
     /// untaken explicit messages. Follow-ups deferred until after the turn do not count.
     pub fn has_pending_input(&self) -> bool {
+        if self.recovery_held {
+            return false;
+        }
         self.queued.iter().any(|(_, follow_up)| !follow_up)
             || self.explicit.iter().any(|item| item.untaken)
     }
@@ -921,6 +1001,12 @@ impl Composer {
 
     pub fn handle_key(&mut self, key: KeyEvent, ctx: &ComposerCtx) -> ComposerEvent {
         if key.kind == KeyEventKind::Release {
+            return ComposerEvent::None;
+        }
+        // Held submit keys must never confirm missing or truncated attachments.
+        if key.kind == KeyEventKind::Repeat
+            && (ctx.keys.matches(Action::Submit, &key) || key.code == KeyCode::Enter)
+        {
             return ComposerEvent::None;
         }
         // A held Enter repeats: while busy, a repeat must not open, confirm or flush a choice by itself.
@@ -1149,13 +1235,28 @@ impl Composer {
             if self.editing_queue.is_some() {
                 return self.submit_queued(false);
             }
-            // Busy Enter asks whether to route automatically or queue; wait for the user's choice.
+            // The chooser is the safe default. Direct sending requires an explicitly saved preference.
             if !self.editor.text.trim().is_empty() {
-                self.open_choice(DRAFT_CHOICES);
+                return match self.busy_send {
+                    BusySend::Choose => {
+                        self.open_choice(DRAFT_CHOICES);
+                        ComposerEvent::None
+                    }
+                    BusySend::Redirect => self.send_explicit(SteerKind::Steer),
+                    BusySend::AfterTurn => self.submit_queued(true),
+                    BusySend::Independent => self.send_explicit(SteerKind::Independent),
+                    BusySend::Auto => self.submit_queued(false),
+                };
             }
             return ComposerEvent::None;
         }
         if self.editor.text.trim().is_empty() {
+            return ComposerEvent::None;
+        }
+        if !self.attachment_send_allowed() {
+            return ComposerEvent::None;
+        }
+        if !self.recovery_before_take(recovery::Take::Draft) {
             return ComposerEvent::None;
         }
         let sent = expand_pastes(&self.editor.text, &self.pastes);
@@ -1168,6 +1269,9 @@ impl Composer {
     }
 
     fn submit_queued(&mut self, follow_up: bool) -> ComposerEvent {
+        if !self.attachment_send_allowed() {
+            return ComposerEvent::None;
+        }
         if self.editor.text.trim().is_empty() {
             return ComposerEvent::None;
         }
@@ -1246,6 +1350,8 @@ impl Composer {
             self.choice = None;
             let event = match options[selected] {
                 BusyChoice::Auto => self.submit_queued(false),
+                BusyChoice::Redirect => self.send_explicit(SteerKind::Steer),
+                BusyChoice::Independent => self.send_explicit(SteerKind::Independent),
                 BusyChoice::AfterTurn => self.submit_queued(true),
                 BusyChoice::KeepWorking => ComposerEvent::None,
                 BusyChoice::StopAndSend => self.send_oldest_queued(),
@@ -1262,6 +1368,9 @@ impl Composer {
 
     /// Sends the oldest queued message now. Only an explicit stop does this; queuing already recorded it.
     fn send_oldest_queued(&mut self) -> ComposerEvent {
+        if !self.recovery_before_take(recovery::Take::FollowUp) {
+            return ComposerEvent::None;
+        }
         let Some((text, _)) = self.queued.pop_front() else {
             return ComposerEvent::None;
         };
@@ -1580,7 +1689,7 @@ impl Composer {
     /// query it was computed for, so stale results never reach the screen. Returns `true` when the
     /// open menu changed and the caller should repaint.
     pub fn poll_autocomplete(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.poll_attachments();
         while let Ok((generation, query, file_start, matches)) = self.autocomplete_rx.try_recv() {
             if generation == self.candidates_generation
                 && self.menu_query() == Some((query.as_str(), file_start))
@@ -1609,6 +1718,7 @@ impl Composer {
         self.menu.as_ref().is_some_and(|menu| menu.pending)
             || self.history_lookup.pending.is_some()
             || self.history_lookup.running
+            || self.attachments.pending()
     }
 
     /// Marks every outstanding background ranking as stale and returns the new latest request id.
@@ -2176,6 +2286,16 @@ impl Composer {
             queued.extend(rows);
             rows = queued;
         }
+        if let Some(summary) = self.attachments.summary() {
+            rows.insert(
+                0,
+                Line::from(Span::styled(
+                    text::ellipsize(&summary, w, theme.ascii()),
+                    theme.fg(Tok::Dim),
+                )),
+            );
+            cursor.0 += 1;
+        }
         ComposerView { rows, cursor }
     }
 
@@ -2447,8 +2567,17 @@ impl Composer {
                     if !self.queued.is_empty() {
                         pieces.push(hint(Action::Submit, "stop or keep"));
                     }
+                    if self.queued.is_empty() {
+                        let submit = keys.label(Action::Submit);
+                        if !submit.is_empty() {
+                            pieces.push(plain(format!(
+                                "with a draft: {submit} {}",
+                                self.busy_send_hint()
+                            )));
+                        }
+                    }
                 } else if !blank {
-                    pieces.push(hint(Action::Submit, "send now or later"));
+                    pieces.push(hint(Action::Submit, self.busy_send_hint()));
                 }
                 // Alt-Enter only queues a non-blank draft.
                 if !command && !blank {

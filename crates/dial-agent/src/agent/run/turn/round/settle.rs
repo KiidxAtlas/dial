@@ -39,13 +39,23 @@ impl Agent<'_> {
         } else {
             tools::ToolStatus::from_output(&output)
         };
+        if !contract_failed
+            && !controller_blocked
+            && !recovery_blocked
+            && !matches!(
+                call.name.as_str(),
+                "todo" | "working_state" | "finish" | "ask" | "tool_load"
+            )
+        {
+            self.step_checks.observations += 1;
+        }
         if controller_blocked {
             output.execution.status = Some(status);
             output.execution.effects = tools::surface::outcome::Effects::None;
         }
         // A controller retry/loop refusal did not attempt a native mutation.
         if !recovery_blocked {
-            prerequisites.observe(&self.workspace, self.edit_mode(), call, &output);
+            prerequisites.observe(&self.workspace, self.edit_mode(), call, &output, &self.ext);
         }
         self.record(step, "tool_outcome", json!({"name":call.name,"id":call.id,"status":status,"effects":tools::surface::outcome::effects(&output),"duration_ms":tool_seconds*1000.0}))?;
         let callback_intercepted = std::mem::take(&mut self.portable_callback_intercepted);
@@ -103,6 +113,40 @@ impl Agent<'_> {
             && call.arguments["command"]
                 .as_str()
                 .is_some_and(is_check_command);
+        if call.name == "bash"
+            && let Some(command) = call.arguments["command"].as_str()
+        {
+            if output
+                .execution
+                .process
+                .as_ref()
+                .is_some_and(|process| process.started)
+            {
+                self.efficiency_metrics.full_builds +=
+                    u64::from(crate::agent::workflow::efficiency::broad_check(command));
+            }
+            if is_check && tool_seconds >= 5.0 {
+                let key = format!(
+                    "{}\0{command}",
+                    call.arguments["cwd"].as_str().unwrap_or_default()
+                );
+                let repeated =
+                    self.step_checks.slow_checks.get(&key) == Some(&self.step_checks.mutations);
+                if self.step_checks.slow_checks.len() < 8
+                    || self.step_checks.slow_checks.contains_key(&key)
+                {
+                    self.step_checks
+                        .slow_checks
+                        .insert(key, self.step_checks.mutations);
+                }
+                let note = if repeated {
+                    "The same slow check was repeated with no intervening native source edit observed. Reuse its retained output for diagnostics; rerun only for changed inputs or a new verification need. This hint is not proof that external inputs stayed unchanged."
+                } else {
+                    "This check took more than five seconds. Use its retained output for diagnostics and prefer a scoped check during iteration; do not rerun a build just to filter or recover its output."
+                };
+                output.text.push_str(&format!("\n[Check cost] {note}"));
+            }
+        }
         // A passing cell that asserted its own results already verified them; a failed assert makes
         // the cell an error, so only success is credited, like a passing shell check.
         let asserted_eval = call.name == "eval"
@@ -133,7 +177,7 @@ impl Agent<'_> {
         outcome.observed_check_failure |= check_failed;
         self.step_checks.reproduced |= check_failed;
         if self.config.experimental.outcome_gradient_rounds > 0
-            && (is_check || call.name == crate::agent::verify::check_tool::NAME)
+            && (is_check || call.name == crate::agent::verify::verify_tool::NAME)
         {
             outcome.checked = true;
             let failing = crate::agent::run::outcome_gradient::failing_tests(&output.text);
@@ -176,18 +220,18 @@ impl Agent<'_> {
         if !output.is_error {
             outcome.succeeded = true;
         }
-        // Opted mutations already settled before running the attached check.
+        // A mutation that ran the batch's `verify` already settled before running it.
         // Do not immediately stale that evidence by advancing the revision a second time.
-        let attached_check = matches!(call.name.as_str(), "edit" | "write")
-            .then(|| crate::agent::verify::check_tool::post_mutation_check(&output))
+        let attached_verify = matches!(call.name.as_str(), "edit" | "write")
+            .then(|| crate::agent::verify::verify_tool::post_mutation_verify(&output))
             .flatten();
-        let repro_advice = if attached_check.is_some() {
+        let repro_advice = if attached_verify.is_some() {
             None
         } else {
             self.settle_tool_mutation(call, &output)
         };
         let committed = !output.execution.changed_paths.is_empty();
-        if let Some(check) = attached_check {
+        if let Some(check) = attached_verify {
             outcome.checked = true;
             if check["is_error"] == true {
                 outcome.execution_failed = true;
@@ -198,7 +242,7 @@ impl Agent<'_> {
                             .any(|result| result["status"] == "code_failed")
                     });
                 outcome.last_tool_failure = Some(format!(
-                    "Post-{} verification failed; mutation remains applied:\n{}",
+                    "verify after {} failed; the change remains applied:\n{}",
                     call.name,
                     check["text"].as_str().unwrap_or_default()
                 ));
@@ -452,7 +496,7 @@ impl Agent<'_> {
             })
             .collect();
         let check_passed = shell_check_passed
-            || (call.name == crate::agent::verify::check_tool::NAME && !output.is_error);
+            || (call.name == crate::agent::verify::verify_tool::NAME && !output.is_error);
         if let Some(advice) = turn.edit_churn.observe(&changed, check_passed) {
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                 crate::agent::ui::ui_event::EventKind::Recovery,
@@ -509,6 +553,9 @@ impl Agent<'_> {
                 && output.execution.effects != tools::surface::outcome::Effects::None
                 && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve"))
         {
+            if !self.verify_batch.settle_once(&call.id) {
+                return None;
+            }
             self.step_checks.mutations += 1;
             self.behavioral_checks.clear();
             if !self.hermetic

@@ -1,6 +1,169 @@
 use super::*;
 use crate::agent::run::tool_exposure::default_offer_tests::with_review_disabled as with_agent;
 
+#[derive(Default)]
+struct NoticeUi(Vec<String>);
+impl Ui for NoticeUi {
+    fn notice(&mut self, message: &str) {
+        self.0.push(message.to_owned());
+    }
+}
+
+#[test]
+fn answers_with_a_blocked_plan_retain_it_and_stop_incomplete() {
+    let questions = [
+        "I thought tests were optional?",
+        "Why did you create that task?",
+        "How did Dial allow it?",
+    ];
+    let mut scripts = Vec::new();
+    for _ in questions {
+        scripts.push(response(
+            "The old plan remains pending; this is an explanation.",
+            None,
+        ));
+        // Endpoint slot discovery happens once per backend, not once per user turn.
+    }
+    scripts.insert(1, llm::fake::json(200, &json!({"total_slots":1})));
+    let server = llm::fake::serve(scripts);
+    with_agent("[compaction]\nenabled=false\n", |agent| {
+        connect(agent, &server.url);
+        assert!(!agent.todo.call(&json!({"op":"set","tasks":[{"content":"Verify locally and prepare optional live plan"}]})).is_error);
+        assert!(
+            !agent
+                .todo
+                .call(
+                    &json!({"op":"block","reason":"Provider choice needed only for the live plan"})
+                )
+                .is_error
+        );
+        let plan = agent.todo.snapshot();
+        let mut ui = NoticeUi::default();
+        for question in questions {
+            let report = agent.turn(question, &mut ui).unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+            assert!(
+                report
+                    .text
+                    .contains("The old plan remains pending; this is an explanation.")
+            );
+            assert!(
+                !report.halts_automation(),
+                "incomplete work remains available for bounded continuation"
+            );
+            assert_eq!(agent.todo.snapshot(), plan);
+            let evidence = agent.completion_evidence(report.outcome);
+            assert_eq!(evidence["work_completion_accepted"], false);
+            assert_eq!(evidence["outstanding_tasks"].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(
+            ui.0.iter()
+                .filter(|notice| notice.starts_with("Outstanding work retained:"))
+                .count(),
+            3
+        );
+        assert!(agent.session.custom_records("training_turn").is_empty());
+    });
+    assert_eq!(completion_requests(&server).len(), questions.len());
+}
+
+#[test]
+fn neither_answered_nor_completed_can_bypass_required_work() {
+    for explicit_answer in [false, true] {
+        let first = if explicit_answer {
+            response(
+                "",
+                Some((
+                    "finish",
+                    json!({"outcome":"answered","summary":"Here is why."}),
+                )),
+            )
+        } else {
+            response("Here is why.", None)
+        };
+        let server = llm::fake::serve(vec![
+            first,
+            llm::fake::json(200, &json!({"total_slots":1})),
+            response(
+                "",
+                Some((
+                    "finish",
+                    json!({"outcome":"completed","summary":"Delivery is complete."}),
+                )),
+            ),
+        ]);
+        with_agent("[compaction]\nenabled=false\n", |agent| {
+            connect(agent, &server.url);
+            let mut control = agent.session.control_state();
+            control["working_state"] = json!({"deliverables":[{"id":"required","description":"Required output","status":"blocked"}]});
+            agent.session.set_control_state(control).unwrap();
+            let mut ui = NoticeUi::default();
+            let answer = agent.turn("Explain the blocker", &mut ui).unwrap();
+            assert_eq!(answer.outcome, TurnOutcome::Incomplete);
+            assert!(answer.text.contains("Here is why."));
+            assert!(
+                ui.0.iter()
+                    .any(|notice| notice.contains("1 required deliverable(s)"))
+            );
+            assert_eq!(
+                agent.session.control_state()["working_state"]["deliverables"][0]["status"],
+                "blocked"
+            );
+            let attempt = agent.turn("Complete the delivery", &mut ui).unwrap();
+            assert_eq!(attempt.outcome, TurnOutcome::Incomplete, "{}", attempt.text);
+            assert!(
+                attempt.text.contains("required (blocked)"),
+                "{}",
+                attempt.text
+            );
+            assert!(
+                !agent.completion_evidence(attempt.outcome)["work_completion_accepted"]
+                    .as_bool()
+                    .unwrap()
+            );
+        });
+        assert_eq!(completion_requests(&server).len(), 2);
+    }
+}
+
+#[test]
+fn optional_blocked_follow_up_is_retained_without_blocking_completed_delivery() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some((
+                "finish",
+                json!({"outcome":"completed","summary":"The requested fix is implemented."}),
+            )),
+        ),
+        llm::fake::json(200, &json!({"total_slots":1})),
+    ]);
+    with_agent("[compaction]\nenabled=false\n", |agent| {
+        connect(agent, &server.url);
+        assert!(!agent.todo.call(&json!({"op":"set","tasks":[{"content":"Optional live diagnostic","kind":"follow_up"}]})).is_error);
+        assert!(
+            !agent
+                .todo
+                .call(&json!({"op":"block","index":1,"reason":"Awaiting separate authorization"}))
+                .is_error
+        );
+        let plan = agent.todo.snapshot();
+        let mut ui = NoticeUi::default();
+        let report = agent.turn("Report the implemented fix", &mut ui).unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+        assert_eq!(agent.todo.snapshot(), plan);
+        let evidence = agent.completion_evidence(report.outcome);
+        assert_eq!(evidence["optional_follow_ups"].as_array().unwrap().len(), 1);
+        assert_eq!(evidence["work_completion_accepted"], true);
+        assert_ne!(evidence["deliverable_coverage"], "open_obligations");
+        assert!(
+            ui.0.iter()
+                .any(|notice| notice.contains("1 optional follow-up(s)"))
+        );
+    });
+    assert_eq!(completion_requests(&server).len(), 1);
+}
+
 pub(super) fn response(text: &str, call: Option<(&str, Value)>) -> llm::fake::Script {
     let mut delta = json!({"content":text});
     let reason = if let Some((name, args)) = call {
@@ -91,7 +254,7 @@ fn a_missing_requirement_stops_with_the_candidate_and_observed_failure() {
 }
 
 #[test]
-fn a_blocked_todo_rejects_plain_and_explicit_success_without_retrying() {
+fn blocked_steps_refuse_both_plain_and_explicit_completion() {
     for explicit in [false, true] {
         let candidate = "The delivery is ready.";
         let reply = if explicit {
@@ -120,17 +283,24 @@ fn a_blocked_todo_rejects_plain_and_explicit_success_without_retrying() {
             let report = agent.turn("Prepare the delivery", &mut NullUi).unwrap();
             assert_eq!(
                 report.outcome,
-                TurnOutcome::Blocked,
+                TurnOutcome::Incomplete,
                 "explicit={explicit}: {}",
                 report.text
             );
-            assert!(report.halts_automation());
-            assert!(report.text.starts_with("Blocked:"), "{}", report.text);
-            assert!(report.text.contains(candidate), "{}", report.text);
             assert!(
-                report.text.contains("Missing deployment credential"),
-                "{}",
-                report.text
+                !report.halts_automation(),
+                "incomplete work remains available for bounded continuation"
+            );
+            assert!(report.text.starts_with("Incomplete:"), "{}", report.text);
+            assert!(report.text.contains(candidate));
+            assert!(report.text.contains(candidate), "{}", report.text);
+            assert_eq!(
+                agent.todo.tasks()[0].status,
+                crate::agent::workflow::todo::Status::Blocked
+            );
+            assert_eq!(
+                agent.todo.tasks()[0].note.as_deref(),
+                Some("Missing deployment credential")
             );
             assert!(agent.session.custom_records("training_turn").is_empty());
         });
@@ -165,7 +335,10 @@ fn a_terminal_failed_batch_at_the_recovery_limit_retains_the_rejected_candidate(
             connect(agent, &server.url);
             let report = agent.turn("Prepare the delivery", &mut NullUi).unwrap();
             assert_eq!(report.outcome, TurnOutcome::Blocked, "{}", report.text);
-            assert!(report.halts_automation());
+            assert!(
+                report.halts_automation(),
+                "the observed recovery limit stops automation"
+            );
             assert!(report.text.contains(candidate), "{}", report.text);
             assert!(
                 report.text.contains("16 recovery attempts"),
@@ -247,67 +420,92 @@ fn hosted_turn_without_store_retains_exact_requests_and_original_identity() {
         response("", Some(("read", json!({"path":"input.txt"})))),
         llm::fake::json(200, &json!({"total_slots":1})),
         response("The input says ready.", None),
+        response("", Some(("read", json!({"path":"input.txt"})))),
+        response("The input still says ready.", None),
     ]);
-    with_agent("[compaction]\nenabled=false", |agent| {
-        std::fs::write(agent.workspace.root().join("input.txt"), "ready\n").unwrap();
-        connect(agent, &server.url);
-        assert!(agent.store.is_none());
-        let report = agent.turn("Read input.txt", &mut NullUi).unwrap();
-        assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
-        assert!(!agent.logging, "retention must not enable event logging");
-        let records = agent.session.custom_records("training_turn");
-        assert_eq!(records.len(), 1);
-        let record = &records[0].1;
-        assert_eq!(record["version"], 1);
-        assert_eq!(record["source_session"], agent.session.id());
-        let user_entry = agent
-            .session
-            .branchable_user_messages()
-            .into_iter()
-            .find(|(_, text)| text == "Read input.txt")
-            .unwrap()
-            .0;
-        assert_eq!(record["source_turn"], user_entry);
-        let selection = agent.effective_config().selection();
-        assert_eq!(
-            record["source_model"],
-            format!("{}/{}", selection.provider, selection.model)
-        );
-        assert!(record.get("source_state").is_none());
-        assert!(record.get("source_trajectory").is_none());
-        assert_eq!(record["prompt"], "Read input.txt");
-        let requests = completion_requests(&server);
-        let examples = record["payload"]["examples"].as_array().unwrap();
-        assert_eq!(examples.len(), 2);
-        assert_eq!(requests.len(), examples.len());
-        for (example, request) in examples.iter().zip(&requests) {
-            let messages = example["messages"].as_array().unwrap();
-            // Training records the request exactly as this loopback route sent it.
-            let context: Vec<_> = request["messages"]
-                .as_array()
+    with_agent(
+        "[compaction]\nenabled=false\n[training]\nretain_session_requests=true",
+        |agent| {
+            std::fs::write(agent.workspace.root().join("input.txt"), "ready\n").unwrap();
+            connect(agent, &server.url);
+            assert!(agent.store.is_none());
+            let report = agent.turn("Read input.txt", &mut NullUi).unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+            assert!(!agent.logging, "retention must not enable event logging");
+            let report = agent.turn("Read input.txt again", &mut NullUi).unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Completed);
+            assert_eq!(agent.session.custom_records("training_turn").len(), 2);
+            let records = agent.session.custom_records("training_turn");
+            assert_eq!(records.len(), 2);
+            let record = &records[0].1;
+            assert_eq!(record["version"], 3);
+            let sets = agent.session.custom_records("training_tool_sets")[0].1["tool_sets"]
+                .as_object()
                 .unwrap()
-                .iter()
-                .map(llm::messages::canonical)
-                .collect();
-            assert_eq!(&messages[..messages.len() - 1], context.as_slice());
-            assert_eq!(example["tools"], request["tools"]);
-        }
-        assert_eq!(
-            examples[0]["messages"].as_array().unwrap().last().unwrap()["tool_calls"][0]["function"]
-                ["name"],
-            "read"
-        );
-        assert_eq!(
-            examples[1]["messages"].as_array().unwrap().last().unwrap()["content"],
-            "The input says ready."
-        );
-        let reopened =
-            crate::storage::session::Session::read(agent.session.path().unwrap()).unwrap();
-        assert_eq!(reopened.custom_records("training_turn"), records);
-        let fork = agent.session.fork(agent.layout.as_ref().unwrap()).unwrap();
-        assert_ne!(fork.id(), agent.session.id());
-        assert_eq!(fork.custom_records("training_turn"), records);
-    });
+                .clone();
+            let expanded = crate::storage::store::SessionTrainingExample::from_retained_with_tools(
+                record.clone(),
+                &sets,
+            )
+            .unwrap();
+            assert_eq!(record["source_session"], agent.session.id());
+            let user_entry = agent
+                .session
+                .branchable_user_messages()
+                .into_iter()
+                .find(|(_, text)| text == "Read input.txt")
+                .unwrap()
+                .0;
+            assert_eq!(record["source_turn"], user_entry);
+            let selection = agent.effective_config().selection();
+            assert_eq!(
+                record["source_model"],
+                format!("{}/{}", selection.provider, selection.model)
+            );
+            assert!(record.get("source_state").is_none());
+            assert!(record.get("source_trajectory").is_none());
+            assert_eq!(record["prompt"], "Read input.txt");
+            let requests = completion_requests(&server);
+            let examples = expanded.payload["examples"].as_array().unwrap();
+            assert_eq!(examples.len(), 2);
+            assert_eq!(requests.len(), 4);
+            for (example, request) in examples.iter().zip(&requests) {
+                let messages = example["messages"].as_array().unwrap();
+                // Training records the request exactly as this loopback route sent it.
+                let context: Vec<_> = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(llm::messages::canonical)
+                    .collect();
+                assert_eq!(&messages[..messages.len() - 1], context.as_slice());
+                assert_eq!(example["tools"], request["tools"]);
+            }
+            assert_eq!(
+                examples[0]["messages"].as_array().unwrap().last().unwrap()["tool_calls"][0]["function"]
+                    ["name"],
+                "read"
+            );
+            assert_eq!(
+                examples[1]["messages"].as_array().unwrap().last().unwrap()["content"],
+                "The input says ready."
+            );
+            let reopened =
+                crate::storage::session::Session::read(agent.session.path().unwrap()).unwrap();
+            assert_eq!(reopened.custom_records("training_turn"), records);
+            let fork = agent.session.fork(agent.layout.as_ref().unwrap()).unwrap();
+            assert_ne!(fork.id(), agent.session.id());
+            assert_eq!(fork.custom_records("training_turn"), records);
+            assert_eq!(
+                agent.session.custom_records("training_tool_sets").len(),
+                1,
+                "unchanged wire schemas are stored once across turns"
+            );
+            let reopened =
+                crate::storage::session::Session::read(agent.session.path().unwrap()).unwrap();
+            assert_eq!(reopened.custom_records("training_tool_sets").len(), 1);
+        },
+    );
 }
 
 /// The observed failures: a project runs another program's tests (or a non-terminal launch fails)
@@ -447,8 +645,9 @@ fn honest_non_success_reports_do_not_require_success_evidence() {
         ),
     ] {
         let server = llm::fake::serve(vec![
-            response(text, None),
+            response("", Some(("read", json!({"path":"local testing/game.sh"})))),
             llm::fake::json(200, &json!({"total_slots":1})),
+            response(text, None),
         ]);
         with_agent(&missing_visual(0), |agent| {
             game_workspace(agent, &server.url);
@@ -460,7 +659,7 @@ fn honest_non_success_reports_do_not_require_success_evidence() {
                 "not_run"
             );
         });
-        assert_eq!(completion_requests(&server).len(), 1);
+        assert_eq!(completion_requests(&server).len(), 2);
     }
 }
 
@@ -549,7 +748,7 @@ fn disabling_target_evidence_restores_the_unverified_completion() {
 }
 
 #[test]
-fn default_artifact_reconciliation_piggybacks_plain_and_typed_completion() {
+fn verified_artifact_completion_adds_no_self_review_to_either_surface() {
     for explicit in [false, true] {
         for disabled in [false, true] {
             let final_reply = || {
@@ -598,11 +797,9 @@ fn default_artifact_reconciliation_piggybacks_plain_and_typed_completion() {
                 2,
                 "explicit={explicit}, disabled={disabled}"
             );
-            if !disabled {
-                let last = requests.last().unwrap().to_string();
-                assert!(last.contains("one bounded self-review"));
-                assert!(last.contains("Create result.txt containing delivered"));
-            }
+            let last = requests.last().unwrap().to_string();
+            assert!(!last.contains("one bounded self-review"));
+            assert!(!last.contains("[Dial completion]"));
         }
     }
 }

@@ -140,7 +140,8 @@ pub fn request_stop(layout: &Layout, id: &str) -> Result<Value> {
         .unwrap_or(Value::Null);
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
-    crate::platform::fs::open_owner_only(&options, &state.join("improvement.stop"))?.sync_all()?;
+    let stop = crate::platform::fs::open_owner_only(&options, &state.join("improvement.stop"))?;
+    crate::platform::fs::sync_file(&stop)?;
     Ok(
         json!({"state_id":id,"stop_requested":true,"automatic_paused":true,
         "running_worker_supports_stop":status["stop_supported"] == true,
@@ -475,7 +476,7 @@ fn spawn_job(
     options.write(true).create(true).truncate(true);
     let mut file = crate::platform::fs::open_owner_only(&options, &request_path)?;
     serde_json::to_writer(&mut file, &request)?;
-    file.sync_all()?;
+    crate::platform::fs::sync_file(&file)?;
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     let log =

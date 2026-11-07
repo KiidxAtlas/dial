@@ -144,7 +144,7 @@ impl NewBinary {
         ws: &Workspace,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(), String> {
-        self.file.sync_all().map_err(|e| e.to_string())?;
+        crate::platform::fs::sync_file(&self.file).map_err(|e| e.to_string())?;
         let _lease = super::document_transaction::Lease::acquire([self.path.clone()])?;
         if ws.resolve(&ws.rel(&self.path))? != self.path {
             return Err("binary destination physical alias changed".into());

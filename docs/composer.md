@@ -16,6 +16,27 @@ Word completion offers the rest of the word under the cursor as dim ghost text w
 
 ## Commands during a turn
 
+While Dial is working, Enter on a non-empty message opens four selectable intent actions.
+Use Up/Down and Enter (or their rebound selection/submit keys) to choose:
+
+- **Update current task (auto)** is the default. It uses the existing message-routing rules;
+  those rules may classify the message for another route rather than unconditionally steering.
+- **Redirect current task now** explicitly redirects at the next safe point. Running tools
+  finish; “now” does not mean forcibly interrupting them. The existing shortcut is `r` or
+  `Ctrl+Enter` while the chooser is open.
+- **After this turn** queues a follow-up until the running turn finishes. `Alt+Enter` (the
+  rebindable follow-up action) still queues directly without opening the chooser.
+- **Run independently** requests a worker without redirecting the current task. If separate
+  work cannot start, the existing fallback queues it after the turn. `w` or `Ctrl+W` selects
+  this route directly in the chooser; `/worker <message>` remains available.
+
+Explicit redirect and worker requests retain their pending, received and applied indicators;
+selecting an option does not itself claim the agent has applied it. Esc closes the chooser
+without changing the draft, collapsed pastes or history. Editing a queued message preserves
+its original route. Enter on an empty draft with queued work opens a separate two-option
+queue menu: **Keep working** (default) or **Stop and send oldest**; it does not offer the four
+draft-intent actions.
+
 Live slash commands run immediately rather than queueing a follow-up or stopping the turn.
 `/retry` takes no arguments and requests an immediate provider retry only while a retry wait is
 pending. It skips the remaining automatic or server-requested delay without cancelling the turn

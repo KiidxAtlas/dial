@@ -74,6 +74,9 @@ pub(super) fn during_turn(name: &str, args: &str) -> DuringTurn {
     if name == "activity" && args == "resume" {
         return DuringTurn::AfterTurn;
     }
+    if name == "search" && (args == "back" || args.starts_with("open ")) {
+        return DuringTurn::Stop;
+    }
     if command_spec(name).is_some_and(|spec| spec.argument_policy == ArgumentPolicy::Model)
         && args == "restart"
     {
@@ -119,6 +122,7 @@ pub(super) fn command_panel(name: &str, args: &str) -> Option<Which> {
         ("model", "settings" | "setting") | ("model-settings", "") => Some(Which::ModelSettings),
         ("image", "settings" | "setting") => Some(Which::ImageSettings),
         ("model", "defaults") => Some(Which::ContextDefaults),
+        ("model", "backups") => Some(Which::BackupModels),
         ("model", "local") => Some(Which::ModelDownloads),
         ("model", "memory") => Some(Which::ModelMemory),
         ("roles", "") => Some(Which::ModelRoles),

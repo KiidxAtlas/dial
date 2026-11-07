@@ -56,10 +56,22 @@ impl Status {
     }
 }
 
+/// Planning records are not user-authored acceptance criteria. Durable required deliverables
+/// belong to `working_state`; optional follow-ups never block delivery or start automatically.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    #[default]
+    Step,
+    FollowUp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub content: String,
     pub status: Status,
+    #[serde(default)]
+    pub kind: Kind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     /// Why a blocked task is blocked or why a task was abandoned.
@@ -77,14 +89,16 @@ pub struct Task {
 impl Task {
     /// `N. content`, with the blocker or abandonment reason when there is one.
     pub fn label(&self, number: usize) -> String {
+        let kind = if self.kind == Kind::FollowUp {
+            " [optional follow-up]"
+        } else {
+            ""
+        };
+        let label = format!("{number}. {}{kind}", self.content);
         match (&self.note, self.status) {
-            (Some(note), Status::Blocked) => {
-                format!("{number}. {} (blocked: {note})", self.content)
-            }
-            (Some(note), Status::Abandoned) => {
-                format!("{number}. {} (dropped: {note})", self.content)
-            }
-            _ => format!("{number}. {}", self.content),
+            (Some(note), Status::Blocked) => format!("{label} (blocked: {note})"),
+            (Some(note), Status::Abandoned) => format!("{label} (dropped: {note})"),
+            _ => label,
         }
     }
 }
@@ -141,7 +155,7 @@ fn check_tasks(tasks: &[Task]) -> Result<(), String> {
 
 const OPS_HINT: &str = "Use one call such as {\"op\":\"set\",\"tasks\":[{\"content\":\"...\"}]}, {\"op\":\"done\"}, or {\"op\":\"view\"}.";
 const TOP_KEYS: &[&str] = &["op", "tasks", "index", "reason", "finding", "evidence"];
-const ITEM_KEYS: &[&str] = &["content", "status", "phase", "investigation"];
+const ITEM_KEYS: &[&str] = &["content", "status", "phase", "investigation", "kind"];
 
 /// Parse `tasks` for `set`/`append`. A task without `phase` inherits the phase of the task before it
 /// (`inherited` for the first), so a phase is named once at the head of its group.
@@ -157,7 +171,7 @@ fn parse_items(args: &Value, op: &str, mut inherited: Option<String>) -> Result<
             .and_then(|obj| obj.keys().find(|key| !ITEM_KEYS.contains(&key.as_str())))
         {
             return Err(format!(
-                "task {n}: unknown key {key:?}. Allowed keys: content, status, phase, investigation. Example: {{\"content\":\"...\"}}"
+                "task {n}: unknown key {key:?}. Allowed keys: content, status, phase, investigation, kind. Example: {{\"content\":\"...\"}}"
             ));
         }
         let raw = item
@@ -180,9 +194,15 @@ fn parse_items(args: &Value, op: &str, mut inherited: Option<String>) -> Result<
             None | Some(Value::Null) => false,
             Some(value) => value.as_bool().ok_or("investigation must be a boolean")?,
         };
+        let kind = match item.get("kind").filter(|value| !value.is_null()) {
+            None => Kind::Step,
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|_| format!("task {n}: kind must be step or follow_up"))?,
+        };
         tasks.push(Task {
             content,
             status,
+            kind,
             phase: inherited.clone(),
             note: None,
             investigation,
@@ -288,6 +308,13 @@ impl TodoList {
         self.tasks.iter().any(|t| t.status.is_open())
     }
 
+    /// Only execution steps can block a completion claim. Follow-ups are retained separately.
+    pub fn blocked_steps(&self) -> impl Iterator<Item = &Task> {
+        self.tasks
+            .iter()
+            .filter(|task| task.status == Status::Blocked && task.kind == Kind::Step)
+    }
+
     /// `(closed, total)`: completed or abandoned tasks against all tasks.
     pub fn progress(&self) -> (usize, usize) {
         (
@@ -324,16 +351,6 @@ impl TodoList {
         out.join("\n")
     }
 
-    /// Accepted final report closes only the in-progress entry: the work the model was doing. Pending
-    /// entries were never started, so they stay open; explicit blockers are never erased.
-    pub fn complete_reported_work(&mut self) {
-        for task in &mut self.tasks {
-            if task.status == Status::InProgress {
-                task.status = Status::Completed;
-            }
-        }
-    }
-
     /// Complete the active progress entry without an index or a proof payload.
     pub fn completion_hint(&self) -> Option<Value> {
         self.tasks
@@ -359,7 +376,7 @@ impl TodoList {
             .enumerate()
             .skip(slot + 1)
             .chain(self.tasks.iter().enumerate().take(slot))
-            .find(|(_, t)| t.status == Status::Pending)
+            .find(|(_, t)| t.status == Status::Pending && t.kind == Kind::Step)
             .map_or_else(
                 || "This is the last open step.".to_owned(),
                 |(i, t)| format!("Next: {}.", t.label(i + 1)),
@@ -574,7 +591,7 @@ impl TodoList {
                 let slot = match args.get("index") {
                     None | Some(Value::Null) => tasks
                         .iter()
-                        .position(|t| t.status == Status::Pending)
+                        .position(|t| t.status == Status::Pending && t.kind == Kind::Step)
                         .ok_or_else(|| {
                             "no pending task to start; give op \"start\" an \"index\"".to_string()
                         })?,
@@ -665,7 +682,9 @@ fn advance(tasks: &mut [Task]) -> Option<usize> {
     if tasks.iter().any(|t| t.status == Status::InProgress) {
         return None;
     }
-    let slot = tasks.iter().position(|t| t.status == Status::Pending)?;
+    let slot = tasks
+        .iter()
+        .position(|t| t.status == Status::Pending && t.kind == Kind::Step)?;
     tasks[slot].status = Status::InProgress;
     Some(slot)
 }
@@ -705,7 +724,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": "todo",
-            "description": "todo: plan substantial multi-step work. done closes the active item and starts the next; never resend set to mark progress. Indices are 1-based. Send with a real call, never alone; skip a closing update before the final answer.",
+            "description": "todo: plan substantial multi-step work. done closes the active item and starts the next; never resend set to mark progress. Indices are 1-based. Batch updates with real work when possible. Explicitly close completed execution steps before a final reply or finish; neither closes tasks automatically.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -718,6 +737,7 @@ pub fn schema() -> Value {
                             "properties": {
                                 "content": {"type": "string"},
                                 "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "abandoned"]},
+                                "kind": {"type":"string", "enum":["step","follow_up"], "description":"Execution step (default) or optional follow-up. Follow-ups never block completion or start automatically. Required deliverables belong in working_state, not planning text."},
                                 "phase": {"type": "string"},
                                 "investigation": {"type": "boolean", "description": "Legacy label; same lifecycle."}
                             }

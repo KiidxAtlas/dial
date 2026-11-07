@@ -729,6 +729,22 @@ impl Tool for Computer {
         })
     }
 
+    /// A build without a native desktop backend (the `desktop` feature off, or an unsupported OS)
+    /// cannot run any desktop action. Screen-recording and accessibility grants are not probed here.
+    fn readiness(&self, _config: &Config) -> crate::tools::surface::catalog::Readiness {
+        if cfg!(any(
+            dial_desktop_macos,
+            dial_desktop_windows,
+            dial_desktop_linux
+        )) {
+            crate::tools::surface::catalog::Readiness::Unknown
+        } else {
+            crate::tools::surface::catalog::Readiness::Unsupported {
+                reason: "this Dial build has no native desktop backend".into(),
+            }
+        }
+    }
+
     fn needs_approval(&self, args: &Value) -> bool {
         computer_policy(args) == Policy::Exec
     }

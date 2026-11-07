@@ -1,8 +1,4 @@
-//! Stop-time handling for open work and missing evidence. Text alone never closes pending todos:
-//! an accepted completed answer closes only the in-progress task (see
-//! `TodoList::complete_reported_work`), and not in goal mode. Tests are never mandatory: edits with
-//! no passing check are accepted with the gap disclosed; only a failure the gate itself observed
-//! earns one reminder per round.
+//! Shared candidate reconciliation against observed work, with one durable recovery allowance.
 use crate::agent::workflow::todo::{Status, TodoList};
 use serde_json::{Value, json};
 
@@ -21,8 +17,13 @@ impl Finish {
         let outcome = match args["outcome"].as_str() {
             Some("completed") => TurnOutcome::Completed,
             Some("blocked") => TurnOutcome::Blocked,
+            Some("answered") => TurnOutcome::Answered,
             Some("needs_input") => TurnOutcome::NeedsInput,
-            _ => return Err("finish outcome must be completed, blocked or needs_input".into()),
+            _ => {
+                return Err(
+                    "finish outcome must be completed, answered, blocked or needs_input".into(),
+                );
+            }
         };
         let summary = args["summary"]
             .as_str()
@@ -30,14 +31,7 @@ impl Finish {
             .filter(|s| !s.is_empty() && s.len() <= 8192)
             .ok_or("finish requires a nonempty summary of at most 8192 bytes")?
             .to_owned();
-        let question = if outcome == TurnOutcome::Completed {
-            if crate::agent::safety::stream_guards::announces_unexpected_stop(&summary)
-                || crate::agent::safety::stream_guards::reports_unfinished_work(&summary)
-            {
-                return Err(
-                    "completed requires a report of finished work, not a promise to act".into(),
-                );
-            }
+        let question = if matches!(outcome, TurnOutcome::Completed | TurnOutcome::Answered) {
             None
         } else {
             Some(
@@ -76,7 +70,7 @@ impl Finish {
             }
             Vec::new()
         };
-        let text = if outcome == TurnOutcome::Completed {
+        let text = if matches!(outcome, TurnOutcome::Completed | TurnOutcome::Answered) {
             summary.clone()
         } else {
             let label = if outcome == TurnOutcome::Blocked {
@@ -104,9 +98,9 @@ impl Finish {
 pub fn schema() -> Value {
     json!({"type":"function","function":{
         "name":"finish",
-        "description":"Optional structured outcome; ordinary work ends with a plain final answer instead. completed reports finished, verified work and requires no live tasks; it closes only the in-progress todo. A review-pending response continues the turn: inspect the supplied diff and evidence, then call finish again. blocked names a concrete missing prerequisite. needs_input asks a specific question (optional 1–8 options) and continues the turn with the answer. blocked and needs_input require reason. Use as the last call in a batch.",
+        "description":"Submit a structured candidate to the same state gate as a plain reply. completed requires settled execution steps, deliverables, jobs and required checks. answered delivers information without certifying work; it cannot bypass open obligations. blocked and needs_input require a concrete reason, and available workspace evidence is investigated first. needs_input accepts optional choices. One recovery nudge is shared per user request; exhausted recovery is incomplete. Use last in a batch.",
         "parameters":{"type":"object","properties":{
-            "outcome":{"type":"string","enum":["completed","blocked","needs_input"]},
+            "outcome":{"type":"string","enum":["completed","answered","blocked","needs_input"]},
             "summary":{"type":"string","minLength":1,"maxLength":8192},
             "reason":{"type":"string","minLength":1,"maxLength":8192},
             "options":{"type":"array","items":{"type":"string","minLength":1,"maxLength":512},"minItems":1,"maxItems":8}
@@ -129,20 +123,186 @@ fn lines(todo: &TodoList, keep: impl Fn(Status) -> bool) -> String {
         .join("\n")
 }
 
-/// `Blocked` carries the blocker list: every open task is blocked, so stopping is the honest outcome.
-pub enum StopAction {
-    Accept,
-    Blocked(String),
+/// A bounded, separate notice, never a rewrite of the answer or a declaration of success.
+pub(in crate::agent) fn outstanding_notice(
+    todo: &TodoList,
+    working: &Value,
+    outcome: TurnOutcome,
+) -> Option<String> {
+    let steps = todo
+        .tasks()
+        .iter()
+        .filter(|task| {
+            task.status.is_open() && task.kind == crate::agent::workflow::todo::Kind::Step
+        })
+        .count();
+    let follow_ups = todo
+        .tasks()
+        .iter()
+        .filter(|task| {
+            task.status.is_open() && task.kind == crate::agent::workflow::todo::Kind::FollowUp
+        })
+        .count();
+    let deliverables = crate::agent::workflow::working_state::open_deliverables(working);
+    if steps == 0 && follow_ups == 0 && deliverables.is_empty() {
+        return None;
+    }
+    let mut notice = format!(
+        "Outstanding work retained: {steps} execution step(s), {} required deliverable(s), {follow_ups} optional follow-up(s).",
+        deliverables.len()
+    );
+    if outcome == TurnOutcome::Answered {
+        notice.push_str(" This answer does not mark that work complete.");
+    }
+    for (index, task) in todo
+        .tasks()
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.status.is_open())
+        .take(3)
+    {
+        notice.push_str(&format!(
+            "\n{}",
+            crate::agent::base::helpers::byte_prefix(&task.label(index + 1), 300)
+        ));
+    }
+    Some(notice)
 }
 
-/// What a completed answer owes for edits that no passing check covers.
-#[derive(Debug, PartialEq, Eq)]
-pub enum EvidenceGate {
-    Accept,
-    /// Ask once for a check, or for an explanation of why none can run.
-    Remind(String),
-    /// The reminder was spent: accept, and append this disclosure to the answer.
-    Disclose(String),
+/// A candidate is reconciled with controller observations before either delivery surface ends.
+pub(in crate::agent) enum Decision {
+    Accept(TurnOutcome),
+    Continue(String),
+    Incomplete(String),
+}
+
+impl crate::agent::Agent<'_> {
+    /// One instruction-scoped nudge for missing work or observations. Wording never grants
+    /// completion, and rebuilding an inner loop cannot replenish this allowance.
+    pub(in crate::agent) fn completion_decision(
+        &mut self,
+        requested: TurnOutcome,
+        candidate: &str,
+        ui: &mut dyn crate::agent::Ui,
+    ) -> Decision {
+        if self.hermetic || self.plan_mode {
+            return match self.validate_completion(ui) {
+                Err(reason)
+                    if matches!(requested, TurnOutcome::Completed | TurnOutcome::Answered) =>
+                {
+                    Decision::Incomplete(reason)
+                }
+                _ => Decision::Accept(requested),
+            };
+        }
+        let mut control = self.session.control_state();
+        let instruction = control["current_instruction_entry_id"].clone();
+        let nudged = control["completion_gate"]["instruction"] == instruction
+            && control["completion_gate"]["nudged"] == true;
+        let delivery = matches!(requested, TurnOutcome::Completed | TurnOutcome::Answered);
+        let open_steps = self
+            .todo
+            .tasks()
+            .iter()
+            .filter(|task| {
+                task.kind == crate::agent::workflow::todo::Kind::Step && task.status.is_open()
+            })
+            .map(|task| task.content.as_str())
+            .collect::<Vec<_>>();
+        let has_open_steps = !open_steps.is_empty();
+        let open = has_open_steps.then(|| format!(
+            "Execution steps remain open: {}. Complete or explicitly block them; a final reply does not close them.",
+            open_steps.join("; ")));
+        let mut blocker = if delivery {
+            open.or_else(|| self.validate_completion(ui).err())
+        } else {
+            None
+        };
+        let hard_blocker = delivery
+            && blocker.is_some()
+            && !has_open_steps
+            && crate::agent::workflow::working_state::open_deliverables(&control["working_state"])
+                .is_empty();
+        if delivery && blocker.is_none() {
+            let (unverified, failures) = self.gate_unverified_edits(!nudged, ui);
+            if let Some(checks) = unverified {
+                blocker = Some(format!(
+                    "Current edits have no passing applicable check: {}. {}",
+                    checks.join(", "),
+                    if failures.is_empty() && nudged {
+                        control["completion_gate"]["reason"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned()
+                    } else {
+                        failures.join("\n")
+                    }
+                ));
+            }
+        }
+        // Inspecting the directory is only an availability check. It supplies no task evidence.
+        let workspace_available =
+            std::fs::read_dir(self.workspace.root())
+                .ok()
+                .is_some_and(|entries| {
+                    entries.filter_map(Result::ok).any(|entry| {
+                        !matches!(entry.file_name().to_str(), Some(".git" | ".dial" | ".tmp"))
+                    })
+                });
+        let work_request = control["current_instruction"]
+            .as_str()
+            .is_some_and(|prompt| {
+                crate::learn::task_policy::Kind::classify(prompt)
+                    != crate::learn::task_policy::Kind::General
+            });
+        let missing_observation = !self.step_checks.autonomous_continuation
+            && self.step_checks.observations == 0
+            && workspace_available
+            && work_request
+            && !self.interrupt.load(std::sync::atomic::Ordering::SeqCst);
+        if requested == TurnOutcome::NeedsInput && self.step_checks.observations == 0 {
+            self.efficiency_metrics.questions_before_investigation += 1;
+        }
+        let missing = blocker.or_else(|| missing_observation.then(||
+            "No investigation has been observed for this request. Inspect available workspace evidence before asking the user or claiming completion; if it cannot answer the question, state the concrete missing information.".to_owned()));
+        let Some(reason) = missing else {
+            return Decision::Accept(requested);
+        };
+        let externally_blocked = self.todo.blocked_steps().next().is_some()
+            || control["working_state"]["deliverables"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["status"] == "blocked"));
+        if nudged || hard_blocker || externally_blocked || self.stop_boundary().is_some() {
+            self.efficiency_metrics.incomplete_stops += 1;
+            return Decision::Incomplete(reason);
+        }
+        control = self.session.control_state();
+        control["completion_gate"] =
+            json!({"instruction":instruction,"nudged":true,"reason":reason});
+        if let Err(error) = self.session.set_control_state(control) {
+            return Decision::Incomplete(format!(
+                "Completion recovery could not be recorded: {error:#}"
+            ));
+        }
+        self.efficiency_metrics.completion_nudges += 1;
+        ui.notice(&format!(
+            "Completion deferred for unfinished work or investigation: {reason}"
+        ));
+        let wording = if crate::agent::safety::stream_guards::announces_unexpected_stop(candidate)
+            || crate::agent::safety::stream_guards::reports_unfinished_work(candidate)
+        {
+            crate::agent::safety::stream_guards::render_retry_prompt(
+                crate::agent::safety::stream_guards::UNEXPECTED_STOP_RETRY,
+                1,
+                1,
+            )
+        } else {
+            String::new()
+        };
+        Decision::Continue(format!(
+            "{wording}\n[Dial completion] {reason}\nContinue the permitted work or report a concrete blocker. This is the single completion nudge for this request."
+        ))
+    }
 }
 
 /// Explicit labels in plain reports use the same outcomes as typed finish calls.
@@ -271,61 +431,6 @@ impl CapabilitySearch {
 
 /// The reminder `CapabilitySearch::remind` sends back with the rejected answer.
 pub(in crate::agent) const CAPABILITY_SEARCH_REMINDER: &str = "Your answer says something is not possible or not available, but you have not searched the tool catalog this turn. Tools you were not offered may provide it (an interactive terminal, a browser, a debugger and more are loadable). Call `tool_search` with the capability you need, load a match with `tool_load` and use it; if nothing fits, give the same answer again and name what you searched for.";
-
-/// One reminder for edits that no passing check covers, per round of a turn. Unstarted todos earn
-/// none: an answer may cover them without another request, and the turn discloses open items.
-#[derive(Default)]
-pub struct CompletionGuard {
-    evidence_reminded: bool,
-}
-impl CompletionGuard {
-    pub fn stopped(&mut self, todo: &TodoList) -> StopAction {
-        let blocked = lines(todo, |status| status == Status::Blocked);
-        if blocked.is_empty() {
-            StopAction::Accept
-        } else {
-            StopAction::Blocked(format!("Blocked tasks:\n{blocked}"))
-        }
-    }
-
-    /// Whether this round's evidence reminder was already sent.
-    pub fn reminder_spent(&self) -> bool {
-        self.evidence_reminded
-    }
-
-    /// `unverified` names the applicable checks when this turn's edits have no passing check on the
-    /// current revision, `None` when evidence is not owed. `failures` is what the gate's own run of
-    /// those checks observed. A missing check is disclosed, never demanded; only an observed failure
-    /// earns one reminder (carrying its output), and without `can_remind` or once spent it is
-    /// disclosed too.
-    pub fn evidence(
-        &mut self,
-        unverified: Option<&[String]>,
-        failures: &[String],
-        can_remind: bool,
-    ) -> EvidenceGate {
-        let Some(checks) = unverified else {
-            return EvidenceGate::Accept;
-        };
-        let applicable = checks.join(", ");
-        if failures.is_empty()
-            || !can_remind
-            || std::mem::replace(&mut self.evidence_reminded, true)
-        {
-            return EvidenceGate::Disclose(format!(
-                "\n\nUnverified: no relevant check passed after the last edit (applicable: {applicable})."
-            ));
-        }
-        EvidenceGate::Remind(format!(
-            "[Dial] The completion gate ran the applicable checks after this turn's edits and they failed (applicable: {applicable}). Fix the failure, or explain it in the final answer. This reminder is sent once.\nThe completion gate ran the applicable checks:\n{}",
-            failures.join("\n")
-        ))
-    }
-
-    pub fn reset_for_steering(&mut self) {
-        *self = Self::default();
-    }
-}
 
 /// A successful `eval` cell whose code asserts its results is verification the model already ran:
 /// a failed assertion makes the cell an error. It counts like a passing shell check.

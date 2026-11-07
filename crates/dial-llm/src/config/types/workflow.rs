@@ -30,8 +30,8 @@ impl Default for CommitConfig {
 }
 
 /// Experimental agent workflow features. Every feature is disabled unless explicitly enabled,
-/// except `repro_first = advise`.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// except `repro_first = advise` and `dependency_dispatch`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExperimentalConfig {
     /// Offer bounded, approved video frame investigations; image tokens can be expensive.
@@ -65,12 +65,37 @@ pub struct ExperimentalConfig {
     /// Present exact native edit calls as a finite one-shot approval batch.
     pub batch_approvals: bool,
     /// Schedule only operations with trusted resource contracts across independent calls.
+    /// Enabled by default; `false` serializes native mutations (read batching remains).
     pub dependency_dispatch: bool,
     /// Start configured focused verification after committed edits, overlapping safe reads only.
     pub background_checks: bool,
     /// Offer `check.expect` (pass/fail prediction); a mismatch is reported as a fact and the next
     /// request asks the model to account for it before editing again.
     pub check_predictions: bool,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            video_analysis: false,
+            work_packet_contracts: false,
+            verification_receipts: false,
+            context_overlap_dedup: false,
+            profile_matching: false,
+            tool_speculation: false,
+            turn_optimizer: false,
+            reasoning_strategy: ReasoningStrategy::default(),
+            fault_witness: false,
+            repro_first: ReproFirst::default(),
+            edit_bisection_runs: 0,
+            outcome_gradient_rounds: 0,
+            streaming_dispatch: true,
+            batch_approvals: false,
+            dependency_dispatch: true,
+            background_checks: false,
+            check_predictions: false,
+        }
+    }
 }
 
 /// `experimental.repro_first`: how debugging tasks are steered toward a failing reproduction

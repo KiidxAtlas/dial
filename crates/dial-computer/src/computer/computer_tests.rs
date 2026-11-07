@@ -8,6 +8,27 @@ fn computer_timeout_clamps_to_bounds() {
 }
 
 #[test]
+fn computer_readiness_reports_a_build_without_a_desktop_backend_as_unsupported() {
+    use crate::tools::surface::catalog::Readiness;
+    let tool = Computer {
+        session: Arc::new(ComputerSession::new(current_cwd())),
+    };
+    let readiness = tool.readiness(&Config::default());
+    if cfg!(any(
+        dial_desktop_macos,
+        dial_desktop_windows,
+        dial_desktop_linux
+    )) {
+        assert_eq!(readiness, Readiness::Unknown);
+    } else {
+        assert!(
+            matches!(readiness, Readiness::Unsupported { .. }),
+            "{readiness:?}"
+        );
+    }
+}
+
+#[test]
 fn computer_policy_tiers() {
     assert_eq!(
         computer_policy(&json!({"action": "capabilities"})),

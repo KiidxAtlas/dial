@@ -78,10 +78,10 @@ fn role_for_agent(spec: &AgentSpec) -> &'static str {
 /// These chains are delegation-only: maintenance requests keep their own role semantics.
 fn default_task_role(config: &Config, preferred: &'static str) -> (&'static str, String) {
     let candidates: &[&str] = match preferred {
-        "task" => &["task", "coach", "small"],
+        "task" => &["task", "coach"],
         "small" => &["small", "task"],
-        "tester" => &["tester", "coach", "task", "small"],
-        "coach" => &["coach", "task", "small"],
+        "tester" => &["tester", "coach", "task"],
+        "coach" => &["coach", "task"],
         _ => return (preferred, format!("{preferred} selected")),
     };
     let mut evaluated = Vec::new();
@@ -229,11 +229,11 @@ pub fn schema(config: &Config) -> Value {
         format!("{presets}\nCustom agents:{custom}")
     };
     let description = format!(
-        "task: delegate self-contained work to subagents. `tasks[]` runs independent slices in one call with shared `context`; action=start runs them live while you keep working, then `wait`. Agent types:{types}{presets}"
+        "Delegate independent work. tasks[] shares context; start returns live ids, wait collects results. Unspecified agents are read-only and use the main model; choose scout for bounded routine lookups, reviewer for audits, planner for open-ended analysis, worker for implementation. source_session attaches a selected session record to a read-only audit without granting private-directory access. Types:{types}{presets}"
     );
     let mut entry_properties = json!({
         "acceptance_checks":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1},"description":"Names of configured checks, not shell commands. A mutating worker's changes merge only when these pass."},
-        "agent":{"type":"string","description":"Agent type or preset (default scout)."},
+        "agent":{"type":"string","description":"Agent type or preset; omitted uses a read-only agent on the main model."},
         "task":{"type":"string","description":"Complete assignment with scope and acceptance criteria."},
         "solution_space":{"type":"string","description":"What is fixed versus what the child may choose; never empty. Example: \"Fixed: edit only src/parser.rs. Free: helper names.\""},
         "skills":{"type":"array","items":{"type":"string"},"description":"Skills to load first."},
@@ -243,7 +243,7 @@ pub fn schema(config: &Config) -> Value {
         "isolation":{"type":"string","enum":["copy"],"description":"Workers only: work in a private copy, merged on success unless the parent changed the same files."},
         "isolation_backend":{"type":"string","enum":ISOLATION_BACKENDS,"description":"Workers only; implies isolation. Fails before starting if unavailable."}
     });
-    entry_properties.as_object_mut().unwrap().insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session or worker id to read."}));
+    entry_properties.as_object_mut().unwrap().insert("source_session".into(), json!({"type":"string","minLength":1,"description":"Read-only agents: session or worker id whose record is attached to the assignment."}));
     entry_properties.as_object_mut().unwrap().insert(
         "model".into(),
         json!({"type":"string","description":"seance only: answering model."}),
@@ -344,7 +344,7 @@ pub fn schema(config: &Config) -> Value {
         },
         "required":["id"],"additionalProperties":false
     }));
-    properties.insert("source_session".into(), json!({"type":"string","minLength":1,"description":"seance only: session or worker id to read."}));
+    properties.insert("source_session".into(), json!({"type":"string","minLength":1,"description":"Read-only agents: session or worker id whose record is attached to the assignment."}));
     properties.insert(
         "model".into(),
         json!({"type":"string","description":"seance only: answering model."}),
@@ -554,13 +554,14 @@ fn model_routes(
     let definition = config.agents.get(job.kind);
     let selectors = definition.map(|d| d.model.as_slice()).unwrap_or_default();
     // A consultation runs on its explicit or source model only; profiles and definitions do not apply.
-    let selectors: Vec<Option<&str>> = if let Some(seance) = &job.seance {
-        vec![seance.model.as_deref()]
-    } else if selectors.is_empty() || profile.is_some() {
-        vec![None]
-    } else {
-        selectors.iter().map(|s| Some(s.as_str())).collect()
-    };
+    let selectors: Vec<Option<&str>> =
+        if let Some(seance) = job.seance.as_ref().filter(|_| job.spec.name == "seance") {
+            vec![seance.model.as_deref()]
+        } else if selectors.is_empty() || profile.is_some() {
+            vec![None]
+        } else {
+            selectors.iter().map(|s| Some(s.as_str())).collect()
+        };
     let mut routes = selectors
         .into_iter()
         .map(|selector| {
@@ -1072,12 +1073,15 @@ fn parse_job<'c>(
         }
         Some(value) => Some(parse_work_packet(value)?),
     };
-    let seance = if spec.name == "seance" {
+    let seance = if spec.name == "seance" || entry.get("source_session").is_some() {
+        if spec.mutates {
+            return Err("source_session is a read-only audit capability".into());
+        }
         let source = optional_str(entry, "source_session")?
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or("agent seance needs a non-empty `source_session`: a session id prefix or a worker id from this session")?;
-        if !skills.is_empty() {
+        if spec.name == "seance" && !skills.is_empty() {
             return Err(
                 "agent seance reads only the record it is given; `skills` does not apply".into(),
             );
@@ -1086,6 +1090,11 @@ fn parse_job<'c>(
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_owned);
+        if spec.name != "seance" && model.is_some() {
+            return Err(
+                "model is a seance-only override; other auditors keep their configured role".into(),
+            );
+        }
         Some(seance::Seance::new(source.to_owned(), model))
     } else {
         if optional_str(entry, "source_session")?.is_some()
@@ -1109,7 +1118,11 @@ fn parse_job<'c>(
         label,
         kind,
         spec,
-        role: role_for_agent(spec),
+        role: if entry.get("agent").is_none() {
+            "main"
+        } else {
+            role_for_agent(spec)
+        },
         model_routes: Vec::new(),
         preset,
         allowed_tools,
@@ -1326,6 +1339,7 @@ pub(in crate::agent) struct Outcome {
     pub model_route: Option<Value>,
     /// Controller-owned exact inspection identities; never part of the worker's validated answer.
     pub inspections: crate::agent::workflow::efficiency::Inspections,
+    pub scheduling: crate::agent::workflow::efficiency::Scheduling,
     /// The child's conversation at finish, moved out so a retained slot can continue it.
     pub conversation: Option<ChildConversation>,
 }
@@ -1355,6 +1369,7 @@ impl Outcome {
             retryable_provider: false,
             model_route: None,
             inspections: Default::default(),
+            scheduling: Default::default(),
             conversation: None,
         }
     }
@@ -1369,6 +1384,7 @@ impl Outcome {
             retryable_provider: false,
             model_route: None,
             inspections: Default::default(),
+            scheduling: Default::default(),
             conversation: None,
         }
     }
@@ -1383,6 +1399,7 @@ impl Outcome {
             retryable_provider: false,
             model_route: None,
             inspections: Default::default(),
+            scheduling: Default::default(),
             conversation: None,
         }
     }
@@ -2044,7 +2061,13 @@ pub(in crate::agent) fn run(
             };
         }
     };
-    if let Err(why) = seance::attach(&mut request.jobs, env.layout, session_id, &config) {
+    if let Err(why) = seance::attach(
+        &mut request.jobs,
+        env.layout,
+        session_id,
+        &config,
+        env.workspace.artifacts(),
+    ) {
         return ToolOutput {
             execution: Default::default(),
             data: None,
@@ -2447,6 +2470,7 @@ pub(in crate::agent) fn run_child(
         approver.model_route(&metadata);
         route_used = Some(metadata);
         let earlier_inspections = outcome.inspections;
+        let earlier_scheduling = outcome.scheduling;
         outcome = child::run(
             Env {
                 config: &route.config,
@@ -2460,6 +2484,7 @@ pub(in crate::agent) fn run_child(
         );
         alternate.release();
         outcome.inspections.extend(earlier_inspections);
+        outcome.scheduling.extend(earlier_scheduling);
         attempts = attempts.saturating_add(outcome.steps);
     }
     outcome.steps = attempts;
@@ -3363,6 +3388,7 @@ fn render(
         let text = outcome.status.text.as_str();
         let mut result = json!({"name":job.label,"agent":job.kind,"status":status,"steps":outcome.steps,"result":outcome.data.clone().unwrap_or_else(|| json!(text))});
         result["inspections"] = json!(outcome.inspections);
+        result["scheduling"] = json!(outcome.scheduling);
         result["acceptance"] = json!(outcome.acceptance);
         result["candidate"] = candidate_status(status, outcome.acceptance.state, &job.acceptance_checks);
         result["projection"] = result_projection(text, outcome.data.as_ref(), job.work_packet.as_ref().map(|p| p.acceptance.as_slice()).unwrap_or_default(), workspace);

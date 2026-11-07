@@ -12,9 +12,60 @@ fn row(name: &str, running: bool) -> JobRow {
         status: if running { "running" } else { "exited 0" }.into(),
         process_outcome: None,
         running,
+        stop_requested: false,
         terminal: true,
         mode: "session".into(),
     }
+}
+
+#[test]
+fn stop_and_dismiss_are_distinct_and_never_infer_cancellation() {
+    let keys = Keymap::defaults();
+    let mut overlay = JobsOverlay::new();
+    let mut job = row("worker", true);
+    overlay.set_jobs(vec![job.clone()]);
+    assert!(matches!(
+        overlay.handle(
+            &Event::Key(key(KeyCode::Char('d'), KeyModifiers::NONE)),
+            &keys
+        ),
+        OverlayEvent::None
+    ));
+    assert!(
+        matches!(overlay.handle(&Event::Key(key(KeyCode::Char('s'), KeyModifiers::NONE)), &keys), OverlayEvent::JobStop { name } if name == "worker")
+    );
+    job.stop_requested = true;
+    assert_eq!(job.lifecycle_label(), "Stop requested");
+    overlay.set_jobs(vec![job.clone()]);
+    assert!(matches!(
+        overlay.handle(
+            &Event::Key(key(KeyCode::Char('d'), KeyModifiers::NONE)),
+            &keys
+        ),
+        OverlayEvent::None
+    ));
+    job.running = false;
+    assert_eq!(job.lifecycle_label(), "Unknown");
+    job.process_outcome = Some(crate::runtime::execution::ProcessOutcome {
+        started: true,
+        exit_code: None,
+        signal: Some(9),
+        timed_out: false,
+        cancelled: false,
+        output_complete: true,
+    });
+    assert_eq!(job.lifecycle_label(), "Stopped");
+    overlay.set_jobs(vec![job]);
+    assert!(matches!(
+        overlay.handle(
+            &Event::Key(key(KeyCode::Char('s'), KeyModifiers::NONE)),
+            &keys
+        ),
+        OverlayEvent::None
+    ));
+    assert!(
+        matches!(overlay.handle(&Event::Key(key(KeyCode::Char('d'), KeyModifiers::NONE)), &keys), OverlayEvent::JobDismiss { name } if name == "worker")
+    );
 }
 
 #[test]

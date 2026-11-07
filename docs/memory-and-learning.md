@@ -359,3 +359,13 @@ context_max_bytes = 0
 teacher_enabled = false
 teacher_timeout_secs = 0
 ```
+
+### Idle maintenance and degraded recall
+
+The idle timer checks whether the selected backend has queued observations, eligible extraction,
+missing embeddings or due consolidation before creating a maintenance worker/runtime record.
+Retry deadlines remain authoritative; an empty queue does not create a periodic no-op worker.
+Semantic embedding setup, retain or recall failures produce one status notice per runtime explaining
+keyword fallback. An intentionally disabled embedding mode is not a connection failure.
+Exact teaching snapshots are opt-in through `training.retain_session_requests`; see
+[teaching from sessions](improvement.md#teach-b-from-a-successful-session-with-a).

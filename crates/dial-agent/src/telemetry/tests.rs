@@ -32,6 +32,7 @@ fn request_event(session: &str, error: bool) -> Event {
         billing: None,
         first_output: Some(Duration::from_millis(420)),
         effort: Some("medium".into()),
+        failure: None,
     }))
 }
 
@@ -528,4 +529,12 @@ fn flush_deadline_is_bounded_even_for_unvalidated_config() {
         let settings = OtlpSettings::resolve_with(&config, |_| None).unwrap();
         assert!((Duration::from_secs(1)..=Duration::from_secs(86400)).contains(&settings.flush));
     }
+}
+
+#[test]
+fn interrupted_requests_are_not_recorded_as_fatal_provider_failures() {
+    let interrupted = anyhow::Error::from(crate::llm::Interrupted).context("model request");
+    assert_eq!(failure_finish_reason(&interrupted), "error:interrupted");
+    let fatal = anyhow::anyhow!("unexpected provider reply");
+    assert_eq!(failure_finish_reason(&fatal), "error:fatal");
 }

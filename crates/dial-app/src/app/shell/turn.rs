@@ -6,7 +6,6 @@ use crate::app::core::App;
 use crate::app::display::local_time;
 use crate::app::drive::Step;
 use crate::app::shell::teach::TEACH_OFF;
-use crate::app::shell::turn_report;
 use crate::app::shell::{PAINT_EVERY, Shell};
 use crate::config::types::Outcome;
 use crate::platform;
@@ -200,6 +199,8 @@ impl Shell {
         self.status.activity.clear();
         self.status.model_progress = None;
         self.status.model_silence_secs = 0;
+        self.status.background_wait = None;
+        self.status.provider_retry = None;
         let elapsed = started.elapsed().as_secs_f64();
         self.live_cost = None;
         self.refresh_status(app, agent);
@@ -229,7 +230,12 @@ impl Shell {
                 &app.layout,
                 &self.session_id,
                 crate::cli::watch::Event::Text {
-                    title: "Turn finished".into(),
+                    title: if outcome == crate::agent::TurnOutcome::Answered {
+                        "Reply delivered"
+                    } else {
+                        "Turn finished"
+                    }
+                    .into(),
                     body: outcome.label().to_owned(),
                 },
             )
@@ -238,11 +244,6 @@ impl Shell {
                 "Live feed",
                 format!("Could not record turn outcome: {error:#}"),
             );
-        }
-        let control = agent.session().control_state();
-        let latency = control["efficiency"]["inference_latency"].clone();
-        if let Some(report) = turn_report::render(&control["turn_summary"], &latency) {
-            self.note("Turn report", report);
         }
         // Inbox availability is independent of terminal notification preferences. Use the
         // authoritative typed outcome, not message text, to attach its settings destination.
@@ -269,15 +270,31 @@ impl Shell {
             self.auto_speak(app, agent);
         }
         if result.is_ok() {
-            self.transcript.turn_stats(TurnStats {
-                clock: local_time("%Y-%m-%d %H:%M:%S"),
-                elapsed_secs: elapsed,
-                prompt_tokens: self.status.prompt_tokens,
-                output_tokens: (streamed_tokens > 0).then_some(streamed_tokens),
-                tokens_per_second: self.status.tokens_per_second,
-                outcome: None,
+            let control = agent.session().control_state();
+            self.transcript
+                .completion(crate::app::shell::turn_report::outcome(
+                    &control["turn_summary"],
+                    &control["efficiency"]["inference_latency"],
+                ));
+        } else {
+            // A fatal error may precede durable completion. Never reuse an older turn's summary.
+            self.transcript.completion(crate::ui::transcript::TurnOutcome {
+                status: "failed".into(),
+                handoff: vec![
+                    "Full handoff unavailable: the turn ended before completion was recorded.".into(),
+                    "Next: inspect /review-file and /evidence before continuing; shell effects may be outside /undo.".into(),
+                ],
+                ..Default::default()
             });
         }
+        self.transcript.turn_stats(TurnStats {
+            clock: local_time("%Y-%m-%d %H:%M:%S"),
+            elapsed_secs: elapsed,
+            prompt_tokens: self.status.prompt_tokens,
+            output_tokens: (streamed_tokens > 0).then_some(streamed_tokens),
+            tokens_per_second: self.status.tokens_per_second,
+            outcome: None,
+        });
         // Questions, blockers and failures wait for the human instead of re-arming the loop.
         let halted = result
             .as_ref()

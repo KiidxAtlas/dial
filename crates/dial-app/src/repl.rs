@@ -286,8 +286,14 @@ impl PrintUi {
             3
         } else if interrupted
             || text.trim().is_empty()
-            || self.completed == Some(false)
-            || report.is_some_and(|r| r.outcome != crate::agent::TurnOutcome::Completed)
+            || (self.completed == Some(false)
+                && !report.is_some_and(|r| r.outcome == crate::agent::TurnOutcome::Answered))
+            || report.is_some_and(|r| {
+                !matches!(
+                    r.outcome,
+                    crate::agent::TurnOutcome::Completed | crate::agent::TurnOutcome::Answered
+                )
+            })
         {
             2
         } else {

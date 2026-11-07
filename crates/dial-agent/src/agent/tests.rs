@@ -1221,30 +1221,16 @@ fn an_empty_stop_is_retried_with_a_nudge_instead_of_ending_the_turn() {
 }
 
 #[test]
-fn an_announced_action_without_a_tool_call_is_retried() {
+fn hermetic_transport_recovery_does_not_classify_reply_prose_as_task_state() {
     let config = Config::default();
-    let (text, outcome, requests) = scripted_turn(
-        &config,
-        vec![sse_reply("Let me read the file."), sse_reply("Done.")],
-        "hi",
-    );
-    assert_eq!((text.as_str(), outcome), ("Done.", TurnOutcome::Completed));
-    assert_eq!(requests.len(), 2);
-    let expected = crate::agent::safety::stream_guards::render_retry_prompt(
-        crate::agent::safety::stream_guards::UNEXPECTED_STOP_RETRY,
+    let (text, outcome, requests) =
+        scripted_turn(&config, vec![sse_reply("Let me read the file.")], "hi");
+    assert_eq!(text, "Let me read the file.");
+    assert_eq!(outcome, TurnOutcome::Completed);
+    assert_eq!(
+        requests.len(),
         1,
-        crate::agent::safety::stream_guards::UNEXPECTED_STOP_MAX_RETRIES,
-    );
-    assert!(
-        crate::llm::fake::body(&requests[1])["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|message| {
-                message["content"]
-                    .as_str()
-                    .is_some_and(|text| text.contains(&expected))
-            })
+        "only controller obligations may request semantic recovery"
     );
 }
 

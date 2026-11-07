@@ -109,3 +109,53 @@ fn eta_and_cached_prompt_tokens_show_only_when_known_and_positive() {
     status.model_progress = Some(g);
     assert!(!status.activity_label().contains("left"));
 }
+
+#[test]
+fn controller_wait_and_retry_override_stale_telemetry_without_inventing_progress() {
+    use std::time::{Duration, Instant};
+    let mut status = StatusData {
+        phase: Phase::Working,
+        model_progress: Some(ModelProgress::new(InferencePhase::Generating)),
+        background_wait: Some(WorkWait {
+            label: "jobs check-1; workers audit\n\x1b[31m".into(),
+            started: Instant::now().checked_sub(Duration::from_secs(5)).unwrap(),
+        }),
+        ..Default::default()
+    };
+    let label = status.activity_label();
+    let elapsed = label
+        .split(" · ")
+        .nth(1)
+        .unwrap()
+        .strip_suffix('s')
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(label.contains("jobs check-1") && elapsed >= 5, "{label}");
+    assert!(label.contains("results resume automatically"), "{label}");
+    assert!(
+        !label.contains("generating")
+            && !label.contains('%')
+            && !label.contains('\x1b')
+            && !label.contains('\n'),
+        "{label}"
+    );
+    status.background_wait = None;
+    status.provider_retry = Some(ProviderRetry {
+        attempt: 4,
+        maximum: "10".into(),
+        ready_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+    });
+    let label = status.activity_label();
+    assert!(
+        label.contains("retry 4/10")
+            && label.contains("next attempt in 0s")
+            && label.contains("/retry"),
+        "{label}"
+    );
+    status.activity = "stopping".into();
+    assert_eq!(status.activity_label(), "stopping");
+    status.provider_retry = None;
+    status.activity.clear();
+    assert!(status.activity_label().contains("generating"));
+}

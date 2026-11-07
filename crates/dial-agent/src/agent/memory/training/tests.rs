@@ -82,6 +82,42 @@ fn snapshots_record_the_route_layout_that_was_sent() {
 }
 
 #[test]
+fn retained_schema_tables_are_lossless_and_do_not_repeat_lists() {
+    let mut capture = Capture::default();
+    let tools = vec![json!({"function":{"name":"read","parameters":{"type":"object"}}})];
+    for target in ["first", "second"] {
+        capture.record(
+            &[json!({"role":"user","content":"task"})],
+            &tools,
+            json!({"role":"assistant","content":target}),
+            Default::default(),
+        );
+    }
+    let payload = capture.retained_payload();
+    assert_eq!(payload["tool_sets"].as_object().unwrap().len(), 1);
+    assert!(payload["examples"][0].get("tools").is_none());
+    let record = json!({"version":2,"source_session":"s","source_turn":"t","source_model":"m",
+        "prompt":"task","payload":payload});
+    let restored =
+        crate::storage::store::SessionTrainingExample::from_retained(record.clone()).unwrap();
+    assert_eq!(restored.payload, capture.payload());
+    let mut corrupted = record;
+    corrupted["payload"]["examples"][0]["tools_ref"] = json!("missing");
+    assert!(crate::storage::store::SessionTrainingExample::from_retained(corrupted).is_err());
+}
+
+#[test]
+fn ordinary_sessions_do_not_capture_training_without_opt_in() {
+    crate::agent::run::tool_exposure::default_offer_tests::with_agent("", |agent| {
+        assert!(!agent.capture_training_requests());
+    });
+    crate::agent::run::tool_exposure::default_offer_tests::with_agent(
+        "[training]\nretain_session_requests=true",
+        |agent| assert!(agent.capture_training_requests()),
+    );
+}
+
+#[test]
 fn session_retention_excludes_nonordinary_unfinished_and_empty_captures() {
     use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
     use crate::agent::{NullUi, TurnOutcome, TurnReport};

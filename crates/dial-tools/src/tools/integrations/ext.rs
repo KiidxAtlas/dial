@@ -81,6 +81,16 @@ pub enum Concurrency {
 }
 
 pub trait Tool: Send + Sync {
+    /// Trusted scheduling resources, independent of approval and read-only hints. Return None
+    /// for external/unbounded effects. Mutators must use ToolContext::authorize_mutation for
+    /// every computed effect; the controller rejects effects beyond these declared files.
+    fn resources(
+        &self,
+        _workspace: &Workspace,
+        _args: &Value,
+    ) -> Option<crate::tools::surface::resources::Access> {
+        None
+    }
     /// Unique name the model calls; also the entry in `harness.tools` that enables it.
     fn name(&self) -> &str;
 
@@ -275,6 +285,10 @@ pub trait Tool: Send + Sync {
     fn kill_job(&self, _name: &str) -> Result<String, String> {
         Err("this tool does not own background jobs".into())
     }
+    /// Dismiss an observed terminal job from retained history; never stops live work.
+    fn dismiss_job(&self, _name: &str) -> Result<String, String> {
+        Err("this tool does not own dismissible job history".into())
+    }
     /// Whether [`Self::adopt_job`] would currently accept a job (capacity, not job validity).
     /// A refused hand-off drops, and so stops, the job, so callers check this first.
     #[doc(hidden)]
@@ -329,6 +343,7 @@ pub struct JobEntry {
     /// Optional native owner receipt; absent for older/custom job-view providers.
     pub process_outcome: Option<crate::runtime::execution::ProcessOutcome>,
     pub running: bool,
+    pub stop_requested: bool,
     /// Runs on a pseudo-terminal.
     pub terminal: bool,
 }

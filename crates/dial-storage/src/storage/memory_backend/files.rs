@@ -127,7 +127,7 @@ impl PrivateDirectory {
                 "cannot secure private directory"
             );
         }
-        self.fd.sync_all()?;
+        platform_fs::sync_file(&self.fd)?;
         Ok(Self {
             path: self.path.join(name),
             fd: Arc::new(fd),
@@ -238,9 +238,9 @@ impl PrivateDirectory {
         let mut file = self.file(&temporary, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
         let result = (|| {
             file.write_all(bytes)?;
-            file.sync_all()?;
+            platform_fs::sync_file(&file)?;
             self.rename(&temporary, name)?;
-            self.fd.sync_all()?;
+            platform_fs::sync_file(&self.fd)?;
             Ok(())
         })();
         if result.is_err() {

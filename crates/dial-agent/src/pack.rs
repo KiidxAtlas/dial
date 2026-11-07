@@ -135,7 +135,7 @@ fn write_pack(out: &Path, manifest: &Manifest, sources: &[(String, PathBuf)]) ->
     for (name, path) in sources {
         tar.append_path_with_name(path, format!("files/{name}"))?;
     }
-    tar.into_inner()?.finish()?.sync_all()?;
+    crate::platform::fs::sync_file(&tar.into_inner()?.finish()?)?;
     fs::rename(&partial, out)?;
     Ok(())
 }

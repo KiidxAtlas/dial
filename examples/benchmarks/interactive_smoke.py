@@ -16,6 +16,7 @@ import pathlib
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -55,8 +56,15 @@ class DiscoveryGate:
 class Provider(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self):
-        super().__init__(("127.0.0.1", 0), Handler)
+    def __init__(self, listening=True):
+        super().__init__(("127.0.0.1", 0), Handler, bind_and_activate=False)
+        # A bound, non-listening socket times out on Darwin. Close the allocated port
+        # for genuine ECONNREFUSED; repair rebinds the same address or fails on collision.
+        self.server_bind()
+        if listening:
+            self.server_activate()
+        else:
+            self.socket.close()
         self.discovery = DiscoveryGate()
         self.chat_requests = 0
         self.lock = threading.Lock()
@@ -82,6 +90,21 @@ class Provider(http.server.ThreadingHTTPServer):
         self.side_disconnected = threading.Event()
         self.side_requests = 0
         self.pool_runs = []
+        self.diagnostic_requests = 0
+        self.auth_repaired = threading.Event()
+        self.auth_requests = 0
+        self.busy_release = threading.Event()
+        self.busy_requests = []
+        self.redirect_release = threading.Event()
+        self.redirect_disconnected = threading.Event()
+        self.redirect_requests = []
+        self.job_starts = 0
+
+    def repair_listener(self):
+        assert self.socket.fileno() == -1, "repair requires a closed fixture endpoint"
+        self.socket = socket.socket(self.address_family, self.socket_type)
+        self.server_bind()
+        self.server_activate()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -123,6 +146,55 @@ class Handler(http.server.BaseHTTPRequestHandler):
         messages = request["messages"]
         # The request-tail latest-user note is runtime context, not the scenario prompt.
         last_user = next((m.get("content") for m in reversed(messages) if m["role"] == "user" and "[Latest admitted user request" not in str(m.get("content", ""))), "")
+        if any(tool.get("function", {}).get("name") == "dial_diagnostic_echo"
+               for tool in request.get("tools", [])):
+            message = self.coding_diagnostic(index, messages)
+            self.respond({"id": f"pty-{index}", "choices": [{"index": 0, "message": message,
+                          "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}]})
+            return
+        if last_user == "PTY-EXPIRED-CREDENTIAL":
+            self.server.auth_requests += 1
+            if not self.server.auth_repaired.is_set():
+                self.respond({"error": {"message": "PTY credential expired; repair before retry",
+                                       "type": "authentication_error", "code": "invalid_api_key"}}, 401)
+            else:
+                self.respond({"id": f"pty-{index}", "choices": [{"index": 0,
+                              "message": {"role": "assistant", "content": "AUTH-RECOVERY-EXPLICIT-RETRY"},
+                              "finish_reason": "stop"}]})
+            return
+        if last_user in ("PTY-REDIRECT-MAIN", "PTY-REDIRECT-NOW"):
+            self.server.redirect_requests.append(last_user)
+            if last_user == "PTY-REDIRECT-MAIN":
+                self.gated_stream(index, "REDIRECT-MAIN-PREFIX",
+                                  [(self.server.redirect_release, "REDIRECT-STALE-END")],
+                                  self.server.redirect_disconnected)
+            else:
+                self.respond({"id": f"pty-{index}", "choices": [{"index": 0,
+                              "message": {"role": "assistant", "content": "REDIRECT-CURRENT-INSTRUCTION-ANSWER"},
+                              "finish_reason": "stop"}]})
+            return
+        if last_user == "PTY-OS-JOB":
+            results = [m for m in messages if m["role"] == "tool"]
+            if not results:
+                self.server.job_starts += 1
+                message = self.call(index, "bg", {"action": "start", "name": "pty-os-job",
+                                    "command": "printf 'OS-JOB-OUTPUT-KEPT\\n'; exec sleep 120",
+                                    "ready": {"log": "OS-JOB-OUTPUT-KEPT", "timeout": 5}})
+            else:
+                assert "pty-os-job" in str(results[-1]["content"]), "job start receipt missing"
+                message = {"role": "assistant", "content": "OS-JOB-STARTED"}
+            self.respond({"id": f"pty-{index}", "choices": [{"index": 0, "message": message,
+                          "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}]})
+            return
+        if last_user in ("PTY-BUSY-MAIN", "PTY-BUSY-FOLLOW-UP", "PTY-BUSY-REMOVED"):
+            self.server.busy_requests.append(last_user)
+            if last_user == "PTY-BUSY-MAIN":
+                self.gated_stream(index, "BUSY-MAIN-PREFIX", [(self.server.busy_release, "BUSY-MAIN-END")])
+            else:
+                self.respond({"id": f"pty-{index}", "choices": [{"index": 0,
+                              "message": {"role": "assistant", "content": "BUSY-FOLLOW-UP-ADMITTED"},
+                              "finish_reason": "stop"}]})
+            return
         if isinstance(last_user, str) and "PTY-SIDE-QUESTION" in last_user:
             assert any(m.get("content") == "PTY-SIDE-MAIN" for m in messages), "side context lost the active main prompt"
             self.server.side_requests += 1
@@ -263,6 +335,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             if disconnected:
                 disconnected.set()
+
+    def coding_diagnostic(self, index, messages):
+        """Synthetic tool protocol only: never dispatch a real registry tool."""
+        self.server.diagnostic_requests += 1
+        results = [message for message in messages if message["role"] == "tool"]
+        if not results:
+            return self.call(index, "dial_diagnostic_echo", {"value": "dial-probe"})
+        assert len(results) == 1, "coding diagnostic must have one synthetic result"
+        receipt = json.loads(results[0]["content"])["receipt"]
+        assert isinstance(receipt, str) and receipt, "coding result must supply a receipt"
+        return {"role": "assistant", "content": receipt}
 
     @staticmethod
     def call(index, name, arguments):
@@ -465,7 +548,7 @@ def wait_model(home, expected):
     raise AssertionError(f"expected saved model {expected}, got {model(home)}")
 
 
-def fixture(root, port):
+def fixture(root, port, busy_send="choose"):
     project, home = root / "project", root / "home"
     project.mkdir()
     home.mkdir(mode=0o700)
@@ -486,6 +569,7 @@ enabled=false
 enabled=false
 [ui]
 theme="dark"
+busy_send="{busy_send}"
 [harness]
 max_steps=8
 max_tokens=2048
@@ -654,6 +738,284 @@ def side_thread_case(server, binary, captures):
             terminal.close()
 
 
+def measured_case(name, scenario, server, binary, captures):
+    """Descriptive wall-clock observations, not comparative performance claims."""
+    started = time.monotonic()
+    before = server.chat_requests
+    corrections = scenario(server, binary, captures) or {}
+    return {"name": name, "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+            "chat_requests": server.chat_requests - before, **corrections}
+
+
+def busy_preference_case(server, binary, captures):
+    server.busy_release.clear()
+    server.busy_requests.clear()
+    with tempfile.TemporaryDirectory(prefix="dial-pty-busy-") as directory:
+        project, home = fixture(pathlib.Path(directory), server.server_port, busy_send="after_turn")
+        terminal = Terminal(binary, project, home, captures)
+        try:
+            terminal.wait("mock-main")
+            terminal.command("PTY-BUSY-MAIN")
+            terminal.wait("BUSY-MAIN-PREFIX")
+            terminal.command("PTY-BUSY-REMOVED")  # Plain Enter must honor the preference.
+            terminal.wait("1 queued", history=False)
+            terminal.command("/queue remove 1")
+            terminal.wait("Removed only the selected queued message")
+            terminal.command("PTY-BUSY-FOLLOW-UP")
+            terminal.wait("1 queued", history=False)
+            terminal.command("/queue")
+            terminal.wait_panel()
+            terminal.wait("PTY-BUSY-FOLLOW-UP", history=False)
+            assert server.busy_requests == ["PTY-BUSY-MAIN"], server.busy_requests
+            terminal.key("Escape")
+            terminal.wait_panel(False)
+            released = time.monotonic()
+            server.busy_release.set()
+            terminal.wait("BUSY-MAIN-END")
+            terminal.wait("BUSY-FOLLOW-UP-ADMITTED")
+            assert server.busy_requests == ["PTY-BUSY-MAIN", "PTY-BUSY-FOLLOW-UP"], server.busy_requests
+            terminal.capture("busy-preference-queued-once")
+            return {"release_to_follow_up_ms": round((time.monotonic() - released) * 1000, 3)}
+        finally:
+            server.busy_release.set()
+            terminal.close()
+
+
+def redirect_preference_case(server, binary, captures):
+    server.redirect_release.clear()
+    server.redirect_disconnected.clear()
+    server.redirect_requests.clear()
+    with tempfile.TemporaryDirectory(prefix="dial-pty-redirect-") as directory:
+        project, home = fixture(pathlib.Path(directory), server.server_port, busy_send="redirect")
+        terminal = Terminal(binary, project, home, captures)
+        try:
+            terminal.wait("mock-main")
+            terminal.command("PTY-REDIRECT-MAIN")
+            terminal.wait("REDIRECT-MAIN-PREFIX")
+            started = time.monotonic()
+            terminal.command("PTY-REDIRECT-NOW")  # Plain Enter, not Ctrl+Enter.
+            terminal.wait("REDIRECT-CURRENT-INSTRUCTION-ANSWER")
+            assert server.redirect_disconnected.wait(5), "redirect did not cancel stale inference"
+            assert server.redirect_requests == ["PTY-REDIRECT-MAIN", "PTY-REDIRECT-NOW"], server.redirect_requests
+            terminal.command("/help")  # Process a local UI round trip before checking no replay.
+            terminal.wait_panel()
+            terminal.key("Escape")
+            terminal.wait_panel(False)
+            text = terminal.capture("busy-preference-redirect-once")
+            assert "REDIRECT-STALE-END" not in text, "stale answer committed after redirect"
+            assert server.redirect_requests == ["PTY-REDIRECT-MAIN", "PTY-REDIRECT-NOW"], server.redirect_requests
+            return {"redirect_to_answer_ms": round((time.monotonic() - started) * 1000, 3)}
+        finally:
+            server.redirect_release.set()
+            terminal.close()
+
+
+def refused_connection_case(_server, binary, captures):
+    server = Provider(listening=False)
+    thread = None
+    terminal = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="dial-pty-refused-") as directory:
+            project, home = fixture(pathlib.Path(directory), server.server_port)
+            try:
+                terminal = Terminal(binary, project, home, captures)
+                terminal.wait("mock-main")
+                terminal.command("/setup choose verify-coding")
+                terminal.wait("Check coding/tool compatibility", history=False)
+                terminal.key("v")
+                terminal.wait("Endpoint unavailable", timeout=30)
+                assert server.chat_requests == 0, "refused socket unexpectedly served HTTP"
+                terminal.capture("refused-socket-diagnostic-failure")
+                server.discovery.open()
+                server.repair_listener()
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                terminal.command("/help")
+                terminal.wait_panel()
+                terminal.wait("Actions", history=False)
+                assert server.chat_requests == 0, "endpoint repair automatically replayed diagnostic"
+                terminal.key("Escape")
+                terminal.wait_panel(False)
+                started = time.monotonic()
+                terminal.command("/setup choose verify-coding")
+                terminal.wait("Check coding/tool compatibility", history=False)
+                terminal.key("v")
+                terminal.wait("Structured tool roundtrip verified", timeout=25)
+                assert server.chat_requests == server.diagnostic_requests == 2, "explicit retry duplicated work"
+                assert_no_project_edits(project)
+                terminal.capture("refused-socket-explicit-retry")
+                return {"explicit_retry_to_receipt_ms": round((time.monotonic() - started) * 1000, 3),
+                        "repaired_endpoint_chat_requests": server.chat_requests}
+            finally:
+                if terminal:
+                    terminal.close()
+    finally:
+        server.discovery.open()
+        if thread:
+            server.shutdown()
+            thread.join(timeout=5)
+        server.server_close()
+
+
+def assert_stop_receipt(text):
+    # A signal request is not proof of exit. Both receipts are honest owner outcomes.
+    assert ("stop requested for pty-os-job; termination not yet observed" in text
+            or "terminal history and output retained" in text), f"missing honest stop receipt:\n{text}"
+
+
+def os_job_case(server, binary, captures):
+    before = server.job_starts
+    with tempfile.TemporaryDirectory(prefix="dial-pty-os-job-") as directory:
+        project, home = fixture(pathlib.Path(directory), server.server_port)
+        terminal = Terminal(binary, project, home, captures)
+        try:
+            terminal.wait("mock-main")
+            terminal.command("PTY-OS-JOB")
+            terminal.wait("OS-JOB-STARTED")
+            terminal.command("/processes")
+            terminal.wait_panel()
+            terminal.wait("Running", history=False)
+            terminal.key("d")  # Dismiss is not a way to stop a running process.
+            terminal.wait("Running", history=False)
+            assert "dismissed pty-os-job" not in terminal.text(history=False)
+            terminal.key("s")
+            terminal.wait("Stopped", history=False)
+            assert_stop_receipt(terminal.capture("os-job-stop-receipt", history=False))
+            terminal.key("Enter")
+            terminal.wait("OS-JOB-OUTPUT-KEPT", history=False)
+            terminal.wait("showing its last output", history=False)
+            terminal.capture("os-job-stopped-output-retained", history=False)
+            terminal.key("Escape")
+            terminal.key("d")
+            terminal.wait("dismissed pty-os-job from job history", history=False)
+            terminal.wait("No background processes yet", history=False)
+            terminal.capture("os-job-dismiss-receipt", history=False)
+            terminal.key("Escape")
+            terminal.wait_panel(False)
+            assert server.job_starts - before == 1, "stop/dismiss replayed job start"
+        finally:
+            terminal.close()
+
+
+def assert_no_project_edits(project):
+    # Startup owns a Cargo target lease even for a scripted model. That runtime lease is
+    # not a model/tool edit; no other file, directory or symlink is allowed in this fixture.
+    allowed_dirs = {".tmp", ".tmp/cargo-target", ".tmp/cargo-target/.leases"}
+    for path in project.rglob("*"):
+        relative = path.relative_to(project)
+        if relative.parts[0] == ".git":
+            continue
+        assert not path.is_symlink(), f"unexpected project symlink: {relative}"
+        if relative.as_posix() in allowed_dirs and path.is_dir():
+            continue
+        assert (relative.parent.as_posix() == ".tmp/cargo-target/.leases"
+                and path.is_file()), f"unexpected project edit: {relative}"
+
+
+def coding_diagnostic_case(server, binary, captures):
+    with tempfile.TemporaryDirectory(prefix="dial-pty-coding-") as directory:
+        project, home = fixture(pathlib.Path(directory), server.server_port)
+        terminal = Terminal(binary, project, home, captures)
+        try:
+            terminal.wait("mock-main")
+            before = server.chat_requests
+            terminal.command("/setup choose verify-coding")
+            terminal.wait("Check coding/tool compatibility", history=False)
+            terminal.key("Enter")  # Default is Cancel, never implicit model spending.
+            terminal.wait_panel(False)
+            terminal.command("/setup choose verify-coding")
+            terminal.wait("Check coding/tool compatibility", history=False)
+            assert server.chat_requests == before, "diagnostic Cancel sent a request"
+            diagnostic_before = server.diagnostic_requests
+            started = time.monotonic()
+            terminal.key("v")
+            terminal.wait("Structured tool roundtrip verified", timeout=25)
+            assert server.diagnostic_requests - diagnostic_before == 2, "diagnostic exceeded its two-request contract"
+            assert server.chat_requests - before == 2, "unexpected diagnostic or chat dispatch"
+            assert_no_project_edits(project)
+            terminal.capture("coding-diagnostic-roundtrip")
+            return {"confirmation_to_receipt_ms": round((time.monotonic() - started) * 1000, 3)}
+        finally:
+            terminal.close()
+
+
+def credential_recovery_case(server, binary, captures):
+    server.auth_repaired.clear()
+    before = server.auth_requests
+    with tempfile.TemporaryDirectory(prefix="dial-pty-auth-") as directory:
+        project, home = fixture(pathlib.Path(directory), server.server_port)
+        terminal = Terminal(binary, project, home, captures)
+        try:
+            terminal.wait("mock-main")
+            terminal.command("PTY-EXPIRED-CREDENTIAL")
+            terminal.wait("PTY credential expired; repair before retry")
+            terminal.command("/help")
+            terminal.wait_panel()
+            terminal.wait("Actions", history=False)
+            terminal.key("Escape")
+            terminal.wait_panel(False)
+            server.auth_repaired.set()
+            # A second local UI round trip proves the loop progressed after repair;
+            # changing external credentials must never replay the failed prompt.
+            terminal.command("/help")
+            terminal.wait_panel()
+            terminal.wait("Actions", history=False)
+            assert server.auth_requests - before == 1, "authentication repair automatically replayed work"
+            assert_no_project_edits(project)
+            terminal.key("Escape")
+            terminal.wait_panel(False)
+            started = time.monotonic()
+            terminal.command("PTY-EXPIRED-CREDENTIAL")
+            terminal.wait("AUTH-RECOVERY-EXPLICIT-RETRY")
+            assert server.auth_requests - before == 2, "explicit retry was duplicated"
+            terminal.capture("credential-recovery-explicit-retry")
+            return {"explicit_retry_to_answer_ms": round((time.monotonic() - started) * 1000, 3)}
+        finally:
+            terminal.close()
+
+
+def recovery_preview_case(server, binary, captures):
+    with tempfile.TemporaryDirectory(prefix="dial-pty-recovery-") as directory:
+        project, home = fixture(pathlib.Path(directory), server.server_port)
+        terminal = Terminal(binary, project, home, captures)
+        try:
+            terminal.wait("mock-main")
+            terminal.command("PTY-INPUT")
+            terminal.wait("Choose destination")
+            terminal.key("Escape")
+            terminal.wait("Cancelled-input-recovered")
+            terminal.draft("PTY-RECOVERY-HELD-DRAFT")
+            terminal.wait("PTY-RECOVERY-HELD-DRAFT", history=False)
+            def records():
+                return {str(path): json.loads(path.read_text())
+                        for path in home.rglob("input-recovery/*.json")}
+            saved = settled(records)
+            assert "PTY-RECOVERY-HELD-DRAFT" in json.dumps(saved), "draft never became durable"
+            before = server.chat_requests
+            terminal.crash_and_resume()
+            terminal.wait("mock-main")
+            terminal.command("/draft preview")
+            terminal.wait("Review saved input", history=False)
+            terminal.wait("PTY-RECOVERY-HELD-DRAFT", history=False)
+            baseline = settled(records)
+            terminal.key("Escape")
+            terminal.wait("Current input and saved records kept unchanged")
+            assert settled(records) == baseline, "preview Cancel mutated saved input"
+            assert server.chat_requests == before, "preview Cancel dispatched work"
+            terminal.command("/draft restore")
+            terminal.wait("Review saved input", history=False)
+            restored = time.monotonic()
+            terminal.key("r")
+            terminal.wait("Input restored and held")
+            terminal.wait("PTY-RECOVERY-HELD-DRAFT", history=False)
+            assert server.chat_requests == before, "restore automatically sent the recovered draft"
+            assert_no_project_edits(project)
+            terminal.capture("recovery-preview-cancel-restore-held")
+            return {"restore_to_held_preview_ms": round((time.monotonic() - restored) * 1000, 3)}
+        finally:
+            terminal.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dial", type=pathlib.Path, required=True)
@@ -663,8 +1025,10 @@ def main():
     server = Provider()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    journeys = []
     terminal = None
     try:
+        baseline_started, baseline_requests = time.monotonic(), server.chat_requests
         with tempfile.TemporaryDirectory(prefix="dial-pty-regression-") as directory, ExitStack() as cleanup:
             root = pathlib.Path(directory)
             project, home = fixture(root, server.server_port)
@@ -713,11 +1077,16 @@ def main():
             terminal.wait("Review file")
             terminal.capture("selective-review-dialog")
             terminal.key("r")
+            terminal.wait("Revert file?")
+            terminal.key("r")
             terminal.wait("Restored only the selected file")
             terminal.wait("checkpoint for /undo files.")
             assert (project / "a.txt").read_text() == "original-a"
             assert (project / "b.txt").read_text() == "edited-b"
             terminal.capture("selective-revert")
+            terminal.wait("Changed files", history=False)
+            terminal.key("Escape")
+            terminal.wait_panel(False)
             terminal.command("/undo")
             terminal.wait("unrelated newer file checkpoint blocks undo; conversation kept")
             assert (project / "a.txt").read_text() == "original-a"
@@ -797,10 +1166,20 @@ def main():
             terminal.key("Escape")
             terminal.close()
             terminal = None
-        workers_case(server, binary, args.captures)
-        pool_case(server, binary, args.captures)
-        draft_focus_case(server, binary, args.captures)
-        side_thread_case(server, binary, args.captures)
+        journeys.append({"name": "baseline-workflows", "elapsed_ms": round((time.monotonic() - baseline_started) * 1000, 3),
+                         "chat_requests": server.chat_requests - baseline_requests})
+        for name, scenario in (("workers", workers_case), ("pool", pool_case),
+                               ("draft-focus", draft_focus_case), ("side-thread", side_thread_case)):
+            journeys.append(measured_case(name, scenario, server, binary, args.captures))
+        for name, scenario in (("busy-after-turn", busy_preference_case),
+                               ("busy-redirect", redirect_preference_case),
+                               ("refused-connection-recovery", refused_connection_case),
+                               ("os-job-stop-dismiss", os_job_case),
+                               ("coding-diagnostic", coding_diagnostic_case),
+                               ("credential-recovery", credential_recovery_case),
+                               ("recovery-preview", recovery_preview_case)):
+            journeys.append(measured_case(name, scenario, server, binary, args.captures))
+        cancel_started, cancel_requests = time.monotonic(), server.chat_requests
         with tempfile.TemporaryDirectory(prefix="dial-pty-cancel-") as directory, ExitStack() as cleanup:
             project, home = fixture(pathlib.Path(directory), server.server_port)
             server.discovery = DiscoveryGate()
@@ -824,7 +1203,9 @@ def main():
             terminal.capture("favorite-cancelled")
             terminal.close()
             terminal = None
-        print(json.dumps({
+        journeys.append({"name": "favorite-cancellation", "elapsed_ms": round((time.monotonic() - cancel_started) * 1000, 3),
+                         "chat_requests": server.chat_requests - cancel_requests})
+        result = {
             "kind": "real-pty-workflow-regression",
             "checks": [
                 "first-press-favorite", "picker-and-resize", "wrapped-input-cancellation",
@@ -837,12 +1218,22 @@ def main():
                 "question-draft-focus-and-preservation", "side-request-during-main",
                 "side-survives-main-cancel", "side-cancellation-persisted",
                 "side-promotion-is-independent",
+                "busy-enter-after-turn-queued-exactly-once", "coding-diagnostic-cancel-and-roundtrip",
+                "expired-credential-explicit-retry-only",
+                "recovery-preview-cancel-and-held-restore",
+                "busy-enter-redirect-without-stale-replay", "refused-socket-explicit-diagnostic-retry",
+                "os-job-stop-output-retained-and-dismiss-receipts",
             ],
             "chat_requests": server.chat_requests,
             "side_requests": server.side_requests,
+            "journeys": journeys,
             "pixel_screenshot_verification": False,
             "model_quality_evidence": False,
-        }))
+        }
+        if args.captures:
+            args.captures.mkdir(parents=True, exist_ok=True)
+            (args.captures / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps(result))
     finally:
         server.discovery.open()
         server.crash_release.set()
@@ -851,6 +1242,8 @@ def main():
         server.side_main_release.set()
         server.side_advance.set()
         server.side_release.set()
+        server.busy_release.set()
+        server.redirect_release.set()
         for gate in server.stream_gates:
             gate.set()
         if terminal:

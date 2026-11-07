@@ -345,3 +345,66 @@ fn final_request_reports_pending_work_without_suspending_for_its_completion() {
     );
     assert_eq!(server.requests().len(), 1);
 }
+
+struct ObserveWait {
+    host: ReleaseOnWait,
+    events: Vec<crate::agent::ui::ui_event::BackgroundWait>,
+}
+impl Ui for ObserveWait {
+    fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
+        if let Some(wait) = &event.background_wait {
+            self.events.push(wait.clone());
+        }
+        self.host.notice(&event.text);
+    }
+    fn pending_input(&mut self) -> bool {
+        self.host.input
+    }
+}
+
+#[test]
+fn typed_wait_start_and_end_distinguish_delivery_input_and_interruption() {
+    use crate::agent::ui::ui_event::BackgroundWait;
+    for reason in ["result_or_message", "user_input", "interrupted"] {
+        with_agent("", |agent| {
+            let (job, release) = pending_cell(agent, "terminal diagnostic, not success");
+            let expected_jobs = agent.awaited_background_jobs();
+            let mut host = ObserveWait {
+                host: ReleaseOnWait {
+                    release: None,
+                    waits: 0,
+                    input: reason == "user_input",
+                },
+                events: Vec::new(),
+            };
+            let mut release = Some(release);
+            if reason == "result_or_message" {
+                host.host.release = release.take();
+            }
+            agent
+                .interrupt
+                .store(reason == "interrupted", Ordering::Release);
+            assert!(agent.wait_for_background_event(&mut host).unwrap());
+            assert!(
+                matches!(&host.events[0], BackgroundWait::Started { jobs, .. } if jobs == &expected_jobs)
+            );
+            assert!(
+                matches!(&host.events[1], BackgroundWait::Ended { reason: actual, .. } if actual == reason),
+                "{:?}",
+                host.events
+            );
+            assert_eq!(host.events.len(), 2);
+            if let Some(release) = release {
+                assert_eq!(
+                    agent.awaited_background_jobs(),
+                    expected_jobs,
+                    "ending the wait must not cancel the job {job}"
+                );
+                release.send(()).unwrap();
+                agent.interrupt.store(false, Ordering::Release);
+                host.host.input = false;
+                agent.wait_for_background_event(&mut host).unwrap();
+            }
+        });
+    }
+}

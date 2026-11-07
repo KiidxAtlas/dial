@@ -10,7 +10,7 @@
 //! Standalone turns materialize only on writes. Conversation-linked turns also persist empty
 //! manifests so `/undo` can distinguish a read-only turn from missing history; these do not
 //! count toward `rollback(n)`.
-use crate::platform::atomic::write_checkpoint as atomic_write;
+use crate::platform::atomic::{write_checkpoint as atomic_write, write_checkpoint_deferred};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 /// Longest a review diff may search for a minimal edit script before settling for a coarser one.
@@ -69,6 +69,11 @@ struct Entry {
     /// attribution, so old checkpoints are shown as unattributed rather than guessed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     writers: Vec<String>,
+    /// Byte length of the saved content (`files/<n>`). Saved content is flushed in the
+    /// background, so a power loss can truncate it; restores refuse a mismatch. `None` in
+    /// checkpoints written before the length was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    len: Option<u64>,
 }
 
 impl Entry {
@@ -110,6 +115,7 @@ struct Inner {
     journal: revisions::Journal,
 }
 
+mod deferred;
 mod review;
 mod revisions;
 pub use review::{GroupPlan, ReviewFile, TurnReview, UNATTRIBUTED};
@@ -121,6 +127,8 @@ pub struct Checkpoints {
     /// Directories attached to the workspace; files under them are recorded and restored too.
     added: Mutex<Vec<PathBuf>>,
     inner: Mutex<Inner>,
+    /// Background flushes of records published on the write path.
+    flusher: deferred::Flusher,
 }
 
 fn turn_dir(dir: &Path, turn: u64) -> PathBuf {
@@ -161,6 +169,22 @@ fn read_manifest(dir: &Path, turn: u64) -> Result<Manifest> {
 fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     let path = turn_dir(dir, manifest.turn).join("manifest.json");
     atomic_write(&path, &serde_json::to_vec(manifest)?, 0o600)
+}
+
+/// Read a turn's saved content of `entry` (`files/<index>`), refusing a truncated record.
+fn read_saved(dir: &Path, turn: u64, index: usize, entry: &Entry) -> Result<Vec<u8>> {
+    let blob = turn_dir(dir, turn).join("files").join(index.to_string());
+    let bytes =
+        fs::read(&blob).with_context(|| format!("reading saved content {}", blob.display()))?;
+    if let Some(len) = entry.len {
+        ensure!(
+            bytes.len() as u64 == len,
+            "saved content {} is incomplete ({} of {len} bytes); not restoring",
+            blob.display(),
+            bytes.len()
+        );
+    }
+    Ok(bytes)
 }
 
 impl Checkpoints {
@@ -206,6 +230,7 @@ impl Checkpoints {
                 current: None,
                 journal: Default::default(),
             }),
+            flusher: deferred::Flusher::default(),
         })
     }
 
@@ -234,6 +259,8 @@ impl Checkpoints {
     }
 
     fn begin_linked_turn(&self, label: &str, session: Option<&str>) -> Result<u64> {
+        // Earlier turns' records must be durable, and a failed flush reported, before a new turn.
+        self.flusher.drain()?;
         let mut inner = self.lock();
         let turn = inner.next_turn;
         let next = turn
@@ -531,7 +558,7 @@ impl Checkpoints {
             // writes it again, as `record_first_write` does.
             let mut saved = manifest.clone();
             saved.entries[index].writers.push(owner);
-            write_manifest(&self.dir, &saved)?;
+            self.write_manifest_deferred(&saved)?;
             *manifest = saved;
         }
         Ok(())
@@ -550,6 +577,7 @@ impl Checkpoints {
             existed: false,
             mode: 0,
             writers: Vec::new(),
+            len: None,
         }
         .display();
         if inner.current.is_none() {
@@ -578,7 +606,7 @@ impl Checkpoints {
             Ok(meta) if meta.is_file() => {
                 if meta.len() > MAX_FILE_BYTES {
                     manifest.skipped.push(shown);
-                    write_manifest(&self.dir, &manifest)?;
+                    self.write_manifest_deferred(&manifest)?;
                     inner.current = Some(manifest);
                     return Ok(());
                 }
@@ -587,13 +615,14 @@ impl Checkpoints {
                 let blob = turn_dir(&self.dir, manifest.turn)
                     .join("files")
                     .join(manifest.entries.len().to_string());
-                atomic_write(&blob, &bytes, 0o600)?;
+                self.write_deferred(&blob, &bytes)?;
                 manifest.entries.push(Entry {
                     rel,
                     root,
                     existed: true,
                     mode: platform_fs::mode(&meta) & 0o7777,
                     writers: Vec::new(),
+                    len: Some(bytes.len() as u64),
                 });
             }
             Ok(_) => bail!("{shown} is not a regular file; refusing to checkpoint it"),
@@ -604,13 +633,33 @@ impl Checkpoints {
                     existed: false,
                     mode: 0,
                     writers: Vec::new(),
+                    len: None,
                 });
             }
             Err(e) => return Err(e).with_context(|| format!("inspecting {shown}")),
         }
-        write_manifest(&self.dir, &manifest)?;
+        self.write_manifest_deferred(&manifest)?;
         inner.current = Some(manifest);
         Ok(())
+    }
+
+    /// Publish a checkpoint record now and flush it in the background.
+    fn write_deferred(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        self.flusher
+            .submit(write_checkpoint_deferred(path, bytes, 0o600)?);
+        Ok(())
+    }
+
+    fn write_manifest_deferred(&self, manifest: &Manifest) -> Result<()> {
+        let path = turn_dir(&self.dir, manifest.turn).join("manifest.json");
+        self.write_deferred(&path, &serde_json::to_vec(manifest)?)
+    }
+
+    /// A failed background flush cannot block restoring readable records; it is reported.
+    fn drain_into(&self, report: &mut RollbackReport) {
+        if let Err(error) = self.flusher.drain() {
+            report.warnings.push(format!("{error:#}"));
+        }
     }
 
     /// Checkpointed turns, newest first.
@@ -637,6 +686,7 @@ impl Checkpoints {
         ensure!(turns > 0, "rollback needs at least one turn");
         let mut inner = self.lock();
         let mut report = RollbackReport::default();
+        self.drain_into(&mut report);
         let mut manifests: Vec<Manifest> = Vec::new();
         for t in disk_turns(&self.dir).into_iter().rev() {
             if manifests.len() == turns {
@@ -662,6 +712,8 @@ impl Checkpoints {
     /// Restore exactly the checkpoint turns linked to a selected conversation range.
     /// Missing links and intervening file-changing turns fail before touching any file.
     pub fn rollback_conversation(&self, session: &str, turns: &[u64]) -> Result<RollbackReport> {
+        let mut report = RollbackReport::default();
+        self.drain_into(&mut report);
         let mut inner = self.lock();
         ensure!(
             turns.windows(2).all(|pair| pair[0] < pair[1]),
@@ -692,17 +744,13 @@ impl Checkpoints {
                 );
             }
         }
-        self.restore_manifests(
-            &mut inner,
-            &manifests,
-            RollbackReport::default(),
-            RestoreMode::Conversation,
-        )
+        self.restore_manifests(&mut inner, &manifests, report, RestoreMode::Conversation)
     }
 
     /// Remove completed restoration markers only after the conversation rewind commits.
     /// Cleanup failures leave harmless markers, never checkpoints that replay restored files.
     pub fn finalize_conversation_rollback(&self, session: &str, turns: &[u64]) -> Result<()> {
+        self.flusher.drain()?;
         let _inner = self.lock();
         for &turn in turns {
             let manifest = read_manifest(&self.dir, turn)?;
@@ -875,11 +923,7 @@ impl Checkpoints {
     fn restore_entry(&self, turn: u64, index: usize, entry: &Entry) -> Result<bool> {
         let (target, base) = self.target_of(entry)?;
         if entry.existed {
-            let blob = turn_dir(&self.dir, turn)
-                .join("files")
-                .join(index.to_string());
-            let bytes = fs::read(&blob)
-                .with_context(|| format!("reading saved content {}", blob.display()))?;
+            let bytes = read_saved(&self.dir, turn, index, entry)?;
             if let Ok(meta) = fs::symlink_metadata(&target) {
                 ensure!(
                     meta.is_file(),

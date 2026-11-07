@@ -28,6 +28,7 @@ pub struct JobRow {
     /// Native owner evidence, independent of the legacy machine-status diagnostic.
     pub process_outcome: Option<crate::runtime::execution::ProcessOutcome>,
     pub running: bool,
+    pub stop_requested: bool,
     /// Runs on a pseudo-terminal, so full-screen programs and line editing work.
     pub terminal: bool,
     /// `session`, `persist` or `detached`.
@@ -38,11 +39,16 @@ impl JobRow {
     /// Shared lifecycle wording from owner evidence only; no status-string interpretation.
     pub fn lifecycle_label(&self) -> &'static str {
         if self.running {
-            return "Running";
+            return if self.stop_requested {
+                "Stop requested"
+            } else {
+                "Running"
+            };
         }
         match self.process_outcome.as_ref() {
             Some(outcome) if outcome.cancelled => "Cancelled",
             Some(outcome) if outcome.timed_out => "Failed",
+            Some(outcome) if self.stop_requested && outcome.signal.is_some() => "Stopped",
             Some(outcome) if outcome.exit_code == Some(0) => "Completed",
             Some(outcome) if outcome.exit_code.is_some() || outcome.signal.is_some() => "Failed",
             _ => "Unknown",
@@ -195,6 +201,23 @@ impl JobsOverlay {
             self.cursor = 0;
         } else if key.code == KeyCode::End && key.modifiers.is_empty() {
             self.cursor = last;
+        } else if key.code == KeyCode::Char('s')
+            && key.modifiers.is_empty()
+            && let Some(job) = self
+                .jobs
+                .get(self.cursor)
+                .filter(|job| job.running && !job.stop_requested)
+        {
+            return OverlayEvent::JobStop {
+                name: job.name.clone(),
+            };
+        } else if key.code == KeyCode::Char('d')
+            && key.modifiers.is_empty()
+            && let Some(job) = self.jobs.get(self.cursor).filter(|job| !job.running)
+        {
+            return OverlayEvent::JobDismiss {
+                name: job.name.clone(),
+            };
         } else if keys.matches(Action::SelectConfirm, key)
             && let Some(job) = self.jobs.get(self.cursor)
         {
@@ -462,6 +485,11 @@ impl JobsOverlay {
                     "view output"
                 },
             ));
+            if job.running && !job.stop_requested {
+                segments.push("s stop".into());
+            } else if !job.running {
+                segments.push("d dismiss".into());
+            }
             segments.push(format!(
                 "{} select",
                 super::settings::arrows(theme, super::settings::Axis::Vertical)

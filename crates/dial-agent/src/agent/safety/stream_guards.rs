@@ -10,8 +10,6 @@ use crate::agent::prompts::recovery::{
 };
 use std::fmt;
 
-/// Retry cap for an unexpected stop.
-pub(crate) const UNEXPECTED_STOP_MAX_RETRIES: u32 = 3;
 /// Retry cap for an empty stop.
 pub(crate) const EMPTY_STOP_MAX_RETRIES: u32 = 3;
 /// Retry cap for a stalled stream continuation.

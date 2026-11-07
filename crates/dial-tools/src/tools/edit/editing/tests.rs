@@ -296,15 +296,22 @@ fn optional_check_is_boolean_and_valid_in_every_edit_grammar() {
         EditMode::ApplyPatch,
         EditMode::Sloppy,
     ] {
-        for check in [json!(true), json!(false), Value::Null] {
+        for verify in [json!([]), json!(["tests/test_a.py::test_b"]), Value::Null] {
             assert!(
-                validate_shape(mode, &json!({"check":check})).is_ok(),
+                validate_shape(mode, &json!({"verify":verify})).is_ok(),
                 "{mode:?}"
             );
         }
-        for check in [json!("yes"), json!({}), json!(1)] {
+        for verify in [
+            json!("yes"),
+            json!(true),
+            json!({}),
+            json!([1]),
+            json!([" "]),
+            json!(vec!["t.py"; 17]),
+        ] {
             assert!(
-                validate_shape(mode, &json!({"check":check})).is_err(),
+                validate_shape(mode, &json!({"verify":verify})).is_err(),
                 "{mode:?}"
             );
         }

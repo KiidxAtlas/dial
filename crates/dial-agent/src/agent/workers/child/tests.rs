@@ -1,4 +1,5 @@
 use super::*;
+mod scheduling;
 use crate::{
     agent::{safety::approval::Denial, workers::subagents},
     config::types::{Config, Harness},
@@ -8,6 +9,75 @@ use crate::{
     },
 };
 use std::sync::{Arc, atomic::AtomicBool};
+
+#[test]
+fn child_groups_disjoint_writes_and_keeps_later_reads_after_their_mutation() {
+    let batch = [
+        ("write", json!({"path":"new-a","content":"alpha"})),
+        ("write", json!({"path":"new-b","content":"beta"})),
+        ("read", json!({"paths":["new-a","new-b"]})),
+    ];
+    let calls: Vec<_> = batch.iter().enumerate().map(|(index,(name,args))|
+        json!({"index":index,"id":format!("group-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})
+    ).collect();
+    let event = json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+    let (outcome, requests, _, started) = scripted_worker_with_tools(
+        &["write", "read"],
+        vec![
+            llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n")),
+            scripted_reply("Both files were written and read.", None),
+        ],
+        0,
+        vec![],
+    );
+    assert_eq!(
+        outcome.status.phase,
+        crate::runtime::Phase::Completed,
+        "{}",
+        outcome.status.text
+    );
+    assert_eq!(started, ["write", "write", "read"]);
+    assert_eq!(outcome.scheduling.groups["native"].sizes[&2], 1);
+    let results: Vec<_> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .collect();
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|r| r["is_error"] != true), "{results:?}");
+    assert!(results[2]["content"].as_str().unwrap().contains("alpha"));
+    assert!(results[2]["content"].as_str().unwrap().contains("beta"));
+    assert_eq!(
+        outcome.scheduling.early_reads_started, 0,
+        "reads after effects cannot run early"
+    );
+}
+
+#[test]
+fn child_read_prefix_uses_the_shared_streaming_observer_with_explicit_opt_out() {
+    for enabled in [true, false] {
+        let batch = (0..2).map(|index| json!({"index":index,"id":format!("read-{index}"),"type":"function",
+            "function":{"name":"read","arguments":json!({"path":format!("source-{index}.txt")}).to_string()}})).collect::<Vec<_>>();
+        let event =
+            json!({"choices":[{"delta":{"tool_calls":batch},"finish_reason":"tool_calls"}]});
+        let (outcome, _, _, started) = scripted_worker_with_config(
+            &["read"],
+            vec![
+                llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n")),
+                scripted_reply("Inspected both source files.", None),
+            ],
+            0,
+            vec![],
+            |config| config.experimental.streaming_dispatch = enabled,
+        );
+        assert_eq!(outcome.status.phase, crate::runtime::Phase::Completed);
+        assert_eq!(started, ["read", "read"]);
+        assert_eq!(outcome.scheduling.early_reads_started, u64::from(enabled));
+        assert_eq!(outcome.scheduling.early_reads_reused, u64::from(enabled));
+        assert_eq!(outcome.scheduling.early_reads_discarded, 0);
+    }
+}
 
 struct Fake {
     name: &'static str,
@@ -547,7 +617,7 @@ fn assembled_delegation_requests_deduplicate_background_without_losing_contracts
         assert!(with_journal.iter().any(|m| {
             m["content"]
                 .as_str()
-                .is_some_and(|text| text.contains("side_request"))
+                .is_some_and(|text| text.contains("advisory"))
         }));
         // Reconstruct the pre-dedup initial request with identical system messages
         // and tool schemas: this measures assembled request bytes, not a template.
@@ -1377,7 +1447,7 @@ fn a_worker_native_write_refusal_skips_dependent_actions_but_allows_diagnostics_
             json!({"path":"source-0.txt","content":"dependent overwrite\n"}),
         ),
         ("bash", json!({"command":"printf ran > run-started.txt"})),
-        ("check", json!({"names":["candidate"]})),
+        ("verify", json!({"targets":["candidate"]})),
         ("read", json!({"path":"source-0.txt"})),
         ("read", json!({"path":"source-1.txt"})),
         (
@@ -1398,7 +1468,7 @@ fn a_worker_native_write_refusal_skips_dependent_actions_but_allows_diagnostics_
         ),
     ];
     let (outcome, requests, _, started) = scripted_worker_with_config(
-        &["write", "read", "bash", "check"],
+        &["write", "read", "bash", "verify"],
         scripts,
         0,
         vec![],
@@ -1431,7 +1501,7 @@ fn a_worker_native_write_refusal_skips_dependent_actions_but_allows_diagnostics_
     assert!(
         !started
             .iter()
-            .any(|name| matches!(name.as_str(), "bash" | "check")),
+            .any(|name| matches!(name.as_str(), "bash" | "verify")),
         "{started:?}"
     );
     assert_eq!(requests.len(), 3, "{requests:?}");
@@ -1918,9 +1988,9 @@ fn child_reasoning_strategy_is_inherited_on_initial_and_resumed_requests_without
 fn child_refuses_post_edit_checks_before_mutating_source() {
     for tool in ["edit", "write"] {
         let arguments = if tool == "edit" {
-            json!({"path":"source-0.txt","old_string":"source","new_string":"changed","check":true})
+            json!({"path":"source-0.txt","old_string":"source","new_string":"changed","verify":["t.py"]})
         } else {
-            json!({"path":"source-0.txt","content":"changed","check":true})
+            json!({"path":"source-0.txt","content":"changed","verify":["t.py"]})
         };
         let scripts = vec![
             scripted_reply("", Some((tool, arguments))),
@@ -1937,10 +2007,7 @@ fn child_refuses_post_edit_checks_before_mutating_source() {
             started.is_empty(),
             "unsupported {tool} must not start: {started:?}"
         );
-        assert!(
-            requests[1]["messages"]
-                .to_string()
-                .contains("foreground controller")
-        );
+        let messages = requests[1]["messages"].to_string();
+        assert!(messages.contains("foreground controller"), "{messages}");
     }
 }

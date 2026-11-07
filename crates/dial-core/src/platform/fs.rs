@@ -8,6 +8,46 @@ mod rename;
 pub use reflink::{CopyCounts, copy_counts, copy_on_write};
 pub use rename::rename_noreplace;
 
+/// Flush `file`'s data and metadata with the platform's ordinary `fsync`. Apple's
+/// `File::sync_all` issues `F_FULLFSYNC`, which also drains the drive's volatile write cache and
+/// costs milliseconds per call; plain `fsync` keeps process- and kernel-crash durability but on
+/// Apple not power-loss durability of that cache. Elsewhere this is `File::sync_all`.
+pub fn sync_file(file: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        loop {
+            // SAFETY: the descriptor belongs to `file`, which is borrowed for the whole call;
+            // `fsync` neither closes it nor retains it.
+            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        file.sync_all()
+    }
+}
+
+/// [`sync_file`] for data (and the metadata needed to read it back). Apple's
+/// `File::sync_data` is also `F_FULLFSYNC`, so it uses `fsync`; elsewhere this is
+/// `File::sync_data` (`fdatasync`).
+pub fn sync_file_data(file: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        sync_file(file)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        file.sync_data()
+    }
+}
+
 /// Open `path` with `options`, refusing a symbolic link (or, on Windows, a junction or other
 /// name-surrogate reparse point) as the final component. Unix: `O_NOFOLLOW | O_CLOEXEC`.
 pub fn open_nofollow(options: &OpenOptions, path: &Path) -> io::Result<File> {

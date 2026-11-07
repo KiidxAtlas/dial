@@ -231,7 +231,7 @@ impl PythonRuntime {
                             };
                             let script = format!(
                                 "{} {} {flags} {} {sites}",
-                                fork_fence_prefix(),
+                                fork_fence_prefix(ctx.workspace),
                                 shell_quote(
                                     launch
                                         .python
@@ -256,7 +256,6 @@ impl PythonRuntime {
                     check_operation(end, &self.interrupt, cancel)?;
                     slot.as_mut().unwrap().prelude_language =
                         Some(preludes::PreludeLanguage::Python);
-                    effect_started.store(true, Ordering::Release);
                     let scope = CellScope {
                         workspace: ctx.workspace,
                         end,
@@ -264,7 +263,14 @@ impl PythonRuntime {
                         cancel,
                         callback_wait: &callback_wait,
                     };
-                    native_cell(slot.as_mut().unwrap(), &scope, code, dispatch, &handoff)
+                    native_cell(
+                        slot.as_mut().unwrap(),
+                        &scope,
+                        code,
+                        dispatch,
+                        &handoff,
+                        effect_started,
+                    )
                 })();
                 if result.is_err() {
                     // Only this owner's namespace is discarded; a pending host callback additionally
@@ -571,19 +577,30 @@ fn probe_fork_containment(label: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn fork_fence_prefix() -> String {
+/// Prefix that execs the interpreter under the mandatory process-fork fence. Linux applies the
+/// fence in the launcher, and a sandboxed macOS command carries it in its workspace profile:
+/// Seatbelt refuses to apply a second, different profile inside one. Only an unsandboxed macOS
+/// command gets the fence as its own `sandbox-exec` profile.
+pub(super) fn fork_fence_prefix(workspace: &Workspace) -> String {
     #[cfg(target_os = "linux")]
-    return "exec".into();
-    #[cfg(not(target_os = "linux"))]
-    format!("exec /usr/bin/sandbox-exec -p {}", shell_quote(FORK_FENCE))
+    let nested = false;
+    #[cfg(target_os = "macos")]
+    let nested = workspace.unsandboxed;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let nested = {
+        let _ = workspace;
+        true
+    };
+    if nested {
+        format!("exec /usr/bin/sandbox-exec -p {}", shell_quote(FORK_FENCE))
+    } else {
+        "exec".into()
+    }
 }
 
 #[cfg(not(windows))]
 pub(super) fn fenced_command(workspace: &Workspace, script: &str) -> Result<Command, String> {
-    #[cfg(target_os = "linux")]
-    return super::shell::shell_command_fenced(workspace, script, workspace.root());
-    #[cfg(not(target_os = "linux"))]
-    super::shell::shell_command(workspace, script, workspace.root())
+    super::shell::shell_command_fenced(workspace, script, workspace.root())
 }
 
 #[cfg(windows)]
@@ -926,14 +943,31 @@ fn native_cell_once(
 
 /// Runs one cell in the foreground after installing eval preludes when the registry changed; `__dial_display__`
 /// text is prepended to the cell's stdout. A cell that `handoff.policy` asks to move is adopted as a background
-/// job; if adoption is refused, the cell resumes in the foreground and finishes there.
+/// job; if adoption is refused, the cell resumes in the foreground and finishes there. `started` is raised only
+/// once a fresh interpreter has answered a no-op request, so a launch that never ran code is a known failure.
 pub(crate) fn native_cell(
     process: &mut NativeProcess,
     scope: &CellScope<'_>,
     code: &str,
     dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
     handoff: &Handoff<'_>,
+    started: &AtomicBool,
 ) -> Result<CellOutcome, String> {
+    let never = || false;
+    if !process.ready {
+        native_cell_once(
+            process,
+            scope,
+            Some("0"),
+            &preludes::DisplayBuffer::default(),
+            dispatch,
+            &never,
+        )
+        .map_err(|error| format!("eval interpreter did not start: {error}"))?
+        .ok_or("eval interpreter yielded during startup")?;
+        process.ready = true;
+    }
+    started.store(true, Ordering::Release);
     let never = || false;
     if let Some(language) = process.prelude_language {
         let generation = preludes::generation();
@@ -1039,6 +1073,8 @@ pub(crate) struct NativeProcess {
     transport: crate::runtime::json_transport::JsonProcess,
     pub(crate) prelude_language: Option<preludes::PreludeLanguage>,
     prelude_generation: u64,
+    /// The interpreter answered a request, so it is running under its launch confinement.
+    ready: bool,
 }
 impl NativeProcess {
     pub(crate) fn start(command: Command, pid: Arc<AtomicI32>) -> Result<Self, String> {
@@ -1046,6 +1082,7 @@ impl NativeProcess {
             transport: crate::runtime::json_transport::JsonProcess::start(command, pid)?,
             prelude_language: None,
             prelude_generation: 0,
+            ready: false,
         })
     }
     pub(crate) fn alive(&mut self) -> bool {

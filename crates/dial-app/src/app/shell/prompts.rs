@@ -101,6 +101,7 @@ impl Shell {
                         status: job.status,
                         process_outcome: job.process_outcome,
                         running: job.running,
+                        stop_requested: job.stop_requested,
                         terminal: job.terminal,
                         mode: "session".into(),
                     })
@@ -244,7 +245,18 @@ impl Shell {
         body: &str,
         options: &[(&str, char)],
     ) -> Option<usize> {
-        self.ask_with_cancel(title, body, options, None)
+        self.ask_selected(title, body, options, 0)
+    }
+
+    /// Same modal safety and draft routing, with an existing list selection restored.
+    pub(in crate::app) fn ask_selected(
+        &mut self,
+        title: &str,
+        body: &str,
+        options: &[(&str, char)],
+        selected: usize,
+    ) -> Option<usize> {
+        self.ask_with_selection(title, body, options, None, selected)
     }
 
     pub(in crate::app) fn ask_with_cancel(
@@ -254,13 +266,24 @@ impl Shell {
         options: &[(&str, char)],
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Option<usize> {
+        self.ask_with_selection(title, body, options, cancel, 0)
+    }
+
+    fn ask_with_selection(
+        &mut self,
+        title: &str,
+        body: &str,
+        options: &[(&str, char)],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        selected: usize,
+    ) -> Option<usize> {
         if options.is_empty() {
             return None;
         }
         self.park_pending_input();
         // The terminal tab shows that Dial waits for an answer while the panel is up.
         let was_waiting = std::mem::replace(&mut self.awaiting_user, true);
-        let answer = self.ask_loop(title, body, options, cancel);
+        let answer = self.ask_loop(title, body, options, cancel, selected);
         self.awaiting_user = was_waiting;
         answer
     }
@@ -271,9 +294,10 @@ impl Shell {
         body: &str,
         options: &[(&str, char)],
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        selected: usize,
     ) -> Option<usize> {
         let mut body_offset = 0usize;
-        let mut selected = 0usize;
+        let mut selected = selected.min(options.len().saturating_sub(1));
         let mut show_raw = false;
         let mut focus = self.initial_focus();
         loop {

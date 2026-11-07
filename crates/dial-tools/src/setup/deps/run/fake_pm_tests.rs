@@ -153,3 +153,26 @@ fn standard_manager_discovery_rejects_relative_destination_and_query_failure() {
     }
     assert!(!env.user_dir.exists());
 }
+
+#[test]
+fn rustup_components_resolve_through_rustup_which() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = fake_tools(tmp.path(), &["rustup"]);
+    let toolchain_bin = tmp.path().join("toolchains/stable/bin");
+    let program = toolchain_bin.join("rust-analyzer");
+    let script = format!(
+        "#!/bin/sh\nset -eu\ncase \"$*\" in\n'which rust-analyzer') if [ -x '{0}' ]; then printf '%s\\n' '{0}'; else echo 'not installed' >&2; exit 1; fi ;;\n'component add rust-analyzer') /bin/mkdir -p '{1}'; printf '#!/bin/sh\\necho rust-analyzer 1.0\\n' > '{0}'; /bin/chmod +x '{0}' ;;\n*) echo unexpected-arguments >&2; exit 1 ;;\nesac\n",
+        program.display(),
+        toolchain_bin.display()
+    );
+    let rustup = env.path[0].join("rustup");
+    std::fs::write(&rustup, script).unwrap();
+    std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let target = recipe("rust-analyzer").unwrap();
+    assert_eq!(standard_location(target, &env).unwrap(), None);
+    let location =
+        install_with_requirements("rust-analyzer", &env, &AtomicBool::new(false), &mut |_| {})
+            .unwrap();
+    assert_eq!(location, program);
+    assert_eq!(standard_location(target, &env).unwrap(), Some(program));
+}

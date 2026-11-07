@@ -3950,3 +3950,24 @@ fn ollama_context_is_sent_only_when_the_operator_configures_a_limit() {
         None
     );
 }
+
+#[test]
+fn retry_elapsed_budget_bounds_a_server_wait_without_replaying_or_losing_its_cause() {
+    let server = fake::serve(vec![Script::HttpHeaders {
+        status: 429,
+        headers: vec![("Retry-After", "300".into())],
+        body: b"quota limited".to_vec(),
+    }]);
+    let mut config = crate::config::types::Config::default();
+    config.retry.max_elapsed_secs = 1;
+    let mut remote = backend(endpoint(&server.url)).with_steering(&config);
+    let start = Instant::now();
+    let error = remote.chat(None, &request(), 5, None).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("elapsed-time budget"),
+        "{error:#}"
+    );
+    assert_eq!(error.downcast_ref::<llm::HttpError>().unwrap().status, 429);
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert_eq!(server.requests().len(), 1);
+}

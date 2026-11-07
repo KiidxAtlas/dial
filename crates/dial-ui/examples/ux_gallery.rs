@@ -7,16 +7,18 @@ use dial_llm::{
     config::settings_store::Scope,
     llm::{
         catalog::{Discovery, ModelEntry, ProviderStatus},
-        model_config::{ModelSelection, RoleSource, RoleStatus, UiConfig},
+        model_config::{BusySend, ModelSelection, RoleSource, RoleStatus, UiConfig},
     },
 };
-use dial_storage::storage::session::SessionInfo;
+use dial_storage::storage::session::{SearchHit, SessionInfo};
 use dial_ui::ui::{
     Rows,
     composer::{CommandEntry, CommandKind, Composer, ComposerCtx, SteerStage},
     keys::Keymap,
     overlay::{
         DrawCtx,
+        history_search::HistorySearchOverlay,
+        jobs::{JobRow, JobsOverlay},
         models::ModelOverlay,
         palette::{PaletteEntry, PaletteOverlay},
         providers::ProviderOverlay,
@@ -336,6 +338,13 @@ fn main() -> anyhow::Result<()> {
         ] {
             let mut phase_status = status.clone();
             phase_status.activity = phase.label().into();
+            if phase == dial_agent::agent::RequestPhase::Backoff {
+                phase_status.provider_retry = Some(dial_ui::ui::status::ProviderRetry {
+                    attempt: 4,
+                    maximum: "10".into(),
+                    ready_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+                });
+            }
             let view = composer.view(
                 width,
                 &ComposerCtx {
@@ -352,6 +361,26 @@ fn main() -> anyhow::Result<()> {
                 light,
             );
         }
+        let mut wait_status = status.clone();
+        wait_status.background_wait = Some(dial_ui::ui::status::WorkWait {
+            label: "jobs check-42; workers review".into(),
+            started: std::time::Instant::now() - std::time::Duration::from_secs(65),
+        });
+        let wait_view = composer.view(
+            width,
+            &ComposerCtx {
+                theme: &theme,
+                keys: &keys,
+                ui: &ui,
+                status: &wait_status,
+            },
+        );
+        screen(
+            &mut out,
+            &format!("Owned work wait / {name}"),
+            &rows_buffer(wait_view.rows, width, 6),
+            light,
+        );
         let working_ctx = ComposerCtx {
             theme: &theme,
             keys: &keys,
@@ -378,11 +407,18 @@ fn main() -> anyhow::Result<()> {
             ),
             &working_ctx,
         );
-        // Explicit steering: Steer now is the third choice; the strip shows only reported stages.
+        composer.set_busy_send(BusySend::Redirect);
+        screen(
+            &mut out,
+            &format!("Busy send preference: steer / {name}"),
+            &rows_buffer(composer.view(width, &working_ctx).rows, width, 8),
+            light,
+        );
+        composer.set_busy_send(BusySend::Choose);
+        // Explicit redirect is the second selectable intent; stages remain controller-reported.
         let key =
             |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
         composer.handle_key(key(crossterm::event::KeyCode::Enter), &working_ctx);
-        composer.handle_key(key(crossterm::event::KeyCode::Down), &working_ctx);
         composer.handle_key(key(crossterm::event::KeyCode::Down), &working_ctx);
         composer.handle_key(key(crossterm::event::KeyCode::Enter), &working_ctx);
         screen(
@@ -449,7 +485,28 @@ fn main() -> anyhow::Result<()> {
             true,
             1.1,
         );
-        transcript.assistant_delta("The existing API is preserved. The focused tests pass.");
+        transcript.assistant_delta("The parser changed; its final recorded check is stale and failed. Review before continuing.");
+        transcript.completion(dial_ui::ui::transcript::TurnOutcome {
+            status: "blocked".into(),
+            changed_files: 2,
+            open_tasks: 1,
+            handoff: vec![
+                "Changed: src/parser.rs, tests/parser.rs".into(),
+                "Checks: failed · freshness stale · parser-check failed".into(),
+                "Outstanding: inspect failing parser fixture (blocked)".into(),
+                "Outside /undo: 1 shell command may have changed files".into(),
+                "Next: send a follow-up message · /review-file · /undo (checkpointed edits only)"
+                    .into(),
+            ],
+        });
+        transcript.turn_stats(dial_ui::ui::transcript::TurnStats {
+            clock: "2026-11-06 18:00:00".into(),
+            elapsed_secs: 2.0,
+            prompt_tokens: None,
+            output_tokens: None,
+            tokens_per_second: None,
+            outcome: None,
+        });
         transcript.finish_turn();
         let rows = transcript
             .take_settled_with_images(
@@ -664,6 +721,71 @@ fn main() -> anyhow::Result<()> {
             status: &status,
             preview_status: &preview,
         };
+        let mut history_search = HistorySearchOverlay::new(
+            "checkpoint review".into(),
+            vec![SearchHit {
+                session_id: "fixture-prior-conversation".into(),
+                entry_id: "fixture-message-42".into(),
+                preview: "Review the checkpoint changes before continuing. Opening this conversation keeps its current branch head; this matched message is a read-only preview, not a rewind destination.".into(),
+                role: "user".into(),
+                snippet: "Review the checkpoint changes before continuing".into(),
+                when: "2026-10-01 10:00".into(),
+            }],
+            true,
+        );
+        let mut ux_terminal = Terminal::new(TestBackend::new(width, height))?;
+        ux_terminal.draw(|f| history_search.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Selectable history / {name}"),
+            ux_terminal.backend().buffer(),
+            light,
+        );
+        // Inject synthetic adapter output into the actual asynchronous Composer component.
+        // This sheet reviews rendering; the PTY suite checks real attachment expansion.
+        let mut attachment_composer = Composer::new(vec![], 100);
+        attachment_composer.set_attachment_provider(Some(
+            dial_ui::ui::composer::attachments::Provider {
+                candidates: std::sync::Arc::new(|text| text.contains('@')),
+                preview: std::sync::Arc::new(|_, _| dial_ui::ui::composer::attachments::Preview {
+                    summary:
+                        "Attachments: 1 included · 1 truncated · 1 skipped · estimated 2400 tokens"
+                            .into(),
+                    issues: vec!["large.txt truncated; missing.txt unavailable".into()],
+                    items: vec![dial_ui::ui::composer::attachments::PreviewItem {
+                        reference: "@missing.txt".into(),
+                        detail: "File · Skipped · fixture missing file".into(),
+                    }],
+                }),
+                remove: std::sync::Arc::new(|text, reference| Some(text.replace(reference, ""))),
+            },
+        ));
+        attachment_composer.set_draft("Review @src/main.rs @large.txt @missing.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while attachment_composer.attachment_items().is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        anyhow::ensure!(
+            !attachment_composer.attachment_items().is_empty(),
+            "synthetic attachment preview did not settle"
+        );
+        let attachment_view = attachment_composer.view(
+            width,
+            &ComposerCtx {
+                theme: &theme,
+                keys: &keys,
+                ui: &ui,
+                status: &status,
+            },
+        );
+        screen(
+            &mut out,
+            &format!("Attachment warning (synthetic adapter) / {name}"),
+            &rows_buffer(attachment_view.rows, width, 8),
+            light,
+        );
         let mut plan = TodoList::new();
         plan.call(&serde_json::json!({"op":"set", "tasks":[
             {"content":"Locate the compatibility boundary", "phase":"Investigate"},
@@ -1120,6 +1242,124 @@ fn main() -> anyhow::Result<()> {
             &mut out,
             &format!("Keyboard shortcuts / {name}"),
             terminal.backend().buffer(),
+            light,
+        );
+        let mut jobs = JobsOverlay::new();
+        jobs.set_jobs(vec![
+            JobRow {
+                name: "test-build".into(),
+                command: "cargo test".into(),
+                status: "signal 15 observed; output retained".into(),
+                process_outcome: Some(dial_core::runtime::execution::ProcessOutcome {
+                    started: true,
+                    exit_code: None,
+                    signal: Some(15),
+                    timed_out: false,
+                    cancelled: false,
+                    output_complete: true,
+                }),
+                running: false,
+                stop_requested: true,
+                terminal: false,
+                mode: "session".into(),
+            },
+            JobRow {
+                name: "cleanup".into(),
+                command: "await tool cleanup".into(),
+                status: "still managed until actual completion".into(),
+                process_outcome: None,
+                running: true,
+                stop_requested: true,
+                terminal: false,
+                mode: "session".into(),
+            },
+        ]);
+        terminal.draw(|f| jobs.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Retained Stop outcomes / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
+        jobs.handle(
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            &keys,
+        );
+        jobs.set_screen(
+            vec!["Compiling fixture".into(), "Last output before stop".into()],
+            None,
+        );
+        terminal.draw(|f| jobs.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Stopped job retained output / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
+        let saved: dial_ui::ui::composer::recovery::RecoverySnapshot =
+            serde_json::from_value(serde_json::json!({
+                "draft": "Fix the parser without changing its API",
+                "queued": [["Then run the focused tests", true]],
+            }))?;
+        let mut recovery_preview = Transcript::new();
+        recovery_preview.notice(
+            "Saved input preview content (not a confirmation)",
+            &saved.preview_text(),
+        );
+        let rows = recovery_preview
+            .take_settled_with_images(
+                width,
+                &TranscriptCtx {
+                    theme: &theme,
+                    ui: &ui,
+                    tick: 0,
+                    tools_expanded: false,
+                    expand_key: &keys.label(dial_ui::ui::keys::Action::ToolsExpand),
+                },
+            )
+            .0;
+        screen(
+            &mut out,
+            &format!("Saved input content / {name}"),
+            &rows_buffer(rows, width, 20),
+            light,
+        );
+        let mut answered = Transcript::new();
+        answered.push_user("Why is the optional live diagnostic still pending?");
+        answered.assistant_delta("The local implementation is delivered. The live diagnostic is an optional follow-up awaiting separate approval; it does not block this answer.");
+        answered.finish_turn();
+        answered.notice("Outstanding work", "Retained: 0 execution steps, 0 required deliverables, 1 optional follow-up. No live request was made.");
+        answered.turn_stats(dial_ui::ui::transcript::TurnStats {
+            clock: String::new(),
+            elapsed_secs: 1.0,
+            prompt_tokens: None,
+            output_tokens: None,
+            tokens_per_second: None,
+            outcome: Some(dial_ui::ui::transcript::TurnOutcome {
+                status: "answered".into(),
+                open_tasks: 1,
+                ..Default::default()
+            }),
+        });
+        let rows = answered
+            .take_settled_with_images(
+                width,
+                &TranscriptCtx {
+                    theme: &theme,
+                    ui: &ui,
+                    tick: 0,
+                    tools_expanded: false,
+                    expand_key: &keys.label(dial_ui::ui::keys::Action::ToolsExpand),
+                },
+            )
+            .0;
+        screen(
+            &mut out,
+            &format!("Answer with optional follow-up / {name}"),
+            &rows_buffer(rows, width, 16),
             light,
         );
         let mut markdown_transcript = Transcript::new();

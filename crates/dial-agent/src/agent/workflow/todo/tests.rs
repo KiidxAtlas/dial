@@ -1,6 +1,69 @@
 use super::*;
 
 #[test]
+fn follow_ups_require_explicit_start_and_survive_legacy_snapshot_migration() {
+    let mut list = TodoList::new();
+    assert!(
+        !set(
+            &mut list,
+            json!([
+                {"content":"Implement"},
+                {"content":"Live diagnostic", "kind":"follow_up"},
+                {"content":"Report locally"}
+            ])
+        )
+        .is_error
+    );
+    assert_eq!(list.tasks()[0].kind, Kind::Step);
+    let focus = list.focus().unwrap();
+    assert!(focus.contains("Next: 3. Report locally"), "{focus}");
+    assert!(!focus.contains("Live diagnostic"), "{focus}");
+    assert!(!list.call(&json!({"op":"done"})).is_error);
+    assert_eq!(
+        statuses(&list),
+        [Status::Completed, Status::Pending, Status::InProgress]
+    );
+    assert!(!list.call(&json!({"op":"done"})).is_error);
+    assert_eq!(
+        statuses(&list),
+        [Status::Completed, Status::Pending, Status::Completed]
+    );
+    let before_start = list.snapshot();
+    assert!(
+        list.call(&json!({"op":"start"})).is_error,
+        "optional work needs an explicit index"
+    );
+    assert_eq!(list.snapshot(), before_start);
+    assert!(!list.call(&json!({"op":"start","index":2})).is_error);
+    assert_eq!(
+        list.tasks()[1].status,
+        Status::InProgress,
+        "a generic final cannot silently close a follow-up"
+    );
+    assert!(
+        !list
+            .call(&json!({"op":"block","reason":"Separate approval needed"}))
+            .is_error
+    );
+    assert!(list.blocked_steps().next().is_none());
+    let mut restored = TodoList::new();
+    restored.restore(&list.snapshot()).unwrap();
+    assert_eq!(restored, list);
+    restored
+        .restore(&json!([{"content":"Legacy blocker", "status":"blocked", "note":"Missing input"}]))
+        .unwrap();
+    assert_eq!(restored.tasks()[0].kind, Kind::Step);
+    assert_eq!(restored.blocked_steps().count(), 1);
+    let before = restored.snapshot();
+    assert!(
+        restored
+            .call(&json!({"op":"append","tasks":[{"content":"Bad kind", "kind":"required"}]}))
+            .is_error
+    );
+    assert_eq!(restored.snapshot(), before);
+}
+
+#[test]
 fn coherent_runtime_investigations_use_the_same_simple_completion() {
     let mut list = TodoList::new();
     set(
@@ -20,29 +83,7 @@ fn coherent_runtime_investigations_use_the_same_simple_completion() {
             .call(&json!({"op":"block","reason":"Missing fixture"}))
             .is_error
     );
-    list.complete_reported_work();
     assert_eq!(list.tasks()[1].status, Status::Blocked);
-}
-
-#[test]
-fn accepted_report_closes_only_the_started_task_and_leaves_later_work_open() {
-    let mut list = TodoList::new();
-    assert!(
-        !set(
-            &mut list,
-            json!([{"content":"One"},{"content":"Two"},{"content":"Three"}])
-        )
-        .is_error
-    );
-    list.complete_reported_work();
-    assert_eq!(
-        statuses(&list),
-        [Status::Completed, Status::Pending, Status::Pending]
-    );
-    let mut resumed = TodoList::new();
-    resumed.restore(&list.snapshot()).unwrap();
-    assert_eq!(resumed, list);
-    assert!(resumed.has_open());
 }
 
 #[test]

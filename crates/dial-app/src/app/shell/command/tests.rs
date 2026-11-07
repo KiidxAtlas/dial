@@ -232,3 +232,70 @@ fn undo_retry_finishes_without_replaying_newer_restore_or_gating_twice() {
             .all(|entry| !entry.unwrap().file_type().unwrap().is_dir())
     );
 }
+
+#[test]
+fn compaction_cancel_precedes_compute_busy_and_history_mutation() {
+    let (_home, _project, app, mut shell) = shell();
+    let mut agent = permission_agent(&app);
+    agent
+        .session_mut()
+        .append(serde_json::json!({"role":"user","content":"history remains"}))
+        .unwrap();
+    let before = agent.session().messages();
+    shell.composer.set_busy(true);
+    shell.composer.set_draft("queued input");
+    shell.composer.submit_voice();
+    shell.composer.set_busy(false);
+    shell.composer.set_draft("unsent input");
+    let queued = shell.composer.queued_messages();
+    let phase = shell.status.phase;
+    let mut reviewed = false;
+    shell
+        .compact_command_review(&app, &mut agent, "soft", |shell, text| {
+            reviewed = true;
+            assert!(text.contains("Eligible older history"));
+            assert!(text.contains("Cancel leaves history unchanged"));
+            assert_eq!(shell.status.phase, phase);
+            assert_eq!(shell.composer.draft(), "unsent input");
+            false
+        })
+        .unwrap();
+    assert!(reviewed);
+    assert_eq!(agent.session().messages(), before);
+    assert_eq!(shell.composer.queued_messages(), queued);
+    assert_eq!(shell.composer.draft(), "unsent input");
+    assert_eq!(shell.status.phase, phase);
+}
+
+#[test]
+fn context_command_counts_pending_input_without_consuming_it() {
+    let (_home, _project, app, mut shell) = shell();
+    let agent = permission_agent(&app);
+    shell.composer.set_busy(true);
+    shell.composer.set_draft("queued input");
+    shell.composer.submit_voice();
+    shell.composer.set_busy(false);
+    shell.composer.set_draft("unsent input");
+    let queued = shell.composer.queued_messages();
+    shell.context_command(&agent).unwrap();
+    let ctx = TranscriptCtx {
+        theme: shell.themes.current(),
+        ui: &shell.ui,
+        tick: 0,
+        tools_expanded: false,
+        expand_key: "Ctrl+O",
+    };
+    let text = shell
+        .transcript
+        .document(400, &ctx)
+        .0
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("2 queued/draft messages included"), "{text}");
+    assert!(text.contains("Last sent request: unavailable"), "{text}");
+    assert_eq!(shell.composer.queued_messages(), queued);
+    assert_eq!(shell.composer.draft(), "unsent input");
+    assert!(agent.session().messages().is_empty());
+}

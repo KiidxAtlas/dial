@@ -527,7 +527,7 @@ impl Notebook {
                         .permissions(),
                 )
                 .map_err(|e| e.to_string())?;
-            staged.sync_all().map_err(|e| e.to_string())?;
+            crate::platform::fs::sync_file(&staged).map_err(|e| e.to_string())?;
             let fresh = load(ctx.workspace, string(a, "path")?)?;
             if fresh.identity != loaded.identity
                 || fresh.revision != loaded.revision
@@ -656,7 +656,7 @@ impl Notebook {
         crate::tools::exec::execution::committed([loaded.path.clone()]);
         ctx.workspace.store().forget(&loaded.path);
         seen.retain(|(p, _, _), _| p != &loaded.path);
-        loaded.dir.sync_all().map_err(|error| format!("notebook changes were committed, but directory durability sync failed: {error}; inspect the current notebook before retrying"))?;
+        crate::platform::fs::sync_file(&loaded.dir).map_err(|error| format!("notebook changes were committed, but directory durability sync failed: {error}; inspect the current notebook before retrying"))?;
         loaded.value = updated;
         Ok(
             json!({"path":ctx.workspace.rel(&loaded.path),"action":action,"changed":true,"content_hash":hash(&bytes),"cell_count":loaded.value["cells"].as_array().unwrap().len(),"outputs_preserved_stale":preserved_stale,"reread_required":true}),

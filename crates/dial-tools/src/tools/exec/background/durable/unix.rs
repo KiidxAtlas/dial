@@ -110,7 +110,7 @@ fn publish(path: &Path, value: &impl Serialize) -> Result<()> {
     temp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
     serde_json::to_writer(&mut temp, value)?;
-    temp.as_file().sync_all()?;
+    crate::platform::fs::sync_file(temp.as_file())?;
     temp.persist(path).map_err(|error| error.error)?;
     Ok(())
 }

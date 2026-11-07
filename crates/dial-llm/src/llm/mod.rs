@@ -1111,7 +1111,14 @@ fn transport_error(error: ureq::Error, url: &str, auth: Option<&str>) -> anyhow:
                         | std::io::ErrorKind::TimedOut
                         | std::io::ErrorKind::WouldBlock
                         | std::io::ErrorKind::UnexpectedEof
+                        // The network itself is down or changing (sleep/wake, Wi-Fi switch, VPN):
+                        // a later attempt can succeed.
+                        | std::io::ErrorKind::AddrNotAvailable
+                        | std::io::ErrorKind::NetworkDown
+                        | std::io::ErrorKind::NetworkUnreachable
+                        | std::io::ErrorKind::HostUnreachable
                 )
+                || errors::is_network_outage_text(&io.to_string())
         }
         ureq::Error::ConnectionFailed | ureq::Error::HostNotFound | ureq::Error::Timeout(_) => true,
         _ => false,

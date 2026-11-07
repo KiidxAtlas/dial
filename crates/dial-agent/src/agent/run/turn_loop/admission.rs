@@ -191,8 +191,8 @@ impl Agent<'_> {
             .transpose()?;
         message["dial_checkpoint"] = json!({"session": self.session.id(), "turn": checkpoint_turn});
         self.step_checks = StepChecks {
+            autonomous_continuation: !matches!(origin, TurnOrigin::User),
             turn: checkpoint_turn,
-            started: std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(2)),
             visual: if self.hermetic {
                 crate::agent::verify::visual::Review::default()
             } else {

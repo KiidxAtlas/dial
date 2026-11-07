@@ -1,4 +1,19 @@
 use super::*;
+
+#[test]
+fn delivered_answer_roundtrips_without_claiming_completed_work() {
+    assert_eq!(Phase::from_status("answered"), Phase::Answered);
+    assert_eq!(Phase::Answered.label(), "answered");
+    assert!(!Phase::Answered.is_running());
+    assert!(!Phase::Answered.is_failure());
+    let tree = Tree::default();
+    let body = tree.start("completion", "Reply", None);
+    body.settle("Explanation".into(), None, Phase::Answered);
+    let node = body.snapshot();
+    let restored: Node = serde_json::from_value(serde_json::to_value(&node).unwrap()).unwrap();
+    assert_eq!(restored.result.phase, Phase::Answered);
+    assert_ne!(restored.result.phase, Phase::Completed);
+}
 #[test]
 fn coherent_runtime_legacy_phases_and_late_cancellation_results() {
     assert_eq!(

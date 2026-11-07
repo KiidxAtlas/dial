@@ -1456,13 +1456,13 @@ fn routed_tools_stay_offered_across_requests_once_the_session_has_history() {
 
 #[test]
 fn ordinary_english_tool_names_need_explicit_intent_to_route() {
-    let candidates = ["check", "find", "finish", "memory"]
+    let candidates = ["verify", "find", "finish", "memory"]
         .map(|name| (name.to_owned(), "Capability".to_owned()));
-    // Benchmark wording: "check the result" must not override the unattended `check` deferral.
+    // Benchmark wording: "verify the result" must not override the unattended `verify` deferral.
     for query in [
-        "Fix the arithmetic bug in calc.add. Preserve the public API; check the result.",
+        "Fix the arithmetic bug in calc.add. Preserve the public API; verify the result.",
         "find the bug and finish the fix",
-        "Leave existing files unchanged and check the generated result.",
+        "Leave existing files unchanged and verify the generated result.",
     ] {
         assert!(
             select(query, &BTreeSet::new(), &candidates).is_empty(),
@@ -1470,10 +1470,10 @@ fn ordinary_english_tool_names_need_explicit_intent_to_route() {
         );
     }
     assert_eq!(
-        select("Run the `check` tool", &BTreeSet::new(), &candidates),
-        ["check"]
+        select("Run the `verify` tool", &BTreeSet::new(), &candidates),
+        ["verify"]
     );
-    assert_eq!(select("check", &BTreeSet::new(), &candidates), ["check"]);
+    assert_eq!(select("verify", &BTreeSet::new(), &candidates), ["verify"]);
 }
 
 #[test]

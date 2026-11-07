@@ -1,8 +1,10 @@
 //! `dial gc`: reclaim disk space held by Dial state.
 //!
 //! Sweeps, in the order they run: `stale` (dangling artifact lifecycle records), `blobs` (unreferenced
-//! content-addressed artifacts), `archive` (cold sessions moved to `sessions/archive/`), and `wal`
-//! (SQLite WAL checkpoints). With no sweep flag, blobs, archive and wal run; stale is opt-in.
+//! content-addressed artifacts), `archive` (cold sessions moved to `sessions/archive/`), `wal`
+//! (SQLite WAL checkpoints), `subagents` (idle worker transcript directories) and
+//! `orphaned-projects` (idle state of other projects whose directory no longer exists). With no
+//! sweep flag, blobs, archive and wal run; the others are opt-in because they delete history.
 //! Dry-run is the default and touches nothing; `--apply` takes `gc.sqlite3.lock` first.
 use std::{
     collections::HashSet,
@@ -26,6 +28,8 @@ pub const DEFAULT_RETAIN_NEWEST_GLOBAL: usize = 20;
 pub const DEFAULT_RETAIN_NEWEST_PER_CWD: usize = 10;
 pub const DEFAULT_STALE_RETAIN_NEWEST: usize = 20;
 pub const DEFAULT_STALE_RETAIN_DAYS: u64 = 30;
+pub const DEFAULT_PRUNE_AFTER_DAYS: u64 = 30;
+const SUBAGENTS_DIR: &str = "subagents";
 const ARTIFACTS_DIR: &str = "artifacts";
 const LIFECYCLE_DIR: &str = ".lifecycle";
 const ARCHIVE_DIR: &str = "archive";
@@ -55,6 +59,16 @@ pub struct GcArgs {
     /// Prune dangling artifact lifecycle records (opt-in).
     #[arg(long)]
     pub stale: bool,
+    /// Delete worker transcript directories untouched for `--prune-after-days` (opt-in).
+    #[arg(long)]
+    pub subagents: bool,
+    /// Delete other projects' Dial state whose project directory no longer exists and that is
+    /// untouched for `--prune-after-days` (opt-in).
+    #[arg(long)]
+    pub orphaned_projects: bool,
+    /// Age in days after which `--subagents` and `--orphaned-projects` delete.
+    #[arg(long, value_name = "DAYS")]
+    pub prune_after_days: Option<u64>,
     /// Sessions untouched for this many days are archived (0 archives every unprotected one).
     #[arg(long, value_name = "DAYS")]
     pub cold_archive_after_days: Option<u64>,
@@ -81,6 +95,7 @@ pub struct AppliedSettings {
     pub retain_newest_per_cwd: usize,
     pub stale_retain_newest: usize,
     pub stale_retain_days: u64,
+    pub prune_after_days: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -142,6 +157,20 @@ pub struct WalResult {
     pub errors: Vec<String>,
 }
 
+/// A directory sweep: whole directories untouched for `prune_after_days` are deleted.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneResult {
+    pub scanned: usize,
+    /// Directories still in use: recently modified, or (for projects) with a live or unknown
+    /// project directory.
+    pub kept: usize,
+    pub would_delete: usize,
+    pub deleted: usize,
+    pub bytes: u64,
+    pub errors: Vec<String>,
+}
+
 /// Full gc report. Serialized as camelCase JSON, with `stateDir` as the Dial state directory.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,6 +187,10 @@ pub struct GcReport {
     pub archive: Option<ArchiveResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wal: Option<WalResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<PruneResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orphaned_projects: Option<PruneResult>,
 }
 
 impl GcReport {
@@ -176,28 +209,43 @@ impl GcReport {
         if let Some(w) = &self.wal {
             out.extend(w.errors.iter().map(String::as_str));
         }
+        for p in [&self.subagents, &self.orphaned_projects]
+            .into_iter()
+            .flatten()
+        {
+            out.extend(p.errors.iter().map(String::as_str));
+        }
         out
     }
 }
 
-/// Which sweeps a set of flags selects. With no sweep flag: blobs, archive and wal; stale is
-/// opt-in. With any sweep flag: exactly the flagged ones.
+/// Which sweeps a set of flags selects. With no sweep flag: blobs, archive and wal; stale,
+/// subagents and orphaned projects are opt-in. With any sweep flag: exactly the flagged ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub stale: bool,
     pub blobs: bool,
     pub archive: bool,
     pub wal: bool,
+    pub subagents: bool,
+    pub orphaned_projects: bool,
 }
 
 pub fn select(args: &GcArgs) -> Selection {
-    let any = args.blobs || args.archive || args.wal || args.stale;
+    let any = args.blobs
+        || args.archive
+        || args.wal
+        || args.stale
+        || args.subagents
+        || args.orphaned_projects;
     if any {
         Selection {
             stale: args.stale,
             blobs: args.blobs,
             archive: args.archive,
             wal: args.wal,
+            subagents: args.subagents,
+            orphaned_projects: args.orphaned_projects,
         }
     } else {
         Selection {
@@ -205,6 +253,8 @@ pub fn select(args: &GcArgs) -> Selection {
             blobs: true,
             archive: true,
             wal: true,
+            subagents: false,
+            orphaned_projects: false,
         }
     }
 }
@@ -224,6 +274,7 @@ pub fn applied_settings(args: &GcArgs) -> AppliedSettings {
             .stale_retain_newest
             .unwrap_or(DEFAULT_STALE_RETAIN_NEWEST),
         stale_retain_days: args.stale_retain_days.unwrap_or(DEFAULT_STALE_RETAIN_DAYS),
+        prune_after_days: args.prune_after_days.unwrap_or(DEFAULT_PRUNE_AFTER_DAYS),
     }
 }
 
@@ -267,6 +318,12 @@ pub fn execute(layout: &Layout, args: &GcArgs, now_ms: i64) -> Result<GcReport> 
         .archive
         .then(|| sweep_archive(layout, &policy, &settings, args.apply, now_ms));
     let wal = selection.wal.then(|| sweep_wal(layout, args.apply));
+    let subagents = selection
+        .subagents
+        .then(|| sweep_subagents(layout, &settings, args.apply, now_ms));
+    let orphaned_projects = selection
+        .orphaned_projects
+        .then(|| sweep_orphaned_projects(layout, &settings, args.apply, now_ms));
 
     Ok(GcReport {
         state_dir: layout.state_dir.display().to_string(),
@@ -277,6 +334,8 @@ pub fn execute(layout: &Layout, args: &GcArgs, now_ms: i64) -> Result<GcReport> 
         blobs,
         archive,
         wal,
+        subagents,
+        orphaned_projects,
     })
 }
 
@@ -888,6 +947,166 @@ fn checkpoint(db: &Path) -> Result<(i64, i64, i64)> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Subagents and orphaned projects: whole idle directories
+// ---------------------------------------------------------------------------------------------
+
+/// Total file bytes and the newest file modification under `dir`, without following symlinks.
+/// Directory mtimes are ignored (adding or removing an entry is not activity); a tree with no
+/// files reports the directory's own mtime.
+fn tree_usage(dir: &Path) -> Result<(u64, i64)> {
+    let mut bytes = 0;
+    let mut newest = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in
+            fs::read_dir(&current).with_context(|| format!("reading {}", current.display()))?
+        {
+            let path = entry?.path();
+            let meta = fs::symlink_metadata(&path)
+                .with_context(|| format!("checking {}", path.display()))?;
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                bytes += meta.len();
+                newest = newest.max(Some(retention::modified_ms(&meta)));
+            }
+        }
+    }
+    let newest = match newest {
+        Some(newest) => newest,
+        None => retention::modified_ms(&fs::symlink_metadata(dir)?),
+    };
+    Ok((bytes, newest))
+}
+
+fn prune_cutoff(settings: &AppliedSettings, now_ms: i64) -> i64 {
+    let age_ms = i64::try_from(
+        settings
+            .prune_after_days
+            .saturating_mul(retention::DAY_MS as u64),
+    )
+    .unwrap_or(i64::MAX);
+    now_ms.saturating_sub(age_ms.max(retention::WRITE_GRACE_MS))
+}
+
+/// Real subdirectories of `dir` (symlinks are skipped, never followed).
+fn subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if fs::symlink_metadata(&path)?.is_dir() {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Deletes (or, in dry-run, counts) each directory in `dirs` whose files are all older than the
+/// prune cutoff. `keep` marks directories that must stay whatever their age.
+fn prune_idle_dirs(
+    dirs: Vec<PathBuf>,
+    keep: impl Fn(&Path) -> bool,
+    settings: &AppliedSettings,
+    apply: bool,
+    now_ms: i64,
+) -> PruneResult {
+    let mut result = PruneResult::default();
+    let cutoff = prune_cutoff(settings, now_ms);
+    for dir in dirs {
+        result.scanned += 1;
+        if keep(&dir) {
+            result.kept += 1;
+            continue;
+        }
+        let (bytes, newest) = match tree_usage(&dir) {
+            Ok(usage) => usage,
+            Err(e) => {
+                result.errors.push(format!("{e:#}"));
+                continue;
+            }
+        };
+        if newest >= cutoff {
+            result.kept += 1;
+            continue;
+        }
+        result.would_delete += 1;
+        result.bytes += bytes;
+        if apply {
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => result.deleted += 1,
+                Err(e) => result
+                    .errors
+                    .push(format!("removing {}: {e}", dir.display())),
+            }
+        }
+    }
+    result
+}
+
+/// `subagents/<parent session>/` worker transcript directories with no file written for
+/// `prune_after_days`.
+fn sweep_subagents(
+    layout: &Layout,
+    settings: &AppliedSettings,
+    apply: bool,
+    now_ms: i64,
+) -> PruneResult {
+    let root = layout.state_dir.join(SUBAGENTS_DIR);
+    if !root.is_dir() {
+        return PruneResult::default();
+    }
+    match subdirectories(&root) {
+        Ok(dirs) => prune_idle_dirs(dirs, |_| false, settings, apply, now_ms),
+        Err(e) => PruneResult {
+            errors: vec![format!("{e:#}")],
+            ..Default::default()
+        },
+    }
+}
+
+/// The project directory a state directory belongs to, read from its first session header
+/// (live sessions first, then archived ones). `None` when no session records it.
+fn recorded_project_dir(state_dir: &Path) -> Option<PathBuf> {
+    let sessions = state_dir.join("sessions");
+    [sessions.clone(), sessions.join(ARCHIVE_DIR)]
+        .iter()
+        .filter_map(|dir| session_candidates(dir).ok())
+        .flat_map(|mut candidates| {
+            candidates.sort_by(|a, b| a.path.cmp(&b.path));
+            candidates
+        })
+        .find(|candidate| !candidate.cwd.is_empty())
+        .map(|candidate| PathBuf::from(candidate.cwd))
+}
+
+/// Other projects' state directories under `projects/` whose recorded project directory no
+/// longer exists and that have been idle for `prune_after_days`. The current project, and
+/// projects whose directory exists or cannot be determined, are always kept.
+fn sweep_orphaned_projects(
+    layout: &Layout,
+    settings: &AppliedSettings,
+    apply: bool,
+    now_ms: i64,
+) -> PruneResult {
+    let root = crate::config::paths::projects_dir(&layout.user_dir);
+    if !root.is_dir() {
+        return PruneResult::default();
+    }
+    let keep = |dir: &Path| {
+        dir == layout.state_dir
+            || recorded_project_dir(dir).is_none_or(|project| fs::symlink_metadata(project).is_ok())
+    };
+    match subdirectories(&root) {
+        Ok(dirs) => prune_idle_dirs(dirs, keep, settings, apply, now_ms),
+        Err(e) => PruneResult {
+            errors: vec![format!("{e:#}")],
+            ..Default::default()
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Text rendering
 // ---------------------------------------------------------------------------------------------
 
@@ -972,6 +1191,29 @@ pub fn render_text(report: &GcReport) -> String {
             format_bytes(w.wal_bytes),
             if report.apply { ", checkpointed" } else { "" },
         ));
+    }
+    for (label, prune) in [
+        ("subagents", &report.subagents),
+        ("orphaned projects", &report.orphaned_projects),
+    ] {
+        if let Some(p) = prune {
+            out.push_str(&format!(
+                "{label}: {} scanned, kept {}, {} {} ({})\n",
+                p.scanned,
+                p.kept,
+                if report.apply {
+                    "deleted"
+                } else {
+                    "would delete"
+                },
+                if report.apply {
+                    p.deleted
+                } else {
+                    p.would_delete
+                },
+                format_bytes(p.bytes),
+            ));
+        }
     }
     for error in report.errors() {
         out.push_str(&format!("error: {error}\n"));

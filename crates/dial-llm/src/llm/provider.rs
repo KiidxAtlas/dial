@@ -1909,7 +1909,27 @@ impl Backend {
         } else {
             None
         };
+        let request_started = Instant::now();
         for attempt in 1..=retry_policy.max_attempts {
+            let timeout_secs = if attempt > 1 {
+                match retry_policy.remaining(request_started.elapsed()) {
+                    Some(left) => {
+                        ensure!(
+                            !left.is_zero(),
+                            "provider retry elapsed-time budget exhausted"
+                        );
+                        let seconds = left.as_secs() + u64::from(left.subsec_nanos() != 0);
+                        if timeout_secs == 0 {
+                            seconds
+                        } else {
+                            timeout_secs.min(seconds)
+                        }
+                    }
+                    None => timeout_secs,
+                }
+            } else {
+                timeout_secs
+            };
             if interrupted() {
                 return Err(llm::Interrupted.into());
             }
@@ -2158,6 +2178,7 @@ impl Backend {
                     attempt,
                     retry_policy: &retry_policy,
                     attempt_started,
+                    request_started,
                     interrupt: &interrupt,
                 },
                 on_notice,

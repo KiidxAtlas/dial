@@ -13,6 +13,9 @@ mod settle;
 mod step;
 mod transition;
 
+#[cfg(test)]
+mod lifecycle_tests;
+
 /// A reply admitted for tool execution, with the request facts its round still needs.
 struct Round {
     step: u32,
@@ -139,7 +142,6 @@ pub(in crate::agent) struct TurnState<'a> {
     /// One catalog-search reminder before an answer that denies a capability.
     capability_search: crate::agent::verify::completion::CapabilitySearch,
     // Completion acceptance.
-    completion: crate::agent::verify::completion::CompletionGuard,
     completion_candidate: Option<String>,
     // Background enrichment and steering.
     enrichment: crate::agent::run::enrichment::Enrichment,
@@ -474,7 +476,6 @@ impl Agent<'_> {
             edit_churn: Default::default(),
             capability_gaps: Default::default(),
             capability_search: Default::default(),
-            completion: Default::default(),
             completion_candidate: None,
             enrichment: Default::default(),
             enrichment_epoch: 0,

@@ -6,6 +6,7 @@ pub mod compute;
 pub mod extensions;
 pub mod git;
 mod headers;
+pub mod history_search;
 pub mod image_settings;
 pub mod improve;
 pub mod inbox;
@@ -148,6 +149,14 @@ pub enum OverlayEvent {
         name: String,
         bytes: Vec<u8>,
     },
+    /// Explicit stop request; completion is reported separately by the owner.
+    JobStop {
+        name: String,
+    },
+    /// Forget terminal history without changing live work.
+    JobDismiss {
+        name: String,
+    },
 }
 
 impl fmt::Debug for OverlayEvent {
@@ -242,6 +251,8 @@ impl fmt::Debug for OverlayEvent {
                 .field("chords", chords)
                 .finish(),
             Self::Action(action) => f.debug_tuple("Action").field(action).finish(),
+            Self::JobStop { name } => f.debug_struct("JobStop").field("name", name).finish(),
+            Self::JobDismiss { name } => f.debug_struct("JobDismiss").field("name", name).finish(),
             // Typed bytes may be secrets (passwords at a prompt): never log them.
             Self::JobInput { name, bytes } => f
                 .debug_struct("JobInput")

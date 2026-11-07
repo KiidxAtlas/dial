@@ -7,6 +7,72 @@ fn default_table() -> Table {
 }
 
 #[test]
+fn dispatch_defaults_are_shared_by_deserialization_and_settings_with_an_opt_out() {
+    let config: Config = toml::from_str("").unwrap();
+    assert!(config.experimental.streaming_dispatch);
+    assert!(config.experimental.dependency_dispatch);
+    assert!(!config.experimental.batch_approvals);
+    for path in [
+        "experimental.streaming_dispatch",
+        "experimental.dependency_dispatch",
+    ] {
+        let setting = registry().iter().find(|s| s.path == path).unwrap();
+        assert_eq!(setting.default_value(), Some(Value::Boolean(true)));
+        let mut settings = default_table();
+        set(&mut settings, path, Value::Boolean(false));
+        let config: Config = Value::Table(settings).try_into().unwrap();
+        assert!(!if path.ends_with("streaming_dispatch") {
+            config.experimental.streaming_dispatch
+        } else {
+            config.experimental.dependency_dispatch
+        });
+    }
+}
+
+#[test]
+fn busy_send_is_explicit_typed_and_persisted_with_a_safe_default() {
+    use crate::llm::model_config::BusySend;
+
+    for source in ["", "[ui]\n", "[ui]\nhistory_limit = 20"] {
+        let config: Config = toml::from_str(source).unwrap();
+        assert_eq!(config.ui.busy_send, BusySend::Choose);
+    }
+    let path = "ui.busy_send";
+    let setting = registry().iter().find(|s| s.path == path).unwrap();
+    assert_eq!(
+        setting.default_value(),
+        Some(Value::String("choose".into()))
+    );
+    for (stored, preference) in [
+        ("choose", BusySend::Choose),
+        ("redirect", BusySend::Redirect),
+        ("after_turn", BusySend::AfterTurn),
+        ("independent", BusySend::Independent),
+        ("auto", BusySend::Auto),
+    ] {
+        let value = Value::String(stored.into());
+        check_value(path, &value).unwrap();
+        let mut settings = default_table();
+        set(&mut settings, path, value);
+        let config: Config = Value::Table(settings).try_into().unwrap();
+        assert_eq!(config.ui.busy_send, preference);
+        let saved = toml::to_string(&config).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.ui.busy_send, preference);
+    }
+    for value in [
+        Value::Boolean(true),
+        Value::String("learned".into()),
+        Value::String("after-turn".into()),
+    ] {
+        assert!(check_value(path, &value).is_err());
+        let mut settings = default_table();
+        set(&mut settings, path, value);
+        assert!(Value::Table(settings).try_into::<Config>().is_err());
+    }
+}
+
+#[test]
 fn video_analysis_is_opt_in_and_typed() {
     for source in [
         "",
@@ -380,7 +446,6 @@ fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
         "experimental.profile_matching",
         "experimental.tool_speculation",
         "experimental.turn_optimizer",
-        "experimental.streaming_dispatch",
         "experimental.check_predictions",
     ];
     let setting = |path: &str| {
@@ -407,18 +472,30 @@ fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
     assert_eq!(witness.tab, "Experimental");
     assert_eq!(witness.kind, Kind::Bool);
     assert_eq!(witness.default_value(), Some(Value::Boolean(false)));
+    let streaming = setting("experimental.streaming_dispatch");
+    assert_eq!(streaming.tab, "Experimental");
+    assert_eq!(streaming.default_value(), Some(Value::Boolean(true)));
+    // Dependency dispatch graduated to on-by-default after reliability trials; `false` opts out.
+    let dependency = setting("experimental.dependency_dispatch");
+    assert_eq!(dependency.tab, "Experimental");
+    assert_eq!(dependency.kind, Kind::Bool);
+    assert_eq!(dependency.default_value(), Some(Value::Boolean(true)));
     let repro = setting("experimental.repro_first");
     assert_eq!(repro.tab, "Experimental");
     assert_eq!(repro.default_value(), Some(Value::String("advise".into())));
     let unset: Config = toml::from_str("").unwrap();
     assert!(!unset.experimental.fault_witness);
+    assert!(unset.experimental.dependency_dispatch);
     assert_eq!(
         unset.experimental.repro_first,
         crate::config::types::ReproFirst::Advise
     );
-    let opted_out: Config =
-        toml::from_str("[experimental]\nfault_witness = false\nrepro_first = \"off\"").unwrap();
+    let opted_out: Config = toml::from_str(
+        "[experimental]\nfault_witness = false\nrepro_first = \"off\"\ndependency_dispatch = false",
+    )
+    .unwrap();
     assert!(!opted_out.experimental.fault_witness);
+    assert!(!opted_out.experimental.dependency_dispatch);
     assert_eq!(
         opted_out.experimental.repro_first,
         crate::config::types::ReproFirst::Off

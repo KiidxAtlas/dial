@@ -125,6 +125,7 @@ fn reset_restores_everything_but_the_directory() {
 fn turn_outcomes_map_to_activity() {
     use crate::runtime::Phase;
     assert_eq!(Activity::after_turn(Phase::Completed), Activity::Done);
+    assert_eq!(Activity::after_turn(Phase::Answered), Activity::Idle);
     assert_eq!(Activity::after_turn(Phase::NeedsInput), Activity::Waiting);
     assert_eq!(Activity::after_turn(Phase::Blocked), Activity::Failed);
     assert_eq!(Activity::after_turn(Phase::Interrupted), Activity::Idle);

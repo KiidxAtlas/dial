@@ -1205,7 +1205,7 @@ pub(in crate::tools) fn shell_command(
 }
 
 /// Eval's mandatory process fence is independent of the filesystem sandbox opt-out.
-#[cfg(target_os = "linux")]
+#[cfg(not(windows))]
 pub(super) fn shell_command_fenced(
     ws: &Workspace,
     script: &str,
@@ -1375,7 +1375,7 @@ fn shell_command_with_state(
     fork_fence: bool,
 ) -> Result<std::process::Command, String> {
     let runner = runner_for(ws)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     let _ = fork_fence;
     // Background jobs and tool helpers need a child process; they run the same shell in a child
     // host (only reachable with the sandbox off, which `runner_for` verified).
@@ -1468,7 +1468,17 @@ fn shell_command_with_state(
         let (program, args) = match runner {
             Runner::Bash(bash) => (
                 bash.to_str().ok_or("bash path is not UTF-8")?.to_owned(),
-                vec!["-c".to_owned(), missing_program::decorate(script)],
+                // Missing-program hints are for model commands. A fenced launch script is
+                // controller-owned, and the hint prelude forks (`$(…)` on Bash 3), which the
+                // macOS in-profile fork fence refuses before the interpreter is exec'd.
+                vec![
+                    "-c".to_owned(),
+                    if fork_fence {
+                        script.to_owned()
+                    } else {
+                        missing_program::decorate(script)
+                    },
+                ],
             ),
             Runner::Embedded | Runner::InProcess => embedded_invocation(&scratch, script, state)?,
             Runner::PowerShell => return Err("PowerShell is only available on Windows".into()),

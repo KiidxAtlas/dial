@@ -10,8 +10,8 @@ fn no_execution_receipts_distinguish_empty_scope_from_unobserved_checks() {
             Config::default()
         };
         let mut agent = hermetic_agent(&config, root.path());
-        for args in [json!({}), json!({"failed_only":true})] {
-            let output = agent.check_tool(&args, &mut NullUi);
+        for args in [json!({}), json!({"targets":["failed"]})] {
+            let output = agent.verify_tool(&args, &mut NullUi);
             assert!(!output.is_error, "{}", output.text);
             let data = output.data.expect("structured no-execution receipt");
             assert_eq!(data["results"], json!([]));
@@ -44,13 +44,13 @@ fn passing_subset_reports_other_checks_and_preserves_stale_evidence() {
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
     std::fs::write(root.path().join("fixed"), "ready").unwrap();
-    let first = agent.check_tool(&json!({}), &mut NullUi);
+    let first = agent.verify_tool(&json!({}), &mut NullUi);
     assert!(!first.is_error, "{}", first.text);
     assert_eq!(first.data.unwrap()["scope"]["pending_count"], 0);
     assert_eq!(agent.verifications.len(), 2);
 
     agent.step_checks.mutations += 1;
-    let subset = agent.check_tool(&json!({"names":["unit"]}), &mut NullUi);
+    let subset = agent.verify_tool(&json!({"targets":["unit"]}), &mut NullUi);
     assert!(
         !subset.is_error,
         "the selected check did pass: {}",
@@ -84,10 +84,10 @@ fn scope_lists_failures_without_hiding_or_executing_them_in_a_passing_subset() {
     let config = config();
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    let failed = agent.check_tool(&json!({}), &mut NullUi);
+    let failed = agent.verify_tool(&json!({}), &mut NullUi);
     assert!(failed.is_error);
     assert_eq!(failed.data.unwrap()["scope"]["pending_count"], 2);
-    let selected = agent.check_tool(&json!({"names":["unit"]}), &mut NullUi);
+    let selected = agent.verify_tool(&json!({"targets":["unit"]}), &mut NullUi);
     assert!(!selected.is_error, "{}", selected.text);
     let data = selected.data.unwrap();
     assert_eq!(
@@ -120,7 +120,7 @@ fn scope_discloses_omission_in_bounded_pending_list_without_running_anything() {
             });
     }
     let mut agent = hermetic_agent(&config, root.path());
-    let output = agent.check_tool(&json!({"failed_only":true}), &mut NullUi);
+    let output = agent.verify_tool(&json!({"targets":["failed"]}), &mut NullUi);
     let data = output.data.unwrap();
     assert_eq!(data["scope"]["applicable_checks"], 20);
     assert_eq!(data["scope"]["pending_count"], 20);

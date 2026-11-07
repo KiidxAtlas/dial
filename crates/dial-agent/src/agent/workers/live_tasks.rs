@@ -1040,6 +1040,7 @@ impl LiveTasks {
             layout,
             Some(session_id.as_str()),
             &config,
+            workspace.artifacts(),
         )?;
         if self
             .jobs
@@ -1350,6 +1351,7 @@ impl LiveTasks {
                         layout.as_ref(),
                         Some(session_id.as_str()),
                         &config,
+                        workspace.artifacts(),
                     ) {
                         return Outcome::failed(0, why);
                     }
@@ -1410,6 +1412,7 @@ impl LiveTasks {
                 let mut value =
                     json!({"id":done_id,"status":status,"steps":outcome.steps,"result":text});
                 value["inspections"] = json!(outcome.inspections);
+                value["scheduling"] = json!(outcome.scheduling);
                 value["acceptance"] = json!(outcome.acceptance);
                 *control
                     .acceptance

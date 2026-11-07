@@ -265,9 +265,10 @@ impl Agent<'_> {
             let bounds = calls
                 .iter()
                 .map(|call| {
-                    crate::agent::run::dependency_dispatch::footprint(
+                    crate::agent::run::dependency_dispatch::footprint_for(
                         &self.workspace,
                         self.edit_mode(),
+                        &self.ext,
                         call,
                     )
                 })
@@ -355,7 +356,8 @@ impl Agent<'_> {
             let active = Arc::new(AtomicBool::new(false));
             active_calls.push(active.clone());
             let started = active;
-            let serial = !matches!(name.as_str(), "edit" | "write")
+            let serial = resource_bounds.is_none()
+                && !matches!(name.as_str(), "edit" | "write")
                 && !extension.as_ref().is_some_and(|tool| {
                     tool.supports_tool_dispatch() || tool.manages_workspace_serialization()
                 })
@@ -655,7 +657,7 @@ impl Agent<'_> {
                                     );
                                 }
                                 if let Some(bounds) = &resource_bounds
-                                    && !bounds[position].permits(&paths, unbounded)
+                                    && !bounds[position].permits(&paths, unbounded, tool == "read")
                                 {
                                     return Err("native effect exceeded its admitted dependency footprint; retry serially".into());
                                 }

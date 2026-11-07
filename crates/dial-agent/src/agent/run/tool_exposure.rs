@@ -10,6 +10,27 @@ mod task_routing;
 pub(in crate::agent) use task_routing::ToolRouting;
 
 impl<'a> Agent<'a> {
+    /// Initial built-in schemas stay below this bound on every ordinary model route.
+    const CORE_SCHEMA_BYTES: usize = 12 * 1024;
+    const CORE_TOOLS: &[&str] = &[
+        "tool_search",
+        "tool_load",
+        "finish",
+        "read",
+        "edit",
+        "write",
+        "bash",
+        "grep",
+        "glob",
+        "todo",
+        "verify",
+    ];
+
+    pub(in crate::agent) fn stable_tool_offer(&self) -> bool {
+        !self.hermetic
+            && self.config.assistance.compact_tools
+            && self.config.harness.tools == config::tools::default_tools()
+    }
     /// Local servers serve a context of their own choosing, often far below Dial's default: LM Studio
     /// loads on demand, llama.cpp splits `-c` across slots, Ollama defaults small and truncates silently.
     /// Their native APIs report the served size (see `catalog::loaded_context`); hosted and unknown
@@ -58,7 +79,7 @@ impl<'a> Agent<'a> {
         "glob",
         "todo",
         "finish",
-        "check",
+        "verify",
         "tool_search",
         "tool_load",
     ];
@@ -70,7 +91,7 @@ impl<'a> Agent<'a> {
     /// loadable: delegation (`message` follows `task`), the compaction-surviving working record,
     /// progress bookkeeping, `find` (which `grep`/`glob` cover), cross-session `memory`, background
     /// job control (`bash` backgrounds on its own and names `bg` as loadable), the optional
-    /// structured `finish` (a plain answer ends the turn), on-demand `check` (the completion gate
+    /// structured `finish` (a plain answer ends the turn), on-demand `verify` (the completion gate
     /// still runs its checks) and `git` (`bash` covers it). In native Harbor print runs (94
     /// requests) none of these was called. A run that needs one pays a single `tool_load` round.
     const UNATTENDED_DEFERRED: &[&str] = &[
@@ -81,7 +102,7 @@ impl<'a> Agent<'a> {
         "memory",
         "bg",
         "finish",
-        "check",
+        "verify",
         "git",
     ];
 
@@ -125,10 +146,8 @@ impl<'a> Agent<'a> {
         }
     }
 
-    /// Discovery mode: offer a bounded core and let the model load specialists with `tool_search`/
-    /// `tool_load`. Meant for small local models whose schema budget is tight; off by default
-    /// because every discovery costs a full extra request and the tool list change invalidates the
-    /// provider's prompt cache.
+    /// Compact schema descriptions and discovery; the default stable offer uses explicit loads
+    /// on local and hosted routes. Legacy noncompact profiles retain bounded automatic discovery.
     pub(in crate::agent) fn tool_discovery(&self) -> bool {
         !self.hermetic
             && self.config.efficiency.enabled
@@ -162,6 +181,13 @@ impl<'a> Agent<'a> {
     /// oldest entries are evicted; otherwise they keep the legacy `enabled_tools` behaviour. Pinned tools are not
     /// recorded as discovered.
     pub(in crate::agent) fn activate_tools(&mut self, names: &[String]) -> Result<()> {
+        if self.stable_tool_offer() {
+            anyhow::ensure!(
+                names.is_empty(),
+                "Specialist schemas are loaded only by tool_load; tool_search describes them without changing the offer"
+            );
+            return Ok(());
+        }
         if let Some(name) = names.iter().find(|name| !self.tool_eligible(name)) {
             anyhow::bail!("tool {name} is unavailable under the current mode or tool allowlist");
         }
@@ -225,10 +251,13 @@ impl<'a> Agent<'a> {
     pub(in crate::agent) fn discoverable_tools(&self, offered: &[String]) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for name in self.catalog() {
+            // Known blockers (no image route, unsupported host...) stay out of the prompt list;
+            // `tool_search` still finds them and reports the readiness reason.
             if offered.contains(&name)
                 || name == "tool_search"
                 || name == "tool_load"
                 || !self.tool_eligible(&name)
+                || !self.tool_readiness(&name).automatic_candidate()
             {
                 continue;
             }
@@ -274,6 +303,11 @@ impl<'a> Agent<'a> {
     /// `bg` is in the catalog and eligible but not in the current offer, and `tool_load` is, so
     /// text that names `bg` must say it is a Dial tool to load first.
     pub(in crate::agent) fn bg_loadable(&self) -> bool {
+        if self.stable_tool_offer() {
+            return self.catalog().iter().any(|name| name == "bg")
+                && self.tool_eligible("bg")
+                && !self.enabled_tools.contains("bg");
+        }
         let offered = self.offered();
         !self.hermetic
             && self.catalog().iter().any(|name| name == "bg")
@@ -317,6 +351,24 @@ impl<'a> Agent<'a> {
         prepare_eval: impl Fn() -> bool,
     ) -> Vec<String> {
         let catalog = self.catalog();
+        if self.stable_tool_offer() && !selection_only {
+            let mut names = self.stable_core_tools();
+            names.extend(
+                self.enabled_tools
+                    .iter()
+                    .filter(|name| catalog.contains(name) && self.tool_eligible(name))
+                    .cloned(),
+            );
+            if self.plan_mode && self.tool_eligible("exit_plan") {
+                names.push("exit_plan".into());
+            }
+            if self.modes.goal.tool_offered() {
+                names.push("goal".into());
+            }
+            names.sort();
+            names.dedup();
+            return names;
+        }
         let discovery = self.tool_discovery();
         let request_tools: Vec<String> = if selection_only || self.lean_tools {
             Vec::new()
@@ -396,8 +448,9 @@ impl<'a> Agent<'a> {
         }
         // The agent and the completion gate agree on "passing" only if the gate's checks are callable;
         // an operator-pinned list still decides for itself.
-        if !self.hermetic && !pinned && catalog.iter().any(|name| name == "check") {
-            names.push("check".into());
+        let verify = crate::agent::verify::verify_tool::NAME;
+        if !self.hermetic && !pinned && catalog.iter().any(|name| name == verify) {
+            names.push(verify.into());
         }
         if !self.hermetic && !pinned && catalog.iter().any(|name| name == "peers") {
             names.push("peers".into());
@@ -456,6 +509,7 @@ impl<'a> Agent<'a> {
         names.sort();
         names.dedup();
         if discovery
+            && !self.stable_tool_offer()
             && self
                 .config
                 .active_model_profile()
@@ -554,7 +608,37 @@ impl<'a> Agent<'a> {
             names.sort();
             names.dedup();
         }
+
         names
+    }
+
+    pub(in crate::agent) fn stable_core_tools(&self) -> Vec<String> {
+        let catalog = self.catalog();
+        let mut core = Vec::new();
+        let mut bytes = 2;
+        let limit = self.initial_tool_limit();
+        for &name in Self::CORE_TOOLS {
+            if !catalog.iter().any(|entry| entry == name) || !self.tool_eligible(name) {
+                continue;
+            }
+            let size = self
+                .schemas(&[name.to_owned()])
+                .ok()
+                .and_then(|schemas| schemas.into_iter().next())
+                .map_or(Self::CORE_SCHEMA_BYTES, |schema| {
+                    schema.to_string().len() + 1
+                });
+            let control = matches!(name, "tool_search" | "tool_load" | "finish");
+            if control
+                || ((limit == 0 || core.len() < limit) && bytes + size <= Self::CORE_SCHEMA_BYTES)
+            {
+                bytes += size;
+                core.push(name.to_owned());
+            }
+        }
+        core.sort();
+        core.dedup();
+        core
     }
 
     /// The selected memory backend's `memory` tool when it is in the catalog: the runtime's, or
@@ -616,7 +700,7 @@ impl<'a> Agent<'a> {
                 "tts" => crate::voice::tool::schema(),
                 "todo" => crate::agent::workflow::todo::schema(),
                 "finish" => crate::agent::verify::completion::schema(),
-                "check" => crate::agent::verify::check_tool::schema(self.config.experimental.check_predictions),
+                crate::agent::verify::verify_tool::NAME => crate::agent::verify::verify_tool::schema(self.config.experimental.check_predictions),
                 "revert_edit" => crate::agent::verify::revert_edit::schema(),
                 "goal" => modes::goal::schema(),
                 "ask" => crate::agent::workflow::questions::schema(),
@@ -630,8 +714,8 @@ impl<'a> Agent<'a> {
                 "skill_manage" => skills::manage_tool::schema(),
                 "session_search" => session::session_search_tool::schema(),
                 "working_state" => crate::agent::workflow::evidence::working_schema(),
-                "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Rank eligible tools by capability or exact name and enable up to three strongest matches for the next model round. Returns names, descriptions and activation status. Never executes tools, grants permission or enables same-batch calls; do not rediscover tools already offered. If nothing matches, the result is a bounded listing of eligible tools (page 0) with empty search_matches and a fallback_reason; nothing is enabled. Continue a listing with the returned next_query (\"*:N\", zero-based) while present. Listing pages show descriptions and status only and enable nothing.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
-                "tool_load" => json!({"type":"function","function":{"name":"tool_load","description":"Explicitly enable or unload exact eligible tool names. Search already enables its strongest matches; use this for exact control. Changes take effect next round, never in this batch, and grant no permissions.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":32,"items":{"type":"string"}},"unload":{"type":"array","maxItems":32,"items":{"type":"string"}}},"additionalProperties":false}}}),
+                "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Search eligible tools by capability or exact name. Returns descriptions, readiness and callable status; use tool_load to load a specialist for the next request. A miss returns catalog page 0; follow next_query (\"*:N\", zero-based) while present. Search and listing never execute tools or grant permission. Legacy noncompact mode may activate exact matches.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
+                "tool_load" => json!({"type":"function","function":{"name":"tool_load","description":"Explicitly enable or unload exact eligible tool names. Changes take effect next round, never in this batch, and grant no permissions.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":32,"items":{"type":"string"}},"unload":{"type":"array","maxItems":32,"items":{"type":"string"}}},"additionalProperties":false}}}),
                 "exit_plan" => json!({"type":"function","function":{"name":"exit_plan","description":"Ask the user to approve this plan and leave plan mode.","parameters":{"type":"object","properties":{"plan":{"type":"string","minLength":1}},"required":["plan"],"additionalProperties":false}}}),
                 other => {
                     let configured = self.config.tools.get(other);
@@ -985,6 +1069,8 @@ pub(crate) mod default_offer_tests;
 mod discovery_tests;
 #[cfg(test)]
 mod gap_tests;
+#[cfg(test)]
+mod stable_offer_tests;
 
 /// Tools whose parameter explanations may be their only documentation: MCP, configured and
 /// non-native extension tools. Their schemas are offered unchanged.

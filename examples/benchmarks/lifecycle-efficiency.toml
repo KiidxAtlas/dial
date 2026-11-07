@@ -1,0 +1,24 @@
+version = 1
+name = "lifecycle-efficiency"
+
+# Real configured models use the normal runner and its observed usage/efficiency counters.
+[[cases]]
+id = "self-contained-answer"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "What is 2 + 2? Answer with just the number; do not use tools."
+categories = ["lifecycle", "informational"]
+checks = [{kind="response_equals",content="4"}, {kind="metric",metric="tool_calls",max=0}, {kind="metric",metric="completion_nudges",max=0}, {kind="metric",metric="delivered_answer_bytes",max=32}]
+
+[[cases]]
+id = "investigate-before-asking"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "Investigate the arithmetic failure in this project's calculator and explain its cause."
+categories = ["lifecycle", "read_only"]
+checks = [{kind="tool_invoked",tool="read"}, {kind="metric",metric="questions_before_investigation",max=0}, {kind="metric",metric="completion_nudges",max=0}, {kind="metric",metric="full_builds",max=0}, {kind="metric",metric="delivered_answer_bytes",max=2400}]
+
+[[cases]]
+id = "finish-the-fix"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "Fix calc.add so it adds both positive and negative numbers, preserve its API, and check the result. Complete the change in this turn."
+categories = ["lifecycle", "implementation"]
+checks = [{kind="command",command="python3 -c 'from calc import add; assert add(2,3)==5; assert add(-2,3)==1'"}, {kind="metric",metric="incomplete_stops",max=0}, {kind="metric",metric="questions_before_investigation",max=0}, {kind="metric",metric="full_builds",max=1}]

@@ -23,19 +23,21 @@ is crate-internal, not a new public prompt-registry API.
 
 ## Shared policy and bounded adjustments
 
-There are no built-in model-family prompt forks. `system.rs` owns the shared `HEADER`
-(engineering, scope, user work and destructive-operation approval), `TRUST_RULE` (sandbox,
-untrusted data and secrets), and `FOCUSED_WORK` (evidence-driven execution). Its private
-`shared_rule!` fragments supply edit-tool preference, honest reporting and role boundaries.
-Keep shared rules there; retain deliberately shorter wording in the full/lean workflow,
-delivery and delegation sections rather than silently expanding the lean budget. Whole-file
-write witness mechanics stay in the native validator and tool description, not system policy.
+There are no built-in model-family prompt forks. `system.rs` owns shared plain-language full/lean
+policy in priority order: active goal, hard boundaries, investigation before acting or asking,
+coherent edits, scoped checks and a short honest report. The base-policy byte test guards a 4 KiB
+ceiling; capability-specific sections remain conditional. Runtime owners enforce completion and
+permissions independently of wording.
 
-The full and compact prose is compressed at these owners, not by stripping operator/project
-content or changing tool contracts. Compact delivery omits the optional diagram style hint.
-The existing byte-budget test renders full, compact, lean and one-call message bands and logs
-UTF-8 byte counts; [agent-loop.md](../../../../../docs/agent-loop.md) records the comparison and
-its measurement limits. A smaller policy is not evidence of better live-model outcomes.
+Deterministic `llm::fake` lifecycle tests exercise one state gate for plain replies and `finish`,
+zero-observation investigation recovery, explicit-only specialist loads, unchanged request prefix
+bytes, check reuse and no default self-review. The live benchmark slice measures provider usage
+and behavior counters separately; passing fake tests does not establish improved model quality.
+
+Required deliverables belong in `working_state`, execution steps in `todo` (`kind=step`), and
+optional follow-ups in `kind=follow_up`. Open execution obligations cannot be bypassed with an
+answer or automatically closed by final prose. Configured/user gates and sandbox/approval
+boundaries remain authoritative. Operator replacement prompts and appended guidance are retained.
 
 The existing adjustments are named below by their selection inputs. They are not family
 classifications, and each can be removed at its selection/assembly boundary without copying
@@ -45,8 +47,8 @@ the common policy into model code.
 | --- | --- | --- |
 | Lean guidance (`lean`) | `base/lifecycle.rs::rebuild_system`: `lean_tools` (context-overflow fallback), `lean_local()` or `local_escalated()`; local tier/escalation decisions stay in `model/local_profile.rs` | `window/prompt.rs::full_guidance`, `system.rs::LEAN_*` |
 | One-call operation (`one_call`) | `model/local_profile.rs::local_one_call`: small local tier with reliability enabled and no passing saved batch fixture | `window/prompt.rs::full_guidance`: `LEAN_ONE_CALL` replaces `LEAN_BATCHING`; the compact workflow has no todo-pairing rule, so it serves both. The active request contract overrides batching/todo pairing on every tier, including later reliability recovery |
-| Worked loop (`worked_example`) | `base/lifecycle.rs::rebuild_system`: `local_one_call()` | `window/prompt.rs::worked_example` / `example_edit`: active edit grammar; requires `grep`, `read`, `edit` and either `check` (preferred) or `bash`; built-in guidance only |
-| Compact guidance (`concise_guidance`) | `base/lifecycle.rs::rebuild_system`: efficiency enabled, non-hermetic run | `window/prompt.rs::full_guidance` / `scoped_guidance`: the same compact sections as `lean` (tool policy, locate → change → prove → test → report workflow, delivery, delegation) with tool-gated skill/project-map/LSP rules and `side_request`/`task` clauses; tool mechanics stay in tool descriptions and harness refusals. `environment_prompt` lists built-in loadable tools by name only (`tool_search` returns descriptions) and bounds deferred MCP previews without changing eligibility. A byte-budget test in `window/prompt/tests.rs` guards the size |
+| Worked loop (`worked_example`) | `base/lifecycle.rs::rebuild_system`: `local_one_call()` | `window/prompt.rs::worked_example` / `example_edit`: active edit grammar; requires `grep`, `read`, `edit` and either `verify` (preferred, shown as an edit `verify` list) or `bash`; built-in guidance only |
+| Compact guidance (`concise_guidance`) | `base/lifecycle.rs::rebuild_system`: efficiency enabled, non-hermetic run | `window/prompt.rs::full_guidance` / `scoped_guidance`: the same compact sections as `lean` (tool policy, frame → gather → decide → act → verify → report execution order, change/verify workflow, delivery, delegation) with tool-gated skill/project-map/LSP rules and `side_request`/`task` clauses; tool mechanics stay in tool descriptions and harness refusals. The default stable system band uses generic schema authority and does not enumerate changing offers; `tool_search` returns descriptions without loading. A byte-budget test in `window/prompt/tests.rs` guards the size |
 | Capability scoping | Configured tool offer, not transient tool loading | `window/prompt.rs::full_guidance` / `scoped_guidance`: tool-specific rules, visual/preview sections and delegation sections |
 | Delegation preference (`prefer_subagents`) | `base/lifecycle.rs::rebuild_system`: `task.prefer_subagents` | `window/prompt.rs::scoped_guidance`: shared selective/specialist policy, only when `task` is offered |
 

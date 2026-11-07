@@ -167,7 +167,7 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
         let text = prompt_text(agent);
         let rule = serde_json::to_string(crate::agent::prompts::system::LEAN_ONE_CALL).unwrap();
         assert!(text.contains(rule.trim_matches('"')));
-        assert!(!text.contains("Batch independent calls"));
+        assert!(!text.contains(crate::agent::prompts::system::LEAN_BATCHING.trim()));
         assert!(text.contains("# Example"));
         assert!(
             text.contains(r#"\"old_string\":\"    total / size\""#),
@@ -182,7 +182,7 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
         agent.rebuild_system();
         assert!(!agent.local_one_call());
         let text = prompt_text(agent);
-        assert!(text.contains("Batch independent calls"));
+        assert!(text.contains(crate::agent::prompts::system::LEAN_BATCHING.trim()));
         assert!(
             !text.contains("# Example"),
             "passing batch evidence omits the single-call tutorial"

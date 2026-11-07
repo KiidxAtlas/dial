@@ -8,6 +8,8 @@ type Calls = Arc<Mutex<Vec<String>>>;
 fn hit(id: &str) -> SearchHit {
     SearchHit {
         session_id: id.to_owned(),
+        entry_id: "entry-1".into(),
+        preview: "Full matched words".into(),
         role: "user".to_owned(),
         snippet: "matched words".to_owned(),
         when: String::new(),
@@ -213,4 +215,39 @@ fn search_text_keeps_the_transcript_wording_and_surfaces_errors() {
     for (result, expected) in cases {
         assert_eq!(search_text("parser", &result), expected);
     }
+}
+
+#[test]
+fn ready_results_are_discarded_by_new_requests_and_session_changes() {
+    let (_home, _project, layout, _) = crate::app::tests::config();
+    let mut search = Search::with_runner(recording(Default::default()));
+    search.ready = Some(("old".into(), vec![hit("old")]));
+    search.request(&layout, "session-a", "new");
+    assert!(search.ready.is_none());
+    search.ready = Some(("new".into(), vec![hit("new")]));
+    search.invalidate();
+    assert!(search.ready.is_none());
+    search.settle(&layout, "session-a");
+}
+
+#[test]
+fn opening_multiple_results_keeps_first_origin_until_return() {
+    let mut search = Search::default();
+    search.remember_origin("original");
+    search.remember_origin("another-hit");
+    assert_eq!(search.origin(), Some("original"));
+    search.invalidate();
+    assert_eq!(search.origin(), Some("original"));
+    search.clear_origin();
+    assert_eq!(search.origin(), None);
+}
+
+#[test]
+fn returning_to_origin_is_scoped_to_the_project() {
+    let (_home, _project, layout, _) = crate::app::tests::config();
+    let mut search = Search::default();
+    search.sync(&layout, "original");
+    search.remember_origin("original");
+    search.sync(&other_project(&layout), "elsewhere");
+    assert_eq!(search.origin(), None);
 }

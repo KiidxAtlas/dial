@@ -237,6 +237,7 @@ fn reset_date(value: &str) -> Option<SystemTime> {
 pub(crate) struct Policy {
     pub(crate) max_attempts: usize,
     pub(crate) max_delay: Duration,
+    pub(crate) max_elapsed: Option<Duration>,
     pub(crate) wait_for_quota_reset: bool,
     pub(crate) rotate_accounts: bool,
     /// Initial automatic retry interval, capped at two seconds and bounded by `max_delay`.
@@ -251,6 +252,8 @@ impl Policy {
         Self {
             max_attempts: config.max_attempts.clamp(1, 50) as usize,
             max_delay: Duration::from_secs(config.max_delay_secs.clamp(1, 3600)),
+            max_elapsed: (config.max_elapsed_secs != 0)
+                .then(|| Duration::from_secs(config.max_elapsed_secs)),
             wait_for_quota_reset: config.wait_for_quota_reset,
             rotate_accounts: config.rotate_accounts,
             backoff,
@@ -264,6 +267,10 @@ impl Policy {
     ) -> Self {
         self.failover = failover;
         self
+    }
+
+    pub(crate) fn remaining(&self, elapsed: Duration) -> Option<Duration> {
+        self.max_elapsed.map(|limit| limit.saturating_sub(elapsed))
     }
 
     /// Whether a ready fallback takes over failures of `class` after a brief retry.

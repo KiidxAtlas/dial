@@ -14,7 +14,13 @@ fn doctor_diagnostics_only_offer_review_and_never_create_state() {
     let spec = doctor_choices(&env, &Config::default());
     assert_eq!(spec.command, "setup");
     assert_eq!(spec.verb, "choose");
-    assert_eq!(spec.items.len(), deps::RECIPES.len());
+    assert_eq!(spec.items.len(), deps::RECIPES.len() + 4);
+    assert_eq!(spec.items[0].value, "models");
+    assert_eq!(spec.items[1].value, "providers");
+    assert_eq!(spec.items[2].value, "verify-model");
+    assert!(spec.items[2].detail.starts_with("Unknown"));
+    assert_eq!(spec.items[3].value, "verify-coding");
+    assert!(spec.items[3].detail.starts_with("Unknown"));
     assert!(
         spec.items
             .iter()
@@ -88,7 +94,15 @@ fn local_model_checklist_uses_existing_review_and_navigation_without_writes() {
             .iter()
             .map(|item| item.value.as_str())
             .collect::<Vec<_>>(),
-        ["ollama", "llama-cpp", "mlx-runtime", "models", "providers"]
+        [
+            "ollama",
+            "llama-cpp",
+            "mlx-runtime",
+            "models",
+            "providers",
+            "verify-model",
+            "verify-coding"
+        ]
     );
     assert!(
         spec.items[..3]

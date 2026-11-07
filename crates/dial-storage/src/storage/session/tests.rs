@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+mod history_search;
 mod io_metrics;
 mod recovery_search;
 mod relocation_artifacts;
@@ -60,7 +61,7 @@ fn legacy_search_index_upgrades_without_trusting_old_offsets() {
     session.append(user("platypus")).unwrap();
     assert_eq!(Session::search(&e.layout, "platypus", 10).unwrap().len(), 1);
     let conn = Connection::open(&db).unwrap();
-    assert_eq!(super::super::sqlite::check_version(&conn, 2).unwrap(), 2);
+    assert_eq!(super::super::sqlite::check_version(&conn, 3).unwrap(), 3);
 }
 #[test]
 fn streamed_observations_survive_reopen_before_any_final_reply() {
@@ -2228,4 +2229,42 @@ fn undo_checkpoint_links_follow_the_selected_branch_and_refuse_legacy_or_forked_
     session.rewind(1).unwrap();
     session.append(user("legacy")).unwrap();
     assert!(session.rewind_checkpoint_turns(1).is_err());
+}
+
+#[test]
+fn running_runtime_snapshots_are_not_repeated_and_stream_recovery_keeps_latest_text() {
+    let e = env();
+    let mut session = new_session(&e);
+    session.append(user("work")).unwrap();
+    let body = session.runtime().start("assistant", "response", None);
+    body.append("first");
+    session.flush_runtime().unwrap();
+    let count = session
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.kind, Kind::Runtime(_)))
+        .count();
+    for _ in 0..5 {
+        body.append(" more");
+        session.flush_runtime().unwrap();
+    }
+    assert_eq!(
+        session
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, Kind::Runtime(_)))
+            .count(),
+        count
+    );
+    let path = session.path().unwrap().to_owned();
+    let expected = body.snapshot().result.text;
+    drop(body);
+    drop(session);
+    let recovered = Session::open(&path).unwrap();
+    let nodes = recovered.runtime().snapshots();
+    assert_eq!(nodes.last().unwrap().result.text, expected);
+    assert_eq!(
+        nodes.last().unwrap().result.phase,
+        crate::runtime::Phase::Interrupted
+    );
 }

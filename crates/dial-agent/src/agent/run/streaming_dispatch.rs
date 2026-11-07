@@ -53,6 +53,9 @@ pub(in crate::agent) struct StreamingDispatch {
     closed: BTreeSet<u64>,
     started: HashMap<String, Receiver<Outcome>>,
     clean: bool,
+    sealed: bool,
+    started_count: u64,
+    reused_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn key(call: &ToolCall) -> String {
@@ -61,6 +64,19 @@ fn key(call: &ToolCall) -> String {
         call.name,
         crate::agent::safety::guard::normalized_arguments(call)
     )
+}
+
+/// Transferred to the existing worker pump. Never wait on it before launching sibling calls.
+pub(in crate::agent) struct EarlyRead {
+    receiver: Receiver<Outcome>,
+    reused: Arc<std::sync::atomic::AtomicU64>,
+}
+impl EarlyRead {
+    pub(in crate::agent) fn receive(self) -> Option<Outcome> {
+        let outcome = self.receiver.recv().ok()?;
+        self.reused.fetch_add(1, Ordering::SeqCst);
+        Some(outcome)
+    }
 }
 
 impl StreamingDispatch {
@@ -85,6 +101,9 @@ impl StreamingDispatch {
             closed: BTreeSet::new(),
             started: HashMap::new(),
             clean: true,
+            sealed: false,
+            started_count: 0,
+            reused_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -113,8 +132,8 @@ impl StreamingDispatch {
             && call_form_error(call, &admission.schemas, &admission.names).is_none()
     }
 
-    fn complete(&mut self, partial: Partial) {
-        if self.started.len() >= self.limit || partial.name.is_empty() {
+    fn complete_if(&mut self, partial: Partial, authorize: &mut dyn FnMut(&ToolCall) -> bool) {
+        if self.sealed || self.started.len() >= self.limit || partial.name.is_empty() {
             return;
         }
         let arguments = if partial.arguments.trim().is_empty() {
@@ -131,8 +150,16 @@ impl StreamingDispatch {
             arguments,
             malformed_arguments: false,
         };
+        if !crate::agent::safety::approval::parallel_read(
+            &self.runner.ext,
+            &call.name,
+            &call.arguments,
+        ) {
+            self.sealed = true;
+            return;
+        }
         let key = key(&call);
-        if self.started.contains_key(&key) || !self.admits(&call) {
+        if self.started.contains_key(&key) || !self.admits(&call) || !authorize(&call) {
             return;
         }
         let (tx, rx) = mpsc::sync_channel(1);
@@ -168,22 +195,31 @@ impl StreamingDispatch {
             });
         if spawned.is_ok() {
             self.started.insert(key, rx);
+            self.started_count += 1;
         }
     }
 
-    /// The early result for exactly this call, waiting for it if it is still running.
-    pub(in crate::agent) fn take(&mut self, call: &ToolCall, ui: &mut dyn Ui) -> Option<Outcome> {
+    pub(in crate::agent) fn has(&self, call: &ToolCall) -> bool {
+        self.clean && self.started.contains_key(&key(call))
+    }
+
+    pub(in crate::agent) fn extract(&mut self, call: &ToolCall) -> Option<EarlyRead> {
         if !self.clean {
             return None;
         }
-        let receiver = self.started.remove(&key(call))?;
-        loop {
-            match receiver.recv_timeout(Duration::from_millis(80)) {
-                Ok(outcome) => return Some(outcome),
-                Err(RecvTimeoutError::Timeout) => ui.heartbeat(),
-                Err(RecvTimeoutError::Disconnected) => return None,
-            }
-        }
+        self.started.remove(&key(call)).map(|receiver| EarlyRead {
+            receiver,
+            reused: self.reused_count.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::agent) fn take(&mut self, call: &ToolCall, _ui: &mut dyn Ui) -> Option<Outcome> {
+        self.extract(call)?.receive()
+    }
+
+    pub(in crate::agent) fn statistics(&self) -> (u64, u64) {
+        (self.started_count, self.reused_count.load(Ordering::SeqCst))
     }
 
     /// A call ran outside the parallel-read path: later early results may be stale.
@@ -203,8 +239,15 @@ impl StreamingDispatch {
     }
 }
 
-impl ToolStream for StreamingDispatch {
-    fn arguments(&mut self, index: u64, id: &str, name: &str, delta: &str) {
+impl StreamingDispatch {
+    pub(in crate::agent) fn arguments_if(
+        &mut self,
+        index: u64,
+        id: &str,
+        name: &str,
+        delta: &str,
+        authorize: &mut dyn FnMut(&ToolCall) -> bool,
+    ) {
         if !self.clean || self.closed.contains(&index) {
             return;
         }
@@ -212,7 +255,7 @@ impl ToolStream for StreamingDispatch {
         for done in earlier {
             self.closed.insert(done);
             if let Some(partial) = self.partial.remove(&done) {
-                self.complete(partial);
+                self.complete_if(partial, authorize);
             }
         }
         let entry = self.partial.entry(index).or_default();
@@ -225,22 +268,58 @@ impl ToolStream for StreamingDispatch {
         entry.arguments.push_str(delta);
     }
 
-    fn completed(&mut self, index: u64, id: &str, name: &str, arguments: &str) {
+    pub(in crate::agent) fn completed_if(
+        &mut self,
+        index: u64,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        authorize: &mut dyn FnMut(&ToolCall) -> bool,
+    ) {
         if !self.clean || !self.closed.insert(index) {
             return;
         }
+        // A later explicit completion is also the next-index signal for buffered earlier calls.
+        // In particular, never start a read past an already observed mutation.
+        let earlier: Vec<_> = self
+            .partial
+            .range(..index)
+            .map(|(&index, _)| index)
+            .collect();
+        for done in earlier {
+            self.closed.insert(done);
+            if let Some(partial) = self.partial.remove(&done) {
+                self.complete_if(partial, authorize);
+            }
+        }
         self.partial.remove(&index);
-        self.complete(Partial {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            arguments: arguments.to_owned(),
-        });
+        self.complete_if(
+            Partial {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                arguments: arguments.to_owned(),
+            },
+            authorize,
+        );
     }
 
-    fn restart(&mut self) {
+    pub(in crate::agent) fn restart_reads(&mut self) {
         // Started reads stay valid: they are keyed by the exact call and no tool ran meanwhile.
         self.partial.clear();
         self.closed.clear();
+        self.sealed = false;
+    }
+}
+
+impl ToolStream for StreamingDispatch {
+    fn arguments(&mut self, index: u64, id: &str, name: &str, delta: &str) {
+        self.arguments_if(index, id, name, delta, &mut |_| true);
+    }
+    fn completed(&mut self, index: u64, id: &str, name: &str, args: &str) {
+        self.completed_if(index, id, name, args, &mut |_| true);
+    }
+    fn restart(&mut self) {
+        self.restart_reads();
     }
 }
 

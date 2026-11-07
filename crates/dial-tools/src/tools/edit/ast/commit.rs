@@ -22,6 +22,7 @@ pub(super) struct Change {
 /// Write every change, or none. On success the workspace's hashline snapshots of the files are
 /// dropped so older `[path#TAG]` headers cannot be used to edit them.
 pub(super) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, String> {
+    let _serial = ws.serial_operation();
     let mut transaction = Vec::with_capacity(changes.len());
     for change in changes {
         crate::tools::edit::editing::generated_guard(ws, &change.abs, Some(&change.original))?;

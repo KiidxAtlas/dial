@@ -665,6 +665,72 @@ fn experimental_profile_matching_only_accepts_named_operator_profiles() {
     assert_eq!(role.selection().model, "small");
     assert_eq!(role.model_profile.as_deref(), Some("fast"));
 }
+
+/// `task` history stays resumable when the configured profile list or the experimental fields
+/// change between turns, and across the `verify` action; any other contract change is refused.
+#[test]
+fn task_history_survives_profile_and_optional_field_changes() {
+    use crate::tools::integrations::ext::Registry;
+    use crate::tools::surface::contracts::{assistant_message, validate_history};
+    let profile = |model: &str| crate::llm::profiles::ModelProfile {
+        provider: "openai".into(),
+        model: model.into(),
+        ..Default::default()
+    };
+    let history = |config: &Config| {
+        let reply = crate::llm::Reply {
+            tool_calls: vec![crate::llm::ToolCall {
+                id: "c1".into(),
+                name: "task".into(),
+                arguments: json!({"action":"status"}),
+                malformed_arguments: false,
+            }],
+            ..Default::default()
+        };
+        vec![
+            assistant_message(&reply, &[schema(config)], &Registry::new()),
+            json!({"role":"tool","tool_call_id":"c1","content":"no jobs"}),
+        ]
+    };
+    let mut before = config(&[]);
+    before.experimental.profile_matching = true;
+    before
+        .model_profiles
+        .insert("fast".into(), profile("small"));
+    let recorded = history(&before);
+
+    let mut after = before.clone();
+    after.model_profiles.insert("deep".into(), profile("large"));
+    after.experimental.work_packet_contracts = !before.experimental.work_packet_contracts;
+    validate_history(&recorded, &[schema(&after)], &Registry::new()).unwrap();
+
+    // History recorded before the `verify` action existed is still recognized.
+    let mut legacy = schema(&before);
+    legacy["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|action| action != "verify");
+    let old = history_with(&recorded, &legacy);
+    validate_history(&old, &[schema(&after)], &Registry::new()).unwrap();
+
+    // A real contract change (a property changing type) is still refused.
+    let mut changed = schema(&after);
+    changed["function"]["parameters"]["properties"]["timeout"]["type"] = json!("string");
+    assert!(validate_history(&recorded, &[changed], &Registry::new()).is_err());
+}
+
+/// `recorded` with its `task` identity replaced by the identity of `schema`.
+fn history_with(recorded: &[Value], schema: &Value) -> Vec<Value> {
+    let identity = crate::tools::surface::contracts::identities(
+        std::slice::from_ref(schema),
+        &crate::tools::integrations::ext::Registry::new(),
+    )
+    .remove("task")
+    .unwrap();
+    let mut old = recorded.to_vec();
+    old[0]["dial_tool_contracts"]["c1"] = json!(identity);
+    old
+}
 #[test]
 fn only_worker_launches_need_approval() {
     assert!(!launches_worker(&json!({"task":"x","solution_space":"s"})));
@@ -778,11 +844,11 @@ fn task_defaults_use_configured_helper_chains_before_main() {
     use crate::llm::model_config::ModelSelection;
     let helpers = ["task", "small", "coach", "tester"];
     let cases = [
-        ("worker", &["task", "coach", "small"][..]),
+        ("worker", &["task", "coach"][..]),
         ("scout", &["small", "task"][..]),
-        ("reviewer", &["tester", "coach", "task", "small"][..]),
-        ("test-runner", &["tester", "coach", "task", "small"][..]),
-        ("planner", &["coach", "task", "small"][..]),
+        ("reviewer", &["tester", "coach", "task"][..]),
+        ("test-runner", &["tester", "coach", "task"][..]),
+        ("planner", &["coach", "task"][..]),
     ];
     // Exercise every assignment combination, including no helpers and all specialists.
     for mask in 0..(1 << helpers.len()) {
@@ -887,7 +953,7 @@ fn recorded_worker_explanation_retains_only_evaluated_missing_assignments() {
     for (assignments, expected) in [
         (
             vec![],
-            "tester unassigned -> coach unassigned -> task unassigned -> small unassigned -> main selected (missing-assignment default)",
+            "tester unassigned -> coach unassigned -> task unassigned -> main selected (missing-assignment default)",
         ),
         (
             vec!["coach", "task"],

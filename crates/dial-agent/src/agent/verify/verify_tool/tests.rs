@@ -52,7 +52,7 @@ fn reports_typed_statuses_and_records_evidence_final_verification_reads() {
     let config = config();
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    let out = agent.check_tool(&json!({}), &mut NullUi);
+    let out = agent.verify_tool(&json!({}), &mut NullUi);
     assert!(out.is_error, "a non-passing check is a failed observation");
     assert!(
         out.text.contains(&format!("passed: unit\n  $ {UNIT}")),
@@ -110,14 +110,14 @@ fn failed_only_reruns_code_failures_and_a_pass_clears_the_retained_failure() {
         .retain(|check| check.name != "python AST: setup");
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    let nothing = agent.check_tool(&json!({"failed_only":true}), &mut NullUi);
+    let nothing = agent.verify_tool(&json!({"targets":["failed"]}), &mut NullUi);
     assert!(!nothing.is_error);
     assert!(nothing.text.contains("nothing run"), "{}", nothing.text);
 
-    agent.check_tool(&json!({}), &mut NullUi);
+    agent.verify_tool(&json!({}), &mut NullUi);
     assert!(agent.step_checks.failed);
     std::fs::write(root.path().join("fixed"), "").unwrap();
-    let rerun = agent.check_tool(&json!({"failed_only":true}), &mut NullUi);
+    let rerun = agent.verify_tool(&json!({"targets":["failed"]}), &mut NullUi);
     assert!(!rerun.is_error, "{}", rerun.text);
     assert!(rerun.text.contains("passed: lint"), "{}", rerun.text);
     assert!(
@@ -161,7 +161,7 @@ fn a_check_outlasting_the_auto_background_threshold_finishes_in_the_foreground()
     agent.hermetic = false;
     agent.approval = crate::config::types::Approval::Auto;
     agent.step_checks.mutations = 1;
-    let out = agent.check_tool(&json!({}), &mut NullUi);
+    let out = agent.verify_tool(&json!({}), &mut NullUi);
     assert!(
         !out.text.contains("background job"),
         "a check must not move to bg: {}",
@@ -177,17 +177,21 @@ fn before_any_change_it_lists_checks_and_runs_only_a_named_baseline() {
     let root = tempfile::tempdir().unwrap();
     let config = config();
     let mut agent = hermetic_agent(&config, root.path());
-    let listed = agent.check_tool(&json!({}), &mut NullUi);
+    let listed = agent.verify_tool(&json!({}), &mut NullUi);
     assert!(!listed.is_error);
     assert!(listed.text.contains("No changes yet"), "{}", listed.text);
     assert!(listed.text.contains("unit; lint"), "{}", listed.text);
     assert_eq!(agent.step_checks.evidence.latest_status(UNIT), None);
 
-    let unknown = agent.check_tool(&json!({"names":["nope"]}), &mut NullUi);
+    let unknown = agent.verify_tool(&json!({"targets":["nope"]}), &mut NullUi);
     assert!(unknown.is_error);
-    assert!(unknown.text.contains("Available: unit"), "{}", unknown.text);
+    assert!(
+        unknown.text.contains("Check names: unit"),
+        "{}",
+        unknown.text
+    );
 
-    let baseline = agent.check_tool(&json!({"names":["unit"]}), &mut NullUi);
+    let baseline = agent.verify_tool(&json!({"targets":["unit"]}), &mut NullUi);
     assert!(!baseline.is_error, "{}", baseline.text);
     assert_eq!(
         agent.step_checks.evidence.latest_status(UNIT),
@@ -208,13 +212,13 @@ fn empty_check_selection_cannot_report_a_pass_or_a_prediction() {
             .step_checks
             .evidence
             .snapshot(agent.step_checks.revision());
-        let out = agent.check_tool(&json!({"names":[], "expect":"pass"}), &mut NullUi);
+        let out = agent.verify_tool(&json!({"targets":[], "expect":"pass"}), &mut NullUi);
         assert!(
             out.is_error,
             "an empty selection is not verification: {}",
             out.text
         );
-        assert!(out.text.contains("omit names"), "{}", out.text);
+        assert!(out.text.contains("omit targets"), "{}", out.text);
         assert!(out.data.is_none(), "no execution or prediction occurred");
         assert_eq!(
             agent
@@ -232,8 +236,8 @@ fn empty_check_selection_still_runs_an_explicit_reproduction() {
     let config = Config::default();
     let mut agent = hermetic_agent(&config, root.path());
     let mut args = repro_args("bug", REPRO);
-    args["names"] = json!([]);
-    let out = agent.check_tool(&args, &mut NullUi);
+    args["targets"] = json!([]);
+    let out = agent.verify_tool(&args, &mut NullUi);
     let results = out.data.as_ref().unwrap()["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["command"], REPRO);
@@ -263,7 +267,7 @@ fn predictions_are_offered_only_under_the_flag_and_mismatches_are_reported() {
     // Off: the argument is inert.
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    let off = agent.check_tool(&json!({"expect":"fail"}), &mut NullUi);
+    let off = agent.verify_tool(&json!({"expect":"fail"}), &mut NullUi);
     assert!(off.data.as_ref().unwrap().get("prediction").is_none());
     assert!(!off.text.contains("Prediction mismatch"), "{}", off.text);
 
@@ -271,9 +275,9 @@ fn predictions_are_offered_only_under_the_flag_and_mismatches_are_reported() {
     config.experimental.check_predictions = true;
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    let invalid = agent.check_tool(&json!({"expect":"maybe"}), &mut NullUi);
+    let invalid = agent.verify_tool(&json!({"expect":"maybe"}), &mut NullUi);
     assert!(invalid.is_error);
-    let missed = agent.check_tool(&json!({"names":["unit"],"expect":"fail"}), &mut NullUi);
+    let missed = agent.verify_tool(&json!({"targets":["unit"],"expect":"fail"}), &mut NullUi);
     assert!(!missed.is_error, "the check itself passed");
     assert_eq!(
         missed.data.as_ref().unwrap()["prediction"],
@@ -284,7 +288,7 @@ fn predictions_are_offered_only_under_the_flag_and_mismatches_are_reported() {
             .text
             .contains("Prediction mismatch: expected fail, observed pass")
     );
-    let matched = agent.check_tool(&json!({"names":["unit"],"expect":"pass"}), &mut NullUi);
+    let matched = agent.verify_tool(&json!({"targets":["unit"],"expect":"pass"}), &mut NullUi);
     assert_eq!(
         matched.data.as_ref().unwrap()["prediction"]["matched"],
         true
@@ -327,7 +331,7 @@ fn a_registered_reproduction_earns_behavioral_credit_only_after_fail_then_fix() 
     let config = Config::default();
     let mut agent = hermetic_agent(&config, root.path());
     // Registration runs it at once, even before any change: this is the pre-fix observation.
-    let first = agent.check_tool(&repro_args("bug", REPRO), &mut NullUi);
+    let first = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
     assert!(first.is_error, "{}", first.text);
     assert!(
         first.text.contains("code_failed: repro: bug"),
@@ -350,7 +354,7 @@ fn a_registered_reproduction_earns_behavioral_credit_only_after_fail_then_fix() 
 
     // Rerunning with no change is not a fix, even if it now passes.
     std::fs::write(root.path().join("fixed"), "").unwrap();
-    let unchanged = agent.check_tool(&json!({"names":["repro: bug"]}), &mut NullUi);
+    let unchanged = agent.verify_tool(&json!({"targets":["repro: bug"]}), &mut NullUi);
     assert!(!unchanged.is_error, "{}", unchanged.text);
     assert!(
         unchanged.text.contains("no behavioral credit"),
@@ -362,13 +366,10 @@ fn a_registered_reproduction_earns_behavioral_credit_only_after_fail_then_fix() 
 
     // A change after the failure, then a pass at the final revision, earns credit.
     std::fs::remove_file(root.path().join("fixed")).unwrap();
-    agent.check_tool(
-        &json!({"failed_only":false,"names":["repro: bug"]}),
-        &mut NullUi,
-    );
+    agent.verify_tool(&json!({"targets":["repro: bug"]}), &mut NullUi);
     std::fs::write(root.path().join("fixed"), "").unwrap();
     agent.step_checks.mutations += 1;
-    let fixed = agent.check_tool(&json!({"failed_only":true}), &mut NullUi);
+    let fixed = agent.verify_tool(&json!({"targets":["failed"]}), &mut NullUi);
     assert!(!fixed.is_error, "{}", fixed.text);
     assert!(fixed.text.contains("passes now"), "{}", fixed.text);
     let revision = agent.step_checks.revision();
@@ -394,7 +395,7 @@ fn a_reproduction_that_never_failed_is_reported_and_earns_no_behavioral_credit()
     let config = Config::default();
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    let out = agent.check_tool(&repro_args("bug", "echo fine"), &mut NullUi);
+    let out = agent.verify_tool(&repro_args("bug", "echo fine"), &mut NullUi);
     assert!(!out.is_error, "{}", out.text);
     assert!(out.text.contains("passed: repro: bug"), "{}", out.text);
     assert!(out.text.contains("not shown to reproduce"), "{}", out.text);
@@ -420,7 +421,7 @@ fn a_reproduction_that_passes_before_any_change_is_refused_and_not_rerun_by_the_
     let config = Config::default();
     let mut agent = hermetic_agent(&config, root.path());
     // Inverted exit logic: passes while the bug is present, so the gate would fail it once fixed.
-    let out = agent.check_tool(&repro_args("inverted", "echo bug present"), &mut NullUi);
+    let out = agent.verify_tool(&repro_args("inverted", "echo bug present"), &mut NullUi);
     assert!(out.is_error, "{}", out.text);
     assert!(
         out.text
@@ -443,7 +444,7 @@ fn a_reproduction_that_passes_before_any_change_is_refused_and_not_rerun_by_the_
             .any(|check| check.name.starts_with("repro: "))
     );
     // A corrected command that fails before the fix registers normally.
-    let corrected = agent.check_tool(&repro_args("inverted", REPRO), &mut NullUi);
+    let corrected = agent.verify_tool(&repro_args("inverted", REPRO), &mut NullUi);
     assert!(
         corrected.text.contains("reproduces the bug"),
         "{}",
@@ -459,7 +460,7 @@ fn invalid_reproduction_selection_preserves_registration_and_failed_evidence() {
         let config = Config::default();
         let mut agent = hermetic_agent(&config, root.path());
         if replace_existing {
-            let first = agent.check_tool(&repro_args("bug", REPRO), &mut NullUi);
+            let first = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
             assert!(first.is_error, "{}", first.text);
             assert!(agent.step_checks.failed);
         }
@@ -469,14 +470,10 @@ fn invalid_reproduction_selection_preserves_registration_and_failed_evidence() {
             .snapshot(agent.step_checks.revision());
         let failures = agent.step_checks.failed_checks.clone();
         let mut args = repro_args("bug", "touch unexpected");
-        args["names"] = json!(["missing"]);
-        let refused = agent.check_tool(&args, &mut NullUi);
+        args["targets"] = json!(["missing"]);
+        let refused = agent.verify_tool(&args, &mut NullUi);
         assert!(refused.is_error, "{}", refused.text);
-        assert!(
-            refused.text.contains("unknown check name"),
-            "{}",
-            refused.text
-        );
+        assert!(refused.text.contains("not run:"), "{}", refused.text);
         assert_eq!(
             agent
                 .step_checks
@@ -506,7 +503,7 @@ fn failed_only_reproduction_registration_is_refused_without_changing_evidence() 
         let config = Config::default();
         let mut agent = hermetic_agent(&config, root.path());
         if replace_existing {
-            let first = agent.check_tool(&repro_args("bug", REPRO), &mut NullUi);
+            let first = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
             assert!(first.is_error, "{}", first.text);
         }
         let before = agent
@@ -515,10 +512,10 @@ fn failed_only_reproduction_registration_is_refused_without_changing_evidence() 
             .snapshot(agent.step_checks.revision());
         let failures = agent.step_checks.failed_checks.clone();
         let mut args = repro_args("bug", "touch unexpected");
-        args["failed_only"] = json!(true);
-        let refused = agent.check_tool(&args, &mut NullUi);
+        args["targets"] = json!(["failed"]);
+        let refused = agent.verify_tool(&args, &mut NullUi);
         assert!(refused.is_error, "{}", refused.text);
-        assert!(refused.text.contains("failed_only"), "{}", refused.text);
+        assert!(refused.text.contains("`failed`"), "{}", refused.text);
         assert_eq!(
             agent
                 .step_checks
@@ -541,12 +538,12 @@ fn explicit_selection_runs_a_replacement_and_other_named_checks() {
         .commands
         .retain(|check| check.name == "unit");
     let mut agent = hermetic_agent(&config, root.path());
-    let first = agent.check_tool(&repro_args("bug", REPRO), &mut NullUi);
+    let first = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
     assert!(first.is_error, "{}", first.text);
     let replacement = "echo 'replacement.rs:1: error: bug remains'; exit 1";
     let mut args = repro_args("bug", replacement);
-    args["names"] = json!(["unit", "repro: bug"]);
-    let result = agent.check_tool(&args, &mut NullUi);
+    args["targets"] = json!(["unit", "repro: bug"]);
+    let result = agent.verify_tool(&args, &mut NullUi);
     let results = result.data.as_ref().unwrap()["results"].as_array().unwrap();
     assert_eq!(results.len(), 2, "{}", result.text);
     assert!(
@@ -580,17 +577,17 @@ fn reproductions_are_capped_validated_and_cannot_relabel_selected_checks() {
     for index in 0..MAX_REPROS {
         // Naming only the reproduction keeps the run to it; lint fails in this fixture.
         let mut args = repro_args(&format!("r{index}"), &format!("echo {index}"));
-        args["names"] = json!([format!("repro: r{index}")]);
-        let out = agent.check_tool(&args, &mut NullUi);
+        args["targets"] = json!([format!("repro: r{index}")]);
+        let out = agent.verify_tool(&args, &mut NullUi);
         assert!(!out.is_error, "{}", out.text);
     }
-    let over = agent.check_tool(&repro_args("extra", "echo extra"), &mut NullUi);
+    let over = agent.verify_tool(&repro_args("extra", "echo extra"), &mut NullUi);
     assert!(over.is_error);
     assert!(over.text.contains("at most 4"), "{}", over.text);
     // Reusing a name replaces it within the cap.
     let mut args = repro_args("r0", "echo replaced");
-    args["names"] = json!(["repro: r0"]);
-    let replaced = agent.check_tool(&args, &mut NullUi);
+    args["targets"] = json!(["repro: r0"]);
+    let replaced = agent.verify_tool(&args, &mut NullUi);
     assert!(!replaced.is_error, "{}", replaced.text);
     assert!(agent.step_checks.evidence.is_repro("echo replaced"));
     assert!(!agent.step_checks.evidence.is_repro("echo 0"));
@@ -605,7 +602,7 @@ fn reproductions_are_capped_validated_and_cannot_relabel_selected_checks() {
         (repro_args("", "echo x"), "repro.name"),
         (repro_args("x", "  "), "repro.command"),
     ] {
-        let out = agent.check_tool(&args, &mut NullUi);
+        let out = agent.verify_tool(&args, &mut NullUi);
         assert!(out.is_error, "{args}");
         assert!(out.text.contains(expected), "{args}: {}", out.text);
     }
@@ -632,7 +629,7 @@ fn reproductions_take_the_shell_approval_path_not_the_generated_check_boundary()
     let marker = root.path().join("ran");
     // A generated check runs unprompted under Ask; a reproduction asks, and NullUi refuses.
     agent.approval = Approval::Ask;
-    let asked = agent.check_tool(&repro_args("bug", "touch ran"), &mut NullUi);
+    let asked = agent.verify_tool(&repro_args("bug", "touch ran"), &mut NullUi);
     assert!(asked.is_error);
     assert!(
         asked.text.contains("permission_denied: repro: bug"),
@@ -642,7 +639,7 @@ fn reproductions_take_the_shell_approval_path_not_the_generated_check_boundary()
     assert!(!marker.exists());
     // Write mode: like bash, a non-destructive workspace command runs without a prompt.
     agent.approval = Approval::Write;
-    let ran = agent.check_tool(&json!({"names":["repro: bug"]}), &mut NullUi);
+    let ran = agent.verify_tool(&json!({"targets":["repro: bug"]}), &mut NullUi);
     assert!(!ran.is_error, "{}", ran.text);
     assert!(marker.exists());
     // Its run is an opaque, disclosed shell effect and stales earlier evidence.
@@ -657,11 +654,11 @@ fn reproductions_take_the_shell_approval_path_not_the_generated_check_boundary()
         command_prefix: vec!["touch".into()],
         paths: vec![],
     });
-    let denied = agent.check_tool(&json!({"names":["repro: bug"]}), &mut NullUi);
+    let denied = agent.verify_tool(&json!({"targets":["repro: bug"]}), &mut NullUi);
     assert!(denied.text.contains("permission_denied"), "{}", denied.text);
     agent.always.clear();
     agent.approval = Approval::Readonly;
-    let readonly = agent.check_tool(&json!({"names":["repro: bug"]}), &mut NullUi);
+    let readonly = agent.verify_tool(&json!({"targets":["repro: bug"]}), &mut NullUi);
     assert!(
         readonly.text.contains("permission_denied"),
         "{}",
@@ -692,7 +689,7 @@ fn mutating_reproduction_stales_required_checks_and_delivered_visual_evidence() 
     );
     let mut agent = hermetic_agent(&config, root.path());
     agent.step_checks.mutations = 1;
-    let baseline = agent.check_tool(&json!({"names":["unit"]}), &mut NullUi);
+    let baseline = agent.verify_tool(&json!({"targets":["unit"]}), &mut NullUi);
     assert!(!baseline.is_error);
     agent.step_checks.record_checked();
     let before = agent.step_checks.revision();
@@ -702,8 +699,8 @@ fn mutating_reproduction_stales_required_checks_and_delivered_visual_evidence() 
     assert_eq!(agent.step_checks.visual.status(before), "observed");
 
     let mut args = repro_args("mutates", "printf changed > source.rs");
-    args["names"] = json!(["repro: mutates"]);
-    let out = agent.check_tool(&args, &mut NullUi);
+    args["targets"] = json!(["repro: mutates"]);
+    let out = agent.verify_tool(&args, &mut NullUi);
     assert!(!out.is_error, "{}", out.text);
     assert_eq!(
         std::fs::read_to_string(root.path().join("source.rs")).unwrap(),
@@ -743,7 +740,7 @@ fn registering_a_reproduction_after_a_change_runs_the_remaining_checks_in_the_sa
     agent.step_checks.mutations = 1;
     // A benchmark run registered a repro, read "1 applicable check(s) lack a current pass" and
     // spent another request on a plain `check`. One call now covers both.
-    let out = agent.check_tool(&repro_args("bug", "echo fixed"), &mut NullUi);
+    let out = agent.verify_tool(&repro_args("bug", "echo fixed"), &mut NullUi);
     assert!(!out.is_error, "{}", out.text);
     assert!(out.text.contains("passed: unit"), "{}", out.text);
     assert!(out.text.contains("passed: repro: bug"), "{}", out.text);
@@ -755,7 +752,7 @@ fn registering_a_reproduction_after_a_change_runs_the_remaining_checks_in_the_sa
     );
     // Before any change the reproduction still runs alone as a baseline.
     let mut fresh = hermetic_agent(&config, root.path());
-    let baseline = fresh.check_tool(&repro_args("bug", REPRO), &mut NullUi);
+    let baseline = fresh.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
     assert!(!baseline.text.contains("passed: unit"), "{}", baseline.text);
 }
 
@@ -765,13 +762,13 @@ fn unsafe_reproduction_rerun_cannot_earn_its_own_fix_credit() {
     let config = Config::default();
     let mut agent = hermetic_agent(&config, root.path());
     let command = "if test -f ran; then exit 0; else touch ran; echo 'AssertionError: first run fails'; exit 1; fi";
-    let first = agent.check_tool(&repro_args("stateful", command), &mut NullUi);
+    let first = agent.verify_tool(&repro_args("stateful", command), &mut NullUi);
     assert!(first.is_error, "{}", first.text);
     assert_eq!(
         first.data.as_ref().unwrap()["results"][0]["reproduction"],
         "not_passing"
     );
-    let rerun = agent.check_tool(&json!({"names":["repro: stateful"]}), &mut NullUi);
+    let rerun = agent.verify_tool(&json!({"targets":["repro: stateful"]}), &mut NullUi);
     assert!(!rerun.is_error, "{}", rerun.text);
     assert_eq!(
         rerun.data.as_ref().unwrap()["results"][0]["reproduction"],
@@ -806,12 +803,12 @@ fn a_reproduction_runs_first_and_its_short_name_selects_it() {
     // An opaque reproduction advances the shell revision. Run after `unit`, it left that
     // check's pass reported as both "passed" and "stale" in the same receipt.
     let command = "if test -f ran; then exit 0; else touch ran; echo 'AssertionError: first run fails'; exit 1; fi";
-    let first = agent.check_tool(&repro_args("stateful", command), &mut NullUi);
+    let first = agent.verify_tool(&repro_args("stateful", command), &mut NullUi);
     assert!(first.is_error, "{}", first.text);
     assert!(first.text.contains("passed: unit"), "{}", first.text);
     assert!(!first.text.contains("unit (stale)"), "{}", first.text);
     // The short name given at registration selects the reproduction, alone or with others.
-    let rerun = agent.check_tool(&json!({"names":["stateful", "unit"]}), &mut NullUi);
+    let rerun = agent.verify_tool(&json!({"targets":["stateful", "unit"]}), &mut NullUi);
     assert!(!rerun.is_error, "{}", rerun.text);
     let results = &rerun.data.as_ref().unwrap()["results"];
     assert_eq!(results[0]["name"], "repro: stateful");
@@ -827,12 +824,8 @@ fn a_reproduction_runs_first_and_its_short_name_selects_it() {
         "passed"
     );
     // Unknown names are still refused.
-    let refused = agent.check_tool(&json!({"names":["missing"]}), &mut NullUi);
-    assert!(
-        refused.text.contains("unknown check name"),
-        "{}",
-        refused.text
-    );
+    let refused = agent.verify_tool(&json!({"targets":["missing"]}), &mut NullUi);
+    assert!(refused.text.contains("not run:"), "{}", refused.text);
 }
 
 #[test]
@@ -840,7 +833,7 @@ fn a_top_level_command_is_refused_with_the_repro_contract_and_runs_nothing() {
     let root = tempfile::tempdir().unwrap();
     let config = Config::default();
     let mut agent = hermetic_agent(&config, root.path());
-    let refused = agent.check_tool(&json!({"command": REPRO}), &mut NullUi);
+    let refused = agent.verify_tool(&json!({"command": REPRO}), &mut NullUi);
     assert!(refused.is_error, "{}", refused.text);
     assert!(refused.text.contains("repro"), "{}", refused.text);
     assert!(refused.text.contains("non-zero"), "{}", refused.text);
@@ -856,7 +849,7 @@ fn a_repro_that_is_not_an_object_names_the_shape_error_and_runs_nothing() {
     // A JSON-encoded repro with a surplus closing brace, as a model produced in a benchmark run.
     let malformed = format!("{}}}", json!({"name": "page_count", "command": REPRO}));
     for repro in [json!(malformed), json!(["page_count", REPRO])] {
-        let refused = agent.check_tool(&json!({ "repro": repro }), &mut NullUi);
+        let refused = agent.verify_tool(&json!({ "repro": repro }), &mut NullUi);
         assert!(refused.is_error, "{}", refused.text);
         assert!(
             refused.text.starts_with("repro must be an object"),

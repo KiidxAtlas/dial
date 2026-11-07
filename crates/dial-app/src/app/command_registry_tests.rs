@@ -355,7 +355,7 @@ fn one_table_preserves_the_legacy_command_contract() {
     use serde_json::{Value, json};
     let baseline: Value =
         serde_json::from_str(include_str!("command_registry/legacy_contract.json")).unwrap();
-    let added = ["set", "inbox", "doctor", "controls"];
+    let added = ["set", "inbox", "doctor", "controls", "attachments", "draft"];
     // Phase B hubs intentionally replace these discovery rows, not their execution behavior.
     const HUB_MENU_CHANGES: &[&str] = &[
         "mode",
@@ -376,10 +376,13 @@ fn one_table_preserves_the_legacy_command_contract() {
     ];
     // Extensions gains tab arguments; /hooks becomes a hidden shortcut to its tab.
     const EXTENSIONS_STATS_MENU_CHANGES: &[&str] = &["extensions", "hooks"];
+    // Approved next-UX changes have exact replacement contracts below.
+    const UX_MENU_CHANGES: &[&str] = &["model", "search", "context"];
     let excluded = |name: &str| {
         HUB_MENU_CHANGES.contains(&name)
             || EXTENSIONS_STATS_MENU_CHANGES.contains(&name)
             || GIT_ACTIVITY_MENU_CHANGES.contains(&name)
+            || UX_MENU_CHANGES.contains(&name)
     };
     let unchanged_hub_row = |row: &&Value| !excluded(row[0].as_str().unwrap());
     let entries: Vec<_> = command_entries(&[], &[])
@@ -402,10 +405,19 @@ fn one_table_preserves_the_legacy_command_contract() {
         .cloned()
         .collect();
     assert_eq!(json!(entries), json!(expected_entries));
-    assert_eq!(
-        json!(super::command_registry::builtin_commands()),
-        baseline["rpc"]
-    );
+    let rpc = json!(super::command_registry::builtin_commands());
+    let unchanged_rpc = |rows: &Value| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                !UX_MENU_CHANGES.contains(&row[0].as_str().unwrap())
+                    && !matches!(row[0].as_str(), Some("attachments" | "draft"))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(unchanged_rpc(&rpc), unchanged_rpc(&baseline["rpc"]));
     assert_eq!(json!(turn_help(true)), baseline["stop"]);
     // Hidden compatibility spellings stay executable, but their top-level help rows are hidden.
     let expected_now: Vec<_> = baseline["now"]
@@ -556,4 +568,48 @@ fn unified_palette_sessions_are_local_conversations_and_use_normal_resume_dispat
         during_turn("resume", saved.id()),
         during_turn("sessions", saved.id())
     );
+}
+
+#[test]
+fn next_ux_commands_have_explicit_replacement_contracts_and_safe_busy_routes() {
+    for (name, usage, description) in [
+        (
+            "model",
+            "[settings|defaults|local|backups]",
+            "choose the main model and assign roles",
+        ),
+        (
+            "search",
+            "<query>|results|open <id>|back",
+            "search, inspect and open past conversations",
+        ),
+        (
+            "context",
+            "",
+            "review last and estimated next request budgets",
+        ),
+        (
+            "attachments",
+            "[inspect|remove <number>]",
+            "inspect or remove draft attachments",
+        ),
+        (
+            "draft",
+            "[restore|replace|discard|resume|status]",
+            "restore or discard saved unsent input",
+        ),
+    ] {
+        let spec = command_spec(name).unwrap();
+        assert_eq!(spec.usage, usage, "{name}");
+        assert_eq!(spec.description, description, "{name}");
+        assert!(super::command_registry::builtin_commands().contains(&(name, usage, description)));
+    }
+    assert!(matches!(
+        command_panel("model", "backups"),
+        Some(crate::app::overlay::Which::BackupModels)
+    ));
+    assert_eq!(during_turn("search", "open fixture"), DuringTurn::Stop);
+    assert_eq!(during_turn("search", "back"), DuringTurn::Stop);
+    assert_eq!(during_turn("search", "results"), DuringTurn::Now);
+    assert_eq!(during_turn("attachments", ""), DuringTurn::Now);
 }

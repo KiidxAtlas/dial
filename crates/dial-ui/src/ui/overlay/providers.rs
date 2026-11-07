@@ -137,6 +137,8 @@ impl Wizard {
 enum ProviderAction {
     ChooseModel,
     TestConnection,
+    VerifySelectedModel,
+    VerifyCodingModel,
     EditConfiguration,
     Headers,
     SetKey,
@@ -556,7 +558,10 @@ impl ProviderOverlay {
         let saved = self.key_saved(&entry);
         let mut items = vec![(ProviderAction::ChooseModel, "Choose a model".to_owned())];
         if entry.id != crate::llm::chatgpt::PROVIDER && entry.base_url.is_some() {
-            items.push((ProviderAction::TestConnection, "Test connection".to_owned()));
+            items.push((
+                ProviderAction::TestConnection,
+                "Check metadata connection (no inference)".to_owned(),
+            ));
         }
         if entry.id == crate::llm::chatgpt::PROVIDER {
             if self.chatgpt_pending {
@@ -702,6 +707,14 @@ impl ProviderOverlay {
                 "Edit configuration / endpoint → Settings providers".into(),
             ));
         }
+        items.push((
+            ProviderAction::VerifySelectedModel,
+            "Verify selected chat model response…".to_owned(),
+        ));
+        items.push((
+            ProviderAction::VerifyCodingModel,
+            "Check selected chat model coding/tool compatibility…".into(),
+        ));
         if entry.spec.is_some() {
             items.push((ProviderAction::Remove, "Remove provider".to_owned()));
         }
@@ -893,10 +906,21 @@ impl ProviderOverlay {
             ProviderAction::TestConnection => {
                 self.mode = Mode::List;
                 self.message = Some((
-                    format!("Testing connection to {}", text::one_line(&entry.label)),
+                    format!(
+                        "Checking metadata for {} · this does not verify a model response",
+                        text::one_line(&entry.label)
+                    ),
                     true,
                 ));
                 return OverlayEvent::Action(format!("test:{}", entry.id));
+            }
+            ProviderAction::VerifySelectedModel => {
+                self.mode = Mode::List;
+                return OverlayEvent::Action("command:setup choose verify-model".to_owned());
+            }
+            ProviderAction::VerifyCodingModel => {
+                self.mode = Mode::List;
+                return OverlayEvent::Action("command:setup choose verify-coding".to_owned());
             }
             ProviderAction::SetKey => {
                 self.mode = Mode::Key {

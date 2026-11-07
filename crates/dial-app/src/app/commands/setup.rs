@@ -91,7 +91,32 @@ pub(super) fn run_command(
         [] => {
             let env = Env::current(&app.layout.user_dir);
             let choices = if name == "doctor" {
-                doctor_choices(&env, &app.config)
+                let config = match app.reload() {
+                    Ok(config) => config,
+                    Err(error) => return Some(Err(error)),
+                };
+                let mut choices = doctor_choices(&env, &config);
+                choices.items[2].detail = shell.model_response_status(&config).into();
+                choices.items[3].detail = shell.model_coding_status(&config).into();
+                let selection = config.selection();
+                if let Some(provider) = shell.catalog.get().and_then(|found| {
+                    found.providers.into_iter().find(|provider| {
+                        provider.id == selection.provider && provider.base_url == selection.base_url
+                    })
+                }) {
+                    choices.items[1].detail = format!(
+                        "Cached metadata check: {} · not an inference test. Open Providers to refresh.",
+                        crate::ui::text::one_line(&provider.state)
+                    );
+                }
+                if let Some(url) = selection.base_url.as_ref() {
+                    let sources =
+                        crate::app::notices::credential_sources(&app.layout.user_dir, &config, &[]);
+                    if let Some(source) = sources.get(url) {
+                        choices.items[1].detail.push_str(&format!(" Authentication source: saved credential {} · environment credential {}. Configuration: active layered settings.", if source.saved { "present" } else { "absent" }, if source.env.as_ref().is_some_and(|env| env.set) { "present" } else { "absent/unknown" }));
+                    }
+                }
+                choices
             } else {
                 setup_choices(&env)
             };
@@ -134,6 +159,12 @@ pub(super) fn run_live(
     }
     let env = Env::current(&app.layout.user_dir);
     match parts.as_slice() {
+        ["choose", "verify-model"] if shell.status.busy() => {
+            return Some(shell.verify_selected_model(app, None).map(|()| Step::Done));
+        }
+        ["choose", "verify-coding"] if shell.status.busy() => {
+            return Some(shell.verify_coding_model(app, None).map(|()| Step::Done));
+        }
         [] | ["providers"] | ["choose" | "memory" | "presets", ..] => return None,
         ["list"] => {
             let config = app.reload().unwrap_or_else(|_| app.config.clone());
@@ -277,26 +308,51 @@ fn setup_choices(env: &Env) -> ChoiceSpec {
 
 /// The same local dependency and memory diagnostics used by `dial doctor`.
 fn doctor_choices(env: &Env, config: &Config) -> ChoiceSpec {
-    let items = deps::report(env)
-        .into_iter()
-        .map(|row| ChoiceItem {
-            value: row.id.to_owned(),
-            label: format!(
-                "{} · {}",
-                if row.status == deps::Status::Ready {
-                    "Ready"
-                } else {
-                    "Missing"
-                },
-                row.title
-            ),
-            detail: row.detail.to_owned(),
+    let selection = config.selection();
+    let configured = !config.model.trim().is_empty();
+    let mut items = vec![
+        ChoiceItem {
+            value: "models".into(),
+            label: format!("Core · Model {}", if configured { "configured" } else { "missing" }),
+            detail: format!("{}/{} · configuration only; open Models to select", crate::ui::text::one_line(&selection.provider), crate::ui::text::one_line(&selection.model)),
             current: false,
-        })
-        .collect();
-    let mut spec = choice_spec("Doctor · local diagnostics", items);
+        },
+        ChoiceItem {
+            value: "providers".into(),
+            label: "Core · Authentication and endpoint".into(),
+            detail: "Unknown · metadata reachability is not inference readiness. Open Providers for credential source and an explicit metadata check.".into(),
+            current: false,
+        },
+        ChoiceItem {
+            value: "verify-model".into(),
+            label: "Core · Verify selected model response".into(),
+            detail: "Unknown · opt-in tiny inference request; review network/cost disclosure first".into(),
+            current: false,
+        },
+        ChoiceItem {
+            value: "verify-coding".into(),
+            label: "Core · Check coding/tool compatibility".into(),
+            detail: "Unknown · separate opt-in synthetic tool roundtrip; review cost disclosure first".into(),
+            current: false,
+        },
+    ];
+    items.extend(deps::report(env).into_iter().map(|row| ChoiceItem {
+        value: row.id.to_owned(),
+        label: format!(
+            "{} · {}",
+            if row.status == deps::Status::Ready {
+                "Ready"
+            } else {
+                "Missing"
+            },
+            row.title
+        ),
+        detail: row.detail.to_owned(),
+        current: false,
+    }));
+    let mut spec = choice_spec("Doctor · core readiness, then optional capabilities", items);
     spec.summary = format!(
-        "{}\nOptional capabilities need not all be installed. Enter reviews a fix; nothing is installed without confirmation.",
+        "Configured ≠ metadata reachable ≠ inference verified. Results are cached/unknown unless explicitly tested. Open Providers for authentication source; no inference or installation runs from this page.\n{}\nOptional capabilities need not all be installed. Enter reviews a fix; nothing is installed without confirmation.",
         crate::setup::memory::doctor_text(config)
     );
     spec
@@ -365,13 +421,25 @@ fn local_model_choices(
         },
         ChoiceItem {
             value: "providers".into(),
-            label: "3 · Test the connection explicitly".into(),
+            label: "3 · Check endpoint metadata explicitly".into(),
             detail: discovery
                 .and_then(|found| found.providers.iter().find(|provider| provider.id == selection.provider))
                 .map_or_else(
                     || "Unknown · no provider check result in this session".to_owned(),
                     |provider| format!("Last known {}: {} · {}", provider.id, provider.state, provider.detail),
-                ) + " · opens Providers; select the local endpoint and use Test connection. Selection is not a successful test.",
+                ) + " · opens Providers; use Check metadata connection. Reachable metadata is not a successful inference test.",
+            current: false,
+        },
+        ChoiceItem {
+            value: "verify-model".into(),
+            label: "4 · Verify selected model response".into(),
+            detail: "Separate opt-in inference test · review network/cost disclosure, then confirm; interrupt cancels".into(),
+            current: false,
+        },
+        ChoiceItem {
+            value: "verify-coding".into(),
+            label: "5 · Check coding/tool compatibility".into(),
+            detail: "Separate opt-in synthetic tool roundtrip · no real tools execute".into(),
             current: false,
         },
     ]);
@@ -445,6 +513,14 @@ fn guided_command(
         }
         "models" => return shell.open(app, agent, Which::Models),
         "providers" => return shell.open(app, agent, Which::Providers),
+        "verify-model" => {
+            shell.verify_selected_model(app, Some(agent))?;
+            return Ok(Step::Done);
+        }
+        "verify-coding" => {
+            shell.verify_coding_model(app, Some(agent))?;
+            return Ok(Step::Done);
+        }
         "embeddings" => {
             return shell.open(app, agent, Which::Choice(Box::new(embedding_choices())));
         }

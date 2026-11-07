@@ -75,7 +75,7 @@ fn write(user_dir: &Path, ids: &[String]) -> Result<()> {
             .with_context(|| format!("creating {}", tmp.display()))?;
     out.write_all(&body)?;
     out.write_all(b"\n")?;
-    out.sync_all()?;
+    platform_fs::sync_file(&out)?;
     drop(out);
     fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())

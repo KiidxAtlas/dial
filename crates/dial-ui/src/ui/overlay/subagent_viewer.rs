@@ -361,7 +361,7 @@ pub fn route(agent: Option<&AgentEntry>) -> Route {
         AgentStatus::Running | AgentStatus::Waiting => {
             Route::Unavailable("This worker cannot take a message right now")
         }
-        AgentStatus::Done | AgentStatus::Failed => {
+        AgentStatus::Done | AgentStatus::Answered | AgentStatus::Failed => {
             Route::Unavailable("This worker cannot be continued")
         }
     }
@@ -1069,6 +1069,7 @@ impl SubagentViewer {
                 (theme.sym(Sym::Warn).to_owned(), theme.fg(Tok::Warning))
             }
             AgentStatus::Done => (theme.sym(Sym::Check).to_owned(), theme.fg(Tok::Success)),
+            AgentStatus::Answered => (theme.sym(Sym::Dot).to_owned(), theme.fg(Tok::Muted)),
             AgentStatus::Failed => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Error)),
             AgentStatus::Cancelled => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Muted)),
         };

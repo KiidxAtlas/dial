@@ -64,9 +64,10 @@ fn clean_check_preserves_the_git_inspection_error() {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-q", "-b", "main"]);
     crate::tools::testkit::disable_inherited_git_filters(dir.path());
+    // Filter drivers are disabled per read; a text-conversion driver is still refused.
     git(
         dir.path(),
-        &["config", "filter.audit.clean", "executable-filter"],
+        &["config", "diff.audit.textconv", "executable-filter"],
     );
     let cause = run_checked(dir.path(), &["status", "--porcelain"], false)
         .unwrap_err()

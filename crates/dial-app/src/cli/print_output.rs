@@ -63,7 +63,10 @@ pub fn enforce(
             }
             Err(why) => {
                 report.text.clear();
-                if report.outcome == TurnOutcome::Completed {
+                if matches!(
+                    report.outcome,
+                    TurnOutcome::Completed | TurnOutcome::Answered
+                ) {
                     report.outcome = TurnOutcome::Incomplete;
                 }
                 return Ok(Checked::Rejected(report, why));

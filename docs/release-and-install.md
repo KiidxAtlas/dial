@@ -96,6 +96,13 @@ Other installations are updated by their owners, which `dial update` runs for yo
 
 The interactive terminal checks the GitHub latest release in the background, at most once a day, and shows a muted line above the composer when a newer version exists, for example ``Dial 0.2.7 is available (you have 0.2.6) · run `/update` ``. It names `/update` for every installation that command can update (installer, Homebrew, Cargo and source builds with their checkout); Nix installs, and source builds whose checkout is gone, get the manual instruction instead. The last answer is cached in `dial-release-check` in Dial's user directory, so the notice shows at once on later launches, including offline ones. Failed checks are silent and wait for the next day. No check runs in strict sandbox mode or with `sandbox.allow_network = false`, and print, JSON, RPC and ACP modes never show the notice. Nothing is installed automatically.
 
+### Which build am I running?
+
+`dial --version` shows the compiled revision and whether the sources differed from it at build
+time. `dial --build-info` prints JSON with the target, profile, build time and executable path.
+Neither reads configuration or contacts a model. Builds without Git metadata report `unknown`;
+release and archive builders can set `DIAL_BUILD_REVISION` and `SOURCE_DATE_EPOCH` explicitly.
+
 ## Release signing inputs
 
 The workflow intentionally fails closed until repository signing inputs are configured. Set:

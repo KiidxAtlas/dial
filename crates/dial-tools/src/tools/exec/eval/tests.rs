@@ -269,6 +269,119 @@ fn slow_cell_moves_at_the_threshold_and_its_display_output_moves_with_it() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn moved_cell_is_a_launch_receipt_not_an_uncertain_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = unsandboxed(&dir);
+    let config = threshold_config(1);
+    let tool = EvalTool::new(config.eval.clone(), config.kernel.clone());
+    let bg = background_tool(&config);
+    let ctx = context(&workspace, &config);
+    let adopt = |job: AdoptedJob| bg.adopt_job(job);
+    let out = tool.call_with_dispatch(
+        &ctx,
+        &json!({"code":"await new Promise(r => setTimeout(r, 2500)); 'done'"}),
+        &|_| {},
+        &AtomicBool::new(false),
+        &adopt,
+        &mut |_| unreachable!(),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    assert_ne!(
+        crate::tools::surface::outcome::effects(&out),
+        crate::tools::surface::outcome::Effects::Unknown
+    );
+    let job = out.data.as_ref().unwrap()["background_job"]
+        .as_str()
+        .expect("the hand-off names its job")
+        .to_owned();
+    assert!(bg_output(bg.as_ref(), &ctx, &job).contains("done"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_eval_runs_under_the_workspace_sandbox_with_the_fork_fence() {
+    for sandboxed in [false, true] {
+        if sandboxed && !crate::tools::exec::sandbox::require_for_test() {
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // Dial's default dev policy: interpreters outside system paths (pyenv, Homebrew) load.
+        let workspace = crate::tools::Workspace::new(dir.path()).unwrap();
+        let workspace = if sandboxed {
+            workspace.with_policy(crate::tools::exec::sandbox::Policy::Dev {
+                deny_read: Vec::new(),
+                extra_write: Vec::new(),
+                allow_network: false,
+            })
+        } else {
+            workspace.without_sandbox()
+        };
+        let config = threshold_config(0);
+        let tool = EvalTool::new(config.eval.clone(), config.kernel.clone());
+        let ctx = context(&workspace, &config);
+        let run = |code: &str| {
+            settled(
+                run_cell(
+                    &tool,
+                    &ctx,
+                    json!({"language":"py","code":code,"background":false}),
+                    &no_background,
+                )
+                .unwrap_or_else(|error| panic!("sandboxed={sandboxed}: {error}")),
+            )
+        };
+        let result = run("open('written', 'w').write('ok')");
+        assert!(result["error"].is_null(), "sandboxed={sandboxed}: {result}");
+        assert!(dir.path().join("written").exists(), "sandboxed={sandboxed}");
+        for code in [
+            "import os\nos.fork()",
+            "import os,sys\nos.posix_spawn(sys.executable,[sys.executable,'-c','pass'],os.environ)",
+        ] {
+            let result = run(code);
+            assert!(
+                result["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("PermissionError")),
+                "sandboxed={sandboxed}: {result}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_interpreter_that_never_starts_is_a_known_failure_not_an_uncertain_effect() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = unsandboxed(&dir);
+    let launcher = tempfile::tempdir().unwrap();
+    let node = launcher.path().join("node");
+    std::fs::write(&node, "#!/bin/sh\necho launch refused >&2\nexit 71\n").unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = threshold_config(0);
+    config.eval.node = node.to_str().unwrap().into();
+    let tool = EvalTool::new(config.eval.clone(), config.kernel.clone());
+    let ctx = context(&workspace, &config);
+    let out = tool.call_with_dispatch(
+        &ctx,
+        &json!({"language":"js","code":"'never'","background":false}),
+        &|_| {},
+        &AtomicBool::new(false),
+        &no_background,
+        &mut |_| unreachable!(),
+    );
+    assert!(out.is_error, "{}", out.text);
+    assert_ne!(
+        crate::tools::surface::outcome::effects(&out),
+        crate::tools::surface::outcome::Effects::Unknown,
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("did not start"), "{}", out.text);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn background_true_moves_at_once_and_background_false_stays_foreground() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = unsandboxed(&dir);

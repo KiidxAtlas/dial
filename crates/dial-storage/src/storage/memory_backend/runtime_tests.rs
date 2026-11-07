@@ -40,6 +40,24 @@ fn pair(prompt: &str, answer: &str) -> [Value; 2] {
 }
 
 #[test]
+fn idle_memory_has_no_maintenance_work_after_observations_are_drained() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, auth) = semantic_runtime(dir.path(), false);
+    let mut runner = FakeRunner::new("{}");
+    assert!(!runtime.maintenance_due(&auth).unwrap());
+    runtime
+        .observe_owned(
+            &auth,
+            pair("Inspect the project", "No durable facts.").to_vec(),
+        )
+        .unwrap();
+    assert!(runtime.maintenance_due(&auth).unwrap());
+    runtime.maintain(&auth, &mut runner).unwrap();
+    assert!(!runtime.maintenance_due(&auth).unwrap());
+    assert!(!runtime.maintenance_due(&auth).unwrap());
+}
+
+#[test]
 fn fact_refs_parse_both_banks_and_reject_garbage() {
     assert_eq!(
         FactRef::parse("12").unwrap(),
@@ -600,4 +618,34 @@ fn automatic_recall_filters_incidental_words_and_old_assistant_subjects() {
         matching.context.unwrap().contains("Image generation"),
         "filtered facts must not become shown"
     );
+}
+
+#[test]
+fn semantic_setup_failure_reports_keyword_fallback_once_and_off_stays_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let layout = Layout::with_user_dir(&project, dir.path().join("home")).unwrap();
+    let config = MemoryConfig {
+        backend: MemoryBackendId::Semantic,
+        ..MemoryConfig::default()
+    };
+    let runtime = MemoryRuntime::with_scope(
+        &layout,
+        &config,
+        authority("a"),
+        bank_scope(&layout, &config),
+        None,
+        Err("embedding endpoint refused connection".into()),
+        false,
+    )
+    .unwrap();
+    let notice = runtime.take_reachability_notice().unwrap();
+    assert!(
+        notice.contains("keyword") && notice.contains("refused connection"),
+        "{notice}"
+    );
+    assert!(runtime.take_reachability_notice().is_none());
+    let (disabled, _) = semantic_runtime(dir.path(), false);
+    assert!(disabled.take_reachability_notice().is_none());
 }

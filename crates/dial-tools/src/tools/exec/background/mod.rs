@@ -200,6 +200,7 @@ impl Background {
                     (!ring.tool_job).then(|| proc.state.outcome(&ring))
                 },
                 running: proc.is_running(),
+                stop_requested: lock(&proc.ring).stop_requested,
                 terminal: proc.terminal,
             })
             .collect();
@@ -708,23 +709,31 @@ impl Background {
                         "signalled {running} running job(s); cancellation requested for {cancelling} tool job(s), still managed until completion"
                     )
                 } else {
-                    format!("killed {running} running process(es); table cleared")
+                    format!(
+                        "stop requested for {running} running process(es); terminal history and output retained"
+                    )
                 }))
             }
             _ => Err("kill needs either `name` or `all: true`".to_string()),
         }
     }
 
-    fn kill_message(&self, name: &str, previous: &State) -> String {
-        let retained = self
-            .table()
-            .procs
-            .iter()
-            .any(|proc| proc.name == name && lock(&proc.ring).tool_job);
-        if retained {
+    fn kill_message(&self, name: &str, _previous: &State) -> String {
+        let mut table = self.table();
+        table.refresh();
+        let Some(proc) = table.procs.iter().find(|proc| proc.name == name) else {
+            return format!("stop requested for {name}; current status unavailable");
+        };
+        let ring = lock(&proc.ring);
+        if proc.is_running() && ring.tool_job {
             format!("cancellation requested for {name}; still managed until actual completion")
+        } else if proc.is_running() {
+            format!("stop requested for {name}; termination not yet observed")
         } else {
-            format!("killed {name} (was {})", previous.label())
+            format!(
+                "{name}: {}; terminal history and output retained",
+                proc.state.label()
+            )
         }
     }
 }
@@ -1210,6 +1219,10 @@ impl Tool for Background {
     fn kill_job(&self, name: &str) -> Result<String, String> {
         let state = kill_entry(&self.table, name)?;
         Ok(self.kill_message(name, &state))
+    }
+    fn dismiss_job(&self, name: &str) -> Result<String, String> {
+        self.table().dismiss(name)?;
+        Ok(format!("dismissed {name} from job history"))
     }
 
     fn schema(&self) -> Value {

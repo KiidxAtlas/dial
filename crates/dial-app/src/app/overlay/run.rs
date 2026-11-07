@@ -57,6 +57,7 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
                             status: job.status,
                             process_outcome: job.process_outcome,
                             running: job.running,
+                            stop_requested: job.stop_requested,
                             terminal: job.terminal,
                             mode: "session".into(),
                         })
@@ -170,6 +171,7 @@ pub(in crate::app) fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut Ac
                         status: job.status,
                         process_outcome: job.process_outcome,
                         running: job.running,
+                        stop_requested: job.stop_requested,
                         terminal: job.terminal,
                         mode: "session".into(),
                     })

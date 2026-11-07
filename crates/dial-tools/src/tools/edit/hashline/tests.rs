@@ -382,7 +382,6 @@ fn parser_rejects_malformed_patches_with_actionable_messages() {
         ("", "empty patch"),
         ("PUT 1.=1:\n+x\n", "section header"),
         ("[a.rs]\nPUT 1.=1:\n+x\n", "no #TAG"),
-        ("[a.rs#12]\nPUT 1.=1:\n+x\n", "four hex"),
         (
             "[a.rs#1234]\nPUT 1.=1:\nPUT 2.=2:\n+x\n",
             "at least one `+` row",
@@ -448,11 +447,20 @@ fn empty_put_bodies_and_sections_name_the_corrected_operation() {
 }
 
 #[test]
-fn an_empty_tag_quotes_the_latest_read_without_applying_the_edit() {
+fn an_empty_or_malformed_tag_quotes_the_latest_read_without_applying_the_edit() {
+    for patch in [
+        "[a.txt#]\nPUT 1.=1:\n+ONE\n",
+        "[a.txt#auto]\nPUT 1.=1:\n+ONE\n",
+        "[a.txt#12]\nPUT 1.=1:\n+ONE\n",
+    ] {
+        a_tagless_edit_quotes_the_latest_read(patch);
+    }
+}
+
+fn a_tagless_edit_quotes_the_latest_read(patch: &str) {
     let dir = tempfile::tempdir().unwrap();
     let ws = Workspace::new(dir.path()).unwrap();
     let path = ws.root().join("a.txt");
-    let patch = "[a.txt#]\nPUT 1.=1:\n+ONE\n";
     fs::write(&path, "one\n").unwrap();
     let unread = edit(&ws, patch).unwrap_err();
     assert!(

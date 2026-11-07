@@ -19,6 +19,9 @@ fn args() -> GcArgs {
         archive: false,
         wal: false,
         stale: false,
+        subagents: false,
+        orphaned_projects: false,
+        prune_after_days: None,
         cold_archive_after_days: None,
         retain_newest_global: None,
         retain_newest_per_cwd: None,
@@ -91,7 +94,9 @@ fn default_selection_is_blobs_archive_wal_without_stale() {
             stale: false,
             blobs: true,
             archive: true,
-            wal: true
+            wal: true,
+            subagents: false,
+            orphaned_projects: false,
         }
     );
 }
@@ -106,7 +111,9 @@ fn any_sweep_flag_selects_only_flagged_sweeps() {
             stale: true,
             blobs: false,
             archive: false,
-            wal: false
+            wal: false,
+            subagents: false,
+            orphaned_projects: false,
         }
     );
     let mut b = args();
@@ -117,7 +124,9 @@ fn any_sweep_flag_selects_only_flagged_sweeps() {
             stale: false,
             blobs: false,
             archive: false,
-            wal: true
+            wal: true,
+            subagents: false,
+            orphaned_projects: false,
         }
     );
 }
@@ -130,6 +139,105 @@ fn default_settings_match_omp() {
     assert_eq!(s.retain_newest_per_cwd, 10);
     assert_eq!(s.stale_retain_newest, 20);
     assert_eq!(s.stale_retain_days, 30);
+    assert_eq!(s.prune_after_days, 30);
+}
+
+#[test]
+fn subagents_sweep_deletes_only_idle_transcript_directories_on_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = layout(dir.path());
+    let root = l.state_dir.join(SUBAGENTS_DIR);
+    let old = root.join("old-parent");
+    let fresh = root.join("fresh-parent");
+    for (d, age) in [(&old, 40), (&fresh, 2)] {
+        fs::create_dir_all(d).unwrap();
+        let file = d.join("task-1.jsonl");
+        fs::write(&file, "{}\n").unwrap();
+        set_age(&file, Duration::from_secs(age * 86_400));
+    }
+    // A fresh file in an otherwise old directory keeps the whole directory.
+    let mixed = root.join("mixed-parent");
+    fs::create_dir_all(&mixed).unwrap();
+    fs::write(mixed.join("task-1.jsonl"), "{}\n").unwrap();
+    set_age(
+        &mixed.join("task-1.jsonl"),
+        Duration::from_secs(40 * 86_400),
+    );
+    fs::write(mixed.join("task-2.jsonl"), "{}\n").unwrap();
+
+    let mut a = args();
+    a.subagents = true;
+    let report = execute(&l, &a, retention::now_ms()).unwrap();
+    assert!(report.blobs.is_none() && report.archive.is_none());
+    let dry = report.subagents.unwrap();
+    assert_eq!(
+        (dry.scanned, dry.kept, dry.would_delete, dry.deleted),
+        (3, 2, 1, 0)
+    );
+    assert_eq!(dry.bytes, 3);
+    assert!(old.exists(), "dry-run must not delete");
+
+    a.apply = true;
+    let applied = execute(&l, &a, retention::now_ms())
+        .unwrap()
+        .subagents
+        .unwrap();
+    assert_eq!(applied.deleted, 1, "errors: {:?}", applied.errors);
+    assert!(!old.exists());
+    assert!(fresh.exists() && mixed.exists());
+
+    a.prune_after_days = Some(1);
+    let shorter = execute(&l, &a, retention::now_ms())
+        .unwrap()
+        .subagents
+        .unwrap();
+    assert_eq!(shorter.deleted, 1);
+    assert!(!fresh.exists() && mixed.exists());
+}
+
+#[test]
+fn orphaned_projects_sweep_keeps_live_unknown_current_and_recent_projects() {
+    let dir = tempfile::tempdir().unwrap();
+    let l = layout(dir.path());
+    let projects = crate::config::paths::projects_dir(&l.user_dir);
+    let gone = dir.path().join("deleted-project");
+    let project = |name: &str, cwd: Option<&Path>, age_days: u64| {
+        let sessions = projects.join(name).join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let file = sessions.join("20260101T000000000Z_abc.jsonl");
+        match cwd {
+            Some(cwd) => {
+                let header = serde_json::json!({"type":"session","cwd":cwd});
+                fs::write(&file, format!("{header}\n")).unwrap();
+            }
+            None => fs::write(&file, "not json\n").unwrap(),
+        }
+        set_age(&file, Duration::from_secs(age_days * 86_400));
+        projects.join(name)
+    };
+    let orphan = project("orphan-1", Some(&gone), 40);
+    let recent_orphan = project("orphan-2", Some(&gone), 3);
+    let live = project("live-1", Some(&l.project_root), 40);
+    let unknown = project("unknown-1", None, 40);
+    // The current project's own state is never a candidate, even if its cwd were missing.
+    fs::create_dir_all(l.sessions_dir()).unwrap();
+    let own = l.sessions_dir().join("20260101T000000000Z_me.jsonl");
+    fs::write(&own, format!("{}\n", serde_json::json!({"cwd":gone}))).unwrap();
+    set_age(&own, Duration::from_secs(40 * 86_400));
+
+    let mut a = args();
+    a.orphaned_projects = true;
+    a.apply = true;
+    let result = execute(&l, &a, retention::now_ms())
+        .unwrap()
+        .orphaned_projects
+        .unwrap();
+    assert_eq!(result.errors, Vec::<String>::new());
+    assert_eq!((result.scanned, result.kept, result.deleted), (5, 4, 1));
+    assert!(!orphan.exists());
+    for kept in [&recent_orphan, &live, &unknown, &l.state_dir] {
+        assert!(kept.exists(), "{} should be kept", kept.display());
+    }
 }
 
 #[test]
@@ -662,6 +770,11 @@ fn exit_code_reflects_errors() {
         }),
         archive: None,
         wal: None,
+        subagents: None,
+        orphaned_projects: Some(PruneResult {
+            errors: vec!["bang".into()],
+            ..Default::default()
+        }),
     };
-    assert_eq!(report.errors(), vec!["boom"]);
+    assert_eq!(report.errors(), vec!["boom", "bang"]);
 }
