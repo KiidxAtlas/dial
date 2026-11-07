@@ -1,5 +1,13 @@
 # Configuration
 
+For native Anthropic models with declared effort support, `--effort low|medium|high|xhigh|max`
+pins output effort independently of `--thinking`. For example, `--thinking off --effort low`
+makes both controls explicit for a comparison without changing defaults for other runs/providers.
+Unsupported combinations fail validation. The runtime journal records secret-free
+`inference_controls` events from the native Messages body builder: model, thinking, output effort,
+token cap and applicable sampling controls, without prompts or tool data. Compare these effective
+controls when benchmarking, rather than CLI flag spellings alone.
+
 Configuration layering, unlimited execution defaults and an annotated example configuration. Feature-specific settings are documented alongside each feature; see the [README index](../README.md#documentation).
 
 ## Configuration layers
@@ -138,6 +146,13 @@ the model's window is larger (0 = the model's full window). Every step resends t
 it fires near 223k, while models with windows of 262144 tokens or less are unaffected by the cap.
 Change it under `/settings` → **Model** → **Roles & Sampling** → **History token ceiling** (under *Show advanced*) or in
 `[efficiency]`; validation accepts 0 or 8192..2000000.
+
+`efficiency.batch_result_percent` (default 30) is the share of the free history window that the
+tool results of one reply may fill together, in the parent and in workers. The largest successful
+results are clipped first, none below 4 KiB, and each clipped result links to its retained full
+text; errors and edits are never clipped. `0` turns the budget off; validation accepts 0..80.
+Change it under `/settings` → **Model** → **Roles & Sampling** → **Reply result budget (%)** (under
+*Show advanced*) or in `[efficiency]`. See [async execution](async-execution.md#reply-result-budget-and-one-call-batches).
 
 Automatic compaction now applies at the planning window minus its response reserve (normally 85%
 of the window), rather than 80% of that usable space. For example, a 200k window triggers near 170k
@@ -307,6 +322,9 @@ history_limit = 0
 
 [message_routing]         # routing of a message typed during a turn when no explicit option is chosen
 route = "steer"           # steer (deterministic, default) | classify (routing judge decides; failure steers)
+
+[goal]
+progress_file = ""         # e.g. ".dial/progress.md": mirror goal, todos and working state after each goal turn
 
 [secrets]                  # mask secrets in provider-bound messages; see llm-transport.md
 enabled = false

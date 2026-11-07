@@ -1,7 +1,9 @@
-//! `--external-thinking`: the model reasons in a private scratchpad the
-//! user never sees. Mechanism: provider reasoning is forced off through the thinking level
-//! (`ReasoningEffort::None`), `INSTRUCTION` is added to the system prompt, and `<scratchpad>`
-//! blocks are removed by `strip_scratchpad` before the reply is shown or stored.
+//! `--external-thinking`: the model reasons in a private scratchpad the user never sees.
+//! Mechanism: provider reasoning is forced off on each request (`ReasoningEffort::None`, applied
+//! after any other effort choice, and automatic thinking selection is skipped); `INSTRUCTION` is
+//! restated per request in the transient `session_mode` notice (`Agent::mode_notice`), so the
+//! cached system prefix never changes; and `<scratchpad>` blocks are removed by `strip_scratchpad`
+//! from replies and stalled partials before they are shown or stored.
 
 use crate::agent::Agent;
 pub use crate::agent::prompts::modes::external_thinking::INSTRUCTION;
@@ -32,14 +34,15 @@ pub fn strip_scratchpad(text: &str) -> String {
 }
 
 impl Agent<'_> {
-    /// The system-prompt addition for `--external-thinking`, or `None` when the flag is off.
+    /// The scratchpad instruction for `--external-thinking`, or `None` when the flag is off. It is
+    /// carried by the request-tail mode notice, not the system prompt.
     pub fn external_thinking_instruction(&self) -> Option<&'static str> {
         self.modes.launch.external_thinking.then_some(INSTRUCTION)
     }
 
     /// `/external-thinking on|off`: the same per-process switch as `--external-thinking`, never
-    /// persisted. The scratchpad instruction lives in the system prompt, so it is rebuilt now and
-    /// the next request carries the change.
+    /// persisted. The next request's mode notice and reasoning effort follow the new value; the
+    /// rebuild keeps any other derived prompt state current but leaves an unchanged prefix as is.
     pub fn set_external_thinking(&mut self, enabled: bool) {
         if self.modes.launch.external_thinking != enabled {
             self.modes.launch.external_thinking = enabled;

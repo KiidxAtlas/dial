@@ -132,16 +132,38 @@ impl<'a> Advisory<'a> {
     }
 }
 
-/// Recovery feedback appended to a failed result. `consecutive` counts failures of this tool and
-/// kind in a row, including this one. The text depends only on its inputs, so stored history
-/// stays byte-stable.
-pub(in crate::agent) fn feedback(kind: &str, advice: &str, consecutive: u32) -> String {
-    let repeated = if consecutive > 1 {
-        format!(" Failed {consecutive} times in a row.")
+/// Failed edits and writes carry one cause-specific line instead of the general retry policy;
+/// the general re-read guidance lives in the editing tool's own description.
+const SOURCE_KIND: &str = "source_or_call_contract";
+
+/// The advice sentence(s) for one failure. `consecutive` counts failures of this tool and kind in
+/// a row, including this one.
+fn advice_body(kind: &str, advice: &str, consecutive: u32) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if kind != SOURCE_KIND {
+        parts.push(FIRST_FAILURE.to_owned());
+    }
+    if consecutive > 1 {
+        parts.push(format!("Failed {consecutive} times in a row."));
+    }
+    parts.push(advice.to_owned());
+    parts.join(" ")
+}
+
+/// One recovery notice appended to a failed result, in the shared harness envelope. Single-line
+/// bodies stay on one line to keep stored history small.
+fn recovery_notice(kind: &str, body: &str) -> String {
+    if body.contains('\n') {
+        format!("\n{}", policy::notice(kind, body))
     } else {
-        String::new()
-    };
-    format!("\n[Dial recovery: {kind}] {FIRST_FAILURE}{repeated} {advice}")
+        format!("\n<dial-notice kind=\"{kind}\">{body}</dial-notice>")
+    }
+}
+
+/// Recovery feedback appended to a failed result. The text depends only on its inputs, so stored
+/// history stays byte-stable.
+pub(in crate::agent) fn feedback(kind: &str, advice: &str, consecutive: u32) -> String {
+    recovery_notice(kind, &advice_body(kind, advice, consecutive))
 }
 
 /// Render one recovery decision from controller-owned facts, without interpreting diagnostic
@@ -162,7 +184,7 @@ pub(in crate::agent) fn report(
         }
     };
     let Some(recovery) = output.recovery() else {
-        return format!("\n{}", feedback(kind, advice, consecutive));
+        return feedback(kind, advice, consecutive);
     };
     // An ordinary nonzero shell exit (missing program, failed build step) whose process ran to
     // completion is routine: the exit code and output above already say what happened. The full
@@ -179,8 +201,9 @@ pub(in crate::agent) fn report(
             p.started && !p.timed_out && !p.cancelled && p.signal.is_none() && p.output_complete
         });
     if routine_exit {
-        return format!(
-            "\n[Dial recovery: {kind}] Command failed; no committed file paths recorded (not proof that nothing changed). Correct the named cause before retrying; a workaround must still deliver the requested final state."
+        return recovery_notice(
+            kind,
+            "Command failed; no committed file paths recorded (not proof that nothing changed). Correct the named cause before retrying; a workaround must still deliver the requested final state.",
         );
     }
     // Any other first failure with known effects, no committed work, complete capture and a plain
@@ -194,9 +217,10 @@ pub(in crate::agent) fn report(
             p.started && !p.timed_out && !p.cancelled && p.signal.is_none() && p.output_complete
         });
     if clean_first {
-        return format!(
-            "\n{} No committed file paths recorded (not proof that nothing changed).",
-            feedback(kind, advice, 1)
+        let body = advice_body(kind, advice, 1);
+        return recovery_notice(
+            kind,
+            &format!("{body} No committed file paths recorded (not proof that nothing changed)."),
         );
     }
     let changed = match recovery.committed_paths {
@@ -227,11 +251,14 @@ pub(in crate::agent) fn report(
             "The original diagnostic and any captured output remain available above; earlier completed work is retained."
         }
     };
-    format!(
-        "\nRecovery state: tool `{}`; status {}. {effects} {changed}\nRetry: {retry}\nRetained: {retained}\nNext action:{}",
-        call.name,
-        recovery.status.as_str(),
-        feedback(kind, advice, consecutive),
+    recovery_notice(
+        kind,
+        &format!(
+            "Recovery state: tool `{}`; status {}. {effects} {changed}\nRetry: {retry}\nRetained: {retained}\nNext action: {}",
+            call.name,
+            recovery.status.as_str(),
+            advice_body(kind, advice, consecutive),
+        ),
     )
 }
 
@@ -295,8 +322,11 @@ pub(in crate::agent) fn classify(
             _ => Some(("verification_unavailable", policy::VERIFICATION_UNAVAILABLE)),
         };
     }
-    if matches!(call.name.as_str(), "edit" | "ast_edit" | "write") {
-        return Some(("source_or_call_contract", policy::SOURCE_OR_CALL_CONTRACT));
+    if call.name == "write" {
+        return Some((SOURCE_KIND, policy::WRITE_NOT_APPLIED));
+    }
+    if matches!(call.name.as_str(), "edit" | "ast_edit") {
+        return Some((SOURCE_KIND, policy::EDIT_NOT_APPLIED));
     }
     Some(("tool_failure", policy::TOOL_FAILURE))
 }

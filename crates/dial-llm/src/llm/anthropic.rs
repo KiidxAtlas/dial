@@ -6,6 +6,125 @@ use std::collections::BTreeMap;
 
 pub const BASE_URL: &str = "https://api.anthropic.com/v1";
 
+/// Models whose documentation lists the tool search tool, and with it `defer_loading` and
+/// `tool_reference` blocks returned in a client tool's `tool_result`
+/// (platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool: "Model
+/// compatibility" and "Custom tool search implementation"; stable, no beta header). The dated
+/// 4.5 snapshots also match their undated aliases.
+const DEFERRED_TOOL_MODELS: &[&str] = &[
+    "claude-fable-5-1",
+    "claude-mythos-5-1",
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+    "claude-opus-5-5",
+    "claude-opus-5",
+    "claude-sonnet-5-5",
+    "claude-sonnet-5",
+    "claude-haiku-5-5",
+    "claude-haiku-4-5-20251001",
+    "claude-haiku-4-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5-20251101",
+    "claude-opus-4-5",
+    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-5",
+];
+
+/// Whether this exact model documents deferred tools and `tool_reference` results.
+pub fn defers_tools(model: &str) -> bool {
+    DEFERRED_TOOL_MODELS.contains(&model)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_FIRST_PARTY: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the first-party host check when dropped ([`test_first_party`]).
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestFirstParty(());
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestFirstParty {
+    fn drop(&mut self) {
+        TEST_FIRST_PARTY.with(|cell| cell.borrow_mut().take());
+    }
+}
+
+/// Treat `origin` (`scheme://host:port`) as Anthropic's first-party host on this thread, so a
+/// fake server can exercise wire behaviour gated on `api.anthropic.com`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_first_party(origin: &str) -> TestFirstParty {
+    TEST_FIRST_PARTY.with(|cell| *cell.borrow_mut() = Some(origin.to_owned()));
+    TestFirstParty(())
+}
+
+/// Whether `url` is Anthropic's own Messages host (exactly `api.anthropic.com`), never a proxy.
+pub(super) fn first_party(url: &str) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if TEST_FIRST_PARTY.with(|cell| {
+        cell.borrow()
+            .as_deref()
+            .is_some_and(|origin| super::same_origin(url, origin))
+    }) {
+        return true;
+    }
+    super::host_of(url).as_deref() == Some("api.anthropic.com")
+}
+
+/// The tool exposure a Messages request to `url` uses: deferred tools only on the first-party
+/// host, without a proxy body hook, for a documented model, unless that endpoint and model have
+/// already refused them in this process. Everything else is sent plain.
+pub(super) fn tool_exposure(url: &str, model: &str, shaped: bool) -> super::tool_offer::Exposure {
+    if !shaped && first_party(url) && defers_tools(model) && !deferral_refused(url, model) {
+        super::tool_offer::Exposure::Deferred
+    } else {
+        super::tool_offer::Exposure::Plain
+    }
+}
+
+/// Whether a 400 says the request's `defer_loading` tools or `tool_reference` results were not
+/// accepted. The request is then resent plain and the refusal is remembered.
+pub(super) fn deferral_rejected(status: u16, body: &[u8]) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    ["defer_loading", "tool_reference", "tool reference"]
+        .iter()
+        .any(|field| text.contains(field))
+}
+
+/// Endpoints (URL without query) and models that refused deferred tools in this process.
+static DEFERRAL_REFUSED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn deferral_key(url: &str, model: &str) -> (String, String) {
+    (
+        url.split('?').next().unwrap_or(url).to_owned(),
+        model.to_owned(),
+    )
+}
+
+fn deferral_refused(url: &str, model: &str) -> bool {
+    DEFERRAL_REFUSED
+        .lock()
+        .is_ok_and(|set| set.contains(&deferral_key(url, model)))
+}
+
+/// Remember that this endpoint and model refused deferred tools: later requests start plain.
+pub(super) fn refuse_deferral(url: &str, model: &str) {
+    if let Ok(mut set) = DEFERRAL_REFUSED.lock() {
+        set.insert(deferral_key(url, model));
+    }
+}
+
 /// A structurally unfinished generation, not a completed reply or executable call.
 /// Static text only: safe to preserve through provider error redaction.
 #[derive(Debug)]
@@ -45,17 +164,20 @@ fn advances_event(event: &Value) -> bool {
     }
 }
 
-/// Longest span after the last real progress that keep-alives may cover while a tool call is open.
+/// Longest span after the last real progress that keep-alives may cover while a tool call or
+/// thinking block is open.
 pub(super) const OPEN_TOOL_CALL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The transport idle clock's progress policy for one Anthropic stream. Anthropic may buffer a tool
 /// call's input while the model writes it, sending only `ping` keep-alives (every 30 s) for minutes
-/// before the arguments arrive in one burst. While a tool call is open those keep-alives show the
-/// generation is alive, bounded by [`OPEN_TOOL_CALL_PATIENCE`] since the last real progress;
-/// otherwise only [`advances_reply`] events count, so keep-alives cannot hold an idle reply open.
+/// before the arguments arrive in one burst. A thinking block whose text is omitted streams the
+/// same way: keep-alives, then a signature. While a tool call or thinking block is open those
+/// keep-alives show the generation is alive, bounded by [`OPEN_TOOL_CALL_PATIENCE`] since the last
+/// real progress; otherwise only [`advances_reply`] events count, so keep-alives cannot hold an
+/// idle reply open.
 #[derive(Default)]
 pub(super) struct ReplyProgress {
-    open_tool_calls: std::collections::BTreeSet<u64>,
+    open_blocks: std::collections::BTreeSet<u64>,
     last_progress: Option<std::time::Instant>,
 }
 
@@ -72,13 +194,13 @@ impl ReplyProgress {
             (Some("content_block_start"), Some(index))
                 if matches!(
                     event["content_block"]["type"].as_str(),
-                    Some("tool_use" | "server_tool_use")
+                    Some("tool_use" | "server_tool_use" | "thinking")
                 ) =>
             {
-                self.open_tool_calls.insert(index);
+                self.open_blocks.insert(index);
             }
             (Some("content_block_stop"), Some(index)) => {
-                self.open_tool_calls.remove(&index);
+                self.open_blocks.remove(&index);
             }
             _ => {}
         }
@@ -87,7 +209,7 @@ impl ReplyProgress {
             return true;
         }
         event["type"] == "ping"
-            && !self.open_tool_calls.is_empty()
+            && !self.open_blocks.is_empty()
             && self
                 .last_progress
                 .is_some_and(|last| now.duration_since(last) < OPEN_TOOL_CALL_PATIENCE)
@@ -104,6 +226,8 @@ pub(crate) fn documented_context_window(model: &str) -> Option<u32> {
         ("claude-sonnet-5-5", 1_000_000),
         ("claude-sonnet-5", 1_000_000),
         ("claude-fable-5-1", 1_000_000),
+        ("claude-fable-5", 1_000_000),
+        ("claude-haiku-5-5", 1_000_000),
         ("claude-haiku-4-5", 200_000),
     ] {
         if model == id
@@ -210,6 +334,7 @@ pub(super) struct Accumulator {
     open: std::collections::BTreeSet<u64>,
     usage: Value,
     stop_reason: Option<String>,
+    stop_details: Value,
     started: bool,
     stopped: bool,
     claude_code_oauth: bool,
@@ -416,6 +541,9 @@ impl Accumulator {
                 if let Some(reason) = event["delta"]["stop_reason"].as_str() {
                     self.stop_reason = Some(reason.to_owned());
                 }
+                if event["delta"]["stop_details"].is_object() {
+                    self.stop_details = event["delta"]["stop_details"].clone();
+                }
                 if let Some(fields) = event["usage"].as_object() {
                     if !self.usage.is_object() {
                         self.usage = json!({});
@@ -456,7 +584,7 @@ impl Accumulator {
             return Err(IncompleteStream.into());
         }
         super::provider::anthropic_reply(
-            &json!({"content":self.blocks.into_values().collect::<Vec<_>>(),"stop_reason":self.stop_reason,"usage":self.usage}),
+            &json!({"content":self.blocks.into_values().collect::<Vec<_>>(),"stop_reason":self.stop_reason,"stop_details":self.stop_details,"usage":self.usage}),
         )
     }
 }

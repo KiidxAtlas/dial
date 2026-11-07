@@ -9,6 +9,9 @@ use std::{
 
 type CallbackGate<'a> = std::sync::Mutex<crate::agent::safety::rules::CallbackGate<'a>>;
 
+/// Callbacks one worker code cell may make; `tool.batch` entries each count.
+const CODE_CALLBACK_LIMIT: usize = crate::agent::run::dispatch::MAX_BATCH_ENTRIES;
+
 struct PreparedCall {
     call: llm::ToolCall,
     private_control: bool,
@@ -621,6 +624,128 @@ fn rewrite_child_call(
     }
 }
 
+/// `tool.batch([...])` from a worker code cell. When every entry is an offered, hook-free parallel
+/// read that this worker's approver authorizes and the portable-rule gate admits, the entries run
+/// together through the ordinary parallel-read group (the worker's own read path). Otherwise each
+/// entry is an ordinary serial callback (`serial`) with its own admission and approval. Results keep
+/// entry order. Steering that arrives meanwhile stays queued for the worker's round loop.
+fn child_code_batch(
+    context: &CallContext<'_, '_, '_>,
+    parent: &llm::ToolCall,
+    calls: &[ToolCall],
+    steps: u32,
+    serial: &mut dyn FnMut(&ToolCall) -> ToolOutput,
+) -> Vec<ToolOutput> {
+    let env = context.env;
+    let ToolSurface { schemas, names, .. } = context.surface;
+    let hooks_free = ["pre_tool_use", "post_tool_use"]
+        .iter()
+        .all(|event| !crate::agent::safety::hooks::wanted(&env.config.hooks, event));
+    let shared = env.config.eval.parallel_batches
+        && hooks_free
+        && !calls.is_empty()
+        && calls.iter().all(|entry| {
+            entry.name != crate::tools::exec::eval::BATCH_CALLBACK
+                && names.contains(&entry.name)
+                && !matches!(entry.name.as_str(), "task" | "finish" | "exit_plan")
+                && approval::parallel_read(env.ext, &entry.name, &entry.arguments)
+                && call_form_error(entry, schemas, names).is_none()
+        })
+        && calls.iter().all(|entry| {
+            context
+                .approver
+                .borrow_mut()
+                .authorize_with_cancel(entry, &summarize(entry), false, env.interrupt)
+                .is_ok()
+                && gate_intercept(context.callback_gate, env.workspace.root(), entry).is_none()
+        });
+    if !shared {
+        return calls.iter().map(serial).collect();
+    }
+    for entry in calls {
+        context.approver.borrow_mut().notice(&format!(
+            "[{} callback] {}",
+            parent.name,
+            summarize(entry)
+        ));
+    }
+    let mut ui = CallbackReadUi(RuleUi {
+        observer: context.approver,
+        steps,
+        stream: context
+            .children
+            .and_then(|children| children.transcript.clone()),
+        stream_error: None,
+        registry: env.ext,
+    });
+    let mut steering = Vec::new();
+    let results = crate::agent::run::dispatch::parallel_tools_with_reads(
+        crate::agent::ParallelToolContext {
+            workspace: env.workspace,
+            config: env.config,
+            ext: env.ext,
+            interrupt: env.interrupt,
+            ui: &mut ui,
+            pending_steering: &mut steering,
+        },
+        calls,
+        None,
+        None,
+        None,
+    );
+    debug_assert!(steering.is_empty(), "callback reads never take steering");
+    let outputs = calls
+        .iter()
+        .zip(results)
+        .map(|(entry, (mut output, _))| {
+            let image = match crate::agent::callback_image(env.workspace, entry, &mut output, None)
+            {
+                Ok(image) => image,
+                Err(error) => {
+                    output.is_error = true;
+                    output.text.push_str(&format!(
+                        "\n[Preparing callback image evidence failed: {error:#}]"
+                    ));
+                    None
+                }
+            };
+            context.approver.borrow_mut().notice(&format!(
+                "[{} callback result] {}",
+                parent.name,
+                crate::agent::truncate(&output.text, 2000)
+            ));
+            if let Err(error) = crate::agent::callback_image_payload(&mut output, image) {
+                output.is_error = true;
+                output.text.push_str(&format!(
+                    "\n[Encoding callback image payload failed: {error:#}]"
+                ));
+            }
+            output
+        })
+        .collect();
+    context
+        .approver
+        .borrow_mut()
+        .tool_started(&parent.id, &parent.name, env.ext);
+    outputs
+}
+
+/// The worker's progress surface for a callback read group. It never takes steering: a message
+/// arriving mid-cell stays queued for the worker's round loop instead of being consumed here.
+struct CallbackReadUi<'a, 'b, 'c>(RuleUi<'a, 'b, 'c>);
+
+impl crate::agent::Ui for CallbackReadUi<'_, '_, '_> {
+    fn tool_call_with_args(&mut self, call_id: &str, name: &str, summary: &str, args: &Value) {
+        self.0.tool_call_with_args(call_id, name, summary, args);
+    }
+    fn tool_result_with_id(&mut self, call_id: &str, name: &str, output: &ToolOutput) {
+        self.0.tool_result_with_id(call_id, name, output);
+    }
+    fn notice(&mut self, message: &str) {
+        self.0.notice(message);
+    }
+}
+
 fn execute_child_call(
     context: &CallContext<'_, '_, '_>,
     original: &llm::ToolCall,
@@ -662,20 +787,96 @@ fn execute_child_call(
     } else if let Some(tool) = code_tool {
         let mut callbacks = 0usize;
         let mut questions = Vec::new();
-        let mut dispatch = |request| {
+        let steps = rerank.as_ref().map_or(0, |context| *context.steps);
+        // Per-callback admission shared by single callbacks and serial `tool.batch` entries.
+        let blocked = || {
             if env.interrupt.load(Ordering::SeqCst) {
-                return crate::agent::interrupted_tool();
+                return Some(crate::agent::interrupted_tool());
             }
             if preview_abort.is_some_and(std::cell::Cell::get) {
-                return ToolOutput::err(
+                return Some(ToolOutput::err(
                     "code-mode callbacks are blocked after an authorized completed edit preview failure",
+                ));
+            }
+            gate_blocked(callback_gate).map(ToolOutput::err)
+        };
+        let mut nested_call = |name: String, arguments: Value| -> ToolOutput {
+            if env
+                .ext
+                .get(&name)
+                .is_some_and(|tool| tool.supports_tool_dispatch())
+                || matches!(name.as_str(), "finish" | "exit_plan")
+            {
+                return ToolOutput::err(
+                    "recursive code-mode and turn-control callbacks are not available",
                 );
             }
-            if let Some(reason) = gate_blocked(callback_gate) {
-                return ToolOutput::err(reason);
+            let nested = llm::ToolCall {
+                id: String::new(),
+                name,
+                arguments,
+                malformed_arguments: false,
+            };
+            let context = rerank.as_mut().map(|context| RerankContext {
+                backend: &mut *context.backend,
+                adapter: context.adapter,
+                steps: &mut *context.steps,
+                budget: context.budget,
+                children: context.children,
+                preview_abort: context.preview_abort,
+                capture: context.capture,
+            });
+            approver.borrow_mut().notice(&format!(
+                "[{} callback] {}",
+                call.name,
+                summarize(&nested)
+            ));
+            // The shared gate runs once in call_tool, before nested authorization.
+            let mut output = call_tool(
+                env,
+                job,
+                surface,
+                &nested,
+                &mut **approver.borrow_mut(),
+                context,
+                callback_gate,
+            );
+            let image =
+                match crate::agent::callback_image(env.workspace, &nested, &mut output, None) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        output.is_error = true;
+                        output.text.push_str(&format!(
+                            "\n[Preparing callback image evidence failed: {error:#}]"
+                        ));
+                        None
+                    }
+                };
+            approver.borrow_mut().notice(&format!(
+                "[{} callback result] {}",
+                call.name,
+                crate::agent::truncate(&output.text, 2000)
+            ));
+            if let Err(error) = crate::agent::callback_image_payload(&mut output, image) {
+                output.is_error = true;
+                output.text.push_str(&format!(
+                    "\n[Encoding callback image payload failed: {error:#}]"
+                ));
+            }
+            if nested.name == "ask" {
+                questions.push(json!({"parent":call.name,"arguments":nested.arguments,"text":output.text,"data":output.data,"is_error":output.is_error}));
+            }
+            approver
+                .borrow_mut()
+                .tool_started(&call.id, &call.name, env.ext);
+            output
+        };
+        let mut dispatch = |request| {
+            if let Some(refusal) = blocked() {
+                return refusal;
             }
             callbacks += 1;
-            if callbacks > 128 {
+            if callbacks > CODE_CALLBACK_LIMIT {
                 return ToolOutput::err("code-mode callback limit exceeded (128 per cell)");
             }
             match request {
@@ -699,80 +900,31 @@ fn execute_child_call(
                     text: String::new(),
                     is_error: false,
                 },
-                crate::tools::integrations::ext::ToolCallback::Call { name, arguments } => {
-                    if env
-                        .ext
-                        .get(&name)
-                        .is_some_and(|tool| tool.supports_tool_dispatch())
-                        || matches!(name.as_str(), "finish" | "exit_plan")
-                    {
-                        return ToolOutput::err(
-                            "recursive code-mode and turn-control callbacks are not available",
-                        );
+                crate::tools::integrations::ext::ToolCallback::Call { name, arguments }
+                    if name == crate::tools::exec::eval::BATCH_CALLBACK =>
+                {
+                    let calls =
+                        match crate::agent::run::dispatch::code_batch_calls(&arguments, &call.id) {
+                            Ok(calls) => calls,
+                            Err(refusal) => return ToolOutput::err(refusal),
+                        };
+                    // Each entry counts against the cell's limit, as the driver counts them.
+                    callbacks += calls.len().saturating_sub(1);
+                    if callbacks > CODE_CALLBACK_LIMIT {
+                        return ToolOutput::err("code-mode callback limit exceeded (128 per cell)");
                     }
-                    let nested = llm::ToolCall {
-                        id: String::new(),
-                        name,
-                        arguments,
-                        malformed_arguments: false,
-                    };
-                    let context = rerank.as_mut().map(|context| RerankContext {
-                        backend: &mut *context.backend,
-                        adapter: context.adapter,
-                        steps: &mut *context.steps,
-                        budget: context.budget,
-                        children: context.children,
-                        preview_abort: context.preview_abort,
-                        capture: context.capture,
-                    });
-                    approver.borrow_mut().notice(&format!(
-                        "[{} callback] {}",
-                        call.name,
-                        summarize(&nested)
-                    ));
-                    // The shared gate runs once in call_tool, before nested authorization.
-                    let mut output = call_tool(
-                        env,
-                        job,
-                        surface,
-                        &nested,
-                        &mut **approver.borrow_mut(),
-                        context,
-                        callback_gate,
-                    );
-                    let image = match crate::agent::callback_image(
-                        env.workspace,
-                        &nested,
-                        &mut output,
-                        None,
-                    ) {
-                        Ok(image) => image,
-                        Err(error) => {
-                            output.is_error = true;
-                            output.text.push_str(&format!(
-                                "\n[Preparing callback image evidence failed: {error:#}]"
-                            ));
-                            None
+                    let outputs = child_code_batch(context, call, &calls, steps, &mut |entry| {
+                        if entry.name == crate::tools::exec::eval::BATCH_CALLBACK {
+                            return ToolOutput::err("tool.batch entries cannot nest tool.batch");
                         }
-                    };
-                    approver.borrow_mut().notice(&format!(
-                        "[{} callback result] {}",
-                        call.name,
-                        crate::agent::truncate(&output.text, 2000)
-                    ));
-                    if let Err(error) = crate::agent::callback_image_payload(&mut output, image) {
-                        output.is_error = true;
-                        output.text.push_str(&format!(
-                            "\n[Encoding callback image payload failed: {error:#}]"
-                        ));
-                    }
-                    if nested.name == "ask" {
-                        questions.push(json!({"parent":call.name,"arguments":nested.arguments,"text":output.text,"data":output.data,"is_error":output.is_error}));
-                    }
-                    approver
-                        .borrow_mut()
-                        .tool_started(&call.id, &call.name, env.ext);
-                    output
+                        blocked().unwrap_or_else(|| {
+                            nested_call(entry.name.clone(), entry.arguments.clone())
+                        })
+                    });
+                    crate::agent::run::dispatch::code_batch_output(outputs)
+                }
+                crate::tools::integrations::ext::ToolCallback::Call { name, arguments } => {
+                    nested_call(name, arguments)
                 }
             }
         };
@@ -1063,3 +1215,6 @@ fn finish_child_call(
     }
     output
 }
+
+#[cfg(test)]
+mod tests;

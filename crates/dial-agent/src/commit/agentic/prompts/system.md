@@ -33,5 +33,5 @@ Tool guidance:
 
 ## Changelog Requirements
 
-If changelog targets provided, you MUST call `propose_changelog` before finishing.
+If changelog targets are provided, call `propose_changelog` before finishing; the workflow needs its entries.
 If you propose split commit plan, include changelog target files in relevant commit changes.

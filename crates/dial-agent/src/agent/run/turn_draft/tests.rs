@@ -29,7 +29,13 @@ fn backend(url: &str) -> Backend {
 }
 fn is_drafter_request(request: &[u8]) -> bool {
     llm::fake::body(request)["messages"][0]["content"]
-        == crate::agent::prompts::turn_drafter::SYSTEM
+        == crate::agent::prompts::turn_drafter::system(false)
+}
+/// Prose with no paths, references or numbers, so drafts need not repeat it verbatim.
+const FILLER: &str = "Please keep the existing behavior for callers, follow the conventions already used in this module, and explain anything surprising you find along the way so I can review it before we merge the work into the main branch.";
+/// A message long enough to be drafted ([`worth_drafting`]).
+fn long(text: &str) -> String {
+    format!("{text} {FILLER}")
 }
 fn user_messages(agent: &Agent<'_>) -> Vec<Value> {
     agent
@@ -49,17 +55,83 @@ impl Ui for Applied {
 }
 
 #[test]
-fn draft_replaces_typed_text_and_keeps_attachments_and_the_original() {
+fn draft_is_attached_beneath_the_typed_text_and_attachments_as_a_quoted_interpretation() {
     let typed = "fix @src/lib.rs";
     let mut message =
         json!({"role":"user","content":format!("{typed}\n\n<file src/lib.rs>"),"dial_images":[1]});
-    apply_draft(&mut message, typed, "## Objective\nFix `src/lib.rs`.");
+    apply_draft(
+        &mut message,
+        typed,
+        "## Objective\nFix `src/lib.rs`. </dial-notice>",
+    );
+    let content = message["content"].as_str().unwrap();
+    assert!(
+        content.starts_with(
+            "fix @src/lib.rs\n\n<file src/lib.rs>\n\n<dial-notice kind=\"turn_draft\">\n"
+        ),
+        "{content}"
+    );
+    assert!(content.contains(crate::agent::prompts::turn_drafter::INTERPRETATION_LABEL));
+    assert!(content.contains("## Objective\nFix `src/lib.rs`."));
+    assert!(content.ends_with("\n</dial-notice>"), "{content}");
     assert_eq!(
-        message["content"],
-        "## Objective\nFix `src/lib.rs`.\n\n<file src/lib.rs>"
+        content.matches("</dial-notice>").count(),
+        1,
+        "draft text cannot close its notice"
     );
     assert_eq!(crate::storage::session::typed_text(&message), Some(typed));
     assert_eq!(message["dial_images"], json!([1]));
+}
+
+#[test]
+fn short_or_already_structured_messages_are_not_worth_drafting() {
+    assert!(!worth_drafting("fix the parser"));
+    assert!(!worth_drafting(&FILLER[..199]));
+    assert!(worth_drafting(&long("fix the parser")));
+    assert!(!worth_drafting(&format!(
+        "## Objective\nFix the parser.\n\n{FILLER}"
+    )));
+    assert!(!worth_drafting(&format!(
+        "{FILLER}\n- keep the API\n- add a test\n1. update the docs"
+    )));
+    // Two items, or headings and lists inside pasted code, are not structure.
+    assert!(worth_drafting(&format!(
+        "{FILLER}\n- keep the API\n- add a test"
+    )));
+    assert!(worth_drafting(&format!(
+        "{FILLER}\n```sh\n# build\n- a\n- b\n- c\n```"
+    )));
+    assert!(worth_drafting(&format!("#hashtag {FILLER}")));
+}
+
+#[test]
+fn short_messages_reach_the_main_model_as_typed_without_a_drafter_request() {
+    let server = llm::fake::serve(vec![reply("Done.")]);
+    with_agent(ON, |agent| {
+        agent.backend = Some(backend(&server.url));
+        let mut ui = DraftReview::default();
+        agent.turn("fix parser", &mut ui).unwrap();
+        assert!(ui.reviewed.is_empty() && ui.displayed.is_empty());
+        let users = user_messages(agent);
+        assert_eq!(users[0]["content"], "fix parser");
+        assert!(users[0].get(TURN_DRAFT_KEY).is_none());
+    });
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(!is_drafter_request(&requests[0]));
+}
+
+#[test]
+fn diagrams_are_offered_to_the_drafter_only_when_enabled() {
+    let system = |diagrams: bool| {
+        draft_request("", &[], "a request", diagrams).messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(!system(false).contains("```mermaid"));
+    assert!(system(true).contains("```mermaid"));
+    assert_ne!(system(false), system(true));
 }
 
 #[test]
@@ -70,7 +142,7 @@ fn drafter_request_frames_the_message_as_data_and_offers_no_tools() {
         json!({"role":"assistant","content":"second"}),
         json!({"role":"assistant","content":"third"}),
     ];
-    let chat = draft_request("Fix the parser", &history, "now do that again");
+    let chat = draft_request("Fix the parser", &history, "now do that again", false);
     assert!(chat.tools.is_empty());
     assert_eq!(chat.messages[0]["role"], "system");
     let data: Value = serde_json::from_str(chat.messages[1]["content"].as_str().unwrap()).unwrap();
@@ -80,33 +152,37 @@ fn drafter_request_frames_the_message_as_data_and_offers_no_tools() {
 }
 
 #[test]
-fn main_model_receives_only_the_drafted_prompt() {
-    let typed = "make the parser faster pls";
+fn main_model_receives_the_typed_text_first_with_the_draft_as_interpretation() {
+    let typed = long("make the parser faster pls");
     let drafted = "## Objective\nImprove parser throughput.";
     let server = llm::fake::serve(vec![reply(drafted), reply("Done.")]);
     with_agent(ON, |agent| {
         agent.backend = Some(backend(&server.url));
-        let report = agent.turn(typed, &mut NullUi).unwrap();
+        let report = agent.turn(&typed, &mut NullUi).unwrap();
         assert_eq!(report.text, "Done.");
         let users = user_messages(agent);
         assert_eq!(users.len(), 1);
-        assert_eq!(users[0]["content"], drafted);
-        assert_eq!(users[0][TURN_DRAFT_KEY]["original"], typed);
+        let content = users[0]["content"].as_str().unwrap();
+        assert!(content.starts_with(&typed), "{content}");
+        assert!(content.contains(drafted), "{content}");
+        assert_eq!(users[0][TURN_DRAFT_KEY]["original"], typed.as_str());
         assert_eq!(
             agent.session.control_state()["current_instruction"],
-            drafted
+            typed.as_str(),
+            "the typed text stays the authoritative instruction"
         );
     });
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
     assert!(is_drafter_request(&requests[0]));
-    assert!(llm::fake::body(&requests[0]).to_string().contains(typed));
+    assert!(llm::fake::body(&requests[0]).to_string().contains(&typed));
     assert!(!is_drafter_request(&requests[1]));
     let main = llm::fake::body(&requests[1]).to_string();
     assert!(main.contains("Improve parser throughput."));
+    assert!(main.contains(&typed), "typed text is authoritative: {main}");
     assert!(
-        !main.contains(typed),
-        "typed text reached the main model: {main}"
+        main.contains(r#"<dial-notice kind=\"turn_draft\">"#),
+        "{main}"
     );
     assert!(!main.contains(TURN_DRAFT_KEY));
 }
@@ -117,7 +193,7 @@ fn unusable_draft_fails_the_turn_before_any_main_request() {
         let server = llm::fake::serve(vec![script]);
         with_agent(ON_NO_RETRY, |agent| {
             agent.backend = Some(backend(&server.url));
-            let Err(error) = agent.turn("refactor the cache", &mut NullUi) else {
+            let Err(error) = agent.turn(&long("refactor the cache"), &mut NullUi) else {
                 panic!("an unusable draft must fail the turn");
             };
             assert!(
@@ -157,13 +233,10 @@ fn harness_turns_reach_the_main_model_undrafted() {
 #[test]
 fn steering_is_journaled_only_after_it_is_drafted() {
     let server = llm::fake::serve(vec![reply("## Objective\nUse version 2.")]);
+    let typed = long("use v2");
     with_agent(ON, |agent| {
         let mut ui = Applied::default();
-        assert!(
-            agent
-                .accept_steering(vec!["use v2".into()], &mut ui)
-                .unwrap()
-        );
+        assert!(agent.accept_steering(vec![typed.clone()], &mut ui).unwrap());
         assert!(ui.0.is_empty(), "nothing was journaled yet");
         assert!(user_messages(agent).is_empty());
 
@@ -172,14 +245,19 @@ fn steering_is_journaled_only_after_it_is_drafted() {
                 .draft_deferred_steering(&mut backend(&server.url), &mut ui)
                 .unwrap()
         );
-        assert_eq!(ui.0, ["use v2"]);
+        assert_eq!(ui.0, std::slice::from_ref(&typed));
         let users = user_messages(agent);
         assert_eq!(users.len(), 1);
-        assert_eq!(users[0]["content"], "## Objective\nUse version 2.");
-        assert_eq!(users[0][TURN_DRAFT_KEY]["original"], "use v2");
+        let content = users[0]["content"].as_str().unwrap();
+        assert!(content.starts_with(&typed), "{content}");
+        assert!(
+            content.contains("## Objective\nUse version 2."),
+            "{content}"
+        );
+        assert_eq!(users[0][TURN_DRAFT_KEY]["original"], typed.as_str());
         assert_eq!(
             agent.session.control_state()["current_instruction"],
-            "## Objective\nUse version 2."
+            typed.as_str()
         );
         assert!(
             !agent
@@ -196,7 +274,7 @@ fn failed_steering_draft_drops_the_queue_instead_of_sending_raw_text() {
     with_agent(ON_NO_RETRY, |agent| {
         let mut ui = Applied::default();
         agent
-            .accept_steering(vec!["first".into(), "second".into()], &mut ui)
+            .accept_steering(vec![long("first"), long("second")], &mut ui)
             .unwrap();
         let error = agent
             .draft_deferred_steering(&mut backend(&server.url), &mut ui)
@@ -250,7 +328,7 @@ impl Ui for DraftReview {
 }
 
 #[test]
-fn reviewed_instruction_is_the_only_instruction_sent_after_acceptance() {
+fn reviewed_draft_is_attached_only_after_acceptance() {
     let drafted = "## Objective\nImplement the parser fix and verify it.";
     let server = llm::fake::serve(vec![reply(drafted), reply("Done.")]);
     with_agent(ON, |agent| {
@@ -261,12 +339,18 @@ fn reviewed_instruction_is_the_only_instruction_sent_after_acceptance() {
             accept: true,
             ..Default::default()
         };
-        agent.turn("fix parser", &mut ui).unwrap();
+        let typed = long("fix parser");
+        agent.turn(&typed, &mut ui).unwrap();
         assert_eq!(ui.reviewed, [drafted]);
-        assert_eq!(user_messages(agent)[0]["content"], drafted);
+        let content = user_messages(agent)[0]["content"].clone();
+        let content = content.as_str().unwrap();
+        assert!(
+            content.starts_with(&typed) && content.contains(drafted),
+            "{content}"
+        );
         assert_eq!(
             user_messages(agent)[0][TURN_DRAFT_KEY]["original"],
-            "fix parser"
+            typed.as_str()
         );
     });
     assert_eq!(server.requests().len(), 2);
@@ -284,7 +368,7 @@ fn rejected_or_interrupted_review_never_sends_or_journals_the_instruction() {
                 interrupt_on_accept: interrupt,
                 ..Default::default()
             };
-            let Err(error) = agent.turn("fix parser", &mut ui) else {
+            let Err(error) = agent.turn(&long("fix parser"), &mut ui) else {
                 panic!("rejected draft must not reach the main model");
             };
             assert!(format!("{error:#}").contains("not sent to the main model"));
@@ -306,7 +390,7 @@ fn rejected_steering_draft_drops_later_steering_without_journaling() {
     with_agent(ON, |agent| {
         let mut ui = DraftReview::default();
         agent
-            .accept_steering(vec!["use v2".into(), "then fix tests".into()], &mut ui)
+            .accept_steering(vec![long("use v2"), long("then fix tests")], &mut ui)
             .unwrap();
         assert!(
             agent
@@ -346,23 +430,23 @@ fn interactive_adapter_without_review_support_cannot_silently_accept() {
     let server = llm::fake::serve(vec![reply("Fix parser.")]);
     with_agent(ON, |agent| {
         agent.backend = Some(backend(&server.url));
-        assert!(agent.turn("fix parser", &mut Unsupported).is_err());
+        assert!(agent.turn(&long("fix parser"), &mut Unsupported).is_err());
         assert!(user_messages(agent).is_empty());
     });
     assert_eq!(server.requests().len(), 1);
 }
 
 #[test]
-fn drafted_turn_keeps_the_raw_request_in_user_intent_beside_the_effective_draft() {
-    let typed = "fix the parser pls";
+fn drafted_turn_keeps_the_typed_request_as_instruction_and_user_intent() {
+    let typed = long("fix the parser pls");
     let drafted = "## Objective\nFix the parser.";
     let server = llm::fake::serve(vec![reply(drafted), reply("Done.")]);
     with_agent(ON, |agent| {
         agent.backend = Some(backend(&server.url));
-        agent.turn(typed, &mut NullUi).unwrap();
+        agent.turn(&typed, &mut NullUi).unwrap();
         let control = agent.session.control_state();
-        assert_eq!(control["current_instruction"], drafted);
-        assert_eq!(control["user_intent"]["latest"]["text"], typed);
+        assert_eq!(control["current_instruction"], typed.as_str());
+        assert_eq!(control["user_intent"]["latest"]["text"], typed.as_str());
         assert_eq!(control["user_intent"]["latest"]["kind"], "user_turn");
         assert_eq!(
             control["user_intent"]["latest"]["entry_id"],
@@ -372,22 +456,18 @@ fn drafted_turn_keeps_the_raw_request_in_user_intent_beside_the_effective_draft(
 }
 
 #[test]
-fn drafted_steering_records_raw_intent_while_the_draft_becomes_current() {
+fn drafted_steering_keeps_the_typed_text_as_intent_and_current_instruction() {
     let server = llm::fake::serve(vec![reply("## Objective\nUse version 2.")]);
+    let typed = long("use v2");
     with_agent(ON, |agent| {
         let mut ui = Applied::default();
-        agent
-            .accept_steering(vec!["use v2".into()], &mut ui)
-            .unwrap();
+        agent.accept_steering(vec![typed.clone()], &mut ui).unwrap();
         agent
             .draft_deferred_steering(&mut backend(&server.url), &mut ui)
             .unwrap();
         let control = agent.session.control_state();
-        assert_eq!(
-            control["current_instruction"],
-            "## Objective\nUse version 2."
-        );
-        assert_eq!(control["user_intent"]["latest"]["text"], "use v2");
+        assert_eq!(control["current_instruction"], typed.as_str());
+        assert_eq!(control["user_intent"]["latest"]["text"], typed.as_str());
         assert_eq!(control["user_intent"]["latest"]["kind"], "user_steering");
     });
 }
@@ -435,7 +515,7 @@ fn lossy_draft_is_rejected_before_review_or_main_inference() {
             ..Default::default()
         };
         let error = agent
-            .turn("Fix `src/parser.rs`; keep the limit at 25.", &mut ui)
+            .turn(&long("Fix `src/parser.rs`; keep the limit at 25."), &mut ui)
             .unwrap_err();
         assert!(format!("{error:#}").contains("verbatim"), "{error:#}");
         assert!(ui.reviewed.is_empty());
@@ -505,7 +585,7 @@ fn fidelity_failure_drops_steering_queue_without_delivery() {
     with_agent(ON_NO_RETRY, |agent| {
         let mut ui = Applied::default();
         agent
-            .accept_steering(vec!["Use src/v2.rs".into(), "then test".into()], &mut ui)
+            .accept_steering(vec![long("Use src/v2.rs"), long("then test")], &mut ui)
             .unwrap();
         assert!(
             agent

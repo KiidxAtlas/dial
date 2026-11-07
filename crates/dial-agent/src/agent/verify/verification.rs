@@ -705,6 +705,40 @@ fn removed_from(root: &Path, path: &Path) -> bool {
     )
 }
 
+/// Whether an automatically planned Python AST check would launch the bare fallback interpreter
+/// although that interpreter resolves neither as a path nor on `PATH`. Such a check can only fail
+/// with "command not found", which the verify report then lists as an unexplained failure of the
+/// model's file (a leftover helper in an image without Python). Project runners (uv, a virtualenv,
+/// Poetry) and an operator `python_command` keep their checks, so a broken project setup still
+/// surfaces.
+pub(in crate::agent) fn python_ast_unrunnable(
+    root: &Path,
+    python: &Path,
+    override_argv: &[String],
+    check: &FocusedCheck,
+) -> bool {
+    // Windows resolution needs PATHEXT; keep the check rather than guess absence there.
+    if cfg!(windows) || !override_argv.is_empty() {
+        return false;
+    }
+    let Some(source) = check.name.strip_prefix("python AST: ") else {
+        return false;
+    };
+    let owner = python_owner(root, Path::new(source));
+    let root_uv = owner != root
+        && root.join("uv.lock").is_file()
+        && !owner.join("poetry.lock").is_file()
+        && !venv_python(&owner).is_file();
+    if root_uv || python_runner(&owner, python) != shell_invocation(&python.to_string_lossy()) {
+        return false;
+    }
+    if python.components().count() > 1 {
+        !python.is_file()
+    } else {
+        !crate::tools::integrations::mcp::catalog::on_path(&python.to_string_lossy())
+    }
+}
+
 /// A retained Python AST obligation whose file is gone is obsolete: nothing remains to parse.
 pub fn obsolete_check(root: &Path, check: &FocusedCheck) -> bool {
     check

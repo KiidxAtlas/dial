@@ -15,12 +15,10 @@ struct TurnPrompt<'input> {
 }
 
 impl TurnPrompt<'_> {
+    /// The typed (or hook-rewritten) text: the turn's authoritative instruction. A draft, when
+    /// present, is only attached to the admitted message as an interpretation.
     fn typed(&self) -> &str {
         &self.typed
-    }
-
-    fn effective(&self) -> &str {
-        self.drafted.as_deref().unwrap_or(&self.typed)
     }
 }
 

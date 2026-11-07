@@ -1,4 +1,22 @@
 use super::*;
+
+#[test]
+fn execution_gap_experiments_have_explicit_defaults_and_validate_bounds() {
+    let defaults = crate::config::types::Config::default();
+    assert!(defaults.eval.portable_helpers && defaults.eval.auto_offer && defaults.eval.parallel_batches);
+    assert!(defaults.efficiency.preserve_task_inputs && defaults.verification.auto_registered_checks);
+    assert!(!defaults.experimental.adaptive_output_effort);
+    assert_eq!(defaults.compaction.argument_projection_tokens, 0);
+    let configured: crate::config::types::Config = toml::from_str("[eval]\nportable_helpers=false\nauto_offer=false\nparallel_batches=false\n[efficiency]\npreserve_task_inputs=false\nevidence_stall_rounds=0\nsmall_case_guard=false\n[verification]\nauto_registered_checks=false\n").unwrap();
+    assert!(!configured.eval.portable_helpers && !configured.eval.auto_offer && !configured.eval.parallel_batches);
+    assert!(!configured.verification.auto_registered_checks);
+    let mut invalid = defaults;
+    invalid.efficiency.evidence_stall_rounds = 257;
+    assert!(invalid.validate().is_err());
+    invalid.efficiency.evidence_stall_rounds = 0;
+    invalid.compaction.argument_projection_tokens = 4096;
+    assert!(invalid.validate().is_err());
+}
 use crate::{config::types::Config, llm::model_config::UiConfig};
 use std::collections::HashSet;
 
@@ -446,6 +464,7 @@ fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
         "experimental.profile_matching",
         "experimental.tool_speculation",
         "experimental.turn_optimizer",
+        "experimental.turn_drafter_diagrams",
         "experimental.check_predictions",
     ];
     let setting = |path: &str| {
@@ -933,5 +952,25 @@ fn reasoning_strategy_is_opt_in_and_all_settings_options_roundtrip() {
             Value::Table(settings).try_into::<Config>().is_err(),
             "deserialized {invalid}"
         );
+    }
+}
+
+#[test]
+fn batch_result_percent_defaults_to_thirty_zero_disables_and_is_bounded() {
+    let setting = registry()
+        .iter()
+        .find(|setting| setting.path == "efficiency.batch_result_percent")
+        .expect("the per-reply result budget is a setting");
+    assert_eq!(setting.default_value(), Some(Value::Integer(30)));
+    assert_eq!(Config::default().efficiency.batch_result_percent, 30);
+    let omitted: Config = toml::from_str("[efficiency]\ntask_packet = true\n").unwrap();
+    assert_eq!(omitted.efficiency.batch_result_percent, 30);
+    check_value("efficiency.batch_result_percent", &Value::Integer(0)).unwrap();
+    check_value("efficiency.batch_result_percent", &Value::Integer(80)).unwrap();
+    assert!(check_value("efficiency.batch_result_percent", &Value::Integer(81)).is_err());
+    for (percent, valid) in [(0, true), (80, true), (81, false)] {
+        let mut config = Config::default();
+        config.efficiency.batch_result_percent = percent;
+        assert_eq!(config.validate().is_ok(), valid, "{percent}");
     }
 }

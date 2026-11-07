@@ -141,9 +141,43 @@ const call = (name, args = {}) => {
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new ToolError('tool arguments must be an object');
   return callback('tool', { name, arguments: args });
 };
+// Reserved controller name (BATCH_CALLBACK in eval.rs); no provider tool can carry it.
+const BATCH = 'dial.batch';
+const batch = (entries) => {
+  if (!Array.isArray(entries) || entries.length > MAX_CALLBACKS) throw new ToolError(`tool.batch expects an array of at most ${MAX_CALLBACKS} {name, args} entries`);
+  const calls = entries.map((entry, index) => {
+    const { name, args = {} } = entry ?? {};
+    if (typeof name !== 'string' || !name || name.length > 256) throw new ToolError(`tool.batch entry ${index}: tool name must be a nonempty string of at most 256 characters`);
+    if (!args || typeof args !== 'object' || Array.isArray(args)) throw new ToolError(`tool.batch entry ${index}: tool arguments must be an object`);
+    return { name, arguments: args };
+  });
+  if (!calls.length) return [];
+  const operation = operationStorage.getStore();
+  // Each entry is one callback against the cell's limit, whether or not it runs concurrently.
+  if (operation) operation.callbacks += calls.length - 1;
+  let result;
+  try {
+    result = callback('tool', { name: BATCH, arguments: { calls } });
+  } catch (error) {
+    // A controller without batch support refuses the reserved name: run the entries serially.
+    if (!(error instanceof ToolError) || !(error.result?.data?.code === 'unsupported_batch' && error.result?.data?.executed === false)) throw error;
+    if (operation) operation.callbacks -= calls.length;
+    return calls.map(({ name, arguments: args }) => {
+      try {
+        return call(name, args);
+      } catch (failure) {
+        if (!(failure instanceof ToolError)) throw failure;
+        return failure.result ?? { is_error: true, text: failure.message, data: null };
+      }
+    });
+  }
+  if (!Array.isArray(result.data) || result.data.length !== calls.length || result.data.some(item => !item || typeof item !== 'object' || typeof item.is_error !== 'boolean')) throw new ToolError('controller returned a malformed tool.batch result', result);
+  return result.data;
+};
 const tool = new Proxy(Object.create(null), {
   get(_target, name) {
     if (name === 'call') return call;
+    if (name === 'batch') return batch;
     if (name === 'schemas') {
       const result = callback('schemas');
       if (!Array.isArray(result.data)) throw new ToolError('controller did not return current tool schemas', result);
@@ -164,6 +198,7 @@ if (!vm.isContext(context)) throw new Error('Node REPL did not create a vm conte
 for (const name of ['require', 'module', 'exports', 'process', '__filename', '__dirname']) delete context[name];
 context.tool = tool;
 context.__dial_prelude__ = async (name, parameters) => callback('prelude', { name, parameters }).data;
+context.__dial_check__ = (name, passed) => callback('check', { name, passed });
 context.__dial_display__ = value => { callback('display', { text: typeof value === 'string' ? value : util.inspect(value) }); };
 context.console = Object.fromEntries(['log', 'info', 'debug', 'warn', 'error', 'dir'].map(name => [name, (...args) => {
   const operation = operationStorage.getStore();

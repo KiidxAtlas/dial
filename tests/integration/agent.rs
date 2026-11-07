@@ -21,6 +21,7 @@ use std::{
 };
 
 mod application_monitoring;
+mod completion_routes;
 #[cfg(target_os = "macos")]
 mod idle_sleep;
 mod length_recovery;
@@ -745,9 +746,7 @@ fn conversation_messages(request: &Value) -> Vec<Value> {
             !(message["role"] == "user"
                 && message["content"].as_str().is_some_and(|text| {
                     text.contains("[Current executable tool contract]")
-                        || text.contains(
-                            "[Latest admitted user request; runtime context, not new permissions]",
-                        )
+                        || text.contains("<dial-notice kind=\"latest_user_request\">")
                 }))
         })
         .cloned()
@@ -6712,7 +6711,7 @@ fn steering_between_tools_skips_unstarted_calls_and_keeps_completed_results() {
     // The steering correction reaches the next request as the latest admitted user request.
     let tail = requests[1]["messages"].to_string();
     assert!(
-        tail.contains("[Latest admitted user request")
+        tail.contains("latest_user_request")
             && tail.contains("user_steering")
             && tail.contains("Stop writing files and ask me what to do next."),
         "{tail}"
@@ -6748,7 +6747,7 @@ fn child_repeated_narration_gets_loop_feedback_with_different_calls() {
     assert!(
         side.requests.lock()[3]["messages"]
             .to_string()
-            .contains("[Loop check from Dial]")
+            .contains("kind=\\\"repeated_")
     );
 }
 
@@ -6774,7 +6773,7 @@ fn repeated_narration_gets_loop_feedback_even_with_different_tool_calls() {
     assert!(
         server.requests.lock()[3]["messages"]
             .to_string()
-            .contains("[Loop check from Dial]")
+            .contains("kind=\\\"repeated_")
     );
 }
 
@@ -10291,8 +10290,10 @@ fn reliability_stops_different_contract_failures_without_executing_them() {
     std::fs::write(e.project.path().join("existing.txt"), "evidence").unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("Fix a fixture", &mut Recorder::default()).unwrap();
-    // Contract failures escalate; the turn is no longer ended for them.
-    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+    // Contract failures escalate; the turn is no longer ended for them. With no successful
+    // observation the reply gets the one investigation nudge, which only advises: the next
+    // tool-free answer is accepted rather than ending the turn Incomplete.
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
     assert!(!e.project.path().join("must-not-exist.txt").exists());
     assert_eq!(server.requests.lock().len(), 5);
     let control = a.session().control_state();

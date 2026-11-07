@@ -22,6 +22,8 @@ use std::{
 };
 
 use crate::platform::fs as platform_fs;
+mod preserved;
+pub use preserved::PreservedInput;
 
 /// Files larger than this are not recorded (they are listed in the warnings instead).
 pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;

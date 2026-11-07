@@ -6,6 +6,15 @@ use crate::config::tools::bash_interceptor::rule;
 
 use super::*;
 
+#[test]
+fn acceptance_status_masking_gets_a_hint_without_changing_the_process_verdict() {
+    assert!(exit_masking_hint("cmp -s input output && echo OK || echo FAIL").is_some());
+    assert!(exit_masking_hint("test -f fixed || printf missing").is_some());
+    assert!(exit_masking_hint("cmp -s input output").is_none());
+    assert!(exit_masking_hint("echo 'this text contains || only'").is_none());
+    assert!(exit_masking_hint("test -f fixed || exit 1").is_none());
+}
+
 const TOOLS: &[&str] = &["read", "grep", "glob", "edit", "write", "bash", "bg"];
 
 fn on() -> BashInterceptorConfig {

@@ -314,6 +314,12 @@ impl<'a> Agent<'a> {
         });
         let exit = verdict.repair_exit_code(output);
         let passed = verdict == crate::agent::verify::verification::CheckStatus::Passed;
+        // A previous run made before any edit, shell effect or extension effect of this
+        // instruction describes the code the user handed over: keep it as the command's
+        // baseline. A debugging request is about such a failure, so it never becomes one.
+        if self.task_policy.kind != crate::learn::task_policy::Kind::Debugging {
+            self.step_checks.evidence.capture_baseline_of(command);
+        }
         self.step_checks.evidence.observe_with_fix_revision(
             command,
             &call.id,
@@ -451,7 +457,13 @@ impl<'a> Agent<'a> {
         // Model-registered reproductions are untrusted shell text: they take the approval path a
         // configured command (and a model `bash` call) takes, never the generated-check boundary.
         let repro = self.step_checks.evidence.is_repro(&check.command);
+        let model_registered = self
+            .step_checks
+            .registered_acceptance
+            .iter()
+            .any(|registered| registered.command == check.command);
         let configured = repro
+            || model_registered
             || crate::agent::verify::verification::test_targets::exit_status_target(&check.name)
             || self
                 .config
@@ -479,7 +491,9 @@ impl<'a> Agent<'a> {
                         "The rule applies to this session but could not be saved: {error:#}"
                     ));
                 }
-                if repro && let Some(reason) = self.repro_hook_refusal(&args, ui) {
+                if (repro || model_registered)
+                    && let Some(reason) = self.repro_hook_refusal(&args, ui)
+                {
                     ui.notice(&reason);
                     crate::runtime::tool_output::ToolOutput::err(format!(
                         "automatic check {} not run: {reason}",
@@ -487,7 +501,7 @@ impl<'a> Agent<'a> {
                     ))
                     .with_status(crate::tools::ToolStatus::Blocked)
                 } else {
-                    if repro
+                    if (repro || model_registered)
                         && !crate::agent::safety::approval::safe_bash(&check.command)
                         && !crate::agent::safety::approval::safe_review_batch(&check.command)
                     {
@@ -807,10 +821,16 @@ impl<'a> Agent<'a> {
     pub(in crate::agent) fn current_focused_checks(
         &self,
     ) -> Vec<crate::agent::verify::verification::FocusedCheck> {
-        match self.step_checks.turn {
+        let mut checks = match self.step_checks.turn {
             Some(turn) => self.focused_checks(turn),
             None => self.focused_checks_for(&[]),
+        };
+        for check in &self.step_checks.registered_acceptance {
+            if !checks.iter().any(|prior| prior.command == check.command) {
+                checks.push(check.clone());
+            }
         }
+        checks
     }
 
     /// Interpreter for generated Python checks. Endpoint users may never have run `dial setup`;
@@ -845,6 +865,14 @@ impl<'a> Agent<'a> {
             paths,
             &self.config.verification.python_command,
         );
+        checks.retain(|check| {
+            !crate::agent::verify::verification::python_ast_unrunnable(
+                self.workspace.root(),
+                &python,
+                &self.config.verification.python_command,
+                check,
+            )
+        });
         if self.config.assistance.enabled && self.config.assistance.selective_verification {
             checks.extend(self.related_test_plan(paths).checks);
         }
@@ -1234,6 +1262,15 @@ impl<'a> Agent<'a> {
     /// blockers, running shell or worker jobs, unreadable worker state, and failed checks with no edit
     /// awaiting a fresh check. Callers decide whether to pump workers or disclose changes.
     pub(in crate::agent) fn completion_blockers(&self) -> Result<(), String> {
+        self.completion_blockers_scoped(true)
+    }
+
+    /// [`Self::completion_blockers`]; `open_steps` false leaves unfinished (not blocked) execution
+    /// steps to the caller, which on non-lean routes lists them with the accepted answer instead.
+    pub(in crate::agent) fn completion_blockers_scoped(
+        &self,
+        open_steps: bool,
+    ) -> Result<(), String> {
         let blocked: Vec<_> = self
             .todo
             .blocked_steps()
@@ -1262,7 +1299,7 @@ impl<'a> Agent<'a> {
             })
             .map(|task| task.content.as_str())
             .collect::<Vec<_>>();
-        if !open.is_empty() {
+        if open_steps && !open.is_empty() {
             return Err(format!(
                 "Execution steps remain open: {}. Complete or explicitly block them; a final reply does not close them.",
                 open.join("; ")
@@ -1323,9 +1360,17 @@ impl<'a> Agent<'a> {
                 > self.step_checks.checked_shell_commands
             || self.step_checks.uncheckpointed_extension_calls
                 > self.step_checks.checked_extension_calls;
+        // Failures that say nothing about this turn's code (see `disclosed_failure`) are disclosed
+        // with the accepted answer; any other current failure still refuses completion.
+        let diagnosis = self.diagnosis_requested();
         if !self.hermetic
             && self.step_checks.failed
             && (!self.config.verification.enabled || !unchecked_effects)
+            && self
+                .step_checks
+                .failed_checks
+                .iter()
+                .any(|check| self.disclosed_failure(check, diagnosis).is_none())
         {
             return Err("Cannot complete: focused checks failed and no new edits are awaiting a fresh check. Repair, rerun the failed check, or report a blocker.".into());
         }
@@ -1353,11 +1398,100 @@ impl<'a> Agent<'a> {
                 &self.workspace,
                 self.step_checks.effect_epoch(),
                 self.terminal_launch_available(),
+                diagnosis && self.step_checks.mutations == 0,
             )
         {
             return Err(reason);
         }
         Ok(())
+    }
+
+    /// The latest instruction asks why something fails without asking for a repair.
+    fn diagnosis_requested(&self) -> bool {
+        self.session.control_state()["current_instruction"]
+            .as_str()
+            .is_some_and(crate::learn::task_policy::diagnosis_only)
+    }
+
+    /// Why a current failure of `check` is disclosed with an accepted answer rather than refusing
+    /// it, or `None` while it stays a completion blocker:
+    /// - an unavailable environment, a denied permission or a time limit says nothing about the
+    ///   code, unless the same check passed before this instruction's first effect;
+    /// - a request to diagnose a failure is answered by observing it, while nothing was edited;
+    /// - an unchanged pre-existing code failure outside declared requirements predates the turn
+    ///   (never on a debugging request, which is about such a failure).
+    pub(in crate::agent) fn disclosed_failure(
+        &self,
+        check: &crate::agent::verify::verification::FocusedCheck,
+        diagnosis: bool,
+    ) -> Option<&'static str> {
+        use crate::agent::verify::verification::CheckStatus;
+        let evidence = &self.step_checks.evidence;
+        if matches!(
+            evidence.current_status(&check.command, self.step_checks.revision()),
+            "not_observed" | "stale" | "passed"
+        ) {
+            return None;
+        }
+        let passed_before = evidence.baseline_status(&check.command) == Some(CheckStatus::Passed);
+        let required = self
+            .config
+            .verification
+            .requirements
+            .values()
+            .any(|requirement| requirement.checks.contains(&check.name));
+        match evidence.latest_status(&check.command)? {
+            CheckStatus::EnvironmentUnavailable if !passed_before => {
+                Some("verification environment unavailable")
+            }
+            CheckStatus::PermissionDenied if !passed_before => {
+                Some("verification permission denied")
+            }
+            CheckStatus::TimedOut if !passed_before => Some("verification timed out"),
+            CheckStatus::Cancelled => None,
+            _ if diagnosis && self.step_checks.mutations == 0 => {
+                Some("the failure this request asked to diagnose; nothing was edited")
+            }
+            CheckStatus::CodeFailed
+                if !required
+                    && self.task_policy.kind != crate::learn::task_policy::Kind::Debugging
+                    && evidence.unchanged_unrelated_failure(&check.command) =>
+            {
+                Some("unchanged pre-existing failure outside the requested scope")
+            }
+            _ => None,
+        }
+    }
+
+    /// Current failures an accepted answer discloses instead of being refused for, one line each:
+    /// failed checks (`disclosed_failure`) and, for a diagnosis request, requested runs that failed.
+    pub(in crate::agent) fn disclosed_gaps(&self) -> Vec<String> {
+        let diagnosis = self.diagnosis_requested();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut checks = self.step_checks.failed_checks.clone();
+        if self.unverified_edits_apply() {
+            checks.extend(self.current_focused_checks());
+        }
+        let mut gaps: Vec<String> = checks
+            .into_iter()
+            .filter(|check| seen.insert(check.command.clone()))
+            .filter_map(|check| {
+                self.disclosed_failure(&check, diagnosis)
+                    .map(|why| format!("- {}: {why}", check.name))
+            })
+            .collect();
+        if diagnosis
+            && self.step_checks.mutations == 0
+            && !self.plan_mode
+            && self.step_checks.targets.has_obligations()
+        {
+            gaps.extend(self.step_checks.targets.conclusive_failures(
+                &self.workspace,
+                self.step_checks.effect_epoch(),
+                self.terminal_launch_available(),
+            ));
+        }
+        gaps
     }
 
     /// Eligible offered or loadable terminal launches, not an execution grant.
@@ -1366,16 +1500,22 @@ impl<'a> Agent<'a> {
             .terminal_available()
     }
 
-    /// The applicable checks when this turn's file edits have no passing check on the current
-    /// revision. `None` when no evidence is owed: nothing was edited, no check applies, automatic
-    /// checks verify after the turn anyway, or a relevant `check` or shell test command passed.
-    pub(in crate::agent) fn unverified_edits(&mut self) -> Option<Vec<String>> {
-        if self.hermetic
+    /// Whether this turn owes evidence for its edits at all: something was edited outside plan mode,
+    /// verification is on, and automatic checks will not verify after the turn anyway.
+    fn unverified_edits_apply(&self) -> bool {
+        !(self.hermetic
             || self.plan_mode
             || !self.config.verification.enabled
             || self.config.verification.automatic_checks
-            || self.step_checks.mutations == 0
-        {
+            || self.step_checks.mutations == 0)
+    }
+
+    /// The applicable checks when this turn's file edits have no passing check on the current
+    /// revision. `None` when no evidence is owed: nothing was edited, no check applies, automatic
+    /// checks verify after the turn anyway, a relevant `check` or shell test command passed, or
+    /// every applicable check either passed or failed for a disclosed reason (`disclosed_failure`).
+    pub(in crate::agent) fn unverified_edits(&mut self) -> Option<Vec<String>> {
+        if !self.unverified_edits_apply() {
             return None;
         }
         self.refresh_check_inputs();
@@ -1384,12 +1524,17 @@ impl<'a> Agent<'a> {
             return None;
         }
         let checks = self.current_focused_checks();
-        let observed = checks.iter().any(|check| {
+        let passed = |check: &crate::agent::verify::verification::FocusedCheck| {
             self.step_checks
                 .evidence
                 .current_status(&check.command, revision)
                 == "passed"
-        });
+        };
+        let diagnosis = self.diagnosis_requested();
+        let observed = checks.iter().any(passed)
+            || checks
+                .iter()
+                .all(|check| passed(check) || self.disclosed_failure(check, diagnosis).is_some());
         (!checks.is_empty() && !observed)
             .then(|| checks.into_iter().map(|check| check.name).collect())
     }
@@ -1409,8 +1554,17 @@ impl<'a> Agent<'a> {
         }
         let checks = self.current_focused_checks();
         let failures = self.run_checks(&checks, ui).failures;
-        if failures.is_empty() {
-            (self.unverified_edits(), failures)
+        let diagnosis = self.diagnosis_requested();
+        let blocking = checks.iter().any(|check| {
+            self.step_checks
+                .failed_checks
+                .iter()
+                .any(|failed| failed.command == check.command)
+                && self.disclosed_failure(check, diagnosis).is_none()
+        });
+        if failures.is_empty() || !blocking {
+            // Only disclosed failures remain; `disclosed_gaps` reports them with the answer.
+            (self.unverified_edits(), Vec::new())
         } else {
             (unverified, failures)
         }
@@ -1419,6 +1573,15 @@ impl<'a> Agent<'a> {
     /// One completion boundary for plain reports and explicit finish calls. Pumps worker results
     /// first, so a worker that already finished is not reported as running.
     pub(in crate::agent) fn validate_completion(&mut self, ui: &mut dyn Ui) -> Result<(), String> {
+        self.validate_completion_scoped(ui, true)
+    }
+
+    /// [`Self::validate_completion`]; `open_steps` as in [`Self::completion_blockers_scoped`].
+    pub(in crate::agent) fn validate_completion_scoped(
+        &mut self,
+        ui: &mut dyn Ui,
+        open_steps: bool,
+    ) -> Result<(), String> {
         self.pump_subagents(ui);
         self.refresh_check_inputs();
         if !self.hermetic
@@ -1461,7 +1624,7 @@ impl<'a> Agent<'a> {
         if let Some(notice) = self.exit_bound_jobs_notice() {
             return Err(notice);
         }
-        self.completion_blockers()?;
+        self.completion_blockers_scoped(open_steps)?;
         if !self.hermetic {
             self.disclose_turn_changes(ui);
         }
@@ -1525,6 +1688,7 @@ impl<'a> Agent<'a> {
             "caller_obligations": self.caller_obligations(),
             "requested_targets": self.step_checks.targets.evidence(&self.workspace, self.step_checks.effect_epoch()),
             "counterfactual_checks": self.step_checks.counterfactual.evidence(),
+            "disclosed_gaps": self.disclosed_gaps(),
             "note": "Observed checks and delivered pixels are evidence, not independent proof of every requested behavior. Undeclared requirements remain unassessed, not complete."
         })
     }

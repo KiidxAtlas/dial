@@ -177,7 +177,10 @@ fn provider_confirmed_single_read_finishes_while_response_is_pending() {
         .started
         .get(&key(&call("read", json!({"path":"a.txt"}))))
         .unwrap();
-    let (output, read_secs) = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (output, read_secs) = receiver
+        .receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
     assert!(!output.is_error, "{}", output.text);
     assert!(output.text.contains("alpha"));
     eprintln!(
@@ -246,4 +249,185 @@ fn explicit_completion_never_bypasses_hooks_denials_or_interrupts() {
         .unwrap();
     assert!(output.is_error);
     assert_eq!(output.text, interrupted_tool().text);
+}
+
+#[test]
+fn bookkeeping_keeps_the_read_prefix_and_later_reads_open() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    let mut stream = dispatch(dir.path());
+    stream.completed(0, "plan", "todo", r#"{"todos":[]}"#);
+    stream.completed(1, "c1", "read", r#"{"path":"a.txt"}"#);
+    assert_eq!(stream.started(), 1, "todo observes no workspace state");
+    let todo = call("todo", json!({"todos":[]}));
+    stream.ran(&todo, false, None);
+    assert!(stream.has(&call("read", json!({"path":"a.txt"}))));
+    assert!(!stream.cancelled());
+}
+
+#[test]
+fn a_serial_call_drops_only_conflicting_reads_and_unknown_effects_cancel_the_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    for file in ["a.txt", "b.txt"] {
+        std::fs::write(dir.path().join(file), "source\n").unwrap();
+    }
+    let mut stream = dispatch(dir.path());
+    stream.completed(0, "c0", "read", r#"{"path":"a.txt"}"#);
+    stream.completed(1, "c1", "read", r#"{"path":"b.txt"}"#);
+    assert_eq!(stream.started(), 2);
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let write = call("write", json!({"path":"b.txt","content":"new"}));
+    let footprint = crate::agent::run::dependency_dispatch::footprint_for(
+        &workspace,
+        crate::config::types::EditMode::default(),
+        &Registry::new(),
+        &write,
+    );
+    assert!(footprint.is_some());
+    stream.ran(&write, false, footprint.clone());
+    assert!(stream.has(&call("read", json!({"path":"a.txt"}))));
+    assert!(!stream.has(&call("read", json!({"path":"b.txt"}))));
+    assert!(!stream.cancelled(), "a disjoint read keeps running");
+
+    // A hooked call may touch anything, even with a resolved footprint.
+    stream.ran(&write, true, footprint);
+    assert!(!stream.has(&call("read", json!({"path":"a.txt"}))));
+    assert!(stream.cancelled());
+}
+
+#[test]
+fn a_cancelled_stream_never_delivers_an_extracted_read() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    let mut stream = dispatch(dir.path());
+    stream.completed(0, "c0", "read", r#"{"path":"a.txt"}"#);
+    let early = stream
+        .extract(&call("read", json!({"path":"a.txt"})))
+        .unwrap();
+    stream.ran(&call("bash", json!({"command":"touch a.txt"})), false, None);
+    assert!(stream.cancelled());
+    assert!(
+        early.receive().is_none(),
+        "the caller reruns the read instead of using a cancelled result"
+    );
+}
+
+fn barrier_footprint(dir: &std::path::Path, call: &ToolCall) -> Footprint {
+    crate::agent::run::dependency_dispatch::footprint_for(
+        &Workspace::new(dir).unwrap(),
+        crate::config::types::EditMode::default(),
+        &Registry::new(),
+        call,
+    )
+    .unwrap()
+}
+
+fn read(id: &str, path: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "read".into(),
+        arguments: json!({ "path": path }),
+        malformed_arguments: false,
+    }
+}
+
+#[test]
+fn reads_beside_a_pending_approval_start_only_when_disjoint_and_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    for file in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        std::fs::write(dir.path().join(file), format!("{file} source\n")).unwrap();
+    }
+    let mut stream = dispatch(dir.path());
+    // The stream sealed at the pending write while the reply streamed.
+    stream.completed(0, "w", "write", r#"{"path":"b.txt","content":"new"}"#);
+    let write = call("write", json!({"path":"b.txt","content":"new"}));
+    let barrier = barrier_footprint(dir.path(), &write);
+    let later = [
+        read("r1", "a.txt"),
+        read("r2", "b.txt"),
+        call("todo", json!({"todos":[]})),
+        read("r3", "c.txt"),
+        call("bash", json!({"command":"touch d.txt"})),
+        read("r4", "d.txt"),
+    ];
+    let mut asked = Vec::new();
+    let started = stream.start_beside(std::slice::from_ref(&barrier), &later, &mut |call| {
+        asked.push(call.id.clone());
+        call.id != "r3"
+    });
+    assert_eq!(started, 1, "only the disjoint, controller-admitted read");
+    assert_eq!(asked, ["r1", "r3"], "the conflicting read is never offered");
+    assert!(stream.has(&read("r1", "a.txt")));
+    assert!(
+        !stream.has(&read("r2", "b.txt")),
+        "it conflicts with the barrier"
+    );
+    assert!(
+        !stream.has(&read("r3", "c.txt")),
+        "the controller refused it"
+    );
+    assert!(
+        !stream.has(&read("r4", "d.txt")),
+        "never past a later effect"
+    );
+    // The approved barrier ran with its declared footprint: the held read survives both checks.
+    stream.ran(&write, false, Some(barrier));
+    let mut wrote = ToolOutput::ok("wrote".into());
+    wrote.execution.changed_paths.push("b.txt".into());
+    stream.settled_beside(&wrote);
+    let held = stream.take(&read("r1", "a.txt"), &mut NullUi).unwrap();
+    assert!(held.0.text.contains("a.txt source"), "{}", held.0.text);
+}
+
+#[test]
+fn a_denied_barrier_keeps_held_reads_and_reached_or_unknown_effects_discard_them() {
+    let dir = tempfile::tempdir().unwrap();
+    for file in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.path().join(file), "source\n").unwrap();
+    }
+    let write = call("write", json!({"path":"c.txt","content":"new"}));
+    let barrier = barrier_footprint(dir.path(), &write);
+    let later = [read("r1", "a.txt"), read("r2", "b.txt")];
+
+    // Denied: nothing ran, so every held read stays valid.
+    let mut stream = dispatch(dir.path());
+    assert_eq!(
+        stream.start_beside(std::slice::from_ref(&barrier), &later, &mut |_| true),
+        2
+    );
+    stream.settled_beside(
+        &ToolOutput::err("denied").with_effects(crate::runtime::execution::Effects::None),
+    );
+    assert!(stream.has(&later[0]) && stream.has(&later[1]));
+
+    // Approved, but its recorded changes reached a held read's file: only that one re-runs.
+    let mut stream = dispatch(dir.path());
+    assert_eq!(
+        stream.start_beside(std::slice::from_ref(&barrier), &later, &mut |_| true),
+        2
+    );
+    let mut reached = ToolOutput::ok("wrote".into());
+    reached.execution.changed_paths.push("b.txt".into());
+    stream.settled_beside(&reached);
+    assert!(stream.has(&later[0]));
+    assert!(!stream.has(&later[1]));
+    assert!(!stream.cancelled());
+
+    // Unknown effects may have reached anything.
+    let mut stream = dispatch(dir.path());
+    assert_eq!(
+        stream.start_beside(std::slice::from_ref(&barrier), &later, &mut |_| true),
+        2
+    );
+    stream.settled_beside(
+        &ToolOutput::ok("ran".into()).with_effects(crate::runtime::execution::Effects::Unknown),
+    );
+    assert!(!stream.has(&later[0]));
+    assert!(stream.cancelled());
+
+    // An invalidated stream never starts reads beside a barrier.
+    assert_eq!(
+        stream.start_beside(std::slice::from_ref(&barrier), &later, &mut |_| true),
+        0
+    );
 }

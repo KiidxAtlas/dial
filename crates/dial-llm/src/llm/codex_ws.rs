@@ -280,7 +280,7 @@ pub(super) fn exchange(
     let (replay_scope, chat) = super::responses::validate_history(endpoint, chat)?;
     let chat = &*chat;
     let mut body = super::responses::request_codex(endpoint.model, chat, profile)?;
-    if super::responses::sends_prompt_cache_key(profile, true)
+    if super::responses::sends_prompt_cache_key(profile, true, endpoint.url)
         && let Some(key) = cache_key
     {
         body["prompt_cache_key"] = json!(key);

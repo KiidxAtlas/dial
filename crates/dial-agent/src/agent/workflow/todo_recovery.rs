@@ -89,7 +89,7 @@ pub(in crate::agent) fn solo_update_note(
         && !calls.is_empty()
         && calls.iter().all(|call| call.name == "todo"))
     .then_some(
-        "[Dial] This response held only `todo`, which costs a full request. Send todo updates in the same response as real work: set with the first reads, done with the next step's first call. Close completed execution steps explicitly, paired with finish when possible; a final answer does not close tasks automatically.",
+        "<dial-notice kind=\"todo_only_response\">\nThis response held only `todo`, which costs a full request. Send todo updates in the same response as real work: set with the first reads, done with the next step's first call.\n</dial-notice>",
     )
 }
 
@@ -106,7 +106,7 @@ pub(in crate::agent) fn refused_edit_done_note(
         && call.name == "todo"
         && crate::agent::workflow::todo::requested_op(&call.arguments) == Some("done"))
     .then_some(
-        "[Dial] The most recent edit/write in this turn was refused, so nothing from it is in the file. If this step depended on it, the work is not done: re-read the file, apply the change, then mark the step done again.",
+        "<dial-notice kind=\"todo_done_after_refused_edit\">\nThe most recent edit/write in this turn was refused, so nothing from it is in the file. If this step depended on it, the work is not done: re-read the file, apply the change, then mark the step done again.\n</dial-notice>",
     )
 }
 

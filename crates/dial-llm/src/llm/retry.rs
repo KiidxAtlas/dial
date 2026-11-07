@@ -96,6 +96,9 @@ pub(crate) struct ServerHints {
     pub(crate) delay: Option<Duration>,
     /// When the provider says its rate-limit or quota window refills.
     pub(crate) reset_at: Option<SystemTime>,
+    /// The provider's explicit verdict on retrying this request (`x-should-retry`). `Some(false)`
+    /// means the same request must not be resent; another credential or model still may be tried.
+    pub(crate) should_retry: Option<bool>,
 }
 
 /// Read the explicit retry delay and the quota-window reset time from response headers.
@@ -109,6 +112,7 @@ impl From<Option<Duration>> for ServerHints {
         Self {
             delay,
             reset_at: None,
+            should_retry: None,
         }
     }
 }
@@ -162,7 +166,18 @@ fn hints<'a>(header: impl Fn(&str) -> Option<&'a str>, now: SystemTime) -> Serve
     })
     .filter(|at| *at > now)
     .max();
-    ServerHints { delay, reset_at }
+    let should_retry = header("x-should-retry").and_then(|value| {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    });
+    ServerHints {
+        delay,
+        reset_at,
+        should_retry,
+    }
 }
 
 fn retry_after(value: &str, now: SystemTime) -> Option<Duration> {

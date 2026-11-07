@@ -86,7 +86,7 @@ fn recall_is_folded_into_its_own_user_message_not_inserted_before_the_conversati
     ];
     project(&mut m, &mut Supersession::default(), &Policy::calm());
     assert_eq!(m.len(), 3);
-    assert_eq!(m[0]["content"], "question\n\nNOTE: fact");
+    assert_eq!(m[0]["content"], "NOTE: fact\n\nquestion");
     assert!(m[0].get("dial_recall").is_none());
     assert_eq!(m[2]["content"], "later");
 }

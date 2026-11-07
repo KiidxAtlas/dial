@@ -224,6 +224,9 @@ impl Agent<'_> {
     ) -> Result<(TurnReport, u32)> {
         let mut turn = self.begin_turn(backend, names, max_steps, user_goal, ui)?;
         let mut engine = crate::agent::run::engine::Engine::default();
+        if self.modes.launch.unattended {
+            engine.set_evidence_stall_limit(self.config.efficiency.evidence_stall_rounds);
+        }
         self.run_round(&mut turn, &mut engine, backend, schemas, max_steps, ui)
     }
 

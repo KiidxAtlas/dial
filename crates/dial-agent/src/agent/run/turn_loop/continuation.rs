@@ -40,12 +40,15 @@ impl Agent<'_> {
             max_steps,
             checkpoint_turn,
         } = admitted;
-        let user_text = prompt.effective();
+        let user_text = prompt.typed();
         // One finite budget: the initial run, verification repairs and stop-hook continuations all draw from it.
         let mut turn_steps = TurnSteps::new(max_steps);
         // One turn state and engine for the whole user turn: repair and stop-hook rounds resume
         // it instead of judging effort, loading portable rules and learning failures again.
         let mut engine = crate::agent::run::engine::Engine::default();
+        if self.modes.launch.unattended {
+            engine.set_evidence_stall_limit(self.config.efficiency.evidence_stall_rounds);
+        }
         let mut turn_state = None;
         let mut result = match self.begin_turn(backend, &names, max_steps, user_text, ui) {
             Ok(state) => {

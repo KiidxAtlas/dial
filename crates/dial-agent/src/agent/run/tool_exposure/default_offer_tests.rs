@@ -1547,7 +1547,7 @@ impl crate::tools::integrations::ext::Tool for WebCapability {
 }
 
 #[test]
-fn offered_native_schemas_are_bare_and_argument_help_restores_explanations() {
+fn offered_native_schemas_are_lean_and_argument_help_restores_explanations() {
     with_agent("", |agent| {
         let names: Vec<String> = [
             "read", "write", "edit", "glob", "grep", "bash", "bg", "eval", "todo", "verify", "task",
@@ -1564,12 +1564,35 @@ fn offered_native_schemas_are_bare_and_argument_help_restores_explanations() {
             bare.len()
         );
         assert!(bare.len() < full.len());
+        // Core and multi-action tools keep short top-level explanations; the rest are bare.
         for schema in agent.schemas(&names).unwrap() {
+            let name = schema["function"]["name"].as_str().unwrap();
             let parameters = &schema["function"]["parameters"];
-            assert!(
-                !parameters.to_string().contains("\"description\""),
-                "{schema}"
-            );
+            for property in parameters["properties"].as_object().unwrap().values() {
+                let nested = property
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| *key != "description");
+                assert!(
+                    nested
+                        .into_iter()
+                        .all(|(_, value)| !value.to_string().contains("\"description\"")),
+                    "{schema}"
+                );
+                if let Some(text) = property["description"].as_str() {
+                    assert!(super::DESCRIBED_PARAMETER_TOOLS.contains(&name), "{schema}");
+                    assert!(text.split_whitespace().count() <= super::PARAMETER_DESCRIPTION_WORDS);
+                    let encoded = json!(text).to_string();
+                    assert!(full.contains(encoded.trim_matches('"')), "{text}");
+                }
+            }
+            if !super::DESCRIBED_PARAMETER_TOOLS.contains(&name) {
+                assert!(
+                    !parameters.to_string().contains("\"description\""),
+                    "{schema}"
+                );
+            }
         }
         // Nothing is hidden: the bare grep schema still offers every parameter.
         let grep = &agent.schemas(&["grep".to_owned()]).unwrap()[0];

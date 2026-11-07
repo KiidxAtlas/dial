@@ -9,6 +9,14 @@ from harbor_diagnostics import summarize_trial
 
 
 class HarborDiagnosticsTests(unittest.TestCase):
+    def test_effective_wire_controls_are_retained_without_arbitrary_request_data(self):
+        result = diagnostics.controls_metadata({'model':'claude-sonnet-4-6','max_tokens':128000,
+            'thinking':{'type':'disabled','secret':'DO NOT COPY'},
+            'output_config':{'effort':'low','prompt':'DO NOT COPY'},'messages':'DO NOT COPY',
+            'temperature':float('nan')})
+        self.assertEqual(result, {'model':'claude-sonnet-4-6','max_tokens':128000,
+            'thinking':{'type':'disabled'},'output_config':{'effort':'low'}})
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

@@ -4,6 +4,8 @@ use super::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VerificationConfig {
+    /// Rerun explicitly model-registered helpers after settled mutation batches.
+    pub auto_registered_checks: bool,
     /// Record check results the model runs and gate `finish` on failed checks that were never repaired.
     pub enabled: bool,
     /// Also run focused checks on the harness's own initiative: a behavioral baseline before edits,
@@ -37,6 +39,7 @@ pub struct VerificationConfig {
 impl Default for VerificationConfig {
     fn default() -> Self {
         Self {
+            auto_registered_checks: true,
             enabled: true,
             automatic_checks: false,
             repair_attempts: 0,

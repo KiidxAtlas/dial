@@ -407,6 +407,23 @@ For a server started with several slots (for example `llama-server --parallel 4`
 
 Use any OpenAI-compatible server instead of the local MLX model (LM Studio, Ollama, llama.cpp, a hosted API): `dial --endpoint http://localhost:1234/v1 --api-key-env KEY -m <model-name>`. Weight updates need the local MLX model.
 
+## Model request facts
+
+A row's optional `f` list records request rules the provider documents for that exact model.
+Dial applies them only to the matching record (Anthropic Messages rows today); a missing fact keeps
+the generic request.
+
+| Fact | Meaning |
+|---|---|
+| `no-sampling` | `temperature`, `top_p` and `top_k` are rejected, so they are never sent. |
+| `thinking-always-on` | `thinking: {type: "disabled"}` is rejected; thinking off omits `thinking` and uses `low` effort unless an effort is set. |
+| `thinking-off-between-tools` | Disabled thinking is rejected; thinking off sends `{type: "between_tools"}` and caps effort at `high`. |
+| `thinking-off-up-to-high` | Disabled thinking is accepted only at effort `high` or below, so thinking off caps effort at `high`. |
+| `summarized-thinking` | Thinking text is omitted by default; requests to `api.anthropic.com` ask for `display: "summarized"`. |
+| `native-compaction` | Messages on-demand compaction (`compact-2026-09-04`) is supported. For a first-party `api.anthropic.com` route, `Backend::native_compaction_capability` reports native Anthropic compaction when `compaction.native_models` declares no models. |
+
+`claude-haiku-4-5` declares no effort levels: the model rejects `output_config.effort`.
+
 ## Reasoning effort wire mapping
 
 A model's `m` (`reasoning_effort_wire`) map sends a declared effort under a provider-specific name, for example Inception's `minimal` → `instant`. The mapping applies to every request that carries an effort value: chat-completions `reasoning_effort`, Responses `reasoning.effort`, Gemini `thinkingLevel`, Bedrock `output_config.effort` and Ollama `think`. Efforts without an entry send their Dial name unchanged.

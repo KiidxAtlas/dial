@@ -184,7 +184,9 @@ impl Warmer {
     }
 
     /// The replay to send at `now`, or `Ok(None)` when none is due. The replay is the settled
-    /// request capped at one output token, so it reads the prefix and writes nothing new.
+    /// request capped at one output token, so it reads the prefix and writes nothing new. Native
+    /// Messages sends a replay made under `usage::Purpose::CacheWarm` as the documented
+    /// `max_tokens: 0` pre-warm instead, which generates nothing at all.
     pub fn replay(&mut self, now: Instant) -> Result<Option<Chat>, Stop> {
         let Some(armed) = self.armed.as_mut() else {
             return Ok(None);

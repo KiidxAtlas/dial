@@ -237,7 +237,7 @@ pub fn schema(config: &Config) -> Value {
         "task":{"type":"string","description":"Complete assignment with scope and acceptance criteria."},
         "solution_space":{"type":"string","description":"What is fixed versus what the child may choose; never empty. Example: \"Fixed: edit only src/parser.rs. Free: helper names.\""},
         "skills":{"type":"array","items":{"type":"string"},"description":"Skills to load first."},
-        "max_steps":{"type":"integer","minimum":0,"description":"Step limit; 0 means unlimited."},
+        "max_steps":{"type":"integer","minimum":0,"description":"Step limit; omitted uses the agent type's default (scout 30, worker 80), 0 means unlimited."},
         "name":{"type":"string","description":"Label shown to the user."},
         "output_schema":{"type":"object","description":"JSON Schema the final answer must satisfy."},
         "isolation":{"type":"string","enum":["copy"],"description":"Workers only: work in a private copy, merged on success unless the parent changed the same files."},

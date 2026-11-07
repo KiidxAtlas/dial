@@ -1,4 +1,4 @@
-//! Owner-local persistent Node code execution. The OS sandbox is the security boundary.
+//! Owner-local persistent JavaScript/Python execution. The OS sandbox is the security boundary.
 use crate::config::tools::eval::EvalConfig;
 
 use super::background::AdoptedJob;
@@ -21,7 +21,41 @@ use std::sync::{
 
 const DRIVER: &str = include_str!("eval/driver.cjs");
 
+/// Reserved callback name for `tool.batch([...])`; never a valid provider tool name. The
+/// execution controller runs the entries together when all are read-only, else one at a time.
+/// Controllers without batch support refuse it, and the driver then calls each entry serially.
+pub const BATCH_CALLBACK: &str = "dial.batch";
+
 use super::kernel::fork_fence_prefix;
+
+#[cfg(all(feature = "embedded-js", unix))]
+mod embedded;
+#[cfg(all(feature = "embedded-js", unix))]
+pub use embedded::{WORKER_ARG as EMBEDDED_JS_WORKER_ARG, worker_main as embedded_js_worker_main};
+
+/// Whether JavaScript cells can run without an operator-installed Node: the embedded QuickJS engine
+/// is compiled in and re-executes `dial` itself (unix only; the fd-3 protocol pipe is unix-shaped).
+pub const fn embedded_js_available() -> bool {
+    cfg!(all(feature = "embedded-js", unix))
+}
+
+/// Shell line that serves JavaScript cells with the embedded engine: this `dial` binary re-executed
+/// under the same fork fence, with the protocol pipe on fd 3.
+#[cfg(all(feature = "embedded-js", unix))]
+fn embedded_js_script(fence: &str) -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("locating dial for the embedded JavaScript engine: {error}"))?;
+    let exe = exe.to_str().ok_or("dial executable path is not UTF-8")?;
+    Ok(format!(
+        "{fence} {} {EMBEDDED_JS_WORKER_ARG} 3>&1 1>&2",
+        shell_quote(exe)
+    ))
+}
+
+#[cfg(not(all(feature = "embedded-js", unix)))]
+fn embedded_js_script(_fence: &str) -> Result<String, String> {
+    Err("the embedded JavaScript engine is not built into this binary".into())
+}
 
 /// Explicitly prepare mandatory containment for an automatic offer, without starting an interpreter.
 /// Catalog/readiness queries only inspect the cached observation; they never call this hook.
@@ -29,18 +63,55 @@ pub fn prepare_containment() -> Result<(), String> {
     require_fork_containment("eval")
 }
 
-/// Cell languages whose configured launcher resolves to an operator-installed executable, in
-/// schema order. Only paths are inspected; no interpreter starts, so a resolved launcher can still
-/// fail its preflight when a cell runs.
+/// Languages backed by a resolved operator launcher or the compiled JavaScript engine. Only
+/// paths/build facts are inspected; version and containment preflight runs at cell launch.
 pub fn installed_languages(workspace: &std::path::Path, config: &Config) -> Vec<&'static str> {
-    [
-        ("js", config.eval.node.as_str(), "eval.node"),
-        ("py", config.kernel.python.as_str(), "kernel.python"),
-    ]
-    .into_iter()
-    .filter(|(_, program, label)| resolve_operator_executable(workspace, program, label).is_ok())
-    .map(|(language, _, _)| language)
-    .collect()
+    let mut languages = Vec::new();
+    if resolve_operator_executable(workspace, &config.eval.node, "eval.node").is_ok()
+        || embedded_js_available()
+    {
+        languages.push("js");
+    }
+    if super::kernel::python_launcher_resolves(workspace, &config.kernel) {
+        languages.push("py");
+    }
+    languages
+}
+
+/// Interpreter prerequisites observed without starting a process. Containment and interpreter
+/// versions are still checked by execution; a resolved launcher is not proof of readiness.
+pub fn runtime_readiness(
+    workspace: &std::path::Path,
+    config: &Config,
+) -> crate::tools::surface::catalog::Readiness {
+    use crate::tools::surface::catalog::Readiness;
+    if installed_languages(workspace, config).is_empty() {
+        Readiness::MissingPrerequisite {
+            reason: "No eval interpreter resolves: JavaScript needs eval.node (Node 22+) or the embedded engine, which this build does not include; Python needs kernel.python (Python 3.8+). Loading eval does not install either interpreter. Status/reset/cancel remain available.".into(),
+        }
+    } else {
+        match super::kernel::cached_fork_containment() {
+            Some(Err(reason)) => Readiness::MissingPrerequisite { reason },
+            Some(Ok(())) | None => Readiness::Unknown,
+        }
+    }
+}
+
+/// Bounded environment facts for the session prompt, using the same resolution as eval itself.
+pub fn runtime_guidance(workspace: &std::path::Path, config: &Config) -> String {
+    let installed = installed_languages(workspace, config);
+    let state = |language| {
+        if installed.contains(&language) {
+            "resolved"
+        } else {
+            "not found"
+        }
+    };
+    format!(
+        "- Eval launchers: JavaScript {} (configured Node 22+ when it resolves, otherwise the embedded engine), Python {} (path resolution only; versions and containment are checked on execution). Loading a tool installs no runtime. Before generating a helper, check its needed interpreter/compiler in the execution environment; a configured eval launcher need not be on the shell PATH.\n",
+        state("js"),
+        state("py")
+    )
 }
 
 pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
@@ -166,6 +237,11 @@ impl JsRuntime {
                 }
                 let scope = CellScope {
                     workspace: ctx.workspace,
+                    prelude_mode: if ctx.config.eval.portable_helpers {
+                        super::preludes::PreludeMode::Portable
+                    } else {
+                        super::preludes::PreludeMode::ExtensionsOnly
+                    },
                     end,
                     interrupt: &self.interrupt,
                     cancel,
@@ -177,31 +253,40 @@ impl JsRuntime {
                     }
                     if slot.is_none() {
                         require_fork_containment("eval")?;
-                        let node = resolve_operator_executable(
+                        let fence = fork_fence_prefix(ctx.workspace);
+                        // The shell preserves only the trusted protocol on fd 3. Native stdout/stderr
+                        // cannot be interpreted as controller callbacks or result frames.
+                        let (script, kernel) = match resolve_operator_executable(
                             ctx.workspace.root(),
                             &self.config.node,
                             "eval.node",
-                        )?;
+                        ) {
+                            Ok(node) => (
+                                format!(
+                                    "{fence} {} --no-addons -e {} 3>&1 1>&2",
+                                    shell_quote(
+                                        node.to_str().ok_or("Node executable path is not UTF-8")?
+                                    ),
+                                    shell_quote(DRIVER),
+                                ),
+                                "Node kernel (install/configure eval.node)",
+                            ),
+                            Err(node_error) => {
+                                if !embedded_js_available() {
+                                    return Err(node_error);
+                                }
+                                (embedded_js_script(&fence)?, "embedded JavaScript engine")
+                            }
+                        };
                         check_operation(end, &self.interrupt, cancel)?;
-                        // The shell preserves only the trusted protocol on fd 3. Native stdout/stderr
-                        // cannot be interpreted as controller callbacks or result frames.
-                        let script = format!(
-                            "{} {} --no-addons -e {} 3>&1 1>&2",
-                            fork_fence_prefix(ctx.workspace),
-                            shell_quote(node.to_str().ok_or("Node executable path is not UTF-8")?),
-                            shell_quote(DRIVER),
-                        );
                         let mut command = fenced_command(ctx.workspace, &script)?;
                         // Even the explicit filesystem-sandbox opt-out cannot inject code before the fence.
                         strip_runtime_injection(&mut command);
                         check_operation(end, &self.interrupt, cancel)?;
-                        *slot = Some(NativeProcess::start(command, self.pid.clone()).map_err(
-                            |error| {
-                                format!(
-                                    "starting Node kernel (install/configure eval.node): {error}"
-                                )
-                            },
-                        )?);
+                        *slot = Some(
+                            NativeProcess::start(command, self.pid.clone())
+                                .map_err(|error| format!("starting {kernel}: {error}"))?,
+                        );
                     }
                     check_operation(end, &self.interrupt, cancel)?;
                     slot.as_mut().unwrap().prelude_language =
@@ -232,22 +317,32 @@ impl Tool for EvalTool {
         "eval"
     }
     fn schema(&self) -> Value {
-        tool_schema(
+        let mut schema = tool_schema(
             "eval",
             &crate::tools::surface::catalog::execution_description(
                 "eval",
-                "Persistent JavaScript (Node 22+) or Python 3.8+ cells, with separate namespaces. Call tool.<name>(args) or tool.call(name,args) under normal approval: JS requires await; Python callbacks are synchronous dictionaries (also await-compatible, without replay). Denied or malformed callbacks raise ToolError. For generated data use one foreground cell (background:false): read original inputs programmatically, compute, serialize, write through tool.write, then assert saved bytes, unchanged inputs, expected shape and independently expected results. Do not transcribe source rows or printed values. Reuse namespace variables until inputs change; then reread and recompute. Print a short validation summary. Assertions cover the saved artifact; stdout alone is not check evidence, and equality alone does not prove the computation. A failed assertion does not undo or authorize replaying a write. Source/config changes use write/edit. reset/status/cancel are owner-scoped; cancel without language affects both. Timeout/cancel destroys the namespace and pending callbacks; callback time is excluded. Requires approval and OS containment; subprocesses/native JS addons are denied, and Windows Python requires explicit unsandboxed opt-in.",
+                "Persistent JavaScript or Python 3.8+ cells, with separate namespaces. Use for scripts, repeated lookups and transformations. Portable dial helpers (JS await, Python synchronous): read/readText/readJson/readBytes, writeText/writeJson/writeBytes, run, batch, snapshot, fresh, check. Data is exact and capped at 1 MiB; writeBytes creates a new file, never overwrites. dial.batch raises on failed prerequisites with error.results; collect:true opts into mixed outcomes. dial.check(name, boolean) records a local check, not task-wide verification. Prove a tiny independent known-answer case before large generation. dial.snapshot(paths) retains source artifacts and rechecks hashes before recovery; it is not an atomic live-database snapshot. dial.fresh(receipt) rechecks inputs before reusing derived data. Keep large values in the namespace and print short results. Call tool.<name>(args) or tool.call(name,args) under normal approval: JS requires await; Python callbacks are synchronous dictionaries (also await-compatible, without replay). For many lookups you only need to aggregate or filter, use one eval cell: tool.batch([{name,args},...]) (JS and Python) runs read-only entries together and returns ordered {is_error,text,data} results. Denied or malformed callbacks raise ToolError. For generated data use one foreground cell (background:false): read original inputs programmatically, compute, serialize, write through tool.write, then assert saved bytes, unchanged inputs, expected shape and independently expected results. Do not transcribe source rows or printed values. Reuse namespace variables until inputs change; then reread and recompute. Print a short validation summary. Assertions cover the saved artifact; stdout alone is not check evidence, and equality alone does not prove the computation. A failed assertion does not undo or authorize replaying a write. Source/config changes use write/edit. reset/status/cancel are owner-scoped; cancel without language affects both. Timeout/cancel destroys the namespace and pending callbacks; callback time is excluded. Requires approval and OS containment; subprocesses/native JS addons are denied, and Windows Python requires explicit unsandboxed opt-in.",
             ),
             json!({
                 "language":{"type":"string","enum":["js","py"],"description":"Runtime for this cell; defaults to js."},
                 "action":{"type":"string","enum":["eval","reset","cancel","status"]},
                 "code":{"type":"string","description":"Cell source, at most 64 KiB UTF-8."},
                 "timeout":{"type":"integer","minimum":0,"maximum":3600},
-                "background":{"type":"boolean","description":"Omit for automatic handoff of a long-running cell to the background; false keeps it in the foreground; true moves it immediately."},
+                "background":{"type":"boolean","description":"Omit to follow shell.auto_background_secs (default 0: the cell stays in the foreground); false keeps it in the foreground; true moves it immediately."},
                 "title":{"type":"string","description":"Label for a backgrounded cell in the background job list."}
             }),
             &[],
-        )
+        );
+        if !self.js.config.portable_helpers
+            && let Some(description) = schema["function"]["description"].as_str()
+            && let Some((start, remaining)) = description.split_once("Portable dial helpers")
+            && let Some((_, rest)) = remaining.split_once("Call tool.<name>")
+        {
+            schema["function"]["description"] = json!(format!(
+                "{start}Portable helpers are disabled. Call tool.<name>{rest}"
+            ));
+        }
+        schema
     }
     fn readiness(&self, _: &Config) -> crate::tools::surface::catalog::Readiness {
         use crate::tools::surface::catalog::Readiness;

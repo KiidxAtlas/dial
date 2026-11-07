@@ -115,8 +115,17 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         EX,
         "Agent routing",
         "Turn optimizer",
-        "Rewrite user and steering messages with turn_drafter. Interactive Dial shows each draft for acceptance before sending; /drafter toggles this feature. A failed or cancelled draft sends nothing.",
+        "Attach a turn_drafter interpretation to user and steering messages; the typed text stays the authoritative request. Short or already structured messages are sent as typed. Interactive Dial shows each draft for acceptance before sending; /drafter toggles this feature. A failed or cancelled draft sends nothing.",
         Kind::Bool
+    ),
+    field!(
+        "experimental.turn_drafter_diagrams",
+        experimental.turn_drafter_diagrams,
+        EX,
+        "Agent routing",
+        "Drafter diagrams",
+        "Let turn_drafter add Mermaid diagrams that restate a flow, architecture or sequence the message describes. Off keeps drafts to prose and lists. Applies only while the turn optimizer is on.",
+        Kind::Bool,
     ),
     field!(
         "experimental.fault_witness",
@@ -172,6 +181,15 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         Kind::Bool,
     ),
     field!(
+        "goal.progress_file",
+        goal.progress_file,
+        EX,
+        "Agent loop",
+        "Goal progress file",
+        "Workspace-relative file (for example .dial/progress.md) that mirrors the goal, todos and working state after each goal-mode turn, so progress is visible and can be committed. It is overwritten each time and recorded in checkpoints. Empty writes nothing.",
+        Kind::Text,
+    ),
+    field!(
         "experimental.check_predictions",
         experimental.check_predictions,
         EX,
@@ -179,5 +197,14 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Check predictions",
         "Offer an optional `expect` (pass or fail) on `verify`. A mismatch is reported as a fact and the next request asks the model to explain it before editing again. Predictions never skip a check.",
         Kind::Bool,
+    ),
+    field!(
+        "experimental.adaptive_output_effort",
+        experimental.adaptive_output_effort,
+        MO,
+        "Roles & Sampling",
+        "Adaptive native output effort",
+        "Experimental native Anthropic effort: low during routine work, high after failing checks or repeated unverified edits. Explicit effort profiles win. Off until measured.",
+        Kind::Bool
     ),
 ];

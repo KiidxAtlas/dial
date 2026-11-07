@@ -30,7 +30,7 @@ impl Tool for Workbench {
     fn schema(&self) -> Value {
         crate::tools::tool_schema(
             "workbench",
-            "Inspect retained citations, bounded parent lineage, coverage gaps, unavailable artifacts and conflicting captured source identities; append a correction without rewriting evidence. Corrections remain caller-authored, never human-approved unless the actual human supplied them. Never reopens mutable sources; source freshness is unknown until an authorized explicit evidence freshness call. Use investigate for semantic comparison.",
+            "Use to audit retained evidence before relying on it. Returns: inspect lists citations, coverage gaps, unavailable artifacts and conflicting captured source identities; lineage walks bounded parent lineage; correct appends a correction without rewriting evidence (it stays caller-authored unless the human supplied it). Sources are not reopened, so freshness is unknown until an explicit evidence freshness call. Use investigate for semantic comparison.",
             json!({
                 "action":{"type":"string","enum":["inspect","lineage","correct"]},
                 "references":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string"}},

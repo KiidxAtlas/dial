@@ -37,18 +37,18 @@ impl std::fmt::Debug for RepairSlot {
 pub fn instructions(mode: EditMode) -> &'static str {
     match mode {
         EditMode::Hashline => crate::tools::HASHLINE_EDIT_DESC,
-        EditMode::Replace => notebook_edit_description!(
-            "Replace old_string with new_string in literal path; old_string must be nonempty and unique unless replace_all=true. Read every touched line first. Exact matching is preferred; enabled fuzzy matching uses normalized Unicode/whitespace then bounded high-confidence source matching and indentation adjustment. Ambiguous matches reject. Recovery diagnostics identify actual matched source. Generated-file and seen-line guards precede one rollback transaction."
-        ),
-        EditMode::Patch => notebook_edit_description!(
-            "Input {path,edits:[{op?:'create'|'update'|'delete',rename?:string,diff?:string}]}. Entries target literal path and evaluate sequentially, committing once. Update diff uses unified @@ line hints or symbolic/hierarchical context headers and space/+/- rows; *** End of File pins EOF. Placement uses exact, normalized whitespace/Unicode, indentation-aware and bounded high-confidence fallback matching; equivalent echoed/repeated context can be repaired, with diagnostics. Ambiguity or conflicting overlap rejects. Create diff supplies complete source (uniform + prefixes are accepted); delete has no diff. Rename destinations must not exist. Read all used anchors/touched lines first. Literal : and ? are not read selectors."
-        ),
-        EditMode::ApplyPatch => notebook_edit_description!(
-            "input is *** Begin Patch, *** Add File: path (+prefixed complete content), *** Update File: path (optional *** Move to: destination, then @@ context/+/- hunks), *** Delete File: path, and *** End Patch. A shell-style EOF wrapper is accepted. Uses the same native normalized, hierarchical, indentation-aware and bounded high-confidence hunk placement as patch. Every section validates before one rollback transaction; ambiguity, conflicting overlap, stale witnesses and existing destinations reject. Read all existing target anchors/touched lines first."
-        ),
-        EditMode::Sloppy => notebook_edit_description!(
-            "input is *** Edit File: path (JSON-quote ambiguous paths; append all for all matches), then *** Find existing text and *** Replace complete final text (empty deletes), *** Insert Before or *** Insert After new lines. Bare *** Edit File: continues the prior path. Prefer raw exact source, no diff prefixes/envelopes/fences. Find … captures omitted text: mid-line gaps stay on that line, line-end gaps span lines; Replace … re-emits captures in order. Native sloppy parsing also recognizes selection markers «…», desired-state fragments and bounded copy/prefix/header recovery; matching uses normalized Unicode/whitespace, captures and bounded unique fuzzy/context reconciliation with explicit recovery diagnostics. Replacement/insert text remains authored text, not a guessed operator or delimiter repair. Operations address original source positions; ambiguity/conflicting overlap rejects, all files commit in one rollback transaction. Read every matched/captured source region first."
-        ),
+        EditMode::Replace => {
+            "Replace old_string with new_string in literal path; old_string must be nonempty and unique unless replace_all=true. Read every touched line first. Exact matching is preferred; enabled fuzzy matching uses normalized Unicode/whitespace then bounded high-confidence source matching and indentation adjustment. Ambiguous matches reject. Recovery diagnostics identify actual matched source. Generated-file and seen-line guards precede one rollback transaction. After a failed match, re-read the target range before retrying."
+        }
+        EditMode::Patch => {
+            "Input {path,edits:[{op?:'create'|'update'|'delete',rename?:string,diff?:string}]}. Entries target literal path and evaluate sequentially, committing once. Update diff uses unified @@ line hints or symbolic/hierarchical context headers and space/+/- rows; *** End of File pins EOF. Placement uses exact, normalized whitespace/Unicode, indentation-aware and bounded high-confidence fallback matching; equivalent echoed/repeated context can be repaired, with diagnostics. Ambiguity or conflicting overlap rejects. Create diff supplies complete source (uniform + prefixes are accepted); delete has no diff. Rename destinations must not exist. Read all used anchors/touched lines first. Literal : and ? are not read selectors. After a failed or stale hunk, re-read the target range before retrying."
+        }
+        EditMode::ApplyPatch => {
+            "input is *** Begin Patch, *** Add File: path (+prefixed complete content), *** Update File: path (optional *** Move to: destination, then @@ context/+/- hunks), *** Delete File: path, and *** End Patch. A shell-style EOF wrapper is accepted. Uses the same native normalized, hierarchical, indentation-aware and bounded high-confidence hunk placement as patch. Every section validates before one rollback transaction; ambiguity, conflicting overlap, stale witnesses and existing destinations reject. Read all existing target anchors/touched lines first. After a failed or stale hunk, re-read the target range before retrying."
+        }
+        EditMode::Sloppy => {
+            "input is *** Edit File: path (JSON-quote ambiguous paths; append all for all matches), then *** Find existing text and *** Replace complete final text (empty deletes), *** Insert Before or *** Insert After new lines. Bare *** Edit File: continues the prior path. Prefer raw exact source, no diff prefixes/envelopes/fences. Find … captures omitted text: mid-line gaps stay on that line, line-end gaps span lines; Replace … re-emits captures in order. Native sloppy parsing also recognizes selection markers «…», desired-state fragments and bounded copy/prefix/header recovery; matching uses normalized Unicode/whitespace, captures and bounded unique fuzzy/context reconciliation with explicit recovery diagnostics. Replacement/insert text remains authored text, not a guessed operator or delimiter repair. Operations address original source positions; ambiguity/conflicting overlap rejects, all files commit in one rollback transaction. Read every matched/captured source region first. After a failed match, re-read the target range before retrying."
+        }
     }
 }
 /// Optional on every grammar: commits an edit the lean local tiers would refuse for new parser errors.
@@ -1444,8 +1444,34 @@ pub(crate) fn finish_with(
     Ok(output)
 }
 
-/// Keep the built-in hashline model projection separate from the raw transcript result.
+/// Keep the built-in hashline model projection separate from the raw transcript result. A failed
+/// edit of a notebook carries [`crate::tools::NOTEBOOK_EDIT_NOTE`], which the schema omits.
 pub(crate) fn edit_output(
+    ws: &Workspace,
+    args: &Value,
+) -> Result<crate::tools::ToolOutput, String> {
+    let result = edit_output_unannotated(ws, args);
+    let notebook = targets(ws.edit_mode, args).is_ok_and(|paths| {
+        paths
+            .iter()
+            .any(|path| super::edit_source::notebook_path(std::path::Path::new(path)))
+    });
+    if !notebook {
+        return result;
+    }
+    let note = crate::tools::NOTEBOOK_EDIT_NOTE;
+    match result {
+        Err(message) => Err(format!("{message}\n{note}")),
+        Ok(mut output) if output.is_error => {
+            output.text.push('\n');
+            output.text.push_str(note);
+            Ok(output)
+        }
+        applied => applied,
+    }
+}
+
+fn edit_output_unannotated(
     ws: &Workspace,
     args: &Value,
 ) -> Result<crate::tools::ToolOutput, String> {

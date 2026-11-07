@@ -33,7 +33,7 @@ pub fn render_call(name: &str, args: &Value) -> Presentation {
         "write" => ("Write", Edit, Write),
         "edit" | "ast_edit" => ("Edit", Edit, Diff),
         "bash" => ("Run", Shell, Text),
-        "eval" => ("Run", Tools, Text),
+        "eval" => ("Eval", Tools, Text),
         "task" => ("Workers", Tone::Workers, BodyStyle::Workers),
         "todo" => ("Plan", Tools, Plan),
         "ask" => ("Ask", Tools, Text),

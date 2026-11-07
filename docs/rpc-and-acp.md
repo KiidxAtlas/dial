@@ -16,6 +16,8 @@ still win. With both a prompt argument and piped stdin, stdin is appended as fen
 Print runs offer a smaller tool set than the terminal: `ask` is disabled, and `task`/`message`,
 `working_state`, `todo`, `find` and `memory` are listed as loadable instead of offered,
 unless `task.prefer_subagents=true` keeps `task`. The model can still `tool_load` any of them.
+`eval` stays in the initial offer whenever containment and a cell runtime are available and it
+fits the route's core budget (always on hosted routes).
 Session `bg` jobs end when a print run exits. Before the run ends, Dial tells the model once which
 explicitly started jobs are still running, and refuses `finish` once for them. A server the task
 needs afterwards should be restarted with `bg persist=true`; otherwise the model should stop it.

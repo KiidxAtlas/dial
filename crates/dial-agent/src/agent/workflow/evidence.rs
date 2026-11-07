@@ -1,6 +1,8 @@
 //! Model-context projection leaves append-only evidence untouched on disk.
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+mod arguments;
+pub(in crate::agent) use arguments::project_arguments;
 /// Provider-neutral wire estimate, never billed usage. Include structured text, tool calls,
 /// native replay and images just as request sizing does; metadata is not model context.
 pub(in crate::agent) fn estimate(message: &Value) -> usize {
@@ -15,6 +17,8 @@ pub struct Supersession {
     replaced: HashSet<String>,
     pruned: HashSet<String>,
     resolved: HashMap<String, String>,
+    arguments: HashMap<String, Value>,
+    argument_boundary: u64,
 }
 
 impl Supersession {
@@ -53,8 +57,9 @@ impl Policy {
 }
 
 /// Build the model-facing view of the session without touching the stored evidence:
-///  * a user message's persisted `dial_recall` is folded into that same message, so the notes recalled for a turn
-///    stay byte-identical on every later request instead of being inserted before the whole conversation;
+///  * a user message's persisted `dial_recall` is folded into that same message, ahead of the user's text, so the
+///    notes recalled for a turn stay byte-identical on every later request instead of being inserted before the
+///    whole conversation;
 ///  * a successful observation of a resource+range, or an identical read-only call and result, that a later
 ///    result repeats becomes a short placeholder,
 ///    but only while the text after it is small (`warm_tokens`) or the context is under `pressure`. Replacing a
@@ -76,12 +81,12 @@ pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy)
         else {
             continue;
         };
+        // Reference material leads and the user's own words follow, as long-context guidance
+        // recommends; the projection is deterministic, so the folded message stays byte-stable.
+        let recall = recall.trim();
         match &mut message["content"] {
-            Value::String(text) => {
-                text.push_str("\n\n");
-                text.push_str(&recall);
-            }
-            Value::Array(parts) => parts.push(json!({"type":"text","text":recall})),
+            Value::String(text) => *text = format!("{recall}\n\n{text}"),
+            Value::Array(parts) => parts.insert(0, json!({"type":"text","text":recall})),
             other => *other = json!(recall),
         }
     }

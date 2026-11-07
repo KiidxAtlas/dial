@@ -172,6 +172,7 @@ def __dial_display__(value):
 
 namespace["__dial_prelude__"] = __dial_prelude__
 namespace["__dial_display__"] = __dial_display__
+namespace["__dial_check__"] = lambda name, passed: callback("check", name=name, passed=passed)
 
 
 class _ToolResult(dict):
@@ -182,7 +183,70 @@ class _ToolResult(dict):
         return self
 
 
+class _BatchResult(list):
+    """Ordered `tool.batch` receipts; awaiting them never dispatches the tools again."""
+
+    def __await__(self):
+        yield from ()
+        return self
+
+
+# Reserved controller name (BATCH_CALLBACK in eval.rs); no provider tool can carry it.
+BATCH = "dial.batch"
+
+
+def _batch_call(index, entry):
+    if not isinstance(entry, dict):
+        raise ToolError(f"tool.batch entry {index}: expected a {{name, args}} object")
+    name, args = entry.get("name"), entry.get("args")
+    if not isinstance(name, str) or not name or len(name) > 256:
+        raise ToolError(f"tool.batch entry {index}: tool name must be a nonempty string of at most 256 characters")
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        raise ToolError(f"tool.batch entry {index}: tool arguments must be an object")
+    return {"name": name, "arguments": args}
+
+
 class ToolProxy:
+    def batch(self, entries):
+        """Run `[{"name": ..., "args": {...}}, ...]` as one controller batch, in order.
+
+        Read-only entries may run together; anything else runs one at a time. Each entry counts
+        against the cell's callback limit. A controller without batch support refuses the reserved
+        name and the entries run serially, each failure kept as its own error result.
+        """
+        if not isinstance(entries, (list, tuple)) or len(entries) > MAX_CALLBACKS:
+            raise ToolError(f"tool.batch expects a list of at most {MAX_CALLBACKS} {{name, args}} entries")
+        calls = [_batch_call(index, entry) for index, entry in enumerate(entries)]
+        if not calls:
+            return _BatchResult()
+        operation = current_operation.get()
+        if operation is not None:
+            operation["callbacks"] += len(calls) - 1
+        try:
+            result = callback("tool", name=BATCH, arguments={"calls": calls})
+        except ToolError as error:
+            if not (error.result and isinstance(error.result.get("data"), dict)
+                    and error.result["data"].get("code") == "unsupported_batch"
+                    and error.result["data"].get("executed") is False):
+                raise
+            if operation is not None:
+                operation["callbacks"] -= len(calls)
+            receipts = _BatchResult()
+            for call in calls:
+                try:
+                    receipts.append(self.call(call["name"], call["arguments"]))
+                except ToolError as failure:
+                    receipts.append(_ToolResult(failure.result if failure.result is not None
+                                                else {"is_error": True, "text": str(failure), "data": None}))
+            return receipts
+        data = result.get("data")
+        if (not isinstance(data, list) or len(data) != len(calls)
+                or any(not isinstance(item, dict) or not isinstance(item.get("is_error"), bool) for item in data)):
+            raise ToolError("controller returned a malformed tool.batch result", result)
+        return _BatchResult(_ToolResult(item) if isinstance(item, dict) else item for item in data)
+
     @property
     def schemas(self):
         result = callback("schemas")
@@ -252,7 +316,7 @@ while True:
                     result["value"] = repr(value)[:LIMIT]
     except BaseException as error:
         result["error"] = traceback.format_exc()[-LIMIT:]
-        if isinstance(error, ToolError) and error.result is not None:
+        if getattr(error, "result", None) is not None:
             result["tool_error"] = error.result
     finally:
         # Detached asyncio tasks keep this token, so subsequent cells cannot authorize their callbacks.

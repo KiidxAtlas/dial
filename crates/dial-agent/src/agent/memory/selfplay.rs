@@ -139,6 +139,20 @@ pub fn selfplay_run(
 }
 
 /// Commands whose exit status is a meaningful external verdict on the work (tests, builds, linters).
+pub(in crate::agent) fn is_check_call(call: &ToolCall) -> bool {
+    call.name == "bash"
+        && call.arguments["background"] != true
+        && call.arguments["pty"] != true
+        && (call.arguments["check"] == true
+            || call.arguments["command"]
+                .as_str()
+                .is_some_and(is_check_command))
+}
+
+#[cfg(test)]
+mod tests;
+
+/// Conventional runner commands recognized without an explicit `check` declaration.
 pub(in crate::agent) fn is_check_command(command: &str) -> bool {
     const MARKERS: &[&str] = &[
         "pytest",

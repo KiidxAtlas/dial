@@ -161,8 +161,20 @@ fn handshake_follows_every_page_and_exposes_prefixed_tools() {
         .iter()
         .map(|t| t.name().to_owned())
         .collect();
+    // The second `a?b` tool takes a suffix of its own identity (`fake`, `a.b`), not a counter.
+    let collided = format!("a_b_{}", super::names::identity_digest("fake", "a.b"));
     let expected: BTreeSet<_> = [
-        "echo", "plain", "fail", "mixed", "slow", "die", "pid", "a_b", "a_b_2", "big", "pong",
+        "echo",
+        "plain",
+        "fail",
+        "mixed",
+        "slow",
+        "die",
+        "pid",
+        "a_b",
+        collided.as_str(),
+        "big",
+        "pong",
         "bare",
     ]
     .iter()
@@ -224,6 +236,41 @@ fn server_read_only_hints_never_bypass_approval() {
     assert!(approval("mcp__fake__plain"), "no annotations");
     assert!(approval("mcp__fake__fail"), "readOnlyHint false");
     assert!(approval("mcp__fake__bare"), "no schema, no annotations");
+}
+
+#[test]
+fn declared_read_only_tools_are_effect_free_external_reads_but_still_need_approval() {
+    use crate::tools::integrations::ext::Concurrency;
+    use crate::tools::surface::resources::external_read;
+    let loaded = load_fake();
+    let (_dir, workspace) = testkit::workspace();
+    let echo = tool(&loaded, "mcp__fake__echo");
+    assert!(
+        echo.needs_approval(&json!({})),
+        "scheduling never grants permission"
+    );
+    assert_eq!(echo.concurrency(&json!({})), Concurrency::Shared);
+    assert!(!echo.may_modify_workspace(&json!({})));
+    assert!(external_read(echo.as_ref(), &json!({})));
+    let footprint = echo.resources(&workspace, &json!({})).unwrap();
+    assert!(footprint.reads.is_empty() && footprint.writes.is_empty());
+    for name in ["mcp__fake__plain", "mcp__fake__fail", "mcp__fake__bare"] {
+        let other = tool(&loaded, name);
+        assert_eq!(
+            other.concurrency(&json!({})),
+            Concurrency::Exclusive,
+            "{name}"
+        );
+        assert!(other.may_modify_workspace(&json!({})), "{name}");
+        assert!(other.resources(&workspace, &json!({})).is_none(), "{name}");
+        assert!(!external_read(other.as_ref(), &json!({})), "{name}");
+    }
+    // A stale catalog revokes the class together with the hint.
+    loaded.sessions[0].on_signal(Signal::ToolsChanged);
+    *loaded.sessions[0].catalog_retry.lock() = Some(Instant::now() + Duration::from_secs(1));
+    assert_eq!(echo.concurrency(&json!({})), Concurrency::Exclusive);
+    assert!(echo.resources(&workspace, &json!({})).is_none());
+    assert!(!external_read(echo.as_ref(), &json!({})));
 }
 
 #[test]

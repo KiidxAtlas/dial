@@ -78,53 +78,120 @@ pub const BG_OFFERED_HINT: &str = " `bg wait` returns its output; no polling.";
 pub const BG_LOAD_HINT: &str =
     " Load the Dial `bg` tool with `tool_load` to wait for or stop it; no polling.";
 
-/// Entry names directly in `dir`, or `None` when it is unreadable or too large to compare.
-fn directory_entries(dir: &Path) -> Option<std::collections::BTreeSet<std::ffi::OsString>> {
-    const LIMIT: usize = 4096;
-    let mut names = std::collections::BTreeSet::new();
+/// Helper languages the session prompt reports, each with the program names that provide it.
+const SHELL_INTERPRETERS: &[(&str, &[&str])] = &[
+    ("python3", &["python3", "python"]),
+    ("node", &["node", "bun", "deno"]),
+    ("perl", &["perl"]),
+    ("ruby", &["ruby"]),
+    ("C compiler", &["cc", "gcc", "clang"]),
+    ("go", &["go"]),
+    ("rustc", &["rustc"]),
+    ("java", &["java"]),
+];
+
+/// Which helper languages the shell's `PATH` provides, for the session prompt. Models otherwise
+/// write a whole Python or Node helper before discovering the image has neither; the bash
+/// missing-program notice arrives only after that output has been generated and paid for.
+pub fn interpreter_guidance() -> String {
+    interpreter_guidance_for(std::env::var_os("PATH").as_deref())
+}
+
+fn interpreter_guidance_for(path: Option<&std::ffi::OsStr>) -> String {
+    let dirs: Vec<PathBuf> = path
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect();
+    let found = |program: &str| dirs.iter().any(|dir| dir.join(program).is_file());
+    let (mut available, mut missing) = (Vec::new(), Vec::new());
+    for (language, programs) in SHELL_INTERPRETERS {
+        match programs.iter().copied().find(|program| found(program)) {
+            Some(program) if program == *language => available.push((*language).to_owned()),
+            Some(program) => available.push(format!("{language} ({program})")),
+            None => missing.push(*language),
+        }
+    }
+    let available = if available.is_empty() {
+        "none".to_owned()
+    } else {
+        available.join(", ")
+    };
+    let missing = if missing.is_empty() {
+        String::new()
+    } else {
+        format!("; not found: {}", missing.join(", "))
+    };
+    format!(
+        "- Shell PATH languages: {available}{missing}. Write helper scripts only in a language listed as available.\n"
+    )
+}
+
+/// Entries directly in `dir`, or `None` when it is unreadable or too large to compare.
+type DirectoryEntries = std::collections::BTreeMap<std::ffi::OsString, Option<u64>>;
+
+fn directory_entries(dir: &Path) -> Option<DirectoryEntries> {
+    let mut names = DirectoryEntries::new();
     for entry in fs::read_dir(dir).ok()? {
         let entry = entry.ok()?;
-        // The scratch directory is Dial's own TMPDIR, created on demand; it is not a task output.
         if entry.file_name() == crate::workspace_copy::SCRATCH_DIR {
             continue;
         }
-        names.insert(entry.file_name());
-        if names.len() > LIMIT {
+        let size = entry
+            .file_type()
+            .ok()
+            .filter(|kind| kind.is_file())
+            .and_then(|_| entry.metadata().ok())
+            .map(|meta| meta.len());
+        names.insert(entry.file_name(), size);
+        if names.len() > 4096 {
             return None;
         }
     }
     Some(names)
 }
 
-/// Names a command left in its working directory that were absent before it ran. Bash writes are
-/// not checkpointed, so build products and scratch files would otherwise go unreported.
-fn created_entries_note(
-    before: Option<&std::collections::BTreeSet<std::ffi::OsString>>,
-    dir: &Path,
-) -> Option<String> {
+/// Bounded directory deltas are observations, never proof that removal was unintended.
+fn created_entries_note(before: Option<&DirectoryEntries>, dir: &Path) -> Option<String> {
+    let before = before?;
     let after = directory_entries(dir)?;
     let created: Vec<_> = after
-        .difference(before?)
+        .keys()
+        .filter(|name| !before.contains_key(*name))
         .map(|name| name.to_string_lossy().into_owned())
         .collect();
-    if created.is_empty() {
-        return None;
-    }
-    let shown = created
+    let lost: Vec<_> = before
         .iter()
-        .take(10)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let more = created.len().saturating_sub(10);
-    let more = if more > 0 {
-        format!(" and {more} more")
-    } else {
-        String::new()
-    };
-    Some(format!(
-        "[new in the working directory: {shown}{more}; remove scratch outputs the task does not want]\n"
-    ))
+        .filter_map(|(name, size)| match after.get(name) {
+            None => Some(format!("{} disappeared", name.to_string_lossy())),
+            Some(Some(now)) if size.is_some_and(|old| *now < old) => Some(format!(
+                "{} shrank from {} to {now} bytes",
+                name.to_string_lossy(),
+                size.unwrap_or(0)
+            )),
+            _ => None,
+        })
+        .collect();
+    let mut note = String::new();
+    if !created.is_empty() {
+        let shown = created
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = created.len().saturating_sub(10);
+        let suffix = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        note.push_str(&format!("[new in the working directory: {shown}{suffix}; remove scratch outputs the task does not want]\n"));
+    }
+    if !lost.is_empty() {
+        note.push_str(&format!("[working-directory inputs changed: {}. If unintended, inspect retained input artifacts or checkpoints before reconstructing; do not invent lost data.]\n", lost.iter().take(10).cloned().collect::<Vec<_>>().join("; ")));
+    }
+    (!note.is_empty()).then_some(note)
 }
 
 /// Transfers the process leader out of the foreground owner's drop guard.
@@ -723,6 +790,10 @@ fn with_bash_interceptor(
         None => None,
     };
     let mut output = run(command)?;
+    if let Some(note) = bash_interceptor::exit_masking_hint(command) {
+        output.text.push('\n');
+        output.text.push_str(note);
+    }
     if let Some((config, offered)) = interceptor
         && let Some(line) = hint
             .or_else(|| bash_interceptor::ci_poll_hint(config, &offered, command, &output.text))

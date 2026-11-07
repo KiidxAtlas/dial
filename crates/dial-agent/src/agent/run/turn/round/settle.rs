@@ -39,6 +39,9 @@ impl Agent<'_> {
         } else {
             tools::ToolStatus::from_output(&output)
         };
+        if matches!(call.name.as_str(), "bash" | "eval") {
+            self.note_preserved_input_changes(&mut output)?;
+        }
         if !contract_failed
             && !controller_blocked
             && !recovery_blocked
@@ -109,10 +112,7 @@ impl Agent<'_> {
         if call.name == "todo" && !output.is_error {
             self.observe_local_plan_change();
         }
-        let is_check = call.name == "bash"
-            && call.arguments["command"]
-                .as_str()
-                .is_some_and(is_check_command);
+        let is_check = crate::agent::memory::selfplay::is_check_call(call);
         if call.name == "bash"
             && let Some(command) = call.arguments["command"].as_str()
         {
@@ -147,25 +147,29 @@ impl Agent<'_> {
                 output.text.push_str(&format!("\n[Check cost] {note}"));
             }
         }
-        // A passing cell that asserted its own results already verified them; a failed assert makes
-        // the cell an error, so only success is credited, like a passing shell check.
-        let asserted_eval = call.name == "eval"
-            && !output.is_error
-            && call.arguments["code"]
-                .as_str()
-                .is_some_and(crate::agent::verify::completion::asserting_eval);
-        if asserted_eval {
-            turn.reliability.passing_checks += 1;
+        // Runtime check receipts record calls that actually executed. They are local algorithm
+        // checks, not blanket verification of all workspace edits at the cell's final revision.
+        if call.name == "eval" {
+            for passed in crate::agent::verify::completion::eval_checks(&output) {
+                if passed {
+                    turn.reliability.passing_checks += 1;
+                } else {
+                    turn.reliability.failing_checks += 1;
+                }
+            }
         }
-        let mut shell_check_passed = asserted_eval;
-        if is_check {
+        let mut shell_check_passed = false;
+        let check_failed = is_check && crate::agent::verify::verification::check_failed(&output);
+        if is_check
+            && let Some(process) = output.process_outcome()
+            && process.started
+            && !process.cancelled
+            && (process.exit_code.is_some() || process.timed_out || process.signal.is_some())
+        {
             if output.is_error
-                || output.process_outcome().is_none_or(|process| {
-                    process.exit_code != Some(0)
-                        || !process.output_complete
-                        || process.cancelled
-                        || process.timed_out
-                })
+                || check_failed
+                || process.exit_code != Some(0)
+                || !process.output_complete
             {
                 turn.reliability.failing_checks += 1;
             } else {
@@ -173,7 +177,6 @@ impl Agent<'_> {
                 shell_check_passed = true;
             }
         }
-        let check_failed = is_check && crate::agent::verify::verification::check_failed(&output);
         outcome.observed_check_failure |= check_failed;
         self.step_checks.reproduced |= check_failed;
         if self.config.experimental.outcome_gradient_rounds > 0
@@ -358,7 +361,8 @@ impl Agent<'_> {
             }
         }
         // A command that outlived its bash call is only reachable through `bg`. Load it for the
-        // next request instead of asking the model to spend a round on `tool_load`.
+        // next request (the stable offer through the `tool_load` owner) instead of asking the
+        // model to spend a round on `tool_load`.
         if call.name == "bash"
             && output
                 .data
@@ -367,9 +371,7 @@ impl Agent<'_> {
             && output
                 .text
                 .contains(crate::tools::exec::shell::BG_LOAD_HINT)
-            && self.bg_loadable()
-            && self.activate_tools(&["bg".to_owned()]).is_ok()
-            && self.offered().iter().any(|name| name == "bg")
+            && self.load_bg_for_background_job()
         {
             output.text = output.text.replacen(
                 crate::tools::exec::shell::BG_LOAD_HINT,
@@ -495,8 +497,29 @@ impl Agent<'_> {
                     .to_string()
             })
             .collect();
-        let check_passed = shell_check_passed
-            || (call.name == crate::agent::verify::verify_tool::NAME && !output.is_error);
+        if shell_check_passed {
+            let paths: Vec<String> = call.arguments["check_paths"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter_map(|path| self.workspace.resolve(path).ok())
+                .map(|path| self.workspace.rel(&path))
+                .collect();
+            turn.edit_churn.checked_paths(&paths);
+        }
+        let check_passed = call.name == crate::agent::verify::verify_tool::NAME
+            && !output.is_error
+            && output.data.as_ref().is_some_and(|data| {
+                data["results"].as_array().is_some_and(|results| {
+                    !results.is_empty()
+                        && results.iter().all(|result| {
+                            result["status"] == "passed"
+                                && result["ran"] == true
+                                && result["reused"] == false
+                        })
+                })
+            });
         if let Some(advice) = turn.edit_churn.observe(&changed, check_passed) {
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                 crate::agent::ui::ui_event::EventKind::Recovery,

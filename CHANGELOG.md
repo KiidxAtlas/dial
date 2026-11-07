@@ -17,7 +17,144 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+- Portable eval: shared `dial` helpers for exact text/JSON/byte I/O, admitted commands and batches,
+  retained recovery snapshots and source freshness. Binary writes use native no-overwrite staging.
+  Batch receipts preserve native execution facts; fallback requires explicit proof no entry ran.
+  Actual named check callbacks replace assertion-keyword credit. Scoped shell checks release
+  rewrite pressure only for their named files. Runtime guidance favors small known-answer cases,
+  persistent computation and preserving damaged sources before recovery.
+- Native Anthropic `--effort` is independent of `--thinking`; secret-free `inference_controls`
+  journal events report effective request controls for benchmark audits. These changes have not
+  yet established a live-model performance improvement.
+- The session prompt lists which helper languages the shell `PATH` provides (Python, Node, Perl,
+  Ruby, a C compiler, Go, rustc, Java), whether or not `eval` is offered, so helpers are not
+  written in a language the image lacks. The base policy asks to inspect or copy damaged inputs as
+  raw bytes before opening them with a tool that may rewrite them, and to report lost data as
+  missing instead of reconstructing it. Automatic `python AST` checks are skipped when no Python
+  interpreter resolves for a file without a project runner, instead of failing with "command not
+  found" against a leftover helper.
+
+### Added
+
+- JavaScript `eval` cells run on an embedded QuickJS engine when no operator-installed Node 22+ resolves (`eval.node` unset or missing). The engine ships inside the `dial` binary behind the default-on `embedded-js` feature and runs as a hidden re-exec under the same fork-fence and fd-3 protocol as the Node driver, so containers with only a shell and a C compiler can run JavaScript cells. Node still takes precedence when it resolves. The embedded engine is ECMAScript only (BigInt included): no `require`, `process`, `module` or other Node APIs, and file access goes through `tool.read`/`tool.write`, commands through `tool.bash`. Asynchronous cell completion values are recovered by rewriting a trailing expression statement, a heuristic that can differ from Node's REPL. Slim builds (`--no-default-features`) and non-unix platforms do not include the embedded engine.
+
 ### Changed
+
+- Tool cards label `eval` calls `Eval` instead of `Run`, so code cells are no longer confused with
+  `bash` commands.
+
+- Fewer bookkeeping and re-check requests: `todo` is described as optional for short tasks and its
+  updates ride with the next real call; on hosted and full-tier local routes an accepted `completed`
+  answer now closes every pending or in-progress execution step (previously only the in-progress
+  one), so no closing `todo done` round is needed. The prompt asks for one-line notes between tool
+  calls and reuse of passing evidence until something changes; `bash` asks for scripts that will be
+  rerun to be saved to a file once.
+- `verify` accepts absolute paths inside the workspace (for example `/app/test_x.py` with root
+  `/app`). Paths outside it and non-test files get errors that say which case applies.
+- `eval` cells stay in the foreground when `shell.auto_background_secs` is 0 (the default), as
+  `bash` commands do. Previously a zero threshold moved every cell that had not answered at once
+  to a background job, so even `1 + 1` cost extra `bg` rounds.
+- `eval` joins the stable core tool offer after `verify` whenever containment is available and a
+  cell runtime resolves (including the embedded JavaScript engine), so hosted runs, unattended
+  print runs included, can run code without a `tool_load` round. Local routes admit it only while
+  it fits their 12 KiB core budget; the lean local eight-tool cap leaves it loadable.
+- Cache-stable tool surfaces: on first-party Anthropic Messages for models that document tool
+  search, Dial sends every eligible tool with non-core tools marked `defer_loading`, and `tool_load`
+  / `tool_search` with `load` return `tool_reference` blocks instead of changing `tools`, so loading a
+  specialist no longer invalidates the cached tools, system prompt and history. A refusal falls back
+  to the previous form for that endpoint and model. On OpenAI Responses at api.openai.com, the
+  planning gate, single-call narrowing and plan/goal state narrow with `tool_choice: allowed_tools`.
+  Other routes, subagents and hermetic runs send the same tools as before.
+- Native compaction runs automatically on first-party Anthropic routes whose model documents
+  on-demand compaction when `compaction.native_models` is empty (any entry stays authoritative;
+  `remote_enabled = false` turns it off). Blocking compaction, background speculation and the
+  `/compact` preview choose it the same way, with Soft as the fallback. Soft summaries, like Handoff,
+  first try the live request prefix plus one appended instruction so caching routes read the
+  conversation from cache; on Anthropic the live-prefix summary keeps the live `tool_choice`. After
+  compaction the current text of files edited this turn is re-attached (8 files, 12 KiB each, 32 KiB
+  total, at most about 5% of the window).
+- Preserved-thinking models (Fable 5.1, Mythos 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5): history
+  projection no longer rewrites sent turns (pressure pruning, `supersede_reads`, `drop_useless`,
+  notice placeholders), client-side compaction re-inserts retained turns without their thinking
+  blocks, and request notes (mode notice, task context, guidance, background, hook and monitor
+  notices) are recorded when a reply arrives and re-sent unchanged at the same place on later
+  requests; identical restatements are not sent again. Subagents apply the same history policy.
+  The catalog records `native-compaction` and `preserved-thinking` facts.
+- Batching: MCP tools whose server declares `readOnlyHint` (and not `destructiveHint`) are scheduled
+  as effect-free external reads; `efficiency.batch_result_percent` (default 30, 0 off) sets the
+  per-reply result budget, which workers now apply too; Python `eval` cells gain `tool.batch([...])`,
+  and worker cells run read-only batches together; while a call waits for an approval prompt, later
+  hook-free reads it cannot affect start early and are held until it settles (denied calls never
+  run). Fixed: concurrent `web_fetch`/`web_search` calls could clear a Stop meant for a sibling.
+- Research checkpoint: one threshold set for the foreground loop and workers; the forced tool-free
+  checkpoint stays at 24 rounds on lean local routes, elsewhere an advisory note appears after 60.
+  Research, tool-contract, application-watch and peer-wake notices use the `<dial-notice>` envelope;
+  the commit workflow's prompts are calmer; skill hints name `skill` only when it is offered;
+  unfinished-work detection recognises more first-person phrasings.
+- Turn optimizer (experimental): the typed message is sent verbatim as the authoritative request with
+  the accepted draft attached as a labeled interpretation; short or already structured messages are
+  not drafted; Mermaid diagrams are opt-in via `experimental.turn_drafter_diagrams`.
+- New `goal.progress_file` setting (empty by default): in goal mode Dial mirrors the objective,
+  budget, todos and working state to the named workspace file after each goal turn, through
+  workspace confinement and checkpoints.
+- Benchmarks: the `enable-compact_tools` variant is now `ablate-compact_tools`, since the compact
+  tool offer ships on.
+
+- Agent execution reports missing eval interpreters before code generation and during tool
+  discovery. Custom foreground shell acceptance commands can declare `check: true`; repeated
+  unverified edits trigger an earlier checkpoint that withholds further large whole-file writes
+  while preserving focused repairs. New algorithms are guided toward minimal known-answer checks.
+- Native Anthropic tool inputs use fine-grained streaming, with stable tool definitions on
+  nonstreaming replays. No live benchmark improvement is claimed by these controller changes.
+
+- Prompt caching (Anthropic): `system` is sent as one block per prompt band with the breakpoint
+  after the stable band; plan mode, the external-thinking instruction and still-connecting MCP
+  servers move from the system prompt to a transient request-tail notice; native compaction
+  requests carry cache breakpoints; one-hour retention applies to the tool and system breakpoints
+  only; cache-warm replays use the documented `max_tokens: 0` form with the live thinking settings.
+  No cache-hit improvement has been measured yet.
+- Claude requests follow per-model catalog facts: `--thinking off` uses each model's documented
+  control, sampling parameters are not sent to models that removed them, first-party requests ask
+  for summarized thinking where it is omitted by default, and keep-alives during an open thinking
+  block no longer trip the idle timeout. A provider `refusal` ends the turn with its category.
+- OpenAI: unprofiled reasoning-model chat requests send `max_completion_tokens`; Responses API-key
+  requests to api.openai.com send `prompt_cache_key` by default. Responses with
+  `x-should-retry: false` are not resent. Catalog: Haiku 4.5 no longer lists effort levels it
+  rejects; Haiku 5.5 and Fable 5 have documented 1M windows.
+- Tools: hosted routes get a 24 KiB core budget that includes `bg`, `task`, `message` and `ask` (lean
+  and local routes keep 12 KiB; unattended runs without a human input channel still omit `ask`). A command that becomes a background job loads `bg` for the next request
+  in every tool mode. `tool_search` accepts `load: true` and `select:a,b` and returns compact
+  parameter summaries. Core and multi-action tools keep short parameter descriptions; hosted routes
+  keep the full grep/glob/bash descriptions. Notebook rules moved from the `edit` description to
+  `.ipynb` reads and failed notebook edits. Specialist descriptions say when to use each tool;
+  `bg` and `lsp` gain examples.
+- MCP: colliding tool names get a stable hash suffix instead of `_2`; PNG image results reach
+  vision models; duplicate `structuredContent` is dropped; input schemas are capped at 16 KiB and
+  results at the 48 KiB agent limit.
+- Batching: `web_fetch`/`web_search` are effect-free external reads (approved one at a time, then run
+  together); each reply shares a result budget of about 30% of the free window, clipping the largest
+  artifact-backed results first; `eval` JavaScript cells gain `tool.batch([...])`; streamed early reads
+  use read reuse (parent and workers), survive `todo`/`working_state` bookkeeping, drop only
+  conflicting results and are cancelled when discarded; in one-call mode a leading read runs and later
+  calls are skipped; parent and worker waves share one admission and honour profile overrides; ordinary
+  dotfile and `@scope` paths no longer serialize scheduling.
+- Completion: check failures not introduced by the turn are accepted with disclosed gaps instead of
+  ending `Incomplete`, and a check's first run before the first edit is kept as its baseline even with
+  `automatic_checks` off. On hosted and full-tier local routes, open todo steps no longer refuse an
+  accepted answer (the single in-progress step is closed, others are listed), and the keyword-based
+  investigation nudge, capability-search reminder and forced research checkpoint apply only on lean
+  local routes; the capability reminder also requires a first-person denial.
+- Subagents get default step limits (scout 30, planner 30, reviewer 40, test-runner 60, worker 80,
+  seance 20; `max_steps = 0` is still unlimited). Coach review honours `min_changed_files`. The default
+  `compaction.keep_recent_tokens` scales to 10% of large windows.
+- Prompting: the base policy is short bullets with reasons, adds git safety, no-extra-scope,
+  `path:line` citation, brief progress text and parallel-read rules, and drops the `[INFERENCE]`
+  marker; project instruction files (AGENTS.md, CLAUDE.md) are followed for work in the repository,
+  below user and operator direction; harness notices share one `<dial-notice kind="…">` envelope
+  without attempt counters, capitalized commands or repeated permission disclaimers; a failed edit
+  gets one cause-specific line; tool-naming sentences appear only when the tool is offered; recalled
+  context comes before the user's text; the `finish` description is rewritten. Effects on model
+  outcomes are unmeasured.
 
 - Completion now reconciles plain replies and `finish` against controller obligations and evidence,
   with one shared investigation/check nudge and no repeated-answer acceptance or automatic todo

@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn plan_updates_do_not_invite_a_separate_closing_request() {
+    let mut list = TodoList::default();
+    let output = list.call(&json!({"op":"set","tasks":[{"content":"Build result"}]}));
+    assert!(!output.is_error, "{}", output.text);
+    assert!(
+        !output.text.contains("After work, close"),
+        "{}",
+        output.text
+    );
+    assert!(
+        output.data.is_some(),
+        "structured plan state must remain available"
+    );
+}
+
+#[test]
 fn follow_ups_require_explicit_start_and_survive_legacy_snapshot_migration() {
     let mut list = TodoList::new();
     assert!(
@@ -15,7 +31,7 @@ fn follow_ups_require_explicit_start_and_survive_legacy_snapshot_migration() {
         .is_error
     );
     assert_eq!(list.tasks()[0].kind, Kind::Step);
-    let focus = list.focus().unwrap();
+    let focus = list.focus(true).unwrap();
     assert!(focus.contains("Next: 3. Report locally"), "{focus}");
     assert!(!focus.contains("Live diagnostic"), "{focus}");
     assert!(!list.call(&json!({"op":"done"})).is_error);
@@ -108,7 +124,7 @@ fn detailed_findings_close_tasks_and_survive_resume_without_truncation() {
         let mut resumed = TodoList::new();
         resumed.restore(&list.snapshot()).unwrap();
         assert_eq!(resumed, list);
-        assert!(resumed.focus().unwrap().contains(&answer));
+        assert!(resumed.focus(true).unwrap().contains(&answer));
         assert!(!resumed.call(&json!({"op":"start","index":1})).is_error);
         let before = resumed.snapshot();
         assert!(resumed.call(&json!({"op":"done","finding":"x".repeat(4_001),"evidence":["src/parser.rs:24"]})).is_error);
@@ -138,7 +154,7 @@ fn optional_investigation_findings_are_validated_and_preserved() {
     let mut resumed = TodoList::new();
     resumed.restore(&list.snapshot()).unwrap();
     assert_eq!(resumed, list);
-    assert!(resumed.focus().unwrap().contains("src/parser.rs:24"));
+    assert!(resumed.focus(true).unwrap().contains("src/parser.rs:24"));
     resumed.call(&json!({"op":"start","index":1}));
     assert!(resumed.tasks()[0].finding.is_none());
     assert!(resumed.tasks()[0].evidence.is_empty());
@@ -201,21 +217,25 @@ fn statuses(list: &TodoList) -> Vec<Status> {
 fn focus_names_the_current_and_next_step_only_for_multi_step_plans() {
     let mut list = TodoList::new();
     set(&mut list, json!([{"content": "only step"}]));
-    assert_eq!(list.focus(), None);
+    assert_eq!(list.focus(true), None);
     set(
         &mut list,
         json!([{"content": "read", "status": "completed"}, {"content": "fix"}, {"content": "test"}]),
     );
-    let focus = list.focus().unwrap();
+    let focus = list.focus(true).unwrap();
     assert!(
         focus.contains("(1/3 done): 2. fix.") && focus.contains("Next: 3. test."),
         "{focus}"
     );
     list.call(&json!({"op": "done"}));
-    assert!(list.focus().unwrap().contains("last open step"));
+    // Only routes whose accepted completion closes steps may say no closing call is needed.
+    let closing = list.focus(true).unwrap();
+    assert!(closing.contains("last open step") && closing.contains("no todo call is needed"));
+    let explicit = list.focus(false).unwrap();
+    assert!(explicit.contains("close it with todo done"), "{explicit}");
     list.call(&json!({"op": "block", "reason": "flaky CI"}));
     assert_eq!(
-        list.focus(),
+        list.focus(true),
         None,
         "nothing in progress means nothing to focus on"
     );
@@ -342,7 +362,7 @@ fn pruning_keeps_the_findings_tail_and_resumes_clean() {
         ["q2", "q3", "q4", "step"],
         "the oldest closed question is pruned once four are closed"
     );
-    let focus = list.focus().unwrap();
+    let focus = list.focus(true).unwrap();
     assert!(
         focus.contains("a2") && focus.contains("a3") && focus.contains("a4"),
         "{focus}"

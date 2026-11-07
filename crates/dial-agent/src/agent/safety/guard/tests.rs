@@ -749,8 +749,8 @@ fn repeated_edits_to_one_file_without_a_passing_check_are_flagged_and_reset_by_o
     // Edits to other files and calls that change nothing do not count toward `src/lib.rs`.
     assert!(guard.observe(&["src/main.rs".to_owned()], false).is_none());
     assert!(guard.observe(&[], false).is_none());
-    let advice = guard.observe(&lib, false).expect("sixth edit is churn");
-    assert!(advice.contains("`src/lib.rs` (6 edits)"), "{advice}");
+    let advice = guard.observe(&lib, false).expect("third edit is churn");
+    assert!(advice.contains("`src/lib.rs` (3 edits)"), "{advice}");
     assert!(
         guard.observe(&lib, false).is_none(),
         "repeats only at multiples"
@@ -771,4 +771,33 @@ fn one_call_touching_a_path_twice_counts_once() {
         assert!(guard.observe(&twice, false).is_none());
     }
     assert!(guard.observe(&twice, false).is_some());
+}
+
+#[test]
+fn a_scoped_check_does_not_release_other_repeated_rewrites() {
+    let mut guard = EditChurnGuard::default();
+    for _ in 0..3 {
+        guard.observe(&["encoder.c".into(), "decoder.c".into()], false);
+    }
+    guard.checked_paths(&["encoder.c".into()]);
+    assert!(guard.rewrite_rejection("encoder.c", 10000).is_none());
+    assert!(guard.rewrite_rejection("decoder.c", 10000).is_some());
+}
+
+#[test]
+fn unverified_churn_withholds_large_rewrites_but_preserves_focused_repairs() {
+    let mut guard = EditChurnGuard::default();
+    for _ in 0..3 {
+        guard.observe(&["encoder.c".into()], false);
+    }
+    assert!(guard.rewrite_rejection("encoder.c", 4096).is_some());
+    assert!(guard.rewrite_rejection("encoder.c", 4095).is_none());
+    assert!(guard.rewrite_rejection("other.c", 10000).is_none());
+    guard.observe(&[], false);
+    assert!(
+        guard.rewrite_rejection("encoder.c", 10000).is_some(),
+        "an unsuccessful check does not certify the implementation"
+    );
+    guard.observe(&[], true);
+    assert!(guard.rewrite_rejection("encoder.c", 10000).is_none());
 }

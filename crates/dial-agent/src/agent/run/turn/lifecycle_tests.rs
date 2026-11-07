@@ -48,9 +48,13 @@ fn open_execution_steps_cannot_finish_through_either_delivery_surface() {
 }
 
 #[test]
-fn a_promise_without_workspace_observations_gets_one_nudge_then_stops_incomplete() {
-    let candidate =
-        "I haven't finished diagnosing.\nNext I'd load the source. Then I'd come back with a fix.";
+fn an_unrecognized_promise_without_workspace_observations_gets_one_nudge_then_is_accepted() {
+    // The keyword-classified investigation nudge never ends a turn Incomplete on its own. Replies
+    // the stream guards recognize as announcing more work ("I will run the tests next") still stop
+    // Incomplete (integration: consistent_ux_promised_actions_stop_incomplete_after_bounded_recovery);
+    // this wording is not one of them. First-person admissions such as "I haven't finished" or
+    // "Next I'd load the source" are recognized (stream_guards tests).
+    let candidate = "Diagnosis is underway.\nThe source comes next, then a fix.";
     let server = serve(vec![response(candidate, None), response(candidate, None)]);
     with_agent(
         "[compaction]\nenabled=false\n[retry]\nmax_attempts=1",
@@ -64,7 +68,7 @@ fn a_promise_without_workspace_observations_gets_one_nudge_then_stops_incomplete
             let report = agent
                 .turn("Diagnose the failure in this project", &mut NullUi)
                 .unwrap();
-            assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+            assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
         },
     );
     assert_eq!(completion_requests(&server).len(), 2);

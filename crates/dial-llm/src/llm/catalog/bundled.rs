@@ -91,6 +91,31 @@ pub enum ThinkingMode {
     GoogleLevel,
 }
 
+/// A documented request rule for one exact model, beyond its thinking mode. Only facts the
+/// provider documents for that model are recorded; an absent fact keeps the generic behaviour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelFact {
+    /// Rejects `temperature`, `top_p` and `top_k`, so sampling parameters are never sent.
+    NoSampling,
+    /// Thinking cannot be disabled (`thinking: {type: "disabled"}` is rejected at every effort):
+    /// thinking off omits `thinking` and lowers the effort instead.
+    ThinkingAlwaysOn,
+    /// Rejects `thinking: {type: "disabled"}`; `{type: "between_tools"}` turns thinking off and
+    /// is accepted only at effort `high` or below.
+    ThinkingOffBetweenTools,
+    /// Accepts `thinking: {type: "disabled"}` only at effort `high` or below.
+    ThinkingOffUpToHigh,
+    /// Thinking text is omitted unless `thinking.display: "summarized"` asks for summaries.
+    SummarizedThinking,
+    /// Supports Messages on-demand compaction (`compaction` parameter, beta `compact-2026-09-04`).
+    NativeCompaction,
+    /// Runs the preserved-thinking history-editing check: a replayed thinking block is rejected
+    /// (400 on enforced accounts) once `system`, `tools` or any earlier message has changed since
+    /// the block was produced, so already-sent history must stay byte-identical.
+    PreservedThinking,
+}
+
 /// USD per million tokens.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Rates {
@@ -222,11 +247,18 @@ pub struct BundledModel {
     /// Provider wire value per declared effort (e.g. `minimal` sent as `instant`).
     pub effort_wire: BTreeMap<ReasoningEffort, String>,
     pub default_effort: Option<ReasoningEffort>,
+    /// Documented request rules for this exact model.
+    pub facts: Vec<ModelFact>,
     /// Base list price per token; `None` when the upstream card is unknown or variable.
     pub pricing: Option<TokenPricing>,
     pub list_price: Option<&'static ListPrice>,
 }
 impl BundledModel {
+    /// Whether this exact model's record documents `fact`.
+    pub fn has(&self, fact: ModelFact) -> bool {
+        self.facts.contains(&fact)
+    }
+
     /// Capability metadata for a discovery entry; live provider fields should take precedence.
     pub fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
@@ -263,6 +295,9 @@ struct Row {
     /// Provider wire value per declared effort when it differs from the Dial name.
     #[serde(default)]
     m: BTreeMap<ReasoningEffort, String>,
+    /// Documented request rules (`ModelFact`, kebab-case).
+    #[serde(default)]
+    f: Vec<ModelFact>,
 }
 #[derive(Deserialize)]
 struct ScheduleRow {
@@ -286,6 +321,7 @@ struct Entry {
     efforts: Vec<ReasoningEffort>,
     default_effort: Option<ReasoningEffort>,
     effort_wire: BTreeMap<ReasoningEffort, String>,
+    facts: Vec<ModelFact>,
     price: Option<ListPrice>,
 }
 struct ProviderModels {
@@ -374,6 +410,7 @@ static MODELS: LazyLock<HashMap<String, ProviderModels>> = LazyLock::new(|| {
                         efforts: row.e,
                         default_effort: row.d,
                         effort_wire: row.m,
+                        facts: row.f,
                         id: row.id,
                     }
                 })
@@ -408,6 +445,7 @@ fn to_bundled(provider: &'static str, entry: &'static Entry) -> BundledModel {
         thinking_efforts: entry.efforts.clone(),
         effort_wire: entry.effort_wire.clone(),
         default_effort: entry.default_effort,
+        facts: entry.facts.clone(),
         pricing: entry.price.as_ref().map(ListPrice::token_pricing),
         list_price: entry.price.as_ref(),
     }

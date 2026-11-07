@@ -79,6 +79,28 @@ impl Agent<'_> {
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Steering, "Kept completed tool results and skipped unstarted old actions; replanning with your new instruction."));
             return Ok(crate::agent::run::engine::Tick::Again);
         }
+        if let Some(check) = self.auto_registered_checks(ui) {
+            if let Some(results) = check
+                .data
+                .as_ref()
+                .and_then(|data| data["results"].as_array())
+            {
+                let verdict = results
+                    .iter()
+                    .map(|result| result["status"].as_str().unwrap_or("unverified"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                engine.note_check_verdict(&verdict);
+            }
+            self.push(crate::agent::run::guidance::note(
+                crate::agent::run::guidance::Priority::Review,
+                format!(
+                    "<dial-notice kind=\"registered_acceptance\">{}\n{}</dial-notice>",
+                    check.text,
+                    check.data.unwrap_or(Value::Null)
+                ),
+            ))?;
+        }
         if let Some(finish) = finished.as_ref() {
             // A terminal batch can itself reach the recovery cap; retain its candidate before
             // the shared policy returns the blocked report instead of publishing completion.
@@ -385,8 +407,11 @@ impl Agent<'_> {
                     "auto_continue",
                     json!({"attempt":turn.auto_continues,"reason":headline}),
                 )?;
+                // Durable: the next reply follows this message in history, so it keeps the
+                // user/assistant alternation that providers require.
                 self.push(json!({"role":"user","content":format!(
-                        "<system-notice>\n{message}\n\nContinue. MUST resume the most recent intent with a different concrete action and complete the unfinished work. NEVER repeat the unchanged call, pause to summarize progress, or ask whether to proceed.\n</system-notice>"
+                        "<dial-notice kind=\"auto_continue\">\n{}\n\nDial is continuing the turn because the last round stopped short. Take a different concrete step toward the most recent request rather than repeating the unchanged call. If a decision or permission that only the user can give is genuinely needed, ask for it.\n</dial-notice>",
+                        message.replace("</dial-notice", "<\\/dial-notice")
                     )}))?;
 
                 self.transition_turn(

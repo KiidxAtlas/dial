@@ -63,6 +63,7 @@ fn live_handoff_preserves_prefix_and_tools_and_only_appends_maintenance() {
         &mut backend,
         &CompactionConfig::default(),
         &context(&source),
+        CompactionMethod::Handoff,
         "keep decision",
         &Arc::new(AtomicBool::new(false)),
         &mut NullUi,
@@ -108,6 +109,7 @@ fn local_and_oversized_handoff_do_not_spend_a_summary_request() {
             &mut local,
             &CompactionConfig::default(),
             &context(&source),
+            CompactionMethod::Handoff,
             "",
             &Arc::new(AtomicBool::new(false)),
             &mut NullUi,
@@ -124,6 +126,7 @@ fn local_and_oversized_handoff_do_not_spend_a_summary_request() {
             &mut remote,
             &CompactionConfig::default(),
             &small,
+            CompactionMethod::Handoff,
             "",
             &Arc::new(AtomicBool::new(false)),
             &mut NullUi,
@@ -144,6 +147,7 @@ fn provider_errors_fall_back_but_cancellation_and_control_denial_are_never_hidde
             &mut backend,
             &CompactionConfig::default(),
             &context(&source),
+            CompactionMethod::Handoff,
             "",
             &cancel,
             &mut NullUi,
@@ -159,6 +163,7 @@ fn provider_errors_fall_back_but_cancellation_and_control_denial_are_never_hidde
             &mut backend,
             &CompactionConfig::default(),
             &context(&source),
+            CompactionMethod::Handoff,
             "",
             &cancel,
             &mut NullUi,
@@ -171,6 +176,7 @@ fn provider_errors_fall_back_but_cancellation_and_control_denial_are_never_hidde
         &mut backend,
         &CompactionConfig::default(),
         &context(&source),
+        CompactionMethod::Handoff,
         "",
         &cancel,
         &mut NullUi,
@@ -184,6 +190,7 @@ fn provider_errors_fall_back_but_cancellation_and_control_denial_are_never_hidde
         &mut backend,
         &CompactionConfig::default(),
         &context(&source),
+        CompactionMethod::Handoff,
         "",
         &cancel,
         &mut NullUi,
@@ -196,6 +203,7 @@ fn provider_errors_fall_back_but_cancellation_and_control_denial_are_never_hidde
             &mut backend,
             &CompactionConfig::default(),
             &context(&source),
+            CompactionMethod::Handoff,
             "",
             &cancel,
             &mut NullUi,
@@ -208,6 +216,7 @@ fn provider_errors_fall_back_but_cancellation_and_control_denial_are_never_hidde
         &mut backend,
         &CompactionConfig::default(),
         &context(&source),
+        CompactionMethod::Handoff,
         "",
         &cancel,
         &mut NullUi,
@@ -218,4 +227,43 @@ fn provider_errors_fall_back_but_cancellation_and_control_denial_are_never_hidde
     )
     .unwrap_err();
     assert!(error.is::<llm::Interrupted>());
+}
+
+#[test]
+fn live_soft_summary_appends_its_own_instruction_to_the_unchanged_prefix() {
+    let mut backend = backend("https://example.com/v1");
+    let source = source();
+    let mut sent = None;
+    let result = summarize(
+        &mut backend,
+        &CompactionConfig::default(),
+        &context(&source),
+        CompactionMethod::Soft,
+        "keep decision",
+        &Arc::new(AtomicBool::new(false)),
+        &mut NullUi,
+        &mut |_, request, _| {
+            sent = Some(request.clone());
+            Ok("summary".into())
+        },
+    )
+    .unwrap();
+    assert_eq!(result.as_deref(), Some("summary"));
+    let sent = sent.expect("a live Soft summary is requested");
+    // Byte-identical prefix and tool offer: only one message is appended.
+    assert_eq!(sent.tools, source.tools);
+    assert_eq!(sent.messages.len(), source.messages.len() + 1);
+    assert_eq!(sent.messages[..source.messages.len()], source.messages);
+    let instruction = sent.messages.last().unwrap();
+    assert_eq!(instruction["dial_compaction_handoff"], true);
+    assert_eq!(instruction["dial_transient"], true);
+    let text = instruction["content"].as_str().unwrap();
+    assert!(text.contains("return only the requested summary"), "{text}");
+    assert!(
+        text.contains(&summary_instructions(
+            CompactionMethod::Soft,
+            "keep decision"
+        )),
+        "{text}"
+    );
 }

@@ -270,3 +270,18 @@ fn manual_retry_only_releases_the_current_wait_and_cancellation_wins() {
         "early exits also clear the pending wait"
     );
 }
+
+#[test]
+fn x_should_retry_is_read_as_an_explicit_verdict() {
+    let now = SystemTime::now();
+    assert_eq!(
+        at(&[("x-should-retry", "false")], now).should_retry,
+        Some(false)
+    );
+    assert_eq!(
+        at(&[("x-should-retry", " TRUE ")], now).should_retry,
+        Some(true)
+    );
+    assert_eq!(at(&[("x-should-retry", "maybe")], now).should_retry, None);
+    assert_eq!(at(&[], now).should_retry, None);
+}

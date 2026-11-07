@@ -1,13 +1,15 @@
-//! Experimental turn optimizer (`experimental.turn_optimizer`): a hard layer between the user and
-//! the main model. The `turn_drafter` role rewrites every user message, both new turns and
-//! steering, into a structured prompt before the main model sees it. The typed text stays beside
-//! the draft under `dial_turn_draft`, so transcripts, resume and memory show what the user wrote.
+//! Experimental turn optimizer (`experimental.turn_optimizer`): a layer between the user and the
+//! main model. The `turn_drafter` role restates a user message, a new turn or steering, as a
+//! structured prompt. The main model receives the typed message verbatim as the authoritative
+//! request, with the draft attached beneath it in a labeled `turn_draft` notice; the typed text is
+//! also kept under `dial_turn_draft`, so transcripts, resume and memory show what the user wrote.
 //!
-//! Drafting fails closed: a failed, cancelled, truncated or empty draft fails the turn and nothing
-//! reaches the main model. Harness-generated turns (goal continuations) and hermetic agents are
-//! not drafted.
+//! Short or already structured messages are sent as typed without a drafter request
+//! ([`worth_drafting`]). Drafting fails closed: a failed, cancelled, truncated or empty draft fails
+//! the turn and nothing reaches the main model. Harness-generated turns (goal continuations) and
+//! hermetic agents are not drafted.
 //! Interactive surfaces require review before delivery; unattended surfaces retain automatic
-//! delivery of valid drafts. Rejection never falls back to the original message.
+//! delivery of valid drafts. Rejection never falls back to sending the message without review.
 
 use crate::agent::*;
 use crate::llm::model_config::TURN_DRAFTER;
@@ -21,6 +23,45 @@ const DRAFT_MAX_TOKENS: u32 = 8192;
 const CONTEXT_REPLIES: usize = 2;
 const CONTEXT_REPLY_CHARS: usize = 2000;
 const CONTEXT_INSTRUCTION_CHARS: usize = 6000;
+/// Messages shorter than this are sent as typed: there is little to structure, and a drafter
+/// request plus review costs more than it adds.
+const MIN_DRAFT_CHARS: usize = 200;
+/// List items that mark a message as already structured.
+const STRUCTURED_ITEMS: usize = 3;
+
+/// Whether a message gets a draft: at least [`MIN_DRAFT_CHARS`] long and not already structured
+/// (a Markdown heading, or [`STRUCTURED_ITEMS`] list items, outside code fences).
+pub(in crate::agent) fn worth_drafting(typed: &str) -> bool {
+    typed.trim().chars().count() >= MIN_DRAFT_CHARS && !already_structured(typed)
+}
+
+fn already_structured(text: &str) -> bool {
+    let mut fenced = false;
+    let mut items = 0;
+    for line in text.lines().map(str::trim_start) {
+        if line.starts_with("```") || line.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let heading = line.trim_start_matches('#');
+        if heading.len() < line.len() && line.len() - heading.len() <= 6 && heading.starts_with(' ')
+        {
+            return true;
+        }
+        let ordered = line.split_once(['.', ')']).is_some_and(|(number, rest)| {
+            !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_digit())
+                && rest.starts_with(' ')
+        });
+        if ordered || line.starts_with("- ") || line.starts_with("* ") || line.starts_with("+ ") {
+            items += 1;
+        }
+    }
+    items >= STRUCTURED_ITEMS
+}
 
 /// Who wrote a turn's text. Only user-authored turns pass through the drafter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +82,7 @@ pub(in crate::agent) fn draft_request(
     active_instruction: &str,
     history: &[Value],
     user_message: &str,
+    diagrams: bool,
 ) -> Chat {
     let mut recent: Vec<Value> = history
         .iter()
@@ -59,7 +101,7 @@ pub(in crate::agent) fn draft_request(
     recent.reverse();
     Chat {
         messages: vec![
-            json!({"role":"system","content":crate::agent::prompts::turn_drafter::SYSTEM}),
+            json!({"role":"system","content":crate::agent::prompts::turn_drafter::system(diagrams)}),
             json!({"role":"user","content":json!({
                 "active_instruction":crate::agent::window::prompt::truncate_chars(
                     active_instruction,
@@ -76,12 +118,21 @@ pub(in crate::agent) fn draft_request(
     }
 }
 
-/// Put the drafted prompt where the typed text was. Attachment blocks that `@references`
-/// appended after the typed text stay attached; the typed text is kept under `dial_turn_draft`.
+/// Attach the draft beneath the typed message (and the attachment blocks `@references` appended
+/// to it) as a labeled interpretation. The typed text stays first and authoritative; the draft is
+/// quoted so it cannot close its notice, and the typed text is also kept under `dial_turn_draft`.
 pub(in crate::agent) fn apply_draft(message: &mut Value, typed: &str, drafted: &str) {
-    let content = message["content"].as_str().unwrap_or("");
-    let attachments = content.strip_prefix(typed).unwrap_or("");
-    message["content"] = json!(format!("{drafted}{attachments}"));
+    use crate::agent::prompts::recovery::{notice, quoted};
+    let content = message["content"].as_str().unwrap_or(typed);
+    let interpretation = notice(
+        "turn_draft",
+        &format!(
+            "{}\n\n{}",
+            crate::agent::prompts::turn_drafter::INTERPRETATION_LABEL,
+            quoted(drafted)
+        ),
+    );
+    message["content"] = json!(format!("{content}\n\n{interpretation}"));
     message[TURN_DRAFT_KEY] = json!({"original": typed});
 }
 
@@ -91,15 +142,23 @@ impl Agent<'_> {
         self.config.experimental.turn_optimizer && !self.hermetic
     }
 
-    /// Rewrite one user message with the `turn_drafter` role, which follows the main model when
-    /// unassigned. Fails closed: the error says the message was not sent to the main model.
+    /// Draft one user message with the `turn_drafter` role, which follows the main model when
+    /// unassigned. `None` means the message goes as typed ([`worth_drafting`]). Fails closed:
+    /// the error says the message was not sent to the main model.
     pub(in crate::agent) fn draft_message(
         &mut self,
         main: &mut Backend,
         typed: &str,
         step: u32,
         ui: &mut dyn Ui,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
+        if !worth_drafting(typed) {
+            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                crate::agent::ui::ui_event::EventKind::Draft,
+                "Turn optimizer: sending your message as typed (short or already structured).",
+            ));
+            return Ok(None);
+        }
         ui.event(&crate::agent::ui::ui_event::UiEvent::new(
             crate::agent::ui::ui_event::EventKind::Draft,
             "Turn optimizer: drafting a structured prompt from your message.",
@@ -108,7 +167,12 @@ impl Agent<'_> {
             .as_str()
             .unwrap_or("")
             .to_owned();
-        let chat = draft_request(&instruction, &self.session.messages(), typed);
+        let chat = draft_request(
+            &instruction,
+            &self.session.messages(),
+            typed,
+            self.config.experimental.turn_drafter_diagrams,
+        );
         let drafted = self
             .role_chat(
                 main,
@@ -138,7 +202,7 @@ impl Agent<'_> {
             "turn_drafted",
             json!({"typed_chars":typed.chars().count(),"drafted_chars":drafted.chars().count()}),
         )?;
-        Ok(drafted.to_owned())
+        Ok(Some(drafted.to_owned()))
     }
 
     /// Draft and journal steering that was deferred while the main stream held the backend, in
@@ -160,8 +224,11 @@ impl Agent<'_> {
                         total - index
                     )
                 })?;
-            apply_draft(&mut message, &text, &drafted);
-            self.journal_steering(message, &drafted)?;
+            if let Some(drafted) = drafted {
+                apply_draft(&mut message, &text, &drafted);
+            }
+            // The typed text stays the current instruction; the draft only travels with it.
+            self.journal_steering(message, &text)?;
             ui.steering_applied(&text);
         }
         Ok(total > 0)
@@ -184,7 +251,7 @@ impl Agent<'_> {
         &mut self,
         typed: &str,
         ui: &mut dyn Ui,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         let mut backend = self.backend.take().context("backend is already in use")?;
         let result = self.draft_message(&mut backend, typed, 0, ui);
         self.backend = Some(backend);

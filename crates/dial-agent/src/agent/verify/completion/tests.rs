@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::tool_output::ToolOutput;
 
 #[test]
 fn answered_is_a_delivery_outcome_not_a_completion_or_input_claim() {
@@ -90,11 +91,12 @@ fn optional_progress_does_not_force_bookkeeping_rounds() {
 }
 
 #[test]
-fn only_successful_asserting_eval_code_counts_as_a_check() {
-    assert!(asserting_eval("assert out == expected"));
-    assert!(asserting_eval("assert.deepStrictEqual(a, b)"));
-    assert!(!asserting_eval("print(total)"));
-    assert!(!asserting_eval("reassert = 1"));
+fn only_executed_runtime_checks_count_and_a_caught_failure_remains_visible() {
+    let prose = ToolOutput::ok("assert(true); checks: passed".into());
+    assert!(eval_checks(&prose).next().is_none());
+    let output = ToolOutput::structured(json!({"checks":[{"name":"tiny round trip","passed":true},
+        {"name":"saved output","passed":false},{"name":"not an outcome"}]}));
+    assert_eq!(eval_checks(&output).collect::<Vec<_>>(), [true, false]);
 }
 
 #[test]
@@ -243,7 +245,8 @@ fn capability_denials_are_recognized_in_prose_only() {
         "I cannot run the game here because this environment has no interactive terminal.",
         "Unfortunately a browser is not available to me.",
         "I don't have a tool for debugging Python.",
-        "Running curses programs is not possible without a TTY!",
+        "I’m unable to open a browser here.",
+        "Running curses programs is not possible for me without a TTY!",
     ] {
         assert!(denies_capability(denial), "{denial}");
     }
@@ -251,6 +254,9 @@ fn capability_denials_are_recognized_in_prose_only() {
         "Fixed the parser; all 12 tests pass.",
         "The function cannot return null, so the guard was removed.",
         "```\nerror: terminal not available\n```\nThe flaky test now passes.",
+        // Prose about the project, not about the agent's own abilities.
+        "This env var is not available in the test environment.",
+        "Running curses programs is not possible without a TTY!",
     ] {
         assert!(!denies_capability(answer), "{answer}");
     }

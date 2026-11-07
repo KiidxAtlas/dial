@@ -98,7 +98,7 @@ impl Finish {
 pub fn schema() -> Value {
     json!({"type":"function","function":{
         "name":"finish",
-        "description":"Submit a structured candidate to the same state gate as a plain reply. completed requires settled execution steps, deliverables, jobs and required checks. answered delivers information without certifying work; it cannot bypass open obligations. blocked and needs_input require a concrete reason, and available workspace evidence is investigated first. needs_input accepts optional choices. One recovery nudge is shared per user request; exhausted recovery is incomplete. Use last in a batch.",
+        "description":"End the request with an explicit outcome; a plain final reply works the same way. completed: the requested work is done; first finish or block planned steps and deliverables, wait for running jobs, and get required checks passing. answered: you are delivering information, not claiming changes are done. blocked or needs_input: put the concrete missing prerequisite or question in reason, after checking what the workspace can tell you; needs_input may offer up to 8 options. Call it last in a batch.",
         "parameters":{"type":"object","properties":{
             "outcome":{"type":"string","enum":["completed","answered","blocked","needs_input"]},
             "summary":{"type":"string","minLength":1,"maxLength":8192},
@@ -177,6 +177,19 @@ pub(in crate::agent) enum Decision {
 }
 
 impl crate::agent::Agent<'_> {
+    /// Small local models keep every completion guard rail: open execution steps block, the
+    /// lexical investigation nudge applies and long observation runs get the forced research
+    /// checkpoint. Hosted and full-tier local routes rely on the state gate alone.
+    pub(in crate::agent) fn lean_completion_route(&self) -> bool {
+        self.lean_local() || self.local_escalated()
+    }
+
+    /// Whether an accepted `completed` answer closes open execution steps (`settle_open_steps`),
+    /// so the todo focus need not ask for a closing `todo done`.
+    pub(in crate::agent) fn finish_closes_steps(&self) -> bool {
+        !(self.hermetic || self.plan_mode || self.lean_completion_route())
+    }
+
     /// One instruction-scoped nudge for missing work or observations. Wording never grants
     /// completion, and rebuilding an inner loop cannot replenish this allowance.
     pub(in crate::agent) fn completion_decision(
@@ -195,6 +208,7 @@ impl crate::agent::Agent<'_> {
                 _ => Decision::Accept(requested),
             };
         }
+        let lean = self.lean_completion_route();
         let mut control = self.session.control_state();
         let instruction = control["current_instruction_entry_id"].clone();
         let nudged = control["completion_gate"]["instruction"] == instruction
@@ -210,11 +224,13 @@ impl crate::agent::Agent<'_> {
             .map(|task| task.content.as_str())
             .collect::<Vec<_>>();
         let has_open_steps = !open_steps.is_empty();
-        let open = has_open_steps.then(|| format!(
+        // Lean routes refuse a final reply over open steps. Other routes settle the remaining
+        // blockers first and, once the answer is accepted, close or list the steps (`settle_open_steps`).
+        let open = (lean && has_open_steps).then(|| format!(
             "Execution steps remain open: {}. Complete or explicitly block them; a final reply does not close them.",
             open_steps.join("; ")));
         let mut blocker = if delivery {
-            open.or_else(|| self.validate_completion(ui).err())
+            open.or_else(|| self.validate_completion_scoped(ui, lean).err())
         } else {
             None
         };
@@ -240,39 +256,50 @@ impl crate::agent::Agent<'_> {
                 ));
             }
         }
-        // Inspecting the directory is only an availability check. It supplies no task evidence.
-        let workspace_available =
-            std::fs::read_dir(self.workspace.root())
-                .ok()
-                .is_some_and(|entries| {
-                    entries.filter_map(Result::ok).any(|entry| {
-                        !matches!(entry.file_name().to_str(), Some(".git" | ".dial" | ".tmp"))
-                    })
+        // The lexical investigation nudge is a guard rail for small local models only.
+        let missing_observation = lean && {
+            // Inspecting the directory is only an availability check. It supplies no task evidence.
+            let workspace_available =
+                std::fs::read_dir(self.workspace.root())
+                    .ok()
+                    .is_some_and(|entries| {
+                        entries.filter_map(Result::ok).any(|entry| {
+                            !matches!(entry.file_name().to_str(), Some(".git" | ".dial" | ".tmp"))
+                        })
+                    });
+            let work_request = control["current_instruction"]
+                .as_str()
+                .is_some_and(|prompt| {
+                    crate::learn::task_policy::Kind::classify(prompt)
+                        != crate::learn::task_policy::Kind::General
                 });
-        let work_request = control["current_instruction"]
-            .as_str()
-            .is_some_and(|prompt| {
-                crate::learn::task_policy::Kind::classify(prompt)
-                    != crate::learn::task_policy::Kind::General
-            });
-        let missing_observation = !self.step_checks.autonomous_continuation
-            && self.step_checks.observations == 0
-            && workspace_available
-            && work_request
-            && !self.interrupt.load(std::sync::atomic::Ordering::SeqCst);
+            !self.step_checks.autonomous_continuation
+                && self.step_checks.observations == 0
+                && workspace_available
+                && work_request
+                && !self.interrupt.load(std::sync::atomic::Ordering::SeqCst)
+        };
         if requested == TurnOutcome::NeedsInput && self.step_checks.observations == 0 {
             self.efficiency_metrics.questions_before_investigation += 1;
         }
+        let investigation_only = blocker.is_none() && missing_observation;
         let missing = blocker.or_else(|| missing_observation.then(||
             "No investigation has been observed for this request. Inspect available workspace evidence before asking the user or claiming completion; if it cannot answer the question, state the concrete missing information.".to_owned()));
         let Some(reason) = missing else {
-            return Decision::Accept(requested);
+            return self.accept_completion(requested, lean, ui);
         };
         let externally_blocked = self.todo.blocked_steps().next().is_some()
             || control["working_state"]["deliverables"]
                 .as_array()
                 .is_some_and(|items| items.iter().any(|item| item["status"] == "blocked"));
+        let unfinished = crate::agent::safety::stream_guards::announces_unexpected_stop(candidate)
+            || crate::agent::safety::stream_guards::reports_unfinished_work(candidate);
         if nudged || hard_blocker || externally_blocked || self.stop_boundary().is_some() {
+            // The keyword-classified investigation nudge advises; it never ends a turn Incomplete
+            // on its own. A candidate that itself says the work is unfinished is not an answer.
+            if investigation_only && !unfinished {
+                return self.accept_completion(requested, lean, ui);
+            }
             self.efficiency_metrics.incomplete_stops += 1;
             return Decision::Incomplete(reason);
         }
@@ -288,20 +315,65 @@ impl crate::agent::Agent<'_> {
         ui.notice(&format!(
             "Completion deferred for unfinished work or investigation: {reason}"
         ));
-        let wording = if crate::agent::safety::stream_guards::announces_unexpected_stop(candidate)
-            || crate::agent::safety::stream_guards::reports_unfinished_work(candidate)
-        {
-            crate::agent::safety::stream_guards::render_retry_prompt(
-                crate::agent::safety::stream_guards::UNEXPECTED_STOP_RETRY,
-                1,
-                1,
-            )
+        let wording = if unfinished {
+            crate::agent::safety::stream_guards::UNEXPECTED_STOP_RETRY.to_owned()
         } else {
             String::new()
         };
         Decision::Continue(format!(
             "{wording}\n[Dial completion] {reason}\nContinue the permitted work or report a concrete blocker. This is the single completion nudge for this request."
         ))
+    }
+
+    /// Accept `requested`, disclosing what the answer leaves unverified. On non-lean routes a
+    /// delivered answer also settles open execution steps (`settle_open_steps`).
+    fn accept_completion(
+        &mut self,
+        requested: TurnOutcome,
+        lean: bool,
+        ui: &mut dyn crate::agent::Ui,
+    ) -> Decision {
+        if !matches!(requested, TurnOutcome::Completed | TurnOutcome::Answered) {
+            return Decision::Accept(requested);
+        }
+        if !lean {
+            self.settle_open_steps(requested, ui);
+        }
+        let gaps = self.disclosed_gaps();
+        if !gaps.is_empty() {
+            ui.notice(&format!(
+                "Accepted with disclosed gaps (not verified, not caused by this turn's edits):\n{}",
+                gaps.join("\n")
+            ));
+        }
+        Decision::Accept(requested)
+    }
+
+    /// Non-lean routes only: an accepted `completed` answer closes every pending or in-progress
+    /// execution step, so the model spends no request on closing bookkeeping. Blocked steps never
+    /// reach here (they refuse completion) and optional follow-ups stay listed by `outstanding_notice`.
+    fn settle_open_steps(&mut self, requested: TurnOutcome, ui: &mut dyn crate::agent::Ui) {
+        if requested != TurnOutcome::Completed {
+            return;
+        }
+        let mut next = self.todo.clone();
+        let closed = next.close_open_steps();
+        if closed.is_empty() {
+            return;
+        }
+        let mut state = self.session.control_state();
+        state["todo"] = next.snapshot();
+        if let Err(error) = self.session.set_control_state(state) {
+            ui.diagnostic(&format!("could not persist the closed steps: {error:#}"));
+            return;
+        }
+        self.todo = next;
+        ui.todo(&self.todo);
+        ui.notice(&format!(
+            "Closed {} open step(s) with the accepted completion: {}",
+            closed.len(),
+            closed.join("; ")
+        ));
     }
 }
 
@@ -356,11 +428,13 @@ pub(in crate::agent) fn awaiting_input(text: &str) -> bool {
     .any(|prefix| last.starts_with(prefix))
 }
 
-/// Whether an answer says a capability is unavailable to the agent ("I cannot provide an
-/// interactive terminal", "a browser is not available in this environment"): one sentence pairs a
-/// denial with a capability noun. Code is ignored. A heuristic for one search reminder per turn,
-/// never a reason to reject an answer outright.
+/// Whether an answer says a capability is unavailable to the agent itself ("I cannot provide an
+/// interactive terminal", "a browser is not available to me"): one sentence pairs a first-person
+/// subject or object with a denial and a capability noun, so prose about the project ("this env
+/// var is not available in tests") does not match. Code is ignored. A heuristic for one search
+/// reminder per turn, never a reason to reject an answer outright.
 pub(in crate::agent) fn denies_capability(text: &str) -> bool {
+    const FIRST_PERSON: &[&str] = &["i", "i'm", "im", "i've", "me", "my", "myself"];
     const DENIALS: &[&str] = &[
         "cannot",
         "can't",
@@ -395,9 +469,12 @@ pub(in crate::agent) fn denies_capability(text: &str) -> bool {
     text.split("```")
         .step_by(2)
         .flat_map(|prose| prose.split(['.', '!', '?', '\n']))
-        .map(str::to_lowercase)
+        .map(|sentence| sentence.to_lowercase().replace('\u{2019}', "'"))
         .any(|sentence| {
-            DENIALS.iter().any(|denial| sentence.contains(denial))
+            sentence
+                .split(|c: char| !c.is_alphanumeric() && c != '\'')
+                .any(|word| FIRST_PERSON.contains(&word))
+                && DENIALS.iter().any(|denial| sentence.contains(denial))
                 && CAPABILITIES
                     .iter()
                     .any(|capability| sentence.contains(capability))
@@ -432,13 +509,18 @@ impl CapabilitySearch {
 /// The reminder `CapabilitySearch::remind` sends back with the rejected answer.
 pub(in crate::agent) const CAPABILITY_SEARCH_REMINDER: &str = "Your answer says something is not possible or not available, but you have not searched the tool catalog this turn. Tools you were not offered may provide it (an interactive terminal, a browser, a debugger and more are loadable). Call `tool_search` with the capability you need, load a match with `tool_load` and use it; if nothing fits, give the same answer again and name what you searched for.";
 
-/// A successful `eval` cell whose code asserts its results is verification the model already ran:
-/// a failed assertion makes the cell an error. It counts like a passing shell check.
-pub(in crate::agent) fn asserting_eval(code: &str) -> bool {
-    code.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .any(|word| word == "assert")
-        || code.contains("assert.")
-        || code.contains("assert(")
+/// Actual runtime check callbacks, not assertion words in source or printed claims. These are
+/// local check outcomes, never evidence that unrelated files or task requirements passed.
+pub(in crate::agent) fn eval_checks(
+    output: &crate::runtime::tool_output::ToolOutput,
+) -> impl Iterator<Item = bool> {
+    output
+        .data
+        .as_ref()
+        .and_then(|data| data["checks"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|check| check["passed"].as_bool())
 }
 
 /// Preserve a candidate as unaccepted work alongside the controller's exact missing prerequisite.

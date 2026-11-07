@@ -167,6 +167,7 @@ fn large_window_background_preparation_starts_before_the_new_auto_trigger() {
                     image_input: false,
                     fixed_tokens: 0,
                     parallel_supported: true,
+                    native_supported: false,
                 })
                 .unwrap()
         };
@@ -270,6 +271,7 @@ fn armed_background_summary_is_claimed_only_at_the_auto_trigger() {
                     image_input: false,
                     fixed_tokens: 0,
                     parallel_supported: true,
+                    native_supported: false,
                 })
                 .unwrap()
         };
@@ -627,7 +629,7 @@ fn live_handoff_is_offered_only_to_the_unchanged_main_route() {
         let hooks = if hook { vec![request_hook()] } else { vec![] };
         let context = portable_context(dir.path(), snapshot.main_config.clone());
         let execution = summary_execution(&snapshot, context, &hooks, main, false).unwrap();
-        assert_eq!(execution.live_handoff, live, "{name}");
+        assert_eq!(execution.live_prefix, live, "{name}");
     }
 }
 

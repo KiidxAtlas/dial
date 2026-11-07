@@ -16,6 +16,14 @@ fn settled(outcome: CellOutcome) -> Value {
     }
 }
 
+/// JavaScript resolves through the embedded engine on unix builds, so these checks observe Python only.
+fn python_languages(workspace: &std::path::Path, config: &Config) -> Vec<&'static str> {
+    installed_languages(workspace, config)
+        .into_iter()
+        .filter(|language| *language == "py")
+        .collect()
+}
+
 #[test]
 fn control_operations_do_not_start_an_interpreter() {
     let dir = tempfile::tempdir().unwrap();
@@ -48,20 +56,54 @@ fn installed_languages_reports_only_resolvable_operator_runtimes() {
     let mut config = Config::default();
     config.eval.node = "/missing-dial-test-node".into();
     config.kernel.python = "/missing-dial-test-python".into();
-    assert!(installed_languages(dir.path(), &config).is_empty());
+    assert!(python_languages(dir.path(), &config).is_empty());
+    if !super::embedded_js_available() {
+        assert!(matches!(runtime_readiness(dir.path(), &config),
+            crate::tools::surface::catalog::Readiness::MissingPrerequisite { reason }
+            if reason.contains("Loading eval does not install")));
+    }
+    let guidance = runtime_guidance(dir.path(), &config);
+    let js_state = if super::embedded_js_available() {
+        "JavaScript resolved"
+    } else {
+        "JavaScript not found"
+    };
+    assert!(guidance.contains(js_state), "{guidance}");
+    assert!(guidance.contains("Python not found"), "{guidance}");
     config.kernel.python = python.to_str().unwrap().into();
-    assert_eq!(installed_languages(dir.path(), &config), ["py"]);
+    assert_eq!(python_languages(dir.path(), &config), ["py"]);
+    assert!(runtime_guidance(dir.path(), &config).contains("Python resolved"));
     // A launcher inside the editable workspace is never an operator-installed runtime.
     let planted = dir.path().join("python-fixture");
     std::fs::copy(&python, &planted).unwrap();
     std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
     config.kernel.python = planted.to_str().unwrap().into();
-    assert!(installed_languages(dir.path(), &config).is_empty());
+    assert!(python_languages(dir.path(), &config).is_empty());
     // An aliased workspace must not hide a planted runtime from the containment check.
     let aliases = tempfile::tempdir().unwrap();
     let alias = aliases.path().join("workspace");
     std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
-    assert!(installed_languages(&alias, &config).is_empty());
+    assert!(python_languages(&alias, &config).is_empty());
+
+    // An explicitly selected venv can resolve an external base interpreter even when the
+    // configured fallback is missing. Readiness must use startup's same environment selection.
+    let venv = dir.path().join(".venv");
+    std::fs::create_dir_all(venv.join("bin")).unwrap();
+    std::fs::write(
+        venv.join("pyvenv.cfg"),
+        "include-system-site-packages = false\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&python, venv.join("bin/python")).unwrap();
+    config.kernel.python = "/missing-dial-test-python".into();
+    config.kernel.venv = ".venv".into();
+    assert_eq!(python_languages(dir.path(), &config), ["py"]);
+    std::fs::remove_file(venv.join("bin/python")).unwrap();
+    std::fs::copy(&python, venv.join("bin/python")).unwrap();
+    assert!(
+        python_languages(dir.path(), &config).is_empty(),
+        "a workspace-owned copy is still not an operator interpreter"
+    );
 }
 
 #[test]

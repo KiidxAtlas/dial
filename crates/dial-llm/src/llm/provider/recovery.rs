@@ -293,6 +293,16 @@ impl Backend {
             };
             return Err(error.context(format!("provider authentication failed (HTTP {status}); check {key} or sign in through /providers")));
         }
+        // `x-should-retry: false`: resending this request cannot succeed. Credential rotation above
+        // has already had its chance; the unchanged class still lets the caller fall back.
+        if error
+            .downcast_ref::<llm::HttpError>()
+            .is_some_and(|http| http.retry_refused)
+        {
+            return Err(error.context(
+                "the provider marked this failure as not retryable (x-should-retry: false); the request was not resent",
+            ));
+        }
         let hinted = error
             .downcast_ref::<llm::HttpError>()
             .and_then(|http| http.retry_after);

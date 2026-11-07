@@ -1917,6 +1917,7 @@ fn run_inner(
     rule_state: &mut crate::agent::safety::rules::State,
     children: &ChildBackends,
 ) -> Outcome {
+    let evidence_stall_limit = env.config.efficiency.evidence_stall_rounds;
     let mut turn = match turn::ChildTurn::prepare(
         env, job, backend, adapter, approver, rule_state, children,
     ) {
@@ -1924,6 +1925,7 @@ fn run_inner(
         Err(reason) => return Outcome::failed(0, reason),
     };
     let mut engine = crate::agent::run::engine::Engine::default();
+    engine.set_evidence_stall_limit(evidence_stall_limit);
     let driven = engine.drive(|engine| turn.step(engine));
     turn.finish(driven)
 }

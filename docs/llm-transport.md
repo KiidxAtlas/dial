@@ -11,6 +11,8 @@ Window-reset headers remain quota information, not mandatory waits. A throttle (
 529) remains distinct from account quota exhaustion. Configured failover retains its shorter
 wait policy. Incomplete/truncated streams are discarded and retried within the same attempt
 bounds; partial tool calls are never executed. Claude usage polling shares this retry policy.
+A response carrying `x-should-retry: false` is not resent: the request fails at once. The failure
+keeps its class, so API-key and OAuth account rotation and a configured fallback model still apply.
 
 Native replay is owner-scoped. Responses items replay only to the account/endpoint/credential (and,
 for compaction state, the model) that produced them, Anthropic signed blocks only to the host that
@@ -31,6 +33,13 @@ The command takes no arguments. When idle, `/retry` keeps its existing meaning: 
 failed, unanswered turn.
 
 Streaming reads have bounded raw and line sizes. Reasoning markup leaked into visible text is routed to reasoning events where recognized, and tool-call markup is kept out of user-visible output. Remote model context is taken from configuration or the bundled catalog, falling back to a conservative 32768 tokens. Image inputs are resized to model limits before transmission. Provider-specific OAuth credentials are refreshed per request/retry, without exposing secrets in errors.
+
+Native first-party Anthropic client-tool definitions set `eager_input_streaming: true` so
+large code arguments can arrive incrementally rather than waiting for server-side JSON buffering.
+Nonstreaming and cache-warm requests keep the same definitions; proxies keep their existing wire
+format. Dial still accumulates and validates complete arguments before admitting a tool call;
+partial or truncated JSON never executes. Client-observed silent gaps do not establish provider
+inactivity, and fine-grained delivery alone does not reduce generated tokens or prove faster work.
 
 Text/reasoning recovery of tool calls is limited to local/private endpoints and names offered
 in that request. A fenced JSON example embedded in prose is not executable. Recovered calls
@@ -208,7 +217,8 @@ state, requests report `registry_default` routing.
 ## Remote idle limits and prompt-cache keys
 
 - Eligible direct HTTP connections are shared across per-request agents after the previous response is fully consumed. The pool keeps at most four idle connections per origin and rejects connections idle for 30 seconds or more when borrowing them. Each request rebinds cancellation and silence controls. Loopback/LAN targets, proxies, and caller-supplied guarded resolvers do not share this pool. This is reuse after traffic, not a hosted-model startup ping or preconnect.
-- `remote_model_idle_timeout_secs` defaults to 60 seconds for remote routes (ChatGPT, Anthropic, and OpenAI-compatible hosts that are not localhost or LAN). It bounds the wait for the first event and silence between events. Only actual stream progress resets it; keep-alives do not, with one exception: while a native Anthropic tool call is open, `ping` events reset it for up to 10 minutes after the last real progress. Anthropic may buffer a large tool call's arguments and send only pings (every 30 seconds) until the call is complete, so a long `write` must not be cut off and replayed identically.
+- `remote_model_idle_timeout_secs` defaults to 60 seconds for remote routes (ChatGPT, Anthropic, and OpenAI-compatible hosts that are not localhost or LAN). It bounds the wait for the first event and silence between events. Only actual stream progress resets it; keep-alives do not, with one exception: while a native Anthropic tool call or `thinking` block is open, `ping` events reset it for up to 10 minutes after the last real progress. Anthropic may buffer a large tool call's arguments and send only pings (every 30 seconds) until the call is complete, so a long `write` must not be cut off and replayed identically. A thinking block whose text is omitted streams the same way until its signature arrives.
+- Requests to `api.anthropic.com` ask for `thinking.display: "summarized"` on models whose catalog record says thinking text is omitted by default (`summarized-thinking`), when adaptive thinking is on and no display is set. Long thinking then streams readable summaries instead of empty blocks. Thinking is billed the same either way; proxies and other hosts are left unchanged.
 - A stall maps to an incomplete stream, which is transient. It retries under `retry.max_attempts`, and the partial reply and its tool calls are discarded before the retry.
 - Sockets opened by the cancellable HTTP transport and WebSocket TCP connector enable TCP keepalive probes after 30 seconds of silence (every 10 seconds, 3 probes). For WebSockets this includes the socket underneath an HTTP CONNECT tunnel. A path that dies while the model is silent (sleep/wake, a network or VPN switch, an expired NAT mapping) can fail sooner than the model idle limit and retry on a fresh connection. A live server answers probes however long the model takes, so slow replies keep the full limit. These are kernel probes, not billed requests or prompt-cache refreshes, and they do not renew model-progress deadlines. Retry notices show how long the failed attempt ran.
 - Local model servers (localhost or LAN) keep an unlimited first-event wait. `worker_timeout_secs` (default `0`) still governs local workers. `0` on `remote_model_idle_timeout_secs` is an explicit opt-out.
@@ -217,7 +227,7 @@ state, requests report `registry_default` routing.
 - The silence watchdog requires advancing telemetry (phase or token-count high-water marks), nonempty text/reasoning, or tool argument progress. Repeated status/rate reports and notices do not renew its deadline. Once generation starts, stale loading/prefill reports cannot disarm it; a provider retry resets the attempt's watchdog state.
 - A failed or cancelled request to a Dial-managed server stops that server and its descendants before reuse. The next request starts a fresh process rather than queueing behind abandoned inference. External servers are never killed. Non-cancellation failures include a bounded stderr tail from the failed request, preserving the original error classification.
 - Local startup health checks and embedding warm-up observe cancellation, including when the startup timeout is unlimited. The supervised server's one-shot generation/embedding warm-up is distinct from optional `preparation.local_prefix` and paid hosted prompt-cache refresh.
-- ChatGPT/Codex Responses requests (HTTP and websocket) send `prompt_cache_key` whenever the session has one, unless the profile sets `prompt_cache = false`. The key is derived from the session identity, account, and history generation, so it is stable within a session. API-key Responses requests keep the declared `capabilities.prompt_cache` gate and `prompt_cache` breakpoint policy.
+- ChatGPT/Codex Responses requests (HTTP and websocket) send `prompt_cache_key` whenever the session has one, unless the profile sets `prompt_cache = false`. The key is derived from the session identity, account, and history generation, so it is stable within a session. API-key Responses requests to `api.openai.com` also send it unless `prompt_cache = false`, since it is only a cache-routing hint there. Other API-key Responses hosts keep the declared `capabilities.prompt_cache` gate, and all API-key routes keep the `prompt_cache` breakpoint policy.
 - The Codex backend routes prompt-cache affinity by the `session_id`/`conversation_id` headers, not by `prompt_cache_key`. The websocket handshake and HTTP SSE requests both send them (the dial session id), so a websocket-to-SSE fallback keeps its cache. A cached websocket idle for more than 30 seconds is replaced before use, because the backend evicts idle sockets without a close frame. A reused socket that fails before any event (a broken-pipe write, or a close with nothing received) is replaced inline and the request replayed in full. Only a fresh socket's failure moves that session/account/model to SSE for the process.
 - Codex WebSocket setup uses one elapsed timeout budget across address attempts and TLS/HTTP upgrade, rather than restarting the budget for each address or read. Handshake network I/O checks cancellation at intervals of at most 100 ms; cancellation propagates without selecting SSE. System DNS, native certificate loading, and an in-flight blocking TCP connect cannot be preempted. Their elapsed time counts against the budget, but DNS/certificate loading can exceed it; with a zero timeout, TCP connect retains the OS timeout.
 - Cached Codex WebSockets bind cancellation and no-progress limits to each active request, including reads inside a partial frame. Ping/pong traffic does not renew model-progress deadlines. Request controls are detached before returning a connection to the cache, so an earlier request's cancellation cannot poison reuse.
@@ -225,7 +235,7 @@ state, requests report `registry_default` routing.
 ### Anthropic cache-control refusal and cache warming
 
 - Anthropic native requests mark cache breakpoints with `cache_control`. If the endpoint refuses that field (HTTP 400 whose body names `cache_control` and a rejection), Dial retries the request once with the next narrower form: first without the 1-hour TTL, then with no markers. Unrelated 400s are not treated as refusals. A refusal is remembered per endpoint (URL without query) and model for the process, so later requests start at the narrower form.
-- `cache.warm` (default `off`) can keep the settled prompt prefix warm after a turn ends, so a follow-up within the cache lifetime reads the cache instead of rewriting it. Each replay is a real billed request with `max_tokens = 1`; it costs the cache-read price on a hit and is recorded under the `cache_warm` purpose in usage and cost.
+- `cache.warm` (default `off`) can keep the settled prompt prefix warm after a turn ends, so a follow-up within the cache lifetime reads the cache instead of rewriting it. Each replay is a real billed request recorded under the `cache_warm` purpose in usage and cost; it costs the cache-read price on a hit. Native Anthropic replays use the documented pre-warm form: an unstreamed request with `max_tokens: 0`, built exactly like the live request (same `thinking`, effort and tools), which generates no output. Budget thinking (`thinking.type: "enabled"`) is rejected with `max_tokens: 0`, so a replay of a budget-thinking request omits it and refreshes only the tools and system entries. A replay sent without usage accounting falls back to `max_tokens = 1`.
   - `off`: no replays.
   - `streaming`: replays only while an agent run is streaming a reply, for up to 30 minutes from the last settled prefix.
   - `idle`: also replays between runs, for up to 60 minutes from the last settled prefix.
@@ -358,18 +368,75 @@ reasoning_efforts = ["low"]
 output_limit = "max-completion-tokens"
 ```
 
+Unprofiled chat-completions requests to `api.openai.com` for a model the catalog records as an
+effort-based reasoning model send the output allowance as `max_completion_tokens`, since OpenAI
+documents `max_tokens` as deprecated and incompatible with its reasoning models. Other hosts keep
+`max_tokens`.
+
 Native Anthropic profiles support declared budget/adaptive thinking and `output_config.effort`.
+Where the exact model's catalog record documents a request rule, the Messages body follows it:
+`no-sampling` models never receive `temperature`, `top_p` or `top_k`; thinking off becomes no
+`thinking` with `low` effort (unless an effort is set) on `thinking-always-on` models,
+`{type: "between_tools"}` on `thinking-off-between-tools` models, and stays `{type: "disabled"}` with
+effort capped at `high` on `thinking-off-up-to-high` models. Models without a record keep the
+generic request.
 Native Anthropic Messages requests automatically cache the stable tool/system prefix and rolling
-conversation history (at most four breakpoints). Request-local task packets and reliability guidance
-stay outside the reusable prefix; signed thinking blocks are never cache anchors. Tool schemas are
-ordered deterministically, and changing harness guidance no longer rewrites tool descriptions.
+conversation history (at most four breakpoints: the last tool, the system prefix, and two rolling
+history anchors). `system` is sent as one block per prompt band (frozen, stable, dynamic) and the
+system breakpoint sits at the end of the last frozen or stable band, so a change to per-turn notes
+or memory in the dynamic band no longer invalidates the cached tools and stable system prompt.
+Subscription requests keep their billing and Claude Code identity blocks first. A prompt with a
+single cacheable band is still sent as one plain string. Native compaction requests carry the same
+breakpoints, so summarizing a long history reads the cached prefix. A live-prefix Soft or Handoff
+summary on Anthropic Messages (`Backend::live_summary_profile`) resends the live request's wire
+messages unchanged with one transient instruction after them and keeps the live `tool_choice`, so
+both rolling breakpoints land where the live turn put them; forcing `tool_choice: none` there would
+invalidate the cached messages. Request-local task packets and
+reliability guidance stay outside the reusable prefix; signed thinking blocks are never cache
+anchors. Tool schemas are ordered deterministically, and changing harness guidance no longer
+rewrites tool descriptions.
+
+### Cache-stable tool surfaces
+
+Editing `tools` between requests invalidates every cached prefix after it, so on two verified
+routes the main loop sends one tool surface and changes only which tools are callable
+(`llm::tool_offer`, `Backend::tool_exposure`). Dial's admission remains the authority: a call to a
+tool the request does not offer is refused before schema validation, approval or execution, and
+loading still grants no permission.
+
+- **Anthropic Messages on `api.anthropic.com`** (API key or subscription), with no proxy body hook,
+  for a model the tool search documentation lists (Fable 5/5.1, Mythos 5/5.1/Preview, Opus 4.5-5.5,
+  Sonnet 4.5-5.5, Haiku 4.5 and 5.5): the stable core is sent loaded; every other eligible catalog
+  tool is sent with `defer_loading: true`. A successful `tool_load` (or `tool_search` with `load`)
+  whose every name became callable returns `tool_reference` blocks as its `tool_result` content,
+  which the API expands inline, so the `tools` array stays byte-identical and the tools, system and
+  history caches survive the load. Deferred tools sort after the loaded ones and the tool cache
+  marker sits on the last loaded tool (deferred tools cannot carry `cache_control`). A partial load,
+  an unload, or a load with a known readiness blocker keeps its text result; an offered tool with
+  no kept reference (a controller load, a mode tool, a compacted result) is sent loaded. Planning-
+  gate and single-call narrowing keep the surface and are refused by state. A 400 naming
+  `defer_loading` or `tool_reference` resends the plain callable set once and latches that
+  endpoint and model to it for the process. No beta header is sent: the feature is documented as
+  stable.
+- **OpenAI Responses on `api.openai.com`** (API key, not ChatGPT/Codex): the full offer plus
+  `exit_plan` and `goal` is sent, and a request that offers fewer of them adds
+  `tool_choice: {"type":"allowed_tools","mode":"auto","tools":[...]}`. Handoff's forced `none`
+  wins. Loads still add schemas, as before.
+- **Every other route**, subagents and hermetic runs receive exactly the callable set and plain
+  tool-result text, as before. Recorded tool contracts are always checked against the callable
+  set, so resumed sessions validate as they did.
+A reply that ends with Anthropic `stop_reason: "refusal"` or `"pause_turn"` keeps that finish reason;
+`Reply::provider_stop()` reports it as a refusal (with the `stop_details.category` label when the
+API sends one) or a paused server-tool turn, so neither is mistaken for a finished answer.
 
 In an Anthropic model profile, `prompt_cache=false` opts out (use this for a compatible endpoint
 that does not support caching). Omission enables automatic caching; existing `prompt_cache=true`
 still requires `capabilities.prompt_cache=true`. `cache_retention="auto"` (default) uses one-hour
 retention for OAuth requests to the official Anthropic API, five-minute retention otherwise.
 Set `cache_retention="short"` to force five minutes or `"long"` to request one hour from an endpoint
-that supports it. Long-lived cache writes can cost more for API keys; retention does not reduce
+that supports it. One-hour retention applies to the tool and system breakpoints only; the rolling
+history breakpoints always use the five-minute default, which keeps every longer-lived entry ahead
+of the shorter ones and avoids paying the one-hour write price on every turn's new history. Long-lived cache writes can cost more for API keys; retention does not reduce
 generated reasoning/output tokens, and Claude subscription quota savings must be measured separately.
 
 Endpoint/model selections can declare `protocol = "chat-completions"`, `"responses"`, `"anthropic"`, `"gemini"` or `"ollama"`, or another of the recognized wire protocols (`bedrock`, `vertex`, `vertex-anthropic`, `azure-responses`, `copilot`, `cloud-code-assist`, `antigravity`, `gitlab-duo`, `gitlab-duo-agent`, `factory-droid`, `devin-agent`). No provider-name guess converts a custom endpoint into a different wire

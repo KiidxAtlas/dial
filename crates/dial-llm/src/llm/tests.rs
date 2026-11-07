@@ -325,3 +325,42 @@ fn sampler_grammar_rejection_explains_backend_fault_without_weakening_validation
         );
     }
 }
+
+#[test]
+fn unprofiled_openai_reasoning_models_get_max_completion_tokens() {
+    let shaped = |url: &str, model: &str| {
+        let mut body = request_body(model, &request(vec![], None), 5, false).unwrap();
+        apply_openai_reasoning_limit(&mut body, url, model);
+        body
+    };
+    let openai = "https://api.openai.com/v1/chat/completions";
+    for model in ["o3", "gpt-5"] {
+        let body = shaped(openai, model);
+        assert_eq!(body["max_completion_tokens"], 16, "{model}");
+        assert!(body.get("max_tokens").is_none(), "{model}");
+    }
+    // Non-reasoning models and other OpenAI-compatible hosts keep `max_tokens`.
+    assert_eq!(shaped(openai, "gpt-4o")["max_tokens"], 16);
+    let other = shaped("https://compatible.example.com/v1/chat/completions", "o3");
+    assert_eq!(other["max_tokens"], 16);
+    assert!(other.get("max_completion_tokens").is_none());
+}
+
+#[test]
+fn x_should_retry_false_marks_a_retryable_failure_as_not_resendable() {
+    let body = Bounded {
+        data: br#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#.to_vec(),
+        truncated: false,
+    };
+    let refused = retry::ServerHints {
+        should_retry: Some(false),
+        ..Default::default()
+    };
+    let error = http_error(529, &body, None, refused);
+    let http = error.downcast_ref::<HttpError>().unwrap();
+    assert!(http.retry_refused);
+    assert!(http.class.is_retryable(), "the class still drives fallback");
+    assert!(!is_transient(&error));
+    let ordinary = http_error(529, &body, None, retry::ServerHints::default());
+    assert!(is_transient(&ordinary));
+}

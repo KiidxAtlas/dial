@@ -37,10 +37,26 @@ impl Agent<'_> {
         // Read-only batch results may already have finished before a prior
         // result arms recovery. Consume those results honestly; never label
         // a prefetched operation as unexecuted or shift its result to another call.
+        // One-call contract: a leading admitted read-only inspection still runs, so the round
+        // is not wasted; every other call in the batch is skipped unexecuted.
+        let first_ran = single_call
+            && reply.tool_calls.len() > 1
+            && reply.tool_calls.first().is_some_and(|first| {
+                crate::agent::safety::approval::parallel_read(
+                    &self.ext,
+                    &first.name,
+                    &first.arguments,
+                ) && call_form_error(first, schemas, &turn.names).is_none()
+                    && engine.rejection_at(&self.workspace, first).is_none()
+            });
         let form = (if parallel.is_empty() && let Some(reason) = engine.rejection_at(&self.workspace, call) {
                 Some(("recovery_checkpoint", reason))
-            } else if single_call && reply.tool_calls.len() > 1 {
-                Some(("batch_contract", "This request permits one tool call. The entire batch is rejected without executing it; choose one action and await its result.".into()))
+            } else if single_call && reply.tool_calls.len() > 1 && !(first_ran && index == 0) {
+                Some(("batch_contract", if first_ran {
+                    "This request permits one tool call. Only the first call (a read-only inspection) ran; this call was skipped without executing it. Await that result, then choose one action.".into()
+                } else {
+                    "This request permits one tool call. The entire batch is rejected without executing it; choose one action and await its result.".into()
+                }))
             } else { call_form_error(call, schemas, &turn.names) }).map(|(kind, why)| {
                 if planning_required && call.name != "todo" && kind == "unknown_tool" {
                     (kind, format!("{} is temporarily withheld until a plan exists. This request offers only todo and finish. Create a plan with todo before requesting read, grep, bash or other tools; they return in the next round after a valid plan. If the request is already answered, call finish.", call.name))
@@ -114,12 +130,17 @@ impl Agent<'_> {
                     .rejected_calls
                     .push(rejected_tool_call_message(call));
             }
-            let output = ToolOutput {
+            let mut output = ToolOutput {
                 execution: Default::default(),
                 data: None,
                 text: format!("invalid tool call: {why}"),
                 is_error: true,
             };
+            if first_ran && kind == "batch_contract" {
+                output = output
+                    .with_status(tools::ToolStatus::Skipped)
+                    .with_effects(tools::surface::outcome::Effects::None);
+            }
             ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
             ui.tool_timing(&call.id, &call.name, 0.0);
             ui.tool_result_with_id(&call.id, &call.name, &output);
@@ -139,15 +160,15 @@ impl Agent<'_> {
             {
                 self.metrics.dynamic_tools_used += 1;
             }
-            if self.config.experimental.dependency_dispatch
+            if self.effective_config().experimental.dependency_dispatch
                 && !reply.text_calls_lifted
                 && !self.hermetic
                 && !single_call
                 && parallel.is_empty()
             {
-                let mut group = self.dependency_wave(&reply.tool_calls[index..]);
+                let mut plan = self.dependency_wave(&reply.tool_calls[index..]);
                 let mut admitted = 0;
-                for candidate in &group {
+                for candidate in &plan.calls {
                     if call_form_error(candidate, schemas, &turn.names).is_some()
                         || engine.rejection_at(&self.workspace, candidate).is_some()
                         || prerequisites
@@ -160,32 +181,50 @@ impl Agent<'_> {
                     }
                     admitted += 1;
                 }
-                if admitted < group.len() {
+                if admitted < plan.calls.len() {
                     self.efficiency_metrics.scheduling.barrier("admission");
                 }
-                group.truncate(admitted);
-                if !streamed
-                    .as_ref()
-                    .is_some_and(|s| group.first().is_some_and(|call| s.has(call)))
-                    && group
-                        .iter()
-                        .filter(|call| !crate::agent::run::dependency_dispatch::bookkeeping(call))
-                        .count()
-                        > 1
-                    && group.iter().any(|call| {
-                        crate::agent::run::dependency_dispatch::bookkeeping(call)
-                            || crate::agent::run::dependency_dispatch::footprint_for(
-                                &self.workspace,
-                                self.edit_mode(),
-                                &self.ext,
-                                call,
-                            )
-                            .is_some_and(|f| f.writes())
-                    })
+                plan.truncate(admitted);
+                let dispatchable = plan.dispatchable();
+                let verifies = plan.calls.iter().any(|call| {
+                    call.arguments["verify"]
+                        .as_array()
+                        .is_some_and(|entries| !entries.is_empty())
+                });
+                let footprints = std::mem::take(&mut plan.footprints);
+                let group = plan.calls;
+                if dispatchable
+                    && !streamed
+                        .as_ref()
+                        .is_some_and(|s| group.first().is_some_and(|call| s.has(call)))
                 {
                     self.drain_background_check(ui, true);
+                    // Waves admit only hook-free calls with resolved footprints; a closing
+                    // verification may touch anything, so it discards the stream.
+                    let mut beside = 0;
                     if let Some(streamed) = streamed.as_mut() {
-                        streamed.invalidate();
+                        if verifies {
+                            streamed.invalidate();
+                        } else {
+                            streamed.retain_disjoint(&footprints);
+                            // A member waits for a human: start later reads disjoint from the
+                            // whole wave meanwhile; they are held until the wave settles.
+                            if group
+                                .iter()
+                                .any(|member| self.approval_prompt_pending(member, provenance))
+                            {
+                                beside = streamed.start_beside(
+                                    &footprints,
+                                    &reply.tool_calls[index + group.len()..],
+                                    &mut |later| {
+                                        self.groupable_read(engine, schemas, &turn.names, later)
+                                    },
+                                );
+                                if beside > 0 {
+                                    ui.diagnostic(&format!("Streaming dispatch: {beside} later read(s) started while the native wave awaits approval."));
+                                }
+                            }
+                        }
                     }
                     for candidate in group.iter().skip(1) {
                         ui.tool_call_with_args(
@@ -214,6 +253,13 @@ impl Agent<'_> {
                     let read_reuse = engine.reusable_reads(|id| self.holds_full_result(id));
                     let outputs =
                         self.dispatch_dependency_wave(backend, &group, ui, Some(&read_reuse));
+                    if beside > 0
+                        && let Some(streamed) = streamed.as_mut()
+                    {
+                        for (output, _) in &outputs {
+                            streamed.settled_beside(output);
+                        }
+                    }
                     for (candidate, (output, seconds)) in group.iter().zip(&outputs) {
                         ui.tool_timing(&candidate.id, &candidate.name, *seconds);
                         ui.tool_result_with_id(&candidate.id, &candidate.name, output);
@@ -235,27 +281,8 @@ impl Agent<'_> {
             {
                 let count = reply.tool_calls[index..]
                     .iter()
-                    .take(self.config.task.parallel_read_limit())
-                    .take_while(|c| {
-                        !crate::agent::safety::hooks::wanted_for_tool(
-                            self.tool_hooks(),
-                            "pre_tool_use",
-                            &c.name,
-                        ) && (self.pending_check.is_none() || c.name != "bash")
-                            && crate::agent::safety::approval::parallel_read(
-                                &self.ext,
-                                &c.name,
-                                &c.arguments,
-                            )
-                            && !crate::agent::safety::approval::denied_by_rule(
-                                &self.always,
-                                c,
-                                self.workspace.root(),
-                            )
-                            && call_form_error(c, schemas, &turn.names).is_none()
-                            && !self.speculative_pending(c)
-                            && engine.rejection_at(&self.workspace, c).is_none()
-                    })
+                    .take(self.effective_config().task.parallel_read_limit())
+                    .take_while(|c| self.groupable_read(engine, schemas, &turn.names, c))
                     .count();
                 let group = &reply.tool_calls[index..index + count];
                 if count > 0 {
@@ -323,14 +350,58 @@ impl Agent<'_> {
                     )
                 }
                 None => {
-                    // Anything executed serially may change what an early read observed.
+                    // A serial call may change what an early read observed; keep only results it
+                    // provably cannot have changed.
+                    let mut beside = 0;
                     if let Some(streamed) = streamed.as_mut() {
-                        streamed.invalidate();
+                        let hooked = ["pre_tool_use", "post_tool_use"].iter().any(|event| {
+                            crate::agent::safety::hooks::wanted_for_tool(
+                                self.tool_hooks(),
+                                event,
+                                &call.name,
+                            )
+                        });
+                        let footprint = crate::agent::run::dependency_dispatch::footprint_for(
+                            &self.workspace,
+                            self.edit_mode(),
+                            &self.ext,
+                            call,
+                        );
+                        let verifies = call.arguments["verify"]
+                            .as_array()
+                            .is_some_and(|entries| !entries.is_empty());
+                        // While this call waits for a human, later reads it cannot affect start;
+                        // their results are held until it settles. Scheduling grants nothing:
+                        // the call is still authorized below, and a denied call never runs.
+                        if let Some(barrier) = footprint.as_ref()
+                            && !hooked
+                            && !verifies
+                            && !single_call
+                            && !reply.text_calls_lifted
+                            && self.approval_prompt_pending(call, provenance)
+                        {
+                            beside = streamed.start_beside(
+                                std::slice::from_ref(barrier),
+                                &reply.tool_calls[index + 1..],
+                                &mut |later| {
+                                    self.groupable_read(engine, schemas, &turn.names, later)
+                                },
+                            );
+                            if beside > 0 {
+                                ui.diagnostic(&format!("Streaming dispatch: {beside} later read(s) started while {} awaits approval.", call.name));
+                            }
+                        }
+                        streamed.ran(call, hooked, footprint);
                     }
                     let started = Instant::now();
                     let reuse = engine.reusable_reads(|id| self.holds_full_result(id));
                     let out =
                         self.dispatch_from_reusing(backend, call, provenance, ui, Some(&reuse));
+                    if beside > 0
+                        && let Some(streamed) = streamed.as_mut()
+                    {
+                        streamed.settled_beside(&out);
+                    }
                     (out, started.elapsed().as_secs_f64(), true)
                 }
             };
@@ -424,4 +495,28 @@ impl Agent<'_> {
             target_sources,
         })
     }
+    /// The parallel-read group's admission for one call, shared with reads started beside a
+    /// pending approval so a held result is only ever produced for a call the group would run.
+    fn groupable_read(
+        &self,
+        engine: &mut crate::agent::run::engine::Engine,
+        schemas: &[Value],
+        names: &[String],
+        call: &ToolCall,
+    ) -> bool {
+        !crate::agent::safety::hooks::wanted_for_tool(self.tool_hooks(), "pre_tool_use", &call.name)
+            && (self.pending_check.is_none() || call.name != "bash")
+            && crate::agent::safety::approval::parallel_read(&self.ext, &call.name, &call.arguments)
+            && !crate::agent::safety::approval::denied_by_rule(
+                &self.always,
+                call,
+                self.workspace.root(),
+            )
+            && call_form_error(call, schemas, names).is_none()
+            && !self.speculative_pending(call)
+            && engine.rejection_at(&self.workspace, call).is_none()
+    }
 }
+
+#[cfg(test)]
+mod tests;

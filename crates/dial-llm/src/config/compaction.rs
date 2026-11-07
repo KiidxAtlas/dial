@@ -14,8 +14,12 @@ const SMALL_WINDOW_RESERVE_PERCENT: u32 = 20;
 
 const SMALL_WINDOW_RESERVE_FLOOR: u32 = 2_048;
 
-/// Default verbatim tail; a configured value equal to this on a small window is scaled to fit the band.
+/// Default verbatim tail; a configured value equal to this is scaled with the window
+/// (`CompactionConfig::keep_recent_budget`): down to fit a small window's band, up on large ones.
 pub const DEFAULT_KEEP_RECENT_TOKENS: u32 = 20_000;
+
+/// Share of a large window the default verbatim tail grows to (never below the default).
+pub const KEEP_RECENT_WINDOW_PERCENT: u64 = 10;
 
 /// Large-window auto trigger uses the whole reserve-subtracted window; speculation starts earlier.
 pub const DEFAULT_THRESHOLD_PERCENT: u64 = 100;
@@ -223,6 +227,9 @@ fn threshold_map_serialize<S: serde::Serializer>(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompactionConfig {
+    /// Opt-in plain-history argument projection boundary; zero disables it. Native replay is
+    /// preserved, and this threshold is independent of the full-compaction trigger.
+    pub argument_projection_tokens: u32,
     pub enabled: bool,
     pub strategy: CompactionStrategy,
     pub method_order: Vec<CompactionMethod>,
@@ -334,6 +341,7 @@ impl PromotionConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
+            argument_projection_tokens: 0,
             enabled: true,
             strategy: CompactionStrategy::ContextFull,
             // A text summary is the default; Remote needs a declared native route and is skipped
@@ -385,8 +393,29 @@ pub struct CompactionIdentity<'a> {
     pub agent: Option<&'a str>,
 }
 
+impl CompactionIdentity<'_> {
+    /// Whether this model runs the preserved-thinking history-editing check (catalog fact
+    /// `preserved-thinking`): once a replayed thinking block's earlier history changed, the
+    /// request is rejected on enforced accounts. The check is documented for every platform, so
+    /// platform model ids (`us.anthropic.claude-opus-5-5`, `anthropic/claude-opus-5-5`,
+    /// `claude-opus-5-5@default`) resolve to the first-party record.
+    pub fn preserved_thinking(&self) -> bool {
+        let model = self.model;
+        let model = model.rsplit_once("anthropic.").map_or(model, |(_, id)| id);
+        let model = model.rsplit_once('/').map_or(model, |(_, id)| id);
+        let model = model.split(['@', ':']).next().unwrap_or(model);
+        crate::llm::catalog::bundled_model("anthropic", model)
+            .is_some_and(|record| record.has(crate::llm::catalog::ModelFact::PreservedThinking))
+    }
+}
+
 impl CompactionConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.argument_projection_tokens == 0
+                || (8192..=2_000_000).contains(&self.argument_projection_tokens),
+            "compaction.argument_projection_tokens must be 0 (off) or 8192..=2000000"
+        );
         if let Some(n) = self.threshold_percent {
             ensure!(
                 n.is_finite() && n > 0.0 && n <= 100.0,
@@ -491,13 +520,15 @@ impl CompactionConfig {
     pub fn summary_budget(&self, window: u32) -> u32 {
         (self.reserve(window).saturating_mul(4) / 5).clamp(1, MAX_SUMMARY_TOKENS)
     }
-    /// Verbatim-tail budget for a cut without an explicit per-call value. The default is scaled only
-    /// on small windows so that the next request (`fixed_tokens` of system/tools, the summary budget,
-    /// and the kept tail) stays within `continue_band`; otherwise the turn pauses after compaction.
+    /// Verbatim-tail budget for a cut without an explicit per-call value. The default scales with
+    /// the window: on small windows it shrinks so that the next request (`fixed_tokens` of
+    /// system/tools, the summary budget, and the kept tail) stays within `continue_band`, otherwise
+    /// the turn pauses after compaction; on large windows it grows to
+    /// [`KEEP_RECENT_WINDOW_PERCENT`] of the window, never below the default, within the same room.
     /// Worked example at 32k: reserve 6553, summary budget 5242, threshold 20972, band 16777, so the
     /// tail is 0.9 * (16777 - 5242) = 10381 < 20000 when fixed overhead is zero. At 64k the band
-    /// (33751) already fits the default, so it is unchanged. Explicit values and windows above
-    /// SMALL_WINDOW_TOKENS are returned as configured.
+    /// (33751) already fits the default, so it is unchanged; up to 200k the default stays 20000, and
+    /// a 1M window keeps 100000. An explicit (non-default) value is returned as configured.
     pub fn keep_recent_budget(
         &self,
         identity: CompactionIdentity<'_>,
@@ -505,15 +536,25 @@ impl CompactionConfig {
         fixed_tokens: u64,
     ) -> Result<u64> {
         let configured = u64::from(self.keep_recent_tokens);
-        if window > SMALL_WINDOW_TOKENS || self.keep_recent_tokens != DEFAULT_KEEP_RECENT_TOKENS {
+        if self.keep_recent_tokens != DEFAULT_KEEP_RECENT_TOKENS {
             return Ok(configured);
         }
-        let band = continue_band(self.effective_threshold(identity, window)?);
-        let room = band
-            .saturating_sub(fixed_tokens)
-            .saturating_sub(u64::from(self.summary_budget(window)));
-        // Keep 10% of the room free for estimate drift between the cut and the committed request.
-        Ok(configured.min(room / 10 * 9))
+        let scaled = configured.max(u64::from(window) * KEEP_RECENT_WINDOW_PERCENT / 100);
+        if window <= SMALL_WINDOW_TOKENS || scaled > configured {
+            let band = continue_band(self.effective_threshold(identity, window)?);
+            let room = band
+                .saturating_sub(fixed_tokens)
+                .saturating_sub(u64::from(self.summary_budget(window)));
+            // Keep 10% of the room free for estimate drift between the cut and the committed request.
+            let fit = room / 10 * 9;
+            return Ok(if window <= SMALL_WINDOW_TOKENS {
+                configured.min(fit)
+            } else {
+                // A large window never drops below the fixed default it had before scaling.
+                scaled.min(fit).max(configured)
+            });
+        }
+        Ok(configured)
     }
     pub fn effective_threshold(
         &self,

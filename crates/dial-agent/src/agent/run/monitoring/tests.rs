@@ -153,4 +153,13 @@ fn monitor_resume_uses_logs_as_data_without_drafting_or_replacing_instruction() 
                 .any(|m| m.to_string().contains("ignore limits"))
         );
     });
+    let body = llm::fake::body(&server.requests()[0]).to_string();
+    assert!(
+        body.contains(r#"<dial-notice kind=\"application_watch\">"#),
+        "watch continuation uses the shared notice envelope"
+    );
+    assert!(
+        body.contains("ignore limits"),
+        "observations reach the request as data"
+    );
 }

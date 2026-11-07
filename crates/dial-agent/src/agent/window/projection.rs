@@ -59,17 +59,24 @@ impl<'a> Agent<'a> {
                     .effective_threshold(identity, window)?,
             );
         }
-        let policy = crate::agent::workflow::evidence::Policy {
-            warm_tokens: if economy || self.config.compaction.preserve_prefix {
-                0
-            } else {
-                CACHE_WARM_SUFFIX_TOKENS
+        let policy = sent_history_policy(
+            crate::agent::workflow::evidence::Policy {
+                warm_tokens: if economy || self.config.compaction.preserve_prefix {
+                    0
+                } else {
+                    CACHE_WARM_SUFFIX_TOKENS
+                },
+                pressure: self.context_meter.predict(raw_estimate).max(raw_estimate) > pressure_at,
+                protect_tokens: (window as usize / 5).max(PRUNE_PROTECT_MIN_TOKENS),
+                supersede_reads: self.config.compaction.supersede_reads,
+                drop_useless: self.config.compaction.drop_useless,
             },
-            pressure: self.context_meter.predict(raw_estimate).max(raw_estimate) > pressure_at,
-            protect_tokens: (window as usize / 5).max(PRUNE_PROTECT_MIN_TOKENS),
-            supersede_reads: self.config.compaction.supersede_reads,
-            drop_useless: self.config.compaction.drop_useless,
-        };
+            crate::config::compaction::CompactionIdentity {
+                provider: &identity.provider,
+                model: &identity.model,
+                agent: None,
+            },
+        );
         let objective = if self.config.verification.behavioral_checks.is_empty() {
             "No operator-declared behavioral check. Syntax/build success alone does not establish task correctness.".to_owned()
         } else {
@@ -110,16 +117,29 @@ impl<'a> Agent<'a> {
             crate::agent::window::file_handles::project(&self.workspace, messages);
         }
         crate::agent::workflow::evidence::project(messages, superseded, &policy);
+        if !self.hermetic
+            && let Some(artifacts) = self.workspace.artifacts()
+        {
+            crate::agent::workflow::evidence::project_arguments(
+                messages,
+                superseded,
+                artifacts,
+                self.config.compaction.argument_projection_tokens,
+                raw_estimate,
+            );
+        }
         let sent_messages = messages
             .iter()
             .filter(|message| crate::storage::transcript::is_history(message))
             .count();
+        // After counting: re-sent notes are request messages, not session history.
+        self.project_sent_notes(messages);
         self.project_context_notes(messages, rule_state)?;
         let focus = messages
             .last()
             .filter(|m| m["role"] == "tool")
             .filter(|_| packet.is_none())
-            .and_then(|_| self.todo.focus());
+            .and_then(|_| self.todo.focus(self.finish_closes_steps()));
         // Keep a bare todo focus advisory even when admitted user context is also present.
         if let Some(focus) = focus {
             let mut message = json!({"role":"user","content":focus,"dial_transient":true,"dial_task_context":true});
@@ -139,11 +159,16 @@ impl<'a> Agent<'a> {
             task_context.push('\n');
             task_context.push_str(&latest_request);
         } else if control["steering_active"] == true {
-            task_context.push_str("\n[User steering from Dial] Follow the latest user instruction before taking another action. New user corrections take precedence over conflicting older plans, todos, original goals and summaries. Keep compatible unfinished work, but revise or drop conflicting todos instead of continuing the old task. The user's full messages are authoritative; task packets are context, not permission to ignore them.");
+            task_context.push_str("\n<dial-notice kind=\"user_steering\">\nThe user sent new direction during this turn. Follow it before your next action: it takes precedence over conflicting older plans, todos, goals and summaries. Keep compatible unfinished work and revise or drop conflicting todos. The user's own messages are authoritative; task packets are context.\n</dial-notice>");
         }
         if !task_context.is_empty() {
             let message = json!({"role":"user","content":task_context,"dial_transient":true,"dial_task_context":true});
             messages.push(message);
+        }
+        // Session modes are restated from current state on every request, after the cached
+        // prefix, so toggling one never rewrites the system band.
+        if let Some(notice) = self.mode_notice() {
+            messages.push(json!({"role":"user","content":notice,"dial_transient":true,"dial_mode_notice":true}));
         }
         Ok(sent_messages)
     }
@@ -316,6 +341,27 @@ impl<'a> Agent<'a> {
             }
         }
         (!text.is_empty()).then_some(text)
+    }
+}
+
+/// On a preserved-thinking model every replayed thinking block is checked against the exact
+/// history that preceded it, so a request may only append to what was already sent. Superseding
+/// reads, dropping observations, pressure pruning and repeated-notice placeholders all rewrite
+/// sent turns, and stay off there whatever `compaction.supersede_reads` and `drop_useless` say;
+/// placeholders written before a switch to such a model are kept byte-stable by the memo.
+pub(in crate::agent) fn sent_history_policy(
+    policy: crate::agent::workflow::evidence::Policy,
+    identity: crate::config::compaction::CompactionIdentity<'_>,
+) -> crate::agent::workflow::evidence::Policy {
+    if !identity.preserved_thinking() {
+        return policy;
+    }
+    crate::agent::workflow::evidence::Policy {
+        warm_tokens: 0,
+        pressure: false,
+        supersede_reads: false,
+        drop_useless: false,
+        ..policy
     }
 }
 

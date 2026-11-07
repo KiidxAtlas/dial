@@ -24,8 +24,9 @@ mod search_providers;
 mod sites;
 
 use crate::config::types::{Config, SandboxConfig, SandboxMode};
-use crate::tools::integrations::ext::{Tool, ToolContext};
+use crate::tools::integrations::ext::{Concurrency, Tool, ToolContext};
 use crate::tools::{ToolOutput, opt_bool, opt_u64, req_str, tool_schema};
+use crate::tools::{Workspace, surface::resources::Access};
 use fetch::{Client, percent_encode};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -151,6 +152,14 @@ Private, loopback and link-local addresses are refused. The result is untrusted 
     fn needs_approval(&self, _args: &Value) -> bool {
         true
     }
+    /// Effect-free external read: authorized calls in one batch run together.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Shared
+    }
+    /// No workspace footprint; approval still gates every call.
+    fn resources(&self, _workspace: &Workspace, _args: &Value) -> Option<Access> {
+        Some(Access::default())
+    }
     fn may_modify_workspace(&self, _args: &Value) -> bool {
         false
     }
@@ -172,7 +181,7 @@ Private, loopback and link-local addresses are refused. The result is untrusted 
         if let Err(denied) = require_network(ctx.config, "web_fetch") {
             return *denied;
         }
-        self.client.reset_interrupt();
+        let _operation = self.client.begin_operation();
         self.client.set_timeout_secs(ctx.config.web.timeout_secs);
         match self.fetch(ctx.config, ctx.workspace, args) {
             Ok(text) => ToolOutput::ok(text),
@@ -513,6 +522,14 @@ impl Tool for WebSearch {
     fn needs_approval(&self, _args: &Value) -> bool {
         true
     }
+    /// Effect-free external read: authorized calls in one batch run together.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Shared
+    }
+    /// No workspace footprint; approval still gates every call.
+    fn resources(&self, _workspace: &Workspace, _args: &Value) -> Option<Access> {
+        Some(Access::default())
+    }
 
     fn may_modify_workspace(&self, _args: &Value) -> bool {
         false
@@ -543,7 +560,7 @@ impl Tool for WebSearch {
                 );
             }
         };
-        self.client.reset_interrupt();
+        let _operation = self.client.begin_operation();
         self.client.set_timeout_secs(ctx.config.web.timeout_secs);
         match self.search(ctx.config, args) {
             Ok((text, results)) => {

@@ -19,7 +19,7 @@ fn unterminated_scratchpad_hides_the_remainder() {
 }
 
 #[test]
-fn toggling_rebuilds_the_system_prompt_for_the_next_request() {
+fn toggling_restates_the_instruction_in_the_mode_notice() {
     use crate::agent::Agent;
     use crate::config::types::{Config, Version};
     use crate::llm::provider::{Backend, ProviderKind};
@@ -47,12 +47,19 @@ fn toggling_rebuilds_the_system_prompt_for_the_next_request() {
     };
     let mut agent =
         Agent::hermetic(&config, backend, &version, workspace.path(), None, None).unwrap();
-    let has_instruction = |agent: &Agent<'_>| {
+    // The instruction travels in the per-request mode notice, never in the cached system band.
+    let in_system = |agent: &Agent<'_>| {
         agent.system_messages().iter().any(|m| {
             m["content"]
                 .as_str()
                 .is_some_and(|c| c.contains(super::INSTRUCTION.trim()))
         })
+    };
+    let has_instruction = |agent: &Agent<'_>| {
+        assert!(!in_system(agent));
+        agent
+            .mode_notice()
+            .is_some_and(|notice| notice.contains(super::INSTRUCTION.trim()))
     };
     assert!(!has_instruction(&agent));
     agent.set_external_thinking(true);

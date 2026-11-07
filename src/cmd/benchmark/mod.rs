@@ -347,7 +347,8 @@ const ASSIST_CASE_TIMEOUT_SECS: u64 = 600;
 /// lever differs from `dial`.
 type FeatureVariant = fn(&mut AssistanceOverrides, EditMode);
 const ASSIST_VARIANTS: [(&str, FeatureVariant); 9] = [
-    ("enable-compact_tools", |o, _| o.compact_tools = Some(true)),
+    // The stable compact tool offer ships on; the ablation offers the whole catalog.
+    ("ablate-compact_tools", |o, _| o.compact_tools = Some(false)),
     ("enable-repair_hints", |o, _| o.repair_hints = Some(true)),
     // 0 means unlimited: the initial tool budget is removed.
     ("ablate-initial_tool_limit", |o, _| {

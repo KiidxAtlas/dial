@@ -9,6 +9,45 @@ use crate::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
+/// Controller observations used by the opt-in native output-effort experiment.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OutputEffortSignal {
+    Routine,
+    CheckFailure,
+    RewritePressure,
+}
+
+pub(crate) fn experimental_output_effort(
+    config: &AppConfig,
+    profile: &ModelProfile,
+    signal: OutputEffortSignal,
+) -> Option<ReasoningEffort> {
+    if !config.experimental.adaptive_output_effort
+        || config.thinking_auto
+        || profile.provider != "anthropic"
+        || !matches!(
+            profile.capabilities.reasoning,
+            ReasoningApi::AnthropicBudget | ReasoningApi::AnthropicAdaptive
+        )
+        || config
+            .active_model_profile()
+            .is_some_and(|p| p.reasoning_effort.is_some())
+    {
+        return None;
+    }
+    let requested = match signal {
+        OutputEffortSignal::Routine => ReasoningEffort::Low,
+        OutputEffortSignal::CheckFailure | OutputEffortSignal::RewritePressure => {
+            ReasoningEffort::High
+        }
+    };
+    profile
+        .capabilities
+        .reasoning_efforts
+        .contains(&requested)
+        .then_some(requested)
+}
+
 #[derive(Debug)]
 pub struct State {
     pub phase: Phase,

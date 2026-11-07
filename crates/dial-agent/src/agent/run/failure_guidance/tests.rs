@@ -98,9 +98,19 @@ fn source_contract_failure_guides_current_range_and_success_is_not_recovery() {
     let mut failed_edit = ToolOutput::err("stale anchors");
     let (kind, advice) = classify(&call("edit"), &failed_edit).unwrap();
     let text = report(&call("edit"), &mut failed_edit, kind, advice, 1);
+    // One cause-specific line, without the general retry policy.
     assert!(
-        text.contains("do not make dependent edits that assume its new text"),
+        text.contains(crate::agent::prompts::recovery::EDIT_NOT_APPLIED),
         "{text}"
+    );
+    assert!(!text.contains(FIRST_FAILURE), "{text}");
+    assert!(text.len() < 320, "{} bytes: {text}", text.len());
+    let mut failed_write = ToolOutput::err("permission denied");
+    let (kind, advice) = classify(&call("write"), &failed_write).unwrap();
+    assert_eq!(kind, "source_or_call_contract");
+    assert!(
+        report(&call("write"), &mut failed_write, kind, advice, 1)
+            .contains(crate::agent::prompts::recovery::WRITE_NOT_APPLIED)
     );
     assert_eq!(
         classify(
@@ -137,15 +147,17 @@ fn feedback_stays_compact_on_repetition_with_the_tag_kept() {
     let first = feedback("tool_failure", "Check the path.", 1);
     assert_eq!(
         first,
-        format!("\n[Dial recovery: tool_failure] {FIRST_FAILURE} Check the path.")
+        format!(
+            "\n<dial-notice kind=\"tool_failure\">{FIRST_FAILURE} Check the path.</dial-notice>"
+        )
     );
     assert!(first.split_whitespace().count() < 25, "{first}");
     let repeat = feedback("tool_failure", "Check the path.", 2);
-    assert!(repeat.starts_with("\n[Dial recovery: tool_failure] "));
+    assert!(repeat.starts_with("\n<dial-notice kind=\"tool_failure\">"));
     assert!(repeat.contains("2 times in a row") && repeat.contains(FIRST_FAILURE));
-    assert!(repeat.ends_with("Check the path."));
+    assert!(repeat.ends_with("Check the path.</dial-notice>"));
     // Uncertain effects keep the cause-specific inspection requirement, without a longer prompt.
-    assert!(feedback("effects_unknown", "Inspect.", 1).ends_with("Inspect."));
+    assert!(feedback("effects_unknown", "Inspect.", 1).ends_with("Inspect.</dial-notice>"));
     assert_eq!(feedback("timeout", "a", 3), feedback("timeout", "a", 3));
 }
 
@@ -257,7 +269,7 @@ fn a_first_ordinary_shell_exit_gets_a_compact_recovery_line() {
     };
     let first = compact(127, 1);
     assert!(
-        first.starts_with("\n[Dial recovery: tool_failure]"),
+        first.starts_with("\n<dial-notice kind=\"tool_failure\">"),
         "{first}"
     );
     assert!(first.contains("not proof that nothing changed"), "{first}");

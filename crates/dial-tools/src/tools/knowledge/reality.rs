@@ -22,7 +22,7 @@ impl Tool for Reality {
     fn schema(&self) -> Value {
         crate::tools::tool_schema(
             "reality",
-            "Compare a repository/document expectation with separately captured runtime evidence. Use normal authorized browser/execution/evidence tools to observe first; this tool never executes the application. check computes an exact literal occurrence count or JSON-pointer scalar from retained text/JSON observation, comparing it to a caller-interpreted expected scalar. Exact expectation quote is validated, but the mapping from prose/code to expected scalar is NOT independently verified. assess records an explicitly caller/model-attributed visual/behavioral mismatch with both inputs, never a measured verdict. Observation must be observation-kind evidence; its producer classification alone is not successful-check proof. Retains both parents for replay, no mutable source reopening or verification credit.",
+            "Use after observing the running app with browser, shell or evidence tools, to compare what the repository or a document expects with that captured observation. Returns: check counts exact literal occurrences or reads a JSON-pointer scalar from the retained observation and compares it with your expected scalar (the quote is validated; your reading of it is not); assess records a visual or behavioral mismatch you attribute, with both inputs. The observation must be observation-kind evidence. Both parents are retained for replay; sources are not reopened, and the result is not verification credit.",
             json!({
                 "action":{"type":"string","enum":["check","assess"]},
                 "expectation":{"type":"string"},"observation":{"type":"string"},

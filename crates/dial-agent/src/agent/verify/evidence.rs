@@ -261,6 +261,28 @@ impl Ledger {
         self.baseline = self.latest.clone();
     }
 
+    /// The lazy form of [`Self::capture_baseline`] for one command, called before a new
+    /// observation replaces the latest one: a latest observation made before any effect of the
+    /// instruction (revision zero) becomes the baseline, even without `automatic_checks`. A run is
+    /// never its own baseline, and later observations never replace one, so a turn's own failure
+    /// cannot become "pre-existing".
+    pub fn capture_baseline_of(&mut self, command: &str) {
+        if !self.baseline.contains_key(command)
+            && let Some(observation) = self.latest.get(command)
+            && observation.revision == [0; 3]
+        {
+            self.baseline
+                .insert(command.to_owned(), observation.clone());
+        }
+    }
+
+    /// The status recorded for `command` before this instruction's first effect, if one was.
+    pub fn baseline_status(&self, command: &str) -> Option<CheckStatus> {
+        self.baseline
+            .get(command)
+            .map(|observation| observation.status)
+    }
+
     /// Register or replace (same name) a reproduction. A replacement starts with no history, so
     /// a corrected command must fail again before it can earn credit. Returns the replaced check.
     pub fn register_repro(&mut self, check: FocusedCheck) -> Result<Option<FocusedCheck>, String> {

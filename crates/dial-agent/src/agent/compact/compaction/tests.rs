@@ -254,17 +254,23 @@ fn small_window_default_keep_recent_keeps_the_next_request_in_band() {
 }
 
 #[test]
-fn explicit_and_large_window_keep_recent_is_unchanged() {
+fn explicit_keep_recent_is_unchanged_and_the_default_scales_with_large_windows() {
     let identity = CompactionIdentity {
         provider: "p",
         model: "m",
         agent: None,
     };
     let default = CompactionConfig::default();
-    for window in [65_537_u32, 200_000, 1_000_000] {
+    // 10% of the window, never below the 20k default.
+    for (window, kept) in [
+        (65_537_u32, 20_000_u64),
+        (200_000, 20_000),
+        (400_000, 40_000),
+        (1_000_000, 100_000),
+    ] {
         assert_eq!(
             default.keep_recent_budget(identity, window, 1_000).unwrap(),
-            20_000,
+            kept,
             "large window {window}"
         );
     }
@@ -273,7 +279,7 @@ fn explicit_and_large_window_keep_recent_is_unchanged() {
             keep_recent_tokens: configured,
             ..CompactionConfig::default()
         };
-        for window in [8_192_u32, 32_768, 65_536, 200_000] {
+        for window in [8_192_u32, 32_768, 65_536, 200_000, 1_000_000] {
             assert_eq!(
                 policy.keep_recent_budget(identity, window, 1_000).unwrap(),
                 u64::from(configured),
@@ -909,7 +915,7 @@ fn live_handoff_keeps_the_exact_recent_tail_and_portable_fallback_is_non_destruc
             },
             None,
             &mut SummaryExecution {
-                live_handoff: true,
+                live_prefix: true,
                 parallel: None,
             },
         )
@@ -929,4 +935,151 @@ fn live_handoff_keeps_the_exact_recent_tail_and_portable_fallback_is_non_destruc
             original
         );
     }
+}
+
+fn first_party(base_url: &str, model: &str) -> Backend {
+    Backend::new(
+        crate::llm::provider::ProviderKind::AnthropicEndpoint {
+            base_url: base_url.to_owned(),
+            model: model.to_owned(),
+            api_key: Some("anth-secret".to_owned()),
+        },
+        std::path::PathBuf::from("/nonexistent/python"),
+        5,
+    )
+}
+
+/// The blocking method order and background speculation must pick native compaction for exactly
+/// the same routes: documented first-party routes when `native_models` declares nothing, the
+/// explicit map otherwise, and never with `remote_enabled = false`.
+#[test]
+fn every_method_choice_site_resolves_native_compaction_the_same_way() {
+    use crate::agent::compact::compaction_runtime::{
+        CompactionRuntime, SpeculationAction, SpeculationContext,
+    };
+    let automatic = CompactionOptions::default();
+    let choose = |backend: &Backend, policy: &CompactionConfig, model: &str| {
+        let identity = CompactionIdentity {
+            provider: "anthropic",
+            model,
+            agent: None,
+        };
+        let supported = native_supported(backend, policy, identity);
+        let blocking = policy
+            .available_methods(&automatic, supported)
+            .first()
+            .copied();
+        let window = 200_000;
+        let speculative = match CompactionRuntime::default()
+            .speculation_action(SpeculationContext {
+                policy,
+                identity,
+                session_id: "agreement",
+                window,
+                tokens: policy.effective_threshold(identity, window).unwrap() - 1,
+                mid_turn: false,
+                image_input: false,
+                fixed_tokens: 0,
+                parallel_supported: true,
+                native_supported: supported,
+            })
+            .unwrap()
+        {
+            SpeculationAction::Start(method) => Some(method),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(blocking, speculative, "{model}");
+        blocking
+    };
+    let default = CompactionConfig::default();
+    let api = "https://api.anthropic.com/v1";
+    // Documented first-party route, nothing declared: native first, Soft behind it.
+    let opus = first_party(api, "claude-opus-5-5");
+    assert_eq!(
+        native_capability(
+            &opus,
+            &default,
+            CompactionIdentity {
+                provider: "anthropic",
+                model: "claude-opus-5-5",
+                agent: None,
+            }
+        ),
+        Some(NativeCompactionCapability::Anthropic)
+    );
+    assert_eq!(
+        choose(&opus, &default, "claude-opus-5-5"),
+        Some(CompactionMethod::Remote)
+    );
+    assert_eq!(
+        default.available_methods(&automatic, true)[..2],
+        [CompactionMethod::Remote, CompactionMethod::Soft]
+    );
+    // Undocumented model, or a proxy host: the portable summary.
+    for (base_url, model) in [
+        (api, "claude-opus-4-5"),
+        ("https://proxy.example.com/v1", "claude-opus-5-5"),
+    ] {
+        assert_eq!(
+            choose(&first_party(base_url, model), &default, model),
+            Some(CompactionMethod::Soft)
+        );
+    }
+    // An explicit map is authoritative even when it names other models only.
+    let mut declared = CompactionConfig::default();
+    declared.native_models.insert(
+        "openai/gpt-*".into(),
+        NativeCompactionCapability::ResponsesV1,
+    );
+    assert_eq!(
+        choose(&opus, &declared, "claude-opus-5-5"),
+        Some(CompactionMethod::Soft)
+    );
+    declared.native_models.insert(
+        "anthropic/claude-opus-5-5".into(),
+        NativeCompactionCapability::Anthropic,
+    );
+    assert_eq!(
+        choose(&opus, &declared, "claude-opus-5-5"),
+        Some(CompactionMethod::Remote)
+    );
+    // `remote_enabled = false` turns the derived native route off everywhere.
+    let disabled = CompactionConfig {
+        remote_enabled: false,
+        ..Default::default()
+    };
+    assert_eq!(
+        choose(&opus, &disabled, "claude-opus-5-5"),
+        Some(CompactionMethod::Soft)
+    );
+}
+
+#[test]
+fn unbinding_thinking_keeps_every_other_block_byte_identical() {
+    let message = json!({"role":"assistant","content":"done","tool_calls":[{"id":"c1"}],
+    "dial_provider_content":[
+        {"type":"thinking","thinking":"","signature":"sig"},
+        {"type":"redacted_thinking","data":"opaque"},
+        {"type":"text","text":"done"},
+        {"type":"tool_use","id":"c1","name":"read","input":{}}
+    ]});
+    let unbound = unbind_thinking(&message);
+    assert_eq!(
+        unbound["dial_provider_content"],
+        json!([
+            {"type":"text","text":"done"},
+            {"type":"tool_use","id":"c1","name":"read","input":{}}
+        ])
+    );
+    assert_eq!(unbound["tool_calls"], message["tool_calls"]);
+    assert_eq!(unbound["content"], "done");
+    let only_thinking = json!({"role":"assistant","content":"",
+        "dial_provider_content":[{"type":"thinking","thinking":"","signature":"sig"}]});
+    assert!(
+        unbind_thinking(&only_thinking)
+            .get("dial_provider_content")
+            .is_none()
+    );
+    let user = json!({"role":"user","content":[{"type":"thinking","thinking":"quoted"}]});
+    assert_eq!(unbind_thinking(&user), user);
 }

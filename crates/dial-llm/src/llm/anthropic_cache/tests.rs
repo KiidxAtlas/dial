@@ -108,8 +108,13 @@ fn retention_and_opt_out_follow_auth_and_explicit_configuration() {
             expected_long.then_some("1h")
         );
         assert_eq!(
-            body["messages"][2]["content"][0]["cache_control"],
+            body["tools"][1]["cache_control"],
             body["system"][0]["cache_control"]
+        );
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"}),
+            "rolling history markers keep the 5-minute default after any 1h head markers"
         );
     }
     let mut disabled = body();
@@ -221,4 +226,84 @@ fn latched_refusals_start_later_requests_narrow_and_never_widen() {
     assert_eq!(latched(url, "model-b"), Level::Full);
     forget_refusals("https://ladder-latch.invalid");
     assert_eq!(latched(url, "model-a"), Level::Full);
+}
+
+fn banded(bands: &[&str]) -> Value {
+    let mut body = body();
+    body["system"] = Value::Array(
+        bands
+            .iter()
+            .map(|band| json!({"type":"text","text":format!("{band} text"),(BAND_TAG):band}))
+            .collect(),
+    );
+    body
+}
+
+#[test]
+fn system_breakpoint_sits_after_the_last_stable_band_not_dynamic_text() {
+    let mut body = banded(&["frozen", "stable", "dynamic"]);
+    apply(&mut body, None, false, Level::Full);
+    let system = body["system"].as_array().unwrap();
+    assert!(system.iter().all(|block| block.get(BAND_TAG).is_none()));
+    assert_eq!(system[1]["cache_control"], json!({"type":"ephemeral"}));
+    assert!(system[0].get("cache_control").is_none());
+    assert!(system[2].get("cache_control").is_none(), "{body}");
+    assert_eq!(count(&body), 4);
+
+    // A changed dynamic band leaves every block up to the breakpoint byte-identical.
+    let mut changed = banded(&["frozen", "stable", "dynamic"]);
+    changed["system"][2]["text"] = json!("new per-turn note");
+    apply(&mut changed, None, false, Level::Full);
+    assert_eq!(
+        changed["system"].as_array().unwrap()[..2],
+        body["system"].as_array().unwrap()[..2]
+    );
+}
+
+#[test]
+fn dynamic_only_system_gets_no_marker_and_untagged_arrays_mark_the_last_block() {
+    let mut dynamic = banded(&["dynamic"]);
+    apply(&mut dynamic, None, false, Level::Full);
+    assert!(dynamic["system"][0].get("cache_control").is_none());
+    assert!(dynamic["system"][0].get(BAND_TAG).is_none());
+    assert_eq!(count(&dynamic), 3);
+
+    let mut untagged = body();
+    untagged["system"] = json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]);
+    apply(&mut untagged, None, false, Level::Full);
+    assert!(untagged["system"][1]["cache_control"].is_object());
+
+    // Band tags never reach the wire, even with caching disabled.
+    let mut off = banded(&["stable", "dynamic"]);
+    apply(&mut off, None, false, Level::Off);
+    assert_eq!(count(&off), 0);
+    assert!(
+        off["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block.get(BAND_TAG).is_none())
+    );
+}
+
+#[test]
+fn long_retention_puts_one_hour_on_head_markers_and_five_minutes_on_history() {
+    let profile = ModelProfile {
+        cache_retention: CacheRetention::Long,
+        ..Default::default()
+    };
+    let mut body = banded(&["frozen", "stable", "dynamic"]);
+    apply(&mut body, Some(&profile), false, Level::Full);
+    let long = json!({"type":"ephemeral","ttl":"1h"});
+    assert_eq!(body["tools"][1]["cache_control"], long);
+    assert_eq!(body["system"][1]["cache_control"], long);
+    assert_eq!(
+        body["messages"][2]["content"][0]["cache_control"],
+        json!({"type":"ephemeral"})
+    );
+    // The refusal ladder still drops every ttl at the next rung.
+    let mut narrowed = banded(&["frozen", "stable", "dynamic"]);
+    apply(&mut narrowed, Some(&profile), false, Level::WithoutTtl);
+    assert!(!narrowed.to_string().contains("\"ttl\""));
+    assert_eq!(count(&narrowed), 4);
 }

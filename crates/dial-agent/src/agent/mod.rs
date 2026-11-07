@@ -199,6 +199,9 @@ struct StepChecks {
     /// Revision at which a shell test/build command (`is_check_command`) last passed; evidence for
     /// the completion gate when the model verifies through `bash` rather than `check`.
     shell_check_passed: Option<verify::evidence::Revision>,
+    /// Model-authored acceptance helpers, distinct from operator/task-provided checks.
+    registered_acceptance: Vec<verify::verification::FocusedCheck>,
+    registered_checked: Option<verify::evidence::Revision>,
     /// Empty `grep`/`glob` results this turn, forgotten whenever the workspace revision moves.
     empty_searches: run::search_frontier::EmptySearches,
     /// Workspace-relative files successfully read this turn; they clear caller obligations.

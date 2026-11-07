@@ -61,7 +61,10 @@ impl ContextBreakdown {
         let bytes = parts.portable;
         let content = message["content"].as_str().unwrap_or_default();
         match message["role"].as_str() {
-            Some("system" | "developer") if content.starts_with(CONTEXT_HEADING) => {
+            Some("system" | "developer")
+                if content.starts_with(CONTEXT_HEADING)
+                    || content.starts_with("\n<context file=") =>
+            {
                 self.context_files += bytes;
             }
             Some("system" | "developer") => self.system_prompt += bytes,

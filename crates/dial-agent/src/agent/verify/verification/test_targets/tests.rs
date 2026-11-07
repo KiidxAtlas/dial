@@ -18,6 +18,8 @@ fn entries_outside_the_workspace_or_with_unsafe_selectors_are_refused() {
     ] {
         assert!(entry(root.path(), bad).is_err(), "{bad:?}");
     }
+    let outside = entry(root.path(), "/etc/passwd").unwrap_err();
+    assert!(outside.contains("outside the workspace"), "{outside}");
     assert!(
         entry(root.path(), "notes.txt")
             .unwrap_err()
@@ -28,6 +30,25 @@ fn entries_outside_the_workspace_or_with_unsafe_selectors_are_refused() {
         entry(root.path(), "notes.txt")
             .unwrap_err()
             .contains("no test runner")
+    );
+}
+
+#[test]
+fn absolute_entries_under_the_workspace_resolve_like_relative_ones() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("test_a.py"), "").unwrap();
+    let relative = entry(root.path(), "test_a.py").unwrap();
+    for absolute in [
+        root.path().join("test_a.py"),
+        root.path().canonicalize().unwrap().join("test_a.py"),
+    ] {
+        let check = entry(root.path(), absolute.to_str().unwrap()).unwrap();
+        assert_eq!(check.command, relative.command, "{}", absolute.display());
+    }
+    assert!(
+        entry(root.path(), root.path().join("../x.py").to_str().unwrap())
+            .unwrap_err()
+            .contains("..")
     );
 }
 

@@ -2,6 +2,38 @@ use super::*;
 fn schema(kind: &str) -> Value {
     json!({"type":"function","function":{"name":"test","parameters":{"type":"object","properties":{"value":{"type":kind}}}}})
 }
+
+#[test]
+fn data_io_and_scoped_checks_resume_old_builtin_contracts_without_replay() {
+    let registry = Registry::new();
+    for (name, added) in [
+        ("read", &["format", "retain"][..]),
+        ("write", &["encoding"][..]),
+        ("bash", &["check_paths"][..]),
+    ] {
+        let current =
+            crate::tools::schema(name, crate::config::types::EditMode::default()).unwrap();
+        let mut old = current.clone();
+        for property in added {
+            old["function"]["parameters"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove(*property)
+                .unwrap();
+        }
+        let identity = identities(&[old], &registry)[name].clone();
+        let history = vec![
+            json!({"role":"assistant","dial_tool_contracts":{"call":identity},
+            "tool_calls":[{"id":"call","type":"function","function":{"name":name,"arguments":"{}"}}]}),
+        ];
+        assert!(
+            project_history(&history, &[current], &registry)
+                .unwrap()
+                .is_none(),
+            "{name}: no replay or mutation of history"
+        );
+    }
+}
 #[test]
 fn changing_native_edit_dialect_preserves_settled_history_without_replaying_it() {
     let registry = Registry::new();
@@ -218,6 +250,29 @@ fn bash_history_before_named_sessions_stays_valid_without_rewriting_calls() {
     let history = vec![
         json!({"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}],"dial_tool_contracts":{"call":old}}),
         json!({"role":"tool","tool_call_id":"call","content":"recorded output"}),
+    ];
+    let original = history.clone();
+    assert!(
+        project_history(&history, &[current], &registry)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(history, original);
+}
+
+#[test]
+fn bash_history_before_explicit_checks_resumes_without_changing_recorded_calls() {
+    let registry = Registry::new();
+    let current = crate::tools::schema("bash", crate::config::types::EditMode::Replace).unwrap();
+    let mut before = current.clone();
+    before["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("check");
+    let identity = identities(&[before], &registry)["bash"].clone();
+    let history = vec![
+        json!({"role":"assistant","tool_calls":[{"id":"old","type":"function","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}],"dial_tool_contracts":{"old":identity}}),
+        json!({"role":"tool","tool_call_id":"old","content":"recorded output"}),
     ];
     let original = history.clone();
     assert!(

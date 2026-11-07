@@ -31,7 +31,7 @@ impl Tool for Timeline {
         let clock = json!({"type":"object","properties":{"id":{"type":"string","maxLength":256},"origin":{"type":"string","enum":["relative","unix"]},"timezone":{"type":"string","maxLength":256}},"required":["id","origin"],"additionalProperties":false});
         crate::tools::tool_schema(
             "timeline",
-            "Reconstruct bounded retained audio segments, video requested seeks, time locations or exact quoted log entries. Never reopens sources. Explicit clocks and single-hop alignment bases are required; no inferred synchrony, measured PTS, semantic causation or verification. Groups are incomparable across clock IDs; sorted coordinates do not resolve overlapping uncertainty.",
+            "Use to line up retained audio segments, video seeks, time locations or exact quoted log entries on one timeline. Each source needs an explicit clock, and alignment uses single-hop bases you supply. Returns events grouped per clock ID, sorted by coordinate; groups on different clocks are not comparable, and overlapping uncertainty stays unresolved. Retained sources only (none reopened); it infers no synchrony, measured PTS or causation, and is not verification.",
             json!({
                 "action":{"type":"string","enum":["reconstruct"]},
                 "sources":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"reference":{"type":"string"},"clock":clock.clone()},"required":["reference"],"additionalProperties":false}},

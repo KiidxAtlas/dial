@@ -108,7 +108,7 @@ pub(in crate::agent) fn request_context(control: &Value, messages: &[Value]) -> 
         "text":excerpt, "text_truncated":text_truncated,
     });
     Some(format!(
-        "{}\n{payload}",
+        "<dial-notice kind=\"latest_user_request\">\n{}\n{payload}\n</dial-notice>",
         crate::agent::prompts::system::CURRENT_USER_REQUEST
     ))
 }

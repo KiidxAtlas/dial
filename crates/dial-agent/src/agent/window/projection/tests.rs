@@ -42,8 +42,10 @@ fn task_context(messages: &[Value]) -> &Value {
 /// The intent payload is the JSON object at the end of the note; the prose before it is not parsed.
 fn intent_payload(content: &str) -> Option<Value> {
     content.match_indices('{').find_map(|(index, _)| {
-        serde_json::from_str::<Value>(&content[index..])
-            .ok()
+        serde_json::Deserializer::from_str(&content[index..])
+            .into_iter::<Value>()
+            .next()
+            .and_then(Result::ok)
             .filter(|value| value.get("entry_id").is_some())
     })
 }
@@ -463,4 +465,120 @@ fn turn_optimizer_keeps_raw_provenance_out_of_the_request_tail() {
                 .any(|message| message["content"] == "Reviewed parser task")
         );
     });
+}
+
+/// Plan mode travels as a request-tail notice restated from current state, so toggling it leaves
+/// the cached system messages byte-identical.
+#[test]
+fn plan_mode_is_a_tail_notice_not_a_system_prompt_rewrite() {
+    with_agent("", |agent| {
+        let in_system = |agent: &Agent<'_>| {
+            agent
+                .system_messages()
+                .iter()
+                .any(|message| message.to_string().contains("Plan mode"))
+        };
+        agent.set_plan_mode(true);
+        assert!(
+            !in_system(agent),
+            "plan mode text stays out of the system band"
+        );
+        let mut messages = vec![json!({"role":"user","content":"plan the change"})];
+        project(agent, &mut messages);
+        let notice = messages.last().unwrap();
+        assert_eq!(notice["dial_mode_notice"], true);
+        assert_eq!(notice["dial_transient"], true);
+        let text = notice["content"].as_str().unwrap();
+        assert!(
+            text.starts_with("<dial-notice kind=\"session_mode\">"),
+            "{text}"
+        );
+        assert!(text.contains("Plan mode is on"), "{text}");
+        agent.set_plan_mode(false);
+        let mut messages = vec![json!({"role":"user","content":"do it"})];
+        project(agent, &mut messages);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["dial_mode_notice"] != true)
+        );
+        assert!(!in_system(agent));
+    });
+}
+
+fn observation(id: &str, text: &str) -> Value {
+    json!({"role":"tool","tool_call_id":id,"content":text,
+        "dial_evidence":{"observation":"src/a.rs:1-40","artifact":format!("artifact://{id}")}})
+}
+
+/// Two requests of one tool loop: the second re-reads a resource the first already returned.
+/// Under pressure with `supersede_reads`/`drop_useless`, the projection would replace the older
+/// read with a placeholder, which rewrites a sent turn.
+fn rewrite_prone_requests(
+    identity: crate::config::compaction::CompactionIdentity<'_>,
+) -> (Chat, Chat) {
+    let policy = sent_history_policy(
+        crate::agent::workflow::evidence::Policy {
+            warm_tokens: 10_000,
+            pressure: true,
+            protect_tokens: 0,
+            supersede_reads: true,
+            drop_useless: true,
+        },
+        identity,
+    );
+    let mut memo = Supersession::default();
+    let call = |id: &str| json!({"role":"assistant","content":"","tool_calls":[{"id":id,"type":"function","function":{"name":"read","arguments":"{}"}}]});
+    let first = vec![
+        json!({"role":"user","content":"fix a.rs"}),
+        call("1"),
+        observation("1", &"old body ".repeat(4_000)),
+    ];
+    let mut second = first.clone();
+    second.extend([call("2"), observation("2", "new body")]);
+    let mut project = |mut messages: Vec<Value>| {
+        crate::agent::workflow::evidence::project(&mut messages, &mut memo, &policy);
+        Chat {
+            messages,
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: 64,
+            seed: None,
+        }
+    };
+    (project(first), project(second))
+}
+
+#[test]
+fn preserved_thinking_models_never_rewrite_sent_history() {
+    use crate::agent::window::request_prefix::Tracker;
+    use crate::config::compaction::CompactionIdentity;
+    let identity = |model| CompactionIdentity {
+        provider: "anthropic",
+        model,
+        agent: None,
+    };
+    for model in [
+        "claude-opus-5-5",
+        "us.anthropic.claude-sonnet-5-5",
+        "claude-fable-5-1@default",
+    ] {
+        assert!(identity(model).preserved_thinking(), "{model}");
+        let (first, second) = rewrite_prone_requests(identity(model));
+        let mut tracker = Tracker::default();
+        tracker.assert_appends_only(model, &first);
+        tracker.assert_appends_only(model, &second);
+    }
+    // Elsewhere the same configuration still supersedes the older read.
+    let (first, second) = rewrite_prone_requests(identity("claude-opus-5"));
+    assert!(!identity("claude-opus-5").preserved_thinking());
+    let mut tracker = Tracker::default();
+    tracker.observe("claude-opus-5", &first);
+    assert!(!tracker.observe("claude-opus-5", &second).appends_only());
+    assert!(
+        second.messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Superseded")
+    );
 }

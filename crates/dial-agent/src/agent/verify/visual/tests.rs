@@ -5,6 +5,13 @@ fn visual_work_is_conditional_and_test_or_backend_edits_do_not_trigger_it() {
     assert!(useful("compare this picture with the rendered UI"));
     assert!(!useful("fix Docker image creation"));
     assert!(!useful("fix database query performance"));
+    // Crate names and paths are identifiers, not UI work.
+    assert!(!useful("fix the failing test in dial-ui"));
+    assert!(!useful(
+        "edit crates/dial-ui/src/ui/state.rs to change the parser"
+    ));
+    assert!(useful("fix the UI."));
+    assert!(useful("Fix the ui: the button overlaps"));
     let mut review = Review::default();
     review.changed(Path::new("api.rs"));
     review.changed(Path::new("Button.test.tsx"));

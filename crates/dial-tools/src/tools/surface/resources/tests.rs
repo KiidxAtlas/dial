@@ -148,3 +148,146 @@ fn read_resources_never_authorize_an_effect_and_unbounded_effects_are_refused() 
     assert!(!read.permits(&paths, false, false));
     assert!(!read.permits(&paths, true, true));
 }
+
+#[cfg(unix)]
+#[test]
+fn dotfile_sources_and_scoped_packages_resolve_but_metadata_and_handles_stay_serial() {
+    let root = tempfile::tempdir().unwrap();
+    for dir in [".github", ".git", ".dial", "node_modules/@scope"] {
+        std::fs::create_dir_all(root.path().join(dir)).unwrap();
+    }
+    for file in [
+        ".github/ci.yml",
+        ".git/config",
+        ".dial/state",
+        "node_modules/@scope/index.js",
+        "icon@2x.png",
+    ] {
+        std::fs::write(root.path().join(file), "source").unwrap();
+    }
+    let ws = Workspace::new(root.path()).unwrap();
+    let registry = Registry::new();
+    let get = |name, args: Value| resolve(&ws, EditMode::default(), &registry, name, &args);
+    for path in [
+        ".github/ci.yml",
+        "node_modules/@scope/index.js",
+        ".env.example",
+    ] {
+        assert!(get("write", json!({"path":path})).is_some(), "{path}");
+    }
+    assert!(get("read", json!({"path":"node_modules/@scope/index.js"})).is_some());
+    for path in [
+        ".git/config",
+        ".dial/state",
+        "@f7",
+        "@f12#AB",
+        "user@host/file",
+        "icon@2x.png",
+        "https://example.com/a",
+    ] {
+        assert!(get("write", json!({"path":path})).is_none(), "{path}");
+    }
+}
+
+#[test]
+fn effect_free_external_reads_have_an_empty_footprint() {
+    use crate::tools::{
+        ToolOutput,
+        integrations::ext::{Concurrency, Tool, ToolContext},
+    };
+    use std::sync::Arc;
+    struct External {
+        name: &'static str,
+        concurrency: Concurrency,
+        modifies: bool,
+    }
+    impl Tool for External {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":self.name,"parameters":{"type":"object","properties":{}}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            true
+        }
+        fn may_modify_workspace(&self, _: &Value) -> bool {
+            self.modifies
+        }
+        fn concurrency(&self, _: &Value) -> Concurrency {
+            self.concurrency
+        }
+        fn resources(&self, _: &Workspace, _: &Value) -> Option<Access> {
+            Some(Access::default())
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            panic!("planning must not execute tools")
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(root.path()).unwrap();
+    let mut registry = Registry::new();
+    for (name, concurrency, modifies) in [
+        ("fetch", Concurrency::Shared, false),
+        ("exclusive", Concurrency::Exclusive, false),
+        ("touches", Concurrency::Shared, true),
+    ] {
+        registry
+            .try_register(Arc::new(External {
+                name,
+                concurrency,
+                modifies,
+            }))
+            .unwrap();
+    }
+    let fetch = resolve(&ws, EditMode::default(), &registry, "fetch", &json!({})).unwrap();
+    assert!(fetch.is_empty() && !fetch.writes());
+    let write = resolve(
+        &ws,
+        EditMode::default(),
+        &registry,
+        "write",
+        &json!({"path":"a"}),
+    );
+    assert!(!fetch.conflicts(&write.unwrap()));
+    for name in ["exclusive", "touches"] {
+        assert!(resolve(&ws, EditMode::default(), &registry, name, &json!({})).is_none());
+    }
+    for builtin in crate::tools::net::web::tools(&crate::config::types::Config::default()) {
+        if matches!(builtin.name(), "web_fetch" | "web_search") {
+            assert!(
+                external_read(builtin.as_ref(), &json!({})),
+                "{}",
+                builtin.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn recorded_changes_touch_footprints_by_lexical_containment() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/a.rs"), "a").unwrap();
+    std::fs::write(root.path().join("b.rs"), "b").unwrap();
+    let ws = Workspace::new(root.path()).unwrap();
+    let registry = Registry::new();
+    let file = resolve(
+        &ws,
+        EditMode::default(),
+        &registry,
+        "read",
+        &json!({"path":"src/a.rs"}),
+    )
+    .unwrap();
+    let base = ws.root();
+    assert!(file.touches(base, &[PathBuf::from("src/a.rs")]));
+    assert!(file.touches(base, &[base.join("src/a.rs")]));
+    assert!(
+        file.touches(base, &[PathBuf::from("./src")]),
+        "a removed parent"
+    );
+    assert!(!file.touches(base, &[PathBuf::from("b.rs")]));
+    assert!(!file.touches(base, &[]));
+    assert!(!Footprint::default().touches(base, &[PathBuf::from("src/a.rs")]));
+}

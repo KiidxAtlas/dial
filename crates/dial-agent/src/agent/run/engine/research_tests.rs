@@ -173,11 +173,11 @@ fn accepted_checkpoint_follow_through_is_cleared_by_new_steering() {
     let reply = crate::llm::Reply { text: json!({"finding":"Steering probe finding","evidence":["observation-23"],"next_action":"Report the probe"}).to_string(), finish_reason:"stop".into(), ..Default::default() };
     assert!(matches!(engine.synthesize(&reply), Synthesis::Accepted));
     assert!(
-        engine.research_prompt().is_some(),
+        engine.research_prompt(true).is_some(),
         "accepted checkpoint keeps follow-through guidance"
     );
     engine.transition(RecoveryTransition::Steering);
-    assert!(engine.research_prompt().is_none());
+    assert!(engine.research_prompt(true).is_none());
 }
 
 #[test]

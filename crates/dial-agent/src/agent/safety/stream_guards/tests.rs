@@ -23,9 +23,14 @@ fn escalation_and_duplicate_results_quote_the_repeated_call_without_stopping() {
 }
 
 #[test]
-fn retry_prompts_show_attempt_and_cap() {
-    let text = render_retry_prompt(EMPTY_STOP_RETRY, 2, EMPTY_STOP_MAX_RETRIES);
-    assert!(text.ends_with("Attempt #2/3\n</system-injection>"));
+fn retry_prompts_are_one_notice_without_attempt_counters() {
+    let text = EMPTY_STOP_RETRY;
+    assert!(
+        text.starts_with("<dial-notice kind=\"empty_reply\">\n"),
+        "{text}"
+    );
+    assert!(text.ends_with("\n</dial-notice>"), "{text}");
+    assert!(!text.contains("Attempt") && !text.contains("{{"), "{text}");
 }
 
 #[test]
@@ -88,6 +93,41 @@ fn finished_reports_quotes_and_optional_work_do_not_restart_the_turn() {
         "The parser now handles nested tables.",
     ] {
         assert!(!announces_unexpected_stop(text), "{text}");
+    }
+}
+
+#[test]
+fn first_person_unfinished_phrasings_report_unfinished_work() {
+    for text in [
+        "I updated the schema. I haven't finished the migration.",
+        "I haven’t finished wiring the CLI flag.",
+        "The parser compiles. Next I'd update the call sites.",
+        "Next, I'd run the integration suite.",
+        "I still have to port the remaining handlers.",
+        "We still need to update the docs and the changelog.",
+        "The refactor is not finished yet.",
+        "Marker creation is still pending.",
+    ] {
+        assert!(reports_unfinished_work(text), "{text}");
+    }
+}
+
+#[test]
+fn completed_answers_and_handoffs_are_not_unfinished_work() {
+    for text in [
+        "All tests pass and the migration is complete.",
+        "Done. You still need to set DIAL_TOKEN in your shell before running it.",
+        "Fixed the parser. Next I'd suggest adding a fuzz test.",
+        "The change is in place. Next, I'd recommend tagging a release.",
+        "Next I'd like to hear whether the new defaults suit you.",
+        "The env var is not available in tests, so the check reads the config file instead.",
+        "I haven't seen a failure in 200 runs since the fix.",
+        "> I haven't finished the migration.",
+        "`next i'd update the parser` is the example from the docs.",
+        "I still need to know which branch to target; it is blocked on your answer.",
+        "Finishing the docs is optional and can happen later.",
+    ] {
+        assert!(!reports_unfinished_work(text), "{text}");
     }
 }
 

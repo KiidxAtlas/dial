@@ -36,6 +36,9 @@ pub(in crate::agent) fn schema(predictions: bool) -> Value {
         schema["function"]["parameters"]["properties"]["expect"] =
             crate::tools::surface::contracts::check_prediction_property();
     }
+    schema["function"]["parameters"]["properties"]["acceptance"] = json!({"type":"object",
+        "description":"Register and run one model-authored acceptance helper for this turn, then rerun it after settled edits when enabled. Separate from task/operator checks. Cannot combine with targets or repro.",
+        "properties":{"name":{"type":"string"},"command":{"type":"string"}},"required":["name","command"],"additionalProperties":false});
     schema
 }
 
@@ -97,7 +100,7 @@ fn prediction(enabled: bool, args: &Value, all_passed: bool, cancelled: bool) ->
 
 /// The reproduction `args` asks to register, if any. Command text is untrusted model input; it
 /// is only validated for shape here and authorized like a shell call when it runs.
-fn requested_repro(args: &Value) -> Option<Result<FocusedCheck, String>> {
+pub(super) fn requested_repro(args: &Value) -> Option<Result<FocusedCheck, String>> {
     let repro = args.get("repro").filter(|value| !value.is_null())?;
     if !repro.is_object() {
         // Schema-directed normalization already decodes a JSON-encoded object; what remains is a
@@ -272,6 +275,9 @@ pub(in crate::agent) fn post_mutation_verify(output: &ToolOutput) -> Option<&Val
 
 impl Agent<'_> {
     pub(in crate::agent) fn verify_tool(&mut self, args: &Value, ui: &mut dyn Ui) -> ToolOutput {
+        if args.get("acceptance").is_some() {
+            return self.register_acceptance(args, ui);
+        }
         let predictions = self.config.experimental.check_predictions;
         if predictions
             && let Some(expect) = args.get("expect").filter(|value| !value.is_null())

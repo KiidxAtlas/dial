@@ -50,6 +50,14 @@ fn main() {
     {
         dial::tools::documents::document_worker_main();
     }
+    // Re-exec target for the embedded JavaScript engine used by `eval` when Node is absent.
+    #[cfg(all(feature = "embedded-js", unix))]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == dial::tools::exec::eval::EMBEDDED_JS_WORKER_ARG)
+    {
+        std::process::exit(dial::tools::exec::eval::embedded_js_worker_main());
+    }
     // Re-exec target for the built-in shell (`shell.backend = "embedded"`); never reaches the CLI parser.
     #[cfg(feature = "embedded-shell")]
     {

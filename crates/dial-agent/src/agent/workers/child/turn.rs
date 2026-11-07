@@ -555,8 +555,16 @@ impl<'a> ChildTurn<'a> {
         if summary_step {
             self.messages.push(json!({"role":"user","dial_transient":true,"content":"Step budget reached: this is your final request. Reply now with your findings: what you verified and its evidence, what remains unverified, and the exact next step. Call no tools."}));
         }
-        let research_step = !summary_step && engine.research_required();
-        if !summary_step && let Some(note) = engine.research_prompt() {
+        // Only a mutating worker on a lean local route gets the forced tool-free checkpoint;
+        // others get the advisory note once it would be due.
+        let forced = crate::agent::workflow::research::worker_checkpoint_forced(
+            job.model_routes
+                .first()
+                .map_or(env.config, |route| &route.config),
+            !job.spec.mutates || env.plan_mode,
+        );
+        let research_step = forced && !summary_step && engine.research_required();
+        if !summary_step && let Some(note) = engine.research_prompt(forced) {
             self.messages.push(note);
         }
         // Queued owner settings apply here, at a request boundary, to this worker's backend only.
@@ -876,6 +884,16 @@ impl<'a> ChildTurn<'a> {
             supersede_reads: env.config.compaction.supersede_reads,
             drop_useless: env.config.compaction.drop_useless,
         };
+        // Preserved-thinking models reject rewritten sent turns; the projection only appends there.
+        let selection = env.config.selection();
+        let policy = crate::agent::window::projection::sent_history_policy(
+            policy,
+            crate::config::compaction::CompactionIdentity {
+                provider: &selection.provider,
+                model: &selection.model,
+                agent: None,
+            },
+        );
         crate::agent::workflow::evidence::project(
             &mut model_request.messages,
             &mut self.superseded,
@@ -984,6 +1002,14 @@ impl<'a> ChildTurn<'a> {
                         failed_calls: engine.failed_calls(),
                     },
                 )
+                // Same coverage rule as the parallel-read path: only results still held in full.
+                .with_reuse(engine.reusable_reads(|id| {
+                    self.superseded.holds_full(id)
+                        && self.messages.iter().any(|message| {
+                            message["tool_call_id"].as_str() == Some(id)
+                                && message["dial_execution"]["output"]["presentation"] != "partial"
+                        })
+                }))
             });
         let mut authorize = |call: &llm::ToolCall| {
             observer
@@ -1914,6 +1940,14 @@ impl<'a> ChildTurn<'a> {
         let mut round_messages = Vec::new();
         let mut portable_batch_intercepted = false;
         let preview_abort = std::cell::Cell::new(false);
+        // The parent's per-reply result budget, against this child's own window and history.
+        let mut result_budget = crate::agent::run::dispatch::result_budget::ResultBudget::new(
+            crate::agent::run::dispatch::result_budget::ResultBudget::percent(
+                &env.config.efficiency,
+            ),
+            child_window(env, backend),
+            crate::llm::wire::estimate_parts(&self.messages, &self.schemas),
+        );
         for (index, call) in reply.tool_calls.iter().enumerate() {
             if parallel.is_empty()
                 && let Some(reason) = engine.pending_refusal()
@@ -2037,22 +2071,19 @@ impl<'a> ChildTurn<'a> {
                 && env.config.experimental.dependency_dispatch
                 && !reply.text_calls_lifted
             {
-                let plan = crate::agent::run::dependency_dispatch::plan_prefix(
+                use crate::agent::run::dependency_dispatch::{WavePolicy, WaveScope, plan_wave};
+                let plan = plan_wave(
                     &reply.tool_calls[index..],
-                    env.config.task.dependency_wave_limit(),
+                    WaveScope {
+                        workspace: env.workspace,
+                        mode: env.workspace.edit_mode(),
+                        registry: env.ext,
+                        hooks: &env.config.hooks,
+                        limit: env.config.task.dependency_wave_limit(),
+                    },
+                    WavePolicy::CHILD,
                     |candidate| {
-                        if crate::agent::run::dependency_dispatch::bookkeeping(candidate)
-                            || ["pre_tool_use", "post_tool_use"].iter().any(|event| {
-                                crate::agent::safety::hooks::wanted_for_tool(
-                                    &env.config.hooks,
-                                    event,
-                                    &candidate.name,
-                                )
-                            })
-                            || candidate.arguments["verify"]
-                                .as_array()
-                                .is_some_and(|v| !v.is_empty())
-                            || call_form_error(candidate, &self.schemas, &self.names).is_some()
+                        if call_form_error(candidate, &self.schemas, &self.names).is_some()
                             || engine.rejection_at(env.workspace, candidate).is_some()
                             || child_speculation_key(env, job, candidate, &children.namespace)
                                 .is_some_and(|key| {
@@ -2061,29 +2092,24 @@ impl<'a> ChildTurn<'a> {
                                         .pending(&key, &candidate.arguments)
                                 })
                         {
-                            return Err("worker_admission");
+                            return Err(WavePolicy::CHILD.refusal);
                         }
-                        let footprint = crate::agent::run::dependency_dispatch::footprint_for(
-                            env.workspace,
-                            env.workspace.edit_mode(),
-                            env.ext,
-                            candidate,
-                        )
-                        .ok_or("unknown_resources")?;
-                        Ok((candidate.clone(), footprint))
+                        Ok(candidate.clone())
                     },
                 );
                 self.scheduling.barrier(plan.barrier);
+                let dispatchable = plan.dispatchable();
+                let footprints = plan.footprints;
                 let group = plan.calls;
-                if group.len() > 1
-                    && plan.writes
+                if dispatchable
                     && !self
                         .streamed
                         .as_ref()
                         .is_some_and(|s| group.first().is_some_and(|call| s.has(call)))
                 {
+                    // Worker waves admit no hooks or verification: keep disjoint early reads.
                     if let Some(stream) = self.streamed.as_mut() {
-                        stream.invalidate();
+                        stream.retain_disjoint(&footprints);
                     }
                     let callback_gate =
                         std::sync::Mutex::new(crate::agent::safety::rules::CallbackGate::new(
@@ -2387,6 +2413,20 @@ impl<'a> ChildTurn<'a> {
                 output.is_error,
                 artifact.is_some(),
             );
+            // Results the current group already produced share the reply's budget.
+            let pending = crate::agent::run::dispatch::result_budget::pending_sizes(
+                &reply.tool_calls[index + 1..],
+                parallel.iter().map(|(output, _)| output),
+                crate::tools::model_output_limit(child_window(env, backend)),
+            );
+            let limit = result_budget.limit(
+                call,
+                &output,
+                limit,
+                artifact.is_some(),
+                duplicate.is_some(),
+                &pending,
+            );
             let original_observation = duplicate.is_none();
             let edit = crate::agent::workflow::efficiency::edit_result(
                 &call.name,
@@ -2429,6 +2469,7 @@ impl<'a> ChildTurn<'a> {
             if let Some(notice) = retain_notice {
                 body.push_str(&notice);
             }
+            result_budget.spend(body.len());
             let mut message = llm::tool_message(&call.id, &body);
             crate::tools::surface::outcome::annotate(&mut message, &output);
             crate::agent::compact::snapcompact::views::mark(&mut message, call, &output);

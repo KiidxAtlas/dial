@@ -47,7 +47,7 @@ fn reminders_are_capped_and_leave_state_incomplete() {
 
 #[test]
 fn reminder_lists_missing_items() {
-    let text = reminder(&["commit proposal (propose_commit or split_commit)"], 2);
+    let text = reminder(&["commit proposal (propose_commit or split_commit)"]);
     assert!(text.contains("Missing: commit proposal (propose_commit or split_commit)"));
-    assert!(text.contains("Reminder 2 of 3."));
+    assert!(!text.contains("CRITICAL"), "{text}");
 }

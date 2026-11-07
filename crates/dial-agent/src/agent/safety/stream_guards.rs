@@ -160,14 +160,16 @@ pub(crate) fn reports_unfinished_work(text: &str) -> bool {
     {
         return false;
     }
-    let lower = last.to_lowercase();
+    let lower = last.to_lowercase().replace('’', "'");
     if ["blocked", "optional", "if you", "when you", "later"]
         .iter()
         .any(|word| lower.contains(word))
     {
         return false;
     }
-    [
+    // First-person subjects only: "you still need to set the token" hands a step to the user
+    // and is a finished answer.
+    if [
         "still pending",
         "work is pending",
         "creation is still pending",
@@ -177,11 +179,41 @@ pub(crate) fn reports_unfinished_work(text: &str) -> bool {
         "i have not read the source",
         "i have not read the",
         "i have not run the",
+        "i haven't read the",
+        "i haven't run the",
         "i still need to",
+        "i still have to",
+        "we still need to",
         "still need to deliver",
+        "i haven't finished",
+        "i have not finished",
+        "isn't finished yet",
+        "is not finished yet",
+        "not done yet",
     ]
     .iter()
     .any(|phrase| lower.contains(phrase))
+    {
+        return true;
+    }
+    // "Next I'd update the parser" names the next step of unfinished work; "Next I'd suggest
+    // adding a test" is a recommendation that closes a finished one.
+    ["next i'd ", "next, i'd ", "next i would ", "next, i would "]
+        .iter()
+        .filter_map(|prefix| lower.find(prefix).map(|at| &lower[at + prefix.len()..]))
+        .any(|rest| {
+            ![
+                "suggest",
+                "recommend",
+                "advise",
+                "propose",
+                "consider",
+                "like",
+                "love",
+            ]
+            .iter()
+            .any(|word| rest.starts_with(word))
+        })
 }
 
 /// Raised when a generation emits a run of reasoning-summary headers with no tool call
@@ -294,13 +326,6 @@ pub(crate) fn render_duplicate_call_result(
     result_summary: &str,
 ) -> String {
     duplicate_call_result(tool_name, earlier_id, result_or_placeholder(result_summary))
-}
-
-/// Fills `{{retryCount}}` and `{{maxRetries}}` in a recovery prompt.
-pub(crate) fn render_retry_prompt(template: &str, retry_count: u32, max_retries: u32) -> String {
-    template
-        .replace("{{retryCount}}", &retry_count.to_string())
-        .replace("{{maxRetries}}", &max_retries.to_string())
 }
 
 #[cfg(test)]

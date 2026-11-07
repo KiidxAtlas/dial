@@ -370,7 +370,7 @@ impl<'a> Agent<'a> {
         let schemas = self.schemas(&names)?;
         let mut catalog =
             crate::tools::surface::catalog::Catalog::from_schemas(&schemas, &self.ext)?;
-        catalog.refresh_readiness(self.config, &self.ext);
+        catalog.refresh_readiness_at(self.workspace.root(), self.config, &self.ext);
         for name in self.config.tools.keys() {
             catalog.set_origin(name, crate::tools::surface::catalog::Origin::Configured);
         }

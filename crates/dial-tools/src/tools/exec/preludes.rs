@@ -47,6 +47,12 @@ pub enum PreludeLanguage {
     Python,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PreludeMode {
+    Portable,
+    ExtensionsOnly,
+}
+
 struct Entry {
     def: PreludeDef,
     handler: PreludeHandler,
@@ -65,13 +71,29 @@ pub fn register_prelude(def: PreludeDef, handler: PreludeHandler) {
     GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
-/// Concatenated install source for every registered prelude in `language`; empty when none.
+/// Portable helpers followed by registered preludes in `language`.
 pub fn prelude_source_for(language: PreludeLanguage) -> String {
+    prelude_source_for_mode(language, PreludeMode::Portable)
+}
+
+pub(crate) fn prelude_source_for_mode(language: PreludeLanguage, mode: PreludeMode) -> String {
     let registry = REGISTRY.read();
-    let (separator, sources): (&str, Vec<&'static str>) = match language {
+    let (separator, mut sources): (&str, Vec<&'static str>) = match language {
         PreludeLanguage::Js => ("\n", registry.iter().map(|entry| entry.def.js).collect()),
         PreludeLanguage::Python => ("\n\n", registry.iter().map(|entry| entry.def.py).collect()),
     };
+    if matches!(mode, PreludeMode::Portable) {
+        sources.insert(
+            0,
+            match language {
+                PreludeLanguage::Js => include_str!("eval/portable.js"),
+                PreludeLanguage::Python => include_str!("eval/portable.py"),
+            },
+        );
+        if matches!(language, PreludeLanguage::Js) {
+            sources.insert(0, include_str!("eval/binary.js"));
+        }
+    }
     sources
         .into_iter()
         .map(str::trim)
@@ -83,12 +105,15 @@ pub fn prelude_source_for(language: PreludeLanguage) -> String {
 /// Text a cell prints through `__dial_display__`. Each cell owns its buffer, so a cell moved to the
 /// background keeps its display output in its job.
 #[derive(Default)]
-pub(crate) struct DisplayBuffer(parking_lot::Mutex<String>);
+pub(crate) struct DisplayBuffer {
+    text: parking_lot::Mutex<String>,
+    checks: parking_lot::Mutex<Vec<Value>>,
+}
 
 impl DisplayBuffer {
     /// Appends one display entry; text without a trailing newline gets one.
     pub(crate) fn push(&self, text: &str) {
-        let mut buffer = self.0.lock();
+        let mut buffer = self.text.lock();
         buffer.push_str(text);
         if !text.ends_with('\n') {
             buffer.push('\n');
@@ -96,12 +121,16 @@ impl DisplayBuffer {
     }
 
     pub(crate) fn take(&self) -> String {
-        std::mem::take(&mut *self.0.lock())
+        std::mem::take(&mut *self.text.lock())
+    }
+
+    pub(crate) fn checks(&self) -> Vec<Value> {
+        self.checks.lock().clone()
     }
 }
 
 pub(crate) fn generation() -> u64 {
-    GENERATION.load(Ordering::Acquire)
+    GENERATION.load(Ordering::Acquire).saturating_add(1)
 }
 
 pub(crate) fn invoke(
@@ -126,6 +155,24 @@ pub(crate) fn bridge_reply(
     dispatch: &mut dyn FnMut(ToolCallback) -> Result<ToolOutput, String>,
 ) -> Option<Result<Value, String>> {
     match request.get("callback").and_then(Value::as_str)? {
+        "check" => {
+            let Some(name) = request["name"]
+                .as_str()
+                .filter(|name| !name.is_empty() && name.len() <= 200)
+            else {
+                return Some(Err(
+                    "check needs a nonempty name of at most 200 bytes".into()
+                ));
+            };
+            let Some(passed) = request["passed"].as_bool() else {
+                return Some(Err("check condition must be a boolean".into()));
+            };
+            display
+                .checks
+                .lock()
+                .push(json!({"name":name,"passed":passed}));
+            Some(Ok(json!({"text":name,"data":null,"is_error":!passed})))
+        }
         "prelude" => {
             let Some(name) = request.get("name").and_then(Value::as_str) else {
                 return Some(Err("malformed prelude name".into()));
@@ -150,3 +197,5 @@ pub(crate) fn bridge_reply(
 
 #[cfg(test)]
 mod computer_tests;
+#[cfg(test)]
+mod portable_tests;

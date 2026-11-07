@@ -258,6 +258,11 @@ impl PythonRuntime {
                         Some(preludes::PreludeLanguage::Python);
                     let scope = CellScope {
                         workspace: ctx.workspace,
+                        prelude_mode: if ctx.config.eval.portable_helpers {
+                            preludes::PreludeMode::Portable
+                        } else {
+                            preludes::PreludeMode::ExtensionsOnly
+                        },
                         end,
                         interrupt: &self.interrupt,
                         cancel,
@@ -320,6 +325,22 @@ pub(crate) fn resolve_operator_executable(
         ));
     }
     Ok(resolved)
+}
+
+/// Side-effect-free counterpart of Python startup's environment selection. Do not launch a
+/// shim or import project code while describing prerequisites to the model.
+pub(super) fn python_launcher_resolves(workspace: &Path, config: &KernelConfig) -> bool {
+    match env::detect(workspace, &config.venv, &config.python, &|key| {
+        std::env::var(key).ok()
+    }) {
+        Ok(Some(environment)) => environment.launchers.iter().any(|candidate| {
+            candidate.to_str().is_some_and(|program| {
+                resolve_operator_executable(workspace, program, "kernel.python").is_ok()
+            })
+        }),
+        Ok(None) => resolve_operator_executable(workspace, &config.python, "kernel.python").is_ok(),
+        Err(_) => false,
+    }
 }
 
 fn executable_file(path: &Path) -> bool {
@@ -542,9 +563,13 @@ pub(crate) fn code_output(result: Result<Value, String>) -> ToolOutput {
             .with_output_integrity(integrity)
             .with_observation(ObservationKind::Wait, true)
         }
-        Err(error) => ToolOutput::err(error)
-            .with_output_integrity(OutputIntegrity::default())
-            .with_observation(ObservationKind::Wait, false),
+        Err(error) => ToolOutput {
+            text: format!("{error}\nCheck eval status before reusing namespace state. Prior file effects may remain; do not replay writes without inspection."),
+            data: Some(json!({"runtime_state":"unconfirmed","namespace_retained":null})),
+            is_error: true,
+            execution: Default::default(),
+        }.with_output_integrity(OutputIntegrity::default())
+         .with_observation(ObservationKind::Wait, false),
     }
 }
 
@@ -760,6 +785,7 @@ fn dispatch_guarded<'a>(
         interrupt,
         cancel,
         callback_wait,
+        ..
     } = scope;
     struct CallbackWait<'a>(&'a AtomicBool);
     impl Drop for CallbackWait<'_> {
@@ -806,12 +832,13 @@ impl BackgroundPolicy {
         })
     }
 
-    /// Whether a cell that is waiting for output should move to the background now.
+    /// Whether a cell that is waiting for output should move to the background now. A zero
+    /// `shell.auto_background_secs` (the default) disables automatic handoff, as it does for `bash`.
     pub(crate) fn should_yield(&self) -> bool {
         match self.mode {
             Some(false) => false,
             Some(true) => true,
-            None => self.started.elapsed() >= self.threshold,
+            None => !self.threshold.is_zero() && self.started.elapsed() >= self.threshold,
         }
     }
 }
@@ -856,6 +883,7 @@ impl Handoff<'_> {
 /// Borrowed state a foreground cell step needs.
 pub(crate) struct CellScope<'a> {
     pub workspace: &'a Workspace,
+    pub prelude_mode: preludes::PreludeMode,
     pub end: &'a Arc<Deadline>,
     pub interrupt: &'a AtomicBool,
     pub cancel: &'a AtomicBool,
@@ -931,7 +959,12 @@ fn native_cell_once(
         };
         // Controller callbacks execute their own Workspace transaction, approvals and observers.
         let output = dispatch_guarded(&mut serial, scope, dispatch, callback)?;
-        Ok(json!({"text":output.text,"data":output.data,"is_error":output.is_error}))
+        Ok(
+            json!({"text":output.text,"data":output.data,"is_error":output.is_error,
+            "status":crate::runtime::execution::ToolStatus::from_output(&output).as_str(),
+            "effects":output.execution.effects,"changed_paths":output.execution.changed_paths,
+            "process":output.execution.process,"output":output.execution.output}),
+        )
     };
     match code {
         Some(code) => {
@@ -972,7 +1005,7 @@ pub(crate) fn native_cell(
     if let Some(language) = process.prelude_language {
         let generation = preludes::generation();
         if process.prelude_generation != generation {
-            let source = preludes::prelude_source_for(language);
+            let source = preludes::prelude_source_for_mode(language, scope.prelude_mode);
             if !source.is_empty() {
                 let installed = native_cell_once(
                     process,
@@ -983,7 +1016,7 @@ pub(crate) fn native_cell(
                     &never,
                 )?
                 .ok_or("installing eval preludes yielded")?;
-                if installed.get("is_error").and_then(Value::as_bool) == Some(true) {
+                if installed.get("error").is_some_and(|error| !error.is_null()) {
                     return Err(format!("installing eval preludes failed: {installed}"));
                 }
             }
@@ -1007,6 +1040,7 @@ pub(crate) fn native_cell(
                 }
             },
         };
+    value["checks"] = json!(display.checks());
     let mut shown = notice
         .map(|notice| format!("[{notice}]\n"))
         .unwrap_or_default();

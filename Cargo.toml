@@ -107,6 +107,8 @@ futures = "0.3"
 xxhash-rust = { version = "0.8", features = ["xxh64", "xxh32"] }
 brush-core = "0.5"
 brush-builtins = "0.2"
+# Embedded ECMAScript engine (QuickJS-ng) for `eval` JavaScript when no Node runtime is installed.
+rquickjs = "0.14"
 # Desktop control (computer tool): platform crates pinned to known-good versions.
 ashpd = { version = "=0.11.1", default-features = false, features = ["tokio"] }
 atspi = { version = "=0.30.0", features = ["tokio", "zbus"] }
@@ -145,13 +147,15 @@ undocumented_unsafe_blocks = "deny"
 workspace = true
 
 [features]
-default = ["aws", "voice", "embedded-shell", "desktop"]
+default = ["aws", "voice", "embedded-shell", "embedded-js", "desktop"]
 # AWS credential chain (env, profiles, SSO, process, web identity, ECS/IMDS) and SigV4 for Bedrock.
 # Bearer-key Bedrock works without it; SigV4 without it fails with a clear error.
 aws = ["dial-llm/aws"]
 voice = ["dial-tools/voice"]
 # Built-in POSIX shell for the `bash` tool (`shell.backend = "embedded"`); brush shell language plus coreutils builtins.
 embedded-shell = ["dial-tools/embedded-shell"]
+# Embedded JavaScript engine for `eval` when no Node runtime is installed (QuickJS-ng via rquickjs).
+embedded-js = ["dial-tools/embedded-js"]
 # Native desktop capture, accessibility and input (crates/dial-computer). Browser automation is independent.
 desktop = ["dial-computer/desktop"]
 # Linux Wayland screencast (PipeWire); off by default.

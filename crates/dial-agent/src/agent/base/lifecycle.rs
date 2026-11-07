@@ -10,10 +10,8 @@ fn capability_prose(offered: &[String], discoverable: &[(String, String)]) -> St
         offered.iter().any(|tool| tool.as_str() == name)
             || discoverable.iter().any(|(tool, _)| tool.as_str() == name)
     };
+    // Discovery itself (`tool_search`/`tool_load`) is stated once in the environment section.
     let mut out = String::new();
-    if available("tool_search") {
-        out.push_str("\nWhen a needed capability is missing, `tool_search` by task or domain; prefer an offered specialist over a shell or web substitute.");
-    }
     // Offered web tools are used directly; only loadable ones need loading first, so the model is
     // never told to rediscover a tool already in its schema.
     let offered_tool = |name: &str| offered.iter().any(|tool| tool.as_str() == name);
@@ -29,10 +27,28 @@ fn capability_prose(offered: &[String], discoverable: &[(String, String)]) -> St
         if !loadable.is_empty() {
             steps.push(format!("load {} first", loadable.join(" and ")));
         }
-        out.push_str(&format!("\nFor live web research, {}; cite source URLs and report real search or network failures. Never invent results.", steps.join("; ")));
+        out.push_str(&format!("\nFor live web research, {}; cite source URLs and report real search or network failures rather than inventing results.", steps.join("; ")));
     }
     out
 }
+/// The skills catalog plus one line naming how to load a skill with the tools this prompt offers:
+/// `skill` directly, or `tool_load` for it when only discovery is offered. Decided from the policy
+/// offer, so loading a tool mid-session leaves the cached prefix unchanged.
+fn with_skill_loader(catalog: &str, tools: &[String]) -> String {
+    let has = |name: &str| tools.iter().any(|tool| tool == name);
+    if catalog.trim().is_empty() {
+        return catalog.to_owned();
+    }
+    let loader = if has("skill") {
+        "Load a skill by name with the `skill` tool."
+    } else if has("tool_load") {
+        "To load a skill, first `tool_load` the `skill` tool, then call it with the skill name."
+    } else {
+        return catalog.to_owned();
+    };
+    format!("{}\n{loader}\n", catalog.trim_end())
+}
+
 impl Agent<'_> {
     /// Observe `session_end` as the agent goes away. Hooks cannot block teardown; their notices
     /// are recorded on the session. Called from the `Drop` impl in `compaction_runtime`, after
@@ -669,7 +685,15 @@ impl<'a> Agent<'a> {
             .into_iter()
             .filter(|skill| self.modes.launch.skill_visible(&skill.name))
             .collect();
-        skills::match_hint(&visible, user_text)
+        // The hint names the route this request actually has: the `skill` tool itself, or
+        // `tool_load` to add it. With neither offered there is nothing to act on.
+        let offered = self.offered();
+        let has = |name: &str| offered.iter().any(|tool| tool == name);
+        let skill_offered = has("skill");
+        if !skill_offered && !has("tool_load") {
+            return None;
+        }
+        skills::match_hint(&visible, user_text, skill_offered)
     }
 
     pub(in crate::agent) fn rebuild_system(&mut self) {
@@ -704,6 +728,21 @@ impl<'a> Agent<'a> {
         let built =
             crate::agent::window::prompt::system_messages(crate::agent::window::prompt::Inputs {
                 cwd: self.workspace.root(),
+                runtimes: {
+                    let mut runtimes = String::new();
+                    // Reported whether or not eval is offered: without eval the shell is the only
+                    // place helpers can run, and that is when a wrong-language helper costs most.
+                    if !self.hermetic && self.tool_eligible("bash") {
+                        runtimes.push_str(&tools::exec::shell::interpreter_guidance());
+                    }
+                    if !self.hermetic && self.tool_eligible("eval") {
+                        runtimes.push_str(&tools::exec::eval::runtime_guidance(
+                            self.workspace.root(),
+                            self.config,
+                        ));
+                    }
+                    runtimes
+                },
                 harness: &self.version.harness,
                 edit_mode: self.edit_mode(),
                 soul: self.parts.soul.clone(),
@@ -714,7 +753,7 @@ impl<'a> Agent<'a> {
                 {
                     String::new()
                 } else {
-                    self.parts.skills.clone()
+                    with_skill_loader(&self.parts.skills, &policy_tools)
                 },
                 memory: self.parts.memory.clone(),
                 tools: &policy_tools,
@@ -745,9 +784,7 @@ impl<'a> Agent<'a> {
         };
         let mut system = String::new();
         if !self.hermetic {
-            if stable {
-                system.push_str("\nSpecialist and MCP tools are available through tool_search and tool_load; only explicit loads change the callable offer. Catalog results describe current readiness.");
-            } else {
+            if !stable {
                 system.push_str(&capability_prose(&offered, &discoverable));
             }
             if self.catalog().iter().any(|name| name == "mcp_servers") {
@@ -755,17 +792,10 @@ impl<'a> Agent<'a> {
                 // only what the MCP catalog index does not: configuration is not a connection.
                 system.push_str("\nConfigured MCP servers are not connection evidence; mcp_servers reports actual runtime status and registered tools.");
             }
-            if !stable && let Some(servers) = self.ext.mcp_connecting() {
-                system.push_str(&format!("\nMCP servers still connecting: {}. Their tools are not listed yet; tool_search and mcp_servers wait for them.", servers.join(", ")));
-            }
         }
-        if self.plan_mode {
-            system.push_str("\n\nPlan mode: explore using read-only tools and produce a concrete plan. Do not mutate files or execute code. Use exit_plan with your complete plan to request user approval before implementation.");
-        }
-        if let Some(instruction) = self.external_thinking_instruction() {
-            system.push_str("\n\n");
-            system.push_str(instruction);
-        }
+        // Plan mode, the external-thinking instruction and still-connecting MCP servers change
+        // during a session, so they travel as a request-tail notice (`mode_notice`), keeping this
+        // prefix constant.
         // Deferred or disallowed servers do not add instructions to unrelated requests. Loading
         // a tool rebuilds this prefix and restores its server's guidance before the next call.
         if let Some(servers) =
@@ -787,6 +817,33 @@ impl<'a> Agent<'a> {
         self.agents_messages =
             crate::agent::window::prompt::agents_md_messages(&self.parts.context);
         self.system_messages = messages;
+    }
+
+    /// Session modes that can change between requests: plan mode, the external-thinking
+    /// instruction and MCP servers still connecting. They are restated from current state on each
+    /// request as a transient tail notice rather than written into the cached system prefix, so a
+    /// toggle never rewrites that prefix and replay, resume and compaction need no extra record.
+    pub(in crate::agent) fn mode_notice(&self) -> Option<String> {
+        let mut lines = Vec::new();
+        if self.plan_mode {
+            lines.push("Plan mode is on: explore with read-only tools and produce a concrete plan; don't change files or run code yet. Call exit_plan with the complete plan to ask the user for approval before implementing.".to_owned());
+        }
+        if let Some(instruction) = self.external_thinking_instruction() {
+            lines.push(instruction.to_owned());
+        }
+        let stable = self.stable_tool_offer() && self.parts.system_template.is_none();
+        if !self.hermetic
+            && !stable
+            && let Some(servers) = self.ext.mcp_connecting()
+        {
+            lines.push(format!("MCP servers still connecting: {}. Their tools are not listed yet; tool_search and mcp_servers wait for them.", servers.join(", ")));
+        }
+        (!lines.is_empty()).then(|| {
+            format!(
+                "<dial-notice kind=\"session_mode\">\n{}\n</dial-notice>",
+                lines.join("\n")
+            )
+        })
     }
 
     /// Load, compile and validate a custom system-prompt template (`--system-prompt-template`).

@@ -86,7 +86,7 @@ pub fn portable_summary_completion(
             .iter()
             .any(|m| m["dial_compaction_handoff"] == true)
         {
-            Some(backend.compaction_handoff_profile(request.max_tokens))
+            Some(backend.live_summary_profile(request.max_tokens))
         } else {
             backend.compaction_summary_profile(request.max_tokens)
         };
@@ -254,7 +254,7 @@ pub(in crate::agent) fn summary_execution(
     busy: bool,
 ) -> Result<compaction::SummaryExecution> {
     let mut execution = compaction::SummaryExecution {
-        live_handoff: snapshot.role_config.is_none()
+        live_prefix: snapshot.role_config.is_none()
             && !snapshot.archive_migration
             && main.supports_live_handoff()
             && !hooks
@@ -611,6 +611,9 @@ pub struct SpeculationContext<'a> {
     pub fixed_tokens: u64,
     /// False for local/shared compute or a hook that requires exact blocking ownership.
     pub parallel_supported: bool,
+    /// `compaction::native_supported` for the live backend, resolved by the caller that owns it,
+    /// so speculation picks the same method as the blocking path and the preview.
+    pub native_supported: bool,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -926,8 +929,7 @@ impl CompactionRuntime {
             CompactionMethod::Remote => {
                 !skip_remote
                     && policy.remote_enabled
-                    && (policy.remote_endpoint.is_some()
-                        || policy.native_capability(context.identity).is_some())
+                    && (policy.remote_endpoint.is_some() || context.native_supported)
             }
             CompactionMethod::Snapcompact => context.image_input && !focused,
             CompactionMethod::Shake => !focused,
@@ -1170,10 +1172,11 @@ impl CompactionRuntime {
                     result.unwrap_or_else(|_| Err(anyhow::anyhow!("compaction worker panicked")));
                 let native_route = worker_options.method == Some(CompactionMethod::Remote)
                     && worker_snapshot.policy.remote_endpoint.is_none()
-                    && worker_snapshot
-                        .policy
-                        .native_capability(worker_snapshot.context().identity)
-                        .is_some();
+                    && compaction::native_supported(
+                        &backends.main,
+                        &worker_snapshot.policy,
+                        worker_snapshot.context().identity,
+                    );
                 let permanent_native_failure = native_route
                     && !worker_cancel.load(Ordering::SeqCst)
                     && prepared
@@ -1500,11 +1503,11 @@ impl crate::agent::Agent<'_> {
             self.maintenance_has_live_work(),
         )?;
         let side_cache_namespace = main.prompt_cache_key().map(str::to_owned);
-        if execution.live_handoff {
+        if execution.live_prefix {
             if let Some(live) = live_backend {
                 main.copy_cache_namespace_from(live);
             } else {
-                execution.live_handoff = false;
+                execution.live_prefix = false;
             }
         }
         let complete = scoped_summary_completion(

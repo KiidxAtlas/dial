@@ -191,3 +191,55 @@ fn invisible_stream_activity_excludes_keepalives_and_honors_cancellation() {
     ).unwrap_err();
     assert!(error.downcast_ref::<Interrupted>().is_some());
 }
+
+#[test]
+fn keepalives_count_as_progress_while_an_omitted_thinking_block_is_open() {
+    let ping = r#"{"type":"ping"}"#;
+    let start = std::time::Instant::now();
+    let at = |secs| start + std::time::Duration::from_secs(secs);
+    let mut progress = ReplyProgress::default();
+    assert!(progress.advances_at(START, at(0)));
+    assert!(progress.advances_at(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        at(1)
+    ));
+    assert!(
+        progress.advances_at(ping, at(90)),
+        "omitted thinking streams only pings"
+    );
+    assert!(
+        !progress.advances_at(ping, at(1 + OPEN_TOOL_CALL_PATIENCE.as_secs())),
+        "the same bound as an open tool call"
+    );
+    assert!(progress.advances_at(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+        at(700)
+    ));
+    assert!(progress.advances_at(r#"{"type":"content_block_stop","index":0}"#, at(701)));
+    assert!(!progress.advances_at(ping, at(702)), "the block is closed");
+}
+
+#[test]
+fn streamed_refusal_keeps_its_category() {
+    let reply = stream(&[
+        START,
+        r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"bio","explanation":"x"}},"usage":{"output_tokens":0}}"#,
+        STOP,
+    ]);
+    assert_eq!(
+        reply.provider_stop(),
+        Some(crate::llm::ProviderStop::Refusal {
+            category: Some("bio".into())
+        })
+    );
+}
+
+#[test]
+fn documented_context_windows_cover_current_haiku_and_fable() {
+    assert_eq!(
+        documented_context_window("claude-haiku-5-5"),
+        Some(1_000_000)
+    );
+    assert_eq!(documented_context_window("claude-fable-5"), Some(1_000_000));
+    assert_eq!(documented_context_window("claude-haiku-4-5"), Some(200_000));
+}

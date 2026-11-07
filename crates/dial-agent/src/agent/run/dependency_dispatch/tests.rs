@@ -92,9 +92,9 @@ fn independent_prefix_stops_at_first_conflict_or_unknown_effect() {
         call("read", "a"),
         call("write", "c"),
     ];
-    assert_eq!(agent.dependency_wave(&calls).len(), 2);
+    assert_eq!(agent.dependency_wave(&calls).calls.len(), 2);
     let calls = [call("write", "a"), call("bash", "b"), call("write", "c")];
-    assert_eq!(agent.dependency_wave(&calls).len(), 1);
+    assert_eq!(agent.dependency_wave(&calls).calls.len(), 1);
 }
 
 #[test]
@@ -260,7 +260,7 @@ fn checks_close_the_wave_after_the_verified_mutation() {
     let mut last = call("write", "b");
     last.arguments["verify"] = json!(["candidate"]);
     let calls = [call("write", "a"), last, call("write", "c")];
-    assert_eq!(agent.dependency_wave(&calls).len(), 2);
+    assert_eq!(agent.dependency_wave(&calls).calls.len(), 2);
     assert_eq!(
         agent.efficiency_metrics.scheduling.barriers["verification"],
         1
@@ -283,12 +283,13 @@ fn bookkeeping_and_scoped_reads_join_native_groups_but_deliverable_changes_stay_
     let mut todo = call("todo", "unused");
     todo.arguments = json!({"op":"view"});
     let calls = [call("write", "new"), todo, read, search];
-    assert_eq!(agent.dependency_wave(&calls).len(), 4);
+    assert_eq!(agent.dependency_wave(&calls).calls.len(), 4);
     let mut scope = call("working_state", "unused");
     scope.arguments = json!({"action":"patch","deliverables":[]});
     assert_eq!(
         agent
             .dependency_wave(&[calls[0].clone(), scope, calls[2].clone()])
+            .calls
             .len(),
         1
     );
@@ -317,7 +318,7 @@ fn grouped_verification_runs_once_after_all_source_epochs_and_bookkeeping_settle
     last.arguments["verify"] = json!(["candidate"]);
     let calls = [call("write", "a"), todo, last];
     agent.verify_batch.begin(&calls);
-    assert_eq!(agent.dependency_wave(&calls).len(), 3);
+    assert_eq!(agent.dependency_wave(&calls).calls.len(), 3);
     let results = agent.dispatch_dependency_wave(&mut backend(), &calls, &mut NullUi, None);
     for (call, (out, _)) in calls.iter().zip(&results) {
         assert!(!out.is_error, "{}: {}", call.name, out.text);
@@ -339,4 +340,202 @@ fn grouped_verification_runs_once_after_all_source_epochs_and_bookkeeping_settle
         agent.efficiency_metrics.scheduling.groups["native"].sizes[&2],
         1
     );
+}
+
+fn plan(
+    workspace: &Workspace,
+    registry: &crate::tools::integrations::ext::Registry,
+    policy: WavePolicy,
+    calls: &[ToolCall],
+) -> Plan {
+    plan_wave(
+        calls,
+        WaveScope {
+            workspace,
+            mode: crate::config::types::EditMode::default(),
+            registry,
+            hooks: &[],
+            limit: 8,
+        },
+        policy,
+        |call| Ok(call.clone()),
+    )
+}
+
+#[test]
+fn one_wave_admission_applies_the_child_role_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let registry = crate::tools::integrations::ext::Registry::new();
+    let mut todo = call("todo", "unused");
+    todo.arguments = json!({"op":"view"});
+    let calls = [call("write", "a"), todo, call("write", "b")];
+    let parent = plan(&workspace, &registry, WavePolicy::PARENT, &calls);
+    assert_eq!(parent.calls.len(), 3);
+    assert!(parent.dispatchable() && parent.writes());
+    let child = plan(&workspace, &registry, WavePolicy::CHILD, &calls);
+    assert_eq!(child.calls.len(), 1);
+    assert_eq!(child.barrier, "worker_admission");
+
+    let mut verified = call("write", "a");
+    verified.arguments["verify"] = json!(["candidate"]);
+    let calls = [call("write", "b"), verified, call("write", "c")];
+    let parent = plan(&workspace, &registry, WavePolicy::PARENT, &calls);
+    assert_eq!((parent.calls.len(), parent.barrier), (2, "verification"));
+    let child = plan(&workspace, &registry, WavePolicy::CHILD, &calls);
+    assert_eq!((child.calls.len(), child.barrier), (1, "worker_admission"));
+}
+
+#[test]
+fn effect_free_external_reads_form_a_wave_but_pure_read_groups_do_not() {
+    let root = tempfile::tempdir().unwrap();
+    for file in ["a", "b"] {
+        std::fs::write(root.path().join(file), "source").unwrap();
+    }
+    let workspace = Workspace::new(root.path()).unwrap();
+    let mut registry = crate::tools::integrations::ext::Registry::new();
+    for tool in crate::tools::net::web::tools(&Config::default()) {
+        registry.try_register(tool).unwrap();
+    }
+    let fetch = |url: &str| ToolCall {
+        id: url.into(),
+        name: "web_fetch".into(),
+        arguments: json!({"url":url}),
+        malformed_arguments: false,
+    };
+    let fetches = plan(
+        &workspace,
+        &registry,
+        WavePolicy::PARENT,
+        &[
+            fetch("https://a.example"),
+            fetch("https://b.example"),
+            call("read", "a"),
+        ],
+    );
+    assert_eq!(fetches.calls.len(), 3);
+    assert!(fetches.external() && !fetches.writes() && fetches.dispatchable());
+    let child = plan(
+        &workspace,
+        &registry,
+        WavePolicy::CHILD,
+        &[fetch("https://a.example"), fetch("https://b.example")],
+    );
+    assert!(child.dispatchable());
+    let reads = plan(
+        &workspace,
+        &registry,
+        WavePolicy::PARENT,
+        &[call("read", "a"), call("read", "b")],
+    );
+    assert_eq!(reads.calls.len(), 2);
+    assert!(
+        !reads.dispatchable(),
+        "pure reads keep the parallel-read path"
+    );
+}
+
+/// An approval-gated, workspace-inert tool: both calls must be in flight at once to succeed.
+struct Rendezvous {
+    name: &'static str,
+    arrived: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+}
+impl crate::tools::integrations::ext::Tool for Rendezvous {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"function","function":{"name":self.name,"parameters":{"type":"object","properties":{"url":{"type":"string"}}}}})
+    }
+    fn needs_approval(&self, _: &Value) -> bool {
+        true
+    }
+    fn may_modify_workspace(&self, _: &Value) -> bool {
+        false
+    }
+    fn concurrency(&self, _: &Value) -> crate::tools::integrations::ext::Concurrency {
+        crate::tools::integrations::ext::Concurrency::Shared
+    }
+    fn resources(
+        &self,
+        _: &Workspace,
+        _: &Value,
+    ) -> Option<crate::tools::surface::resources::Access> {
+        Some(Default::default())
+    }
+    fn call(&self, _: &crate::tools::integrations::ext::ToolContext, _: &Value) -> ToolOutput {
+        let (count, ready) = &*self.arrived;
+        let mut arrived = count.lock().unwrap();
+        *arrived += 1;
+        ready.notify_all();
+        let (arrived, timeout) = ready
+            .wait_timeout_while(arrived, Duration::from_secs(5), |arrived| *arrived < 2)
+            .unwrap();
+        if timeout.timed_out() {
+            ToolOutput::err(format!("ran alone ({} arrived)", *arrived))
+        } else {
+            ToolOutput::ok("fetched".into())
+        }
+    }
+}
+
+#[derive(Default)]
+struct Approvals(Vec<String>);
+impl Ui for Approvals {
+    fn approve(&mut self, tool: &str, _summary: &str) -> crate::agent::ui::surface::Decision {
+        self.0.push(tool.to_owned());
+        if tool == "fetch_denied" {
+            crate::agent::ui::surface::Decision::Deny
+        } else {
+            crate::agent::ui::surface::Decision::Allow
+        }
+    }
+}
+
+#[test]
+fn authorized_external_reads_run_together_and_a_denied_one_never_starts() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = agent(&config, root.path());
+    agent.hermetic = false;
+    agent.approval = crate::config::types::Approval::Ask;
+    let arrived = Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
+    for name in ["fetch_ok", "fetch_denied"] {
+        agent
+            .ext
+            .try_register(Arc::new(Rendezvous {
+                name,
+                arrived: arrived.clone(),
+            }))
+            .unwrap();
+    }
+    let fetch = |id: &str, name: &str| ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: json!({"url":"https://example.test"}),
+        malformed_arguments: false,
+    };
+    let calls = [
+        fetch("first", "fetch_ok"),
+        fetch("denied", "fetch_denied"),
+        fetch("second", "fetch_ok"),
+    ];
+    let plan = agent.dependency_wave(&calls);
+    assert_eq!(plan.calls.len(), 3);
+    assert!(plan.dispatchable() && plan.external());
+    let mut ui = Approvals::default();
+    let results = agent.dispatch_dependency_wave(&mut backend(), &calls, &mut ui, None);
+    assert_eq!(
+        ui.0,
+        ["fetch_ok", "fetch_denied", "fetch_ok"],
+        "serial, model-order approval"
+    );
+    assert_eq!(results[0].0.text, "fetched");
+    assert_eq!(results[2].0.text, "fetched");
+    assert!(results[1].0.is_error);
+    assert_eq!(
+        results[1].0.execution.status,
+        Some(tools::ToolStatus::Blocked)
+    );
+    assert_eq!(*arrived.0.lock().unwrap(), 2, "the denied call never ran");
 }

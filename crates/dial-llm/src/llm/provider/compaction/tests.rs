@@ -260,3 +260,159 @@ fn native_supplemental_context_is_user_data_once_and_never_retained() {
         }
     }
 }
+
+#[test]
+fn anthropic_native_compaction_requests_carry_cache_breakpoints() {
+    use crate::llm::fake;
+    let server = fake::serve(vec![fake::json(
+        200,
+        &json!({"stop_reason":"compaction","content":[{"type":"compaction","content":"signed summary","signature":"sig"}],
+            "usage":{"input_tokens":3,"cache_read_input_tokens":900,"output_tokens":20}}),
+    )]);
+    let mut backend = Backend::new(
+        ProviderKind::AnthropicEndpoint {
+            base_url: server.url.clone(),
+            model: "claude-test".into(),
+            api_key: None,
+        },
+        Default::default(),
+        5,
+    );
+    backend.protocol = Some(llm::model_config::ApiProtocol::Anthropic);
+    let messages = vec![
+        llm::prompt::system(llm::prompt::Band::Stable, "host policy"),
+        llm::prompt::system(llm::prompt::Band::Dynamic, "turn notes"),
+        json!({"role":"user","content":"old user"}),
+        json!({"role":"assistant","content":"old answer"}),
+        json!({"role":"user","content":"retained user"}),
+    ];
+    let request = Chat {
+        messages,
+        tools: vec![
+            json!({"type":"function","function":{"name":"read","parameters":{"type":"object"}}}),
+        ],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let reply = backend
+        .compact_native(
+            NativeCompactionRequest {
+                request: &request,
+                capability: Some(NativeCompactionCapability::Anthropic),
+                streaming_v2: false,
+                retained_user_budget: 128,
+                first_kept: 4,
+                instructions: "summarize",
+            },
+            5,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+    assert_eq!(reply.reply.cached_prompt_tokens, Some(900));
+    let body = fake::body(&server.requests()[0]);
+    assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert!(body["system"][1].get("cache_control").is_none());
+    assert!(!body.to_string().contains("dial_prompt_band"));
+    let history = body["messages"].as_array().unwrap();
+    assert!(
+        history
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("cache_control")
+    );
+}
+
+/// The cache-reading contract of a live-prefix summary on Anthropic Messages: the summary request
+/// is the live request's wire body with one instruction appended to the last user message, and
+/// every control that keys the cache (system, tools, `tool_choice`, thinking, effort) unchanged.
+#[test]
+fn live_summary_request_is_the_live_anthropic_wire_prefix_plus_one_instruction() {
+    let model = "claude-opus-5-5";
+    let mut live_profile = ModelProfile::minimal("anthropic", model);
+    live_profile.capabilities.parallel_tool_calls = Some(true);
+    let backend = Backend::new(
+        ProviderKind::AnthropicEndpoint {
+            base_url: "https://api.anthropic.com/v1".into(),
+            model: model.into(),
+            api_key: Some("anth-secret".into()),
+        },
+        Default::default(),
+        5,
+    )
+    .with_profile(live_profile.clone());
+    assert!(backend.supports_live_handoff());
+    let live = Chat {
+        messages: vec![
+            llm::prompt::system(llm::prompt::Band::Stable, "host policy"),
+            json!({"role":"user","content":"fix the parser"}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"src/parse.rs\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"c1","content":"fn parse() {}"}),
+        ],
+        tools: vec![
+            json!({"type":"function","function":{"name":"read","description":"r","parameters":{"type":"object","properties":{}}}}),
+        ],
+        temperature: 0.0,
+        max_tokens: 32_000,
+        seed: None,
+    };
+    let mut summary = live.clone();
+    summary.max_tokens = 4_096;
+    summary.messages.push(
+        json!({"role":"user","dial_transient":true,"dial_compaction_handoff":true,
+        "content":"[Harness maintenance: return only the requested summary.]"}),
+    );
+    let wire = |request: &Chat, profile: &ModelProfile| {
+        let mut body =
+            super::super::anthropic_request_body(model, request, false, Some(profile)).unwrap();
+        llm::anthropic_cache::apply(
+            &mut body,
+            Some(profile),
+            false,
+            llm::anthropic_cache::Level::Full,
+        );
+        body
+    };
+    let live_body = wire(&live, &live_profile);
+    let summary_body = wire(&summary, &backend.live_summary_profile(summary.max_tokens));
+    for key in [
+        "system",
+        "tools",
+        "tool_choice",
+        "thinking",
+        "output_config",
+    ] {
+        assert_eq!(live_body.get(key), summary_body.get(key), "{key}");
+    }
+    assert_ne!(live_body["max_tokens"], summary_body["max_tokens"]);
+    let live_messages = live_body["messages"].as_array().unwrap();
+    let summary_messages = summary_body["messages"].as_array().unwrap();
+    // Every live wire message, cache breakpoints included, is sent again byte-identical: the
+    // summary reads the exact entries the live turn wrote. The instruction is one more user
+    // message after them, and as a transient suffix it never carries a breakpoint.
+    assert_eq!(summary_messages.len(), live_messages.len() + 1);
+    assert_eq!(summary_messages[..live_messages.len()], live_messages[..]);
+    assert!(
+        live_messages
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("cache_control")
+    );
+    let instruction = summary_messages.last().unwrap();
+    assert_eq!(instruction["role"], "user");
+    assert!(
+        instruction
+            .to_string()
+            .contains("return only the requested summary")
+    );
+    assert!(!instruction.to_string().contains("cache_control"));
+    // The Handoff profile's forced `tool_choice: none` would invalidate the cached messages.
+    let forced = wire(
+        &summary,
+        &backend.compaction_handoff_profile(summary.max_tokens),
+    );
+    assert_ne!(forced["tool_choice"], live_body["tool_choice"]);
+}

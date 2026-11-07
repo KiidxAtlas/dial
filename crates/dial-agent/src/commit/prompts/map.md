@@ -21,7 +21,7 @@ Exclude: import reordering, whitespace/formatting, comment-only changes, debug s
 </scope>
 
 <output_format>
-You MUST return the result in this format WITHOUT the fences:
+Return the result in this format, without the fences:
 ```
 # src/config.rs
 - added TOML configuration loading

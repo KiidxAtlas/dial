@@ -17,6 +17,9 @@ const MAX_ROUND_EVIDENCE: usize = 6;
 const MAX_ROUND_REVIEWS: u32 = 24;
 const MAX_NOTE_CHARS: usize = 600;
 /// Whether this change qualifies for completion review. The caller decides whether review is on.
+/// A change qualifies through uncheckpointed effects, `min_changed_files`, a sensitive path, or
+/// operator-declared requirements that lack current observed evidence. Having no declared
+/// requirements is the ordinary case, so it does not select every small change on its own.
 fn selected_review(
     config: &crate::config::types::IndependentReviewConfig,
     paths: &[String],
@@ -24,8 +27,7 @@ fn selected_review(
     evidence: &Value,
 ) -> bool {
     uncheckpointed
-        || (!paths.is_empty()
-            && evidence["requirements"]["coverage"] != "declared_requirements_observed")
+        || (!paths.is_empty() && evidence["requirements"]["coverage"] == "requirements_uncovered")
         || paths.len() >= config.min_changed_files
         || paths.iter().any(|path| {
             config.sensitive_paths.iter().any(|prefix| {

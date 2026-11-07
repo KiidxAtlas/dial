@@ -273,10 +273,14 @@ fn peer_resume_calls_provider_without_drafting_expanding_files_or_replacing_user
     assert!(text.contains(TASK));
     assert!(text.contains("@peer-only.txt"));
     assert!(text.contains("untrusted data"));
+    assert!(
+        text.contains(r#"<dial-notice kind=\"peer_context\">"#),
+        "peer continuation uses the shared notice envelope"
+    );
     assert!(!text.contains("ATTACHMENT_MUST_NOT_EXPAND_749"));
     assert_ne!(
         body["messages"][0]["content"],
-        crate::agent::prompts::turn_drafter::SYSTEM
+        crate::agent::prompts::turn_drafter::system(false)
     );
 }
 

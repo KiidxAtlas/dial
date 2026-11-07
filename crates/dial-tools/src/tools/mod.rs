@@ -26,7 +26,9 @@ use crate::config::tools::EditSettings;
 
 use crate::config::tools::BUILTIN;
 
-macro_rules! notebook_edit_description {($description:literal)=>{concat!($description,"\nNotebooks: ordinary .ipynb reads expose cell source as # %% [code|markdown|raw] cell:N (zero-based). Keep indexed markers to retain authentic cells; unindexed # %% markers create cells. Preserve source-literal marker lines with one extra %, e.g. # %%%. All edit modes operate on this projection and retain untouched raw JSON metadata, number lexemes and outputs; changed code cells clear stale outputs/execution counts. Metadata-only changes invalidate witnesses. Read :raw for literal JSON; whole-file write requires actual JSON, not the source projection. Notebook moves/deletes need complete relevant source witnesses.")};}
+/// How every edit grammar treats `.ipynb` files. It is shown with notebook reads and failed notebook
+/// edits rather than in every `edit` schema.
+pub const NOTEBOOK_EDIT_NOTE: &str = "Notebooks: ordinary .ipynb reads expose cell source as # %% [code|markdown|raw] cell:N (zero-based). Keep indexed markers to retain authentic cells; unindexed # %% markers create cells. Preserve source-literal marker lines with one extra %, e.g. # %%%. All edit modes operate on this projection and retain untouched raw JSON metadata, number lexemes and outputs; changed code cells clear stale outputs/execution counts. Metadata-only changes invalidate witnesses. Read :raw for literal JSON; whole-file write requires actual JSON, not the source projection. Notebook moves/deletes need complete relevant source witnesses.";
 
 pub mod code;
 pub mod edit;
@@ -1313,8 +1315,7 @@ a `[PATH#TAG]` header then `LINE:TEXT` rows; edit needs that TAG and may touch o
 
 const HASHLINE_WRITE_DESC: &str = "write: create a new file or replace one whose content changes almost entirely. Max 1 MiB; parent directories are created. Replacing an existing file requires reading all of it first; for changes to an existing file use edit (one call carries every operation) instead of regenerating it. Content must be complete, never a placeholder; do not also paste it into chat. Notebooks take literal JSON. Copied read prefixes are stripped; truncated projections are refused. Returns the fresh `[PATH#TAG]`.";
 
-const HASHLINE_EDIT_DESC: &str = notebook_edit_description!(
-    r#"edit: change existing files with a line-anchored patch in `input`; whole files use write.
+const HASHLINE_EDIT_DESC: &str = r#"edit: change existing files with a line-anchored patch in `input`; whole files use write.
 `input` holds sections: a header `[PATH#TAG]` (TAG from that file's latest read, edit or write), then operations. Line numbers refer to THAT snapshot, never to earlier operations in the call; touch only lines a read has shown.
 PUT N.=M:  replace lines N..M with the `+` rows that follow (N.=N for one line)
 PUT <N:    insert before line N (PUT <1: = top of file)
@@ -1326,8 +1327,7 @@ REM        delete the file;  MV new/path  move/rename it (after any edits)
 Rows: `+` then the exact text with indentation; a lone `+` is a blank line; text starting with + or - is `++x`/`+-x`. Rows are final text; never write `-` rows.
 Move code: `CUT 3.=5 @tmp` then `PUT >9 @tmp` (across files too; `PUT N.=M @tmp` replaces; without @name one anonymous register).
 Example: `[src/main.rs#3FA9]` then `PUT 4.=4:` and `+    let total = a + b;` on separate lines.
-One section per file; put every planned change to every file in one call. Success returns the fresh [PATH#TAG] and changed lines. If the file changed since your read, edits re-anchor when their lines are unchanged; otherwise you get the current lines to retry."#
-);
+One section per file; put every planned change to every file in one call. Success returns the fresh [PATH#TAG] and changed lines. If the file changed since your read, edits re-anchor when their lines are unchanged; otherwise you get the current lines: after a stale-anchor failure, re-read the target range (or use those lines and their new TAG) before retrying."#;
 
 const REPLACE_READ_DESC: &str = "read: view a file or directory in any format (text, CSV, PDF, Office, \
 images, video, notebooks, archives). Ranges as a path suffix: `:50-100`, `:50+150`, `:50-`, `:-60`, \
@@ -1351,6 +1351,8 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                     "offset": {"type": "integer", "minimum": 1, "description": "1-based line to start at (default 1); not together with a path selector."},
                     "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of lines (default 2000)."},
                     "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Several targets, each with its own selector, read in one call; use instead of path."},
+                    "format": {"type":"string","enum":["text","base64"],"description":"Lossless local data, at most 1 MiB, in data.content; text output is a receipt. No selectors."},
+                    "retain": {"type":"boolean","description":"With format: preserve exact source bytes as an artifact before recovery operations."},
                 }),
                 &[],
             );
@@ -1371,6 +1373,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
             json!({
                 "path": {"type": "string", "description": "Workspace-relative file path or an `ssh://host/path` remote file (requires approval)."},
                 "content": {"type": "string", "description": "Full file content."},
+                "encoding": {"type":"string","enum":["base64"],"description":"Create a new binary file from base64, at most 1 MiB; parent must exist; never overwrite."},
                 "allow_syntax_errors": {"type": "boolean", "description": "Set true only when valid code is refused for new syntax errors (parser dialect gap)."},
                 "verify": edit::editing::verify_property(),
             }),
@@ -1419,12 +1422,14 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         "bash" => tool_schema(
             "bash",
             if cfg!(windows) {
-                "bash: run a shell command. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. Uses Git for Windows bash when installed, otherwise Dial's built-in bash-compatible shell (PowerShell only with `shell.backend = \"powershell\"`). Windows has no isolation: execution requires `sandbox.mode = \"off\"` and runs with the user's privileges. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside."
+                "bash: run a shell command. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. Uses Git for Windows bash when installed, otherwise Dial's built-in bash-compatible shell (PowerShell only with `shell.backend = \"powershell\"`). Windows has no isolation: execution requires `sandbox.mode = \"off\"` and runs with the user's privileges. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
             } else {
-                "bash: run a shell command with `/bin/bash -c`. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. May be sandboxed: writes confined to the project, network possibly blocked, temp files in `$TMPDIR`. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside."
+                "bash: run a shell command with `/bin/bash -c`. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. May be sandboxed: writes confined to the project, network possibly blocked, temp files in `$TMPDIR`. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
             },
             json!({
                 "command": {"type": "string", "description": "Shell command to run."},
+                "check": {"type":"boolean", "description":"This foreground command is an acceptance check: record its actual exit status as verification. Preserve failures (no || echo or trailing successful command); use assertions or cmp -s for generated artifacts. Omit for ordinary commands."},
+                "check_paths": {"type":"array","items":{"type":"string"},"maxItems":32,"description":"Files this check exercises. A passing foreground check releases rewrite pressure only for these paths."},
                 "cwd": {"type": "string", "description": "Working directory: relative to the workspace root, or absolute in an added root. Defaults to the root; do not prefix `cd <root> &&`."},
                 "session": {"type":"string", "description":"Embedded backend only: keep cwd and exported variables across commands with the same session name."},
                 "pty": {"type": "boolean", "description": "Start as a terminal `bg` job (default false). Incompatible with session and timeout."},
@@ -1467,6 +1472,15 @@ pub fn read_tool_streaming(
     read_streaming(ws, args, cancel, budget, None)
 }
 
+/// Preserve bounded, authorized task inputs without declaring workspace edits.
+pub fn preserve_task_inputs(
+    ws: &Workspace,
+    checkpoints: &crate::storage::checkpoint::Checkpoints,
+    turn: u64,
+) -> Value {
+    fs::data_io::preserve_inputs(ws, checkpoints, turn)
+}
+
 /// Whether a legacy media target requires explicit external-process approval.
 pub fn media_read_needs_approval(path: &str) -> bool {
     fs::media::needs_approval(path)
@@ -1493,6 +1507,12 @@ fn read_streaming(
         return ToolOutput::err("tool arguments must be a JSON object");
     }
     exec::execution::run(cancel, || {
+        if args.get("format").is_some() {
+            return fs::data_io::read(ws, args).unwrap_or_else(ToolOutput::err);
+        }
+        if args.get("retain").is_some() {
+            return ToolOutput::err("retain requires a data read format");
+        }
         if let Some(result) = fs::media::read(ws, args, cancel, context) {
             return result.unwrap_or_else(ToolOutput::err);
         }
@@ -1740,6 +1760,14 @@ pub fn write_with_context(
     repair: Option<edit::syntax::RepairCallback<'_>>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
+    if let Some(encoding) = args.get("encoding") {
+        if encoding != "base64" {
+            return ToolOutput::err("write encoding must be base64 when supplied");
+        }
+        return exec::execution::run(cancel, || {
+            fs::data_io::write(ctx, args, cancel).unwrap_or_else(ToolOutput::err)
+        });
+    }
     if let Some(path) = args
         .get("path")
         .and_then(Value::as_str)
@@ -1814,12 +1842,16 @@ fn dispatch(
         return Err("tool arguments must be a JSON object".to_string());
     }
     match name {
+        "read" if args.get("format").is_some() => fs::data_io::read(ws, args),
         "read" => match fs::media::read(ws, args, &std::sync::atomic::AtomicBool::new(false), None)
         {
             Some(result) => result,
             None => fs::files::read_tool(ws, args).map(ToolOutput::ok),
         },
         "write" => {
+            if args.get("encoding").is_some() {
+                return Err("binary writes require controller mutation admission".into());
+            }
             if let Err(error) = req_str(args, "path")
                 .map_err(io::Error::other)
                 .and_then(|path| ws.resolve_checked(path))

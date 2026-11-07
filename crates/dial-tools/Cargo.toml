@@ -17,6 +17,7 @@ bigdecimal.workspace = true
 time.workspace = true
 brush-builtins = { workspace = true, optional = true }
 brush-core = { workspace = true, optional = true }
+rquickjs = { workspace = true, optional = true }
 csv.workspace = true
 encoding_rs.workspace = true
 fancy-regex.workspace = true
@@ -75,10 +76,12 @@ rars = { workspace = true, features = ["write"] }
 sevenz-rust2 = { workspace = true, features = ["compress"] }
 
 [features]
-default = ["voice", "embedded-shell"]
+default = ["voice", "embedded-shell", "embedded-js"]
 voice = ["dep:cpal"]
 # Built-in POSIX shell for the `bash` tool (`shell.backend = "embedded"`); brush shell language plus coreutils builtins.
 embedded-shell = ["dep:brush-core", "dep:brush-builtins"]
+# Embedded JavaScript engine for `eval` JavaScript when no Node runtime is installed (QuickJS-ng).
+embedded-js = ["dep:rquickjs"]
 # Test helpers used by other crates' tests (`#[cfg(test)]` items compiled only for this crate otherwise).
 test-support = []
 

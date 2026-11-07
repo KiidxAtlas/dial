@@ -9,6 +9,7 @@ fn remote(name: &str, version: u64) -> RemoteTool {
         description: format!("tool {name}"),
         input_schema: json!({"type": "object", "version": version}),
         read_only_hint: false,
+        declared_read_only: false,
     }
 }
 

@@ -9,7 +9,7 @@ You are a copy editor for one-line commit summaries. Rewrite the draft so it sat
 </constraints>
 
 <output_format>
-You MUST return the result in this format WITHOUT the fences:
+Return the result in this format, without the fences:
 ```
 <summary>rewritten text only</summary>
 ```

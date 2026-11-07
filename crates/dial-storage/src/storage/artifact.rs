@@ -214,6 +214,29 @@ impl ArtifactStore {
         }
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
+    /// Open an immutable retained byte artifact with an explicit allocation cap.
+    pub fn exact_bytes(&self, uri: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        ensure!(
+            max_bytes <= 64 * 1024 * 1024,
+            "artifact byte cap exceeds 64 MiB"
+        );
+        let mut file = self.open(uri)?;
+        let meta = file.metadata()?;
+        ensure!(
+            meta.is_file() && meta.len() <= max_bytes as u64,
+            "artifact exceeds the exact-byte cap"
+        );
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= max_bytes,
+            "artifact grew beyond the exact-byte cap"
+        );
+        Ok(bytes)
+    }
+
     pub fn retrieve_bytes(&self, uri: &str, offset: u64, count: usize) -> Result<String> {
         use std::io::{Seek, SeekFrom};
         ensure!((1..=16384).contains(&count), "bytes must be 1..16384");

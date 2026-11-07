@@ -87,12 +87,18 @@ fn selective_review_matches_thresholds_and_path_components() {
     ));
     assert!(!selected_review(&config, &[], false, &json!({})));
     assert!(selected_review(&config, &[], true, &covered));
-    assert!(selected_review(
-        &config,
-        &["result.csv".into()],
-        false,
-        &json!({})
-    ));
+    // No declared requirements: one changed file stays below `min_changed_files`.
+    for evidence in [
+        json!({}),
+        json!({"requirements":{"coverage":"not_independently_assessed"}}),
+    ] {
+        assert!(!selected_review(
+            &config,
+            &["result.csv".into()],
+            false,
+            &evidence
+        ));
+    }
     assert!(selected_review(
         &config,
         &["result.csv".into()],

@@ -10,9 +10,9 @@ pub(crate) const HANDOFF_UPDATE: &str = "Integrate the earlier work in <previous
 
 pub(crate) const TURN_PREFIX_PROMPT: &str = "The current turn is too large to retain whole; its recent suffix is retained verbatim after this summary. Summarize the turn prefix in <conversation> so the retained suffix can be understood.\n\nUse exactly:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Preserve exact file paths, function names, error messages, relevant tool outputs and command results. Output only the structured summary, with no extra text.";
 
-pub(crate) const BRANCH_PROMPT: &str = r#"You MUST create a structured summary of the conversation branch for context when returning.
+pub(crate) const BRANCH_PROMPT: &str = r#"Create a structured summary of this conversation branch, so its context is available after returning to the main conversation.
 
-You MUST use EXACT format:
+Use exactly this format so the work can be resumed from it:
 
 ## Goal
 

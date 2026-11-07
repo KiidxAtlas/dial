@@ -557,4 +557,40 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "When the latest user request begins with run, launch, start, execute or play and names an existing workspace path, refuse completion until a bash or bg run naming that path was observed to stay running or exit zero after the last edit. Lexical and narrow; process evidence, not behavior verification. Grants no execution permission.",
         Kind::Bool,
     ),
+    field!(
+        "eval.portable_helpers",
+        eval.portable_helpers,
+        TO,
+        "JavaScript code mode",
+        "Portable eval helpers",
+        "Install portable data and binary helpers in new JavaScript/Python namespaces. Disable in a fresh session to measure the native tool bridge alone.",
+        Kind::Bool
+    ),
+    field!(
+        "verification.auto_registered_checks",
+        verification.auto_registered_checks,
+        TO,
+        "Verification",
+        "Automatic registered helpers",
+        "Rerun explicitly model-registered acceptance helpers once after settled mutation batches through normal shell approval. Helper outcomes remain separate from configured/task acceptance. Disable for an ablation.",
+        Kind::Bool
+    ),
+    field!(
+        "eval.auto_offer",
+        eval.auto_offer,
+        TO,
+        "JavaScript code mode",
+        "Offer eval directly",
+        "Offer usable eval in the core tool surface. Disable for a fresh-session exposure ablation; explicit loads still work.",
+        Kind::Bool
+    ),
+    field!(
+        "eval.parallel_batches",
+        eval.parallel_batches,
+        TO,
+        "JavaScript code mode",
+        "Parallel eval batches",
+        "Run eligible read-only eval batch entries together through the shared scheduler. Disable to retain ordered serial execution for an ablation.",
+        Kind::Bool
+    ),
 ];

@@ -409,6 +409,12 @@ fn background_flag_overrides_the_automatic_threshold() {
 fn automatic_mode_yields_only_after_the_threshold() {
     let automatic = BackgroundPolicy::from_args(&json!({}), 3600).unwrap();
     assert!(!automatic.should_yield());
+    let due = BackgroundPolicy::from_args(&json!({}), 1).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    assert!(due.should_yield());
+    // Zero is the default and means "never hand off automatically", as for `bash`.
+    let disabled = BackgroundPolicy::from_args(&json!({}), 0).unwrap();
+    assert!(!disabled.should_yield());
 }
 
 #[test]

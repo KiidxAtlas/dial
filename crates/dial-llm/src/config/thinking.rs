@@ -92,6 +92,44 @@ pub fn install_thinking_profile(mut config: Config, profile: ModelProfile) -> Re
     Ok(config)
 }
 
+/// Explicit native Anthropic output effort, independent of whether thinking is disabled.
+/// Other protocols retain their existing thinking/effort coupling.
+pub fn apply_output_effort(config: Config, effort: ReasoningEffort) -> Result<Config> {
+    anyhow::ensure!(
+        config.selection().provider == "anthropic",
+        "--effort is an independent output control for native Anthropic models; use --thinking for other protocols"
+    );
+    let mut profile = reasoning_profile(&config)?
+        .ok_or_else(|| anyhow!("--effort needs declared model capabilities"))?;
+    // Off may create a minimal CLI-only profile. Recover exact catalog facts, not name guesses.
+    if profile.capabilities.reasoning_efforts.is_empty()
+        && config
+            .model_profile
+            .as_deref()
+            .is_some_and(|name| name.starts_with("__cli_thinking_"))
+    {
+        let identity = format!("anthropic/{}", config.selection().model);
+        if let Some(model) = crate::llm::catalog::model_capabilities(&identity) {
+            profile.capabilities.reasoning_efforts = model.thinking_efforts;
+        }
+    }
+    if profile.thinking == Some(false)
+        && matches!(effort, ReasoningEffort::Xhigh | ReasoningEffort::Max)
+        && let Some(record) = crate::llm::catalog::bundled_model("anthropic", &profile.model)
+    {
+        use crate::llm::catalog::ModelFact;
+        anyhow::ensure!(
+            !record.has(ModelFact::ThinkingOffBetweenTools)
+                && !record.has(ModelFact::ThinkingOffUpToHigh),
+            "this model's thinking-off mode accepts effort only up to high; enable thinking or lower --effort"
+        );
+    }
+    profile.reasoning_effort = Some(effort);
+    let mut config = install_thinking_profile(config, profile)?;
+    config.thinking_auto = false;
+    Ok(config)
+}
+
 pub fn apply_thinking(mut config: Config, level: CliThinking) -> Result<Config> {
     let Some(effort) = level.reasoning_effort() else {
         // `auto` is stored, not applied: each user turn's effort is judged from its prompt.
@@ -109,6 +147,14 @@ pub fn apply_thinking(mut config: Config, level: CliThinking) -> Result<Config> 
             // profile, not an inferred capability for enabling thinking on an unknown model.
             let mut profile = ModelProfile::minimal(&selection.provider, &selection.model);
             profile.thinking = Some(false);
+            if selection.provider == "anthropic"
+                && let Some(model) = crate::llm::catalog::model_capabilities(&format!(
+                    "anthropic/{}",
+                    selection.model
+                ))
+            {
+                profile.capabilities.reasoning_efforts = model.thinking_efforts;
+            }
             profile.capabilities.reasoning = if selection.provider == "anthropic" {
                 ReasoningApi::AnthropicBudget
             } else {

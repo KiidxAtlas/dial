@@ -40,7 +40,7 @@ fn first_failure_preserves_the_diagnostic_and_adds_compact_recovery_for_any_tool
                 false
             });
         assert!(output.text.starts_with(&diagnostic));
-        assert!(output.text.contains("[Dial recovery:"));
+        assert!(output.text.contains("<dial-notice kind="));
         let uncertain = output.execution.effects == Effects::Unknown;
         assert!(output.text.contains(FIRST_FAILURE), "{name}");
         assert_eq!(stop.is_some(), uncertain);
@@ -65,12 +65,12 @@ fn repeated_failure_keeps_feedback_compact_and_success_resets_the_counter() {
         output.text
     };
     let first = settle("read", ToolOutput::err("missing file: a.rs"));
-    assert!(first.contains("[Dial recovery: tool_failure] ") && first.contains(FIRST_FAILURE));
+    assert!(first.contains("<dial-notice kind=\"tool_failure\">") && first.contains(FIRST_FAILURE));
     // Another tool's failure is its own first failure.
     assert!(settle("grep", ToolOutput::err("bad regex")).contains(FIRST_FAILURE));
     let second = settle("read", ToolOutput::err("missing file: b.rs"));
     assert!(
-        second.contains("[Dial recovery: tool_failure] "),
+        second.contains("<dial-notice kind=\"tool_failure\">"),
         "{second}"
     );
     assert!(second.contains(FIRST_FAILURE));
@@ -107,7 +107,7 @@ fn parent_and_worker_settlement_produce_identical_feedback_bytes() {
     };
     let (parent, worker) = (run(), run());
     assert_eq!(parent, worker);
-    assert!(parent[0].contains("[Dial recovery: source_or_call_contract] "));
+    assert!(parent[0].contains("<dial-notice kind=\"source_or_call_contract\">"));
     assert!(parent[3].contains("3 times in a row"));
 }
 #[test]

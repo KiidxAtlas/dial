@@ -5,6 +5,7 @@ use crate::agent::*;
 
 #[cfg(test)]
 mod image_question_tests;
+pub(in crate::agent) mod result_budget;
 pub(in crate::agent::run) mod search_index;
 #[cfg(test)]
 mod search_tests;
@@ -13,6 +14,7 @@ mod working_state;
 mod working_state_tests;
 
 mod background;
+#[derive(Clone)]
 enum DispatchMode {
     Foreground,
     Background { name: Option<String> },
@@ -25,6 +27,7 @@ struct DispatchAdmission<'a> {
     read_reuse: Option<&'a crate::agent::workflow::investigation::ReadReuse>,
 }
 
+#[derive(Clone)]
 struct CallbackSource<'a> {
     owner: &'a str,
     provenance: crate::agent::safety::approval::CallProvenance,
@@ -143,14 +146,15 @@ fn listing_output(
 /// Attach advisory prerequisites without changing eligibility, activation or approval.
 fn discovery_readiness(
     entry: &mut Value,
+    workspace: &std::path::Path,
     config: &Config,
     registry: &crate::tools::integrations::ext::Registry,
 ) {
     let Some(name) = entry["name"].as_str() else {
         return;
     };
-    let readiness = json!(crate::tools::surface::catalog::readiness(
-        name, config, registry
+    let readiness = json!(crate::tools::surface::catalog::readiness_at(
+        name, workspace, config, registry
     ));
     let operations = json!(crate::tools::surface::catalog::operation_readiness(
         name, config
@@ -161,6 +165,7 @@ fn discovery_readiness(
 
 fn listing_readiness(
     mut output: ToolOutput,
+    workspace: &std::path::Path,
     config: &Config,
     registry: &crate::tools::integrations::ext::Registry,
 ) -> ToolOutput {
@@ -168,7 +173,7 @@ fn listing_readiness(
         serde_json::from_str(&output.text).expect("listing_output serializes a JSON object");
     if let Some(entries) = page["tools"].as_array_mut() {
         for entry in entries {
-            discovery_readiness(entry, config, registry);
+            discovery_readiness(entry, workspace, config, registry);
         }
     }
     output.text = page.to_string();
@@ -350,6 +355,75 @@ pub(in crate::agent) fn parallel_tools(
     reuse: Option<&crate::agent::workflow::investigation::ReadReuse>,
 ) -> Vec<(ToolOutput, f64)> {
     parallel_tools_with_mutations(ctx, calls, already_started, reuse, None, None, None)
+}
+
+/// Most entries one `tool.batch([...])` may carry; each also counts against the cell's limit.
+pub(in crate::agent) const MAX_BATCH_ENTRIES: usize = 128;
+
+/// Parse a `tool.batch` callback's `{calls:[{name, arguments}]}` payload into ordered calls with
+/// ids under `owner`. Shared by the parent and worker controllers.
+pub(in crate::agent) fn code_batch_calls(
+    arguments: &Value,
+    owner: &str,
+) -> std::result::Result<Vec<ToolCall>, String> {
+    let Some(entries) = arguments["calls"].as_array() else {
+        return Err("tool.batch expects an array of {name, args} entries".into());
+    };
+    if entries.len() > MAX_BATCH_ENTRIES {
+        return Err(format!(
+            "tool.batch accepts at most {MAX_BATCH_ENTRIES} entries"
+        ));
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let (Some(name), Some(arguments)) = (
+                entry["name"].as_str().filter(|name| !name.is_empty()),
+                entry
+                    .get("arguments")
+                    .filter(|arguments| arguments.is_object()),
+            ) else {
+                return Err(format!(
+                    "tool.batch entry {index} needs a tool name and an arguments object"
+                ));
+            };
+            Ok(ToolCall {
+                id: format!("{owner}.batch{index}"),
+                name: name.to_owned(),
+                arguments: arguments.clone(),
+                malformed_arguments: false,
+            })
+        })
+        .collect()
+}
+
+/// The ordered `tool.batch` receipt: one `{text, data, is_error}` per entry. The batch itself
+/// succeeds; a failed entry is reported in its own slot rather than raised.
+pub(in crate::agent) fn code_batch_output(outputs: Vec<ToolOutput>) -> ToolOutput {
+    let failed = outputs.iter().filter(|output| output.is_error).count();
+    ToolOutput {
+        execution: Default::default(),
+        text: format!(
+            "tool.batch settled {} callback(s), {failed} failed",
+            outputs.len()
+        ),
+        data: Some(Value::Array(
+            outputs
+                .into_iter()
+                .enumerate()
+                .map(|(index, output)| {
+                    let status = tools::ToolStatus::from_output(&output);
+                    json!({"index":index,"text":output.text,"data":output.data,
+                        "is_error":output.is_error,"status":status.as_str(),
+                        "effects":output.execution.effects,
+                        "changed_paths":output.execution.changed_paths,
+                        "process":output.execution.process,"output":output.execution.output})
+                })
+                .collect(),
+        )),
+        is_error: false,
+    }
 }
 
 pub(in crate::agent) fn parallel_tools_with_reads(
@@ -733,6 +807,55 @@ impl<'a> Agent<'a> {
         result
     }
 
+    /// Whether authorizing `call` now would stop for a human approval prompt. A dry run of
+    /// [`authorize_call_from`](Self::authorize_call_from)'s policy against copied rules and a
+    /// silent surface; it grants nothing and changes no state. Only a structured call that reaches
+    /// the interactive prompt counts: denials, plan mode, rules, Auto and once-approvals do not.
+    pub(in crate::agent) fn approval_prompt_pending(
+        &self,
+        call: &ToolCall,
+        provenance: crate::agent::safety::approval::CallProvenance,
+    ) -> bool {
+        use crate::agent::safety::approval;
+        #[derive(Default)]
+        struct Probe(bool);
+        impl Ui for Probe {
+            fn approve_call(
+                &mut self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: Option<&AtomicBool>,
+            ) -> Decision {
+                self.0 = true;
+                Decision::Deny
+            }
+        }
+        if provenance != approval::CallProvenance::Structured
+            || self.plan_mode
+            || approval::denied_by_rule(&self.always, call, self.workspace.root())
+            || self.pending_batch_approvals.iter().any(|(prepared, _)| {
+                prepared.id == call.id
+                    && prepared.name == call.name
+                    && prepared.arguments == call.arguments
+            })
+            || !approval::needs_approval(&self.ext, call)
+        {
+            return false;
+        }
+        let mut probe = Probe::default();
+        let _ = approval::authorize_with_cancel(
+            self.approval,
+            &mut self.always.clone(),
+            self.workspace.root(),
+            call,
+            &describe(call),
+            &mut probe,
+            &AtomicBool::new(false),
+        );
+        probe.0
+    }
+
     /// Operator hooks apply to live agents only; evaluation runs must stay hermetic.
     pub(in crate::agent) fn tool_hooks(&self) -> &[crate::config::types::HookConfig] {
         if self.hermetic {
@@ -751,9 +874,11 @@ impl<'a> Agent<'a> {
     ) -> Result<Option<Chat>> {
         let projected = projected_request(
             request,
+            // Recorded contracts are checked against the callable set only: a cache-stable
+            // surface (`llm::tool_offer`) also sends tools this request does not offer.
             crate::tools::surface::contracts::project_history(
                 &request.messages,
-                &request.tools,
+                &crate::llm::tool_offer::callable(&request.tools),
                 &self.ext,
             )?,
         );
@@ -1537,9 +1662,32 @@ impl<'a> Agent<'a> {
                     Ok(query) => query,
                     Err(error) => return denied(&error),
                 };
-                let listing = match listing_request(query) {
-                    Ok(listing) => listing,
-                    Err(error) => return denied(&error),
+                let load = args.get("load").and_then(Value::as_bool) == Some(true);
+                // `select:a,b` names exact tools: no ranking, every eligible name is a match.
+                let selected: Option<Vec<String>> =
+                    query.trim().strip_prefix("select:").map(|names| {
+                        let mut names: Vec<String> = names
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                        let mut seen = std::collections::HashSet::new();
+                        names.retain(|name| seen.insert(name.clone()));
+                        names
+                    });
+                if selected
+                    .as_ref()
+                    .is_some_and(|names| names.is_empty() || names.len() > 32)
+                {
+                    return denied("`select:` takes 1 to 32 comma-separated exact tool names");
+                }
+                let listing = match selected {
+                    Some(_) => None,
+                    None => match listing_request(query) {
+                        Ok(listing) => listing,
+                        Err(error) => return denied(&error),
+                    },
                 };
                 // Discovery covers every configured server, so it waits for any still connecting.
                 self.ext.adopt_mcp(true);
@@ -1556,16 +1704,32 @@ impl<'a> Agent<'a> {
                     // Listing is a read-only view: it never calls `activate_tools`.
                     let offered = self.offered();
                     return match listing_output(page, &descriptions, &offered) {
-                        Ok(output) => listing_readiness(output, self.config, &self.ext),
+                        Ok(output) => {
+                            listing_readiness(output, self.workspace.root(), self.config, &self.ext)
+                        }
                         Err(error) => denied(&error),
                     };
                 }
-                let matches = crate::agent::model::assistance::discover_with_priority(
-                    query,
-                    candidates,
-                    &|name| self.tool_readiness(name).routing_priority(),
-                );
-                if matches.is_empty() {
+                let mut unknown = Vec::new();
+                let matches = match &selected {
+                    Some(names) => names
+                        .iter()
+                        .filter_map(|name| {
+                            let known = candidates.iter().any(|(candidate, _)| candidate == name)
+                                && !matches!(name.as_str(), "tool_search" | "tool_load");
+                            if !known {
+                                unknown.push(name.clone());
+                            }
+                            known.then(|| (name.clone(), String::new(), true))
+                        })
+                        .collect(),
+                    None => crate::agent::model::assistance::discover_with_priority(
+                        query,
+                        candidates,
+                        &|name| self.tool_readiness(name).routing_priority(),
+                    ),
+                };
+                if matches.is_empty() && selected.is_none() {
                     // A ranking miss is not evidence that the capability is absent. Return the
                     // same bounded eligible catalog page as `*`, without activating anything.
                     return match listing_output(0, &descriptions, &self.offered()) {
@@ -1577,7 +1741,7 @@ impl<'a> Agent<'a> {
                                 "No ranked match; inspect the eligible catalog before concluding a capability is unavailable. Listing grants no permission and loads no tools."
                             );
                             output.text = page.to_string();
-                            listing_readiness(output, self.config, &self.ext)
+                            listing_readiness(output, self.workspace.root(), self.config, &self.ext)
                         }
                         Err(error) => denied(&error),
                     };
@@ -1589,12 +1753,28 @@ impl<'a> Agent<'a> {
                     .collect();
                 let offered_before = self.offered();
                 if !self.stable_tool_offer()
+                    && selected.is_none()
                     && let Err(error) = self.activate_tools(&activated)
                 {
                     return denied(&format!("persisting discovered tools: {error:#}"));
                 }
+                // `load` selects the exact or top matches through the `tool_load` owner, with its
+                // eligibility checks, so a specialist costs one round instead of two.
+                if load {
+                    let offered = self.offered();
+                    let pending: Vec<String> = activated
+                        .iter()
+                        .filter(|name| !offered.contains(name))
+                        .cloned()
+                        .collect();
+                    if !pending.is_empty()
+                        && let Err(error) = self.select_tools(&pending, &[])
+                    {
+                        return denied(&error);
+                    }
+                }
                 let offered = self.offered();
-                let matches: Vec<Value> = matches
+                let mut matches: Vec<Value> = matches
                     .into_iter()
                     .map(|(name, _, _)| {
                         let description = descriptions.remove(&name).unwrap_or_default();
@@ -1603,11 +1783,34 @@ impl<'a> Agent<'a> {
                         // action that makes it callable. Discovery never grants permission itself.
                         let (status, next) =
                             activation_status(loaded, Some(offered_before.contains(&name)));
-                        let mut entry = json!({"name":name,"description":description,"status":status,"enabled_next_round":loaded,"next":next});
-                        discovery_readiness(&mut entry, self.config, &self.ext);
+                        let parameters = self
+                            .schemas(std::slice::from_ref(&name))
+                            .ok()
+                            .and_then(|mut schemas| schemas.pop())
+                            .map(|schema| super::tool_exposure::parameter_summary(&schema))
+                            .unwrap_or_default();
+                        let mut entry = json!({"name":name,"description":description,"parameters":parameters,"status":status,"enabled_next_round":loaded,"next":next});
+                        discovery_readiness(&mut entry, self.workspace.root(), self.config, &self.ext);
                         entry
                     })
                     .collect();
+                // A load that made every match callable can be shown as the loaded definitions.
+                let shown: Vec<String> = matches
+                    .iter()
+                    .filter_map(|entry| entry["name"].as_str().map(str::to_owned))
+                    .collect();
+                if load
+                    && unknown.is_empty()
+                    && matches
+                        .iter()
+                        .all(|entry| entry["enabled_next_round"] == true)
+                    && let Err(error) = self.note_tool_references(&call.id, &shown)
+                {
+                    return denied(&format!("persisting tool references: {error:#}"));
+                }
+                matches.extend(unknown.into_iter().map(|name| {
+                    json!({"name":name,"status":"unavailable","enabled_next_round":false,"next":"not an eligible tool name; search by capability or list the catalog with `*`"})
+                }));
                 ToolOutput {
                     execution: Default::default(),
                     data: None,
@@ -1634,11 +1837,6 @@ impl<'a> Agent<'a> {
                 requested.dedup();
                 unload.sort();
                 unload.dedup();
-                if let Some(name) = requested.iter().find(|name| unload.contains(name)) {
-                    return denied(&format!(
-                        "tool_load cannot load and unload {name} in the same call; no selection changed"
-                    ));
-                }
                 if requested
                     .iter()
                     .chain(&unload)
@@ -1646,39 +1844,10 @@ impl<'a> Agent<'a> {
                 {
                     self.ext.adopt_mcp(true);
                 }
-                let catalog = self.catalog();
-                if (requested.is_empty() && unload.is_empty())
-                    || requested
-                        .iter()
-                        .chain(&unload)
-                        .any(|n| !catalog.contains(n))
-                {
-                    return denied("tool_load contains an unavailable tool; use tool_search first");
-                }
-                if let Some(name) = requested.iter().find(|name| !self.tool_eligible(name)) {
-                    return denied(&format!(
-                        "tool {name} is unavailable under the current mode or tool allowlist"
-                    ));
-                }
                 let offered_before = self.offered();
-                let mut enabled = self.enabled_tools.clone();
-                enabled.extend(requested.iter().cloned());
-                for name in &unload {
-                    enabled.remove(name);
+                if let Err(error) = self.select_tools(&requested, &unload) {
+                    return denied(&error);
                 }
-                let mut discovered = self.discovered_tools();
-                discovered.retain(|name| !unload.contains(name) && !enabled.contains(name));
-                let mut state = self.session.control_state();
-                let mut sorted: Vec<_> = enabled.iter().cloned().collect();
-                sorted.sort();
-                state["enabled_tools"] = json!(sorted);
-                state["discovered_tools"] = json!(discovered);
-                if let Err(e) = self.session.set_control_state(state) {
-                    return denied(&format!("persisting enabled tools: {e:#}"));
-                }
-                self.enabled_tools = enabled;
-                self.tool_routing.unload(&unload);
-                self.rebuild_system();
                 let offered = self.offered();
                 let mut entries = Vec::new();
                 let mut effective = Vec::new();
@@ -1703,7 +1872,12 @@ impl<'a> Agent<'a> {
                             "retained_by_policy": action == "unload" && loaded,
                             "next": next,
                         });
-                        discovery_readiness(&mut entry, self.config, &self.ext);
+                        discovery_readiness(
+                            &mut entry,
+                            self.workspace.root(),
+                            self.config,
+                            &self.ext,
+                        );
                         entries.push(entry);
                         if loaded {
                             effective.push(name.as_str());
@@ -1711,6 +1885,14 @@ impl<'a> Agent<'a> {
                             deferred.push(name.as_str());
                         }
                     }
+                }
+                // A load that made every requested tool callable can be shown as the loaded
+                // definitions on a route that defers tools; any unload keeps the text.
+                if unload.is_empty()
+                    && deferred.is_empty()
+                    && let Err(error) = self.note_tool_references(&call.id, &requested)
+                {
+                    return denied(&format!("persisting tool references: {error:#}"));
                 }
                 ToolOutput {
                     execution: Default::default(),
@@ -1880,6 +2062,9 @@ impl<'a> Agent<'a> {
                 (name, arguments)
             }
         };
+        if name == crate::tools::exec::eval::BATCH_CALLBACK {
+            return self.code_callback_batch(backend, &arguments, &names, ui, gate, source);
+        }
         if !names.contains(&name) {
             return ToolOutput::err(format!(
                 "tool {name:?} is not available in this code-mode scope"
@@ -1901,6 +2086,183 @@ impl<'a> Agent<'a> {
             return ToolOutput::err(format!("invalid code-mode tool call: {why}"));
         }
         self.execute_callback_from(backend, ui, &call, &schemas, source, gate)
+    }
+
+    /// `tool.batch([...])` from a code cell. When every entry is an offered, hook-free,
+    /// rule-permitted parallel read, the entries run together through the ordinary parallel-read
+    /// group with one coalesced journal flush on each side; otherwise each entry is an ordinary
+    /// serial callback with its own admission and approval. Results keep entry order.
+    fn code_callback_batch(
+        &mut self,
+        backend: &mut Backend,
+        arguments: &Value,
+        names: &[String],
+        ui: &mut dyn Ui,
+        gate: &mut crate::agent::safety::rules::CallbackGate<'_>,
+        source: CallbackSource<'_>,
+    ) -> ToolOutput {
+        let calls = match code_batch_calls(arguments, source.owner) {
+            Ok(calls) => calls,
+            Err(refusal) => return ToolOutput::err(refusal),
+        };
+        let hooks = self.tool_hooks();
+        let shared = self.config.eval.parallel_batches
+            && calls.iter().all(|call| {
+                call.name != crate::tools::exec::eval::BATCH_CALLBACK
+                    && names.contains(&call.name)
+                    && crate::agent::safety::approval::parallel_read(
+                        &self.ext,
+                        &call.name,
+                        &call.arguments,
+                    )
+                    && ["pre_tool_use", "post_tool_use"].iter().all(|event| {
+                        !crate::agent::safety::hooks::wanted_for_tool(hooks, event, &call.name)
+                    })
+                    && !crate::agent::safety::approval::denied_by_rule(
+                        &self.always,
+                        call,
+                        self.workspace.root(),
+                    )
+                    && (self.pending_check.is_none() || call.name != "bash")
+                    && image_question(call).is_none()
+            });
+        let outputs: Vec<ToolOutput> = if shared {
+            self.code_callback_reads(&calls, names, ui, gate, source.owner)
+        } else {
+            calls
+                .into_iter()
+                .map(|call| {
+                    if call.name == crate::tools::exec::eval::BATCH_CALLBACK {
+                        return ToolOutput::err("tool.batch entries cannot nest tool.batch");
+                    }
+                    self.code_callback_mode(
+                        backend,
+                        crate::tools::integrations::ext::ToolCallback::Call {
+                            name: call.name,
+                            arguments: call.arguments,
+                        },
+                        ui,
+                        gate,
+                        source.clone(),
+                    )
+                })
+                .collect()
+        };
+        code_batch_output(outputs)
+    }
+
+    /// Admitted read-only batch entries: per-entry form checks and portable-rule interception,
+    /// then the parallel-read group. Reads need no approval; their records share two flushes.
+    fn code_callback_reads(
+        &mut self,
+        calls: &[ToolCall],
+        names: &[String],
+        ui: &mut dyn Ui,
+        gate: &mut crate::agent::safety::rules::CallbackGate<'_>,
+        owner: &str,
+    ) -> Vec<ToolOutput> {
+        let mut outputs: Vec<Option<ToolOutput>> = vec![None; calls.len()];
+        let mut admitted = Vec::new();
+        let mut positions = Vec::new();
+        for (index, call) in calls.iter().enumerate() {
+            if self.interrupt.load(Ordering::SeqCst) {
+                outputs[index] = Some(interrupted_tool());
+                continue;
+            }
+            if let Some(reason) = gate.blocked() {
+                outputs[index] = Some(ToolOutput::err(reason));
+                continue;
+            }
+            let schemas = match self.schemas(std::slice::from_ref(&call.name)) {
+                Ok(schemas) => schemas,
+                Err(error) => {
+                    outputs[index] = Some(ToolOutput::err(format!(
+                        "resolving code-mode tool schema: {error:#}"
+                    )));
+                    continue;
+                }
+            };
+            if let Some((_, why)) = call_form_error(call, &schemas, names) {
+                outputs[index] = Some(ToolOutput::err(format!(
+                    "invalid code-mode tool call: {why}"
+                )));
+                continue;
+            }
+            if let Err(reason) = self.intercept_native_effect(gate, call, ui) {
+                outputs[index] = Some(ToolOutput::err(reason));
+                continue;
+            }
+            if let Err(error) = self.record(
+                self.cur_step,
+                "code_tool_call",
+                json!({"parent":owner,"name":call.name,"input":call.arguments,"contract":tools::surface::contracts::identities(&schemas,&self.ext).get(&call.name)}),
+            ) {
+                outputs[index] = Some(ToolOutput::err(format!(
+                    "recording code-mode call before execution: {error:#}"
+                )));
+                continue;
+            }
+            admitted.push(call.clone());
+            positions.push(index);
+        }
+        if !admitted.is_empty() {
+            let mut steering = Vec::new();
+            let results = parallel_tools_with_reads(
+                ParallelToolContext {
+                    workspace: &self.workspace,
+                    config: self.effective_config(),
+                    ext: &self.ext,
+                    interrupt: &self.interrupt,
+                    ui,
+                    pending_steering: &mut steering,
+                },
+                &admitted,
+                None,
+                None,
+                None,
+            );
+            self.pending_tool_steering.extend(steering);
+            let flushed = self.session.flush_runtime();
+            for ((call, (mut output, _)), position) in admitted.iter().zip(results).zip(positions) {
+                modes::lifecycle::Lifecycle::dispatched(self, call, &output);
+                let image = match callback_image(&self.workspace, call, &mut output, None) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        output.is_error = true;
+                        output.text.push_str(&format!(
+                            "\n[Preparing callback image evidence failed: {error:#}]"
+                        ));
+                        None
+                    }
+                };
+                if let Some((reference, _, _)) = &image {
+                    ui.image(reference);
+                }
+                let recorded = flushed.as_ref().map_err(|error| anyhow::anyhow!("{error:#}")).and_then(|_| {
+                    self.record(
+                        self.cur_step,
+                        "code_tool_result",
+                        json!({"parent":owner,"name":call.name,"is_error":output.is_error,"output":output.text,"data":output.data,"execution":output.execution}),
+                    )
+                });
+                if let Err(error) = recorded {
+                    output.execution.effects = crate::tools::surface::outcome::Effects::Unknown;
+                    output.is_error = true;
+                    output.text.push_str(&format!("\n[Recording completed callback evidence failed; inspect state before retrying: {error:#}]"));
+                }
+                if let Err(error) = callback_image_payload(&mut output, image) {
+                    output.is_error = true;
+                    output.text.push_str(&format!(
+                        "\n[Encoding callback image payload failed: {error:#}]"
+                    ));
+                }
+                outputs[position] = Some(output);
+            }
+        }
+        outputs
+            .into_iter()
+            .map(|output| output.expect("one result per batch entry"))
+            .collect()
     }
 
     fn execute_callback_from(
@@ -1936,7 +2298,11 @@ impl<'a> Agent<'a> {
             ));
         }
         ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
-        if let Err(error) = self.session.flush_runtime() {
+        // Effects need their write-ahead record durable first. A read-only callback has no effect
+        // to recover, so its call record is flushed with its result instead (one flush, not two).
+        if !crate::agent::safety::approval::parallel_read(&self.ext, &call.name, &call.arguments)
+            && let Err(error) = self.session.flush_runtime()
+        {
             let output = ToolOutput::err(format!(
                 "journaling code-mode call before execution: {error:#}"
             ));

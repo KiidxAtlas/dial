@@ -685,7 +685,7 @@ fn an_invalid_call_to_an_unloaded_deferred_tool_is_refused_with_its_schema() {
     );
 }
 
-const FAILING_NOTE_CHECK: &str = "[compaction]\nenabled=false\n[[verification.commands]]\nname=\"notes\"\ncommand=\"echo note check failed; exit 1\"\nfile_extensions=[\"txt\"]\ntimeout_secs=5\n";
+const FAILING_NOTE_CHECK: &str = "approval=\"auto\"\n[compaction]\nenabled=false\n[[verification.commands]]\nname=\"notes\"\ncommand=\"echo note check failed; exit 1\"\nfile_extensions=[\"txt\"]\ntimeout_secs=5\n";
 
 #[test]
 fn an_edit_whose_gate_check_fails_is_reminded_once_then_disclosed() {
@@ -718,6 +718,34 @@ fn an_edit_whose_gate_check_fails_is_reminded_once_then_disclosed() {
         "the reminder carries the gate's own check output"
     );
     assert!(!mentions(&requests[1], "no passing applicable check"));
+}
+
+#[test]
+fn a_gate_check_whose_approval_is_denied_is_disclosed_with_the_accepted_answer() {
+    // Without approval the check never ran: that says nothing about the edit, so the answer is
+    // accepted with the gap disclosed instead of ending Incomplete.
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some(("write", json!({"path":"note.txt","content":"x\n"}))),
+        ),
+        slots(),
+        response("The note is written.", None),
+    ]);
+    let config = FAILING_NOTE_CHECK.replacen("approval=\"auto\"\n", "", 1);
+    let (report, gaps) = with_agent(&config, |agent| {
+        connect(agent, &server.url);
+        let report = agent.turn("Write the note", &mut NullUi).unwrap();
+        let gaps = agent.completion_evidence(report.outcome)["disclosed_gaps"].clone();
+        (report, gaps)
+    });
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(completion_requests(&server).len(), 2, "no reminder round");
+    assert!(
+        gaps.to_string()
+            .contains("notes: verification permission denied"),
+        "{gaps}"
+    );
 }
 
 #[test]

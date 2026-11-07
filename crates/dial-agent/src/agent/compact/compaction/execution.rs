@@ -21,7 +21,9 @@ pub(in crate::agent) struct SummaryWorker {
 
 #[derive(Default)]
 pub(in crate::agent) struct SummaryExecution {
-    pub live_handoff: bool,
+    /// Soft and Handoff may summarize over the live request prefix (same route, model, tools
+    /// and cache namespace), reading the prompt cache instead of re-serializing the history.
+    pub live_prefix: bool,
     /// Consumed only for the independent turn-prefix fold, not for dependent incremental windows.
     pub parallel: Option<SummaryWorker>,
 }

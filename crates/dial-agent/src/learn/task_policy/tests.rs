@@ -153,3 +153,22 @@ fn only_an_explicit_verify_word_is_a_verification_request() {
         );
     }
 }
+
+#[test]
+fn diagnosis_only_requests_ask_why_without_asking_for_a_repair() {
+    for prompt in [
+        "Run tests/smoke.sh and tell me why it fails",
+        "Diagnose the failing build",
+        "Explain the cause of this crash",
+    ] {
+        assert!(diagnosis_only(prompt), "{prompt}");
+    }
+    for prompt in [
+        "Run tests/smoke.sh and fix why it fails",
+        "Why does this fail? Make it pass.",
+        "Run the build",
+        "Add a flag",
+    ] {
+        assert!(!diagnosis_only(prompt), "{prompt}");
+    }
+}

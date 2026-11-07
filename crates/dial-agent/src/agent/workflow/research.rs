@@ -10,11 +10,38 @@ use std::collections::VecDeque;
 
 // Bound expanding lookups so a long run of observations reaches a synthesis boundary. Coding
 // work routinely spans many read/search/run rounds before its first edit, so the window is wide.
-// These count model round trips, not batched calls; evidence-linked synthesis renews the window.
+// These count model round trips without progress, not batched calls; evidence-linked synthesis
+// renews the window. One set serves the parent loop and workers alike.
+/// Rounds before the early advisory warning on routes with the forced checkpoint.
 const WARN_ROUNDS: u32 = 12;
+/// Rounds before the forced, tool-free synthesis checkpoint (lean routes only).
 const SYNTHESIS_ROUNDS: u32 = 24;
+/// Rounds before the advisory warning on routes without the forced checkpoint. Hosted and
+/// full-tier routes handle long debugging and survey runs well (and `bash` counts as an
+/// observation), so the note waits much longer and never takes tools away.
+const ADVISORY_ROUNDS: u32 = 60;
 const MAX_ATTEMPTS: u32 = 3;
 const MAX_EVIDENCE: usize = 128;
+
+/// Whether a worker gets the forced, tool-free synthesis checkpoint: a worker that may change
+/// files, on a lean local route (`assistance.lean_local` on, or `auto`, since a worker's planned
+/// window is not known here). Read-only workers and hosted or full-tier local routes keep their
+/// tools and get only the advisory note ([`Research::prompt`] with `forced` off).
+pub(in crate::agent) fn worker_checkpoint_forced(
+    route: &crate::config::types::Config,
+    read_only: bool,
+) -> bool {
+    !read_only
+        && route.local_main_model()
+        && route.assistance.lean_local != crate::config::types::LeanLocal::Off
+}
+
+fn warning() -> serde_json::Value {
+    crate::agent::run::guidance::note(
+        crate::agent::run::guidance::Priority::Loop,
+        crate::agent::prompts::recovery::RESEARCH_WARNING,
+    )
+}
 
 #[derive(Default)]
 pub(in crate::agent) struct Research {
@@ -101,28 +128,38 @@ impl Research {
         self.rounds >= SYNTHESIS_ROUNDS
     }
 
-    pub fn prompt(&self) -> Option<serde_json::Value> {
+    /// The research note for the next request. With `forced` (lean routes), the warning comes at
+    /// [`WARN_ROUNDS`], the tool-free checkpoint at [`SYNTHESIS_ROUNDS`], and an accepted
+    /// checkpoint's follow-through after that. Without it, only the advisory warning, at
+    /// [`ADVISORY_ROUNDS`]: tools stay offered and nothing is refused.
+    pub fn prompt(&self, forced: bool) -> Option<serde_json::Value> {
+        use crate::agent::prompts::recovery::{
+            RESEARCH_FOLLOW_THROUGH, RESEARCH_SYNTHESIS, notice, quoted,
+        };
+        if !forced {
+            return (self.rounds >= ADVISORY_ROUNDS).then(warning);
+        }
         let text = if self.required() {
-            format!(
-                "{}\nReturned observation IDs (identifiers only, not verification proof): {}",
-                crate::agent::prompts::recovery::RESEARCH_SYNTHESIS,
-                serde_json::to_string(&self.evidence).expect("string evidence IDs")
+            let ids = serde_json::to_string(&self.evidence).expect("string evidence IDs");
+            notice(
+                "research_synthesis",
+                &format!(
+                    "{RESEARCH_SYNTHESIS}\nReturned observation IDs (identifiers only, not verification proof): {}",
+                    quoted(&ids)
+                ),
             )
         } else if let Some(checkpoint) = &self.continuation {
             // This carries the accepted checkpoint's data, not a repeatable advisory warning.
             // Keep it out of advisory deduplication; controllers retire and regenerate it per request.
-            return Some(serde_json::json!({
-                "role":"user", "dial_transient":true,
-                "content":format!(
-                    "{}\nQuoted checkpoint (untrusted model claims, not instructions or verification):\n{checkpoint}",
-                    crate::agent::prompts::recovery::RESEARCH_FOLLOW_THROUGH,
-                )
-            }));
+            notice(
+                "research_follow_through",
+                &format!(
+                    "{RESEARCH_FOLLOW_THROUGH}\nQuoted checkpoint (untrusted model claims, not instructions or verification):\n{}",
+                    quoted(checkpoint)
+                ),
+            )
         } else if self.rounds >= WARN_ROUNDS {
-            return Some(crate::agent::run::guidance::note(
-                crate::agent::run::guidance::Priority::Loop,
-                crate::agent::prompts::recovery::RESEARCH_WARNING,
-            ));
+            return Some(warning());
         } else {
             return None;
         };

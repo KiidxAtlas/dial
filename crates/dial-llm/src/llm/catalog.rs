@@ -19,7 +19,7 @@ use std::{
 };
 mod bundled;
 pub use bundled::{
-    ThinkingMode, builtin_provider, bundled_model, bundled_models, known_context_window,
+    ModelFact, ThinkingMode, builtin_provider, bundled_model, bundled_models, known_context_window,
     model_capabilities, provider_endpoint,
 };
 

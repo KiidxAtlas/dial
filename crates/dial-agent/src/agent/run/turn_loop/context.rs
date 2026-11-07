@@ -12,7 +12,7 @@ impl Agent<'_> {
         ui: &mut dyn Ui,
     ) -> Result<()> {
         let typed_text = prompt.typed();
-        let user_text = prompt.effective();
+        let user_text = typed_text;
         if let (Some(hint), Some(content)) = (
             self.skill_hint(user_text),
             message["content"].as_str().map(str::to_owned),

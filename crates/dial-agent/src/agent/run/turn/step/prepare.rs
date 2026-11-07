@@ -106,7 +106,7 @@ impl Agent<'_> {
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Plan, "Plan required: create a todo plan to resume tools. The next request offers only todo."));
             }
             messages.push(json!({"role":"user","dial_transient":true,"content":
-                    "The previous generation stalled without an active plan. If the request is already answered, answer directly. Otherwise your next tool call must create actual todos: use todo set for an empty list, or append to preserve existing tasks. Add 1-3 concrete unresolved questions with investigation=true, then the known implementation and verification steps. Do not invent a large speculative plan. A prose plan is not a todo update."}));
+                    "<dial-notice kind=\"planning_required\">\nThe previous generation stalled without an active plan, so this request offers only `todo` and `finish`. If the request is already answered, answer directly. Otherwise create a short todo plan (todo set for an empty list, append to keep existing tasks): 1-3 concrete open questions, then the known implementation and verification steps. A prose plan is not a todo update.\n</dial-notice>"}));
             offer.retain(|s| matches!(s["function"]["name"].as_str(), Some("todo" | "finish")));
             turn.names.retain(|name| name == "todo" || name == "finish");
         }
@@ -236,8 +236,11 @@ impl Agent<'_> {
                 cycle.guidance(),
             ));
         }
-        let research_step = engine.research_required();
-        if let Some(note) = engine.research_prompt() {
+        // Only lean local routes get the forced tool-free checkpoint; elsewhere a long
+        // observation run receives the advisory note and keeps its tools.
+        let research_forced = self.lean_completion_route();
+        let research_step = research_forced && engine.research_required();
+        if let Some(note) = engine.research_prompt(research_forced) {
             messages.push(note);
         }
         // One advisory note per request, by priority, then one merged harness message; protocol
@@ -406,6 +409,11 @@ impl Agent<'_> {
                     mid_turn: step != 0,
                     image_input: backend.accepts_image_input(),
                     parallel_supported: !backend.local_inference(),
+                    native_supported: crate::agent::compact::compaction::native_supported(
+                        backend,
+                        &self.config.compaction,
+                        compaction_identity,
+                    ),
                 },
             )?;
             match action {
@@ -547,6 +555,10 @@ impl Agent<'_> {
             request_overhead.task_context_bytes,
             request_overhead.conversation_bytes
         );
+        // Where the route keeps `tools` byte-stable, the narrowing above (planning gate,
+        // single-call simplification) and mode state change only which tools are callable, and
+        // loads change no definition. Accounting, compaction and admission used the callable set.
+        self.wire_tool_surface(backend.tool_exposure(), schemas, &mut request)?;
         Ok(ControlFlow::Continue(PreparedRequest {
             step,
             prep_started,

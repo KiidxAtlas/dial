@@ -135,6 +135,26 @@ def numbers(mapping):
     return {k: v for k, v in mapping.items() if number(v) is not None} if isinstance(mapping, dict) else {}
 
 
+def controls_metadata(controls):
+    """Allowlisted native request controls, excluding arbitrary strings and request content."""
+    out = {'model': label(controls.get('model'))}
+    out.update({key: number(controls[key]) for key in ('max_tokens', 'temperature', 'top_p')
+                if number(controls.get(key)) is not None})
+    thinking = controls.get('thinking')
+    if isinstance(thinking, dict):
+        out['thinking'] = {}
+        if thinking.get('type') in ('disabled', 'enabled', 'adaptive', 'between_tools'):
+            out['thinking']['type'] = thinking['type']
+        if thinking.get('display') in ('summarized', 'omitted'):
+            out['thinking']['display'] = thinking['display']
+        if number(thinking.get('budget_tokens')) is not None:
+            out['thinking']['budget_tokens'] = number(thinking['budget_tokens'])
+    output = controls.get('output_config')
+    if isinstance(output, dict) and output.get('effort') in ('low', 'medium', 'high', 'xhigh', 'max'):
+        out['output_config'] = {'effort': output['effort']}
+    return out
+
+
 def validate_event(event):
     paths = ['node', 'node.result', 'node.result.data', 'node.result.data.latency', 'message',
              'message.usage', 'message.dial_execution', 'message.dial_execution.output',
@@ -253,6 +273,7 @@ def summarize_trial(trial):
         gaps.append({'kind': 'journal_limit', 'found': len(journals), 'limit': MAX_JOURNALS})
     for path in journals[:MAX_JOURNALS]:
         active_request = None
+        active_controls = None
         for line, event in records(path):
             where = source(path, line)
             node, message = event.get('node') or {}, event.get('message') or {}
@@ -263,6 +284,10 @@ def summarize_trial(trial):
                     runtime_latency[active_request] = numbers(latency)
             if message.get('role') == 'dial_state':
                 state = message.get('patch', message.get('state')) or {}
+                controls = state.get('inference_controls')
+                if isinstance(controls, dict):
+                    # Fixed metadata fields only: never copy an arbitrary request body or headers.
+                    active_controls = controls_metadata(controls)
                 policy = state.get('adaptive_policy') or {}
                 result = policy.get('result') or {}
                 if result.get('state') == 'response received':
@@ -270,6 +295,8 @@ def summarize_trial(trial):
                         gaps.append({'kind': 'request_identity_unavailable', **where})
                     else:
                         request = requests.setdefault(active_request, {'source': where})
+                        if active_controls and active_controls.get('model') != 'unknown' and active_controls.get('model') == policy.get('model'):
+                            request['effective_controls'] = active_controls.copy()
                         request.update(model=label(policy.get('model')), result=numbers(result),
                                        finish_reason=label(result.get('finish_reason')))
                         selection = policy.get('selection') or {}

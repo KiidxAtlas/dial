@@ -134,7 +134,8 @@ enum WaitFor {
 }
 
 const DESCRIPTION: &str = "bg: run and monitor background jobs or logs. Jobs end with the session; `wait` blocks until `until` matches or the job exits; \
-output past 32 KiB stays in artifacts.";
+output past 32 KiB stays in artifacts. Example: {\"action\":\"start\",\"name\":\"web\",\"command\":\"npm run dev\"}, \
+then {\"action\":\"wait\",\"name\":\"web\",\"until\":\"listening\"}.";
 
 /// Owns every background process; dropping it kills them all (each entry kills its process
 /// group when dropped).

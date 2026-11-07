@@ -111,6 +111,20 @@ impl Agent<'_> {
             turn.budget.give_back();
             return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
         }
+        // A provider refusal is not an answer and retrying the same request repeats it: stop with
+        // the provider's category instead of entering empty-reply or completion recovery.
+        if let Some(crate::llm::ProviderStop::Refusal { category }) = reply.provider_stop() {
+            let reason = match category {
+                Some(category) => {
+                    format!("The provider declined this request (category: {category}).")
+                }
+                None => "The provider declined this request.".to_owned(),
+            };
+            return self
+                .stop_turn(ui, reason, sent.step + 1)
+                .map(crate::agent::run::engine::Tick::Finished)
+                .map(ControlFlow::Break);
+        }
         // A research checkpoint is a tool-free protocol step. Handle it before length/inline
         // recovery and completion so retained schemas cannot authorize any effects.
         if sent.research_step {
@@ -555,6 +569,7 @@ impl Agent<'_> {
             // A small model that denies a capability without looking for a tool gets one
             // reminder; the catalog often holds it (an interactive terminal is `bg pty`).
             let loadable_tools = !self.hermetic
+                && self.lean_completion_route()
                 && self.stop_boundary().is_none()
                 && self
                     .catalog()

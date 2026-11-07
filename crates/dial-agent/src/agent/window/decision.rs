@@ -118,12 +118,10 @@ impl Agent<'_> {
                     count(&request.messages[at..]),
                 )
             });
-        let supported = self.backend.as_ref().is_some_and(|backend| {
-            backend.supports_native_compaction(
-                policy.native_capability(identity),
-                policy.remote_streaming_v2_enabled,
-            )
-        });
+        let supported = self
+            .backend
+            .as_ref()
+            .is_some_and(|backend| compaction::native_supported(backend, policy, identity));
         let summary = self
             .role_selection("small")
             .cloned()

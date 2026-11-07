@@ -73,7 +73,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Compaction",
         "Recent history tokens",
-        "Retain newest complete assistant/tool groups within the effective budget. Never split calls from their results.",
+        "Retain newest complete assistant/tool groups within the effective budget. Never split calls from their results. The default 20000 scales with the window (smaller on small windows, 10% of large ones); any other value is used as set.",
         Kind::Int {
             min: 0,
             max: u32::MAX as i64,
@@ -131,7 +131,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Compaction",
         "Native/remote compaction",
-        "Permit declared supported native routes or the configured summary endpoint. Unsupported routes never fabricate native history.",
+        "Permit native compaction (declared routes, or first-party Anthropic routes whose model documents it) or the configured summary endpoint. Unsupported routes never fabricate native history.",
         Kind::Bool,
     ),
     field!(
@@ -171,7 +171,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Compaction",
         "Native route declarations",
-        "TOML exact/prefix map: responses-v1, responses-v2, responses-v1-v2, anthropic, or none. A protocol name alone does not prove endpoint support.",
+        "TOML exact/prefix map: responses-v1, responses-v2, responses-v1-v2, anthropic, or none. A protocol name alone does not prove endpoint support. Empty: first-party Anthropic routes use native compaction where the model documents it; any entry makes the map authoritative.",
         Kind::Table,
     ),
     field!(
@@ -313,7 +313,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Compaction",
         "Supersede older reads",
-        "Under context pressure, replace older reads of a re-read resource with a pointer to the retained artifact. Rewrites the cached request prefix once when it triggers.",
+        "Under context pressure, replace older reads of a re-read resource with a pointer to the retained artifact. Rewrites the cached request prefix once when it triggers. Not applied on models with preserved thinking, which reject edits to sent turns.",
         Kind::Bool,
     ),
     field!(
@@ -322,7 +322,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Compaction",
         "Drop redundant observations",
-        "Under context pressure, replace large old observation results with artifact pointers; mutation results and complete tool groups stay. Rewrites the cached request prefix once when it triggers.",
+        "Under context pressure, replace large old observation results with artifact pointers; mutation results and complete tool groups stay. Rewrites the cached request prefix once when it triggers. Not applied on models with preserved thinking, which reject edits to sent turns.",
         Kind::Bool,
     ),
     field!(
@@ -360,5 +360,19 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Promotion target map",
         "TOML map from default, an exact provider/model or provider/* to an ordered list of larger-window models (provider/model, bare model on the same provider, or @role). A target qualifies only with a strictly larger window and credentials.",
         Kind::Table,
+    ),
+    field!(
+        "compaction.argument_projection_tokens",
+        compaction.argument_projection_tokens,
+        MO,
+        "Compaction",
+        "Settled argument projection",
+        "Opt-in raw-history token interval for replacing large settled plain-history argument bodies with retained artifact references. Preserves native replay and failed/pending calls. Batches cache-invalidating changes; 0 disables it. Not enabled by default or counted as a benchmark gain.",
+        Kind::Int {
+            min: 0,
+            max: 2000000,
+            step: 8192
+        },
+        true
     ),
 ];

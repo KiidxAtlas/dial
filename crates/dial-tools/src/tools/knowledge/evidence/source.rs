@@ -19,6 +19,17 @@ pub(crate) fn now_ms() -> Result<u64> {
 
 /// Open only within currently authorized roots, checking deny-read policy before descriptor access.
 pub(crate) fn read(ws: &Workspace, input: &str) -> Result<Vec<u8>> {
+    read_bounded(ws, input, MAX_SOURCE)
+}
+
+/// Same source admission with a caller's smaller allocation bound.
+pub(crate) fn read_bounded(ws: &Workspace, input: &str, limit: u64) -> Result<Vec<u8>> {
+    let limit = limit.min(MAX_SOURCE);
+    let bound = if limit == MAX_SOURCE {
+        "64 MiB".to_owned()
+    } else {
+        format!("{limit} bytes")
+    };
     let path = ws.resolve_read(input).map_err(anyhow::Error::msg)?;
     if let Some(
         crate::tools::exec::sandbox::Policy::Dev { deny_read, .. }
@@ -43,16 +54,13 @@ pub(crate) fn read(ws: &Workspace, input: &str) -> Result<Vec<u8>> {
         .context("opening evidence source")?;
     let before = file.metadata()?;
     ensure!(
-        before.is_file() && before.len() <= MAX_SOURCE,
-        "evidence source must be a regular file no larger than 64 MiB"
+        before.is_file() && before.len() <= limit,
+        "source must be a regular file no larger than {bound}"
     );
     let identity = crate::platform::fs::identity(&file)?;
     let mut bytes = Vec::new();
-    (&mut file).take(MAX_SOURCE + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_SOURCE,
-        "evidence source grew beyond 64 MiB"
-    );
+    (&mut file).take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= limit, "source grew beyond {bound}");
     let after = file.metadata()?;
     let reopened = crate::platform::fs::open_beneath(root, relative, false)?;
     ensure!(

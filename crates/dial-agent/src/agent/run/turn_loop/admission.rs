@@ -71,13 +71,13 @@ impl Agent<'_> {
         let submitted_text = user_text;
         let user_text = prompt_rewrite.as_deref().unwrap_or(user_text);
         // Turn optimizer: steering left from an earlier turn, then this message, pass through the
-        // drafter before anything else reads them. From here on the turn runs on the drafted text;
-        // the typed text is kept only as message metadata for display and memory.
+        // drafter before anything else reads them. The typed text stays the turn's instruction;
+        // an accepted draft is attached to the message as an interpretation.
         let typed_text = user_text;
         let drafted = if self.turn_optimizer_enabled() {
             self.draft_leftover_steering(ui)?;
             match origin {
-                TurnOrigin::User => Some(self.draft_turn_text(typed_text, ui)?),
+                TurnOrigin::User => self.draft_turn_text(typed_text, ui)?,
                 TurnOrigin::Harness | TurnOrigin::Peer | TurnOrigin::Monitor => None,
             }
         } else {
@@ -157,7 +157,7 @@ impl Agent<'_> {
     ) -> Result<AdmittedTurn<'input>> {
         let prompt = self.prepare_turn_prompt(user_text, ui, reset_interrupt, origin)?;
         let typed_text = prompt.typed();
-        let user_text = prompt.effective();
+        let user_text = typed_text;
         let drafted = &prompt.drafted;
         self.prepare_turn_runtime(user_text, ui)?;
         let mut message = if let Some(message) = prepared {
@@ -259,6 +259,25 @@ impl Agent<'_> {
         self.reasoning_recovery = crate::agent::workflow::reasoning::Recovery::default();
         self.logging = self.store.is_some();
         self.admit_turn_message(message, &prompt, origin, ui)?;
+        if !self.hermetic
+            && self.modes.launch.unattended
+            && matches!(origin, TurnOrigin::User)
+            && self.config.efficiency.preserve_task_inputs
+            && self
+                .session
+                .control_state()
+                .get("preserved_inputs")
+                .is_none()
+            && let (Some(checkpoints), Some(turn)) = (&self.checkpoints, checkpoint_turn)
+        {
+            let preserved = crate::tools::preserve_task_inputs(&self.workspace, checkpoints, turn);
+            let count = preserved["files"].as_array().map_or(0, Vec::len);
+            let mut state = self.session.control_state();
+            state["preserved_inputs"] = preserved;
+            self.session.set_control_state(state)?;
+            self.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Review,
+                format!("Initial task preservation retained {count} bounded root-level source files as independent artifacts. Hidden, credential-like, linked and oversized sources are excluded; this is not an atomic live-database snapshot. If an input disappears or shrinks, its retained reference will be reported. Recover actual evidence; never invent missing records or report guessed data as recovered.")))?;
+        }
         let names = self.offered();
         let schemas = self.schemas(&names)?;
         crate::tools::surface::contracts::validate_history(

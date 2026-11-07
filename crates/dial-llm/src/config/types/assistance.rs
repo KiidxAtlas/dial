@@ -307,11 +307,21 @@ impl Default for AssistanceConfig {
 /// Default `efficiency.history_token_cap` (2^18, a multiple of the settings step).
 pub const DEFAULT_HISTORY_TOKEN_CAP: u32 = 262_144;
 
+/// Default `efficiency.batch_result_percent`.
+pub const DEFAULT_BATCH_RESULT_PERCENT: u32 = 30;
+/// Largest accepted `efficiency.batch_result_percent`.
+pub const MAX_BATCH_RESULT_PERCENT: u32 = 80;
+
 /// Shared context economy; does not change approvals, output/reasoning budgets or verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EfficiencyConfig {
     pub enabled: bool,
+    /// Bounded initial source preservation in unattended task sessions.
+    pub preserve_task_inputs: bool,
+    /// Unattended work rounds without new independent evidence before a blocked stop; 0 off.
+    pub evidence_stall_rounds: u32,
+    pub small_case_guard: bool,
     pub ambient_context_bytes: usize,
     /// Bytes of a successful, artifact-retained inspection result the model sees inline; 0 keeps the
     /// whole result up to the per-model output limit. Errors and edits are never reduced.
@@ -326,17 +336,25 @@ pub struct EfficiencyConfig {
     /// trigger fires near 223k instead of 850k on a 1M-token model. Smaller model windows are
     /// unaffected by the cap.
     pub history_token_cap: u32,
+    /// Share (percent) of the remaining context window that one reply's tool results may fill
+    /// together; the largest successful results are clipped first and keep their full text as an
+    /// artifact. Errors and edits are exempt. 0 disables the per-reply budget.
+    pub batch_result_percent: u32,
 }
 impl Default for EfficiencyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            preserve_task_inputs: true,
+            evidence_stall_rounds: 32,
+            small_case_guard: true,
             ambient_context_bytes: 8192,
             tool_preview_bytes: 0,
             task_packet: false,
             lightweight_requests: 4,
             cache_pressure_percent: 75,
             history_token_cap: DEFAULT_HISTORY_TOKEN_CAP,
+            batch_result_percent: DEFAULT_BATCH_RESULT_PERCENT,
         }
     }
 }

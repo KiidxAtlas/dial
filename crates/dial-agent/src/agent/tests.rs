@@ -1202,11 +1202,7 @@ fn an_empty_stop_is_retried_with_a_nudge_instead_of_ending_the_turn() {
     );
     assert_eq!((text.as_str(), outcome), ("done", TurnOutcome::Completed));
     assert_eq!(requests.len(), 2);
-    let expected = crate::agent::safety::stream_guards::render_retry_prompt(
-        crate::agent::safety::stream_guards::EMPTY_STOP_RETRY,
-        1,
-        crate::agent::safety::stream_guards::EMPTY_STOP_MAX_RETRIES,
-    );
+    let expected = crate::agent::safety::stream_guards::EMPTY_STOP_RETRY;
     assert!(
         crate::llm::fake::body(&requests[1])["messages"]
             .as_array()
@@ -1215,7 +1211,7 @@ fn an_empty_stop_is_retried_with_a_nudge_instead_of_ending_the_turn() {
             .any(|message| {
                 message["content"]
                     .as_str()
-                    .is_some_and(|text| text.contains(&expected))
+                    .is_some_and(|text| text.contains(expected))
             })
     );
 }
@@ -1743,13 +1739,13 @@ fn a_detected_loop_resamples_with_a_redirect_instead_of_ending_the_turn() {
     assert_eq!(requests.len(), 2);
     let retried = crate::llm::fake::body(&requests[1])["messages"].to_string();
     assert!(
-        retried.contains("thinking_loop_detected"),
+        retried.contains("kind=\\\"thinking_loop\\\""),
         "the re-sample carries the redirect"
     );
     assert!(
         !crate::llm::fake::body(&requests[0])["messages"]
             .to_string()
-            .contains("thinking_loop_detected")
+            .contains("kind=\\\"thinking_loop\\\"")
     );
 }
 

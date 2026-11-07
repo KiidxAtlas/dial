@@ -310,7 +310,7 @@ impl CallCycle {
 
     pub(in crate::agent) fn guidance(&self) -> String {
         format!(
-            "[Dial] Your last {} tool rounds cycled through the same {} call sets ({}) with identical arguments. Repeating the cycle will not produce new information: use the results you already have, change the approach, or answer with what is known and what remains unresolved.",
+            "<dial-notice kind=\"tool_call_cycle\">\nYour last {} tool rounds cycled through the same {} call sets ({}) with identical arguments. Repeating the cycle will not produce new information: use the results you already have, change the approach, or answer with what is known and what remains unresolved.\n</dial-notice>",
             self.turns,
             self.period,
             self.tools.join(" → ")
@@ -363,7 +363,7 @@ impl NarrationGuard {
                 *count = count.saturating_add(1);
                 if *count >= 3 && (*count).is_multiple_of(3) {
                     return Some(format!(
-                        "[Loop check from Dial] You have promised {category} {count} times without a confirmed edit or task closure. Rewording the promise is not progress. Reuse returned evidence and take the concrete next action, or report the blocker. Do not repeat the promise to check again."
+                        "<dial-notice kind=\"repeated_promise\">\nYou have promised {category} {count} times without a confirmed edit or task closure; rewording the promise is not progress. Reuse returned evidence and take the concrete next action, or report the blocker.\n</dial-notice>"
                     ));
                 }
             }
@@ -378,7 +378,7 @@ impl NarrationGuard {
         let key = hash.finish();
         if let Some((_, count)) = self.seen.iter_mut().find(|(seen, _)| *seen == key) {
             *count = count.saturating_add(1);
-            return (*count >= 3 && (*count).is_multiple_of(3)).then(|| format!("[Loop check from Dial] You have repeated the same explanation {count} times this turn, even if the tool arguments differ. Reuse current evidence and choose a different concrete action or report the blocker. If the repeated action is necessary, identify the changed state or uncertainty it checks."));
+            return (*count >= 3 && (*count).is_multiple_of(3)).then(|| format!("<dial-notice kind=\"repeated_explanation\">\nYou have repeated the same explanation {count} times this turn, even if the tool arguments differ. Reuse current evidence and choose a different concrete action or report the blocker. If the repeated action is necessary, say what changed state or uncertainty it checks.\n</dial-notice>"));
         }
         if self.seen.len() == 32 {
             self.seen.pop_front();
@@ -872,18 +872,54 @@ fn only_sets_shell_state(head: &str) -> bool {
 
 /// Successful edits to one file, with no passing check in between, before the model is asked to
 /// reconsider its approach. The note repeats at each further multiple.
-const EDIT_CHURN_WARN: u32 = 6;
+const EDIT_CHURN_WARN: u32 = 3;
+const LARGE_REWRITE_BYTES: usize = 4096;
 
 /// Many small variations of one fix to the same file (a "doom loop"). Each edit is a novel
 /// mutation, so [`RepeatedToolCall`], [`CallCycle`] and the recovery ledger all see progress; this
-/// counts committed edits per path instead, and a passing check clears every count. Advisory only:
-/// nothing is refused and the turn continues.
+/// counts committed edits per path instead, and a passing check clears every count. Focused edits
+/// stay available; after the warning, another large whole-file write needs a passing check.
 #[derive(Default)]
 pub struct EditChurnGuard {
     edits: std::collections::HashMap<String, u32>,
+    large_unchecked_noted: bool,
 }
 
 impl EditChurnGuard {
+    pub fn has_pressure(&self) -> bool {
+        self.edits.values().any(|count| *count >= EDIT_CHURN_WARN)
+    }
+    /// A controller checkpoint before the first large unchecked write, not a claim that the
+    /// model's algorithm was tested. The next generation sees it without losing the write.
+    pub fn first_large_write_notice(
+        &mut self,
+        path: &str,
+        bytes: usize,
+        executed_checks: u64,
+    ) -> Option<String> {
+        if bytes < LARGE_REWRITE_BYTES || executed_checks > 0 || self.large_unchecked_noted {
+            return None;
+        }
+        self.large_unchecked_noted = true;
+        Some(format!(
+            "<dial-notice kind=\"large_unchecked_generation\">A {bytes}-byte write to {path:?} is being admitted before any executed check was observed this turn. Before another large generation, prove the smallest independent known-answer/round-trip case in eval or a foreground check. Keep reasoning out of script comments and repair localized differences with edit.</dial-notice>"
+        ))
+    }
+    /// Only the explicitly checked paths lose rewrite pressure; a passing unrelated check
+    /// does not certify every file touched this turn.
+    pub fn checked_paths(&mut self, paths: &[String]) {
+        for path in paths {
+            self.edits.remove(path);
+        }
+    }
+    /// Avoid regenerating a large file repeatedly while its implementation remains unverified.
+    /// A focused edit can still repair a failed check; unrelated files are unaffected.
+    pub fn rewrite_rejection(&self, path: &str, bytes: usize) -> Option<String> {
+        (bytes >= LARGE_REWRITE_BYTES && self.edits.get(path).copied().unwrap_or(0) >= EDIT_CHURN_WARN)
+            .then(|| format!(
+                "Large rewrite of `{path}` withheld after repeated unverified changes; no bytes were written. Isolate the first divergence with a minimal known-answer or round-trip check, then repair the affected lines with edit. A passing foreground bash check with check_paths naming this file, or a fresh passing verify pass, permits another full write. Do not copy the implementation to another path to bypass this checkpoint."
+            ))
+    }
     /// Observe one settled call. `changed` holds the workspace-relative paths it committed;
     /// `check_passed` is true when the call was a passing check.
     pub fn observe(&mut self, changed: &[String], check_passed: bool) -> Option<String> {
@@ -904,7 +940,7 @@ impl EditChurnGuard {
             .collect();
         (!churned.is_empty()).then(|| {
             format!(
-                "[Edit churn: {} changed repeatedly this turn with no passing check in between. If each edit adjusts the previous attempt, the approach is probably wrong, not the details: re-read the failing output and the current file, reconsider the plan, or report what you tried and what remains unresolved. If these are planned incremental edits, run a focused check to confirm progress. The turn continues.]",
+                "[Edit churn: {} changed repeatedly this turn with no passing check in between. Run a minimal known-answer or round-trip check and isolate the first divergent value before another rewrite. Repair the affected lines with edit; another large whole-file write is withheld until a passing check. Focused edits and work on other files remain available.]",
                 churned.join(", ")
             )
         })

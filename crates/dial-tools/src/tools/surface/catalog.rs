@@ -91,6 +91,22 @@ pub fn readiness(
     }
 }
 
+/// Readiness with the editable workspace identity available. Interpreter path checks must use
+/// this scope so project-owned executables cannot masquerade as operator-installed runtimes.
+pub fn readiness_at(
+    name: &str,
+    workspace: &std::path::Path,
+    config: &crate::config::types::Config,
+    registry: &Registry,
+) -> Readiness {
+    let observation = readiness(name, config, registry);
+    if name == "eval" && !matches!(observation, Readiness::Unsupported { .. }) {
+        crate::tools::exec::eval::runtime_readiness(workspace, config)
+    } else {
+        observation
+    }
+}
+
 /// Operation-specific prerequisites must not disable unrelated operations of a multi-action tool.
 pub fn operation_readiness(
     name: &str,
@@ -233,6 +249,18 @@ impl Catalog {
         for definition in self.definitions.values_mut() {
             definition.readiness = readiness(&definition.name, config, registry);
             definition.operation_readiness = operation_readiness(&definition.name, config);
+        }
+    }
+    /// Refresh with the workspace scope, including executable prerequisites for native eval.
+    pub fn refresh_readiness_at(
+        &mut self,
+        workspace: &std::path::Path,
+        config: &crate::config::types::Config,
+        registry: &Registry,
+    ) {
+        self.refresh_readiness(config, registry);
+        if let Some(definition) = self.definitions.get_mut("eval") {
+            definition.readiness = readiness_at("eval", workspace, config, registry);
         }
     }
     pub fn set_origin(&mut self, name: &str, origin: Origin) {

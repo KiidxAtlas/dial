@@ -1,5 +1,5 @@
 //! Read-only comparison of recorded call ordering against current workspace resource contracts.
-use crate::agent::run::dependency_dispatch::{bookkeeping, footprint_for, plan_prefix};
+use crate::agent::run::dependency_dispatch::{WavePolicy, WaveScope, plan_wave};
 use crate::{
     config::types::Config,
     llm::ToolCall,
@@ -53,30 +53,24 @@ pub fn replay_scheduling(
                 let rest = &calls[index..];
                 let mut count = 0;
                 if resource_dispatch {
-                    let plan = plan_prefix(rest, config.task.dependency_wave_limit(), |call| {
+                    let scope = WaveScope {
+                        workspace,
+                        mode: workspace.edit_mode(),
+                        registry,
+                        hooks: &config.hooks,
+                        limit: config.task.dependency_wave_limit(),
+                    };
+                    let plan = plan_wave(rest, scope, WavePolicy::PARENT, |call| {
                         if call.malformed_arguments {
                             return Err("malformed_arguments");
                         }
-                        if ["pre_tool_use", "post_tool_use"].iter().any(|event| {
-                            crate::agent::safety::hooks::wanted_for_tool(
-                                &config.hooks,
-                                event,
-                                &call.name,
-                            )
-                        }) {
-                            return Err("hook_or_preflight");
-                        }
-                        let resources =
-                            footprint_for(workspace, workspace.edit_mode(), registry, call)
-                                .ok_or("unknown_resources")?;
-                        Ok((call.clone(), resources))
+                        Ok(call.clone())
                     });
                     *report
                         .resource_barriers
                         .entry(plan.barrier.into())
                         .or_default() += 1;
-                    let native = plan.calls.iter().filter(|call| !bookkeeping(call)).count();
-                    if native > 1 && (plan.writes || plan.calls.iter().any(bookkeeping)) {
+                    if plan.dispatchable() {
                         count = plan.calls.len();
                     }
                 }

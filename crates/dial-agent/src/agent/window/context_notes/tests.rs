@@ -99,3 +99,24 @@ fn tool_name_reads_both_schema_shapes() {
     assert_eq!(tool_name(&json!({"name":"b"})), Some("b"));
     assert_eq!(tool_name(&json!({"type":"function"})), None);
 }
+
+/// The kept raw tail never replays signed thinking: on preserved-thinking models that thinking is
+/// bound to the window being replaced.
+#[test]
+fn rollover_tail_carries_no_signed_thinking() {
+    let mut session = Session::ephemeral();
+    for message in [
+        json!({"role":"user","content":"task"}),
+        json!({"role":"assistant","content":"done",
+            "dial_provider_content":[{"type":"thinking","thinking":"","signature":"sig"},{"type":"text","text":"done"}]}),
+    ] {
+        session.append(message).unwrap();
+    }
+    let history = rollover_history(&session, u64::MAX).unwrap();
+    assert!(history.iter().any(|message| message["content"] == "done"));
+    assert!(
+        !serde_json::to_string(&history)
+            .unwrap()
+            .contains("signature")
+    );
+}

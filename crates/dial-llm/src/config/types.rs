@@ -228,6 +228,8 @@ pub struct Config {
     pub isolation: crate::config::isolation::IsolationConfig,
     /// Opt-in behaviors that are still under evaluation.
     pub experimental: ExperimentalConfig,
+    /// `[goal]`: goal-mode (`/goal`) options.
+    pub goal: GoalConfig,
 }
 
 impl Default for Config {
@@ -342,6 +344,7 @@ impl Default for Config {
             agents: BTreeMap::new(),
             task: Default::default(),
             experimental: ExperimentalConfig::default(),
+            goal: GoalConfig::default(),
         }
     }
 }
@@ -352,5 +355,7 @@ pub fn default_user_dir() -> PathBuf {
     config::paths::user_dir().unwrap_or_default()
 }
 
+#[cfg(test)]
+mod goal_tests;
 #[cfg(test)]
 mod lean_local_tests;

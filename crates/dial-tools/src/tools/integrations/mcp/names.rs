@@ -18,8 +18,10 @@ pub fn sanitize(text: &str) -> String {
         .collect()
 }
 
-/// Hands out unique names. Two tools that sanitise or truncate to the same name get `_2`, `_3`, … so
-/// no remote tool shadows another.
+/// Hands out unique names. A name that no other tool sanitises or truncates to stays as it is; a
+/// colliding one gets a suffix derived from its own server and tool name (`_` and six hex digits of
+/// their SHA-256), so it does not depend on which server registered first and no remote tool
+/// shadows another.
 #[derive(Clone, Default)]
 pub struct Namer {
     taken: HashSet<String>,
@@ -31,15 +33,32 @@ impl Namer {
             &format!("mcp__{}__{}", sanitize(server), sanitize(tool)),
             MAX_NAME,
         );
-        let mut name = base.clone();
+        if self.taken.insert(base.clone()) {
+            return base;
+        }
+        let digest = identity_digest(server, tool);
+        let mut suffix = format!("_{digest}");
         let mut n = 2;
-        while !self.taken.insert(name.clone()) {
-            let suffix = format!("_{n}");
-            name = format!("{}{suffix}", truncate(&base, MAX_NAME - suffix.len()));
+        loop {
+            let name = format!("{}{suffix}", truncate(&base, MAX_NAME - suffix.len()));
+            if self.taken.insert(name.clone()) {
+                return name;
+            }
+            // Only the same server and tool registered twice (or a digest collision) gets here.
+            suffix = format!("_{digest}_{n}");
             n += 1;
         }
-        name
     }
+}
+
+/// Six hex digits of the SHA-256 of the unsanitised server and tool names.
+pub(super) fn identity_digest(server: &str, tool: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{server}\0{tool}").as_bytes());
+    digest[..3]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn truncate(text: &str, max: usize) -> String {

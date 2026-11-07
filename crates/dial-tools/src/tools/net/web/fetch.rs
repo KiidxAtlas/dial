@@ -57,10 +57,29 @@ struct DiscoveryRemaining {
     seen: HashSet<(String, String)>,
 }
 
+/// One running tool operation on a [`Client`]; see [`Client::begin_operation`].
+pub struct Operation<'a> {
+    client: &'a Client,
+}
+
+impl Drop for Operation<'_> {
+    fn drop(&mut self) {
+        let mut running = self
+            .client
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *running = running.saturating_sub(1);
+    }
+}
+
 pub struct Client {
     agent: ureq::Agent,
     interrupt: Arc<AtomicBool>,
-    /// Job-owned cancellation is never cleared by reset_interrupt at operation start.
+    /// Tool calls running on this client. The interrupt flag is cleared only when the first one
+    /// starts, so a sibling call starting mid-batch cannot clear a Stop meant for the others.
+    in_flight: Arc<Mutex<usize>>,
+    /// Job-owned cancellation is never cleared when an operation starts.
     external_cancel: Option<Arc<AtomicBool>>,
     /// Total seconds one request may take, set from `web.timeout_secs` at each tool call.
     timeout_secs: AtomicU64,
@@ -94,6 +113,7 @@ impl Client {
         Self {
             agent: ureq::Agent::with_parts(config, DefaultConnector::new(), resolver),
             interrupt: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(Mutex::new(0)),
             external_cancel: None,
             timeout_secs: AtomicU64::new(DEFAULT_WEB_TIMEOUT_SECS),
             discovery: None,
@@ -105,14 +125,25 @@ impl Client {
         self.timeout_secs.store(secs, Ordering::Release);
     }
 
-    /// Abort in-flight and future requests until [`reset_interrupt`](Self::reset_interrupt).
+    /// Abort in-flight and future requests until the next operation starts on an idle client.
     pub fn interrupt(&self) {
         self.interrupt.store(true, Ordering::Release);
     }
 
-    /// Clear a previous [`interrupt`](Self::interrupt) at the start of a new operation.
-    pub fn reset_interrupt(&self) {
-        self.interrupt.store(false, Ordering::Release);
+    /// Start one tool operation. A previous [`interrupt`](Self::interrupt) is cleared only when no
+    /// other operation is in flight: concurrent `web_fetch`/`web_search` calls share this client,
+    /// and a Stop must reach every running sibling rather than be cleared by the next one to start.
+    /// Job-owned cancellation is never cleared.
+    pub fn begin_operation(&self) -> Operation<'_> {
+        let mut running = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *running == 0 {
+            self.interrupt.store(false, Ordering::Release);
+        }
+        *running += 1;
+        Operation { client: self }
     }
 
     pub fn is_interrupted(&self) -> bool {
@@ -131,6 +162,7 @@ impl Client {
         Self {
             agent: self.agent.clone(),
             interrupt: self.interrupt.clone(),
+            in_flight: self.in_flight.clone(),
             external_cancel: self.external_cancel.clone(),
             timeout_secs: AtomicU64::new(self.timeout_secs.load(Ordering::Acquire)),
             discovery: Some(Arc::new(Discovery {

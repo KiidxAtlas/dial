@@ -36,7 +36,7 @@ impl Contract {
     }
     pub fn instruction(&self, single: bool, examples: bool) -> String {
         let mut out = format!(
-            "[Tool contract]\nCall only: {}. Follow supplied JSON schemas. Loads apply next request, not this batch.",
+            "Call only: {}. Follow supplied JSON schemas. Loads apply next request, not this batch.",
             self.names.join(", ")
         );
         if single {
@@ -72,7 +72,7 @@ impl Contract {
                 }
             }
         }
-        out
+        crate::agent::prompts::recovery::notice("tool_contract", &out)
     }
 }
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]

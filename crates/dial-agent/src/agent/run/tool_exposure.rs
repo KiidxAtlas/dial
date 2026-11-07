@@ -10,8 +10,14 @@ mod task_routing;
 pub(in crate::agent) use task_routing::ToolRouting;
 
 impl<'a> Agent<'a> {
-    /// Initial built-in schemas stay below this bound on every ordinary model route.
+    /// Initial built-in schemas stay below this bound on lean and local model routes.
     const CORE_SCHEMA_BYTES: usize = 12 * 1024;
+    /// Hosted routes ([`Self::hosted_route`]) have room for delegation and job control up front.
+    const HOSTED_CORE_SCHEMA_BYTES: usize = 24 * 1024;
+    /// The stable first-request offer, in priority order: each tool joins while it fits the route's
+    /// budget. `bg` is the only way to wait for or stop a command that became a background job.
+    /// `task` (and `message`, which follows it) is offered only on hosted routes. `eval` joins only
+    /// when containment is available and a cell runtime resolves ([`Self::automatic_eval_ready`]).
     const CORE_TOOLS: &[&str] = &[
         "tool_search",
         "tool_load",
@@ -24,7 +30,26 @@ impl<'a> Agent<'a> {
         "glob",
         "todo",
         "verify",
+        "eval",
+        "bg",
+        "task",
+        "ask",
     ];
+
+    /// The main model is served by a hosted provider: not a local route (`local_tier`) and not a
+    /// hermetic run. Hosted routes get the larger core budget and the full discovery descriptions.
+    pub(in crate::agent) fn hosted_route(&self) -> bool {
+        !self.hermetic && self.local_tier().is_none()
+    }
+
+    /// Byte budget of the stable core offer on this route.
+    pub(in crate::agent) fn core_schema_budget(&self) -> usize {
+        if self.hosted_route() {
+            Self::HOSTED_CORE_SCHEMA_BYTES
+        } else {
+            Self::CORE_SCHEMA_BYTES
+        }
+    }
 
     pub(in crate::agent) fn stable_tool_offer(&self) -> bool {
         !self.hermetic
@@ -226,6 +251,256 @@ impl<'a> Agent<'a> {
         Ok(())
     }
 
+    /// The one owner of explicit tool selection: `tool_load`, `tool_search` with `load`, and the
+    /// controller's `bg` load after a command became a background job. Every requested name must
+    /// be in the catalog and eligible under the current mode and allowlists; the selection persists
+    /// in the session and takes effect on the next request. Selecting grants no permission.
+    pub(in crate::agent) fn select_tools(
+        &mut self,
+        requested: &[String],
+        unload: &[String],
+    ) -> std::result::Result<(), String> {
+        if let Some(name) = requested.iter().find(|name| unload.contains(name)) {
+            return Err(format!(
+                "tool_load cannot load and unload {name} in the same call; no selection changed"
+            ));
+        }
+        if requested
+            .iter()
+            .chain(unload)
+            .any(|name| !self.ext.contains(name) && self.ext.mcp_connecting().is_some())
+        {
+            self.ext.adopt_mcp(true);
+        }
+        let catalog = self.catalog();
+        if (requested.is_empty() && unload.is_empty())
+            || requested
+                .iter()
+                .chain(unload)
+                .any(|name| !catalog.contains(name))
+        {
+            return Err("tool_load contains an unavailable tool; use tool_search first".into());
+        }
+        if let Some(name) = requested.iter().find(|name| !self.tool_eligible(name)) {
+            return Err(format!(
+                "tool {name} is unavailable under the current mode or tool allowlist"
+            ));
+        }
+        let mut enabled = self.enabled_tools.clone();
+        enabled.extend(requested.iter().cloned());
+        for name in unload {
+            enabled.remove(name);
+        }
+        let mut discovered = self.discovered_tools();
+        discovered.retain(|name| !unload.contains(name) && !enabled.contains(name));
+        let mut state = self.session.control_state();
+        let mut sorted: Vec<_> = enabled.iter().cloned().collect();
+        sorted.sort();
+        state["enabled_tools"] = json!(sorted);
+        state["discovered_tools"] = json!(discovered);
+        self.session
+            .set_control_state(state)
+            .map_err(|error| format!("persisting enabled tools: {error:#}"))?;
+        self.enabled_tools = enabled;
+        self.tool_routing.unload(unload);
+        self.rebuild_system();
+        Ok(())
+    }
+
+    /// Mode tools an `allowed_tools` surface always sends: their offer follows session state (plan
+    /// mode, an active goal), so they stay in `tools` and only `tool_choice` changes.
+    fn mode_tools(&self) -> Vec<String> {
+        ["exit_plan", "goal"]
+            .into_iter()
+            .filter(|name| self.tool_eligible(name))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Remember that the result of `call_id` made `names` callable, so a route that defers
+    /// tools ([`Self::wire_tool_surface`]) can return them as `tool_reference` blocks instead of
+    /// the result text. Only a selection that loaded every name, none of them already sent
+    /// loaded, qualifies: the references then say everything the text said. Grants nothing.
+    pub(in crate::agent) fn note_tool_references(
+        &mut self,
+        call_id: &str,
+        names: &[String],
+    ) -> Result<()> {
+        if call_id.is_empty() || names.is_empty() || !self.stable_tool_offer() {
+            return Ok(());
+        }
+        let offered = self.offered();
+        let core = self.stable_core_tools();
+        // A known readiness blocker is part of the result text, so that result keeps its text.
+        if names.iter().any(|name| {
+            !offered.contains(name)
+                || core.contains(name)
+                || !self.tool_readiness(name).automatic_candidate()
+        }) {
+            return Ok(());
+        }
+        let mut state = self.session.control_state();
+        if !state["tool_references"].is_object() {
+            state["tool_references"] = json!({});
+        }
+        state["tool_references"][call_id] = json!(names);
+        self.session.set_control_state(state)
+    }
+
+    /// The request's `tools` on a route that keeps them byte-stable ([`crate::llm::tool_offer`]).
+    /// `request.tools` arrives as the callable contract (the turn's `offer` after request-scoped
+    /// narrowing); admission, accounting and compaction use that contract, never this surface,
+    /// and a call to an uncallable tool is refused as before.
+    ///
+    /// - `Deferred` (first-party Anthropic): the stable core is sent loaded, callable or not.
+    ///   Every other eligible catalog tool, offered tool or tool referenced by a kept loading
+    ///   result is sent with `defer_loading`, so a `tool_load` changes no definition: its result
+    ///   returns `tool_reference` blocks instead. An offered tool without a kept reference (a
+    ///   mode tool, a controller load, a compacted result) is sent loaded so it stays visible.
+    /// - `AllowedTools` (OpenAI Responses): the full offer plus the mode tools; narrowing and mode
+    ///   state change only `tool_choice`.
+    /// - `Plain`, hermetic runs and (for `Deferred`) operator-pinned offers: unchanged.
+    pub(in crate::agent) fn wire_tool_surface(
+        &self,
+        exposure: crate::llm::tool_offer::Exposure,
+        offer: &[Value],
+        request: &mut Chat,
+    ) -> Result<()> {
+        use crate::llm::tool_offer::{self, Exposure, Mark};
+        if self.hermetic
+            || request.tools.is_empty()
+            || match exposure {
+                Exposure::Plain => true,
+                Exposure::Deferred => !self.stable_tool_offer(),
+                Exposure::AllowedTools => false,
+            }
+        {
+            return Ok(());
+        }
+        let name_of = |schema: &Value| schema["function"]["name"].as_str().map(str::to_owned);
+        let callable: BTreeSet<String> = request.tools.iter().filter_map(name_of).collect();
+        let offered: std::collections::BTreeMap<String, &Value> = offer
+            .iter()
+            .filter_map(|schema| Some((name_of(schema)?, schema)))
+            .collect();
+        let schema_of = |name: &str| -> Option<Value> {
+            match offered.get(name) {
+                Some(schema) => Some((*schema).clone()),
+                None => self
+                    .schemas(&[name.to_owned()])
+                    .ok()
+                    .and_then(|mut schemas| schemas.pop()),
+            }
+        };
+        if exposure == Exposure::AllowedTools {
+            let modes = self.mode_tools();
+            let names: BTreeSet<&str> = offered
+                .keys()
+                .map(String::as_str)
+                .chain(modes.iter().map(String::as_str))
+                .collect();
+            request.tools = names
+                .into_iter()
+                .filter_map(|name| {
+                    let mut schema = schema_of(name)?;
+                    tool_offer::mark(
+                        &mut schema,
+                        Mark {
+                            callable: callable.contains(name),
+                            deferred: false,
+                        },
+                    );
+                    Some(schema)
+                })
+                .collect();
+            return Ok(());
+        }
+        // The mode tools are not sent loaded here: Messages has no verified way to show a deferred
+        // tool without a tool result, and an always-visible `goal` invites calls the harness must
+        // refuse. They follow their state like any offered tool, as before.
+        let core: BTreeSet<String> = self.stable_core_tools().into_iter().collect();
+        // Loading results still in the projected history, with the names each one loaded.
+        let recorded = self.session.control_state()["tool_references"].clone();
+        let pending: Vec<(usize, Vec<String>)> = request
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message["role"] == "tool" && message["is_error"] != true)
+            .filter_map(|(index, message)| {
+                let names: Vec<String> = recorded[message["tool_call_id"].as_str()?]
+                    .as_array()?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                (!names.is_empty()).then_some((index, names))
+            })
+            .collect();
+        let mut names: BTreeSet<String> = core.clone();
+        names.extend(offered.keys().cloned());
+        names.extend(
+            self.catalog()
+                .into_iter()
+                .filter(|name| self.tool_eligible(name)),
+        );
+        names.extend(pending.iter().flat_map(|(_, names)| names.iter().cloned()));
+        let surface: Vec<(String, Value)> = names
+            .into_iter()
+            .filter_map(|name| {
+                let schema = schema_of(&name)?;
+                Some((name, schema))
+            })
+            .collect();
+        let sent: BTreeSet<String> = surface.iter().map(|(name, _)| name.clone()).collect();
+        // A result is shown by reference only when every tool it loaded is sent deferred.
+        let effective: Vec<&(usize, Vec<String>)> = pending
+            .iter()
+            .filter(|(_, names)| {
+                names
+                    .iter()
+                    .all(|name| sent.contains(name) && !core.contains(name))
+            })
+            .collect();
+        let referenced: BTreeSet<&str> = effective
+            .iter()
+            .flat_map(|(_, names)| names.iter().map(String::as_str))
+            .collect();
+        let mut tools = Vec::with_capacity(surface.len());
+        for (name, mut schema) in surface {
+            let deferred = !core.contains(&name)
+                && (referenced.contains(name.as_str()) || !offered.contains_key(&name));
+            tool_offer::mark(
+                &mut schema,
+                Mark {
+                    callable: callable.contains(&name),
+                    deferred,
+                },
+            );
+            tools.push(schema);
+        }
+        for (index, names) in effective {
+            request.messages[*index][tool_offer::REFERENCES] = json!(names);
+        }
+        request.tools = tools;
+        Ok(())
+    }
+
+    /// Offer `bg` for the next request after a command became a background job, so waiting for
+    /// or stopping it costs no `tool_load` round. The stable offer selects it through
+    /// [`Self::select_tools`]; legacy discovery activates it. True when `bg` is then offered.
+    pub(in crate::agent) fn load_bg_for_background_job(&mut self) -> bool {
+        if !self.bg_loadable() {
+            return false;
+        }
+        let bg = ["bg".to_owned()];
+        let loaded = if self.stable_tool_offer() {
+            self.select_tools(&bg, &[]).is_ok()
+        } else {
+            self.activate_tools(&bg).is_ok()
+        };
+        loaded && self.offered().iter().any(|name| name == "bg")
+    }
+
     /// Integrations that earn a place in every request's schema when configured: the ones a
     /// coding turn reaches for without being told. Everything else in the catalog (browser,
     /// debug adapters, kernels, archives, MCP servers, and the specialists in
@@ -304,9 +579,10 @@ impl<'a> Agent<'a> {
     /// text that names `bg` must say it is a Dial tool to load first.
     pub(in crate::agent) fn bg_loadable(&self) -> bool {
         if self.stable_tool_offer() {
+            // The core offer includes `bg` wherever the route's budget allows it.
             return self.catalog().iter().any(|name| name == "bg")
                 && self.tool_eligible("bg")
-                && !self.enabled_tools.contains("bg");
+                && !self.offered().iter().any(|name| name == "bg");
         }
         let offered = self.offered();
         !self.hermetic
@@ -338,11 +614,16 @@ impl<'a> Agent<'a> {
     }
 
     pub(in crate::agent) fn offered_with(&self, selection_only: bool) -> Vec<String> {
-        self.offered_with_eval_readiness(selection_only, || {
-            tools::exec::eval::prepare_containment().is_ok()
-                && !tools::exec::eval::installed_languages(self.workspace.root(), self.config)
-                    .is_empty()
-        })
+        self.offered_with_eval_readiness(selection_only, || self.automatic_eval_ready())
+    }
+
+    /// An automatic (not explicitly loaded) `eval` offer prepares containment and needs at least
+    /// one cell runtime: an operator interpreter or the embedded JavaScript engine.
+    fn automatic_eval_ready(&self) -> bool {
+        self.config.eval.auto_offer
+            && tools::exec::eval::prepare_containment().is_ok()
+            && !tools::exec::eval::installed_languages(self.workspace.root(), self.config)
+                .is_empty()
     }
 
     fn offered_with_eval_readiness(
@@ -352,7 +633,7 @@ impl<'a> Agent<'a> {
     ) -> Vec<String> {
         let catalog = self.catalog();
         if self.stable_tool_offer() && !selection_only {
-            let mut names = self.stable_core_tools();
+            let mut names = self.stable_core_tools_with(&prepare_eval);
             names.extend(
                 self.enabled_tools
                     .iter()
@@ -613,27 +894,53 @@ impl<'a> Agent<'a> {
     }
 
     pub(in crate::agent) fn stable_core_tools(&self) -> Vec<String> {
+        self.stable_core_tools_with(&|| self.automatic_eval_ready())
+    }
+
+    fn stable_core_tools_with(&self, eval_ready: &dyn Fn() -> bool) -> Vec<String> {
         let catalog = self.catalog();
         let mut core = Vec::new();
         let mut bytes = 2;
         let limit = self.initial_tool_limit();
+        let budget = self.core_schema_budget();
+        // `bash` is counted with its note that `bg` is loadable until `bg` itself joins.
+        let schema_size = |name: &str| self.budgeted_schema_bytes(name, true).unwrap_or(budget);
+        let bg_note_bytes = || {
+            schema_size("bash")
+                .saturating_sub(self.budgeted_schema_bytes("bash", false).unwrap_or(budget))
+        };
         for &name in Self::CORE_TOOLS {
             if !catalog.iter().any(|entry| entry == name) || !self.tool_eligible(name) {
                 continue;
             }
-            let size = self
-                .schemas(&[name.to_owned()])
-                .ok()
-                .and_then(|schemas| schemas.into_iter().next())
-                .map_or(Self::CORE_SCHEMA_BYTES, |schema| {
-                    schema.to_string().len() + 1
-                });
-            let control = matches!(name, "tool_search" | "tool_load" | "finish");
-            if control
-                || ((limit == 0 || core.len() < limit) && bytes + size <= Self::CORE_SCHEMA_BYTES)
+            if name == "eval" && !eval_ready() {
+                continue;
+            }
+            // Delegation is a hosted-route default; an unattended run defers it unless the
+            // operator prefers subagents. Peer messaging joins with it (one budget decision).
+            let delegation = name == "task";
+            if delegation
+                && (!self.hosted_route()
+                    || (self.modes.launch.unattended && !self.config.task.prefer_subagents))
             {
-                bytes += size;
+                continue;
+            }
+            let mut size = schema_size(name);
+            if delegation {
+                size += schema_size("message");
+            }
+            let note = if name == "bg" && core.iter().any(|tool| tool == "bash") {
+                bg_note_bytes()
+            } else {
+                0
+            };
+            let control = matches!(name, "tool_search" | "tool_load" | "finish");
+            if control || ((limit == 0 || core.len() < limit) && bytes + size <= budget + note) {
+                bytes = bytes + size - note;
                 core.push(name.to_owned());
+                if delegation {
+                    core.push("message".to_owned());
+                }
             }
         }
         core.sort();
@@ -667,12 +974,28 @@ impl<'a> Agent<'a> {
         Ok(schemas)
     }
 
+    /// Offered size of one schema for the core budget, with or without the `bash` note that `bg`
+    /// is loadable: whether that note applies depends on the budget decision itself.
+    fn budgeted_schema_bytes(&self, name: &str, bg_note: bool) -> Option<usize> {
+        let mut schemas = self
+            .full_schemas_with(&[name.to_owned()], Some(bg_note))
+            .ok()?;
+        bare_schemas(&mut schemas, self.config, &self.ext);
+        schemas.pop().map(|schema| schema.to_string().len() + 1)
+    }
+
     /// Complete parameter explanations for one offered tool, for argument-error feedback.
     pub(in crate::agent) fn parameter_help(&self, name: &str) -> Option<String> {
         parameter_help(&self.full_schemas(&[name.to_owned()]).ok()?.pop()?)
     }
 
     pub(in crate::agent) fn full_schemas(&self, names: &[String]) -> Result<Vec<Value>> {
+        self.full_schemas_with(names, None)
+    }
+
+    /// `bg_note` forces the `bash` note that `bg` is a loadable Dial tool; `None` decides it from
+    /// the current offer ([`Self::bg_loadable`]).
+    fn full_schemas_with(&self, names: &[String], bg_note: Option<bool>) -> Result<Vec<Value>> {
         let mode = self.edit_mode();
         let mut schemas = Vec::new();
         for name in names {
@@ -714,7 +1037,7 @@ impl<'a> Agent<'a> {
                 "skill_manage" => skills::manage_tool::schema(),
                 "session_search" => session::session_search_tool::schema(),
                 "working_state" => crate::agent::workflow::evidence::working_schema(),
-                "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Search eligible tools by capability or exact name. Returns descriptions, readiness and callable status; use tool_load to load a specialist for the next request. A miss returns catalog page 0; follow next_query (\"*:N\", zero-based) while present. Search and listing never execute tools or grant permission. Legacy noncompact mode may activate exact matches.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
+                "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Find a tool the offer lacks: search eligible tools by capability or exact name, or name them with `select:a,b`. Returns each match's description, parameters, readiness and status. `load: true` also loads the exact or top matches for the next request (tool_load's checks). A miss returns catalog page 0; follow next_query (\"*:N\", zero-based) while present. Never executes tools or grants permission. Legacy noncompact mode may activate exact matches.","parameters":{"type":"object","properties":{"query":{"type":"string"},"load":{"type":"boolean"}},"required":["query"],"additionalProperties":false}}}),
                 "tool_load" => json!({"type":"function","function":{"name":"tool_load","description":"Explicitly enable or unload exact eligible tool names. Changes take effect next round, never in this batch, and grant no permissions.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":32,"items":{"type":"string"}},"unload":{"type":"array","maxItems":32,"items":{"type":"string"}}},"additionalProperties":false}}}),
                 "exit_plan" => json!({"type":"function","function":{"name":"exit_plan","description":"Ask the user to approve this plan and leave plan mode.","parameters":{"type":"object","properties":{"plan":{"type":"string","minLength":1}},"required":["plan"],"additionalProperties":false}}}),
                 other => {
@@ -734,17 +1057,27 @@ impl<'a> Agent<'a> {
                     json!({"type":"function","function":{"name":other,"description":description,"parameters":parameters}})
                 }
             });
-            if self.tool_discovery() {
+            // Lean and local routes take shorter texts for the most-used tools; each keeps the
+            // facts a first call depends on (regex dialect, output format, scopes, paging, the
+            // sandbox). Hosted routes keep the tools' own descriptions.
+            if self.tool_discovery() && !self.hosted_route() {
                 let description = match name.as_str() {
                     "write" => Some(
-                        "Write complete UTF-8 source to a workspace path; guarded syntax and normal approvals apply.",
+                        "Write complete UTF-8 source to a workspace path; guarded syntax and normal approvals apply.".to_owned(),
                     ),
-                    "bash" => Some(
-                        "Run a shell command. Runs in the project root by default; set `cwd` (relative) instead of prefixing `cd`. Commands run with normal approvals; inspect exit status. Long commands (servers, watchers, builds) may keep running: pass `background: true` to start one now, or it moves to background automatically after ~15s. Check or stop background jobs with `bg`.",
+                    "bash" => Some(format!(
+                        "Run a shell command in the project root; set relative `cwd` instead of prefixing `cd`. {} Normal approvals apply; inspect exit status. A foreground command returns when it finishes or reaches `timeout` (seconds); `background: true` starts a server, watcher or long job as a `bg` job.",
+                        if cfg!(windows) {
+                            "Windows has no isolation: execution requires `sandbox.mode = \"off\"`."
+                        } else {
+                            "May be sandboxed: writes confined to the project, network possibly blocked, temp files in `$TMPDIR`."
+                        }
+                    )),
+                    "glob" => Some(
+                        "List workspace paths matching a glob such as `src/**/*.rs`; ignore-aware, sorted, 500 per page, the footer gives next_cursor.".to_owned(),
                     ),
-                    "glob" => Some("Find workspace paths with an ignore-aware glob."),
                     "grep" => Some(
-                        "Search workspace source with a regular expression; provide path scope when known.",
+                        "Search file contents with a Rust regex (no lookaround or backreferences); `path` takes files, directories or `;`-separated scopes. Returns path:line:text; the footer names capped scopes and next_cursor.".to_owned(),
                     ),
                     _ => None,
                 };
@@ -754,14 +1087,14 @@ impl<'a> Agent<'a> {
             }
             // The shell text names `bg` for background jobs; when the offer does not include it,
             // say it is a Dial tool to load, so `bg` is not mistaken for the shell builtin.
-            if name == "bash" && self.bg_loadable() {
+            if name == "bash" && bg_note.unwrap_or_else(|| self.bg_loadable()) {
                 let schema = schemas.last_mut().expect("schema was just inserted");
                 let description = schema["function"]["description"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
                 schema["function"]["description"] = json!(format!(
-                    "{description} `bg` is a Dial tool, not a shell command. It is not loaded yet; Dial loads it when a command moves to the background, or load it with `tool_load` to start a server."
+                    "{description} `bg` is a Dial tool, not a shell command, and is not offered yet: Dial loads it for the next request when a command becomes a background job, or load it with `tool_load`."
                 ));
             }
             // An offered `eval` may have only one runtime installed (a Node-only or Python-only
@@ -774,16 +1107,19 @@ impl<'a> Agent<'a> {
                     .filter(|(language, _)| !installed.contains(language))
                     .map(|(_, label)| label)
                     .collect();
-                if !missing.is_empty() && !installed.is_empty() {
+                if !missing.is_empty() {
                     let schema = schemas.last_mut().expect("schema was just inserted");
                     let description = schema["function"]["description"]
                         .as_str()
                         .unwrap_or_default()
                         .to_owned();
+                    let advice = installed.first().map_or_else(
+                        || "No eval interpreter resolves here; loading preserves status/reset/cancel but does not install an interpreter.".to_owned(),
+                        |language| format!("Use language {language:?}."),
+                    );
                     schema["function"]["description"] = json!(format!(
-                        "{description} Not installed here: {} cells; use language {:?}.",
-                        missing.join(", "),
-                        installed[0]
+                        "{description} Not installed here: {} cells. {advice}",
+                        missing.join(", ")
                     ));
                 }
             }
@@ -941,7 +1277,7 @@ impl Agent<'_> {
         &self,
         name: &str,
     ) -> tools::surface::catalog::Readiness {
-        tools::surface::catalog::readiness(name, self.config, &self.ext)
+        tools::surface::catalog::readiness_at(name, self.workspace.root(), self.config, &self.ext)
     }
 
     /// Automatic routing shares discovery's eligibility boundary, then removes only known execution
@@ -1071,6 +1407,8 @@ mod discovery_tests;
 mod gap_tests;
 #[cfg(test)]
 mod stable_offer_tests;
+#[cfg(test)]
+mod wire_surface_tests;
 
 /// Tools whose parameter explanations may be their only documentation: MCP, configured and
 /// non-native extension tools. Their schemas are offered unchanged.
@@ -1085,8 +1423,17 @@ fn foreign_tool(
             && ext.origin(name) != Some(crate::tools::surface::catalog::Origin::Native)
 }
 
-/// Offer Dial-owned schemas bare: every parameter keeps its name, type, enum, bounds and required
-/// status, without per-parameter explanations. Shared by the parent loop and subagents; the
+/// Core and multi-action tools whose top-level parameters keep a short explanation: their units,
+/// defaults, maxima and per-action meaning are otherwise visible only after a failed call.
+const DESCRIBED_PARAMETER_TOOLS: &[&str] = &[
+    "read", "edit", "bash", "grep", "glob", "todo", "verify", "bg", "lsp",
+];
+/// Longest parameter explanation kept in an offered schema, in words.
+const PARAMETER_DESCRIPTION_WORDS: usize = 15;
+
+/// Offer Dial-owned schemas lean: every parameter keeps its name, type, enum, bounds and required
+/// status; only [`DESCRIBED_PARAMETER_TOOLS`] keep a short explanation of each top-level parameter
+/// ([`short_parameter_description`]). Shared by the parent loop and subagents; the complete
 /// explanations return in argument errors ([`parameter_help`]). Contract identities ignore
 /// descriptions, so recorded sessions are unaffected.
 pub(in crate::agent) fn bare_schemas(
@@ -1095,13 +1442,107 @@ pub(in crate::agent) fn bare_schemas(
     ext: &crate::tools::integrations::ext::Registry,
 ) {
     for schema in schemas {
-        let name = schema["function"]["name"].as_str().unwrap_or_default();
-        if !foreign_tool(name, config, ext)
-            && let Some(parameters) = schema.pointer_mut("/function/parameters")
-        {
-            crate::runtime::arguments::strip_property_descriptions(parameters);
+        let name = schema["function"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if foreign_tool(&name, config, ext) {
+            continue;
+        }
+        let Some(parameters) = schema.pointer_mut("/function/parameters") else {
+            continue;
+        };
+        let kept: Vec<(String, String)> = if DESCRIBED_PARAMETER_TOOLS.contains(&name.as_str()) {
+            parameters["properties"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(key, property)| {
+                    let text = property["description"].as_str()?;
+                    Some((key.clone(), short_parameter_description(text)?))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        crate::runtime::arguments::strip_property_descriptions(parameters);
+        for (key, text) in kept {
+            parameters["properties"][key]["description"] = json!(text);
         }
     }
+}
+
+/// The first sentence of a parameter explanation when it has at most
+/// [`PARAMETER_DESCRIPTION_WORDS`] words, otherwise its leading clause (before a parenthesis,
+/// semicolon or colon) when that is short enough; `None` drops the explanation.
+fn short_parameter_description(text: &str) -> Option<String> {
+    let words = |text: &str| text.split_whitespace().count();
+    let text = text.trim();
+    let sentence = text
+        .find(". ")
+        .map_or(text, |end| &text[..end])
+        .trim_end_matches('.');
+    if (1..=PARAMETER_DESCRIPTION_WORDS).contains(&words(sentence)) {
+        return Some(sentence.to_owned());
+    }
+    [" (", "; ", ": "].iter().find_map(|separator| {
+        let clause = sentence[..sentence.find(separator)?].trim_end_matches([',', '.']);
+        (2..=PARAMETER_DESCRIPTION_WORDS)
+            .contains(&words(clause))
+            .then(|| clause.to_owned())
+    })
+}
+
+/// Compact list of a schema's top-level parameters for search results: `name*` marks a required
+/// parameter, then its type or its enum values. Bounded so a large schema cannot flood a result.
+pub(in crate::agent) fn parameter_summary(schema: &Value) -> String {
+    const MAX_CHARS: usize = 400;
+    const MAX_ENUM: usize = 12;
+    let parameters = &schema["function"]["parameters"];
+    let required: Vec<&str> = parameters["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let entries: Vec<String> = parameters["properties"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, property)| {
+            let marker = if required.contains(&name.as_str()) {
+                "*"
+            } else {
+                ""
+            };
+            let kind = match property["enum"].as_array() {
+                Some(values) => {
+                    let mut shown: Vec<String> = values
+                        .iter()
+                        .take(MAX_ENUM)
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map_or_else(|| value.to_string(), str::to_owned)
+                        })
+                        .collect();
+                    if values.len() > MAX_ENUM {
+                        shown.push("…".into());
+                    }
+                    shown.join("|")
+                }
+                None => property["type"].as_str().unwrap_or("any").to_owned(),
+            };
+            format!("{name}{marker}: {kind}")
+        })
+        .collect();
+    let summary = entries.join("; ");
+    if summary.chars().count() <= MAX_CHARS {
+        return summary;
+    }
+    let mut cut: String = summary.chars().take(MAX_CHARS).collect();
+    cut.push('…');
+    cut
 }
 
 /// Complete parameter explanations from one full schema, for an argument error.

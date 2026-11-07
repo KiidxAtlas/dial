@@ -1,6 +1,32 @@
 use crate::config::adaptive::Phase;
 
 use super::*;
+
+#[test]
+fn experimental_output_effort_raises_on_failure_but_never_overrides_an_explicit_pin() {
+    let mut config = config();
+    config.experimental.adaptive_output_effort = true;
+    let mut profile = ModelProfile::minimal("anthropic", "test");
+    profile.capabilities.reasoning = ReasoningApi::AnthropicAdaptive;
+    profile.capabilities.reasoning_efforts = vec![ReasoningEffort::Low, ReasoningEffort::High];
+    assert_eq!(
+        experimental_output_effort(&config, &profile, OutputEffortSignal::Routine),
+        Some(ReasoningEffort::Low)
+    );
+    assert_eq!(
+        experimental_output_effort(&config, &profile, OutputEffortSignal::CheckFailure),
+        Some(ReasoningEffort::High)
+    );
+    profile.reasoning_effort = Some(ReasoningEffort::Low);
+    config
+        .model_profiles
+        .insert("fixed".into(), profile.clone());
+    config.model_profile = Some("fixed".into());
+    assert_eq!(
+        experimental_output_effort(&config, &profile, OutputEffortSignal::RewritePressure),
+        None
+    );
+}
 fn config() -> AppConfig {
     AppConfig {
         model: "test".into(),

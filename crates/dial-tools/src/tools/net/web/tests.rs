@@ -822,8 +822,9 @@ fn markdown_discovery_bounds_requests_and_aggregate_bodies() {
 fn background_cancellation_is_not_reset_or_shared_with_foreground_clients() {
     let cancel = Arc::new(AtomicBool::new(true));
     let client = Client::with_cancel(cancel.clone());
-    client.reset_interrupt();
+    let operation = client.begin_operation();
     assert!(client.is_interrupted());
+    drop(operation);
     assert!(client.for_discovery().is_interrupted());
     assert_eq!(
         client
@@ -838,6 +839,25 @@ fn background_cancellation_is_not_reset_or_shared_with_foreground_clients() {
     assert!(!client.is_interrupted());
     foreground.interrupt();
     assert!(!client.is_interrupted());
+}
+
+#[test]
+fn a_sibling_call_starting_cannot_clear_a_stop_meant_for_running_calls() {
+    let client = Client::new();
+    let first = client.begin_operation();
+    client.interrupt();
+    let second = client.begin_operation();
+    assert!(client.is_interrupted(), "a sibling start cleared the Stop");
+    assert!(client.for_discovery().is_interrupted());
+    drop(first);
+    let third = client.begin_operation();
+    assert!(client.is_interrupted(), "a call is still in flight");
+    drop((second, third));
+    let _next = client.begin_operation();
+    assert!(
+        !client.is_interrupted(),
+        "an idle client clears the previous Stop"
+    );
 }
 
 #[test]

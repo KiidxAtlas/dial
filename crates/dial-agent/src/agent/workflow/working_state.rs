@@ -590,5 +590,84 @@ pub(in crate::agent) fn check_references(state: &Value) -> Vec<(String, String)>
         .collect()
 }
 
+/// Markdown view of a stored state for the goal progress file: the goal, deliverables with their
+/// status and evidence references, claims, open work, decisions, constraints and evidence notes.
+/// Sections without content are left out; an empty state renders as an empty string. Content is
+/// the model's own record, shown as written, never verification.
+pub(in crate::agent) fn render_markdown(state: &Value) -> String {
+    let strings = |key: &str| -> Vec<&str> {
+        state[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .collect()
+    };
+    let refs = |item: &Value, key: &str| -> String {
+        let refs: Vec<&str> = item[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if refs.is_empty() {
+            String::new()
+        } else {
+            format!(" (evidence: {})", refs.join("; "))
+        }
+    };
+    let mut sections = Vec::new();
+    if let Some(goal) = state["goal"]
+        .as_str()
+        .filter(|goal| !goal.trim().is_empty())
+    {
+        sections.push(format!("### Working goal\n\n{}", goal.trim()));
+    }
+    let rows = |key: &str, text: &str, refs_key: &str| -> Vec<String> {
+        state[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                format!(
+                    "- [{}] {}: {}{}",
+                    item["status"].as_str().unwrap_or("?"),
+                    item["id"].as_str().unwrap_or("<unnamed>"),
+                    item[text].as_str().unwrap_or("").trim(),
+                    refs(item, refs_key)
+                )
+            })
+            .collect()
+    };
+    for (title, lines) in [
+        (
+            "Deliverables",
+            rows("deliverables", "description", "evidence_refs"),
+        ),
+        ("Claims", rows("claims", "text", "source_refs")),
+    ] {
+        if !lines.is_empty() {
+            sections.push(format!("### {title}\n\n{}", lines.join("\n")));
+        }
+    }
+    for (title, key) in [
+        ("Open work", "open_work"),
+        ("Decisions", "decisions"),
+        ("Constraints", "constraints"),
+        ("Evidence", "evidence"),
+    ] {
+        let items = strings(key);
+        if !items.is_empty() {
+            let lines: Vec<String> = items
+                .iter()
+                .map(|item| format!("- {}", item.trim()))
+                .collect();
+            sections.push(format!("### {title}\n\n{}", lines.join("\n")));
+        }
+    }
+    sections.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests;

@@ -7,15 +7,25 @@ use crate::runtime::integration::{
     DispatchState, IntegrationExecution, IntegrationFailure, Settlement,
 };
 use crate::runtime::tool_output::ToolOutput;
-use crate::tools::integrations::ext::{EXTENSION_API_VERSION, LifecycleEvent, Tool, ToolContext};
+use crate::tools::Workspace;
+use crate::tools::integrations::ext::{
+    Concurrency, EXTENSION_API_VERSION, LifecycleEvent, Tool, ToolContext,
+};
+use crate::tools::surface::resources::Access;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Longest result handed to the model.
-const MAX_RESULT: usize = 64 * 1024;
+/// Longest result handed to the model: the agent's per-result cap, so the agent never cuts a
+/// result this module already bounded and labelled.
+const MAX_RESULT: usize = crate::tools::MODEL_OUTPUT_LIMIT;
 /// Server-supplied tool descriptions are untrusted prompt text; keep them short.
 const MAX_DESCRIPTION: usize = 2048;
+/// Server-supplied input schemas are sent with every request that offers the tool; bound them
+/// like descriptions ([`bounded_input_schema`]).
+const MAX_INPUT_SCHEMA: usize = 16 * 1024;
+/// Base64 of the PNG signature: only PNG image blocks reach the shared image-attachment path.
+const PNG_BASE64_PREFIX: &str = "iVBORw0KGgo";
 
 /// What `tools/list` says about one tool.
 #[derive(Clone, Debug, PartialEq)]
@@ -23,7 +33,11 @@ pub struct RemoteTool {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// `readOnlyHint`, masked by the operator's `trust_read_only_hint` (approval exemption).
     pub read_only_hint: bool,
+    /// The server declares the tool effect-free: `readOnlyHint: true` and not `destructiveHint:
+    /// true`. Never masked by trust: it selects the scheduling class only, never permission.
+    pub declared_read_only: bool,
 }
 
 impl RemoteTool {
@@ -46,14 +60,19 @@ impl RemoteTool {
             }
             _ => json!({"type": "object"}),
         };
+        let hint = |name: &str| {
+            entry
+                .pointer(&format!("/annotations/{name}"))
+                .and_then(Value::as_bool)
+        };
+        let read_only_hint = hint("readOnlyHint") == Some(true);
         Some(RemoteTool {
             name,
             description,
             input_schema,
-            read_only_hint: entry
-                .pointer("/annotations/readOnlyHint")
-                .and_then(Value::as_bool)
-                == Some(true),
+            read_only_hint,
+            // A contradictory `destructiveHint: true` keeps the conservative exclusive class.
+            declared_read_only: read_only_hint && hint("destructiveHint") != Some(true),
         })
     }
 }
@@ -86,6 +105,10 @@ impl McpTool {
         }
     }
 
+    fn effect_free(&self) -> bool {
+        self.remote.declared_read_only && self.session.catalog_current()
+    }
+
     fn description(&self) -> String {
         let text = if self.remote.description.trim().is_empty() {
             format!("MCP tool `{}`", self.remote.name)
@@ -93,6 +116,12 @@ impl McpTool {
             self.remote.description.trim().to_owned()
         };
         let text: String = text.chars().take(MAX_DESCRIPTION).collect();
+        if bounded_input_schema(&self.remote.input_schema).1 {
+            return format!(
+                "{}: {text} (Input schema shortened for size; the server validates arguments.)",
+                self.server
+            );
+        }
         format!("{}: {text}", self.server)
     }
 
@@ -264,7 +293,7 @@ impl Tool for McpTool {
             "function": {
                 "name": self.name,
                 "description": self.description(),
-                "parameters": self.remote.input_schema,
+                "parameters": bounded_input_schema(&self.remote.input_schema).0,
             }
         })
     }
@@ -275,6 +304,25 @@ impl Tool for McpTool {
 
     fn read_only_hint(&self) -> bool {
         self.remote.read_only_hint && self.session.catalog_current()
+    }
+
+    /// A server-declared read-only tool is an effect-free external read: shared batch slot and no
+    /// workspace footprint, so authorized calls run together. Approval is unchanged
+    /// ([`needs_approval`](Self::needs_approval)); a stale catalog revokes the class with the hint.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        if self.effect_free() {
+            Concurrency::Shared
+        } else {
+            Concurrency::Exclusive
+        }
+    }
+
+    fn resources(&self, _workspace: &Workspace, _args: &Value) -> Option<Access> {
+        self.effect_free().then(Access::default)
+    }
+
+    fn may_modify_workspace(&self, _args: &Value) -> bool {
+        !self.effect_free()
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
@@ -531,16 +579,144 @@ fn lifecycle_payload(hooks: &[String], event: &LifecycleEvent) -> Option<Value> 
 #[cfg(test)]
 mod lifecycle_tests;
 
+/// An input schema within [`MAX_INPUT_SCHEMA`] bytes, and whether it had to be shortened. Steps,
+/// each tried only when the previous one is still too large: drop annotations (descriptions,
+/// titles, examples); keep only top-level parameter names with their type, enum and required
+/// status; accept any object. The server still validates every call against its own schema.
+fn bounded_input_schema(schema: &Value) -> (Value, bool) {
+    let fits = |schema: &Value| schema.to_string().len() <= MAX_INPUT_SCHEMA;
+    if fits(schema) {
+        return (schema.clone(), false);
+    }
+    let mut lean = schema.clone();
+    strip_schema_annotations(&mut lean);
+    if fits(&lean) {
+        return (lean, true);
+    }
+    let mut flat = json!({"type": "object"});
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        let shapes: serde_json::Map<String, Value> = properties
+            .iter()
+            .map(|(name, property)| {
+                let mut shape = serde_json::Map::new();
+                for keyword in ["type", "enum"] {
+                    if let Some(value) = property.get(keyword) {
+                        shape.insert(keyword.into(), value.clone());
+                    }
+                }
+                (name.clone(), Value::Object(shape))
+            })
+            .collect();
+        flat["properties"] = Value::Object(shapes);
+    }
+    if let Some(required) = schema.get("required").filter(|value| value.is_array()) {
+        flat["required"] = required.clone();
+    }
+    if fits(&flat) {
+        return (flat, true);
+    }
+    (json!({"type": "object"}), true)
+}
+
+/// Remove annotation keywords from every schema node. Property names and literal values are data:
+/// a parameter named `description` keeps its schema.
+fn strip_schema_annotations(node: &mut Value) {
+    let Some(object) = node.as_object_mut() else {
+        return;
+    };
+    for annotation in ["description", "title", "examples", "$comment"] {
+        object.remove(annotation);
+    }
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ] {
+        if let Some(Value::Object(children)) = object.get_mut(keyword) {
+            children.values_mut().for_each(strip_schema_annotations);
+        }
+    }
+    for keyword in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "prefixItems",
+    ] {
+        match object.get_mut(keyword) {
+            Some(Value::Array(children)) => children.iter_mut().for_each(strip_schema_annotations),
+            Some(child) => strip_schema_annotations(child),
+            None => {}
+        }
+    }
+}
+
+/// The first PNG image block, as the shared tool-image envelope (`data.artifact`) that the agent
+/// attaches for a model route that accepts images. Other image types and audio stay noted only.
+fn png_attachment(result: &Value) -> Option<Value> {
+    result
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find(|block| png_block(block))
+        .map(
+            |block| json!({"data": block["data"], "encoding": "base64", "media_type": "image/png"}),
+        )
+}
+
+fn png_block(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("image")
+        && block.get("mimeType").and_then(Value::as_str) == Some("image/png")
+        && block
+            .get("data")
+            .and_then(Value::as_str)
+            .is_some_and(|data| data.starts_with(PNG_BASE64_PREFIX))
+}
+
 /// Flattens a `tools/call` result: text blocks verbatim, other block kinds noted by type. The text
-/// is the server's, so control characters are stripped and the length bounded.
+/// is the server's, so control characters are stripped and the length bounded. The first PNG image
+/// travels in `data.artifact` for vision routes. `structuredContent` is appended only when no text
+/// block already carries the same JSON (servers are asked to send both).
 pub fn render_result(result: &Value) -> ToolOutput {
-    let mut parts: Vec<String> = result
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|blocks| blocks.iter().map(render_block).collect())
+    let blocks = result.get("content").and_then(Value::as_array);
+    let attachment = png_attachment(result);
+    let mut attached = attachment.is_some();
+    let mut parts: Vec<String> = blocks
+        .map(|blocks| {
+            blocks
+                .iter()
+                .map(|block| {
+                    if attached && png_block(block) {
+                        attached = false;
+                        "[image content, image/png, attached for models that accept images]"
+                            .to_owned()
+                    } else {
+                        render_block(block)
+                    }
+                })
+                .collect()
+        })
         .unwrap_or_default();
     if let Some(structured) = result.get("structuredContent") {
-        parts.push(structured.to_string());
+        let duplicated = blocks.into_iter().flatten().any(|block| {
+            block.get("type").and_then(Value::as_str) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .is_some_and(|parsed| parsed == *structured)
+        });
+        if !duplicated {
+            parts.push(structured.to_string());
+        }
     }
     let text = if parts.is_empty() {
         "(the tool returned no content)".to_owned()
@@ -552,7 +728,13 @@ pub fn render_result(result: &Value) -> ToolOutput {
         .get("content")
         .and_then(Value::as_array)
         .is_some_and(|blocks| blocks.iter().any(block_omitted));
-    rendered(result, text, is_error, omitted)
+    let mut output = rendered(result, text, is_error, omitted);
+    if let (Some(artifact), Some(data)) = (attachment, output.data.as_mut())
+        && !is_error
+    {
+        data["artifact"] = artifact;
+    }
+    output
 }
 
 /// Renders a `resources/read` result: each content item's text verbatim, blobs noted.

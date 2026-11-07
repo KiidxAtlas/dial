@@ -28,6 +28,19 @@ pub enum Verdict {
     Hint(String),
 }
 
+/// Advisory only: a successful final printer can hide the status of an earlier command.
+/// The ordinary process receipt retains the actual exit code; printed FAIL is never a verdict.
+pub fn exit_masking_hint(command: &str) -> Option<&'static str> {
+    if !command.contains("||") {
+        return None;
+    }
+    let segments = extract_flat_shell_command_segments(command);
+    let printer = |text: &str| matches!(text.split_whitespace().next(), Some("echo" | "printf"));
+    (segments.len() > 1 && segments.last().is_some_and(|segment| printer(&segment.text))
+        && segments.iter().any(|segment| !printer(&segment.text)))
+        .then_some("[check warning] A trailing echo/printf after || can turn an earlier failure into exit 0. Acceptance checks must preserve a failing status; printed OK/FAIL is not a process verdict. Minimize the check helper before changing a previously passing artifact.")
+}
+
 /// Decides what happens to `command` when a dedicated tool in `available_tools` covers it;
 /// `None` runs it unchanged.
 ///

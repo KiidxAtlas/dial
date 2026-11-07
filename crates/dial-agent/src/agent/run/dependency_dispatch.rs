@@ -35,8 +35,100 @@ pub(in crate::agent) fn footprint_for(
 /// Callers retain their policy owners; a rejected call always closes the prefix.
 pub(in crate::agent) struct Plan {
     pub calls: Vec<ToolCall>,
-    pub writes: bool,
+    /// One resolved footprint per admitted call, in call order.
+    pub footprints: Vec<Footprint>,
     pub barrier: &'static str,
+}
+
+impl Plan {
+    pub(in crate::agent) fn writes(&self) -> bool {
+        self.footprints.iter().any(Footprint::writes)
+    }
+
+    /// An admitted native call has no workspace footprint (an effect-free external read).
+    pub(in crate::agent) fn external(&self) -> bool {
+        self.calls
+            .iter()
+            .zip(&self.footprints)
+            .any(|(call, footprint)| footprint.is_empty() && !bookkeeping(call))
+    }
+
+    /// Keep the first `admitted` calls after a controller check closed the prefix early.
+    pub(in crate::agent) fn truncate(&mut self, admitted: usize) {
+        self.calls.truncate(admitted);
+        self.footprints.truncate(admitted);
+    }
+
+    /// Whether this prefix should run as a native wave rather than through the parallel-read
+    /// group or serially: more than one native call, and at least one the read group cannot take
+    /// (a declared write, an approval-gated external read, or settled bookkeeping).
+    pub(in crate::agent) fn dispatchable(&self) -> bool {
+        self.calls.iter().filter(|call| !bookkeeping(call)).count() > 1
+            && (self.writes() || self.external() || self.calls.iter().any(bookkeeping))
+    }
+}
+
+/// Role differences in wave admission; every other rule is shared by [`plan_wave`].
+#[derive(Clone, Copy, Debug)]
+pub(in crate::agent) struct WavePolicy {
+    /// Bookkeeping joins the wave and settles on the controller after native work drains.
+    pub bookkeeping: bool,
+    /// A call carrying `verify` entries joins the wave and closes it; otherwise it is a barrier.
+    pub verify_closes: bool,
+    /// Barrier label for a role refusal (hooks, bookkeeping, verification, preflight).
+    pub refusal: &'static str,
+}
+
+impl WavePolicy {
+    /// The foreground controller settles bookkeeping and coalesced verification itself.
+    pub(in crate::agent) const PARENT: Self = Self {
+        bookkeeping: true,
+        verify_closes: true,
+        refusal: "hook_or_preflight",
+    };
+    /// Workers run bookkeeping and verification through their serial call path.
+    pub(in crate::agent) const CHILD: Self = Self {
+        bookkeeping: false,
+        verify_closes: false,
+        refusal: "worker_admission",
+    };
+}
+
+/// Resources a wave would schedule against; hooks and the role's preflight are evaluated first.
+pub(in crate::agent) struct WaveScope<'a> {
+    pub workspace: &'a Workspace,
+    pub mode: crate::config::types::EditMode,
+    pub registry: &'a crate::tools::integrations::ext::Registry,
+    pub hooks: &'a [crate::config::types::HookConfig],
+    pub limit: usize,
+}
+
+/// The one wave admission for foreground, child and replay controllers. `preflight` applies the
+/// role's controller checks and may return the effective (expanded) call; a refusal closes the
+/// prefix. Resources are resolved from the effective call.
+pub(in crate::agent) fn plan_wave(
+    calls: &[ToolCall],
+    scope: WaveScope<'_>,
+    policy: WavePolicy,
+    mut preflight: impl FnMut(&ToolCall) -> std::result::Result<ToolCall, &'static str>,
+) -> Plan {
+    plan_prefix(calls, scope.limit, |call| {
+        let verifies = call.arguments["verify"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty());
+        if (!policy.bookkeeping && bookkeeping(call))
+            || (!policy.verify_closes && verifies)
+            || ["pre_tool_use", "post_tool_use"].iter().any(|event| {
+                crate::agent::safety::hooks::wanted_for_tool(scope.hooks, event, &call.name)
+            })
+        {
+            return Err(policy.refusal);
+        }
+        let effective = preflight(call)?;
+        let resources = footprint_for(scope.workspace, scope.mode, scope.registry, &effective)
+            .ok_or("unknown_resources")?;
+        Ok((effective, resources))
+    })
 }
 
 pub(in crate::agent) fn plan_prefix(
@@ -46,10 +138,9 @@ pub(in crate::agent) fn plan_prefix(
 ) -> Plan {
     let mut plan = Plan {
         calls: Vec::new(),
-        writes: false,
+        footprints: Vec::new(),
         barrier: "response_end",
     };
-    let mut footprints = Vec::new();
     for call in calls {
         if plan.calls.len() >= limit {
             plan.barrier = "concurrency_limit";
@@ -62,15 +153,15 @@ pub(in crate::agent) fn plan_prefix(
                 break;
             }
         };
-        if footprints
+        if plan
+            .footprints
             .iter()
             .any(|previous| resources.conflicts(previous))
         {
             plan.barrier = "resource_conflict";
             break;
         }
-        plan.writes |= resources.writes();
-        footprints.push(resources);
+        plan.footprints.push(resources);
         let verifies = call.arguments["verify"]
             .as_array()
             .is_some_and(|entries| !entries.is_empty());
@@ -168,24 +259,37 @@ impl BatchPrerequisites {
 impl Agent<'_> {
     /// A maximal independent prefix, bounded by `TaskConfig::dependency_wave_limit` (at most 32).
     /// A conflicting resource or unknown effect closes the wave; nothing jumps a serial barrier.
-    pub(in crate::agent) fn dependency_wave(&mut self, calls: &[ToolCall]) -> Vec<ToolCall> {
-        let plan = plan_prefix(calls, self.config.task.dependency_wave_limit(), |call| {
-            if ["pre_tool_use", "post_tool_use"].iter().any(|event| {
-                crate::agent::safety::hooks::wanted_for_tool(self.tool_hooks(), event, &call.name)
-            }) || self.repro_first_fires(call, crate::config::types::ReproFirst::Gate)
-                || self.speculative_pending(call)
-            {
-                return Err("hook_or_preflight");
+    pub(in crate::agent) fn dependency_wave(&mut self, calls: &[ToolCall]) -> Plan {
+        // Waves read the same effective (profile-overridden) config as streaming and read groups.
+        let config = self.effective_config();
+        let scope = WaveScope {
+            workspace: &self.workspace,
+            mode: self.edit_mode(),
+            registry: &self.ext,
+            hooks: self.tool_hooks(),
+            limit: config.task.dependency_wave_limit(),
+        };
+        let mut plan = plan_wave(calls, scope, WavePolicy::PARENT, |call| {
+            if self.speculative_pending(call) {
+                return Err(WavePolicy::PARENT.refusal);
             }
             let mut effective = call.clone();
             crate::agent::window::file_handles::expand(&self.workspace, &mut effective)
                 .map_err(|_| "file_reference")?;
-            let resources = footprint_for(&self.workspace, self.edit_mode(), &self.ext, &effective)
-                .ok_or("unknown_resources")?;
-            Ok((effective, resources))
+            Ok(effective)
         });
+        // The repro-first gate consumes a once-per-turn trigger, so it is asked only of calls
+        // the shared admission already accepted, in call order; a firing gate closes the wave.
+        if let Some(gated) = plan
+            .calls
+            .iter()
+            .position(|call| self.repro_first_fires(call, crate::config::types::ReproFirst::Gate))
+        {
+            plan.truncate(gated);
+            plan.barrier = WavePolicy::PARENT.refusal;
+        }
         self.efficiency_metrics.scheduling.barrier(plan.barrier);
-        plan.calls
+        plan
     }
 
     /// Schema-admitted, dependency-independent native calls use the ordinary worker pump.

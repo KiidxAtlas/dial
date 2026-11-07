@@ -1255,6 +1255,41 @@ impl Backend {
         }
     }
 
+    /// How this route carries a cache-stable tool surface ([`llm::tool_offer`]): deferred tools on
+    /// first-party Anthropic Messages (`api.anthropic.com`, API key or subscription) for a model
+    /// that documents tool search, `allowed_tools` on OpenAI Responses at `api.openai.com`, and
+    /// the plain callable set everywhere else. The exchange re-checks its actual URL, so a grant
+    /// route or proxy never receives marks it was not chosen for.
+    pub fn tool_exposure(&self) -> llm::tool_offer::Exposure {
+        use llm::model_config::ApiProtocol;
+        use llm::tool_offer::Exposure;
+        let (base_url, model, default) = match &self.kind {
+            ProviderKind::AnthropicSubscription { model, .. } => (
+                llm::anthropic::BASE_URL,
+                model.as_str(),
+                ApiProtocol::Anthropic,
+            ),
+            ProviderKind::AnthropicEndpoint {
+                base_url, model, ..
+            } => (base_url.as_str(), model.as_str(), ApiProtocol::Anthropic),
+            ProviderKind::Endpoint {
+                base_url, model, ..
+            } => (
+                base_url.as_str(),
+                model.as_str(),
+                ApiProtocol::ChatCompletions,
+            ),
+            _ => return Exposure::Plain,
+        };
+        match self.protocol.unwrap_or(default) {
+            ApiProtocol::Anthropic => llm::anthropic::tool_exposure(base_url, model, false),
+            ApiProtocol::Responses if llm::responses::first_party(base_url) => {
+                Exposure::AllowedTools
+            }
+            _ => Exposure::Plain,
+        }
+    }
+
     pub fn adapter_monitor(&self) -> AdapterMonitor {
         Arc::clone(&self.adapter_monitor)
     }
@@ -1500,6 +1535,10 @@ impl Backend {
             "this is a {} model, not a chat model; select a chat model in /models or assign an embedding model to the embedding role",
             self.metadata.kind.label()
         );
+        // A marked tool surface reaches only the wires that carry it; every other route gets the
+        // callable set it always received. The Anthropic and Responses exchanges re-check.
+        let offered = llm::tool_offer::normalize(req, self.tool_exposure());
+        let req = offered.as_ref();
         let mut profile = self.next_profile.take().or_else(|| self.profile.clone());
         // The detected mechanism only matters to a constrained retry that offers tools; ordinary
         // requests are never probed.
@@ -2261,9 +2300,52 @@ pub(super) fn anthropic_exchange_shaped(
     validate_anthropic_compaction_scope(req, &replay_scope, model)?;
     let origin = llm::host_of(url);
     let req = &*anthropic_replayable_history(req, origin.as_deref());
-    let mut body = anthropic_request_body(model, req, claude_code_oauth, profile)?;
+    // Deferred tools only where this exact URL and model support them; otherwise the plain set.
+    // A request without deferred tools references none, so it is sent plain.
+    let mut deferring = llm::anthropic::tool_exposure(url, model, shape.is_some())
+        == llm::tool_offer::Exposure::Deferred
+        && req
+            .tools
+            .iter()
+            .any(|tool| llm::tool_offer::mark_of(tool).deferred);
+    let mut offered = llm::tool_offer::normalize(
+        req,
+        if deferring {
+            llm::tool_offer::Exposure::Deferred
+        } else {
+            llm::tool_offer::Exposure::Plain
+        },
+    );
+    deferring &= offered
+        .tools
+        .iter()
+        .any(|tool| llm::tool_offer::mark_of(tool).deferred);
     let streaming = on_text.is_some();
-    body["stream"] = serde_json::json!(streaming);
+    let build_body = |req: &Chat| -> Result<serde_json::Value> {
+        let mut body = anthropic_request_body(model, req, claude_code_oauth, profile)?;
+        body["stream"] = serde_json::json!(streaming);
+        // Fine-grained inputs prevent large code parameters from looking like idle streams.
+        // Keep the definitions identical on nonstreaming/cache-warm requests too; only `stream`
+        // selects SSE. Proxies retain their existing wire contract.
+        if shape.is_none()
+            && llm::anthropic::first_party(url)
+            && let Some(tools) = body
+                .get_mut("tools")
+                .and_then(serde_json::Value::as_array_mut)
+        {
+            for tool in tools {
+                tool["eager_input_streaming"] = serde_json::json!(true);
+            }
+        }
+        if llm::host_of(url).as_deref() == Some("api.anthropic.com") {
+            request_thinking_summaries(model, &mut body);
+        }
+        if !streaming && llm::usage::transport_purpose() == Some(llm::usage::Purpose::CacheWarm) {
+            prewarm_body(&mut body);
+        }
+        Ok(body)
+    };
+    let mut body = build_body(&offered)?;
     // Cache markers depend on the rung the endpoint last accepted, so each attempt rebuilds them.
     let official_oauth =
         claude_code_oauth && llm::host_of(url).as_deref() == Some("api.anthropic.com");
@@ -2369,6 +2451,17 @@ pub(super) fn anthropic_exchange_shaped(
                 FAST_MODE_REJECTED.lock().insert(scope.clone());
             }
             fast = false;
+            continue;
+        }
+        // The endpoint refused deferred tools or tool references: remember it for the process
+        // and resend the plain callable set once, as routes without deferral always send.
+        if deferring && llm::anthropic::deferral_rejected(status, &bytes.data) {
+            llm::anthropic::refuse_deferral(url, model);
+            deferring = false;
+            offered = std::borrow::Cow::Owned(
+                llm::tool_offer::normalize(&offered, llm::tool_offer::Exposure::Plain).into_owned(),
+            );
+            body = build_body(&offered)?;
             continue;
         }
         // The endpoint refused cache markers: latch the next narrower rung and resend once.
@@ -2516,6 +2609,11 @@ fn anthropic_request_variant(
 ) -> Result<serde_json::Value> {
     use serde_json::{Value, json};
     const CLAUDE_CODE_SYSTEM: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+    let tool_names: std::collections::HashSet<&str> = req
+        .tools
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
     let mut system = Vec::new();
     let mut messages = Vec::new();
     for message in &req.messages {
@@ -2578,13 +2676,35 @@ fn anthropic_request_variant(
                     if message["dial_transient"] == true {
                         messages.push(json!({"role":"user","content":text}));
                     } else {
-                        system.push(text.to_owned());
+                        system.push((llm::prompt::band(message), text.to_owned()));
                     }
                 }
             }
             "tool" => {
+                // A result that made deferred tools visible returns their `tool_reference`
+                // blocks, which the API expands inline; only `Exposure::Deferred` keeps them.
+                let references = llm::tool_offer::references(message);
+                let content = if !references.is_empty()
+                    && references.iter().all(|name| tool_names.contains(name))
+                {
+                    Value::Array(
+                        references
+                            .iter()
+                            .map(|name| {
+                                let name = if claude_code_oauth {
+                                    format!("_{name}")
+                                } else {
+                                    (*name).to_owned()
+                                };
+                                json!({"type":"tool_reference","tool_name":name})
+                            })
+                            .collect(),
+                    )
+                } else {
+                    message["content"].clone()
+                };
                 let mut block = json!({
-                    "type":"tool_result","tool_use_id":message["tool_call_id"],"content":message["content"]
+                    "type":"tool_result","tool_use_id":message["tool_call_id"],"content":content
                 });
                 if message["is_error"] == true {
                     block["is_error"] = json!(true);
@@ -2641,6 +2761,22 @@ fn anthropic_request_variant(
             }
         }
     }
+    let mut body = json!({"model":model,"max_tokens":req.max_tokens,"messages":messages});
+    // One system block per prompt band, in band order, so a change in a later band leaves the
+    // earlier blocks byte-identical. `anthropic_cache::apply` anchors the system breakpoint on the
+    // last Frozen/Stable block and strips the band tags. Subscription requests keep the billing
+    // header and Claude Code identity as their own leading blocks.
+    let mut blocks: Vec<(Option<llm::prompt::Band>, String)> = Vec::new();
+    for (band, text) in system {
+        let band = Some(band);
+        match blocks.last_mut() {
+            Some((last, joined)) if *last == band => {
+                joined.push_str("\n\n");
+                joined.push_str(&text);
+            }
+            _ => blocks.push((band, text)),
+        }
+    }
     if claude_code_oauth {
         let first_user_message = req
             .messages
@@ -2659,21 +2795,31 @@ fn anthropic_request_variant(
                 }
             })
             .unwrap_or_default();
-        system.insert(0, claude_billing_header(&first_user_message));
-        system.insert(1, CLAUDE_CODE_SYSTEM.into());
+        // Untagged: the billing block must keep `text` as its first serialized key for the
+        // attestation anchor, and both blocks precede every band.
+        blocks.insert(0, (None, claude_billing_header(&first_user_message)));
+        blocks.insert(1, (None, CLAUDE_CODE_SYSTEM.into()));
     }
-    let mut body = json!({"model":model,"max_tokens":req.max_tokens,"messages":messages});
-    if !system.is_empty() {
-        body["system"] = if claude_code_oauth {
-            json!(
-                system
+    match blocks.as_slice() {
+        [] => {}
+        // A single cacheable band keeps the plain-string form an unbanded prompt always had.
+        [(Some(llm::prompt::Band::Frozen | llm::prompt::Band::Stable), text)] => {
+            body["system"] = json!(text);
+        }
+        _ => {
+            body["system"] = json!(
+                blocks
                     .iter()
-                    .map(|text| json!({"type":"text","text":text}))
+                    .map(|(band, text)| {
+                        let mut block = json!({"type":"text","text":text});
+                        if let Some(band) = band {
+                            block[llm::anthropic_cache::BAND_TAG] = json!(band);
+                        }
+                        block
+                    })
                     .collect::<Vec<_>>()
-            )
-        } else {
-            json!(system.join("\n\n"))
-        };
+            );
+        }
     }
     if !req.tools.is_empty() {
         body["tools"] = Value::Array(
@@ -2690,6 +2836,10 @@ fn anthropic_request_variant(
                         let mut schema = json!({"name":name,"input_schema":function["parameters"]});
                         if let Some(description) = function["description"].as_str() {
                             schema["description"] = json!(description);
+                        }
+                        // Only `Exposure::Deferred` leaves marks on a Messages request.
+                        if llm::tool_offer::mark_of(tool).deferred {
+                            schema["defer_loading"] = json!(true);
                         }
                         schema
                     })
@@ -2744,6 +2894,28 @@ fn fast_mode_rejected(status: u16, body: &[u8]) -> bool {
         429 => text.contains("rate_limit_error") && text.contains("fast mode"),
         _ => false,
     }
+}
+
+/// Secret-free effective native Messages controls, built by the actual transport body builder.
+pub fn anthropic_request_controls(
+    model: &str,
+    req: &Chat,
+    profile: Option<&llm::profiles::ModelProfile>,
+) -> Result<serde_json::Value> {
+    let body = anthropic_request_body(model, req, false, profile)?;
+    let mut controls = serde_json::json!({"model":model});
+    for key in [
+        "thinking",
+        "output_config",
+        "max_tokens",
+        "temperature",
+        "top_p",
+    ] {
+        if let Some(value) = body.get(key) {
+            controls[key] = value.clone();
+        }
+    }
+    Ok(controls)
 }
 
 fn anthropic_request_body(
@@ -2820,7 +2992,92 @@ fn anthropic_request_body(
             }
         }
     }
+    apply_anthropic_model_facts(model, &mut body);
     Ok(body)
+}
+
+/// Rewrites controls the exact model's catalog record documents as rejected: sampling parameters
+/// where they were removed, and a disabled-thinking request where `{type: "disabled"}` is refused.
+/// Thinking off then becomes `between_tools`, or no `thinking` with low effort, per the record.
+fn apply_anthropic_model_facts(model: &str, body: &mut serde_json::Value) {
+    use llm::catalog::ModelFact;
+    let Some(record) = llm::catalog::bundled_model("anthropic", model) else {
+        return;
+    };
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if record.has(ModelFact::NoSampling) {
+        for key in ["temperature", "top_p", "top_k"] {
+            object.remove(key);
+        }
+    }
+    let disabled = object
+        .get("thinking")
+        .is_some_and(|thinking| thinking["type"] == "disabled");
+    if !disabled {
+        return;
+    }
+    let effort = object
+        .get("output_config")
+        .and_then(|config| config["effort"].as_str())
+        .map(str::to_owned);
+    // `between_tools` and capped disabled thinking are accepted only at effort `high` or below.
+    let cap_effort = |object: &mut serde_json::Map<String, serde_json::Value>| {
+        if matches!(effort.as_deref(), Some("xhigh" | "max")) {
+            object["output_config"]["effort"] = serde_json::json!("high");
+        }
+    };
+    if record.has(ModelFact::ThinkingAlwaysOn) {
+        object.remove("thinking");
+        if effort.is_none() {
+            let config = object
+                .entry("output_config")
+                .or_insert_with(|| serde_json::json!({}));
+            config["effort"] = serde_json::json!("low");
+        }
+    } else if record.has(ModelFact::ThinkingOffBetweenTools) {
+        object.insert(
+            "thinking".into(),
+            serde_json::json!({"type":"between_tools"}),
+        );
+        cap_effort(object);
+    } else if record.has(ModelFact::ThinkingOffUpToHigh) {
+        cap_effort(object);
+    }
+}
+
+/// A cache-warming replay uses the documented pre-warm form: `max_tokens: 0` runs prefill only,
+/// reading (and refreshing) the cached prefix and generating nothing. The replay is built exactly
+/// like the live request, so `thinking`, effort and tools match its prefix. Budget thinking
+/// (`type: "enabled"`) is rejected with `max_tokens: 0` and is dropped; such a replay can refresh
+/// only the tools and system entries. Streaming is also rejected, so callers replay unstreamed.
+fn prewarm_body(body: &mut serde_json::Value) {
+    body["max_tokens"] = serde_json::json!(0);
+    if let Some(object) = body.as_object_mut()
+        && object
+            .get("thinking")
+            .is_some_and(|thinking| thinking["type"] == "enabled")
+    {
+        object.remove("thinking");
+    }
+}
+
+/// First-party Messages: ask for readable thinking summaries where the exact model omits thinking
+/// text by default, so a long thinking phase streams progress instead of empty blocks.
+fn request_thinking_summaries(model: &str, body: &mut serde_json::Value) {
+    let summarized = llm::catalog::bundled_model("anthropic", model)
+        .is_some_and(|record| record.has(llm::catalog::ModelFact::SummarizedThinking));
+    if summarized
+        && let Some(thinking) = body
+            .get_mut("thinking")
+            .and_then(serde_json::Value::as_object_mut)
+        && thinking.get("type").and_then(serde_json::Value::as_str) == Some("adaptive")
+    {
+        thinking
+            .entry("display")
+            .or_insert_with(|| serde_json::json!("summarized"));
+    }
 }
 
 use super::anthropic::{
@@ -3032,6 +3289,23 @@ pub(super) fn anthropic_reply(value: &serde_json::Value) -> Result<Reply> {
         );
     }
     let reason = value["stop_reason"].as_str().unwrap_or("stop");
+    // `refusal` and `pause_turn` stay distinct finish reasons (see `Reply::provider_stop`); only the
+    // classifier's bounded category label is kept, never its explanation text.
+    let refusal_category = (reason == "refusal")
+        .then(|| {
+            value
+                .pointer("/stop_details/category")
+                .and_then(Value::as_str)
+        })
+        .flatten()
+        .filter(|category| {
+            !category.is_empty()
+                && category.len() <= 64
+                && category
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        })
+        .map(str::to_owned);
     Ok(Reply {
         text,
         tool_calls,
@@ -3052,6 +3326,7 @@ pub(super) fn anthropic_reply(value: &serde_json::Value) -> Result<Reply> {
         cache_creation_5m_tokens: cache_writes_5m,
         cache_creation_1h_tokens: cache_writes_1h,
         provider_content: value["content"].as_array().cloned().unwrap_or_default(),
+        refusal_category,
         ..Default::default()
     })
 }

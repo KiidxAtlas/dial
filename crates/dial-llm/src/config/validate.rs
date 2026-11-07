@@ -180,6 +180,15 @@ impl Config {
                     || (8192..=2_000_000).contains(&self.efficiency.history_token_cap)),
             "invalid efficiency context, preview, lightweight, cache-pressure or history-cap bounds"
         );
+        ensure!(
+            self.efficiency.batch_result_percent <= crate::config::types::MAX_BATCH_RESULT_PERCENT,
+            "efficiency.batch_result_percent must be 0 (off) or at most {}",
+            crate::config::types::MAX_BATCH_RESULT_PERCENT
+        );
+        ensure!(
+            self.efficiency.evidence_stall_rounds <= 256,
+            "efficiency.evidence_stall_rounds must be 0 (off) or at most 256"
+        );
         self.assistance
             .local
             .validate()
@@ -212,6 +221,7 @@ impl Config {
             "verification.python_command must be an argv list (or [] for autodetection), without control characters"
         );
         self.preparation.validate()?;
+        self.goal.validate()?;
         self.solve.validate()?;
         self.escalation.validate()?;
         Ok(())

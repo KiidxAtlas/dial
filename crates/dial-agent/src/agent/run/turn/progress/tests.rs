@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn repeated_mutations_without_evidence_cannot_repay_convergence_debt() {
+    let mut ledger = ProgressLedger::default();
+    for _ in 0..3 {
+        assert_eq!(ledger.evidence_round(true, false, 4), Rung::Retry);
+        ledger.progressed();
+    }
+    assert!(matches!(
+        ledger.evidence_round(true, false, 4),
+        Rung::Stop(_)
+    ));
+    assert_eq!(ledger.evidence_round(true, true, 4), Rung::Retry);
+    assert_eq!(ledger.evidence_round(false, false, 4), Rung::Retry);
+    for _ in 0..10 {
+        assert_eq!(ledger.evidence_round(true, false, 0), Rung::Retry);
+    }
+}
+
+#[test]
 fn mixed_setbacks_stop_without_a_redirect() {
     let mut ledger = ProgressLedger::default();
     let kinds = [

@@ -401,8 +401,15 @@ fn a_single_prompt_defaults_to_a_scout_with_the_types_step_budget() {
     assert!(!request.batch);
     assert_eq!(
         (job.spec.name, job.max_steps, job.label.as_str()),
-        ("scout", 0, "scout")
+        ("scout", 30, "scout")
     );
+    // An explicit 0 still means unlimited.
+    let unlimited = parse(
+        &json!({"task":"look around","solution_space":"s","max_steps":0}),
+        &config,
+    )
+    .unwrap();
+    assert_eq!(unlimited.jobs[0].max_steps, 0);
 }
 
 #[test]

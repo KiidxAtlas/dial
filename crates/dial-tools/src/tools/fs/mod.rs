@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod audio;
 pub(in crate::tools) mod conflicts;
+pub(in crate::tools) mod data_io;
 pub mod documents;
 pub(in crate::tools) mod files;
 pub mod image_weights;

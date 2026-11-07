@@ -80,6 +80,7 @@ fn is_turn_start(message: &Value) -> bool {
             "dial_generated_user",
             "dial_compaction_summary",
             "dial_compaction_notes",
+            "dial_compaction_files",
             "dial_branch_summary",
             "dial_context_rollover",
             "dial_continuation",
@@ -92,6 +93,23 @@ fn is_turn_start(message: &Value) -> bool {
         })
         && message["dial_snapcompact"].is_null()
         && Session::compaction_summary_text(message).is_none()
+}
+
+/// Files the current turn attempted to modify, newest first: write/edit targets in tool calls
+/// since the latest human turn start (or since the history's start when an earlier compaction
+/// already folded that turn start). Attempted targets, never confirmed outcomes.
+pub(in crate::agent) fn edited_this_turn(messages: &[Value]) -> Vec<String> {
+    let start = messages.iter().rposition(is_turn_start).unwrap_or(0);
+    let mut ops = FileOps::default();
+    for message in &messages[start..] {
+        ops.observe(message);
+    }
+    ops.recent
+        .iter()
+        .rev()
+        .filter(|path| ops.modified.contains(*path))
+        .cloned()
+        .collect()
 }
 
 /// Index into `source` where the turn containing the cut starts, when the cut lands mid-turn.

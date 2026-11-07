@@ -141,11 +141,28 @@ Changing a rule means editing that test and stating why here.
 
 - `agent::verify::completion` owns one state-based decision for plain replies, `finish` and
   clarification. Execution obligations and current evidence, not candidate phrasing or repetition,
-  determine acceptance. One instruction-scoped recovery allowance survives inner-loop reentry;
-  accepted text cannot auto-close execution todos. Optional follow-ups remain separate.
-- Default tool exposure selects a stable core under a serialized byte budget for hosted/local
-  routes; only explicit tool loading adds specialist schemas. System policy does not enumerate
+  determine acceptance. One instruction-scoped recovery allowance survives inner-loop reentry.
+  On lean local routes accepted text cannot auto-close execution todos; on other routes an accepted
+  `completed` answer closes the single in-progress execution step and lists other open steps.
+  Check failures not introduced by the turn (unavailable environment, denied approval, timeout,
+  unchanged baseline failure, or a failure the request only asked to diagnose) are accepted with
+  disclosed gaps (`verify/checks.rs::disclosed_failure`). Optional follow-ups remain separate.
+- Default tool exposure selects a stable core under a serialized byte budget (24 KiB on hosted
+  routes, which adds `bg`, `task`, `message` and `ask`; 12 KiB on lean/local routes); only explicit tool
+  loading (`tool_load`, or `tool_search` with `load: true`) adds specialist schemas.
+  `Agent::wire_tool_surface` is the only producer of per-request tool-offer marks and runs after
+  accounting and compaction; `llm::tool_offer` turns them into each wire's form (Anthropic
+  `defer_loading` plus `tool_reference` results, Responses `allowed_tools`, or the plain callable
+  set). Admission (`turn.names` and the offer schemas) stays authoritative, history contracts are
+  checked against `tool_offer::callable`, and loading never grants permission. System policy does not enumerate
   the changing offer. Explicit harnesses and legacy opt-out configurations retain their contracts.
+
+- Every compaction method-choice site resolves native capability through
+  `compact::compaction::native_capability`/`native_supported` where the backend is known;
+  speculation receives it as `SpeculationContext::native_supported`.
+- On preserved-thinking models, sent history is append-only: `window::projection::sent_history_policy`
+  disables rewriting of sent turns, and `window::sent_notes` records request notes on reply and
+  re-sends them in place; compaction starts a new epoch and unbinds retained thinking.
 
 - The session owns the active branch and execution tree. Conversation records are immutable;
   in-flight assistant, reasoning, tool and worker nodes have shared mutable result bodies.

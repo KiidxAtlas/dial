@@ -463,7 +463,7 @@ pub fn catalog_block(skills: &[Skill]) -> String {
         return String::new();
     }
     let mut out = String::from(
-        "## Skills\nReusable procedures for substantial work. When a multi-step task matches one, load it with the `skill` tool before starting; small or single-file changes need none. Descriptions below are summaries only.\n",
+        "## Skills\nReusable procedures for substantial work. When a multi-step task matches one, load it before starting; small or single-file changes need none. Descriptions below are summaries only.\n",
     );
     let mut shown = 0;
     for skill in skills {
@@ -486,7 +486,7 @@ pub fn catalog_block(skills: &[Skill]) -> String {
     }
     if shown < skills.len() {
         out.push_str(&format!(
-            "- ... and {} more skills (load one by name with the `skill` tool)\n",
+            "- ... and {} more skills (load one by name)\n",
             skills.len() - shown
         ));
     }
@@ -499,8 +499,9 @@ pub fn catalog_block(skills: &[Skill]) -> String {
 /// "test") occur in most requests, so they never count as description overlap: an ordinary bug
 /// report shares them with a debugging skill, and the hint would cost a skill load on a small fix.
 /// Deterministic word overlap only: the model still decides whether a skill applies. Returns
-/// `None` when nothing matches, so ordinary prompts get no hint.
-pub fn match_hint(skills: &[Skill], text: &str) -> Option<String> {
+/// `None` when nothing matches, so ordinary prompts get no hint. `skill_offered` says whether the
+/// request offers the `skill` tool; otherwise the hint says to load that tool with `tool_load` first.
+pub fn match_hint(skills: &[Skill], text: &str, skill_offered: bool) -> Option<String> {
     const STOP: &[&str] = &[
         "with", "this", "that", "from", "when", "your", "into", "about", "should", "will", "need",
         "make", "have", "what", "them", "they", "some", "also", "than", "then",
@@ -537,8 +538,13 @@ pub fn match_hint(skills: &[Skill], text: &str) -> Option<String> {
         .take(3)
         .map(|(_, skill)| skill.name.as_str())
         .collect();
+    let how = if skill_offered {
+        "load it with the `skill` tool in the same response as your first reads, not as a round of its own"
+    } else {
+        "load the `skill` tool with `tool_load` in the same response as your first reads, then load the skill with it"
+    };
     Some(format!(
-        "Skill hint: {} may match this request. If a matching skill covers substantial multi-step work, load it with the `skill` tool in the same response as your first reads, not as a round of its own.",
+        "Skill hint: {} may match this request. If a matching skill covers substantial multi-step work, {how}.",
         names.join(", ")
     ))
 }

@@ -17,7 +17,8 @@ fn index(phase: RequestPhase) -> usize {
     }
 }
 
-/// A gap this long between streamed deltas is a provider stall, not token generation.
+/// Client-observed silence between deltas. Server-side buffering can also produce this gap;
+/// it does not establish that the provider stopped generating tokens.
 const STALL: Duration = Duration::from_secs(10);
 
 #[derive(Default)]

@@ -74,7 +74,7 @@ impl Agent<'_> {
                             crate::agent::run::engine::Tick::Finished(report),
                         ));
                     }
-                    turn.pending_nudges.push(json!({"role":"user","content":crate::agent::safety::stream_guards::render_retry_prompt(crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE, turn.stall_continues, crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE_MAX_RETRIES),"dial_transient":true}));
+                    turn.pending_nudges.push(json!({"role":"user","content":crate::agent::safety::stream_guards::STREAM_STALL_CONTINUE,"dial_transient":true}));
                     turn.refund_unusable(ui);
                     return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
                 }

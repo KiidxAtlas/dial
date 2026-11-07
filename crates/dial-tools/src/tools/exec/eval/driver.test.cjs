@@ -32,6 +32,51 @@ const cell = (id, code) => ({ id, code });
 const reply = (callback_id, operation_id, data, text = '', is_error = false) =>
   ({ callback_id, operation_id, result: { data, text, is_error } });
 
+for (const python of [false, true]) {
+  test(`portable binary helpers use explicit endian and reject truncation (${python ? 'Python' : 'Node'})`, () => {
+    const install = (!python ? fs.readFileSync(path.join(__dirname, 'binary.js'), 'utf8') + '\n' : '') + fs.readFileSync(path.join(__dirname, python ? 'portable.py' : 'portable.js'), 'utf8');
+    const code = python ? "dial.hex(dial.pack('>Ih', [0x01020304, -2]))" : "dial.hex(dial.pack('>Ih', [0x01020304, -2]))";
+    const invalid = python ? "dial.pack('<B', [256])" : "dial.pack('<B', [256])";
+    const truncated = python ? "dial.unpack('>I', bytes([1,2]))" : "dial.unpack('>I', [1,2])";
+    const frames = run([cell(0, install),cell(1,code),cell(2,invalid),cell(3,truncated)],python);
+    assert.match(frames[1].result.value, /01 02 03 04 ff fe/);
+    assert.ok(frames[2].result.error);
+    assert.ok(frames[3].result.error);
+    assert.equal(frames.filter(frame => frame.callback).length, 0);
+  });
+
+  test(`portable JSON rejects nonfinite values before any write (${python ? 'Python' : 'Node'})`, () => {
+    const install = fs.readFileSync(path.join(__dirname, python ? 'portable.py' : 'portable.js'), 'utf8');
+    const code = python ? "dial.writeJson('bad.json', {'value':float('nan')})" : "await dial.writeJson('bad.json', {value:NaN})";
+    const frames = run([cell(0, install), cell(1, code)], python);
+    assert.equal(frames.filter(frame => frame.callback).length, 0);
+    assert.ok(frames.find(frame => frame.id === 1).result.error);
+  });
+
+  test(`batch errors never replay possibly completed mutations (${python ? 'Python' : 'Node'})`, () => {
+    const code = python ? "tool.batch([{'name':'write', 'args':{'path':'once'}}])" : "await tool.batch([{name:'write',args:{path:'once'}}])";
+    const frames = run([cell(1, code), reply(1, 1, null, 'dial.batch failed after a write', true)], python);
+    assert.equal(frames.filter(frame => frame.callback).length, 1);
+    assert.match(frames.find(frame => frame.result).result.error, /failed after a write/);
+  });
+
+  test(`portable API reads bytes and gates dependent writes (${python ? 'Python' : 'Node'})`, () => {
+    const install = fs.readFileSync(path.join(__dirname, python ? 'portable.py' : 'portable.js'), 'utf8');
+    const read = python ? "list(dial.readBytes('source.bin'))" : "Array.from(await dial.readBytes('source.bin'))";
+    const write = python ? "dial.writeBytes('new.bin', bytes([0, 255, 13, 10]))" : "await dial.writeBytes('new.bin', new Uint8Array([0,255,13,10]))";
+    const batch = python ? "dial.batch([{'name':'read'}])\ndial.writeText('must-not-exist','bad')" : "await dial.batch([{name:'read'}]); await dial.writeText('must-not-exist','bad')";
+    const frames = run([cell(0, install), cell(1, read), reply(1, 1, {content:'AP8NCg=='}),
+      cell(2, write), reply(2, 2, {created:true}), cell(3, batch), reply(3, 3, [{is_error:true,text:'denied',data:null,status:'blocked'}])], python);
+    const results = frames.filter(frame => frame.result);
+    assert.equal(results[0].result.error, null);
+    assert.match(results[1].result.value, /0, 255, 13, 10/);
+    assert.match(results[3].result.error, /prerequisites failed/);
+    const calls = frames.filter(frame => frame.callback);
+    assert.equal(calls.length, 3, 'dependent write must never run');
+    assert.deepEqual(calls[1].arguments, {path:'new.bin',content:'AP8NCg==',encoding:'base64'});
+  });
+}
+
 test('Python shorthand preserves dictionary/keyword calls, validation and controller denial', () => {
   const parameters = { path: 'summary.csv', content: 'a,b\n' };
   const output = run([
@@ -202,3 +247,70 @@ for (const python of [false, true]) {
     assert.match(result.stdout, /truncated/);
   });
 }
+
+test('tool.batch sends one ordered batch callback and falls back to serial calls when refused', () => {
+  const output = run([
+    cell(1, "(await tool.batch([{ name: 'read', args: { path: 'a' } }, { name: 'grep' }])).map(r => r.data).join(',')"),
+    reply(1, 1, [{ text: '', data: 1, is_error: false }, { text: '', data: 2, is_error: false }]),
+    cell(2, "tool.batch([{ name: 'x', args: { n: 1 } }, { name: 'y' }]).map(r => r.is_error ? 'E' : r.data).join(',')"),
+    reply(2, 2, { code: 'unsupported_batch', executed: false }, 'batch not supported', true),
+    reply(3, 2, 'X'),
+    reply(4, 2, null, 'denied', true),
+    cell(3, "tool.batch([{ name: '' }])"),
+    cell(4, 'tool.batch([])'),
+  ]);
+  const results = output.filter(frame => frame.result).map(frame => frame.result);
+  assert.equal(results[0].value, "'1,2'");
+  assert.equal(results[1].value, "'X,E'");
+  assert.match(results[2].error, /entry 0: tool name must be a nonempty string/);
+  assert.equal(results[3].value, '[]');
+  assert.deepEqual(output.filter(frame => frame.callback).map(frame => ({ name: frame.name, arguments: frame.arguments })), [
+    { name: 'dial.batch', arguments: { calls: [{ name: 'read', arguments: { path: 'a' } }, { name: 'grep', arguments: {} }] } },
+    { name: 'dial.batch', arguments: { calls: [{ name: 'x', arguments: { n: 1 } }, { name: 'y', arguments: {} }] } },
+    { name: 'x', arguments: { n: 1 } },
+    { name: 'y', arguments: {} },
+  ]);
+});
+
+test('Python tool.batch sends one ordered batch callback and falls back to serial calls when refused', () => {
+  const output = run([
+    cell(1, "','.join(str(r['data']) for r in tool.batch([{'name': 'read', 'args': {'path': 'a'}}, {'name': 'grep'}]))"),
+    reply(1, 1, [{ text: '', data: 1, is_error: false }, { text: '', data: 2, is_error: false }]),
+    cell(2, "','.join('E' if r['is_error'] else str(r['data']) for r in (await tool.batch([{'name': 'x', 'args': {'n': 1}}, {'name': 'y'}])))"),
+    reply(2, 2, { code: 'unsupported_batch', executed: false }, 'batch not supported', true),
+    reply(3, 2, 'X'),
+    reply(4, 2, { reason: 'fixture' }, 'denied', true),
+    cell(3, "tool.batch([{'name': ''}])"),
+    cell(4, 'tool.batch([])'),
+    cell(5, "tool.batch([{'name': 'a'}, {'name': 'b'}])"),
+    reply(5, 5, [{ text: '', data: 1, is_error: false }]),
+    cell(6, "tool.batch([{'name': 'a'}] * 129)"),
+    cell(7, "tool.batch([{'name': 'a'}, {'name': 'b'}])"),
+    reply(6, 7, null, 'cell callback limit exceeded', true),
+  ], true);
+  const results = output.filter(frame => frame.result).map(frame => frame.result);
+  assert.equal(results[0].value, "'1,2'");
+  assert.equal(results[1].value, "'X,E'");
+  assert.match(results[2].error, /entry 0: tool name must be a nonempty string/);
+  assert.equal(results[3].value, '[]');
+  assert.match(results[4].error, /malformed tool.batch result/);
+  assert.match(results[5].error, /at most 128/);
+  assert.match(results[6].error, /cell callback limit exceeded/, 'only a refusal of the reserved name falls back');
+  assert.deepEqual(output.filter(frame => frame.callback).map(frame => ({ name: frame.name, arguments: frame.arguments })), [
+    { name: 'dial.batch', arguments: { calls: [{ name: 'read', arguments: { path: 'a' } }, { name: 'grep', arguments: {} }] } },
+    { name: 'dial.batch', arguments: { calls: [{ name: 'x', arguments: { n: 1 } }, { name: 'y', arguments: {} }] } },
+    { name: 'x', arguments: { n: 1 } },
+    { name: 'y', arguments: {} },
+    { name: 'dial.batch', arguments: { calls: [{ name: 'a', arguments: {} }, { name: 'b', arguments: {} }] } },
+    { name: 'dial.batch', arguments: { calls: [{ name: 'a', arguments: {} }, { name: 'b', arguments: {} }] } },
+  ]);
+});
+
+test('Python tool.batch entries count against the cell callback limit', () => {
+  const frames = [cell(1, "r = tool.batch([{'name': 'a'}] * 128)\ntool.a()")];
+  frames.push(reply(1, 1, Array.from({ length: 128 }, (_, n) => ({ text: '', data: n, is_error: false }))));
+  const output = run(frames, true);
+  const result = output.find(frame => frame.result).result;
+  assert.match(result.error, /cell callback limit exceeded/);
+  assert.equal(output.filter(frame => frame.callback).length, 1);
+});

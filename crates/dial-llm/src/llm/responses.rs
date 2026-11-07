@@ -131,17 +131,84 @@ fn request_api(
     Ok(body)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_FIRST_PARTY: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the first-party host check when dropped ([`test_first_party`]).
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestFirstParty(());
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestFirstParty {
+    fn drop(&mut self) {
+        TEST_FIRST_PARTY.with(|cell| cell.borrow_mut().take());
+    }
+}
+
+/// Treat `origin` (`scheme://host:port`) as the OpenAI API host on this thread, so a fake server
+/// can exercise wire behaviour gated on `api.openai.com`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_first_party(origin: &str) -> TestFirstParty {
+    TEST_FIRST_PARTY.with(|cell| *cell.borrow_mut() = Some(origin.to_owned()));
+    TestFirstParty(())
+}
+
+/// Whether `url` is the OpenAI API's own host (exactly `api.openai.com`).
+pub(super) fn first_party(url: &str) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if TEST_FIRST_PARTY.with(|cell| {
+        cell.borrow()
+            .as_deref()
+            .is_some_and(|origin| super::same_origin(url, origin))
+    }) {
+        return true;
+    }
+    super::host_of(url).as_deref() == Some("api.openai.com")
+}
+
+/// Narrow a request whose surface holds sent but uncallable tools with
+/// `tool_choice: {"type":"allowed_tools","mode":"auto","tools":[...]}`, so the `tools` array
+/// stays the same while the callable set changes (developers.openai.com/api/docs/guides/
+/// function-calling, "Allowed tools"). Flat API bodies only: each entry names a top-level
+/// function. A forced `tool_choice` (handoff's `none`) wins; nothing callable becomes `none`.
+fn apply_allowed_tools(body: &mut Value, chat: &Chat) {
+    let Some(names) = super::tool_offer::allowed_names(&chat.tools) else {
+        return;
+    };
+    if body.get("tool_choice").is_some() {
+        return;
+    }
+    body["tool_choice"] = if names.is_empty() {
+        json!("none")
+    } else {
+        json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": names
+                .iter()
+                .map(|name| json!({"type": "function", "name": name}))
+                .collect::<Vec<_>>(),
+        })
+    };
+}
+
 /// Whether a Responses request carries the session's prompt-cache routing key. ChatGPT/Codex routes
-/// send it whenever one exists, unless the profile sets `prompt_cache = false`. API-key routes keep
-/// the declared-capability gate.
+/// and the OpenAI API (`api.openai.com`, where the key is only a cache-routing hint) send it
+/// whenever one exists, unless the profile sets `prompt_cache = false`. Other API-key hosts keep
+/// the declared-capability gate, since an OpenAI-compatible server may reject the field.
 pub(super) fn sends_prompt_cache_key(
     profile: Option<&super::profiles::ModelProfile>,
     codex: bool,
+    url: &str,
 ) -> bool {
-    if codex {
-        profile.and_then(|p| p.prompt_cache) != Some(false)
+    let opted_out = profile.and_then(|p| p.prompt_cache) == Some(false);
+    if codex || super::host_of(url).as_deref() == Some("api.openai.com") {
+        !opted_out
     } else {
-        profile.is_some_and(|p| p.capabilities.prompt_cache && p.prompt_cache != Some(false))
+        !opted_out && profile.is_some_and(|p| p.capabilities.prompt_cache)
     }
 }
 
@@ -938,13 +1005,27 @@ fn exchange_inner(
         ..
     } = endpoint;
     let (replay_scope, chat) = validate_history(endpoint, chat)?;
-    let chat = &*chat;
+    // `allowed_tools` only on the OpenAI API host; every other Responses route gets the plain
+    // callable set.
+    let allowed_tools = codex_account_id.is_none() && first_party(url);
+    let offered = super::tool_offer::normalize(
+        &chat,
+        if allowed_tools {
+            super::tool_offer::Exposure::AllowedTools
+        } else {
+            super::tool_offer::Exposure::Plain
+        },
+    );
+    let chat = &*offered;
     let mut body = if codex_account_id.is_some() {
         request_codex(model, chat, profile)?
     } else {
         request_api(model, chat, profile)?
     };
-    if sends_prompt_cache_key(profile, codex_account_id.is_some())
+    if allowed_tools && !chat.tools.is_empty() {
+        apply_allowed_tools(&mut body, chat);
+    }
+    if sends_prompt_cache_key(profile, codex_account_id.is_some(), url)
         && let Some(key) = cache_key
     {
         body["prompt_cache_key"] = json!(key);
@@ -1237,7 +1318,7 @@ pub(super) fn compact(
     if endpoint.account_id.is_none() {
         body["max_output_tokens"] = json!(chat.max_tokens);
     }
-    if sends_prompt_cache_key(profile, endpoint.account_id.is_some())
+    if sends_prompt_cache_key(profile, endpoint.account_id.is_some(), endpoint.url)
         && let Some(key) = cache_key
     {
         body["prompt_cache_key"] = json!(key);

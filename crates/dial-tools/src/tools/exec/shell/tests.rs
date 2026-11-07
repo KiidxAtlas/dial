@@ -1,4 +1,17 @@
 use super::*;
+
+#[test]
+fn directory_delta_reports_disappearing_and_shrinking_sources() {
+    let (dir, _ws) = workspace();
+    fs::write(dir.path().join("main.db-wal"), b"original WAL").unwrap();
+    fs::write(dir.path().join("input"), b"input bytes").unwrap();
+    let before = directory_entries(dir.path());
+    fs::remove_file(dir.path().join("main.db-wal")).unwrap();
+    fs::write(dir.path().join("input"), b"x").unwrap();
+    let note = created_entries_note(before.as_ref(), dir.path()).unwrap();
+    assert!(note.contains("main.db-wal disappeared"), "{note}");
+    assert!(note.contains("input shrank"), "{note}");
+}
 #[cfg(target_os = "macos")]
 use crate::tools::execute;
 use crate::tools::testkit::*;
@@ -1410,4 +1423,25 @@ fn captured_output_never_splits_a_character_at_the_head_cut() {
         "replacement character around the omission"
     );
     assert!(text.contains("bytes of output omitted"));
+}
+
+#[test]
+fn interpreter_guidance_lists_available_and_missing_helper_languages() {
+    let bin = tempfile::tempdir().unwrap();
+    for program in ["perl", "gcc"] {
+        fs::write(bin.path().join(program), "").unwrap();
+    }
+    let guidance = interpreter_guidance_for(Some(bin.path().as_os_str()));
+    assert!(
+        guidance.contains("Shell PATH languages: perl, C compiler (gcc); not found: python3, node, ruby, go, rustc, java."),
+        "{guidance}"
+    );
+    fs::write(bin.path().join("python"), "").unwrap();
+    let guidance = interpreter_guidance_for(Some(bin.path().as_os_str()));
+    assert!(guidance.contains("python3 (python)"), "{guidance}");
+    let empty = interpreter_guidance_for(None);
+    assert!(
+        empty.contains("Shell PATH languages: none; not found: python3"),
+        "{empty}"
+    );
 }

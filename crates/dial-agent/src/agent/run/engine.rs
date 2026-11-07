@@ -85,6 +85,11 @@ pub(in crate::agent) struct Engine {
     progress_captures: std::collections::BTreeSet<(String, Option<String>)>,
     round_progress: RoundProgress,
     progress: super::turn::progress::ProgressLedger,
+    evidence_stall_limit: u32,
+    evidence_this_round: bool,
+    convergence_notice: bool,
+    authored_paths: std::collections::BTreeSet<std::path::PathBuf>,
+    observed_verdict: Option<String>,
     pub narration: guard::NarrationGuard,
     pub recovery: turn_recovery::Recovery,
     uncertain: bool,
@@ -166,8 +171,9 @@ impl Engine {
     pub fn reusable_reads(&self, visible: impl Fn(&str) -> bool) -> investigation::ReadReuse {
         self.returned_reads.reusable(visible)
     }
-    pub fn research_prompt(&self) -> Option<serde_json::Value> {
-        self.research.prompt()
+    /// See [`crate::agent::workflow::research::Research::prompt`]; `forced` marks a lean route.
+    pub fn research_prompt(&self, forced: bool) -> Option<serde_json::Value> {
+        self.research.prompt(forced)
     }
 
     pub fn research_required(&self) -> bool {
@@ -197,10 +203,30 @@ impl Engine {
 
     pub fn record_progress(&mut self, progress: RoundProgress) -> super::turn::progress::Rung {
         use super::turn::progress::Rung;
+        let grounded = std::mem::take(&mut self.evidence_this_round);
+        if let rung @ Rung::Stop(_) = self.progress.evidence_round(
+            progress != RoundProgress::Neutral,
+            grounded,
+            self.evidence_stall_limit,
+        ) {
+            return rung;
+        }
+        self.convergence_notice |= self.progress.hypothesis_due(self.evidence_stall_limit);
         if let Some(kind) = self.progress.tool_round(progress) {
             self.progress.setback(kind)
         } else {
             self.progress.stop_reason().map_or(Rung::Retry, Rung::Stop)
+        }
+    }
+
+    pub fn set_evidence_stall_limit(&mut self, rounds: u32) {
+        self.evidence_stall_limit = rounds;
+    }
+
+    pub fn note_check_verdict(&mut self, verdict: &str) {
+        if self.observed_verdict.as_deref() != Some(verdict) {
+            self.observed_verdict = Some(verdict.to_owned());
+            self.evidence_this_round = true;
         }
     }
 
@@ -587,10 +613,7 @@ impl Engine {
             self.returned_reads
                 .pointer(call, &output.text, output.is_error, holds_result);
         let duplicate = pointer.or(duplicate);
-        let shell_check = call.name == "bash"
-            && call.arguments["command"]
-                .as_str()
-                .is_some_and(crate::agent::memory::selfplay::is_check_command);
+        let shell_check = crate::agent::memory::selfplay::is_check_call(call);
         let successful = status == crate::runtime::execution::ToolStatus::Ok
             && !output.is_error
             && !check_failed
@@ -653,6 +676,48 @@ impl Engine {
                 || !output.execution.captures.is_empty())
         {
             self.round_progress = RoundProgress::Stalled;
+        }
+        let authored_read = call.name == "read"
+            && call.arguments["path"]
+                .as_str()
+                .and_then(|path| workspace.resolve(path).ok())
+                .is_some_and(|path| self.authored_paths.contains(&path));
+        self.evidence_this_round |= captured || (observed && call.name != "bash" && !authored_read);
+        self.authored_paths
+            .extend(output.execution.changed_paths.iter().cloned());
+        let verdict = if shell_check {
+            Some(
+                serde_json::to_value(crate::agent::verify::verification::classify_output(
+                    None, output, false,
+                ))
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unverified".into()),
+            )
+        } else if call.name == crate::agent::verify::verify_tool::NAME {
+            output
+                .data
+                .as_ref()
+                .and_then(|data| data["results"].as_array())
+                .filter(|results| !results.is_empty())
+                .map(|results| {
+                    results
+                        .iter()
+                        .map(|result| result["status"].as_str().unwrap_or("unverified"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+        } else {
+            None
+        };
+        if let Some(verdict) = verdict
+            && self.observed_verdict.as_ref() != Some(&verdict)
+        {
+            self.observed_verdict = Some(verdict);
+            self.evidence_this_round = true;
+        }
+        if std::mem::take(&mut self.convergence_notice) {
+            output.text.push_str("\n<dial-notice kind=\"evidence_stall\">Repeated work has not produced new independent evidence or changed check results. State the revised hypothesis and the smallest discriminating check before further rewrites. Inspect retained original inputs; report blocked if the needed evidence cannot be recovered.</dial-notice>");
         }
         // Keep duplicate accounting and retry barriers even when coaching would be larger
         // than a successful read's model-visible source, including compact file handles.

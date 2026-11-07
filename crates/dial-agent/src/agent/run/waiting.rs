@@ -5,6 +5,9 @@ use crate::agent::*;
 // paint, runtime projection and budget checks responsive at the UI heartbeat, but never ask the
 // model to poll on this tick.
 const HOST_TICK: Duration = crate::agent::ui::chat::HEARTBEAT;
+/// How long a settled wait waits for a finished job's trailing completion notification.
+const SETTLE_GRACE: Duration = Duration::from_millis(500);
+const SETTLE_POLL: Duration = Duration::from_millis(10);
 
 impl Agent<'_> {
     /// Returns true when a continuation is needed, including user steering, peer mail or a stop
@@ -65,9 +68,22 @@ impl Agent<'_> {
                     && self.side_questions.running_ids().is_empty()
                 {
                     // Work may have finished after the pump above; deliver that result, not a bare
-                    // "no longer running" note.
-                    self.pump_subagents(ui);
-                    if self.background_result_ready() {
+                    // "no longer running" note. A job's completion notification can trail its exit
+                    // briefly, so give it a bounded grace period before falling back.
+                    let grace = Instant::now() + SETTLE_GRACE;
+                    let mut ready = false;
+                    loop {
+                        self.pump_subagents(ui);
+                        if self.background_result_ready() {
+                            ready = true;
+                            break;
+                        }
+                        if Instant::now() >= grace || self.interrupt.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(SETTLE_POLL);
+                    }
+                    if ready {
                         break "result_or_message";
                     }
                     // A provider may settle work without a notification. Never turn its disappearance

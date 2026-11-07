@@ -82,10 +82,22 @@ impl Tracker {
     pub fn observe(&mut self, model: &str, request: &Chat) -> Observation {
         let started = std::time::Instant::now();
         let mut scratch = Vec::new();
+        // A request note is sent as its role and content alone, first as a transient and later
+        // re-sent (`sent_notes`) under a different marker: compare what the provider receives.
         let messages: Vec<_> = request
             .messages
             .iter()
-            .map(|value| digest(value, &mut scratch))
+            .map(|value| {
+                if value["dial_transient"] == true || value.get(super::sent_notes::MARKER).is_some()
+                {
+                    digest(
+                        &serde_json::json!({"role":value["role"],"content":value["content"]}),
+                        &mut scratch,
+                    )
+                } else {
+                    digest(value, &mut scratch)
+                }
+            })
             .collect();
         let mut system = Sha256::new();
         let mut system_bytes = 0;
@@ -139,6 +151,33 @@ impl Tracker {
         self.messages = messages;
         observation.elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         observation
+    }
+
+    /// Test check for preserved-thinking routes, where a replayed thinking block is rejected once
+    /// anything sent before it changed: observe `request` and panic, naming the first changed
+    /// part, unless it is a byte-prefix extension of the previous request.
+    #[cfg(test)]
+    pub fn assert_appends_only(&mut self, model: &str, request: &Chat) -> Observation {
+        let observation = self.observe(model, request);
+        assert!(
+            observation.appends_only(),
+            "request is not an append-only extension of the previous one: {} (first {} messages unchanged)",
+            observation.invalidation,
+            observation.stable_message_count
+        );
+        observation
+    }
+}
+
+#[cfg(test)]
+impl Observation {
+    /// The request only appended to the previous one: the same model, system and tools, and
+    /// every earlier message byte-identical.
+    pub fn appends_only(&self) -> bool {
+        matches!(
+            self.invalidation,
+            Invalidation::Initial | Invalidation::None
+        )
     }
 }
 

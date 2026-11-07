@@ -6,6 +6,42 @@ use super::*;
 use crate::llm::profiles::ReasoningEffort;
 
 #[test]
+fn native_output_effort_can_be_pinned_independently_of_thinking_off() {
+    let config = Config {
+        provider: Some("anthropic".into()),
+        model: "claude-sonnet-4-6".into(),
+        ..Default::default()
+    };
+    let configured = apply(
+        config,
+        &ModelFlags {
+            thinking: Some(CliThinking::Off),
+            effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let profile = configured.active_model_profile().unwrap();
+    assert_eq!(profile.thinking, Some(false));
+    assert_eq!(profile.reasoning_effort, Some(ReasoningEffort::Low));
+    assert!(
+        !configured.thinking_auto,
+        "explicit effort must survive automatic judgment"
+    );
+    assert!(
+        apply(
+            Config::default(),
+            &ModelFlags {
+                effort: Some(ReasoningEffort::Low),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    assert!(parse_output_effort("none").is_err());
+}
+
+#[test]
 fn thinking_accepts_selectors_and_unambiguous_prefixes() {
     assert_eq!(parse_thinking("off"), Ok(CliThinking::Off));
     assert_eq!(parse_thinking("minimal"), Ok(CliThinking::Minimal));

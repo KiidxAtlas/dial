@@ -1,7 +1,10 @@
 //! `/goal` and `/guided-goal`: a persistent objective the agent keeps working on across turns.
 //! Budget accounting, continuation and budget-limit prompts, the `goal` tool operations, and the
 //! stall rule. Continuations run inside `Agent::turn` as follow-up turns, so one user turn drives the
-//! whole loop.
+//! whole loop. With `goal.progress_file` set, each goal turn also mirrors the goal to that
+//! workspace file ([`progress`]).
+
+mod progress;
 
 use crate::agent::prompts::modes::goal::{
     BUDGET_LIMIT, CONTINUATION, GOAL_MODE_ACTIVE, GUIDED_RULES,
@@ -79,7 +82,7 @@ Single `op` field:
 - `complete`: marks goal complete only when actually done and every deliverable verified against current evidence. NEVER because budget low or turn ending.
 - `drop`: discards current goal without completing it and ends goal mode; `goal` tool leaves your tool set immediately, so you cannot `create` a replacement (not even later in the same turn or eval cell). To change the objective, NEVER drop; ask the user to set the new goal.
 
-Paused goal from `get` → MUST `resume` before continuing work."#;
+Paused goal from `get` → `resume` it before continuing work."#;
 
 /// Prompt for `/guided-goal [initial]`: the interview kickoff, with the rough goal as data.
 pub fn guided_kickoff(initial: &str) -> String {
@@ -514,8 +517,28 @@ impl Agent<'_> {
                 .goal
                 .account(goal_tokens(&turn.all), started.elapsed().as_secs());
             self.save_modes()?;
+            self.write_goal_progress(ui);
         }
         Ok(report)
+    }
+
+    /// Mirror the goal, todos and working state to `goal.progress_file` when one is configured
+    /// (see [`progress`]). A failed write is reported and never fails the turn.
+    fn write_goal_progress(&self, ui: &mut dyn Ui) {
+        let path = self.config.goal.progress_file.trim();
+        if path.is_empty() || self.plan_mode {
+            return;
+        }
+        let Some(goal) = &self.modes.goal.goal else {
+            return;
+        };
+        let control = self.session.control_state();
+        let text = progress::render(goal, &self.todo, &control["working_state"]);
+        if let Err(error) = progress::write(&self.workspace, path, &text) {
+            ui.diagnostic(&format!(
+                "Goal progress file {path} was not written: {error}"
+            ));
+        }
     }
 
     /// Runs one `goal` tool call against the session's goal state and persists the result.

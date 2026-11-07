@@ -1,5 +1,22 @@
 use super::*;
 
+#[test]
+fn batch_receipts_preserve_partial_effects_and_refused_entries() {
+    let done = ToolOutput::ok("written".into()).with_changes([PathBuf::from("output.bin")]);
+    let blocked = ToolOutput::err("denied")
+        .with_status(tools::ToolStatus::Blocked)
+        .with_effects(crate::runtime::execution::Effects::None);
+    let uncertain =
+        ToolOutput::err("interrupted").with_effects(crate::runtime::execution::Effects::Unknown);
+    let output = code_batch_output(vec![done, blocked, uncertain]);
+    let data = output.data.unwrap();
+    assert_eq!(data[0]["changed_paths"][0], "output.bin");
+    assert_eq!(data[1]["status"], "blocked");
+    assert_eq!(data[1]["effects"], "none");
+    assert_eq!(data[2]["effects"], "unknown");
+    assert_eq!(data[2]["index"], 2);
+}
+
 fn request(messages: Vec<Value>) -> Chat {
     Chat {
         messages,
@@ -228,5 +245,89 @@ fn recovered_safe_reads_require_human_approval_in_the_main_owner() {
             Err(Denial::User)
         ));
         assert_eq!(view.0, 2, "denied and cancelled calls must not prompt");
+    });
+}
+
+#[test]
+fn code_cell_batches_run_read_only_entries_together_and_fall_back_to_serial_callbacks() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    use crate::agent::safety::rules::{CallbackGate, CallbackRules, Catalog, State};
+    use crate::tools::exec::eval::BATCH_CALLBACK;
+    use crate::tools::integrations::ext::ToolCallback;
+    with_agent("", |agent| {
+        std::fs::write(agent.workspace.root().join("a.txt"), "alpha\n").unwrap();
+        let mut backend = agent.backend.take().unwrap_or_else(|| {
+            Backend::new(
+                ProviderKind::Endpoint {
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                    model: "test".into(),
+                    api_key: None,
+                },
+                PathBuf::new(),
+                5,
+            )
+        });
+        let catalog = Catalog::default();
+        let mut state = State::restore(&agent.session.control_state());
+        let mut regenerations = 0;
+        let mut gate = CallbackGate::new(CallbackRules {
+            catalog: &catalog,
+            state: &mut state,
+            agent: "main",
+            regenerations: &mut regenerations,
+            max_regenerations: 3,
+        });
+        let mut batch = |agent: &mut Agent<'_>, calls: Value| {
+            agent.code_callback(
+                &mut backend,
+                ToolCallback::Call {
+                    name: BATCH_CALLBACK.into(),
+                    arguments: json!({ "calls": calls }),
+                },
+                "cell",
+                &mut NullUi,
+                &mut gate,
+                crate::agent::safety::approval::CallProvenance::Structured,
+            )
+        };
+        let reads = batch(
+            agent,
+            json!([
+                {"name":"read","arguments":{"path":"a.txt"}},
+                {"name":"read","arguments":{"path":"missing.txt"}},
+                {"name":"read","arguments":{"path":"a.txt"}},
+            ]),
+        );
+        assert!(!reads.is_error, "{}", reads.text);
+        let results = reads.data.unwrap();
+        let results = results.as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0]["text"].as_str().unwrap().contains("alpha"));
+        assert_eq!(results[1]["is_error"], true);
+        assert_eq!(
+            results[0]["text"], results[2]["text"],
+            "entry order is kept"
+        );
+
+        // A non-read entry makes every entry an ordinary serial callback (NullUi denies).
+        agent.approval = Approval::Ask;
+        let mixed = batch(
+            agent,
+            json!([
+                {"name":"read","arguments":{"path":"a.txt"}},
+                {"name":"write","arguments":{"path":"b.txt","content":"x"}},
+            ]),
+        );
+        let results = mixed.data.unwrap();
+        assert!(results[0]["text"].as_str().unwrap().contains("alpha"));
+        assert_eq!(results[1]["is_error"], true);
+        assert!(!agent.workspace.root().join("b.txt").exists());
+
+        let nested = batch(
+            agent,
+            json!([{"name":BATCH_CALLBACK,"arguments":{"calls":[]}}]),
+        );
+        assert_eq!(nested.data.unwrap()[0]["is_error"], true);
+        assert!(batch(agent, json!("not entries")).is_error);
     });
 }

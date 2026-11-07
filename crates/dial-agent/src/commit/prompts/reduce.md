@@ -34,7 +34,7 @@ Base the answer only on the provided observations, stat, and scope candidates. D
 </synthesis_rules>
 
 <output_format>
-You MUST return the result in this format WITHOUT the fences:
+Return the result in this format, without the fences:
 ```
 # type(scope): summary
 

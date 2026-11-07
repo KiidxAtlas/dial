@@ -231,14 +231,14 @@ fn assist_variants_change_exactly_one_feature_from_dial() {
 fn dial_baseline_tracks_shipped_defaults_and_ignores_user_config() {
     let shipped = Config::default();
     let mut user = Config::default();
-    user.assistance.compact_tools = true;
+    user.assistance.compact_tools = false;
     user.assistance.repair_hints = true;
     user.assistance.lean_local = LeanLocal::Off;
     user.efficiency.history_token_cap = 8192;
     let configurations = assist_configurations(&user, "openai", "model");
     let dial = &configurations[1];
-    // Shipped: compact_tools and repair_hints are off, lean_local is on.
-    assert_eq!(dial.assistance.compact_tools, Some(false));
+    // Shipped: compact_tools is on, repair_hints is off, lean_local is on.
+    assert_eq!(dial.assistance.compact_tools, Some(true));
     assert_eq!(dial.assistance.repair_hints, Some(false));
     assert_eq!(dial.assistance.lean_local, Some(LeanLocal::On));
     assert_eq!(
@@ -253,12 +253,17 @@ fn dial_baseline_tracks_shipped_defaults_and_ignores_user_config() {
         dial.efficiency.history_token_cap,
         Some(shipped.efficiency.history_token_cap)
     );
-    // Default-off features are enabled by variants, not reported as ablations of dial.
+    // Default-on features are ablated by variants, and default-off ones enabled.
+    let ablate = configurations
+        .iter()
+        .find(|c| c.name == "ablate-compact_tools")
+        .unwrap();
+    assert_eq!(ablate.assistance.compact_tools, Some(false));
     let enable = configurations
         .iter()
-        .find(|c| c.name == "enable-compact_tools")
+        .find(|c| c.name == "enable-repair_hints")
         .unwrap();
-    assert_eq!(enable.assistance.compact_tools, Some(true));
+    assert_eq!(enable.assistance.repair_hints, Some(true));
     assert_eq!(configurations[2].assistance.lean_local, Some(LeanLocal::On));
     assert!(
         configurations

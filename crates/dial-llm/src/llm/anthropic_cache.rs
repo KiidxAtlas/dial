@@ -33,20 +33,26 @@ impl Level {
     }
 }
 
-/// Whether the profile and account select the 1h lifetime for `Level::Full`.
+/// Whether the profile and account select the 1h lifetime for the head markers at `Level::Full`.
 pub(super) fn ttl_applies(profile: Option<&ModelProfile>, official_oauth: bool) -> bool {
     let retention = profile.map(|p| p.cache_retention).unwrap_or_default();
     retention == CacheRetention::Long || (retention == CacheRetention::Auto && official_oauth)
 }
 
-/// Effective retention, shared by wire markers and the paid warming schedule.
+/// Transient tag on a system block naming its prompt band (`llm::prompt::Band`). The request
+/// builder sets it; [`apply`] anchors the system breakpoint with it and always removes it.
+pub(super) const BAND_TAG: &str = "dial_prompt_band";
+
+/// Retention of the head markers (tools and system), shared by the wire and the paid warming
+/// schedule. Rolling history markers always use the 5-minute default, so under `Long` a replay
+/// keeps the head entries warm while older history entries may already have lapsed.
 pub(super) fn tier(
     profile: Option<&ModelProfile>,
     official_oauth: bool,
     level: Level,
 ) -> Option<super::cache_warmer::Tier> {
     use super::cache_warmer::Tier;
-    if level == Level::Off || profile.and_then(|p| p.prompt_cache) == Some(false) {
+    if !enabled(profile, level) {
         None
     } else if level == Level::Full && ttl_applies(profile, official_oauth) {
         Some(Tier::Long)
@@ -55,38 +61,62 @@ pub(super) fn tier(
     }
 }
 
+fn enabled(profile: Option<&ModelProfile>, level: Level) -> bool {
+    level != Level::Off && profile.and_then(|p| p.prompt_cache) != Some(false)
+}
+
 /// Apply after schema/profile transforms and before OAuth body attestation.
 /// Native-compatible endpoints can opt out with prompt_cache=false.
+///
+/// Budget: one marker on the last tool, one at the end of the last Frozen/Stable system band, and
+/// at most two rolling history anchors, within the four-marker limit. The head markers (tools and
+/// system) carry the long lifetime when it applies; the rolling ones always use the 5-minute
+/// default, so every longer-lived entry precedes the shorter ones as the API requires.
 pub(super) fn apply(
     body: &mut Value,
     profile: Option<&ModelProfile>,
     official_oauth: bool,
     level: Level,
 ) {
-    let tier = tier(profile, official_oauth, level);
-    let enabled = tier.is_some();
-    let long = tier == Some(super::cache_warmer::Tier::Long);
-    let control = if long {
+    let enabled = enabled(profile, level);
+    let head = if enabled && level == Level::Full && ttl_applies(profile, official_oauth) {
         json!({"type":"ephemeral", "ttl":"1h"})
     } else {
         json!({"type":"ephemeral"})
     };
+    let rolling = json!({"type":"ephemeral"});
 
     // Native tool order must not depend on registry insertion order. Do not retain withdrawn
     // tools: exposing them would contradict approval/recovery and tool-loading contracts.
     // Mutable indexing inserts null for absent keys. Tool-free compaction requests must
     // retain absent optional fields instead of sending invalid tools/system null values.
+    // Deferred tools (`defer_loading`) are outside the prompt prefix and cannot carry
+    // `cache_control`: they sort after the loaded ones and the marker goes on the last loaded tool.
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-        tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        if enabled && let Some(last) = tools.last_mut() {
-            last["cache_control"] = control.clone();
+        let deferred = |tool: &Value| tool["defer_loading"] == true;
+        tools.sort_by(|a, b| {
+            (deferred(a), a["name"].as_str()).cmp(&(deferred(b), b["name"].as_str()))
+        });
+        if enabled && let Some(last) = tools.iter_mut().rev().find(|tool| !deferred(tool)) {
+            last["cache_control"] = head.clone();
         }
     }
-    if enabled {
-        if let Some(text) = body["system"].as_str().map(str::to_owned) {
-            body["system"] = json!([{"type":"text", "text":text, "cache_control":control}]);
-        } else if let Some(blocks) = body.get_mut("system").and_then(Value::as_array_mut) {
-            mark_last(blocks, &control);
+    if let Some(text) = body["system"].as_str().map(str::to_owned) {
+        if enabled {
+            body["system"] = json!([{"type":"text", "text":text, "cache_control":head}]);
+        }
+    } else if let Some(blocks) = body.get_mut("system").and_then(Value::as_array_mut) {
+        let anchor = take_band_anchor(blocks);
+        if enabled {
+            match anchor {
+                // Dynamic bands follow the breakpoint, so a per-turn note or memory change no
+                // longer invalidates the cached tools and stable system prefix.
+                BandAnchor::At(index) => blocks[index]["cache_control"] = head.clone(),
+                BandAnchor::Untagged => {
+                    mark_last(blocks, &head);
+                }
+                BandAnchor::DynamicOnly => {}
+            }
         }
     }
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
@@ -100,20 +130,20 @@ pub(super) fn apply(
             }
         }
         if enabled {
-            // Two head anchors + at most two rolling history anchors obey the four-marker limit.
-            // The previous tail remains discoverable as the conversation grows. Never mark generated
-            // thinking/redacted_thinking, and never place an anchor beyond a transient suffix.
+            // Two rolling history anchors: the previous tail remains discoverable as the
+            // conversation grows. Never mark generated thinking/redacted_thinking, and never place
+            // an anchor beyond a transient suffix.
             let mut marked = 0;
             for message in messages[..stable_end].iter_mut().rev() {
                 let cached = if let Some(text) = message["content"].as_str().map(str::to_owned) {
                     message["content"] =
-                        json!([{"type":"text","text":text,"cache_control":control.clone()}]);
+                        json!([{"type":"text","text":text,"cache_control":rolling.clone()}]);
                     true
                 } else {
                     message
                         .get_mut("content")
                         .and_then(Value::as_array_mut)
-                        .is_some_and(|blocks| mark_last(blocks, &control))
+                        .is_some_and(|blocks| mark_last(blocks, &rolling))
                 };
                 if cached {
                     marked += 1;
@@ -123,6 +153,37 @@ pub(super) fn apply(
                 }
             }
         }
+    }
+}
+
+/// Where the system breakpoint goes, read from the band tags (which are removed).
+enum BandAnchor {
+    /// The last text block of a Frozen or Stable band.
+    At(usize),
+    /// No block carried a band tag: mark the last block, as for any caller-built system array.
+    Untagged,
+    /// Only Dynamic bands: nothing reusable to anchor.
+    DynamicOnly,
+}
+
+fn take_band_anchor(blocks: &mut [Value]) -> BandAnchor {
+    use super::prompt::Band;
+    let mut tagged = false;
+    let mut anchor = None;
+    for (index, block) in blocks.iter_mut().enumerate() {
+        let Some(tag) = block.as_object_mut().and_then(|b| b.remove(BAND_TAG)) else {
+            continue;
+        };
+        tagged = true;
+        let band = serde_json::from_value(tag).unwrap_or(Band::Stable);
+        if matches!(band, Band::Frozen | Band::Stable) && block["type"] == "text" {
+            anchor = Some(index);
+        }
+    }
+    match (anchor, tagged) {
+        (Some(index), _) => BandAnchor::At(index),
+        (None, false) => BandAnchor::Untagged,
+        (None, true) => BandAnchor::DynamicOnly,
     }
 }
 

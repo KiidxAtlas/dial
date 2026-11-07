@@ -34,6 +34,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+pub(in crate::agent) use summary::edited_this_turn;
 pub use summary::{BranchSummary, summarize_branch};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +127,34 @@ impl PreparedCompaction {
         history
     }
 }
+/// The native compaction capability of the active route. Every site that chooses a compaction
+/// method resolves it here, where the backend is known: an explicit `compaction.native_models`
+/// entry wins, and only when that map declares no models at all does a first-party route use the
+/// capability its catalog record documents.
+pub fn native_capability(
+    backend: &Backend,
+    policy: &CompactionConfig,
+    identity: CompactionIdentity<'_>,
+) -> Option<NativeCompactionCapability> {
+    backend.native_compaction_capability(
+        policy.native_capability(identity),
+        !policy.native_models.is_empty(),
+    )
+}
+
+/// Whether the active route can run native compaction (capability, protocol and streaming).
+/// `remote_enabled` and the method order are applied by the callers' method selection.
+pub fn native_supported(
+    backend: &Backend,
+    policy: &CompactionConfig,
+    identity: CompactionIdentity<'_>,
+) -> bool {
+    backend.supports_native_compaction(
+        native_capability(backend, policy, identity),
+        policy.remote_streaming_v2_enabled,
+    )
+}
+
 pub fn prompt_budget(policy: &CompactionConfig, window: u32, output: u32) -> u64 {
     u64::from(window.saturating_sub(policy.reserve(window).max(output)))
 }
@@ -570,13 +599,8 @@ pub(in crate::agent) fn compact_history_with_execution(
         !non_summary || focus.is_empty(),
         "snapcompact and shake do not take summary focus instructions"
     );
-    let methods = policy.available_methods(
-        options,
-        backend.supports_native_compaction(
-            policy.native_capability(context.identity),
-            policy.remote_streaming_v2_enabled,
-        ),
-    );
+    let methods =
+        policy.available_methods(options, native_supported(backend, policy, context.identity));
     ensure!(
         !methods.is_empty(),
         "no compaction method is enabled for this invocation"
@@ -603,7 +627,7 @@ pub(in crate::agent) fn compact_history_with_execution(
                     bail!("remote compaction is disabled")
                 }
                 CompactionMethod::Remote if policy.remote_endpoint.is_none() => {
-                    let capability = policy.native_capability(context.identity);
+                    let capability = native_capability(backend, policy, context.identity);
                     ensure!(
                         backend.supports_native_compaction(
                             capability,
@@ -750,18 +774,26 @@ pub(in crate::agent) fn compact_history_with_execution(
                             "{method:?} would replace only {replaceable} history tokens, too few for a summary to shrink; no summary was requested"
                         )));
                     }
-                    let live = if method == CompactionMethod::Handoff && execution.live_handoff {
+                    // Soft and Handoff read the live request prefix where the route allows it,
+                    // so a caching route summarizes from cache; otherwise the portable fold
+                    // re-serializes the history for the summary model.
+                    let live = if matches!(
+                        method,
+                        CompactionMethod::Handoff | CompactionMethod::Soft
+                    ) && execution.live_prefix
+                    {
                         let retained = request.messages[keep..]
                             .iter()
                             .filter(|m| is_history(m))
                             .count();
                         let live_focus = format!(
-                            "{focus}\n\nThe newest {retained} history messages will remain verbatim after this summary. Use them to orient the handoff; prioritize facts from the earlier context being replaced, and avoid needlessly repeating the retained tail."
+                            "{focus}\n\nThe newest {retained} history messages will remain verbatim after this summary. Use them to orient the summary; prioritize facts from the earlier context being replaced, and avoid needlessly repeating the retained tail."
                         );
                         handoff::summarize(
                             backend,
                             policy,
                             &context,
+                            method,
                             &live_focus,
                             &interrupt,
                             ui,
@@ -1099,6 +1131,39 @@ pub fn portable_history_message(message: &Value) -> Value {
         }
     }
     portable
+}
+
+/// A retained message after a compaction that replaced the history before it. On a
+/// preserved-thinking model each signed thinking block is bound to the exact history that
+/// preceded it, so a replayed block from a turn kept after a client-side summary is rejected on
+/// enforced accounts. Removing the thinking blocks from re-inserted turns is the documented
+/// remedy; text, tool calls and every other provider block stay byte-identical.
+pub fn unbind_thinking(message: &Value) -> Value {
+    let thinking = |block: &Value| {
+        matches!(
+            block["type"].as_str(),
+            Some("thinking" | "redacted_thinking")
+        ) || block.get("reasoningContent").is_some()
+    };
+    let mut message = message.clone();
+    if message["role"] != "assistant" {
+        return message;
+    }
+    if let Some(object) = message.as_object_mut() {
+        for key in ["dial_provider_content", "content"] {
+            if let Some(blocks) = object.get_mut(key).and_then(Value::as_array_mut) {
+                blocks.retain(|block| !thinking(block));
+            }
+        }
+        if object
+            .get("dial_provider_content")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            object.remove("dial_provider_content");
+        }
+    }
+    message
 }
 
 fn public_transcript(message: &Value) -> Result<String> {

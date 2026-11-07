@@ -409,7 +409,8 @@ approved call with action_id; unsandboxed command effects cannot be rolled back 
 requests are refused. Stale versions/files, invalid UTF-16 ranges, overlaps and outside-root edits \
 fail before writing. `status` lists existing sessions without starting servers; `capabilities` \
 shows a selected live session's real initialize/dynamic capabilities; approved `reload` stops and \
-restarts the selected session. `request` sends one raw LSP method named by `query` to a session that advertises it; `payload` is a JSON object of params, with `textDocument` and `position` defaulted from `path` and `line`; a WorkspaceEdit result is validated and previewed, never applied. First startup and reload run project code outside the sandbox.";
+restarts the selected session. `request` sends one raw LSP method named by `query` to a session that advertises it; `payload` is a JSON object of params, with `textDocument` and `position` defaulted from `path` and `line`; a WorkspaceEdit result is validated and previewed, never applied. First startup and reload run project code outside the sandbox. \
+Examples: {\"action\":\"references\",\"path\":\"src/lib.rs\",\"line\":12,\"symbol\":\"parse\"}; {\"action\":\"rename_preview\",\"path\":\"src/lib.rs\",\"line\":12,\"symbol\":\"parse\",\"new_name\":\"parse_all\"}.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {

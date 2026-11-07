@@ -17,27 +17,36 @@ fn names_skills_whose_name_or_description_shares_words_with_the_request() {
         skill("release", "Cut a versioned release"),
         skill("tables", "Extract fields from scanned forms into tables"),
     ];
-    let hint = match_hint(&skills, "Please fill these PDF forms for me").unwrap();
+    let hint = match_hint(&skills, "Please fill these PDF forms for me", true).unwrap();
     assert!(hint.contains("pdf-forms may match"), "{hint}");
     assert!(!hint.contains("release"), "{hint}");
-    assert!(hint.contains("`skill` tool"));
+    assert!(hint.contains("load it with the `skill` tool"), "{hint}");
+    // Without the `skill` tool in the offer, the hint points at `tool_load` instead.
+    let hint = match_hint(&skills, "Please fill these PDF forms for me", false).unwrap();
+    assert!(hint.contains("`skill` tool with `tool_load`"), "{hint}");
+    assert!(!hint.contains("load it with the `skill` tool"), "{hint}");
     // Three shared description words suggest a skill the request does not name.
-    let hint = match_hint(&skills, "extract the fields from these scanned invoices").unwrap();
+    let hint = match_hint(
+        &skills,
+        "extract the fields from these scanned invoices",
+        true,
+    )
+    .unwrap();
     assert!(hint.contains("tables may match"), "{hint}");
 }
 
 #[test]
 fn ordinary_prompts_get_no_hint() {
     let skills = [skill("pdf-forms", "Fill PDF forms")];
-    assert_eq!(match_hint(&skills, "Summarize the readme"), None);
-    assert_eq!(match_hint(&[], "fill pdf forms"), None);
+    assert_eq!(match_hint(&skills, "Summarize the readme", true), None);
+    assert_eq!(match_hint(&[], "fill pdf forms", true), None);
 }
 
 #[test]
 fn short_and_stop_words_never_match_on_their_own() {
     let skills = [skill("review", "Review this and that with care")];
-    assert_eq!(match_hint(&skills, "this is with that"), None);
-    assert_eq!(match_hint(&skills, "review the diff"), Some(
+    assert_eq!(match_hint(&skills, "this is with that", true), None);
+    assert_eq!(match_hint(&skills, "review the diff", true), Some(
         "Skill hint: review may match this request. If a matching skill covers substantial multi-step work, load it with the `skill` tool in the same response as your first reads, not as a round of its own."
             .into()
     ));
@@ -49,16 +58,24 @@ fn one_generic_description_word_or_pasted_code_is_not_a_match() {
         "code-cleanup",
         "Audit or clean up dead code and duplicated behavior",
     )];
-    assert_eq!(match_hint(&skills, "why does my code crash"), None);
+    assert_eq!(match_hint(&skills, "why does my code crash", true), None);
     assert_eq!(
         match_hint(
             &skills,
-            "why does this crash\n    dead_code = cleanup(code)"
+            "why does this crash\n    dead_code = cleanup(code)",
+            true
         ),
         None
     );
-    assert!(match_hint(&skills, "remove the dead code and duplicated helpers here").is_some());
-    assert!(match_hint(&skills, "remove the dead code here").is_none());
+    assert!(
+        match_hint(
+            &skills,
+            "remove the dead code and duplicated helpers here",
+            true
+        )
+        .is_some()
+    );
+    assert!(match_hint(&skills, "remove the dead code here", true).is_none());
 }
 
 #[test]
@@ -69,16 +86,17 @@ fn an_ordinary_bug_report_does_not_suggest_a_debugging_skill_it_does_not_name() 
     )];
     // Shares only "verify" and "behavior" with the description: a small fix needs no skill.
     let request = "Customers receive incorrect invoice totals when quantities differ from one. Fix the production invoice calculation, preserve its public API and the integer-cents representation, and verify the behavior.";
-    assert_eq!(match_hint(&skills, request), None);
+    assert_eq!(match_hint(&skills, request, true), None);
     // Shares "wrong", "verify" and "behavior": three words, but all of them describe coding work
     // in general, not the debugging skill's domain.
     let request = "Checkout applies the wrong discount. Fix amount_due using current source declarations and verify its public behavior. Preserve the public API and current settings. Historical notes are advisory and may be stale.";
-    assert_eq!(match_hint(&skills, request), None);
-    assert!(match_hint(&skills, "start debugging this").is_some());
+    assert_eq!(match_hint(&skills, request, true), None);
+    assert!(match_hint(&skills, "start debugging this", true).is_some());
     // Words of the skill's own domain still suggest it.
     let hint = match_hint(
         &skills,
         "Diagnose the intermittent crashes in the worker pool",
+        true,
     )
     .unwrap();
     assert!(hint.contains("debugging may match"), "{hint}");
@@ -93,10 +111,11 @@ fn task_vocabulary_alone_never_suggests_a_skill() {
     assert_eq!(
         match_hint(
             &skills,
-            "Verify the changes, run the tests, check the results and fix the wrong behavior and errors"
+            "Verify the changes, run the tests, check the results and fix the wrong behavior and errors",
+            true
         ),
         None
     );
     // The skill's name is still a match on its own.
-    assert!(match_hint(&skills, "run the checks").is_some());
+    assert!(match_hint(&skills, "run the checks", true).is_some());
 }

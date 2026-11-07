@@ -447,10 +447,12 @@ fn read_target(
     }
     if crate::tools::edit::edit_source::notebook_path(Path::new(path_text)) {
         let offset = offset.map_or(1, |value| value.min(usize::MAX as u64) as usize);
+        // The edit schema omits notebook rules; the cell projection carries them.
         return if sel.raw {
             read_plain(ws, path_text, &sel, offset, limit, budget)
         } else {
             hashline::read(ws, path_text, &sel, offset, limit, budget)
+                .map(|text| format!("{text}\n{}", crate::tools::NOTEBOOK_EDIT_NOTE))
         };
     }
     if crate::llm::images::is_image(Path::new(path_text)) {

@@ -60,6 +60,23 @@ fn read_only_annotation_is_parsed_from_tool_annotations() {
         RemoteTool::parse(&json!({"name":"write","annotations":{"readOnlyHint":false}})).unwrap();
     assert!(read.read_only_hint);
     assert!(!write.read_only_hint);
+    assert!(read.declared_read_only && !write.declared_read_only);
+    let contradictory = RemoteTool::parse(
+        &json!({"name":"wipe","annotations":{"readOnlyHint":true,"destructiveHint":true}}),
+    )
+    .unwrap();
+    assert!(
+        !contradictory.declared_read_only,
+        "destructive is never effect-free"
+    );
+    let open_world = RemoteTool::parse(
+        &json!({"name":"search","annotations":{"readOnlyHint":true,"openWorldHint":true}}),
+    )
+    .unwrap();
+    assert!(
+        open_world.declared_read_only,
+        "an open-world read is still a read"
+    );
 }
 
 #[test]
@@ -180,4 +197,80 @@ fn catalog_publication_at_admission_refuses_the_previously_approved_definition()
     assert_eq!(facts.dispatch, DispatchState::NotDispatched);
     assert_eq!(facts.failure, Some(IntegrationFailure::Admission));
     assert_eq!(output.execution.effects, Effects::None);
+}
+
+#[test]
+fn png_images_travel_in_the_shared_attachment_envelope() {
+    let png = format!("{PNG_BASE64_PREFIX}AAAA");
+    let result = json!({"content":[
+        {"type":"text","text":"chart"},
+        {"type":"image","data":png,"mimeType":"image/png"},
+        {"type":"image","data":"/9j/AAAA","mimeType":"image/jpeg"},
+    ]});
+    let output = render_result(&result);
+    assert_eq!(
+        output.text,
+        "chart\n[image content, image/png, attached for models that accept images]\n[image content, image/jpeg, not shown]"
+    );
+    let data = output.data.unwrap();
+    assert_eq!(
+        data["artifact"],
+        json!({"data": png, "encoding": "base64", "media_type": "image/png"})
+    );
+    assert_eq!(data["content"], result["content"]);
+    // Bytes that are not a PNG, and error results, are noted only.
+    let fake =
+        render_result(&json!({"content":[{"type":"image","data":"AAAA","mimeType":"image/png"}]}));
+    assert!(fake.data.unwrap().get("artifact").is_none());
+    let failed = render_result(
+        &json!({"isError":true,"content":[{"type":"image","data":png,"mimeType":"image/png"}]}),
+    );
+    assert!(failed.data.unwrap().get("artifact").is_none());
+}
+
+#[test]
+fn structured_content_is_not_repeated_after_the_same_text() {
+    let both = render_result(&json!({
+        "content":[{"type":"text","text":"{\"n\": 1, \"m\": [2]}"}],
+        "structuredContent":{"m":[2],"n":1},
+    }));
+    assert_eq!(both.text, "{\"n\": 1, \"m\": [2]}");
+    let different = render_result(&json!({
+        "content":[{"type":"text","text":"summary"}],
+        "structuredContent":{"n":1},
+    }));
+    assert_eq!(different.text, "summary\n{\"n\":1}");
+}
+
+#[test]
+fn oversized_input_schemas_are_shortened_in_steps() {
+    let small = json!({"type":"object","properties":{"q":{"type":"string","description":"query"}}});
+    assert_eq!(bounded_input_schema(&small), (small.clone(), false));
+
+    let long = "x".repeat(MAX_INPUT_SCHEMA);
+    let annotated = json!({"type":"object","required":["description"],"properties":{
+        "description":{"type":"string","description":long},
+        "mode":{"type":"string","enum":["a","b"],"title":"Mode"},
+    }});
+    let (lean, shortened) = bounded_input_schema(&annotated);
+    assert!(shortened);
+    assert_eq!(
+        lean,
+        json!({"type":"object","required":["description"],"properties":{
+            "description":{"type":"string"},
+            "mode":{"type":"string","enum":["a","b"]},
+        }})
+    );
+
+    let nested = json!({"type":"object","required":["a"],"properties":{
+        "a":{"type":"object","properties":{"deep":{"type":"string","enum":[long]}}},
+    }});
+    let (flat, _) = bounded_input_schema(&nested);
+    assert_eq!(
+        flat,
+        json!({"type":"object","required":["a"],"properties":{"a":{"type":"object"}}})
+    );
+
+    let wide = json!({"type":"object","properties":{"a":{"enum":[long]}}});
+    assert_eq!(bounded_input_schema(&wide).0, json!({"type":"object"}));
 }

@@ -49,7 +49,7 @@ Meta phrases: this change, this commit, updated the, changed the, modified the, 
 </banned_words>
 
 <output_format>
-You MUST return the result in this format WITHOUT the fences:
+Return the result in this format, without the fences:
 ```
 <summary>description text only</summary>
 ```

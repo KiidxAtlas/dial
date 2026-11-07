@@ -70,7 +70,7 @@ impl Recovery {
         } else {
             StopAction::Continue {
                 reason,
-                message: stream_guards::render_retry_prompt(prompt, attempt, cap),
+                message: prompt.to_owned(),
             }
         }
     }

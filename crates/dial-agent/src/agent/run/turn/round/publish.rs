@@ -4,6 +4,8 @@ use super::*;
 /// Truncated-output artifacts remembered for the recovery metric; older ones are forgotten.
 const TRUNCATED_ARTIFACTS_KEPT: usize = 256;
 
+pub(super) use crate::agent::run::dispatch::result_budget::ResultBudget;
+
 impl Agent<'_> {
     pub(super) fn publish_call_result(
         &mut self,
@@ -11,6 +13,8 @@ impl Agent<'_> {
         context: &mut DispatchContext<'_>,
         step: u32,
         settled: SettledCall<'_>,
+        budget: &mut ResultBudget,
+        pending: &[usize],
     ) -> Result<()> {
         let backend = &mut *context.backend;
         let ui = &mut *context.ui;
@@ -52,6 +56,14 @@ impl Agent<'_> {
             &call.name,
             output.is_error,
             artifact.is_some(),
+        );
+        let limit = budget.limit(
+            call,
+            &output,
+            limit,
+            artifact.is_some(),
+            duplicate.is_some(),
+            pending,
         );
         let edit = crate::agent::workflow::efficiency::edit_result(
             &call.name,
@@ -96,6 +108,7 @@ impl Agent<'_> {
         if let Some(note) = repro_advice {
             body.push_str(note);
         }
+        budget.spend(body.len());
         self.efficiency_metrics.result(&output.text, &body);
         let mut message = llm::tool_message(&call.id, &body);
         crate::tools::surface::outcome::annotate(&mut message, &output);

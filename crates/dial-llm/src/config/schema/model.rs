@@ -454,4 +454,52 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         },
         true
     ),
+    field!(
+        "efficiency.batch_result_percent",
+        efficiency.batch_result_percent,
+        MO,
+        "Roles & Sampling",
+        "Reply result budget (%)",
+        "Share of the remaining context window that the tool results of one reply may fill together. The largest successful results are clipped first and keep their full text as an artifact; errors and edits are never clipped. 0 turns the budget off.",
+        Kind::Int {
+            min: 0,
+            max: 80,
+            step: 5
+        },
+        true
+    ),
+    field!(
+        "efficiency.preserve_task_inputs",
+        efficiency.preserve_task_inputs,
+        MO,
+        "Roles & Sampling",
+        "Preserve task inputs",
+        "Capture bounded root-level inputs before an unattended task starts. Independent bytes are retained outside the workspace; hidden, credential-like, oversized and linked sources are skipped. Disable for an ablation.",
+        Kind::Bool,
+        true
+    ),
+    field!(
+        "efficiency.evidence_stall_rounds",
+        efficiency.evidence_stall_rounds,
+        MO,
+        "Roles & Sampling",
+        "Evidence stall limit",
+        "Unattended work rounds without new independent observations or changed check verdicts before stopping blocked. A hypothesis checkpoint occurs halfway. 0 disables the guard for an ablation.",
+        Kind::Int {
+            min: 0,
+            max: 256,
+            step: 4
+        },
+        true
+    ),
+    field!(
+        "efficiency.small_case_guard",
+        efficiency.small_case_guard,
+        MO,
+        "Roles & Sampling",
+        "Small-case checkpoint",
+        "Before the first large unchecked write, queue one controller notice requesting a tiny independent known-answer case before further generation. Does not discard the admitted write.",
+        Kind::Bool,
+        true
+    ),
 ];

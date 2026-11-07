@@ -104,6 +104,30 @@ fn lora_runtime_distinguishes_loading_use_failure_and_release() {
     });
 }
 use super::*;
+
+#[test]
+fn diagnostic_controls_match_native_wire_and_never_include_prompt_or_tools() {
+    let model = "claude-sonnet-4-6";
+    let mut profile = llm::profiles::ModelProfile::minimal("anthropic", model);
+    profile.capabilities.reasoning = llm::profiles::ReasoningApi::AnthropicBudget;
+    profile.capabilities.reasoning_efforts = vec![llm::profiles::ReasoningEffort::Low];
+    profile.thinking = Some(false);
+    profile.reasoning_effort = Some(llm::profiles::ReasoningEffort::Low);
+    let req = request();
+    let body = anthropic_request_body(model, &req, false, Some(&profile)).unwrap();
+    let controls = anthropic_request_controls(model, &req, Some(&profile)).unwrap();
+    assert_eq!(
+        controls["thinking"],
+        body.get("thinking")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    );
+    assert_eq!(controls["output_config"], json!({"effort":"low"}));
+    assert_eq!(controls["max_tokens"], body["max_tokens"]);
+    assert!(controls.get("messages").is_none());
+    assert!(controls.get("tools").is_none());
+    assert!(controls.get("system").is_none());
+}
 use crate::llm::cancel::Patience;
 use crate::llm::fake::{self, Script, header, request_line};
 use serde_json::json;
@@ -3747,7 +3771,7 @@ fn anthropic_cache_refusal_retries_without_markers_and_latches_for_later_request
 }
 
 #[test]
-fn anthropic_cache_warm_tier_tracks_accepted_ttl_and_latched_fallback() {
+fn anthropic_cache_warm_tier_and_head_ttl_track_latched_fallback() {
     use llm::cache_warmer::Tier;
     for refused in [false, true] {
         let ok = json!({
@@ -3774,8 +3798,11 @@ fn anthropic_cache_warm_tier_tracks_accepted_ttl_and_latched_fallback() {
                 ..Default::default()
             },
         );
+        let mut chat = request();
+        chat.messages
+            .insert(0, json!({"role":"system","content":"rules"}));
         for _ in 0..2 {
-            let reply = remote.chat(None, &request(), 5, None).unwrap();
+            let reply = remote.chat(None, &chat, 5, None).unwrap();
             assert_eq!(
                 reply.cache_warm_tier,
                 Some(if refused { Tier::Short } else { Tier::Long })
@@ -3783,9 +3810,11 @@ fn anthropic_cache_warm_tier_tracks_accepted_ttl_and_latched_fallback() {
         }
         let seen = server.requests();
         let last = fake::body(seen.last().unwrap());
-        let control = &last["messages"][0]["content"][0]["cache_control"];
-        assert_eq!(control["type"], "ephemeral");
-        assert_eq!(control["ttl"].as_str(), (!refused).then_some("1h"));
+        let head = &last["system"][0]["cache_control"];
+        assert_eq!(head["type"], "ephemeral");
+        assert_eq!(head["ttl"].as_str(), (!refused).then_some("1h"));
+        let rolling = &last["messages"][0]["content"][0]["cache_control"];
+        assert_eq!(rolling, &json!({"type":"ephemeral"}));
     }
 }
 
@@ -3970,4 +3999,559 @@ fn retry_elapsed_budget_bounds_a_server_wait_without_replaying_or_losing_its_cau
     assert_eq!(error.downcast_ref::<llm::HttpError>().unwrap().status, 429);
     assert!(start.elapsed() < Duration::from_secs(5));
     assert_eq!(server.requests().len(), 1);
+}
+
+fn thinking_off(model: &str) -> llm::profiles::ModelProfile {
+    // The request-only profile `--thinking off` installs for an unprofiled Anthropic model.
+    let mut profile = llm::profiles::ModelProfile::minimal("anthropic", model);
+    profile.thinking = Some(false);
+    profile.capabilities.reasoning = llm::profiles::ReasoningApi::AnthropicBudget;
+    profile
+}
+
+#[test]
+fn thinking_off_follows_each_models_documented_control_and_drops_removed_sampling() {
+    let body = |model: &str, effort: Option<llm::profiles::ReasoningEffort>| {
+        let mut profile = thinking_off(model);
+        if let Some(effort) = effort {
+            profile.capabilities.reasoning_efforts = vec![effort];
+            profile.reasoning_effort = Some(effort);
+        }
+        anthropic_request_body(model, &request(), false, Some(&profile)).unwrap()
+    };
+    use llm::profiles::ReasoningEffort::{Max, Xhigh};
+    // Thinking cannot be disabled: omit it and lower the effort.
+    let opus = body("claude-opus-5-5", None);
+    assert!(opus.get("thinking").is_none(), "{opus}");
+    assert_eq!(opus["output_config"]["effort"], "low");
+    assert!(opus.get("temperature").is_none(), "{opus}");
+    let fable = body("claude-fable-5-1", Some(Max));
+    assert!(fable.get("thinking").is_none());
+    assert_eq!(
+        fable["output_config"]["effort"], "max",
+        "an explicit effort is kept"
+    );
+    // Disabled is refused; between_tools turns thinking off at effort high or below.
+    let sonnet = body("claude-sonnet-5-5", Some(Xhigh));
+    assert_eq!(sonnet["thinking"], json!({"type":"between_tools"}));
+    assert_eq!(sonnet["output_config"]["effort"], "high");
+    // Disabled is accepted only at effort high or below.
+    let opus5 = body("claude-opus-5", Some(Max));
+    assert_eq!(opus5["thinking"], json!({"type":"disabled"}));
+    assert_eq!(opus5["output_config"]["effort"], "high");
+    // Disabled is accepted, but sampling parameters were removed.
+    let opus48 = body("claude-opus-4-8", None);
+    assert_eq!(opus48["thinking"], json!({"type":"disabled"}));
+    assert!(opus48.get("temperature").is_none());
+    // A model whose record documents neither rule keeps today's request.
+    let haiku = body("claude-haiku-4-5", None);
+    assert_eq!(haiku["thinking"], json!({"type":"disabled"}));
+    assert_eq!(haiku["temperature"], 0.0);
+    let unknown = body("claude-test", None);
+    assert_eq!(unknown["thinking"], json!({"type":"disabled"}));
+    assert_eq!(unknown["temperature"], 0.0);
+}
+
+#[test]
+fn explicit_sampling_is_never_sent_where_the_record_says_it_was_removed() {
+    let mut profile = llm::profiles::ModelProfile::minimal("anthropic", "claude-sonnet-5-5");
+    profile.capabilities.top_p = true;
+    profile.temperature = Some(0.3);
+    profile.top_p = Some(0.9);
+    let body =
+        anthropic_request_body("claude-sonnet-5-5", &request(), false, Some(&profile)).unwrap();
+    assert!(
+        body.get("temperature").is_none() && body.get("top_p").is_none(),
+        "{body}"
+    );
+}
+
+#[test]
+fn thinking_summaries_are_requested_only_where_the_record_omits_thinking_text() {
+    let mut body = anthropic_request_body("claude-opus-5-5", &request(), false, None).unwrap();
+    request_thinking_summaries("claude-opus-5-5", &mut body);
+    assert_eq!(
+        body["thinking"],
+        json!({"type":"adaptive","display":"summarized"})
+    );
+    // Opus 4.6 already summarizes by default; unknown models are left alone.
+    for model in ["claude-opus-4-6", "claude-test"] {
+        let mut body = anthropic_request_body(model, &request(), false, None).unwrap();
+        let before = body.clone();
+        request_thinking_summaries(model, &mut body);
+        assert_eq!(body, before, "{model}");
+    }
+    // between_tools takes no other field.
+    let mut off = anthropic_request_body(
+        "claude-sonnet-5-5",
+        &request(),
+        false,
+        Some(&thinking_off("claude-sonnet-5-5")),
+    )
+    .unwrap();
+    request_thinking_summaries("claude-sonnet-5-5", &mut off);
+    assert_eq!(off["thinking"], json!({"type":"between_tools"}));
+}
+
+#[test]
+fn cache_warm_replays_use_max_tokens_zero_and_keep_adaptive_thinking() {
+    let mut adaptive = anthropic_request_body("claude-opus-5-5", &request(), false, None).unwrap();
+    let thinking = adaptive["thinking"].clone();
+    prewarm_body(&mut adaptive);
+    assert_eq!(adaptive["max_tokens"], 0);
+    assert_eq!(adaptive["thinking"], thinking);
+    // `max_tokens: 0` rejects budget thinking, so the replay drops it.
+    let mut budget = json!({"max_tokens":4096,"thinking":{"type":"enabled","budget_tokens":2048}});
+    prewarm_body(&mut budget);
+    assert_eq!(budget, json!({"max_tokens":0}));
+}
+
+#[test]
+fn cache_warm_purpose_sends_the_prewarm_form_on_the_wire() {
+    let ok = json!({"content":[],"stop_reason":"max_tokens",
+        "usage":{"input_tokens":2,"output_tokens":0,"cache_read_input_tokens":40}});
+    let server = fake::serve(vec![fake::json(200, &ok)]);
+    let mut remote = backend(anthropic_endpoint(&format!("{}/v1", server.url)));
+    let scope = llm::usage::Scope::default().next_turn(2).unwrap();
+    remote.set_usage_scope(Some(scope.for_purpose(llm::usage::Purpose::CacheWarm)));
+    let mut replay = request();
+    replay.max_tokens = 1;
+    let reply = remote.chat(None, &replay, 5, None).unwrap();
+    assert_eq!(reply.cached_prompt_tokens, Some(40));
+    let sent = fake::body(&server.requests()[0]);
+    assert_eq!(sent["max_tokens"], 0);
+    assert_eq!(sent["stream"], false);
+}
+
+#[test]
+fn system_bands_become_blocks_with_the_breakpoint_after_the_stable_band() {
+    use llm::prompt::{Band, system};
+    let mut chat = request();
+    chat.messages.splice(
+        0..0,
+        [
+            system(Band::Frozen, "policy"),
+            system(Band::Stable, "environment"),
+            json!({"role":"system","content":"AGENTS.md"}),
+            system(Band::Dynamic, "turn notes"),
+            system(Band::Dynamic, "memory"),
+        ],
+    );
+    let mut body = anthropic_request("claude-test", &chat).unwrap();
+    llm::anthropic_cache::apply(&mut body, None, false, llm::anthropic_cache::Level::Full);
+    assert_eq!(
+        body["system"],
+        json!([
+            {"type":"text","text":"policy"},
+            {"type":"text","text":"environment\n\nAGENTS.md","cache_control":{"type":"ephemeral"}},
+            {"type":"text","text":"turn notes\n\nmemory"}
+        ])
+    );
+    // An unbanded prompt keeps its single plain-string system.
+    let mut plain = request();
+    plain
+        .messages
+        .insert(0, json!({"role":"system","content":"Follow rules"}));
+    assert_eq!(
+        anthropic_request("claude-test", &plain).unwrap()["system"],
+        "Follow rules"
+    );
+}
+
+#[test]
+fn subscription_system_keeps_leading_blocks_and_anchors_on_the_stable_band() {
+    use llm::prompt::{Band, system};
+    let mut chat = request();
+    chat.messages.splice(
+        0..0,
+        [
+            system(Band::Stable, "environment"),
+            system(Band::Dynamic, "notes"),
+        ],
+    );
+    let mut body = anthropic_request_variant("claude-test", &chat, true).unwrap();
+    llm::anthropic_cache::apply(&mut body, None, true, llm::anthropic_cache::Level::Full);
+    let system = body["system"].as_array().unwrap();
+    assert_eq!(system.len(), 4);
+    assert!(
+        system[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(CLAUDE_BILLING_PREFIX)
+    );
+    assert!(system[0].get("cache_control").is_none());
+    assert!(system[1].get("cache_control").is_none());
+    assert_eq!(system[2]["text"], "environment");
+    assert_eq!(system[2]["cache_control"]["ttl"], "1h");
+    assert!(system[3].get("cache_control").is_none());
+    assert!(!body.to_string().contains(llm::anthropic_cache::BAND_TAG));
+    attest_claude_code_body(&mut body).unwrap();
+    assert!(
+        !body["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(CCH_PLACEHOLDER)
+    );
+}
+
+#[test]
+fn refusal_and_pause_turn_are_distinct_provider_stops() {
+    let refusal = anthropic_reply(&json!({
+        "content":[],"stop_reason":"refusal",
+        "stop_details":{"type":"refusal","category":"cyber","explanation":"declined text"},
+        "usage":{"input_tokens":1,"output_tokens":0}
+    }))
+    .unwrap();
+    assert_eq!(refusal.finish_reason, "refusal");
+    assert_eq!(
+        refusal.provider_stop(),
+        Some(llm::ProviderStop::Refusal {
+            category: Some("cyber".into())
+        })
+    );
+    let unlabelled = anthropic_reply(&json!({
+        "content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":null},
+        "usage":{}
+    }))
+    .unwrap();
+    assert_eq!(
+        unlabelled.provider_stop(),
+        Some(llm::ProviderStop::Refusal { category: None })
+    );
+    let paused = anthropic_reply(&json!({
+        "content":[{"type":"text","text":"searching"}],"stop_reason":"pause_turn","usage":{}
+    }))
+    .unwrap();
+    assert_eq!(paused.provider_stop(), Some(llm::ProviderStop::PauseTurn));
+    let done = anthropic_reply(&json!({"content":[],"stop_reason":"end_turn","usage":{}})).unwrap();
+    assert_eq!(done.provider_stop(), None);
+}
+
+#[test]
+fn documented_native_compaction_needs_a_first_party_route_and_a_documented_model() {
+    use crate::config::compaction::NativeCompactionCapability::{Anthropic, ResponsesV1};
+    let route = |base_url: &str, model: &str| {
+        backend(ProviderKind::AnthropicEndpoint {
+            base_url: base_url.into(),
+            model: model.into(),
+            api_key: Some("anth-secret".into()),
+        })
+    };
+    let first_party = route("https://api.anthropic.com/v1", "claude-opus-5-5");
+    assert_eq!(first_party.documented_native_compaction(), Some(Anthropic));
+    assert_eq!(
+        first_party.native_compaction_capability(None, false),
+        Some(Anthropic)
+    );
+    // A declared native_models map is authoritative, matched or not.
+    assert_eq!(first_party.native_compaction_capability(None, true), None);
+    assert_eq!(
+        first_party.native_compaction_capability(Some(ResponsesV1), false),
+        Some(ResponsesV1)
+    );
+    for (base_url, model) in [
+        ("https://api.anthropic.com/v1", "claude-opus-4-5"),
+        ("https://proxy.example.com/v1", "claude-opus-5-5"),
+    ] {
+        assert_eq!(route(base_url, model).documented_native_compaction(), None);
+    }
+}
+
+/// A load on a cache-stable surface: `read` and `tool_load` are the loaded core, `lsp` and `git`
+/// are deferred catalog tools, and `loaded` says whether `tool_load` already made `lsp` callable
+/// (its result then references it).
+fn tool_surface_request(loaded: bool) -> Chat {
+    use llm::tool_offer::{Mark, mark};
+    let tool = |name: &str| json!({"type":"function","function":{"name":name,"description":format!("{name} tool"),"parameters":{"type":"object","properties":{}}}});
+    let mut lsp = tool("lsp");
+    mark(
+        &mut lsp,
+        Mark {
+            callable: loaded,
+            deferred: true,
+        },
+    );
+    let mut git = tool("git");
+    mark(
+        &mut git,
+        Mark {
+            callable: false,
+            deferred: true,
+        },
+    );
+    let mut messages = vec![
+        json!({"role":"system","content":"sys"}),
+        json!({"role":"user","content":"find the symbol"}),
+    ];
+    if loaded {
+        messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":"call-load","type":"function","function":{"name":"tool_load","arguments":"{\"names\":[\"lsp\"]}"}}]}));
+        messages.push(json!({"role":"tool","tool_call_id":"call-load","content":"Selection persisted. Next request: offered [lsp]; not offered [].",llm::tool_offer::REFERENCES:["lsp"]}));
+    }
+    Chat {
+        messages,
+        tools: vec![tool("read"), tool("tool_load"), lsp, git],
+        temperature: 0.0,
+        max_tokens: 16,
+        seed: None,
+    }
+}
+
+fn anthropic_ok() -> Script {
+    fake::json(
+        200,
+        &json!({"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}),
+    )
+}
+
+fn first_party_anthropic(server: &fake::Fake, model: &str) -> Backend {
+    backend(ProviderKind::AnthropicEndpoint {
+        base_url: format!("{}/v1", server.url),
+        model: model.into(),
+        api_key: Some("anth-secret".into()),
+    })
+}
+
+#[test]
+fn fine_grained_tool_definitions_stay_stable_on_first_party_streaming_and_replays() {
+    for (first_party, streaming) in [(true, true), (true, false), (false, true)] {
+        let script = if streaming {
+            Script::Sse(anthropic_sse(&thinking_tool_events()))
+        } else {
+            anthropic_ok()
+        };
+        let server = fake::serve(vec![script]);
+        let _first_party = first_party.then(|| llm::anthropic::test_first_party(&server.url));
+        let mut remote = first_party_anthropic(&server, "claude-sonnet-4-6");
+        let mut req = request();
+        req.tools = vec![
+            json!({"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
+        ];
+        let mut on_text = |_: &str| true;
+        remote
+            .chat(
+                None,
+                &req,
+                5,
+                if streaming { Some(&mut on_text) } else { None },
+            )
+            .unwrap();
+        let body = fake::body(&server.requests()[0]);
+        for tool in body["tools"].as_array().unwrap() {
+            assert_eq!(tool["eager_input_streaming"] == true, first_party, "{body}");
+        }
+    }
+}
+
+#[test]
+fn tool_exposure_follows_exact_first_party_hosts_and_documented_models() {
+    use llm::tool_offer::Exposure;
+    let anthropic = |base_url: &str, model: &str| {
+        backend(ProviderKind::AnthropicEndpoint {
+            base_url: base_url.into(),
+            model: model.into(),
+            api_key: Some("anth-secret".into()),
+        })
+        .tool_exposure()
+    };
+    assert_eq!(
+        anthropic("https://api.anthropic.com/v1", "claude-opus-5-5"),
+        Exposure::Deferred
+    );
+    assert_eq!(
+        anthropic("https://api.anthropic.com/v1", "claude-haiku-4-5"),
+        Exposure::Deferred
+    );
+    // Opus 4.1 predates tool search; proxies and look-alike hosts are never first-party.
+    for (base_url, model) in [
+        ("https://api.anthropic.com/v1", "claude-opus-4-1"),
+        ("https://proxy.example.com/v1", "claude-opus-5-5"),
+        (
+            "https://api.anthropic.com.example.com/v1",
+            "claude-opus-5-5",
+        ),
+    ] {
+        assert_eq!(anthropic(base_url, model), Exposure::Plain, "{base_url}");
+    }
+    let responses = |base_url: &str| {
+        backend(endpoint(base_url))
+            .with_protocol(Some(ApiProtocol::Responses))
+            .tool_exposure()
+    };
+    assert_eq!(
+        responses("https://api.openai.com/v1"),
+        Exposure::AllowedTools
+    );
+    assert_eq!(responses("https://openrouter.ai/api/v1"), Exposure::Plain);
+    assert_eq!(
+        backend(endpoint("https://api.openai.com/v1")).tool_exposure(),
+        Exposure::Plain
+    );
+}
+
+#[test]
+fn first_party_anthropic_tools_stay_byte_stable_across_a_tool_load() {
+    let server = fake::serve(vec![anthropic_ok(), anthropic_ok()]);
+    let _first_party = llm::anthropic::test_first_party(&server.url);
+    let mut remote = first_party_anthropic(&server, "claude-opus-5-5");
+    for loaded in [false, true] {
+        remote
+            .chat(None, &tool_surface_request(loaded), 5, None)
+            .unwrap();
+    }
+    let seen = server.requests();
+    let (before, after) = (fake::body(&seen[0]), fake::body(&seen[1]));
+    assert_eq!(
+        serde_json::to_string(&before["tools"]).unwrap(),
+        serde_json::to_string(&after["tools"]).unwrap(),
+        "a tool load must not change the tools array"
+    );
+    let tools = before["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["read", "tool_load", "git", "lsp"]);
+    for tool in tools {
+        let deferred = matches!(tool["name"].as_str(), Some("git" | "lsp"));
+        assert_eq!(tool["defer_loading"] == true, deferred, "{tool}");
+        // The cache marker sits on the last loaded tool; deferred tools never carry one.
+        assert_eq!(
+            tool.get("cache_control").is_some(),
+            tool["name"] == "tool_load",
+            "{tool}"
+        );
+        assert!(tool.get(llm::tool_offer::MARK).is_none());
+    }
+    // The loading result returns the loaded definition by reference.
+    let result = after["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .find(|block| block["type"] == "tool_result")
+        .unwrap();
+    assert_eq!(
+        result["content"],
+        json!([{"type":"tool_reference","tool_name":"lsp"}])
+    );
+    assert!(!String::from_utf8_lossy(&seen[1]).contains(llm::tool_offer::REFERENCES));
+}
+
+#[test]
+fn anthropic_routes_without_tool_search_receive_only_the_callable_tools() {
+    for (first_party, model) in [(false, "claude-opus-5-5"), (true, "claude-opus-4-1")] {
+        let server = fake::serve(vec![anthropic_ok()]);
+        let _first_party = first_party.then(|| llm::anthropic::test_first_party(&server.url));
+        let mut remote = first_party_anthropic(&server, model);
+        remote
+            .chat(None, &tool_surface_request(true), 5, None)
+            .unwrap();
+        let body = fake::body(&server.requests()[0]);
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["lsp", "read", "tool_load"], "{model}");
+        let raw = String::from_utf8_lossy(&server.requests()[0]).into_owned();
+        assert!(!raw.contains("defer_loading") && !raw.contains("tool_reference"));
+        assert!(raw.contains("Selection persisted"));
+    }
+}
+
+#[test]
+fn refused_deferral_resends_the_plain_callable_set_and_latches() {
+    let refusal = json!({"type":"error","error":{"type":"invalid_request_error","message":"tools.2.defer_loading: Extra inputs are not permitted"}});
+    let server = fake::serve(vec![
+        fake::json(400, &refusal),
+        anthropic_ok(),
+        anthropic_ok(),
+    ]);
+    let _first_party = llm::anthropic::test_first_party(&server.url);
+    let mut remote = first_party_anthropic(&server, "claude-sonnet-5-5");
+    for _ in 0..2 {
+        let reply = remote
+            .chat(None, &tool_surface_request(true), 5, None)
+            .unwrap();
+        assert_eq!(reply.text, "ok");
+    }
+    let seen = server.requests();
+    assert_eq!(seen.len(), 3);
+    assert!(String::from_utf8_lossy(&seen[0]).contains("defer_loading"));
+    for raw in &seen[1..] {
+        let raw = String::from_utf8_lossy(raw);
+        assert!(!raw.contains("defer_loading") && !raw.contains("tool_reference"));
+        assert!(
+            !raw.contains("\"git\""),
+            "uncallable tools are not sent plain"
+        );
+    }
+}
+
+#[test]
+fn responses_narrow_with_allowed_tools_only_on_the_openai_api() {
+    use llm::tool_offer::{Mark, mark};
+    let completed = || {
+        Script::Sse(format!(
+            "data: {}\n\n",
+            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}})
+        ))
+    };
+    let tool = |name: &str| json!({"type":"function","function":{"name":name,"description":name,"parameters":{"type":"object","properties":{}}}});
+    let narrowed = |todo_only: bool| {
+        let mut read = tool("read");
+        mark(
+            &mut read,
+            Mark {
+                callable: !todo_only,
+                deferred: false,
+            },
+        );
+        let mut exit_plan = tool("exit_plan");
+        mark(
+            &mut exit_plan,
+            Mark {
+                callable: false,
+                deferred: false,
+            },
+        );
+        Chat {
+            tools: vec![exit_plan, read, tool("todo")],
+            ..request()
+        }
+    };
+    let server = fake::serve(vec![completed(), completed(), completed()]);
+    let _first_party = llm::responses::test_first_party(&server.url);
+    let mut remote = backend(endpoint(&format!("{}/v1", server.url)))
+        .with_protocol(Some(ApiProtocol::Responses));
+    for todo_only in [false, true] {
+        remote.chat(None, &narrowed(todo_only), 5, None).unwrap();
+    }
+    // Any other Responses host receives the callable set, without `tool_choice`.
+    drop(_first_party);
+    remote.chat(None, &narrowed(true), 5, None).unwrap();
+    let seen = server.requests();
+    let (full, gated) = (fake::body(&seen[0]), fake::body(&seen[1]));
+    assert_eq!(
+        serde_json::to_string(&full["tools"]).unwrap(),
+        serde_json::to_string(&gated["tools"]).unwrap(),
+        "narrowing must not change the tools array"
+    );
+    assert_eq!(full["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        full["tool_choice"],
+        json!({"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"read"},{"type":"function","name":"todo"}]})
+    );
+    assert_eq!(
+        gated["tool_choice"]["tools"],
+        json!([{"type":"function","name":"todo"}])
+    );
+    assert!(!String::from_utf8_lossy(&seen[0]).contains(llm::tool_offer::MARK));
+    let plain = fake::body(&seen[2]);
+    let names: Vec<&str> = plain["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["todo"]);
+    assert!(plain.get("tool_choice").is_none());
 }

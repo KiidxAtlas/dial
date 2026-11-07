@@ -93,6 +93,42 @@ impl Policy {
     }
 }
 
+/// Whether `prompt` asks to explain a behaviour ("run X and tell me why it fails") without asking
+/// for a repair. Observing such a failure answers the request; it does not count as unfinished
+/// work. Any repair word ("fix", "make it pass", ...) keeps it an ordinary task.
+pub fn diagnosis_only(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    let words: std::collections::HashSet<_> = lower.split(|c: char| !c.is_alphanumeric()).collect();
+    let asks_why = [
+        "why",
+        "diagnose",
+        "diagnosis",
+        "explain",
+        "investigate",
+        "cause",
+        "causes",
+    ]
+    .iter()
+    .any(|word| words.contains(word));
+    let asks_repair = [
+        "fix",
+        "repair",
+        "resolve",
+        "patch",
+        "make",
+        "solve",
+        "correct",
+        "implement",
+        "change",
+        "edit",
+        "update",
+        "refactor",
+    ]
+    .iter()
+    .any(|word| words.contains(word));
+    asks_why && !asks_repair
+}
+
 /// Whether a word of `prompt` starts with "verif": verify, verifies, verified, verifying,
 /// verification. Words like "check" or "test" are not an explicit verification request.
 fn asks_for_verification(prompt: &str) -> bool {

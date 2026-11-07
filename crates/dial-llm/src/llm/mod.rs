@@ -72,6 +72,7 @@ pub mod template_options;
 mod text_tool_calls;
 pub use text_tool_calls::mentions_call_markup;
 pub mod thinking_loop;
+pub mod tool_offer;
 pub mod tool_repair;
 mod transports;
 pub mod usage;
@@ -136,6 +137,9 @@ pub struct HttpError {
     pub retry_after: Option<Duration>,
     /// Decided from the full body before any redaction replaces the excerpt.
     pub class: errors::ErrorClass,
+    /// `x-should-retry: false`: the provider says resending this exact request cannot succeed.
+    /// The class is kept, so key/account rotation and model fallback still apply.
+    pub retry_refused: bool,
 }
 
 impl fmt::Display for HttpError {
@@ -169,7 +173,7 @@ impl std::error::Error for TransportError {}
 /// Whether retrying is reasonable before a response body has been consumed.
 pub fn is_transient(error: &anyhow::Error) -> bool {
     if let Some(http) = error.downcast_ref::<HttpError>() {
-        return http.class.is_retryable();
+        return http.class.is_retryable() && !http.retry_refused;
     }
     error
         .downcast_ref::<TransportError>()
@@ -320,6 +324,21 @@ pub struct Reply {
     /// Reasoning effort the request asked for (`off` when thinking was disabled); `None` leaves
     /// the provider default in place.
     pub requested_effort: Option<String>,
+    /// Provider classifier category of a declined turn (`finish_reason == "refusal"`), e.g.
+    /// Anthropic `stop_details.category`. A bounded label only, never provider explanation text.
+    pub refusal_category: Option<String>,
+}
+
+/// A provider stop that is neither a finished answer nor a truncation. See [`Reply::provider_stop`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderStop {
+    /// The provider declined the request (`stop_reason: "refusal"`); the content may be empty or
+    /// partial and must not be treated as a finished answer. `category` is the provider's label
+    /// (Anthropic `stop_details.category`, an open set such as `cyber` or `bio`) when reported.
+    Refusal { category: Option<String> },
+    /// A server-side tool loop paused (`stop_reason: "pause_turn"`). Sending the conversation
+    /// again with this assistant turn appended, and no new user text, resumes it.
+    PauseTurn,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -337,6 +356,17 @@ impl Reply {
     /// as an empty final answer.
     pub fn dropped_tool_call(&self) -> bool {
         self.finish_reason == "tool_calls" && self.tool_calls.is_empty()
+    }
+
+    /// The refusal or pause this reply ended with, when it did not finish or truncate normally.
+    pub fn provider_stop(&self) -> Option<ProviderStop> {
+        match self.finish_reason.as_str() {
+            "refusal" => Some(ProviderStop::Refusal {
+                category: self.refusal_category.clone(),
+            }),
+            "pause_turn" => Some(ProviderStop::PauseTurn),
+            _ => None,
+        }
     }
 }
 /// Stages reported by a local inference engine.
@@ -660,6 +690,8 @@ fn chat_at_controlled(
         profile.validate_request(req, false)?;
         profile.apply_openai(&mut body);
         openrouter::apply(&mut body, profile)?;
+    } else {
+        apply_openai_reasoning_limit(&mut body, url, model_label);
     }
     let mut response = send_with_headers(url, auth, &body, timeout_secs, None, interrupt, headers)?;
     let status = response.status().as_u16();
@@ -752,6 +784,8 @@ fn chat_stream_at_controlled(
         profile.validate_request(req, false)?;
         profile.apply_openai(&mut body);
         openrouter::apply(&mut body, profile)?;
+    } else {
+        apply_openai_reasoning_limit(&mut body, url, model_label);
     }
     let mut response = send_with_headers(
         url,
@@ -899,6 +933,25 @@ fn apply_local_reasoning(
             "max_bytes": guard.max_reasoning_bytes.saturating_mul(3) / 4,
             "max_seconds": if guard.enabled { guard.max_pre_action_secs as f64 * 0.75 } else { 0.0 },
         });
+    }
+}
+
+/// Unprofiled OpenAI chat-completions requests to a reasoning model the catalog records: OpenAI
+/// documents `max_tokens` as deprecated and incompatible with its reasoning models, and
+/// `max_completion_tokens` as its replacement, so the output allowance moves to that field.
+/// Other hosts keep `max_tokens`, which OpenAI-compatible servers expect.
+fn apply_openai_reasoning_limit(body: &mut Value, url: &str, model: &str) {
+    if host_of(url).as_deref() != Some("api.openai.com")
+        || !catalog::bundled_model("openai", model).is_some_and(|record| {
+            record.reasoning && record.thinking == Some(catalog::ThinkingMode::Effort)
+        })
+    {
+        return;
+    }
+    if let Some(object) = body.as_object_mut()
+        && let Some(limit) = object.remove("max_tokens")
+    {
+        object.insert("max_completion_tokens".into(), limit);
     }
 }
 
@@ -1343,6 +1396,7 @@ fn http_error(
         excerpt,
         retry_after,
         class,
+        retry_refused: hints.should_retry == Some(false),
     })
 }
 

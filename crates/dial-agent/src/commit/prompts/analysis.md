@@ -15,7 +15,7 @@ Cross-cutting, evenly split, project-wide, or vague best scope → no scope.
 
 Prefer `<common_scopes>` and `<scope_candidates>`; invent only when no candidate fits.
 
-Scope MUST be short — ideally one word, max two joined by `-`. Long candidate (e.g. `coding-agent-chunk-edit-protocol`) → most distinctive segment (`chunk-edit`). Never 3+ hyphenated words.
+Scope should be short — ideally one word, max two joined by `-`. Long candidate (e.g. `coding-agent-chunk-edit-protocol`) → most distinctive segment (`chunk-edit`). Never 3+ hyphenated words.
 
 Forbidden scopes: `src`, `lib`, `include`, `tests`, `benches`, `examples`, `docs`, project name, `app`, `main`, `entire`, `all`, `misc`.
 
@@ -51,7 +51,7 @@ Highest-signal 0-6 only. Each:
 </instructions>
 
 <output_format>
-You MUST return the result in this format WITHOUT the fences:
+Return the result in this format, without the fences:
 ```
 # type(scope): summary
 

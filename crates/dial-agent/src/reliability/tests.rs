@@ -92,6 +92,8 @@ fn request_contract_is_exact_and_examples_validate() {
     let contract = Contract::new(schemas.clone()).unwrap();
     assert_eq!(contract.names, ["read", "grep"]);
     let text = contract.instruction(true, true);
+    assert!(text.starts_with("<dial-notice kind=\"tool_contract\">\nCall only: read, grep."));
+    assert!(text.ends_with("\n</dial-notice>"));
     assert!(text.contains("at most one tool call"));
     assert!(text.contains("read argument shape"));
     assert!(!text.contains("todo argument shape"));

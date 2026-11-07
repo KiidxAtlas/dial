@@ -59,12 +59,39 @@ pub(in crate::agent) enum Rung {
 #[derive(Default)]
 pub(in crate::agent) struct ProgressLedger {
     since_progress: std::collections::BTreeMap<Setback, u32>,
+    rounds_without_evidence: u32,
 }
 
 impl ProgressLedger {
     /// Productive execution repays the debt; bookkeeping alone never calls this.
     pub(in crate::agent) fn progressed(&mut self) {
-        *self = Self::default();
+        self.since_progress.clear();
+    }
+
+    /// Mutations are execution progress but cannot indefinitely repay evidence debt. This
+    /// shares the turn ledger; bookkeeping does not charge it and zero disables the experiment.
+    pub(in crate::agent) fn evidence_round(
+        &mut self,
+        active: bool,
+        grounded: bool,
+        limit: u32,
+    ) -> Rung {
+        if grounded {
+            self.rounds_without_evidence = 0;
+        } else if active {
+            self.rounds_without_evidence = self.rounds_without_evidence.saturating_add(1);
+        }
+        if limit > 0 && self.rounds_without_evidence >= limit {
+            Rung::Stop(format!(
+                "Blocked: {limit} work rounds produced no new independent observations or changed check verdicts. Repeated edits are not convergence. Completed effects are retained; inspect preserved inputs and revise the hypothesis before resuming. No completion was recorded."
+            ))
+        } else {
+            Rung::Retry
+        }
+    }
+
+    pub(in crate::agent) fn hypothesis_due(&self, limit: u32) -> bool {
+        limit > 0 && self.rounds_without_evidence == (limit / 2).max(1)
     }
 
     pub(in crate::agent) fn tool_round(

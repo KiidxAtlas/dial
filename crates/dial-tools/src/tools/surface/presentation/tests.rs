@@ -43,6 +43,12 @@ fn coherent_runtime_check_presentation_does_not_guess_from_command_text() {
     assert_eq!(check.body, BodyStyle::Quiet);
 }
 #[test]
+fn eval_cells_are_labelled_eval_not_run() {
+    let cell = render_call("eval", &serde_json::json!({"language":"js","code":"1 + 1"}));
+    assert_eq!(cell.label, "Eval");
+    assert_eq!(cell.tone, Tone::Tools);
+}
+#[test]
 fn edit_results_with_new_language_server_errors_show_the_count_as_a_fact() {
     let output = ToolOutput::ok(
         "Edited src/a.rs\n[LSP advisory, not verification] 2 new error(s) after this edit:\nsrc/a.rs:3:1: expected `;`\nsrc/a.rs:9:5: unknown name\n".into(),

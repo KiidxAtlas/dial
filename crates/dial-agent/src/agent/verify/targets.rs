@@ -804,10 +804,7 @@ impl Targets {
                     "its latest run (`{}`: `{}`) {ended}{launch}",
                     run.tool, run.command
                 );
-                if run.terminal == Some(false)
-                    && terminal_launch_available
-                    && record.is_some_and(|record| record.terminal_launches == 0)
-                {
+                if self.untried_terminal(target, terminal_launch_available) {
                     detail.push_str(". A terminal-backed launch (`bg` start with `pty: true`) is available and was not attempted for this path");
                 }
                 detail
@@ -820,12 +817,49 @@ impl Targets {
         format!("- `{}`: {detail}.", target.requested)
     }
 
+    /// The latest run of `target` launched without a terminal while an untried terminal launch is
+    /// available, so its failure may say more about the launch than about the program.
+    fn untried_terminal(&self, target: &Target, terminal_launch_available: bool) -> bool {
+        let record = self.records.get(&target.path);
+        terminal_launch_available
+            && record.is_some_and(|record| {
+                record.terminal_launches == 0
+                    && record
+                        .latest
+                        .as_ref()
+                        .is_some_and(|run| run.terminal == Some(false))
+            })
+    }
+
+    /// Requested paths whose latest run failed at the current epoch with no untried terminal
+    /// launch: the failure itself is the observation, which is what a request to run a path and
+    /// explain its failure asks for. Described as `blocker` would describe them.
+    pub(in crate::agent) fn conclusive_failures(
+        &self,
+        workspace: &Workspace,
+        epoch: u64,
+        terminal_launch_available: bool,
+    ) -> Vec<String> {
+        let epoch = epoch.saturating_sub(self.own_effects);
+        self.requested
+            .iter()
+            .filter(|target| {
+                self.status(target, epoch, self.source_state(workspace, target)) == Status::Failed
+                    && !self.untried_terminal(target, terminal_launch_available)
+            })
+            .map(|target| self.describe(target, Status::Failed, terminal_launch_available))
+            .collect()
+    }
+
     /// Why completion is refused, or `None` when every requested path has a current successful run.
+    /// With `accept_failures`, a current conclusive failed run (see [`Self::conclusive_failures`])
+    /// answers the request instead of blocking it.
     pub(in crate::agent) fn blocker(
         &self,
         workspace: &Workspace,
         epoch: u64,
         terminal_launch_available: bool,
+        accept_failures: bool,
     ) -> Option<String> {
         let epoch = epoch.saturating_sub(self.own_effects);
         let open: Vec<String> = self
@@ -835,6 +869,12 @@ impl Targets {
                 let source = self.source_state(workspace, target);
                 match self.status(target, epoch, source) {
                     Status::Succeeded => None,
+                    Status::Failed
+                        if accept_failures
+                            && !self.untried_terminal(target, terminal_launch_available) =>
+                    {
+                        None
+                    }
                     status => Some(self.describe(target, status, terminal_launch_available)),
                 }
             })

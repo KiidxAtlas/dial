@@ -769,3 +769,37 @@ fn inactive_goals_do_not_attach_active_work_guidance_to_a_new_user_turn() {
         );
     }
 }
+
+#[test]
+fn goal_turns_mirror_progress_to_the_configured_workspace_file_only() {
+    for configured in [true, false] {
+        let server = fake::serve(vec![
+            sse_tool_call(
+                "todo",
+                json!({"op":"append","tasks":[{"content":"Write the lexer"}]}),
+            ),
+            sse_reply("blocked on the grammar"),
+        ]);
+        let mut config = Config::default();
+        if configured {
+            config.goal.progress_file = ".dial/progress.md".into();
+        }
+        let dir = workspace();
+        let mut agent = new_agent(&config, &server.url, dir.path());
+        agent
+            .goal_mutate(|goal| goal.start("ship the parser", None))
+            .unwrap();
+        // One user turn; the continuation that follows has no scripted reply and is not needed.
+        let _ = agent
+            .goal_turn("begin", &mut NullUi, TurnOrigin::User)
+            .unwrap();
+        let path = dir.path().join(".dial/progress.md");
+        if configured {
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("ship the parser"), "{text}");
+            assert!(text.contains("Write the lexer"), "{text}");
+        } else {
+            assert!(!path.exists());
+        }
+    }
+}

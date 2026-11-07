@@ -180,7 +180,7 @@ fn driving_a_tracked_job_does_not_make_its_run_stale() {
         targets.observe_prepared(&workspace, tool, &start, &started("game", true), 1);
         assert!(
             targets
-                .blocker(&workspace, 1, true)
+                .blocker(&workspace, 1, true, false)
                 .unwrap()
                 .contains("never observed"),
             "{tool}"
@@ -192,13 +192,13 @@ fn driving_a_tracked_job_does_not_make_its_run_stale() {
         targets.observe_prepared(&workspace, "bg", &keys, &ToolOutput::ok(String::new()), 2);
         let output = json!({"action": "output", "name": "game"});
         targets.observe_prepared(&workspace, "bg", &output, &alive(false), 2);
-        assert_eq!(targets.blocker(&workspace, 2, false), None, "{tool}");
+        assert_eq!(targets.blocker(&workspace, 2, false, false), None, "{tool}");
         // Input to an unrelated job is a foreign effect.
         let other = json!({"action": "input", "name": "other", "text": "x"});
         targets.observe_prepared(&workspace, "bg", &other, &ToolOutput::ok(String::new()), 3);
         assert!(
             targets
-                .blocker(&workspace, 3, false)
+                .blocker(&workspace, 3, false, false)
                 .unwrap()
                 .contains("before a later edit"),
             "{tool}"
@@ -226,7 +226,7 @@ fn another_programs_passing_tests_leave_the_requested_path_unrun() {
         &exited(0, false),
         0,
     );
-    let blocker = targets.blocker(&workspace, 0, true).unwrap();
+    let blocker = targets.blocker(&workspace, 0, true, false).unwrap();
     assert!(
         blocker.contains("`local testing/`: no run naming this path"),
         "{blocker}"
@@ -244,7 +244,7 @@ fn a_failed_run_without_a_terminal_reports_the_untried_terminal_launch() {
     let mut targets = Targets::resolve(&workspace, "run the snake game in local testing/");
     let run = json!({"command": "cd \"local testing\" && python3 snake.py"});
     targets.observe_prepared(&workspace, "bash", &run, &exited(1, false), 0);
-    let blocker = targets.blocker(&workspace, 0, true).unwrap();
+    let blocker = targets.blocker(&workspace, 0, true, false).unwrap();
     assert!(
         blocker.contains("exited with code 1; launched without a terminal"),
         "{blocker}"
@@ -256,7 +256,7 @@ fn a_failed_run_without_a_terminal_reports_the_untried_terminal_launch() {
     // Without an available terminal launch the refusal states only what was observed.
     assert!(
         !targets
-            .blocker(&workspace, 0, false)
+            .blocker(&workspace, 0, false, false)
             .unwrap()
             .contains("pty")
     );
@@ -266,7 +266,7 @@ fn a_failed_run_without_a_terminal_reports_the_untried_terminal_launch() {
     targets.observe_prepared(&workspace, "bg", &start, &started("game", true), 0);
     assert!(
         targets
-            .blocker(&workspace, 0, true)
+            .blocker(&workspace, 0, true, false)
             .unwrap()
             .contains("never observed")
     );
@@ -277,7 +277,7 @@ fn a_failed_run_without_a_terminal_reports_the_untried_terminal_launch() {
         &alive(false),
         0,
     );
-    assert_eq!(targets.blocker(&workspace, 0, true), None);
+    assert_eq!(targets.blocker(&workspace, 0, true, false), None);
     let evidence = targets.evidence(&workspace, 0);
     assert_eq!(evidence["targets"][0]["status"], "process_succeeded");
     assert_eq!(evidence["targets"][0]["terminal_launches"], 1);
@@ -288,7 +288,7 @@ fn a_failed_run_without_a_terminal_reports_the_untried_terminal_launch() {
     // launch before that effect, so only a fresh launch can be current again.
     assert!(
         targets
-            .blocker(&workspace, 1, true)
+            .blocker(&workspace, 1, true, false)
             .unwrap()
             .contains("before a later edit or effectful command")
     );
@@ -311,7 +311,7 @@ fn a_failed_run_without_a_terminal_reports_the_untried_terminal_launch() {
         &exited(1, true),
         1,
     );
-    let blocker = targets.blocker(&workspace, 1, true).unwrap();
+    let blocker = targets.blocker(&workspace, 1, true, false).unwrap();
     assert!(blocker.contains("launched in a terminal"), "{blocker}");
     assert!(!blocker.contains("was not attempted"), "{blocker}");
 }
@@ -336,7 +336,7 @@ fn a_readiness_failure_keeps_the_started_job_observable() {
         &alive(false),
         0,
     );
-    assert_eq!(targets.blocker(&workspace, 0, false), None);
+    assert_eq!(targets.blocker(&workspace, 0, false, false), None);
 }
 
 #[test]
@@ -351,10 +351,10 @@ fn readiness_zero_exits_and_auto_backgrounded_runs_count_and_unknown_jobs_do_not
         &alive(true),
         0,
     );
-    assert!(targets.blocker(&workspace, 0, false).is_some());
+    assert!(targets.blocker(&workspace, 0, false, false).is_some());
     let run = json!({"command": "python3 snake.py", "cwd": "local testing"});
     targets.observe_prepared(&workspace, "bash", &run, &exited(0, false), 0);
-    assert_eq!(targets.blocker(&workspace, 0, false), None);
+    assert_eq!(targets.blocker(&workspace, 0, false, false), None);
 
     let mut targets = Targets::resolve(&workspace, request);
     let mut moved = ToolOutput::ok(String::new());
@@ -362,7 +362,7 @@ fn readiness_zero_exits_and_auto_backgrounded_runs_count_and_unknown_jobs_do_not
     targets.observe_prepared(&workspace, "bash", &run, &moved, 0);
     assert!(
         targets
-            .blocker(&workspace, 0, false)
+            .blocker(&workspace, 0, false, false)
             .unwrap()
             .contains("never observed"),
         "an adoption receipt is not an observation of the running program"
@@ -374,7 +374,7 @@ fn readiness_zero_exits_and_auto_backgrounded_runs_count_and_unknown_jobs_do_not
         &alive(false),
         0,
     );
-    assert_eq!(targets.blocker(&workspace, 0, false), None);
+    assert_eq!(targets.blocker(&workspace, 0, false, false), None);
     targets.observe_prepared(
         &workspace,
         "bg",
@@ -384,7 +384,7 @@ fn readiness_zero_exits_and_auto_backgrounded_runs_count_and_unknown_jobs_do_not
     );
     assert!(
         targets
-            .blocker(&workspace, 0, false)
+            .blocker(&workspace, 0, false, false)
             .unwrap()
             .contains("exited with code 2")
     );
@@ -404,7 +404,7 @@ fn readiness_zero_exits_and_auto_backgrounded_runs_count_and_unknown_jobs_do_not
         targets.evidence(&workspace, 0)["targets"][0]["latest"]["state"],
         "ready"
     );
-    assert_eq!(targets.blocker(&workspace, 0, false), None);
+    assert_eq!(targets.blocker(&workspace, 0, false, false), None);
 }
 
 #[test]
@@ -427,11 +427,11 @@ fn steering_replaces_obligations_only_with_a_new_run_request() {
     let run = json!({"command": "python3 'local testing/snake.py'"});
     targets.observe_prepared(&workspace, "bash", &run, &exited(0, false), 0);
     targets.retarget(&workspace, "now run local testing/snake.py again");
-    assert_eq!(targets.blocker(&workspace, 0, false), None);
+    assert_eq!(targets.blocker(&workspace, 0, false, false), None);
     // Steering that names nothing to run keeps the open obligation and its evidence.
     targets.retarget(&workspace, "also check the colours");
     assert!(targets.has_obligations());
-    assert_eq!(targets.blocker(&workspace, 0, false), None);
+    assert_eq!(targets.blocker(&workspace, 0, false, false), None);
     // A run request for another path replaces the obligation and drops unrelated runs.
     targets.retarget(&workspace, "run fixtures/snake/test_snake.py");
     assert_eq!(
@@ -473,7 +473,7 @@ fn compatibility_payload_does_not_supply_terminal_authority() {
     assert!(targets.evidence(&workspace, 0)["targets"][0]["latest"]["terminal"].is_null());
     assert!(
         !targets
-            .blocker(&workspace, 0, true)
+            .blocker(&workspace, 0, true, false)
             .unwrap()
             .contains("launched in a terminal")
     );
@@ -493,7 +493,7 @@ fn external_edits_invalidate_a_run_without_advancing_the_effect_epoch() {
         }
         targets.observe(&workspace, "bash", &args, &exited(0, false), 0, sources);
         if !edit_before_result {
-            assert_eq!(targets.blocker(&workspace, 0, false), None);
+            assert_eq!(targets.blocker(&workspace, 0, false, false), None);
             std::fs::write(&path, "print(2)\n").unwrap();
         }
         let evidence = targets.evidence(&workspace, 0);
@@ -501,7 +501,7 @@ fn external_edits_invalidate_a_run_without_advancing_the_effect_epoch() {
         assert_eq!(evidence["targets"][0]["latest"]["current"], false);
         assert!(
             targets
-                .blocker(&workspace, 0, false)
+                .blocker(&workspace, 0, false, false)
                 .unwrap()
                 .contains("source changed")
         );
@@ -529,7 +529,7 @@ fn observing_a_job_retains_its_original_source_until_a_new_launch() {
             "source_changed",
             "{action}"
         );
-        assert!(targets.blocker(&workspace, 0, false).is_some());
+        assert!(targets.blocker(&workspace, 0, false, false).is_some());
     }
     targets.observe_prepared(&workspace, "bg", &launch, &started("game", false), 0);
     targets.observe_prepared(
@@ -539,7 +539,7 @@ fn observing_a_job_retains_its_original_source_until_a_new_launch() {
         &alive(false),
         0,
     );
-    assert_eq!(targets.blocker(&workspace, 0, false), None);
+    assert_eq!(targets.blocker(&workspace, 0, false, false), None);
 }
 
 #[test]
@@ -561,12 +561,12 @@ fn process_success_is_bound_to_the_original_path_and_never_behavior_verification
         assert_eq!(evidence["behavior_verified"], false);
         if command.contains("fixtures") {
             assert_eq!(evidence["targets"][0]["status"], "not_run");
-            assert!(targets.blocker(&workspace, 0, false).is_some());
+            assert!(targets.blocker(&workspace, 0, false, false).is_some());
         } else {
             assert_eq!(evidence["targets"][0]["status"], "process_succeeded");
             assert_eq!(evidence["targets"][0]["latest"]["terminal"], false);
             assert_eq!(evidence["targets"][0]["latest"]["behavior_verified"], false);
-            assert_eq!(targets.blocker(&workspace, 0, false), None);
+            assert_eq!(targets.blocker(&workspace, 0, false, false), None);
         }
     }
 }
@@ -600,7 +600,7 @@ fn unavailable_source_identities_do_not_become_current_process_evidence() {
         assert_eq!(evidence["targets"][0]["latest"]["current"], false, "{case}");
         assert!(
             targets
-                .blocker(&workspace, 0, false)
+                .blocker(&workspace, 0, false, false)
                 .unwrap()
                 .contains("source identity is unknown"),
             "{case}"
@@ -625,7 +625,7 @@ fn identity_reads_stay_confined_when_a_target_is_replaced_by_an_external_symlink
         targets.evidence(&workspace, 0)["targets"][0]["status"],
         "source_identity_unknown"
     );
-    assert!(targets.blocker(&workspace, 0, false).is_some());
+    assert!(targets.blocker(&workspace, 0, false, false).is_some());
 }
 
 #[test]
@@ -654,7 +654,11 @@ fn named_directory_runs_remain_current_only_while_the_complete_source_tree_match
         );
         assert_eq!(evidence["targets"][0]["kind"], "directory");
         assert_eq!(evidence["behavior_verified"], false);
-        assert_eq!(targets.blocker(&workspace, 0, false), None, "{change}");
+        assert_eq!(
+            targets.blocker(&workspace, 0, false, false),
+            None,
+            "{change}"
+        );
         match change {
             "modify" => std::fs::write(dir.join("snake.py"), "print(2)\n").unwrap(),
             "modify_ignored" => std::fs::write(dir.join(".cache/data"), "changed").unwrap(),
@@ -673,6 +677,29 @@ fn named_directory_runs_remain_current_only_while_the_complete_source_tree_match
             evidence["targets"][0]["latest"]["current"], false,
             "{change}"
         );
-        assert!(targets.blocker(&workspace, 0, false).is_some(), "{change}");
+        assert!(
+            targets.blocker(&workspace, 0, false, false).is_some(),
+            "{change}"
+        );
     }
+}
+
+#[test]
+fn a_conclusive_failed_run_answers_a_diagnosis_request() {
+    // "Run X and tell me why it fails": the observed failure is the answer, not missing work.
+    let (_root, workspace) = workspace();
+    let mut targets = Targets::resolve(&workspace, "run local testing/snake.py");
+    let run = json!({"command": "cd \"local testing\" && python3 snake.py"});
+    targets.observe_prepared(&workspace, "bash", &run, &exited(1, false), 0);
+    assert!(targets.blocker(&workspace, 0, false, false).is_some());
+    assert_eq!(targets.blocker(&workspace, 0, false, true), None);
+    let failures = targets.conclusive_failures(&workspace, 0, false);
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("exited with code 1"), "{failures:?}");
+    // An untried terminal launch may change the result, so the failure is not conclusive yet.
+    assert!(targets.blocker(&workspace, 0, true, true).is_some());
+    assert!(targets.conclusive_failures(&workspace, 0, true).is_empty());
+    // A later effect makes the failure stale; stale runs never answer anything.
+    assert!(targets.blocker(&workspace, 1, false, true).is_some());
+    assert!(targets.conclusive_failures(&workspace, 1, false).is_empty());
 }

@@ -41,7 +41,7 @@ agent is not patched in place.
 Built-in full and compact prompts set one order of work: frame the outcome, acceptance criteria and
 unknowns; gather with one planned batch of the most precise offered tools; then decide, act, verify
 and report. Evidence suffices when each claim about the project (that something exists, is missing
-or works) rests on a lookup made for it, or is marked `[INFERENCE]`. Reuse returned paths and
+or works) rests on a lookup made for it, or says in plain words that it is inference. Reuse returned paths and
 excerpts; calls that need an earlier result stay sequential. One-call profiles and request-specific
 limits still take precedence. This is prompt guidance, not forced scheduling or a measured
 model-efficiency improvement.
@@ -301,19 +301,61 @@ end a turn with a stop report and keep completed work, instead of failing it:
 ### Answer delivery and work completion
 
 Plain replies, `finish`, and explicit clarification use one controller completion decision. Open
-execution steps or deliverables, live jobs, stale or failed required evidence and unverified edits
-cannot be accepted as completed or bypassed with `outcome=answered`. A refused candidate is kept
-beside its observed unmet prerequisite and the turn ends `Incomplete`. Final prose does not close
-todos. Optional follow-ups remain separate, and explicit blockers and necessary questions retain
-their non-success outcomes after investigation.
+deliverables, live jobs, stale or failed required evidence and unverified edits cannot be accepted
+as completed or bypassed with `outcome=answered`. A refused candidate is kept beside its observed
+unmet prerequisite and the turn ends `Incomplete`. Optional follow-ups remain separate, and explicit
+blockers and necessary questions retain their non-success outcomes after investigation.
 
-A fresh workspace work request with no observed tool attempt gets one instruction-scoped
-investigation nudge before a question or completion is accepted. Self-contained general questions
-need no tool. Peer and monitor callbacks carry an existing task rather than creating a fresh
-investigation obligation. Missing work and post-edit evidence share this one nudge allowance;
-inner-loop retries cannot renew it, and repeating the candidate never grants completion. Phrase
-recognition can choose recovery wording, but does not decide acceptance. Controller observations
-are a prerequisite, not independent proof that arbitrary model claims are correct.
+Open execution steps depend on the route. On lean local routes (`assistance.lean_local`, or a local
+profile that escalated to the lean prompt) a final reply does not close todos and open steps refuse
+completion. On hosted and full-tier local routes, open steps do not refuse an answer that nothing
+else blocks: an accepted `completed` answer closes every pending or `in_progress` execution step (a
+notice names them), so the model spends no request on closing bookkeeping. Optional follow-ups stay
+open and are listed after the answer by the outstanding-work notice. Blocked steps refuse
+completion on every route.
+
+Some check failures say nothing about this turn's code. They are disclosed with the accepted answer
+("Accepted with disclosed gaps") and in `completion_evidence.disclosed_gaps` instead of ending the
+turn `Incomplete`:
+
+- an unavailable verification environment, a denied permission or a timeout, unless the same check
+  passed before this instruction's first effect;
+- an unchanged pre-existing code failure outside declared requirements (not on a debugging
+  request, which is about such a failure);
+- any check or requested run failure when the request asks why something fails without asking for
+  a repair ("run X and tell me why it fails") and nothing was edited.
+
+A failure introduced by this turn's edits still refuses completion. The first run of a check before
+the instruction's first edit, shell effect or extension effect becomes that check's baseline, also
+when `automatic_checks` is off.
+
+On lean local routes, a fresh workspace work request with no observed tool attempt gets one
+instruction-scoped investigation nudge before a question or completion is accepted. The request is
+classified by keywords, so the nudge is advisory: if the model answers again without a tool, the
+answer is accepted rather than ending `Incomplete`, unless that reply itself announces further
+action or unfinished work ("I will run the tests next"), which is not an answer. Hosted and full-tier local routes skip the
+nudge. Self-contained general questions need no tool, and peer and monitor callbacks carry an
+existing task rather than creating a fresh investigation obligation. Missing work and post-edit
+evidence share this one nudge allowance; inner-loop retries cannot renew it, and repeating the
+candidate never grants completion. Phrase recognition can choose recovery wording and keep a
+promise of further action from counting as an answer, but never grants acceptance. Controller observations are a prerequisite, not independent proof that
+arbitrary model claims are correct.
+
+#### Completion and loop gates
+
+| Gate | Trigger | Extra model rounds | Routes |
+|---|---|---|---|
+| Completion nudge | Open deliverables, unverified edits, failed checks or other completion blockers on a `completed` or `answered` candidate | 1 per instruction (shared by every reason below), then `Incomplete` | All |
+| Hard completion blocker | A blocker with no open steps or deliverables to work on (for example a failure introduced this turn after the nudge) | 0, ends `Incomplete` | All |
+| Disclosed gaps | Environment, permission, timeout, unchanged pre-existing or asked-to-diagnose failures | 0, accepted with a notice | All |
+| Open execution steps | `kind=step` todos still open | Shares the completion nudge | Lean local only; elsewhere an accepted `completed` answer closes them |
+| Investigation nudge | Keyword-classified work request with no observed tool call | Shares the completion nudge; ends `Incomplete` only if the next reply still announces unfinished work | Lean local only |
+| Capability-search reminder | The answer says, in the first person, that a capability is unavailable, with loadable tools and no search this instruction | 1 per instruction | All |
+| Unverified-edit check run | Current edits with no passing applicable check (`automatic_checks` off) | 0, the controller runs the checks itself | All |
+| Research advisory note | 12 observation rounds without progress where the checkpoint is forced; 60 elsewhere (one threshold for the parent and workers) | 0, a request-tail note | All |
+| Research checkpoint | 24 observation rounds without progress | 1 tool-free request, up to 3 attempts | Lean local routes: the foreground turn, and workers that may change files |
+| Subagent step limit | A worker reaches its role's default or the task's `max_steps` | 1 reserved tool-free summary request | Workers |
+| Coach review | Configured coach review and a change with uncheckpointed effects, `min_changed_files`, a sensitive path or uncovered declared requirements | Up to `verification.review.max_rounds` | Where a coach route is usable |
 
 Planning distinguishes three records: user-required durable deliverables belong in
 `working_state`; execution steps are `todo` items with `kind=step` (also the default for omitted
@@ -341,17 +383,22 @@ their existing failure obligations remain visible. No extra reviewer-model reque
 When `[verification].automatic_checks` is off and applicable checks are missing for current edits,
 the completion gate runs them through the same approval and freshness owner as `verify`. A
 passing current check adds no review request. An unresolved check receives at most the shared
-completion nudge, then remains incomplete with its diagnostic. Read-only and already-verified
+completion nudge, then remains incomplete with its diagnostic, unless its failure is a disclosed
+gap (above). Read-only and already-verified
 work has no default completion self-review. Configured independent coach/advisor review remains
 available under its own explicit policy. A deadline or cost boundary prevents further recovery.
 An interrupt during a tool round keeps finished parallel results and records
 calls that never started as not run. A panicking read-only tool is a failure with no effects
 (except `bash`, or a tool that committed before panicking). A timed-out or killed check counts as
 failed; a cancelled one settles nothing. Calls repeating in an exact short cycle (period 2 or 3)
-get an advisory note. A file changed by six committed edits (counted once per call) with no
-passing check in between gets an advisory edit-churn note asking the model to step back and verify
-or re-plan; the note repeats every six further edits, a passing `verify` or recognized shell check
-clears the counts, and the turn always continues.
+get an advisory note. A file changed by three committed edits (counted once per call) with no
+passing check in between gets a checkpoint asking for a minimal known-answer or round-trip check
+and the first divergent value. Further whole-file `write` calls supplying at least 4 KiB to that
+path are withheld before mutation until a check passes. Focused edits, smaller writes and other
+files remain available, so a failing implementation can still be repaired. A completed passing
+foreground check, asserting eval cell or fresh passing `verify` run clears the counts; merely
+loading a checker, a skipped check or a successful status observation does not. Custom shell
+checks declare `check: true` and must preserve nonzero failure statuses.
 
 Both the foreground turn and child workers decide how to recover from a reply in
 `agent/run/reply_triage.rs`. A reply cut off at the output limit with no text or tool call uses the
@@ -376,7 +423,9 @@ session does not return at cooldown end at all; see [model routing](model-routin
 
 Different successful lookups also have a shared foreground/worker synthesis boundary. After twelve
 observation-bearing model rounds without a novel committed change or accepted task resolution,
-Dial requests synthesis; after 24 it reserves a tool-free checkpoint request. Batches count as one
+Dial requests synthesis; after 24 it reserves a tool-free checkpoint request. Workers get the
+tool-free request only when they may change files and run on a lean local route; read-only workers
+and hosted routes keep their tools and get only the advisory note, from round 24. Batches count as one
 round. Successful skill, memory (`recall` and `codebase_memory` read actions), capability discovery
 (`tool_search`) and peer-list lookups count too; remembering findings, loading tools or sending peer
 messages do not. The checkpoint must return JSON with a new nonempty `finding`, `evidence` containing
@@ -902,6 +951,20 @@ unrecorded observations and edits may still matter, changed bookkeeping is not p
 and the existing activity/stall, blocker and budget limits are unchanged. The recovery ladder's
 successful-tool signal remains operational recovery telemetry, not goal satisfaction.
 
+`goal.progress_file` (Settings → Experimental → Agent loop; empty by default) names a
+workspace-relative file, for example `.dial/progress.md`, that Dial rewrites after each goal-mode
+turn with the objective, status and budget, the todo list and the working state (goal,
+deliverables with their evidence references, claims, open work, decisions, constraints). It makes
+a long goal's progress readable outside the session and easy to commit. The file is a user-visible
+deliverable, not Dial's private state: the path must be relative without `..`, it resolves through
+the workspace's roots and symlink checks, writes into protected Dial storage or Git metadata are
+refused (for example `.dial/` when the workspace is your home directory and `~/.dial` is Dial's own
+directory), and the checkpoint observer records the previous content like any native edit. Naming
+the path is the opt-in, so no per-write approval is asked; plan mode writes nothing, unchanged
+content is not rewritten, and a failed write is reported as a diagnostic without failing the turn.
+Its todos and working state are the agent's own records, not verification. Dial does not commit
+the file.
+
 These are provenance/completion correctness changes with deterministic harness coverage, not
 a measured improvement in model reasoning, completion rate, token use or latency. Evaluate the
 existing opt-in drafter before expanding or enabling it: compare matched model/thinking,
@@ -921,6 +984,9 @@ Python checks find the nearest owning Python metadata/environment boundary withi
 including nested projects, and run source paths and related tests relative to that root.
 `uv.lock` selects `uv run --offline --no-sync python`; an existing `.venv/bin/python` or Poetry
 configuration selects that project's runner. Root uv workspace locks can supply a shared runner.
+A file with no project runner falls back to `python3`; when that interpreter resolves neither as a
+path nor on `PATH`, its AST check is not planned, so a leftover helper in an image without Python
+is not reported as an unexplained failure. Project runners and `python_command` keep their checks.
 An operator can explicitly override argv with `[verification].python_command`, for example
 `python_command = ["/absolute/project/.venv/bin/python"]`; this is argv, not an interpolated shell
 snippet. There is no interpreter fallback after a selected runner fails. Setup failures stay
@@ -1021,7 +1087,7 @@ busy admission skips optional work. Turns poll without waiting and cancel pendin
 new steering or turn exit. Ready hints are revision-bound advisory notes for a later request, not
 edit witnesses. Automatic hints use source-validated lexical neighbors; explicit impact retrieval
 retains the richer saved-architecture context. Mandatory pre-edit source checks are unchanged.
-Approval-denied writes are not treated as successful verification. `todo` is optional progress bookkeeping, not a verification checkpoint. `done` closes the current item and starts the next; findings and references are optional notes, including for legacy investigation entries. No separate tool-activity, citation or text-delivery gate applies. Final prose never closes execution steps; the model must explicitly settle them. Open execution obligations, explicit blockers and running workers remain completion prerequisites. Failed checks remain failures independently of todo state.
+Approval-denied writes are not treated as successful verification. `todo` is optional progress bookkeeping for long multi-step work, not a verification checkpoint; the prompt and schema tell the model to skip it for short tasks and to send each update with a real tool call. `done` closes the current item and starts the next; findings and references are optional notes, including for legacy investigation entries. No separate tool-activity, citation or text-delivery gate applies. On lean local routes final prose never closes execution steps; elsewhere an accepted `completed` answer closes them. Explicit blockers and running workers remain completion prerequisites. Failed checks remain failures independently of todo state.
 
 Todo-only updates receive a one-time batching reminder only when the active request allows
 multiple calls. The small local tier's one-call contract, and any later one-call reliability
@@ -1047,8 +1113,8 @@ missing/observed/not-required pixels, and effects outside checkpoints. Baseline 
 observations remain separate. Passing checks establish what ran, not independent proof of all
 requirements. A simple answer needs no todo list and is not forced into verification ceremony.
 
-Accepted reports close only the current progress item outside goal mode, as before. Pending items
-stay open and are disclosed in the report/evidence rather than implicitly called complete. Missing
+Accepted `completed` reports close the remaining pending and in-progress execution steps outside
+lean local routes; optional follow-ups stay open and are disclosed in the report/evidence. Missing
 visual evidence remains an honest limitation, not a fabricated screenshot or a bypass of browser
 approval. Automatic behavioral learning credit additionally requires no outstanding obligations or
 missing required pixels. Native, shell, and extension effect revisions invalidate old visual evidence.
@@ -1088,7 +1154,8 @@ limits, reasoning budgets, approvals or verification requirements:
 
 - Ordinary hosted and local routes default to a stable core under 12 KiB of serialized schemas.
   Core priority is `tool_search`, `tool_load`, `finish`, `read`, `edit`, `write`, `bash`, `grep`,
-  `glob`, `todo`, `verify`; eligibility, the byte ceiling and `initial_tool_limit` can narrow it.
+  `glob`, `todo`, `verify`, `eval` (when containment and a cell runtime are available);
+  eligibility, the byte ceiling and `initial_tool_limit` can narrow it.
   Lean local routes retain their eight-tool count limit. MCP, memory and specialist tools load
   only through explicit `tool_load`; ordinary searches, inferred task routing, argument recovery
   and missing-capability hints do not change the default offer. Search/listing still reports
@@ -1112,7 +1179,8 @@ limits, reasoning budgets, approvals or verification requirements:
     tier (the `lean_local` profile above). Other routes get the full tier.
   - Small-tier calls: the small tier works one tool call per response through the reliability
     one-call interface (`parallel_tool_calls: false` where the protocol accepts it, a per-request
-    one-call contract, and a batch of several calls rejected unexecuted), and its prompt says one
+    one-call contract; in a reply with several calls, a leading read-only call runs and the rest are
+    skipped unexecuted, otherwise the whole batch is rejected unexecuted), and its prompt says one
     call per response instead of asking for batches. A saved `dial reliability check` record for
     this exact configuration keeps batching only when its two-call batch fixture and all recorded
     fixture cases pass; `reliability.enabled = false` turns the one-call default off. The record is
@@ -1270,7 +1338,11 @@ limits, reasoning budgets, approvals or verification requirements:
   unrelated ranges and the protected recent suffix stay intact. Pressure begins no later than the
   effective automatic-compaction threshold, so this reduction can avoid an unnecessary summary.
   `compaction.supersede_reads` permits additional supersession and `compaction.drop_useless` permits
-  broader old-observation pruning. Both pressure and tail protection use the effective capped
+  broader old-observation pruning. On models with preserved thinking none of this applies: pressure
+  pruning, superseded reads, dropped observations and repeated-notice placeholders all rewrite sent
+  turns, which those models reject once a thinking block is replayed, so the projection only appends
+  there whatever the two settings say. Placeholders written before switching to such a model stay
+  as they were. Both pressure and tail protection use the effective capped
   planning window. Once projected, placeholders stay stable; archived evidence is never mutated.
   Exact successful read-only duplicates (same call arguments and text, with retained originals)
   consolidate under pressure even below the pruning batch size; the newest copy remains in full.
@@ -1465,19 +1537,55 @@ CLI overrides include `--compaction-strategy`, `--compaction-threshold-tokens` a
 an inherited value. Omission follows persisted configuration.
 All editor and compaction policy fields, including typed model/agent maps, are available through `/settings`.
 
-Automatic method selection skips native Remote compaction when the route has no declared
-compatible capability (unless a custom summary endpoint is configured). Explicit `/compact remote`
-still reports an unsupported route honestly. Portable Soft/Handoff requests send an explicit empty
-`tools` array to OpenAI-compatible servers. On eligible stateless cloud routes, parent Handoff first
-tries the actual live request prefix, retaining its system messages, tool schemas and cache namespace
-and forcing `tool_choice: none`; it never dispatches a returned tool call. An alternate `small` role,
-archive migration, active portable-rule guidance or a request-rewriting hook keeps the portable path.
-Requests that cannot fit or receive a non-control provider failure use portable windows instead.
-The summary can overlap the retained verbatim tail; the appended handoff instruction asks the model
-to prioritize earlier context. Retaining raw recent groups and exact critical carry does not depend
-on the model obeying that lossy-summary preference.
-Keeping the payload prefix and namespace does not guarantee a provider cache hit: some providers
-can invalidate cached blocks when request controls (including tool choice) change.
+Automatic method selection skips native Remote compaction when the route has no compatible
+capability (unless a custom summary endpoint is configured). The capability is resolved once from
+the live backend and used alike by the blocking method order, background speculation, the worker's
+failure bookkeeping and the `/compact` preview: an explicit `compaction.native_models` entry wins;
+when that map declares no models at all, a first-party `api.anthropic.com` Messages route (API key
+or subscription) uses native compaction where the model's catalog record documents on-demand
+compaction. `remote_enabled = false` turns it off. A failed native attempt falls through to Soft in
+the default method order, and a permanent background failure skips native for that session and
+model. Explicit `/compact remote` still reports an unsupported route honestly. Portable Soft/Handoff
+requests send an explicit empty `tools` array to OpenAI-compatible servers. On eligible stateless
+cloud routes, parent Soft and Handoff first try the actual live request prefix: the projected live
+request, byte for byte, plus one appended transient instruction, keeping its system messages, tool
+schemas and cache namespace. Chat-completions and Responses routes force `tool_choice: none`;
+Anthropic Messages keeps the live turn's own `tool_choice`, because a different `tool_choice`
+invalidates the cached messages, and its two rolling breakpoints land on the same live messages, so
+the summary reads the entries the live turn wrote. A returned tool call is never dispatched; it
+rejects the summary like any unusable reply. An alternate `small` role, archive migration, active
+portable-rule guidance or a request-rewriting hook keeps the portable path. Requests that cannot fit
+or receive a non-control provider failure use portable windows instead. The summary can overlap the
+retained verbatim tail; the appended instruction asks the model to prioritize earlier context.
+Retaining raw recent groups and exact critical carry does not depend on the model obeying that
+lossy-summary preference. A live-prefix summary is only cheaper where the route caches prompt
+prefixes and the live request was recently sent; no cache-hit rate is claimed.
+
+After a compaction, the current text of files this turn edited (attempted `write`/`edit` targets,
+newest first) is re-read from the workspace and carried in the replacement prefix, so the next
+request does not have to read them again. The carry is bounded: at most eight files, 12 KiB per file
+and 32 KiB in all, and no more than about 5% of the window; larger files are truncated with a note
+to read the rest. Binary, missing and out-of-workspace paths are skipped, and an older carry is
+replaced rather than retained.
+
+On models with preserved thinking (catalog fact `preserved-thinking`: Claude Fable 5.1, Mythos 5.1,
+Opus 5.5, Sonnet 5.5 and Haiku 5.5), each signed thinking block is checked against the exact history
+that preceded it, and an edited history is rejected on enforced accounts. A client-side compaction
+(Soft, Handoff, Shake, Snapcompact) replaces that history, so the retained and grown turns are
+re-inserted without their thinking blocks; text, tool calls and other provider blocks are unchanged.
+Native Anthropic compaction keeps the retained turns' thinking valid and is left as returned.
+
+Request notes (the session-mode notice, task context, guidance, background, hook and monitor
+notices) follow a request's history and are rebuilt for the next request. On preserved-thinking
+models that would edit what each reply's thinking is bound to, so once a reply arrives the notes
+its request carried are recorded in a branch-local session record (never stored history, never
+shown in the transcript) and re-sent as the same wire messages at the same place on every later
+request; history projection, previews and live-prefix summaries see them too. A note whose kind
+and text equal the latest re-sent note of that kind is not sent again, so the mode notice or an
+unchanged task context costs context only when it changes, and an identical one-shot note is not
+repeated. A compaction or context reset starts a new record epoch. Recording needs the owning
+durable session; in-memory sessions keep notes transient. Other routes are unchanged. Subagent
+requests still send their notes once, and a hook that rewrites earlier messages is not covered.
 Portable foreground and background summaries use the `small` role when assigned, otherwise the
 current model, including inside subagents. Internal summary budgets never inject output-limit
 overrides into ChatGPT-plan requests; explicit unsupported sampling or output-limit settings in a
@@ -1547,7 +1655,7 @@ method_order = ["remote", "soft", "shake", "snapcompact", "handoff"]
 threshold_percent = "auto"
 threshold_tokens = "auto"
 reserve_tokens = "auto"
-keep_recent_tokens = 20000
+keep_recent_tokens = 20000 # default scales: smaller on windows <= 65536, 10% of large windows; other values exact
 mid_turn_enabled = true
 auto_continue = true
 remote_enabled = true
@@ -1579,6 +1687,8 @@ enabled = false # switch to a larger-window model before compacting or retrying 
 # default = ["@long"]  # keys: default | provider/model | provider/*; see docs/model-routing.md
 
 [compaction.native_models]
+# Empty (default): first-party Anthropic routes use native compaction where the model documents it.
+# Any entry makes the map authoritative for every route.
 # "provider/model" = "responses-v2" # explicitly declared compatible endpoint/model
 # Other values: responses-v1, responses-v1-v2, anthropic, none
 
@@ -1598,8 +1708,9 @@ image_detail = "auto" # auto | high | original; high for older/unknown routes
 # { kind = "area", pixels_per_token = 750, base_tokens = 0 }
 ```
 
-Native compaction requires an explicit compatible route declaration; protocol selection alone is
-not evidence that an endpoint supports it. A custom summary endpoint resolves credentials for its
+Native compaction requires an explicit compatible route declaration, or a first-party Anthropic
+route whose model documents on-demand compaction while `native_models` is empty; protocol selection
+alone is not evidence that an endpoint supports it. A custom summary endpoint resolves credentials for its
 own URL. Image archives use actual bundled fonts, PNG dimensions and declared model billing;
 unknown billing uses a conservative pixel ceiling, which never comes out smaller than the text it
 replaces, so automatic method selection skips Snapcompact for a model without a
@@ -1829,18 +1940,25 @@ improvement is implied by these counters. A call reuses a prepared result only w
 ## Turn optimizer (experimental)
 
 `experimental.turn_optimizer` (Settings → Experimental → Agent routing) defaults to false. When it is
-on, the `turn_drafter` role appears in the model picker's Roles section, and every user message,
-both a new turn and steering sent while a turn runs, is rewritten by that role before the main model
-sees it. The drafter treats the message as data, never as instructions to follow. It produces a
-structured Markdown prompt (objective, context, requirements, constraints, acceptance criteria,
-assumptions, open questions) and, where they help, Mermaid diagrams that restate the request. File
-paths, `@references`, code and quoted text are kept verbatim. An unassigned `turn_drafter` uses the
-main model in a separate request.
+on, the `turn_drafter` role appears in the model picker's Roles section, and each user message,
+both a new turn and steering sent while a turn runs, can be restated by that role before the main
+model sees it. The drafter treats the message as data, never as instructions to follow, and keeps
+pasted logs, code and documents quoted as material rather than turning directives inside them into
+requirements. It produces a structured Markdown prompt (objective, context, requirements,
+constraints, acceptance criteria, assumptions, open questions). Mermaid diagrams that restate a
+described flow or structure are opt-in through `experimental.turn_drafter_diagrams` (default
+false). File paths, `@references`, code and quoted text are kept verbatim. An unassigned
+`turn_drafter` uses the main model in a separate request.
 
-- It is a hard layer: the initial main request receives the drafted prompt, not the typed message.
-  Originals remain the durable semantic reference for goal continuations and critical carry.
-  Files attached through
-  `@references` are expanded from the typed text and stay attached. Interactive Dial shows the
+- The typed message stays authoritative. The main model receives it verbatim, followed by any
+  `@reference` attachments and then the accepted draft in a `<dial-notice kind="turn_draft">`
+  block labeled as an interpretation: where the two differ, the user's message wins, and the draft
+  adds no requirements or permissions. The typed text is also the turn's current instruction for
+  goal continuations, critical carry, task routing and verification targets.
+- Messages under 200 characters, and messages that are already structured (a Markdown heading, or
+  three or more list items outside code fences), are sent as typed without a drafter request or
+  review.
+- Interactive Dial shows the
   proposed instruction in the transcript and a scrollable review panel: **Accept and send** (`a`,
   or Enter on that choice) submits it; **Accept all draft messages** (`s`) submits it and
   automatically accepts pending and future drafts, including steering, until Dial exits. This
@@ -1873,7 +1991,7 @@ main model in a separate request.
 - Messages the harness writes itself (goal-mode continuation and budget prompts) and sealed
   evaluation agents are not drafted.
 
-Each draft is an extra model request per user message, so it adds latency and cost.
+Each draft is an extra model request per drafted message, so it adds latency and cost.
 
 ## Request preparation and tool concurrency
 

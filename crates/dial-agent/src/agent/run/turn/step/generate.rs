@@ -39,6 +39,8 @@ impl Agent<'_> {
         // every path below that discards this request before a reply resends them.
         self.efficiency_metrics
             .request(&request_overhead, lightweight, self.request_phase.phase);
+        // Preserved-thinking routes re-send earlier notes; an identical restatement is not repeated.
+        self.drop_repeated_notes(&mut request.messages);
         let requested_tokens = request.max_tokens;
         self.record(
             step,
@@ -57,6 +59,22 @@ impl Agent<'_> {
                 profile.capabilities.parallel_tool_calls = Some(false);
             }
             self.judge_turn_effort(turn, profile.as_ref(), ui);
+            if turn.turn_effort.is_none()
+                && let Some(profile) = profile.as_mut()
+            {
+                let signal = if self.step_checks.failed {
+                    crate::adaptive::OutputEffortSignal::CheckFailure
+                } else if turn.edit_churn.has_pressure() {
+                    crate::adaptive::OutputEffortSignal::RewritePressure
+                } else {
+                    crate::adaptive::OutputEffortSignal::Routine
+                };
+                if let Some(effort) =
+                    crate::adaptive::experimental_output_effort(&self.auth_config, profile, signal)
+                {
+                    profile.reasoning_effort = Some(effort);
+                }
+            }
             if let (Some(effort), Some(profile)) = (turn.turn_effort, profile.as_mut())
                 && let Some(clamped) =
                     crate::judgment::clamp_effort(effort, &profile.capabilities.reasoning_efforts)
@@ -84,6 +102,17 @@ impl Agent<'_> {
                     &selection.sampling_source,
                 )
             });
+            let inference_controls = if self.auth_config.selection().provider == "anthropic" {
+                let controls = crate::llm::provider::anthropic_request_controls(
+                    &self.auth_config.selection().model,
+                    &request,
+                    profile.as_ref(),
+                )?;
+                self.record(step, "inference_controls", controls.clone())?;
+                Some(controls)
+            } else {
+                None
+            };
             backend.next_request_profile(crate::llm::profiles::request_tiers_for(
                 profile,
                 &self.auth_config.selection(),
@@ -107,6 +136,11 @@ impl Agent<'_> {
                 }
             }
             let mut control = request_control;
+            if let Some(controls) = inference_controls {
+                control["inference_controls"] = controls;
+            } else if let Some(object) = control.as_object_mut() {
+                object.remove("inference_controls");
+            }
             control["reliability"]["interface"] = json!(if single_call {
                 "compact single call"
             } else {
@@ -232,6 +266,8 @@ impl Agent<'_> {
                         failed_calls: engine.failed_calls(),
                     },
                 )
+                // Coverage visible when the request was sent; settled reads cannot change it.
+                .with_reuse(engine.reusable_reads(|id| self.holds_full_result(id)))
             });
         // With a configured fallback still untried, failures it accepts come back after a brief
         // retry so the turn fails over instead of waiting out every provider retry first.
@@ -407,6 +443,10 @@ impl Agent<'_> {
             ));
             turn.budget.give_back();
             return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
+        }
+        // A reply's thinking is bound to the notes this request carried; keep them on the wire.
+        if result.is_ok() {
+            self.record_sent_notes(&context_before, ui);
         }
         let rule_hit = result
             .as_ref()

@@ -89,6 +89,9 @@ pub struct ModelFlags {
     /// Thinking level: off, minimal, low, medium, high, xhigh, max or auto.
     #[arg(long, global = true, value_parser = parse_thinking)]
     pub thinking: Option<CliThinking>,
+    /// Native Anthropic output effort independent of --thinking: low, medium, high, xhigh, max.
+    #[arg(long, global = true, value_parser = parse_output_effort)]
+    pub effort: Option<crate::llm::profiles::ReasoningEffort>,
     /// Default provider for the main model.
     #[arg(long, global = true, value_parser = parse_provider)]
     pub provider: Option<String>,
@@ -291,8 +294,23 @@ pub fn apply(mut config: Config, flags: &ModelFlags) -> Result<Config> {
     if let Some(level) = flags.thinking {
         config = apply_thinking(config, level)?;
     }
+    if let Some(effort) = flags.effort {
+        config = crate::config::thinking::apply_output_effort(config, effort)?;
+    }
     config.validate()?;
     Ok(config)
+}
+
+fn parse_output_effort(value: &str) -> Result<crate::llm::profiles::ReasoningEffort, String> {
+    use crate::llm::profiles::ReasoningEffort;
+    match value {
+        "low" => Ok(ReasoningEffort::Low),
+        "medium" => Ok(ReasoningEffort::Medium),
+        "high" => Ok(ReasoningEffort::High),
+        "xhigh" => Ok(ReasoningEffort::Xhigh),
+        "max" => Ok(ReasoningEffort::Max),
+        _ => Err("effort must be low, medium, high, xhigh or max".into()),
+    }
 }
 
 /// Retain only launch-time changes in the process overlay used by settings reloads.

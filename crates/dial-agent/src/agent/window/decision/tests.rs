@@ -80,3 +80,54 @@ fn media_cost_is_explicitly_uncertain_and_preview_is_read_only() {
         assert_eq!(agent.session.message_count(), before);
     });
 }
+
+/// The preview resolves native compaction through the same helper as the blocking path.
+#[test]
+fn compaction_preview_offers_derived_native_compaction_only_where_execution_would() {
+    for (overlay, model, native) in [
+        ("", "claude-opus-5-5", true),
+        ("", "claude-opus-4-5", false),
+        (
+            "[compaction]\nremote_enabled=false",
+            "claude-opus-5-5",
+            false,
+        ),
+    ] {
+        with_agent(overlay, |agent| {
+            agent.auth_config.provider = Some("anthropic".into());
+            agent.auth_config.model = model.into();
+            let backend = crate::llm::provider::Backend::new(
+                crate::llm::provider::ProviderKind::AnthropicEndpoint {
+                    base_url: "https://api.anthropic.com/v1".into(),
+                    model: model.into(),
+                    api_key: Some("anth-secret".into()),
+                },
+                std::path::PathBuf::new(),
+                5,
+            );
+            let policy = agent.config.compaction.clone();
+            let selection = agent.auth_config.selection();
+            let identity = CompactionIdentity {
+                provider: &selection.provider,
+                model: &selection.model,
+                agent: None,
+            };
+            let supported = compaction::native_supported(&backend, &policy, identity);
+            agent.backend = Some(backend);
+            let methods = agent
+                .compaction_preflight(&CompactionOptions::default())
+                .unwrap()
+                .methods;
+            assert_eq!(
+                methods,
+                policy.available_methods(&CompactionOptions::default(), supported),
+                "{overlay} {model}"
+            );
+            assert_eq!(
+                methods.first() == Some(&CompactionMethod::Remote),
+                native,
+                "{overlay} {model}: {methods:?}"
+            );
+        });
+    }
+}

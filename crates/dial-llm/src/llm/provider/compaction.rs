@@ -55,6 +55,20 @@ impl Backend {
         self.bounded_request_profile(None, max_tokens)
     }
 
+    /// Request controls for a summary written over the live request prefix (Soft or Handoff).
+    /// OpenAI-protocol routes force `tool_choice: none` (`compaction_handoff_profile`). Anthropic
+    /// Messages keeps the live turn's own `tool_choice`: a different `tool_choice` invalidates the
+    /// cached messages, which are the prefix this request exists to read. The appended instruction
+    /// asks for no tool call, and a reply that calls one is rejected like any unusable summary.
+    /// Call only after `supports_live_handoff` returned `true`.
+    pub fn live_summary_profile(&self, max_tokens: u32) -> llm::profiles::ModelProfile {
+        let mut profile = self.compaction_handoff_profile(max_tokens);
+        if self.compaction_anthropic_family() {
+            profile.force_tool_choice_none = false;
+        }
+        profile
+    }
+
     /// Internal auxiliary budgets must not become unsupported subscription overrides.
     /// Explicit profile controls remain intact so transport validation still reports them.
     pub fn bounded_request_profile(
@@ -266,6 +280,45 @@ impl Backend {
             }
         }
         Ok(())
+    }
+    /// Native compaction the provider documents for this exact route: first-party Anthropic
+    /// Messages (`api.anthropic.com`, API key or subscription) whose bundled catalog record
+    /// documents on-demand compaction. Proxies and other hosts never qualify.
+    pub fn documented_native_compaction(&self) -> Option<NativeCompactionCapability> {
+        let model = match &self.kind {
+            ProviderKind::AnthropicSubscription { model, .. } => model.as_str(),
+            ProviderKind::Endpoint {
+                base_url, model, ..
+            }
+            | ProviderKind::AnthropicEndpoint {
+                base_url, model, ..
+            } => {
+                let anthropic = self.protocol == Some(llm::model_config::ApiProtocol::Anthropic)
+                    || (self.protocol.is_none()
+                        && matches!(self.kind, ProviderKind::AnthropicEndpoint { .. }));
+                if !anthropic || llm::host_of(base_url).as_deref() != Some("api.anthropic.com") {
+                    return None;
+                }
+                model.as_str()
+            }
+            _ => return None,
+        };
+        llm::catalog::bundled_model("anthropic", model)
+            .is_some_and(|record| record.has(llm::catalog::ModelFact::NativeCompaction))
+            .then_some(NativeCompactionCapability::Anthropic)
+    }
+    /// The native compaction capability to use: the configured `compaction.native_models` match,
+    /// or, when that map declares no models at all, the route's documented capability.
+    pub fn native_compaction_capability(
+        &self,
+        configured: Option<NativeCompactionCapability>,
+        models_declared: bool,
+    ) -> Option<NativeCompactionCapability> {
+        configured.or_else(|| {
+            (!models_declared)
+                .then(|| self.documented_native_compaction())
+                .flatten()
+        })
     }
     /// Metadata/explicit-route capability, not a speculative request to discover support.
     pub fn supports_native_compaction(
@@ -780,6 +833,17 @@ fn anthropic_compact(
     body["stream"] = json!(false);
     body.as_object_mut().unwrap().remove("temperature");
     body.as_object_mut().unwrap().remove("top_p");
+    // Without breakpoints the request reads no cache at all, so the whole summarized prefix
+    // would bill at the full input rate. Use the same markers as live turns, at the rung this
+    // endpoint and model last accepted.
+    let official_oauth =
+        oauth && llm::host_of(endpoint.url).as_deref() == Some("api.anthropic.com");
+    llm::anthropic_cache::apply(
+        &mut body,
+        profile,
+        official_oauth,
+        llm::anthropic_cache::latched(endpoint.url, endpoint.model),
+    );
     if oauth {
         attest_claude_code_body(&mut body)?;
     }

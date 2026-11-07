@@ -1285,3 +1285,107 @@ fn deliverable_contract_gates_claims_independently_of_cited_refs_and_strict_mode
     agent.step_checks.mutations += 1;
     assert!(agent.completion_blockers().unwrap_err().contains("ship"));
 }
+
+#[test]
+fn non_code_failures_are_disclosed_unless_the_check_passed_before_the_first_effect() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    let program = "dial_test_nonexistent_verification_runner_43";
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "custom runner".into(),
+            command: program.into(),
+            file_extensions: vec![],
+            timeout_secs: 30,
+        });
+    config.verification.runners.insert(
+        "custom runner".into(),
+        crate::config::types::VerificationRunner {
+            program: program.into(),
+            module: None,
+        },
+    );
+    let check = crate::agent::verify::verification::FocusedCheck {
+        name: "custom runner".into(),
+        command: program.into(),
+        timeout_secs: 30,
+    };
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    assert_eq!(
+        agent.disclosed_failure(&check, false),
+        Some("verification environment unavailable")
+    );
+    let gaps = agent.disclosed_gaps();
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(gaps[0].contains("custom runner"), "{gaps:?}");
+
+    // The same check passed before this instruction's first effect: the turn may have broken it.
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.step_checks.evidence.observe(
+        program,
+        "focused-check:custom runner",
+        crate::agent::verify::verification::CheckStatus::Passed,
+        agent.step_checks.revision(),
+        false,
+    );
+    agent.step_checks.evidence.capture_baseline_of(program);
+    agent.step_checks.mutations = 1;
+    agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    assert_eq!(agent.disclosed_failure(&check, false), None);
+    assert!(agent.disclosed_gaps().is_empty());
+}
+
+#[test]
+fn a_check_run_before_the_first_effect_becomes_its_lazy_baseline() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let check = crate::agent::verify::verification::FocusedCheck {
+        name: "unrelated".into(),
+        command: "cat diagnostic; exit 1".into(),
+        timeout_secs: 30,
+    };
+    std::fs::write(
+        root.path().join("diagnostic"),
+        "AssertionError: old_test expected 1 got 2\n",
+    )
+    .unwrap();
+    let mut agent = hermetic_agent(&config, root.path());
+    assert!(!config.verification.automatic_checks);
+    let first = agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    // A run is never its own baseline: the first failure stays actionable.
+    assert_eq!(first.actionable.len(), 1);
+    assert_eq!(agent.disclosed_failure(&check, false), None);
+    // After an edit the identical failure predates the turn and is disclosed, not refused.
+    agent.step_checks.mutations = 1;
+    agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    assert_eq!(
+        agent.step_checks.evidence.baseline_status(&check.command),
+        Some(crate::agent::verify::verification::CheckStatus::CodeFailed)
+    );
+    assert_eq!(
+        agent.disclosed_failure(&check, false),
+        Some("unchanged pre-existing failure outside the requested scope")
+    );
+    // A debugging request is about that failure, so it stays a blocker.
+    agent.task_policy.kind = crate::learn::task_policy::Kind::Debugging;
+    assert_eq!(agent.disclosed_failure(&check, false), None);
+    agent.task_policy.kind = crate::learn::task_policy::Kind::General;
+    // A changed diagnostic after the edit is this turn's failure; later runs never move the baseline.
+    std::fs::write(
+        root.path().join("diagnostic"),
+        "AssertionError: new_test expected 1 got 3\n",
+    )
+    .unwrap();
+    agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    assert_eq!(agent.disclosed_failure(&check, false), None);
+    // Asked only to diagnose, with nothing edited, any current failure is the answer.
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    assert_eq!(
+        agent.disclosed_failure(&check, true),
+        Some("the failure this request asked to diagnose; nothing was edited")
+    );
+}

@@ -51,7 +51,7 @@ pub fn target_check(
     if path_text.is_empty() || entry.len() > MAX_ENTRY_BYTES || entry.chars().any(char::is_control)
     {
         return Err(format!(
-            "`{entry}` is not a verify target; use a workspace-relative path, optionally `path::test`"
+            "`{entry}` is not a verify target; name a test file in the workspace, optionally `path::test`"
         ));
     }
     if selector.is_some_and(|selector| {
@@ -64,14 +64,8 @@ pub fn target_check(
             "`{entry}`: the test selector after `::` must be a test, class or module name"
         ));
     }
-    let path = Path::new(path_text);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(format!("`{path_text}` must be a path inside the workspace"));
-    }
+    let path = workspace_relative(root, Path::new(path_text))?;
+    let path = path.as_path();
     if !root.join(path).is_file() {
         return Err(format!(
             "`{path_text}` does not exist; write the test first or name an existing file"
@@ -118,9 +112,47 @@ pub fn target_check(
             javascript_check(root, path, selector).map(check)
         }
         _ => Err(format!(
-            "no test runner is known for `{path_text}`; run it with bash instead"
+            "no test runner is known for `{path_text}`; verify runs test files (Python, Rust, Go, JavaScript/TypeScript), so check other outputs with bash"
         )),
     }
+}
+
+/// `path` relative to the workspace `root`. Absolute paths are accepted when they lie under the
+/// root as given or as canonicalized (e.g. `/app/x.py` with root `/app`); `..` never is.
+fn workspace_relative(root: &Path, path: &Path) -> Result<std::path::PathBuf, String> {
+    let relative = if path.is_absolute() {
+        let canonical = root.canonicalize().ok();
+        let stripped = path
+            .strip_prefix(root)
+            .ok()
+            .or_else(|| path.strip_prefix(canonical.as_deref()?).ok());
+        let Some(stripped) = stripped else {
+            return Err(format!(
+                "`{}` is outside the workspace `{}`; verify only runs tests inside it",
+                path.display(),
+                root.display()
+            ));
+        };
+        stripped.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    if relative
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(format!(
+            "`{}` must stay inside the workspace without `..`",
+            path.display()
+        ));
+    }
+    if relative.as_os_str().is_empty() {
+        return Err(format!(
+            "`{}` names the workspace, not a test file",
+            path.display()
+        ));
+    }
+    Ok(relative)
 }
 
 /// The Python command for `path` and whether it is a plain script judged by exit status alone.

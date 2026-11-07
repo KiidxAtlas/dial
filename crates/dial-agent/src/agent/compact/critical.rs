@@ -44,7 +44,74 @@ pub(super) fn message(control: &Value, todos: &Value) -> Result<Value> {
 }
 
 pub(super) fn retained(message: &&Value) -> bool {
-    message["dial_compaction_critical"] != true && crate::storage::transcript::is_history(message)
+    message["dial_compaction_critical"] != true
+        && message["dial_compaction_files"] != true
+        && crate::storage::transcript::is_history(message)
+}
+
+/// Upper bound on re-attached file text, whatever the window.
+const MAX_FILE_CARRY_BYTES: usize = 32_768;
+/// Share of the window, in estimated bytes (four per token), the carry may take on small windows.
+const FILE_CARRY_WINDOW_PERCENT: usize = 5;
+const MAX_FILE_BYTES: usize = 12_288;
+const MAX_CARRIED_FILES: usize = 8;
+
+/// The current text of files this turn edited, re-read from the workspace after a compaction so
+/// the next request does not have to read them again. Bounded by a byte budget scaled to the
+/// window; binary, missing, unreadable and out-of-workspace paths are skipped. Paths are the
+/// attempted edit targets, newest first.
+pub(super) fn files_message(
+    workspace: &crate::tools::Workspace,
+    paths: &[String],
+    window_tokens: u32,
+) -> Option<Value> {
+    let mut remaining =
+        MAX_FILE_CARRY_BYTES.min(window_tokens as usize * 4 * FILE_CARRY_WINDOW_PERCENT / 100);
+    let mut body = String::new();
+    let mut carried = 0;
+    for path in paths {
+        if carried == MAX_CARRIED_FILES || remaining == 0 {
+            break;
+        }
+        let Ok(absolute) = workspace.resolve(path) else {
+            continue;
+        };
+        if !absolute.is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read(&absolute).map(String::from_utf8) else {
+            continue;
+        };
+        let Ok(text) = text else {
+            continue;
+        };
+        if text.contains('\0') {
+            continue;
+        }
+        let shown = crate::agent::base::helpers::byte_prefix(&text, MAX_FILE_BYTES.min(remaining));
+        if shown.is_empty() && !text.is_empty() {
+            break;
+        }
+        let truncated = if shown.len() < text.len() {
+            format!(
+                " truncated=\"first {} of {} bytes; read the file for the rest\"",
+                shown.len(),
+                text.len()
+            )
+        } else {
+            String::new()
+        };
+        body.push_str(&format!(
+            "\n<file path=\"{}\"{truncated}>\n{shown}\n</file>",
+            workspace.rel(&absolute)
+        ));
+        remaining = remaining.saturating_sub(shown.len());
+        carried += 1;
+    }
+    (carried > 0).then(|| {
+        json!({"role":"user","dial_compaction_files":true,
+        "content":format!("Current content of files edited this turn, re-read from the workspace after compaction (not summary-derived). Use it instead of re-reading them; re-read only a truncated file or one changed since.{body}")})
+    })
 }
 
 #[cfg(test)]

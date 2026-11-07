@@ -1,5 +1,42 @@
-//! Agent workflow sections: worktrees, the commit cache, experiments, named agents and spend caps.
+//! Agent workflow sections: worktrees, the commit cache, experiments, goal mode, named agents and
+//! spend caps.
 use super::*;
+
+/// `[goal]`: goal-mode (`/goal`) options.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct GoalConfig {
+    /// Workspace-relative file that mirrors the goal, todos and working state after each goal-mode
+    /// turn, for example `.dial/progress.md`. It is a user-visible deliverable written through the
+    /// workspace's confinement and checkpoints, never private state. Empty writes nothing.
+    pub progress_file: String,
+}
+
+impl GoalConfig {
+    /// The progress file is a plain relative path inside the workspace: no absolute path, root,
+    /// `..` component or control character.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let path = self.progress_file.as_str();
+        if path.is_empty() {
+            return Ok(());
+        }
+        let relative = std::path::Path::new(path);
+        anyhow::ensure!(
+            !path.contains(|c: char| c.is_control())
+                && relative.components().all(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                })
+                && relative
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::Normal(_))),
+            "goal.progress_file must be a workspace-relative file path without `..`, for example .dial/progress.md"
+        );
+        Ok(())
+    }
+}
 
 /// `[worktree]`: behavior of `/wt` worktrees.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,10 +67,12 @@ impl Default for CommitConfig {
 }
 
 /// Experimental agent workflow features. Every feature is disabled unless explicitly enabled,
-/// except `repro_first = advise` and `dependency_dispatch`.
+/// except `repro_first = advise`, `streaming_dispatch` and `dependency_dispatch`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExperimentalConfig {
+    /// Native Anthropic effort adaptation; explicit output-effort profiles remain authoritative.
+    pub adaptive_output_effort: bool,
     /// Offer bounded, approved video frame investigations; image tokens can be expensive.
     pub video_analysis: bool,
     pub work_packet_contracts: bool,
@@ -43,6 +82,8 @@ pub struct ExperimentalConfig {
     pub tool_speculation: bool,
     /// Rewrite each user message with the `turn_drafter` role before the main model sees it.
     pub turn_optimizer: bool,
+    /// Let the turn drafter add Mermaid diagrams that restate a described flow or structure.
+    pub turn_drafter_diagrams: bool,
     /// Optional prompt guidance, independent of provider thinking controls and permissions.
     pub reasoning_strategy: ReasoningStrategy,
     /// Opt in to a diagnostic comparison of an operator-declared behavioral check against
@@ -77,6 +118,7 @@ pub struct ExperimentalConfig {
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
+            adaptive_output_effort: false,
             video_analysis: false,
             work_packet_contracts: false,
             verification_receipts: false,
@@ -84,6 +126,7 @@ impl Default for ExperimentalConfig {
             profile_matching: false,
             tool_speculation: false,
             turn_optimizer: false,
+            turn_drafter_diagrams: false,
             reasoning_strategy: ReasoningStrategy::default(),
             fault_witness: false,
             repro_first: ReproFirst::default(),

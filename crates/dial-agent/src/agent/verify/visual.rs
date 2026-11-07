@@ -3,9 +3,32 @@ use std::{collections::HashSet, path::Path};
 
 pub type Revision = super::evidence::Revision;
 
+/// The prompt with compound identifiers (`dial-ui`, `src/ui/mod.rs`, `ui::state`) replaced by a
+/// neutral placeholder, so their parts do not count as standalone words. Line structure and
+/// indentation are kept for the prose filter.
+fn without_compound_identifiers(prompt: &str) -> String {
+    prompt
+        .split_inclusive(char::is_whitespace)
+        .map(|piece| {
+            let token = piece.trim_end();
+            let core = token.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_'));
+            if core.contains(['-', '/', '.', ':']) {
+                format!("_{}", &piece[token.len()..])
+            } else {
+                piece.to_owned()
+            }
+        })
+        .collect()
+}
+
 pub fn useful(prompt: &str) -> bool {
     let words: HashSet<String> = dial_core::prose::words(prompt).collect();
     let any = |terms: &[&str]| terms.iter().any(|term| words.contains(*term));
+    // UI subjects and edit verbs count only as standalone words: crate names and paths such as
+    // `dial-ui` or `ui/fix.rs` are not requests for visual work.
+    let plain = without_compound_identifiers(prompt);
+    let standalone: HashSet<String> = dial_core::prose::words(&plain).collect();
+    let any_standalone = |terms: &[&str]| terms.iter().any(|term| standalone.contains(*term));
     // Words that describe how something looks, not merely that it changes.
     const APPEARANCE: &[&str] = &[
         "design",
@@ -20,10 +43,10 @@ pub fn useful(prompt: &str) -> bool {
     ];
     any(&["screenshot", "visually", "appearance"])
         || (words.contains("visual") && any(&["inspect", "inspection", "verify", "verification"]))
-        || (any(&[
+        || (any_standalone(&[
             "website", "webpage", "frontend", "ui", "css", "layout", "button", "image", "picture",
             "photo",
-        ]) && (any(&["fix", "edit", "change", "build", "create", "inspect", "compare"])
+        ]) && (any_standalone(&["fix", "edit", "change", "build", "create", "inspect", "compare"])
             || any(APPEARANCE))
             && !any(&["docker", "container"]))
         // "page" is also pagination ("page size", `page_count`), so it needs an appearance word.

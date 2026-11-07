@@ -361,7 +361,8 @@ impl TodoList {
 
     /// Current step plus a bounded tail of investigation findings. Ordinary single-step lists
     /// need no reminder. Appended transiently to mid-turn requests to preserve the cached prefix.
-    pub fn focus(&self) -> Option<String> {
+    /// `finish_closes` says whether an accepted completion closes the remaining steps on this route.
+    pub fn focus(&self, finish_closes: bool) -> Option<String> {
         if self.tasks.len() < 2 && !self.tasks.iter().any(|t| t.investigation) {
             return None;
         }
@@ -377,12 +378,22 @@ impl TodoList {
             .skip(slot + 1)
             .chain(self.tasks.iter().enumerate().take(slot))
             .find(|(_, t)| t.status == Status::Pending && t.kind == Kind::Step)
-            .map_or_else(
-                || "This is the last open step.".to_owned(),
-                |(i, t)| format!("Next: {}.", t.label(i + 1)),
-            );
+            .map(|(i, t)| {
+                format!(
+                    "Next: {}. When this step is done, send todo done in the same response as the next step's first call.",
+                    t.label(i + 1)
+                )
+            })
+            .unwrap_or_else(|| {
+                if finish_closes {
+                    "This is the last open step; an accepted finish(completed) closes it, so no todo call is needed."
+                } else {
+                    "This is the last open step; close it with todo done before finishing."
+                }
+                .to_owned()
+            });
         let mut focus = format!(
-            "[Task focus from dial, not the user] Current step ({closed}/{total} done): {}. {next} Finish and check this step, then todo done.",
+            "[Task focus from dial, not the user] Current step ({closed}/{total} done): {}. {next}",
             self.tasks[slot].label(slot + 1)
         );
         if self.tasks[slot].investigation {
@@ -403,6 +414,23 @@ impl TodoList {
 
     pub fn snapshot(&self) -> Value {
         serde_json::to_value(&self.tasks).unwrap_or_else(|_| json!([]))
+    }
+
+    /// Complete every pending or in-progress execution step, returning their contents. Blocked
+    /// steps and optional follow-ups are left as they are.
+    pub fn close_open_steps(&mut self) -> Vec<String> {
+        self.tasks
+            .iter_mut()
+            .filter(|task| {
+                task.kind == Kind::Step
+                    && matches!(task.status, Status::Pending | Status::InProgress)
+            })
+            .map(|task| {
+                task.status = Status::Completed;
+                task.note = None;
+                task.content.clone()
+            })
+            .collect()
     }
 
     /// Replace the list from a previously persisted snapshot. The snapshot is validated like model
@@ -553,9 +581,6 @@ impl TodoList {
         }
         text.push('\n');
         text.push_str(&self.summary());
-        if let Some(hint) = self.completion_hint() {
-            text.push_str(&format!("\nAfter work, close the current task with {hint}. Omit index for the current task (explicit indices are 1-based)."));
-        }
         ToolOutput {
             execution: Default::default(),
             data: Some(
@@ -724,7 +749,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": "todo",
-            "description": "todo: plan substantial multi-step work. done closes the active item and starts the next; never resend set to mark progress. Indices are 1-based. Batch updates with real work when possible. Explicitly close completed execution steps before a final reply or finish; neither closes tasks automatically.",
+            "description": "todo: optional plan for long work with several distinct steps; skip it for short tasks. done closes the active item and starts the next; never resend set to mark progress. Indices are 1-based. Send each update in the same response as the next real tool call when several calls are allowed. An accepted finish(completed) closes the steps still open, so no closing todo call is needed.",
             "parameters": {
                 "type": "object",
                 "properties": {

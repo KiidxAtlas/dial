@@ -14,6 +14,28 @@ default (see CONTRIBUTING's evidence rule).
 Priorities: **P0** is a correctness bug or a silent cost leak. **P1** is high leverage. **P2** is
 worthwhile. **P3** is an idea or cleanup.
 
+## Implementation status (2026-11-06)
+
+Implemented in the working tree (uncommitted), in two rounds: P0 #1-#8; P1 #9-#12, #14-#28, #29
+(cache key only), #30, #31 (Haiku 4.5 row only) and parts of #13 (notebook text and re-read clause);
+P2 #32, #33, #34, #35 (refusal stops the turn; `pause_turn` is exposed but not resumed), #36
+(`max_completion_tokens` only), #37-#43, #46; P3 #47 (no commit-checkpoint offer), #51 (aliases
+removed; no new lean variant), #53-#56. Hosted routes also offer `ask` in a 24 KiB core.
+
+Partial:
+- #3: on Anthropic, plan-mode and goal toggles still change `tools`. Plan mode narrows the core,
+  and `policy_tools` uses plan-mode eligibility. Responses loads still append schemas.
+  `tool_addition`/`tool_removal` is unused.
+- #34: no `prefix_mismatch_behavior` safety net (it opts older accounts into enforcement).
+  Subagent request notes and in-memory sessions keep notes transient.
+
+Not done:
+- #44, cursor redesign, and #45, strict schemas. Both change contract hashes.
+- #48, task budgets. Dial's limits are wall time and cost, not tokens.
+- #49, #50 and #52: tool consolidation, merging todo and working_state, and retiring modes. These are
+  product decisions that delete features and break recorded sessions.
+- Defaults that need a live A/B first: edit grammar per model, effort levels, OpenAI protocol.
+
 ---
 
 ## P0: bugs and silent cost leaks

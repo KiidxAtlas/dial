@@ -2449,3 +2449,39 @@ fn immutable_catalog_lookup_invalidates_file_stamp_without_changing_old_snapshot
         Some(1234)
     );
 }
+
+#[test]
+fn anthropic_records_carry_documented_request_facts() {
+    use super::ModelFact::*;
+    let record = |model: &str| bundled_model("anthropic", model).unwrap();
+    let opus = record("claude-opus-5-5");
+    assert!(opus.has(NoSampling) && opus.has(ThinkingAlwaysOn) && opus.has(NativeCompaction));
+    assert!(opus.has(SummarizedThinking));
+    assert!(record("claude-sonnet-5-5").has(ThinkingOffBetweenTools));
+    assert!(record("claude-haiku-5-5").has(ThinkingOffUpToHigh));
+    // The on-demand compaction page's supported-model list (beta `compact-2026-09-04`).
+    for model in ["claude-fable-5-1", "claude-opus-4-6", "claude-sonnet-4-6"] {
+        assert!(record(model).has(NativeCompaction), "{model}");
+    }
+    assert!(!record("claude-opus-4-5").has(NativeCompaction));
+    // The models whose migration guides document the preserved-thinking history-editing check.
+    for model in [
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    ] {
+        assert!(record(model).has(PreservedThinking), "{model}");
+    }
+    for model in ["claude-fable-5", "claude-opus-5", "claude-sonnet-5"] {
+        assert!(!record(model).has(PreservedThinking), "{model}");
+    }
+    // Opus 4.6 accepts sampling, disabled thinking and summarizes by default.
+    assert_eq!(record("claude-opus-4-6").facts, vec![NativeCompaction]);
+    // Haiku 4.5 rejects `effort`, so its record declares no effort levels.
+    for model in ["claude-haiku-4-5", "claude-haiku-4-5-20251001"] {
+        assert!(record(model).thinking_efforts.is_empty(), "{model}");
+        assert!(record(model).facts.is_empty(), "{model}");
+    }
+}

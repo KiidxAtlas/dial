@@ -158,8 +158,20 @@ impl<'a> Agent<'a> {
                 agent: None,
             },
         );
+        // The commit re-reads edited files; reserve what they take now (bounded by the carry budget).
+        let files_tokens = if self.hermetic {
+            0
+        } else {
+            super::critical::files_message(
+                &self.workspace,
+                &crate::agent::compact::compaction::edited_this_turn(&visible_history),
+                self.budget_window(),
+            )
+            .map_or(0, |files| crate::llm::wire::estimate(&files))
+        };
         let retained_overhead_tokens = notes_tokens
             .saturating_add(crate::llm::wire::estimate(&critical))
+            .saturating_add(files_tokens)
             .saturating_add(
                 self.projected_tokens(&native_request)
                     .saturating_sub(raw_tokens),
@@ -439,29 +451,59 @@ impl<'a> Agent<'a> {
             // Append notes without rewriting provider-signed blocks or exact tails.
             prepared.prefix.push(json!({"role":"user","content":format!("<compaction-notes>\n{notes}\n</compaction-notes>"),"dial_compaction_notes":true}));
         }
-        prepared
-            .prefix
-            .retain(|message| message["dial_compaction_critical"] != true);
+        prepared.prefix.retain(|message| {
+            message["dial_compaction_critical"] != true && message["dial_compaction_files"] != true
+        });
         prepared.prefix.push(super::critical::message(
             &self.session.control_state(),
             &self.todo.snapshot(),
         )?);
+        if !self.hermetic {
+            let edited = crate::agent::compact::compaction::edited_this_turn(&current);
+            if let Some(files) =
+                super::critical::files_message(&self.workspace, &edited, self.budget_window())
+            {
+                prepared.prefix.push(files);
+            }
+        }
         let portable_migration =
             snapshot.archive_migration && prepared.outcome.native_usage.is_none();
+        // A client-side summary replaces the history that every retained turn's signed thinking
+        // was produced after; on a preserved-thinking model those blocks would be rejected. A
+        // native compaction block keeps the retained turns' thinking valid, so it is left alone.
+        let unbind = prepared.outcome.native_usage.is_none()
+            && snapshot.context().identity.preserved_thinking();
+        let carry = |message: &Value| {
+            let message = if portable_migration {
+                crate::agent::compact::compaction::portable_history_message(message)
+            } else {
+                message.clone()
+            };
+            if unbind {
+                crate::agent::compact::compaction::unbind_thinking(&message)
+            } else {
+                message
+            }
+        };
+        if unbind {
+            for message in &mut prepared.prefix {
+                *message = crate::agent::compact::compaction::unbind_thinking(message);
+            }
+        }
         let mut candidate = prepared.prefix.clone();
         candidate.extend(
             snapshot.source.messages[prepared.first_kept..]
                 .iter()
                 .filter(super::critical::retained)
-                .map(|message| {
-                    if portable_migration {
-                        crate::agent::compact::compaction::portable_history_message(message)
-                    } else {
-                        message.clone()
-                    }
-                }),
+                .map(&carry),
         );
-        candidate.extend_from_slice(growth);
+        candidate.extend(growth.iter().map(|message| {
+            if unbind {
+                crate::agent::compact::compaction::unbind_thinking(message)
+            } else {
+                message.clone()
+            }
+        }));
         let projected = self.projected_request(&candidate, template)?;
         let remaining = self.projected_tokens(&projected);
         let output = live_backend
@@ -532,14 +574,19 @@ impl<'a> Agent<'a> {
             .filter(super::critical::retained);
         // Reinstall the exact selected tail, excluding obsolete machine carry. Counting a filtered
         // tail as `keep` would retain different source messages when an older carry was in it.
-        prefix.extend(retained_source.map(|message| {
-            if portable_migration {
-                crate::agent::compact::compaction::portable_history_message(message)
-            } else {
-                message.clone()
-            }
-        }));
-        let keep = growth.len();
+        prefix.extend(retained_source.map(&carry));
+        // Grown turns were produced after the replaced history too: on a preserved-thinking model
+        // they are re-inserted without their thinking, as part of the prefix.
+        let keep = if unbind && !growth.is_empty() {
+            prefix.extend(
+                growth
+                    .iter()
+                    .map(crate::agent::compact::compaction::unbind_thinking),
+            );
+            0
+        } else {
+            growth.len()
+        };
         self.retire_memory_capture();
         if let Some(memory) = &self.memory_runtime {
             memory.cancel();
@@ -739,3 +786,6 @@ impl<'a> Agent<'a> {
         )
     }
 }
+
+#[cfg(test)]
+mod tests;

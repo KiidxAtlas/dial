@@ -1,5 +1,6 @@
 //! Verification and repair: completion checks, verification receipts, repair and mutation-cycle guards.
 
+mod acceptance;
 pub(in crate::agent) mod auto_escalation;
 pub(in crate::agent) mod caller_obligations;
 pub(in crate::agent) mod checks;

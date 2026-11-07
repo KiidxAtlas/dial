@@ -17,7 +17,7 @@ Self-check before finalizing:
 - all claims grounded in the provided diff
 
 <output_format>
-You MUST return the result in this format WITHOUT the fences:
+Return the result in this format, without the fences:
 ```
 # type(scope): summary
 

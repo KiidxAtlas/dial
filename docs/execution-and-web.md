@@ -49,6 +49,71 @@ observation on growth; this is not a measured matching-speed improvement.
 
 ## Persistent kernels and evaluation
 
+The portable `dial` helpers work in Node, embedded JavaScript and Python. JavaScript calls use
+`await`; Python calls are synchronous. All I/O uses the normal admitted tools, approvals,
+confinement and execution records:
+
+- `read(path)` returns exact UTF-8 content, byte count and SHA-256. `readText`, `readJson` and
+  `readBytes` return decoded values. Data reads require one literal local path, limited to 1 MiB.
+- `writeText`/`writeJson` use the text editor transaction. `writeBytes` stages a new binary file,
+  limited to 1 MiB. Its parent must exist; it never overwrites an existing output or source.
+- `run(command, options)` calls `bash`. Mark an acceptance command with `check: true`, preserve
+  its failing exit status, and name the files it exercises in `check_paths`. A passing foreground
+  command releases repeated-rewrite pressure only for those paths.
+- `batch(entries)` calls `tool.batch` and raises on failed prerequisites before subsequent code
+  runs. The error retains ordered `results`, including completed effects. Use `collect: true`
+  (Python: `collect=True`) to inspect mixed outcomes. Existing `tool.batch` retains its collecting
+  behavior. No batch rolls back completed work. Receipts include native status, effects, changed
+  paths and process/output facts. Arbitrary batch failures never trigger replay; serial fallback
+  requires an explicit `unsupported_batch` result with `executed: false`.
+- `check(name, boolean)` records a check callback that actually ran and raises when false.
+  Catching the exception does not erase the failed receipt. Local checks do not certify unrelated
+  workspace edits or every task requirement. Assertion words in source/stdout earn no credit.
+- `snapshot(paths)` retains exact artifacts for 1–16 source files and rechecks their hashes. The
+  compact manifest omits content. Preserve the database/WAL/SHM set before recovery tools open it.
+  Individual captures and a second hash pass are **not an atomic live-database snapshot**;
+  quiesce its writer or use the database's consistency mechanism. Normal artifact retention applies.
+- `fresh(receipt)` reopens an authorized source and compares its SHA-256. Recompute derived data
+  after input changes. If execution loses its namespace, inspect prior effects before rebuilding.
+
+Keep bulk data in the persistent namespace and print a concise result. Prove an algorithm on a
+tiny independently expected case before generating a large implementation. For example:
+
+```js
+var source = await dial.read("input.json");
+var rows = JSON.parse(source.content);
+await dial.check("tiny sum", [1, 2, 3].reduce((a, b) => a + b, 0) === 6);
+var total = rows.reduce((sum, row) => sum + row.amount, 0);
+await dial.check("input unchanged", await dial.fresh(source));
+await dial.writeJson("summary.json", { count: rows.length, total });
+console.log({ count: rows.length, total });
+```
+
+Choose independent checks for the actual task; this illustrative sum does not establish that
+arbitrary input records or every acceptance condition are correct.
+
+The environment prompt reports whether the configured JavaScript and Python eval launchers
+resolve before the model generates a helper. Discovery reports a missing prerequisite when
+neither resolves. These are executable-path observations: interpreter version, containment and
+actual execution still need validation. Loading `eval` installs no interpreter; its status,
+reset and cancel actions remain loadable without one. JavaScript runs on operator-installed
+Node 22+ when `eval.node` resolves; otherwise on Dial's embedded QuickJS engine (unix builds with
+the default `embedded-js` feature), which needs no installed interpreter. Python 3.8+ still needs
+the existing [dependency setup](setup.md), including in benchmark containers.
+Do not assume a configured absolute eval launcher is also available by name in the shell.
+
+Whenever `bash` is offered, the environment prompt also lists which helper languages the shell
+`PATH` provides (python3/python, node/bun/deno, perl, ruby, a C compiler, go, rustc, java) and
+which are missing, whether or not `eval` is offered. It reports executable names found on `PATH`
+when the prompt is built, not versions or what a sandbox later admits.
+
+For an arbitrary foreground acceptance command, `bash` accepts `check: true`, for example
+`{"command":"cmp -s expected.bin actual.bin","check":true}`. Its completed process verdict
+is recorded as verification. Background/PTY launches do not qualify. Preserve failures instead
+of masking them with `|| echo`, a trailing successful command or an unchecked pipeline. The
+declaration does not establish that a command covers the requested behavior or infer a verdict
+from printed words. Conventional test/build runners retain automatic recognition.
+
 The `eval` tool runs persistent cells in two languages selected by `language`: `js` (the default) and `py`. Each language keeps its own namespace between successful cells. Recorded `kernel` calls from earlier sessions replay as `eval` Python cells. Interrupting a running Python cell first sends SIGINT; an interrupt that does not unwind within five seconds escalates to terminating the kernel. Failed transport, cancellation and timeout paths discard the namespace. Effects already performed remain; loss of the final cell result is recorded as uncertain. Python interpreters may be selected from the project virtual environment (`.venv`/`VIRTUAL_ENV`) or conda environment when configured/approved, but execution remains subject to the mandatory process-creation fence. The cell deadline pauses while a tool callback requested by the cell is running, so callback time is not charged to the cell.
 
 Python tool callbacks are synchronous: `tool.write({'path': path, 'content': content})`,
@@ -62,6 +127,22 @@ concurrent. Denials and failures still raise `ToolError`. JavaScript uses
 and invoke the write callback in the producing cell, then validate the delivered file as needed,
 instead of printing data for the model to transcribe into a later write. Source/config changes
 still use the dedicated write/edit tools; callback syntax grants no additional access.
+
+For many lookups whose results you only need to aggregate or filter, use one cell.
+`tool.batch([{name, args}, ...])` (JavaScript and Python) returns the results in entry order, each
+a `{is_error, text, data}` object (a failed entry does not throw). In Python the entries are
+dictionaries (`tool.batch([{"name": "read", "args": {"path": "a.txt"}}])`) and the result list,
+like other callback receipts, also tolerates `await`. When every entry is an offered,
+hook-free, read-only call (`read`, `grep`, `glob`, safe `bash` inspections and the like), the
+parent controller runs them together through the ordinary parallel-read group, with one journal
+flush before and one after. Otherwise each entry is an ordinary serial callback with its own
+validation and approval. Each entry counts against the cell's callback limit. Worker cells
+handle batches through the worker's own parallel-read path: entries run together when every one is
+an offered, hook-free read that the worker's approver authorizes and portable rules admit;
+otherwise they run one at a time as ordinary worker callbacks. Steering that arrives during a
+worker batch stays queued for the worker's next boundary. A controller without batch support
+refuses the reserved callback, and the driver then runs the entries one by one. A single read-only
+callback is journaled with its result (one flush) rather than before and after.
 
 For generated artifacts, keep the computation, serialization, approved write and validation
 in one **foreground** cell (`background: false` keeps callbacks available). Carry computed
@@ -129,10 +210,15 @@ unsandboxed setting because filesystem/network isolation is unavailable. JavaScr
 remains unsupported. Discovery and `status` report platform support, not approval or interpreter
 availability. Reset, cancel and status remain usable on unsupported platforms.
 
-JavaScript eval requires an operator-installed Node 22 or newer. It uses Node's persistent REPL
-evaluator for lexical declarations and top-level `await`; runtime and syntax failures are reported
-as cell errors without discarding an otherwise healthy namespace. Node 26 uses the public REPL
-error hook, while earlier supported releases use the legacy REPL error path. Strings crossing the
+JavaScript eval uses operator-installed Node 22 or newer when `eval.node` resolves. Otherwise it
+uses the embedded QuickJS engine, which runs as a re-exec of `dial` (hidden worker argument) under
+the same containment and fd-3 JSON protocol. Node uses its persistent REPL evaluator for lexical
+declarations and top-level `await`; the embedded engine keeps lexical bindings across cells,
+supports top-level `await` and ES built-ins including BigInt, and has no `require`, `process`,
+`module` or other Node APIs. Its asynchronous completion value comes from rewriting a trailing
+expression statement, so it can differ from Node in edge cases. Runtime and syntax failures are
+reported as cell errors without discarding an otherwise healthy namespace. Node 26 uses the public
+REPL error hook, while earlier supported releases use the legacy REPL error path. Strings crossing the
 JSON transport are normalized to well-formed Unicode, including truncated output and nested values.
 
 Both eval runtimes must resolve outside the editable workspace. Dial compares canonical
@@ -197,7 +283,7 @@ Supported platforms are macOS, Linux, and Windows with Chrome or Chromium that s
 
 ## Web access
 
-`web_fetch` and `web_search` require approval and are unavailable when the session sandbox disables networking. HTTP and HTTPS requests are resolved and checked against the SSRF policy at every redirect; private, loopback, link-local, and metadata endpoints remain blocked. Responses are bounded and returned as untrusted content.
+`web_fetch` and `web_search` require approval and are unavailable when the session sandbox disables networking. They are effect-free external reads for scheduling: with `experimental.dependency_dispatch`, several of them in one response are authorized one at a time in model order and the authorized calls then run together (see [async execution](async-execution.md#dependency-scheduling-boundary)). HTTP and HTTPS requests are resolved and checked against the SSRF policy at every redirect; private, loopback, link-local, and metadata endpoints remain blocked. Responses are bounded and returned as untrusted content.
 `web_fetch` reports both display truncation and the download-size cutoff when both apply; text beyond
 the download cap was not retrieved.
 

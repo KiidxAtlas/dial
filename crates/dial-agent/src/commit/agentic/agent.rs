@@ -32,9 +32,11 @@ fn missing_items(env: &ToolEnv<'_>) -> Vec<&'static str> {
     missing
 }
 
-fn reminder(missing: &[&str], n: usize) -> String {
+/// The commit workflow finishes only through its proposal tools, so a text-only reply is
+/// answered with what is still missing. The reminder limit stays with the loop.
+fn reminder(missing: &[&str]) -> String {
     format!(
-        "<system-reminder>\nCRITICAL: You must call the required tools before finishing.\n\nMissing: {}\nReminder {n} of {MAX_REMINDERS}.\n\nCall the missing tool(s) now.\n</system-reminder>",
+        "<system-reminder>\nThe commit workflow ends when its required tools have been called, so the reply is not final yet.\n\nMissing: {}\n\nCall the missing tool(s) next, using what you have already gathered.\n</system-reminder>",
         missing.join(", ")
     )
 }
@@ -113,8 +115,7 @@ pub(crate) fn run_agent(
             }
             reminders += 1;
             messages.push(json!({"role": "assistant", "content": reply.text}));
-            messages
-                .push(json!({"role": "user", "content": reminder(&missing_items(env), reminders)}));
+            messages.push(json!({"role": "user", "content": reminder(&missing_items(env))}));
             continue;
         }
 

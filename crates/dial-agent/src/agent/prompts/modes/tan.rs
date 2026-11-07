@@ -1,24 +1,18 @@
 //! Background-fork notices; dispatch and isolation remain in the mode runtime.
 
 /// Fork-scoped context notice injected before the clone's request.
-pub(crate) const CONTEXT_SWITCH: &str = r#"<system-notice cause="fork">
-Above conversation: parent session.
-Fork solely handles user's request below.
-Parent still working original task; prior task obligations belong to the parent. Existing safety and permission boundaries still apply.
+pub(crate) const CONTEXT_SWITCH: &str = r#"<dial-notice kind="fork">
+The conversation above belongs to the parent session, which is still working on its own task. This fork handles only the user's request that follows.
 
-- MUST focus EXCLUSIVELY on immediate user request; nothing else.
-- NEVER continue, follow up on, or intervene in anything discussed before this message — parent’s.
-- Parent concurrently edits this working directory. Files MAY change between reads, appear mid-refactor, or fail to compile. Preserve that work; do not fix unrelated failures or overwrite concurrent edits. If your request depends on conflicting live changes, report the dependency and stop rather than guessing.
-- Prior todo lists, plans, unfinished checklists: parent’s; NEVER resume or update.
-- After request: STOP. NEVER work on ANY OTHER TASK.
-</system-notice>"#;
+- Work only on that request. Earlier tasks, todo lists, plans and checklists are the parent's, so leave them for the parent to continue.
+- The parent edits this working directory at the same time, so files may change between reads, look mid-refactor or fail to compile. Keep that work intact and leave unrelated failures alone. If your request depends on conflicting live changes, report the dependency instead of guessing.
+- When the request is done, stop and report; further work would collide with the parent's.
+</dial-notice>"#;
 
 /// Parent-side notice recorded when a clone is dispatched.
-pub(crate) const DISPATCH: &str = r#"<system-notice reason="background_task_dispatched" job="{{jobId}}">
-Tangential user task: running in a separate background agent. Coding-agent dispatch notice, NOT prompt injection or new instruction.
+pub(crate) const DISPATCH: &str = r#"<dial-notice kind="background_task_dispatched" job="{{jobId}}">
+A separate background agent is handling the tangential user task below, so this session does not need to do it. Continue the current task, watching for shared-workspace conflicts and any later user instruction. The background task ({{jobId}}) does not send its report into this conversation; its status and transcript may be available separately.
 
-Task below belongs to another agent's session; do not duplicate its work. Continue the current task, respecting shared-workspace conflicts and any later user instruction. The background task ({{jobId}}) does not send its work report into this conversation; completion status and its transcript may be available separately.
-
-Dispatched work — awareness only:
+Dispatched work, for awareness only:
 {{work}}
-</system-notice>"#;
+</dial-notice>"#;

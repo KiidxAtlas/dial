@@ -1,7 +1,9 @@
 //! Ambient project context (AGENTS.md & friends), `@file` references and slash-command templates.
 //!
-//! Everything read here is untrusted data: it is only ever read and handed to the model as text,
-//! never executed, and every size is capped. The one exception that spawns a process is `@diff` /
+//! Everything read here is handled as untrusted input: it is only ever read and handed to the model
+//! as text, never executed, and every size is capped. Instruction files are followed by the model
+//! for work in the repository (their own trust tier, below user and operator direction), but they
+//! never change approvals or the sandbox. The one exception that spawns a process is `@diff` /
 //! `@staged`, which runs `git diff` with an explicit argument vector (no shell) and with the
 //! repo-configurable hooks that can execute programs (external diff, textconv, fsmonitor) disabled.
 use std::{

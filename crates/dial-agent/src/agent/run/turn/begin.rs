@@ -93,12 +93,12 @@ impl Agent<'_> {
         // After steering, whose reset would drop these one-shot notes.
         turn.final_step = !self.hermetic && turn.budget.on_last_step();
         if turn.final_step {
-            turn.pending_nudges.push(json!({"role":"user","dial_transient":true,"content":"[Dial] Step limit reached: this is the final request of this turn. Call no tools; they would not run. Reply now with what was done and its evidence, what remains unverified or unfinished, and the exact next step."}));
+            turn.pending_nudges.push(json!({"role":"user","dial_transient":true,"content":"<dial-notice kind=\"step_limit\">\nThis is the final request of this turn, so tools would not run. Reply with what was done and its evidence, what remains unverified or unfinished, and the exact next step.\n</dial-notice>"}));
         } else if !turn.wrap_up_noted
             && let Some(budget) = self.boundary_near(turn.turn_started)
         {
             turn.wrap_up_noted = true;
-            turn.pending_nudges.push(json!({"role":"user","dial_transient":true,"content":format!("[Dial] About 80% of this turn's {budget} is used. Prioritize finishing: complete the change in progress, run the most relevant check, and report; leave optional work for later.")}));
+            turn.pending_nudges.push(json!({"role":"user","dial_transient":true,"content":format!("<dial-notice kind=\"turn_budget\">\nAbout 80% of this turn's {budget} is used. Prioritize finishing: complete the change in progress, run the most relevant check, and report; leave optional work for later.\n</dial-notice>")}));
         }
         self.pump_subagents(ui);
         self.cur_step = step;

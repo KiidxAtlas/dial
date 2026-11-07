@@ -20,7 +20,8 @@ pub enum Purpose {
     Repair,
     Judgment,
     Auxiliary,
-    /// Prompt-cache replay (`max_tokens: 1`); costed like any request so warming shows in spend.
+    /// Prompt-cache replay (native Messages sends it as a `max_tokens: 0` pre-warm); costed like
+    /// any request so warming shows in spend.
     CacheWarm,
 }
 
@@ -639,6 +640,10 @@ impl Drop for Transport {
     fn drop(&mut self) {
         TRANSPORT.with(|slot| slot.replace(self.previous.take()));
     }
+}
+/// The purpose of the provider exchange running on this thread, when it is accounted.
+pub(super) fn transport_purpose() -> Option<Purpose> {
+    TRANSPORT.with(|slot| slot.borrow().as_ref().map(|state| state.scope.purpose))
 }
 pub(super) fn transport_attempt() -> Result<()> {
     TRANSPORT.with(|slot| {

@@ -28,7 +28,7 @@ impl Tool for Investigation {
     fn schema(&self) -> Value {
         crate::tools::tool_schema(
             "investigate",
-            "Compare retained inputs and record semantic interpretations with exact quoted highlights; plan competing falsifiable hypotheses and discriminating experiments; attach results from separately authorized tools. Never executes a proposed test, calls a model, establishes causality, or grants verification credit. compare returns bounded text inputs/diff for the agent to interpret; interpret retains the agent's attributed claims, not independent semantic proof. Actions: compare, interpret, plan, result.",
+            "Use when debugging needs a written record: compare two retained inputs, record your interpretation with exact quoted highlights, plan competing falsifiable hypotheses with discriminating experiments, and attach results from tools you ran separately. Returns: compare gives a bounded text diff for you to interpret; interpret, plan and result retain your attributed claims. It runs nothing itself (no tests, no model calls) and is not proof of causality or verification credit. Actions: compare, interpret, plan, result.",
             json!({
                 "action":{"type":"string","enum":["compare","interpret","plan","result"]},
                 "reference":{"type":"string"},"other":{"type":"string"},

@@ -724,18 +724,25 @@ fn explicit_prompt_cache_wraps_instruction_when_it_is_the_only_stable_item() {
 }
 
 #[test]
-fn codex_routes_send_prompt_cache_key_unless_profile_opts_out() {
+fn codex_and_openai_routes_send_prompt_cache_key_unless_profile_opts_out() {
     use super::super::profiles::CacheRetention;
-    assert!(sends_prompt_cache_key(None, true));
+    const CODEX: &str = "https://chatgpt.com/backend-api/codex/responses";
+    const OPENAI: &str = "https://api.openai.com/v1/responses";
+    const OTHER: &str = "https://responses.example.com/v1/responses";
+    assert!(sends_prompt_cache_key(None, true, CODEX));
     let undeclared = cache_profile(None, CacheRetention::Auto, false);
-    assert!(sends_prompt_cache_key(Some(&undeclared), true));
+    assert!(sends_prompt_cache_key(Some(&undeclared), true, CODEX));
     let opted_out = cache_profile(Some(false), CacheRetention::Auto, true);
-    assert!(!sends_prompt_cache_key(Some(&opted_out), true));
-    // API-key routes keep the declared-capability gate.
-    assert!(!sends_prompt_cache_key(None, false));
-    assert!(!sends_prompt_cache_key(Some(&undeclared), false));
+    assert!(!sends_prompt_cache_key(Some(&opted_out), true, CODEX));
+    // The OpenAI API takes the routing hint without a declared profile.
+    assert!(sends_prompt_cache_key(None, false, OPENAI));
+    assert!(sends_prompt_cache_key(Some(&undeclared), false, OPENAI));
+    assert!(!sends_prompt_cache_key(Some(&opted_out), false, OPENAI));
+    // Other API-key hosts keep the declared-capability gate.
+    assert!(!sends_prompt_cache_key(None, false, OTHER));
+    assert!(!sends_prompt_cache_key(Some(&undeclared), false, OTHER));
     let declared = cache_profile(None, CacheRetention::Auto, true);
-    assert!(sends_prompt_cache_key(Some(&declared), false));
+    assert!(sends_prompt_cache_key(Some(&declared), false, OTHER));
 }
 
 #[test]

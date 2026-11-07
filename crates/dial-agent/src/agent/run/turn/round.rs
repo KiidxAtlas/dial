@@ -3,6 +3,7 @@ use super::*;
 use std::ops::ControlFlow;
 
 mod dispatch;
+mod input_preservation;
 mod prepare;
 mod publish;
 mod settle;
@@ -97,6 +98,41 @@ impl Agent<'_> {
         call: &ToolCall,
         ui: &mut dyn Ui,
     ) -> Option<ToolOutput> {
+        if call.name == "write" {
+            if self.config.efficiency.small_case_guard
+                && let (Some(path), Some(content)) = (
+                    call.arguments["path"].as_str(),
+                    call.arguments["content"].as_str(),
+                )
+                && let Some(note) = turn.edit_churn.first_large_write_notice(
+                    path,
+                    content.len(),
+                    turn.reliability.passing_checks + turn.reliability.failing_checks,
+                )
+            {
+                turn.pending_nudges.push(crate::agent::run::guidance::note(
+                    crate::agent::run::guidance::Priority::Review,
+                    note,
+                ));
+            }
+            let mut expanded = call.clone();
+            if crate::agent::window::file_handles::expand(&self.workspace, &mut expanded).is_ok()
+                && let (Some(path), Some(content)) = (
+                    expanded.arguments["path"].as_str(),
+                    expanded.arguments["content"].as_str(),
+                )
+                && let Ok(path) = self.workspace.resolve(path)
+                && let Some(reason) = turn
+                    .edit_churn
+                    .rewrite_rejection(&self.workspace.rel(&path), content.len())
+            {
+                return Some(
+                    ToolOutput::err(reason)
+                        .with_status(tools::ToolStatus::Blocked)
+                        .with_effects(tools::surface::outcome::Effects::None),
+                );
+            }
+        }
         let mut preflight = None;
         if !self.hermetic
             && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
@@ -186,6 +222,15 @@ impl Agent<'_> {
         };
         let step = request.step;
         let reply = request.reply;
+        let mut budget = publish::ResultBudget::new(
+            if self.hermetic {
+                0
+            } else {
+                publish::ResultBudget::percent(&self.config.efficiency)
+            },
+            self.budget_window(),
+            self.context_usage().0,
+        );
         self.verify_batch.begin(&reply.tool_calls);
         for (index, call) in reply.tool_calls.iter().enumerate() {
             let engine = &mut *context.engine;
@@ -368,7 +413,14 @@ impl Agent<'_> {
                 executed,
                 &mut outcome,
             )?;
-            self.publish_call_result(turn, &mut context, step, settled)?;
+            // Results already produced by this call's group are known; water-fill across them.
+            let result_cap = crate::tools::model_output_limit(self.context_window());
+            let pending = crate::agent::run::dispatch::result_budget::pending_sizes(
+                &reply.tool_calls[index + 1..],
+                batch.parallel.iter().map(|(output, _)| output),
+                result_cap,
+            );
+            self.publish_call_result(turn, &mut context, step, settled, &mut budget, &pending)?;
         }
         self.verify_batch.end();
         if let Some(stream) = round.streamed.take() {
