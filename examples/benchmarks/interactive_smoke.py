@@ -427,7 +427,11 @@ class Terminal:
         self.socket = f"dial-pty-smoke-{os.getpid()}-{time.monotonic_ns()}"
         self.captures = captures
         self.binary, self.project = binary, project
-        self.environment = dict(os.environ, HOME=str(home), DIAL_HOME=str(home), TERM="xterm-256color")
+        # A real Dial home is private state beneath (never equal to) HOME. Sharing one directory
+        # puts HOME toolchain read roots inside the denied private tree, which the Linux sandbox refuses.
+        user_home = pathlib.Path(home).parent / "user-home"
+        user_home.mkdir(mode=0o700, exist_ok=True)
+        self.environment = dict(os.environ, HOME=str(user_home), DIAL_HOME=str(home), TERM="xterm-256color")
         for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
             self.environment.pop(key, None)
         # Configure retention before launching Dial so an early startup failure remains readable.
