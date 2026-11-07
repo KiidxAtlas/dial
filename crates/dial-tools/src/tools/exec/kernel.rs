@@ -608,7 +608,10 @@ fn probe_fork_containment(label: &str) -> Result<(), String> {
 /// command gets the fence as its own `sandbox-exec` profile.
 pub(super) fn fork_fence_prefix(workspace: &Workspace) -> String {
     #[cfg(target_os = "linux")]
-    let nested = false;
+    let nested = {
+        let _ = workspace;
+        false
+    };
     #[cfg(target_os = "macos")]
     let nested = workspace.unsandboxed;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

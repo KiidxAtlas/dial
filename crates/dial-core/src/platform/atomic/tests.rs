@@ -25,7 +25,8 @@ fn deferred_checkpoint_writes_are_published_before_their_flush() {
     assert_eq!(pending.path(), path);
     pending.finish().unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"new");
-    platform_fs::sync_file(&File::open(&path).unwrap()).unwrap();
+    // Flushing needs write access on Windows (`FlushFileBuffers`); a read-only handle is refused.
+    platform_fs::sync_file(&fs::OpenOptions::new().write(true).open(&path).unwrap()).unwrap();
 }
 
 #[cfg(unix)]

@@ -17,6 +17,7 @@ fn settled(outcome: CellOutcome) -> Value {
 }
 
 /// JavaScript resolves through the embedded engine on unix builds, so these checks observe Python only.
+#[cfg(unix)]
 fn python_languages(workspace: &std::path::Path, config: &Config) -> Vec<&'static str> {
     installed_languages(workspace, config)
         .into_iter()

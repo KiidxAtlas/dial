@@ -22,11 +22,11 @@ def selections(matrix):
 class FeatureMatrixTests(unittest.TestCase):
     def test_push_matrix_covers_boundaries_single_features_and_defaults(self):
         selected = selections(features.matrix())
-        self.assertEqual(len(selected), 8)
+        self.assertEqual(len(selected), 9)
         self.assertEqual(len(set(selected)), len(selected))
         for required in [frozenset(), *(frozenset([name]) for name in features.FEATURES),
                          frozenset(features.FEATURES),
-                         frozenset(["aws", "voice", "embedded-shell", "desktop"])]:
+                         frozenset(["aws", "voice", "embedded-shell", "embedded-js", "desktop"])]:
             self.assertIn(required, selected)
         self.assertTrue(set(selected) < set(selections(features.matrix(True))))
 
@@ -37,13 +37,13 @@ class FeatureMatrixTests(unittest.TestCase):
         self.assertIn(frozenset(declared["default"]), selections(features.matrix()))
         self.assertIn("desktop", declared["wayland-pipewire"])
 
-    def test_exhaustive_matrix_checks_each_of_the_32_combinations_once(self):
+    def test_exhaustive_matrix_checks_each_of_the_64_combinations_once(self):
         selected = selections(features.matrix(True))
         expected = {
             frozenset(name for name, enabled in zip(features.FEATURES, switches) if enabled)
-            for switches in itertools.product([False, True], repeat=5)
+            for switches in itertools.product([False, True], repeat=6)
         }
-        self.assertEqual(len(selected), 32)
+        self.assertEqual(len(selected), 64)
         self.assertEqual(set(selected), expected)
 
     def test_pipewire_uses_newer_runner_and_only_largest_selections_write_caches(self):

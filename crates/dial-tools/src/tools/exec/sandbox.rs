@@ -101,6 +101,7 @@ use std::time::{Duration, Instant};
 pub(super) struct CommandMode {
     #[cfg(not(windows))]
     pub owned_terminal: Option<i32>,
+    #[cfg(not(windows))]
     pub fork_fence: bool,
 }
 
