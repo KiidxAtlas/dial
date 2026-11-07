@@ -186,7 +186,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     "command": "printf 'OS-JOB-OUTPUT-KEPT\\n'; exec sleep 120",
                                     "ready": {"log": "OS-JOB-OUTPUT-KEPT", "timeout": 5}})
             else:
-                assert "pty-os-job" in str(results[-1]["content"]), "job start receipt missing"
+                self.server.job_receipt = str(results[-1]["content"])
+                assert "pty-os-job" in self.server.job_receipt, "job start receipt missing"
                 message = {"role": "assistant", "content": "OS-JOB-STARTED"}
             self.respond({"id": f"pty-{index}", "choices": [{"index": 0, "message": message,
                           "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}]})
@@ -882,7 +883,10 @@ def os_job_case(server, binary, captures):
             terminal.wait("OS-JOB-STARTED")
             terminal.command("/processes")
             terminal.wait_panel()
-            terminal.wait("Running", history=False)
+            try:
+                terminal.wait("Running", history=False)
+            except AssertionError as error:
+                raise AssertionError(f"{error}\nbg start receipt:\n{getattr(server, 'job_receipt', None)}") from None
             terminal.key("d")  # Dismiss is not a way to stop a running process.
             terminal.wait("Running", history=False)
             assert "dismissed pty-os-job" not in terminal.text(history=False)
