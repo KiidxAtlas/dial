@@ -145,7 +145,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             index = self.server.chat_requests
         messages = request["messages"]
         # The request-tail latest-user note is runtime context, not the scenario prompt.
-        last_user = next((m.get("content") for m in reversed(messages) if m["role"] == "user" and "[Latest admitted user request" not in str(m.get("content", ""))), "")
+        last_user = next((m.get("content") for m in reversed(messages) if m["role"] == "user" and "Latest admitted user request" not in str(m.get("content", ""))), "")
         if any(tool.get("function", {}).get("name") == "dial_diagnostic_echo"
                for tool in request.get("tools", [])):
             message = self.coding_diagnostic(index, messages)
@@ -175,7 +175,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if last_user == "PTY-OS-JOB":
             results = [m for m in messages if m["role"] == "tool"]
-            if not results:
+            calls = [call["function"]["name"] for m in messages for call in m.get("tool_calls", [])]
+            offered = any(tool.get("function", {}).get("name") == "bg" for tool in request.get("tools", []))
+            if "bg" not in calls and not offered:
+                # Like a real provider, load job control when the budgeted core offer omits it.
+                message = self.call(index, "tool_load", {"names": ["bg"]})
+            elif "bg" not in calls:
                 self.server.job_starts += 1
                 message = self.call(index, "bg", {"action": "start", "name": "pty-os-job",
                                     "command": "printf 'OS-JOB-OUTPUT-KEPT\\n'; exec sleep 120",
@@ -217,7 +222,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Task packets may quote older prompts. Only actual standalone user messages
         # select this fixture scenario; their latest instruction remains authoritative.
         user_index = next(i for i in range(len(messages) - 1, -1, -1)
-                          if messages[i]["role"] == "user" and messages[i].get("content") in ("PTY-INPUT", "PTY-DRAFT-INPUT", "PTY-BLOCK", "PTY-REVIEW", "PTY-STREAM", "PTY-IMAGE", "PTY-IMAGE-RECHECK", "PTY-CRASH", "PTY-AFTER-CRASH"))
+                          if messages[i]["role"] == "user" and messages[i].get("content") in ("PTY-INPUT", "PTY-DRAFT-INPUT", "PTY-BLOCK", "PTY-REVIEW", "PTY-STREAM", "PTY-IMAGE", "PTY-IMAGE-RECHECK", "PTY-CRASH", "PTY-AFTER-RESUME"))
         prompt = messages[user_index]["content"]
         names = [call["function"]["name"] for message in messages[user_index + 1:] for call in message.get("tool_calls", [])]
         if prompt == "PTY-STREAM":
@@ -246,7 +251,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not self.server.crash_release.wait(20):
                     self.server.fixture_errors.append("crash fixture release deadline")
                 return  # The real client has been killed; never complete this response.
-        elif prompt == "PTY-AFTER-CRASH":
+        elif prompt == "PTY-AFTER-RESUME":
             writes = [call for message in messages for call in message.get("tool_calls", [])
                       if call["function"]["name"] == "write" and "crash-marker.txt" in call["function"]["arguments"]]
             if len(writes) != 1:
@@ -274,6 +279,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 message = self.call(index, "finish", {"outcome": "completed", "summary": "Review-fixture-ready."})
             else:
                 message = {"role": "assistant", "content": "Review-fixture-ready."}
+        elif "todo" not in names and not any(tool.get("function", {}).get("name") == "todo" for tool in request.get("tools", [])):
+            # Like a real provider, load a tool the route's budgeted core offer omits.
+            message = self.call(index, "tool_load", {"names": ["todo"]})
         elif names.count("todo") == 0:
             message = self.call(index, "todo", {"op": "set", "tasks": [{"content": "Inspect the isolated fixture"}]})
         elif names.count("todo") == 1:
@@ -355,10 +363,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if any(m["role"] == "user" and m.get("content") == "PTY-WORKERS" for m in messages):
             with self.server.lock:
                 self.server.worker_parent_requests += 1
-            # Respect lazy exposure just like a real provider: discovery enables task for
-            # the next request, rather than mistaking an unexecuted call for started workers.
+            # Respect lazy exposure just like a real provider: tool_load enables task for
+            # the next request (discovery only describes it), rather than mistaking an unexecuted call for started workers.
             if not any(tool.get("function", {}).get("name") == "task" for tool in tools):
-                return self.call(index, "tool_search", {"query": "task"})
+                return self.call(index, "tool_load", {"names": ["task"]})
             names = [call["function"]["name"] for message in messages for call in message.get("tool_calls", [])]
             if "task" not in names:
                 return self.call(index, "task", {"action": "start", "tasks": [
@@ -379,7 +387,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def pool(self, index, messages, tools):
         if any(m["role"] == "user" and m.get("content") == "PTY-POOL" for m in messages):
             if not any(tool.get("function", {}).get("name") == "task" for tool in tools):
-                return self.call(index, "tool_search", {"query": "task"})
+                return self.call(index, "tool_load", {"names": ["task"]})
             calls = [json.loads(call["function"]["arguments"]) for message in messages
                      for call in message.get("tool_calls", []) if call["function"]["name"] == "task"]
             actions = [call.get("action") for call in calls]
@@ -1147,7 +1155,7 @@ def main():
             server.crash_release.set()
             terminal.wait("mock-next")
             terminal.wait("Crash-stream-prefix-kept")
-            terminal.command("PTY-AFTER-CRASH")
+            terminal.command("PTY-AFTER-RESUME")
             terminal.wait("Crash-history-resumed-without-replay")
             assert (project / "crash-marker.txt").read_text() == "effect-before-crash"
             assert server.crash_checks == 1 and not server.fixture_errors, server.fixture_errors

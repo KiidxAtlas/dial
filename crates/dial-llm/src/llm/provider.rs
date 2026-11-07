@@ -355,6 +355,8 @@ pub struct Backend {
     /// A fallback model is ready for the next request; see [`Backend::next_request_failover`].
     next_failover: Option<crate::config::types::FallbackOn>,
     steering_config: Option<crate::config::types::Config>,
+    /// Explicit retry limits for a bounded caller (diagnostics); kept by [`Backend::without_steering`].
+    retry_override: Option<crate::config::types::RetryConfig>,
     steering_runtime: serde_json::Value,
     usage_scope: Option<llm::usage::Scope>,
     account_id: Option<String>,
@@ -451,6 +453,7 @@ impl Backend {
             next_reasoning_guard: None,
             next_failover: None,
             steering_config: None,
+            retry_override: None,
             steering_runtime: serde_json::json!({"state":"disabled","uses":0}),
             usage_scope: None,
             account_id,
@@ -851,6 +854,12 @@ impl Backend {
         self.release();
         self.next_profile = None;
         self.steering_config = None;
+        self
+    }
+    /// Use `retry` for this backend's requests instead of the steering configuration's `[retry]`.
+    /// Bounded probes set this so their attempt limit survives [`Backend::without_steering`].
+    pub fn with_retry(mut self, retry: crate::config::types::RetryConfig) -> Self {
+        self.retry_override = Some(retry);
         self
     }
     pub fn steering_runtime(&self) -> serde_json::Value {
@@ -1920,9 +1929,13 @@ impl Backend {
         let model = model.to_owned();
         let retry_policy = llm::retry::Policy::new(
             &self
-                .steering_config
-                .as_ref()
-                .map(|config| config.retry.clone())
+                .retry_override
+                .clone()
+                .or_else(|| {
+                    self.steering_config
+                        .as_ref()
+                        .map(|config| config.retry.clone())
+                })
                 .unwrap_or_default(),
             self.retry_backoff,
         )

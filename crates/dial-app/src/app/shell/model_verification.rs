@@ -84,7 +84,9 @@ fn response_test(config: &Config, cancel: Arc<AtomicBool>, budget: Duration) -> 
             }
         });
         let result = (|| {
-            let mut backend = make_backend(&config)?.without_steering();
+            let mut backend = make_backend(&config)?
+                .without_steering()
+                .with_retry(config.retry.clone());
             let mut profile = backend.model_profile().cloned().unwrap_or_else(|| {
                 crate::llm::profiles::ModelProfile::minimal(
                     &config.selection().provider,

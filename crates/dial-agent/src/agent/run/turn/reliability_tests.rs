@@ -1116,6 +1116,10 @@ fn an_auto_backgrounded_command_loads_bg_for_the_next_request() {
 
 #[test]
 fn an_auto_backgrounded_eval_cell_does_not_stop_the_turn_as_uncertain() {
+    if let Err(reason) = crate::tools::exec::eval::prepare_containment() {
+        eprintln!("skipping: eval cells cannot run without OS containment: {reason}");
+        return;
+    }
     let server = llm::fake::serve(vec![
         response(
             "",

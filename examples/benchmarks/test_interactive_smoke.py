@@ -163,14 +163,20 @@ class ScriptedProviderTests(unittest.TestCase):
 
     def test_os_job_script_starts_once_then_acknowledges_tool_receipt(self):
         prompt = [{"role": "user", "content": "PTY-OS-JOB"}]
-        first = self.post(prompt).respond.call_args.args[0]["choices"][0]
+        # Without bg in the offer, the script loads it rather than calling an unavailable tool.
+        load = self.post(prompt).respond.call_args.args[0]["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual((load["function"]["name"], json.loads(load["function"]["arguments"])),
+                         ("tool_load", {"names": ["bg"]}))
+        self.assertEqual(self.server.job_starts, 0)
+        offered = [{"type": "function", "function": {"name": "bg"}}]
+        first = self.post(prompt, offered).respond.call_args.args[0]["choices"][0]
         call = first["message"]["tool_calls"][0]
         self.assertEqual(call["function"]["name"], "bg")
         arguments = json.loads(call["function"]["arguments"])
         self.assertEqual((arguments["action"], arguments["name"]), ("start", "pty-os-job"))
         self.assertIn("exec sleep 120", arguments["command"])
         result = self.post(prompt + [first["message"], {"role": "tool", "tool_call_id": call["id"],
-                           "content": "pty-os-job: running; OS-JOB-OUTPUT-KEPT"}])
+                           "content": "pty-os-job: running; OS-JOB-OUTPUT-KEPT"}], offered)
         self.assertEqual(result.respond.call_args.args[0]["choices"][0]["message"]["content"], "OS-JOB-STARTED")
         self.assertEqual(self.server.job_starts, 1)
 

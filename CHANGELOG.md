@@ -23,6 +23,9 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   "invalid stored Anthropic native compaction messages": the replay check now accepts the plain
   string content that the retained wire tail stores for text turns. Affected sessions resume
   without re-compacting.
+- The setup model and coding/tool compatibility checks honor their single-attempt limit again, so
+  an unreachable endpoint reports "Endpoint unavailable" promptly instead of retrying until the
+  20-second diagnostic budget expires and reporting a timeout.
 - DAP discovery now explicitly advertises existing runtime probes through non-stopping logpoints;
   tool documentation includes setup, output collection, cleanup and adapter/side-effect limits.
   This reuses the debugger session rather than introducing a separate probe execution pipeline.

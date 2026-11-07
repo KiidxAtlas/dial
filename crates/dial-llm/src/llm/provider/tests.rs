@@ -2264,6 +2264,28 @@ fn transient_failures_retry_with_visible_notices_and_stop_at_the_bound() {
 }
 
 #[test]
+fn explicit_retry_limits_survive_dropping_the_steering_configuration() {
+    let server = fake::serve(vec![fake::json(503, &json!({"error":"busy"}))]);
+    let mut config = crate::config::types::Config::default();
+    config.retry.max_attempts = 3;
+    let single = crate::config::types::RetryConfig {
+        max_attempts: 1,
+        ..Default::default()
+    };
+    // Bounded probes drop steering but keep their own single-attempt limit.
+    let mut probe = backend(endpoint(&server.url))
+        .with_steering(&config)
+        .without_steering()
+        .with_retry(single);
+    let error = probe.chat(None, &request(), 5, None).unwrap_err();
+    assert!(
+        error.to_string().contains("failed after 1 attempts"),
+        "{error:#}"
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
 fn manual_retry_skips_automatic_and_explicit_waits_without_leaking_into_other_attempts() {
     let server = fake::serve(vec![
         fake::json(503, &json!({"error":"busy"})),

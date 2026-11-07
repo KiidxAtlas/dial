@@ -48,11 +48,24 @@ fn missing_eval_interpreters_are_disclosed_before_loading_or_generating_code() {
                 // The embedded engine keeps JavaScript resolved, so only Python can be missing.
                 assert!(text.contains("JavaScript resolved"), "{text}");
                 assert!(text.contains("Python not found"), "{text}");
+                let containment = tools::exec::eval::prepare_containment();
                 let catalog = agent.tool_catalog().unwrap();
-                assert!(!matches!(
-                    catalog.get("eval").unwrap().readiness,
-                    tools::surface::catalog::Readiness::MissingPrerequisite { .. }
-                ));
+                let readiness = &catalog.get("eval").unwrap().readiness;
+                match containment {
+                    Ok(()) => assert!(!matches!(
+                        readiness,
+                        tools::surface::catalog::Readiness::MissingPrerequisite { .. }
+                    )),
+                    // Without OS containment the only missing prerequisite is containment itself.
+                    Err(reason) => assert!(
+                        matches!(
+                            readiness,
+                            tools::surface::catalog::Readiness::MissingPrerequisite { reason: shown }
+                                if *shown == reason
+                        ),
+                        "{readiness:?}"
+                    ),
+                }
                 return;
             }
             assert!(text.contains("JavaScript not found"), "{text}");

@@ -118,7 +118,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         messages = request.get("messages", [])
         # The request-tail latest-user note is runtime context, not the scenario prompt.
-        last = next((text_of(m.get("content")) for m in reversed(messages) if m.get("role") == "user" and "[Latest admitted user request" not in text_of(m.get("content"))), "")
+        last = next((text_of(m.get("content")) for m in reversed(messages) if m.get("role") == "user" and "Latest admitted user request" not in text_of(m.get("content"))), "")
         context = json.dumps(messages)
         m = server.markers
         if last == m["main"]:
