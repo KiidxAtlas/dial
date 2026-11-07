@@ -1226,8 +1226,7 @@ pub fn destructive_bash(command: &str) -> bool {
 /// approval (network, browser, MCP) are outside the workspace and still ask.
 fn workspace_write(call: &ToolCall) -> bool {
     match call.name.as_str() {
-        "write" | "edit" | "ast_edit" | "notebook_edit" | "revert_edit" | "task" | "todo"
-        | "finish" => true,
+        "write" | "edit" | "ast_edit" | "revert_edit" | "task" | "todo" | "finish" => true,
         "bash" => call.arguments["command"]
             .as_str()
             .is_some_and(|command| !destructive_bash(command)),

@@ -16,6 +16,7 @@ impl<'a> Agent<'a> {
     const HOSTED_CORE_SCHEMA_BYTES: usize = 24 * 1024;
     /// The stable first-request offer, in priority order: each tool joins while it fits the route's
     /// budget. `bg` is the only way to wait for or stop a command that became a background job.
+    /// Basic workspace operations precede questions, which precede optional execution helpers.
     /// `task` (and `message`, which follows it) is offered only on hosted routes. `eval` joins only
     /// when containment is available and a cell runtime resolves ([`Self::automatic_eval_ready`]).
     const CORE_TOOLS: &[&str] = &[
@@ -28,12 +29,12 @@ impl<'a> Agent<'a> {
         "bash",
         "grep",
         "glob",
+        "ask",
         "todo",
         "verify",
         "eval",
         "bg",
         "task",
-        "ask",
     ];
 
     /// The main model is served by a hosted provider: not a local route (`local_tier`) and not a

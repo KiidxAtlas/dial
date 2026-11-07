@@ -161,6 +161,48 @@ pub(in crate::platform) fn replace_beneath(root: &File, from: &Path, to: &Path) 
     Ok(())
 }
 
+pub(in crate::platform) fn exchange_beneath(root: &File, a: &Path, b: &Path) -> io::Result<()> {
+    let a = plain_name(a)?;
+    let b = plain_name(b)?;
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        // SAFETY: root pins both parent descriptors and both names are live NUL-terminated
+        // single components. The exchange swaps the entries without traversing either symlink.
+        // musl does not export the renameat2 wrapper on every toolchain, so Linux uses syscall.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                root.as_raw_fd(),
+                a.as_ptr(),
+                root.as_raw_fd(),
+                b.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        // SAFETY: as above; RENAME_SWAP is the Apple exchange flag.
+        #[cfg(target_vendor = "apple")]
+        let result = unsafe {
+            libc::renameatx_np(
+                root.as_raw_fd(),
+                a.as_ptr(),
+                root.as_raw_fd(),
+                b.as_ptr(),
+                libc::RENAME_SWAP,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = (root, a, b);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
 pub(in crate::platform) fn remove_beneath(root: &File, relative: &Path) -> io::Result<()> {
     unlink_at(root, relative, 0)
 }

@@ -103,6 +103,8 @@ pub fn with_dispatch(
     run(cancel, || {
         let mut uncertain = false;
         let mut changes = Vec::new();
+        let mut callback_mutation = false;
+        let mut callbacks_settled = true;
         let mut output = tool.call_with_dispatch(
             context,
             args,
@@ -116,6 +118,10 @@ pub fn with_dispatch(
                         .with_effects(Effects::None);
                 }
                 let output = dispatch(request);
+                if !output.execution.changed_paths.is_empty() {
+                    callback_mutation = true;
+                    callbacks_settled &= output.execution.mutation_settled;
+                }
                 changes.extend(output.execution.changed_paths.iter().cloned());
                 uncertain |= crate::tools::surface::outcome::effects(&output) == Effects::Unknown;
                 output
@@ -124,6 +130,8 @@ pub fn with_dispatch(
         output.execution.changed_paths.extend(changes);
         output.execution.changed_paths.sort();
         output.execution.changed_paths.dedup();
+        // These paths describe nested effects, not another mutation by the containing cell.
+        output.execution.mutation_settled = callback_mutation && callbacks_settled;
         if uncertain && crate::tools::surface::outcome::effects(&output) != Effects::Unknown {
             output.with_effects(Effects::Unknown)
         } else {
@@ -161,6 +169,7 @@ fn contained(
         unsettled();
     }
     let facts = capture.finish(!output.is_error && !cancel.load(Ordering::SeqCst));
+    output.execution.invocation = facts.invocation;
     if let Some(status) = facts
         .status
         .filter(|status| matches!(status, ToolStatus::Aborted | ToolStatus::Timeout))

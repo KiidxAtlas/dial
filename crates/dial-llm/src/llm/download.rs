@@ -157,11 +157,14 @@ fn curated(list: &[(Family, &str)], family: Family) -> Vec<Hit> {
 }
 
 fn get_text(url: &str, query: &[(&str, &str)]) -> Result<String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(HTTP_TIMEOUT))
-        .build()
-        .into();
+    let agent = super::agent_with_policy(
+        super::HttpPolicy {
+            redirects: super::RedirectPolicy::Follow(10),
+            proxy: super::ProxyPolicy::Environment,
+            deadline: super::HttpDeadline::WholeRequest(Some(HTTP_TIMEOUT)),
+        },
+        None,
+    );
     let mut request = agent.get(url);
     for &(key, value) in query {
         request = request.query(key, value);

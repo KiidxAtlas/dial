@@ -3,12 +3,22 @@ use super::*;
 #[test]
 fn execution_gap_experiments_have_explicit_defaults_and_validate_bounds() {
     let defaults = crate::config::types::Config::default();
-    assert!(defaults.eval.portable_helpers && defaults.eval.auto_offer && defaults.eval.parallel_batches);
-    assert!(defaults.efficiency.preserve_task_inputs && defaults.verification.auto_registered_checks);
+    assert!(
+        defaults.eval.portable_helpers
+            && defaults.eval.auto_offer
+            && defaults.eval.parallel_batches
+    );
+    assert!(
+        defaults.efficiency.preserve_task_inputs && defaults.verification.auto_registered_checks
+    );
     assert!(!defaults.experimental.adaptive_output_effort);
     assert_eq!(defaults.compaction.argument_projection_tokens, 0);
     let configured: crate::config::types::Config = toml::from_str("[eval]\nportable_helpers=false\nauto_offer=false\nparallel_batches=false\n[efficiency]\npreserve_task_inputs=false\nevidence_stall_rounds=0\nsmall_case_guard=false\n[verification]\nauto_registered_checks=false\n").unwrap();
-    assert!(!configured.eval.portable_helpers && !configured.eval.auto_offer && !configured.eval.parallel_batches);
+    assert!(
+        !configured.eval.portable_helpers
+            && !configured.eval.auto_offer
+            && !configured.eval.parallel_batches
+    );
     assert!(!configured.verification.auto_registered_checks);
     let mut invalid = defaults;
     invalid.efficiency.evidence_stall_rounds = 257;
@@ -717,7 +727,7 @@ fn known_list_values_are_accepted_by_their_settings() {
 
 #[test]
 fn layout_lists_every_registered_section_exactly_once() {
-    for def in REGISTRY.iter().chain(management::DECLARATIONS) {
+    for def in declarations().chain(management::DECLARATIONS) {
         let sections = LAYOUT
             .iter()
             .find(|(tab, _)| *tab == def.tab)
@@ -736,8 +746,7 @@ fn layout_lists_every_registered_section_exactly_once() {
         assert_eq!(unique.len(), sections.len(), "{tab} repeats a section");
         for section in *sections {
             assert!(
-                REGISTRY
-                    .iter()
+                declarations()
                     .chain(management::DECLARATIONS)
                     .any(|def| def.tab == *tab && def.section == *section),
                 "LAYOUT lists {tab}/{section}, which holds no setting"
@@ -778,7 +787,7 @@ fn tabs_follow_the_layout_table_not_declaration_order() {
 
 #[test]
 fn presentation_groups_keep_canonical_contracts_and_original_locations() {
-    for original in REGISTRY.iter().chain(management::DECLARATIONS) {
+    for original in declarations().chain(management::DECLARATIONS) {
         let presented = registry()
             .iter()
             .find(|def| def.path == original.path)
@@ -973,4 +982,65 @@ fn batch_result_percent_defaults_to_thirty_zero_disables_and_is_bounded() {
         config.efficiency.batch_result_percent = percent;
         assert_eq!(config.validate().is_ok(), valid, "{percent}");
     }
+}
+#[test]
+fn registry_keeps_observable_order_and_includes_every_domain_group() {
+    let actual: Vec<_> = registry().iter().map(|def| def.path).collect();
+    let expected: Vec<_> = include_str!("tests/registry-order.txt").lines().collect();
+    assert_eq!(
+        actual, expected,
+        "registry order changed; review the settings surface"
+    );
+    let grouped = [
+        model::GROUPS,
+        tools::GROUPS,
+        improvement::GROUPS,
+        compaction::GROUPS,
+        experimental::GROUPS,
+    ];
+    let standalone = [
+        APPEARANCE,
+        COMPOSER,
+        memory::DECLARATIONS,
+        preparation::DECLARATIONS,
+        coordination::DECLARATIONS,
+        message_routing::DECLARATIONS,
+        voice::DECLARATIONS,
+        ida::DECLARATIONS,
+        image::DECLARATIONS,
+        web::DECLARATIONS,
+        management::DECLARATIONS,
+    ];
+    let mut declared = std::collections::BTreeSet::new();
+    for def in standalone
+        .into_iter()
+        .chain(grouped.into_iter().flatten().copied())
+        .flatten()
+    {
+        assert!(
+            declared.insert(def.path),
+            "duplicate declaration: {}",
+            def.path
+        );
+    }
+    assert_eq!(
+        actual
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        declared
+    );
+}
+
+#[test]
+fn setting_pairs_are_symmetric_and_both_paths_are_declared() {
+    for path in [
+        "memory.semantic.embedding_base_url",
+        "memory.semantic.embedding_model",
+    ] {
+        let partner = pair_partner(path).expect("embedding override has a partner");
+        assert_eq!(pair_partner(partner), Some(path));
+        assert!(registry().iter().any(|def| def.path == partner));
+    }
+    assert_eq!(pair_partner("memory.semantic.embedding_api_key_env"), None);
+    assert_eq!(pair_partner("ui.theme"), None);
 }

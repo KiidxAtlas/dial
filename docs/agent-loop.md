@@ -786,6 +786,16 @@ Four verification aids are always on (not experimental):
 
 `agent/engine.rs` owns the lifecycle driver used by parent and worker adapters, result settlement, output-length recovery, repetition checkpoints, unchanged-read reuse, narration progress, reply recovery, committed-content edit-loop steering, and the uncertain-effect stop boundary. `tools/execution.rs` owns native dispatch, pre-start cancellation, panic containment, and callback effect propagation. A callback tool cannot hide an uncertain nested result by catching its error or returning success; subsequent callbacks are refused.
 
+Mutation settlement consumes controller-native invocation receipts, not provider call IDs or
+attached verification JSON. Receipt deduplication lasts for the assistant batch; a returned
+receipt also preserves settlement across ordinary result copies. Each callback settles its
+committed paths before a subsequent check, including when a containing cell later fails.
+Compound batch/cell results retain those paths and receipts without counting the same effects
+again. Mutation and verification outcomes remain separate. Process-local receipts are skipped
+on serialization; durable runtime nodes continue to own restart recovery and never replay an
+unfinished invocation automatically. A native eval reset repairs matching namespace retry
+dependencies without clearing the uncertain-effect stop.
+
 `agent/turn.rs` is the parent adapter for durable session state, live steering and learning policy. `agent/child.rs` is the worker adapter for private history, assignment permissions and worker request budgets. Both adapters advance the same lifecycle driver and share inference transport, authorization helpers and the parallel scheduler. Their preparation and persistence callbacks retain explicit role responsibilities. New common execution policy belongs in the shared engine, not copied into both adapters. `agent/tool_runner.rs` handles foreground UI events and routes callbacks back to their owner.
 
 Read-batch admission applies recovery restrictions to every candidate, not just the first call.

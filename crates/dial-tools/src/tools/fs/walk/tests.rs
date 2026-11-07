@@ -177,3 +177,29 @@ fn ignored_oversized_subtree_is_not_enumerated_and_prefix_keeps_ancestor_rules()
     assert!(!walk.truncated);
     assert_eq!(walk.directory_entries, 2);
 }
+
+#[test]
+fn search_walk_honors_repository_exclude_below_gitignore_rules() {
+    let (_dir, root, ws) = workspace();
+    fs::create_dir_all(root.join(".git/info")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join(".git/info/exclude"), "excluded.rs\noverride.rs\n").unwrap();
+    fs::write(root.join("src/.gitignore"), "!override.rs\n").unwrap();
+    for name in ["excluded.rs", "override.rs", "kept.rs"] {
+        fs::write(root.join("src").join(name), "").unwrap();
+    }
+    for start in [root.clone(), root.join("src")] {
+        let mut found = Vec::new();
+        let mut search = SearchWalk::new(&ws, true, true, None);
+        search.run_with_prefix(&start, &start, &mut |path| {
+            if let Some(name) = path.file_name() {
+                found.push(name.to_string_lossy().into_owned());
+            }
+            true
+        });
+        found.retain(|name| name.ends_with(".rs"));
+        found.sort();
+        assert_eq!(found, ["kept.rs", "override.rs"], "scope {start:?}");
+        assert!(search.is_complete());
+    }
+}

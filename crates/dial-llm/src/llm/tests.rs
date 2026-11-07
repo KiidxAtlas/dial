@@ -364,3 +364,41 @@ fn x_should_retry_false_marks_a_retryable_failure_as_not_resendable() {
     let ordinary = http_error(529, &body, None, retry::ServerHints::default());
     assert!(is_transient(&ordinary));
 }
+#[test]
+fn http_policy_preserves_explicit_redirect_proxy_and_deadline_choices() {
+    let agent = agent_with_policy(
+        HttpPolicy {
+            redirects: RedirectPolicy::Refuse,
+            proxy: ProxyPolicy::Direct,
+            deadline: HttpDeadline::WholeRequest(Some(Duration::from_secs(3))),
+        },
+        None,
+    );
+    assert_eq!(agent.config().max_redirects(), 0);
+    assert!(agent.config().proxy().is_none());
+    assert_eq!(
+        agent.config().timeouts().global,
+        Some(Duration::from_secs(3))
+    );
+    let download = agent_with_policy(
+        HttpPolicy {
+            redirects: RedirectPolicy::Follow(10),
+            proxy: ProxyPolicy::Direct,
+            deadline: HttpDeadline::WholeRequest(None),
+        },
+        None,
+    );
+    assert_eq!(download.config().max_redirects(), 10);
+    assert_eq!(download.config().timeouts().global, None);
+    let streaming = agent_with(
+        30,
+        false,
+        None,
+        Some(Patience::new(
+            Some(Duration::from_secs(30)),
+            Duration::from_secs(5),
+        )),
+    );
+    assert_eq!(streaming.config().timeouts().global, None);
+    assert_eq!(streaming.config().max_redirects(), 0);
+}

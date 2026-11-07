@@ -17,6 +17,45 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-06
+
+- Sessions compacted with Anthropic native compaction no longer fail every later request with
+  "invalid stored Anthropic native compaction messages": the replay check now accepts the plain
+  string content that the retained wire tail stores for text turns. Affected sessions resume
+  without re-compacting.
+- DAP discovery now explicitly advertises existing runtime probes through non-stopping logpoints;
+  tool documentation includes setup, output collection, cleanup and adapter/side-effect limits.
+  This reuses the debugger session rather than introducing a separate probe execution pipeline.
+- Standalone-artifact verification guidance points to one explicit format/constraint acceptance
+  helper instead of empty verification calls or unrelated test searches. No-applicable-check
+  receipts explicitly say nothing ran and do not claim a pass; required checks remain unchanged.
+- `read` continuations after a byte-budget cut keep the requested bounds and later ranges
+  (`f:10-16,960-973`, not `f:10-`), and raw reads continue as raw (`f:raw:30-`). Streamed reads
+  no longer mark a CRLF line of exactly the line cap as truncated or split a multibyte character.
+- `grep`/`glob` scoped inside an added root apply that root's parent `.gitignore` rules, and
+  honor `.git/info/exclude` (lowest precedence) like the AST walker already did.
+- `edit` refuses a `PUT @name` authored before the same call's `CUT … @name` instead of pasting
+  the register's value from an earlier call.
+- On Linux and macOS, local edits replace an existing file with an atomic exchange, so a crash
+  mid-commit leaves the old or new file in place rather than neither. Filesystems without the
+  exchange primitive keep the previous capture-then-install path.
+- Settings relationships are owned by configuration and consumed by UI/application saves and
+  reviewed resets. Named domain groups replace numeric registry offsets while preserving the
+  existing order, metadata and defaults.
+- Native invocation receipts distinguish callbacks even when provider IDs are empty. Mutation
+  accounting no longer depends on verification JSON; completed callback writes are accounted
+  before verification and are not counted again by their containing cell. Successful eval reset
+  repairs retry dependencies only for that namespace; uncertain effects still stop continuation.
+- Desktop request admission is bounded to 32 queued operations and rejects overload without
+  blocking. Caller waits observe cancellation; explicit close has one two-second budget, while
+  Drop cancels and detaches without waiting for an uncooperative native operation.
+- Session pins reuse the owner-private atomic publisher, retaining their JSON format and locks.
+  Failed publication preserves the prior file; unsafe link targets and metadata over 8 MiB are
+  refused. Obsolete ratatui/lru advisory exceptions have been removed.
+- Eval's core description is shorter and distinguishes embedded JavaScript from Node. Enabled
+  interactive questions take priority in the initial tool offer, so optional execution schemas
+  do not silently crowd out the human-input channel. Print-mode questions remain disabled.
+
 - Portable eval: shared `dial` helpers for exact text/JSON/byte I/O, admitted commands and batches,
   retained recovery snapshots and source freshness. Binary writes use native no-overwrite staging.
   Batch receipts preserve native execution facts; fallback requires explicit proof no entry ran.

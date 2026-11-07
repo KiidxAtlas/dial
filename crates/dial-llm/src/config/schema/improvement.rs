@@ -1,6 +1,6 @@
 //! Improvement setting declarations. Defaults derive from typed configuration fields.
 use super::*;
-pub(super) static DECLARATIONS: &[SettingDef] = &[
+pub(super) static LEARNING: &[SettingDef] = &[
     field!(
         "improve.enabled",
         improve.enabled,
@@ -412,6 +412,91 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         },
     ),
     field!(
+        "assistance.local.thinking",
+        assistance.local.thinking,
+        IM,
+        "Local model assistance",
+        "Local thinking",
+        "Phase turns reasoning on for a turn's first request, after a failed round, an intercepted generation or a plan change, and off after a successful tool round. Only servers that expose a thinking switch are affected (llama.cpp, LM Studio, Ollama). Model leaves it to the model, server and model profile. Explicit thinking, reasoning effort or chat template settings always win.",
+        Kind::Enum(LOCAL_THINKING),
+    ),
+    field!(
+        "assistance.local.keep_loaded_secs",
+        assistance.local.keep_loaded_secs,
+        IM,
+        "Local model assistance",
+        "Keep loaded seconds",
+        "Ask the local server to keep the model loaded this long after each request (Ollama keep_alive, LM Studio ttl). Dial also unloads a model it loaded itself at session end on Ollama. 0 leaves the server default. An explicit model-profile keep_alive wins.",
+        Kind::Int {
+            min: 0,
+            max: 86400,
+            step: 60
+        },
+    ),
+    field!(
+        "assistance.local.prompt_cache",
+        assistance.local.prompt_cache,
+        IM,
+        "Local model assistance",
+        "Local prompt cache",
+        "llama.cpp servers only: reuse the prompt cache (cache_prompt) and keep the main session on slot 0 with workers on other slots, so side work does not evict the main prompt. Off by default; when off Dial sends no cache setting and the server keeps its own behaviour.",
+        Kind::Bool,
+    ),
+    field!(
+        "assistance.local.side_models",
+        assistance.local.side_models,
+        IM,
+        "Local model assistance",
+        "Side model swaps",
+        "Side requests to a different model on the same local server. Warn uses the configured model and says once per session that it swaps the loaded model. Reuse main sends them to the loaded main model. Allow uses the configured model silently.",
+        Kind::Enum(LOCAL_SIDE_MODELS),
+    ),
+    field!(
+        "assistance.local.context_advice",
+        assistance.local.context_advice,
+        IM,
+        "Local model assistance",
+        "Context fit advice",
+        "One notice when a local server serves a smaller context window than configured. Dial does not raise a server's context window automatically; set context_window or the server's own setting.",
+        Kind::Bool,
+    ),
+    field!(
+        "assistance.local.loop_penalty",
+        assistance.local.loop_penalty,
+        IM,
+        "Local model assistance",
+        "Loop recovery penalty",
+        "Off by default. When the repetition detector stops a local generation, retry once with a presence and repetition penalty instead of failing the round.",
+        Kind::Bool,
+    ),
+    field!(
+        "assistance.local.suggestions",
+        assistance.local.suggestions,
+        IM,
+        "Local model assistance",
+        "Model suggestions",
+        "Record per-model evidence in local-profile.json and list evidence-backed setting suggestions, including a speculative draft model, in /model settings. Suggestions are never applied without a key press.",
+        Kind::Bool,
+    ),
+    field!(
+        "assistance.local.time_budget",
+        assistance.local.time_budget,
+        IM,
+        "Local model assistance",
+        "Time budget from speed",
+        "Derive the pre-action time limit from the model's measured speed when reasoning_guard.max_pre_action_secs is 0, and show an estimated time left in the status line.",
+        Kind::Bool,
+    ),
+    field!(
+        "weights.model",
+        weights.model,
+        IM,
+        "Weights",
+        "Weight edit target",
+        "Local MLX model (id or path) that `dial weights`, /weights and the model_weights tool inspect and edit. Empty uses the main model, which must then be local MLX. Set it to let a hosted frontier main model drive edits to a different local model; promoting an edit then replaces this setting, not the main model.",
+        Kind::Text,
+    ),
+    field!(
         "assistance.tool_grammar",
         assistance.tool_grammar,
         IM,
@@ -671,6 +756,9 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             step: 1000
         },
     ),
+];
+
+pub(super) static ASSISTANCE: &[SettingDef] = &[
     field!(
         "assistance.syntax_guard",
         assistance.syntax_guard,
@@ -891,91 +979,6 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         },
     ),
     field!(
-        "assistance.local.thinking",
-        assistance.local.thinking,
-        IM,
-        "Local model assistance",
-        "Local thinking",
-        "Phase turns reasoning on for a turn's first request, after a failed round, an intercepted generation or a plan change, and off after a successful tool round. Only servers that expose a thinking switch are affected (llama.cpp, LM Studio, Ollama). Model leaves it to the model, server and model profile. Explicit thinking, reasoning effort or chat template settings always win.",
-        Kind::Enum(LOCAL_THINKING),
-    ),
-    field!(
-        "assistance.local.keep_loaded_secs",
-        assistance.local.keep_loaded_secs,
-        IM,
-        "Local model assistance",
-        "Keep loaded seconds",
-        "Ask the local server to keep the model loaded this long after each request (Ollama keep_alive, LM Studio ttl). Dial also unloads a model it loaded itself at session end on Ollama. 0 leaves the server default. An explicit model-profile keep_alive wins.",
-        Kind::Int {
-            min: 0,
-            max: 86400,
-            step: 60
-        },
-    ),
-    field!(
-        "assistance.local.prompt_cache",
-        assistance.local.prompt_cache,
-        IM,
-        "Local model assistance",
-        "Local prompt cache",
-        "llama.cpp servers only: reuse the prompt cache (cache_prompt) and keep the main session on slot 0 with workers on other slots, so side work does not evict the main prompt. Off by default; when off Dial sends no cache setting and the server keeps its own behaviour.",
-        Kind::Bool,
-    ),
-    field!(
-        "assistance.local.side_models",
-        assistance.local.side_models,
-        IM,
-        "Local model assistance",
-        "Side model swaps",
-        "Side requests to a different model on the same local server. Warn uses the configured model and says once per session that it swaps the loaded model. Reuse main sends them to the loaded main model. Allow uses the configured model silently.",
-        Kind::Enum(LOCAL_SIDE_MODELS),
-    ),
-    field!(
-        "assistance.local.context_advice",
-        assistance.local.context_advice,
-        IM,
-        "Local model assistance",
-        "Context fit advice",
-        "One notice when a local server serves a smaller context window than configured. Dial does not raise a server's context window automatically; set context_window or the server's own setting.",
-        Kind::Bool,
-    ),
-    field!(
-        "assistance.local.loop_penalty",
-        assistance.local.loop_penalty,
-        IM,
-        "Local model assistance",
-        "Loop recovery penalty",
-        "Off by default. When the repetition detector stops a local generation, retry once with a presence and repetition penalty instead of failing the round.",
-        Kind::Bool,
-    ),
-    field!(
-        "assistance.local.suggestions",
-        assistance.local.suggestions,
-        IM,
-        "Local model assistance",
-        "Model suggestions",
-        "Record per-model evidence in local-profile.json and list evidence-backed setting suggestions, including a speculative draft model, in /model settings. Suggestions are never applied without a key press.",
-        Kind::Bool,
-    ),
-    field!(
-        "assistance.local.time_budget",
-        assistance.local.time_budget,
-        IM,
-        "Local model assistance",
-        "Time budget from speed",
-        "Derive the pre-action time limit from the model's measured speed when reasoning_guard.max_pre_action_secs is 0, and show an estimated time left in the status line.",
-        Kind::Bool,
-    ),
-    field!(
-        "weights.model",
-        weights.model,
-        IM,
-        "Weights",
-        "Weight edit target",
-        "Local MLX model (id or path) that `dial weights`, /weights and the model_weights tool inspect and edit. Empty uses the main model, which must then be local MLX. Set it to let a hosted frontier main model drive edits to a different local model; promoting an edit then replaces this setting, not the main model.",
-        Kind::Text,
-    ),
-    field!(
         "training.retain_session_requests",
         training.retain_session_requests,
         IM,
@@ -985,3 +988,5 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         Kind::Bool,
     ),
 ];
+
+pub(super) static GROUPS: &[&[SettingDef]] = &[LEARNING, ASSISTANCE];

@@ -193,6 +193,15 @@ fn redeclaration_gets_hint() {
 }
 
 #[test]
+fn embedded_missing_globals_do_not_recommend_unavailable_node_imports() {
+    let result = cell("require('fs')");
+    let error = result["error"].as_str().unwrap();
+    assert!(error.contains("Node modules are unavailable"), "{error}");
+    assert!(error.contains("tool.read"), "{error}");
+    assert!(!error.contains("await import('node:"), "{error}");
+}
+
+#[test]
 fn tool_callback_round_trip_returns_data() {
     let frames = drive(&[
         json!({"id": 1, "code": "(await tool.read({path: 'a.txt'})).text"}),

@@ -177,3 +177,29 @@ fn native_witness_requirements_survive_nested_failures_but_not_recovered_calls()
     native_edit_retry(requirement);
     assert!(capture.finish(true).native_edit_retry.is_none());
 }
+#[test]
+fn invocation_receipts_are_nested_unique_and_never_restored_from_json() {
+    let outer = Capture::begin();
+    let inner = Capture::begin();
+    let inner = inner.finish(true).invocation.unwrap();
+    let outer = outer.finish(true).invocation.unwrap();
+    assert_eq!(inner.parent, Some(outer.id));
+    assert_ne!(inner.id, outer.id);
+    assert_ne!(Invocation::fresh().id, inner.id);
+    let facts = Execution {
+        invocation: Some(outer),
+        mutation_settled: true,
+        namespace_reset: Some(EvalNamespace::JavaScript),
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&facts).unwrap();
+    assert!(json.get("invocation").is_none());
+    let restored: Execution = serde_json::from_value(serde_json::json!({
+        "status":null,"effects":"known","invocation":{"id":1},
+        "mutation_settled":true,"namespace_reset":"JavaScript"
+    }))
+    .unwrap();
+    assert!(restored.invocation.is_none());
+    assert!(!restored.mutation_settled);
+    assert!(restored.namespace_reset.is_none());
+}

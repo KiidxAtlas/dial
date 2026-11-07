@@ -611,15 +611,6 @@ const EMBEDDING_URL_PATH: &str = "memory.semantic.embedding_base_url";
 const EMBEDDING_OVERRIDE_ROWS: [&str; 2] =
     [EMBEDDING_URL_PATH, "memory.semantic.embedding_api_key_env"];
 
-/// The other half of the OpenAI-compatible embedding override, which is valid only as a pair.
-pub fn pair_partner(path: &str) -> Option<&'static str> {
-    match path {
-        EMBEDDING_URL_PATH => Some(EMBEDDING_MODEL_PATH),
-        EMBEDDING_MODEL_PATH => Some(EMBEDDING_URL_PATH),
-        _ => None,
-    }
-}
-
 pub struct SettingsOverlay {
     panel_keys: super::panel_keys::PanelKeys,
     effective: Table,
@@ -2183,7 +2174,7 @@ impl SettingsOverlay {
         self.notes.remove(def.path);
         // One half of the embedding override alone is invalid: hold it until its partner is set,
         // then the controller saves both together (see `take_staged_pair`).
-        if let Some(partner) = pair_partner(def.path)
+        if let Some(partner) = crate::config::schema::pair_partner(def.path)
             && value.as_str().is_some_and(|v| !v.trim().is_empty())
             && self
                 .current_path(partner)

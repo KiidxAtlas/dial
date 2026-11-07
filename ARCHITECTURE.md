@@ -282,6 +282,14 @@ Lib tests report timings with `RUSTC_BOOTSTRAP=1 target/debug/deps/<crate>-<hash
 - `crates/dial-llm/src/llm/download.rs` owns inference acquisition and quantization planning. The `crates/dial-agent/src/learn/download.rs` re-export preserves the earlier Rust import path, not learning ownership. Callers supply cancellation and progress; cached discovery does not fetch weights.
 - `crates/dial-core/src/platform/atomic.rs` owns publication mechanics with distinct private-state, workspace-replacement and mode-preserving policies. Ownership/link checks and platform durability constraints are not interchangeable.
 - Configuration owns its own types, defaults and persistence (`crates/dial-llm/src/config/settings_store.rs`, `crates/dial-llm/src/config/paths.rs`, and the per-domain modules under `crates/dial-llm/src/config/`). Feature modules consume configuration; configuration never imports agent, tools, storage or app code.
+  The schema also owns paired-setting relationships. Named domain groups assemble the registry;
+  regression tests pin observable order and reject duplicate or omitted groups. UI owns staging,
+  while the application publishes the exact reviewed transaction.
+- `runtime::execution::Capture` assigns process-local native invocation identities and parent
+  links. Internal settlement receipts are skipped by serialization and cannot be supplied through
+  tool payloads. The agent settles committed mutations before verification, while containing eval
+  cells preserve nested effect facts without counting settled callback writes twice. Existing
+  durable runtime nodes own restart recovery; ephemeral invocation IDs never authorize replay.
 - CI records runtime-journal overhead and markdown/terminal encoding p95 without imposing a host-dependent speed threshold.
 - RPC has one state projector for worker and cached queries. Typed notices expose their lane;
   ACP preserves source metadata in `_meta.dial` without requiring clients to change text handling.

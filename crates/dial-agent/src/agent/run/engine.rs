@@ -75,6 +75,9 @@ pub(in crate::agent) struct Engine {
     failed_access: std::collections::HashMap<[u8; 32], (String, Vec<String>)>,
     /// First line of each withheld call's original error, quoted when the barrier refuses it.
     failed_errors: std::collections::HashMap<[u8; 32], String>,
+    /// Namespace dependencies are repaired by an actual reset, not a printed reset claim.
+    failed_eval:
+        std::collections::HashMap<[u8; 32], (crate::runtime::execution::EvalNamespace, String)>,
     repeats: guard::RepeatGuard,
     investigation: investigation::InvestigationGuard,
     returned_reads: investigation::ReturnedReads,
@@ -538,6 +541,19 @@ impl Engine {
             });
         if status.failed() && !witnessed {
             let identity = failed_identity(call);
+            if call.name == "eval"
+                && matches!(call.arguments["action"].as_str(), None | Some("eval"))
+            {
+                let namespace = match call.arguments["language"].as_str().unwrap_or("js") {
+                    "js" => Some(crate::runtime::execution::EvalNamespace::JavaScript),
+                    "py" => Some(crate::runtime::execution::EvalNamespace::Python),
+                    _ => None,
+                };
+                if let Some(namespace) = namespace {
+                    self.failed_eval
+                        .insert(identity, (namespace, call_identity(call)));
+                }
+            }
             self.failed_witnesses.remove(&identity);
             if let Some(retry) =
                 native_retry.filter(|_| status == crate::runtime::execution::ToolStatus::Error)
@@ -579,6 +595,20 @@ impl Engine {
                 }
             }
         } else if status == crate::runtime::execution::ToolStatus::Ok {
+            if call.name == "eval"
+                && let Some(namespace) = output.execution.namespace_reset
+            {
+                let repaired: Vec<_> = self
+                    .failed_eval
+                    .iter()
+                    .filter(|(_, (failed_namespace, _))| *failed_namespace == namespace)
+                    .map(|(id, (_, key))| (*id, key.clone()))
+                    .collect();
+                for (id, key) in repaired {
+                    self.forget_failure(&id);
+                    self.checkpoint.release_key(&key);
+                }
+            }
             self.release_ready_witnesses(workspace);
             if call.name == "request_directory" {
                 let released: Vec<([u8; 32], String)> = self
@@ -809,6 +839,7 @@ impl Engine {
         self.failed_versions.remove(identity);
         self.failed_access.remove(identity);
         self.failed_errors.remove(identity);
+        self.failed_eval.remove(identity);
     }
 }
 

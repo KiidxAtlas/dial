@@ -209,7 +209,7 @@ fn save_reviewed_reset(
             );
             // Single-key reset clears embedding pairs. Bulk reset must review every stored half,
             // never silently expand a preview to remove an unreviewed partner.
-            if let Some(partner) = crate::ui::overlay::settings::pair_partner(path) {
+            if let Some(partner) = crate::config::schema::pair_partner(path) {
                 ensure!(
                     crate::config::schema::get(&layer, partner).is_none()
                         || expected.contains_key(partner),

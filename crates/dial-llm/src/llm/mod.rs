@@ -471,29 +471,86 @@ pub fn agent_with(
     interrupt: Option<Arc<AtomicBool>>,
     patience: Option<Patience>,
 ) -> ureq::Agent {
+    agent_with_policy(
+        HttpPolicy {
+            redirects: RedirectPolicy::Refuse,
+            proxy: if env_proxy {
+                ProxyPolicy::Environment
+            } else {
+                ProxyPolicy::Direct
+            },
+            deadline: match patience {
+                Some(patience) => HttpDeadline::Streaming {
+                    patience,
+                    read_ceiling: (timeout_secs > 0).then_some(STREAM_CEILING),
+                },
+                None => HttpDeadline::WholeRequest(
+                    (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs)),
+                ),
+            },
+        },
+        interrupt,
+    )
+}
+
+/// Construction policy only: authentication, guarded resolvers and protocol framing stay with callers.
+#[derive(Clone, Debug)]
+pub(crate) struct HttpPolicy {
+    pub redirects: RedirectPolicy,
+    pub proxy: ProxyPolicy,
+    pub deadline: HttpDeadline,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RedirectPolicy {
+    Refuse,
+    Follow(u32),
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ProxyPolicy {
+    Environment,
+    Direct,
+}
+#[derive(Clone, Debug)]
+pub(crate) enum HttpDeadline {
+    WholeRequest(Option<Duration>),
+    Streaming {
+        patience: Patience,
+        read_ceiling: Option<Duration>,
+    },
+}
+
+pub(crate) fn agent_with_policy(
+    policy: HttpPolicy,
+    interrupt: Option<Arc<AtomicBool>>,
+) -> ureq::Agent {
     crate::install_tls_provider();
     let builder = ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .max_redirects(0);
-    let builder = match patience {
-        None => {
-            builder.timeout_global((timeout_secs > 0).then(|| Duration::from_secs(timeout_secs)))
-        }
+        .max_redirects(match policy.redirects {
+            RedirectPolicy::Refuse => 0,
+            RedirectPolicy::Follow(limit) => limit,
+        });
+    let builder = match &policy.deadline {
+        HttpDeadline::WholeRequest(timeout) => builder.timeout_global(*timeout),
         // `recv_*` ceilings are set (not left unset) so ureq reports the phase in each timeout; the transport reads
         // that to apply the first-event and idle limits.
-        Some(_) => builder
+        HttpDeadline::Streaming { read_ceiling, .. } => builder
             .timeout_global(None)
             .timeout_resolve(Some(Duration::from_secs(15)))
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_send_request(Some(Duration::from_secs(60)))
             .timeout_send_body(Some(Duration::from_secs(120)))
-            .timeout_recv_response((timeout_secs > 0).then_some(STREAM_CEILING))
-            .timeout_recv_body((timeout_secs > 0).then_some(STREAM_CEILING)),
+            .timeout_recv_response(*read_ceiling)
+            .timeout_recv_body(*read_ceiling),
     };
-    let builder = if env_proxy {
+    let builder = if matches!(policy.proxy, ProxyPolicy::Environment) {
         builder
     } else {
         builder.proxy(None)
+    };
+    let patience = match policy.deadline {
+        HttpDeadline::Streaming { patience, .. } => Some(patience),
+        HttpDeadline::WholeRequest(_) => None,
     };
     match (patience, interrupt) {
         (Some(patience), interrupt) => {

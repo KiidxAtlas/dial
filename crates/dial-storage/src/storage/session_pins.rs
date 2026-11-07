@@ -3,12 +3,9 @@
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
 };
-
-use crate::platform::fs as platform_fs;
 
 static LOCK: Mutex<()> = Mutex::new(());
 
@@ -63,22 +60,11 @@ pub fn unpin(user_dir: &Path, session_id: &str) -> Result<()> {
 
 /// Atomic replace: write a private temp file, fsync, then rename over the target.
 fn write(user_dir: &Path, ids: &[String]) -> Result<()> {
-    fs::create_dir_all(user_dir).with_context(|| format!("creating {}", user_dir.display()))?;
+    crate::platform::atomic::private_dir(user_dir)?;
     let path = file(user_dir);
-    let tmp = crate::config::paths::session_pins_temp_file(
-        user_dir,
-        &crate::storage::session::random_hex(4),
-    );
-    let body = serde_json::to_vec_pretty(ids)?;
-    let mut out =
-        platform_fs::open_owner_only(OpenOptions::new().write(true).create_new(true), &tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-    out.write_all(&body)?;
-    out.write_all(b"\n")?;
-    platform_fs::sync_file(&out)?;
-    drop(out);
-    fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    let mut body = serde_json::to_vec_pretty(ids)?;
+    body.push(b'\n');
+    crate::platform::atomic::write_private(&path, &body)
 }
 
 /// Stable partition: pinned ids first, each group keeps its incoming order.

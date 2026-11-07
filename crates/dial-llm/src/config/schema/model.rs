@@ -5,7 +5,21 @@ const CACHE_WARM: EnumValues = &[
     ("streaming", "While streaming"),
     ("idle", "Streaming and idle"),
 ];
-pub(super) static DECLARATIONS: &[SettingDef] = &[
+pub(super) static MODEL: &[SettingDef] = &[
+    field!(
+        "codebase.context_max_bytes",
+        codebase.context_max_bytes,
+        MO,
+        "Project understanding",
+        "Context budget (bytes)",
+        "Maximum saved project context added to a user turn; 0 means unlimited, subject to model context capacity.",
+        Kind::Int {
+            min: 0,
+            max: 24000,
+            step: 1024
+        },
+        true
+    ),
     field!(
         "context_window",
         context_limit,
@@ -144,6 +158,15 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         true
     ),
     field!(
+        "improve.teach",
+        improve.teach,
+        MO,
+        "Learning",
+        "Teach this model",
+        "Local models only (MLX, Ollama, LM Studio). Turns that prove good become training examples: passing behavioral checks, committing the changes, or Alt+Up. /undo and Alt+Down mark a bad turn. The latest version admitted by /improve train serves your sessions. Hosted models are never recorded.",
+        Kind::Bool,
+    ),
+    field!(
         "remote_model_idle_timeout_secs",
         remote_model_idle_timeout_secs,
         MO,
@@ -254,6 +277,15 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         true
     ),
     field!(
+        "compute_locks",
+        compute_locks,
+        MO,
+        "Local worker",
+        "Compute locks",
+        "Coordinate background training and maintenance with sessions. Sessions with local models share compute and never wait on each other; background work waits for them and yields to coding. Turn off to run background work concurrently; it may exhaust RAM/GPU memory. Pause and stop controls still apply. Laya never requires this lock.",
+        Kind::Bool,
+    ),
+    field!(
         "efficiency.history_token_cap",
         efficiency.history_token_cap,
         MO,
@@ -275,6 +307,20 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Task evidence packet",
         "Append a transient packet with the active todo, recorded findings and constraints to every request while a task is in progress. Off sends only a one-line task focus.",
         Kind::Bool,
+        true
+    ),
+    field!(
+        "efficiency.batch_result_percent",
+        efficiency.batch_result_percent,
+        MO,
+        "Roles & Sampling",
+        "Reply result budget (%)",
+        "Share of the remaining context window that the tool results of one reply may fill together. The largest successful results are clipped first and keep their full text as an artifact; errors and edits are never clipped. 0 turns the budget off.",
+        Kind::Int {
+            min: 0,
+            max: 80,
+            step: 5
+        },
         true
     ),
     field!(
@@ -380,38 +426,6 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         true
     ),
     field!(
-        "codebase.context_max_bytes",
-        codebase.context_max_bytes,
-        MO,
-        "Project understanding",
-        "Context budget (bytes)",
-        "Maximum saved project context added to a user turn; 0 means unlimited, subject to model context capacity.",
-        Kind::Int {
-            min: 0,
-            max: 24000,
-            step: 1024
-        },
-        true
-    ),
-    field!(
-        "improve.teach",
-        improve.teach,
-        MO,
-        "Learning",
-        "Teach this model",
-        "Local models only (MLX, Ollama, LM Studio). Turns that prove good become training examples: passing behavioral checks, committing the changes, or Alt+Up. /undo and Alt+Down mark a bad turn. The latest version admitted by /improve train serves your sessions. Hosted models are never recorded.",
-        Kind::Bool,
-    ),
-    field!(
-        "compute_locks",
-        compute_locks,
-        MO,
-        "Local worker",
-        "Compute locks",
-        "Coordinate background training and maintenance with sessions. Sessions with local models share compute and never wait on each other; background work waits for them and yields to coding. Turn off to run background work concurrently; it may exhaust RAM/GPU memory. Pause and stop controls still apply. Laya never requires this lock.",
-        Kind::Bool,
-    ),
-    field!(
         "retry.fallback_on",
         retry.fallback_on,
         MO,
@@ -454,20 +468,9 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         },
         true
     ),
-    field!(
-        "efficiency.batch_result_percent",
-        efficiency.batch_result_percent,
-        MO,
-        "Roles & Sampling",
-        "Reply result budget (%)",
-        "Share of the remaining context window that the tool results of one reply may fill together. The largest successful results are clipped first and keep their full text as an artifact; errors and edits are never clipped. 0 turns the budget off.",
-        Kind::Int {
-            min: 0,
-            max: 80,
-            step: 5
-        },
-        true
-    ),
+];
+
+pub(super) static EFFICIENCY: &[SettingDef] = &[
     field!(
         "efficiency.preserve_task_inputs",
         efficiency.preserve_task_inputs,
@@ -503,3 +506,5 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         true
     ),
 ];
+
+pub(super) static GROUPS: &[&[SettingDef]] = &[MODEL, EFFICIENCY];

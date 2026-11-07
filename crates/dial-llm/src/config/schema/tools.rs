@@ -1,15 +1,16 @@
 //! Tools setting declarations. Defaults derive from typed configuration fields.
 use super::*;
-pub(super) static DECLARATIONS: &[SettingDef] = &[
-    field!(
-        "approval",
-        approval,
-        IN,
-        "Approvals",
-        "Approval mode",
-        "Write: workspace edits and non-destructive shell commands run without a prompt; destructive or privileged commands and tools that leave the workspace still ask. Ask: prompt before every write, edit and shell command. Auto: never prompt. Read-only: only read tools run.",
-        Kind::Enum(APPROVAL),
-    ),
+pub(super) static APPROVAL_POLICY: &[SettingDef] = &[field!(
+    "approval",
+    approval,
+    IN,
+    "Approvals",
+    "Approval mode",
+    "Write: workspace edits and non-destructive shell commands run without a prompt; destructive or privileged commands and tools that leave the workspace still ask. Ask: prompt before every write, edit and shell command. Auto: never prompt. Read-only: only read tools run.",
+    Kind::Enum(APPROVAL),
+)];
+
+pub(super) static SANDBOX_AND_EDITING: &[SettingDef] = &[
     field!(
         "sandbox.mode",
         sandbox.mode,
@@ -37,6 +38,26 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Sandbox",
         "Extra writable paths",
         "Additional directories shell commands may write to in dev mode, comma separated (e.g. ~/.cargo, ~/.npm).",
+        Kind::StringList,
+        true
+    ),
+    field!(
+        "sandbox.network_allow",
+        sandbox.network_allow,
+        TO,
+        "Sandbox",
+        "Allowed network domains",
+        "Domains shell commands may reach when network is allowed, comma separated: example.com (exact), *.example.com (subdomains) or * (any). When this or the deny list is set, command traffic goes through Dial's filtering proxy and private addresses are blocked unless named exactly. Empty: unfiltered.",
+        Kind::StringList,
+        true
+    ),
+    field!(
+        "sandbox.network_deny",
+        sandbox.network_deny,
+        TO,
+        "Sandbox",
+        "Denied network domains",
+        "Domains shell commands may never reach, comma separated (same patterns as the allow list); denials win over allows.",
         Kind::StringList,
         true
     ),
@@ -224,6 +245,9 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Record bounded before/after source in private project state after a parse regression. Source is not redacted; opt in only when appropriate.",
         Kind::Bool,
     ),
+];
+
+pub(super) static EXECUTION: &[SettingDef] = &[
     field!(
         "edit.auto_repair.enabled",
         edit.auto_repair.enabled,
@@ -279,6 +303,30 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 64,
             step: 1
         },
+        true
+    ),
+    field!(
+        "portable_rules.repeat_after_turns",
+        portable_rules.repeat_after_turns,
+        TO,
+        "Portable rules",
+        "Repeat after turns",
+        "User turns after which a stream rule that already fired may fire again. 0 fires each rule at most once per session; its reminder stays delivered either way.",
+        Kind::Int {
+            min: 0,
+            max: 1000,
+            step: 1
+        },
+        true
+    ),
+    field!(
+        "portable_rules.judge",
+        portable_rules.judge,
+        TO,
+        "Portable rules",
+        "Judge question rules",
+        "Ask judged `question` rules about each completed main-agent reply. Auto: only when the decision role is assigned. On: the decision role, falling back to small and then the main model. Off: never. Judging never interrupts a reply.",
+        Kind::Enum(RULE_JUDGE),
         true
     ),
     field!(
@@ -349,6 +397,18 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         Kind::Bool,
     ),
     field!(
+        "shell.git_guard",
+        shell.git_guard,
+        TO,
+        "Shell",
+        "Git guard",
+        "Refuse shell commands that discard uncommitted work (git reset --hard, stash, checkout -- paths, restore, clean -f, switch --discard-changes). Workers: only delegated workers that share the parent's checkout. Always: every command. Off: never.",
+        Kind::Enum(GIT_GUARD),
+    ),
+];
+
+pub(super) static INTEGRATIONS: &[SettingDef] = &[
+    field!(
         "verification.behavioral_checks",
         verification.behavioral_checks,
         TO,
@@ -373,6 +433,15 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Verification",
         "Require declared outcome evidence",
         "Refuse completion when an operator-declared requirement has missing, failed or stale evidence. Does not invent requirements or grant execution permission.",
+        Kind::Bool,
+    ),
+    field!(
+        "verification.target_evidence",
+        verification.target_evidence,
+        TO,
+        "Verification",
+        "Require runs of requested paths",
+        "When the latest user request begins with run, launch, start, execute or play and names an existing workspace path, refuse completion until a bash or bg run naming that path was observed to stay running or exit zero after the last edit. Lexical and narrow; process evidence, not behavior verification. Grants no execution permission.",
         Kind::Bool,
     ),
     field!(
@@ -487,15 +556,6 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         Kind::Bool,
     ),
     field!(
-        "shell.git_guard",
-        shell.git_guard,
-        TO,
-        "Shell",
-        "Git guard",
-        "Refuse shell commands that discard uncommitted work (git reset --hard, stash, checkout -- paths, restore, clean -f, switch --discard-changes). Workers: only delegated workers that share the parent's checkout. Always: every command. Off: never.",
-        Kind::Enum(GIT_GUARD),
-    ),
-    field!(
         "task.prefer_subagents",
         task.prefer_subagents,
         TO,
@@ -504,59 +564,9 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Prefer specialist workers and tester-owned verification when useful. Off keeps coupled implementation and focused testing in the main loop, delegating for independent parallel work, fresh-context review or context isolation. Guidance only; permissions and worker limits are unchanged.",
         Kind::Bool,
     ),
-    field!(
-        "portable_rules.repeat_after_turns",
-        portable_rules.repeat_after_turns,
-        TO,
-        "Portable rules",
-        "Repeat after turns",
-        "User turns after which a stream rule that already fired may fire again. 0 fires each rule at most once per session; its reminder stays delivered either way.",
-        Kind::Int {
-            min: 0,
-            max: 1000,
-            step: 1
-        },
-        true
-    ),
-    field!(
-        "portable_rules.judge",
-        portable_rules.judge,
-        TO,
-        "Portable rules",
-        "Judge question rules",
-        "Ask judged `question` rules about each completed main-agent reply. Auto: only when the decision role is assigned. On: the decision role, falling back to small and then the main model. Off: never. Judging never interrupts a reply.",
-        Kind::Enum(RULE_JUDGE),
-        true
-    ),
-    field!(
-        "sandbox.network_allow",
-        sandbox.network_allow,
-        TO,
-        "Sandbox",
-        "Allowed network domains",
-        "Domains shell commands may reach when network is allowed, comma separated: example.com (exact), *.example.com (subdomains) or * (any). When this or the deny list is set, command traffic goes through Dial's filtering proxy and private addresses are blocked unless named exactly. Empty: unfiltered.",
-        Kind::StringList,
-        true
-    ),
-    field!(
-        "sandbox.network_deny",
-        sandbox.network_deny,
-        TO,
-        "Sandbox",
-        "Denied network domains",
-        "Domains shell commands may never reach, comma separated (same patterns as the allow list); denials win over allows.",
-        Kind::StringList,
-        true
-    ),
-    field!(
-        "verification.target_evidence",
-        verification.target_evidence,
-        TO,
-        "Verification",
-        "Require runs of requested paths",
-        "When the latest user request begins with run, launch, start, execute or play and names an existing workspace path, refuse completion until a bash or bg run naming that path was observed to stay running or exit zero after the last edit. Lexical and narrow; process evidence, not behavior verification. Grants no execution permission.",
-        Kind::Bool,
-    ),
+];
+
+pub(super) static EVAL: &[SettingDef] = &[
     field!(
         "eval.portable_helpers",
         eval.portable_helpers,
@@ -593,4 +603,12 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Run eligible read-only eval batch entries together through the shared scheduler. Disable to retain ordered serial execution for an ablation.",
         Kind::Bool
     ),
+];
+
+pub(super) static GROUPS: &[&[SettingDef]] = &[
+    APPROVAL_POLICY,
+    SANDBOX_AND_EDITING,
+    EXECUTION,
+    INTEGRATIONS,
+    EVAL,
 ];

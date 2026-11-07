@@ -9,12 +9,42 @@ fn batch_receipts_preserve_partial_effects_and_refused_entries() {
     let uncertain =
         ToolOutput::err("interrupted").with_effects(crate::runtime::execution::Effects::Unknown);
     let output = code_batch_output(vec![done, blocked, uncertain]);
+    assert_eq!(
+        output.execution.changed_paths,
+        [PathBuf::from("output.bin")]
+    );
+    assert_eq!(
+        output.execution.effects,
+        crate::runtime::execution::Effects::Unknown
+    );
+    assert!(
+        output.is_error,
+        "unknown batch effects cannot be hidden by per-entry results"
+    );
     let data = output.data.unwrap();
     assert_eq!(data[0]["changed_paths"][0], "output.bin");
     assert_eq!(data[1]["status"], "blocked");
     assert_eq!(data[1]["effects"], "none");
     assert_eq!(data[2]["effects"], "unknown");
     assert_eq!(data[2]["index"], 2);
+}
+
+#[test]
+fn settled_callback_batches_keep_their_native_accounting_receipt() {
+    let mut done = ToolOutput::ok("written".into()).with_changes([PathBuf::from("output.bin")]);
+    done.execution.mutation_settled = true;
+    let output = code_batch_output(vec![done, ToolOutput::err("later callback failed")]);
+    assert!(output.execution.mutation_settled);
+    assert_eq!(
+        output.execution.changed_paths,
+        [PathBuf::from("output.bin")]
+    );
+    let unsettled = ToolOutput::ok("new write".into()).with_changes([PathBuf::from("other.bin")]);
+    assert!(
+        !code_batch_output(vec![output, unsettled])
+            .execution
+            .mutation_settled
+    );
 }
 
 fn request(messages: Vec<Value>) -> Chat {

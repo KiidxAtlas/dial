@@ -121,6 +121,14 @@ fn read_line_capped(
     buf.clear();
     let mut seen = false;
     let mut truncated = false;
+    // A chunk-final `\r` is held back until the next chunk shows whether it ends a CRLF, so a
+    // line of exactly `cap` bytes is not reported as truncated (and keeps its edit witness).
+    let mut held_cr = false;
+    let mut push = |buf: &mut Vec<u8>, bytes: &[u8]| {
+        let room = cap.saturating_sub(buf.len());
+        truncated |= bytes.len() > room;
+        buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    };
     loop {
         let chunk = match reader.fill_buf() {
             Ok(chunk) => chunk,
@@ -128,22 +136,59 @@ fn read_line_capped(
             Err(e) => return Err(e),
         };
         if chunk.is_empty() {
-            return Ok(seen.then_some(truncated));
+            if held_cr {
+                push(buf, b"\r");
+            }
+            break;
         }
         seen = true;
         let newline = chunk.iter().position(|&b| b == b'\n');
         let consumed = newline.map_or(chunk.len(), |i| i + 1);
         let content = &chunk[..newline.unwrap_or(chunk.len())];
-        let room = cap.saturating_sub(buf.len());
-        truncated |= content.len() > room;
-        buf.extend_from_slice(&content[..content.len().min(room)]);
+        if held_cr && newline != Some(0) {
+            push(buf, b"\r");
+        }
+        held_cr = false;
+        let content = match content.strip_suffix(b"\r") {
+            Some(body) if newline.is_some() => body,
+            Some(body) => {
+                held_cr = true;
+                body
+            }
+            None => content,
+        };
+        push(buf, content);
         reader.consume(consumed);
         if newline.is_some() {
-            if !truncated && buf.last() == Some(&b'\r') {
-                buf.pop();
-            }
-            return Ok(Some(truncated));
+            break;
         }
+    }
+    if truncated {
+        trim_partial_utf8(buf);
+    }
+    Ok(seen.then_some(truncated))
+}
+
+/// Drop an incomplete UTF-8 sequence left at the end of a byte-capped line, so the cut does not
+/// render as U+FFFD. Invalid bytes elsewhere (non-UTF-8 files) are kept for lossy display.
+fn trim_partial_utf8(buf: &mut Vec<u8>) {
+    let continuations = buf
+        .iter()
+        .rev()
+        .take(3)
+        .take_while(|&&b| b & 0xC0 == 0x80)
+        .count();
+    let Some(lead) = buf.len().checked_sub(continuations + 1) else {
+        return;
+    };
+    let needed = match buf[lead] {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => return,
+    };
+    if continuations + 1 < needed {
+        buf.truncate(lead);
     }
 }
 
@@ -666,18 +711,20 @@ pub(in crate::tools) fn read_plain(
         return Ok(empty_read(len));
     }
     let capped = stopped_at.is_some();
-    let next = stopped_at.or_else(|| {
-        spans
-            .last()
-            .filter(|s| s.bounded && s.end < len)
-            .map(|s| s.end + 1)
-    });
+    let next = stopped_at
+        .and_then(|n| select::resume(&spans, n, len))
+        .or_else(|| {
+            spans
+                .last()
+                .filter(|s| s.bounded && s.end < len)
+                .map(|s| format!("{}-", s.end + 1))
+        });
     out.push_str(&select::footer(
         &crate::tools::edit::edit_source::display_path(ws.rel(&path)),
         sel,
         &shown,
         len,
-        next,
+        next.as_deref(),
         capped,
     ));
     if meta.len() <= MAX_EDIT_FILE

@@ -325,6 +325,61 @@ fn anthropic_native_compaction_requests_carry_cache_breakpoints() {
     );
 }
 
+/// The retained wire tail keeps plain user text as a string; the stored prefix must replay.
+#[test]
+fn anthropic_native_compaction_prefix_replays_with_string_tail_content() {
+    use crate::llm::fake;
+    let server = fake::serve(vec![fake::json(
+        200,
+        &json!({"stop_reason":"compaction","content":[{"type":"compaction","content":"signed summary","signature":"sig"}],
+            "usage":{"input_tokens":3,"output_tokens":20}}),
+    )]);
+    let mut backend = Backend::new(
+        ProviderKind::AnthropicEndpoint {
+            base_url: server.url.clone(),
+            model: "claude-test".into(),
+            api_key: None,
+        },
+        Default::default(),
+        5,
+    );
+    backend.protocol = Some(llm::model_config::ApiProtocol::Anthropic);
+    let request = Chat {
+        messages: vec![
+            json!({"role":"user","content":"old user"}),
+            json!({"role":"assistant","content":"old answer"}),
+            json!({"role":"user","content":"retained user"}),
+        ],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 64,
+        seed: None,
+    };
+    let reply = backend
+        .compact_native(
+            NativeCompactionRequest {
+                request: &request,
+                capability: Some(NativeCompactionCapability::Anthropic),
+                streaming_v2: false,
+                retained_user_budget: 128,
+                first_kept: 2,
+                instructions: "summarize",
+            },
+            5,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+    let mut replay = request.clone();
+    replay.messages = reply.prefix.clone();
+    replay
+        .messages
+        .push(json!({"role":"user","content":"next request"}));
+    let body = crate::llm::provider::anthropic_request("claude-test", &replay).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["content"][0]["type"], "compaction");
+    assert!(body.to_string().contains("retained user"));
+}
+
 /// The cache-reading contract of a live-prefix summary on Anthropic Messages: the summary request
 /// is the live request's wire body with one instruction appended to the last user message, and
 /// every control that keys the cache (system, tools, `tool_choice`, thinking, effort) unchanged.

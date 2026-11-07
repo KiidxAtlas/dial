@@ -402,8 +402,28 @@ pub(in crate::agent) fn code_batch_calls(
 /// succeeds; a failed entry is reported in its own slot rather than raised.
 pub(in crate::agent) fn code_batch_output(outputs: Vec<ToolOutput>) -> ToolOutput {
     let failed = outputs.iter().filter(|output| output.is_error).count();
+    let changed: Vec<_> = outputs
+        .iter()
+        .filter(|output| !output.execution.changed_paths.is_empty())
+        .collect();
+    let mut execution = crate::runtime::execution::Execution {
+        changed_paths: changed
+            .iter()
+            .flat_map(|output| output.execution.changed_paths.iter().cloned())
+            .collect(),
+        mutation_settled: !changed.is_empty()
+            && changed
+                .iter()
+                .all(|output| output.execution.mutation_settled),
+        ..Default::default()
+    };
+    execution.changed_paths.sort();
+    execution.changed_paths.dedup();
+    let unknown = outputs
+        .iter()
+        .any(|output| output.execution.effects == tools::surface::outcome::Effects::Unknown);
     ToolOutput {
-        execution: Default::default(),
+        execution,
         text: format!(
             "tool.batch settled {} callback(s), {failed} failed",
             outputs.len()
@@ -424,6 +444,11 @@ pub(in crate::agent) fn code_batch_output(outputs: Vec<ToolOutput>) -> ToolOutpu
         )),
         is_error: false,
     }
+    .with_effects(if unknown {
+        tools::surface::outcome::Effects::Unknown
+    } else {
+        tools::surface::outcome::Effects::Known
+    })
 }
 
 pub(in crate::agent) fn parallel_tools_with_reads(
@@ -1126,6 +1151,12 @@ impl<'a> Agent<'a> {
                 ))
             });
             self.queue_hook_context(context);
+        }
+        out.execution
+            .invocation
+            .get_or_insert_with(crate::runtime::execution::Invocation::fresh);
+        if let Some(advice) = self.settle_tool_mutation(call, &mut out) {
+            crate::tools::surface::outcome::append_text(&mut out, &format!("\n\n{advice}"));
         }
         self.post_mutation_verification(call, &mut out, ui);
         out

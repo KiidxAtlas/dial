@@ -18,6 +18,32 @@ fn adapter_config_deserializes_defaults_and_rejects_unknown_fields() {
     assert!(toml::from_str::<DapAdapterConfig>("program = 'adapter'\nunknown = true").is_err());
 }
 
+#[test]
+fn schemas_expose_runtime_probes_and_logpoint_arguments() {
+    for tool in tools(&BTreeMap::new()) {
+        let schema = tool.schema();
+        let description = schema["function"]["description"].as_str().unwrap();
+        for term in ["probes", "logpoints", "setBreakpoints", "logMessage"] {
+            assert!(description.contains(term), "{} omits {term}", tool.name());
+        }
+        let help = schema["function"]["parameters"]["properties"]["breakpoints"]["description"]
+            .as_str()
+            .unwrap();
+        for term in [
+            "logMessage",
+            "condition",
+            "hitCondition",
+            "supportsLogPoints",
+        ] {
+            assert!(
+                help.contains(term),
+                "{} breakpoint help omits {term}",
+                tool.name()
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 fn fake_adapter(dir: &Path, mode: &str) -> DapAdapterConfig {
     let script = dir.join("adapter.py");
@@ -201,4 +227,42 @@ fn breakpoint_actions_merge_into_the_session_book() {
 
     let invalid = tool.call(&ctx, &json!({"action":"removeBreakpoint","source":source}));
     assert!(invalid.is_error);
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_probe_options_are_refused_without_poisoning_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let configs = BTreeMap::from([("fake".to_owned(), fake_adapter(dir.path(), "valid"))]);
+    let tool = pick(tools(&configs), "dap_fake");
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+    let source = json!({"path": "/src/main.rs"});
+
+    // This adapter advertises no optional breakpoint capabilities.
+    for (field, value) in [("logMessage", "value={value}"), ("hitCondition", "3")] {
+        let mut breakpoint = json!({"line": 20});
+        breakpoint[field] = json!(value);
+        let refused = tool.call(
+            &ctx,
+            &json!({"action":"setBreakpoints","source":source,"breakpoints":[breakpoint]}),
+        );
+        assert!(refused.is_error, "{}", refused.text);
+        assert!(
+            refused
+                .text
+                .contains(&format!("adapter does not support breakpoint {field}")),
+            "{}",
+            refused.text
+        );
+    }
+
+    let ordinary = tool.call(
+        &ctx,
+        &json!({"action":"setBreakpoints","source":source,"breakpoints":[{"line":5}]}),
+    );
+    assert!(!ordinary.is_error, "{}", ordinary.text);
+    let response: Value = serde_json::from_str(&ordinary.text).unwrap();
+    assert_eq!(response["args"]["breakpoints"], json!([{"line":5}]));
 }

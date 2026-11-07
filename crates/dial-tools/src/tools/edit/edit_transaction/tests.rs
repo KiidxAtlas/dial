@@ -283,3 +283,40 @@ fn applied_client_write_with_lost_acknowledgement_has_unknown_effects() {
     assert!(!output.text.contains("was not written"), "{}", output.text);
     assert!(output.text.contains("not confirmed"), "{}", output.text);
 }
+
+/// A local multi-target commit replaces, creates and deletes as asked, keeps permissions and a
+/// second hard link on the original inode, and leaves no staging or backup entries behind.
+#[cfg(unix)]
+#[test]
+fn local_commit_installs_every_target_and_leaves_no_staging_entries() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, ws, a) = project(None);
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::fs::hard_link(&a, dir.path().join("alias.txt")).unwrap();
+    std::fs::write(dir.path().join("gone.txt"), "bye\n").unwrap();
+    let gone = ws.resolve("gone.txt").unwrap();
+    let created = ws.resolve("new.txt").unwrap();
+    let changes = [
+        Change::load(&ws, a.clone(), Some("edited\n".into())).unwrap(),
+        Change::load(&ws, gone.clone(), None).unwrap(),
+        Change::load(&ws, created.clone(), Some("fresh\n".into())).unwrap(),
+    ];
+    commit(&ws, &changes).unwrap();
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "edited\n");
+    assert_eq!(
+        std::fs::metadata(&a).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("alias.txt")).unwrap(),
+        "disk\n"
+    );
+    assert!(!gone.exists());
+    assert_eq!(std::fs::read_to_string(&created).unwrap(), "fresh\n");
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".dial-edit-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}

@@ -4,6 +4,30 @@ use super::*;
 const HOSTED: &str = "[endpoint]\nbase_url='https://example.com/v1'";
 
 #[test]
+fn enabled_interactive_questions_fit_without_crowding_out_hosted_core_capabilities() {
+    with_agent(&format!("{HOSTED}\n[ask]\nenabled=true"), |agent| {
+        let offered = agent.offered();
+        for name in [
+            "ask", "read", "write", "edit", "bash", "bg", "task", "message",
+        ] {
+            assert!(
+                offered.iter().any(|tool| tool == name),
+                "{name}: {offered:?}"
+            );
+        }
+        if agent.automatic_eval_ready() {
+            assert!(offered.iter().any(|tool| tool == "eval"), "{offered:?}");
+        }
+        assert!(
+            serde_json::to_vec(&agent.schemas(&offered).unwrap())
+                .unwrap()
+                .len()
+                <= Agent::HOSTED_CORE_SCHEMA_BYTES
+        );
+    });
+}
+
+#[test]
 fn automatic_eval_exposure_can_be_ablated_without_refusing_an_explicit_load() {
     with_agent("[eval]\nauto_offer=false", |agent| {
         assert!(!agent.offered().iter().any(|name| name == "eval"));

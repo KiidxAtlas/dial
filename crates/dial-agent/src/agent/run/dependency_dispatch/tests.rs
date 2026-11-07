@@ -319,8 +319,8 @@ fn grouped_verification_runs_once_after_all_source_epochs_and_bookkeeping_settle
     let calls = [call("write", "a"), todo, last];
     agent.verify_batch.begin(&calls);
     assert_eq!(agent.dependency_wave(&calls).calls.len(), 3);
-    let results = agent.dispatch_dependency_wave(&mut backend(), &calls, &mut NullUi, None);
-    for (call, (out, _)) in calls.iter().zip(&results) {
+    let mut results = agent.dispatch_dependency_wave(&mut backend(), &calls, &mut NullUi, None);
+    for (call, (out, _)) in calls.iter().zip(&mut results) {
         assert!(!out.is_error, "{}: {}", call.name, out.text);
         agent.settle_tool_mutation(call, out); // ordinary settlement must not stale the checks
     }

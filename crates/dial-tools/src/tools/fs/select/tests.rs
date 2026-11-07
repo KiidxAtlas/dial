@@ -126,16 +126,33 @@ fn footer_states_range_total_and_continuation() {
         "[lines 5, 9-12 of 20]\n"
     );
     assert_eq!(
-        footer("f", &none, &[(1, 2)], 9, Some(3), false),
+        footer("f", &none, &[(1, 2)], 9, Some("3-"), false),
         "[lines 1-2 of 9; continue with `f:3-`]\n"
     );
     assert_eq!(footer("f", &raw, &[(2, 3)], 5, None, false), "");
     assert_eq!(
-        footer("f", &raw, &[(1, 2)], 9, Some(3), false),
-        "[continue with `f:3-`]\n"
+        footer("f", &raw, &[(1, 2)], 9, Some("3-"), false),
+        "[continue with `f:raw:3-`]\n"
     );
     assert_eq!(
-        footer("f", &none, &[(1, 2)], 9, Some(3), true),
+        footer("f", &none, &[(1, 2)], 9, Some("3-"), true),
         "[output truncated at the byte budget after line 2 of 9; continue with `f:3-`]\n"
+    );
+}
+
+#[test]
+fn resume_keeps_the_bounds_and_later_ranges_of_a_capped_read() {
+    let spans = [span(5, 16, false), span(960, 973, false)];
+    assert_eq!(resume(&spans, 10, 1000).as_deref(), Some("10-16,960-973"));
+    assert_eq!(resume(&spans, 960, 1000).as_deref(), Some("960-973"));
+    assert_eq!(resume(&spans, 970, 971).as_deref(), Some("970-971"));
+    assert_eq!(resume(&spans, 974, 1000), None);
+    assert_eq!(
+        resume(&[span(1, 50, false)], 30, 100).as_deref(),
+        Some("30-50")
+    );
+    assert_eq!(
+        resume(&[span(1, 2000, true)], 30, 5000).as_deref(),
+        Some("30-")
     );
 }

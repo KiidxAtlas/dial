@@ -92,7 +92,7 @@ impl SettingsOverlay {
         }
         // Never silently expand a filtered selection to a hidden partner.
         if expected.keys().any(|path| {
-            pair_partner(path).is_some_and(|partner| {
+            crate::config::schema::pair_partner(path).is_some_and(|partner| {
                 crate::config::schema::get(self.layer_ref(self.scope), partner).is_some()
                     && !expected.contains_key(partner)
             })

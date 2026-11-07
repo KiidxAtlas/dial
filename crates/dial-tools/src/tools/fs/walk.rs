@@ -245,8 +245,34 @@ impl<'a> SearchWalk<'a> {
         if !self.gitignore {
             return rules;
         }
-        let root = self.ws.root.clone();
-        let Some(parent) = start.strip_prefix(&root).ok().and_then(Path::parent) else {
+        // Scopes inside an extra read root take that root's rules, as `Walk::run` does.
+        let root = self
+            .ws
+            .root_containing(start)
+            .unwrap_or(&self.ws.root)
+            .to_path_buf();
+        let Ok(relative) = start.strip_prefix(&root) else {
+            return rules;
+        };
+        // `.git/info/exclude` applies repository-wide at the lowest precedence (rules match
+        // last-pushed first), as it does for `Walk` and git itself. A worktree's `.git` file
+        // has no `info/` beside it.
+        let git = root.join(".git");
+        if std::fs::symlink_metadata(&git).is_ok_and(|meta| meta.is_dir()) {
+            match bounded_ignore(
+                &root,
+                &git.join("info").join("exclude"),
+                &mut self.ignore_bytes,
+            ) {
+                Ok(Some(rule)) => rules.push(rule),
+                Ok(None) => {}
+                Err(()) => {
+                    self.unreadable += 1;
+                    self.omit(&git, "unavailable repository exclude rules");
+                }
+            }
+        }
+        let Some(parent) = relative.parent() else {
             return rules;
         };
         let mut directory = root;

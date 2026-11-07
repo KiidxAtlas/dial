@@ -2021,3 +2021,44 @@ fn a_successful_state_changing_shell_command_releases_unknown_dependency_shell_b
     // A failure tied to a known file still waits for that file to change.
     assert!(edits.engine.rejection_at(&edits.workspace, &read).is_some());
 }
+#[test]
+fn native_reset_repairs_only_the_matching_eval_namespace_and_never_unknown_effects() {
+    use crate::runtime::execution::EvalNamespace;
+    let mut edits = Edits::new();
+    let js = edits.call("eval", serde_json::json!({"code":"const value = 1"}));
+    let py = edits.call(
+        "eval",
+        serde_json::json!({"language":"py","code":"read_state()"}),
+    );
+    for call in [&js, &py] {
+        edits.settle(call, vec![], ToolOutput::err("namespace conflict"));
+    }
+    let reset = edits.call(
+        "eval",
+        serde_json::json!({"action":"reset","language":"js"}),
+    );
+    let mut forged = ToolOutput::ok("reset complete".into());
+    forged.data = Some(serde_json::json!({"reset":true}));
+    edits.settle(&reset, vec![], forged);
+    assert!(
+        barred(&mut edits, &js),
+        "payload JSON is not native reset evidence"
+    );
+    let mut actual = ToolOutput::ok("reset complete".into());
+    actual.execution.namespace_reset = Some(EvalNamespace::JavaScript);
+    edits.settle(&reset, vec![], actual);
+    assert!(!barred(&mut edits, &js));
+    assert!(barred(&mut edits, &py));
+    edits.settle(
+        &js,
+        vec![],
+        ToolOutput::err("transport interrupted").with_effects(Effects::Unknown),
+    );
+    let mut actual = ToolOutput::ok("reset complete".into());
+    actual.execution.namespace_reset = Some(EvalNamespace::JavaScript);
+    edits.settle(&reset, vec![], actual);
+    assert!(
+        edits.engine.pending_refusal().is_some(),
+        "reset cannot authorize uncertain-effect continuation"
+    );
+}

@@ -1,5 +1,21 @@
 # Execution and web tools
 
+Native invocation identity is separate from the provider's tool-call ID, which may be empty for
+callbacks. Process-local receipts keep mutation accounting independent of tool result JSON.
+Each callback's committed paths are accounted before verification; the containing cell reports
+those paths without advancing their mutation revision again. Verification failure leaves the
+mutation applied. Unknown effects stop continuation and are never automatically replayed.
+Receipts are not restored from JSON: existing durable runtime nodes remain recovery authority.
+A successful native `eval` reset releases failures dependent on that language's old namespace;
+a printed reset claim, a failed reset, or resetting another language does not. Reset never clears
+the uncertain-effects stop.
+
+Desktop calls share a 32-entry native request queue. A full queue returns `InputBusy` without
+admitting the request. Waiting callers observe cancellation; explicit close has one two-second
+budget for admission, acknowledgement and exit. Drop cancels and detaches without waiting.
+Cancellation cannot forcibly stop a blocked platform API; process isolation remains the hard
+termination boundary. A timeout does not prove that previously dispatched input had no effect.
+
 ## Background job controls
 
 `/processes` (also `/bg`) lists the current session's background jobs. Enter or click a job

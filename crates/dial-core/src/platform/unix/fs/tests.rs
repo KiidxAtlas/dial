@@ -97,3 +97,28 @@ fn relative_mutations_reject_escaping_or_invalid_names() {
         assert!(remove_dir_beneath(&root, name).is_err(), "rmdir {name:?}");
     }
 }
+
+#[test]
+fn exchange_swaps_two_entries_without_following_links_or_freeing_a_name() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = open_dir_nofollow(parent.path()).unwrap();
+    std::fs::write(parent.path().join("a"), b"first").unwrap();
+    std::fs::write(parent.path().join("b"), b"second").unwrap();
+    match exchange_beneath(&root, Path::new("a"), Path::new("b")) {
+        Ok(()) => {
+            assert_eq!(std::fs::read(parent.path().join("a")).unwrap(), b"second");
+            assert_eq!(std::fs::read(parent.path().join("b")).unwrap(), b"first");
+        }
+        // A filesystem without an exchange primitive must leave both names unchanged.
+        Err(error) => {
+            eprintln!("exchange unsupported here: {error}");
+            assert_eq!(std::fs::read(parent.path().join("a")).unwrap(), b"first");
+            assert_eq!(std::fs::read(parent.path().join("b")).unwrap(), b"second");
+        }
+    }
+    assert!(exchange_beneath(&root, Path::new("a"), Path::new("missing")).is_err());
+    assert!(parent.path().join("a").exists());
+    for name in ["", "..", "two/names", "nul\0name"] {
+        assert!(exchange_beneath(&root, Path::new(name), Path::new("a")).is_err());
+    }
+}

@@ -2623,11 +2623,13 @@ fn anthropic_request_variant(
                 let replay = message["dial_anthropic_compaction"]["history"]
                     .as_array()
                     .context("invalid stored Anthropic compaction history")?;
+                // The retained tail is the Messages wire form, where plain text stays a string.
                 ensure!(
-                    replay
-                        .iter()
-                        .all(|m| matches!(m["role"].as_str(), Some("user" | "assistant"))
-                            && m["content"].is_array()),
+                    replay.iter().all(|m| {
+                        matches!(m["role"].as_str(), Some("user" | "assistant"))
+                            && (m["content"].is_array()
+                                || m["content"].as_str().is_some_and(|text| !text.is_empty()))
+                    }),
                     "invalid stored Anthropic native compaction messages"
                 );
                 messages.extend_from_slice(replay);

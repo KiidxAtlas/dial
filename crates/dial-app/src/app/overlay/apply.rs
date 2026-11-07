@@ -79,7 +79,7 @@ impl OverlayEnv<'_> {
                         value,
                     }];
                     // The embedding override saves as a pair: add the half the panel held back.
-                    let partner = crate::ui::overlay::settings::pair_partner(&path);
+                    let partner = crate::config::schema::pair_partner(&path);
                     if let ActiveOverlay::Settings(settings) = &mut *overlay
                         && let Some((staged, staged_value)) = settings.take_staged_pair()
                         && Some(staged.as_str()) == partner
@@ -96,7 +96,7 @@ impl OverlayEnv<'_> {
                 *self.scope = scope;
                 let mut changes = vec![Change::Remove { path: path.clone() }];
                 // Clearing one half of the embedding override clears the pair.
-                if let Some(partner) = crate::ui::overlay::settings::pair_partner(&path) {
+                if let Some(partner) = crate::config::schema::pair_partner(&path) {
                     changes.push(Change::Remove {
                         path: partner.to_owned(),
                     });

@@ -191,6 +191,25 @@ fn builtin_profiles_share_priority_and_safety_contracts() {
 }
 
 #[test]
+fn standalone_artifact_acceptance_guidance_requires_verify_in_every_profile() {
+    for (lean, one_call) in [(false, false), (true, false), (true, true)] {
+        for offered in [false, true] {
+            let tools = if offered {
+                names(&["read", "edit", "bash", "verify"])
+            } else {
+                names(&["read", "edit", "bash"])
+            };
+            let policy = guidance_for(&tools, lean, one_call);
+            assert_eq!(
+                policy.contains(ARTIFACT_CHECK_RULE),
+                offered,
+                "profile {lean}/{one_call}, verify offered: {offered}"
+            );
+        }
+    }
+}
+
+#[test]
 fn generated_artifact_policy_reaches_all_builtin_message_profiles() {
     let harness = Harness::default();
     let template = prompt_template::compile("CUSTOM TEMPLATE").unwrap();

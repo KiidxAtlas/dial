@@ -1,8 +1,52 @@
 use super::*;
-use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+use crate::agent::run::tool_exposure::default_offer_tests::with_agent as with_configured_agent;
 use crate::tools::integrations::ext::{Tool, ToolContext};
 use crate::tools::surface::catalog::Readiness;
 use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Synthetic ranking cases control the competing capabilities. The operator's default adapter
+/// catalog can gain stronger keyword matches without changing the contract being tested here.
+fn with_agent<T>(overlay: &str, run: impl FnOnce(&mut Agent<'_>) -> T) -> T {
+    with_configured_agent(overlay, |agent| {
+        let adapters: Vec<_> = agent
+            .ext
+            .names()
+            .filter(|name| *name == "dap" || name.starts_with("dap_"))
+            .map(str::to_owned)
+            .collect();
+        for name in adapters {
+            agent.ext.remove(&name);
+        }
+        run(agent)
+    })
+}
+
+#[test]
+fn configured_adapter_catalog_stays_eligible_without_starting_an_adapter() {
+    with_configured_agent("", |agent| {
+        let candidates = agent.eligible_candidates();
+        assert!(
+            candidates
+                .iter()
+                .any(|(name, _, _)| name.starts_with("dap_"))
+        );
+        let activated = agent
+            .activate_gap_capabilities(CapabilityGap::DiagnosticFailure, &mut BTreeSet::new())
+            .unwrap();
+        assert!(
+            !activated.is_empty() && activated.len() <= 3,
+            "{activated:?}"
+        );
+        for name in activated {
+            assert!(agent.tool_readiness(&name).automatic_candidate());
+            assert!(
+                candidates
+                    .iter()
+                    .any(|(candidate, _, _)| *candidate == name)
+            );
+        }
+    });
+}
 
 struct Capability {
     name: String,

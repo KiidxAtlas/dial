@@ -321,7 +321,7 @@ impl Tool for EvalTool {
             "eval",
             &crate::tools::surface::catalog::execution_description(
                 "eval",
-                "Persistent JavaScript or Python 3.8+ cells, with separate namespaces. Use for scripts, repeated lookups and transformations. Portable dial helpers (JS await, Python synchronous): read/readText/readJson/readBytes, writeText/writeJson/writeBytes, run, batch, snapshot, fresh, check. Data is exact and capped at 1 MiB; writeBytes creates a new file, never overwrites. dial.batch raises on failed prerequisites with error.results; collect:true opts into mixed outcomes. dial.check(name, boolean) records a local check, not task-wide verification. Prove a tiny independent known-answer case before large generation. dial.snapshot(paths) retains source artifacts and rechecks hashes before recovery; it is not an atomic live-database snapshot. dial.fresh(receipt) rechecks inputs before reusing derived data. Keep large values in the namespace and print short results. Call tool.<name>(args) or tool.call(name,args) under normal approval: JS requires await; Python callbacks are synchronous dictionaries (also await-compatible, without replay). For many lookups you only need to aggregate or filter, use one eval cell: tool.batch([{name,args},...]) (JS and Python) runs read-only entries together and returns ordered {is_error,text,data} results. Denied or malformed callbacks raise ToolError. For generated data use one foreground cell (background:false): read original inputs programmatically, compute, serialize, write through tool.write, then assert saved bytes, unchanged inputs, expected shape and independently expected results. Do not transcribe source rows or printed values. Reuse namespace variables until inputs change; then reread and recompute. Print a short validation summary. Assertions cover the saved artifact; stdout alone is not check evidence, and equality alone does not prove the computation. A failed assertion does not undo or authorize replaying a write. Source/config changes use write/edit. reset/status/cancel are owner-scoped; cancel without language affects both. Timeout/cancel destroys the namespace and pending callbacks; callback time is excluded. Requires approval and OS containment; subprocesses/native JS addons are denied, and Windows Python requires explicit unsandboxed opt-in.",
+                "Persistent JavaScript (default) or Python 3.8+ cells with separate namespaces. Top-level bindings persist; prefer var for reusable JS bindings. Embedded JS has no Node modules. Portable dial helpers (JS await, Python synchronous): read/readText/readJson/readBytes, writeText/writeJson/writeBytes, run, batch, check, snapshot/fresh/restore, hex/pack/unpack. Exact I/O is capped at 1 MiB; writeBytes creates only. dial.batch raises with error.results unless collect:true; dial.check records local checks, not task-wide verification. Snapshots retain individual source bytes, not an atomic live-database backup. Call tool.<name>(args) or tool.call(name,args): JS await, Python synchronous dictionaries (also await-compatible, without replay). tool.batch([{name,args},...]) returns ordered {is_error,text,data}; eligible read-only entries run together. Normal approval applies; denied/malformed callbacks raise ToolError. For generated data use one foreground cell (background:false): read original inputs programmatically, compute, serialize, write, then assert saved bytes, unchanged inputs, shape and independently expected results. Do not transcribe source rows or printed values. Prove a tiny known-answer case first. Keep large values in the namespace; print short summaries. Stdout alone is not check evidence. Failed cells can leave effects: inspect receipts before retrying. reset/status/cancel are owner-scoped; cancel without language affects both. Timeout/cancel discards the namespace; callback time is excluded. OS containment is required; subprocesses/native addons are denied. Windows Python requires explicit unsandboxed opt-in.",
             ),
             json!({
                 "language":{"type":"string","enum":["js","py"],"description":"Runtime for this cell; defaults to js."},
@@ -461,6 +461,19 @@ impl Tool for EvalTool {
             if !images.is_empty() {
                 data.insert("dial_images".into(), json!(images));
             }
+        }
+        if !output.is_error
+            && args["action"] == "reset"
+            && output
+                .data
+                .as_ref()
+                .is_some_and(|data| data["reset"] == true)
+        {
+            output.execution.namespace_reset = match args["language"].as_str().unwrap_or("js") {
+                "js" => Some(crate::runtime::execution::EvalNamespace::JavaScript),
+                "py" => Some(crate::runtime::execution::EvalNamespace::Python),
+                _ => None,
+            };
         }
         output
     }

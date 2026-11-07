@@ -1,5 +1,15 @@
 # LLM transport behavior
 
+HTTP construction policy is explicit in the existing LLM owner: redirect handling, environment
+versus direct proxy routing, whole-request deadlines versus streaming patience, and cancellation.
+Construction installs TLS before use. Provider clients refuse redirects; unauthenticated model
+catalog discovery retains its explicit ten-redirect limit. Guarded web DNS/resolvers, provider
+authentication and WebSockets retain their specialized owners.
+
+Streaming parsers bound bytes and inspect patience between reads. They cannot interrupt an
+arbitrary blocking `Read`; network callers must supply the cancellation-aware reader, which polls
+below TLS and enforces the shared patience clock. A parser byte cap alone is not a deadline.
+
 The shared LLM layer provides bounded streaming, provider-aware error classification, retries, and request budgeting. Context-overflow classifications are kept attached to errors before any header redaction so compaction remains reliable. HTTP 413 is classified as a payload failure unless the body identifies a token/context limit; it must not trigger token compaction merely because its status is 413. oMLX's "prefill memory guard rejected this prompt" refusal (prefill would exceed the server's memory ceiling) is classified as context overflow, as an HTTP body or a stream error, so the turn compacts and retries a smaller prompt instead of failing.
 
 `[retry]` settings bound attempts and delays. Unhinted retries use bounded exponential backoff

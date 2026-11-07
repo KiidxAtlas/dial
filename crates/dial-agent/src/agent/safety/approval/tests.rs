@@ -2,6 +2,33 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn actual_notebook_actions_keep_their_approval_contract() {
+    let mut registry = Registry::new();
+    registry.register(std::sync::Arc::new(
+        crate::tools::fs::notebook::Notebook::default(),
+    ));
+    for action in ["read", "edit", "insert", "delete", "move"] {
+        let call = ToolCall {
+            id: "notebook-policy".into(),
+            name: "notebook".into(),
+            arguments: json!({"action":action,"path":"notes.ipynb"}),
+            malformed_arguments: false,
+        };
+        assert_eq!(needs_approval(&registry, &call), action != "read");
+        assert!(
+            !workspace_write(&call),
+            "notebook must retain its explicit mutation approval"
+        );
+    }
+    assert!(!workspace_write(&ToolCall {
+        id: String::new(),
+        name: "notebook_edit".into(),
+        arguments: json!({}),
+        malformed_arguments: false
+    }));
+}
+
+#[test]
 fn ssh_url_file_reads_require_approval() {
     let registry = Registry::new();
     assert!(!is_read_only(

@@ -53,3 +53,5 @@ benchmarks/
 !examples/benchmarks/
 examples/benchmarks/*
 !examples/benchmarks/lifecycle-efficiency.toml
+!examples/benchmarks/omp_gap.py
+!examples/benchmarks/test_omp_gap.py

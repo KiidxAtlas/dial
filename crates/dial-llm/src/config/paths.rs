@@ -209,10 +209,6 @@ pub fn oauth_refresh_lock_file(user_dir: &Path, id: &str, digest: &str) -> PathB
 pub fn mcp_oauth_file(user_dir: &Path, encoded_server: &str) -> PathBuf {
     user_dir.join(format!("mcp-oauth-{encoded_server}.json"))
 }
-pub fn session_pins_temp_file(user_dir: &Path, nonce: &str) -> PathBuf {
-    user_dir.join(format!(".session-pins.{}.{nonce}.tmp", std::process::id()))
-}
-
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub project_root: PathBuf,

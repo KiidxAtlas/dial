@@ -231,6 +231,86 @@ fn empty_check_selection_cannot_report_a_pass_or_a_prediction() {
 }
 
 #[test]
+fn no_applicable_checks_points_to_artifact_acceptance_without_claiming_a_pass() {
+    for mutations in [0, 1] {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let mut agent = hermetic_agent(&config, root.path());
+        agent.step_checks.mutations = mutations;
+        let before = agent
+            .step_checks
+            .evidence
+            .snapshot(agent.step_checks.revision());
+        let out = agent.verify_tool(&json!({}), &mut NullUi);
+        assert!(!out.is_error, "{}", out.text);
+        assert!(
+            out.text.contains("nothing ran; this is not a pass"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("acceptance: {name, command}"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("Do not repeat an unchanged verify"),
+            "{}",
+            out.text
+        );
+        let data = out.data.as_ref().unwrap();
+        assert_eq!(data["scope"]["applicable_checks"], 0);
+        assert_eq!(data["results"], json!([]));
+        assert_eq!(
+            agent
+                .step_checks
+                .evidence
+                .snapshot(agent.step_checks.revision()),
+            before,
+            "guidance must not create verification evidence"
+        );
+    }
+}
+
+#[test]
+fn standalone_artifact_acceptance_checks_actual_format_and_constraints() {
+    let command = "awk -F, 'NR == 1 { if ($0 != \"name,count\") exit 1; next } { if (NF != 2 || $1 != \"widget\" || $2 !~ /^[0-9]+$/ || $2 < 1 || $2 > 5) exit 1 } END { if (NR != 2) exit 1 }' report.csv || { echo 'assertion failed: report format or count constraint'; exit 1; }";
+    for (content, expected) in [
+        ("name,count\nwidget,3\n", "passed"),
+        ("name;count\nwidget;3\n", "code_failed"),
+        ("name,count\nwidget,9\n", "code_failed"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("report.csv"), content).unwrap();
+        let config = Config::default();
+        let mut agent = hermetic_agent(&config, root.path());
+        agent.step_checks.mutations = 1;
+        let empty = agent.verify_tool(&json!({}), &mut NullUi);
+        assert_eq!(empty.data.as_ref().unwrap()["results"], json!([]));
+        assert_eq!(agent.step_checks.evidence.latest_status(command), None);
+
+        let out = agent.verify_tool(
+            &json!({"acceptance":{"name":"report format and count","command":command}}),
+            &mut NullUi,
+        );
+        assert_eq!(out.is_error, expected != "passed", "{}", out.text);
+        let data = out.data.as_ref().unwrap();
+        assert_eq!(data["origin"], "model_registered");
+        assert_eq!(data["results"].as_array().unwrap().len(), 1);
+        assert_eq!(data["results"][0]["status"], expected, "{}", out.text);
+        assert_eq!(data["results"][0]["ran"], true);
+        assert_eq!(
+            agent
+                .step_checks
+                .evidence
+                .current_status(command, agent.step_checks.revision()),
+            expected
+        );
+        assert!(agent.config.verification.commands.is_empty());
+    }
+}
+
+#[test]
 fn empty_check_selection_still_runs_an_explicit_reproduction() {
     let root = tempfile::tempdir().unwrap();
     let config = Config::default();

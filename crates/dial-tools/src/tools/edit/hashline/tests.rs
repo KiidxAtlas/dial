@@ -247,6 +247,39 @@ fn unread_ranges_across_operations_and_files_are_revealed_in_one_retry() {
 }
 
 #[test]
+fn put_from_a_register_cut_later_in_the_same_call_is_refused_not_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let a = ws.resolve("a.txt").unwrap();
+    let b = ws.resolve("b.txt").unwrap();
+    let c = ws.resolve("c.txt").unwrap();
+    fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    fs::write(&b, "b\n").unwrap();
+    fs::write(&c, "stale\nc\n").unwrap();
+    // Fill @x in an earlier call so a stale value exists to be pasted by mistake.
+    let ctag = ws.store().record_all(&c, "stale\nc\n");
+    edit(&ws, &format!("[c.txt#{ctag}]\nCUT 1.=1 @x\n")).unwrap();
+    let original_a = fs::read_to_string(&a).unwrap();
+    let tag = ws.store().record_all(&a, &original_a);
+    let btag = ws.store().record_all(&b, "b\n");
+    let error = edit(
+        &ws,
+        &format!("[b.txt#{btag}]\nPUT >1 @x\n[a.txt#{tag}]\nCUT 3.=3 @x\n"),
+    )
+    .unwrap_err();
+    assert!(error.contains("put the CUT section first"), "{error}");
+    assert_eq!(fs::read_to_string(&a).unwrap(), original_a);
+    assert_eq!(fs::read_to_string(&b).unwrap(), "b\n");
+    // Authored in CUT-then-PUT order, the same move succeeds.
+    edit(
+        &ws,
+        &format!("[a.txt#{tag}]\nCUT 3.=3 @x\n[b.txt#{btag}]\nPUT >1 @x\n"),
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(&b).unwrap(), "b\nthree\n");
+}
+
+#[test]
 fn invalid_anchors_remain_visible_alongside_unread_previews() {
     for invalid_first in [true, false] {
         let dir = tempfile::tempdir().unwrap();

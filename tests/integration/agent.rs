@@ -1116,9 +1116,8 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
             .collect::<Vec<_>>()
     };
     let initial = names(0);
-    // Core tools are always offered, including `task`, `skill`, `message`, `verify`,
-    // `working_state` and the memory tools, so the initial set is the core, not
-    // `initial_tool_limit`. Specialists such as `side_request` and `git` are loadable.
+    // Basic workspace tools remain available within the compact offer. Optional helpers cannot
+    // displace them; specialists such as `side_request` and `git` require explicit loading.
     assert!(initial.len() <= 21, "{initial:?}");
     for core in [
         "read",

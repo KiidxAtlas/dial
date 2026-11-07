@@ -81,6 +81,33 @@ fn file_tools_read_and_write_under_an_added_root() {
     assert_eq!(std::fs::read_to_string(&created).unwrap(), "made\n");
 }
 
+/// A search scoped below an added root still applies that root's parent `.gitignore`, as it
+/// does under the primary root.
+#[test]
+fn search_scoped_inside_an_added_root_applies_its_parent_ignore_rules() {
+    let (_dir, mut ws) = workspace();
+    let extra = tempfile::tempdir().unwrap();
+    let root = extra.path().canonicalize().unwrap();
+    std::fs::write(root.join(".gitignore"), "dist/\n").unwrap();
+    for name in ["packages/web/src/kept.txt", "packages/web/dist/built.txt"] {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "ignore-canary\n").unwrap();
+    }
+    ws.add_root(&root).unwrap();
+    let scope = root.join("packages/web");
+    let grep = run(
+        &ws,
+        "grep",
+        json!({"path": scope, "pattern": "ignore-canary"}),
+    );
+    assert!(grep.text.contains("kept.txt"), "{}", grep.text);
+    assert!(!grep.text.contains("built.txt"), "{}", grep.text);
+    let glob = run(&ws, "glob", json!({"path": scope, "pattern": "**/*.txt"}));
+    assert!(glob.text.contains("kept.txt"), "{}", glob.text);
+    assert!(!glob.text.contains("built.txt"), "{}", glob.text);
+}
+
 /// An absolute path outside every root is a structural boundary refusal: `Blocked` with no
 /// effects, so recovery names the permission boundary instead of a malformed call.
 #[test]

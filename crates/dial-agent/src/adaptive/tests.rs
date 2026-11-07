@@ -5,6 +5,7 @@ use super::*;
 #[test]
 fn experimental_output_effort_raises_on_failure_but_never_overrides_an_explicit_pin() {
     let mut config = config();
+    config.provider = Some("anthropic".into());
     config.experimental.adaptive_output_effort = true;
     let mut profile = ModelProfile::minimal("anthropic", "test");
     profile.capabilities.reasoning = ReasoningApi::AnthropicAdaptive;
@@ -22,6 +23,10 @@ fn experimental_output_effort_raises_on_failure_but_never_overrides_an_explicit_
         .model_profiles
         .insert("fixed".into(), profile.clone());
     config.model_profile = Some("fixed".into());
+    assert!(
+        config.active_model_profile().is_some(),
+        "the pinned fixture must match the selected route"
+    );
     assert_eq!(
         experimental_output_effort(&config, &profile, OutputEffortSignal::RewritePressure),
         None

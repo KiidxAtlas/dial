@@ -17,7 +17,7 @@ const REASONING_STRATEGIES: EnumValues = &[
     ("minimal_change", "Minimal change"),
 ];
 
-pub(super) static DECLARATIONS: &[SettingDef] = &[
+pub(super) static EXPERIMENTS: &[SettingDef] = &[
     field!(
         "experimental.reasoning_strategy",
         experimental.reasoning_strategy,
@@ -198,13 +198,16 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Offer an optional `expect` (pass or fail) on `verify`. A mismatch is reported as a fact and the next request asks the model to explain it before editing again. Predictions never skip a check.",
         Kind::Bool,
     ),
-    field!(
-        "experimental.adaptive_output_effort",
-        experimental.adaptive_output_effort,
-        MO,
-        "Roles & Sampling",
-        "Adaptive native output effort",
-        "Experimental native Anthropic effort: low during routine work, high after failing checks or repeated unverified edits. Explicit effort profiles win. Off until measured.",
-        Kind::Bool
-    ),
 ];
+
+pub(super) static OUTPUT_EFFORT: &[SettingDef] = &[field!(
+    "experimental.adaptive_output_effort",
+    experimental.adaptive_output_effort,
+    MO,
+    "Roles & Sampling",
+    "Adaptive native output effort",
+    "Experimental native Anthropic effort: low during routine work, high after failing checks or repeated unverified edits. Explicit effort profiles win. Off until measured.",
+    Kind::Bool
+)];
+
+pub(super) static GROUPS: &[&[SettingDef]] = &[EXPERIMENTS, OUTPUT_EFFORT];

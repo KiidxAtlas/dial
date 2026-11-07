@@ -225,14 +225,10 @@ impl Agent<'_> {
         }
         // A mutation that ran the batch's `verify` already settled before running it.
         // Do not immediately stale that evidence by advancing the revision a second time.
+        let repro_advice = self.settle_tool_mutation(call, &mut output);
         let attached_verify = matches!(call.name.as_str(), "edit" | "write")
             .then(|| crate::agent::verify::verify_tool::post_mutation_verify(&output))
             .flatten();
-        let repro_advice = if attached_verify.is_some() {
-            None
-        } else {
-            self.settle_tool_mutation(call, &output)
-        };
         let committed = !output.execution.changed_paths.is_empty();
         if let Some(check) = attached_verify {
             outcome.checked = true;
@@ -564,7 +560,7 @@ impl Agent<'_> {
     pub(in crate::agent) fn settle_tool_mutation(
         &mut self,
         call: &ToolCall,
-        output: &ToolOutput,
+        output: &mut ToolOutput,
     ) -> Option<&'static str> {
         if let Some(checkpoints) = &self.checkpoints {
             checkpoints.settle_changes();
@@ -576,7 +572,7 @@ impl Agent<'_> {
                 && output.execution.effects != tools::surface::outcome::Effects::None
                 && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve"))
         {
-            if !self.verify_batch.settle_once(&call.id) {
+            if !self.verify_batch.settle_once(&mut output.execution) {
                 return None;
             }
             self.step_checks.mutations += 1;

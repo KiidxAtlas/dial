@@ -292,6 +292,7 @@ impl Agent<'_> {
             Callback(
                 crate::tools::integrations::ext::ToolCallback,
                 mpsc::SyncSender<ToolOutput>,
+                Option<u64>,
             ),
             Mutation(
                 String,
@@ -461,7 +462,7 @@ impl Agent<'_> {
                                 return interrupted_tool();
                             }
                             let (reply, result) = mpsc::sync_channel(1);
-                            if tx.send(Event::Callback(request, reply)).is_err() {
+                            if tx.send(Event::Callback(request, reply, crate::runtime::execution::root_invocation())).is_err() {
                                 return ToolOutput::err("code-mode controller disconnected");
                             }
                             loop {
@@ -607,9 +608,9 @@ impl Agent<'_> {
                                 ));
                             }
                         }
-                        Event::Callback(request, reply) => {
+                        Event::Callback(request, reply, parent_invocation) => {
                             callback_counts[position] += 1;
-                            let output = if !supports_callbacks {
+                            let mut output = if !supports_callbacks {
                                 ToolOutput::err(
                                     "this native tool has no code-mode callback capability",
                                 )
@@ -631,6 +632,9 @@ impl Agent<'_> {
                                     "code-mode callbacks require the agent execution controller",
                                 )
                             };
+                            if let Some(invocation) = &mut output.execution.invocation {
+                                invocation.parent = parent_invocation;
+                            }
                             self.portable_callback_intercepted |= callback_gate
                                 .as_ref()
                                 .is_some_and(|gate| gate.blocked().is_some());

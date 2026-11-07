@@ -24,7 +24,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub use applications::{Application, ApplicationOpenOptions, ApplicationQuery};
@@ -43,6 +43,8 @@ use ax::AxRegistry;
 
 const OPERATION_TIMEOUT: Duration = Duration::from_mins(3);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Admission never waits behind a stuck native operation. Close/drop use the same bounded lane.
+const REQUEST_CAPACITY: usize = 32;
 
 enum Response {
     Capabilities(DesktopCapabilities),
@@ -1120,7 +1122,7 @@ impl SessionCore {
         if let Some(tx) = &lifecycle.tx {
             return Ok(tx.clone());
         }
-        let (tx, rx) = flume::unbounded::<QueuedRequest>();
+        let (tx, rx) = flume::bounded::<QueuedRequest>(REQUEST_CAPACITY);
         let (done_tx, done_rx) = flume::bounded(1);
         let selector = self.selector.clone();
         let caps = Arc::clone(&self.capabilities);
@@ -1135,6 +1137,8 @@ impl SessionCore {
                         break;
                     }
                 }
+                // Completion includes native backend cleanup, not just the request loop.
+                drop(worker);
                 let _ = done_tx.send(());
             })
             .map_err(|e| {
@@ -1158,17 +1162,36 @@ impl SessionCore {
         let tx = self.ensure_started()?;
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         let response = tx
-            .send(QueuedRequest {
+            .try_send(QueuedRequest {
                 request: make(txr),
-                token,
+                token: token.clone(),
             })
-            .map_err(|_| DesktopError::internal("native desktop worker stopped unexpectedly"))
+            .map_err(|error| match error {
+                flume::TrySendError::Full(_) => DesktopError::input_busy(
+                    "native desktop request queue is full; this request was not admitted",
+                ),
+                flume::TrySendError::Disconnected(_) => DesktopError::closed(),
+            })
             .and_then(|()| {
-                rxr.recv_timeout(OPERATION_TIMEOUT).map_err(|e| {
-                    self.cancellation
-                        .cancel_with(CancelReason::OperationTimeout);
-                    DesktopError::timeout(format!("native desktop operation did not complete: {e}"))
-                })
+                let deadline = Instant::now() + OPERATION_TIMEOUT;
+                loop {
+                    token.check()?;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        self.cancellation
+                            .cancel_with(CancelReason::OperationTimeout);
+                        return Err(DesktopError::timeout(
+                            "native desktop operation did not complete",
+                        ));
+                    }
+                    match rxr.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                        Ok(response) => return Ok(response),
+                        Err(flume::RecvTimeoutError::Timeout) => {}
+                        Err(flume::RecvTimeoutError::Disconnected) => {
+                            return Err(DesktopError::closed());
+                        }
+                    }
+                }
             });
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
         response?
@@ -1176,9 +1199,10 @@ impl SessionCore {
 
     fn close(&self) -> CoreResult<()> {
         self.cancellation.cancel_with(CancelReason::SessionClosed);
-        // The waits below can each block for `CLOSE_TIMEOUT`, and every other
-        // caller needs this lock to observe `closed`, so take the handles out
-        // and wait without holding it.
+        // One total close budget includes queue admission, acknowledgement and worker exit.
+        // Never wait while holding the lifecycle lock.
+        let deadline = Instant::now() + CLOSE_TIMEOUT;
+        let remaining = || deadline.saturating_duration_since(Instant::now());
         let (tx, done, join) = {
             let mut lifecycle = self.lifecycle.lock();
             lifecycle.closed = true;
@@ -1188,20 +1212,37 @@ impl SessionCore {
             (tx, lifecycle.done.take(), lifecycle.join.take())
         };
         let (rtx, rrx) = flume::bounded(1);
-        tx.send(QueuedRequest {
-            request: Request::Close { reply: rtx },
-            token: self.cancellation.token(),
-        })
-        .map_err(|_| DesktopError::closed())?;
-        let _ = rrx.recv_timeout(CLOSE_TIMEOUT).map_err(|e| {
+        tx.send_timeout(
+            QueuedRequest {
+                request: Request::Close { reply: rtx },
+                token: self.cancellation.token(),
+            },
+            remaining(),
+        )
+        .map_err(|error| match error {
+            flume::SendTimeoutError::Timeout(_) => DesktopError::timeout(
+                "native desktop worker did not admit close before the deadline",
+            ),
+            flume::SendTimeoutError::Disconnected(_) => DesktopError::closed(),
+        })?;
+        let _ = rrx.recv_timeout(remaining()).map_err(|e| {
             DesktopError::timeout(format!("timed out closing native desktop worker: {e}"))
         })?;
         if let Some(done) = done {
-            done.recv_timeout(CLOSE_TIMEOUT).map_err(|e| {
+            done.recv_timeout(remaining()).map_err(|e| {
                 DesktopError::timeout(format!("native desktop worker did not exit: {e}"))
             })?;
         }
         if let Some(join) = join {
+            while !join.is_finished() {
+                let left = remaining();
+                if left.is_zero() {
+                    return Err(DesktopError::timeout(
+                        "native desktop worker cleanup did not exit",
+                    ));
+                }
+                thread::sleep(left.min(Duration::from_millis(1)));
+            }
             join.join().map_err(|_| {
                 DesktopError::internal("native desktop worker panicked during close")
             })?;
@@ -1216,7 +1257,7 @@ impl Drop for SessionCore {
         let lifecycle = self.lifecycle.get_mut();
         if let Some(tx) = lifecycle.tx.take() {
             let (reply, _) = flume::bounded(1);
-            let _ = tx.send(QueuedRequest {
+            let _ = tx.try_send(QueuedRequest {
                 request: Request::Close { reply },
                 token: self.cancellation.token(),
             });
@@ -1240,8 +1281,10 @@ fn unexpected<T>() -> CoreResult<T> {
 /// Persistent, serialized native desktop capture/input/accessibility session.
 ///
 /// Every method is a blocking call that runs on a single worker thread; calls
-/// are serialized in submission order. Dropping the session cancels pending
-/// work and stops the worker.
+/// are serialized in admission order. The 32-entry queue refuses overload immediately.
+/// Cancellation stops callers waiting for replies; it cannot forcibly terminate a blocked
+/// platform API. Explicit close waits at most two seconds in total, while Drop cancels and
+/// detaches without waiting. Process-isolated computer workers remain the hard-stop boundary.
 pub struct DesktopSession {
     core: Arc<SessionCore>,
     /// Admission-time token for a native RPC; only the owning handle cancels on drop.
@@ -1773,3 +1816,6 @@ impl DesktopSession {
 
 #[cfg(all(test, not(feature = "desktop")))]
 mod native_absent_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;

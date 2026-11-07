@@ -240,6 +240,25 @@ fn read_ranges_clip_at_the_end_of_the_file() {
 }
 
 #[test]
+fn capped_lines_drop_a_crlf_terminator_and_never_split_a_character() {
+    let read = |input: &[u8], cap: usize| {
+        let mut reader = io::BufReader::with_capacity(4, input);
+        let mut buf = Vec::new();
+        let truncated = read_line_capped(&mut reader, &mut buf, cap).unwrap();
+        (String::from_utf8(buf).unwrap(), truncated)
+    };
+    // A line exactly at the cap is whole, whether LF, CRLF or CRLF split across chunks.
+    assert_eq!(read(b"abcd\n", 4), ("abcd".into(), Some(false)));
+    assert_eq!(read(b"abcd\r\n", 4), ("abcd".into(), Some(false)));
+    assert_eq!(read(b"abc\r\nx", 3), ("abc".into(), Some(false)));
+    assert_eq!(read(b"a\r\r\n", 9), ("a\r".into(), Some(false)));
+    assert_eq!(read(b"abcde\r\n", 4), ("abcd".into(), Some(true)));
+    // A cut inside a multibyte character backs off to the character boundary.
+    assert_eq!(read("aé€\n".as_bytes(), 4), ("aé".into(), Some(true)));
+    assert_eq!(read("aé€".as_bytes(), 5), ("aé".into(), Some(true)));
+}
+
+#[test]
 fn read_without_trailing_newline_counts_the_last_line() {
     let (dir, ws) = workspace();
     fs::write(dir.path().join("f.txt"), "a\nb\nc").unwrap();

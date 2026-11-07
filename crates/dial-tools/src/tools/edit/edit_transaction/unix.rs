@@ -261,6 +261,22 @@ impl Directory {
         .map_err(|e| format!("capturing edit original in {}: {e}", self.path.display()))?;
         Ok(())
     }
+    /// Atomically swap two entries. `Err(None)`: no exchange primitive here; nothing changed.
+    fn exchange(&self, a: &CString, b: &CString) -> Result<(), Option<String>> {
+        crate::platform::fs::exchange_beneath(
+            &self.file,
+            Path::new(std::ffi::OsStr::from_bytes(a.as_bytes())),
+            Path::new(std::ffi::OsStr::from_bytes(b.as_bytes())),
+        )
+        .map_err(|e| {
+            let unsupported = e.kind() == std::io::ErrorKind::Unsupported
+                || matches!(
+                    e.raw_os_error(),
+                    Some(libc::EINVAL | libc::ENOTSUP | libc::ENOSYS | libc::EXDEV)
+                );
+            (!unsupported).then(|| format!("installing edit in {}: {e}", self.path.display()))
+        })
+    }
     fn temp(
         &self,
         content: &str,
@@ -401,6 +417,9 @@ struct Staged {
     new: Option<CString>,
     backup: Option<CString>,
     installed: bool,
+    /// The staged replacement as read before an atomic exchange installed it. The exchange moves
+    /// the original to the staging name, so rollback proves ownership against this instead.
+    exchanged: Option<Original>,
 }
 impl Drop for Staged {
     fn drop(&mut self) {
@@ -493,6 +512,7 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
             new,
             backup: None,
             installed: false,
+            exchanged: None,
         });
     }
     let result = (|| {
@@ -503,6 +523,32 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
                 return Err(format!("{} changed during staging", ws.rel(&change.path)));
             }
             if change.before.is_some() {
+                // Swap the replacement in atomically where the kernel and filesystem allow it:
+                // the target name is never absent, so a crash leaves the old or the new file,
+                // never neither. The original lands at the staging name as the backup.
+                if let Some(new) = stage.new.clone() {
+                    let replacement = stage.dir.read(&new)?;
+                    match stage.dir.exchange(&new, &stage.name) {
+                        Ok(()) => {
+                            stage.backup = stage.new.take();
+                            stage.installed = true;
+                            stage.exchanged = replacement;
+                            if !matches(
+                                &stage.dir.read(stage.backup.as_ref().unwrap())?,
+                                &change.before,
+                                true,
+                            ) {
+                                return Err(format!(
+                                    "{} raced original capture",
+                                    ws.rel(&change.path)
+                                ));
+                            }
+                            continue;
+                        }
+                        Err(None) => {}
+                        Err(Some(e)) => return Err(e),
+                    }
+                }
                 // Reserve a unique backup name, then replace only our reservation.
                 let backup = stage.dir.temp("", None, "original")?;
                 if let Err(e) = stage.dir.rename(&stage.name, &backup) {
@@ -519,7 +565,7 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
                 }
             }
         }
-        // Every original is safely captured before the first replacement is installed.
+        // Every remaining original is safely captured before its replacement is installed.
         for (stage, change) in staged.iter_mut().zip(changes) {
             stage.dir.validate_location(ws, &change.path)?;
             if let Some(backup) = &stage.backup
@@ -566,17 +612,16 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
                     recovery.push(e);
                     continue;
                 }
+                let expected = match &stage.new {
+                    Some(new) => stage.dir.read(new).ok().flatten(),
+                    None => stage.exchanged.take(),
+                };
                 let owned = stage
                     .dir
                     .read(&captured)
                     .ok()
                     .flatten()
-                    .zip(
-                        stage
-                            .new
-                            .as_ref()
-                            .and_then(|n| stage.dir.read(n).ok().flatten()),
-                    )
+                    .zip(expected)
                     .is_some_and(|(a, b)| a.identity.dev == b.identity.dev && a.text == b.text);
                 if !owned {
                     let restored = stage.dir.link(&captured, &stage.name);

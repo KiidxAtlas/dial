@@ -5,6 +5,155 @@ use crate::agent::verify::verify_tool::{VerifyBatch, VerifyStep};
 const OVERLAY: &str = "approval='auto'\n[compaction]\nenabled=false\n[harness]\nedit_mode='replace'\n[edit]\nstreaming_abort=false\n[verification]\nautomatic_checks=false\n";
 const COMMAND: &str = "grep -q after candidate.txt";
 
+#[test]
+fn eval_only_batches_deduplicate_native_receipts_without_provider_identity() {
+    let mut batch = VerifyBatch::default();
+    batch.begin(&[ToolCall {
+        id: String::new(),
+        name: "eval".into(),
+        arguments: json!({}),
+        malformed_arguments: false,
+    }]);
+    let mut first = crate::runtime::execution::Execution {
+        invocation: Some(crate::runtime::execution::Invocation::fresh()),
+        ..Default::default()
+    };
+    let mut duplicate = first.clone();
+    assert!(batch.settle_once(&mut first));
+    assert!(!batch.settle_once(&mut duplicate));
+    batch.end();
+    assert!(
+        !batch.settle_once(&mut first),
+        "batch retirement never revives a settled receipt"
+    );
+    assert!(
+        batch.settle_once(&mut Default::default()),
+        "a new direct invocation remains distinct"
+    );
+}
+
+#[test]
+fn callback_writes_settle_before_a_later_cell_failure_without_double_counting() {
+    use crate::tools::exec::background::AdoptedJob;
+    use crate::tools::integrations::ext::{Tool, ToolCallback, ToolContext, ToolEvent};
+    use std::sync::{Arc, atomic::AtomicBool};
+    struct Cell;
+    impl Tool for Cell {
+        fn name(&self) -> &str {
+            "cell"
+        }
+        fn schema(&self) -> Value {
+            crate::runtime::schema::tool_schema("cell", "test callback cell", json!({}), &[])
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn supports_tool_dispatch(&self) -> bool {
+            true
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            unreachable!()
+        }
+        fn call_with_dispatch(
+            &self,
+            _: &ToolContext,
+            _: &Value,
+            _: &(dyn Fn(ToolEvent) + Sync),
+            _: &AtomicBool,
+            _: &dyn Fn(AdoptedJob) -> std::result::Result<String, String>,
+            dispatch: &mut dyn FnMut(ToolCallback) -> ToolOutput,
+        ) -> ToolOutput {
+            let mut receipts = Vec::new();
+            for path in ["first.txt", "second.txt"] {
+                let output = dispatch(ToolCallback::Call {
+                    name: "write".into(),
+                    arguments: json!({"path":path,"content":"committed\n"}),
+                });
+                assert!(!output.is_error, "{}", output.text);
+                let invocation = output
+                    .execution
+                    .invocation
+                    .expect("native callback identity");
+                receipts.push(json!({"id":invocation.id,"parent":invocation.parent,
+                    "settled":output.execution.mutation_settled}));
+            }
+            let mut output = ToolOutput::err("cell failed after completed writes");
+            output.data = Some(json!({"receipts":receipts}));
+            output
+        }
+    }
+    with_agent(OVERLAY, |agent| {
+        agent.ext.register(Arc::new(Cell));
+        let mut backend = agent.backend.take().unwrap();
+        let call = ToolCall {
+            id: "outer-cell".into(),
+            name: "cell".into(),
+            arguments: json!({}),
+            malformed_arguments: false,
+        };
+        let mut output = agent.dispatch(&mut backend, &call, &mut NullUi);
+        assert!(output.is_error);
+        assert_eq!(
+            output.execution.effects,
+            tools::surface::outcome::Effects::Known
+        );
+        assert_eq!(output.execution.changed_paths.len(), 2);
+        assert_eq!(
+            agent.step_checks.mutations, 2,
+            "each callback is accounted once"
+        );
+        let receipts = &output.data.as_ref().unwrap()["receipts"];
+        assert_ne!(receipts[0]["id"], receipts[1]["id"]);
+        let parent = output.execution.invocation.unwrap().id;
+        for receipt in receipts.as_array().unwrap() {
+            assert_eq!(receipt["parent"], parent);
+            assert_eq!(receipt["settled"], true);
+        }
+        agent.settle_tool_mutation(&call, &mut output);
+        assert_eq!(agent.step_checks.mutations, 2);
+        for path in ["first.txt", "second.txt"] {
+            assert_eq!(
+                std::fs::read_to_string(agent.workspace.root().join(path)).unwrap(),
+                "committed\n"
+            );
+        }
+        agent.backend = Some(backend);
+    });
+}
+
+#[test]
+fn empty_provider_ids_and_payload_fields_cannot_conflate_or_forge_settlement() {
+    with_agent(OVERLAY, |agent| {
+        let call = ToolCall {
+            id: String::new(),
+            name: "write".into(),
+            arguments: json!({"path":"candidate.txt"}),
+            malformed_arguments: false,
+        };
+        for _ in 0..2 {
+            let mut output = ToolOutput::ok("committed".into());
+            output
+                .execution
+                .changed_paths
+                .push(agent.workspace.root().join("candidate.txt"));
+            output.data = Some(json!({"post_write_verify":{"is_error":false}}));
+            agent.settle_tool_mutation(&call, &mut output);
+            let revision = agent.step_checks.revision();
+            let mut copy = output.clone();
+            agent.settle_tool_mutation(&call, &mut copy);
+            assert_eq!(
+                agent.step_checks.revision(),
+                revision,
+                "settled receipt survives cloning"
+            );
+        }
+        assert_eq!(
+            agent.step_checks.mutations, 2,
+            "empty provider IDs name distinct invocations"
+        );
+    });
+}
+
 fn args(tool: &str, verify: Option<Value>, old: &str) -> Value {
     let mut args = if tool == "write" {
         json!({"path":"candidate.txt","content":"after\n"})

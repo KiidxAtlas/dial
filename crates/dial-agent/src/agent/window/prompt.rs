@@ -110,6 +110,7 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
         ("codebase_memory", PROJECT_MAP_RULE),
         ("lsp", LSP_RULE),
         ("glob", SOURCE_PREVIEW_RULE),
+        ("verify", ARTIFACT_CHECK_RULE),
     ]
     .into_iter()
     .filter(|(tool, _)| has(tool))

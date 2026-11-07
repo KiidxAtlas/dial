@@ -355,7 +355,7 @@ impl Agent<'_> {
             checkpoints.settle_changes();
         }
         // Settle source epochs before any coalesced verification sees the final candidate tree.
-        for (call, output) in calls.iter().zip(&results) {
+        for (call, output) in calls.iter().zip(&mut results) {
             if let Some((output, _)) = output {
                 self.settle_tool_mutation(call, output);
             }

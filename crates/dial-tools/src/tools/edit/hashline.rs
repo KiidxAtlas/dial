@@ -33,7 +33,7 @@ use crate::tools::fs::select::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2417,6 +2417,16 @@ pub(crate) fn edit_output_with(
         return Err(errors.join("\n\n"));
     }
 
+    // Registers persist across calls, so a `PUT @n` authored before this call's `CUT @n` would
+    // silently paste the previous call's text. Refuse it instead.
+    let batch_cuts: HashSet<&String> = resolved
+        .iter()
+        .flat_map(|(_, sec)| &sec.ops)
+        .filter_map(|op| match &op.kind {
+            OpKind::Cut { name: Some(n), .. } => Some(n),
+            _ => None,
+        })
+        .collect();
     for ((_, sec), &ji) in resolved.iter().zip(&section_jobs) {
         if sec.rem {
             jobs[ji].rem = true;
@@ -2442,6 +2452,14 @@ pub(crate) fn edit_output_with(
                 OpKind::Put { anchor, src } => {
                     let lines = match src {
                         Src::Body(body) => body.clone(),
+                        Src::Register(Some(n))
+                            if batch_cuts.contains(n)
+                                && !regs.pending.iter().any(|(cut, ..)| cut == n) =>
+                        {
+                            return Err(located(format!(
+                                "`PUT @{n}` comes before the `CUT ... @{n}` that fills it in this call; put the CUT section first"
+                            )));
+                        }
                         Src::Register(name) => regs.get(name).map_err(located)?,
                     };
                     if op.bare > 0 {
@@ -2935,13 +2953,15 @@ fn read_impl(
     }
     let capped = stopped_at.is_some() || clipped;
 
-    let next = stopped_at.or_else(|| {
-        spans
-            .last()
-            .filter(|s| s.bounded && s.end < len)
-            .map(|s| s.end + 1)
-    });
-    let footer = select::footer(&rel, sel, &shown, len, next, capped);
+    let next = stopped_at
+        .and_then(|n| select::resume(&spans, n, len))
+        .or_else(|| {
+            spans
+                .last()
+                .filter(|s| s.bounded && s.end < len)
+                .map(|s| format!("{}-", s.end + 1))
+        });
+    let footer = select::footer(&rel, sel, &shown, len, next.as_deref(), capped);
     // Nothing fit at all: say why instead of claiming the range holds no lines.
     let empty = match stopped_at {
         Some(n) if shown.is_empty() => format!(

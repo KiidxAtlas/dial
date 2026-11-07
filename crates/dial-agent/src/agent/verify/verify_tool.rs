@@ -37,7 +37,7 @@ pub(in crate::agent) fn schema(predictions: bool) -> Value {
             crate::tools::surface::contracts::check_prediction_property();
     }
     schema["function"]["parameters"]["properties"]["acceptance"] = json!({"type":"object",
-        "description":"Register and run one model-authored acceptance helper for this turn, then rerun it after settled edits when enabled. Separate from task/operator checks. Cannot combine with targets or repro.",
+        "description":"Register and run one focused model-authored acceptance helper for a standalone artifact without an existing test suite: check required format and task constraints with a command that exits non-zero on failure. Reuse its passing result until inputs or criteria change; rerun after settled edits when enabled. Separate from task/operator checks. Cannot combine with targets, repro, command or expect.",
         "properties":{"name":{"type":"string"},"command":{"type":"string"}},"required":["name","command"],"additionalProperties":false});
     schema
 }
@@ -150,8 +150,9 @@ pub(in crate::agent) struct VerifyBatch {
     /// callback dispatch) is its own batch.
     mutations: Vec<String>,
     pending: Vec<String>,
-    calls: std::collections::HashSet<String>,
-    settled: std::collections::HashSet<String>,
+    /// Exists for the assistant batch, including a batch containing only eval callbacks.
+    /// Outside a batch the returned execution receipt owns its settlement lifetime.
+    settled: Option<std::collections::HashSet<u64>>,
 }
 
 /// What a finished mutation means for the batch's `verify` entries.
@@ -174,12 +175,24 @@ impl VerifyBatch {
             .map(|call| call.id.clone())
             .collect();
         self.pending.clear();
-        self.calls = calls.iter().map(|call| call.id.clone()).collect();
-        self.settled.clear();
+        self.settled = Some(Default::default());
     }
 
-    pub(in crate::agent) fn settle_once(&mut self, id: &str) -> bool {
-        !self.calls.contains(id) || self.settled.insert(id.to_owned())
+    pub(in crate::agent) fn settle_once(
+        &mut self,
+        execution: &mut crate::runtime::execution::Execution,
+    ) -> bool {
+        if execution.mutation_settled {
+            return false;
+        }
+        let invocation = *execution
+            .invocation
+            .get_or_insert_with(crate::runtime::execution::Invocation::fresh);
+        execution.mutation_settled = true;
+        // Without an assistant batch the receipt itself owns the settlement lifetime.
+        self.settled
+            .as_mut()
+            .is_none_or(|settled| settled.insert(invocation.id))
     }
 
     pub(in crate::agent) fn end(&mut self) {
@@ -361,11 +374,7 @@ impl Agent<'_> {
         }
         let note = |text: String| self.check_receipt(ToolOutput::ok(text), &candidates);
         if candidates.is_empty() {
-            return note(if changed {
-                "No focused check applies to this turn's changes; the completion gate has nothing to run. Name the tests that cover the change in targets.".into()
-            } else {
-                "No changes yet and no focused check applies; nothing run.".into()
-            });
+            return note("No focused check applies; nothing ran; this is not a pass. If an existing test covers the change, name it in targets. For a standalone artifact without a test suite, use acceptance: {name, command} to register and run one focused format/constraint check, or disclose the verification gap if no meaningful check is available. Do not repeat an unchanged verify or search for unrelated tests; reuse passing evidence only while its inputs and criteria are unchanged.".into());
         }
         let mut selected = candidates.clone();
         if let Some(names) = &names {

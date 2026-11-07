@@ -1,5 +1,11 @@
 # Configuration
 
+Setting declarations and paired override relationships live in `dial-llm::config::schema`.
+The registry assembles named domain groups; its public order, defaults and metadata remain
+stable. UI staging and application publication consume that schema. Clearing a single embedding
+URL/model override clears its partner; a bulk reset must explicitly review every stored partner
+and never silently adds unreviewed removals.
+
 For native Anthropic models with declared effort support, `--effort low|medium|high|xhigh|max`
 pins output effort independently of `--thinking`. For example, `--thinking off --effort low`
 makes both controls explicit for a comparison without changing defaults for other runs/providers.

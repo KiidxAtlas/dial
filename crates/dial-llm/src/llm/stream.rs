@@ -1,8 +1,13 @@
 //! Server-sent-event reading and chat-completion chunk accumulation.
 //!
 //! [`read_events`] turns a byte stream into `data:` payloads under hard bounds
-//! (total bytes, bytes per line, silence). [`Accumulator`] folds
+//! (total bytes, bytes per line, silence between reads). [`Accumulator`] folds
 //! `chat.completion.chunk` payloads into a [`Reply`].
+//!
+//! The parser checks patience between reads; an arbitrary `Read` can still block forever inside
+//! `read`. Production network readers must come from the cancellation-aware transport, which
+//! polls below TLS and enforces the same patience clock. Parser byte limits alone are not a
+//! cancellation or wall-clock guarantee.
 
 use super::cancel::Patience;
 use super::errors::{self, Classified};

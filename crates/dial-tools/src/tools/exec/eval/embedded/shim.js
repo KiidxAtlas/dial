@@ -285,7 +285,7 @@
 
   // ---- cell state ----
   const WITHHELD_GLOBALS = {
-    process: "await import('node:process')", require: "await import('node:<module>')",
+    process: 'tool callbacks for host operations', require: 'tool callbacks for host operations',
     module: 'top-level declarations', exports: 'top-level declarations',
     __filename: 'a workspace-relative path', __dirname: 'a workspace-relative path',
   };
@@ -301,7 +301,7 @@
     const message = String(error?.message ?? '');
     const missing = error?.name === 'ReferenceError' && /^(\w+) is not defined$/.exec(message);
     if (missing && Object.hasOwn(WITHHELD_GLOBALS, missing[1])) {
-      return `\n[dial] \`${missing[1]}\` is not a global in eval cells; use ${WITHHELD_GLOBALS[missing[1]]} instead.`;
+      return `\n[dial] \`${missing[1]}\` is not a global in the embedded engine; Node modules are unavailable. Use ${WITHHELD_GLOBALS[missing[1]]} instead (for files, await tool.read({path,format:'text'}) or dial.readText(path) when portable helpers are enabled).`;
     }
     if (error?.name === 'SyntaxError' && /^(Identifier '[^']+' has already been declared|redeclaration of '[^']+')$/.test(message)) {
       return '\n[dial] Top-level declarations persist across cells in this namespace; reuse the existing binding, assign to it, or pick a new name.';

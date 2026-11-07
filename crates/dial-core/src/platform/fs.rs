@@ -103,6 +103,14 @@ pub fn replace_beneath(root: &File, from: &Path, to: &Path) -> io::Result<()> {
     super::imp::fs::replace_beneath(root, from, to)
 }
 
+/// Atomically swap two existing entries under a pinned directory; neither name is ever absent.
+/// Unix requires two plain names and follows neither symlink. Kernels or filesystems without an
+/// exchange primitive fail without changing either name (callers keep a non-swap fallback).
+#[cfg(unix)]
+pub fn exchange_beneath(root: &File, a: &Path, b: &Path) -> io::Result<()> {
+    super::imp::fs::exchange_beneath(root, a, b)
+}
+
 #[cfg(windows)]
 pub fn replace_beneath_file(
     root: &File,

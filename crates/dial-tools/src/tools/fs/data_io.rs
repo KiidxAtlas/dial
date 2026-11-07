@@ -77,8 +77,12 @@ pub(in crate::tools) fn preserve_inputs(
     preserve_inputs_with_budget(ws, checkpoints, turn, std::time::Duration::from_millis(100))
 }
 
-fn preserve_inputs_with_budget(ws: &Workspace, checkpoints: &crate::storage::checkpoint::Checkpoints,
-    turn: u64, budget: std::time::Duration) -> Value {
+fn preserve_inputs_with_budget(
+    ws: &Workspace,
+    checkpoints: &crate::storage::checkpoint::Checkpoints,
+    turn: u64,
+    budget: std::time::Duration,
+) -> Value {
     let started = std::time::Instant::now();
     let Some(artifacts) = ws.artifacts() else {
         return json!({"files":[],"coverage":"unavailable: no artifact store"});

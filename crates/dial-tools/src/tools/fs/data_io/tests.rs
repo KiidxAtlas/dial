@@ -25,7 +25,8 @@ fn automatic_input_capture_preserves_small_sources_and_excludes_credentials() {
     ] {
         std::fs::write(dir.path().join(name), [0, 255, 42]).unwrap();
     }
-    let result = preserve_inputs_with_budget(&ws, &checkpoints, turn, std::time::Duration::from_secs(5));
+    let result =
+        preserve_inputs_with_budget(&ws, &checkpoints, turn, std::time::Duration::from_secs(5));
     let files = result["files"].as_array().unwrap();
     assert_eq!(files.len(), 2, "{result}");
     assert!(

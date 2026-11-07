@@ -1,6 +1,6 @@
 //! Compaction setting declarations. Defaults derive from typed configuration fields.
 use super::*;
-pub(super) static DECLARATIONS: &[SettingDef] = &[
+pub(super) static COMPACTION: &[SettingDef] = &[
     field!(
         "compaction.enabled",
         compaction.enabled,
@@ -361,18 +361,21 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "TOML map from default, an exact provider/model or provider/* to an ordered list of larger-window models (provider/model, bare model on the same provider, or @role). A target qualifies only with a strictly larger window and credentials.",
         Kind::Table,
     ),
-    field!(
-        "compaction.argument_projection_tokens",
-        compaction.argument_projection_tokens,
-        MO,
-        "Compaction",
-        "Settled argument projection",
-        "Opt-in raw-history token interval for replacing large settled plain-history argument bodies with retained artifact references. Preserves native replay and failed/pending calls. Batches cache-invalidating changes; 0 disables it. Not enabled by default or counted as a benchmark gain.",
-        Kind::Int {
-            min: 0,
-            max: 2000000,
-            step: 8192
-        },
-        true
-    ),
 ];
+
+pub(super) static ARGUMENT_PROJECTION: &[SettingDef] = &[field!(
+    "compaction.argument_projection_tokens",
+    compaction.argument_projection_tokens,
+    MO,
+    "Compaction",
+    "Settled argument projection",
+    "Opt-in raw-history token interval for replacing large settled plain-history argument bodies with retained artifact references. Preserves native replay and failed/pending calls. Batches cache-invalidating changes; 0 disables it. Not enabled by default or counted as a benchmark gain.",
+    Kind::Int {
+        min: 0,
+        max: 2000000,
+        step: 8192
+    },
+    true
+)];
+
+pub(super) static GROUPS: &[&[SettingDef]] = &[COMPACTION, ARGUMENT_PROJECTION];

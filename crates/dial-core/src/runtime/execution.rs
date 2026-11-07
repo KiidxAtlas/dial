@@ -17,6 +17,16 @@ pub enum Effects {
 /// Controller-owned execution facts. Tool payload and display text never supply these facts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Execution {
+    /// Process-local controller identity, independent of provider IDs (which may be empty).
+    /// Recovery uses durable runtime nodes, never these ephemeral settlement receipts.
+    #[serde(skip)]
+    pub invocation: Option<Invocation>,
+    /// Internal accounting receipt. JSON payloads and restored sessions cannot manufacture it.
+    #[serde(skip)]
+    pub mutation_settled: bool,
+    /// A successful native eval reset repairs only the named namespace's dependencies.
+    #[serde(skip)]
+    pub namespace_reset: Option<EvalNamespace>,
     pub status: Option<ToolStatus>,
     pub effects: Effects,
     #[serde(default)]
@@ -37,6 +47,40 @@ pub struct Execution {
     /// Native source-witness prerequisites for retry, never inferred from diagnostic text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_edit_retry: Option<NativeEditRetry>,
+}
+
+/// One admitted native invocation and its synchronous parent. IDs are unique in this process;
+/// they are not permissions, idempotency keys, or authority to replay an operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Invocation {
+    pub id: u64,
+    pub parent: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvalNamespace {
+    JavaScript,
+    Python,
+}
+
+impl Invocation {
+    pub fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .expect("native invocation identity space exhausted");
+        let parent = CHANGES.with(|stack| {
+            stack
+                .borrow()
+                .last()
+                .and_then(|facts| facts.invocation.map(|invocation| invocation.id))
+        });
+        Self { id, parent }
+    }
 }
 
 /// A native edit was refused for missing source witnesses. Every requirement must be satisfied
@@ -266,6 +310,16 @@ impl Execution {
 }
 
 thread_local! { static CHANGES: std::cell::RefCell<Vec<Execution>> = const { std::cell::RefCell::new(Vec::new()) }; }
+/// The outer native invocation on this execution thread. A controller may carry this correlation
+/// across a callback channel; it grants no authority and does not carry mutation state.
+pub fn root_invocation() -> Option<u64> {
+    CHANGES.with(|stack| {
+        stack
+            .borrow()
+            .first()
+            .and_then(|facts| facts.invocation.map(|invocation| invocation.id))
+    })
+}
 /// Called by the transaction owner after a real commit, never from rendered output.
 pub fn committed(paths: impl IntoIterator<Item = PathBuf>) {
     CHANGES.with(|stack| {
@@ -332,7 +386,13 @@ fn merge_status(previous: Option<ToolStatus>, incoming: ToolStatus) -> Option<To
 pub struct Capture;
 impl Capture {
     pub fn begin() -> Self {
-        CHANGES.with(|stack| stack.borrow_mut().push(Default::default()));
+        let invocation = Invocation::fresh();
+        CHANGES.with(|stack| {
+            stack.borrow_mut().push(Execution {
+                invocation: Some(invocation),
+                ..Default::default()
+            })
+        });
         Self
     }
     pub fn finish(self, recovered: bool) -> Execution {

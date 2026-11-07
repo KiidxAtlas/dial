@@ -229,11 +229,30 @@ fn describe_spans(shown: &[(usize, usize)]) -> String {
     parts.join(", ")
 }
 
+/// The selector text that continues a read cut short at line `from`: the rest of the span it
+/// stopped in and every later span, so a capped multi-range read does not lose its later ranges
+/// and a bounded range does not turn open-ended. `None` when nothing requested remains.
+pub(in crate::tools) fn resume(spans: &[Span], from: usize, len: usize) -> Option<String> {
+    let parts: Vec<String> = spans
+        .iter()
+        .filter(|span| span.end.min(len) >= from)
+        .map(|span| {
+            let start = span.start.max(from);
+            if span.bounded {
+                format!("{start}-")
+            } else {
+                format!("{start}-{}", span.end.min(len))
+            }
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(","))
+}
+
 /// Trailing status line, or empty when nothing needs saying.
 ///
 /// `shown` are the line spans actually returned and `len` the file's total
 /// lines. `capped` is set when the byte budget (the model-facing output limit) cut the read short;
-/// `next` is the first line not returned that the model may want, if any.
+/// `next` is the selector (after `rel:`) for the lines not returned that the model may want.
 /// Anchored output states its range and the total whenever it is not the
 /// whole file read without a selector; raw output stays verbatim and only says
 /// how to continue.
@@ -242,7 +261,7 @@ pub(in crate::tools) fn footer(
     sel: &Selector,
     shown: &[(usize, usize)],
     len: usize,
-    next: Option<usize>,
+    next: Option<&str>,
     capped: bool,
 ) -> String {
     let mut parts = Vec::new();
@@ -254,8 +273,10 @@ pub(in crate::tools) fn footer(
     } else if !sel.raw && (sel.selects_lines() || shown != [(1, len)]) {
         parts.push(format!("lines {} of {len}", describe_spans(shown)));
     }
-    if let Some(n) = next {
-        parts.push(format!("continue with `{rel}:{n}-`"));
+    if let Some(next) = next {
+        // A raw read continues raw; dropping `:raw` would switch the next page to anchored rows.
+        let mode = if sel.raw { "raw:" } else { "" };
+        parts.push(format!("continue with `{rel}:{mode}{next}`"));
     }
     if parts.is_empty() {
         String::new()
