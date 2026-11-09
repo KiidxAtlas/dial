@@ -17,6 +17,8 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-09
+
 - Safer interaction with the agent. Approval and question prompts ignore answer keys for a moment
   after they appear, saving a project-wide grant asks for confirmation, and Ctrl+C at a prompt
   denies and stops the turn (Esc or `n` only deny). Keys typed just before a prompt are no longer
