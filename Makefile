@@ -118,7 +118,7 @@ test-install:
 test-build:
 	$(PYTHON) scripts/test-build.py
 
-test-wzindows-contract:
+test-windows-contract:
 	$(PYTHON) scripts/test-windows-contract.py
 
 test-packaging:
