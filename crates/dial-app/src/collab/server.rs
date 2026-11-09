@@ -179,7 +179,11 @@ fn would_block(error: &tungstenite::Error) -> bool {
 /// the connection has ended normally from the relay's view; membership cleanup still runs.
 fn peer_gone(error: &tungstenite::Error) -> bool {
     match error {
-        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => true,
+        tungstenite::Error::ConnectionClosed
+        | tungstenite::Error::AlreadyClosed
+        | tungstenite::Error::Protocol(
+            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ) => true,
         tungstenite::Error::Io(e) => matches!(
             e.kind(),
             std::io::ErrorKind::BrokenPipe

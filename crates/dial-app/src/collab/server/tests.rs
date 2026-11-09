@@ -18,6 +18,27 @@ fn connection_limit_includes_pending_handshakes_and_releases_on_worker_drop() {
 }
 
 #[test]
+fn a_peer_that_drops_its_socket_without_closing_has_ended_normally() {
+    use std::io::{Error as IoError, ErrorKind};
+    use tungstenite::error::ProtocolError;
+    for gone in [
+        tungstenite::Error::ConnectionClosed,
+        tungstenite::Error::AlreadyClosed,
+        tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+        tungstenite::Error::Io(IoError::from(ErrorKind::ConnectionReset)),
+        tungstenite::Error::Io(IoError::from(ErrorKind::BrokenPipe)),
+    ] {
+        assert!(peer_gone(&gone), "{gone}");
+    }
+    for failure in [
+        tungstenite::Error::Protocol(ProtocolError::NonZeroReservedBits),
+        tungstenite::Error::Io(IoError::from(ErrorKind::PermissionDenied)),
+    ] {
+        assert!(!peer_gone(&failure), "{failure}");
+    }
+}
+
+#[test]
 fn room_limit_refuses_new_host_without_mutating_rooms() {
     let rooms: Rooms = Arc::default();
     for n in 0..MAX_ROOMS {
