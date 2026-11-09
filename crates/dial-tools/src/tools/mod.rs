@@ -1616,10 +1616,16 @@ fn bind_edit_targets(
         .map(|literal| {
             let canonical = ws.resolve_checked(&literal)?;
             let path = Path::new(&literal);
-            let lexical = if path.is_absolute() {
+            // The lexical spelling is authorized alongside the canonical target, so it must name a
+            // workspace root as spelled. A path that reached a root only through another spelling
+            // (a symlinked parent, or `C:\` against a verbatim `\\?\C:\` root on Windows) has no such
+            // form; its canonical-prefixed path is the one resolution accepted.
+            let lexical = if !path.is_absolute() {
+                ws.root().join(path)
+            } else if ws.roots().any(|root| path.starts_with(root)) {
                 path.to_path_buf()
             } else {
-                ws.root().join(path)
+                Workspace::canonical_prefix(path)
             };
             Ok((literal, canonical, lexical))
         })

@@ -19,6 +19,9 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [0.3.3] - 2026-11-09
 
+- Windows: replacing or deleting Dial's private files (sessions, settings, state) no longer fails with "access is denied" or "being used by another process" while another process, such as a second Dial window or a reader, has the file open. Renames and deletes now use POSIX semantics on NTFS/ReFS, and fall back to the old calls on filesystems without them. A sharing violation from a brief scan by antivirus, indexing or sync tools is retried for about 0.3 s before it is reported (`docs/windows.md`).
+- Windows: `write` and `edit` no longer fail with `opening workspace ...: The process cannot access the file because it is being used by another process. (os error 32)` when the workspace folder is the current directory of a shell or other program. Dial no longer asks for delete access on directories it writes into; it never deleted those directories through that handle.
+- `write` and `edit` accept an absolute path that names the workspace by a different spelling of its root, such as `C:\Users\...` against Dial's `\\?\C:\Users\...` root on Windows or a symlinked parent on macOS/Linux. Before, these failed with `native mutation must declare canonical workspace targets`.
 - The `/watch` pane's **Peers** tab is now **Chats**: a text-message style conversation per peer,
   labelled by model, with grouped bubbles, ages, read receipts and an inline composer, plus a
   **This session** thread that prompts this session's own model. Peer messages wake idle, finished,

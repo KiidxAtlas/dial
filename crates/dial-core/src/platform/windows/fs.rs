@@ -68,9 +68,14 @@ pub(in crate::platform) fn open_dir_nofollow(path: &Path) -> io::Result<File> {
     }
     Ok(file)
 }
+/// Writable directory handle: create, rename and delete children, flush, and set its DACL.
+/// Without `DELETE` on the directory itself: every process whose current directory this is
+/// (a shell started there, Explorer) holds it open without delete sharing, so requesting
+/// `DELETE` fails with a sharing violation. Children are removed through their own handles.
+const DIRECTORY_WRITE_ACCESS: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | 0x40;
 pub(in crate::platform) fn open_dir_nofollow_write(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
-        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | DELETE | 0x40)
+        .access_mode(DIRECTORY_WRITE_ACCESS)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
     reject_reparse(&file)?;
@@ -359,7 +364,7 @@ pub(in crate::platform) fn open_dir_beneath_handle_write(
     root: &File,
     relative: &Path,
 ) -> io::Result<File> {
-    let access = FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | DELETE | 0x40;
+    let access = DIRECTORY_WRITE_ACCESS;
     let directory = relative_name(root, relative, access, 1, 1)?;
     if !directory.metadata()?.is_dir() {
         return Err(io::Error::new(
@@ -399,51 +404,54 @@ pub(in crate::platform) fn create_dir_beneath(root: &File, relative: &Path) -> i
     }
     Ok(())
 }
-fn set_name(
-    file: &File,
-    root: &File,
-    relative: &Path,
-    class: i32,
-    delete: bool,
-    replace: bool,
-) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    let mut buffer;
-    if delete {
-        buffer = vec![1u8];
-    } else {
-        let parts: Vec<_> = relative.components().collect();
-        if parts.len() != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "mutation name must be one component",
-            ));
-        }
-        let Component::Normal(part) = parts[0] else {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "invalid mutation name",
-            ));
-        };
-        let name: Vec<u16> = part.encode_wide().collect();
-        if name.is_empty() || name.contains(&0) || name.contains(&(b':' as u16)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid mutation name",
-            ));
-        }
-        buffer = vec![u8::from(replace); 20 + name.len() * 2];
-        let root_handle = root.as_raw_handle() as usize;
-        buffer[8..8 + mem::size_of::<usize>()].copy_from_slice(&root_handle.to_ne_bytes());
-        buffer[16..20].copy_from_slice(&((name.len() * 2) as u32).to_ne_bytes());
-        for (i, unit) in name.iter().enumerate() {
-            buffer[20 + i * 2..22 + i * 2].copy_from_slice(&unit.to_ne_bytes());
+/// Windows error 32: another process has the file open in a mode that excludes this access.
+const ERROR_SHARING_VIOLATION: i32 = 32;
+/// Delays between retries of a namespace mutation refused by a sharing violation. Antivirus,
+/// indexing and sync tools open fresh files briefly; about 0.3 s covers those scans without
+/// hanging on a file another program keeps open.
+const SHARING_RETRY_DELAYS_MS: [u64; 5] = [10, 20, 40, 80, 160];
+/// Re-run `op` while it fails with a sharing violation. Each attempt opens its own handles and
+/// a refused open or rename changes nothing, so a retry repeats the whole operation safely.
+fn retry_sharing<T>(op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    retry_sharing_with(op, std::thread::sleep)
+}
+fn retry_sharing_with<T>(
+    mut op: impl FnMut() -> io::Result<T>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> io::Result<T> {
+    for delay in SHARING_RETRY_DELAYS_MS {
+        match op() {
+            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                sleep(std::time::Duration::from_millis(delay));
+            }
+            result => return result,
         }
     }
+    op()
+}
+/// `FILE_INFORMATION_CLASS` values used by [`set_name`].
+const FILE_DISPOSITION_INFORMATION_EX: i32 = 64;
+const FILE_RENAME_INFORMATION_EX: i32 = 65;
+const FILE_RENAME_REPLACE_IF_EXISTS: u32 = 0x1;
+const FILE_RENAME_POSIX_SEMANTICS: u32 = 0x2;
+const FILE_DISPOSITION_DELETE: u32 = 0x1;
+const FILE_DISPOSITION_POSIX_SEMANTICS: u32 = 0x2;
+/// The extended classes need Windows 10 1607+/1709+ and a filesystem that implements them
+/// (NTFS, ReFS); others (FAT, many network shares) refuse the class, so the legacy call runs.
+fn extended_class_unsupported(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
+    matches!(
+        error.raw_os_error().map(|code| code as u32),
+        Some(ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION)
+    )
+}
+fn set_information(file: &File, class: i32, buffer: &mut [u8]) -> io::Result<()> {
     let mut status = IO_STATUS_BLOCK::default();
-    // SAFETY: file and root stay open; buffer encodes the class-specific disposition byte
-    // or counted rename/link name and live root handle. Its supplied length covers all bytes,
-    // status is writable, and this synchronous call retains no buffer references.
+    // SAFETY: file stays open; buffer encodes the class-specific disposition flags or counted
+    // rename/link name and live root handle. Its supplied length covers all bytes, status is
+    // writable, and this synchronous call retains no buffer references.
     let result = unsafe {
         windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile(
             file.as_raw_handle() as HANDLE,
@@ -461,21 +469,95 @@ fn set_name(
     }
     Ok(())
 }
+/// Rename (class 10), link (11) or delete (13) through `file`.
+///
+/// Renames and deletes use POSIX semantics where available: replacing or deleting a name that
+/// another process holds open (with delete sharing) succeeds and frees the name at once, where
+/// the legacy classes fail with "access denied" or leave a delete-pending name that blocks the
+/// next create. Unsupported filesystems fall back to the legacy class with the same meaning.
+fn set_name(
+    file: &File,
+    root: &File,
+    relative: &Path,
+    class: i32,
+    delete: bool,
+    replace: bool,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    if delete {
+        let mut flags = (FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS).to_ne_bytes();
+        match set_information(file, FILE_DISPOSITION_INFORMATION_EX, &mut flags) {
+            Err(error) if extended_class_unsupported(&error) => {}
+            result => return result,
+        }
+        return set_information(file, class, &mut [1u8]);
+    }
+    let parts: Vec<_> = relative.components().collect();
+    if parts.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mutation name must be one component",
+        ));
+    }
+    let Component::Normal(part) = parts[0] else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid mutation name",
+        ));
+    };
+    let name: Vec<u16> = part.encode_wide().collect();
+    if name.is_empty() || name.contains(&0) || name.contains(&(b':' as u16)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid mutation name",
+        ));
+    }
+    // FILE_RENAME_INFORMATION(_EX) / FILE_LINK_INFORMATION on 64-bit Windows: a 4-byte
+    // ReplaceIfExists/Flags field, the root handle at 8, the name byte length at 16, the name at 20.
+    let mut buffer = vec![0u8; 20 + name.len() * 2];
+    let root_handle = root.as_raw_handle() as usize;
+    buffer[8..8 + mem::size_of::<usize>()].copy_from_slice(&root_handle.to_ne_bytes());
+    buffer[16..20].copy_from_slice(&((name.len() * 2) as u32).to_ne_bytes());
+    for (i, unit) in name.iter().enumerate() {
+        buffer[20 + i * 2..22 + i * 2].copy_from_slice(&unit.to_ne_bytes());
+    }
+    if class == 10 {
+        let flags = FILE_RENAME_POSIX_SEMANTICS
+            | if replace {
+                FILE_RENAME_REPLACE_IF_EXISTS
+            } else {
+                0
+            };
+        buffer[..4].copy_from_slice(&flags.to_ne_bytes());
+        match set_information(file, FILE_RENAME_INFORMATION_EX, &mut buffer) {
+            Err(error) if extended_class_unsupported(&error) => {}
+            result => return result,
+        }
+    }
+    buffer[..4].copy_from_slice(&[u8::from(replace), 0, 0, 0]);
+    set_information(file, class, &mut buffer)
+}
 pub(in crate::platform) fn link_beneath(
     root: &File,
     existing: &Path,
     new: &Path,
 ) -> io::Result<()> {
-    let file = open_beneath_handle(root, existing)?;
-    set_name(&file, root, new, 11, false, false)
+    retry_sharing(|| {
+        let file = open_beneath_handle(root, existing)?;
+        set_name(&file, root, new, 11, false, false)
+    })
 }
 pub(in crate::platform) fn rename_beneath(root: &File, from: &Path, to: &Path) -> io::Result<()> {
-    let file = open_beneath_handle(root, from)?;
-    set_name(&file, root, to, 10, false, false)
+    retry_sharing(|| {
+        let file = open_beneath_handle(root, from)?;
+        set_name(&file, root, to, 10, false, false)
+    })
 }
 pub(in crate::platform) fn replace_beneath(root: &File, from: &Path, to: &Path) -> io::Result<()> {
-    let file = open_beneath_handle(root, from)?;
-    set_name(&file, root, to, 10, false, true)
+    retry_sharing(|| {
+        let file = open_beneath_handle(root, from)?;
+        set_name(&file, root, to, 10, false, true)
+    })
 }
 pub(in crate::platform) fn replace_beneath_file(
     root: &File,
@@ -483,16 +565,21 @@ pub(in crate::platform) fn replace_beneath_file(
     expected: &File,
     to: &Path,
 ) -> io::Result<()> {
-    let source = open_beneath_handle(root, from)?;
-    if identity(&source)? != identity(expected)? {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "staged file changed before publication",
-        ));
-    }
-    set_name(&source, root, to, 10, false, true)
+    retry_sharing(|| {
+        let source = open_beneath_handle(root, from)?;
+        if identity(&source)? != identity(expected)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "staged file changed before publication",
+            ));
+        }
+        set_name(&source, root, to, 10, false, true)
+    })
 }
 pub(in crate::platform) fn remove_beneath(root: &File, relative: &Path) -> io::Result<()> {
+    retry_sharing(|| remove_beneath_once(root, relative))
+}
+fn remove_beneath_once(root: &File, relative: &Path) -> io::Result<()> {
     let parts: Vec<_> = relative.components().collect();
     if parts.len() != 1 {
         return Err(io::Error::new(
@@ -561,14 +648,16 @@ pub(in crate::platform) fn remove_beneath(root: &File, relative: &Path) -> io::R
     set_name(&file, root, relative, 13, true, false)
 }
 pub(in crate::platform) fn remove_dir_beneath(root: &File, relative: &Path) -> io::Result<()> {
-    let file = relative_name(
-        root,
-        relative,
-        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        1,
-        1,
-    )?;
-    set_name(&file, root, relative, 13, true, false)
+    retry_sharing(|| {
+        let file = relative_name(
+            root,
+            relative,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            1,
+            1,
+        )?;
+        set_name(&file, root, relative, 13, true, false)
+    })
 }
 pub(in crate::platform) fn read_dir_beneath(root: &File) -> io::Result<Vec<std::ffi::OsString>> {
     use std::os::windows::ffi::OsStringExt;

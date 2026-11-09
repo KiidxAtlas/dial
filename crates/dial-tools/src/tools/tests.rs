@@ -230,6 +230,38 @@ fn native_mutations_refuse_git_metadata_but_allow_inspection() {
     assert!(ws.observe_delete(ws.root()).is_err());
 }
 
+/// An absolute path that reaches the workspace only through another spelling of its root (a
+/// symlinked parent here; `C:\...` against a verbatim `\\?\C:\...` root on Windows) is accepted by
+/// path resolution, so the targets it declares for authorization must lie under that root too.
+#[cfg(unix)]
+#[test]
+fn absolute_write_through_an_alias_of_the_root_is_authorized() {
+    let (dir, ws) = workspace();
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("alias");
+    symlink(dir.path(), &alias).unwrap();
+    let config = crate::config::types::Config::default();
+    let authorize = testkit::authorize_in_workspace(&ws, "write");
+    let ctx = integrations::ext::ToolContext {
+        workspace: &ws,
+        config: &config,
+        mutation_authorizer: Some(&authorize),
+        confirm: None,
+    };
+    let path = alias.join("note.txt");
+    let out = write_with_context(
+        &ctx,
+        &json!({"path": path.to_string_lossy(), "content": "hello\n"}),
+        None,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("note.txt")).unwrap(),
+        "hello\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn native_mutations_protect_linked_worktree_metadata_and_aliases() {

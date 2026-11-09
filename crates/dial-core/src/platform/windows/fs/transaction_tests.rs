@@ -155,3 +155,88 @@ fn append_only_log_handle_is_created_private_under_private_dir() {
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_dir(&base).unwrap();
 }
+
+#[test]
+fn sharing_violations_are_retried_within_a_bound() {
+    let mut attempts = 0;
+    let mut slept = Vec::new();
+    let result = retry_sharing_with(
+        || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION))
+            } else {
+                Ok(attempts)
+            }
+        },
+        |delay| slept.push(delay.as_millis()),
+    );
+    assert_eq!(result.unwrap(), 3);
+    assert_eq!(slept, [10, 20]);
+
+    let mut attempts = 0;
+    let result: io::Result<()> = retry_sharing_with(
+        || {
+            attempts += 1;
+            Err(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION))
+        },
+        |_| {},
+    );
+    assert_eq!(
+        result.unwrap_err().raw_os_error(),
+        Some(ERROR_SHARING_VIOLATION)
+    );
+    assert_eq!(attempts, SHARING_RETRY_DELAYS_MS.len() + 1);
+
+    let mut attempts = 0;
+    let result: io::Result<()> = retry_sharing_with(
+        || {
+            attempts += 1;
+            Err(io::Error::from_raw_os_error(5))
+        },
+        |_| panic!("only sharing violations are retried"),
+    );
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+    assert_eq!(attempts, 1);
+}
+
+#[test]
+fn replace_and_remove_succeed_while_another_handle_has_the_target_open() {
+    use std::io::Read;
+    let base = scratch_dir("posix");
+    std::fs::write(base.join("target"), b"old").unwrap();
+    std::fs::write(base.join("staged"), b"new").unwrap();
+    // std opens with read/write/delete sharing, like a concurrent reader of a published record.
+    let mut reader = File::open(base.join("target")).unwrap();
+    let root = open_dir_nofollow_write(&base).unwrap();
+    replace_beneath(&root, Path::new("staged"), Path::new("target")).unwrap();
+    assert_eq!(std::fs::read(base.join("target")).unwrap(), b"new");
+    let mut text = Vec::new();
+    reader.read_to_end(&mut text).unwrap();
+    assert_eq!(text, b"old", "the open handle keeps the replaced object");
+
+    let held = File::open(base.join("target")).unwrap();
+    remove_beneath(&root, Path::new("target")).unwrap();
+    // POSIX deletion frees the name at once, so it can be created again while `held` is open.
+    assert!(!base.join("target").exists());
+    create_new_beneath(&root, Path::new("target"), false).unwrap();
+    drop((held, reader, root));
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn writable_directory_opens_while_another_handle_denies_delete_sharing() {
+    // A process whose current directory this is holds it open with read/write sharing only.
+    let base = scratch_dir("cwd-held");
+    let held = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&base)
+        .unwrap();
+    let root = open_dir_nofollow_write(&base).unwrap();
+    create_new_beneath(&root, Path::new("file"), false).unwrap();
+    remove_beneath(&root, Path::new("file")).unwrap();
+    drop((root, held));
+    std::fs::remove_dir_all(&base).unwrap();
+}
