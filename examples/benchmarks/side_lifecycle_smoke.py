@@ -280,7 +280,7 @@ def scenario(binary, server, captures, root):
         terminal.command("/delete")
         terminal.wait("Delete session?")
         terminal.wait(session_id)
-        terminal.key("d")
+        terminal.answer("d")
         terminal.wait(f"Deleted session {session_id}")
         assert not dest.exists(), "moved journal survived deletion"
         assert not dest_side.exists(), "moved side file survived deletion"
