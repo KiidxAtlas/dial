@@ -63,7 +63,7 @@ aws-sigv4 = "1"
 aws-smithy-http-client = { version = "1.5", default-features = false, features = ["rustls-ring", "rt-tokio"] }
 crc32fast = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
-toml = "0.9"
+toml = "1.1"
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
 # `use-dev-tty` reads the terminal with level-triggered poll(2), so a hung-up terminal cannot
 # trap the input reader (the default mio source retries its end-of-file forever).
