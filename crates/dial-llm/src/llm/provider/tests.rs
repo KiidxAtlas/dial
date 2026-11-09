@@ -695,7 +695,7 @@ fn claude_subscription_request_matches_claude_code_message_conventions() {
         body["system"][0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.280.")
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.290.")
     );
     assert_eq!(
         body["system"][1]["text"],
@@ -1946,9 +1946,15 @@ fn local_vision_model_receives_pixels_and_uses_one_supervised_vlm_server() {
     assert_eq!(
         info["apc_config"],
         json!({
-            "APC_DISK_ENABLED": "0", "APC_NUM_BLOCKS": "256", "APC_MEMORY_MAX_GB": "1",
-            "APC_MEMORY_RESERVE_GB": "0.25", "APC_CHECKPOINT_ENTRIES": "1",
+            "APC_DISK_ENABLED": "0", "APC_NUM_BLOCKS": "256",
+            "APC_MEMORY_MAX_GB": server::vision_prefix_cache_gib(),
+            "APC_MEMORY_RESERVE_GB": "0.25", "APC_CHECKPOINT_ENTRIES": "4",
         })
+    );
+    let budget: f64 = server::vision_prefix_cache_gib().parse().unwrap();
+    assert!(
+        budget > 1.0,
+        "a long-context snapshot must not evict the reusable checkpoint"
     );
     assert!(
         info["argv"]

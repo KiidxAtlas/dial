@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Rewrite Formula/dial.rb's version and on_macos/on_linux stanzas from a release's SHA256SUMS.
+"""Rewrite Formula/dial.rb (and optionally the AUR dial-bin metadata) from a release's SHA256SUMS.
 
-Every Homebrew target is required; a missing checksum aborts without touching the formula.
+Every Homebrew and AUR target is required; a missing checksum aborts before anything is written.
 """
 import argparse
 import re
@@ -18,6 +18,11 @@ HOMEBREW_TARGETS = (
 )
 VERSION_LINE = re.compile(r'^  version ".*"$', re.MULTILINE)
 PLATFORM_BLOCKS = re.compile(r"^  on_macos do\n.*?^  on_linux do\n.*?^  end\n", re.MULTILINE | re.DOTALL)
+# AUR architecture name -> Rust target triple of the release archive dial-bin installs.
+AUR_TARGETS = (
+    ("x86_64", "x86_64-unknown-linux-gnu"),
+    ("aarch64", "aarch64-unknown-linux-gnu"),
+)
 
 
 def parse_sums(text):
@@ -59,15 +64,65 @@ def update_formula(formula_text, version, sums):
     return PLATFORM_BLOCKS.sub(lambda _: render_platform_blocks(version, sums), updated, count=1)
 
 
+def aur_digests(version, sums):
+    digests = {}
+    for arch, target in AUR_TARGETS:
+        archive = f"dial-v{version}-{target}.tar.gz"
+        if archive not in sums:
+            raise SystemExit(f"missing release checksum for {archive}")
+        digests[arch] = sums[archive]
+    return digests
+
+
+def substitute_once(pattern, replacement, text, what):
+    updated, count = re.subn(pattern, replacement, text, flags=re.MULTILINE)
+    if count != 1:
+        raise SystemExit(f"expected exactly one {what}, found {count}")
+    return updated
+
+
+def update_pkgbuild(text, version, sums):
+    """Set pkgver, reset pkgrel to 1 and replace each architecture's checksum."""
+    digests = aur_digests(version, sums)
+    text = substitute_once(r"^pkgver=.*$", f"pkgver={version}", text, "pkgver line")
+    text = substitute_once(r"^pkgrel=.*$", "pkgrel=1", text, "pkgrel line")
+    for arch, digest in digests.items():
+        text = substitute_once(rf"^sha256sums_{arch}=\(.*\)$", f"sha256sums_{arch}=('{digest}')",
+                               text, f"sha256sums_{arch} line")
+    return text
+
+
+def update_srcinfo(text, version, sums):
+    """The .SRCINFO that `makepkg --printsrcinfo` would print for the updated PKGBUILD."""
+    digests = aur_digests(version, sums)
+    text = substitute_once(r"^\tpkgver = .*$", f"\tpkgver = {version}", text, "pkgver entry")
+    text = substitute_once(r"^\tpkgrel = .*$", "\tpkgrel = 1", text, "pkgrel entry")
+    for arch, target in AUR_TARGETS:
+        archive = f"dial-v{version}-{target}.tar.gz"
+        text = substitute_once(rf"^\tsource_{arch} = .*$",
+                               f"\tsource_{arch} = {REPO_URL}/v{version}/{archive}", text,
+                               f"source_{arch} entry")
+        text = substitute_once(rf"^\tsha256sums_{arch} = .*$",
+                               f"\tsha256sums_{arch} = {digests[arch]}", text,
+                               f"sha256sums_{arch} entry")
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--version", required=True)
     parser.add_argument("--sums", type=Path, required=True)
     parser.add_argument("--formula", type=Path, default=Path("Formula/dial.rb"))
+    parser.add_argument("--aur", type=Path, help="AUR package directory holding PKGBUILD and .SRCINFO")
     args = parser.parse_args()
     sums = parse_sums(args.sums.read_text(encoding="utf-8"))
-    formula = args.formula.read_text(encoding="utf-8")
-    args.formula.write_text(update_formula(formula, args.version, sums), encoding="utf-8")
+    outputs = {args.formula: update_formula(args.formula.read_text(encoding="utf-8"), args.version, sums)}
+    if args.aur:
+        pkgbuild, srcinfo = args.aur / "PKGBUILD", args.aur / ".SRCINFO"
+        outputs[pkgbuild] = update_pkgbuild(pkgbuild.read_text(encoding="utf-8"), args.version, sums)
+        outputs[srcinfo] = update_srcinfo(srcinfo.read_text(encoding="utf-8"), args.version, sums)
+    for path, text in outputs.items():
+        path.write_text(text, encoding="utf-8")
     return 0
 
 

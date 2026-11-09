@@ -56,6 +56,9 @@ pub struct ShellConfig {
     pub minimize_output: bool,
     /// When `bash` and `bg` refuse git commands that discard uncommitted work: `workers`, `always` or `off`.
     pub git_guard: GitGuard,
+    /// Opt-in: copy the project's source files before a turn's first shell command that may
+    /// change files, so `/undo` also restores what `bash` changed, created or deleted.
+    pub undo_snapshot: bool,
 }
 impl Default for ShellConfig {
     fn default() -> Self {
@@ -66,6 +69,7 @@ impl Default for ShellConfig {
             backend: ShellBackend::Auto,
             minimize_output: true,
             git_guard: GitGuard::Workers,
+            undo_snapshot: false,
         }
     }
 }

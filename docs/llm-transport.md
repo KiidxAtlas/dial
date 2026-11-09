@@ -344,8 +344,12 @@ inspection remains unavailable, the final result explicitly reports that it was 
 Known non-vision models skip images with a notice to both the user and model. Downloaded local models
 with a vision encoder in `config.json` use MLX-VLM and receive the image pixels; text-only models use
 MLX-LM. `dial setup` installs both runners in Dial's private runtime. The vision runner retains at most
-one image-feature cache and uses process-local prefix caching: at most 256 blocks and one exact
-checkpoint, with a 1 GiB cache-admission budget and 256 MiB free-memory reserve. Disk caching is
+one image-feature cache and uses process-local prefix caching: at most 256 blocks and four exact
+checkpoints, within a cache-admission budget of a quarter of physical memory (the text runner's
+prompt-cache share) and a 256 MiB free-memory reserve. Models with sliding-window layers, such as
+Gemma 4, reuse only exact checkpoints that are a strict prefix of the next prompt. The final snapshot
+includes the template's generation prompt, so reuse comes from the checkpoint MLX-VLM takes every
+2,048 prompt tokens. Disk caching is
 disabled, so caches cannot cross server/profile/steering restarts. The runner checks cache compatibility
 before use and falls back to uncached inference when it cannot validate it. These are cache admission
 bounds, not a cap on the model's total or peak memory. Vision prefill reports measured token counts

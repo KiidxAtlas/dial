@@ -45,3 +45,37 @@ fn a_large_syntax_refusal_suggests_smaller_edits_or_write() {
     let refused = refusal(Path::new("a.py"), "a.py", &before, &whole).expect("refused");
     assert!(refused.contains("`write`"), "{refused}");
 }
+
+#[test]
+fn python_short_strings_reject_literal_newlines_but_not_valid_multiline_forms() {
+    let path = Path::new("game.py");
+    for source in [
+        "print(\"\n\")\n",
+        "print('before\nafter')\n",
+        "print(r\"before\nafter\")\n",
+        "print(f\"before\nafter\")\n",
+        "print(\"before\\\\\nafter\")\n",
+    ] {
+        assert_eq!(report(path, source)["valid"], false, "{source:?}");
+        assert!(
+            refusal(path, "game.py", "print()\n", source).is_some(),
+            "{source:?}"
+        );
+    }
+    for source in [
+        "print(\"\\n\")\n",
+        "print(\"before\\\nafter\")\n",
+        "print(\"before\\\r\nafter\")\n",
+        "print(r\"before\\\nafter\")\n",
+        "print('''before\nafter''')\n",
+        "print(f\"\"\"before\n{1} after\"\"\")\n",
+        "print(f\"{(\n1 + 2\n)}\")\n",
+        "# not a string: \"\nprint('洞窟')\n",
+    ] {
+        assert_eq!(report(path, source)["valid"], true, "{source:?}");
+        assert!(
+            refusal(path, "game.py", "print()\n", source).is_none(),
+            "{source:?}"
+        );
+    }
+}

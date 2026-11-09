@@ -37,6 +37,7 @@ fn kernel_alias_resolves_to_eval_in_tools_and_integrations() {
     assert_eq!(canonical_tool_name("kernel"), "eval");
     assert_eq!(canonical_tool_name("Kernel"), "eval");
     assert_eq!(canonical_tool_name("read"), "read");
+    assert_eq!(canonical_tool_name("working_state"), "todo");
     assert_eq!(
         normalize_tool_names("kernel, read, KERNEL", &known()),
         vec!["eval", "read"]

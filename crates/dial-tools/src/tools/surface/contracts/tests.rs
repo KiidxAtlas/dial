@@ -1333,3 +1333,265 @@ fn completion_controller_additions_reject_other_contract_changes() {
         assert!(validate_history(&unknown_revision, &[current], &registry).is_err());
     }
 }
+
+fn evidence_registry() -> (Registry, Value) {
+    let mut registry = Registry::new();
+    for tool in crate::tools::knowledge::evidence::tools(&crate::config::types::Config::default()) {
+        registry.register(tool);
+    }
+    let current = registry.get("evidence").unwrap().schema();
+    (registry, current)
+}
+
+/// The evidence family merged into `evidence`; each recorded call resumes as the `evidence`
+/// action that replaced it, with its other arguments unchanged.
+#[test]
+fn recorded_evidence_family_calls_project_onto_evidence_actions() {
+    use crate::tools::knowledge::{investigate, reality, retrieval, timeline, workbench};
+    let (registry, current) = evidence_registry();
+    let reference = format!("artifact://{}", "a".repeat(64));
+    for (schema, arguments, action) in [
+        (
+            retrieval::schema(),
+            json!({"query":"timeout","references":[reference]}),
+            "search",
+        ),
+        (
+            workbench::schema(),
+            json!({"action":"inspect","references":[reference]}),
+            "audit",
+        ),
+        (
+            investigate::schema(),
+            json!({"action":"compare","reference":reference,"other":reference}),
+            "diff",
+        ),
+        (
+            reality::schema(),
+            json!({"action":"assess","expectation":reference,"observation":reference,"expectation_quote":"q","claim":"c","assessment":"mismatch"}),
+            "assess",
+        ),
+        (
+            timeline::schema(),
+            json!({"action":"reconstruct"}),
+            "timeline",
+        ),
+        (
+            crate::tools::knowledge::perception::schema(),
+            json!({"action":"close","reason":"done"}),
+            "budget_close",
+        ),
+    ] {
+        let name = schema["function"]["name"].as_str().unwrap().to_owned();
+        let old = identities(&[schema], &Registry::new())[&name].clone();
+        let history = vec![
+            json!({"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":name,"arguments":arguments.to_string()}}],"dial_tool_contracts":{"c1":old}}),
+            json!({"role":"tool","tool_call_id":"c1","content":"{}"}),
+        ];
+        let projected = project_history(&history, std::slice::from_ref(&current), &registry)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} must project onto evidence"));
+        let call = &projected[0]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "evidence", "{name}");
+        let projected_arguments: Value =
+            serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        let mut expected = arguments.clone();
+        expected["action"] = json!(action);
+        assert_eq!(projected_arguments, expected, "{name}");
+        crate::tools::surface::catalog::validate_arguments(&current, &projected_arguments)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        validate_history(&projected, std::slice::from_ref(&current), &registry).unwrap();
+        assert!(
+            project_history(&projected, std::slice::from_ref(&current), &registry)
+                .unwrap()
+                .is_none(),
+            "{name}: projection is idempotent"
+        );
+
+        // An action the retired tool never had is not a shape it recorded.
+        let mut unknown = history.clone();
+        unknown[0]["tool_calls"][0]["function"]["arguments"] =
+            json!(json!({"action":"capture"}).to_string());
+        assert!(
+            project_history(&unknown, std::slice::from_ref(&current), &registry).is_err(),
+            "{name}"
+        );
+    }
+}
+
+/// Sessions recorded under the pre-merge `evidence` contract still resume.
+#[test]
+fn recorded_pre_merge_evidence_contract_is_accepted() {
+    let (registry, current) = evidence_registry();
+    let mut before = current.clone();
+    let native = [
+        "action",
+        "reference",
+        "other",
+        "path",
+        "start",
+        "count",
+        "retain_source",
+        "region",
+        "summary",
+        "parents",
+        "clock",
+        "alignment",
+        "time_ms",
+    ];
+    before["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .retain(|name, _| native.contains(&name.as_str()));
+    before["function"]["parameters"]["properties"]["action"]["enum"] = json!([
+        "capture",
+        "snapshot",
+        "inspect",
+        "context",
+        "crop",
+        "compare",
+        "freshness",
+        "derive",
+        "align"
+    ]);
+    let old = identities(&[before], &registry)["evidence"].clone();
+    assert_ne!(
+        old,
+        identities(std::slice::from_ref(&current), &registry)["evidence"]
+    );
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"id":old}})];
+    validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
+}
+
+/// `todo` with and without the state ops that replaced `working_state`.
+fn todo_schemas() -> (Value, Value) {
+    let before = json!({"type":"function","function":{"name":"todo","parameters":{"type":"object","properties":{
+        "op":{"type":"string","enum":["set","append","start","done","drop","block","view"]},
+        "tasks":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"kind":{"type":"string","enum":["step","follow_up"]}}}}
+    }}}});
+    let mut current = before.clone();
+    let properties = current["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap();
+    properties["op"]["enum"] = json!([
+        "set",
+        "append",
+        "start",
+        "done",
+        "drop",
+        "block",
+        "view",
+        "state_view",
+        "state_update",
+        "state_patch"
+    ]);
+    properties.insert(
+        "expected_revision".into(),
+        json!({"type":"integer","minimum":0}),
+    );
+    properties.insert("state".into(), json!({"type":"object"}));
+    (before, current)
+}
+
+fn working_state_stub() -> Value {
+    json!({"type":"function","function":{"name":"working_state","parameters":{"type":"object","properties":{
+        "action":{"type":"string","enum":["view","update","patch"]},
+        "expected_revision":{"type":"integer","minimum":0},
+        "goal":{"type":"string"}
+    },"required":["action"],"additionalProperties":false}}})
+}
+
+#[test]
+fn todo_recorded_before_state_ops_resumes_but_other_changes_are_refused() {
+    let registry = Registry::new();
+    let (before, current) = todo_schemas();
+    let history = old_names_history("todo", before, r#"{"op":"view"}"#);
+    assert!(
+        project_history(&history, std::slice::from_ref(&current), &registry)
+            .unwrap()
+            .is_none()
+    );
+    validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
+    let mut changed = current.clone();
+    changed["function"]["parameters"]["properties"]["state"] = json!({"type":"string"});
+    let mut extra_op = current.clone();
+    extra_op["function"]["parameters"]["properties"]["op"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("state_drop"));
+    for changed in [changed, extra_op] {
+        assert!(validate_history(&history, &[changed], &registry).is_err());
+    }
+}
+
+#[test]
+fn recorded_working_state_calls_project_onto_todo_state_ops() {
+    let registry = Registry::new();
+    let (_, current) = todo_schemas();
+    for (arguments, expected) in [
+        (json!({"action":"view"}), json!({"op":"state_view"})),
+        (
+            json!({"action":"update","goal":"ship","deliverables":[{"id":"d","description":"x","status":"open"}]}),
+            json!({"op":"state_update","state":{"goal":"ship","deliverables":[{"id":"d","description":"x","status":"open"}]}}),
+        ),
+        (
+            json!({"action":"patch","expected_revision":3,"goal":"ship"}),
+            json!({"op":"state_patch","expected_revision":3,"state":{"goal":"ship"}}),
+        ),
+    ] {
+        let history = old_names_history(
+            "working_state",
+            working_state_stub(),
+            &arguments.to_string(),
+        );
+        let projected = project_history(&history, std::slice::from_ref(&current), &registry)
+            .unwrap()
+            .expect("working_state history projects onto todo");
+        let call = &projected[0]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "todo");
+        let projected_arguments: Value =
+            serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(projected_arguments, expected);
+        assert_eq!(working_state_as_todo(&arguments), Some(expected));
+        validate_history(&projected, std::slice::from_ref(&current), &registry).unwrap();
+        assert!(
+            project_history(&projected, std::slice::from_ref(&current), &registry)
+                .unwrap()
+                .is_none(),
+            "projection is idempotent"
+        );
+    }
+    let unknown = old_names_history(
+        "working_state",
+        working_state_stub(),
+        r#"{"action":"drop"}"#,
+    );
+    assert!(project_history(&unknown, std::slice::from_ref(&current), &registry).is_err());
+}
+
+#[test]
+fn merged_history_stays_inert_while_its_successor_is_not_callable() {
+    let registry = Registry::new();
+    let unrelated = schema("string");
+    for history in [
+        old_names_history(
+            "working_state",
+            working_state_stub(),
+            r#"{"action":"view"}"#,
+        ),
+        old_names_history(
+            "workbench",
+            crate::tools::knowledge::workbench::schema(),
+            r#"{"action":"inspect","references":["artifact://x"]}"#,
+        ),
+    ] {
+        let original = history.clone();
+        assert!(
+            project_history(&history, std::slice::from_ref(&unrelated), &registry)
+                .unwrap()
+                .is_none()
+        );
+        validate_history(&history, std::slice::from_ref(&unrelated), &registry).unwrap();
+        assert_eq!(history, original);
+    }
+}

@@ -196,28 +196,42 @@ pub fn migrate_memory_tool_table(table: &mut toml::Table) -> bool {
     changed
 }
 
-/// `kernel` was merged into the `eval` tool (`language = "py"`). Rename a saved `kernel` integration
-/// to `eval`, dropping it when `eval` is already listed, so old settings still load. Only the
-/// `kernel` entries are touched; other duplicates stay for validation to report. Returns whether
+/// Integrations retired by a merge ([`tools::integrations::MERGED_INTEGRATIONS`]): `kernel` became
+/// `eval` and the evidence family became `evidence` actions. Rename each saved entry to its
+/// successor, dropping it when the successor is already listed, so old settings still load. Only
+/// retired entries are touched; other duplicates stay for validation to report. Returns whether
 /// anything changed.
-pub fn migrate_kernel_integration(table: &mut toml::Table) -> bool {
+pub fn migrate_merged_integrations(table: &mut toml::Table) -> bool {
+    use tools::integrations::{MERGED_INTEGRATIONS, canonical_integration};
     let Some(values) = table
         .get_mut("integrations")
         .and_then(toml::Value::as_array_mut)
     else {
         return false;
     };
-    if !values.iter().any(|value| value.as_str() == Some("kernel")) {
+    let retired = |value: &toml::Value| {
+        value
+            .as_str()
+            .is_some_and(|name| MERGED_INTEGRATIONS.iter().any(|(old, _)| *old == name))
+    };
+    if !values.iter().any(retired) {
         return false;
     }
-    let mut has_eval = values.iter().any(|value| value.as_str() == Some("eval"));
+    let mut listed: Vec<String> = values
+        .iter()
+        .filter(|value| !retired(value))
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect();
     let mut migrated = Vec::with_capacity(values.len());
     for value in values.drain(..) {
-        if value.as_str() != Some("kernel") {
+        if !retired(&value) {
             migrated.push(value);
-        } else if !has_eval {
-            migrated.push(toml::Value::String("eval".to_owned()));
-            has_eval = true;
+            continue;
+        }
+        let successor = canonical_integration(value.as_str().unwrap_or_default()).to_owned();
+        if !listed.contains(&successor) {
+            migrated.push(toml::Value::String(successor.clone()));
+            listed.push(successor);
         }
     }
     *values = migrated;
@@ -602,7 +616,7 @@ impl Config {
                 | migrate_edit_configuration(&mut part)
                 | migrate_model_role_table(&mut part)
                 | migrate_removed_settings(&mut part)
-                | migrate_kernel_integration(&mut part)
+                | migrate_merged_integrations(&mut part)
             {
                 migrations.push(path);
             }
@@ -648,7 +662,7 @@ impl Config {
                 | migrate_edit_configuration(&mut current)
                 | migrate_model_role_table(&mut current)
                 | migrate_removed_settings(&mut current)
-                | migrate_kernel_integration(&mut current)
+                | migrate_merged_integrations(&mut current)
                 | half.is_some_and(|key| drop_semantic_key(&mut current, key))
             {
                 write_private(&path, toml::to_string_pretty(&current)?.as_bytes())?;

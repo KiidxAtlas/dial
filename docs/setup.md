@@ -11,6 +11,15 @@ Esc backs out of a panel to the path choice; Esc or Cancel at the choice exits w
 model. Browsing is not permission to install software, download weights, or send an inference request.
 Provider/model panels may discover endpoint metadata using their existing catalog checks.
 
+Before asking, first launch checks for local inference servers that are already listening at their
+usual addresses (LM Studio, Ollama, MLX-Serve, llama.cpp, Docker Model Runner, Osaurus; the
+`*_BASE_URL` variables and `OLLAMA_HOST` override them). It names the ones it finds and highlights
+**Local model**, so Enter opens Models. This is a TCP connection check only: it does not list
+models, send a request or select anything, and Esc still exits without choosing. When no server is
+listening on Apple Silicon, it instead suggests the largest MLX coding model in the `dial models
+recommend` list (7B and up) that fits physical memory, and highlights **Local model**. That is an
+estimate by RAM tier, not a measurement, and nothing downloads until you confirm in **Get models**.
+
 Interactive **`/doctor`** leads with core model readiness, then optional capabilities. It distinguishes
 configuration, cached/unknown endpoint metadata, and session-only response evidence. Open Models to
 change the selection or Providers to inspect the credential source and check metadata. A configured

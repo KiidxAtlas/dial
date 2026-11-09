@@ -1756,6 +1756,12 @@ class ComputerWorkerCore {
 					cancelRejection,
 				]);
 				completed = true;
+				if (typeof returnValue === "function") {
+					completed = false;
+					throw new ToolError(
+						"`code` evaluated to a function that was never called, so nothing ran. Direct `code` is a function body, e.g. `return await desktop.windows();`. To send function source such as `async ({ desktop }) => …`, pass it as `fn` instead of `code`.",
+					);
+				}
 			} finally {
 				signal.removeEventListener("abort", onCancel);
 			}

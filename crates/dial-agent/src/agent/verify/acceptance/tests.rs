@@ -78,3 +78,74 @@ fn acceptance_registration_cannot_bypass_readonly_approval_or_replace_configured
     assert!(invalid.is_error);
     assert_eq!(agent.step_checks.registered_acceptance.len(), count);
 }
+
+#[test]
+fn repeated_acceptance_failures_keep_fresh_results_without_repeating_diagnostics() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = agent(&config, root.path());
+    std::fs::write(root.path().join("diagnostic"), "first failure").unwrap();
+    std::fs::write(root.path().join("runs"), "").unwrap();
+    let first = agent.verify_tool(
+        &json!({"acceptance":{"name":"regression","command":"printf x >> runs; cat diagnostic >&2; exit 1"}}),
+        &mut NullUi,
+    );
+    assert!(
+        first.is_error && first.text.contains("first failure"),
+        "{}",
+        first.text
+    );
+    let previous = agent.step_checks.registered_failures.clone();
+    agent.step_checks.mutations += 1;
+    let repeated = agent.auto_registered_checks(&mut NullUi).unwrap();
+    assert_eq!(agent.step_checks.registered_failures, previous);
+    assert!(repeated.is_error, "{}", repeated.text);
+    assert!(
+        !repeated.text.contains("first failure"),
+        "{}",
+        repeated.text
+    );
+    assert_eq!(
+        repeated.data.as_ref().unwrap()["diagnostics_repeated"],
+        true
+    );
+    assert_eq!(repeated.data.as_ref().unwrap()["results"][0]["ran"], true);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("runs")).unwrap(),
+        "xx"
+    );
+    assert!(agent.step_checks.failed);
+    assert!(agent.auto_registered_checks(&mut NullUi).is_none());
+    std::fs::write(root.path().join("diagnostic"), "different failure").unwrap();
+    agent.step_checks.mutations += 1;
+    let changed = agent.auto_registered_checks(&mut NullUi).unwrap();
+    assert!(
+        changed.is_error && changed.text.contains("different failure"),
+        "{}",
+        changed.text
+    );
+}
+
+#[test]
+fn acceptance_failure_after_a_pass_is_reported_in_full_again() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = agent(&config, root.path());
+    let first = agent.verify_tool(
+        &json!({"acceptance":{"name":"ready","command":"test -f ready || { echo not-ready; exit 1; }"}}),
+        &mut NullUi,
+    );
+    assert!(first.is_error);
+    std::fs::write(root.path().join("ready"), "ready").unwrap();
+    agent.step_checks.mutations += 1;
+    assert!(!agent.auto_registered_checks(&mut NullUi).unwrap().is_error);
+    std::fs::remove_file(root.path().join("ready")).unwrap();
+    agent.step_checks.mutations += 1;
+    let failed = agent.auto_registered_checks(&mut NullUi).unwrap();
+    assert!(
+        failed.is_error && failed.text.contains("not-ready"),
+        "{}",
+        failed.text
+    );
+    assert_ne!(failed.data.as_ref().unwrap()["diagnostics_repeated"], true);
+}

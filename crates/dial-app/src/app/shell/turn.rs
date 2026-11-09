@@ -7,6 +7,7 @@ use crate::app::display::local_time;
 use crate::app::drive::Step;
 use crate::app::shell::teach::TEACH_OFF;
 use crate::app::shell::{PAINT_EVERY, Shell};
+use crate::cli::watch::state::ChatRole;
 use crate::config::types::Outcome;
 use crate::platform;
 use crate::ui::status::Phase;
@@ -185,6 +186,13 @@ impl Shell {
         self.status.elapsed_secs = 0.0;
         if automatic {
             self.note("Automatic continuation", text);
+            self.live_pane.chat(
+                ChatRole::Event,
+                match input {
+                    TurnInput::Peer => "Woken by a project peer message",
+                    _ => "Woken by an application watch",
+                },
+            );
         }
         self.composer.set_busy(true);
         self.status.phase = Phase::Working;
@@ -226,6 +234,7 @@ impl Shell {
         if !automatic {
             self.transcript
                 .push_user_at(text, &crate::storage::session::timestamp_now());
+            self.live_pane.chat(ChatRole::User, text);
         }
         // Distinguishes this turn's recorded summary from an older one when the turn errors.
         let summary_before = agent.session().control_state()["turn_summary"].clone();
@@ -279,8 +288,10 @@ impl Shell {
         self.refresh_status(app, agent);
         match &result {
             Ok(report) => {
+                self.live_pane.chat(ChatRole::Model, &report.text);
                 if report.interrupted {
                     self.note("Interrupted", "the turn stopped at the next safe point");
+                    self.live_pane.chat(ChatRole::Event, "Interrupted");
                 }
                 if report.trajectory.is_some() {
                     self.last_trajectory = report.trajectory;
@@ -289,7 +300,16 @@ impl Shell {
                     self.teach_turn_end(app, agent, trajectory, start);
                 }
             }
-            Err(error) => self.transcript.error(&format!("{error:#}")),
+            Err(error) => {
+                self.transcript.error(&format!("{error:#}"));
+                self.live_pane.chat(
+                    ChatRole::Event,
+                    &format!(
+                        "Turn failed: {}",
+                        crate::ui::text::one_line(&format!("{error:#}"))
+                    ),
+                );
+            }
         }
         // Notify from the agent's outcome, not from transport success: failed, blocked and
         // incomplete turns are errors, and an interrupted turn is silent (see `turn_end_notice`).

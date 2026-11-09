@@ -1477,7 +1477,7 @@ impl<'a> Agent<'a> {
         if name == "edit_preview" {
             return self.preview_tool(args, ui);
         }
-        if matches!(name, "find" | "evidence_search") {
+        if matches!(name, "find" | "evidence") {
             match crate::agent::model::roles::retrieval_request(
                 &self.workspace,
                 name,
@@ -1602,6 +1602,21 @@ impl<'a> Agent<'a> {
         }
         match name {
             "todo" => {
+                if let Some(legacy) = crate::agent::workflow::todo::state_call(args) {
+                    let contract = crate::agent::workflow::evidence::working_schema();
+                    if let Err(error) =
+                        crate::tools::surface::catalog::validate_arguments(&contract, &legacy)
+                    {
+                        return ToolOutput::err(format!(
+                            "todo {}: {error}\nState contract: {}",
+                            args["op"].as_str().unwrap_or_default(),
+                            contract["function"]["description"]
+                                .as_str()
+                                .unwrap_or_default()
+                        ));
+                    }
+                    return self.working_state_tool(&legacy, ui);
+                }
                 let mut next = self.todo.clone();
                 let output = next.call(args);
                 if output.is_error || next == self.todo {
@@ -1760,21 +1775,45 @@ impl<'a> Agent<'a> {
                         .collect(),
                     None => crate::agent::model::assistance::discover_with_priority(
                         query,
-                        candidates,
+                        candidates.clone(),
                         &|name| self.tool_readiness(name).routing_priority(),
                     ),
                 };
                 if matches.is_empty() && selected.is_none() {
                     // A ranking miss is not evidence that the capability is absent. Return the
-                    // same bounded eligible catalog page as `*`, without activating anything.
-                    return match listing_output(0, &descriptions, &self.offered()) {
+                    // closest partial matches and the same bounded eligible catalog page as `*`,
+                    // without activating anything.
+                    let partial = crate::agent::model::assistance::partial_matches(
+                        query,
+                        candidates,
+                        &|name| self.tool_readiness(name).routing_priority(),
+                    );
+                    let offered = self.offered();
+                    let partial: Vec<Value> = partial
+                        .into_iter()
+                        .map(|name| {
+                            let description: String = descriptions
+                                .get(&name)
+                                .map(|text| text.chars().take(TOOL_LIST_DESCRIPTION_CHARS).collect())
+                                .unwrap_or_default();
+                            let loaded = offered.contains(&name);
+                            let (status, next) = activation_status(loaded, None);
+                            let mut entry = json!({"name":name,"description":description,"status":status,"enabled_next_round":loaded,"next":next});
+                            discovery_readiness(&mut entry, self.workspace.root(), self.config, &self.ext);
+                            entry
+                        })
+                        .collect();
+                    let reason = if partial.is_empty() {
+                        "No ranked match; inspect the eligible catalog before concluding a capability is unavailable. Listing grants no permission and loads no tools."
+                    } else {
+                        "No tool matched most query terms; `search_matches` are the closest partial matches. Inspect them and the catalog before concluding a capability is unavailable, load one with tool_load, or search again with fewer, specific words. Matches and listing grant no permission and load no tools."
+                    };
+                    return match listing_output(0, &descriptions, &offered) {
                         Ok(mut output) => {
                             let mut page: Value = serde_json::from_str(&output.text)
                                 .expect("listing_output serializes a JSON object");
-                            page["search_matches"] = json!([]);
-                            page["fallback_reason"] = json!(
-                                "No ranked match; inspect the eligible catalog before concluding a capability is unavailable. Listing grants no permission and loads no tools."
-                            );
+                            page["search_matches"] = json!(partial);
+                            page["fallback_reason"] = json!(reason);
                             output.text = page.to_string();
                             listing_readiness(output, self.workspace.root(), self.config, &self.ext)
                         }
@@ -1940,7 +1979,6 @@ impl<'a> Agent<'a> {
                     is_error: false,
                 }
             }
-            "working_state" => self.working_state_tool(args, ui),
             "skill" | "skill_manage" | "session_search" => match &self.layout {
                 None => denied("unavailable here"),
                 Some(layout) => match name {

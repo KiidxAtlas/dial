@@ -622,7 +622,6 @@ impl<'a> Agent<'a> {
                         | "ask"
                         | "tool_search"
                         | "tool_load"
-                        | "working_state"
                         | "tts"
                         | "verify"
                         | "revert_edit"

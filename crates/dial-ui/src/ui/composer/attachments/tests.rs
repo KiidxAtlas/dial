@@ -208,12 +208,18 @@ fn panicking_provider_is_collected_without_poisoning_later_generations() {
     assert!(composer.attachments.result.as_ref().unwrap().issues[0].contains("panicked"));
     assert!(composer.attachment_send_allowed());
 
+    // Keep the old worker in flight through set_draft, which can poll and reap it.
+    let (release, wait) = mpsc::channel();
     composer.attachments.running = Some(Running {
         generation: composer.attachments.generation,
         rx: mpsc::channel().1,
-        handle: std::thread::spawn(|| panic!("stale worker")),
+        handle: std::thread::spawn(move || {
+            wait.recv().unwrap();
+            panic!("stale worker");
+        }),
     });
     composer.set_draft("new @draft");
+    release.send(()).unwrap();
     wait_finished(&composer.attachments);
     composer.poll_attachments();
     assert!(composer.attachments.result.is_none());

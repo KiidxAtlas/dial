@@ -6,6 +6,16 @@ Dial bundles the provider registry and model pricing/capability cards in `crates
 
 The bundled model catalog exposes `known_context_window` and `model_capabilities` for inference budgeting and thinking configuration. Runtime discovery/provider metadata takes precedence over the bundled card. List prices are estimates, not invoices; missing usage or unpriced cards remain unknown. A provider-reported cost takes precedence over calculated list pricing where available, and subscriptions are not reported as API invoices.
 
+A Claude model released after the build you run does not need a `models.json` edit to get thinking
+and effort controls. When `/models` (or any discovery) lists Anthropic models, Dial saves what each
+row declares under `capabilities.thinking.types` (adaptive or budget thinking) and
+`capabilities.effort` (the supported levels). For a model the bundle does not describe, Dial uses
+that saved declaration to turn thinking on by default, to offer `/effort`, `--effort` and role
+thinking levels, and to
+show the level in the status line. Only capabilities reported as `{"supported": true}` count.
+Request rules that only the bundle records, such as sampling restrictions, still need a bundle
+update.
+
 ## Model purpose and selection
 
 `/models` separates **chat**, **embedding**, **image**, and **other** models using structured provider

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fail early with one diagnosis when Linux Rust sandbox tests cannot run.
+"""Fail early with actionable prerequisites for the selected test tier.
 
-This checks prerequisites, not Dial's full enforcement policy. The Rust sandbox tests
-still run their real enforcement probes. Other platforms retain their native checks.
+Checks never install dependencies. Native Rust enforcement probes still run in the suite.
 """
+import argparse
+import importlib
 import os
 import subprocess
 import sys
@@ -40,7 +41,24 @@ def linux_problems():
     return problems
 
 
-def main():
+def python_prerequisites(suite):
+    module = "pytest" if suite == "python" else "cryptography.hazmat.primitives.asymmetric.ed25519"
+    try:
+        importlib.import_module(module)
+    except (ImportError, OSError) as error:
+        print(f"{suite} tests cannot start: {sys.executable} cannot import {module}: {error}", file=sys.stderr)
+        print("Use the pinned CI environment (no system Python changes):", file=sys.stderr)
+        print(f"  uv run --no-project --python 3.12 --with-requirements scripts/requirements-ci.lock make test-{suite}", file=sys.stderr)
+        print("Or select an existing prepared interpreter with make PYTHON=/path/to/python.", file=sys.stderr)
+        print("No tests ran; this is a prerequisite failure, not a passing or skipped suite.", file=sys.stderr)
+        return 1
+    print(f"{suite} test prerequisites available in {sys.executable}.")
+    return 0
+
+
+def main(suite="rust"):
+    if suite != "rust":
+        return python_prerequisites(suite)
     if sys.platform != "linux":
         print("Linux sandbox prerequisite gate is not applicable on this platform; native Rust checks remain required.")
         return 0
@@ -56,4 +74,6 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("suite", nargs="?", choices=("rust", "python", "release-policy"), default="rust")
+    sys.exit(main(parser.parse_args().suite))

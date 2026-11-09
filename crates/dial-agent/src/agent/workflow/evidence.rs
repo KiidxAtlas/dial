@@ -210,8 +210,6 @@ const OBSERVATIONS: &[&str] = &[
     "document",
     "network_inspect",
     "runtime_inspect",
-    "timeline",
-    "evidence_search",
     "audio",
     "visual",
     "video",

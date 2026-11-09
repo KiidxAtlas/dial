@@ -77,24 +77,23 @@ The message stays labelled untrusted peer context rather than becoming a typed p
 command, attachment reference, or turn-drafter input.
 
 With `coordination.auto_wake = true` (the default), an open terminal session checks for mail once
-per second while its last turn is **Completed** or **Incomplete**. At most two fresh messages are
-admitted for each wake-up, with at most **three automatic wake-ups per user turn**, separated by
-at least **30 seconds**.
+per second while it is idle, **whatever its last turn did**: completed, answered, incomplete,
+blocked, failed or interrupted. A session that has no task yet (just opened) also starts a turn to
+answer the message. At most two fresh messages are admitted for each wake-up. Each user turn grants
+**eight automatic wake-ups**, separated by at least **5 seconds**, so two models cannot wake each
+other forever; a message typed by the human in a `/watch` pane refills that budget and skips the
+cooldown.
 Repeated sender/text pairs in the most recent 32 delivered messages do not trigger another wake-up.
 These continuations can incur model charges; normal tool approvals, sandbox rules and compute
 admission still apply. No extra process or headless session is launched.
 Relevance is assessed by the model after waking, not by a pre-inference filter: even unrelated
 fresh mail can consume a request. Disable automatic wake-ups below to avoid that cost.
 
-Blocked, failed, interrupted, and human-input-waiting tasks do not wake automatically. A completed
-reply can wake for relevant peer follow-up within the existing task or conversation; completion
-does not authorize new work or permission changes. Without fresh mail, no inference starts.
-No task is armed on process restart or session resume; a real user turn must first end successfully.
-Normal same-session settings/model rebuilds retain the bounded wake budget. A different task or
-session cannot inherit an armed wake-up. Queued human input, a nonempty composer, open panels,
-and scheduled loop turns take priority. Esc at the idle composer suspends wake-ups until the next
-user turn. Cancellation or failure during wake admission also suspends them, retaining reserved
-mail for a later normal request.
+A wake-up resumes within the existing task or conversation; it does not authorize new work or
+permission changes, and approvals still stop in the main window. Without fresh mail, no inference
+starts. Queued human input, a nonempty composer, open panels and scheduled loop turns take
+priority. Esc at the idle composer, a new prompt, or a failed wake admission stands wake-ups down
+until the next fresh message arrives; reserved mail is kept for the next normal request.
 
 To keep guidance delivery but disable automatic inference, set:
 

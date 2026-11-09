@@ -419,7 +419,17 @@ jobs:
         with:
           name: signed-release-assets
           path: dist
-      - name: Open Homebrew formula update PR
+      - name: Verify signed manifest
+        # The formula and AUR checksums are merged without review, so re-check the signature here.
+        env:
+          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$DIAL_RELEASE_PUBLIC_KEY_PEM" > "$RUNNER_TEMP/release-public.pem"
+          base64 -d dist/SHA256SUMS.sig > "$RUNNER_TEMP/SHA256SUMS.sig"
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/release-public.pem" -rawin \
+            -in dist/SHA256SUMS -sigfile "$RUNNER_TEMP/SHA256SUMS.sig"
+      - name: Update and merge Homebrew formula and AUR metadata
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
@@ -430,13 +440,14 @@ jobs:
           branch="release-packaging/$RELEASE_TAG"
           git fetch origin main
           git checkout -B "$branch" origin/main
-          python3 scripts/update-formula.py --version "$version" --sums dist/SHA256SUMS --formula Formula/dial.rb
+          python3 scripts/update-formula.py --version "$version" --sums dist/SHA256SUMS \
+            --formula Formula/dial.rb --aur packaging/aur/dial-bin
           python3 scripts/check-packaging.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add Formula/dial.rb
+          git add Formula/dial.rb packaging/aur/dial-bin
           if git diff --cached --quiet; then
-            echo "Formula already matches $RELEASE_TAG; no pull request needed"
+            echo "Package metadata already matches $RELEASE_TAG; no pull request needed"
             exit 0
           fi
           git commit -m "release: update package metadata for $version"
@@ -446,8 +457,12 @@ jobs:
           else
             gh pr create --base main --head "$branch" \
               --title "release: Dial $RELEASE_TAG package metadata" \
-              --body "Automated Homebrew formula update for $RELEASE_TAG. Merge once the release is published."
+              --body "Automated Homebrew formula and AUR metadata update for $RELEASE_TAG, generated from the signed SHA256SUMS of the published release."
           fi
+          # The release is already published (this job needs publish) and the checksums come from
+          # its verified manifest, so merge now; an unmerged PR leaves Homebrew users on the old version.
+          # Publishing to the AUR itself still needs the maintainer's AUR key (packaging/README.md).
+          gh pr merge "$branch" --merge --delete-branch
 
   container:
     name: Publish signed container with build provenance and SBOM

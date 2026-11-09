@@ -7,6 +7,7 @@ mod input_preservation;
 mod prepare;
 mod publish;
 mod settle;
+mod shell_undo;
 
 /// Runtime services borrowed for dispatch only; execution authority stays with their owners.
 struct DispatchContext<'a> {
@@ -232,6 +233,7 @@ impl Agent<'_> {
             self.context_usage().0,
         );
         self.verify_batch.begin(&reply.tool_calls);
+        self.snapshot_before_shell(&reply.tool_calls, &mut *context.ui);
         for (index, call) in reply.tool_calls.iter().enumerate() {
             let engine = &mut *context.engine;
             let ui = &mut *context.ui;

@@ -1,10 +1,9 @@
-use crate::args::{Cli, Command, WeightsCommand};
+use crate::args::{Cli, Command, DevCommand, WeightsCommand};
 use crate::chat::chat;
 use crate::cmd;
 use crate::exit_with;
 use crate::overlay::overlay;
 use anyhow::{Result, bail};
-use clap::CommandFactory;
 use dial::config::paths::Layout;
 use dial::config::types::Config;
 use dial::repl::OutputFormat;
@@ -13,7 +12,12 @@ use std::io::IsTerminal;
 
 pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
     if let Some(Command::Completions { shell }) = &cli.command {
-        clap_complete::generate(*shell, &mut Cli::command(), "dial", &mut std::io::stdout());
+        clap_complete::generate(
+            *shell,
+            &mut crate::args::command(),
+            "dial",
+            &mut std::io::stdout(),
+        );
         return Ok(());
     }
     if let Some(Command::Update { version }) = &cli.command {
@@ -29,6 +33,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         None => std::env::current_dir()?,
     };
     let layout = Layout::discover(&cwd)?;
+    cli.command = cli.command.map(Command::normalized);
     match &cli.command {
         Some(Command::ProviderBatch(args)) => {
             return dial::cli::provider_batches::run(&layout, args);
@@ -58,16 +63,18 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         }) => {
             return cmd::sessions::share(&cli, &layout, id, endpoint, *gist, *whole_journal);
         }
-        Some(Command::Reliability { action }) => {
+        Some(Command::Developer(DevCommand::Reliability { action })) => {
             return cmd::inspection::reliability(&cli, &layout, action);
         }
-        Some(Command::Policy { prompt, json }) => {
+        Some(Command::Developer(DevCommand::Policy { prompt, json })) => {
             return cmd::inspection::policy(&cli, &layout, prompt, *json);
         }
-        Some(Command::Steering { action }) => {
+        Some(Command::Developer(DevCommand::Steering { action })) => {
             return cmd::steering::run(&cli, &layout, action);
         }
-        Some(Command::Weights { action }) if !matches!(action, WeightsCommand::Improve { .. }) => {
+        Some(Command::Developer(DevCommand::Weights { action }))
+            if !matches!(action, WeightsCommand::Improve { .. }) =>
+        {
             return cmd::weights::run(&cli, &layout, action);
         }
         Some(Command::Experience { json }) => {
@@ -97,7 +104,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         Some(Command::Skills { action }) => {
             return cmd::skills::run(&cli, &layout, action);
         }
-        Some(Command::Laya { action }) => {
+        Some(Command::Developer(DevCommand::Laya { action })) => {
             return cmd::laya::run(&cli, &layout, action);
         }
         Some(Command::Schedule { action }) => {
@@ -154,20 +161,20 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         Some(Command::Run(args)) => {
             return exit_with(dial::cli::run::run(&layout, args)?);
         }
-        Some(Command::Gc(args)) => {
+        Some(Command::Developer(DevCommand::Gc(args))) => {
             return exit_with(dial::cli::gc::run(&layout, args.clone())?);
         }
-        Some(Command::Rules(args)) => {
+        Some(Command::Developer(DevCommand::Rules(args))) => {
             let config = Config::load(&layout, Some(overlay(&cli)?))?;
             return exit_with(dial::cli::rules::run(&layout, &cwd, &config, args)?);
         }
-        Some(Command::EditBench(args)) => {
+        Some(Command::Developer(DevCommand::EditBench(args))) => {
             return exit_with(dial::cli::edit_bench::run(args)?);
         }
         Some(Command::BrowserRelay(args)) => {
             return exit_with(dial::cli::browser_relay::run(&layout, args.clone())?);
         }
-        Some(Command::Anonymize(args)) => {
+        Some(Command::Developer(DevCommand::Anonymize(args))) => {
             return exit_with(dial::cli::anonymize::run(&layout, args.clone())?);
         }
         Some(Command::Ps(args)) => {
@@ -210,9 +217,9 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         _ => {}
     }
     let improving = match &cli.command {
-        Some(Command::Weights {
+        Some(Command::Developer(DevCommand::Weights {
             action: WeightsCommand::Improve { goal },
-        }) => Some(dial::weights::improvement_prompt(&goal.join(" "))),
+        })) => Some(dial::weights::improvement_prompt(&goal.join(" "))),
         _ => None,
     };
     if let Some(prompt) = &improving {
@@ -300,7 +307,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         mode.validate_protocol("ACP")?;
         return dial::acp::run_with_launch(layout, config.for_coding(), launch);
     }
-    if let Some(Command::Benchmark {
+    if let Some(Command::Developer(DevCommand::Benchmark {
         manifest,
         baseline,
         report,
@@ -310,7 +317,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         ablate_assistance,
         allow_remote,
         share_auth,
-    }) = cli.command.as_ref()
+    })) = cli.command.as_ref()
     {
         if *ablate_assistance {
             anyhow::ensure!(
@@ -345,7 +352,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
             },
         );
     }
-    if let Some(Command::Improve(cmd)) = cli.command {
+    if let Some(Command::Developer(DevCommand::Improve(cmd))) = cli.command {
         return cmd::improve::run(cmd, &layout, config);
     }
     chat(

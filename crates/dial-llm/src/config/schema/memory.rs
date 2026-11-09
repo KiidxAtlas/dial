@@ -784,6 +784,16 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         false
     ),
     field!(
+        "memory.semantic.embedding_autostart",
+        memory.semantic.embedding_autostart,
+        LE,
+        "Semantic memory",
+        "Start Ollama for embeddings",
+        "When the embedding role uses Ollama on this machine and it is not running, start one shared `ollama serve` for all Dial windows and stop it when the last one exits. A server you started yourself is reused and left running.",
+        Kind::Bool,
+        false
+    ),
+    field!(
         "memory.semantic.recall_limit",
         memory.semantic.recall_limit,
         LE,

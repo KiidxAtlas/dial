@@ -201,8 +201,8 @@ fn exhausted_budget_refuses_audio_before_source_retention() {
         confirm: Some(&|_| true),
         mutation_authorizer: Some(&|_, _, _| Ok(())),
     };
-    let perception = crate::tools::knowledge::perception::tools(&config).remove(0);
-    let opened = perception.call(&ctx, &json!({"action":"open","question":"no audio","limits":{"images":0,"pages":0,"frames":0,"audio_ms":0,"operations":1}}));
+    let evidence = crate::tools::knowledge::evidence::tools(&config).remove(0);
+    let opened = evidence.call(&ctx, &json!({"action":"budget_open","question":"no audio","limits":{"images":0,"pages":0,"frames":0,"audio_ms":0,"operations":1}}));
     assert!(opened.data.unwrap()["budget"].is_object());
     let before = walkdir_count(state.path());
     for action in ["replay", "analyze"] {
@@ -218,7 +218,10 @@ fn exhausted_budget_refuses_audio_before_source_retention() {
             "over-budget {action} retained original bytes"
         );
     }
-    perception.call(&ctx, &json!({"action":"close","reason":"test finished"}));
+    evidence.call(
+        &ctx,
+        &json!({"action":"budget_close","reason":"test finished"}),
+    );
 }
 
 #[test]

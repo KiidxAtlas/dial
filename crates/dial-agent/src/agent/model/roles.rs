@@ -56,10 +56,19 @@ pub(in crate::agent) fn retrieval_request(
     match name {
         "find" => crate::tools::code::navigation::semantic_request(workspace, args)
             .map(|request| request.map(|request| RetrievalRequest::Source(Box::new(request)))),
-        "evidence_search" => crate::tools::knowledge::retrieval::semantic_request_with_cancel(
-            workspace, args, cancel,
-        )
-        .map(|request| request.map(RetrievalRequest::Evidence)),
+        "evidence" => {
+            // Only the merged `search` action ranks citations; it runs under the retired
+            // `evidence_search` arguments, which its owner parses.
+            let Some(("evidence_search", legacy)) =
+                crate::tools::knowledge::evidence::legacy_call(args)
+            else {
+                return Ok(None);
+            };
+            crate::tools::knowledge::retrieval::semantic_request_with_cancel(
+                workspace, &legacy, cancel,
+            )
+            .map(|request| request.map(RetrievalRequest::Evidence))
+        }
         _ => Ok(None),
     }
 }

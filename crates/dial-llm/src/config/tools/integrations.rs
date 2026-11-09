@@ -39,17 +39,11 @@ integrations! {
     ("find", true, true),
     ("autoresearch", true, true),
     ("evidence", true, true),
-    ("evidence_search", true, true),
-    ("investigate", true, true),
-    ("workbench", true, true),
     ("data", true, true),
     ("document", true, true),
     ("audio", true, true),
     ("visual", true, true),
-    ("timeline", true, true),
     ("research", true, true),
-    ("reality", true, true),
-    ("perception", true, true),
     ("runtime_inspect", true, true),
     ("network_inspect", true, true),
     ("database", true, true),
@@ -70,4 +64,26 @@ integrations! {
     ("ida", false, false),
     ("image_gen", false, false),
     ("report_tool_issue", false, false),
+}
+
+/// Integration names retired by a merge: (retired, successor). Saved configuration and
+/// `--tools` entries that name a retired integration select its successor
+/// (`config::migrate_merged_integrations`, `cli::tool_flags::canonical_tool_name`).
+/// `kernel` became `eval` (`language = "py"`); the evidence family became `evidence` actions.
+pub const MERGED_INTEGRATIONS: &[(&str, &str)] = &[
+    ("kernel", "eval"),
+    ("evidence_search", "evidence"),
+    ("investigate", "evidence"),
+    ("workbench", "evidence"),
+    ("reality", "evidence"),
+    ("timeline", "evidence"),
+    ("perception", "evidence"),
+];
+
+/// The successor of a retired integration name, or the name itself.
+pub fn canonical_integration(name: &str) -> &str {
+    MERGED_INTEGRATIONS
+        .iter()
+        .find(|(retired, _)| retired.eq_ignore_ascii_case(name))
+        .map_or(name, |&(_, successor)| successor)
 }

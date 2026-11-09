@@ -181,8 +181,32 @@ public static class DialInstallerEd25519V1
     function Invoke-DialNative {
         param([string] $File, [string[]] $Arguments)
         $ErrorActionPreference = 'Continue'
-        $lines = @(& $File @Arguments 2>&1 | ForEach-Object { "$_" })
-        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($lines -join "`n") }
+        try {
+            $lines = @(& $File @Arguments 2>&1 | ForEach-Object { "$_" })
+        } catch {
+            # The process never started, e.g. Smart App Control or another application control policy blocked it.
+            return [pscustomobject]@{ ExitCode = $null; Output = $_.Exception.Message; Started = $false }
+        }
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($lines -join "`n"); Started = $true }
+    }
+
+    # Explains a failed launch of the downloaded dial.exe when Windows application control is the likely cause.
+    function Get-DialAppControlHint {
+        param([string] $Path, [string] $Output)
+        $sacState = $null
+        try {
+            $sacState = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name 'VerifiedAndReputablePolicyState' -ErrorAction Stop).VerifiedAndReputablePolicyState
+        } catch { }
+        $authenticode = $null
+        try { $authenticode = [string](Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop).Status } catch { }
+        $policyBlock = $Output -match 'Application Control|blocked this file|0x800711C7'
+        if ($sacState -eq 1 -and $authenticode -ne 'Valid') {
+            return " Windows Smart App Control is on and blocked dial.exe because Dial releases are not Authenticode-signed (signature status: $authenticode). The download passed Dial's signed-manifest and checksum verification; nothing was installed. Use the Linux build of Dial in WSL2 instead. Turning Smart App Control off is a system-wide security change that Dial does not require. See docs/windows.md#smart-app-control."
+        }
+        if ($policyBlock) {
+            return ' A Windows application control policy blocked dial.exe; nothing was installed. See docs/windows.md#smart-app-control.'
+        }
+        return ''
     }
 
     function Get-DialStatusCode {
@@ -338,9 +362,12 @@ public static class DialInstallerEd25519V1
             throw 'Release archive did not contain the expected regular dial.exe.'
         }
         $run = Invoke-DialNative $binary @('--version')
+        if (-not $run.Started) {
+            throw "Downloaded dial.exe could not start: $($run.Output)$(Get-DialAppControlHint $binary $run.Output)"
+        }
         $firstLine = ($run.Output -split "`n")[0].Trim()
         if ($run.ExitCode -ne 0 -or $firstLine -notmatch ('^dial ' + [regex]::Escape($versionNumber) + '( |$)')) {
-            throw "Downloaded binary version check failed (expected dial $versionNumber): $firstLine"
+            throw "Downloaded binary version check failed (expected dial $versionNumber): $firstLine$(Get-DialAppControlHint $binary $run.Output)"
         }
 
         $null = New-Item -ItemType Directory -Force -Path $destination

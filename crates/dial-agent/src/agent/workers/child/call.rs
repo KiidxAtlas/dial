@@ -69,7 +69,7 @@ pub(super) fn run(
         ControlFlow::Break(output) => return output,
     };
     let original = &prepared.call;
-    if matches!(original.name.as_str(), "find" | "evidence_search") {
+    if matches!(original.name.as_str(), "find" | "evidence") {
         match crate::agent::model::roles::retrieval_request(
             env.workspace,
             &original.name,

@@ -1,59 +1,36 @@
 //! Replayable expectation-versus-observation checks, not a browser or execution controller.
 use super::evidence::publish;
-use crate::config::types::Config;
 use crate::runtime::evidence::{
     Evidence, EvidenceContext, EvidenceKind, Location, Method, Representation,
 };
-use crate::tools::integrations::ext::{Tool, ToolContext};
 use crate::tools::{ToolOutput, Workspace};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
 
-pub fn tools(_: &Config) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(Reality)]
-}
-struct Reality;
-impl Tool for Reality {
-    fn name(&self) -> &str {
-        "reality"
-    }
-    fn schema(&self) -> Value {
-        crate::tools::tool_schema(
-            "reality",
-            "Use after observing the running app with browser, shell or evidence tools, to compare what the repository or a document expects with that captured observation. Returns: check counts exact literal occurrences or reads a JSON-pointer scalar from the retained observation and compares it with your expected scalar (the quote is validated; your reading of it is not); assess records a visual or behavioral mismatch you attribute, with both inputs. The observation must be observation-kind evidence. Both parents are retained for replay; sources are not reopened, and the result is not verification credit.",
-            json!({
-                "action":{"type":"string","enum":["check","assess"]},
-                "expectation":{"type":"string"},"observation":{"type":"string"},
-                "expectation_quote":{"type":"string","maxLength":4096},
-                "claim":{"type":"string","maxLength":4096},
-                "expected":{},
-                "selector":{"type":"object","properties":{"kind":{"type":"string","enum":["count","pointer"]},"value":{"type":"string","maxLength":4096}},"required":["kind","value"],"additionalProperties":false},
-                "operator":{"type":"string","enum":["eq","le","ge"]},
-                "assessment":{"type":"string","enum":["matches","mismatch","inconclusive"]}
-            }),
-            &[
-                "action",
-                "expectation",
-                "observation",
-                "expectation_quote",
-                "claim",
-            ],
-        )
-    }
-    fn needs_approval(&self, _: &Value) -> bool {
-        false
-    }
-    fn read_only_hint(&self) -> bool {
-        true
-    }
-    fn may_modify_workspace(&self, _: &Value) -> bool {
-        false
-    }
-    fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        run(ctx.workspace, args).unwrap_or_else(|e| ToolOutput::err(format!("{e:#}")))
-    }
+/// The retired `reality` contract, now the `evidence` `check` and `assess` actions.
+pub(crate) fn schema() -> Value {
+    crate::tools::tool_schema(
+        "reality",
+        "Use after observing the running app with browser, shell or evidence tools, to compare what the repository or a document expects with that captured observation. Returns: check counts exact literal occurrences or reads a JSON-pointer scalar from the retained observation and compares it with your expected scalar (the quote is validated; your reading of it is not); assess records a visual or behavioral mismatch you attribute, with both inputs. The observation must be observation-kind evidence. Both parents are retained for replay; sources are not reopened, and the result is not verification credit.",
+        json!({
+            "action":{"type":"string","enum":["check","assess"]},
+            "expectation":{"type":"string"},"observation":{"type":"string"},
+            "expectation_quote":{"type":"string","maxLength":4096},
+            "claim":{"type":"string","maxLength":4096},
+            "expected":{},
+            "selector":{"type":"object","properties":{"kind":{"type":"string","enum":["count","pointer"]},"value":{"type":"string","maxLength":4096}},"required":["kind","value"],"additionalProperties":false},
+            "operator":{"type":"string","enum":["eq","le","ge"]},
+            "assessment":{"type":"string","enum":["matches","mismatch","inconclusive"]}
+        }),
+        &[
+            "action",
+            "expectation",
+            "observation",
+            "expectation_quote",
+            "claim",
+        ],
+    )
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

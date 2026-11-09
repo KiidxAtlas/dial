@@ -1262,3 +1262,15 @@ fn activity_row_names_the_phase_from_what_the_turn_is_doing() {
         "{setup}"
     );
 }
+
+#[test]
+fn the_default_layout_shows_the_thinking_level_at_every_width() {
+    let data = StatusData {
+        thinking: "high".into(),
+        ..data()
+    };
+    for width in [70, 100, 160] {
+        let line = plain(&render(&UiConfig::default(), &data, width));
+        assert!(line.contains("THINK HIGH"), "{width}: {line}");
+    }
+}

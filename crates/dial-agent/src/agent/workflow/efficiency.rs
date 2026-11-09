@@ -456,7 +456,6 @@ pub(in crate::agent) fn preview_limit(
                 | "todo"
                 | "finish"
                 | "codebase_memory"
-                | "working_state"
         )
     {
         original

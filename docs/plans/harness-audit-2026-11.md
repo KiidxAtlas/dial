@@ -32,8 +32,8 @@ Partial:
 Not done:
 - #44, cursor redesign, and #45, strict schemas. Both change contract hashes.
 - #48, task budgets. Dial's limits are wall time and cost, not tokens.
-- #49, #50 and #52: tool consolidation, merging todo and working_state, and retiring modes. These are
-  product decisions that delete features and break recorded sessions.
+- #49 (partly, see below), #50 (done) and #52: tool consolidation, merging todo and working_state,
+  and retiring modes. These are product decisions that delete features and break recorded sessions.
 - Defaults that need a live A/B first: edit grammar per model, effort levels, OpenAI protocol.
 
 ---
@@ -267,7 +267,9 @@ Not done:
     `BUDGET_LIMIT` with the provider-side `task_budget` where supported.
 49. **Consolidate overlapping tools.** The catalog has about 70 tools.
     - Evidence: `evidence`, `evidence_search`, `workbench`, `investigate`, `reality`, `timeline` and
-      `perception` → one `evidence` tool with actions, or a skill.
+      `perception` → one `evidence` tool with actions, or a skill. **Implemented:** all seven
+      are now `evidence` actions, with config, `--tools` and recorded-history migration
+      (`knowledge/evidence.rs` `MERGED_ACTIONS`).
     - Search: `find` and `ast_search` → modes of `grep`.
     - Read: `read` already covers URLs, documents, media and archives, which makes most of
       `web_fetch`, `document`, `audio`, `visual`, `video`, `archive` and `notebook` redundant.
@@ -275,7 +277,11 @@ Not done:
     - State: `memory`, `experience`, `codebase_memory`, `working_state`, `context_notes`, `todo` and
       `checkpoint`.
     - Fewer tools means better search ranking and less model confusion.
-50. **Merge `todo` and `working_state`.**
+50. **Merge `todo` and `working_state`.** *Implemented:* `todo` ops `state_view`/`state_update`/
+    `state_patch` route to the unchanged working-state owner and are validated against its
+    contract. Config, `--tools` and recorded history migrate (`contracts.rs` `merged_todo_projection`).
+    Not done: the status-only redesign and dropping `investigation`/`finding`/`evidence` fields,
+    which would change the plan contract and its behaviour.
     - `open_work` overlaps with todos, and deliverables overlap with steps.
     - Fix: one plan tool with status-only updates, and keep claims/decisions as the compaction
       carry. Drop the legacy `investigation` field and fold `finding`/`evidence` into `note`.

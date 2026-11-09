@@ -736,6 +736,37 @@ fn prune_closed(tasks: &mut Vec<Task>) -> Vec<String> {
     archived
 }
 
+/// The `todo` ops that read or write the durable working state (formerly the `working_state`
+/// tool) and the `working_state` action each one stands for.
+pub const STATE_OPS: [(&str, &str); 3] = [
+    ("state_view", "view"),
+    ("state_update", "update"),
+    ("state_patch", "patch"),
+];
+
+/// A `todo` call naming a state op, as the equivalent `working_state` arguments: `action` from
+/// the op and the `state` object's fields at the top level. Every other key is carried over
+/// unchanged, so validating the result against the working-state schema refuses it. `None` for
+/// planning ops.
+pub fn state_call(args: &Value) -> Option<Value> {
+    let op = args.get("op").and_then(Value::as_str)?;
+    let action = STATE_OPS.iter().find(|(name, _)| *name == op)?.1;
+    let mut legacy = serde_json::Map::new();
+    legacy.insert("action".into(), json!(action));
+    for (key, value) in args.as_object()? {
+        match (key.as_str(), value) {
+            ("op", _) => {}
+            ("state", Value::Object(fields)) => {
+                legacy.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            _ => {
+                legacy.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Some(Value::Object(legacy))
+}
+
 /// The operation a todo call requests, including the accepted `done: true` shorthand. Guards that
 /// classify raw todo calls use this so shorthand and canonical calls are treated alike.
 pub fn requested_op(args: &Value) -> Option<&str> {
@@ -744,16 +775,21 @@ pub fn requested_op(args: &Value) -> Option<&str> {
         .or_else(|| (args.get("done") == Some(&Value::Bool(true))).then_some("done"))
 }
 
+/// The `state` object's shape, validated on use against the working-state contract
+/// (`working_state::schema`) rather than spelled out in the always-offered schema.
+const STATE_DESCRIPTION: &str =
+    "goal, decisions, constraints, open_work, evidence, claims, deliverables";
+
 pub fn schema() -> Value {
     json!({
         "type": "function",
         "function": {
             "name": "todo",
-            "description": "todo: optional plan for long work with several distinct steps; skip it for short tasks. done closes the active item and starts the next; never resend set to mark progress. Indices are 1-based. Send each update in the same response as the next real tool call when several calls are allowed. An accepted finish(completed) closes the steps still open, so no closing todo call is needed.",
+            "description": "todo: optional plan for long work with several distinct steps; skip it for short tasks. done closes the active item and starts the next; never resend set to mark progress. Indices are 1-based. Send each update in the same response as the next real tool call when several calls are allowed. An accepted finish(completed) closes the steps still open, so no closing todo call is needed. state_* ops keep deliverables across compaction.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "op": {"type": "string", "enum": ["set", "append", "start", "done", "drop", "block", "view"]},
+                    "op": {"type": "string", "enum": ["set", "append", "start", "done", "drop", "block", "view", "state_view", "state_update", "state_patch"]},
                     "tasks": {
                         "type": "array",
                         "description": "For set (the full list, in order) and append (tasks to add at the end).",
@@ -762,16 +798,18 @@ pub fn schema() -> Value {
                             "properties": {
                                 "content": {"type": "string"},
                                 "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "abandoned"]},
-                                "kind": {"type":"string", "enum":["step","follow_up"], "description":"Execution step (default) or optional follow-up. Follow-ups never block completion or start automatically. Required deliverables belong in working_state, not planning text."},
+                                "kind": {"type":"string", "enum":["step","follow_up"], "description":"Execution step (default) or optional follow-up. Follow-ups never block completion or start automatically. Required deliverables belong in state, not planning text."},
                                 "phase": {"type": "string"},
                                 "investigation": {"type": "boolean", "description": "Legacy label; same lifecycle."}
                             }
                         }
                     },
                     "index": {"type": "integer", "minimum": 1, "description": "1-based task number. start defaults to the first pending task; done/drop/block to the in-progress or only open task."},
-                    "reason": {"type": "string", "maxLength": MAX_REASON_CHARS, "description": format!("block (required) and drop: why, with evidence; up to {MAX_REASON_CHARS} chars.")},
-                    "finding": {"type": "string", "maxLength": MAX_FINDING_CHARS, "description": format!("Optional answer, ruled-out hypotheses or remaining uncertainty; up to {MAX_FINDING_CHARS} chars.")},
-                    "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4, "description": "Optional file:line, check or artifact references (240 chars each), or an earlier call that already did the step; observations, not proof."}
+                    "reason": {"type": "string", "maxLength": MAX_REASON_CHARS, "description": "block (required) and drop: why, with evidence."},
+                    "finding": {"type": "string", "maxLength": MAX_FINDING_CHARS, "description": "Optional answer, ruled-out hypotheses or remaining uncertainty."},
+                    "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4, "description": "Optional file:line, check or artifact references (240 chars each), or an earlier call that already did the step; observations, not proof."},
+                    "expected_revision": {"type": "integer", "minimum": 0},
+                    "state": {"type": "object", "description": STATE_DESCRIPTION}
                 }
             }
         }

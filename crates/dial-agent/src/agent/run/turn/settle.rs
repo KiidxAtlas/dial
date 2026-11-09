@@ -23,6 +23,7 @@ impl Agent<'_> {
             max_tokens,
             seed,
             outcome,
+            repeat_streak,
             ..
         } = round;
         let ToolOutcome {
@@ -78,6 +79,32 @@ impl Agent<'_> {
             turn.steering_pending = true;
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Steering, "Kept completed tool results and skipped unstarted old actions; replanning with your new instruction."));
             return Ok(crate::agent::run::engine::Tick::Again);
+        }
+        // The first identical repeat past the escalation is answered with references; a model
+        // that repeats it again is not changing approach, so the turn stops instead of spending
+        // further requests on references to references.
+        if short_circuited
+            && let Some(repeat) = repeat_streak.as_ref()
+            && repeat.count > crate::agent::safety::stream_guards::TOOL_CALL_LOOP_THRESHOLD + 1
+        {
+            let attempts = repeat.count + 1;
+            self.record(
+                step,
+                "repeated_call_stop",
+                json!({"name":repeat.tool_name,"count":attempts}),
+            )?;
+            let result = if repeat.result_summary.is_empty() {
+                "(no text result)"
+            } else {
+                repeat.result_summary.as_str()
+            };
+            let reason = format!(
+                "Blocked: the model sent the identical `{}` call {attempts} times in a row and kept repeating it after being told it would not run again.\nArguments: `{}`\nLast executed result: `{result}`\nCompleted effects and the conversation are kept; no completion was recorded. Send a direction (for example the corrected command) or say \"continue\" to resume.",
+                repeat.tool_name, repeat.arguments_summary
+            );
+            let mut report = self.stop_turn(ui, reason, step + 1)?;
+            report.outcome = TurnOutcome::Blocked;
+            return Ok(crate::agent::run::engine::Tick::Finished(report));
         }
         if let Some(check) = self.auto_registered_checks(ui) {
             if let Some(results) = check

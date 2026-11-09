@@ -1,57 +1,32 @@
 //! Bounded evidence inspection, lineage, conflict reporting and append-only human corrections.
 use super::evidence::publish;
-use crate::config::types::Config;
 use crate::runtime::evidence::{
     Evidence, EvidenceContext, EvidenceKind, Location, Method, Representation,
 };
-use crate::tools::integrations::ext::{Tool, ToolContext};
 use crate::tools::{ToolOutput, Workspace};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const MAX_NODES: usize = 64;
 const MAX_BYTES: usize = 1024 * 1024;
 const PREVIEW_BYTES: usize = 4096;
 
-/// Register model-facing access to the same workbench used by `/evidence`.
-pub fn tools(_: &Config) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(Workbench)]
-}
-struct Workbench;
-impl Tool for Workbench {
-    fn name(&self) -> &str {
-        "workbench"
-    }
-    fn schema(&self) -> Value {
-        crate::tools::tool_schema(
-            "workbench",
-            "Use to audit retained evidence before relying on it. Returns: inspect lists citations, coverage gaps, unavailable artifacts and conflicting captured source identities; lineage walks bounded parent lineage; correct appends a correction without rewriting evidence (it stays caller-authored unless the human supplied it). Sources are not reopened, so freshness is unknown until an explicit evidence freshness call. Use investigate for semantic comparison.",
-            json!({
-                "action":{"type":"string","enum":["inspect","lineage","correct"]},
-                "references":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string"}},
-                "depth":{"type":"integer","minimum":0,"maximum":8},
-                "correction":{"type":"string","maxLength":8192}
-            }),
-            &["action", "references"],
-        )
-    }
-    fn needs_approval(&self, _: &Value) -> bool {
-        false
-    }
-    fn read_only_hint(&self) -> bool {
-        true
-    }
-    fn may_modify_workspace(&self, _: &Value) -> bool {
-        false
-    }
-    fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        run(ctx.workspace, args).unwrap_or_else(|e| ToolOutput::err(format!("{e:#}")))
-    }
+/// The retired `workbench` contract, now the `evidence` `audit`, `lineage` and `correct` actions.
+/// `/evidence` uses the same [`run`].
+pub(crate) fn schema() -> Value {
+    crate::tools::tool_schema(
+        "workbench",
+        "Use to audit retained evidence before relying on it. Returns: inspect lists citations, coverage gaps, unavailable artifacts and conflicting captured source identities; lineage walks bounded parent lineage; correct appends a correction without rewriting evidence (it stays caller-authored unless the human supplied it). Sources are not reopened, so freshness is unknown until an explicit evidence freshness call. Use investigate for semantic comparison.",
+        json!({
+            "action":{"type":"string","enum":["inspect","lineage","correct"]},
+            "references":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string"}},
+            "depth":{"type":"integer","minimum":0,"maximum":8},
+            "correction":{"type":"string","maxLength":8192}
+        }),
+        &["action", "references"],
+    )
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

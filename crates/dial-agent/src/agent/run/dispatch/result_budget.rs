@@ -115,7 +115,6 @@ pub(in crate::agent) fn budget_exempt(call: &ToolCall, output: &ToolOutput) -> b
                 | "revert_edit"
                 | "todo"
                 | "finish"
-                | "working_state"
                 | "tool_load"
                 | "tool_search"
                 | "ask"

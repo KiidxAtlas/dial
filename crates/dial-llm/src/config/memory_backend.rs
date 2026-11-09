@@ -189,6 +189,8 @@ pub struct SemanticConfig {
     pub embedding_model: String,
     pub embedding_api_key_env: String,
     pub embedding_timeout_secs: u64,
+    /// Start `ollama serve` when the embedding role points at a local Ollama that is not running.
+    pub embedding_autostart: bool,
     pub recall_limit: usize,
     pub token_budget: usize,
     /// Retain facts from substantive completed turns automatically, using the memory role.
@@ -204,6 +206,7 @@ impl Default for SemanticConfig {
             embedding_model: String::new(),
             embedding_api_key_env: String::new(),
             embedding_timeout_secs: 20,
+            embedding_autostart: true,
             recall_limit: 8,
             token_budget: 1500,
             auto_retain: true,

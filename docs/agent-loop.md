@@ -209,7 +209,7 @@ decision rule. Reports briefly identify reused coverage or the gap requiring new
 Checks are optional unless required by configured/user gates; when warranted they start focused
 once relevant edits settle, not after each edit. Diagnose errors before a rerun and disclose gaps
 rather than inventing required optional checks. When three model rounds in a row each make one lookup (`read`, search or safe
-shell, ignoring a `todo`/`working_state` call beside it), the turn adds advice to batch known
+shell, ignoring a `todo` call beside it), the turn adds advice to batch known
 lookups in one response — read every relevant search hit together with the next searches — and
 repeats it every three such rounds. Broader runs need affected interfaces,
 unresolved risk, an explicit request or a required project gate. Passing evidence is reusable
@@ -357,8 +357,8 @@ arbitrary model claims are correct.
 | Subagent step limit | A worker reaches its role's default or the task's `max_steps` | 1 reserved tool-free summary request | Workers |
 | Coach review | Configured coach review and a change with uncheckpointed effects, `min_changed_files`, a sensitive path or uncovered declared requirements | Up to `verification.review.max_rounds` | Where a coach route is usable |
 
-Planning distinguishes three records: user-required durable deliverables belong in
-`working_state`; execution steps are `todo` items with `kind=step` (also the default for omitted
+Planning distinguishes three records: user-required durable deliverables belong in the working
+state (`todo` `state_*` ops); execution steps are `todo` items with `kind=step` (also the default for omitted
 kinds and older snapshots); optional experiments and future checks use `kind=follow_up`.
 Pending follow-ups are not automatically started, and blocked follow-ups do not gate completion.
 Outstanding follow-ups remain recorded and visible in notices rather than being silently closed.
@@ -550,7 +550,7 @@ adding `data`. This applies in interactive and print runs. Explicit inspection/a
 workbook inputs and stated large-data work retain the specialist; `Analyze sales.csv and write
 summary.json` still selects it. Routing does not open files or infer their actual size. Explicit
 tool requests, catalog discovery and retained selections remain available. The
-`evidence`/`evidence_search` pair is routed only for citation intent (evidence, citations, quotes,
+`evidence` tool is routed only for citation intent (evidence, citations, quotes,
 cited sources), no longer alongside every routed format tool.
 This is conservative lexical routing, not natural-language understanding: explicitly named tools and
 ordinary discovery remain available. Schemas, validation, permissions and routing budgets are unchanged.
@@ -594,6 +594,19 @@ not in Dial's catalog, incomplete processes, compound commands, and policy denia
 ordinary diagnostics; this coaching never grants filesystem, network or execution permission.
 
 Duplicate recovery withholds only the exact repeated call, including reads. Different ranges and files remain available, changed source identities clear the affected restriction, and new user steering resets the turn's recovery state. A withheld call is reported explicitly as unexecuted; its cached observation still contributes to the shared repetition bound rather than being misclassified as a new execution failure.
+
+Failed-operation retry summaries retain up to 1,600 characters of the original multiline diagnostic,
+before recovery notices are appended; a refusal does not replace it with another refusal. For shell
+checks declaring `check_paths`, those workspace-relative files take precedence over the whole-Git-tree
+fallback: unrelated edits do not release the retry barrier, but a change to a declared input does,
+including an external repair outside Git. Checks without declared inputs retain the existing
+whole-tree/unknown-dependency recovery rules. Source changes make a retry eligible, not verified.
+
+Native syntax diagnostics also catch literal newlines in short Python strings, which the linked
+tree-sitter grammar otherwise accepts. Triple-quoted strings, escaped line continuations and
+multiline f-string expressions remain supported. This uses the existing syntax advisory/refusal
+policy, including explicit disable and dialect escape hatches; it does not silently rewrite source
+or replace Python's own syntax checks and focused behavioral tests.
 
 Read restrictions track every target in `read.paths`, not just `read.path`; a changed or removed
 target releases that batch's restriction without releasing unrelated calls. Unchanged reads use
@@ -729,6 +742,19 @@ claim they were unexecuted. Successful results containing background warnings (f
 Vue Router missing-route warnings) do not become failed executions by text matching.
 Typed preflight, schema and permission refusals do not arm it: they were not executed, and
 their existing admission requirements still govern the next call.
+When a refused retry's shell error points at the command line itself (for example `No module
+named …` or `command not found`), the refusal also names the rejected command and asks for its
+program, module and path names and argument spacing to be corrected.
+
+An identical call set repeated across consecutive replies is a separate, history-derived guard.
+At five repeats the model receives a redirect and at six a stronger notice; the next identical
+reply is answered with references to the earlier results instead of running. Each reference quotes
+the newest result in the streak that came from actually running the call, never a retry-barrier
+refusal or an earlier reference, so the original diagnostic stays visible. Repeating the same call
+set once more after a reference ends the turn as **blocked**, naming the call, its arguments and
+its last executed result. A different call at any point runs normally. Calls refused by the
+controller (retry barrier, contract or preflight) are not counted as shell or extension effects
+in the turn report's "Outside /undo" line.
 Provider-generation failures separately explain that no tools were dispatched from that failed
 response, while earlier operations in the turn remain retained. The original error chain and
 provider retry classification are preserved; recovery guidance does not automatically replay tools.
@@ -934,8 +960,9 @@ is stored once with a lossless in-contract JSON pointer; distinct drafts and ori
 Fresh worker handoffs carry a bounded snapshot with explicit overflow and a request to recover
 omitted context from the parent.
 
-For substantial work, optional `working_state.deliverables` records concrete outcomes, status
-and evidence references. Notes-only `update` preserves these obligations; `patch` preserves every
+For substantial work, optional working-state `deliverables` (`todo` `state_update`/`state_patch`)
+record concrete outcomes, status and evidence references. Notes-only `state_update` preserves these
+obligations; `state_patch` preserves every
 omitted field. Declaring an obligation records the current runtime user-message provenance without
 claiming that the model captured the whole request. Removing, cancelling or redefining one requires
 an explicit human scope confirmation through the existing question surface. Refusal, timeout or an
@@ -1359,8 +1386,8 @@ limits, reasoning budgets, approvals or verification requirements:
   Short observation text and harness notices stay verbatim when a pointer would be larger.
   Observations are results of search/read tools (`read`, `grep`, `glob`, `find`, read-only `lsp`,
   `ast_search`, `dep_source`, web search/fetch) and the bounded read-only investigation tools
-  (`data`, `database`, `document`, `network_inspect`, `runtime_inspect`, `timeline`,
-  `evidence_search`, `audio`, `visual`, `video`); tools that also record state keep their results.
+  (`data`, `database`, `document`, `network_inspect`, `runtime_inspect`, `audio`, `visual`,
+  `video`); tools that also record state, including `evidence`, keep their results.
   Compaction still uses configured token/percentage/model/agent policy with output/reserve headroom.
   With `compaction.drop_useless`, an old artifact-backed read-only failure can condense only after
   a later exact tool-and-arguments retry has explicit successful metadata and known effects.

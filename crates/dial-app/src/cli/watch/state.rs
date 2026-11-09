@@ -6,7 +6,8 @@
 //!   pane only renders it and never reads session internals.
 //! - `inbox/` holds one file per pane request. The session drains it in name order, deletes each
 //!   file before acting, and runs every request through the same owner the main window uses.
-//!   Requests are limited to stopping work and messaging a peer; approvals never travel here.
+//!   Requests are limited to stopping work, messaging a peer and prompting this session's model;
+//!   approvals never travel here.
 use super::directory;
 use crate::agent::workflow::todo::Task;
 use crate::config::paths::Layout;
@@ -40,6 +41,35 @@ pub(crate) struct Snapshot {
     pub peers: Peers,
     /// Outcomes of recent pane requests, oldest first.
     pub outcomes: Vec<String>,
+    /// The model this session runs.
+    #[serde(default)]
+    pub model: String,
+    /// Recent prompts, replies and wake-ups of this session, oldest first, bounded to
+    /// [`CONVERSATION`].
+    #[serde(default)]
+    pub conversation: Vec<ChatLine>,
+}
+
+/// Lines kept of this session's own conversation.
+pub(crate) const CONVERSATION: usize = 60;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ChatRole {
+    /// A prompt the human typed (in the main window or the pane).
+    #[default]
+    User,
+    /// The model's reply at the end of a turn.
+    Model,
+    /// A lifecycle event such as a peer wake-up or an interrupted turn.
+    Event,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ChatLine {
+    pub role: ChatRole,
+    pub text: String,
+    pub at_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +142,9 @@ pub(crate) struct PeerRow {
     pub summary: String,
     pub phase: String,
     pub scopes: Vec<String>,
+    /// The model that peer runs; empty when it does not say.
+    #[serde(default)]
+    pub model: String,
     pub overlapping: Vec<String>,
     /// The recent conversation with this peer, oldest first, bounded to [`PEER_MESSAGES`].
     #[serde(default)]
@@ -126,8 +159,15 @@ pub(crate) struct PeerMessage {
     /// Sent by this session; otherwise received from the peer.
     pub outgoing: bool,
     pub text: String,
-    /// Still queued for this session; the model has not received it yet.
+    /// Not received by its recipient's model yet: incoming mail still queued here, or outgoing
+    /// mail still queued in the peer's inbox.
     pub unread: bool,
+    /// When it was sent, in Unix milliseconds; 0 when unknown.
+    #[serde(default)]
+    pub at_ms: u64,
+    /// Typed by the human in this pane rather than by this session's model.
+    #[serde(default)]
+    pub by_user: bool,
 }
 
 /// One pane request. Unknown fields or actions are refused.
@@ -151,6 +191,10 @@ pub(crate) enum Request {
         to: String,
         text: String,
     },
+    /// Send a prompt to this session's own model, as if typed in its main window.
+    Prompt {
+        text: String,
+    },
 }
 
 impl Request {
@@ -169,14 +213,19 @@ impl Request {
             Self::CancelSideAnswer => Ok(()),
             Self::MessagePeer { to, text } => {
                 short(to, "peer id")?;
-                ensure!(
-                    !text.trim().is_empty() && text.len() <= MAX_MESSAGE,
-                    "a peer message must be 1 to {MAX_MESSAGE} bytes"
-                );
-                Ok(())
+                message(text)
             }
+            Self::Prompt { text } => message(text),
         }
     }
+}
+
+fn message(text: &str) -> Result<()> {
+    ensure!(
+        !text.trim().is_empty() && text.len() <= MAX_MESSAGE,
+        "a message must be 1 to {MAX_MESSAGE} bytes"
+    );
+    Ok(())
 }
 
 fn state_path(layout: &Layout, session: &str) -> Result<PathBuf> {

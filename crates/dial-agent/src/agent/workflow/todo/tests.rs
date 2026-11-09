@@ -729,3 +729,49 @@ fn missing_op_without_tasks_gets_the_usage_hint() {
     assert!(out.is_error);
     assert!(out.text.contains("{\"op\":\"done\"}"), "{}", out.text);
 }
+
+#[test]
+fn state_ops_round_trip_with_recorded_working_state_calls() {
+    use crate::tools::surface::contracts::working_state_as_todo;
+    for recorded in [
+        json!({"action":"view"}),
+        json!({"action":"update","goal":"ship","claims":[]}),
+        json!({"action":"patch","expected_revision":2,"deliverables":[{"id":"d","description":"x","status":"open"}]}),
+    ] {
+        let call = working_state_as_todo(&recorded).unwrap();
+        assert_eq!(state_call(&call), Some(recorded));
+    }
+    assert_eq!(state_call(&json!({"op":"view"})), None);
+    assert_eq!(state_call(&json!({"op":"set","tasks":[]})), None);
+}
+
+#[test]
+fn sessions_recorded_before_state_ops_resume_against_the_real_schema() {
+    use crate::tools::surface::contracts::{identities, project_history};
+    let registry = crate::tools::integrations::ext::Registry::new();
+    let current = schema();
+    let mut before = current.clone();
+    let properties = before["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap();
+    properties.remove("state");
+    properties.remove("expected_revision");
+    properties["op"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|op| !op.as_str().unwrap().starts_with("state_"));
+    let old = identities(std::slice::from_ref(&before), &registry)["todo"].clone();
+    assert_ne!(
+        old,
+        identities(std::slice::from_ref(&current), &registry)["todo"]
+    );
+    let history = vec![
+        json!({"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"todo","arguments":"{\"op\":\"view\"}"}}],"dial_tool_contracts":{"c":old}}),
+        json!({"role":"tool","tool_call_id":"c","content":"No tasks."}),
+    ];
+    assert!(
+        project_history(&history, std::slice::from_ref(&current), &registry)
+            .unwrap()
+            .is_none()
+    );
+}

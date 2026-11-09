@@ -80,6 +80,17 @@ completion and zero-test runs cannot earn success credit; clipped output without
 complete artifact remains unverified. A wrapper's observed zero exit still does not prove that
 every inner command succeeded, so verification commands must propagate inner failures.
 
+## Model-registered helper diagnostics
+
+`verify` acceptance helpers remain distinct from operator-declared requirements. They rerun
+after an effect revision changes; an opaque shell operation can invalidate evidence even when
+it was intended only to inspect files. A repeated identical failure is reported with a short
+notice rather than another copy of the diagnostic. Each rerun still records its actual status,
+process outcome and retained log reference, and still blocks successful completion. Changed
+diagnostics, changed helper commands and failures after a passing run are reported in full again.
+Explicit registration also reports the full diagnostic. Short notices do not reuse failed checks
+or imply that unchanged diagnostics establish unchanged inputs.
+
 ## Requested run targets
 
 When the latest admitted user request starts with a run verb (`run`, `launch`, `start`, `execute`, `play`) and names an existing workspace path, completion needs an observed run of that path. Filler such as "please", "okay" or "can you" may come first. A verb followed by `by`, `with`, `on`, `a`, `review` or a gerund ("start by…", "start editing…", "launch a review of…") does not count. A path span is up to four words and must contain a `/` or a file extension, so `local testing/` resolves and plain prose does not. Questions, explanations and requests that only mention a path create no obligation. Autonomous, peer and hermetic turns create none either. A steering message that itself asks to run named paths replaces the obligation, keeping runs already observed for paths it still names; other steering keeps the open obligation. `verification.target_evidence = false` turns the rule off.

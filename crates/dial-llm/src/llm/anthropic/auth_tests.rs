@@ -20,7 +20,7 @@ fn subscription_headers_are_shared_by_discovery_and_inference() {
                     && beta.contains("fallback-credit-2026-06-01")
             );
         }
-        assert!(headers.contains(&("User-Agent", "claude-cli/2.1.280 (external, cli)".into())));
+        assert!(headers.contains(&("User-Agent", "claude-cli/2.1.290 (external, cli)".into())));
         assert!(headers.contains(&("anthropic-dangerous-direct-browser-access", "true".into())));
         assert!(headers.contains(&("x-app", "cli".into())));
         assert!(headers.contains(&("X-Stainless-Lang", "js".into())));

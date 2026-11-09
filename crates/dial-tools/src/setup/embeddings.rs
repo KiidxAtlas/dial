@@ -27,9 +27,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Settings path of the embedding model row, which carries the setup offer.
 pub const EMBEDDING_MODEL_PATH: &str = "memory.semantic.embedding_model";
@@ -486,7 +485,9 @@ pub fn wiring(config: &Config, model: &str, mode: EmbeddingMode) -> Result<Vec<C
 }
 
 /// Ensures the server answers. Only the local default is started (installing Ollama through the
-/// dependency registry first when the registry knows how); other servers must already be running.
+/// dependency registry first when the registry knows how), through the shared owner that sessions
+/// also use, so setup never launches a second server and the one it starts is stopped when no Dial
+/// process needs it. Other servers must already be running.
 fn ensure_ollama(
     layout: &Layout,
     server: &Server,
@@ -513,26 +514,21 @@ fn ensure_ollama(
         }
     };
     progress("starting ollama serve");
-    Command::new(&program)
-        .arg("serve")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("starting {} serve", program.display()))?;
-    let started = Instant::now();
-    while !reachable(server) {
-        ensure!(
-            !cancel.load(Ordering::Relaxed),
-            "cancelled while starting Ollama"
-        );
-        ensure!(
-            started.elapsed() < START_TIMEOUT,
-            "Ollama did not start within {}s; run `ollama serve` in a terminal and try again",
-            START_TIMEOUT.as_secs()
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "cancelled while starting Ollama"
+    );
+    let ready = crate::llm::ollama::serve::ensure(
+        &layout.user_dir,
+        &server.base_url,
+        Some(&program),
+        START_TIMEOUT,
+    )?;
+    ensure!(
+        ready != crate::llm::ollama::serve::Ready::Starting,
+        "Ollama did not start within {}s; run `ollama serve` in a terminal and try again",
+        START_TIMEOUT.as_secs()
+    );
     Ok(())
 }
 

@@ -1,12 +1,14 @@
 //! The interactive side pane `dial watch` opens in a terminal: one full-screen view with tabs for
-//! the live feed, the plan, jobs, workers, side threads and peers. Enter on a peer opens the
-//! conversation between this session and that peer.
+//! the live feed, the plan, jobs, workers, side threads and chats. The Chats tab lists this
+//! session's own conversation and one per project peer; Enter opens a text-message style thread
+//! with an inline composer.
 //!
 //! The pane renders what the session publishes (`state.json`, see [`super::state`]) plus the
 //! append-only feed, and never reads session internals. Its only effects are requests in the
-//! session's private inbox: stop a job, a worker or a side answer, or message a peer. Every stop
-//! asks for confirmation first. Approvals and questions stay in the main window.
-use super::state::{self, Job, JobKind, Request, Snapshot};
+//! session's private inbox: stop a job, a worker or a side answer, message a peer, or prompt this
+//! session's model. Every stop asks for confirmation first. Approvals and questions stay in the
+//! main window.
+use super::state::{self, ChatRole, Job, JobKind, Request, Snapshot};
 use super::{Event, load_image, next_event};
 use crate::agent::workflow::todo::Status;
 use crate::config::paths::Layout;
@@ -24,6 +26,9 @@ use std::io::BufRead;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+mod chat;
+use chat::{Bubble, Side};
+
 /// Feed entries kept in memory; older ones scroll away.
 const FEED_LIMIT: usize = 500;
 /// A snapshot older than this means the session stopped publishing (closed, or busy in a call
@@ -31,6 +36,12 @@ const FEED_LIMIT: usize = 500;
 const STALE_MS: u64 = 5_000;
 const STATE_EVERY: Duration = Duration::from_millis(250);
 const MESSAGE_LIMIT: usize = 4000;
+/// Messages shown as "Sending…" until the session publishes them.
+const OUTBOX: usize = 16;
+/// A sent message the session never published stops showing after this long.
+const OUTBOX_MS: u64 = 120_000;
+/// Rows the composer may grow to.
+const COMPOSER_ROWS: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tab {
@@ -63,7 +74,7 @@ impl Tab {
             Self::Jobs => "Jobs",
             Self::Workers => "Workers",
             Self::Threads => "Threads",
-            Self::Peers => "Peers",
+            Self::Peers => "Chats",
         }
     }
 }
@@ -82,7 +93,22 @@ enum FeedItem {
 enum Mode {
     Browse,
     Confirm { request: Request, prompt: String },
-    Compose { to: String, text: String },
+}
+
+/// Whose conversation the Chats tab has open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Target {
+    /// This session's own model.
+    Session,
+    /// A project peer, by instance id.
+    Peer(String),
+}
+
+/// A message sent from this pane that the session has not published yet.
+struct Pending {
+    target: Target,
+    text: String,
+    at_ms: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -104,8 +130,12 @@ pub(super) struct Pane {
     error: Option<String>,
     status: Option<String>,
     mode: Mode,
-    /// The peer whose conversation fills the Peers tab, if one is open.
-    chat: Option<String>,
+    /// The conversation open in the Chats tab, if any.
+    chat: Option<Target>,
+    /// The message being typed into the open conversation.
+    draft: String,
+    /// Sent from here, not yet published by the session.
+    outbox: Vec<Pending>,
     /// Chat lines scrolled up from the newest; 0 follows new messages.
     chat_back: usize,
     /// Body height at the last render, for page keys.
@@ -125,6 +155,8 @@ impl Pane {
             status: None,
             mode: Mode::Browse,
             chat: None,
+            draft: String::new(),
+            outbox: Vec::new(),
             chat_back: 0,
             page: 10,
         }
@@ -160,16 +192,23 @@ impl Pane {
             let selected = &mut self.selected[tab.index()];
             *selected = (*selected).min(count.saturating_sub(1));
         }
+        let now = crate::ui::subagent_model::epoch_ms();
+        let state = self.state.as_ref();
+        self.outbox.retain(|pending| {
+            now.saturating_sub(pending.at_ms) < OUTBOX_MS
+                && !state.is_some_and(|state| published(state, pending))
+        });
     }
 
     pub(super) fn paste(&mut self, pasted: &str) {
-        if let Mode::Compose { text: draft, .. } = &mut self.mode {
-            for c in pasted.chars().filter(|c| !c.is_control()) {
-                if draft.len() + c.len_utf8() > MESSAGE_LIMIT {
-                    break;
-                }
-                draft.push(c);
+        if self.chat.is_none() {
+            return;
+        }
+        for c in pasted.chars().filter(|c| *c == '\n' || !c.is_control()) {
+            if self.draft.len() + c.len_utf8() > MESSAGE_LIMIT {
+                break;
             }
+            self.draft.push(c);
         }
     }
 
@@ -183,7 +222,7 @@ impl Pane {
             Tab::Jobs => state.jobs.len(),
             Tab::Workers => state.workers.len(),
             Tab::Threads => state.threads.len(),
-            Tab::Peers => state.peers.rows.len(),
+            Tab::Peers => state.peers.rows.len() + 1,
         }
     }
 
@@ -192,50 +231,28 @@ impl Pane {
         if ctrl && key.code == KeyCode::Char('c') {
             return KeyOutcome::Quit;
         }
-        match std::mem::replace(&mut self.mode, Mode::Browse) {
-            Mode::Browse => {}
-            Mode::Confirm { request, prompt } => {
-                return match key.code {
-                    KeyCode::Char('y') | KeyCode::Enter => {
-                        self.status = Some(format!("Requested: {prompt}"));
-                        KeyOutcome::Send(request)
-                    }
-                    KeyCode::Char('n') | KeyCode::Esc => {
-                        self.status = Some("Nothing was stopped.".into());
-                        KeyOutcome::Continue
-                    }
-                    _ => {
-                        self.mode = Mode::Confirm { request, prompt };
-                        KeyOutcome::Continue
-                    }
-                };
-            }
-            Mode::Compose { to, mut text } => {
-                match key.code {
-                    KeyCode::Esc => self.status = Some("Message discarded.".into()),
-                    KeyCode::Enter if !text.trim().is_empty() => {
-                        self.status = Some(format!("Message queued for {}.", short(&to)));
-                        return KeyOutcome::Send(Request::MessagePeer { to, text });
-                    }
-                    KeyCode::Backspace => {
-                        text.pop();
-                        self.mode = Mode::Compose { to, text };
-                    }
-                    KeyCode::Char(c) if !ctrl => {
-                        if text.len() + c.len_utf8() <= MESSAGE_LIMIT {
-                            text.push(c);
-                        }
-                        self.mode = Mode::Compose { to, text };
-                    }
-                    _ => self.mode = Mode::Compose { to, text },
+        if let Mode::Confirm { request, prompt } = std::mem::replace(&mut self.mode, Mode::Browse) {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.status = Some(format!("Requested: {prompt}"));
+                    KeyOutcome::Send(request)
                 }
-                return KeyOutcome::Continue;
-            }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.status = Some("Nothing was stopped.".into());
+                    KeyOutcome::Continue
+                }
+                _ => {
+                    self.mode = Mode::Confirm { request, prompt };
+                    KeyOutcome::Continue
+                }
+            };
+        }
+        if self.chat.is_some()
+            && let Some(outcome) = self.chat_key(key)
+        {
+            return outcome;
         }
         self.status = None;
-        if self.chat.is_some() && self.chat_key(key.code) {
-            return KeyOutcome::Continue;
-        }
         match key.code {
             KeyCode::Char('q') => return KeyOutcome::Quit,
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.switch(1),
@@ -251,28 +268,86 @@ impl Pane {
             KeyCode::Home | KeyCode::Char('g') => self.ends(false),
             KeyCode::End | KeyCode::Char('G') => self.ends(true),
             KeyCode::Char('x') => self.confirm_stop(),
-            KeyCode::Char('m') if self.tab == Tab::Peers => self.compose(),
-            KeyCode::Enter if self.tab == Tab::Peers => self.open_chat(),
+            KeyCode::Enter | KeyCode::Char('m') if self.tab == Tab::Peers => self.open_chat(),
             _ => {}
         }
         KeyOutcome::Continue
     }
 
-    /// Keys of the open chat view; `false` leaves the key to the tab-level handling.
-    fn chat_key(&mut self, code: KeyCode) -> bool {
+    /// Keys of the open conversation: typing goes to the composer, arrows scroll. `None` leaves
+    /// the key to the tab-level handling (Tab switches tabs and closes the conversation).
+    fn chat_key(&mut self, key: KeyEvent) -> Option<KeyOutcome> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let page = self.page.max(2) / 2;
-        match code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace => self.chat = None,
-            KeyCode::Up | KeyCode::Char('k') => self.chat_back += 1,
-            KeyCode::Down | KeyCode::Char('j') => self.chat_back = self.chat_back.saturating_sub(1),
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab => return None,
+            KeyCode::Esc if self.draft.is_empty() => {
+                self.chat = None;
+                self.status = None;
+            }
+            KeyCode::Esc => {
+                self.draft.clear();
+                self.status = Some("Draft cleared.".into());
+            }
+            KeyCode::Enter => return Some(self.send_draft()),
+            KeyCode::Backspace => {
+                self.draft.pop();
+            }
+            KeyCode::Up => self.chat_back += 1,
+            KeyCode::Down => self.chat_back = self.chat_back.saturating_sub(1),
             KeyCode::PageUp => self.chat_back += page,
             KeyCode::PageDown => self.chat_back = self.chat_back.saturating_sub(page),
-            KeyCode::Home | KeyCode::Char('g') => self.chat_back = usize::MAX / 2,
-            KeyCode::End | KeyCode::Char('G') => self.chat_back = 0,
-            KeyCode::Char('m') => self.compose(),
-            _ => return false,
+            KeyCode::Home => self.chat_back = usize::MAX / 2,
+            KeyCode::End => self.chat_back = 0,
+            KeyCode::Char(c) if !ctrl && self.draft.len() + c.len_utf8() <= MESSAGE_LIMIT => {
+                self.draft.push(c);
+            }
+            _ => {}
         }
-        true
+        Some(KeyOutcome::Continue)
+    }
+
+    /// Send the draft to the open conversation; the message shows as "Sending…" until the
+    /// session publishes it.
+    fn send_draft(&mut self) -> KeyOutcome {
+        let text = self.draft.trim().to_owned();
+        let Some(target) = self.chat.clone() else {
+            return KeyOutcome::Continue;
+        };
+        if text.is_empty() {
+            return KeyOutcome::Continue;
+        }
+        let request = match &target {
+            Target::Session => Request::Prompt { text: text.clone() },
+            Target::Peer(id) => {
+                if self.chat_peer().is_none() {
+                    self.status = Some("That peer is no longer active; nothing was sent.".into());
+                    return KeyOutcome::Continue;
+                }
+                Request::MessagePeer {
+                    to: id.clone(),
+                    text: text.clone(),
+                }
+            }
+        };
+        self.status = Some(match &target {
+            Target::Session => "Sent to this session's model.".to_owned(),
+            Target::Peer(_) => format!(
+                "Sent to {}.",
+                self.chat_peer().map(peer_name).unwrap_or_default()
+            ),
+        });
+        if self.outbox.len() == OUTBOX {
+            self.outbox.remove(0);
+        }
+        self.outbox.push(Pending {
+            target,
+            text,
+            at_ms: crate::ui::subagent_model::epoch_ms(),
+        });
+        self.draft.clear();
+        self.chat_back = 0;
+        KeyOutcome::Send(request)
     }
 
     fn switch(&mut self, by: usize) {
@@ -390,46 +465,39 @@ impl Pane {
         }
     }
 
+    /// The selected peer in the Chats list; row 0 is this session.
     fn selected_peer(&self) -> Option<&state::PeerRow> {
-        self.state.as_ref()?.peers.rows.get(self.selected())
+        let row = self.selected().checked_sub(1)?;
+        self.state.as_ref()?.peers.rows.get(row)
     }
 
-    /// The peer whose chat is open, while it is still published.
+    /// The peer whose conversation is open, while it is still published.
     fn chat_peer(&self) -> Option<&state::PeerRow> {
-        let id = self.chat.as_deref()?;
+        let Some(Target::Peer(id)) = &self.chat else {
+            return None;
+        };
         self.state
             .as_ref()?
             .peers
             .rows
             .iter()
-            .find(|peer| peer.id == id)
+            .find(|peer| &peer.id == id)
     }
 
     fn open_chat(&mut self) {
-        match self.selected_peer() {
-            Some(peer) => {
-                self.chat = Some(peer.id.clone());
-                self.chat_back = 0;
-            }
-            None => self.status = Some("No peer selected.".into()),
+        if self.state.is_none() {
+            self.status = Some("Waiting for the session.".into());
+            return;
         }
-    }
-
-    fn compose(&mut self) {
-        let peer = if self.chat.is_some() {
-            self.chat_peer()
-        } else {
-            self.selected_peer()
+        let target = match self.selected_peer() {
+            Some(peer) => Target::Peer(peer.id.clone()),
+            None => Target::Session,
         };
-        match peer {
-            Some(peer) => {
-                self.mode = Mode::Compose {
-                    to: peer.id.clone(),
-                    text: String::new(),
-                }
-            }
-            None => self.status = Some("No peer selected.".into()),
+        if self.chat.as_ref() != Some(&target) {
+            self.draft.clear();
         }
+        self.chat = Some(target);
+        self.chat_back = 0;
     }
 
     pub(super) fn render(&mut self, frame: &mut Frame, theme: &Theme, now_ms: u64) {
@@ -470,7 +538,7 @@ impl Pane {
         let lines = if self.tab == Tab::Feed {
             self.feed_view(body.width as usize, body.height as usize, theme)
         } else if self.tab == Tab::Peers && self.chat.is_some() {
-            self.chat_view(body.width as usize, body.height as usize, theme)
+            self.chat_view(body.width as usize, body.height as usize, theme, now_ms)
         } else {
             self.split_view(body.width as usize, body.height as usize, theme)
         };
@@ -526,7 +594,20 @@ impl Pane {
                 .iter()
                 .filter(|thread| thread.streaming.is_some())
                 .count(),
-            Tab::Peers => state.peers.rows.len(),
+            Tab::Peers => {
+                let unread: usize = state
+                    .peers
+                    .rows
+                    .iter()
+                    .flat_map(|peer| &peer.messages)
+                    .filter(|message| !message.outgoing && message.unread)
+                    .count();
+                return match (unread, state.peers.rows.len()) {
+                    (0, 0) => String::new(),
+                    (0, peers) => format!(" {peers}"),
+                    (unread, _) => format!(" {unread} new"),
+                };
+            }
         };
         if n == 0 {
             String::new()
@@ -558,18 +639,18 @@ impl Pane {
                 Span::styled(format!("{}? ", capitalize(prompt)), theme.fg(Tok::Warning)),
                 Span::styled("y confirm · n keep it running", theme.fg(Tok::Muted)),
             ]),
-            Mode::Compose { to, text } => Line::from(vec![
-                Span::styled(format!("To {}: ", short(to)), theme.fg(Tok::Accent)),
-                Span::styled(format!("{text}▏"), theme.fg(Tok::Text)),
-                Span::styled("  Enter send · Esc discard", theme.fg(Tok::Muted)),
-            ]),
             Mode::Browse => match &self.status {
                 Some(status) => Line::styled(status.clone(), theme.fg(Tok::Accent)),
                 None => {
+                    if self.tab == Tab::Peers && self.chat.is_some() {
+                        return Line::styled(
+                            "Type a message · Enter send · Esc back · ↑↓ PgUp/PgDn scroll · Tab tabs",
+                            theme.fg(Tok::Muted),
+                        );
+                    }
                     let action = match self.tab {
-                        Tab::Peers if self.chat.is_some() => " · m message · Esc back",
                         Tab::Jobs | Tab::Workers | Tab::Threads => " · x stop",
-                        Tab::Peers => " · Enter chat · m message",
+                        Tab::Peers => " · Enter open chat",
                         Tab::Feed | Tab::Plan => "",
                     };
                     let outcome = self
@@ -639,63 +720,146 @@ impl Pane {
         lines[start..end].to_vec()
     }
 
-    /// The open conversation with one peer under a pinned title, newest at the bottom.
-    fn chat_view(&self, width: usize, height: usize, theme: &Theme) -> Vec<Line<'static>> {
-        let id = self.chat.as_deref().unwrap_or_default();
-        let Some(peer) = self.chat_peer() else {
-            return vec![Line::styled(
-                format!(
-                    "Peer {} is no longer active in this checkout. Esc goes back.",
-                    short(id)
-                ),
-                theme.fg(Tok::Muted),
-            )];
+    /// The open conversation: a pinned title, message bubbles with the newest at the bottom, a
+    /// working indicator and the composer.
+    fn chat_view(
+        &self,
+        width: usize,
+        height: usize,
+        theme: &Theme,
+        now_ms: u64,
+    ) -> Vec<Line<'static>> {
+        let Some(state) = &self.state else {
+            return vec![Line::styled(self.empty_text(), theme.fg(Tok::Muted))];
         };
-        let mut title = format!("Chat with {}", short(&peer.id));
-        if !peer.summary.trim().is_empty() {
-            title.push_str(&format!(" · {}", text::one_line(&peer.summary)));
-        }
-        let mut lines = Vec::new();
-        if peer.messages.is_empty() {
-            lines.push(Line::styled(
-                "No messages with this peer yet. m sends one.",
+        let own = if state.model.trim().is_empty() {
+            "This session".to_owned()
+        } else {
+            state.model.clone()
+        };
+        let target = self.chat.clone().unwrap_or(Target::Session);
+        let (title, working, mut bubbles) = match &target {
+            Target::Session => (
+                vec![
+                    Span::styled(
+                        "● ",
+                        theme.fg(if state.busy { Tok::Accent } else { Tok::Muted }),
+                    ),
+                    Span::styled(
+                        own.clone(),
+                        theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" · this session", theme.fg(Tok::Dim)),
+                ],
+                state.busy,
+                session_bubbles(state, &own),
+            ),
+            Target::Peer(id) => {
+                let Some(peer) = self.chat_peer() else {
+                    return vec![Line::styled(
+                        format!(
+                            "Peer {} is no longer active in this checkout. Esc goes back.",
+                            short(id)
+                        ),
+                        theme.fg(Tok::Muted),
+                    )];
+                };
+                let mut title = vec![
+                    Span::styled("● ", theme.fg(phase_tok(&peer.phase))),
+                    Span::styled(
+                        peer_name(peer),
+                        theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" · {} · {}", short(&peer.id), peer.phase),
+                        theme.fg(Tok::Dim),
+                    ),
+                ];
+                if !peer.summary.trim().is_empty() {
+                    title.push(Span::styled(
+                        format!(" · {}", text::one_line(&peer.summary)),
+                        theme.fg(Tok::Muted),
+                    ));
+                }
+                (title, peer.phase == "working", peer_bubbles(peer, &own))
+            }
+        };
+        bubbles.extend(
+            self.outbox
+                .iter()
+                .filter(|pending| pending.target == target)
+                .map(|pending| Bubble {
+                    side: Side::Right,
+                    sender: "You".into(),
+                    text: pending.text.clone(),
+                    at_ms: pending.at_ms,
+                    receipt: Some(("Sending…".into(), Tok::Dim)),
+                }),
+        );
+        let name = match &target {
+            Target::Session => own.clone(),
+            Target::Peer(_) => self.chat_peer().map(peer_name).unwrap_or_default(),
+        };
+        let mut lines = if bubbles.is_empty() {
+            vec![Line::styled(
+                match target {
+                    Target::Session => {
+                        "No messages yet. What you type here goes to this session's model, like a prompt in its main window."
+                    }
+                    Target::Peer(_) => {
+                        "No messages yet. What you type here goes to this peer's model; a message wakes an idle or finished session."
+                    }
+                },
                 theme.fg(Tok::Muted),
+            )]
+        } else {
+            chat::render(&bubbles, width, now_ms, theme)
+        };
+        if working {
+            lines.push(Line::styled(
+                format!("{name} is working…"),
+                theme.fg(Tok::Accent).add_modifier(Modifier::ITALIC),
             ));
         }
-        for message in &peer.messages {
-            let (who, tok) = if message.outgoing {
-                ("You", Tok::Accent)
-            } else {
-                (short(&peer.id), Tok::Success)
-            };
-            let mut label = vec![Span::styled(
-                who.to_owned(),
-                theme.fg(tok).add_modifier(Modifier::BOLD),
-            )];
-            if message.unread {
-                label.push(Span::styled(
-                    "  unread by the agent",
-                    theme.fg(Tok::Warning),
-                ));
-            }
-            lines.push(Line::from(label));
-            for line in text::sanitize(&message.text).lines() {
-                lines.push(Line::styled(line.to_owned(), theme.fg(Tok::Text)));
-            }
-            lines.push(Line::default());
-        }
+        let composer = self.composer(&name, width, theme);
         let lines = text::wrap(lines, width.max(1));
-        let room = height.saturating_sub(1);
+        let room = height.saturating_sub(2 + composer.len());
         let end = lines
             .len()
             .saturating_sub(self.chat_back.min(lines.len().saturating_sub(room)));
         let start = end.saturating_sub(room);
-        let mut view = vec![clip_line(
-            Line::styled(title, theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)),
-            width,
-        )];
+        let mut view = vec![clip_line(Line::from(title), width)];
+        // Like a messenger, the newest messages sit just above the composer.
+        view.extend(std::iter::repeat_n(Line::default(), room - (end - start)));
         view.extend_from_slice(&lines[start..end]);
+        view.push(Line::styled("─".repeat(width), theme.fg(Tok::Border)));
+        view.extend(composer);
         view
+    }
+
+    /// The composer under an open conversation, at most [`COMPOSER_ROWS`] rows (the newest).
+    fn composer(&self, name: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        if self.draft.is_empty() {
+            return vec![clip_line(
+                Line::from(vec![
+                    Span::styled("› ", theme.fg(Tok::Accent)),
+                    Span::styled(format!("Message {name}…"), theme.fg(Tok::Dim)),
+                ]),
+                width,
+            )];
+        }
+        let rows = text::wrap_words(&format!("{}▏", self.draft), width.saturating_sub(2).max(1));
+        let skip = rows.len().saturating_sub(COMPOSER_ROWS);
+        rows.into_iter()
+            .enumerate()
+            .skip(skip)
+            .map(|(n, row)| {
+                Line::from(vec![
+                    Span::styled(if n == 0 { "› " } else { "  " }, theme.fg(Tok::Accent)),
+                    Span::styled(row, theme.fg(Tok::Text)),
+                ])
+            })
+            .collect()
     }
 
     fn split_view(&self, width: usize, height: usize, theme: &Theme) -> Vec<Line<'static>> {
@@ -742,11 +906,7 @@ impl Pane {
             }
             Tab::Workers => "No workers in this session.".into(),
             Tab::Threads => "No side threads. /btw <question> starts one.".into(),
-            Tab::Peers => self
-                .state
-                .as_ref()
-                .and_then(|state| state.peers.error.clone())
-                .unwrap_or_else(|| "No other Dial sessions in this checkout.".into()),
+            Tab::Peers => String::new(),
         }
     }
 
@@ -823,24 +983,54 @@ impl Pane {
                     ])
                 })
                 .collect(),
-            Tab::Peers => state
-                .peers
-                .rows
-                .iter()
-                .map(|peer| {
-                    let overlap = if peer.overlapping.is_empty() {
-                        ""
-                    } else {
-                        "  overlaps"
+            Tab::Peers => {
+                let own = if state.model.trim().is_empty() {
+                    "This session".to_owned()
+                } else {
+                    state.model.clone()
+                };
+                let last = state.conversation.last().map(|line| {
+                    let who = match line.role {
+                        ChatRole::User => "You: ",
+                        ChatRole::Model | ChatRole::Event => "",
                     };
-                    Line::from(vec![
-                        Span::styled(format!("{} ", short(&peer.id)), theme.fg(Tok::Dim)),
-                        Span::styled(format!("{:<8} ", peer.phase), theme.fg(Tok::Muted)),
-                        Span::styled(text::one_line(&peer.summary), theme.fg(Tok::Text)),
-                        Span::styled(overlap, theme.fg(Tok::Warning)),
-                    ])
-                })
-                .collect(),
+                    (format!("{who}{}", text::one_line(&line.text)), line.at_ms)
+                });
+                let mut rows = vec![conversation_row(
+                    theme,
+                    if state.busy { Tok::Accent } else { Tok::Muted },
+                    format!("{own} (this session)"),
+                    last,
+                    0,
+                    false,
+                )];
+                rows.extend(state.peers.rows.iter().map(|peer| {
+                    let last = peer.messages.last().map(|message| {
+                        let who = if message.outgoing { "You: " } else { "" };
+                        (
+                            format!("{who}{}", text::one_line(&message.text)),
+                            message.at_ms,
+                        )
+                    });
+                    let unread = peer
+                        .messages
+                        .iter()
+                        .filter(|message| !message.outgoing && message.unread)
+                        .count();
+                    conversation_row(
+                        theme,
+                        phase_tok(&peer.phase),
+                        format!("{} · {} · {}", peer_name(peer), short(&peer.id), peer.phase),
+                        last.or_else(|| {
+                            (!peer.summary.trim().is_empty())
+                                .then(|| (text::one_line(&peer.summary), 0))
+                        }),
+                        unread,
+                        !peer.overlapping.is_empty(),
+                    )
+                }));
+                rows
+            }
         }
     }
 
@@ -925,14 +1115,33 @@ impl Pane {
             }
             Tab::Peers => {
                 let peers = &state.peers;
-                if let Some(peer) = peers.rows.get(selected) {
-                    out.title(&peer.summary);
-                    out.field("Peer", &peer.id);
-                    out.field("Phase", &peer.phase);
-                    out.list("Claims", &peer.scopes, Tok::Text);
-                    out.list("Overlaps yours", &peer.overlapping, Tok::Warning);
-                    out.lines.push(Line::default());
+                match self.selected_peer() {
+                    Some(peer) => {
+                        out.title(&peer_name(peer));
+                        out.field("Peer", &peer.id);
+                        out.field("Phase", &peer.phase);
+                        out.optional("Task", Some(&peer.summary));
+                        out.field("Messages", &peer.messages.len().to_string());
+                        out.list("Claims", &peer.scopes, Tok::Text);
+                        out.list("Overlaps yours", &peer.overlapping, Tok::Warning);
+                    }
+                    None => {
+                        out.title("This session");
+                        out.optional("Model", Some(&state.model));
+                        out.field("Status", if state.busy { "working" } else { "idle" });
+                        out.field("Messages", &state.conversation.len().to_string());
+                        if let Some(error) = &peers.error {
+                            out.field("Peers", error);
+                        } else if peers.rows.is_empty() {
+                            out.text("No other Dial sessions in this checkout.", Tok::Muted);
+                        }
+                    }
                 }
+                out.lines.push(Line::default());
+                out.text(
+                    "Enter opens the conversation. Messages wake idle, finished or blocked sessions.",
+                    Tok::Dim,
+                );
                 out.list("This session claims", &peers.scopes, Tok::Text);
                 if peers.queued > 0 {
                     out.field("Unread peer mail", &peers.queued.to_string());
@@ -1057,6 +1266,132 @@ fn worker_name(worker: &state::Worker) -> &str {
 
 fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+/// A peer as a chat contact: its model, or its short id when it does not say.
+fn peer_name(peer: &state::PeerRow) -> String {
+    if peer.model.trim().is_empty() {
+        format!("peer {}", short(&peer.id))
+    } else {
+        text::one_line(&peer.model)
+    }
+}
+
+fn phase_tok(phase: &str) -> Tok {
+    match phase {
+        "working" => Tok::Accent,
+        "idle" => Tok::Muted,
+        _ => Tok::Warning,
+    }
+}
+
+/// Whether the session already published a message this pane sent.
+fn published(state: &Snapshot, pending: &Pending) -> bool {
+    let recent = |at_ms: u64| at_ms + 10_000 >= pending.at_ms;
+    match &pending.target {
+        Target::Session => state.conversation.iter().any(|line| {
+            line.role == ChatRole::User && line.text == pending.text && recent(line.at_ms)
+        }),
+        Target::Peer(id) => state
+            .peers
+            .rows
+            .iter()
+            .filter(|peer| &peer.id == id)
+            .flat_map(|peer| &peer.messages)
+            .any(|message| {
+                message.outgoing && message.text == pending.text && recent(message.at_ms)
+            }),
+    }
+}
+
+/// This session's own thread: prompts on the right, replies on the left, events in the middle.
+fn session_bubbles(state: &Snapshot, own: &str) -> Vec<Bubble> {
+    state
+        .conversation
+        .iter()
+        .map(|line| {
+            let (side, sender) = match line.role {
+                ChatRole::User => (Side::Right, "You".to_owned()),
+                ChatRole::Model => (Side::Left, own.to_owned()),
+                ChatRole::Event => (Side::Center, String::new()),
+            };
+            Bubble {
+                side,
+                sender,
+                text: line.text.clone(),
+                at_ms: line.at_ms,
+                receipt: None,
+            }
+        })
+        .collect()
+}
+
+/// A peer thread: this session on the right (its model, or "You" for what the human typed here),
+/// the peer on the left. The newest outgoing message carries a read receipt.
+fn peer_bubbles(peer: &state::PeerRow, own: &str) -> Vec<Bubble> {
+    let last_out = peer.messages.iter().rposition(|message| message.outgoing);
+    peer.messages
+        .iter()
+        .enumerate()
+        .map(|(n, message)| {
+            let receipt = if message.outgoing {
+                (Some(n) == last_out).then(|| {
+                    if message.unread {
+                        ("Delivered".to_owned(), Tok::Muted)
+                    } else {
+                        ("Read".to_owned(), Tok::Success)
+                    }
+                })
+            } else {
+                message
+                    .unread
+                    .then(|| (format!("Not yet read by {own}"), Tok::Warning))
+            };
+            Bubble {
+                side: if message.outgoing {
+                    Side::Right
+                } else {
+                    Side::Left
+                },
+                sender: match (message.outgoing, message.by_user) {
+                    (true, true) => "You".to_owned(),
+                    (true, false) => own.to_owned(),
+                    (false, _) => peer_name(peer),
+                },
+                text: message.text.clone(),
+                at_ms: message.at_ms,
+                receipt,
+            }
+        })
+        .collect()
+}
+
+/// One row of the Chats list: status dot, contact, newest message preview and badges.
+fn conversation_row(
+    theme: &Theme,
+    dot: Tok,
+    name: String,
+    last: Option<(String, u64)>,
+    unread: usize,
+    overlaps: bool,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("● ", theme.fg(dot)),
+        Span::styled(name, theme.fg(Tok::Text).add_modifier(Modifier::BOLD)),
+    ];
+    if unread > 0 {
+        spans.push(Span::styled(
+            format!("  {unread} new"),
+            theme.fg(Tok::Warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if overlaps {
+        spans.push(Span::styled("  overlaps", theme.fg(Tok::Warning)));
+    }
+    if let Some((preview, _)) = last {
+        spans.push(Span::styled(format!("  {preview}"), theme.fg(Tok::Muted)));
+    }
+    Line::from(spans)
 }
 
 fn capitalize(text: &str) -> String {

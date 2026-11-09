@@ -2485,3 +2485,114 @@ fn anthropic_records_carry_documented_request_facts() {
         assert!(record(model).facts.is_empty(), "{model}");
     }
 }
+
+#[test]
+fn local_server_probe_reports_only_listening_endpoints() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}/v1");
+    assert!(accepts_connections(&url, Duration::from_millis(500)));
+    drop(listener);
+    assert!(!accepts_connections(&url, Duration::from_millis(200)));
+    assert!(!accepts_connections(
+        "not a url",
+        Duration::from_millis(200)
+    ));
+    assert!(!accepts_connections(
+        "ftp://127.0.0.1:21",
+        Duration::from_millis(200)
+    ));
+}
+
+#[test]
+fn local_server_table_has_unique_ids_and_valid_default_urls() {
+    let mut ids = std::collections::BTreeSet::new();
+    for &(id, _, _, default) in LOCAL_SERVERS {
+        assert!(ids.insert(id), "duplicate local server {id}");
+        assert!(crate::url::parse_url(default).is_ok(), "{id}: {default}");
+    }
+}
+
+#[test]
+fn unbundled_claude_models_take_thinking_controls_from_the_live_listing() {
+    use crate::llm::profiles::{ReasoningApi, ReasoningEffort};
+    let model = "claude-unreleased-test-9";
+    assert!(
+        model_capabilities(model).is_none(),
+        "the bundle must not know {model}"
+    );
+    let probe = test_probe(super::super::anthropic::BASE_URL.into(), "anthropic");
+    let entries = parse_models(
+        &serde_json::json!({"data":[
+            {"id":model,"capabilities":{
+                "thinking":{"supported":true,"types":{
+                    "adaptive":{"supported":true},"enabled":{"supported":true}}},
+                "effort":{"supported":true,"low":{"supported":true},"medium":{"supported":true},
+                    "high":{"supported":true},"xhigh":{"supported":false},"max":{"supported":true}}
+            }},
+            {"id":"claude-budget-only","capabilities":{
+                "thinking":{"supported":true,"types":{"enabled":{"supported":true}}}
+            }},
+            {"id":"claude-no-thinking","capabilities":{
+                "thinking":{"supported":false,"types":{"adaptive":{"supported":true}}},
+                "effort":{"supported":true,"high":{"supported":true}}
+            }}
+        ]}),
+        &probe,
+    )
+    .unwrap();
+    let declared = entries[0].metadata.declared_reasoning.unwrap();
+    assert_eq!(declared.mode, ThinkingMode::AnthropicAdaptive);
+    assert_eq!(
+        declared.efforts(),
+        [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Max
+        ]
+    );
+    let budget = entries[1].metadata.declared_reasoning.unwrap();
+    assert_eq!(
+        (budget.mode, budget.efforts()),
+        (ThinkingMode::Budget, vec![])
+    );
+    assert_eq!(entries[2].metadata.declared_reasoning, None);
+
+    // Saved with the listing, the declaration drives the profile, /effort levels and defaults.
+    let home = tempfile::tempdir().unwrap();
+    persist_cache(
+        home.path(),
+        BTreeMap::from([(probe_cache_key(&probe), entries.clone())]),
+    )
+    .unwrap();
+    assert_eq!(
+        declared_reasoning(home.path(), &entries[0].selection),
+        Some(declared)
+    );
+    let config = crate::config::types::Config {
+        user_dir: home.path().to_owned(),
+        provider: Some("anthropic".into()),
+        model: model.into(),
+        ..Default::default()
+    };
+    let profile = crate::config::thinking::reasoning_profile(&config)
+        .unwrap()
+        .expect("a declared model has a reasoning profile");
+    assert_eq!(
+        profile.capabilities.reasoning,
+        ReasoningApi::AnthropicAdaptive
+    );
+    assert_eq!(profile.capabilities.reasoning_efforts, declared.efforts());
+    assert_eq!(profile.thinking, Some(true));
+    // Request builders read the listing this process last parsed; parallel tests parse others.
+    assert!((0..100).any(|_| {
+        cached(home.path());
+        crate::llm::profiles::default_anthropic_thinking(model)
+            == Some(ReasoningApi::AnthropicAdaptive)
+    }));
+    assert_eq!(
+        crate::llm::profiles::default_anthropic_thinking("claude-no-thinking"),
+        None
+    );
+}

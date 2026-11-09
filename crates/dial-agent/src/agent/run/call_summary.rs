@@ -84,7 +84,6 @@ pub fn describe_call(name: &str, a: &Value) -> String {
                     .join(", ")
             })
             .unwrap_or_default(),
-        "working_state" => s("action").to_owned(),
         _ if a.is_null() => String::new(),
         _ => a.to_string(),
     }

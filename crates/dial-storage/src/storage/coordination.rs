@@ -26,6 +26,7 @@ const MAX_TEXT: usize = 8 * 1024;
 const MAX_MESSAGES: usize = 32;
 const MAX_INBOX: usize = 64 * 1024;
 const MAX_RECORD: usize = 128 * 1024;
+const MAX_MODEL: usize = 128;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -35,13 +36,36 @@ pub struct Peer {
     pub summary: String,
     pub phase: String,
     pub scopes: Vec<String>,
+    /// The model this session runs, for display; empty until published.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Letter {
     pub from: String,
     pub text: String,
+    /// When the sender queued it, in Unix milliseconds; 0 when unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub at_ms: u64,
+    /// Typed by the human in the sender's watch pane rather than by its model. Unverifiable, so it
+    /// only refills the recipient's automatic wake budget; it is never shown to the model.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub human: bool,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Milliseconds since the Unix epoch, for letter timestamps.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +112,7 @@ impl Participant {
                 summary: String::new(),
                 phase: "idle".to_owned(),
                 scopes: Vec::new(),
+                model: String::new(),
             },
             inbox: Vec::new(),
         };
@@ -116,6 +141,18 @@ impl Participant {
         save(&self.dir, &record)
     }
 
+    /// Advertise the model this session runs, for peers' chat views.
+    pub fn set_model(&self, model: &str) -> Result<()> {
+        bounded_text(model, MAX_MODEL, "model")?;
+        let _transaction = transaction(&self.dir)?;
+        let mut record = load(&self.dir, &self.id)?;
+        if record.peer.model == model {
+            return Ok(());
+        }
+        record.peer.model = model.to_owned();
+        save(&self.dir, &record)
+    }
+
     /// Live peers only, excluding this instance. Malformed records are not advertised.
     pub fn peers(&self) -> Result<Vec<Peer>> {
         let _transaction = transaction(&self.dir)?;
@@ -134,6 +171,11 @@ impl Participant {
 
     /// Address an exact live instance id. Full or malformed inboxes fail without eviction.
     pub fn send(&self, to: &str, text: &str) -> Result<()> {
+        self.send_letter(to, text, false).map(drop)
+    }
+
+    /// [`Self::send`], marking whether the human typed it, and returning the queued letter.
+    pub fn send_letter(&self, to: &str, text: &str, human: bool) -> Result<Letter> {
         ensure!(valid_id(to), "recipient must be an exact peer instance id");
         ensure!(to != self.id, "cannot send a peer message to self");
         bounded_text(text, MAX_TEXT, "message")?;
@@ -145,15 +187,34 @@ impl Participant {
         );
         let mut record = load(&self.dir, to)?;
         ensure!(record.inbox.len() < MAX_MESSAGES, "recipient inbox is full");
-        record.inbox.push(Letter {
+        let letter = Letter {
             from: self.id.clone(),
             text: text.to_owned(),
-        });
+            at_ms: now_ms(),
+            human,
+        };
+        record.inbox.push(letter.clone());
         ensure!(
             serde_json::to_vec(&record.inbox)?.len() <= MAX_INBOX,
             "recipient inbox is full"
         );
-        save(&self.dir, &record)
+        save(&self.dir, &record)?;
+        Ok(letter)
+    }
+
+    /// Letters this instance sent that are still queued in `to`'s inbox: its model has not
+    /// received them yet. Empty once `to` is gone.
+    pub fn undelivered(&self, to: &str) -> Result<Vec<Letter>> {
+        ensure!(valid_id(to), "recipient must be an exact peer instance id");
+        let _transaction = transaction(&self.dir)?;
+        if !is_live(&self.dir, to)? {
+            return Ok(Vec::new());
+        }
+        Ok(load(&self.dir, to)?
+            .inbox
+            .into_iter()
+            .filter(|letter| letter.from == self.id)
+            .collect())
     }
 
     /// Atomically take up to two oldest letters (at most 16 KiB of text), leaving the
@@ -334,6 +395,7 @@ fn load(dir: &Path, id: &str) -> Result<Record> {
     bounded_text(&record.peer.session_id, 256, "session id")?;
     bounded_text(&record.peer.summary, 1024, "summary")?;
     bounded_text(&record.peer.phase, 64, "phase")?;
+    bounded_text(&record.peer.model, MAX_MODEL, "model")?;
     ensure!(
         normalized_scopes(&record.peer.scopes)? == record.peer.scopes,
         "noncanonical scopes"

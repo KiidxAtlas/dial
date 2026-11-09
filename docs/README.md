@@ -1,13 +1,17 @@
 # Documentation
 
-Start with [Everyday Dial](everyday.md). References are grouped by what you want to do,
+New here? Follow the [Quickstart](quickstart.md). References are grouped by what you want to do,
 not by crate ownership. In the terminal, `/help <topic>` prints a focused documentation path.
+
+## Start here
+
+- [Quickstart](quickstart.md) — Install, pick a model, get a fix reviewed and undo it, in five minutes.
+- [Release and installation](release-and-install.md) — Install Dial, build from source and check or publish releases.
+- [How Dial compares](comparison.md) — Dial's defaults and capabilities next to another open-source terminal agent.
 
 ## Everyday
 
 - [Everyday Dial](everyday.md) — Start, steer, review, undo and resume ordinary coding work.
-- [Everyday UX acceptance](ux-journeys.md) — Offline journey coverage, measurement boundaries and the separately approved real-service test plan.
-- [Release and installation](release-and-install.md) — Install Dial, build from source and check or publish releases.
 - [Running Dial in Docker](docker.md) — Run Dial with Docker, Compose and Docker Model Runner.
 - [Windows](windows.md) — Set up and use Dial on Windows and WSL.
 - [Terminal interface](terminal-interface.md) — Choose a focused terminal reference; legacy section links remain available.
@@ -50,6 +54,7 @@ not by crate ownership. In the terminal, `/help <topic>` prints a focused docume
 
 ## Internals
 
+- [Everyday UX acceptance](ux-journeys.md) — Offline journey coverage, measurement boundaries and the separately approved real-service test plan.
 - [Agent loop and context maintenance](agent-loop.md) — Trace agent execution, context maintenance, verification and completion.
 - [Tools, safety and context](tools.md) — Reference tool contracts, schemas, safety and context sources.
 - [Execution and web tools](execution-and-web.md) — Understand execution kernels, browser tools and web access.
@@ -84,8 +89,10 @@ not by crate ownership. In the terminal, `/help <topic>` prints a focused docume
   install a daemon. The browser and `eval` tools require OS containment and fail closed without it.
 - Live memory and skill edits are your working state and are not gated; only the admitted harness is.
 - Operator tools are trusted programs and are not sandboxed during live work; they are excluded from
-  automatic evaluation. Outside macOS, `bash` is unavailable for live use unless
-  `sandbox.mode = "off"`, while generated evaluations still require the strict sandbox.
+  automatic evaluation. On macOS and Linux/WSL2, `bash` runs inside the OS sandbox (Linux needs
+  bubblewrap and unprivileged user namespaces, and refuses to run commands without them rather than
+  falling back). On Windows, `bash` is unavailable for live use unless `sandbox.mode = "off"`;
+  generated evaluations always require the strict sandbox.
 
 See also [Architecture](../ARCHITECTURE.md) for crate ownership and invariants, and
 [contributor notes](../AGENTS.md) for repository conventions and checks.

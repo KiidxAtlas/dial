@@ -478,6 +478,7 @@ fn http_embedder(
         token: token.map(str::to_owned),
         headers,
         timeout_secs: 5,
+        autostart: None,
     }
 }
 
@@ -940,4 +941,75 @@ fn status_reports_cache_use_and_the_last_recall() {
     assert_eq!(status["recall"]["last"]["projectCache"], "hit");
     assert_eq!(status["recall"]["last"]["items"], 1);
     assert_eq!(status["recall"]["last"]["voices"], json!(["lexical"]));
+}
+
+fn ollama_role(base_url: &str) -> EmbeddingRoute {
+    EmbeddingRoute {
+        base_url: base_url.into(),
+        model: "embeddinggemma".into(),
+        api_key_env: None,
+        explicit: false,
+        wire: EmbeddingWire::Ollama,
+        allow_insecure: false,
+        headers: Vec::new(),
+    }
+}
+
+#[test]
+fn only_a_local_ollama_embedding_role_is_started_automatically() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = SemanticConfig::default();
+    let local = ollama_role("http://127.0.0.1:11434");
+    assert!(autostart_for(&config, &local, dir.path()).is_some());
+    let remote = ollama_role("http://gpu-box.example:11434");
+    assert!(autostart_for(&config, &remote, dir.path()).is_none());
+    let override_route = EmbeddingRoute {
+        explicit: true,
+        ..local.clone()
+    };
+    assert!(autostart_for(&config, &override_route, dir.path()).is_none());
+    let openai = EmbeddingRoute {
+        wire: EmbeddingWire::OpenAi,
+        ..local.clone()
+    };
+    assert!(autostart_for(&config, &openai, dir.path()).is_none());
+    config.embedding_autostart = false;
+    assert!(autostart_for(&config, &local, dir.path()).is_none());
+}
+
+/// A loopback port with nothing listening.
+fn closed_port_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn a_refused_request_without_autostart_keeps_its_error_and_starts_nothing() {
+    let base = closed_port_url();
+    let url = embedding_url(EmbeddingWire::Ollama, &base, false, "m").unwrap();
+    let mut embedder = http_embedder(&url, EmbeddingWire::Ollama, None, Vec::new());
+    let error = embedder.embed(&["hello".to_owned()]).unwrap_err();
+    assert!(error.downcast_ref::<Refused>().is_some(), "{error:#}");
+    assert!(error.to_string().contains("embedding role"), "{error:#}");
+}
+
+#[test]
+fn a_paused_autostart_does_not_retry_starting_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = closed_port_url();
+    let url = embedding_url(EmbeddingWire::Ollama, &base, false, "m").unwrap();
+    let mut embedder = http_embedder(&url, EmbeddingWire::Ollama, None, Vec::new());
+    embedder.autostart = Some(Autostart {
+        user_dir: dir.path().to_path_buf(),
+        base_url: base,
+        retry_at: Some(Instant::now() + Duration::from_secs(60)),
+    });
+    let error = embedder.embed(&["hello".to_owned()]).unwrap_err();
+    assert!(error.downcast_ref::<Refused>().is_some(), "{error:#}");
+    assert!(
+        !dir.path().join("state").exists(),
+        "no server state is touched while paused"
+    );
 }

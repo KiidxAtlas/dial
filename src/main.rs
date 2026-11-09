@@ -5,8 +5,6 @@ mod dispatch;
 mod overlay;
 
 use anyhow::Result;
-use args::Cli;
-use clap::Parser;
 use dial::repl::{OutputFormat, PrintExit, PrintUi};
 use dispatch::real_main;
 
@@ -77,7 +75,7 @@ fn main() {
             ));
         }
     }
-    let cli = Cli::parse();
+    let cli = args::parse();
     if let Some(suggestion) = args::mistyped_subcommand(&cli, std::env::args_os()) {
         args::mistyped_subcommand_error(&cli.prompt[0], &suggestion).exit();
     }
@@ -110,6 +108,7 @@ fn main() {
 /// Drains buffered stdout (bounded) so final output is never lost, then exits with `code`.
 fn flush_or_exit(code: i32) -> ! {
     dial::telemetry::shutdown();
+    dial::llm::ollama::serve::shutdown();
     if let Err(error) = dial::flush_stdout_on_exit() {
         eprintln!("error: stdout flush failed: {error}");
         std::process::exit(if code == 0 { 1 } else { code });

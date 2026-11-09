@@ -93,10 +93,77 @@ struct HttpEmbedder {
     token: Option<String>,
     headers: Vec<RequestHeader>,
     timeout_secs: u64,
+    /// Starts the local Ollama server the embedding role points at when nothing answers there.
+    autostart: Option<Autostart>,
 }
 
+/// A local Ollama address this embedder may start, and when a failed start may be retried.
+struct Autostart {
+    user_dir: std::path::PathBuf,
+    base_url: String,
+    retry_at: Option<Instant>,
+}
+
+/// Wait before trying again after `ollama serve` could not be started.
+const AUTOSTART_RETRY: Duration = Duration::from_secs(60);
+
+/// An embedding request that found nothing listening at the endpoint.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 impl HttpEmbedder {
+    /// Sends the request; when nothing listens at a local Ollama address this embedder may start,
+    /// starts the shared server (or waits for one another Dial process is starting) and retries once.
     fn send(
+        &mut self,
+        inputs: &[String],
+        timeout_secs: u64,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Vec<Vec<f32>>> {
+        match self.attempt(inputs, timeout_secs, cancel.clone()) {
+            Err(error) if error.downcast_ref::<Refused>().is_some() => {
+                match self.start_server(Duration::from_secs(timeout_secs)) {
+                    Ok(true) => self.attempt(inputs, timeout_secs, cancel),
+                    Ok(false) => Err(error),
+                    Err(start) => Err(anyhow::anyhow!("{error}; {start:#}")),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// `Ok(true)` once the server answers; `Ok(false)` when starting is off or paused after a
+    /// failure; an error when the start failed or the server is still coming up.
+    fn start_server(&mut self, wait: Duration) -> Result<bool> {
+        use crate::llm::ollama::serve::{self, Ready};
+        let Some(auto) = self.autostart.as_mut() else {
+            return Ok(false);
+        };
+        if auto.retry_at.is_some_and(|at| Instant::now() < at) {
+            return Ok(false);
+        }
+        match serve::ensure(&auto.user_dir, &auto.base_url, None, wait) {
+            Ok(Ready::Running | Ready::Started) => Ok(true),
+            Ok(Ready::Starting) => anyhow::bail!(
+                "Dial is starting Ollama at {}; recall uses keywords until it answers",
+                auto.base_url
+            ),
+            Err(error) => {
+                auto.retry_at = Some(Instant::now() + AUTOSTART_RETRY);
+                Err(error.context("could not start Ollama for embeddings"))
+            }
+        }
+    }
+
+    fn attempt(
         &self,
         inputs: &[String],
         timeout_secs: u64,
@@ -130,12 +197,18 @@ impl HttpEmbedder {
             };
         }
         let mut response = request.send(&serde_json::to_vec(&body)?).map_err(|error| {
-            anyhow::anyhow!(redact(
+            let refused = matches!(&error, ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused);
+            let message = redact(
                 &format!(
-                    "embedding request failed ({error}); check memory.semantic.embedding_base_url and that the endpoint is reachable"
+                    "embedding request failed ({error}); check that the embedding endpoint (the embedding role, or memory.semantic.embedding_base_url) is reachable"
                 ),
                 &secrets,
-            ))
+            );
+            if refused {
+                anyhow::Error::new(Refused(message))
+            } else {
+                anyhow::anyhow!(message)
+            }
         })?;
         let status = response.status().as_u16();
         let mut bytes = Vec::new();
@@ -460,6 +533,24 @@ fn resolve_route(config: &SemanticConfig, role: EmbeddingRole) -> Result<Option<
     }
 }
 
+/// Only an embedding role on a local Ollama address is started, and only with the setting on;
+/// explicit OpenAI-compatible overrides and remote servers are the user's to run.
+fn autostart_for(
+    config: &SemanticConfig,
+    route: &EmbeddingRoute,
+    user_dir: &std::path::Path,
+) -> Option<Autostart> {
+    (config.embedding_autostart
+        && !route.explicit
+        && route.wire == EmbeddingWire::Ollama
+        && crate::llm::ollama::serve::local_address(&route.base_url).is_some())
+    .then(|| Autostart {
+        user_dir: user_dir.to_path_buf(),
+        base_url: route.base_url.clone(),
+        retry_at: None,
+    })
+}
+
 fn build_embedder(
     config: &SemanticConfig,
     role: EmbeddingRole,
@@ -491,6 +582,7 @@ fn build_embedder(
             route.api_key_env.as_deref(),
         )?
     };
+    let autostart = autostart_for(config, &route, user_dir);
     Ok(Some(Box::new(HttpEmbedder {
         url: embedding_url(route.wire, &route.base_url, route.allow_insecure, &model)?,
         wire: route.wire,
@@ -498,6 +590,7 @@ fn build_embedder(
         token,
         headers: route.headers,
         timeout_secs: config.embedding_timeout_secs,
+        autostart,
     })))
 }
 

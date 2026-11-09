@@ -140,10 +140,15 @@ pairs and both source revisions. Null keys do not match; output columns use `lef
 Joins run before the query window; many-to-many results are never silently deduplicated/truncated.
 `data action="inspect"` delegates to the same isolated workbook inspector as `document`.
 
-## Cross-source retrieval (`evidence_search`)
+## Cross-source retrieval (`evidence` `search`)
+
+The retrieval, comparison, experiment and workbench actions below used to be the separate
+`evidence_search`, `investigate` and `workbench` tools. They are now actions of the one `evidence`
+tool with unchanged bounds; `investigate compare` became `diff` and `workbench inspect` became
+`audit`, so the names do not collide with the native byte-level `compare` and `inspect`.
 
 ```json
-{"references":["artifact://<document>","artifact://<transcript>","artifact://<calculation>"],"query":"request timeout","limit":10}
+{"action":"search","references":["artifact://<document>","artifact://<transcript>","artifact://<calculation>"],"query":"request timeout","limit":10}
 ```
 
 Only explicitly supplied citation manifests are searched; no global store scan, source reopening,
@@ -160,12 +165,12 @@ semantic retrieval**. It consumes a normal accounted model request; main and wor
 configured model policy, cancellation and request budgets. Local lexical mode makes no provider call.
 Search results are candidates to inspect, not evidence that a proposed conclusion is true.
 
-## Semantic comparison (`investigate`)
+## Semantic comparison (`evidence` `diff` and `interpret`)
 
 This uses the current agent's interpretation, not a hidden second model or semantic oracle:
 
 1. Capture/read the relevant inputs and obtain citations.
-2. Call `investigate` with `action: "compare"`, `reference` and `other` to authenticate and expose
+2. Call `evidence` with `action: "diff"`, `reference` and `other` to authenticate and expose
    retained text/JSON inputs and a textual change diff. The combined diff input is limited to
    48 KiB and 2,000 lines; capture narrower regions when needed.
 3. Interpret the functional/content changes, then retain findings:
@@ -178,9 +183,9 @@ Findings require exact input quotes (one side may be empty for an addition/delet
 validation establishes attribution, **not entailment or truth**. Both parents remain linked.
 For screenshots/images, inspect both citations with `evidence inspect`, crop relevant regions,
 then use `evidence derive` with both parent citations and an explicitly interpreted summary.
-`investigate compare` itself is text/JSON only; it is not a general multimodal comparator.
+`evidence diff` itself is text/JSON only; it is not a general multimodal comparator.
 
-## Hypothesis-driven experiments (`investigate`)
+## Hypothesis-driven experiments (`evidence` `plan` and `result`)
 
 ```json
 {"action":"plan","question":"Why does the request time out?","hypotheses":[{"id":"cache","explanation":"The cache is stale.","test":"Disable the cache and rerun the focused request.","prediction":"The failure disappears.","falsifier":"The same failure occurs without the cache."},{"id":"input","explanation":"The input is invalid.","test":"Validate the captured input independently.","prediction":"The validator rejects it.","falsifier":"The validator accepts it."}],"parents":["artifact://<symptom>"]}
@@ -201,7 +206,7 @@ The hypothesis must exist in the retained plan, and results need a separate obse
 outcomes or causal conclusions. No plan, result or citation grants authority or successful-check
 credit. Revised plans/results are new immutable records linked to prior evidence.
 
-## Evidence workbench (`workbench`, `/evidence`)
+## Evidence workbench (`evidence` `audit`, `/evidence`)
 
 The terminal workbench displays records in the existing **scrollable transcript**, not a separate
 graphical panel:
@@ -213,7 +218,7 @@ graphical panel:
 /evidence correct artifact://<manifest> The event happened later than this annotation says.
 ```
 
-The model-facing `workbench` tool offers `inspect`, `lineage`, and `correct` with `references`.
+The model-facing `evidence` tool offers `audit`, `lineage`, and `correct` with `references`.
 It shows authenticated manifests, bounded text previews, producer/selection/coverage/limitations,
 parent links, storage lifecycle and missing/invalid representations. Different captured hashes of
 the same source are flagged as revisions, **not automatically contradictory claims**. Missing

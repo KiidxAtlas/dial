@@ -55,6 +55,23 @@ fn prompt_cache_bytes() -> Option<u64> {
     }
 }
 
+/// Exact prefix snapshots kept by the vision runner. Models with sliding-window layers (Gemma 3/4)
+/// can only reuse an exact snapshot that is a strict token prefix of the next prompt. The snapshot
+/// at a prompt's end includes the template's generation prompt, which the next turn renders
+/// differently, so reuse comes from the interval checkpoint taken during prefill; one entry would
+/// keep only the unusable final snapshot.
+const VISION_PREFIX_CHECKPOINTS: &str = "4";
+
+/// Vision runner prefix-cache budget in GiB: the same share of physical memory as the text
+/// runner's prompt cache. A single long-context snapshot can exceed 1 GiB, which would evict
+/// the reusable checkpoint before the next turn.
+pub(crate) fn vision_prefix_cache_gib() -> String {
+    prompt_cache_bytes().map_or_else(
+        || "1".to_owned(),
+        |bytes| format!("{:.2}", bytes as f64 / f64::from(1u32 << 30)),
+    )
+}
+
 #[derive(Default)]
 struct Tail {
     bytes: Vec<u8>,
@@ -842,9 +859,9 @@ fn launch(
                 .env("APC_ENABLED", "1")
                 .env("APC_DISK_ENABLED", "0")
                 .env("APC_NUM_BLOCKS", "256")
-                .env("APC_MEMORY_MAX_GB", "1")
+                .env("APC_MEMORY_MAX_GB", vision_prefix_cache_gib())
                 .env("APC_MEMORY_RESERVE_GB", "0.25")
-                .env("APC_CHECKPOINT_ENTRIES", "1");
+                .env("APC_CHECKPOINT_ENTRIES", VISION_PREFIX_CHECKPOINTS);
         } else if let Some(bytes) = prompt_cache_bytes() {
             command.arg(format!("--prompt-cache-bytes={bytes}"));
         }

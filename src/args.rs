@@ -762,26 +762,54 @@ pub(crate) enum Command {
     },
     /// Record or list human feedback tied to immutable artifact content.
     Annotate(dial::cli::annotate::AnnotateArgs),
-    /// Write an anonymized copy of a session (redacted content, metadata kept).
-    Anonymize(dial::cli::anonymize::AnonymizeArgs),
-    /// Sweep stale blobs, archives, and WAL state (dry run unless --apply).
-    Gc(dial::cli::gc::GcArgs),
-    /// List the stream rules this workspace loads, or test which ones a sample output fires.
-    Rules(dial::cli::rules::RulesArgs),
-    /// Inspect tool reliability or run a bounded backend capability check.
-    Reliability {
+    /// Developer and research tools: benchmarks, learning, MLX weights, diagnostics.
+    ///
+    /// Benchmarks, the gated self-improvement loop, MLX weights and steering, Laya, policy and
+    /// reliability inspection, stream rules, session anonymizing and garbage collection.
+    Dev {
         #[command(subcommand)]
-        action: ReliabilityCommand,
+        command: DevCommand,
     },
-    /// Inspect adaptive controls, or preview a task policy without loading a model.
-    Policy {
-        prompt: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// The gated self-improvement loop (evaluation suites, harvesting, LoRA training, rollback).
-    #[command(subcommand)]
-    Improve(cmd::improve::Cmd),
+    /// The `dev` commands also parse at the top level (`dial weights …`) so existing scripts keep
+    /// working; [`command`] hides them from the root help and completions.
+    #[command(flatten)]
+    Developer(DevCommand),
+}
+
+impl Command {
+    /// `dial dev <cmd>` and the hidden top-level `dial <cmd>` are the same command; dispatch sees
+    /// only [`Command::Developer`].
+    pub(crate) fn normalized(self) -> Self {
+        match self {
+            Command::Dev { command } => Command::Developer(command),
+            other => other,
+        }
+    }
+}
+
+/// The root command for parsing, help and completions: the top-level copies of the `dev`
+/// subcommands are hidden, so `dial --help` lists everyday commands and the `dev` group.
+pub(crate) fn command() -> clap::Command {
+    use clap::{CommandFactory, Subcommand};
+    let names: Vec<String> = DevCommand::augment_subcommands(clap::Command::new("dev"))
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    names.iter().fold(Cli::command(), |root, name| {
+        root.mut_subcommand(name, |sub| sub.hide(true))
+    })
+}
+
+/// Parse the process arguments through [`command`], exiting with clap's message on error.
+/// [`crate::dispatch::real_main`] folds `dev` into [`Command::Developer`].
+pub(crate) fn parse() -> Cli {
+    use clap::FromArgMatches;
+    let matches = command().get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.format(&mut command()).exit())
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DevCommand {
     /// Run a reproducible coding benchmark suite in isolated project copies.
     #[command(alias = "bench")]
     Benchmark {
@@ -812,6 +840,9 @@ pub(crate) enum Command {
     },
     /// Run the deterministic, model-free edit-grammar benchmark (exits 1 on any wrong result).
     EditBench(dial::cli::edit_bench::EditBenchArgs),
+    /// The gated self-improvement loop (evaluation suites, harvesting, LoRA training, rollback).
+    #[command(subcommand)]
+    Improve(cmd::improve::Cmd),
     /// Extract, evaluate or inspect experimental local MLX activation steering.
     Steering {
         #[command(subcommand)]
@@ -827,6 +858,23 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: LayaCommand,
     },
+    /// Inspect adaptive controls, or preview a task policy without loading a model.
+    Policy {
+        prompt: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect tool reliability or run a bounded backend capability check.
+    Reliability {
+        #[command(subcommand)]
+        action: ReliabilityCommand,
+    },
+    /// List the stream rules this workspace loads, or test which ones a sample output fires.
+    Rules(dial::cli::rules::RulesArgs),
+    /// Write an anonymized copy of a session (redacted content, metadata kept).
+    Anonymize(dial::cli::anonymize::AnonymizeArgs),
+    /// Sweep stale blobs, archives, and WAL state (dry run unless --apply).
+    Gc(dial::cli::gc::GcArgs),
 }
 #[derive(Subcommand)]
 pub(crate) enum ScheduleCommand {

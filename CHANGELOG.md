@@ -17,6 +17,112 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-09
+
+- The `/watch` pane's **Peers** tab is now **Chats**: a text-message style conversation per peer,
+  labelled by model, with grouped bubbles, ages, read receipts and an inline composer, plus a
+  **This session** thread that prompts this session's own model. Peer messages wake idle, finished,
+  blocked, failed and interrupted sessions and start a session with no task yet, with eight
+  wake-ups per user turn at least 5 seconds apart; a message typed in the pane refills the budget
+  ([terminal integration](docs/terminal-integration.md),
+  [session coordination](docs/session-coordination.md)).
+- Claude models newer than the bundled catalog no longer need a `models.json` update before
+  thinking works. Dial reads the thinking mode and effort levels Anthropic's model listing declares
+  (`capabilities.thinking`, `capabilities.effort`), saves them with the discovered models, and uses
+  them for default thinking, `/effort` and the status line when the bundle has no record
+  ([provider catalog](docs/provider-catalog.md)).
+- The default status line now shows the thinking level at every terminal width, and shows
+  `think auto` while `/effort auto` judges effort per turn
+  ([terminal composer](docs/terminal-composer.md)).
+- New opt-in `shell.undo_snapshot` (off by default): Dial copies the project's source files before
+  a turn's first shell command that may change files, and files `bash` then changes, creates or
+  deletes are restored by `/undo` and `/rollback` like tool edits. Ignored files, dependency and
+  build directories, credential-like files and effects outside the project are not covered;
+  projects over 20,000 source files or 512 MiB are not copied. The effect on model behaviour is
+  unmeasured ([shell](docs/shell.md#undo-for-shell-changes)).
+- `tool_search` no longer returns an empty `search_matches` when no tool matches most of a broad
+  query (for example a list of synonyms). It now lists up to five closest partial matches, not
+  loaded, beside the catalog page, so a model can find and `tool_load` the capability it asked
+  about. Automatic routing keeps the strict threshold. The `computer` readiness note now says that
+  only `locate` needs a grounding model ([tools](docs/tools.md#tool-roster-safety-and-context-sources)).
+- A `computer` `run` whose `code` is function source (for example `async ({ desktop }) => …`) now
+  fails with a message to pass it as `fn` or write a function body. Before, nothing ran and the
+  result was the function's source text, which models misread as a broken tool.
+- On Windows, Dial now turns on virtual terminal processing before drawing its interface. Before,
+  the classic console window (`powershell.exe`, `cmd.exe`) printed raw codes such as `←[2K` in place
+  of the interface. A console that cannot enable it ("Use legacy console") now gets a message to
+  use Windows Terminal ([Windows](docs/windows.md#terminal-and-administrator-shells)).
+- Local MLX vision models such as Gemma 4 now reuse their prompt cache between turns. The vision
+  runner kept one exact snapshot within 1 GiB. That snapshot ended in the chat template's generation
+  prompt, which the next turn renders differently, so it never matched and every request
+  re-read the whole prompt. It now keeps four checkpoints within a quarter of physical memory. On
+  Gemma 4 26B-A4B with a 36–50k-token agent conversation, time to first token fell from 25–40 s to
+  3–4.5 s, with about 93% of prompt tokens cached ([transport](docs/llm-transport.md)).
+- Clarify that Windows releases need no Azure account or paid code-signing certificate. Installers
+  retain signed-checksum verification; unsigned executables can still receive Windows publisher
+  and reputation warnings ([Windows installation](docs/windows.md#publisher-signatures-and-download-warnings)).
+- Windows: when Smart App Control or another application control policy stops the downloaded
+  `dial.exe` from starting, the PowerShell installer now says so and names Smart App Control when
+  it is on, instead of reporting an empty "version check failed". Nothing is installed. Use WSL2 on
+  machines with Smart App Control on ([Smart App Control](docs/windows.md#smart-app-control)).
+- Repeated acceptance-helper failures keep fresh execution/status evidence but use a short notice
+  when their bounded diagnostics are unchanged; changed failures and failures after a pass still
+  print the diagnostic ([verification](docs/requirement-verification.md#model-registered-helper-diagnostics)).
+  Python and release-policy test targets now fail early with the selected interpreter and a
+  pinned-environment setup command when their required imports are unavailable
+  ([source checks](docs/release-and-install.md#build-from-source)).
+- Semantic memory starts Ollama for a local `embedding` role when it is not running, instead of
+  falling back to keyword search. Dial windows share one `ollama serve` through a lock and leases,
+  never start a second one, and stop it when the last Dial process exits; a server you started
+  is never stopped. `/setup embeddings` now starts its server through the same owner. Turn it off
+  with `memory.semantic.embedding_autostart = false`
+  ([embeddings](docs/model-embeddings.md#starting-ollama-automatically)).
+- Python edit diagnostics now catch literal newlines inside short quoted strings, a blind spot
+  in the linked syntax grammar, while allowing triple quotes, escaped line continuations and
+  multiline f-string expressions. Retry barriers retain bounded multiline compiler diagnostics
+  instead of only their first line. Shell checks with explicit `check_paths` stay withheld after
+  unrelated file changes and become eligible after their declared source changes
+  ([agent loop](docs/agent-loop.md)).
+- A model that keeps repeating one identical tool call is stopped sooner and sees the real
+  error. Duplicate-call references now quote the last executed result instead of nesting earlier
+  references or retry-barrier refusals, and repeating the call again after a reference ends the
+  turn as blocked instead of running on to the 16-attempt recovery limit. A refused shell retry
+  whose error points at the command line (`No module named …`, `command not found`) names the
+  command to correct. Refused calls no longer inflate the report's "Outside /undo" shell count
+  ([agent loop](docs/agent-loop.md)).
+- One `evidence` tool replaces `evidence_search`, `workbench`, `investigate`, `reality`,
+  `timeline` and `perception`, cutting six schemas from the catalog. Their operations are now `evidence` actions
+  with the same bounds: `search`, `audit`/`lineage`/`correct`, `diff`/`interpret`/`plan`/`result`,
+  `check`/`assess`, `timeline` and `budget_open`/`budget_status`/`budget_step`/`budget_close`.
+  Saved `integrations` and `harness.tools` entries, `--tools`
+  names and resumed sessions that used the old tools move to `evidence` automatically
+  ([tools](docs/tools.md), [evidence investigations](docs/evidence-investigation.md)).
+- `working_state` is now part of `todo`: the `state_view`, `state_update` and `state_patch` ops
+  take the former `view`, `update` and `patch` fields in `state`, with the same revision checks,
+  deliverable confirmations and compaction carry. One planning tool replaces two in the default
+  offer, and `task` still fits the hosted core budget. Saved `harness.tools` lists, `--tools
+  working_state` and resumed sessions that used the old tool move to `todo` automatically
+  ([tools](docs/tools.md), [agent loop](docs/agent-loop.md)).
+- Specialist commands are grouped under `dial dev` (`benchmark`, `edit-bench`, `improve`,
+  `steering`, `weights`, `laya`, `policy`, `reliability`, `rules`, `anonymize`, `gc`), so
+  `dial --help` lists everyday commands. The old top-level spellings still work and are hidden
+  from help ([everyday](docs/everyday.md#command-line)).
+- First launch names local inference servers that are already running (Ollama, LM Studio,
+  llama.cpp and others) and highlights **Local model**, so a machine with a local server needs no
+  API key to get started. When none is running on Apple Silicon, it suggests the largest MLX coding
+  model (7B and up) that fits your memory instead. Nothing is selected or downloaded without your
+  confirmation ([setup](docs/setup.md)).
+- The Unix installer warns about bubblewrap only when it is missing, prints the install command for
+  your package manager and shows the WSL interop note only on WSL. The documentation no longer says
+  `bash` needs `sandbox.mode = "off"` on Linux; that applies to Windows only
+  ([release and install](docs/release-and-install.md)).
+- The install docs now give the Homebrew tap command, and `packaging/` holds submission-ready
+  definitions for the AUR (`dial-bin`) and homebrew-core ([packaging](packaging/README.md)).
+- Releases now update the AUR `dial-bin` metadata along with the Homebrew formula, re-verify the
+  signed `SHA256SUMS` first, and merge the packaging pull request automatically, so the tap no
+  longer lags behind a release ([release and install](docs/release-and-install.md)).
+- New [Quickstart](docs/quickstart.md) page; the docs index starts with a "Start here" section.
+
 ## [0.3.2] - 2026-11-09
 
 - Safer interaction with the agent. Approval and question prompts ignore answer keys for a moment

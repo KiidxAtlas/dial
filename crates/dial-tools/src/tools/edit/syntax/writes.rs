@@ -278,3 +278,54 @@ fn lean_write_refuses_new_errors_before_commit_and_preserves_the_witness() {
     assert!(out.is_error, "{}", out.text);
     assert!(!root.path().join("new.py").exists());
 }
+
+#[test]
+fn python_string_round_trip_and_focused_repair_preserve_saved_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(root.path()).unwrap().with_syntax_guard(true);
+    let source = "room = '洞窟'\nprint(\"\\n\")\nprint(f\"{room}: \\\"shield\\\" \\\\ path\")\n";
+    let arguments = json!({"path":"dungeon_game.py","content":source});
+    let wire = serde_json::to_vec(&arguments).unwrap();
+    let decoded: Value = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(
+        decoded["content"].as_str().unwrap().as_bytes(),
+        source.as_bytes()
+    );
+    let written = execute(&ws, "write", &decoded, 5);
+    assert!(!written.is_error, "{}", written.text);
+    assert_eq!(
+        std::fs::read(root.path().join("dungeon_game.py")).unwrap(),
+        source.as_bytes()
+    );
+    assert_eq!(report(Path::new("dungeon_game.py"), source)["valid"], true);
+
+    let read = execute(&ws, "read", &json!({"path":"dungeon_game.py"}), 5);
+    let header = read.text.lines().next().unwrap();
+    let broken = execute(
+        &ws,
+        "edit",
+        &json!({"input":format!("{header}\nPUT 2.=2:\n+print(\"\n+\")")}),
+        5,
+    );
+    assert!(!broken.is_error, "{}", broken.text);
+    assert!(broken.text.contains("Syntax advisory"), "{}", broken.text);
+    let saved = std::fs::read_to_string(root.path().join("dungeon_game.py")).unwrap();
+    assert!(
+        saved.contains("print(\"\n\")"),
+        "malformed source must not be silently fixed"
+    );
+    assert_eq!(report(Path::new("dungeon_game.py"), &saved)["valid"], false);
+    let read = execute(&ws, "read", &json!({"path":"dungeon_game.py"}), 5);
+    let header = read.text.lines().next().unwrap();
+    let repaired = execute(
+        &ws,
+        "edit",
+        &json!({"input":format!("{header}\nPUT 2.=3:\n+print()")}),
+        5,
+    );
+    assert!(!repaired.is_error, "{}", repaired.text);
+    let expected = source.replacen("print(\"\\n\")", "print()", 1);
+    let saved = std::fs::read_to_string(root.path().join("dungeon_game.py")).unwrap();
+    assert_eq!(saved, expected);
+    assert_eq!(report(Path::new("dungeon_game.py"), &saved)["valid"], true);
+}

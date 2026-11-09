@@ -57,6 +57,21 @@ const SUGGESTIONS: &[Suggestion] = &[
     },
 ];
 
+/// Smallest suggestion tier offered at first launch: the 7B coding model. Smaller suggestions are
+/// for smoke tests and summaries and often produce broken tool calls (README "Small local models").
+const FIRST_LAUNCH_MIN_GIB: u64 = 16;
+
+/// The largest suggested coding model that fits `memory_bytes`, for first-launch guidance.
+/// `None` when not even the 7B tier fits. An estimate by RAM tier, not a measurement.
+pub fn first_launch_suggestion(memory_bytes: u64) -> Option<&'static Suggestion> {
+    SUGGESTIONS
+        .iter()
+        .filter(|s| {
+            s.min_memory_gib >= FIRST_LAUNCH_MIN_GIB && s.min_memory_gib * GIB <= memory_bytes
+        })
+        .max_by_key(|s| s.min_memory_gib)
+}
+
 /// Parsed `dial models recommend` flags.
 #[derive(Debug, Clone, Default)]
 pub struct RecommendOptions {

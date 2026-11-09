@@ -1,59 +1,37 @@
 //! Citation-backed comparisons and falsifiable experiment records, never an execution authority.
 use super::evidence::publish;
-use crate::config::types::Config;
 use crate::runtime::evidence::{
     Evidence, EvidenceContext, EvidenceKind, Location, Method, Representation,
 };
 use crate::storage::artifact::ArtifactStore;
-use crate::tools::integrations::ext::{Tool, ToolContext};
 use crate::tools::{ToolOutput, Workspace};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, sync::Arc};
+use std::collections::BTreeSet;
 
 const MAX_INPUT: usize = 256 * 1024;
 const MAX_RECORD: usize = 128 * 1024;
 const MAX_ITEMS: usize = 16;
 
-/// Register the bounded investigation tool.
-pub fn tools(_: &Config) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(Investigation)]
-}
-struct Investigation;
-impl Tool for Investigation {
-    fn name(&self) -> &str {
-        "investigate"
-    }
-    fn schema(&self) -> Value {
-        crate::tools::tool_schema(
-            "investigate",
-            "Use when debugging needs a written record: compare two retained inputs, record your interpretation with exact quoted highlights, plan competing falsifiable hypotheses with discriminating experiments, and attach results from tools you ran separately. Returns: compare gives a bounded text diff for you to interpret; interpret, plan and result retain your attributed claims. It runs nothing itself (no tests, no model calls) and is not proof of causality or verification credit. Actions: compare, interpret, plan, result.",
-            json!({
-                "action":{"type":"string","enum":["compare","interpret","plan","result"]},
-                "reference":{"type":"string"},"other":{"type":"string"},
-                "question":{"type":"string","maxLength":4096},
-                "findings":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"claim":{"type":"string"},"left_quote":{"type":"string"},"right_quote":{"type":"string"}},"required":["claim","left_quote","right_quote"],"additionalProperties":false}},
-                "hypotheses":{"type":"array","minItems":2,"maxItems":16,"items":{"type":"object","properties":{"id":{"type":"string"},"explanation":{"type":"string"},"test":{"type":"string"},"prediction":{"type":"string"},"falsifier":{"type":"string"}},"required":["id","explanation","test","prediction","falsifier"],"additionalProperties":false}},
-                "parents":{"type":"array","maxItems":32,"items":{"type":"string"}},
-                "hypothesis":{"type":"string"},"observation":{"type":"string","maxLength":8192},
-                "assessment":{"type":"string","enum":["supports","contradicts","inconclusive"]}
-            }),
-            &["action"],
-        )
-    }
-    fn needs_approval(&self, _: &Value) -> bool {
-        false
-    }
-    fn read_only_hint(&self) -> bool {
-        true
-    }
-    fn may_modify_workspace(&self, _: &Value) -> bool {
-        false
-    }
-    fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        run(ctx.workspace, args).unwrap_or_else(|e| ToolOutput::err(format!("{e:#}")))
-    }
+/// The retired `investigate` contract, now the `evidence` `diff`, `interpret`, `plan` and
+/// `result` actions. `/evidence` uses the same [`run`].
+pub(crate) fn schema() -> Value {
+    crate::tools::tool_schema(
+        "investigate",
+        "Use when debugging needs a written record: compare two retained inputs, record your interpretation with exact quoted highlights, plan competing falsifiable hypotheses with discriminating experiments, and attach results from tools you ran separately. Returns: compare gives a bounded text diff for you to interpret; interpret, plan and result retain your attributed claims. It runs nothing itself (no tests, no model calls) and is not proof of causality or verification credit. Actions: compare, interpret, plan, result.",
+        json!({
+            "action":{"type":"string","enum":["compare","interpret","plan","result"]},
+            "reference":{"type":"string"},"other":{"type":"string"},
+            "question":{"type":"string","maxLength":4096},
+            "findings":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"claim":{"type":"string"},"left_quote":{"type":"string"},"right_quote":{"type":"string"}},"required":["claim","left_quote","right_quote"],"additionalProperties":false}},
+            "hypotheses":{"type":"array","minItems":2,"maxItems":16,"items":{"type":"object","properties":{"id":{"type":"string"},"explanation":{"type":"string"},"test":{"type":"string"},"prediction":{"type":"string"},"falsifier":{"type":"string"}},"required":["id","explanation","test","prediction","falsifier"],"additionalProperties":false}},
+            "parents":{"type":"array","maxItems":32,"items":{"type":"string"}},
+            "hypothesis":{"type":"string"},"observation":{"type":"string","maxLength":8192},
+            "assessment":{"type":"string","enum":["supports","contradicts","inconclusive"]}
+        }),
+        &["action"],
+    )
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -20,6 +20,51 @@ With GitHub CLI signed in, the installer downloads through `gh` instead; this is
 
 Dial finds its state directory from a nonempty `DIAL_HOME`, otherwise `HOME\.dial`, falling back to `USERPROFILE\.dial` on Windows when `HOME` is missing or empty. A typical default is `C:\Users\YourName\.dial`. To choose another location in PowerShell, set `$env:DIAL_HOME = 'D:\Dial'` before running `dial`. To keep it for future terminals too, run `[Environment]::SetEnvironmentVariable('DIAL_HOME', 'D:\Dial', 'User')` (this does not update terminals already open). `DIAL_INSTALL_DIR` controls the executable location, not this state directory.
 
+### Publisher signatures and download warnings
+
+Dial's installer verifies the Ed25519-signed checksum manifest and archive checksum. Releases
+do not require an Azure account or paid signing certificate, and the release workflow does not
+Authenticode-sign `dial.exe`. Windows may show an unknown-publisher warning, block it under Smart
+App Control, or apply an enterprise policy block even when the installer has verified the
+download. The one-command installer simplifies setup; it does not bypass Windows security controls.
+
+After installing or extracting a release, inspect the executable in PowerShell:
+
+```powershell
+$signature = Get-AuthenticodeSignature -LiteralPath (Get-Command dial).Source
+$signature | Format-List Status, StatusMessage, SignatureType
+$signature.SignerCertificate | Format-List Subject, Issuer
+$signature.TimeStamperCertificate | Format-List Subject, Issuer
+```
+
+For an extracted copy not on PATH, use its full `dial.exe` path instead. `NotSigned` is expected
+for current releases; it is separate from the installer's manifest/checksum verification. Report
+`HashMismatch`, `NotTrusted`, checksum-verification failures or Windows blocks with the release
+version and exact warning, without private system data.
+
+SmartScreen reputation warnings can persist for new signed software; signing does not guarantee
+an immediate bypass. Antivirus detections and enterprise policy blocks are separate issues.
+Do not disable Defender/SmartScreen or install an untrusted root certificate to run Dial.
+
+### Smart App Control
+
+Smart App Control (Windows 11) blocks any executable that is neither signed by a trusted
+publisher nor already known to Microsoft's cloud service. Release builds of `dial.exe` are not
+Authenticode-signed, so Smart App Control blocks them. It has no per-app allow list, and
+`Unblock-File` does not help. In that case the installer stops before installing anything. It
+reports `Downloaded dial.exe could not start` and says that Smart App Control is on. To check
+the state, open Windows Security > App & browser control > Smart App Control settings.
+
+Options:
+
+- Run the Linux build in WSL2 ([WSL2 instructions](release-and-install.md#windows-through-wsl2--linux-x86-64)).
+  Smart App Control does not check Linux binaries inside WSL. This is the recommended route.
+- Turning Smart App Control off is a system-wide security change. Dial does not require or
+  recommend it, and on some Windows builds it cannot be turned back on without resetting Windows.
+
+Building from source does not avoid the block: a locally built unsigned `dial.exe` is also unknown
+to Smart App Control.
+
 ## First run and LM Studio
 
 First run opens Providers. To use a local model without a hosted account, press Esc once to
@@ -31,6 +76,23 @@ If you start the server after opening Dial, press F5 or Ctrl+R in Models to resc
 empty model list, Enter opens Providers, where you can inspect connection details and run
 Test connection. These navigation and test actions keep setup open; Esc from a setup subpage
 returns to Models. Esc again from Models without choosing a model exits setup.
+
+## Terminal and Administrator shells
+
+Dial's interface uses virtual terminal sequences. Windows Terminal supports them by default, and
+Dial turns them on in the classic console window (`powershell.exe`, `cmd.exe`). If the console is
+set to "Use legacy console", Dial stops with a message instead of printing raw codes such as `←[2K`.
+In that case, run Dial in Windows Terminal or clear that option in the window's Properties.
+
+Run Dial from a normal, non-Administrator shell, inside a project folder. Files that an elevated
+shell creates belong to the Administrators group, and Dial refuses to read private files it does
+not own once it is no longer elevated. That refusal reads `private storage target must be an
+owner-owned regular file without hard links`. To return the folder to your account, run once in
+an Administrator PowerShell:
+
+```powershell
+takeown /F "$env:USERPROFILE\.dial" /R /D Y
+```
 
 ## Security
 

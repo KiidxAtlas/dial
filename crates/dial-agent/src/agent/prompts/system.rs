@@ -46,8 +46,6 @@ pub(crate) const RULES: &str = "
 - Keep required work, real blockers and optional follow-ups separate, and settle each step you finish.";
 pub(crate) const TODO_RULE: &str = "
 - Track execution steps with `todo` only for long work; pair updates with real calls when batching is allowed.";
-pub(crate) const WORKING_STATE_RULE: &str = "
-- Record required deliverables in `working_state`.";
 pub(crate) const CHANGE_RULES: &str = "
 - Update owners, callers, configuration, serialized contracts and docs together so the change stays coherent.
 - Run the narrowest useful check first (a type check or one focused test of the changed module), reuse passing evidence until something changes, and broaden once for affected interfaces, real uncertainty or required gates.";
@@ -78,7 +76,7 @@ pub(crate) const LSP_RULE: &str =
 pub(crate) const SOURCE_PREVIEW_RULE: &str =
     "Use glob preview=true for discovery and file outlines or targeted ranges for large files.";
 pub(crate) const EVIDENCE_DATA_RULE: &str = "Check schema, units, keys and coverage for data or media, and recheck unclear OCR or audio before citing it.";
-pub(crate) const EVIDENCE_DATA_TOOLS: [&str; 4] = ["data", "document", "audio", "perception"];
+pub(crate) const EVIDENCE_DATA_TOOLS: [&str; 3] = ["data", "document", "audio"];
 pub(in crate::agent) const CURRENT_USER_REQUEST: &str = "Latest admitted user request, restated by Dial as context. Follow it over conflicting older plans, keep compatible unfinished work, and resolve the actual requested target before changing it. If text_truncated is true, recover the full message from session history before relying on omitted scope.";
 pub(in crate::agent) const CHILD_FOCUSED_WORK: &str = "Investigate the assigned target using the handoff's paths and evidence before rediscovering it; batch independent reads and edits to disjoint owned files, use focused checks after edits settle, and report concrete findings, commands and gaps without treating successful calls as complete acceptance.";
 

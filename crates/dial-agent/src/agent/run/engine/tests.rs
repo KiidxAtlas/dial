@@ -1525,7 +1525,10 @@ fn productive_rounds_aggregate_batches_without_bookkeeping_forgiving_failure() {
         }
         assert_eq!(edits.engine.take_round_progress(), RoundProgress::Stalled);
         assert_eq!(edits.engine.take_round_progress(), RoundProgress::Neutral);
-        let todo = edits.call("working_state", serde_json::json!({"action": "update"}));
+        let todo = edits.call(
+            "todo",
+            serde_json::json!({"op": "state_update", "state": {"goal": "ship"}}),
+        );
         edits.settle(&todo, vec![], ToolOutput::ok("updated task claims".into()));
         assert_eq!(edits.engine.take_round_progress(), RoundProgress::Neutral);
     }
@@ -1752,13 +1755,6 @@ fn productive_rounds_respect_operation_contracts_and_bookkeeping_neutrality() {
             "lookup",
             Effects::Unknown,
             RoundProgress::Stalled,
-        ),
-        (
-            "working_state",
-            true,
-            "inspect",
-            Effects::None,
-            RoundProgress::Neutral,
         ),
         (
             "todo",
@@ -2061,4 +2057,116 @@ fn native_reset_repairs_only_the_matching_eval_namespace_and_never_unknown_effec
         edits.engine.pending_refusal().is_some(),
         "reset cannot authorize uncertain-effect continuation"
     );
+}
+
+#[test]
+fn a_malformed_shell_command_hint_names_the_command_only_for_command_line_errors() {
+    let bash = |command: &str| ToolCall {
+        id: "b".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({ "command": command }),
+        malformed_arguments: false,
+    };
+    let hint = malformed_command_hint(
+        &bash("python3 -m venv.venv"),
+        "/usr/bin/python3: No module named venv.venv",
+    )
+    .expect("a missing module points at the command line");
+    assert!(hint.contains("`python3 -m venv.venv`"), "{hint}");
+    assert!(hint.contains("spaces between arguments"), "{hint}");
+    assert!(malformed_command_hint(&bash("cargo test"), "test result: FAILED").is_none());
+    let read = ToolCall {
+        name: "read".into(),
+        arguments: serde_json::json!({ "command": "x", "path": "a" }),
+        ..bash("x")
+    };
+    assert!(malformed_command_hint(&read, "No such file or directory").is_none());
+}
+
+#[test]
+fn failed_python_check_keeps_the_compiler_diagnostic_without_recursive_notices() {
+    let mut edits = Edits::new();
+    let check = edits.call(
+        "bash",
+        serde_json::json!({"command":"python3 -m py_compile dungeon_game.py"}),
+    );
+    let diagnostic = "File \"dungeon_game.py\", line 25\n    print(\"\n          ^\nSyntaxError: unterminated string literal";
+    edits.settle(&check, vec![], ToolOutput::err(diagnostic));
+    let first = edits.engine.rejection_at(&edits.workspace, &check).unwrap();
+    assert!(first.contains(diagnostic), "{first}");
+    assert!(!first.contains("<dial-notice"), "{first}");
+    edits.settle(&check, vec![], ToolOutput::err(first.clone()));
+    let second = edits.engine.rejection_at(&edits.workspace, &check).unwrap();
+    assert_eq!(
+        second, first,
+        "refusals must not replace executed diagnostics"
+    );
+}
+
+#[test]
+fn declared_shell_inputs_ignore_unrelated_mutations_inside_and_outside_git() {
+    for git in [false, true] {
+        let mut edits = Edits::new();
+        if git {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(edits.workspace.root())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "user.name=Test",
+                        "-c",
+                        "user.email=test@example.invalid",
+                        "commit",
+                        "-q",
+                        "--allow-empty",
+                        "-m",
+                        "baseline"
+                    ])
+                    .current_dir(edits.workspace.root())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        edits.write("dungeon_game.py", "print(\"\n");
+        let check = edits.call(
+            "bash",
+            serde_json::json!({
+                "command":"python3 -m py_compile dungeon_game.py", "check":true,
+                "check_paths":["dungeon_game.py"]
+            }),
+        );
+        edits.settle(
+            &check,
+            vec![],
+            ToolOutput::err("SyntaxError: unterminated string literal"),
+        );
+        assert!(barred(&mut edits, &check));
+        edits.write("other.txt", "unrelated change");
+        let write = edits.call(
+            "write",
+            serde_json::json!({"path":"other.txt","content":"unrelated change"}),
+        );
+        edits.settle(
+            &write,
+            vec![edits.path("other.txt")],
+            ToolOutput::ok("written".into()),
+        );
+        assert!(
+            barred(&mut edits, &check),
+            "unrelated edits cannot release a known-input check (git={git})"
+        );
+        edits.write("dungeon_game.py", "print()\n");
+        assert!(
+            !barred(&mut edits, &check),
+            "external repair releases the matching check (git={git})"
+        );
+    }
 }

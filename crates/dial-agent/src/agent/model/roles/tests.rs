@@ -181,10 +181,10 @@ fn retained_evidence_ranking_uses_index_only_chat_and_no_lsp_supplement() {
         .unwrap()
         .retain_evidence(&evidence, bytes)
         .unwrap();
-    let args = json!({"query":"timeout", "references":[reference], "ranking":"semantic"});
+    let args = json!({"action":"search", "query":"timeout", "references":[reference], "ranking":"semantic"});
     let request = retrieval_request(
         &workspace,
-        "evidence_search",
+        "evidence",
         &args,
         &std::sync::atomic::AtomicBool::new(false),
     )
@@ -201,8 +201,19 @@ fn retained_evidence_ranking_uses_index_only_chat_and_no_lsp_supplement() {
     assert!(
         retrieval_request(
             &workspace,
-            "evidence_search",
-            &json!({"query":"timeout","references":[reference]}),
+            "evidence",
+            &json!({"action":"search","query":"timeout","references":[reference]}),
+            &std::sync::atomic::AtomicBool::new(false)
+        )
+        .unwrap()
+        .is_none()
+    );
+    // Other evidence actions never rank.
+    assert!(
+        retrieval_request(
+            &workspace,
+            "evidence",
+            &json!({"action":"inspect","reference":reference}),
             &std::sync::atomic::AtomicBool::new(false)
         )
         .unwrap()

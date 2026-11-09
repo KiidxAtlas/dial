@@ -202,6 +202,12 @@ struct StepChecks {
     /// Model-authored acceptance helpers, distinct from operator/task-provided checks.
     registered_acceptance: Vec<verify::verification::FocusedCheck>,
     registered_checked: Option<verify::evidence::Revision>,
+    /// Bounded last helper failures, for concise notices without reusing failed evidence.
+    registered_failures: Vec<(
+        verify::verification::FocusedCheck,
+        verify::verification::CheckStatus,
+        String,
+    )>,
     /// Empty `grep`/`glob` results this turn, forgotten whenever the workspace revision moves.
     empty_searches: run::search_frontier::EmptySearches,
     /// Workspace-relative files successfully read this turn; they clear caller obligations.
@@ -216,6 +222,8 @@ struct StepChecks {
     outcome_gradient: run::outcome_gradient::Gradient,
     /// `experimental.fault_witness` and `experimental.edit_bisection_runs` results this turn.
     counterfactual: verify::counterfactual::State,
+    /// `shell.undo_snapshot` already said this turn that no pre-image could be taken.
+    shell_undo_unavailable_noted: bool,
 }
 impl StepChecks {
     fn revision(&self) -> verify::evidence::Revision {

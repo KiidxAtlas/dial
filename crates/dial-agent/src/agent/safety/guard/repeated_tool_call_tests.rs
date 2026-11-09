@@ -197,6 +197,61 @@ fn a_multi_call_repeat_pairs_each_call_with_its_own_earlier_result() {
 }
 
 #[test]
+fn the_quoted_result_skips_references_and_barrier_refusals_that_ran_nothing() {
+    let reply = |id: &str, content: &str| {
+        vec![
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":"bash","arguments":"{\"command\":\"python3 -m venv.venv\"}"}}]}),
+            json!({"role":"tool","tool_call_id":id,"content":content}),
+        ]
+    };
+    let mut messages = reply("c0", "python3: No module named venv.venv");
+    for n in 1..5 {
+        messages.extend(reply(
+            &format!("c{n}"),
+            "invalid tool call: Failed-operation retry barrier: this unchanged `bash` call already failed and was not executed again.",
+        ));
+    }
+    let stub = crate::agent::safety::stream_guards::render_duplicate_call_result(
+        "bash",
+        "c4",
+        "invalid tool call: Failed-operation retry barrier: …",
+    );
+    messages.extend(reply("c5", &stub));
+    let repeat = RepeatedToolCall::detect(&messages, 5, &["wait"]).expect("streak of six");
+    assert_eq!(repeat.result_summary, "python3: No module named venv.venv");
+    let results = repeat
+        .short_circuit(&[call(
+            "new",
+            "bash",
+            json!({"command": "python3 -m venv.venv"}),
+        )])
+        .expect("identical repeat");
+    assert!(results[0].contains("tool_call_id `c0`"), "{}", results[0]);
+    assert!(
+        results[0].contains("No module named venv.venv"),
+        "{}",
+        results[0]
+    );
+    assert_eq!(
+        results[0].matches("[Not executed").count(),
+        1,
+        "{}",
+        results[0]
+    );
+
+    // With no executed result in the streak, the newest one is still quoted.
+    let mut only_refusals = Vec::new();
+    for n in 0..5 {
+        only_refusals.extend(reply(
+            &format!("r{n}"),
+            "invalid tool call: Failed-operation retry barrier: x",
+        ));
+    }
+    let repeat = RepeatedToolCall::detect(&only_refusals, 5, &["wait"]).expect("streak of five");
+    assert!(repeat.result_summary.starts_with("invalid tool call:"));
+}
+
+#[test]
 fn alternating_identical_call_sets_are_a_cycle_once_three_full_cycles_repeat() {
     let alternate = |rounds: usize| {
         let mut messages = Vec::new();

@@ -27,13 +27,13 @@ pub fn report(path: &Path, content: &str) -> Value {
     let Some(lang) = language(path) else {
         return json!({"supported":false,"reason":"no syntax parser for this extension"});
     };
-    match AstGrep::try_new(content, lang) {
-        Ok(tree) => {
-            let errors: Vec<_> = tree.root().dfs().filter(|node|node.is_error()||node.is_missing()).take(33)
-                .map(|node| {let pos=node.start_pos();json!({"line":pos.line()+1,"column":pos.column(&node)+1,"missing":node.is_missing()})}).collect();
+    match error_positions(lang, content) {
+        Some(positions) => {
+            let errors: Vec<_> = positions.into_iter().take(33)
+                .map(|(line, column, missing)| json!({"line":line,"column":column,"missing":missing})).collect();
             json!({"supported":true,"language":lang.to_string(),"errors":errors,"valid":errors.is_empty()})
         }
-        Err(_) => json!({"supported":false,"reason":"parser unavailable"}),
+        None => json!({"supported":false,"reason":"parser unavailable"}),
     }
 }
 
@@ -123,7 +123,16 @@ fn error_positions(lang: SupportLang, content: &str) -> Option<Vec<(usize, usize
     Some(
         tree.root()
             .dfs()
-            .filter(|node| node.is_error() || node.is_missing())
+            .filter(|node| {
+                node.is_error()
+                    || node.is_missing()
+                    || (lang == SupportLang::Python
+                        && node.kind() == "string_content"
+                        && node.parent().is_some_and(|parent| {
+                            parent.kind() == "string"
+                                && python_short_string_newline(&node.text(), &parent.text())
+                        }))
+            })
             .take(4096)
             .map(|node| {
                 let pos = node.start_pos();
@@ -131,6 +140,35 @@ fn error_positions(lang: SupportLang, content: &str) -> Option<Vec<(usize, usize
             })
             .collect(),
     )
+}
+
+/// The Python tree-sitter grammar accepts unescaped newlines in short string content.
+/// Check only string-content nodes: triple quotes and multiline f-string expressions are valid.
+fn python_short_string_newline(content: &str, string: &str) -> bool {
+    let Some(quote) = string.find(['\'', '"']) else {
+        return false;
+    };
+    if string[quote..].starts_with("\"\"\"") || string[quote..].starts_with("'''") {
+        return false;
+    }
+    let mut escaped = false;
+    let mut bytes = content.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'\\' => escaped = !escaped,
+            b'\r' | b'\n' => {
+                if !escaped {
+                    return true;
+                }
+                if byte == b'\r' && bytes.peek() == Some(&b'\n') {
+                    bytes.next();
+                }
+                escaped = false;
+            }
+            _ => escaped = false,
+        }
+    }
+    false
 }
 /// The refusal for an edit that raises the parser error count of a high-confidence grammar, naming
 /// the first new error with a few lines of the would-be result. `None` lets the edit proceed.

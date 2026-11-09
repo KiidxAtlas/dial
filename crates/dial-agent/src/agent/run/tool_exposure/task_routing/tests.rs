@@ -159,15 +159,8 @@ fn task_intents_select_native_specialists_without_discovery_calls() {
 
 #[test]
 fn source_investigations_offer_eligible_native_tools_for_formats_and_task_verbs() {
-    let candidates = [
-        "document",
-        "data",
-        "audio",
-        "visual",
-        "evidence",
-        "evidence_search",
-    ]
-    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    let candidates = ["document", "data", "audio", "visual", "evidence"]
+        .map(|name| (name.to_owned(), "Capability".to_owned()));
     for (query, specialist) in [
         ("Inspect the PDF structure before summarizing", "document"),
         (
@@ -197,7 +190,7 @@ fn source_investigations_offer_eligible_native_tools_for_formats_and_task_verbs(
             &BTreeSet::new(),
             &candidates
         ),
-        ["evidence", "evidence_search"]
+        ["evidence"]
     );
     // Routing selects schemas from the eligible catalog, never invents unavailable capabilities.
     assert_eq!(
@@ -214,15 +207,8 @@ fn source_investigations_offer_eligible_native_tools_for_formats_and_task_verbs(
 
 #[test]
 fn source_routing_ignores_incidental_module_names_and_format_mentions_without_intent() {
-    let candidates = [
-        "document",
-        "data",
-        "audio",
-        "visual",
-        "evidence",
-        "evidence_search",
-    ]
-    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    let candidates = ["document", "data", "audio", "visual", "evidence"]
+        .map(|name| (name.to_owned(), "Capability".to_owned()));
     for query in [
         "Inspect src/audio.rs and visual.rs",
         "Read crates/document/mod.rs and knowledge/data.rs",
@@ -255,15 +241,8 @@ fn source_routing_ignores_incidental_module_names_and_format_mentions_without_in
 
 #[test]
 fn output_only_formats_do_not_route_source_specialists() {
-    let candidates = [
-        "document",
-        "data",
-        "audio",
-        "visual",
-        "evidence",
-        "evidence_search",
-    ]
-    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    let candidates = ["document", "data", "audio", "visual", "evidence"]
+        .map(|name| (name.to_owned(), "Capability".to_owned()));
     // The named file is the deliverable, not an input. Its format must not pull in a source reader.
     for query in [
         "Analyze the plaintext logs in /app/logs and write a CSV file /app/summary.csv",
@@ -307,15 +286,8 @@ fn output_only_formats_do_not_route_source_specialists() {
 
 #[test]
 fn output_clauses_and_input_clauses_are_routed_independently() {
-    let candidates = [
-        "document",
-        "data",
-        "audio",
-        "visual",
-        "evidence",
-        "evidence_search",
-    ]
-    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    let candidates = ["document", "data", "audio", "visual", "evidence"]
+        .map(|name| (name.to_owned(), "Capability".to_owned()));
     // Input formats keep their specialist whether the output is named before or after them.
     assert_eq!(
         select(
@@ -408,14 +380,8 @@ fn output_clauses_and_input_clauses_are_routed_independently() {
 
 #[test]
 fn ordinary_words_and_coding_tasks_do_not_route_runtime_or_evidence_specialists() {
-    let candidates = [
-        "monitor",
-        "investigate",
-        "research",
-        "timeline",
-        "workbench",
-    ]
-    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    let candidates =
+        ["monitor", "research", "evidence"].map(|name| (name.to_owned(), "Capability".to_owned()));
     for query in [
         "investigate why the parser test fails",
         "research how tokio schedules tasks",
@@ -442,21 +408,15 @@ fn ordinary_words_and_coding_tasks_do_not_route_runtime_or_evidence_specialists(
         );
     }
     assert_eq!(
-        select("Use the `investigate` tool", &BTreeSet::new(), &candidates),
-        ["investigate"]
+        select("Use the `evidence` tool", &BTreeSet::new(), &candidates),
+        ["evidence"]
     );
 }
 
 #[test]
 fn system_sources_route_to_eligible_read_only_specialists_not_incidental_code_names() {
-    let candidates = [
-        "runtime_inspect",
-        "network_inspect",
-        "database",
-        "evidence",
-        "evidence_search",
-    ]
-    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    let candidates = ["runtime_inspect", "network_inspect", "database", "evidence"]
+        .map(|name| (name.to_owned(), "Capability".to_owned()));
     for (query, specialist) in [
         ("Analyze Chrome traces and slow spans", "runtime_inspect"),
         ("Inspect OTLP service spans", "runtime_inspect"),
@@ -496,14 +456,8 @@ fn system_sources_route_to_eligible_read_only_specialists_not_incidental_code_na
 
 #[test]
 fn system_sources_accept_plain_questions_without_tool_names_or_inspection_jargon() {
-    let candidates = [
-        "runtime_inspect",
-        "network_inspect",
-        "database",
-        "evidence",
-        "evidence_search",
-    ]
-    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    let candidates = ["runtime_inspect", "network_inspect", "database", "evidence"]
+        .map(|name| (name.to_owned(), "Capability".to_owned()));
     for (query, specialist) in [
         ("What tables are in exports/app.sqlite?", "database"),
         ("“What tables are in `exports/app.sqlite`?”", "database"),
@@ -599,7 +553,7 @@ fn output_only_csv_prompt_offers_no_source_specialists_and_costs_no_extra_schema
             "Analyze the plaintext logs in /app/logs and write a text file /app/summary.txt with counts per severity",
         ] {
             agent.begin_tool_routing(query);
-            for specialist in ["data", "document", "evidence", "evidence_search"] {
+            for specialist in ["data", "document", "evidence"] {
                 assert!(
                     !selected(agent, specialist),
                     "{query}: unexpectedly routed {specialist}: {:?}",
@@ -632,7 +586,7 @@ fn legacy_offer_reconstruction_is_labelled_offline_and_corrected_offer_is_not_la
     with_agent("[assistance]\nlean_local=false", |agent| {
         agent.begin_tool_routing("");
         let mut legacy = agent.offered();
-        legacy.extend(["data", "evidence", "evidence_search"].map(str::to_owned));
+        legacy.extend(["data", "evidence"].map(str::to_owned));
         legacy.sort();
         legacy.dedup();
         agent.begin_tool_routing(
@@ -647,14 +601,14 @@ fn legacy_offer_reconstruction_is_labelled_offline_and_corrected_offer_is_not_la
         let legacy_bytes = bytes(&legacy);
         let corrected_bytes = bytes(&corrected);
         eprintln!(
-            "LEGACY RECONSTRUCTION (offline, not a measured before/after): baseline + data/evidence/evidence_search = {legacy_bytes} schema bytes"
+            "LEGACY RECONSTRUCTION (offline, not a measured before/after): baseline + data/evidence = {legacy_bytes} schema bytes"
         );
         eprintln!(
             "CORRECTED OFFER (current routing, output CSV prompt) = {corrected_bytes} schema bytes; delta {}",
             legacy_bytes as i64 - corrected_bytes as i64
         );
         assert!(corrected_bytes <= legacy_bytes);
-        for name in ["data", "evidence", "evidence_search"] {
+        for name in ["data", "evidence"] {
             assert!(!corrected.iter().any(|tool| tool == name), "{name}");
         }
     });
@@ -663,14 +617,7 @@ fn legacy_offer_reconstruction_is_labelled_offline_and_corrected_offer_is_not_la
 #[test]
 fn source_specialists_preserve_task_schema_caps_and_lean_routing() {
     with_agent("[assistance]\nlean_local=false", |agent| {
-        for name in [
-            "document",
-            "data",
-            "audio",
-            "visual",
-            "evidence",
-            "evidence_search",
-        ] {
+        for name in ["document", "data", "audio", "visual", "evidence"] {
             register(agent, name, "Source capability");
         }
         agent.begin_tool_routing("Inspect PDF CSV audio and diagram sources online");
@@ -1178,15 +1125,8 @@ fn successful_discovery_exposes_its_consumer_not_unrelated_tools_or_result_instr
 /// filename or quoted name are not clause separators.
 #[test]
 fn comma_separated_output_formats_preserve_inputs() {
-    let candidates = [
-        "document",
-        "data",
-        "audio",
-        "visual",
-        "evidence",
-        "evidence_search",
-    ]
-    .map(|name| (name.to_owned(), "Capability".to_owned()));
+    let candidates = ["document", "data", "audio", "visual", "evidence"]
+        .map(|name| (name.to_owned(), "Capability".to_owned()));
     // Comma-only output clauses must not pull in source specialists for the deliverable format.
     for query in [
         "Analyze text logs, write summary.csv",
@@ -1483,7 +1423,7 @@ fn tabular_deliverables_use_computation_routing_in_interactive_and_unattended_ru
         with_agent("[assistance]\nlean_local=false", |agent| {
             agent.modes.launch.unattended = unattended;
             agent.begin_tool_routing(query);
-            for name in ["data", "evidence", "evidence_search"] {
+            for name in ["data", "evidence"] {
                 assert!(
                     !selected(agent, name),
                     "{name}: {:?}",

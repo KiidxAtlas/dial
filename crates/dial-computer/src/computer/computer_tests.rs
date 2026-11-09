@@ -266,6 +266,45 @@ fn computer_function_runs_use_async_bodies_and_keep_session_usable() {
     }
 }
 
+#[test]
+fn computer_run_code_that_only_defines_a_function_fails_instead_of_echoing_it() {
+    // A local model sent function source as `code`; the run returned the source text, not a result.
+    let dir = tempfile::tempdir().unwrap();
+    let session = ComputerSession::new(dir.path().display().to_string());
+    let action = parse_action(&json!({
+        "action": "run", "read_only": true,
+        "code": "async ({ desktop }) => {\n  return 42;\n}"
+    }))
+    .unwrap();
+    let Err(error) = session.execute(
+        action,
+        dir.path().to_str().unwrap(),
+        false,
+        None,
+        None,
+        &AbortSignal::new(),
+    ) else {
+        panic!("function source sent as `code` must not succeed");
+    };
+    let error = error.to_string();
+    assert!(error.contains("pass it as `fn`"), "{error}");
+    let action = parse_action(&json!({
+        "action": "run", "read_only": true, "code": "return 42;"
+    }))
+    .unwrap();
+    let result = session
+        .execute(
+            action,
+            dir.path().to_str().unwrap(),
+            false,
+            None,
+            None,
+            &AbortSignal::new(),
+        )
+        .unwrap();
+    assert_eq!(result.value["returnValue"], 42, "the session stays usable");
+}
+
 #[cfg(unix)]
 mod worker {
     use super::*;

@@ -70,22 +70,67 @@ fn with_turn(test: impl FnOnce(&mut Agent<'_>, &mut Backend)) {
     });
 }
 
+/// Sends a working-state request the way the model now does: as the equivalent `todo` state op.
 fn call(
     agent: &mut Agent<'_>,
     backend: &mut Backend,
     human: &mut Human,
     args: Value,
 ) -> ToolOutput {
+    let arguments = crate::tools::surface::contracts::working_state_as_todo(&args)
+        .expect("a working-state action");
     agent.dispatch(
         backend,
         &ToolCall {
             id: "working-state".into(),
-            name: "working_state".into(),
-            arguments: args,
+            name: "todo".into(),
+            arguments,
             malformed_arguments: false,
         },
         human,
     )
+}
+
+#[test]
+fn state_ops_are_validated_against_the_working_state_contract() {
+    with_turn(|agent, backend| {
+        let mut human = Human::replying(QuestionOutcome::Unsupported("no human".into()));
+        let before = working(agent);
+        for arguments in [
+            json!({"op":"state_update","state":{"goal":"ship","origin":"forged"}}),
+            json!({"op":"state_update","state":"ship"}),
+            json!({"op":"state_patch","index":1,"state":{"goal":"ship"}}),
+            json!({"op":"state_update","state":{"deliverables":[{"id":"d","status":"open"}]}}),
+        ] {
+            let out = agent.dispatch(
+                backend,
+                &ToolCall {
+                    id: "state".into(),
+                    name: "todo".into(),
+                    arguments: arguments.clone(),
+                    malformed_arguments: false,
+                },
+                &mut human,
+            );
+            assert!(out.is_error, "{arguments}: {}", out.text);
+            assert!(out.text.starts_with("todo state_"), "{}", out.text);
+            assert_eq!(working(agent), before, "{arguments}");
+        }
+        assert!(human.asked.is_empty());
+        // Planning ops never reach the working state.
+        let plan = agent.dispatch(
+            backend,
+            &ToolCall {
+                id: "plan".into(),
+                name: "todo".into(),
+                arguments: json!({"op":"set","tasks":[{"content":"ship"}]}),
+                malformed_arguments: false,
+            },
+            &mut human,
+        );
+        assert!(!plan.is_error, "{}", plan.text);
+        assert_eq!(working(agent), before);
+    });
 }
 
 fn working(agent: &Agent<'_>) -> Value {

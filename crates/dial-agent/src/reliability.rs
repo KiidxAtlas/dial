@@ -760,7 +760,6 @@ pub fn simplify(schemas: &mut Vec<Value>, loaded: &HashSet<String>) {
                     | "tool_load"
                     | "tool_search"
                     | "codebase_memory"
-                    | "working_state"
                     | "context_notes"
                     | "new_context"
                     | "exit_plan"

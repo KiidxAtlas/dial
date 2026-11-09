@@ -1,0 +1,21 @@
+pkgbase = dial-bin
+	pkgdesc = Sandboxed coding agent for the terminal with undo and test evidence; runs local or hosted models
+	pkgver = 0.3.1
+	pkgrel = 1
+	url = https://github.com/KiidxAtlas/dial
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends = glibc
+	depends = gcc-libs
+	depends = bubblewrap
+	optdepends = ollama: run local models through Ollama
+	optdepends = llama.cpp: serve GGUF models locally
+	provides = dial
+	conflicts = dial
+	source_x86_64 = https://github.com/KiidxAtlas/dial/releases/download/v0.3.1/dial-v0.3.1-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums_x86_64 = a778ae8e74079504774f4e63f82fdadc8cce38f33296c9b43f6af0c7ceaf90e2
+	source_aarch64 = https://github.com/KiidxAtlas/dial/releases/download/v0.3.1/dial-v0.3.1-aarch64-unknown-linux-gnu.tar.gz
+	sha256sums_aarch64 = 0a44480e55bc58064e11e7bf43126b0122381292dfb82cd0bbee5944d94f82b7
+
+pkgname = dial-bin

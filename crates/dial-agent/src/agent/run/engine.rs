@@ -13,6 +13,38 @@ use crate::{
     },
 };
 
+/// Opening of the failed-operation retry refusal; recognizes a result that ran nothing.
+pub(in crate::agent) const RETRY_BARRIER_LEAD: &str = "Failed-operation retry barrier:";
+
+/// Error text that usually means the command line itself is wrong (a misspelled program or
+/// module, or two arguments run together), which retrying cannot fix.
+const MALFORMED_COMMAND_MARKERS: &[&str] = &[
+    "No module named",
+    "command not found",
+    "No such file or directory",
+    "unrecognized arguments",
+    "invalid option",
+    "unknown option",
+    "is not recognized as",
+];
+
+/// For a refused shell retry whose error points at the command line, names the command so the
+/// model corrects it rather than repeating it.
+fn malformed_command_hint(call: &ToolCall, error: &str) -> Option<String> {
+    let command = call.arguments["command"]
+        .as_str()
+        .filter(|_| call.name == "bash")?;
+    MALFORMED_COMMAND_MARKERS
+        .iter()
+        .any(|marker| error.contains(marker))
+        .then(|| {
+            format!(
+                " The error points at the command line itself: check the program, module and path names and the spaces between arguments in `{}`, then run the corrected command.",
+                crate::agent::window::prompt::truncate_chars(command, 200)
+            )
+        })
+}
+
 /// Reuse operation contracts rather than treating every successful tool receipt as evidence.
 /// Scheduling/read-only declarations describe observation eligibility, never authorization.
 fn progress_observation(
@@ -22,7 +54,7 @@ fn progress_observation(
     use crate::tools::integrations::ext::{Concurrency, Tool};
     if matches!(
         call.name.as_str(),
-        "todo" | "working_state" | "finish" | "verify" | "tool_load" | "task" | "message"
+        "todo" | "finish" | "verify" | "tool_load" | "task" | "message"
     ) {
         return false;
     }
@@ -73,7 +105,7 @@ pub(in crate::agent) struct Engine {
     failed_versions: std::collections::HashMap<[u8; 32], Vec<Option<[u8; 32]>>>,
     /// Read targets refused by workspace confinement, tracked until a grant admits them.
     failed_access: std::collections::HashMap<[u8; 32], (String, Vec<String>)>,
-    /// First line of each withheld call's original error, quoted when the barrier refuses it.
+    /// Bounded original diagnostics, captured before harness feedback and never from refusals.
     failed_errors: std::collections::HashMap<[u8; 32], String>,
     /// Namespace dependencies are repaired by an actual reset, not a printed reset claim.
     failed_eval:
@@ -366,13 +398,15 @@ impl Engine {
             && !self.sources_changed_since_failure(workspace, &identity)
             && !self.witnesses_ready_since_failure(workspace, &identity)
         {
-            let original = self
-                .failed_errors
-                .get(&identity)
+            let error = self.failed_errors.get(&identity);
+            let original = error
                 .map(|error| format!(" Its original error was: {error}"))
                 .unwrap_or_default();
+            let hint = error
+                .and_then(|error| malformed_command_hint(call, error))
+                .unwrap_or_default();
             return Some(format!(
-                "Failed-operation retry barrier: this unchanged `{}` call already failed and was not executed again.{original} Inspect the retained diagnostic, use a different targeted observation, correct the arguments, or repair the source or environment (a successful state-changing command releases it) before retrying. Todo updates and compaction do not release this barrier.",
+                "{RETRY_BARRIER_LEAD} this unchanged `{}` call already failed and was not executed again.{original}{hint} Inspect the retained diagnostic, use a different targeted observation, correct the arguments, or repair the source or environment (a successful state-changing command releases it) before retrying. Todo updates and compaction do not release this barrier.",
                 call.name
             ));
         }
@@ -417,6 +451,11 @@ impl Engine {
     /// file that broke the build) may run again; its barrier is released.
     fn tree_changed_since_failure(&mut self, workspace: &Workspace, call: &ToolCall) -> bool {
         let identity = failed_identity(call);
+        // Explicit check inputs take precedence over a whole-tree fallback. An unrelated edit
+        // must not authorize a retry of a check whose own source is unchanged.
+        if self.failed_versions.contains_key(&identity) {
+            return false;
+        }
         let Some(before) = self.failed_trees.get(&identity) else {
             return false;
         };
@@ -452,6 +491,7 @@ impl Engine {
             contract_failed,
             tool,
         } = settlement;
+        let original_diagnostic: String = output.text.chars().take(1600).collect();
         let classified = if contract_failed && outcome::effects(output) != Effects::Unknown {
             Some(crate::agent::run::failure_guidance::CALL_CONTRACT)
         } else {
@@ -566,11 +606,10 @@ impl Engine {
                     .insert(identity, (call_identity(call), targets));
             }
             self.failed.insert(identity);
-            if let Some(line) = output.text.lines().map(str::trim).find(|l| !l.is_empty()) {
-                self.failed_errors.insert(
-                    identity,
-                    crate::agent::window::prompt::truncate_chars(line, 300),
-                );
+            if !original_diagnostic.trim().is_empty() {
+                self.failed_errors
+                    .entry(identity)
+                    .or_insert(original_diagnostic);
             }
             if let Some(tree) = crate::agent::verify::shared_runs::shell_tree(workspace, call) {
                 self.failed_trees.insert(identity, tree);

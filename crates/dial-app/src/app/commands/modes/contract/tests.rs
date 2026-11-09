@@ -5,7 +5,7 @@ fn kickoff_keeps_the_task_verbatim_and_asks_for_a_checkable_contract() {
     let text = kickoff("Fix the parser crash on empty input");
     assert!(text.starts_with("Fix the parser crash on empty input\n\n"));
     for required in [
-        "working_state",
+        "`state_update`",
         "constraints",
         "status `open`",
         "observable check",

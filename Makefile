@@ -106,6 +106,7 @@ test-drivers:
 	DIAL_TEST_PYTHON="$(PYTHON)" $(NODE) --test crates/dial-tools/src/tools/net/browser/driver.test.cjs crates/dial-tools/src/tools/exec/eval/driver.test.cjs assets/collab-web/viewer.test.cjs
 
 test-python:
+	$(PYTHON) scripts/test-prerequisites.py python
 	HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m pytest -rs python/test_*.py
 
 test-bench-offline:
@@ -117,7 +118,7 @@ test-install:
 test-build:
 	$(PYTHON) scripts/test-build.py
 
-test-windows-contract:
+test-wzindows-contract:
 	$(PYTHON) scripts/test-windows-contract.py
 
 test-packaging:
@@ -125,6 +126,7 @@ test-packaging:
 	$(PYTHON) scripts/check-packaging.py
 
 test-release-policy:
+	$(PYTHON) scripts/test-prerequisites.py release-policy
 	$(PYTHON) scripts/test-release-policy.py
 
 # No compilation, dependency installation, network, staging or publication. Aggregate cheap

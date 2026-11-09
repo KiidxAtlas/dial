@@ -29,6 +29,9 @@ Ollama is missing, it is installed through the dependency registry (Homebrew whe
 registry knows how; otherwise the setup stops and shows the download page. A remote server must already
 be running; the setup stops with a message when it is not reachable. It then pulls the model with
 Ollama's `/api/pull`, which streams progress and can be cancelled; Ollama checks each layer's digest.
+A server the setup starts is the shared one described in
+[Starting Ollama automatically](#starting-ollama-automatically), so it is stopped when no Dial process
+needs it.
 Only after the pull succeeds does Dial save the config:
 
 - `model_roles.embedding` is replaced as a whole with `provider = "ollama"`, `model = "<model>"`,
@@ -42,6 +45,32 @@ Only after the pull succeeds does Dial save the config:
   OpenAI-compatible and still win over the role when both are set; clear them to use the role.
 - `memory.backend` is not changed. Semantic recall needs `memory.backend = "semantic"`; select it
   in settings when the setup reports that it is not selected.
+
+## Starting Ollama automatically
+
+With `memory.semantic.embedding_autostart` on (the default), an embedding role that uses Ollama at an
+`http://` address on this machine does not need a server you keep running. When an embedding request
+finds nothing listening there, Dial starts `ollama serve` for that address (`OLLAMA_HOST` set to it)
+and retries the request once. Ollama loads the model on that request and unloads it after its own
+idle time (`keep_alive`, five minutes by default).
+
+- **One server.** Dial processes coordinate through a lock under `~/.dial/state/ollama-serve/`, so
+  several Dial windows share one server: a caller reuses a server that already answers, or waits for
+  one another Dial process is starting, instead of launching another.
+- **Stopped when unused.** Each Dial process that relies on the server holds a lease. When Dial exits
+  it drops its lease and stops the server only if Dial started it and no other live Dial process
+  holds a lease. A lease left by a Dial process that crashed is ignored, so its server is stopped
+  when the next Dial process exits.
+- **Yours is left alone.** A server you started (`ollama serve`, the Ollama app, `brew services`) is
+  reused and never stopped.
+- **Limits.** Only the `embedding` role is started, never the explicit `embedding_base_url` /
+  `embedding_model` override or a remote address. Ollama must already be installed and on `PATH`
+  (or in `/opt/homebrew/bin` or `/usr/local/bin`); this path never installs it. A recall waits at
+  most its remaining time budget, so the first recall can still be keyword-only while the server
+  comes up. After a failed start Dial waits a minute before trying again. The server's output goes
+  to `serve.log` in the state directory.
+
+Set `memory.semantic.embedding_autostart = false` to manage the server yourself.
 
 Curated models (Ollama library, sizes rounded; dimensions from each model card):
 

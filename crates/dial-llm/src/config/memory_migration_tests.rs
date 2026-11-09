@@ -147,3 +147,14 @@ max_tokens = 4096
     );
     assert_eq!(Config::load(&layout, None).unwrap().model_profile, None);
 }
+
+#[test]
+fn saved_working_state_selection_selects_todo_once() {
+    let mut tools: Vec<String> = ["read", "working_state", "bash"].map(String::from).into();
+    assert!(types::migrate_memory_tool_names(&mut tools));
+    assert_eq!(tools, ["read", "todo", "bash"]);
+    let mut both: Vec<String> = ["todo", "read", "working_state"].map(String::from).into();
+    assert!(types::migrate_memory_tool_names(&mut both));
+    assert_eq!(both, ["todo", "read"]);
+    assert!(!types::migrate_memory_tool_names(&mut both));
+}

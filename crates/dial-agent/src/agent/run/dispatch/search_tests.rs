@@ -50,7 +50,10 @@ fn search(agent: &mut Agent<'_>, query: &str) -> Vec<Value> {
     assert!(!output.is_error, "{}", output.text);
     let value: Value = serde_json::from_str(&output.text).unwrap();
     if value["listing"] == true {
-        assert_eq!(value["search_matches"], json!([]));
+        // A strict miss returns non-activated partial matches beside the catalog page.
+        for entry in value["search_matches"].as_array().unwrap() {
+            assert_eq!(entry["enabled_next_round"], false, "{entry}");
+        }
         Vec::new()
     } else {
         serde_json::from_value(value).unwrap()

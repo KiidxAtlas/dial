@@ -132,6 +132,7 @@ memory.semantic.embedding_base_url
 memory.semantic.embedding_model
 memory.semantic.embedding_api_key_env
 memory.semantic.embedding_timeout_secs
+memory.semantic.embedding_autostart
 memory.semantic.recall_limit
 memory.semantic.token_budget
 memory.semantic.auto_retain
@@ -283,6 +284,7 @@ eval.node
 eval.timeout_secs
 verification.automatic_checks
 shell.git_guard
+shell.undo_snapshot
 assistance.syntax_guard
 assistance.selective_verification
 adaptive.enabled

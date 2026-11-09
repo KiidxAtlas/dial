@@ -22,7 +22,7 @@ This is an autonomous continuation. The objective stands unless the user amends,
 
 Before `goal({op:"complete"})`, audit the current repo state:
 
-1. Turn the objective and any user amendments into concrete deliverables: required files, behaviors, tests, gates, artifacts. For substantial multi-step work, record deliverables and evidence references in working_state when available; todo tracks next actions, not proof.
+1. Turn the objective and any user amendments into concrete deliverables: required files, behaviors, tests, gates, artifacts. For substantial multi-step work, record deliverables and evidence references with todo state ops when available; todo steps track next actions, not proof.
 2. Match each deliverable to authoritative evidence: file contents, command output, test results, PR/issue state. Marking a deliverable satisfied is a model claim, not a substitute for observed checks.
 3. Check the actual current state. Reuse observed file contents and check results while their supporting state is unchanged; inspect or rerun where evidence is missing, stale or invalidated by later changes. Memory of an earlier session alone is not verification.
 4. Match verification scope to claim scope: one passing unit test does not show a feature works end to end.
@@ -72,7 +72,7 @@ Budget:
 - `goal({op:"complete"})`: only verified completion.
 
 Keep the full objective across turns rather than redefining success as a smaller, easier or already-completed subset.
-Interpret later user messages before continuing: distinguish refinement from replacement, cancellation or a separate task. Preserve compatible constraints; do not let the historical objective override explicit current user intent. Clarify only material ambiguity. For substantial work, connect concrete deliverables and evidence in working_state when available; tool success and todo changes alone do not prove progress or completion.
+Interpret later user messages before continuing: distinguish refinement from replacement, cancellation or a separate task. Preserve compatible constraints; do not let the historical objective override explicit current user intent. Clarify only material ambiguity. For substantial work, connect concrete deliverables and evidence with todo state ops when available; tool success and todo step changes alone do not prove progress or completion.
 
 Before `goal({op:"complete"})`, audit current state against every concrete deliverable and match verification scope to claim scope. Reuse observed evidence while its supporting state is unchanged; inspect or rerun only where evidence is missing, stale, or invalidated by relevant changes. If any deliverable lacks direct current-state evidence, it is not yet verified.
 

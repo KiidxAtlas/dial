@@ -57,10 +57,10 @@ cannot recover excluded rows. See the base investigation guide for current table
 whole-source options, arithmetic modes and limits. There is no separate graphical brushing panel:
 the interaction is through tool requests and retained linked SVG charts.
 
-## Cross-source event reconstruction (`timeline`)
+## Cross-source event reconstruction (`evidence` `timeline`)
 
 ```json
-{"action":"reconstruct","events":[{"reference":"artifact://<log>","clock":{"id":"server-a","origin":"relative"},"start_ms":1200,"end_ms":1200,"uncertainty_ms":50,"quote":"request failed"}]}
+{"action":"timeline","events":[{"reference":"artifact://<log>","clock":{"id":"server-a","origin":"relative"},"start_ms":1200,"end_ms":1200,"uncertainty_ms":50,"quote":"request failed"}]}
 ```
 
 Quoted events require exact retained text/JSON quotes and explicit caller times. `sources` can
@@ -75,7 +75,7 @@ arithmetic. Chained/cyclic mappings are refused. Different clock groups remain i
 overlapping or uncertain intervals have no established order. Sorting never establishes causality.
 Limits: 16 sources, 16 alignments, 128 total events, 64 dependencies and 256 KiB retained record.
 
-## Repository expectations versus observations (`reality`)
+## Repository expectations versus observations (`evidence` `check` and `assess`)
 
 First capture repository/document expectations and separate runtime observations with the ordinary
 authorized tools. This tool does not launch the application or browse a page itself.
@@ -105,7 +105,7 @@ This is separate from the existing Jupyter `notebook` editing integration.
 `update` takes a prior `reference`, appends entries and explicitly replaces only supplied working
 state fields (`open_questions`, `competing_explanations`, `unknowns`, `next_experiment`). The original
 question stays fixed. Entries use `observation`, `plan`, `result` or `correction`; optional `supports`
-and `contradicts` are caller assessments linked to citations. Use `investigate` to retain experiment
+and `contradicts` are caller assessments linked to citations. Use `evidence` `plan`/`result` to retain experiment
 plans/results and authorized execution tools to actually run them.
 
 `resume` authenticates an immutable snapshot and its predecessor chain after restart. It exposes
@@ -133,22 +133,26 @@ channel, with at most eight decoded channels. Defaults are shown above; signal p
 rejected for other audio actions. Parameters, actual fractional decoded end, omitted tail and
 window-sized boundary uncertainty are retained. Existing replay/downmix behavior is unchanged.
 
-## Budgeted active perception (`perception`)
+## Budgeted active perception (`evidence` `budget_*`)
+
+These were the separate `perception` tool's `open`, `status`, `step` and `close`; they are now the
+`evidence` actions `budget_open`, `budget_status`, `budget_step` and `budget_close`, with the same
+bounds and confirmations. Only `budget_status` runs without approval.
 
 ```json
-{"action":"open","question":"Which region explains the mismatch?","limits":{"images":4,"pages":2,"frames":0,"audio_ms":0,"operations":6}}
+{"action":"budget_open","question":"Which region explains the mismatch?","limits":{"images":4,"pages":2,"frames":0,"audio_ms":0,"operations":6}}
 ```
 
 Opening or closing requires actual human confirmation, even when a tool approval policy otherwise
-auto-allows calls. An existing budget cannot be replaced without confirmed close. `status` shows
+auto-allows calls. An existing budget cannot be replaced without confirmed close. `budget_status` shows
 counters. Choose the next discriminating inspection from actual evidence, then dispatch:
 
 ```json
-{"action":"step","reason":"Inspect the suspected second page before widening the search","tool":"visual","request":{"action":"inspect","path":"scan.pdf","pages":[2]}}
+{"action":"budget_step","reason":"Inspect the suspected second page before widening the search","tool":"visual","request":{"action":"inspect","path":"scan.pdf","pages":[2]}}
 ```
 
 Supported direct `visual`, `audio`, `video` and fresh `document` producer calls share atomic counters
-with `step`. Retained PNG inspection/cropping through `evidence` also reserves image units. Attempts
+with `budget_step`. Retained PNG inspection/cropping through `evidence` also reserves image units. Attempts
 reserved before inspection remain charged if later work fails; rejected over-budget reservations
 change no dimension. Image crops consume image units; PDF renders consume page units; video seeks
 consume frame units; audio consumes requested milliseconds. Each reservation consumes an operation.

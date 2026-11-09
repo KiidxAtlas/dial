@@ -274,8 +274,8 @@ fn claude_sdk_headers() -> [(&'static str, String); 8] {
     ]
 }
 /// Pinned compatibility identity shared by subscription inference and usage requests.
-pub(super) const CLAUDE_CODE_VERSION: &str = "2.1.280";
-pub(super) const CLAUDE_USER_AGENT: &str = "claude-cli/2.1.280 (external, cli)";
+pub(super) const CLAUDE_CODE_VERSION: &str = "2.1.290";
+pub(super) const CLAUDE_USER_AGENT: &str = "claude-cli/2.1.290 (external, cli)";
 pub(super) const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
 const MODEL_BETAS: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15";
 const MESSAGE_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01";

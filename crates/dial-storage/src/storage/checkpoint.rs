@@ -115,13 +115,19 @@ struct Inner {
     current: Option<Manifest>,
     /// Latest change per file in `current`, for the agent's single-file revert.
     journal: revisions::Journal,
+    /// Pre-image shell commands of `current` are compared against, when one was taken.
+    shell: Option<shell_snapshot::ShellSnapshot>,
 }
 
 mod deferred;
 mod review;
 mod revisions;
+mod shell_snapshot;
 pub use review::{GroupPlan, ReviewFile, TurnReview, UNATTRIBUTED};
 pub use revisions::RevertPlan;
+pub use shell_snapshot::{
+    SHELL_SNAPSHOT_MAX_BYTES, SHELL_SNAPSHOT_MAX_FILES, SHELL_WRITER, ShellCoverage,
+};
 
 pub struct Checkpoints {
     dir: PathBuf,
@@ -223,7 +229,7 @@ impl Checkpoints {
             .last()
             .map_or(1, |t| t + 1)
             .max(recorded_next.unwrap_or(1));
-        Ok(Self {
+        let checkpoints = Self {
             dir,
             root,
             added: Mutex::new(Vec::new()),
@@ -231,9 +237,13 @@ impl Checkpoints {
                 next_turn,
                 current: None,
                 journal: Default::default(),
+                shell: None,
             }),
             flusher: deferred::Flusher::default(),
-        })
+        };
+        // A pre-image left by an interrupted process belongs to no turn of this one.
+        checkpoints.remove_shell_store();
+        Ok(checkpoints)
     }
 
     /// Replace the directories attached to the workspace (canonical paths, as the workspace keeps
@@ -276,6 +286,7 @@ impl Checkpoints {
         )?;
         inner.next_turn = next;
         inner.journal.reset(&self.dir, None);
+        self.drop_shell_snapshot(&mut inner);
         let manifest = Manifest {
             turn,
             label: one_line(label),
@@ -831,6 +842,7 @@ impl Checkpoints {
         }
         inner.current = None;
         inner.journal.reset(&self.dir, None);
+        self.drop_shell_snapshot(inner);
         Ok(report)
     }
 

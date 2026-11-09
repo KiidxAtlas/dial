@@ -1131,14 +1131,7 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
     ] {
         assert!(initial.contains(&core), "{core}");
     }
-    for deferred in [
-        "find",
-        "working_state",
-        "side_request",
-        "git",
-        "lsp",
-        "peers",
-    ] {
+    for deferred in ["find", "side_request", "git", "lsp", "peers"] {
         assert!(!initial.contains(&deferred), "{deferred}");
     }
     assert!(!initial.contains(&"web_fetch"));
@@ -2189,7 +2182,18 @@ fn repeated_successful_shell_inspections_withhold_bash_and_stop_without_step_lim
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     let report = a.turn("Verify the package version", &mut ui).unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+    assert_eq!(report.outcome, TurnOutcome::Blocked, "{}", report.text);
+    assert!(
+        report.text.contains("identical `bash` call"),
+        "{}",
+        report.text
+    );
+    assert!(
+        report.text.contains("no completion was recorded"),
+        "{}",
+        report.text
+    );
+    assert!(report.text.contains("Send a direction"), "{}", report.text);
     assert_eq!(
         ui.results
             .iter()
@@ -2201,7 +2205,7 @@ fn repeated_successful_shell_inspections_withhold_bash_and_stop_without_step_lim
         ui.results
     );
     let requests = server.requests.lock();
-    assert!(requests.len() >= 9);
+    assert_eq!(requests.len(), 9, "stop after the eight repeated calls");
     assert!(
         tool_names(&requests[3]).iter().any(|name| name == "bash"),
         "different commands remain available"
@@ -2764,6 +2768,50 @@ fn text_only_completion_surfaces_uncheckpointed_shell_mutations() {
         status["reliability"]["edit_loop"]["phase"],
         "uncheckpointed_operations_disclosed_not_verified"
     );
+}
+
+#[test]
+fn shell_undo_snapshot_makes_shell_changes_undoable_only_when_enabled() {
+    if skip_without_sandbox() {
+        return;
+    }
+    for enabled in [false, true] {
+        let server = serve(vec![
+            Reply::Call(
+                "bash",
+                json!({"command":"printf changed > keep.txt; rm gone.txt; printf new > made.txt"}),
+            ),
+            Reply::Text("done"),
+        ]);
+        let mut e = env(&server.url, "auto");
+        e.config.shell.undo_snapshot = enabled;
+        let file = |name: &str| e.project.path().join(name);
+        std::fs::write(file("keep.txt"), "original").unwrap();
+        std::fs::write(file("gone.txt"), "frames").unwrap();
+        let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+        let report = a
+            .turn("change files through shell", &mut Recorder::default())
+            .unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Completed);
+        assert_eq!(
+            std::fs::read_to_string(file("keep.txt")).unwrap(),
+            "changed"
+        );
+        assert!(!file("gone.txt").exists());
+        let checkpoints = a.checkpoints().unwrap();
+        if !enabled {
+            assert!(checkpoints.list().is_empty(), "off keeps shell effects out");
+            continue;
+        }
+        let rollback = checkpoints.rollback(1).unwrap();
+        assert!(rollback.warnings.is_empty(), "{rollback:?}");
+        assert_eq!(
+            std::fs::read_to_string(file("keep.txt")).unwrap(),
+            "original"
+        );
+        assert_eq!(std::fs::read_to_string(file("gone.txt")).unwrap(), "frames");
+        assert!(!file("made.txt").exists());
+    }
 }
 
 #[test]
@@ -8044,8 +8092,8 @@ fn specialist_schema_can_be_released_and_loaded_again() {
 fn working_state_and_read_evidence_survive_compaction_without_mutation_loss() {
     let server = serve(vec![
         Reply::Call(
-            "working_state",
-            json!({"action":"update","goal":"preserve exact goal","decisions":["keep public API"],"open_work":["finish regression tests"]}),
+            "todo",
+            json!({"op":"state_update","state":{"goal":"preserve exact goal","decisions":["keep public API"],"open_work":["finish regression tests"]}}),
         ),
         Reply::Call("read", json!({"path":"evidence.txt"})),
         Reply::Call(
@@ -8859,8 +8907,8 @@ fn delegated_semantic_find_reuses_the_child_backend_and_request_budget() {
 fn live_training_targets_match_actual_requests_across_turns_and_harvest_final_solution() {
     let server = serve(vec![
         Reply::Call(
-            "working_state",
-            json!({"action":"update","goal":"preserve SQLite constraints"}),
+            "todo",
+            json!({"op":"state_update","state":{"goal":"preserve SQLite constraints"}}),
         ),
         Reply::Call("read", json!({"path":"facts.txt"})),
         Reply::Text("first answer"),
@@ -8933,7 +8981,7 @@ fn live_training_targets_match_actual_requests_across_turns_and_harvest_final_so
     assert_eq!(system_count, 1, "{:?}", messages[0]);
     assert_eq!(messages[0]["role"], "system");
     assert!(messages.iter().any(|m| {
-        m["tool_calls"].to_string().contains("working_state")
+        m["tool_calls"].to_string().contains("state_update")
             && m["tool_calls"]
                 .to_string()
                 .contains("preserve SQLite constraints")

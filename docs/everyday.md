@@ -35,7 +35,8 @@ for the recorded results. Dial does not claim shell or extension effects are che
 
 Use `/undo` to revert checkpointed edits. Read the report's reversibility warning: shell commands
 and extensions can have effects outside checkpoints. Undo is not a general rollback of every
-external action.
+external action. To have `/undo` also restore project files that shell commands change, turn on
+[`shell.undo_snapshot`](shell.md#undo-for-shell-changes).
 
 ## Resume
 
@@ -49,3 +50,12 @@ Use `/settings` for preferences and the command palette (**Alt+K** or **F1**) to
 Use `/models` for model selection, roles, downloads, favorites, and filters—all in one panel.
 Keep permission and sandbox choices appropriate to the project, and read approval prompts
 before allowing risky actions.
+
+## Command line
+
+`dial --help` lists the everyday subcommands: `sessions`, `review`, `commit`, `models`, `config`,
+`doctor`, `update` and the rest you use from a shell. Developer and research tools live under
+`dial dev`: `benchmark`, `edit-bench`, `improve`, `steering`, `weights`, `laya`, `policy`,
+`reliability`, `rules`, `anonymize` and `gc` (`dial dev --help`). The earlier top-level spellings
+such as `dial gc` or `dial weights analyze` still run the same commands; they are only hidden from
+help and shell completions.

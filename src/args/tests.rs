@@ -191,7 +191,7 @@ fn rules_cli_samples_are_exclusive_and_do_not_clash_with_global_flags() {
     .unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Rules(args)) if matches!(
+        Some(Command::Developer(DevCommand::Rules(args))) if matches!(
             &args.action,
             Some(RulesAction::Test { reasoning: Some(plan), agent, .. }) if plan == "plan" && agent == "w"
         )
@@ -203,18 +203,77 @@ fn weights_analyze_and_improve_parse_without_extra_flags() {
     let cli = Cli::try_parse_from(["dial", "weights", "analyze", "--json"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Weights {
+        Some(Command::Developer(DevCommand::Weights {
             action: WeightsCommand::Analyze { json: true }
-        })
+        }))
     ));
     let cli =
         Cli::try_parse_from(["dial", "weights", "improve", "stop", "endless", "loops"]).unwrap();
-    let Some(Command::Weights {
+    let Some(Command::Developer(DevCommand::Weights {
         action: WeightsCommand::Improve { goal },
-    }) = cli.command
+    })) = cli.command
     else {
         panic!("expected weights improve");
     };
     assert_eq!(goal.join(" "), "stop endless loops");
     assert!(Cli::try_parse_from(["dial", "weights", "improve"]).is_err());
+}
+
+#[test]
+fn dev_commands_parse_under_dev_and_at_the_hidden_top_level() {
+    let grouped = Cli::try_parse_from(["dial", "dev", "gc", "--apply"])
+        .unwrap()
+        .command
+        .map(Command::normalized);
+    let top = Cli::try_parse_from(["dial", "gc", "--apply"])
+        .unwrap()
+        .command
+        .map(Command::normalized);
+    for command in [grouped, top] {
+        assert!(matches!(
+            command,
+            Some(Command::Developer(DevCommand::Gc(_)))
+        ));
+    }
+    let cli = Cli::try_parse_from(["dial", "dev", "bench", "--ablate-assistance"]).unwrap();
+    assert!(matches!(
+        cli.command.map(Command::normalized),
+        Some(Command::Developer(DevCommand::Benchmark {
+            ablate_assistance: true,
+            ..
+        }))
+    ));
+
+    let mut root = command();
+    let visible: Vec<&str> = root
+        .get_subcommands()
+        .filter(|sub| !sub.is_hide_set())
+        .map(|sub| sub.get_name())
+        .collect();
+    assert!(visible.contains(&"dev"), "{visible:?}");
+    assert!(visible.contains(&"sessions"), "{visible:?}");
+    let dev = root.find_subcommand("dev").unwrap();
+    for sub in dev.get_subcommands() {
+        let name = sub.get_name();
+        assert!(
+            !visible.contains(&name),
+            "{name} is listed at the top level"
+        );
+        assert!(root.find_subcommand(name).is_some(), "{name} not accepted");
+    }
+    let dev_help = root
+        .find_subcommand_mut("dev")
+        .unwrap()
+        .render_help()
+        .to_string();
+    for listed in [
+        "weights",
+        "steering",
+        "laya",
+        "edit-bench",
+        "anonymize",
+        "gc",
+    ] {
+        assert!(dev_help.contains(listed), "{listed} missing:\n{dev_help}");
+    }
 }

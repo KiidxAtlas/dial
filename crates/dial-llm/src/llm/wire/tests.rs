@@ -78,7 +78,7 @@ fn nested_scopes_restore_owner() {
 #[test]
 fn the_per_request_billing_attestation_is_not_a_prompt_change() {
     let header = |cch: &str| {
-        format!("x-anthropic-billing-header: cc_version=2.1.280.abc; cc_entrypoint=cli; cch={cch};")
+        format!("x-anthropic-billing-header: cc_version=2.1.290.abc; cc_entrypoint=cli; cch={cch};")
     };
     let body = |cch: &str, tail: &str| {
         json!({"model":"m","system":[{"type":"text","text":header(cch)},{"type":"text","text":"fixed"}],

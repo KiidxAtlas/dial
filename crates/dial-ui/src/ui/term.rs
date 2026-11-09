@@ -211,6 +211,16 @@ impl InlineTerminal {
         #[cfg(unix)]
         let termination = crate::platform::terminal::Signals::install_termination()
             .context("installing terminal termination handlers")?;
+        // Dial writes its own escape sequences, so the console must interpret them. Windows
+        // Terminal does by default; the classic console host only after this mode change.
+        #[cfg(windows)]
+        if !crossterm::ansi_support::supports_ansi() {
+            bail!(
+                "this console cannot show Dial's interface because it does not support virtual \
+                 terminal sequences. Run Dial in Windows Terminal, or clear \"Use legacy console\" \
+                 in the console window's Properties"
+            );
+        }
         enable_raw_mode().context("enabling raw mode")?;
         // Clear only the visible screen. The user's scrollback belongs to their terminal.
         let _ = io::stdout().write_all(b"\x1b[2J\x1b[H");

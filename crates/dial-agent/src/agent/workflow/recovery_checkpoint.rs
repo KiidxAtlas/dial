@@ -24,10 +24,7 @@ struct Withheld {
 }
 
 fn control(name: &str) -> bool {
-    matches!(
-        name,
-        "todo" | "finish" | "working_state" | "tool_search" | "tool_load"
-    )
+    matches!(name, "todo" | "finish" | "tool_search" | "tool_load")
 }
 
 /// Resolved files a call reads, edits or writes. Empty for other tools and whenever any named
@@ -58,6 +55,16 @@ pub(in crate::agent) fn declared_targets(
             .as_str()
             .map(|path| ws.resolve(path))
             .into_iter()
+            .collect::<Result<Vec<_>, _>>(),
+        "bash" => call.arguments["check_paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|path| {
+                path.as_str()
+                    .ok_or_else(|| "invalid check path".to_owned())
+                    .and_then(|path| ws.resolve(path))
+            })
             .collect::<Result<Vec<_>, _>>(),
         _ => return Vec::new(),
     };
@@ -106,7 +113,18 @@ impl RecoveryCheckpoint {
         match call.name.as_str() {
             "read" => Self::read_versions(ws, call).map(SourceVersion::Read),
             "bash" => {
-                crate::agent::verify::shared_runs::shell_tree(ws, call).map(SourceVersion::Shell)
+                let targets = declared_targets(ws, call);
+                if targets.is_empty() {
+                    crate::agent::verify::shared_runs::shell_tree(ws, call)
+                        .map(SourceVersion::Shell)
+                } else {
+                    Some(SourceVersion::Read(
+                        targets
+                            .iter()
+                            .map(|path| ws.read_identity(&ws.rel(path)))
+                            .collect(),
+                    ))
+                }
             }
             _ => None,
         }

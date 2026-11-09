@@ -31,11 +31,16 @@ impl ReasoningEffort {
     }
 }
 /// Thinking a Claude request uses when its profile leaves `thinking` unset: on, in the mode the
-/// catalog documents for that exact model. Models the catalog does not know, or that document no
-/// thinking support, stay at the provider default. Explicit profiles always win.
+/// catalog documents for that exact model, or, for a model released after this build, the mode
+/// Anthropic's live model listing declares for it. Models neither source describes, or that
+/// document no thinking support, stay at the provider default. Explicit profiles always win.
 pub fn default_anthropic_thinking(model: &str) -> Option<ReasoningApi> {
     use super::catalog::ThinkingMode;
-    match super::catalog::model_capabilities(model)?.thinking? {
+    let mode = match super::catalog::model_capabilities(model) {
+        Some(bundled) => bundled.thinking?,
+        None => super::catalog::remembered_declared_reasoning("anthropic", model)?.mode,
+    };
+    match mode {
         ThinkingMode::AnthropicAdaptive => Some(ReasoningApi::AnthropicAdaptive),
         ThinkingMode::AnthropicBudgetEffort | ThinkingMode::Budget => {
             Some(ReasoningApi::AnthropicBudget)

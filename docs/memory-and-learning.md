@@ -30,6 +30,7 @@ the scan, not an atomic snapshot of the entire filesystem and not edit authority
 | `memory.semantic.embedding_model` | empty | Advanced override of the role's model name sent to `/embeddings`. Set together with `embedding_base_url`. |
 | `memory.semantic.embedding_api_key_env` | empty | Name of the environment variable holding the key for the explicit override. Empty for a local server without authentication. Role routes use the role's own key. |
 | `memory.semantic.embedding_timeout_secs` | 20 | Per-request timeout, 1–120. |
+| `memory.semantic.embedding_autostart` | `true` | When the `embedding` role uses Ollama on this machine and nothing answers, start one shared `ollama serve` and stop it when the last Dial process exits. A server you started is reused and never stopped. See [model-embeddings.md](model-embeddings.md#starting-ollama-automatically). |
 | `memory.semantic.recall_limit` | 8 | Most facts per query, 1–50. |
 | `memory.semantic.token_budget` | 1500 | Recall text budget in tokens, 64–16000. |
 | `memory.semantic.auto_retain` | `true` | Queue each completed turn and extract durable facts with the `memory` role between turns. It pauses while the `memory` role is unassigned (it never falls back to the main model); recall and the `memory` tool's `retain` action keep working. Assign the role with Alt+M to save facts automatically. Malformed model output drops the turn; an unreachable model keeps it queued. A failing extraction does not block duplicate merging. |

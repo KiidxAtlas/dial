@@ -315,7 +315,6 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
             "bg",
             "task",
             "memory",
-            "working_state",
             "tool_load",
             "tool_search",
         ] {
@@ -383,7 +382,7 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
 
 #[test]
 fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
-    let helpers = ["task", "message", "working_state", "todo", "find"];
+    let helpers = ["task", "message", "todo", "find"];
     with_agent("[assistance]\nlean_local=false", |agent| {
         let attended = agent.offered();
         for helper in helpers {
@@ -395,15 +394,7 @@ fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
         for helper in helpers {
             assert!(!offered.iter().any(|name| name == helper), "{offered:?}");
         }
-        for loadable in [
-            "task",
-            "working_state",
-            "todo",
-            "find",
-            "bg",
-            "finish",
-            "verify",
-        ] {
+        for loadable in ["task", "todo", "find", "bg", "finish", "verify"] {
             assert!(
                 !offered.iter().any(|name| name == loadable),
                 "{loadable}: {offered:?}"

@@ -6,11 +6,13 @@ pub(in crate::agent) use crate::tools::surface::resources::Footprint;
 /// Bookkeeping is settled on the controller in call order after native work drains. Deliverable
 /// scope changes can ask the human, so they remain boundaries before later source effects.
 pub(in crate::agent) fn bookkeeping(call: &ToolCall) -> bool {
-    call.name == "todo"
-        || (call.name == "working_state"
-            && (call.arguments["action"] == "view"
-                || (call.arguments["action"] == "patch"
-                    && call.arguments.get("deliverables").is_none())))
+    if call.name != "todo" {
+        return false;
+    }
+    crate::agent::workflow::todo::state_call(&call.arguments).is_none_or(|state| {
+        state["action"] == "view"
+            || (state["action"] == "patch" && state.get("deliverables").is_none())
+    })
 }
 
 pub(in crate::agent) fn footprint_for(

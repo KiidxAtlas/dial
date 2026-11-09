@@ -405,6 +405,15 @@ pub(super) static EXECUTION: &[SettingDef] = &[
         "Refuse shell commands that discard uncommitted work (git reset --hard, stash, checkout -- paths, restore, clean -f, switch --discard-changes). Workers: only delegated workers that share the parent's checkout. Always: every command. Off: never.",
         Kind::Enum(GIT_GUARD),
     ),
+    field!(
+        "shell.undo_snapshot",
+        shell.undo_snapshot,
+        TO,
+        "Shell",
+        "Undo shell changes",
+        "Copy the project's source files before a turn's first shell command that may change files, so /undo and /rollback also restore files bash changed, created or deleted. Ignored files, dependency and build directories, credential-like files and effects outside the project are not covered. Projects over 20,000 source files or 512 MiB are not copied. Copies are instant on copy-on-write filesystems (APFS, Btrfs, XFS reflink) and full copies elsewhere.",
+        Kind::Bool,
+    ),
 ];
 
 pub(super) static INTEGRATIONS: &[SettingDef] = &[

@@ -167,6 +167,44 @@ class FormulaUpdateTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             updater.update_formula(REAL_FORMULA(), "0.2.0", sums)
 
+class AurUpdateTests(unittest.TestCase):
+    AUR = Path(__file__).resolve().parent.parent / "packaging" / "aur" / "dial-bin"
+    # The published v0.3.1 checksums the committed AUR metadata was written from.
+    V031 = {
+        "dial-v0.3.1-x86_64-unknown-linux-gnu.tar.gz":
+            "a778ae8e74079504774f4e63f82fdadc8cce38f33296c9b43f6af0c7ceaf90e2",
+        "dial-v0.3.1-aarch64-unknown-linux-gnu.tar.gz":
+            "0a44480e55bc58064e11e7bf43126b0122381292dfb82cd0bbee5944d94f82b7",
+    }
+
+    def setUp(self):
+        self.updater = FormulaUpdateTests.load_updater(self)
+        self.pkgbuild = (self.AUR / "PKGBUILD").read_text(encoding="utf-8")
+        self.srcinfo = (self.AUR / ".SRCINFO").read_text(encoding="utf-8")
+
+    def test_same_release_reproduces_the_committed_files(self):
+        self.assertEqual(self.updater.update_pkgbuild(self.pkgbuild, "0.3.1", self.V031), self.pkgbuild)
+        self.assertEqual(self.updater.update_srcinfo(self.srcinfo, "0.3.1", self.V031), self.srcinfo)
+
+    def test_new_release_updates_version_release_and_every_checksum(self):
+        sums = {"dial-v0.4.0-x86_64-unknown-linux-gnu.tar.gz": "1" * 64,
+                "dial-v0.4.0-aarch64-unknown-linux-gnu.tar.gz": "2" * 64}
+        pkgbuild = self.updater.update_pkgbuild(self.pkgbuild.replace("pkgrel=1", "pkgrel=3"), "0.4.0", sums)
+        self.assertIn("pkgver=0.4.0\npkgrel=1\n", pkgbuild)
+        self.assertIn(f"sha256sums_x86_64=('{'1' * 64}')", pkgbuild)
+        self.assertIn(f"sha256sums_aarch64=('{'2' * 64}')", pkgbuild)
+        srcinfo = self.updater.update_srcinfo(self.srcinfo, "0.4.0", sums)
+        self.assertNotIn("0.3.1", srcinfo)
+        self.assertIn("\tpkgver = 0.4.0\n\tpkgrel = 1\n", srcinfo)
+        self.assertIn("/v0.4.0/dial-v0.4.0-aarch64-unknown-linux-gnu.tar.gz\n\tsha256sums_aarch64 = " + "2" * 64,
+                      srcinfo)
+
+    def test_missing_aur_checksum_aborts(self):
+        with self.assertRaises(SystemExit):
+            self.updater.update_pkgbuild(self.pkgbuild, "0.4.0",
+                                         {"dial-v0.4.0-x86_64-unknown-linux-gnu.tar.gz": "1" * 64})
+
+
 
 class ArtifactFormatTests(unittest.TestCase):
     @staticmethod

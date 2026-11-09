@@ -284,7 +284,7 @@ class CheckTargetTests(unittest.TestCase):
             "test-build": ["scripts/test-build.py"],
             "test-windows-contract": ["scripts/test-windows-contract.py"],
             "test-packaging": ["scripts/test-packaging.py", "scripts/check-packaging.py"],
-            "test-release-policy": ["scripts/test-release-policy.py"],
+            "test-release-policy": ["scripts/test-prerequisites.py release-policy", "scripts/test-release-policy.py"],
         }
         with tempfile.TemporaryDirectory(prefix="dial-check-targets-") as directory:
             root = Path(directory)

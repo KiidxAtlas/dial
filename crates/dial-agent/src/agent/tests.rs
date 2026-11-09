@@ -1161,6 +1161,20 @@ fn scripted_turn_at(
     root: &std::path::Path,
     configure: impl FnOnce(&mut Agent),
 ) -> (String, TurnOutcome, Vec<Vec<u8>>) {
+    let (text, outcome, requests, ()) =
+        scripted_turn_inspect(config, scripts, prompt, root, configure, |_| ());
+    (text, outcome, requests)
+}
+
+/// As [`scripted_turn_at`], also returning what `inspect` reads from the agent after its turn.
+fn scripted_turn_inspect<T>(
+    config: &Config,
+    scripts: Vec<crate::llm::fake::Script>,
+    prompt: &str,
+    root: &std::path::Path,
+    configure: impl FnOnce(&mut Agent),
+    inspect: impl FnOnce(&Agent) -> T,
+) -> (String, TurnOutcome, Vec<Vec<u8>>, T) {
     let server = crate::llm::fake::serve(scripts);
     let backend = Backend::new(
         ProviderKind::Endpoint {
@@ -1185,8 +1199,9 @@ fn scripted_turn_at(
     let report = agent.turn(prompt, &mut NullUi).unwrap();
     let text = report.text.clone();
     let outcome = report.outcome;
+    let inspected = inspect(&agent);
     drop(agent);
-    (text, outcome, server.requests())
+    (text, outcome, server.requests(), inspected)
 }
 
 #[test]
@@ -1231,18 +1246,18 @@ fn hermetic_transport_recovery_does_not_classify_reply_prose_as_task_state() {
 }
 
 #[test]
-fn repeated_successful_tools_escalate_and_the_turn_completes() {
-    // The model repeats one successful read eight times, then answers. Nothing stops the turn: stronger
-    // guidance appears, and identical calls past the threshold are answered with their earlier result.
+fn a_repeat_that_stops_after_one_duplicate_reference_completes() {
+    // Seven identical successful reads, then an answer. The seventh is past the escalation, so it
+    // is answered with a reference instead of running; the model then answers and the turn completes.
     let config = Config::default();
-    let mut scripts: Vec<crate::llm::fake::Script> = (0..8)
+    let mut scripts: Vec<crate::llm::fake::Script> = (0..7)
         .map(|n| sse_tool_call(&format!("call_read_{n}"), "read", r#"{"path":"notes.txt"}"#))
         .collect();
     scripts.push(sse_reply("done"));
     let (text, outcome, requests) = scripted_turn(&config, scripts, "hi");
     assert_eq!((text.as_str(), outcome), ("done", TurnOutcome::Completed));
-    assert_eq!(requests.len(), 9);
-    let last = sent_messages(&requests[8]);
+    assert_eq!(requests.len(), 8);
+    let last = sent_messages(&requests[7]);
     assert!(
         last.contains("tool_call_loop_persisted"),
         "escalation guidance was not shown"
@@ -1254,11 +1269,12 @@ fn repeated_successful_tools_escalate_and_the_turn_completes() {
 }
 
 #[test]
-fn repeated_failures_escalate_and_never_stop_the_turn() {
-    // Twelve identical failing reads, then an answer: failures warn, escalate and are withheld, but
-    // the turn itself completes.
+fn repeating_after_the_duplicate_reference_stops_blocked_with_the_real_error() {
+    // The model keeps sending one failing read. Failures are withheld by the retry barrier, then
+    // answered with a reference; repeating once more ends the turn instead of looping on. Every
+    // scripted reply is consumed, so a ninth request would fail the fake server.
     let config = Config::default();
-    let mut scripts: Vec<crate::llm::fake::Script> = (0..12)
+    let scripts: Vec<crate::llm::fake::Script> = (0..8)
         .map(|n| {
             sse_tool_call(
                 &format!("call_missing_{n}"),
@@ -1267,29 +1283,69 @@ fn repeated_failures_escalate_and_never_stop_the_turn() {
             )
         })
         .collect();
-    scripts.push(sse_reply("done"));
     let (text, outcome, requests) = scripted_turn(&config, scripts, "hi");
-    assert_eq!((text.as_str(), outcome), ("done", TurnOutcome::Completed));
-    assert_eq!(requests.len(), 13);
-    let body = crate::llm::fake::body(&requests[12]);
+    assert_eq!(outcome, TurnOutcome::Blocked, "{text}");
+    assert_eq!(requests.len(), 8, "no request after the repeat persists");
+    assert!(
+        text.contains("identical `read` call 8 times") && text.contains("missing.txt"),
+        "{text}"
+    );
+    assert!(!text.contains("retry barrier"), "{text}");
+    let body = crate::llm::fake::body(&requests[7]);
     let messages = body["messages"].as_array().unwrap();
-    let results: Vec<_> = messages
+    let results: Vec<&str> = messages
         .iter()
         .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["content"].as_str())
         .collect();
     assert_eq!(
         results.len(),
-        12,
+        7,
         "every attempted call must receive a result"
     );
-    assert!(results.iter().any(|message| message["is_error"] == true));
-    // Recovery withholds unchanged calls before ten executions; assert escalation, not old prose.
+    let reference = results.last().unwrap();
+    assert!(reference.starts_with("[Not executed:"), "{reference}");
+    // The reference quotes the executed failure, not a barrier refusal or another reference.
+    assert_eq!(reference.matches("[Not executed").count(), 1, "{reference}");
+    assert!(
+        reference.contains("tool_call_id `call_missing_0`"),
+        "{reference}"
+    );
+    assert!(!reference.contains("retry barrier"), "{reference}");
     assert!(messages.iter().any(|message| {
         message["role"] == "user"
             && message["content"]
                 .as_str()
                 .is_some_and(|text| text.contains("tool_call_loop_persisted"))
     }));
+}
+
+#[test]
+fn shell_calls_refused_by_the_retry_barrier_are_not_counted_as_effects() {
+    let config = Config::default();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut scripts: Vec<crate::llm::fake::Script> = (0..3)
+        .map(|n| {
+            sse_tool_call(
+                &format!("call_sh_{n}"),
+                "bash",
+                r#"{"command":"sh -c 'exit 3'"}"#,
+            )
+        })
+        .collect();
+    scripts.push(sse_reply("done"));
+    let (text, _, requests, shell) = scripted_turn_inspect(
+        &config,
+        scripts,
+        "hi",
+        workspace.path(),
+        |_| {},
+        |agent| agent.step_checks.uncheckpointed_shell_commands,
+    );
+    assert_eq!(requests.len(), 4, "{text}");
+    let refusals = sent_messages(&requests[3]).matches("retry barrier").count();
+    assert!(refusals >= 2, "the repeats were refused: {text}");
+    assert_eq!(shell, 1, "only the command that ran may have changed files");
 }
 
 #[test]

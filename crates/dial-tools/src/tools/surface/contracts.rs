@@ -134,6 +134,39 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
             "observe",
         ],
     ),
+    // The evidence family (`evidence_search`, `workbench`, `investigate`, `reality`, `timeline`,
+    // `perception`)
+    // merged into `evidence`; their properties arrived together with their actions.
+    (
+        "evidence",
+        &[
+            "references",
+            "query",
+            "limit",
+            "ranking",
+            "depth",
+            "correction",
+            "question",
+            "findings",
+            "hypotheses",
+            "hypothesis",
+            "observation",
+            "assessment",
+            "expectation",
+            "expectation_quote",
+            "claim",
+            "expected",
+            "selector",
+            "operator",
+            "sources",
+            "events",
+            "alignments",
+            "limits",
+            "tool",
+            "request",
+            "reason",
+        ],
+    ),
 ];
 
 /// Enum values added after release. History recorded before them stays valid because the old
@@ -151,6 +184,27 @@ const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
     ("data", "format", &["jsonl"]),
     ("audio", "action", &["analyze"]),
     ("document", "action", &["inspect"]),
+    (
+        "evidence",
+        "action",
+        &[
+            "search",
+            "audit",
+            "lineage",
+            "correct",
+            "diff",
+            "interpret",
+            "plan",
+            "result",
+            "check",
+            "assess",
+            "timeline",
+            "budget_open",
+            "budget_status",
+            "budget_step",
+            "budget_close",
+        ],
+    ),
     (
         "browser",
         "action",
@@ -262,6 +316,124 @@ fn successor(name: &str) -> Option<(&'static str, &'static str, &'static str)> {
                 .find(|(from, _)| *from == name)
                 .map(|&(_, action)| ("memory", "action", action))
         })
+}
+
+/// A recorded call of a tool merged into `evidence` (`knowledge::evidence::MERGED_ACTIONS`):
+/// (call index, the `evidence` arguments, the current `evidence` identity). `None` when the
+/// identity is not a retired evidence tool, is still registered, is a catalog callback, or
+/// `evidence` is not callable in this request (the history then stays inert, like any other
+/// call to a tool outside the current set, and is projected once `evidence` is loaded).
+fn merged_evidence_projection(
+    messages: &[Value],
+    index: usize,
+    id: &str,
+    old: &Identity,
+    current: &BTreeMap<String, Identity>,
+) -> Result<Option<(usize, Value, Identity)>> {
+    use crate::tools::knowledge::evidence::{MERGED_ACTIONS, merged_action};
+    if current.contains_key(&old.name)
+        || id.starts_with("callback:")
+        || !MERGED_ACTIONS.iter().any(|(tool, ..)| *tool == old.name)
+    {
+        return Ok(None);
+    }
+    let Some(target) = current.get("evidence") else {
+        return Ok(None);
+    };
+    ensure!(
+        old.revision == 1,
+        "tool {} contract revision {} has no merge projection",
+        old.name,
+        old.revision
+    );
+    let message = &messages[index];
+    let (call_index, _) = paired_call(messages, index, id).ok_or_else(|| {
+        anyhow::anyhow!("tool {} history is unpaired; no merge projection", old.name)
+    })?;
+    let raw = &message["tool_calls"][call_index]["function"]["arguments"];
+    let mut arguments: Value = match raw.as_str() {
+        Some(text) => serde_json::from_str(text)?,
+        None => raw.clone(),
+    };
+    let action = arguments
+        .is_object()
+        .then(|| merged_action(&old.name, &arguments))
+        .flatten()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "tool {} history has an unrecognised legacy shape; no merge projection",
+                old.name
+            )
+        })?;
+    arguments["action"] = json!(action);
+    Ok(Some((call_index, arguments, target.clone())))
+}
+
+/// The `todo` ops that replaced the `working_state` tool's actions (`view`, `update`, `patch`).
+const WORKING_STATE_OPS: [(&str, &str); 3] = [
+    ("view", "state_view"),
+    ("update", "state_update"),
+    ("patch", "state_patch"),
+];
+
+/// Recorded `working_state` arguments as the equivalent `todo` state call: `op` from the action,
+/// `expected_revision` kept, every other field moved into `state`. `None` for an action the
+/// tool never had.
+pub fn working_state_as_todo(arguments: &Value) -> Option<Value> {
+    let fields = arguments.as_object()?;
+    let action = fields.get("action")?.as_str()?;
+    let op = WORKING_STATE_OPS.iter().find(|(old, _)| *old == action)?.1;
+    let mut call = json!({ "op": op });
+    let state: serde_json::Map<String, Value> = fields
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "action" | "expected_revision"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if let Some(revision) = fields.get("expected_revision") {
+        call["expected_revision"] = revision.clone();
+    }
+    if !state.is_empty() {
+        call["state"] = Value::Object(state);
+    }
+    Some(call)
+}
+
+/// A recorded `working_state` call projected onto `todo`: (call index, the `todo` arguments, the
+/// current `todo` identity). `None` while `working_state` is still offered, for catalog
+/// callbacks, or when `todo` is not callable in this request (the history then stays inert).
+fn merged_todo_projection(
+    messages: &[Value],
+    index: usize,
+    id: &str,
+    old: &Identity,
+    current: &BTreeMap<String, Identity>,
+) -> Result<Option<(usize, Value, Identity)>> {
+    if old.name != "working_state" || current.contains_key(&old.name) || id.starts_with("callback:")
+    {
+        return Ok(None);
+    }
+    let Some(target) = current.get("todo") else {
+        return Ok(None);
+    };
+    ensure!(
+        old.revision == 1,
+        "tool working_state contract revision {} has no merge projection",
+        old.revision
+    );
+    let (call_index, _) = paired_call(messages, index, id).ok_or_else(|| {
+        anyhow::anyhow!("tool working_state history is unpaired; no merge projection")
+    })?;
+    let raw = &messages[index]["tool_calls"][call_index]["function"]["arguments"];
+    let arguments: Value = match raw.as_str() {
+        Some(text) => serde_json::from_str(text)?,
+        None => raw.clone(),
+    };
+    let call = working_state_as_todo(&arguments).ok_or_else(|| {
+        anyhow::anyhow!(
+            "tool working_state history has an unrecognised legacy shape; no merge projection"
+        )
+    })?;
+    Ok(Some((call_index, call, target.clone())))
 }
 
 /// `artifact_read` merged into `read`: a recorded call's arguments become the equivalent
@@ -673,6 +845,48 @@ fn controller_compatible(
             return true;
         }
     }
+    if old.name == "todo" {
+        // The state ops that replaced `working_state` were added in one release: the schema
+        // before them lacks `state`, `expected_revision` and the `state_*` ops. A schema without
+        // them predates nothing here and falls through to the older `kind` addition below.
+        let Some(properties) = before
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        match (
+            properties.remove("state"),
+            properties.remove("expected_revision"),
+        ) {
+            (None, None) => {}
+            (Some(state), Some(revision)) => {
+                if parameter_shape(&state) != json!({"type":"object"})
+                    || parameter_shape(&revision) != json!({"type":"integer","minimum":0})
+                {
+                    return false;
+                }
+                let Some(ops) = properties
+                    .get_mut("op")
+                    .and_then(|op| op.get_mut("enum"))
+                    .and_then(Value::as_array_mut)
+                else {
+                    return false;
+                };
+                let count = ops.len();
+                ops.retain(|op| !WORKING_STATE_OPS.iter().any(|(_, new)| op == new));
+                if count - ops.len() != WORKING_STATE_OPS.len() {
+                    return false;
+                }
+                if identities(std::slice::from_ref(&before), &Registry::new()).get(&old.name)
+                    == Some(old)
+                {
+                    return true;
+                }
+            }
+            _ => return false,
+        }
+    }
     let Some(properties) = before
         .pointer_mut("/function/parameters/properties")
         .and_then(Value::as_object_mut)
@@ -844,6 +1058,24 @@ pub fn project_history(
                 projected[index]["tool_calls"][call_index]["function"]["name"] = json!("read");
                 projected[index]["tool_calls"][call_index]["function"]["arguments"] =
                     json!(json!({ "path": path }).to_string());
+                projected[index]["dial_tool_contracts"][id] = json!(target);
+                continue;
+            }
+            if let Some(merged) = merged_evidence_projection(messages, index, id, old, &current)? {
+                let (call_index, arguments, target) = merged;
+                let projected = projected.get_or_insert_with(|| messages.to_vec());
+                projected[index]["tool_calls"][call_index]["function"]["name"] = json!("evidence");
+                projected[index]["tool_calls"][call_index]["function"]["arguments"] =
+                    json!(arguments.to_string());
+                projected[index]["dial_tool_contracts"][id] = json!(target);
+                continue;
+            }
+            if let Some(merged) = merged_todo_projection(messages, index, id, old, &current)? {
+                let (call_index, arguments, target) = merged;
+                let projected = projected.get_or_insert_with(|| messages.to_vec());
+                projected[index]["tool_calls"][call_index]["function"]["name"] = json!("todo");
+                projected[index]["tool_calls"][call_index]["function"]["arguments"] =
+                    json!(arguments.to_string());
                 projected[index]["dial_tool_contracts"][id] = json!(target);
                 continue;
             }

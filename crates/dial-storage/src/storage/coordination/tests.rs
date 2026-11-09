@@ -224,6 +224,31 @@ fn crash_releases_liveness_and_reaps_stale_files() {
 }
 
 #[test]
+fn letters_carry_time_and_authorship_and_receipts_track_delivery() {
+    let fixture = Fixture::new();
+    let sender = Participant::join(&fixture.layout, "sender").unwrap();
+    let recipient = Participant::join(&fixture.layout, "recipient").unwrap();
+    sender.set_model("gpt-5").unwrap();
+    assert!(sender.set_model(&"m".repeat(MAX_MODEL + 1)).is_err());
+    let seen = recipient.peers().unwrap();
+    assert_eq!(seen[0].model, "gpt-5");
+    let letter = sender.send_letter(recipient.id(), "typed", true).unwrap();
+    assert!(letter.human && letter.at_ms > 0);
+    sender.send(recipient.id(), "from the model").unwrap();
+    let queued = sender.undelivered(recipient.id()).unwrap();
+    assert_eq!(
+        queued
+            .iter()
+            .map(|l| (l.text.as_str(), l.human))
+            .collect::<Vec<_>>(),
+        [("typed", true), ("from the model", false)]
+    );
+    let drained = recipient.drain().unwrap();
+    assert_eq!(drained.len(), 2);
+    assert!(sender.undelivered(recipient.id()).unwrap().is_empty());
+}
+
+#[test]
 fn full_inbox_rejects_without_eviction_and_drain_is_exact() {
     let fixture = Fixture::new();
     let sender = Participant::join(&fixture.layout, "sender").unwrap();

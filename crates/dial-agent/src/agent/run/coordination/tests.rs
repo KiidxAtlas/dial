@@ -282,6 +282,7 @@ fn automatic_roster_prioritizes_overlaps_past_the_routine_preview_limit() {
             summary: format!("task-{i}"),
             phase: "working".into(),
             scopes: vec![format!("unrelated/{i}")],
+            model: String::new(),
         })
         .collect();
     peers[9].scopes = vec!["src/important.rs".into()];
@@ -344,18 +345,28 @@ fn peer_messages_keep_both_directions_and_show_queued_mail_as_unread() {
         peer.send(&own_id, "delivered").unwrap();
         agent.poll_coordination(&mut NullUi);
         peer.send(&own_id, "still queued").unwrap();
-        let message = |outgoing, text: &str, unread| PeerMessage {
-            peer: peer.id().to_owned(),
-            outgoing,
-            text: text.into(),
-            unread,
+        let chat = || -> Vec<(bool, String, bool)> {
+            agent
+                .peer_messages()
+                .unwrap()
+                .into_iter()
+                .inspect(|message| {
+                    assert_eq!(message.peer, peer.id());
+                    assert!(message.at_ms > 0 && !message.by_user);
+                })
+                .map(|message| (message.outgoing, message.text, message.unread))
+                .collect()
         };
+        let message = |outgoing, text: &str, unread| (outgoing, text.to_owned(), unread);
+        // "hello" waits in the peer's inbox: its read receipt is still pending.
         let expected = vec![
-            message(true, "hello", false),
+            message(true, "hello", true),
             message(false, "delivered", false),
             message(false, "still queued", true),
         ];
-        assert_eq!(agent.peer_messages().unwrap(), expected);
+        assert_eq!(chat(), expected);
+        assert_eq!(peer.drain().unwrap()[0].text, "hello");
+        assert!(!chat()[0].2, "a drained letter reads as received");
         assert_eq!(
             agent.peer_board().unwrap().queued,
             1,
@@ -371,12 +382,14 @@ fn a_sender_handle_delivers_without_the_agent_and_keeps_the_chat_history() {
         let peer = Participant::join(&layout, "other-session").unwrap();
         let sender = agent.peer_sender().expect("coordination is enabled");
         // The agent is free to be borrowed elsewhere (a turn); the sender stands alone.
-        sender.send(peer.id(), "hold off on src").unwrap();
-        assert!(sender.send("not-a-peer", "x").is_err());
-        assert_eq!(peer.drain().unwrap()[0].text, "hold off on src");
+        sender.send(peer.id(), "hold off on src", true).unwrap();
+        assert!(sender.send("not-a-peer", "x", true).is_err());
+        let letter = peer.drain().unwrap().remove(0);
+        assert_eq!(letter.text, "hold off on src");
+        assert!(letter.human);
         let chat = agent.peer_messages().unwrap();
         assert_eq!(chat.len(), 1, "a refused send leaves no history");
-        assert!(chat[0].outgoing && chat[0].text == "hold off on src");
+        assert!(chat[0].outgoing && chat[0].text == "hold off on src" && chat[0].by_user);
     });
 }
 

@@ -134,6 +134,41 @@ Refused forms: `git stash` (push, save, drop, clear, pop, apply; `list`, `show`,
 
 The command is read before it runs, following `-C <dir>`, `-c k=v` and other global options, a preceding `cd`, `env`/`command`/`exec` wrappers, `sh -c '...'` scripts, subshells and `if`/`while` bodies. A git command whose directory resolves outside every workspace root is allowed (it is another repository). Only clear matches are refused: a script that cannot be lexed (unterminated quote), `git` reached through a variable, alias or script file, and arguments that need expansion are never refused on a guess. The refusal is a blocked tool error naming the form and the safe alternatives; to proceed, ask the user to run it or to set `shell.git_guard = "off"`, or run the worker isolated.
 
+## Undo for shell changes
+
+Tool edits are checkpointed before they happen; a shell command's effects are not, so by default
+`/undo` and `/rollback` leave files that `bash` changed as they are. `shell.undo_snapshot = true`
+(off by default; **Settings → Tools → Shell → Undo shell changes**) closes most of that gap:
+
+- Before a turn's first `bash` command that may change files, Dial copies the project's source
+  files into the session's private checkpoint storage. Read-only commands (`ls`, `git status`,
+  `git diff` and similar) never trigger a copy.
+- After each such command, and once more when the turn ends, files that differ from the copy are
+  added to the turn's checkpoint with their earlier content: changed and deleted files are restored
+  by `/undo`, created files are removed. They appear in the turn's changed files and in
+  `/review-file`, attributed to `shell`.
+- The copy is discarded when the next turn starts.
+
+Not covered: files matched by `.gitignore`, dependency and build directories (`target`,
+`node_modules`, `build`, `dist`, `vendor`, virtual environments), `.git`, `.dial`, credential-like
+files (`.env`, keys), symlinks, directories added with `/add-dir`, and anything outside the project.
+A file over 8 MiB is not copied; if a command changes it, the undo report names it as not restored.
+The copy is taken only before the main agent's own `bash` commands. Changes that `eval`, extension
+tools or delegated workers make outside checkpoints are captured only when they follow such a
+command in the same turn. Because the comparison is against the whole project, a file you edit in
+your own editor while the turn runs is recorded as changed too, and `/undo` would put back its
+earlier content; `/review-file` shows the difference first.
+
+A project with more than 20,000 source files, or more than 512 MiB of them, is not copied: Dial
+says so once in that turn and shell changes stay outside `/undo`. The copy is a copy-on-write clone
+where the filesystem supports it (APFS, Btrfs, XFS with reflinks) and a full copy elsewhere, which
+takes time and disk space in proportion to the source tree.
+
+The turn report still counts the commands under "Outside /undo", since ignored files and effects
+outside the project are not captured. Enabling the setting also makes shell-changed files part of
+the turn's changed files, which focused verification and review use; its effect on model behaviour
+has not been measured.
+
 ## Approval of shell commands
 
 Shell commands are classified from executable arguments, with conservative fallback for unsupported

@@ -163,12 +163,12 @@ pub fn segments_for(cfg: &UiConfig, data: &StatusData, width: usize) -> (Vec<Str
             })
         } else if width < 80 {
             (
-                names(&["model", "approval", "mode"]),
+                names(&["model", "thinking", "approval", "mode"]),
                 names(&["inbox", "workers", "context"]),
             )
         } else if width < 120 {
             (
-                names(&["model", "approval", "mode", "git"]),
+                names(&["model", "thinking", "approval", "mode", "git"]),
                 names(&["inbox", "workers", "cost", "context"]),
             )
         } else {

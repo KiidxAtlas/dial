@@ -119,9 +119,8 @@ pub fn operation_readiness(
         Readiness::Unknown // Assignment is not proof that the model is loaded or reachable.
     } else {
         Readiness::MissingPrerequisite {
-            reason:
-                "Locate requires a grounding model; run /setup grounding or set vision.grounding"
-                    .into(),
+            reason: "Only the `locate` operation needs a grounding model (run /setup grounding or set vision.grounding); screenshots, windows, input and every other computer operation work without it"
+                .into(),
         }
     };
     BTreeMap::from([("locate".into(), locate)])

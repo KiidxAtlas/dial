@@ -125,10 +125,8 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     }
     // Workflow sentences that name a tool appear only when it is offered.
     let mut rules = String::from(RULES);
-    for (tool, rule) in [("todo", TODO_RULE), ("working_state", WORKING_STATE_RULE)] {
-        if has(tool) {
-            rules.push_str(rule);
-        }
+    if has("todo") {
+        rules.push_str(TODO_RULE);
     }
     rules.push_str(CHANGE_RULES);
     if !compact {

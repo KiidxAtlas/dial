@@ -1,58 +1,32 @@
 //! Bounded reconstruction from retained event coordinates, without inferred synchrony or causation.
 use super::evidence::publish;
-use crate::config::types::Config;
 use crate::runtime::evidence::{
     Clock, ClockAlignment, Evidence, EvidenceContext, EvidenceKind, Location, Method,
     Representation,
 };
-use crate::tools::integrations::ext::{Tool, ToolContext};
 use crate::tools::{ToolOutput, Workspace};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_EVENTS: usize = 128;
 const MAX_BYTES: usize = 256 * 1024;
 
-/// Register retained cross-source reconstruction.
-pub fn tools(_: &Config) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(Timeline)]
-}
-struct Timeline;
-impl Tool for Timeline {
-    fn name(&self) -> &str {
-        "timeline"
-    }
-    fn schema(&self) -> Value {
-        let clock = json!({"type":"object","properties":{"id":{"type":"string","maxLength":256},"origin":{"type":"string","enum":["relative","unix"]},"timezone":{"type":"string","maxLength":256}},"required":["id","origin"],"additionalProperties":false});
-        crate::tools::tool_schema(
-            "timeline",
-            "Use to line up retained audio segments, video seeks, time locations or exact quoted log entries on one timeline. Each source needs an explicit clock, and alignment uses single-hop bases you supply. Returns events grouped per clock ID, sorted by coordinate; groups on different clocks are not comparable, and overlapping uncertainty stays unresolved. Retained sources only (none reopened); it infers no synchrony, measured PTS or causation, and is not verification.",
-            json!({
-                "action":{"type":"string","enum":["reconstruct"]},
-                "sources":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"reference":{"type":"string"},"clock":clock.clone()},"required":["reference"],"additionalProperties":false}},
-                "events":{"type":"array","maxItems":128,"items":{"type":"object","properties":{"reference":{"type":"string"},"clock":clock,"start_ms":{"type":"integer"},"end_ms":{"type":"integer"},"uncertainty_ms":{"type":"integer","minimum":0},"quote":{"type":"string","maxLength":4096}},"required":["reference","start_ms","end_ms","quote"],"additionalProperties":false}},
-                "alignments":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"offset_ms":{"type":"integer"},"uncertainty_ms":{"type":"integer","minimum":0},"basis":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string"}}},"required":["from","to","offset_ms","uncertainty_ms","basis"],"additionalProperties":false}}
-            }),
-            &["action"],
-        )
-    }
-    fn needs_approval(&self, _: &Value) -> bool {
-        false
-    }
-    fn read_only_hint(&self) -> bool {
-        true
-    }
-    fn may_modify_workspace(&self, _: &Value) -> bool {
-        false
-    }
-    fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        run(ctx.workspace, args).unwrap_or_else(|e| ToolOutput::err(format!("{e:#}")))
-    }
+/// The retired `timeline` contract, now the `evidence` `timeline` action.
+pub(crate) fn schema() -> Value {
+    let clock = json!({"type":"object","properties":{"id":{"type":"string","maxLength":256},"origin":{"type":"string","enum":["relative","unix"]},"timezone":{"type":"string","maxLength":256}},"required":["id","origin"],"additionalProperties":false});
+    crate::tools::tool_schema(
+        "timeline",
+        "Use to line up retained audio segments, video seeks, time locations or exact quoted log entries on one timeline. Each source needs an explicit clock, and alignment uses single-hop bases you supply. Returns events grouped per clock ID, sorted by coordinate; groups on different clocks are not comparable, and overlapping uncertainty stays unresolved. Retained sources only (none reopened); it infers no synchrony, measured PTS or causation, and is not verification.",
+        json!({
+            "action":{"type":"string","enum":["reconstruct"]},
+            "sources":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"reference":{"type":"string"},"clock":clock.clone()},"required":["reference"],"additionalProperties":false}},
+            "events":{"type":"array","maxItems":128,"items":{"type":"object","properties":{"reference":{"type":"string"},"clock":clock,"start_ms":{"type":"integer"},"end_ms":{"type":"integer"},"uncertainty_ms":{"type":"integer","minimum":0},"quote":{"type":"string","maxLength":4096}},"required":["reference","start_ms","end_ms","quote"],"additionalProperties":false}},
+            "alignments":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"offset_ms":{"type":"integer"},"uncertainty_ms":{"type":"integer","minimum":0},"basis":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string"}}},"required":["from","to","offset_ms","uncertainty_ms","basis"],"additionalProperties":false}}
+        }),
+        &["action"],
+    )
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

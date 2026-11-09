@@ -115,7 +115,6 @@ pub const EXTRA_TOOLS: &[&str] = &[
     "session_search",
     "tool_search",
     "tool_load",
-    "working_state",
     "message",
     "peers",
     "memory",
@@ -142,7 +141,6 @@ pub fn default_tools() -> Vec<String> {
                 "skill",
                 "tool_search",
                 "tool_load",
-                "working_state",
                 "memory",
             ]
             .iter(),

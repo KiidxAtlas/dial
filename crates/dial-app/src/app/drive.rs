@@ -210,10 +210,70 @@ fn onboarding_destination(choice: Option<usize>) -> Option<Which> {
     }
 }
 
+/// What first launch can say about local models before the user picks a path.
+#[derive(Debug, Default)]
+pub(super) struct LocalHint {
+    /// Labels of local inference servers that accept connections right now.
+    pub(super) running: Vec<&'static str>,
+    /// A suggested MLX coding model that fits this Mac's RAM, offered only when no server runs.
+    pub(super) suggestion: Option<&'static str>,
+}
+
+impl LocalHint {
+    /// A connection check of local servers, then (Apple Silicon only) a RAM-tier suggestion.
+    /// Neither loads, downloads or selects a model.
+    fn detect() -> Self {
+        let running =
+            crate::llm::catalog::running_local_servers(std::time::Duration::from_millis(200));
+        let suggestion =
+            if running.is_empty() && cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                crate::llm::local_fit::physical_memory_bytes()
+                    .and_then(crate::cli::models_recommend::first_launch_suggestion)
+                    .map(|suggestion| suggestion.model)
+            } else {
+                None
+            };
+        Self {
+            running,
+            suggestion,
+        }
+    }
+
+    fn points_to_local(&self) -> bool {
+        !self.running.is_empty() || self.suggestion.is_some()
+    }
+}
+
+/// The first-run prompt body. It names local servers that are already running or, when none is,
+/// a local model this Mac can hold, so the local path is obvious. This is a hint only: the user
+/// still chooses, and nothing is selected or downloaded for them.
+pub(super) fn onboarding_prompt(hint: &LocalHint) -> String {
+    let base = "Hosted: sign in or add an API key. Local: choose a running Ollama/LM Studio endpoint or a downloaded local model. Browsing never installs or downloads a model. Esc cancels; Esc in a panel returns here.";
+    if !hint.running.is_empty() {
+        format!(
+            "Running on this machine: {}. Choose Local model to use it with no API key. {base}",
+            hint.running.join(", ")
+        )
+    } else if let Some(model) = hint.suggestion {
+        format!(
+            "No local model server is running. This Mac has enough memory for {model}: choose Local model, then Get models, to download it (only after you confirm). {base}"
+        )
+    } else {
+        base.to_owned()
+    }
+}
+
+/// The highlighted first-run choice: "Local model" when there is a local path to point at, else
+/// "Cancel". Enter still has to confirm it; Esc still cancels.
+pub(super) fn onboarding_default(hint: &LocalHint) -> usize {
+    if hint.points_to_local() { 2 } else { 0 }
+}
+
 /// First run (or a provider that cannot be used): let the user pick a model before any agent exists.
 fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Result<bool> {
     let mut auth_warned = false;
     let mut destination = None;
+    let mut local: Option<LocalHint> = None;
     loop {
         let backend = match session {
             Some(session) => crate::agent::make_session_backend(&app.config, session),
@@ -235,10 +295,16 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
         let which = if let Some(which) = destination.take() {
             which
         } else {
-            match onboarding_destination(shell.ask(
+            let local = local.get_or_insert_with(LocalHint::detect);
+            match onboarding_destination(shell.ask_selected(
                 "Welcome to dial · choose a model path",
-                "Hosted: sign in or add an API key. Local: choose a running Ollama/LM Studio endpoint or a downloaded local model. Browsing never installs or downloads a model. Esc cancels; Esc in a panel returns here.",
-                &[("Cancel", 'c'), ("Hosted provider", 'h'), ("Local model", 'l')],
+                &onboarding_prompt(local),
+                &[
+                    ("Cancel", 'c'),
+                    ("Hosted provider", 'h'),
+                    ("Local model", 'l'),
+                ],
+                onboarding_default(local),
             )) {
                 Some(which) => which,
                 None => {

@@ -89,67 +89,61 @@ pub(in crate::agent) fn discover(
     discover_with_priority(query, candidates, &|_| 0)
 }
 
-/// Routing and explicit discovery prefer readiness only after capability relevance ties, before
-/// result and activation caps. Exact-name access remains authoritative regardless of readiness.
-pub(in crate::agent) fn discover_with_priority(
+/// Grammatical filler, not domain terms such as "read", "web" or "file".
+const DISCOVERY_STOPWORDS: [&str; 40] = [
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "to",
+    "for",
+    "of",
+    "in",
+    "on",
+    "at",
+    "by",
+    "with",
+    "from",
+    "that",
+    "this",
+    "these",
+    "those",
+    "is",
+    "are",
+    "be",
+    "can",
+    "could",
+    "would",
+    "should",
+    "i",
+    "me",
+    "my",
+    "we",
+    "our",
+    "you",
+    "your",
+    "please",
+    "need",
+    "want",
+    "use",
+    "using",
+    "tool",
+    "tools",
+    "capability",
+];
+
+/// Candidates scored against the query's weighted terms, best first. Only candidates whose matched
+/// weight reaches `min_coverage` of the query's known-term weight are kept.
+fn ranked_candidates(
     query: &str,
-    mut candidates: Vec<(String, String)>,
+    candidates: Vec<(String, String)>,
     priority: &impl Fn(&str) -> u8,
-) -> Vec<(String, String, bool)> {
-    let query = query.trim();
-    if let Some(index) = candidates
-        .iter()
-        .position(|(name, _)| name.eq_ignore_ascii_case(query))
-    {
-        let (name, description) = candidates.swap_remove(index);
-        return vec![(name, description, true)];
-    }
+    min_coverage: f64,
+) -> Vec<(String, String, f64)> {
     let words = discovery_words;
-    // Remove grammatical filler, not domain terms such as "read", "web" or "file".
-    let stopwords = [
-        "a",
-        "an",
-        "the",
-        "and",
-        "or",
-        "to",
-        "for",
-        "of",
-        "in",
-        "on",
-        "at",
-        "by",
-        "with",
-        "from",
-        "that",
-        "this",
-        "these",
-        "those",
-        "is",
-        "are",
-        "be",
-        "can",
-        "could",
-        "would",
-        "should",
-        "i",
-        "me",
-        "my",
-        "we",
-        "our",
-        "you",
-        "your",
-        "please",
-        "need",
-        "want",
-        "use",
-        "using",
-        "tool",
-        "tools",
-        "capability",
-    ];
     let mut terms = words(query);
-    terms.retain(|term| !stopwords.contains(&term.as_str()));
+    terms.retain(|term| !DISCOVERY_STOPWORDS.contains(&term.as_str()));
     if terms.is_empty() {
         return Vec::new();
     }
@@ -191,9 +185,11 @@ pub(in crate::agent) fn discover_with_priority(
                 .filter(|(term, _)| name_words.contains(*term))
                 .map(|(_, weight)| weight)
                 .sum();
-            // A lone shared word must not activate unrelated capabilities when
-            // the query contains stronger discriminating evidence.
-            (matched >= total * 0.5).then_some((name, description, matched + name_score * 2.0))
+            (matched > 0.0 && matched >= total * min_coverage).then_some((
+                name,
+                description,
+                matched + name_score * 2.0,
+            ))
         })
         .collect();
     ranked.sort_by(|a, b| {
@@ -201,6 +197,27 @@ pub(in crate::agent) fn discover_with_priority(
             .then_with(|| priority(&a.0).cmp(&priority(&b.0)))
             .then_with(|| a.0.cmp(&b.0))
     });
+    ranked
+}
+
+/// Routing and explicit discovery prefer readiness only after capability relevance ties, before
+/// result and activation caps. Exact-name access remains authoritative regardless of readiness.
+pub(in crate::agent) fn discover_with_priority(
+    query: &str,
+    mut candidates: Vec<(String, String)>,
+    priority: &impl Fn(&str) -> u8,
+) -> Vec<(String, String, bool)> {
+    let query = query.trim();
+    if let Some(index) = candidates
+        .iter()
+        .position(|(name, _)| name.eq_ignore_ascii_case(query))
+    {
+        let (name, description) = candidates.swap_remove(index);
+        return vec![(name, description, true)];
+    }
+    // A lone shared word must not activate unrelated capabilities when
+    // the query contains stronger discriminating evidence.
+    let ranked = ranked_candidates(query, candidates, priority, 0.5);
     let best = ranked.first().map_or(0.0, |entry| entry.2);
     ranked
         .into_iter()
@@ -211,6 +228,24 @@ pub(in crate::agent) fn discover_with_priority(
         })
         .collect()
 }
+
+/// Explicit-search fallback after `discover_with_priority` found nothing: the strongest candidates
+/// sharing any weighted query term, for the model to inspect. A long list of synonyms rarely has
+/// one tool covering half of its terms, yet the best partial match is usually the capability asked
+/// for. These names are never activated; automatic routing keeps the strict threshold.
+pub(in crate::agent) fn partial_matches(
+    query: &str,
+    candidates: Vec<(String, String)>,
+    priority: &impl Fn(&str) -> u8,
+) -> Vec<String> {
+    ranked_candidates(query.trim(), candidates, priority, 0.0)
+        .into_iter()
+        .take(PARTIAL_MATCH_LIMIT)
+        .map(|(name, _, _)| name)
+        .collect()
+}
+
+pub(in crate::agent) const PARTIAL_MATCH_LIMIT: usize = 5;
 
 /// Recipe credit comes only from the shared check verdict: an observed, complete, passing run.
 /// Printed `[exit code: 0]` text, zero-test reports, cancellation, unknown effects, and incomplete
@@ -238,7 +273,7 @@ impl Agent<'_> {
                     | "bg"
                     | "lsp"
                     | "ast_edit"
-                    | "working_state"
+                    | "todo"
                     | "tool_search"
                     | "tool_load"
                     | "computer"
@@ -270,7 +305,6 @@ pub(in crate::agent) fn compact(
         "verify",
         "tool_search",
         "tool_load",
-        "working_state",
         "codebase_memory",
         "task",
         "skill",
@@ -485,7 +519,7 @@ impl Agent<'_> {
         } else if matches!(call.name.as_str(), "solve" | "task")
             || (!matches!(
                 call.name.as_str(),
-                "todo" | "finish" | "experience" | "working_state" | "tool_load" | "bash"
+                "todo" | "finish" | "experience" | "tool_load" | "bash"
             ) && !crate::agent::safety::approval::is_read_only(
                 &self.ext,
                 &call.name,

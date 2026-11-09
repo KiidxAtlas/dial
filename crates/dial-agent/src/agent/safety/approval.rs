@@ -425,7 +425,9 @@ pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
         "context_notes" => crate::agent::window::context_notes::readonly(name, args),
         "new_context" => false,
         "checkpoint" | "rewind" => true,
-        "ask" | "finish" | "goal" | "tool_search" | "tool_load" | "working_state" => true,
+        "ask" | "finish" | "goal" | "tool_search" | "tool_load" => true,
+        // Durable working state is private session bookkeeping; planning ops are not read-only.
+        "todo" => crate::agent::workflow::todo::state_call(args).is_some(),
         // Each selected command passes the automatic-check gate itself (`run_focused_check`).
         "verify" => true,
         // Project coordination changes only bounded advisory metadata, never workspace authority.

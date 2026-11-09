@@ -37,7 +37,7 @@ traffic, make HTTP requests, connect to remote databases, install software or ru
 
 Results are structured observations of the supplied capture, not independent proof of what happened
 in a live system. When artifact storage is attached, the result has an immutable evidence citation;
-`evidence inspect` or `evidence_search` can consume that retained JSON. Original source bytes are not
+`evidence inspect` or `evidence search` can consume that retained JSON. Original source bytes are not
 retained by these tools. The source digest identifies the captured input, while the representation
 digest identifies the returned analysis; these are different identities. Artifact retention can
 expire. Missing storage does not turn a result into durable evidence.
@@ -71,7 +71,7 @@ inclusive-weight functions and the number of omitted rows. Generic log/crash tex
 and binary profiler formats are not accepted.
 
 Interpret timing within the capture's own clock. Do not merge captures by comparing timestamp numbers
-alone: clock origin, units and uncertainty matter. Use the existing `timeline` and explicit
+alone: clock origin, units and uncertainty matter. Use the existing `evidence timeline` and explicit
 `evidence align` workflow for independently justified cross-source clock mappings. A missing parent
 may mean incomplete capture rather than an invalid application trace.
 

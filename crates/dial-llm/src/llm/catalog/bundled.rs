@@ -12,7 +12,7 @@ use crate::llm::{
     model_config::{ApiProtocol, ModelSelection},
     profiles::ReasoningEffort,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::LazyLock,
@@ -76,7 +76,7 @@ pub fn provider_endpoint(id: &str) -> Option<(&'static str, Option<&'static str>
 }
 
 /// How a model exposes reasoning control, as recorded by the upstream catalog.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThinkingMode {
     /// OpenAI-style `reasoning_effort` levels.

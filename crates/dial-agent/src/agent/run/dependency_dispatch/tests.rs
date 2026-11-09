@@ -284,11 +284,34 @@ fn bookkeeping_and_scoped_reads_join_native_groups_but_deliverable_changes_stay_
     todo.arguments = json!({"op":"view"});
     let calls = [call("write", "new"), todo, read, search];
     assert_eq!(agent.dependency_wave(&calls).calls.len(), 4);
-    let mut scope = call("working_state", "unused");
-    scope.arguments = json!({"action":"patch","deliverables":[]});
+    let mut scope = call("todo", "unused");
+    scope.arguments = json!({"op":"state_patch","state":{"deliverables":[]}});
     assert_eq!(
         agent
             .dependency_wave(&[calls[0].clone(), scope, calls[2].clone()])
+            .calls
+            .len(),
+        1
+    );
+    for state in [
+        json!({"op":"state_view"}),
+        json!({"op":"state_patch","expected_revision":1,"state":{"goal":"ship"}}),
+    ] {
+        let mut notes = call("todo", "unused");
+        notes.arguments = state;
+        assert_eq!(
+            agent
+                .dependency_wave(&[calls[0].clone(), notes, calls[2].clone()])
+                .calls
+                .len(),
+            3
+        );
+    }
+    let mut replace = call("todo", "unused");
+    replace.arguments = json!({"op":"state_update","state":{"goal":"ship"}});
+    assert_eq!(
+        agent
+            .dependency_wave(&[calls[0].clone(), replace, calls[2].clone()])
             .calls
             .len(),
         1

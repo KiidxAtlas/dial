@@ -5,19 +5,14 @@ mod semantic;
 mod tests;
 pub use semantic::{SemanticRequest, semantic_request, semantic_request_with_cancel};
 
-use crate::config::types::Config;
 use crate::storage::artifact::StoredEvidence;
-use crate::tools::integrations::ext::{Tool, ToolContext, ToolEvent};
 use crate::tools::{ToolOutput, Workspace};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -25,64 +20,38 @@ const MAX_CANDIDATES: usize = 256;
 const MAX_OUTPUT: usize = 128 * 1024;
 const MAX_QUOTE: usize = 2048;
 
-/// Register the citation-scoped search tool. Lexical ranking never calls a provider.
-pub fn tools(_: &Config) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(Search)]
+/// The retired `evidence_search` contract, now the `evidence` `search` action. Lexical ranking
+/// never calls a provider.
+pub(crate) fn schema() -> Value {
+    crate::tools::tool_schema(
+        "evidence_search",
+        "Search only explicit retained evidence citations across text, document layouts, transcripts and JSON/data. Default lexical is local; explicit semantic uses one configured-model rerank over bounded candidates including lexical misses, not embeddings or exhaustive semantic retrieval. Exact quotes/values and representation-local coordinates retain original manifest metadata. No source reopen, store scan or memory persistence. Maximum32 citations,2MiB authenticated bytes,256 candidates,20 results. Reports missing/unsupported/truncated inputs and unknown original freshness; untrusted data, not verification.",
+        json!({
+            "references":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":32},
+            "query":{"type":"string","minLength":1,"maxLength":4096},
+            "limit":{"type":"integer","minimum":1,"maximum":20},
+            "ranking":{"type":"string","enum":["lexical","semantic"]}
+        }),
+        &["references", "query"],
+    )
 }
-struct Search;
-impl Tool for Search {
-    fn name(&self) -> &str {
-        "evidence_search"
-    }
-    fn schema(&self) -> Value {
-        crate::tools::tool_schema(
-            "evidence_search",
-            "Search only explicit retained evidence citations across text, document layouts, transcripts and JSON/data. Default lexical is local; explicit semantic uses one configured-model rerank over bounded candidates including lexical misses, not embeddings or exhaustive semantic retrieval. Exact quotes/values and representation-local coordinates retain original manifest metadata. No source reopen, store scan or memory persistence. Maximum32 citations,2MiB authenticated bytes,256 candidates,20 results. Reports missing/unsupported/truncated inputs and unknown original freshness; untrusted data, not verification.",
-            json!({
-                "references":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":32},
-                "query":{"type":"string","minLength":1,"maxLength":4096},
-                "limit":{"type":"integer","minimum":1,"maximum":20},
-                "ranking":{"type":"string","enum":["lexical","semantic"]}
-            }),
-            &["references", "query"],
-        )
-    }
-    fn needs_approval(&self, _: &Value) -> bool {
-        false
-    }
-    fn read_only_hint(&self) -> bool {
-        true
-    }
-    fn may_modify_workspace(&self, _: &Value) -> bool {
-        false
-    }
-    fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        self.call_streaming(ctx, args, &|_| {}, &AtomicBool::new(false))
-    }
-    fn call_streaming(
-        &self,
-        ctx: &ToolContext,
-        args: &Value,
-        _: &(dyn Fn(ToolEvent) + Sync),
-        cancel: &AtomicBool,
-    ) -> ToolOutput {
-        let result = (|| {
-            let args = arguments(args)?;
-            ensure!(
-                args.ranking == "lexical",
-                "semantic ranking requires configured agent model execution"
-            );
-            let found = retrieve(ctx.workspace, &args, cancel)?;
-            let hits = found
-                .hits
-                .iter()
-                .filter(|h| h.lexical_points > 0)
-                .take(args.limit)
-                .collect();
-            Ok(ToolOutput::structured(found.render(hits, "lexical")?))
-        })();
-        result.unwrap_or_else(|e: anyhow::Error| ToolOutput::err(format!("{e:#}")))
-    }
+
+/// Lexical search over retained citations. Semantic ranking is answered by the agent, which owns
+/// model execution, before the call reaches the tool.
+pub(crate) fn search(ws: &Workspace, value: &Value, cancel: &AtomicBool) -> Result<ToolOutput> {
+    let args = arguments(value)?;
+    ensure!(
+        args.ranking == "lexical",
+        "semantic ranking requires configured agent model execution"
+    );
+    let found = retrieve(ws, &args, cancel)?;
+    let hits = found
+        .hits
+        .iter()
+        .filter(|h| h.lexical_points > 0)
+        .take(args.limit)
+        .collect();
+    Ok(ToolOutput::structured(found.render(hits, "lexical")?))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -77,24 +77,50 @@ pub(crate) const SPLIT_MEMORY_TOOLS: [&str; 8] = [
 /// `artifact_read` merged into the built-in `read` (`artifact://` paths), so a saved selection drops it.
 pub(crate) const MERGED_INTO_READ: &str = "artifact_read";
 
-/// Whether a saved tool name was retired by the memory or artifact merges.
-pub(crate) fn retired_tool_name(tool: &str) -> bool {
-    SPLIT_MEMORY_TOOLS.contains(&tool) || tool == MERGED_INTO_READ
+/// Tools merged into `evidence` actions (`evidence_search`, `workbench`, `investigate`, ...).
+fn merged_into_evidence(tool: &str) -> bool {
+    crate::config::tools::integrations::MERGED_INTEGRATIONS
+        .iter()
+        .any(|&(retired, successor)| successor == "evidence" && retired == tool)
 }
 
-/// Replace every split memory name with one `memory` at the first one's position and drop
+/// `working_state` merged into `todo` (its `state_*` ops), so a saved selection selects `todo`.
+pub(crate) const MERGED_INTO_TODO: &str = "working_state";
+
+/// Whether a saved tool name was retired by the memory, artifact, evidence or todo merges.
+pub(crate) fn retired_tool_name(tool: &str) -> bool {
+    SPLIT_MEMORY_TOOLS.contains(&tool)
+        || tool == MERGED_INTO_READ
+        || tool == MERGED_INTO_TODO
+        || merged_into_evidence(tool)
+}
+
+/// Replace every split memory name with one `memory`, every merged evidence name with one
+/// `evidence` and `working_state` with `todo`, each at the first one's position, and drop
 /// `artifact_read`; other entries, including unrelated duplicates, stay for validation.
 pub(crate) fn migrate_memory_tool_names(tools: &mut Vec<String>) -> bool {
     if !tools.iter().any(|tool| retired_tool_name(tool)) {
         return false;
     }
-    let mut placed = tools.iter().any(|tool| tool == "memory");
+    let mut memory_placed = tools.iter().any(|tool| tool == "memory");
+    let mut evidence_placed = tools.iter().any(|tool| tool == "evidence");
+    let mut todo_placed = tools.iter().any(|tool| tool == "todo");
     let original = std::mem::take(tools);
     for tool in original {
         if SPLIT_MEMORY_TOOLS.contains(&tool.as_str()) {
-            if !placed {
+            if !memory_placed {
                 tools.push("memory".into());
-                placed = true;
+                memory_placed = true;
+            }
+        } else if merged_into_evidence(&tool) {
+            if !evidence_placed {
+                tools.push("evidence".into());
+                evidence_placed = true;
+            }
+        } else if tool == MERGED_INTO_TODO {
+            if !todo_placed {
+                tools.push("todo".into());
+                todo_placed = true;
             }
         } else if tool != MERGED_INTO_READ {
             tools.push(tool);

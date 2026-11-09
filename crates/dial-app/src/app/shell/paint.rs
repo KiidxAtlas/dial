@@ -75,12 +75,17 @@ pub(super) fn update_model_status(
         .display_name()
         .trim_start_matches(&format!("{}/", selection.provider))
         .to_owned();
-    status.thinking = reasoning_profile(config)
-        .ok()
-        .flatten()
-        .as_ref()
-        .map(thinking_label)
-        .unwrap_or_default();
+    // `auto` keeps no profile level: each user turn's effort is judged from its prompt.
+    status.thinking = if config.thinking_auto {
+        "auto".to_owned()
+    } else {
+        reasoning_profile(config)
+            .ok()
+            .flatten()
+            .as_ref()
+            .map(thinking_label)
+            .unwrap_or_default()
+    };
     if let Some(home) = home {
         home.info.provider.clone_from(&status.provider);
         home.info.model.clone_from(&status.model);

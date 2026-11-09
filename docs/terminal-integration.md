@@ -63,18 +63,31 @@ not repaint).
 | **Jobs** | Background (`bg`) processes and slash-command jobs such as `/update`, `/gc` or `/benchmark`, with their recent output | `x` stops the selected job |
 | **Workers** | Workers with status, current step, usage and recent activity | `x` stops the selected worker |
 | **Threads** | `/btw` side threads, including the answer streaming now | `x` stops the streaming answer |
-| **Peers** | Other Dial sessions in this checkout, their claims and overlaps with yours | `Enter` opens the chat with the selected peer; `m` writes a message to it |
+| **Chats** | This session's own conversation, then one per other Dial session in this checkout, with its model, phase, newest message, unread count and overlapping claims | `Enter` opens the conversation |
 
-The peer chat lists the messages this session sent to and received from that peer since it started,
-oldest first (the last 50 are shown). Messages still queued for this session are marked **unread by
-the agent** until the next model request delivers them; reading the chat never takes them. History
-lives only in the running session's memory and disappears with the peer. In the chat, `↑`/`↓` and
-`PgUp`/`PgDn` scroll, `m` writes to the peer and returns to the chat, and `Esc` goes back to the list.
+An open conversation reads like a text-message thread: the other side's bubbles on the left, yours
+on the right, grouped by sender with compact ages (`now`, `4m`, `2h`), wake-ups and interruptions as
+centred markers, and the newest message just above an inline composer. Type and press `Enter` to
+send; `↑`/`↓` and `PgUp`/`PgDn` scroll, `Esc` clears the draft and then goes back to the list, and
+`Tab` switches tabs (`q` is text while a conversation is open).
+
+- **This session** sends what you type to this session's own model, like a prompt in its main
+  window: it starts at once when the session is idle and otherwise runs after the current turn.
+- **A peer** conversation sends to that session's model. Messages are labelled by model; ones
+  you typed show as **You**, while the peer sees them as coming from this session. The newest of
+  yours shows **Delivered** until the peer's model receives it, then **Read**; a received message
+  still queued for this session shows **Not yet read by** this model. A message is sent at once,
+  even during a turn, and wakes the peer whether it is idle, finished, blocked or interrupted, or
+  starts its model when it has no task yet (see [session coordination](session-coordination.md)).
+  Until the session publishes a message it shows as **Sending…**.
+
+History lives only in the running sessions' memory (the last 50 messages per peer) and disappears
+with the peer.
 
 Every stop asks `y`/`n` first. Requests go through the same controls the main window uses; each
-outcome is noted in the conversation under **Side pane** and shown in the pane's footer. A peer
-message written during a turn is sent when the turn ends. Approvals, questions and anything else
-that needs a decision stay in the main window; the pane cannot approve, answer or start work.
+outcome is noted in the conversation under **Side pane** and shown in the pane's footer.
+Approvals, questions and anything else that needs a decision stay in the main window; the pane
+cannot approve or answer them.
 
 While the pane is attached, slash-command job output goes only to its **Jobs** tab (the conversation
 keeps the job's one-line status and result), and the pinned worker block above the composer is

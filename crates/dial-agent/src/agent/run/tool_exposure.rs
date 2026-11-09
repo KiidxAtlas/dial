@@ -121,15 +121,7 @@ impl<'a> Agent<'a> {
     /// still runs its checks) and `git` (`bash` covers it). In native Harbor print runs (94
     /// requests) none of these was called. A run that needs one pays a single `tool_load` round.
     const UNATTENDED_DEFERRED: &[&str] = &[
-        "task",
-        "working_state",
-        "todo",
-        "find",
-        "memory",
-        "bg",
-        "finish",
-        "verify",
-        "git",
+        "task", "todo", "find", "memory", "bg", "finish", "verify", "git",
     ];
 
     /// Lean local profile (`assistance.lean_local`): compact tool interface, a bounded initial tool
@@ -1037,7 +1029,6 @@ impl<'a> Agent<'a> {
                 "skill" => skills::skill_tool::schema(),
                 "skill_manage" => skills::manage_tool::schema(),
                 "session_search" => session::session_search_tool::schema(),
-                "working_state" => crate::agent::workflow::evidence::working_schema(),
                 "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Find a tool the offer lacks: search eligible tools by capability or exact name, or name them with `select:a,b`. Returns each match's description, parameters, readiness and status. `load: true` also loads the exact or top matches for the next request (tool_load's checks). A miss returns catalog page 0; follow next_query (\"*:N\", zero-based) while present. Never executes tools or grants permission. Legacy noncompact mode may activate exact matches.","parameters":{"type":"object","properties":{"query":{"type":"string"},"load":{"type":"boolean"}},"required":["query"],"additionalProperties":false}}}),
                 "tool_load" => json!({"type":"function","function":{"name":"tool_load","description":"Explicitly enable or unload exact eligible tool names. Changes take effect next round, never in this batch, and grant no permissions.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":32,"items":{"type":"string"}},"unload":{"type":"array","maxItems":32,"items":{"type":"string"}}},"additionalProperties":false}}}),
                 "exit_plan" => json!({"type":"function","function":{"name":"exit_plan","description":"Ask the user to approve this plan and leave plan mode.","parameters":{"type":"object","properties":{"plan":{"type":"string","minLength":1}},"required":["plan"],"additionalProperties":false}}}),

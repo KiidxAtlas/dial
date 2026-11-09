@@ -1,6 +1,5 @@
 //! Human-approved live inspection budgets shared by supported producers, not an execution grant.
-use crate::config::types::Config;
-use crate::tools::integrations::ext::{Tool, ToolContext};
+use crate::tools::integrations::ext::ToolContext;
 use crate::tools::{ToolOutput, Workspace};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -9,7 +8,7 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{
-        Arc, Mutex, OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -76,46 +75,27 @@ pub(crate) fn reserve_workspace(ws: &Workspace, spend: Spend) -> Result<()> {
     Ok(())
 }
 
-pub fn tools(_: &Config) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(Perception)]
+/// The retired `perception` contract, now the `evidence` `budget_open`, `budget_status`,
+/// `budget_step` and `budget_close` actions.
+pub(crate) fn schema() -> Value {
+    crate::tools::tool_schema(
+        "perception",
+        "Use when a question needs several visual, audio, video or document inspections under a fixed budget. open starts a human-confirmed, workspace-wide live budget; step runs one inspection; status reports units left; close ends it with confirmation. Choose each next selection from the evidence so far and stop when resolved or out of budget. Units count inspections (failed ones too, and direct producer calls), not tokens or dollars. Budgets live in this process, shared across sessions in this workspace; after a restart open a fresh one. Video is opt-in; during a budget, read selected visual PDF pages instead of whole-document extraction. It makes no hidden model calls and is not a security boundary or an execution grant.",
+        json!({
+            "action":{"type":"string","enum":["open","status","step","close"]},
+            "question":{"type":"string","maxLength":4096},
+            "limits":{"type":"object","properties":{"images":{"type":"integer","minimum":0,"maximum":128},"pages":{"type":"integer","minimum":0,"maximum":64},"frames":{"type":"integer","minimum":0,"maximum":64},"audio_ms":{"type":"integer","minimum":0,"maximum":600000},"operations":{"type":"integer","minimum":1,"maximum":128}},"required":["images","pages","frames","audio_ms","operations"],"additionalProperties":false},
+            "tool":{"type":"string","enum":["visual","audio","video","document"]},"request":{"type":"object"},
+            "reason":{"type":"string","maxLength":4096}
+        }),
+        &["action"],
+    )
 }
-struct Perception;
-impl Tool for Perception {
-    fn name(&self) -> &str {
-        "perception"
-    }
-    fn schema(&self) -> Value {
-        crate::tools::tool_schema(
-            "perception",
-            "Use when a question needs several visual, audio, video or document inspections under a fixed budget. open starts a human-confirmed, workspace-wide live budget; step runs one inspection; status reports units left; close ends it with confirmation. Choose each next selection from the evidence so far and stop when resolved or out of budget. Units count inspections (failed ones too, and direct producer calls), not tokens or dollars. Budgets live in this process, shared across sessions in this workspace; after a restart open a fresh one. Video is opt-in; during a budget, read selected visual PDF pages instead of whole-document extraction. It makes no hidden model calls and is not a security boundary or an execution grant.",
-            json!({
-                "action":{"type":"string","enum":["open","status","step","close"]},
-                "question":{"type":"string","maxLength":4096},
-                "limits":{"type":"object","properties":{"images":{"type":"integer","minimum":0,"maximum":128},"pages":{"type":"integer","minimum":0,"maximum":64},"frames":{"type":"integer","minimum":0,"maximum":64},"audio_ms":{"type":"integer","minimum":0,"maximum":600000},"operations":{"type":"integer","minimum":1,"maximum":128}},"required":["images","pages","frames","audio_ms","operations"],"additionalProperties":false},
-                "tool":{"type":"string","enum":["visual","audio","video","document"]},"request":{"type":"object"},
-                "reason":{"type":"string","maxLength":4096}
-            }),
-            &["action"],
-        )
-    }
-    fn needs_approval(&self, args: &Value) -> bool {
-        args["action"] != "status"
-    }
-    fn may_modify_workspace(&self, _: &Value) -> bool {
-        false
-    }
-    fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        self.call_streaming(ctx, args, &|_| {}, &AtomicBool::new(false))
-    }
-    fn call_streaming(
-        &self,
-        ctx: &ToolContext,
-        args: &Value,
-        _: &(dyn Fn(crate::tools::integrations::ext::ToolEvent) + Sync),
-        cancel: &AtomicBool,
-    ) -> ToolOutput {
-        run(ctx, args, cancel).unwrap_or_else(|e| ToolOutput::err(format!("{e:#}")))
-    }
+
+/// Whether a call in the retired `perception` shape changes or spends a live budget. Only
+/// `status` is free of human confirmation and side effects.
+pub(crate) fn changes_budget(args: &Value) -> bool {
+    args["action"] != "status"
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,7 +126,7 @@ fn status(ws: &Workspace) -> Value {
     let all = budgets().lock().expect("perception budgets lock poisoned");
     json!({"budget":all.get(ws.root()),"scope":"live process, shared workspace; supported producers only; not token or money limits","cost":{"tokens":null,"money":null,"reason":"provider-dependent; inspection counts are not a price estimate"}})
 }
-fn run(ctx: &ToolContext, value: &Value, cancel: &AtomicBool) -> Result<ToolOutput> {
+pub(crate) fn run(ctx: &ToolContext, value: &Value, cancel: &AtomicBool) -> Result<ToolOutput> {
     let args: Args = serde_json::from_value(value.clone())?;
     ensure!(!cancel.load(Ordering::Relaxed), "perception cancelled");
     match args.action.as_str() {

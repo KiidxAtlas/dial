@@ -58,7 +58,7 @@ any writer in that scope. Read/read overlap is safe. A conflict closes the prefi
 jump over a conflicting or unknown operation. Git inspection actions use ordinary read groups;
 Git mutations remain exclusive.
 
-Parent `todo` and `working_state` view/ordinary progress patches can appear inside a group. They
+Parent `todo` steps and working-state views/ordinary progress patches can appear inside a group. They
 settle on the controller in original order after native work drains. Deliverable-scope changes
 remain barriers because they may need a human decision. An `edit`/`write` with `verify` can end
 a group; verification uses the ordinary coalescing owner after source epochs settle, and results
@@ -100,7 +100,7 @@ role limits, live approval, portable rules and computed-target bounds still appl
 
 `experimental.streaming_dispatch` is also on by default; set it to `false` to disable early reads.
 Parent and child loops reuse the same streaming observer. Only the admitted read prefix starts
-before the response ends; an observed effect seals it, while `todo` and ordinary `working_state`
+before the response ends; an observed effect seals it, while `todo` steps and ordinary working-state
 bookkeeping do not. Child reads additionally require the live parent's authorization before
 starting. Early `read`s use the same read reuse as the parallel group: rows already visible in an
 earlier result come back as an evidence link. Exact results are reused only after ordinary final

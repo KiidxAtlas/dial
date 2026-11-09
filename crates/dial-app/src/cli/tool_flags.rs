@@ -146,15 +146,15 @@ pub fn validate_tool_names(requested: &[String], known: &[String]) -> Result<()>
     bail!("unknown tool(s) for --tools: {}", unknown.join(", "));
 }
 
-/// Canonical name for a renamed tool. `kernel` was merged into `eval` (`language = "py"`), so
-/// `--tools kernel` and a `kernel` entry select `eval`. This is the single alias point for CLI
-/// tool and integration names.
+/// Canonical name for a retired tool. `kernel` was merged into `eval` (`language = "py"`) and the
+/// evidence family into `evidence`, so `--tools kernel` or `--tools workbench` selects the
+/// successor. This is the single alias point for CLI tool and integration names; the table is
+/// `config::tools::integrations::MERGED_INTEGRATIONS`, plus `working_state`, now `todo` state ops.
 pub fn canonical_tool_name(name: &str) -> &str {
-    if name.eq_ignore_ascii_case("kernel") {
-        "eval"
-    } else {
-        name
+    if name.eq_ignore_ascii_case("working_state") {
+        return "todo";
     }
+    crate::config::tools::integrations::canonical_integration(name)
 }
 
 /// Integration-gated tools among `tools`, after alias canonicalization. These are the only names

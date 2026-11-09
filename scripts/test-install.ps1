@@ -177,14 +177,19 @@ function New-ZipFromFile {
 
 # Builds <serve>/<Scenario>/ with the archive, SHA256SUMS, and SHA256SUMS.sig for $Tag.
 function New-Release {
-    param([string] $Scenario, [string] $Tag, [string] $ReportedVersion, [string] $KeyPath, [string] $ArchiveName, [string] $Target = 'x86_64-pc-windows-msvc')
+    param([string] $Scenario, [string] $Tag, [string] $ReportedVersion, [string] $KeyPath, [string] $ArchiveName, [string] $Target = 'x86_64-pc-windows-msvc', [switch] $Unlaunchable)
     $dir = Join-Path $script:Serve $Scenario
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $pkg = "dial-$Tag-$Target"
     if (-not $ArchiveName) { $ArchiveName = "$pkg.zip" }
     $stage = Join-Path $script:WorkRoot ('stage-' + [Guid]::NewGuid().ToString('N'))
     $binary = Join-Path $stage (Join-Path $pkg 'dial.exe')
-    New-FixtureBinary -Path $binary -Version $ReportedVersion
+    if ($Unlaunchable) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $binary) | Out-Null
+        [IO.File]::WriteAllBytes($binary, [byte[]](0x00, 0x01, 0x02, 0x03))
+    } else {
+        New-FixtureBinary -Path $binary -Version $ReportedVersion
+    }
     $archive = Join-Path $dir $ArchiveName
     New-ZipFromFile -ZipPath $archive -EntryName "$pkg/dial.exe" -SourceFile $binary
     $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -294,6 +299,7 @@ try {
     New-Release -Scenario 'mismatch' -Tag 'v9.9.9' -ReportedVersion '0.1.0' -KeyPath $keyA.Private | Out-Null
     $manifestDir = New-Release -Scenario 'manifest-edit' -Tag 'v0.1.0' -ReportedVersion '0.1.0' -KeyPath $keyA.Private
     New-Release -Scenario 'arm' -Tag 'v0.1.0' -ReportedVersion '0.1.0' -KeyPath $keyA.Private -Target 'aarch64-pc-windows-msvc' | Out-Null
+    New-Release -Scenario 'unlaunchable' -Tag 'v0.1.0' -ReportedVersion '0.1.0' -KeyPath $keyA.Private -Unlaunchable | Out-Null
 
     # Tamper the archive after the manifest was signed.
     $tamperedZip = Join-Path (Join-Path $script:Serve 'tampered') 'dial-v0.1.0-x86_64-pc-windows-msvc.zip'
@@ -452,6 +458,16 @@ try {
         $run = Invoke-Installer @('-Version', 'v9.9.9', '-InstallDir', (Join-Path $script:WorkRoot 'bin-mismatch')) $envMap
         Assert-True ($run.Code -ne 0) 'mismatched binary was installed'
         Assert-Contains $run.Output 'version check failed'
+    }
+
+    Test-Case 'reports a downloaded binary that cannot start instead of an empty version' {
+        $envMap = Get-BaseEnvironment (Get-ScenarioUrl 'unlaunchable')
+        $envMap['DIAL_RELEASE_PUBLIC_KEY_PEM'] = $keyA.PublicPem
+        $dir = Join-Path $script:WorkRoot 'bin-unlaunchable'
+        $run = Invoke-Installer @('-Version', 'v0.1.0', '-InstallDir', $dir) $envMap
+        Assert-True ($run.Code -ne 0) 'unlaunchable binary was installed'
+        Assert-Contains $run.Output 'could not start'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $dir 'dial.exe'))) 'dial.exe written although it could not start'
     }
 
     Test-Case 'reports a missing release as not found' {

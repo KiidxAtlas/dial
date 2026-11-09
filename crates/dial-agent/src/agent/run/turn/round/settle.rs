@@ -45,10 +45,7 @@ impl Agent<'_> {
         if !contract_failed
             && !controller_blocked
             && !recovery_blocked
-            && !matches!(
-                call.name.as_str(),
-                "todo" | "working_state" | "finish" | "ask" | "tool_load"
-            )
+            && !matches!(call.name.as_str(), "todo" | "finish" | "ask" | "tool_load")
         {
             self.step_checks.observations += 1;
         }
@@ -83,7 +80,6 @@ impl Agent<'_> {
                 call.name.as_str(),
                 "todo"
                     | "finish"
-                    | "working_state"
                     | "tool_search"
                     | "tool_load"
                     | "context_notes"
@@ -253,14 +249,18 @@ impl Agent<'_> {
                 turn.reliability.passing_checks += 1;
             }
         }
-        if call.name == "bash" {
+        // A call the controller refused (retry barrier, contract or preflight) never ran.
+        if call.name == "bash" && !controller_blocked {
             if call.arguments["command"]
                 .as_str()
                 .is_some_and(crate::agent::safety::approval::opaque_shell_effect)
             {
                 self.step_checks.uncheckpointed_shell_commands += 1;
+                self.record_shell_changes(ui);
             }
-        } else if let Some(tool) = self.ext.get(&call.name)
+        } else if !controller_blocked
+            && call.name != "bash"
+            && let Some(tool) = self.ext.get(&call.name)
             && tool.may_modify_workspace(&call.arguments)
         {
             self.step_checks.uncheckpointed_extension_calls += 1;

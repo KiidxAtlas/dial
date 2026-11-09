@@ -45,7 +45,8 @@ pub(in crate::agent) struct RepeatedToolCall {
     pub result_summary: String,
     /// Identity of the streak's call set. A reply whose calls produce the same key repeats it.
     key: String,
-    /// The streak's newest turn, with the result each of its calls received.
+    /// One entry per call of the streak's newest turn, each paired with the newest result in the
+    /// streak that came from running it (see [`executed_result`]).
     earlier: Vec<EarlierCall>,
 }
 
@@ -67,6 +68,41 @@ fn call_key(calls: &[(String, String, serde_json::Value)]) -> String {
         .collect();
     parts.sort();
     serde_json::to_string(&parts).unwrap_or_default()
+}
+
+/// Whether a tool result is a harness reference that ran nothing: a duplicate-call answer or a
+/// retry-barrier refusal. Quoting one of these as "the earlier result" nests references and
+/// truncates the real diagnostic away.
+fn is_unexecuted_reference(text: &str) -> bool {
+    text.starts_with(crate::agent::prompts::recovery::DUPLICATE_RESULT_LEAD)
+        || text
+            .strip_prefix("invalid tool call: ")
+            .unwrap_or(text)
+            .starts_with(crate::agent::run::engine::RETRY_BARRIER_LEAD)
+}
+
+/// The `(id, result)` to quote for one repeated call: the newest result in the streak that came
+/// from actually running it, else the newest result. `turns` is newest first.
+fn executed_result(
+    messages: &[serde_json::Value],
+    turns: &[Vec<(String, String, serde_json::Value)>],
+    name: &str,
+    canonical: &serde_json::Value,
+) -> (String, String) {
+    let mut newest = None;
+    for turn in turns {
+        let Some((id, _, _)) = turn.iter().find(|(_, other, args)| {
+            other == name && identity_arguments(other, args) == *canonical
+        }) else {
+            continue;
+        };
+        let result = result_text_for(messages, id);
+        if !is_unexecuted_reference(&result) {
+            return (id.clone(), result);
+        }
+        newest.get_or_insert((id.clone(), result));
+    }
+    newest.unwrap_or_default()
 }
 
 /// Summarized text of the tool result that answers `id`, or empty when none is in `messages`.
@@ -135,8 +171,7 @@ impl RepeatedToolCall {
         exempt: &[&str],
     ) -> Option<Self> {
         let mut streak_key: Option<String> = None;
-        let mut count = 0usize;
-        let mut newest: Vec<(String, String, serde_json::Value)> = Vec::new();
+        let mut turns: Vec<Vec<(String, String, serde_json::Value)>> = Vec::new();
         for message in messages.iter().rev() {
             if message["role"].as_str() != Some("assistant") {
                 continue;
@@ -157,37 +192,38 @@ impl RepeatedToolCall {
             let key = call_key(&parsed);
             match &streak_key {
                 Some(existing) if *existing != key => break,
-                Some(_) => count += 1,
-                None => {
-                    streak_key = Some(key);
-                    count = 1;
-                    newest = parsed;
-                }
+                Some(_) => {}
+                None => streak_key = Some(key),
             }
+            turns.push(parsed);
         }
+        let count = turns.len();
         if count < threshold || count == 0 {
             return None;
         }
-        let (id, name, args) = newest
+        let newest = &turns[0];
+        let earlier: Vec<EarlierCall> = newest
             .iter()
-            .find(|(_, name, _)| !exempt.contains(&name.as_str()))
-            .unwrap_or(&newest[0])
-            .clone();
-        let earlier = newest
-            .iter()
-            .map(|(id, name, args)| EarlierCall {
-                name: name.clone(),
-                arguments: identity_arguments(name, args),
-                id: id.clone(),
-                result: result_text_for(messages, id),
+            .map(|(_, name, args)| {
+                let arguments = identity_arguments(name, args);
+                let (id, result) = executed_result(messages, &turns, name, &arguments);
+                EarlierCall {
+                    name: name.clone(),
+                    arguments,
+                    id,
+                    result,
+                }
             })
             .collect();
-        let arguments_summary = summarize_text(&identity_arguments(&name, &args).to_string(), 400);
+        let lead = earlier
+            .iter()
+            .find(|call| !exempt.contains(&call.name.as_str()))
+            .unwrap_or(&earlier[0]);
         Some(Self {
-            tool_name: name,
+            tool_name: lead.name.clone(),
             count,
-            arguments_summary,
-            result_summary: result_text_for(messages, &id),
+            arguments_summary: summarize_text(&lead.arguments.to_string(), 400),
+            result_summary: lead.result.clone(),
             key: streak_key.unwrap_or_default(),
             earlier,
         })
@@ -730,7 +766,7 @@ impl StallGuard {
 /// Read/search alternation is the common waste, so the advice comes early and repeats per streak.
 const SERIAL_WARN: u32 = 3;
 /// Session-state calls that ride along with real work; they do not make a lone lookup a batch.
-const BOOKKEEPING_TOOLS: &[&str] = &["todo", "working_state"];
+const BOOKKEEPING_TOOLS: &[&str] = &["todo"];
 /// Tools that only observe the project: they neither change what a command would print nor
 /// depend on one another unless the model chooses so.
 const OBSERVING_TOOLS: &[&str] = &[

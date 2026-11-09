@@ -202,8 +202,9 @@ pub fn apply_thinking(mut config: Config, level: CliThinking) -> Result<Config> 
 }
 
 /// The reasoning profile for the selected model: the active model profile, a ChatGPT account
-/// profile, or one built from the bundled catalog's thinking metadata. `None` when nothing
-/// declares the model's reasoning controls.
+/// profile, one built from the bundled catalog's thinking metadata, or, for a model the bundle
+/// does not describe, one built from what the provider's saved live listing declares. `None` when
+/// nothing declares the model's reasoning controls.
 pub fn reasoning_profile(config: &Config) -> Result<Option<ModelProfile>> {
     if let Some(profile) = config.active_model_profile() {
         return Ok(Some(profile.clone()));
@@ -215,11 +216,23 @@ pub fn reasoning_profile(config: &Config) -> Result<Option<ModelProfile>> {
     }
     let selection = config.selection();
     let identity = format!("{}/{}", selection.provider, selection.model);
-    let Some(model) = crate::llm::catalog::model_capabilities(&identity) else {
-        return Ok(None);
-    };
-    let Some(mode) = model.thinking else {
-        return Ok(None);
+    let bundled = crate::llm::catalog::model_capabilities(&identity)
+        .and_then(|model| Some((model.thinking?, model)));
+    let (mode, efforts, effort_wire, default_effort) = match bundled {
+        Some((mode, model)) => (
+            mode,
+            model.thinking_efforts,
+            model.effort_wire,
+            model.default_effort,
+        ),
+        None => {
+            let Some(declared) =
+                crate::llm::catalog::declared_reasoning(&config.user_dir, &selection)
+            else {
+                return Ok(None);
+            };
+            (declared.mode, declared.efforts(), Default::default(), None)
+        }
     };
     use crate::llm::catalog::ThinkingMode;
     let reasoning = match mode {
@@ -244,11 +257,11 @@ pub fn reasoning_profile(config: &Config) -> Result<Option<ModelProfile>> {
         model: selection.model,
         capabilities: crate::llm::profiles::ModelCapabilities {
             reasoning,
-            reasoning_efforts: model.thinking_efforts,
-            reasoning_effort_wire: model.effort_wire,
+            reasoning_efforts: efforts,
+            reasoning_effort_wire: effort_wire,
             ..Default::default()
         },
-        reasoning_effort: model.default_effort,
+        reasoning_effort: default_effort,
         thinking: Some(true),
         ..Default::default()
     }))

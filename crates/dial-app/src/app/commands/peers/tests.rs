@@ -25,10 +25,12 @@ fn board_maps_to_a_view_with_overlaps_marked_on_both_sides() {
                 summary: "client".into(),
                 phase: "idle".into(),
                 scopes: vec!["src/client".into(), "tests".into()],
+                model: String::new(),
             },
             overlapping: vec!["src/client".into()],
         }],
         queued: 3,
+        model: String::new(),
     };
     let view = view(board);
     assert_eq!(view.queued, 3);

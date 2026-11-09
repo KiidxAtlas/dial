@@ -158,13 +158,13 @@ fn recovery_labels_do_not_invent_failed_rounds_and_shell_success_clears_them() {
     let server = llm::fake::serve(vec![
         calls(&[("read", json!({"path":"missing-one"}))]),
         slots(),
-        calls(&[("working_state", json!({"action":"view"}))]),
+        calls(&[("todo", json!({"op":"state_view"}))]),
         calls(&[("read", json!({"path":"missing-two"}))]),
         calls(&[("bash", json!({"command":"printf 'recovered\\n'"}))]),
         response("Observed the shell result.", None),
     ]);
     with_agent(
-        "[compaction]\nenabled=false\n[harness]\ntools=['read','bash','working_state']\n",
+        "[compaction]\nenabled=false\n[harness]\ntools=['read','bash','todo']\n",
         |agent| {
             connect(agent, &server.url);
             let report = agent

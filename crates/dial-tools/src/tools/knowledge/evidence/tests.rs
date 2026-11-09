@@ -486,3 +486,156 @@ fn capture_and_freshness_honor_both_sandbox_deny_read_policies() {
         );
     }
 }
+
+#[test]
+fn merged_schema_keeps_native_properties_and_offers_every_merged_action() {
+    let schema = super::schema();
+    let native = super::native_schema();
+    let properties = &schema["function"]["parameters"]["properties"];
+    for (name, property) in native["function"]["parameters"]["properties"]
+        .as_object()
+        .unwrap()
+    {
+        if name != "action" {
+            assert_eq!(&properties[name], property, "{name}");
+        }
+    }
+    let actions: Vec<&str> = properties["action"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    for &(_, _, merged) in MERGED_ACTIONS {
+        assert_eq!(
+            actions.iter().filter(|a| **a == merged).count(),
+            1,
+            "{merged}"
+        );
+    }
+    // Two owners bound `references` differently; the merged shape keeps the item type.
+    assert_eq!(
+        properties["references"],
+        json!({"type":"array","items":{"type":"string"}})
+    );
+    // `assessment` unites the investigate and reality judgements.
+    let assessments = properties["assessment"]["enum"].as_array().unwrap();
+    assert!(assessments.contains(&json!("supports")));
+    assert!(assessments.contains(&json!("mismatch")));
+    crate::runtime::schema::check_schema(&schema["function"]["parameters"]).unwrap();
+}
+
+#[test]
+fn merged_actions_round_trip_to_the_retired_tool_arguments() {
+    for &(tool, recorded, merged) in MERGED_ACTIONS {
+        let (legacy_tool, legacy) =
+            legacy_call(&json!({"action":merged,"references":["artifact://x"]})).unwrap();
+        assert_eq!(legacy_tool, tool);
+        assert_eq!(legacy.get("action").and_then(Value::as_str), recorded);
+        assert_eq!(merged_action(tool, &legacy), Some(merged));
+    }
+    assert!(legacy_call(&json!({"action":"capture"})).is_none());
+    assert_eq!(
+        merged_action("workbench", &json!({"action":"capture"})),
+        None
+    );
+    assert_eq!(
+        merged_action("evidence_search", &json!({"action":"search"})),
+        None
+    );
+}
+
+#[test]
+fn merged_actions_run_their_owner_with_its_own_bounds() {
+    let (work, _state, ws) = fixture();
+    fs::write(work.path().join("a.txt"), "timeout after five seconds\n").unwrap();
+    fs::write(work.path().join("b.txt"), "timeout after nine seconds\n").unwrap();
+    let a = capture(&ws, "a.txt");
+    let b = capture(&ws, "b.txt");
+    let cancel = AtomicBool::new(false);
+    let config = Config::default();
+    let ctx = ToolContext {
+        workspace: &ws,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    let run = |args: Value| dispatch(&ctx, &args, &cancel);
+
+    let audit = run(json!({"action":"audit","references":[a]})).unwrap();
+    assert!(!audit.is_error, "{}", audit.text);
+    let search = run(json!({"action":"search","query":"timeout","references":[a, b]})).unwrap();
+    assert!(search.text.contains("five"), "{}", search.text);
+    let diff = run(json!({"action":"diff","reference":a,"other":b})).unwrap();
+    assert!(diff.text.contains("nine"), "{}", diff.text);
+    // The native `compare` still compares exact bytes rather than diffing text.
+    let compare = run(json!({"action":"compare","reference":a,"other":b})).unwrap();
+    assert!(!compare.is_error, "{}", compare.text);
+
+    // workbench accepted at most 16 references; the widened schema does not lift that.
+    let many: Vec<String> = (0..17).map(|_| a.clone()).collect();
+    let error = run(json!({"action":"audit","references":many})).unwrap_err();
+    assert!(format!("{error:#}").contains("evidence audit"), "{error:#}");
+    // A property from another merged tool is refused for this action.
+    assert!(run(json!({"action":"audit","references":[a],"query":"x"})).is_err());
+    // Semantic ranking still needs the agent's model execution.
+    assert!(
+        run(json!({"action":"search","query":"x","references":[a],"ranking":"semantic"})).is_err()
+    );
+}
+
+#[test]
+fn budget_actions_keep_perception_approval_confirmation_and_exclusivity() {
+    use crate::tools::integrations::ext::Concurrency;
+    let tool = super::tools(&Config::default()).remove(0);
+    let limits = json!({"images":1,"pages":0,"frames":0,"audio_ms":0,"operations":2});
+    let open = json!({"action":"budget_open","question":"Which frame?","limits":limits});
+    let status = json!({"action":"budget_status"});
+    for (args, gated) in [
+        (open.clone(), true),
+        (
+            json!({"action":"budget_step","tool":"visual","request":{},"reason":"r"}),
+            true,
+        ),
+        (json!({"action":"budget_close","reason":"done"}), true),
+        (status.clone(), false),
+        (json!({"action":"capture","path":"a.txt"}), false),
+        (
+            json!({"action":"audit","references":["artifact://x"]}),
+            false,
+        ),
+    ] {
+        assert_eq!(tool.needs_approval(&args), gated, "{args}");
+        let expected = if gated {
+            Concurrency::Exclusive
+        } else {
+            Concurrency::Shared
+        };
+        assert_eq!(tool.concurrency(&args), expected, "{args}");
+    }
+
+    let (_work, _state, ws) = fixture();
+    let config = Config::default();
+    let mut ctx = ToolContext {
+        workspace: &ws,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    // Opening still needs a real human confirmation, not just approval of the call.
+    let refused = tool.call(&ctx, &open);
+    assert!(refused.is_error, "{}", refused.text);
+    ctx.confirm = Some(&|_| true);
+    let opened = tool.call(&ctx, &open);
+    assert!(!opened.is_error, "{}", opened.text);
+    let counted = tool.call(&ctx, &status);
+    assert_eq!(counted.data.unwrap()["budget"]["limits"]["operations"], 2);
+    // perception's own bounds apply: at most 128 operations.
+    let too_many = tool.call(
+        &ctx,
+        &json!({"action":"budget_open","question":"q","limits":{"images":0,"pages":0,"frames":0,"audio_ms":0,"operations":129}}),
+    );
+    assert!(too_many.is_error);
+    let closed = tool.call(&ctx, &json!({"action":"budget_close","reason":"done"}));
+    assert!(!closed.is_error, "{}", closed.text);
+}

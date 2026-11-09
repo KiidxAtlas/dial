@@ -518,7 +518,7 @@ fn prepare_config(
         crate::config::migrate_edit_configuration(&mut layer);
         crate::config::migrate_model_role_table(&mut layer);
         crate::config::migrate_removed_settings(&mut layer);
-        crate::config::migrate_kernel_integration(&mut layer);
+        crate::config::migrate_merged_integrations(&mut layer);
         if scope == Scope::Global && index == 1 {
             // Clear canonical roles after migrating legacy assignments too.
             for reset in project_resets {

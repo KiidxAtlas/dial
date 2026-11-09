@@ -5,16 +5,17 @@
 //! board, the `bg` tool, the slash-command job slot, side threads and the peer board), so the pane
 //! never shows a second version of anything. Requests go back through the same owners: `bg` kills,
 //! live-task cancellation, the job slot's cancel flag, `/btw cancel` and the `peers` send action.
-//! Peer messages are sent at once: by the idle agent, or during a turn by the sender handle the
-//! shell takes when the turn starts. Only without either (no project registry yet) do they wait.
+//! Peer messages are sent at once, marked as typed by the human: by the idle agent's sender, or
+//! during a turn by the sender handle the shell takes when the turn starts. Prompts for this
+//! session's own model wait for the idle shell and then run like a prompt typed in the main window.
 use super::Shell;
 use crate::agent::Agent;
 use crate::app::core::App;
 use crate::cli::watch::{
     self,
     state::{
-        self, Exchange, Job, JobKind, PeerMessage, PeerRow, Peers, Request, Snapshot, Thread,
-        Worker,
+        self, ChatLine, ChatRole, Exchange, Job, JobKind, PeerMessage, PeerRow, Peers, Request,
+        Snapshot, Thread, Worker,
     },
 };
 use crate::storage::side_thread::Outcome;
@@ -50,8 +51,12 @@ pub(in crate::app) struct LivePane {
     peers: Peers,
     peers_at: Option<Instant>,
     outcomes: VecDeque<String>,
-    /// Peer messages waiting for a sender (no project registry joined yet).
+    /// Requests waiting for the idle session or a sender (no project registry joined yet).
     held: Vec<Request>,
+    /// This session's model, as last read from the idle agent.
+    model: String,
+    /// Recent prompts, replies and wake-ups of this session, for the pane's own thread.
+    conversation: VecDeque<ChatLine>,
 }
 
 impl LivePane {
@@ -117,6 +122,22 @@ impl LivePane {
         }
         self.outcomes.push_back(text);
     }
+
+    /// Record one line of this session's own conversation for the pane.
+    pub(in crate::app) fn chat(&mut self, role: ChatRole, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.conversation.len() == state::CONVERSATION {
+            self.conversation.pop_front();
+        }
+        self.conversation.push_back(ChatLine {
+            role,
+            text: state::bounded(text, state::TEXT_LIMIT),
+            at_ms: crate::ui::subagent_model::epoch_ms(),
+        });
+    }
 }
 
 impl Shell {
@@ -166,12 +187,18 @@ impl Shell {
                 .live_pane
                 .outcome(format!("Cannot read pane requests: {error:#}")),
         }
+        if let Some(agent) = agent.as_deref() {
+            self.live_pane.model = agent.model().to_owned();
+        }
         for request in std::mem::take(&mut self.live_pane.held) {
-            // Without the agent or a sender (no registry yet) a peer message keeps its place in line.
-            if matches!(request, Request::MessagePeer { .. })
-                && agent.is_none()
-                && self.peer_sender.is_none()
-            {
+            // A peer message without the agent or a sender (no registry yet), or a prompt while a
+            // turn runs or another prompt is starting, keeps its place in line.
+            let wait = match request {
+                Request::MessagePeer { .. } => agent.is_none() && self.peer_sender.is_none(),
+                Request::Prompt { .. } => agent.is_none() || self.startup.is_some(),
+                _ => false,
+            };
+            if wait {
                 self.live_pane.held.push(request);
                 continue;
             }
@@ -259,28 +286,27 @@ impl Shell {
                 }
             }
             Request::MessagePeer { to, text } => {
-                // Idle, the agent sends; during a turn the handle taken at its start does. Either
+                // Idle, the agent's sender; during a turn the handle taken at its start. Either
                 // writes only to the peer's inbox, so nothing waits for the turn to end.
-                let sent = match (agent, &self.peer_sender) {
-                    (Some(agent), _) => {
-                        let output = agent.peer_coordination(
-                            &serde_json::json!({"action": "send", "to": to, "text": text}),
-                        );
-                        if output.is_error {
-                            Err(output.text)
-                        } else {
-                            Ok(())
-                        }
-                    }
-                    (None, Some(sender)) => sender.send(&to, &text).map_err(|e| format!("{e:#}")),
-                    (None, None) => return "Peer messages need the idle session".into(),
+                let sender = match agent {
+                    Some(agent) => agent.peer_sender(),
+                    None => self.peer_sender.clone(),
                 };
+                let Some(sender) = sender else {
+                    return "Project peers are unavailable in this session".into();
+                };
+                let sent = sender.send(&to, &text, true);
                 // Republish the board at once, so the chat view shows the message just sent.
                 self.live_pane.peers_at = None;
                 match sent {
-                    Ok(()) => format!("Message queued for peer {}", short(&to)),
-                    Err(error) => format!("Message to {} failed: {error}", short(&to)),
+                    Ok(()) => format!("Message sent to peer {}", short(&to)),
+                    Err(error) => format!("Message to {} failed: {error:#}", short(&to)),
                 }
+            }
+            Request::Prompt { text } => {
+                // The main loop submits it next, exactly like a prompt typed in the main window.
+                self.startup = Some(text);
+                "Prompt sent to this session's model".into()
             }
         }
     }
@@ -430,6 +456,8 @@ impl Shell {
             threads,
             peers: self.live_pane.peers.clone(),
             outcomes: self.live_pane.outcomes.iter().cloned().collect(),
+            model: self.live_pane.model.clone(),
+            conversation: self.live_pane.conversation.iter().cloned().collect(),
         }
     }
 }
@@ -465,6 +493,8 @@ fn peers(
                         outgoing: message.outgoing,
                         text: state::bounded(&message.text, state::TEXT_LIMIT),
                         unread: message.unread,
+                        at_ms: message.at_ms,
+                        by_user: message.by_user,
                     })
                     .collect();
                 chat.drain(..chat.len().saturating_sub(state::PEER_MESSAGES));
@@ -473,6 +503,7 @@ fn peers(
                     summary: row.peer.summary,
                     phase: row.peer.phase,
                     scopes: row.peer.scopes,
+                    model: row.peer.model,
                     overlapping: row.overlapping,
                     messages: chat,
                 }

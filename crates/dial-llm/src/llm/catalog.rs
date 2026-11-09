@@ -177,6 +177,70 @@ pub struct ModelMetadata {
     /// On-disk format of a downloaded local model; `None` for served and hosted models.
     #[serde(default)]
     pub format: Option<LocalFormat>,
+    /// Thinking mode and effort levels the live listing declares for this exact model.
+    #[serde(default)]
+    pub declared_reasoning: Option<DeclaredReasoning>,
+}
+
+/// Reasoning controls a live model listing declares for one exact model (Anthropic Models API
+/// `capabilities.thinking.types` and `capabilities.effort`). A model released after this build
+/// gets its thinking and effort controls from here instead of waiting for a bundled record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredReasoning {
+    pub mode: ThinkingMode,
+    /// Declared levels as a bit set over [`DECLARABLE_EFFORTS`].
+    efforts: u8,
+}
+
+/// Effort levels a listing can declare, weakest first.
+const DECLARABLE_EFFORTS: [super::profiles::ReasoningEffort; 5] = {
+    use super::profiles::ReasoningEffort::*;
+    [Low, Medium, High, Xhigh, Max]
+};
+
+impl DeclaredReasoning {
+    /// Declared effort levels, weakest first.
+    pub fn efforts(self) -> Vec<super::profiles::ReasoningEffort> {
+        DECLARABLE_EFFORTS
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| self.efforts & (1 << bit) != 0)
+            .map(|(_, effort)| *effort)
+            .collect()
+    }
+
+    /// Anthropic `/v1/models` row: only capabilities reported as `{"supported": true}` count.
+    fn from_anthropic_row(row: &Value) -> Option<Self> {
+        let supported = |path: &str| {
+            row.pointer(&format!("/capabilities/{path}/supported"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        };
+        if !supported("thinking") {
+            return None;
+        }
+        let efforts = if supported("effort") {
+            DECLARABLE_EFFORTS
+                .iter()
+                .enumerate()
+                .filter(|(_, effort)| supported(&format!("effort/{}", effort.as_str())))
+                .fold(0u8, |bits, (bit, _)| bits | (1 << bit))
+        } else {
+            0
+        };
+        let mode = if supported("thinking/types/adaptive") {
+            ThinkingMode::AnthropicAdaptive
+        } else if supported("thinking/types/enabled") {
+            if efforts == 0 {
+                ThinkingMode::Budget
+            } else {
+                ThinkingMode::AnthropicBudgetEffort
+            }
+        } else {
+            return None;
+        };
+        Some(Self { mode, efforts })
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoraCheck {
@@ -447,6 +511,7 @@ fn metadata(row: &Value) -> ModelMetadata {
         }),
         pricing,
         kind: declared_kind(row),
+        declared_reasoning: DeclaredReasoning::from_anthropic_row(row),
         ..Default::default()
     }
 }
@@ -585,6 +650,52 @@ pub fn model_metadata(layout: &Layout, selection: &ModelSelection) -> ModelMetad
         })
         .unwrap_or_default();
     bundled::complete_metadata(selection, metadata)
+}
+
+/// Reasoning controls the saved live listing declares for `selection`'s exact model at its
+/// endpoint, for models the bundled catalog does not describe yet. No network access.
+pub fn declared_reasoning(
+    user_dir: &Path,
+    selection: &ModelSelection,
+) -> Option<DeclaredReasoning> {
+    find_declared_reasoning(
+        &cached(user_dir),
+        &selection.provider,
+        &selection.model,
+        |entry| {
+            let trim = |url: Option<&str>| url.map(|url| url.trim_end_matches('/').to_owned());
+            selection.base_url.is_none()
+                || trim(entry.base_url.as_deref()) == trim(selection.base_url.as_deref())
+        },
+    )
+}
+
+/// Like [`declared_reasoning`], from the listing this process last read. Request builders that
+/// know only the model id use it; backend construction reads the listing first.
+pub fn remembered_declared_reasoning(provider: &str, model: &str) -> Option<DeclaredReasoning> {
+    let parsed = PARSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, parsed)| parsed.clone())?;
+    find_declared_reasoning(&parsed, provider, model, |_| true)
+}
+
+fn find_declared_reasoning(
+    cache: &BTreeMap<String, Vec<ModelEntry>>,
+    provider: &str,
+    model: &str,
+    endpoint: impl Fn(&ModelSelection) -> bool,
+) -> Option<DeclaredReasoning> {
+    cache
+        .values()
+        .flatten()
+        .filter(|entry| {
+            entry.selection.provider == provider
+                && entry.selection.model == model
+                && endpoint(&entry.selection)
+        })
+        .find_map(|entry| entry.metadata.declared_reasoning)
 }
 #[derive(Clone, Debug)]
 pub struct ProviderStatus {
@@ -3182,6 +3293,116 @@ fn oauth_catalog(
         .collect()
 }
 
+/// Local inference servers Dial looks for: id, label, base-URL override variable, default URL.
+const LOCAL_SERVERS: &[(&str, &str, &str, &str)] = &[
+    (
+        "lm-studio",
+        "LM Studio",
+        "LM_STUDIO_BASE_URL",
+        "http://127.0.0.1:1234/v1",
+    ),
+    (
+        "ollama",
+        "Ollama",
+        "OLLAMA_BASE_URL",
+        super::ollama::BASE_URL,
+    ),
+    (
+        "mlx-serve",
+        "MLX-Serve",
+        "MLX_SERVE_BASE_URL",
+        "http://127.0.0.1:11234/v1",
+    ),
+    (
+        "llama-cpp",
+        "llama.cpp",
+        "LLAMA_CPP_BASE_URL",
+        "http://127.0.0.1:8080/v1",
+    ),
+    (
+        "docker-model-runner",
+        "Docker Model Runner",
+        "DOCKER_MODEL_RUNNER_BASE_URL",
+        "http://127.0.0.1:12434/engines/v1",
+    ),
+    (
+        "osaurus",
+        "Osaurus",
+        "OSAURUS_BASE_URL",
+        "http://127.0.0.1:1337/v1",
+    ),
+];
+
+/// The base URL for one local server: its override variable, `OLLAMA_HOST` for Ollama, else the default.
+fn local_server_url(id: &str, variable: &str, default: &str) -> String {
+    std::env::var(variable)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            if id == "ollama" {
+                std::env::var("OLLAMA_HOST")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        if s.contains("://") {
+                            s
+                        } else {
+                            format!("http://{s}")
+                        }
+                    })
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| default.into())
+}
+
+/// Whether something accepts TCP connections at `base_url` within `timeout`.
+fn accepts_connections(base_url: &str, timeout: Duration) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(uri) = crate::url::parse_url(base_url) else {
+        return false;
+    };
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        });
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, timeout).is_ok())
+}
+
+/// Labels of local inference servers that accept a connection right now, in [`LOCAL_SERVERS`]
+/// order. A reachability hint for first-run setup only: it does not list models or check the
+/// protocol, and it never selects a model.
+pub fn running_local_servers(timeout: Duration) -> Vec<&'static str> {
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = LOCAL_SERVERS
+            .iter()
+            .map(|&(id, label, variable, default)| {
+                scope.spawn(move || {
+                    accepts_connections(&local_server_url(id, variable, default), timeout)
+                        .then_some(label)
+                })
+            })
+            .collect();
+        probes
+            .into_iter()
+            .filter_map(|probe| probe.join().ok().flatten())
+            .collect()
+    })
+}
+
 pub fn discover(
     layout: &Layout,
     configured: &BTreeMap<String, ProviderSpec>,
@@ -3210,68 +3431,12 @@ pub fn discover(
         discovery.models.extend(entry);
     }
     let mut endpoints = BTreeMap::new();
-    for (id, label, variable, default) in [
-        (
-            "lm-studio",
-            "LM Studio",
-            "LM_STUDIO_BASE_URL",
-            "http://127.0.0.1:1234/v1",
-        ),
-        (
-            "ollama",
-            "Ollama",
-            "OLLAMA_BASE_URL",
-            super::ollama::BASE_URL,
-        ),
-        (
-            "mlx-serve",
-            "MLX-Serve",
-            "MLX_SERVE_BASE_URL",
-            "http://127.0.0.1:11234/v1",
-        ),
-        (
-            "llama-cpp",
-            "llama.cpp",
-            "LLAMA_CPP_BASE_URL",
-            "http://127.0.0.1:8080/v1",
-        ),
-        (
-            "docker-model-runner",
-            "Docker Model Runner",
-            "DOCKER_MODEL_RUNNER_BASE_URL",
-            "http://127.0.0.1:12434/engines/v1",
-        ),
-        (
-            "osaurus",
-            "Osaurus",
-            "OSAURUS_BASE_URL",
-            "http://127.0.0.1:1337/v1",
-        ),
-    ] {
-        let override_url = std::env::var(variable)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                if id == "ollama" {
-                    std::env::var("OLLAMA_HOST")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                        .map(|s| {
-                            if s.contains("://") {
-                                s
-                            } else {
-                                format!("http://{s}")
-                            }
-                        })
-                } else {
-                    None
-                }
-            });
+    for &(id, label, variable, default) in LOCAL_SERVERS {
         endpoints.insert(
             id.to_owned(),
             ProviderSpec {
                 label: label.into(),
-                base_url: override_url.unwrap_or_else(|| default.into()),
+                base_url: local_server_url(id, variable, default),
                 protocol: Some(ApiProtocol::builtin(id)),
                 ..ProviderSpec::default()
             },

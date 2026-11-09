@@ -392,15 +392,15 @@ fn source_tools(query: &str) -> Vec<&'static str> {
     {
         names.push("visual");
     }
-    // The evidence pair answers citation intent. It used to ride along with every routed format
+    // The evidence tool answers citation intent. It used to ride along with every routed format
     // tool, and unattended runs then spent requests on `evidence capture` for plain CSV deliverables.
     // A bare "sources" is usually build or package sources ("uses Debian sources"); it routes
-    // the pair only alongside citation intent.
+    // evidence only alongside citation intent.
     if inspect
         && (any(&terms, &["evidence", "citations", "citation", "quotes"])
             || (terms.contains("sources") && any(&terms, &["cite", "cited", "claim", "claims"])))
     {
-        names.extend(["evidence", "evidence_search"]);
+        names.push("evidence");
     }
     names
 }
@@ -603,26 +603,8 @@ fn explicit(query: &str, candidates: &[(String, String)]) -> Vec<String> {
             query.split_whitespace().any(|word| {
                 let matches = word.trim_matches(['`', ',', '.', '"', ';', ':']) == name;
                 let common_word = [
-                    "document",
-                    "data",
-                    "audio",
-                    "visual",
-                    "evidence",
-                    "database",
-                    "investigate",
-                    "research",
-                    "monitor",
-                    "timeline",
-                    "task",
-                    "message",
-                    "goal",
-                    "reality",
-                    "perception",
-                    "video",
-                    "workbench",
-                    "verify",
-                    "find",
-                    "finish",
+                    "document", "data", "audio", "visual", "evidence", "database", "research",
+                    "monitor", "task", "message", "goal", "video", "verify", "find", "finish",
                     "memory",
                 ]
                 .contains(&name.as_str());

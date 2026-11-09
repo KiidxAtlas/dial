@@ -138,6 +138,37 @@ fn empty_filler_and_unknown_queries_activate_nothing() {
 }
 
 #[test]
+fn synonym_list_misses_strict_discovery_but_partial_matches_find_the_capability() {
+    // The query a local model sent when asked to look at a game window.
+    let query = "graphical display, visual rendering, desktop environment, GUI, screen capture, video stream, interactive desktop, VNC, X11, display server";
+    let catalog = candidates(&[
+        (
+            "computer",
+            "Control the host desktop: windows, screenshots, native input, displays, on-screen capture",
+        ),
+        ("video", "Inspect a video stream and extract frames"),
+        ("lsp", "Query a language server for definitions"),
+        ("bg", "Run a background server process in this environment"),
+        ("read", "Read files"),
+    ]);
+    assert!(
+        discover(query, catalog.clone()).is_empty(),
+        "the strict threshold still refuses to activate on a scattered synonym list"
+    );
+    let partial = partial_matches(query, catalog, &|_| 0);
+    assert!(partial.iter().any(|name| name == "computer"), "{partial:?}");
+    assert!(!partial.iter().any(|name| name == "read"));
+    assert!(partial.len() <= PARTIAL_MATCH_LIMIT);
+}
+
+#[test]
+fn partial_matches_need_a_shared_term() {
+    for query in ["", "I need a tool please", "quuxflorb"] {
+        assert!(partial_matches(query, candidates(&[("read", "Read files")]), &|_| 0).is_empty());
+    }
+}
+
+#[test]
 fn discovery_cannot_recover_profile_excluded_candidates() {
     let eligible = candidates(&[("read", "Read files")]);
     assert!(discover("web_search", eligible.clone()).is_empty());

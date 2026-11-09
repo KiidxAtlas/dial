@@ -181,6 +181,8 @@ impl<'a> Agent<'a> {
         }
         self.clear_context_rollover();
         self.note_compaction_input();
+        // Background shell work may have written after its command returned.
+        self.record_shell_changes(&mut observed);
         let state = self.session.control_state();
         let changed_files = self
             .step_checks
@@ -267,7 +269,6 @@ impl<'a> Agent<'a> {
                 report.outcome == TurnOutcome::Completed && !report.interrupted
             }),
         );
-        self.coordination_turn_settled(origin, &result);
         self.monitor_turn_settled(origin, &result);
         result
     }

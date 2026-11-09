@@ -27,10 +27,11 @@ Write, paste and edit drafts without losing your place; understand the launch sc
 - Text that starts with `/` but is not a command is sent as an ordinary message. A first word
   containing another `/` (a pasted path such as `/Users/me/notes.md`) never opens the command
   menu, so `Enter` sends it as typed, and while busy it queues like any other message.
-- A configurable status line shows model, role, path, Git state, context, token usage/rate, approval,
-  sandbox and session state. It keeps the same segments while idle and busy. The default layout adapts
-  to width (path drops below 120 columns, branch and cost below 80); narrow layouts keep the workers
-  segment (with a warning when a worker is waiting for you), the inbox and the mode. `Alt+S` or `F11`
+- A configurable status line shows model, thinking level, role, path, Git state, context, token
+  usage/rate, approval, sandbox and session state. It keeps the same segments while idle and busy.
+  The default layout adapts to width (path drops below 120 columns, branch and cost below 80); every
+  width keeps the thinking level (`think high`, `think on`, `think auto`, …), and narrow layouts keep
+  the workers segment (with a warning when a worker is waiting for you), the inbox and the mode. `Alt+S` or `F11`
   (`app.status.expand`) temporarily shows every segment, also while a turn runs. Presets
   and custom left/right segments still apply when configured. Learning diagnostics are available in the explicit improvement views.
   The activity label names what the model is doing (**Reasoning**, **Writing**, **Preparing** *tool*),

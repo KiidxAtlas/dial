@@ -1,0 +1,24 @@
+# Maintainer: KiidxAtlas
+pkgname=dial-bin
+pkgver=0.3.1
+pkgrel=1
+pkgdesc="Sandboxed coding agent for the terminal with undo and test evidence; runs local or hosted models"
+arch=('x86_64' 'aarch64')
+url="https://github.com/KiidxAtlas/dial"
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'bubblewrap')
+optdepends=('ollama: run local models through Ollama'
+            'llama.cpp: serve GGUF models locally')
+provides=('dial')
+conflicts=('dial')
+source_x86_64=("https://github.com/KiidxAtlas/dial/releases/download/v${pkgver}/dial-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("https://github.com/KiidxAtlas/dial/releases/download/v${pkgver}/dial-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('a778ae8e74079504774f4e63f82fdadc8cce38f33296c9b43f6af0c7ceaf90e2')
+sha256sums_aarch64=('0a44480e55bc58064e11e7bf43126b0122381292dfb82cd0bbee5944d94f82b7')
+
+package() {
+  cd "dial-v${pkgver}-${CARCH}-unknown-linux-gnu"
+  install -Dm755 dial "${pkgdir}/usr/bin/dial"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 THIRD_PARTY_NOTICES "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_NOTICES"
+}

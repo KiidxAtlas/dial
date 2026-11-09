@@ -48,8 +48,17 @@ fn video_registry_requires_opt_in_and_integration_but_investigation_tools_are_di
     };
     let registry = Registry::standard(&config, Vec::new());
     assert!(!registry.contains("video"));
-    for name in ["document", "audio", "data", "investigate", "workbench"] {
+    for name in ["document", "audio", "data", "evidence"] {
         assert!(registry.contains(name), "{name}");
+    }
+    for retired in [
+        "investigate",
+        "workbench",
+        "evidence_search",
+        "reality",
+        "timeline",
+    ] {
+        assert!(!registry.contains(retired), "{retired}");
     }
     config.experimental.video_analysis = true;
     assert!(Registry::standard(&config, Vec::new()).contains("video"));

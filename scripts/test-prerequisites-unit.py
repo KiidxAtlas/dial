@@ -86,9 +86,53 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertIn("native Rust checks remain required", output.getvalue())
         self.probe.assert_not_called()
 
+    def test_missing_python_modules_name_the_interpreter_and_pinned_setup(self):
+        with mock.patch.object(prerequisites.importlib, "import_module", side_effect=ImportError("missing")), \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(prerequisites.main("python"), 1)
+        diagnostic = error.getvalue()
+        self.assertIn(sys.executable, diagnostic)
+        self.assertIn("pytest", diagnostic)
+        self.assertIn("scripts/requirements-ci.lock", diagnostic)
+        self.assertIn("No tests ran", diagnostic)
+        self.probe.assert_not_called()
+
+    def test_python_tiers_probe_only_their_required_imports(self):
+        for suite, module in [("python", "pytest"), ("release-policy", "cryptography.hazmat.primitives.asymmetric.ed25519")]:
+            with self.subTest(suite=suite), \
+                    mock.patch.object(prerequisites.importlib, "import_module") as imported, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(prerequisites.main(suite), 0)
+                imported.assert_called_once_with(module)
+        self.probe.assert_not_called()
+
+    def test_broken_python_import_is_a_prerequisite_failure(self):
+        with mock.patch.object(prerequisites.importlib, "import_module", side_effect=OSError("shared library unavailable")), \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(prerequisites.main("release-policy"), 1)
+        self.assertIn("shared library unavailable", error.getvalue())
+        self.assertIn("cryptography", error.getvalue())
+
 
 @unittest.skipIf(os.name == "nt", "Make's POSIX command fixtures require a Unix host")
 class MakePrerequisiteTests(unittest.TestCase):
+    def test_python_tiers_stop_before_running_tests_when_prerequisites_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copy2(ROOT / "Makefile", root / "Makefile")
+            (root / "scripts").mkdir()
+            (root / "scripts/test-prerequisites.py").write_text(
+                "import sys\nprint('prerequisite gate')\nsys.exit(19)\n")
+            for target in ["test-python", "test-release-policy"]:
+                with self.subTest(target=target):
+                    result = subprocess.run(
+                        ["make", target, f"PYTHON={sys.executable}"], cwd=root,
+                        capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("prerequisite gate", result.stdout)
+                    self.assertNotIn("No module named", result.stderr)
+                    self.assertNotIn("can't open file", result.stderr)
+
     def test_both_test_runners_stop_before_cargo_when_prerequisites_fail(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

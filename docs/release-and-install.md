@@ -150,7 +150,14 @@ For local use of the source-tree installers, provide the trusted public PEM befo
 
 ## Other distribution channels
 
-The Homebrew formula is in `Formula/dial.rb`. Each release regenerates its checksums from `SHA256SUMS` with `scripts/update-formula.py` and opens a `release-packaging/<tag>` pull request for review; merge it after the release is published. The Nix flake is `flake.nix`; the Docker image is built from `Dockerfile` and published to `ghcr.io/kiidxatlas/dial` on releases. Pin versions or image digests for reproducible deployment. The container runs interactively or one-shot; mount the project directory and persistent Dial state explicitly. [`docs/docker.md`](docker.md) has the `docker run` and Compose recipes, the sandbox options Bubblewrap needs, and Docker Model Runner setup.
+The Homebrew formula is in `Formula/dial.rb`. Install it from this repository's tap:
+
+```sh
+brew tap kiidxatlas/dial https://github.com/KiidxAtlas/dial
+brew install dial
+```
+
+After a release is published, the release workflow verifies the signed `SHA256SUMS`, regenerates `Formula/dial.rb` and the AUR `dial-bin` metadata from it with `scripts/update-formula.py`, and opens and merges a `release-packaging/<tag>` pull request, so Homebrew users get the release without a manual step. Submission-ready definitions for the AUR (`dial-bin`) and homebrew-core are in [`packaging/`](../packaging/README.md). The Nix flake is `flake.nix`; the Docker image is built from `Dockerfile` and published to `ghcr.io/kiidxatlas/dial` on releases. Pin versions or image digests for reproducible deployment. The container runs interactively or one-shot; mount the project directory and persistent Dial state explicitly. [`docs/docker.md`](docker.md) has the `docker run` and Compose recipes, the sandbox options Bubblewrap needs, and Docker Model Runner setup.
 
 To build the container locally, pass the source revision explicitly because `.dockerignore`
 excludes Git metadata:
@@ -166,6 +173,21 @@ so the container binary retains its source identity and trusted update key.
 ## Build from source
 
 Install the pinned Rust toolchain from `rust-toolchain.toml` and run `cargo build --release --locked -p dial` for shipping optimization. `make build` and `make update` default to the optimized `local` profile (incremental compilation, no LTO); pass `PROFILE=release` for shipping-equivalent builds (thin LTO). `make update` rebuilds from the checkout, backs up existing binaries, and retains only the three newest backups at each managed location. `make check`, `make test-lib`, and `make test-module MOD=module::path` provide narrower development checks; `make test` retains the full Rust suite. CI builds and tests with the `ci` profile (unoptimized, no debug info) and caches Rust dependencies separately for test, lint, and release jobs. Release jobs require a completed successful push-to-main CI run for the exact tagged commit before building, signing or publishing. Python tests run under pytest in CI; optional model/runtime dependencies are separate from the Rust executable.
+
+`make test-python` and `make test-release-policy` check the selected `PYTHON` interpreter before
+starting their suites. Missing or broken `pytest`/`cryptography` imports fail with the interpreter
+path and setup command, rather than a partial run or an optional-dependency skip. To use the
+pinned portable test environment without modifying system Python:
+
+```sh
+uv run --no-project --python 3.12 --with-requirements scripts/requirements-ci.lock \
+  make test-python test-release-policy
+```
+
+An existing prepared environment can be selected with `make PYTHON=/path/to/python ...`.
+The test targets never install packages automatically; add `--offline` to `uv run` when its
+interpreter and pinned dependencies are already cached. Optional MLX/model checks remain
+separate and report their unavailable prerequisites.
 
 Unix subprocess creation shares one pipe/fork guard for ordinary, detached and process-group
 children. This prevents concurrent core spawns from retaining unrelated output-pipe writers on

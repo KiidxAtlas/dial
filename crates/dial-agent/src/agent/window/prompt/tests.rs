@@ -294,7 +294,7 @@ fn supported_target_guidance_is_carried_by_every_focused_profile() {
 
 #[test]
 fn planning_and_delivery_keep_optional_work_separate_in_every_profile() {
-    let tools = names(&["todo", "working_state", "finish", "verify"]);
+    let tools = names(&["todo", "finish", "verify"]);
     for (lean, concise, one_call) in [
         (false, false, false),
         (false, true, false),
@@ -311,7 +311,6 @@ fn planning_and_delivery_keep_optional_work_separate_in_every_profile() {
             false,
         );
         for contract in [
-            "deliverables in `working_state`",
             "execution steps with `todo`",
             "settle each step you finish",
             "optional follow-ups separate",

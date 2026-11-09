@@ -383,7 +383,7 @@ base_url = "http://127.0.0.1:1234/v1"
 api_key_env = "LMSTUDIO_KEY"
 [harness]                 # the part the improvement loop is allowed to change
 system_prompt = "Work in small verified steps."
-tools = ["read","edit","write","glob","grep","bash","todo","tool_search","tool_load","working_state"]
+tools = ["read","edit","write","glob","grep","bash","todo","tool_search","tool_load"]
 [bash_interceptor]        # bash commands that duplicate a dedicated tool
 mode = "hint"             # hint (default): run it and add a one-line pointer | block: refuse it
 # enabled = false         # turn it off; patterns = [...] replaces the built-in rules

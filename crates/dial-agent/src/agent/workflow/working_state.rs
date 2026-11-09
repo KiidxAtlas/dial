@@ -164,7 +164,7 @@ pub(in crate::agent) fn prepare(
     if patch {
         ensure!(
             given.get("expected_revision").and_then(Value::as_u64) == Some(revision),
-            "working_state patch requires expected_revision {revision}; stale or missing revision, state unchanged"
+            "state_patch requires expected_revision {revision} (from state_view); stale or missing revision, state unchanged"
         );
     }
     let mut next: Map<String, Value> = if patch {
@@ -513,7 +513,7 @@ fn revise(
 pub(in crate::agent) fn completion_blocker(state: &Value) -> Option<String> {
     if let Err(error) = validate_deliverables(state) {
         return Some(format!(
-            "Declared deliverables are invalid: {error}; restore working_state before completing."
+            "Declared deliverables are invalid: {error}; restore the todo state before completing."
         ));
     }
     let items = match state.get("deliverables").filter(|value| !value.is_null()) {
@@ -521,7 +521,7 @@ pub(in crate::agent) fn completion_blocker(state: &Value) -> Option<String> {
         Some(Value::Array(items)) => items,
         Some(_) => {
             return Some(
-                "working_state deliverables are unreadable; restore them with working_state update before completing.".into(),
+                "Working-state deliverables are unreadable; restore them with todo state_update before completing.".into(),
             );
         }
     };

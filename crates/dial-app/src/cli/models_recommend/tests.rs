@@ -35,3 +35,21 @@ fn gguf_models_are_sized_from_their_header_and_file() {
     assert_eq!(row.fit, Fit::Fits);
     assert!(row.max_context_tokens > 8192);
 }
+
+#[test]
+fn first_launch_suggests_the_largest_coding_tier_that_fits() {
+    assert!(first_launch_suggestion(8 * GIB).is_none());
+    assert!(first_launch_suggestion(16 * GIB - 1).is_none());
+    assert_eq!(
+        first_launch_suggestion(16 * GIB).map(|s| s.model),
+        Some("mlx-community/Qwen2.5-7B-Instruct-4bit")
+    );
+    assert_eq!(
+        first_launch_suggestion(36 * GIB).map(|s| s.model),
+        Some("mlx-community/Qwen3-30B-A3B-4bit")
+    );
+    assert_eq!(
+        first_launch_suggestion(128 * GIB).map(|s| s.model),
+        Some("mlx-community/Qwen3-32B-4bit")
+    );
+}

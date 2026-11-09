@@ -254,5 +254,18 @@ printf 'Installed dial %s to %s/dial.\n' "${version#v}" "$destination"
 [ -z "$path_hint" ] || printf '%s\n' "$path_hint"
 echo 'Run dial in a project directory to get started.'
 case "$target" in
-    *-linux-*) echo 'Linux/WSL2: install bubblewrap and use a normal user; WSL Windows interop must be disabled (see README).' ;;
+    *-linux-*)
+        if ! command -v bwrap >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then bwrap_install='sudo apt-get install -y bubblewrap'
+            elif command -v dnf >/dev/null 2>&1; then bwrap_install='sudo dnf install -y bubblewrap'
+            elif command -v pacman >/dev/null 2>&1; then bwrap_install='sudo pacman -S bubblewrap'
+            elif command -v zypper >/dev/null 2>&1; then bwrap_install='sudo zypper install bubblewrap'
+            elif command -v apk >/dev/null 2>&1; then bwrap_install='sudo apk add bubblewrap'
+            else bwrap_install='install the bubblewrap package'; fi
+            echo "Dial runs commands inside a bubblewrap sandbox, which is not installed. Run: $bwrap_install"
+        fi
+        if grep -qi microsoft /proc/version 2>/dev/null; then
+            echo 'WSL2: disable Windows interop before running commands (see docs/windows.md); run dial as a normal user.'
+        fi
+        ;;
 esac

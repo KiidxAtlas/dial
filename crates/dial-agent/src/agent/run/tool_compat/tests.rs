@@ -214,3 +214,25 @@ fn find_single_keyword_is_one_literal_not_a_split_list() {
     normalize("find", &string_schema, &mut args);
     assert_eq!(args["keywords"], "SI");
 }
+
+#[test]
+fn replace_arguments_never_translate_into_a_hashline_patch() {
+    let schema = crate::tools::edit::editing::schema(crate::config::types::EditMode::Hashline);
+    let parameters = &schema["function"]["parameters"];
+    let original = json!({"path":"dungeon_game.py","old_string":"print(\"","new_string":"print()"});
+    let mut arguments = original.clone();
+    normalize("edit", parameters, &mut arguments);
+    assert_eq!(
+        arguments, original,
+        "compatibility must not invent line anchors"
+    );
+    assert!(crate::agent::run::calls::validate(parameters, &arguments).is_err());
+    let original = json!({"input":"[dungeon_game.py#ABCD]\nPUT 25.=26:\n+print()\n+print(f\"場所: {room}\\n\")"});
+    let mut arguments = original.clone();
+    normalize("edit", parameters, &mut arguments);
+    assert_eq!(
+        arguments, original,
+        "patch strings are opaque to normalization"
+    );
+    assert!(crate::agent::run::calls::validate(parameters, &arguments).is_ok());
+}
