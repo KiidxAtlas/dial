@@ -1,6 +1,6 @@
 use super::super::{
     DrawCtx,
-    settings::{filled, fit, hint},
+    settings::{Axis, arrows, filled, hint, hint_line, scroll_cell},
 };
 use super::{
     GitOverlay,
@@ -23,6 +23,69 @@ use ratatui::{
 
 impl GitOverlay {
     // ---- rendering ----
+
+    /// The Log tab: recent commits as a selectable list with the shared selection row, a scroll
+    /// indicator when they overflow, guidance when there are none, and a key-hint footer.
+    pub(super) fn log_lines(&self, width: u16, height: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
+        let (w, h) = (usize::from(width), usize::from(height));
+        if w == 0 || h == 0 {
+            return Vec::new();
+        }
+        let theme = ctx.theme;
+        let body_h = h.saturating_sub(1);
+        let mut out = Vec::new();
+        let mut hints = Vec::new();
+        let note = |value: String, tok| {
+            text::wrap_words(&value, w.saturating_sub(1).max(1))
+                .into_iter()
+                .map(move |row| Line::from(Span::styled(format!(" {row}"), theme.fg(tok))))
+        };
+        match &self.recent {
+            Ok(entries) if entries.is_empty() => out.extend(note(
+                "No commits yet. Stage changes on the Status tab and write a message on the \
+                 Commit tab; new commits appear here."
+                    .into(),
+                Tok::Muted,
+            )),
+            Ok(entries) => {
+                let row_w = w.saturating_sub(1);
+                let top = self.log_cursor.saturating_sub(body_h.saturating_sub(1));
+                for (index, (_, label)) in entries.iter().enumerate().skip(top).take(body_h) {
+                    let selected = index == self.log_cursor;
+                    let pointer = if selected {
+                        theme.sym(Sym::Pointer)
+                    } else {
+                        " "
+                    };
+                    let spans = vec![
+                        Span::styled(format!(" {pointer} "), theme.fg(Tok::Accent)),
+                        Span::styled(text::one_line(label), theme.fg(Tok::Text)),
+                    ];
+                    let mut line = if selected {
+                        chrome::selected_row(theme, spans, row_w)
+                    } else {
+                        filled(spans, row_w, Style::default())
+                    };
+                    line.spans
+                        .push(scroll_cell(theme, index - top, body_h, entries.len(), top));
+                    out.push(line);
+                }
+                hints.push(hint(ctx.keys, Action::SelectConfirm, "open commit"));
+            }
+            Err(error) => out.extend(note(
+                format!("Could not read recent commits: {}", text::one_line(error)),
+                Tok::Error,
+            )),
+        }
+        hints.push("r refresh".to_owned());
+        hints.push("Tab tabs".to_owned());
+        hints.push("? keys".to_owned());
+        hints.push(hint(ctx.keys, Action::SelectCancel, "close"));
+        out.truncate(body_h);
+        out.resize(body_h, Line::default());
+        out.push(hint_line(theme, &hints, w));
+        out
+    }
 
     pub(super) fn compose(&self, width: u16, height: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
         let (w, h) = (usize::from(width), usize::from(height));
@@ -100,25 +163,27 @@ impl GitOverlay {
                 let tok = if *error { Tok::Error } else { Tok::Success };
                 Line::from(vec![Span::styled(format!(" {message}"), theme.fg(tok))])
             }
-            _ => footer_line(theme, &self.hints(ctx), w),
+            _ => hint_line(theme, &self.hints(ctx), w),
         };
         out.push(footer);
         out
     }
 
-    /// Footer hints, most useful first: the way out, then what the focused pane can do, then view
-    /// options. The footer drops hints from the end (keeping the first) when they do not fit.
+    /// Footer hints, most useful first, with the way out last: what the focused pane can do, then
+    /// view options. [`hint_line`] drops hints nearest the end (never the way out) when they do
+    /// not fit.
     fn hints(&self, ctx: &DrawCtx) -> Vec<String> {
         if self.editing {
             return vec![
-                "esc stop editing".to_owned(),
-                "ctrl+s commit".to_owned(),
-                "ctrl+g generate".to_owned(),
-                "ctrl+t amend".to_owned(),
+                "Ctrl+S commit".to_owned(),
+                "Ctrl+G generate".to_owned(),
+                "Ctrl+T amend".to_owned(),
+                "Esc stop editing".to_owned(),
             ];
         }
-        let mut hints = vec![hint(ctx.keys, Action::SelectCancel, "close")];
-        let line_hints = self.line_hints();
+        let arrows = arrows(ctx.theme, Axis::Vertical);
+        let mut hints = Vec::new();
+        let line_hints = self.line_hints(&arrows);
         let working_tree = self.commit.is_none();
         if working_tree && !self.changes.is_empty() {
             if self.focus == Focus::Diff && !line_hints.is_empty() {
@@ -126,9 +191,9 @@ impl GitOverlay {
             }
             hints.push(
                 if self.focus == Focus::Diff {
-                    "space stage hunk"
+                    "Space stage hunk"
                 } else {
-                    "space stage file"
+                    "Space stage file"
                 }
                 .to_owned(),
             );
@@ -136,21 +201,26 @@ impl GitOverlay {
         }
         hints.push("? keys".to_owned());
         if !self.changes.is_empty() {
-            hints.push("tab focus".to_owned());
+            hints.push("Tab tabs".to_owned());
             hints.push("]/[ file".to_owned());
-            hints.push("alt+↓/↑ hunk".to_owned());
+            hints.push(format!("Alt+{arrows} hunk"));
             hints.push("v view".to_owned());
         }
         if working_tree && !self.changes.is_empty() {
             hints.push("x discard hunk".to_owned());
-            hints.push("del discard file".to_owned());
-            hints.push("A ai stage".to_owned());
+            hints.push("Delete discard file".to_owned());
+            hints.push("A AI stage".to_owned());
         }
         hints.push("b whitespace".to_owned());
         hints.push("w wrap".to_owned());
         hints.push("r refresh".to_owned());
         if self.focus == Focus::Diff {
             hints.extend(line_hints.into_iter().skip(1));
+        }
+        if self.focus == Focus::Diff && self.selecting() {
+            hints.push("Esc clear lines".to_owned());
+        } else {
+            hints.push(hint(ctx.keys, Action::SelectCancel, "close"));
         }
         hints
     }
@@ -639,7 +709,7 @@ impl GitOverlay {
             }
             if self.editing {
                 lines.push(vec![Span::styled(
-                    "  ctrl+s commit · ctrl+t amend · ctrl+g generate",
+                    "  Ctrl+S commit · Ctrl+T amend · Ctrl+G generate",
                     muted,
                 )]);
             }
@@ -698,14 +768,10 @@ impl GitOverlay {
                 ]
             }
         };
-        let mut spans = pad(parts, width);
         if selected && self.focus == Focus::Sidebar {
-            let fill = theme.bg(Tok::SelectedBg);
-            for span in &mut spans {
-                span.style = span.style.patch(fill).add_modifier(Modifier::BOLD);
-            }
+            return chrome::selected_row(theme, parts, width).spans;
         }
-        spans
+        pad(parts, width)
     }
 }
 
@@ -713,29 +779,6 @@ impl GitOverlay {
 
 fn pad(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     filled(spans, width, Style::default()).spans
-}
-
-/// Footer hints: each hint is `key label` with the key in amber bold. Segments drop from the one
-/// before the last (the close hint stays) until they fit `width`.
-fn footer_line(theme: &Theme, segments: &[String], width: usize) -> Line<'static> {
-    let mut keep: Vec<(&str, &str)> = segments
-        .iter()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.split_once(' ').unwrap_or((s.as_str(), "")))
-        .collect();
-    let cells = |keep: &[(&str, &str)]| -> usize {
-        chrome::key_hint_spans(theme, keep)
-            .iter()
-            .map(|span| text::width(&span.content))
-            .sum()
-    };
-    // Hints come most useful first (the way out leads), so the tail gives way.
-    while keep.len() > 1 && cells(&keep) > width.saturating_sub(1) {
-        keep.pop();
-    }
-    let mut spans = vec![Span::raw(" ")];
-    spans.extend(chrome::key_hint_spans(theme, &keep));
-    Line::from(fit(spans, width))
 }
 
 pub(super) fn plain_char(key: &KeyEvent) -> Option<char> {

@@ -1,4 +1,4 @@
-//! `/cleanse`: runs the project's checkers, then repairs their diagnostics with worker subagents
+//! `/cleanse`: runs the project's checkers, then repairs their diagnostics with workers
 //! until the checkers report clean. Discovery and the repair loop live in `agent::modes::cleanse`.
 
 use crate::agent::Agent;

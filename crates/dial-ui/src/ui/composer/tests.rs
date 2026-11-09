@@ -442,8 +442,8 @@ fn action_palette_shortcuts_preserve_pasted_drafts_and_the_running_queue() {
         let pastes = composer.pastes.clone();
         let cursor = composer.editor.cursor;
         for (code, modifiers) in [
-            (KeyCode::Char('p'), KeyModifiers::CONTROL),
             (KeyCode::Char('k'), KeyModifiers::ALT),
+            (KeyCode::F(1), KeyModifiers::NONE),
         ] {
             assert!(matches!(
                 key(&mut composer, &env, code, modifiers),
@@ -761,11 +761,15 @@ fn primary_hints_follow_context_and_effective_bindings() {
     c.set_draft("a draft");
     assert_eq!(&c.hint(&env.ctx())[..2], ["F2 send", "F3 newline"]);
     c.set_busy(true);
-    assert_eq!(&c.hint(&env.ctx())[..2], ["Esc close", "Ctrl+C stop"]);
+    // A busy Ctrl+C clears a draft before it stops the turn; Esc has nothing to close.
+    assert_eq!(
+        &c.hint(&env.ctx())[..2],
+        ["Ctrl+C clear draft", "F2 choose send action"]
+    );
     env.keys.rebind(Action::Interrupt, &["F4"]).unwrap();
     assert_eq!(
-        &c.hint(&env.ctx())[..3],
-        ["Esc close", "F4 stop", "F2 choose send action"]
+        &c.hint(&env.ctx())[..2],
+        ["F4 stop", "F2 choose send action"]
     );
     env.keys.rebind(Action::Interrupt, &[]).unwrap();
     assert!(!c.hint(&env.ctx()).iter().any(|h| h.ends_with(" stop")));
@@ -795,9 +799,9 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
     c.set_busy(true);
     c.set_draft("/mo");
     assert_eq!(
-        c.hint(&env.ctx())[1],
-        "Ctrl+C stop",
-        "Esc dismisses a menu first"
+        c.hint(&env.ctx())[0],
+        "Ctrl+C clear draft",
+        "Esc dismisses a menu first and is not advertised twice"
     );
     for follow_up in [false, true] {
         c.set_draft("queued draft");
@@ -814,11 +818,11 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
         press(&mut c, &env, KeyCode::Up);
         let hints = c.hint(&env.ctx());
         assert_eq!(
-            hints[1], "Ctrl+C stop",
+            hints[0], "Ctrl+C clear draft",
             "Esc cancels an edited queue item first"
         );
         assert_eq!(
-            hints[2],
+            hints[1],
             format!(
                 "editing queued message ({})",
                 if follow_up {
@@ -961,6 +965,7 @@ fn unmatched_completion_rows_are_informational_and_width_safe() {
 fn hints_come_from_the_keymap_and_change_with_state() {
     let env = Env::new();
     let mut c = Composer::new(vec!["hello world".into()], 10);
+    c.set_keyboard_enhanced(Some(false));
     let hint = |c: &Composer| {
         screen(c, &env, 110)
             .into_iter()
@@ -968,9 +973,13 @@ fn hints_come_from_the_keymap_and_change_with_state() {
             .unwrap()
     };
     let idle = hint(&c);
+    // Without the kitty protocol Ctrl+, cannot arrive, so its Ctrl+4 fallback is advertised.
     assert!(
         idle.contains(&format!("{} model", env.keys.label(Action::ModelSelect)))
-            && idle.contains(&format!("{} settings", env.keys.label(Action::Settings))),
+            && idle.contains(&format!(
+                "{} settings",
+                env.keys.reachable_label(Action::Settings, false)
+            )),
         "{idle:?}"
     );
     c.set_busy(true);
@@ -1445,10 +1454,111 @@ fn ctrl_c_preserves_busy_draft_and_arms_exit_only_when_idle() {
         "and the next one arms again rather than exiting"
     );
 
+    // Busy: the first Ctrl+C clears the draft (undo brings it back), the next one stops.
     c.set_busy(true);
     typed(&mut c, &env, "busy draft");
+    assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::None);
+    assert_eq!(c.draft(), "");
+    ctrl(&mut c, &env, '-');
+    assert_eq!(c.draft(), "busy draft", "a cleared busy draft is undoable");
+    let hints = c.hint(&env.ctx());
+    assert!(
+        hints.contains(&"Ctrl+C clear draft".to_owned())
+            && !hints.iter().any(|hint| hint.contains("restore draft")),
+        "once restored, the hints describe the draft again: {hints:?}"
+    );
+    ctrl(&mut c, &env, 'u');
     assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::Interrupt);
-    assert_eq!(c.draft(), "busy draft");
+}
+
+#[test]
+fn ctrl_p_browses_history_up_like_ctrl_n_browses_down_when_no_menu_is_open() {
+    let env = Env::new();
+    let mut c = composer();
+    assert_eq!(ctrl(&mut c, &env, 'p'), ComposerEvent::None);
+    assert_eq!(c.draft(), "recent prompt");
+    ctrl(&mut c, &env, 'p');
+    assert_eq!(c.draft(), "older prompt");
+    ctrl(&mut c, &env, 'n');
+    assert_eq!(c.draft(), "recent prompt");
+}
+
+#[test]
+fn up_steps_through_queued_messages_then_into_history_and_down_comes_back() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    for text in ["first", "second", "third"] {
+        c.set_draft(text);
+        c.submit_queued(true);
+    }
+    let original = c.queued_messages();
+    // Queuing records history too, so after the oldest queued message history starts at "third".
+    for expected in ["third", "second", "first", "third"] {
+        press(&mut c, &env, KeyCode::Up);
+        assert_eq!(c.draft(), expected);
+    }
+    assert_eq!(
+        c.queued_messages(),
+        original,
+        "stepping never drops or reorders"
+    );
+    press(&mut c, &env, KeyCode::Down);
+    assert_eq!(
+        c.draft(),
+        "",
+        "past the newest history entry the draft is empty again"
+    );
+    press(&mut c, &env, KeyCode::Up);
+    press(&mut c, &env, KeyCode::Up);
+    assert_eq!(c.draft(), "second");
+    press(&mut c, &env, KeyCode::Down);
+    assert_eq!(c.draft(), "third");
+    press(&mut c, &env, KeyCode::Down);
+    assert_eq!(c.draft(), "");
+    assert_eq!(c.queued_messages(), original);
+    // A changed queue edit keeps its text: arrows do not step away from it.
+    press(&mut c, &env, KeyCode::Up);
+    typed(&mut c, &env, "!");
+    press(&mut c, &env, KeyCode::Up);
+    assert_eq!(c.draft(), "third", "history browsing stashes the edit");
+    press(&mut c, &env, KeyCode::Down);
+    assert_eq!(c.draft(), "third!");
+}
+
+#[test]
+fn the_newline_hint_names_a_chord_the_terminal_can_send() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_draft("draft");
+    c.set_keyboard_enhanced(Some(true));
+    assert!(
+        c.hint(&env.ctx())
+            .contains(&"Shift+Enter newline".to_owned())
+    );
+    c.set_keyboard_enhanced(Some(false));
+    assert!(c.hint(&env.ctx()).contains(&"Ctrl+J newline".to_owned()));
+}
+
+#[test]
+fn a_clipboard_image_becomes_a_draft_chip_even_while_history_search_is_open() {
+    let env = Env::new();
+    let mut c = composer();
+    typed(&mut c, &env, "look ");
+    ctrl(&mut c, &env, 'r');
+    assert!(c.search.is_some());
+    c.attach_image_bytes(b"png").unwrap();
+    assert!(c.search.is_none(), "the image closes the search");
+    assert_eq!(c.draft(), "look [Image #1]");
+    let path = c.pasted_images[0].to_string_lossy().into_owned();
+    assert_eq!(c.expanded_draft(), format!("look \"{path}\""));
+    press(&mut c, &env, KeyCode::Backspace);
+    assert_eq!(c.draft(), "look ", "the chip is removed whole");
+    ctrl(&mut c, &env, '-');
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit(format!("look \"{path}\""))
+    );
 }
 
 #[test]
@@ -2141,7 +2251,7 @@ fn long_pastes_collapse_and_expand_on_submit_short_pastes_stay_literal() {
     c.handle_paste(&"x".repeat(2001));
     assert_eq!(
         c.draft(),
-        "[Pasted text #2 +1 lines]",
+        "[Pasted text #2 +1 line]",
         "very long single lines collapse as well"
     );
     assert_eq!(
@@ -2161,23 +2271,39 @@ fn long_pastes_collapse_and_expand_on_submit_short_pastes_stay_literal() {
 }
 
 #[test]
-fn an_edited_placeholder_stays_literal_and_pasted_lookalikes_are_not_expanded() {
+fn backspace_removes_a_placeholder_whole_and_pasted_lookalikes_are_not_expanded() {
     let env = Env::new();
     let mut c = Composer::new(vec![], 10);
     let long = "a\n".repeat(30);
+    typed(&mut c, &env, "see ");
     c.handle_paste(&long);
+    typed(&mut c, &env, " now");
+    // Inside or beside text, Backspace and Delete at a placeholder edge remove all of it at once.
+    for _ in 0..4 {
+        press(&mut c, &env, KeyCode::Left);
+    }
     press(&mut c, &env, KeyCode::Backspace);
-    typed(&mut c, &env, " ");
+    assert_eq!(c.draft(), "see  now", "the placeholder goes as a unit");
+    ctrl(&mut c, &env, '-');
+    assert_eq!(
+        c.draft(),
+        "see [Pasted text #1 +30 lines] now",
+        "undo restores it"
+    );
     assert_eq!(
         press(&mut c, &env, KeyCode::Enter),
-        ComposerEvent::Submit("[Pasted text #1 +30 lines ".into()),
-        "edited placeholder is sent as typed"
+        ComposerEvent::Submit(format!("see {long} now")),
+        "a restored placeholder still expands"
     );
+    c.handle_paste(&long);
+    press(&mut c, &env, KeyCode::Home);
+    press(&mut c, &env, KeyCode::Delete);
+    assert_eq!(c.draft(), "", "Delete at the leading edge removes it too");
 
     c.handle_paste(&long);
     let first = c.draft();
     c.handle_paste(&format!("{}\n{first}", "b\n".repeat(25)));
-    assert!(c.draft().contains("#2"), "{}", c.draft());
+    assert!(c.draft().contains("#4"), "{}", c.draft());
     let sent = match press(&mut c, &env, KeyCode::Enter) {
         ComposerEvent::Submit(t) => t,
         other => panic!("{other:?}"),
@@ -2879,6 +3005,11 @@ fn esc_dismisses_the_menu_until_the_text_changes() {
     );
     assert!(!c.menu_open());
     assert_eq!(press(&mut c, &env, KeyCode::Esc), ComposerEvent::None);
+    assert_eq!(
+        ctrl(&mut c, &env, 'c'),
+        ComposerEvent::None,
+        "Ctrl+C clears the draft first"
+    );
     assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::Interrupt);
 }
 
@@ -3252,6 +3383,21 @@ fn escape_closes_the_chooser_and_keeps_the_draft_pastes_and_history_exactly() {
     assert_eq!(c.history(), history);
     assert!(c.queued_messages().is_empty());
     assert_eq!(press(&mut c, &env, KeyCode::Esc), ComposerEvent::None);
+    assert_eq!(
+        ctrl(&mut c, &env, 'c'),
+        ComposerEvent::None,
+        "the first busy Ctrl+C clears the draft"
+    );
+    assert_eq!(c.draft(), "");
+    let hints = c.hint(&env.ctx());
+    assert!(
+        hints.contains(&"Ctrl+C again stops".to_owned()),
+        "{hints:?}"
+    );
+    assert!(
+        hints.contains(&"Ctrl+- restore draft".to_owned()),
+        "the cleared draft is one undo away: {hints:?}"
+    );
     assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::Interrupt);
 }
 
@@ -3469,7 +3615,7 @@ fn a_queue_edit_cleared_to_empty_never_opens_the_stop_choice() {
 }
 
 #[test]
-fn a_narrow_send_choice_keeps_close_and_stop_visible_before_navigation_hints() {
+fn a_narrow_send_choice_keeps_its_way_out_visible_before_navigation_hints() {
     let env = Env::new();
     let mut c = composer();
     c.set_busy(true);
@@ -3477,7 +3623,7 @@ fn a_narrow_send_choice_keeps_close_and_stop_visible_before_navigation_hints() {
     press(&mut c, &env, KeyCode::Enter);
     let shown = screen(&c, &env, 38).join("\n");
     assert!(
-        shown.contains("Esc close") && shown.contains("Ctrl+C stop"),
+        !shown.contains("Esc close") && shown.contains("Ctrl+C clear draft"),
         "{shown}"
     );
 }
@@ -3518,7 +3664,7 @@ fn the_band_send_choice_is_its_own_panel_with_whole_labels_at_every_width() {
             // A blank surface row separates the panel from the activity/input rows below it.
             let last_option = rows
                 .iter()
-                .rposition(|row| row.contains("w / Ctrl+W"))
+                .rposition(|row| row.contains("pick directly"))
                 .unwrap();
             let gap = rows[last_option + 1..]
                 .iter()
@@ -3587,7 +3733,7 @@ fn explicit_steer_is_separate_from_the_queue_and_reports_stages() {
     press(&mut c, &env, KeyCode::Enter);
     let rows = screen(&c, &env, 100).join("\n");
     assert!(
-        rows.contains("hard redirect") && rows.contains("/worker <message>"),
+        rows.contains("pick directly") && rows.contains("/worker <message>"),
         "{rows}"
     );
     key(&mut c, &env, KeyCode::Enter, KeyModifiers::CONTROL);
@@ -3627,11 +3773,11 @@ fn independent_messages_are_taken_separately_and_unread_ones_survive_the_turn() 
     c.set_busy(true);
     typed(&mut c, &env, "write the changelog");
     press(&mut c, &env, KeyCode::Enter);
-    press(&mut c, &env, KeyCode::Char('w'));
+    press(&mut c, &env, KeyCode::Char('4'));
     assert!(c.take_explicit_steering().is_empty());
     typed(&mut c, &env, "never read");
     press(&mut c, &env, KeyCode::Enter);
-    press(&mut c, &env, KeyCode::Char('r'));
+    press(&mut c, &env, KeyCode::Char('2'));
     assert_eq!(c.take_explicit_independent(), ["write the changelog"]);
     c.mark_explicit("write the changelog", SteerStage::Applied);
     c.set_busy(false);
@@ -3916,11 +4062,15 @@ fn a_pending_jump_is_cancelled_by_composer_keys_and_paste() {
     c.set_draft("ab");
     c.set_busy(true);
     ctrl(&mut c, &env, ']');
-    assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::Interrupt);
+    assert_eq!(
+        ctrl(&mut c, &env, 'c'),
+        ComposerEvent::None,
+        "clears the draft"
+    );
     typed(&mut c, &env, "x");
     assert_eq!(
         c.draft(),
-        "abx",
+        "x",
         "a key the composer consumed cancels the jump"
     );
 
@@ -3985,13 +4135,12 @@ fn worker_command_admission_keeps_the_draft_and_bounds_pending_requests() {
 }
 
 #[test]
-fn chooser_advanced_shortcuts_have_plain_terminal_fallbacks() {
+fn chooser_direct_picks_use_digits_and_letters_reach_the_draft() {
     let env = Env::new();
     for (code, modifiers, worker) in [
         (KeyCode::Enter, KeyModifiers::CONTROL, false),
-        (KeyCode::Char('r'), KeyModifiers::NONE, false),
-        (KeyCode::Char('w'), KeyModifiers::CONTROL, true),
-        (KeyCode::Char('w'), KeyModifiers::NONE, true),
+        (KeyCode::Char('2'), KeyModifiers::NONE, false),
+        (KeyCode::Char('4'), KeyModifiers::NONE, true),
     ] {
         let mut c = composer();
         c.set_busy(true);
@@ -4008,6 +4157,25 @@ fn chooser_advanced_shortcuts_have_plain_terminal_fallbacks() {
             assert_eq!(c.take_explicit_steering(), ["message"]);
             assert!(c.take_explicit_independent().is_empty());
         }
+    }
+    // Plain letters, Ctrl+W and out-of-range digits close the chooser and edit the draft; nothing is sent.
+    for (code, modifiers, draft) in [
+        (KeyCode::Char('r'), KeyModifiers::NONE, "message r"),
+        (KeyCode::Char('w'), KeyModifiers::NONE, "message w"),
+        (KeyCode::Char('w'), KeyModifiers::CONTROL, ""),
+        (KeyCode::Char('9'), KeyModifiers::NONE, "message 9"),
+    ] {
+        let mut c = composer();
+        c.set_busy(true);
+        c.set_draft("message ");
+        press(&mut c, &env, KeyCode::Enter);
+        assert!(c.choice_open());
+        key(&mut c, &env, code, modifiers);
+        assert!(!c.choice_open());
+        assert_eq!(c.draft(), draft);
+        assert!(c.take_explicit_steering().is_empty());
+        assert!(c.take_explicit_independent().is_empty());
+        assert!(c.queued_messages().is_empty());
     }
 }
 
@@ -4091,7 +4259,7 @@ fn busy_send_preferences_use_existing_routes_without_learning_from_choices() {
         if preference == BusySend::Choose {
             assert!(c.choice_open());
             assert_eq!(c.draft(), "message");
-            press(&mut c, &env, KeyCode::Char('r'));
+            press(&mut c, &env, KeyCode::Char('2'));
         } else {
             assert!(!c.choice_open());
         }

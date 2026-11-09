@@ -213,11 +213,16 @@ pub(super) fn task_spans(
             theme.fg(Tok::Dim),
             struck(Tok::Dim),
         ),
-        Status::Blocked => (
-            glyph(Sym::Warn, "[!]"),
-            theme.fg(Tok::Warning),
-            theme.fg(Tok::Warning),
-        ),
+        // Blocked uses the shared blocked state mark, so a stuck step reads the same as a
+        // blocked worker or tool.
+        Status::Blocked => {
+            let mark = super::chrome::StateMark::Blocked;
+            (
+                glyph(mark.sym(), "[!]"),
+                theme.fg(mark.tok()),
+                theme.fg(mark.tok()),
+            )
+        }
         Status::Pending => (
             glyph(Sym::RadioOff, "[ ]"),
             theme.fg(Tok::Muted),
@@ -229,10 +234,10 @@ pub(super) fn task_spans(
                 (Some(frame), false) => frame.to_owned(),
                 (None, false) => theme.sym(Sym::Working).to_owned(),
             };
-            // The active step is the warm dot of the plan: done is green, pending a hollow ring.
+            // The active step carries the running accent; warning stays for blocked steps.
             (
                 glyph,
-                theme.fg(Tok::Warning),
+                theme.fg(super::chrome::StateMark::Running.tok()),
                 theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
             )
         }

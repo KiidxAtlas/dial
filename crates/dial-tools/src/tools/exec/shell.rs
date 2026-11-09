@@ -1135,6 +1135,14 @@ fn run_bash(
         text.push_str("[foreground commands do not survive this timeout; for a dev server/watcher discover/load bg, reuse an existing process or start it with bg, then wait for readiness before browser navigation]\n");
     } else if let Some(code) = status.code() {
         text.push_str(&format!("[exit code: {code}]\n"));
+        if code == 0
+            && let Some(failure) = super::minimizer::masked_failure(&command, &text)
+        {
+            // `step; ls` reports the last step's status; the model otherwise reads success.
+            text.push_str(&format!(
+                "[exit 0 is the last step's status; earlier output reports a failure: {failure}. Confirm that step succeeded before relying on its result]\n"
+            ));
+        }
         if text.starts_with("(no output)\n")
             && body_len == "(no output)\n".len()
             && let Some(meaning) = super::minimizer::silent_exit_meaning(&command, code)

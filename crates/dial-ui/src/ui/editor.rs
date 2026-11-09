@@ -368,9 +368,20 @@ impl Editor {
         true
     }
 
-    /// Handle a key with the default bindings (dialog text fields).
+    /// Handle a key with the default bindings. Only for fields with no keymap in reach; anything
+    /// that has the user's [`Keymap`] must call [`Editor::key_with`] so remapped editing keys apply.
     pub fn key(&mut self, key: KeyEvent) -> bool {
         self.key_with(key, default_keymap())
+    }
+
+    /// Remove `start..end` as one undoable edit (an atomic placeholder, for example).
+    pub(crate) fn delete_range(&mut self, start: usize, end: usize) {
+        self.jump = None;
+        let end = end.min(self.text.len());
+        if start < end && self.text.is_char_boundary(start) && self.text.is_char_boundary(end) {
+            self.delete(start, end);
+        }
+        self.last = Last::Other;
     }
 
     /// Whether a Ctrl-] jump is waiting for its target character.

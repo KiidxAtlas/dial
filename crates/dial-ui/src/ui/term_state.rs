@@ -50,11 +50,14 @@ impl Activity {
 
     /// The circle that ends the terminal title (and so the tab) for this state, or `""` when
     /// idle. Emoji circles carry their own color, so any terminal that shows titles shows it.
+    /// Waiting for you (blue) and failed (red) differ, so a tab asking for input never reads as
+    /// broken and a failure never reads as a question.
     pub fn marker(self) -> &'static str {
         match self {
             Activity::Idle => "",
             Activity::Working => "\u{1F7E0}",
-            Activity::Waiting | Activity::Failed => "\u{1F534}",
+            Activity::Waiting => "\u{1F535}",
+            Activity::Failed => "\u{1F534}",
             Activity::Done => "\u{1F7E2}",
         }
     }

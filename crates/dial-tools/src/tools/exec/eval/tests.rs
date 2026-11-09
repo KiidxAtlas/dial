@@ -45,6 +45,31 @@ fn control_operations_do_not_start_an_interpreter() {
     assert_eq!(tool.js.pid.load(Ordering::Acquire), 0);
 }
 
+/// A Python cell whose interpreter cannot be resolved names JavaScript eval when it resolves.
+#[test]
+fn a_missing_python_points_to_javascript_only_when_it_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = crate::tools::Workspace::new(dir.path()).unwrap();
+    let mut config = Config::default();
+    config.kernel.python = "/missing-dial-test-python".into();
+    for node in [config.eval.node.clone(), "/missing-dial-test-node".into()] {
+        config.eval.node = node;
+        let tool = EvalTool::new(config.eval.clone(), config.kernel.clone());
+        let output = tool.call(
+            &context(&workspace, &config),
+            &json!({"language":"py","code":"1"}),
+        );
+        assert!(output.is_error, "{}", output.text);
+        let js = installed_languages(dir.path(), &config).contains(&"js");
+        assert_eq!(
+            output.text.contains("JavaScript eval is available"),
+            js,
+            "{}",
+            output.text
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn installed_languages_reports_only_resolvable_operator_runtimes() {
@@ -309,6 +334,39 @@ fn slow_cell_moves_at_the_threshold_and_its_display_output_moves_with_it() {
     assert!(output.contains("before"), "{output}");
     assert!(output.contains("done"), "{output}");
 }
+
+/// Notebook semantics through the Node runtime: an edited cell re-runs with its own top-level
+/// declarations, and a cell that threw after declaring a name does not poison that name. The
+/// embedded engine re-executes the `dial` binary, so its counterpart lives in `embedded/tests.rs`.
+#[cfg(target_os = "macos")]
+#[test]
+fn edited_js_cells_redeclare_their_top_level_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = unsandboxed(&dir);
+    let config = Config::default();
+    if resolve_operator_executable(dir.path(), &config.eval.node, "eval.node").is_err() {
+        return;
+    }
+    let tool = EvalTool::new(config.eval.clone(), config.kernel.clone());
+    let ctx = context(&workspace, &config);
+    let adopt = |_: AdoptedJob| Err("no background".to_owned());
+    let cell = |code: &str| {
+        settled(run_cell(&tool, &ctx, json!({"code":code,"background":false}), &adopt).unwrap())
+    };
+    assert_eq!(cell(REDECLARED_CELLS[0])["error"], Value::Null);
+    let thrown = cell(REDECLARED_CELLS[1]);
+    assert!(thrown["error"].as_str().is_some(), "{thrown}");
+    let rerun = cell(REDECLARED_CELLS[2]);
+    assert_eq!(rerun["error"], Value::Null, "{rerun}");
+    assert_eq!(rerun["value"], json!("17"), "{rerun}");
+}
+
+/// Declares, throws after declaring `fs`, then re-declares everything; the last value is 17.
+pub(super) const REDECLARED_CELLS: [&str; 3] = [
+    "const a = 1; class C {}; let t = 3;",
+    "const fs = undefinedName.x;",
+    "const a = 2; class C { v() { return 4 } }; let t; const fs = 1;\na + new C().v() + fs + (t === undefined ? 10 : 0)",
+];
 
 #[cfg(target_os = "macos")]
 #[test]

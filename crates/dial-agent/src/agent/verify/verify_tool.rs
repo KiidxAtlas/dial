@@ -338,22 +338,21 @@ impl Agent<'_> {
         };
         // Selection errors must not replace a reproduction or clear its failed evidence.
         // Registration adds only its own name; replacing a name keeps that name selectable.
-        if let Some(names) = &mut names {
-            if names.is_empty() && repro.is_none() {
-                return ToolOutput::err(
-                    "targets must name at least one test or check; omit targets to run every applicable check",
-                );
-            }
-            if let Err(error) = self.resolve_targets(names, &mut candidates, repro.as_ref()) {
-                return ToolOutput::err(format!(
-                    "{error}. Check names: {}",
-                    if candidates.is_empty() {
-                        "none apply yet".to_owned()
-                    } else {
-                        listed(&candidates)
-                    }
-                ));
-            }
+        // An empty `targets` list means the same as omitting it: every applicable check.
+        if repro.is_none() && names.as_ref().is_some_and(Vec::is_empty) {
+            names = None;
+        }
+        if let Some(names) = &mut names
+            && let Err(error) = self.resolve_targets(names, &mut candidates, repro.as_ref())
+        {
+            return ToolOutput::err(format!(
+                "{error}. Check names: {}",
+                if candidates.is_empty() {
+                    "none apply yet".to_owned()
+                } else {
+                    listed(&candidates)
+                }
+            ));
         }
         // A registered reproduction runs with the rest of the gate's selection once the turn has
         // changes, so one call reports every applicable check instead of prompting a second plain

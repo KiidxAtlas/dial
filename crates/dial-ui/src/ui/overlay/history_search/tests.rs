@@ -75,3 +75,60 @@ fn narrow_history_keeps_open_close_and_return_controls_visible() {
         assert!(content.contains(control), "{control}: {content}");
     }
 }
+
+#[test]
+fn slash_filters_the_hits_titles_replace_ids_and_no_fixed_branch_note() {
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let mut other = hit("session-two", "entry-two");
+    other.snippet = "haystack".into();
+    let titles = [("session-one".to_string(), "Fix the login flow".to_string())]
+        .into_iter()
+        .collect();
+    let mut panel = HistorySearchOverlay::new(
+        "needle".into(),
+        vec![hit("session-one", "entry-one"), other],
+        true,
+    )
+    .with_titles(titles);
+    let content = screen(&render(100, 24, |frame| panel.draw(frame, &ctx)));
+    assert!(content.contains("Fix the login flow"), "{content}");
+    assert!(!content.contains("no branch changes"), "{content}");
+    assert!(
+        !content.contains("> "),
+        "the selection uses the shared row, not `>`"
+    );
+    // `/` starts the filter; `b` is then typed instead of returning.
+    panel.handle(&ch('/'), &rig.keys);
+    for c in "hay".chars() {
+        assert!(matches!(
+            panel.handle(&ch(c), &rig.keys),
+            OverlayEvent::None
+        ));
+    }
+    assert!(matches!(
+        panel.handle(&ch('b'), &rig.keys),
+        OverlayEvent::None
+    ));
+    panel.handle(&key(KeyCode::Backspace), &rig.keys);
+    let content = screen(&render(100, 24, |frame| panel.draw(frame, &ctx)));
+    assert!(content.contains("1 of 2 matches"), "{content}");
+    panel.handle(&key(KeyCode::Enter), &rig.keys);
+    assert!(
+        matches!(panel.handle(&key(KeyCode::Enter), &rig.keys), OverlayEvent::Action(v) if v == "history-open:session-two")
+    );
+    // Esc clears the filter first, then closes.
+    assert!(matches!(
+        panel.handle(&key(KeyCode::Esc), &rig.keys),
+        OverlayEvent::None
+    ));
+    assert!(matches!(
+        panel.handle(&key(KeyCode::Esc), &rig.keys),
+        OverlayEvent::Close
+    ));
+}

@@ -65,7 +65,7 @@ pub fn session(
     for file in files.iter().take(max.saturating_sub(1)) {
         let stats = match (file.added, file.removed) {
             _ if file.untracked => "new".into(),
-            (Some(a), Some(r)) => format!("+{a} −{r}"),
+            (Some(a), Some(r)) => format!("+{a} {}{r}", theme.sym(Sym::Minus)),
             _ => "binary".into(),
         };
         let room = width.saturating_sub(text::width(&stats) + 4);

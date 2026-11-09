@@ -4,7 +4,7 @@
 //! the conversation itself stays the loudest thing on screen.
 use super::{
     Rows, text,
-    theme::Tok,
+    theme::{Sym, Theme, Tok},
     transcript::{TranscriptCtx, fitted},
 };
 use crate::agent::ui::ui_event::{EventKind, Lane, UiEvent};
@@ -18,29 +18,39 @@ use ratatui::{
 const GUTTER: usize = super::tool_cards::GUTTER;
 const LABEL_W: usize = 7;
 
-fn icon(kind: EventKind, ascii: bool) -> &'static str {
+/// The mark of a context-loading fact (skills, tool schemas), shared with the tool card that
+/// loaded them so both read as one kind of thing.
+pub(super) fn context_glyph(theme: &Theme) -> &'static str {
+    if theme.ascii() { "*" } else { "◆" }
+}
+
+/// A lane's identity icon. States that have a shared symbol (a passed check, a recovery warning,
+/// coach reasoning) take it from the theme, so overrides and presets apply; the other kinds have no
+/// theme symbol of their own and keep a fixed identity glyph with an ASCII fallback.
+fn icon(kind: EventKind, theme: &Theme) -> String {
     use EventKind::*;
-    match (kind, ascii) {
+    let ascii = theme.ascii();
+    let fixed = match (kind, ascii) {
+        (Verification, _) => return theme.sym(Sym::Check).to_owned(),
+        (Recovery, _) => return theme.sym(Sym::Warn).to_owned(),
+        (Coach, _) => return theme.sym(Sym::Reasoning).to_owned(),
+        (Skill | Tools, _) => context_glyph(theme),
         (Steering, false) => "↳",
-        (Skill | Tools, false) => "◆",
         (Plan, false) => "▤",
-        (Coach, false) => "◇",
         (Hook, false) => "⚑",
-        (Verification, false) => "✓",
         (Investigation, false) => "⌕",
         (Model, false) => "⇄",
-        (Recovery, false) => "▲",
         (Learning, false) => "✦",
         (Subagent, false) => "◎",
         (Continue, false) => "↻",
         (Compaction | ContextReset, false) => "⟲",
         (Draft, false) => "✎",
         (Wait, false) => "◷",
-        (Recovery, true) => "!",
         (Steering, true) => ">",
         (Compaction | ContextReset, true) => "~",
         (_, true) => "*",
-    }
+    };
+    fixed.to_owned()
 }
 
 fn icon_tok(kind: EventKind) -> Tok {
@@ -75,7 +85,8 @@ fn line(event: &UiEvent, w: usize, ctx: &TranscriptCtx) -> Rows {
     let mut lines = clean.trim().lines().filter(|line| !line.trim().is_empty());
     let first = lines.next().unwrap_or_default().trim().to_owned();
     let rest: Vec<&str> = lines.collect();
-    let glyph = icon(event.kind, theme.ascii());
+    let glyph = icon(event.kind, theme);
+    let glyph = glyph.as_str();
     let label = event.kind.label();
     let alert = event.kind.lane() == Lane::Alert;
     let label_style = if alert {
@@ -138,29 +149,19 @@ fn line(event: &UiEvent, w: usize, ctx: &TranscriptCtx) -> Rows {
     rows
 }
 
-fn compact_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{}k", (n + 500) / 1_000)
-    } else {
-        n.to_string()
-    }
-}
-
 /// `──── ⟲ compacted · 172k → 31k · Ctrl+O ────`, with the full report under the expand toggle.
 fn divider(event: &UiEvent, w: usize, ctx: &TranscriptCtx) -> Rows {
     let theme = ctx.theme;
-    let ascii = theme.ascii();
-    let rule = if ascii { "-" } else { "─" };
-    let arrow = if ascii { "->" } else { "→" };
-    let dot = theme.sym(super::theme::Sym::Dot);
-    let mut label = format!("{} {}", icon(event.kind, ascii), event.kind.label());
+    let rule = theme.sym(Sym::Hr);
+    // No theme symbol names an arrow; it degrades with the glyph set.
+    let arrow = if theme.ascii() { "->" } else { "→" };
+    let dot = theme.sym(Sym::Dot);
+    let mut label = format!("{} {}", icon(event.kind, theme), event.kind.label());
     if let Some((before, after)) = event.tokens {
         label.push_str(&format!(
             " {dot} {} {arrow} {}",
-            compact_tokens(before),
-            compact_tokens(after)
+            text::compact_count(before),
+            text::compact_count(after)
         ));
     }
     if !ctx.tools_expanded {

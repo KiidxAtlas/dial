@@ -17,18 +17,21 @@ Word completion offers the rest of the word under the cursor as dim ghost text w
 ## Commands during a turn
 
 While Dial is working, Enter on a non-empty message opens four selectable intent actions.
-Use Up/Down and Enter (or their rebound selection/submit keys) to choose:
+Use Up/Down and Enter (or their rebound selection/submit keys), or press `1`–`4`, to choose:
 
-- **Update current task (auto)** is the default. It uses the existing message-routing rules;
+- **Let Dial choose (auto)** is the default. It uses the existing message-routing rules;
   those rules may classify the message for another route rather than unconditionally steering.
 - **Redirect current task now** explicitly redirects at the next safe point. Running tools
-  finish; “now” does not mean forcibly interrupting them. The existing shortcut is `r` or
-  `Ctrl+Enter` while the chooser is open.
-- **After this turn** queues a follow-up until the running turn finishes. `Alt+Enter` (the
-  rebindable follow-up action) still queues directly without opening the chooser.
+  finish; “now” does not mean forcibly interrupting them. `Ctrl+Enter` selects it directly while
+  the chooser is open when the terminal supports the kitty keyboard protocol.
+- **After this turn** queues a follow-up until the running turn finishes. `Ctrl+Q` or `Alt+Enter`
+  (the rebindable follow-up action) still queues directly without opening the chooser.
 - **Run independently** requests a worker without redirecting the current task. If separate
-  work cannot start, the existing fallback queues it after the turn. `w` or `Ctrl+W` selects
-  this route directly in the chooser; `/worker <message>` remains available.
+  work cannot start, the existing fallback queues it after the turn. `/worker <message>` remains
+  available.
+
+Plain letters and editing chords such as `Ctrl+W` are not chooser shortcuts: they close the
+chooser and reach the draft, so typing is never swallowed.
 
 Explicit redirect and worker requests retain their pending, received and applied indicators;
 selecting an option does not itself claim the agent has applied it. Esc closes the chooser

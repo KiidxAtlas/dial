@@ -29,7 +29,9 @@ work or infer semantic dependencies between tasks.
   call. While a turn is suspended waiting for background jobs, live workers or side questions, fresh
   mail ends that wait (checked about once per second) so it reaches the model at once, and the
   awaited work keeps running. In an open terminal, fresh mail can also wake an eligible idle
-  conversation (see below). Queuing is not acknowledgement.
+  conversation (see below). The model-facing send receipt confirms inbox acceptance only: it does
+  not establish the recipient's automatic wake-up eligibility or settings. Queuing is not
+  acknowledgement, and an ineligible idle recipient may need a new user turn to read the message.
 - `clear` clears this session's claimed scopes, not its conversation or another peer's state.
 
 The subcommands write ordinary transcript notices. During a running turn, `/peers` and its

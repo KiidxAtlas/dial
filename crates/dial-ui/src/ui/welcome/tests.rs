@@ -144,10 +144,8 @@ fn empty_recent_and_tips_drop_their_sections() {
     assert!(!joined.contains("welcome back"));
     assert!(!joined.contains("RECENT"));
     assert!(!joined.contains("Ctrl+P"));
-    assert!(
-        !joined.contains("TRY"),
-        "starters need the tips to be enabled"
-    );
+    // Starters are the first visit's picks, not tips: `ui.tips` off hides only the key tips.
+    assert!(joined.contains("START WITH"), "{joined}");
 }
 
 #[test]
@@ -366,10 +364,9 @@ fn the_home_selects_rows_and_picks_sessions_or_starters() {
     );
     let mut bare = info_without_recent();
     bare.tips.clear();
-    assert!(
-        !Home::new(bare, Vec::new(), false).down(),
-        "no list, no selection"
-    );
+    let mut bare = Home::new(bare, Vec::new(), false);
+    assert!(bare.down(), "starters stay pickable without tips");
+    assert_eq!(bare.pick(), Some(Pick::Draft(STARTERS[0])));
 }
 
 #[test]
@@ -432,8 +429,10 @@ fn the_home_collapses_to_one_summary_line() {
     let summary = plain(&summary(&with_branch, 100, &Theme::dark()));
     let lines: Vec<&String> = summary.iter().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(lines.len(), 1, "{summary:?}");
+    let git = Theme::dark().sym(Sym::IconGit).to_owned();
+    let git = if git.is_empty() { "on".to_owned() } else { git };
     assert!(
-        lines[0].contains("dial 0.3.1 · qwen3.5-9b · dial  main"),
+        lines[0].contains(&format!("dial 0.3.1 · qwen3.5-9b · dial  {git} main")),
         "{summary:?}"
     );
     for width in 1..=120u16 {

@@ -1875,6 +1875,7 @@ impl Backend {
                     {
                         crate::llm::reliability::normalize_reply(&mut reply, &req.tools);
                     }
+                    crate::llm::reliability::decode_reply_containers(&mut reply, &req.tools);
                     reply.wire_form = wire_form;
                     reply
                 });
@@ -2215,6 +2216,7 @@ impl Backend {
                     {
                         crate::llm::reliability::normalize_reply(&mut reply, &req.tools);
                     }
+                    crate::llm::reliability::decode_reply_containers(&mut reply, &req.tools);
                     reply.wire_form = wire_form;
                     return Ok(reply);
                 }

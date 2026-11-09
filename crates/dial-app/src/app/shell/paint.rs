@@ -178,6 +178,13 @@ pub(super) fn tab_title(base: &str, scope: &str, marker: &str) -> String {
     title
 }
 
+/// Rows the chrome between the transcript and the composer may take on a `rows`-tall terminal
+/// whose composer takes `composer` rows: at most two fifths of the height, and never so many that
+/// fewer than three rows remain for the transcript.
+pub(super) fn aux_budget(rows: usize, composer: usize) -> usize {
+    rows.saturating_sub(composer + 3).min(rows * 2 / 5)
+}
+
 impl Shell {
     // ----- painting -------------------------------------------------------------------------
 
@@ -211,8 +218,8 @@ impl Shell {
         } else {
             Vec::new()
         };
-        // Workers spawned by a `task` call live in that call's card; the rail keeps the rest
-        // (background and scheduled workers that no card owns).
+        // Workers spawned by a `task` call (a parent node) live in that call's card; the pinned
+        // worker block above the composer lists the rest (background and scheduled workers).
         let snapshots: Vec<crate::runtime::Node> = self
             .runtime
             .bodies("worker")
@@ -261,6 +268,7 @@ impl Shell {
         } = self;
         let theme = themes.current();
         let expand_key = keys.label(Action::ToolsExpand);
+        transcript.set_thinking_key(&keys.label(Action::ThinkingToggle));
         let tctx = TranscriptCtx {
             theme,
             ui,
@@ -300,84 +308,98 @@ impl Shell {
                 };
                 let spinner = (status.phase == Phase::Working).then(|| theme.spinner(status.tick));
                 let cap = (rows as usize / 3).min(10);
-                let available = (rows as usize).saturating_sub(view.rows.len() + 3);
-                let mut bottom = if ui.session_rail && available > 0 {
-                    crate::ui::rail::session(
-                        &self.session_id,
-                        title,
-                        &files,
+                // Short terminals keep the transcript: the rail, pins and work card need room.
+                let tall = rows as usize >= crate::ui::worker_pins::MIN_TERMINAL_ROWS;
+                // One budget for every row between the transcript and the composer, spent in
+                // priority order: what needs attention, the plan, workers, then the rail.
+                let mut budget = aux_budget(rows as usize, view.rows.len());
+                let mut attention = Vec::new();
+                let notices = [
+                    self.release_notice.chrome_notice(),
+                    self.runtime_updates.notice(),
+                ];
+                // Notices join their parts with `·`; the ASCII preset keeps its own separator.
+                let dot = format!(" {} ", theme.sym(crate::ui::theme::Sym::Dot));
+                for notice in notices.into_iter().flatten() {
+                    if attention.len() >= budget {
+                        break;
+                    }
+                    let notice = notice.replace(" · ", &dot);
+                    attention.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                        crate::ui::text::ellipsize(&notice, cols as usize, theme.ascii()),
+                        theme.fg(crate::ui::theme::Tok::Muted),
+                    )));
+                }
+                if let Some((thread, streamed)) = self.side.streamed() {
+                    let room = budget.saturating_sub(attention.len());
+                    attention.extend(side_rows(thread, streamed, cols as usize, theme, room));
+                }
+                budget = budget.saturating_sub(attention.len());
+                let tab_key = keys.label(Action::WorkTab);
+                let cycle_key = keys.label(Action::ApprovalCycle);
+                // Wide terminals show the plan as a tabbed card (the work panel); narrower or
+                // shorter ones keep the compact focus summary.
+                let panel = if tall {
+                    crate::ui::work_panel::rows(
+                        todo,
+                        &crate::ui::work_panel::Facts {
+                            approval: &status.approval,
+                            sandbox: &status.sandbox,
+                            tab_key: &tab_key,
+                            cycle_key: &cycle_key,
+                        },
+                        *work_tab,
                         cols as usize,
-                        (rows as usize / 8).clamp(1, 4).min(available),
+                        budget.min((rows as usize / 2).min(14)),
                         theme,
+                        spinner,
                     )
                 } else {
                     Vec::new()
                 };
+                let plan = if panel.is_empty() {
+                    tasks::rows(todo, cols as usize, theme, spinner, cap.min(budget))
+                } else {
+                    panel
+                };
+                budget = budget.saturating_sub(plan.len());
                 let worker_cap = match ui.pinned_workers {
                     crate::llm::model_config::PinnedWorkers::Full => {
                         (rows as usize / 3).clamp(2, 12)
                     }
                     _ => (rows as usize / 5).clamp(2, 6),
-                }
-                .min(available.saturating_sub(bottom.len()));
+                };
                 // An attached `/watch` pane shows workers in full; the block would repeat it.
-                if rows as usize >= crate::ui::worker_pins::MIN_TERMINAL_ROWS
-                    && !self.live_pane.attached()
-                {
-                    bottom.extend(crate::ui::worker_pins::rows(
+                let workers = if tall && !self.live_pane.attached() {
+                    crate::ui::worker_pins::rows(
                         &self.workers,
                         cols as usize,
-                        worker_cap,
+                        worker_cap.min(budget),
                         ui.pinned_workers,
                         ui.worker_live_preview,
                         status.tick,
                         theme,
-                    ));
-                }
-                let notices = [self.release_notice.notice(), self.runtime_updates.notice()];
-                for notice in notices.into_iter().flatten() {
-                    if available <= bottom.len() {
-                        break;
-                    }
-                    bottom.push(ratatui::text::Line::from(ratatui::text::Span::styled(
-                        crate::ui::text::ellipsize(notice, cols as usize, theme.ascii()),
-                        theme.fg(crate::ui::theme::Tok::Muted),
-                    )));
-                }
-                if let Some((thread, streamed)) = self.side.streamed() {
-                    let room = available.saturating_sub(bottom.len());
-                    bottom.extend(side_rows(thread, streamed, cols as usize, theme, room));
-                }
-                let room = available.saturating_sub(bottom.len());
-                let tab_key = keys.label(Action::WorkTab);
-                let cycle_key = keys.label(Action::ApprovalCycle);
-                // Wide terminals show the plan as two cards beside each other (the work panel);
-                // narrower ones keep the compact focus summary.
-                let panel = crate::ui::work_panel::rows(
-                    todo,
-                    &crate::ui::work_panel::Facts {
-                        approval: &status.approval,
-                        sandbox: &status.sandbox,
-                        tab_key: &tab_key,
-                        cycle_key: &cycle_key,
-                    },
-                    *work_tab,
-                    cols as usize,
-                    room.min((rows as usize / 2).min(14)),
-                    theme,
-                    spinner,
-                );
-                if panel.is_empty() {
-                    bottom.extend(tasks::rows(
-                        todo,
-                        cols as usize,
-                        theme,
-                        spinner,
-                        cap.min(room),
-                    ));
+                    )
                 } else {
-                    bottom.extend(panel);
-                }
+                    Vec::new()
+                };
+                budget = budget.saturating_sub(workers.len());
+                let mut bottom = if ui.session_rail && tall && budget > 0 {
+                    crate::ui::rail::session(
+                        &self.session_id,
+                        title,
+                        &files,
+                        cols as usize,
+                        (rows as usize / 8).clamp(1, 4).min(budget),
+                        theme,
+                    )
+                } else {
+                    Vec::new()
+                };
+                // Drawn top to bottom: rail, workers, attention, then the plan by the composer.
+                bottom.extend(workers);
+                bottom.extend(attention);
+                bottom.extend(plan);
                 if let Some(home) = home {
                     let frame = home.frame(cols, rows.saturating_sub(1), theme, view, bottom);
                     (frame.rows, Some(frame.cursor))
@@ -410,8 +432,10 @@ impl Shell {
     }
 
     /// Re-reads the worker board (throttled to about once a second) and queues finish notices.
-    /// Reads session files, so this runs from the event loop, never from draw. Notices raised while
-    /// the subagent hub or viewer is open are dropped: those views already show the change.
+    /// Reads session files, so this runs from the event loop, never from draw. While the worker
+    /// hub or viewer is open the notices stay queued (those views already show the change) and
+    /// are delivered once it closes, so nothing raised meanwhile is lost. Notices about the worker
+    /// the viewer is showing are dropped instead: the user is already watching it.
     pub(in crate::app) fn refresh_workers(&mut self, app: &App) {
         if self.session_id.is_empty() {
             return;
@@ -426,17 +450,24 @@ impl Shell {
         if !refreshed {
             return;
         }
-        let hub_key = self.keys.label(Action::SubagentsHub);
-        let subagents_open = self.busy_overlay.as_ref().is_some_and(|busy| {
-            matches!(
-                busy.overlay,
-                ActiveOverlay::Subagents(_) | ActiveOverlay::SubagentViewer(_)
-            )
-        });
-        for line in self.workers.take_notices(&hub_key) {
-            if !subagents_open {
-                self.note("Workers", line);
+        let held = self
+            .busy_overlay
+            .as_ref()
+            .and_then(|busy| match &busy.overlay {
+                ActiveOverlay::Subagents(_) => Some(None),
+                ActiveOverlay::SubagentViewer(viewer) => Some(Some(viewer.id().to_owned())),
+                _ => None,
+            });
+        if let Some(viewing) = held {
+            if let Some(id) = viewing {
+                self.workers.drop_notices_for(&id);
             }
+            return;
+        }
+        let hub_key = self.keys.label(Action::SubagentsHub);
+        let open_key = self.keys.label(Action::SubagentsRecent);
+        for line in self.workers.take_notices_with(&hub_key, &open_key) {
+            self.note("Workers", line);
         }
     }
 

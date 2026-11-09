@@ -5,14 +5,17 @@ use crate::agent::{self, Decision, Ui};
 use crate::app::bridge::Bridge;
 use crate::app::notices::RetryNotice;
 use crate::app::shell::TICK;
-use crate::app::shell::prompts::{ATTENTION_HINT, AttentionExit, attention_key};
+use crate::app::shell::prompts::{
+    ATTENTION_HINT, AttentionExit, TypeAhead, attention_key, stop_key,
+};
 use crate::runtime::tool_output::ToolOutput;
 use crate::ui::composer::SteerStage;
 use crate::ui::input::{poll, read};
+use crate::ui::keys::Action;
 use crate::ui::status::Phase;
 use crate::ui::theme::Tok;
 use crate::ui::{tasks, text};
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,28 +40,215 @@ fn request_settings_change(
 struct ApprovalPrompt {
     body: String,
     options: Vec<(&'static str, char, Decision)>,
+    /// What a reusable grant would match, without the lifetime sentence.
+    scope: Option<String>,
 }
 
-/// Choices reflect only scopes the policy owner can actually store.
+/// How to leave an approval: shown under the action so the difference is never a surprise.
+fn deny_hint(keys: &crate::ui::keys::Keymap) -> String {
+    format!(
+        "Esc or n denies · {} denies and stops the turn",
+        keys.label(Action::Interrupt)
+    )
+}
+
+/// The policy owner ends each scope with its lifetime; the option label carries that instead.
+fn grant_matcher(scope: &str) -> &str {
+    scope.split(" Lifetime:").next().unwrap_or(scope).trim()
+}
+
+/// Choices reflect only scopes the policy owner can actually store. The action leads the body;
+/// lifetimes live in the option labels, so the preview is never pushed off-screen.
 fn approval_prompt(
     summary: &str,
     preview: &agent::safety::approval::ApprovalPreview,
+    hint: &str,
 ) -> ApprovalPrompt {
-    let mut body = format!("{summary}\n\nOnce: {}", preview.once);
-    let mut options = vec![("Allow once", 'y', Decision::Allow)];
-    if let Some(scope) = &preview.session {
-        body.push_str(&format!("\n\nSession: {scope}"));
-        options.push(("Allow for this session", 'a', Decision::AllowAlways));
-    }
-    if let Some(scope) = &preview.project {
-        body.push_str(&format!("\n\nProject: {scope}"));
-        options.push(("Allow for this project", 'p', Decision::AllowProject));
+    let mut body = summary.trim_end().to_owned();
+    let scope = preview
+        .session
+        .as_deref()
+        .or(preview.project.as_deref())
+        .map(|scope| grant_matcher(scope).to_owned());
+    if let Some(scope) = &scope {
+        body.push_str(&format!("\n\nA reusable approval would cover: {scope}"));
     }
     if let Some(reason) = &preview.unavailable_reason {
-        body.push_str(&format!("\n\nReusable approval unavailable: {reason}"));
+        body.push_str(&format!("\n\nOne-time approval only: {reason}"));
+    }
+    body.push_str(&format!("\n\n{hint}"));
+    let mut options = vec![("Allow once", 'y', Decision::Allow)];
+    if preview.session.is_some() {
+        options.push((
+            "Allow for this session (not saved)",
+            'a',
+            Decision::AllowAlways,
+        ));
+    }
+    if preview.project.is_some() {
+        options.push((
+            "Allow for this project (saved until revoked)",
+            'p',
+            Decision::AllowProject,
+        ));
     }
     options.push(("Deny", 'n', Decision::Deny));
-    ApprovalPrompt { body, options }
+    ApprovalPrompt {
+        body,
+        options,
+        scope,
+    }
+}
+
+/// One row per change, then how approving and leaving work. Contents never appear here.
+fn batch_prompt(rows: &[String], hint: &str) -> String {
+    format!(
+        "{} changes are ready:\n\n{}\n\nEach approval applies once to that exact change; nothing is saved, and changes can partly succeed.\n\n{hint}",
+        rows.len(),
+        rows.iter()
+            .map(|row| format!("• {row}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+/// The reach of a saved project grant: what it matches, where it applies, how long it lasts,
+/// what still asks and where to undo it.
+fn project_grant_body(scope: Option<&str>, project_root: &std::path::Path) -> String {
+    format!(
+        "Covers: {}\nApplies to: every future session in {}\nLasts: until you revoke it in /permissions\n\nCalls that do not match still ask first. Deny rules still win.",
+        scope.unwrap_or("calls matching this one"),
+        project_root.display()
+    )
+}
+
+/// `ask_user` hotkeys: 1-9 only; later options are reached with the arrows.
+fn ask_user_hotkey(index: usize) -> char {
+    u8::try_from(index)
+        .ok()
+        .filter(|index| *index < 9)
+        .map_or(' ', |index| char::from(b'1' + index))
+}
+
+/// User-facing wording for a policy denial. The model-facing text stays in the tool result.
+fn policy_notice(
+    tool: &str,
+    explanation: &agent::safety::approval::PolicyExplanation,
+) -> Option<String> {
+    use agent::safety::approval::PolicyReason;
+    let scope = explanation
+        .rule_scope
+        .as_deref()
+        .map(|scope| format!(" ({scope})"))
+        .unwrap_or_default();
+    Some(match explanation.reason {
+        PolicyReason::DenyRule => format!(
+            "{tool} was blocked by a deny rule{scope}. Deny rules win over approvals; change it in /permissions."
+        ),
+        PolicyReason::ReadOnly => format!(
+            "{tool} was blocked: the approval mode is read-only, so nothing that changes files or runs commands is allowed."
+        ),
+        PolicyReason::PlanMode => format!(
+            "{tool} was blocked: plan mode only investigates. Approve a plan to start making changes."
+        ),
+        PolicyReason::HookVeto => format!("{tool} was blocked by a pre-tool hook{scope}."),
+        _ => return None,
+    })
+}
+
+impl Bridge<'_> {
+    /// After a prompt closes: show the stop at once when the prompt's stop key raised it.
+    fn settle_prompt(&mut self, was_stopping: bool) {
+        if !was_stopping && self.interrupt.load(Ordering::SeqCst) {
+            self.show_stopping(None);
+        } else {
+            self.repaint(true);
+        }
+    }
+
+    /// Saving a grant for every future session gets its own confirmation.
+    fn confirm_project_grant(
+        &mut self,
+        tool: &str,
+        scope: Option<&str>,
+        cancel: &AtomicBool,
+    ) -> bool {
+        let body = project_grant_body(scope, &self.app.layout.project_root);
+        self.shell.ask_with_cancel(
+            &format!("Save {tool} permission for this project?"),
+            &body,
+            &[("Save for this project", 'p'), ("Back to the choices", 'b')],
+            Some(cancel),
+        ) == Some(0)
+    }
+
+    /// A one-line answer editor for in-turn prompts. Esc cancels; the stop key also stops the
+    /// turn; Enter is ignored briefly after it appears so type-ahead cannot send it.
+    fn line_prompt(&mut self, prompt: &str, title: &str, body: &str) -> Option<String> {
+        let interrupt = self.interrupt.clone();
+        if self.shell.park_pending_input() {
+            interrupt.store(true, Ordering::SeqCst);
+            return None;
+        }
+        let mut editor = crate::ui::editor::Editor::default();
+        let mut guard = TypeAhead::default();
+        loop {
+            if interrupt.load(Ordering::SeqCst) {
+                return None;
+            }
+            let (width, _) = self.shell.term.size();
+            let theme = self.shell.themes.current();
+            let rows = vec![
+                Line::from(Span::styled(
+                    text::clip(prompt, width as usize),
+                    theme.fg(Tok::Warning),
+                )),
+                Line::from(text::clip(&text::one_line(&editor.text), width as usize)),
+                Line::from(text::clip(ATTENTION_HINT, width as usize)),
+            ];
+            if self.shell.paint(Some(rows)).is_err() {
+                return None;
+            }
+            guard.painted(Instant::now());
+            match poll(TICK) {
+                Ok(false) => continue,
+                Err(_) => return None,
+                Ok(true) => {}
+            }
+            match read() {
+                Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                    if attention_key(&key) {
+                        match self.shell.inspect_modal_attention(title, body, || {
+                            interrupt.load(Ordering::SeqCst)
+                        }) {
+                            AttentionExit::Returned => continue,
+                            AttentionExit::Cancelled | AttentionExit::Disconnected => return None,
+                        }
+                    }
+                    if stop_key(&self.shell.keys, &key) {
+                        interrupt.store(true, Ordering::SeqCst);
+                        return None;
+                    }
+                    match key.code {
+                        KeyCode::Enter if guard.blocks(&key, Instant::now()) => {}
+                        KeyCode::Enter => {
+                            if !editor.text.trim().is_empty() {
+                                return Some(editor.text);
+                            }
+                        }
+                        KeyCode::Esc => return None,
+                        _ => {
+                            editor.key_with(key, &self.shell.keys);
+                        }
+                    }
+                }
+                Ok(Event::Paste(value)) => editor.insert(&text::one_line(&value)),
+                Ok(Event::Resize(..)) => self.shell.term.on_resize(),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
 }
 
 impl Ui for Bridge<'_> {
@@ -169,6 +359,11 @@ impl Ui for Bridge<'_> {
     }
 
     fn usage(&mut self, _prompt: Option<u64>, output: Option<u64>, seconds: f64) {
+        // A request that needed provider retries closes its "Retrying" note with one short line.
+        if let Some(attempt) = self.shell.retry_attempt.take() {
+            self.shell
+                .note("Recovered", RetryNotice::recovered_text(attempt));
+        }
         let status = &mut self.shell.status;
         let generation_rate = status
             .model_progress
@@ -224,7 +419,11 @@ impl Ui for Bridge<'_> {
     }
 
     fn tool_progress(&mut self, name: &str, text: &str) {
-        self.shell.transcript.tool_progress(name, text);
+        // Progress names its tool, not its call: it belongs to the newest pending call of that tool,
+        // the same call `tool_output` streams into.
+        if let Some((id, _, _)) = self.pending.iter().rev().find(|(_, tool, _)| tool == name) {
+            self.shell.transcript.tool_progress(id, text);
+        }
         self.repaint(false);
     }
 
@@ -339,6 +538,7 @@ impl Ui for Bridge<'_> {
             self.shell.transcript.bind_tool(&id, body);
         }
         self.pending.push((id, name.to_owned(), Instant::now()));
+        self.shell.status.tool_started = Some(Instant::now());
         self.set_activity(&format!("running {name}"));
         self.repaint(true);
     }
@@ -355,10 +555,10 @@ impl Ui for Bridge<'_> {
                 (format!("call-{}", self.next_id), Instant::now())
             }
         };
-        self.shell.transcript.tool_end(
+        self.shell.transcript.tool_end_with(
             &id,
             &output.text,
-            output.is_error,
+            crate::ui::tool_cards::ToolOutcome::of(output),
             started.elapsed().as_secs_f64(),
         );
         self.attach_write_preview(&id, output);
@@ -366,6 +566,7 @@ impl Ui for Bridge<'_> {
             || "thinking".to_owned(),
             |(_, name, _)| format!("running {name}"),
         );
+        self.shell.status.tool_started = self.pending.last().map(|(_, _, started)| *started);
         self.set_activity(&activity);
         self.repaint(true);
     }
@@ -378,6 +579,7 @@ impl Ui for Bridge<'_> {
         }
         self.pending
             .push((id.to_owned(), name.to_owned(), Instant::now()));
+        self.shell.status.tool_started = Some(Instant::now());
         self.set_activity(&format!("running {name}"));
         self.repaint(true);
     }
@@ -402,10 +604,10 @@ impl Ui for Bridge<'_> {
             .position(|(pending_id, _, _)| pending_id == id)
             .map(|index| self.pending.remove(index).2)
             .unwrap_or_else(Instant::now);
-        self.shell.transcript.tool_end(
+        self.shell.transcript.tool_end_with(
             id,
             &output.text,
-            output.is_error,
+            crate::ui::tool_cards::ToolOutcome::of(output),
             started.elapsed().as_secs_f64(),
         );
         if let Some(data) = &output.data {
@@ -422,6 +624,7 @@ impl Ui for Bridge<'_> {
             || "thinking".to_owned(),
             |(_, name, _)| format!("running {name}"),
         );
+        self.shell.status.tool_started = self.pending.last().map(|(_, _, started)| *started);
         self.set_activity(&activity);
         self.repaint(true);
     }
@@ -453,6 +656,7 @@ impl Ui for Bridge<'_> {
                         ready_at,
                     }
                 });
+            self.shell.retry_attempt = Some(retry.attempt);
             if !std::mem::replace(&mut self.shell.retry_noted, true) {
                 self.shell.note(
                     "Retrying",
@@ -623,22 +827,15 @@ impl Ui for Bridge<'_> {
         tool: &str,
         explanation: &crate::agent::safety::approval::PolicyExplanation,
     ) {
-        use crate::agent::safety::approval::PolicyReason;
-        if matches!(
-            explanation.reason,
-            PolicyReason::DenyRule
-                | PolicyReason::ReadOnly
-                | PolicyReason::PlanMode
-                | PolicyReason::Cancelled
-                | PolicyReason::HookVeto
-        ) {
-            self.notice(&format!("{tool}: {explanation}"));
-        } else {
-            self.diagnostic(&format!("{tool}: {explanation}"));
+        match policy_notice(tool, explanation) {
+            Some(notice) => self.notice(&notice),
+            None => self.diagnostic(&format!("{tool}: {explanation}")),
         }
     }
+    /// Legacy prompts (the plan review among them) still stop the turn on the stop key.
     fn approve(&mut self, tool: &str, summary: &str) -> Decision {
-        self.approve_with_cancel(tool, summary, &std::sync::atomic::AtomicBool::new(false))
+        let interrupt = self.interrupt.clone();
+        self.approve_with_cancel(tool, summary, &interrupt)
     }
 
     fn approve_with_cancel(
@@ -647,36 +844,52 @@ impl Ui for Bridge<'_> {
         summary: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Decision {
-        self.shell.status.phase = Phase::Working;
-        // Capability expansion never offers session/project-wide approval shortcuts.
-        if matches!(tool, "request_directory" | "request_sensitive_directory") {
-            let choice = self.shell.ask_with_cancel(
-                &format!("Allow {tool}?"),
-                summary,
-                &[("Yes — allow this directory", 'y'), ("No — deny", 'n')],
-                Some(cancel),
-            );
-            self.repaint(true);
-            return if choice == Some(0) {
-                Decision::Allow
-            } else {
-                Decision::Deny
-            };
-        }
-        // A direct legacy/capability prompt has no policy-owned reusable matcher.
-        let choice = self.shell.ask_with_cancel(
-            &format!("Allow {tool}?"),
-            &format!("{summary}\n\nOnly this call is approved; no reusable permission is created."),
-            &[("Allow once", 'y'), ("Deny", 'n')],
-            Some(cancel),
-        );
-        let decision = if choice == Some(0) {
+        let phase = std::mem::replace(&mut self.shell.status.phase, Phase::Working);
+        let was_stopping = self.interrupt.load(Ordering::SeqCst);
+        let stop = self.shell.keys.label(Action::Interrupt);
+        let hint = deny_hint(&self.shell.keys);
+        // Capability expansion never offers session/project-wide approval shortcuts, and a
+        // direct legacy prompt has no policy-owned reusable matcher: both allow once only.
+        let (title, body, options) = match tool {
+            "exit_plan" => (
+                crate::app::panel::PLAN_PANEL.to_owned(),
+                format!(
+                    "{}{}\n\nApproving leaves plan mode and starts the work; normal tool approvals still apply.\n\nEsc or n keeps planning · {stop} stops the turn",
+                    summary.trim_end(),
+                    crate::app::panel::MARKDOWN_END,
+                ),
+                [
+                    ("Approve plan", 'y'),
+                    ("Keep planning (give feedback)", 'n'),
+                ],
+            ),
+            "request_directory" | "request_sensitive_directory" => (
+                format!("Allow {tool}?"),
+                format!(
+                    "{}\n\nApplies to this request only.\n\n{hint}",
+                    summary.trim_end()
+                ),
+                [("Allow once", 'y'), ("Deny", 'n')],
+            ),
+            _ => (
+                format!("Allow {tool}?"),
+                format!(
+                    "{}\n\nApplies to this call only; nothing is saved.\n\n{hint}",
+                    summary.trim_end()
+                ),
+                [("Allow once", 'y'), ("Deny", 'n')],
+            ),
+        };
+        let choice = self
+            .shell
+            .ask_with_cancel(&title, &body, &options, Some(cancel));
+        self.shell.status.phase = phase;
+        self.settle_prompt(was_stopping);
+        if choice == Some(0) {
             Decision::Allow
         } else {
             Decision::Deny
-        };
-        self.repaint(true);
-        decision
+        }
     }
 
     fn approve_call_with_preview(
@@ -687,19 +900,85 @@ impl Ui for Bridge<'_> {
         preview: &agent::safety::approval::ApprovalPreview,
         cancel: Option<&AtomicBool>,
     ) -> Decision {
-        let prompt = approval_prompt(summary, preview);
+        let interrupt = self.interrupt.clone();
+        let cancel = cancel.unwrap_or(&interrupt);
+        let was_stopping = self.interrupt.load(Ordering::SeqCst);
+        let prompt = approval_prompt(summary, preview, &deny_hint(&self.shell.keys));
         let choices: Vec<_> = prompt
             .options
             .iter()
             .map(|(label, key, _)| (*label, *key))
             .collect();
-        let choice =
-            self.shell
-                .ask_with_cancel(&format!("Allow {tool}?"), &prompt.body, &choices, cancel);
-        self.repaint(true);
-        choice
-            .and_then(|index| prompt.options.get(index))
-            .map_or(Decision::Deny, |(_, _, decision)| *decision)
+        let decision = loop {
+            let decision = self
+                .shell
+                .ask_with_cancel(
+                    &format!("Allow {tool}?"),
+                    &prompt.body,
+                    &choices,
+                    Some(cancel),
+                )
+                .and_then(|index| prompt.options.get(index))
+                .map_or(Decision::Deny, |(_, _, decision)| *decision);
+            if decision != Decision::AllowProject
+                || self.confirm_project_grant(tool, prompt.scope.as_deref(), cancel)
+            {
+                break decision;
+            }
+            if cancel.load(Ordering::Acquire) {
+                break Decision::Deny;
+            }
+        };
+        self.settle_prompt(was_stopping);
+        decision
+    }
+
+    /// One row per change (tool, target, size), then all, one by one, or none.
+    fn approve_batch(&mut self, calls: &[crate::llm::ToolCall], cancel: &AtomicBool) -> Vec<bool> {
+        if calls.is_empty() || cancel.load(Ordering::Acquire) {
+            return vec![false; calls.len()];
+        }
+        let was_stopping = self.interrupt.load(Ordering::SeqCst);
+        let hint = deny_hint(&self.shell.keys);
+        let rows: Vec<String> = calls
+            .iter()
+            .map(agent::safety::approval::batch_call_line)
+            .collect();
+        let choice = self.shell.ask_with_cancel(
+            &format!("Approve {} changes?", rows.len()),
+            &batch_prompt(&rows, &hint),
+            &[
+                ("Approve all", 'y'),
+                ("Choose one by one", 'c'),
+                ("Deny all", 'n'),
+            ],
+            Some(cancel),
+        );
+        let mut allowed = match choice {
+            Some(0) => vec![true; rows.len()],
+            Some(1) => {
+                let mut allowed = Vec::with_capacity(rows.len());
+                for (index, row) in rows.iter().enumerate() {
+                    let yes = !cancel.load(Ordering::Acquire)
+                        && self.shell.ask_with_cancel(
+                            &format!("Change {} of {}", index + 1, rows.len()),
+                            &format!(
+                                "{row}\n\nApplies to this change only; nothing is saved.\n\n{hint}"
+                            ),
+                            &[("Allow once", 'y'), ("Deny", 'n')],
+                            Some(cancel),
+                        ) == Some(0);
+                    allowed.push(yes);
+                }
+                allowed
+            }
+            _ => vec![false; rows.len()],
+        };
+        if cancel.load(Ordering::Acquire) {
+            allowed = vec![false; rows.len()];
+        }
+        self.settle_prompt(was_stopping);
+        allowed
     }
 
     fn interactive_input(&self) -> bool {
@@ -713,7 +992,8 @@ impl Ui for Bridge<'_> {
     ) -> agent::workflow::questions::QuestionOutcome {
         use crate::app::shell::prompts::{DraftStep, Focus};
         use agent::workflow::questions::QuestionOutcome;
-        let mut dialog = crate::ui::questions::Dialog::new(request, &self.app.layout.project_root);
+        let mut dialog = crate::ui::questions::Dialog::new(request, &self.app.layout.project_root)
+            .with_keys(&self.shell.keys);
         if request.notify && self.shell.ui.notify {
             crate::ui::termcaps::notify(
                 crate::ui::termcaps::NotifyKind::Question,
@@ -722,9 +1002,15 @@ impl Ui for Bridge<'_> {
                 &self.shell.session_id,
             );
         }
-        self.shell.park_pending_input();
+        let was_stopping = self.interrupt.load(Ordering::SeqCst);
+        if self.shell.park_pending_input() {
+            // The stop key arrived before the dialog: stop, never answer.
+            self.show_stopping(None);
+            return QuestionOutcome::Cancelled;
+        }
         let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
         let mut focus = self.shell.initial_focus();
+        let mut guard = TypeAhead::default();
         let outcome = loop {
             if cancel.load(Ordering::SeqCst) || self.interrupt.load(Ordering::SeqCst) {
                 break QuestionOutcome::Cancelled;
@@ -756,6 +1042,7 @@ impl Ui for Bridge<'_> {
             if self.shell.paint(Some(rows)).is_err() {
                 break QuestionOutcome::Disconnected;
             }
+            guard.painted(Instant::now());
             if let Err(error) = dialog.presented() {
                 break QuestionOutcome::Unsupported(error);
             }
@@ -797,15 +1084,22 @@ impl Ui for Bridge<'_> {
                         match self.shell.draft_step(key) {
                             DraftStep::Stay => {}
                             DraftStep::Choices => focus = Focus::Choices,
-                            DraftStep::Cancel => break QuestionOutcome::Cancelled,
+                            DraftStep::Cancel => {
+                                self.interrupt.store(true, Ordering::SeqCst);
+                                break QuestionOutcome::Cancelled;
+                            }
                         }
                         continue;
                     }
-                    if matches!(
-                        key.code,
-                        crossterm::event::KeyCode::Tab | crossterm::event::KeyCode::BackTab
-                    ) {
+                    if stop_key(&self.shell.keys, &key) {
+                        self.interrupt.store(true, Ordering::SeqCst);
+                        break QuestionOutcome::Cancelled;
+                    }
+                    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                         focus = Focus::Draft;
+                        continue;
+                    }
+                    if guard.blocks(&key, Instant::now()) {
                         continue;
                     }
                     if let Some(outcome) = dialog.key(key, &self.shell.keys) {
@@ -822,7 +1116,7 @@ impl Ui for Bridge<'_> {
             }
         };
         self.shell.awaiting_user = was_waiting;
-        self.repaint(true);
+        self.settle_prompt(was_stopping);
         outcome
     }
 
@@ -830,130 +1124,44 @@ impl Ui for Bridge<'_> {
         let mut choices: Vec<(String, char)> = options
             .iter()
             .enumerate()
-            .map(|(index, option)| (option.clone(), char::from(b'1'.wrapping_add(index as u8))))
+            .map(|(index, option)| (option.clone(), ask_user_hotkey(index)))
             .collect();
         choices.push(("Other (type your own)".into(), 'o'));
         let choice_refs: Vec<(&str, char)> = choices
             .iter()
             .map(|(label, key)| (label.as_str(), *key))
             .collect();
-
+        let interrupt = self.interrupt.clone();
+        let was_stopping = interrupt.load(Ordering::SeqCst);
         let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
-        let answer = match self.shell.ask(title, question, &choice_refs) {
-            Some(index) if index < options.len() => Some(options[index].clone()),
-            Some(_) => {
-                let mut editor = crate::ui::editor::Editor::default();
-                let prompt = format!("{} (Enter sends, Esc cancels)", text::one_line(question));
-                let mut answer = None;
-                loop {
-                    let (width, _) = self.shell.term.size();
-                    let theme = self.shell.themes.current();
-                    let rows = vec![
-                        Line::from(Span::styled(
-                            text::clip(&prompt, width as usize),
-                            theme.fg(Tok::Warning),
-                        )),
-                        Line::from(text::clip(&text::one_line(&editor.text), width as usize)),
-                        Line::from(text::clip(ATTENTION_HINT, width as usize)),
-                    ];
-                    if self.shell.paint(Some(rows)).is_err() {
-                        break;
-                    }
-                    match read() {
-                        Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
-                            if attention_key(&key) {
-                                match self
-                                    .shell
-                                    .inspect_modal_attention(title, question, || false)
-                                {
-                                    AttentionExit::Returned => continue,
-                                    AttentionExit::Cancelled | AttentionExit::Disconnected => break,
-                                }
-                            }
-                            match key.code {
-                                KeyCode::Enter => {
-                                    if !editor.text.trim().is_empty() {
-                                        answer = Some(editor.text);
-                                        break;
-                                    }
-                                }
-                                KeyCode::Esc => break,
-                                KeyCode::Char('c')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    break;
-                                }
-                                _ => {
-                                    editor.key(key);
-                                }
-                            }
-                        }
-                        Ok(Event::Paste(value)) => editor.insert(&text::one_line(&value)),
-                        Ok(Event::Resize(..)) => self.shell.term.on_resize(),
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
-                answer
-            }
-            None => None,
-        };
+        let answer =
+            match self
+                .shell
+                .ask_with_cancel(title, question, &choice_refs, Some(&interrupt))
+            {
+                Some(index) if index < options.len() => Some(options[index].clone()),
+                Some(_) => self.line_prompt(
+                    &format!("{} (Enter sends, Esc cancels)", text::one_line(question)),
+                    title,
+                    question,
+                ),
+                None => None,
+            };
         self.shell.awaiting_user = was_waiting;
-        self.repaint(true);
+        self.settle_prompt(was_stopping);
         answer
     }
 
     fn approval_reason(&mut self) -> Option<String> {
-        let mut editor = crate::ui::editor::Editor::default();
-        self.shell.park_pending_input();
+        let was_stopping = self.interrupt.load(Ordering::SeqCst);
         let was_waiting = std::mem::replace(&mut self.shell.awaiting_user, true);
-        let reason = loop {
-            let (width, _) = self.shell.term.size();
-            let theme = self.shell.themes.current();
-            let rows = vec![
-                Line::from(Span::styled(
-                    text::clip(
-                        "Plan denied: feedback (Enter sends, Esc skips)",
-                        width as usize,
-                    ),
-                    theme.fg(Tok::Warning),
-                )),
-                Line::from(text::clip(&text::one_line(&editor.text), width as usize)),
-                Line::from(text::clip(ATTENTION_HINT, width as usize)),
-            ];
-            if self.shell.paint(Some(rows)).is_err() {
-                break None;
-            }
-            let Ok(event) = read() else {
-                break None;
-            };
-            match event {
-                Event::Key(key) if attention_key(&key) => {
-                    match self.shell.inspect_modal_attention("Plan denied: feedback pending", "Return to the feedback field before entering a reason. No plan can be approved here.", || false) {
-                        AttentionExit::Returned => continue,
-                        AttentionExit::Cancelled | AttentionExit::Disconnected => break None,
-                    }
-                }
-                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                    KeyCode::Enter => {
-                        if !editor.text.trim().is_empty() {
-                            break Some(editor.text);
-                        }
-                    }
-                    KeyCode::Esc => break None,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        break None;
-                    }
-                    _ => {
-                        editor.key(key);
-                    }
-                },
-                Event::Paste(value) => editor.insert(&text::one_line(&value)),
-                Event::Resize(..) => self.shell.term.on_resize(),
-                _ => {}
-            }
-        };
+        let reason = self.line_prompt(
+            "Keep planning: what should change? (Enter sends, Esc skips)",
+            "Plan feedback pending",
+            "Return to the feedback field before entering a reason. No plan can be approved here.",
+        );
         self.shell.awaiting_user = was_waiting;
+        self.settle_prompt(was_stopping);
         reason
     }
 }

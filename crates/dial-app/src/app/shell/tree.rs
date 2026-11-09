@@ -22,7 +22,7 @@ impl Shell {
             self.note("Tree", "No messages in this session yet.");
             return Ok(None);
         }
-        let mut picker = Picker::new(nodes);
+        let mut picker = Picker::new(nodes).with_keys(&self.keys);
         // The preview of the node shown last, with the width it was rendered at.
         let mut shown: Option<(String, usize, Preview)> = None;
         loop {

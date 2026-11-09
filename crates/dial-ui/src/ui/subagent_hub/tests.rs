@@ -57,7 +57,7 @@ fn cancel_without_live_control_reports_why() {
     let mut hub = SubagentHub::new("session".into());
     assert_eq!(hub.act("subagent-cancel:task-1", None), None);
     let error = hub.panel.banner_text().expect("banner set");
-    assert!(error.contains("no live subagents"), "{error}");
+    assert!(error.contains("no running workers"), "{error}");
 }
 
 #[test]

@@ -116,7 +116,7 @@ fn pinning_keeps_selection_and_unpinning_restores_activity_order() {
     );
     p.handle(&key(KeyCode::Down, KeyModifiers::NONE), 24);
     assert!(matches!(
-        p.handle(&key(KeyCode::Char('p'), KeyModifiers::CONTROL), 24),
+        p.handle(&key(KeyCode::Char('b'), KeyModifiers::CONTROL), 24),
         Action::Pin(1)
     ));
     p.set_pinned(1, true);
@@ -532,7 +532,7 @@ fn footer_hints_fit_whole_and_only_offer_actions_the_selection_allows() {
     let actions = |p: &Picker| {
         text_of(&p.rows(80, 24, &theme))
             .lines()
-            .find(|row| row.contains("Ctrl+P"))
+            .find(|row| row.contains("Ctrl+B"))
             .unwrap_or_default()
             .to_owned()
     };
@@ -550,9 +550,55 @@ fn footer_hints_fit_whole_and_only_offer_actions_the_selection_allows() {
     for cols in [38, 44, 60, 80, 100, 120] {
         for row in p.rows(cols, 24, &theme) {
             let value: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
-            if value.contains("Esc") || value.contains("Ctrl+P") {
+            if value.contains("Esc") || value.contains("Ctrl+B") {
                 assert!(!value.contains('…'), "{cols}: {value:?}");
             }
         }
     }
+}
+
+#[test]
+fn list_keys_follow_the_keymap_so_ctrl_p_and_ctrl_n_move_instead_of_pinning() {
+    let mut p = Picker::new(
+        vec![session("a", "A", 1), session("b", "B", 1)],
+        vec![],
+        "",
+        "",
+        false,
+    );
+    assert!(matches!(
+        p.handle(&key(KeyCode::Char('n'), KeyModifiers::CONTROL), 24),
+        Action::None
+    ));
+    assert_eq!(p.selected_id(), Some("b"));
+    assert!(matches!(
+        p.handle(&key(KeyCode::Char('p'), KeyModifiers::CONTROL), 24),
+        Action::None
+    ));
+    assert_eq!(p.selected_id(), Some("a"));
+    // A rebound SelectDown moves the list too.
+    let mut keys = crate::ui::keys::Keymap::defaults();
+    keys.rebind(crate::ui::keys::Action::SelectDown, &["Alt+J"])
+        .unwrap();
+    let mut p = p.with_keys(&keys);
+    p.handle(&key(KeyCode::Char('j'), KeyModifiers::ALT), 24);
+    assert_eq!(p.selected_id(), Some("b"));
+}
+
+#[test]
+fn tree_mode_is_titled_session_forks_and_long_lists_show_a_scroll_thumb() {
+    let theme = Theme::dark();
+    let sessions: Vec<_> = (0..30)
+        .map(|i| session(&format!("s{i:02}"), &format!("Session {i}"), 1))
+        .collect();
+    let p = Picker::new(sessions.clone(), vec![], "", "", true);
+    let shown = text_of(&p.rows(80, 24, &theme));
+    assert!(shown.contains("Session forks"), "{shown}");
+    assert!(!shown.contains("Session tree"), "{shown}");
+    let p = Picker::new(sessions, vec![], "", "", false);
+    let shown = text_of(&p.rows(80, 24, &theme));
+    assert!(
+        shown.contains(theme.sym(crate::ui::theme::Sym::ScrollThumb)),
+        "{shown}"
+    );
 }

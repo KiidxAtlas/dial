@@ -175,5 +175,44 @@ pub fn normalize_reply(reply: &mut super::Reply, schemas: &[Value]) {
     }
 }
 
+/// A property whose schema is an object or array but whose value arrived as a JSON string
+/// holding exactly that container (`"repro": "{\"name\": …}"`) is decoded in place, recursively.
+/// A string-accepting or untyped property, and a string that is not such a container, are kept.
+pub fn decode_encoded_containers(args: &mut Value, schema: &Value) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    let properties = &schema["properties"];
+    for (key, value) in object.iter_mut() {
+        let child = &properties[key.as_str()];
+        let accepts = |kind: &str| {
+            child["type"] == kind
+                || child["type"]
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|t| t == kind))
+        };
+        if let Value::String(text) = value
+            && !accepts("string")
+            && let Ok(decoded) = serde_json::from_str::<Value>(text.trim())
+            && ((decoded.is_object() && accepts("object"))
+                || (decoded.is_array() && accepts("array")))
+        {
+            *value = decoded;
+        }
+        if value.is_object() {
+            decode_encoded_containers(value, child);
+        }
+    }
+}
+
+/// Applies [`decode_encoded_containers`] to every call whose offered schema is known.
+pub fn decode_reply_containers(reply: &mut super::Reply, schemas: &[Value]) {
+    for call in &mut reply.tool_calls {
+        if let Some(schema) = schemas.iter().find(|s| s["function"]["name"] == call.name) {
+            decode_encoded_containers(&mut call.arguments, &schema["function"]["parameters"]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

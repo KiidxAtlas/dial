@@ -61,7 +61,13 @@ fn foreground_registration_claims_delivery_and_cleanup_share_one_owner() {
         let sent = agent.peer_coordination(
             &json!({"action":"send","to":peer.id(),"text":"preserve error variants"}),
         );
-        assert_eq!(sent.data.unwrap()["status"], "queued");
+        let receipt = sent.data.unwrap();
+        assert_eq!(receipt["status"], "queued");
+        let delivery = receipt["delivery"].as_str().unwrap();
+        assert!(delivery.contains("accepted into recipient inbox"));
+        assert!(delivery.contains("automatic terminal wake-up is conditional"));
+        assert!(delivery.contains("this receipt does not establish"));
+        assert!(delivery.contains("not acknowledgement"));
         assert_eq!(peer.drain().unwrap()[0].text, "preserve error variants");
         peer.send(&own_id, "Do not treat this as permission")
             .unwrap();

@@ -130,7 +130,13 @@ fn consistent_ux_worker_card_settles_with_its_workers() {
     call.settle("Worker started".into(), None, Phase::Completed);
     transcript.tool_end("spawn", "Worker started", false, 0.1);
     transcript.sync_agents(&[worker.snapshot()], 100);
-    assert!(transcript.take_settled(80, &env.ctx()).is_empty());
+    // The call returned: its card settles at once instead of holding later output back, and the
+    // worker still running is drawn statically, since these rows freeze in scrollback.
+    let settled = text_of(&transcript.take_settled(80, &env.ctx()));
+    assert!(
+        settled.contains("continuing in background") && !settled.contains(env.theme.spinner(0)),
+        "{settled}"
+    );
     worker.settle(
         "Parser drops the final line.".into(),
         None,
@@ -141,8 +147,6 @@ fn consistent_ux_worker_card_settles_with_its_workers() {
         tools_expanded: true,
         ..env.ctx()
     };
-    let settled = text_of(&transcript.take_settled(80, &expanded));
-    assert!(settled.contains("Parser drops the final line."));
     assert!(transcript.take_settled(80, &expanded).is_empty());
 
     transcript.tool_start("status", "task", "Worker status", "");
@@ -820,7 +824,13 @@ fn reasoning_is_muted_italic_prose_or_collapses() {
     assert_eq!(rows[0].spans[1].style, env.theme.fg(Tok::ThinkingText));
     env.ui.show_thinking = false;
     let rows = t.all_rows(40, &env.ctx());
-    assert_eq!(plain(&rows), ["›  reasoning (3 lines)"]);
+    assert_eq!(plain(&rows), ["◇  reasoning · 3 lines hidden"]);
+    // With the keymap's label the collapsed block says how to show it.
+    t.set_thinking_key("Ctrl+T");
+    assert_eq!(
+        plain(&t.all_rows(40, &env.ctx())),
+        ["◇  reasoning · 3 lines (Ctrl+T shows)"]
+    );
 }
 
 #[test]
@@ -839,7 +849,7 @@ fn stats_row_is_dim_and_gated_by_setting() {
     let rows = t.all_rows(80, &env.ctx());
     let line = &plain(&rows)[0];
     assert!(
-        line.contains("26.8s") && line.contains("11K in") && line.contains("59 out"),
+        line.contains("26s") && line.contains("11k in") && line.contains("59 out"),
         "{line}"
     );
     assert!(line.contains("2.2 tok/s"), "measured rate shows: {line}");
@@ -851,7 +861,7 @@ fn stats_row_is_dim_and_gated_by_setting() {
         rows[0]
             .spans
             .iter()
-            .any(|s| s.content.contains("26.8s") && s.style.fg == env.theme.fg(Tok::Muted).fg)
+            .any(|s| s.content.contains("26s") && s.style.fg == env.theme.fg(Tok::Muted).fg)
     );
     env.ui.show_turn_stats = false;
     assert!(t.all_rows(80, &env.ctx()).is_empty());
@@ -916,7 +926,7 @@ fn bash_tool_is_framed_with_output_and_no_bookkeeping() {
     assert!(!text_of(&rows).contains("exit code") && !text_of(&rows).contains("artifact://"));
     // Shell bookkeeping stays out of the body; the run time sits in the bottom edge.
     assert!(
-        text[3].starts_with("╰─") && text[3].contains("0.06s"),
+        text[3].starts_with("╰─") && text[3].contains("0.1s"),
         "{text:?}"
     );
     // Top edge, two output rows, bottom edge: nothing else.
@@ -981,7 +991,12 @@ fn tool_gutter_marks_running_settled_and_failed_calls() {
             .style
             .fg
     };
-    assert_eq!(pending[0].spans[0].style.fg, env.theme.fg(Tok::Accent).fg);
+    // Commands are framed from the start, so the spinner already leads the top edge.
+    assert_eq!(
+        glyph(&pending, env.theme.spinner(0)),
+        env.theme.fg(Tok::Accent).fg
+    );
+    assert!(plain(&pending)[0].starts_with("╭─ "));
     assert_eq!(glyph(&ok, "·"), env.theme.fg(Tok::Dim).fg);
     assert_eq!(glyph(&err, "✗"), env.theme.fg(Tok::Error).fg);
     assert!(plain(&ok)[0].starts_with("╭─ ·"));
@@ -1006,7 +1021,7 @@ fn pending_spinner_animates_with_tick() {
     };
     let (a, b) = (frame(0), frame(1));
     assert_ne!(a, b);
-    assert!(a[1].contains(env.theme.spinner(0)) && b[1].contains(env.theme.spinner(1)));
+    assert!(a[0].contains(env.theme.spinner(0)) && b[0].contains(env.theme.spinner(1)));
     let compact = a.iter().find(|l| l.contains("Read")).unwrap();
     let after_rail = |l: &str| l.trim_start_matches('│').trim_start().to_owned();
     assert!(
@@ -1180,7 +1195,7 @@ fn edit_output_colors_diff_lines_and_hashline_previews() {
     );
     assert!(
         text.iter()
-            .any(|r| r.starts_with("╰─") && r.contains("0.50s")),
+            .any(|r| r.starts_with("╰─") && r.contains("0.5s")),
         "{text:?}"
     );
 }
@@ -1310,7 +1325,7 @@ fn title_falls_back_to_the_call_arguments() {
     t.tool_start("2", "write", "", r#"{"path":"out/a.txt"}"#);
     let text = text_of(&t.all_rows(50, &env.ctx()));
     assert!(
-        text.contains("Run") && text.contains("echo hi") && text.contains("out/a.txt"),
+        text.contains("$ echo hi") && text.contains("out/a.txt"),
         "{text}"
     );
 }
@@ -1322,7 +1337,8 @@ fn long_commands_are_compact_and_expand_to_the_full_target() {
     t.tool_start("1", "bash", &"word ".repeat(80), "");
     let rows = t.all_rows(30, &env.ctx());
     assert_fits(&rows, 30);
-    assert_eq!(rows.len(), 1, "{:?}", plain(&rows));
+    // A running command is framed from the start: its top and bottom edges.
+    assert_eq!(rows.len(), 2, "{:?}", plain(&rows));
     let expanded = t.all_rows(
         30,
         &TranscriptCtx {
@@ -2400,4 +2416,157 @@ fn answered_footer_is_neutral_and_keeps_open_work_visible() {
     assert_eq!(mark.style, env.ctx().theme.fg(Tok::Muted));
     assert!(mark.content.contains(env.ctx().theme.sym(Sym::Dot)));
     assert!(!mark.content.contains(env.ctx().theme.sym(Sym::Check)));
+}
+
+// ---- stopped calls, animation, progress routing, replayed harness text, streaming cuts ----
+
+#[test]
+fn stopped_calls_render_muted_with_their_own_word_not_as_failures() {
+    let env = Env::new();
+    for (outcome, word, failed) in [
+        (ToolOutcome::Denied, "denied", false),
+        (ToolOutcome::Cancelled, "stopped", false),
+        (ToolOutcome::Failed, "failed", true),
+    ] {
+        let mut t = Transcript::new();
+        t.tool_start("1", "read", "src/a.rs", "");
+        t.tool_end_with("1", "denied by the user.", outcome, 0.0);
+        let rows = t.all_rows(80, &env.ctx());
+        let head = &plain(&rows)[0];
+        assert!(head.contains(word), "{head}");
+        let mark = &rows[0].spans[0];
+        assert_eq!(
+            mark.style.fg == env.theme.fg(Tok::Error).fg,
+            failed,
+            "{head}"
+        );
+        assert_eq!(
+            mark.content.contains(env.theme.sym(Sym::Interrupted)),
+            !failed,
+            "{head}"
+        );
+    }
+}
+
+#[test]
+fn every_spinner_on_a_cached_card_moves_and_breathes_per_tick() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.tool_start("spawn", "task", "two workers", "");
+    t.tool_data(
+        "spawn",
+        &serde_json::json!([
+            {"name":"scout","status":"running"},
+            {"name":"tester","status":"running"}
+        ]),
+    );
+    let at = |tick: u64| t.all_rows(80, &TranscriptCtx { tick, ..env.ctx() });
+    let _ = at(0); // fills the render cache
+    let tick = 7;
+    let rows = at(tick);
+    let spinners: Vec<_> = rows
+        .iter()
+        .flat_map(|r| &r.spans)
+        .filter(|s| s.content == env.theme.spinner(tick))
+        .collect();
+    // The call's own spinner and both workers'.
+    assert_eq!(spinners.len(), 3, "{:?}", plain(&rows));
+    let want = spinner_style(&env.theme, tick).fg;
+    assert!(spinners.iter().all(|s| s.style.fg == want));
+    assert!(
+        !text_of(&rows).contains(env.theme.spinner(0)),
+        "{:?}",
+        plain(&rows)
+    );
+}
+
+#[test]
+fn a_running_call_shows_its_live_elapsed_time() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.tool_start("1", "read", "src/a.rs", "");
+    assert!(!text_of(&t.all_rows(80, &env.ctx())).contains("3s"));
+    t.blocks[0].started = Some(Instant::now() - Duration::from_secs(3));
+    let rows = text_of(&t.all_rows(80, &env.ctx()));
+    assert!(rows.contains("3s"), "{rows}");
+}
+
+#[test]
+fn progress_reaches_only_the_call_it_belongs_to() {
+    let mut t = Transcript::new();
+    t.tool_start("1", "bash", "gh run watch 1", "");
+    t.tool_start("2", "bash", "gh run watch 2", "");
+    t.tool_progress("1", "run 1: 3/5 jobs");
+    let progress = |i: usize| match &t.blocks[i].kind {
+        Kind::Tool(tool) => tool.progress.clone(),
+        _ => None,
+    };
+    assert_eq!(progress(0).as_deref(), Some("run 1: 3/5 jobs"));
+    assert_eq!(progress(1), None);
+}
+
+#[test]
+fn replayed_harness_messages_are_never_shown_as_the_users_words() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    let mut replay = Replay::default();
+    for message in [
+        serde_json::json!({"role":"user","content":"fix the parser"}),
+        serde_json::json!({"role":"user","dial_reminder":"reasoning","content":"Call a tool next."}),
+        serde_json::json!({"role":"user","content":"<dial-notice kind=\"tool_call_cycle\">\nStop cycling.\n</dial-notice>"}),
+        serde_json::json!({"role":"user","dial_transient":true,"content":"carried notes"}),
+        serde_json::json!({"role":"user","content":"Recovery direction from the user: Try the lexer\nResume the existing task."}),
+    ] {
+        replay.push(&mut t, &message);
+    }
+    let typed: Vec<String> = t
+        .blocks
+        .iter()
+        .filter_map(|b| match &b.kind {
+            Kind::User(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(typed, ["fix the parser", "Try the lexer"]);
+    let text = text_of(&t.all_rows(100, &env.ctx()));
+    assert!(
+        text.contains("Call a tool next.") && text.contains("Stop cycling."),
+        "{text}"
+    );
+    assert!(
+        !text.contains("dial-notice") && !text.contains("carried notes"),
+        "{text}"
+    );
+}
+
+#[test]
+fn streaming_replies_with_tabs_and_links_still_freeze_their_head() {
+    let env = Env::new();
+    let raw = "a\tb [link](x) and Vec<T>\n\nSecond paragraph\n\nThird\n";
+    let mut stream = StreamingRows::default();
+    let rows = stream.render(raw, 60, &env.theme);
+    assert!(stream.cut > 0, "a tab used to disable every cut");
+    assert_eq!(&raw[..stream.cut], stream.head);
+    assert_eq!(*rows, answer_rows(raw, 60, &env.theme, true));
+    // The mapping back to raw offsets refuses a prefix that does not sanitize to the same text.
+    let clean = text::sanitize(raw);
+    let cut = clean.find("Second").unwrap();
+    assert_eq!(raw_offset(raw, &clean, cut), raw.find("Second"));
+}
+
+#[test]
+fn a_failure_shows_its_last_lines_under_the_earlier_lines_hint() {
+    let mut env = Env::new();
+    env.ui.tool_output_lines = 3;
+    let output: Vec<String> = (1..=10).map(|n| format!("error line {n}")).collect();
+    let mut t = Transcript::new();
+    t.tool_start("1", "read", "src/a.rs", "");
+    t.tool_end("1", &output.join("\n"), true, 0.0);
+    let text = plain(&t.all_rows(80, &env.ctx()));
+    assert!(
+        text[1].contains("7 earlier lines (Ctrl+O expands)"),
+        "{text:?}"
+    );
+    assert!(text.last().unwrap().contains("error line 10"), "{text:?}");
+    assert!(!text.iter().any(|l| l.contains("error line 7")), "{text:?}");
 }

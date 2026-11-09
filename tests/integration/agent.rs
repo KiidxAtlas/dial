@@ -5408,7 +5408,9 @@ fn a_worker_edits_through_the_parents_approval_and_checkpoints() {
         reason: dial::agent::safety::approval::PolicyReason::PromptRequired,
         rule_scope: None,
     };
-    assert!(ui.summaries[1].starts_with(&format!("[worker] f.txt\n{policy}")));
+    // The prompt leads with the worker's action; the generic policy line is no longer repeated.
+    assert!(ui.summaries[1].starts_with("[worker] f.txt\n"));
+    assert!(!ui.summaries[1].contains(&policy.to_string()));
     for choice in ["Once:", "Session:", "Project:"] {
         assert!(ui.summaries[1].contains(choice));
     }

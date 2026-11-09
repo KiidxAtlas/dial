@@ -7,7 +7,7 @@
 //! A session can share the manager with successive panels, so closing a view does not stop work;
 //! dropping the last owner cancels it. Enter on an installed model or embedding model returns a
 //! [`Step`] for the panel to turn into the same assignment or setup event as `/models`.
-use super::settings::{filled, fit, hint, pair_label, selected_fill, typed_char};
+use super::settings::{filled, fit, hint, list_row, pair_label, typed_char};
 use crate::config::paths::Layout;
 use crate::llm::catalog::ModelEntry;
 use crate::llm::download::{self, Choice, Family, Hit, Quant};
@@ -562,12 +562,7 @@ impl ModelDownloads {
             let room = height.saturating_sub(out.len());
             let start = window_start(picker.cursor, room);
             for (index, quant) in picker.quants.iter().enumerate().skip(start).take(room) {
-                let fill = if index == picker.cursor {
-                    selected_fill(theme)
-                } else {
-                    Style::default()
-                };
-                out.push(quant_line(quant, theme, width, fill));
+                out.push(quant_line(quant, theme, width, index == picker.cursor));
             }
             out.truncate(height);
             return out;
@@ -1571,13 +1566,6 @@ impl ModelDownloads {
             )
         };
         let selected = |at: usize| self.focus == Focus::Results && at == cursor;
-        let fill = |at: usize| {
-            if selected(at) {
-                selected_fill(theme)
-            } else {
-                Style::default()
-            }
-        };
         let mut rows = Vec::new();
         match self.shelf {
             Shelf::Hub(_) | Shelf::Memory | Shelf::EmbeddingHub | Shelf::Images => {
@@ -1600,17 +1588,18 @@ impl ModelDownloads {
                     let hit = &self.hits[index];
                     rows.push((
                         Some(at),
-                        filled(hit_spans(hit, theme, width), width, fill(at)),
+                        list_row(theme, hit_spans(hit, theme, width), width, selected(at)),
                     ));
                     rows.push((
                         None,
-                        filled(
+                        list_row(
+                            theme,
                             vec![Span::styled(
                                 format!("   {}", hit_metadata(hit, crate::stats::now_ms() / 1000)),
                                 theme.fg(Tok::Muted),
                             )],
                             width,
-                            fill(at),
+                            selected(at),
                         ),
                     ));
                     at += 1;
@@ -1634,7 +1623,7 @@ impl ModelDownloads {
                     if let Some(row) = self.dashboard.models.get(index) {
                         rows.push((
                             Some(at),
-                            filled(list_spans(row, theme, width), width, fill(at)),
+                            list_row(theme, list_spans(row, theme, width), width, selected(at)),
                         ));
                     }
                     at += 1;
@@ -1651,10 +1640,11 @@ impl ModelDownloads {
                 for index in discovered {
                     rows.push((
                         Some(at),
-                        filled(
+                        list_row(
+                            theme,
                             discovered_spans(&self.discovered[index], theme, width),
                             width,
-                            fill(at),
+                            selected(at),
                         ),
                     ));
                     at += 1;
@@ -1673,10 +1663,11 @@ impl ModelDownloads {
                         .map(|names| embeddings::has_model(names, model.name));
                     rows.push((
                         Some(at),
-                        filled(
+                        list_row(
+                            theme,
                             embedding_spans(model, pulled, theme, width),
                             width,
-                            fill(at),
+                            selected(at),
                         ),
                     ));
                     at += 1;
@@ -1696,13 +1687,14 @@ impl Drop for ModelDownloads {
     }
 }
 
-fn quant_line(quant: &Quant, theme: &Theme, width: usize, fill: Style) -> Line<'static> {
+fn quant_line(quant: &Quant, theme: &Theme, width: usize, selected: bool) -> Line<'static> {
     let label = text::pad(
         &text::ellipsize(&text::one_line(&quant.label), 28, theme.ascii()),
         28,
     );
     let files = quant.files.len();
-    filled(
+    list_row(
+        theme,
         vec![Span::styled(
             format!(
                 " {label} {:>9}  {files} file{}",
@@ -1712,7 +1704,7 @@ fn quant_line(quant: &Quant, theme: &Theme, width: usize, fill: Style) -> Line<'
             theme.fg(Tok::Text),
         )],
         width,
-        fill,
+        selected,
     )
 }
 

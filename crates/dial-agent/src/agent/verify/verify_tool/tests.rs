@@ -200,34 +200,38 @@ fn before_any_change_it_lists_checks_and_runs_only_a_named_baseline() {
     assert_eq!(agent.step_checks.evidence.latest_status(LINT), None);
 }
 
+/// `targets: []` is the omitted selection, not an error: before any change both run nothing,
+/// report the same selection and record no pass or prediction.
 #[test]
-fn empty_check_selection_cannot_report_a_pass_or_a_prediction() {
-    for mutations in [0, 1] {
-        let root = tempfile::tempdir().unwrap();
-        let mut config = config();
-        config.experimental.check_predictions = true;
-        let mut agent = hermetic_agent(&config, root.path());
-        agent.step_checks.mutations = mutations;
-        let before = agent
+fn empty_targets_mean_the_gate_selection_and_cannot_report_a_pass_or_a_prediction() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config();
+    config.experimental.check_predictions = true;
+    let mut agent = hermetic_agent(&config, root.path());
+    let before = agent
+        .step_checks
+        .evidence
+        .snapshot(agent.step_checks.revision());
+    let empty = agent.verify_tool(&json!({"targets":[], "expect":"pass"}), &mut NullUi);
+    let omitted = agent.verify_tool(&json!({"expect":"pass"}), &mut NullUi);
+    assert_eq!(empty.text, omitted.text);
+    assert_eq!(empty.is_error, omitted.is_error);
+    assert!(empty.text.contains("runs nothing"), "{}", empty.text);
+    assert!(
+        empty
+            .data
+            .as_ref()
+            .is_none_or(|data| data.get("prediction").is_none()),
+        "no execution or prediction occurred: {:?}",
+        empty.data
+    );
+    assert_eq!(
+        agent
             .step_checks
             .evidence
-            .snapshot(agent.step_checks.revision());
-        let out = agent.verify_tool(&json!({"targets":[], "expect":"pass"}), &mut NullUi);
-        assert!(
-            out.is_error,
-            "an empty selection is not verification: {}",
-            out.text
-        );
-        assert!(out.text.contains("omit targets"), "{}", out.text);
-        assert!(out.data.is_none(), "no execution or prediction occurred");
-        assert_eq!(
-            agent
-                .step_checks
-                .evidence
-                .snapshot(agent.step_checks.revision()),
-            before
-        );
-    }
+            .snapshot(agent.step_checks.revision()),
+        before
+    );
 }
 
 #[test]

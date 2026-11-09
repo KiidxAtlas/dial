@@ -8,8 +8,8 @@
 use super::{
     DrawCtx, OverlayEvent,
     settings::{
-        Axis, arrows, editor_spans, filled, fit, hint, hint_line, other_scope, pair_label, panel,
-        pressed, scope_name,
+        Axis, arrows, editor_spans, fit, hint, hint_line, other_scope, pair_label, panel, pressed,
+        scope_name,
     },
 };
 use crate::{
@@ -844,7 +844,7 @@ impl ModelSettingsOverlay {
             ),
         ];
         if selected {
-            filled(spans, w, theme.bg(Tok::SelectedBg))
+            crate::ui::chrome::selected_row(theme, spans, w)
         } else {
             Line::from(fit(spans, w))
         }
@@ -1032,7 +1032,7 @@ impl ModelSettingsOverlay {
                 }
                 return self.apply(&text);
             }
-            if editor.key(*key) {
+            if editor.key_with(*key, keys) {
                 self.message = None;
             }
             return OverlayEvent::None;
@@ -1294,7 +1294,6 @@ impl ModelSettingsOverlay {
             .max()
             .unwrap_or(10)
             .min(w.saturating_sub(12).max(8));
-        let fill = theme.bg(Tok::SelectedBg);
         for (section, index) in rows.iter().skip(self.scroll).take(list_h) {
             if let Some(name) = section {
                 let rule = theme.sym(Sym::BoxH);
@@ -1357,7 +1356,7 @@ impl ModelSettingsOverlay {
                 spans.push(Span::styled(" (unsupported)", dim));
             }
             out.push(if selected {
-                filled(spans, w, fill)
+                crate::ui::chrome::selected_row(theme, spans, w)
             } else {
                 Line::from(fit(spans, w))
             });

@@ -1,18 +1,29 @@
 //! Read-only statistics tabs. The application supplies reports from the existing stats database.
+use super::settings::{Axis, arrows, hint, hint_line, panel, scroll_cell, tab_strip};
 use super::{DrawCtx, OverlayEvent, panel_keys};
-use crate::ui::keys::{Action, Keymap};
+use crate::ui::{
+    chrome::Section,
+    keys::{Action, Keymap},
+    text,
+    theme::Tok,
+};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::{
     Frame,
-    widgets::{Block, Borders, Paragraph, Wrap},
+    text::{Line, Span},
 };
 
 pub struct StatsOverlay {
     tabs: Vec<(&'static str, String)>,
     active: usize,
+    /// First visible wrapped row of the report.
     scroll: usize,
     query: String,
     searching: bool,
+    /// Wrapped report rows and visible body rows from the last draw, so keys page and clamp by
+    /// what is on screen.
+    total: usize,
+    page: usize,
     panel_keys: panel_keys::PanelKeys,
 }
 
@@ -24,6 +35,8 @@ impl StatsOverlay {
             scroll: 0,
             query: String::new(),
             searching: false,
+            total: 0,
+            page: 10,
             panel_keys: panel_keys::PanelKeys::default(),
         }
     }
@@ -38,8 +51,12 @@ impl StatsOverlay {
             .collect()
     }
 
+    fn max_scroll(&self) -> usize {
+        self.total.saturating_sub(self.page)
+    }
+
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
-        if self.panel_keys.handle(event, self.searching, false) {
+        if self.panel_keys.handle_key(event, self.searching) {
             return OverlayEvent::None;
         }
         let Event::Key(key) = event else {
@@ -86,56 +103,127 @@ impl StatsOverlay {
         } else if key.code == KeyCode::Char('/') {
             self.searching = true;
         } else if keys.matches(Action::SelectDown, key) {
-            self.scroll = (self.scroll + 1).min(self.lines().len().saturating_sub(1));
+            self.scroll = (self.scroll + 1).min(self.max_scroll());
         } else if keys.matches(Action::SelectUp, key) {
             self.scroll = self.scroll.saturating_sub(1);
         } else if keys.matches(Action::SelectPageDown, key) {
-            self.scroll = self
-                .scroll
-                .saturating_add(10)
-                .min(self.lines().len().saturating_sub(1));
+            self.scroll = self.scroll.saturating_add(self.page).min(self.max_scroll());
         } else if keys.matches(Action::SelectPageUp, key) {
-            self.scroll = self.scroll.saturating_sub(10);
+            self.scroll = self.scroll.saturating_sub(self.page);
+        } else if key.code == KeyCode::Home {
+            self.scroll = 0;
+        } else if key.code == KeyCode::End {
+            self.scroll = self.max_scroll();
         }
         OverlayEvent::None
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        if self.panel_keys.draw(frame, ctx, "Stats", "↑/↓ scroll · PgUp/PgDn page\nReports are a cross-session database snapshot, not live provider quotas. /usage shows quotas; /cost shows the current runtime session.", true, true) { return; }
-        let tabs = self
+        if self.panel_keys.draw(
+            frame,
+            ctx,
+            "Stats",
+            "Home/End jump to the top or bottom of the report.\nReports are a cross-session database snapshot, not live provider quotas. /usage shows quotas; /cost shows the current runtime session.",
+            true,
+            true,
+        ) {
+            return;
+        }
+        let extra = self
             .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, (label, _))| {
-                if i == self.active {
-                    format!("[{label}]")
-                } else {
-                    (*label).to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let title = format!("Stats · {tabs}");
-        let footer = if self.searching {
-            format!("Search: {}_ · Enter browse · Esc clear", self.query)
-        } else {
-            "Tab tabs · / search · ↑/↓ scroll · ? keys · Esc close".into()
-        };
-        let text = self
+            .get(self.active)
+            .map(|_| format!("{}/{}", self.active + 1, self.tabs.len()))
+            .unwrap_or_default();
+        panel(frame, ctx.theme, Section::Dial, "Stats", &extra, |w, h| {
+            self.rows(usize::from(w), usize::from(h), ctx)
+        });
+    }
+
+    /// Tab strip, the search line while one is typed, the wrapped report with a scroll indicator,
+    /// and the key hints.
+    fn rows(&mut self, w: usize, h: usize, ctx: &DrawCtx) -> Vec<Line<'static>> {
+        let theme = ctx.theme;
+        let names: Vec<&str> = self.tabs.iter().map(|(name, _)| *name).collect();
+        let mut out = vec![
+            tab_strip(theme, &names, self.active, true, w),
+            Line::default(),
+        ];
+        if self.searching || !self.query.is_empty() {
+            let mut spans = vec![
+                Span::styled(" Search  ", theme.fg(Tok::Accent)),
+                Span::styled(text::one_line(&self.query), theme.fg(Tok::Text)),
+            ];
+            if self.searching {
+                spans.push(Span::styled(
+                    " ",
+                    theme
+                        .fg(Tok::Text)
+                        .add_modifier(ratatui::style::Modifier::REVERSED),
+                ));
+            }
+            out.push(Line::from(spans));
+        }
+        let text_w = w.saturating_sub(3).max(1);
+        let report: Vec<String> = self
             .lines()
             .into_iter()
-            .skip(self.scroll)
-            .collect::<Vec<_>>()
-            .join("\n");
-        frame.render_widget(
-            Paragraph::new(text).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .title_bottom(footer),
-            ),
-            frame.area(),
-        );
+            .flat_map(|line| {
+                if line.is_empty() {
+                    vec![String::new()]
+                } else {
+                    text::wrap_words(line, text_w)
+                }
+            })
+            .collect();
+        let body_h = h.saturating_sub(out.len() + 1);
+        self.total = report.len();
+        self.page = body_h.max(1);
+        self.scroll = self.scroll.min(self.max_scroll());
+        if report.is_empty() {
+            let message = if self.query.is_empty() {
+                "Nothing recorded for this report yet."
+            } else {
+                "No lines match the search. Esc clears it."
+            };
+            out.push(Line::from(Span::styled(
+                format!(" {message}"),
+                theme.fg(Tok::Muted),
+            )));
+        }
+        for (row, value) in report.iter().skip(self.scroll).take(body_h).enumerate() {
+            let pad = text_w.saturating_sub(text::width(value));
+            out.push(Line::from(vec![
+                Span::styled(format!(" {value}{} ", " ".repeat(pad)), theme.fg(Tok::Text)),
+                scroll_cell(theme, row, body_h, report.len(), self.scroll),
+            ]));
+        }
+        out.truncate(h.saturating_sub(1));
+        out.resize(h.saturating_sub(1), Line::default());
+        let keys = ctx.keys;
+        let hints = if self.searching {
+            vec![
+                "Enter keep results".to_owned(),
+                hint(keys, Action::SelectCancel, "clear search"),
+            ]
+        } else {
+            vec![
+                format!("{} scroll", arrows(theme, Axis::Vertical)),
+                "Tab tabs".to_owned(),
+                "/ search".to_owned(),
+                "? keys".to_owned(),
+                hint(
+                    keys,
+                    Action::SelectCancel,
+                    if self.query.is_empty() {
+                        "close"
+                    } else {
+                        "clear search"
+                    },
+                ),
+            ]
+        };
+        out.push(hint_line(theme, &hints, w));
+        out
     }
 }
 

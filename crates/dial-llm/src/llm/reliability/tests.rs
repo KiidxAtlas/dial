@@ -288,3 +288,35 @@ fn keyword_named_properties_and_payload_data_keep_their_keys() {
     );
     assert_eq!(canonical, tool(parameters));
 }
+
+#[test]
+fn string_encoded_object_and_array_fields_are_decoded_only_where_the_schema_wants_them() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "repro": {"type": "object", "properties": {"steps": {"type": "array"}}},
+            "targets": {"type": "array"},
+            "command": {"type": "string"},
+            "free": {}
+        }
+    });
+    let mut args = json!({
+        "repro": "{\"name\": \"x\", \"steps\": \"[1, 2]\"}",
+        "targets": " [\"a\"] ",
+        "command": "{\"not\": \"decoded\"}",
+        "free": "[1]"
+    });
+    super::decode_encoded_containers(&mut args, &schema);
+    assert_eq!(
+        args,
+        json!({
+            "repro": {"name": "x", "steps": [1, 2]},
+            "targets": ["a"],
+            "command": "{\"not\": \"decoded\"}",
+            "free": "[1]"
+        })
+    );
+    let mut mismatched = json!({"repro": "[1]", "targets": "not json"});
+    super::decode_encoded_containers(&mut mismatched, &schema);
+    assert_eq!(mismatched, json!({"repro": "[1]", "targets": "not json"}));
+}

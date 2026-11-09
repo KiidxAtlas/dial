@@ -826,9 +826,8 @@ impl<'a> Agent<'a> {
             );
             Ok(())
         };
-        if let Err(denial) = &result {
-            ui.notice(denial.message());
-        }
+        // The denial text is model-facing and travels in the tool result. The user already saw
+        // the policy explanation, or made the decision themselves; no duplicate notice here.
         result
     }
 
@@ -1289,7 +1288,7 @@ impl<'a> Agent<'a> {
             && let Err(denial) = self.authorize_call_from(call, provenance, ui)
         {
             *approval_denied = true;
-            return denied(denial.message());
+            return denied(denial.message_in(self.plan_mode));
         }
         if call.name == "request_directory" {
             return self.request_directory(call, ui);
@@ -1318,10 +1317,15 @@ impl<'a> Agent<'a> {
                         text: "Plan approved; implementation is now permitted subject to normal tool approvals.".into(), is_error: false };
                 }
                 Decision::Deny => {
+                    // Ctrl+C at the plan prompt stops the turn: no second feedback prompt.
+                    let feedback = if self.interrupt.load(Ordering::SeqCst) {
+                        None
+                    } else {
+                        ui.approval_reason()
+                    };
                     return denied(&format!(
                         "Plan rejected; remain in plan mode. {}",
-                        ui.approval_reason()
-                            .unwrap_or_else(|| "Ask the user what to revise.".into())
+                        feedback.unwrap_or_else(|| "Ask the user what to revise.".into())
                     ));
                 }
             }
@@ -1332,7 +1336,7 @@ impl<'a> Agent<'a> {
             {
                 ui.notice(&format!("tool denial was not journaled: {error:#}"));
             }
-            return denied(denial.message());
+            return denied(denial.message_in(self.plan_mode));
         }
         if self.interrupt.load(Ordering::SeqCst) {
             return interrupted_tool();

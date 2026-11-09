@@ -176,3 +176,44 @@ fn cancelled_restored_selection_preserves_draft_and_waiting_state() {
     );
     assert_eq!(shell.composer.draft(), "unfinished review follow-up");
 }
+
+#[test]
+fn type_ahead_guard_blocks_only_early_answers() {
+    let key = |code, modifiers| KeyEvent::new(code, modifiers);
+    let mut guard = TypeAhead::default();
+    let start = Instant::now();
+    // Before the first paint every answer key is blocked.
+    assert!(guard.blocks(&key(KeyCode::Enter, KeyModifiers::NONE), start));
+    guard.painted(start);
+    guard.painted(start + TYPE_AHEAD_GUARD); // later paints keep the first time
+    let early = start + TYPE_AHEAD_GUARD / 2;
+    let late = start + TYPE_AHEAD_GUARD;
+    // (key, blocked early)
+    let cases = [
+        (key(KeyCode::Enter, KeyModifiers::NONE), true),
+        (key(KeyCode::Char('p'), KeyModifiers::NONE), true),
+        (key(KeyCode::Char('Y'), KeyModifiers::SHIFT), true),
+        (key(KeyCode::Char('c'), KeyModifiers::CONTROL), false),
+        (key(KeyCode::Esc, KeyModifiers::NONE), false),
+        (key(KeyCode::Down, KeyModifiers::NONE), false),
+        (key(KeyCode::Tab, KeyModifiers::NONE), false),
+    ];
+    for (event, blocked) in cases {
+        assert_eq!(guard.blocks(&event, early), blocked, "{event:?}");
+        assert!(!guard.blocks(&event, late), "{event:?}");
+    }
+}
+
+#[test]
+fn stop_key_is_ctrl_c_or_the_interrupt_binding_but_never_esc() {
+    let mut keys = crate::ui::keys::Keymap::defaults();
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(stop_key(&keys, &ctrl_c));
+    assert!(!stop_key(&keys, &esc));
+    keys.rebind(Action::Interrupt, &["Esc"]).unwrap();
+    assert!(!stop_key(&keys, &esc), "Esc stays cancel-this-prompt");
+    let mut release = ctrl_c;
+    release.kind = KeyEventKind::Release;
+    assert!(!stop_key(&keys, &release));
+}

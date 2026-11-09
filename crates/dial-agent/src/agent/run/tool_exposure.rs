@@ -1300,13 +1300,15 @@ impl Agent<'_> {
     /// Offer the eligible tools that match an observed gap, for the next round only. The caller keeps
     /// `spent`, so one gap activates at most once per turn and a repeated gap cannot churn the working
     /// set. No model call, no execution and no permission change; pinned, hermetic and explicitly
-    /// unloaded tools are left alone. Returns the names newly offered.
+    /// unloaded tools are left alone, and a stable offer never changes outside `tool_load`, so a gap
+    /// there activates nothing rather than failing the turn. Returns the names newly offered.
     pub(in crate::agent) fn activate_gap_capabilities(
         &mut self,
         gap: CapabilityGap,
         spent: &mut BTreeSet<CapabilityGap>,
     ) -> Result<Vec<String>> {
         if self.hermetic
+            || self.stable_tool_offer()
             || self.config.harness.tools != config::tools::default_tools()
             || spent.contains(&gap)
         {

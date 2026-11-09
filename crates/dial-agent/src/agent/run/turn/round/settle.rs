@@ -356,6 +356,12 @@ impl Agent<'_> {
                 output.text.push_str(&advice);
             }
         }
+        if let Some(notice) = crate::agent::run::failure_guidance::directory_request_unavailable(
+            &output,
+            !self.hermetic && ui.interactive_input(),
+        ) {
+            output.text.push_str(&notice);
+        }
         // A command that outlived its bash call is only reachable through `bg`. Load it for the
         // next request (the stable offer through the `tool_load` owner) instead of asking the
         // model to spend a round on `tool_load`.

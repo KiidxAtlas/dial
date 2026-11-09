@@ -113,3 +113,40 @@ fn corrupt_or_future_stamps_do_not_suppress_checks() {
         assert!(notice.notice().is_some(), "{stamp:?}");
     }
 }
+
+#[test]
+fn the_chrome_line_is_pinned_once_per_release_and_the_inbox_message_stays() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join(STAMP), format!("{DAY}\nv999.0.0\n")).unwrap();
+    let mut notice = ReleaseNotice::default();
+    notice.poll_at(root.path(), DAY + 1, || unreachable!("not due"));
+    assert!(notice.chrome_notice().is_some(), "a new release is pinned");
+    notice.poll_at(root.path(), DAY + SHOW_FOR_SECS, || unreachable!("not due"));
+    assert!(notice.chrome_notice().is_some(), "still within its time");
+    assert!(
+        notice.poll_at(root.path(), DAY + 1 + SHOW_FOR_SECS, || unreachable!(
+            "not due"
+        )),
+        "retiring the line is a visible change"
+    );
+    assert!(notice.chrome_notice().is_none());
+    assert!(notice.notice().is_some(), "the inbox keeps the message");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(STAMP)).unwrap(),
+        format!("{DAY}\nv999.0.0\nv999.0.0\n")
+    );
+
+    // A later launch remembers the seen release, through a daily re-check too.
+    let mut next = ReleaseNotice::default();
+    next.poll_at(root.path(), DAY + 2, || unreachable!("not due"));
+    assert!(next.chrome_notice().is_none() && next.notice().is_some());
+    next.poll_at(root.path(), 3 * DAY, || Ok("v999.0.0".into()));
+    settle(&mut next, root.path(), 3 * DAY);
+    assert!(next.chrome_notice().is_none());
+
+    // A newer release than the one seen is pinned again.
+    let mut newer = ReleaseNotice::default();
+    newer.poll_at(root.path(), 5 * DAY, || Ok("v1000.0.0".into()));
+    settle(&mut newer, root.path(), 5 * DAY);
+    assert!(newer.chrome_notice().unwrap().contains("1000.0.0"));
+}

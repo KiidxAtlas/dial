@@ -203,15 +203,11 @@ fn facts(
 
     let approval = text::one_line(info.approval.trim());
     if !approval.is_empty() {
-        let tok = match approval.as_str() {
-            "auto" => Tok::Warning,
-            "readonly" => Tok::StatusSandbox,
-            _ => Tok::Success,
-        };
-        let mut spans = vec![Span::styled(
-            approval.clone(),
-            theme.fg(tok).add_modifier(Modifier::BOLD),
-        )];
+        // The shared approval chip (friendly name, safety-colored dot), as the status line has it.
+        let mut spans = super::chrome::approval_spans(theme, &approval);
+        if let Some(name) = spans.last_mut() {
+            name.style = name.style.add_modifier(Modifier::BOLD);
+        }
         let meaning = approval_meaning(&approval);
         if !meaning.is_empty() {
             spans.push(Span::styled(format!("{dot}{meaning}"), muted));
@@ -280,14 +276,13 @@ pub fn render(info: &WelcomeInfo, width: u16, theme: &Theme, view: View) -> Rows
     out
 }
 
-/// Rows that can be picked: recent sessions on a return, starters on a first visit.
+/// Rows that can be picked: recent sessions on a return, starters on a first visit. Starters are
+/// the first visit's only picks, so they stay when `ui.tips` hides the key tips.
 fn items(info: &WelcomeInfo) -> usize {
-    if !info.recent.is_empty() {
-        info.recent.len().min(MAX_RECENT)
-    } else if !info.tips.is_empty() {
+    if info.recent.is_empty() {
         STARTERS.len()
     } else {
-        0
+        info.recent.len().min(MAX_RECENT)
     }
 }
 
@@ -345,7 +340,7 @@ fn list_lines(
     };
 
     // first visit to this project: things to try
-    if info.recent.is_empty() && !info.tips.is_empty() {
+    if info.recent.is_empty() {
         if limit > 1 {
             out.push(heading("start with"));
         }
@@ -655,8 +650,11 @@ pub fn summary(info: &WelcomeInfo, width: u16, theme: &Theme) -> Rows {
     }
     let branch = text::one_line(info.branch.trim());
     if !branch.is_empty() {
+        // The same git icon (or `on` without icons) as the facts row's project line.
+        let icon = theme.sym(Sym::IconGit);
+        let icon = if icon.is_empty() { "on" } else { icon };
         spans.push(Span::styled(
-            format!("  {branch}"),
+            format!("  {icon} {branch}"),
             theme.fg(Tok::StatusGitClean),
         ));
     }

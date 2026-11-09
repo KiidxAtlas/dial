@@ -457,7 +457,7 @@ impl Agent<'_> {
                 participant.send(to, text)?;
                 remember(&state.history, to, true, text);
                 Ok(
-                    json!({"to":to,"status":"queued","delivery":"next model-request boundary, or bounded terminal wake-up after a completed or incomplete turn; not acknowledgement"}),
+                    json!({"to":to,"status":"queued","delivery":"accepted into recipient inbox for its next model-request boundary; automatic terminal wake-up is conditional on recipient settings and current eligibility, which this receipt does not establish; not acknowledgement"}),
                 )
             }
             action @ ("claim" | "clear") => {

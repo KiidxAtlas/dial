@@ -15,12 +15,10 @@ fn deduplicates_without_reopening_read_notices_and_bounds_session_memory() {
     for i in 0..LIMIT {
         inbox.push("Background", &format!("job {i}"));
     }
-    assert_eq!(inbox.choices().items.len(), LIMIT + 1);
+    // Notices, mark-all-read and the general settings row.
+    assert_eq!(inbox.choices().items.len(), LIMIT + 2);
     assert!(inbox.read(1).is_none());
-    assert_eq!(
-        inbox.choices().items[0].value,
-        format!("notice {}", LIMIT + 1)
-    );
+    assert_eq!(inbox.choices().items[0].value, format!("{}", LIMIT + 1));
 }
 
 #[test]
@@ -65,7 +63,7 @@ fn individual_preferences_use_explicit_categories_without_reading_or_dismissing(
         let mut inbox = Inbox::default();
         inbox.push_category("Same title", "Same body", category);
         let top = inbox.choices();
-        assert_eq!(top.items[0].value, "notice 1");
+        assert_eq!(top.items[0].value, "1", "Enter reads the notice directly");
         let menu = inbox.notice_choices(1).unwrap();
         assert_eq!(menu.command, "inbox");
         assert_eq!(
@@ -113,4 +111,43 @@ fn legacy_notices_never_infer_categories_from_arbitrary_text() {
     assert!(inbox.notice_choices(999).is_none());
     assert_eq!(inbox.settings_path(999), None);
     assert_eq!(inbox.unread(), 4);
+}
+
+#[test]
+fn enter_reads_directly_unread_is_a_mark_and_mark_all_read_clears_every_notice() {
+    let mut inbox = Inbox::default();
+    inbox.push("Worker", "done");
+    inbox.push_category("Build", "failed", Category::Error);
+    let spec = inbox.choices();
+    assert_eq!(spec.verb, "open");
+    assert_eq!(spec.current_tag.as_deref(), Some("unread"));
+    assert!(
+        spec.items
+            .iter()
+            .all(|item| !item.label.starts_with("Unread"))
+    );
+    let unread: Vec<_> = spec
+        .items
+        .iter()
+        .filter(|i| i.current)
+        .map(|i| &i.value)
+        .collect();
+    assert_eq!(unread, ["2", "1"]);
+    let values: Vec<_> = spec.items.iter().map(|i| i.value.as_str()).collect();
+    assert_eq!(
+        values,
+        ["2", "1", "read-all", "notifications 2", "notifications"],
+        "per-category settings appear only for categories present"
+    );
+    assert_eq!(inbox.read_all(), 2);
+    assert_eq!(inbox.unread(), 0);
+    assert_eq!(inbox.read_all(), 0);
+    assert!(
+        inbox
+            .choices()
+            .items
+            .iter()
+            .all(|i| i.value != "read-all" && !i.current),
+        "nothing left to mark"
+    );
 }

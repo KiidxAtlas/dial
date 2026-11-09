@@ -957,7 +957,7 @@ fn main() -> anyhow::Result<()> {
             ("permissions", "Manage tool permissions"),
             ("todo", "Inspect the work plan and evidence"),
             ("queue", "Manage queued messages"),
-            ("workers", "Manage background agents"),
+            ("workers", "Manage workers"),
             ("changes", "Inspect changed files"),
             ("review", "Review the current changes"),
         ]

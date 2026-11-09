@@ -247,6 +247,7 @@ pub struct EnvCredential {
 }
 
 pub struct ProviderOverlay {
+    panel_keys: super::panel_keys::PanelKeys,
     chatgpt_pending: bool,
     chatgpt_accounts: Vec<crate::llm::chatgpt::AccountInfo>,
     anthropic_signed_in: bool,
@@ -318,6 +319,7 @@ impl ProviderOverlay {
         scope: Scope,
     ) -> Self {
         ProviderOverlay {
+            panel_keys: Default::default(),
             chatgpt_pending: false,
             chatgpt_accounts: Vec::new(),
             anthropic_signed_in: false,
@@ -452,6 +454,12 @@ impl ProviderOverlay {
     // ---- input ----------------------------------------------------------------------------
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if self
+            .panel_keys
+            .handle_key(event, !matches!(self.mode, Mode::List))
+        {
+            return OverlayEvent::None;
+        }
         match event {
             Event::Key(key) if pressed(key) => self.key(key, keys),
             Event::Paste(pasted) => {
@@ -515,18 +523,11 @@ impl ProviderOverlay {
         if keys.matches(Action::SelectCancel, key) {
             return OverlayEvent::Close;
         }
+        // Lists stop at their ends, as every other panel's do.
         if keys.matches(Action::SelectUp, key) {
-            self.cursor = if self.cursor == 0 {
-                last
-            } else {
-                self.cursor - 1
-            };
+            self.cursor = self.cursor.saturating_sub(1);
         } else if keys.matches(Action::SelectDown, key) {
-            self.cursor = if self.cursor >= last {
-                0
-            } else {
-                self.cursor + 1
-            };
+            self.cursor = (self.cursor + 1).min(last);
         } else if keys.matches(Action::SelectPageUp, key) {
             self.cursor = self.cursor.saturating_sub(self.page);
         } else if keys.matches(Action::SelectPageDown, key) {
@@ -1167,7 +1168,7 @@ impl ProviderOverlay {
             return OverlayEvent::None;
         }
         if !keys.matches(Action::SelectConfirm, key) {
-            if w.editor.key(*key) {
+            if w.editor.key_with(*key, keys) {
                 w.error = None;
             }
             return OverlayEvent::None;
@@ -1224,6 +1225,9 @@ impl ProviderOverlay {
     // ---- drawing --------------------------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        if self.panel_keys.draw(frame, ctx, "Providers", "a adds a provider · k sets an API key · x or Delete removes (asks first) · Enter opens the provider menu.\nCtrl+S switches save scope.", false, false) {
+            return;
+        }
         let extra = super::settings::scope_caption(
             self.scope,
             &self.project_name,

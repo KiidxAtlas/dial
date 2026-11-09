@@ -467,7 +467,7 @@ impl InlineTerminal {
         } else {
             self.cursor_row as usize
         }
-        .min(rows as usize - 1);
+        .min((rows as usize).saturating_sub(1));
 
         let mut buf = String::with_capacity(
             256 + rendered
@@ -538,7 +538,7 @@ impl InlineTerminal {
         let target = vp.cursor.map(|(r, c)| {
             (
                 (r as usize).saturating_sub(dropped).min(bottom),
-                (c as usize).min(width - 1),
+                (c as usize).min(width.saturating_sub(1)),
             )
         });
         let rest_row = target.map_or(bottom, |(r, _)| r);

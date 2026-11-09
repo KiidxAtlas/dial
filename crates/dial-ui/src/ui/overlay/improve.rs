@@ -5,7 +5,7 @@
 use super::{
     DrawCtx, OverlayEvent,
     compute::tab_line,
-    settings::{filled, fit, panel, selected_fill},
+    settings::{filled, fit, list_row, panel},
 };
 use crate::ui::{
     chrome::{self, Section},
@@ -391,18 +391,14 @@ impl ImproveOverlay {
                 for (index, (row, token)) in
                     rows.into_iter().enumerate().skip(scroll).take(available)
                 {
-                    let fill = if self.ask.is_none() && selected == Some(index) {
-                        selected_fill(ctx.theme)
-                    } else {
-                        Style::default()
-                    };
-                    output.push(filled(
+                    output.push(list_row(
+                        ctx.theme,
                         vec![Span::styled(
                             format!(" {}", text::one_line(&row)),
                             ctx.theme.fg(token),
                         )],
                         w,
-                        fill,
+                        self.ask.is_none() && selected == Some(index),
                     ));
                 }
                 let notice = match (&self.ask, &self.notice) {

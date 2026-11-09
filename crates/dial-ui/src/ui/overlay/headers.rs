@@ -1,4 +1,6 @@
-use super::settings::{Axis, arrows, editor_spans, filled, fit, is_ctrl, typed_char};
+use super::settings::{
+    Axis, arrows, editor_spans, fit, hint_line, is_ctrl, list_row, scroll_cell, typed_char,
+};
 use crate::{
     llm::model_config::{HeaderValue, RequestHeader, RequestHeaders, validate_headers},
     ui::{
@@ -115,7 +117,8 @@ impl HeaderEditor {
                 Ok(()) => return Outcome::Save(Some(rows)),
                 Err(error) => self.error = Some(error.to_string()),
             }
-        } else if is_ctrl(key, 'n') {
+        } else if is_ctrl(key, 'o') {
+            // Add is Ctrl+O: Ctrl+N and Ctrl+P move between rows (the list keymap).
             if self.rows.len() >= 32 {
                 self.error = Some("At most 32 headers".into());
             } else {
@@ -147,9 +150,9 @@ impl HeaderEditor {
             }
         } else if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.value_field = !self.value_field;
-        } else if key.code == KeyCode::Up {
+        } else if keys.matches(Action::SelectUp, key) {
             self.row = self.row.saturating_sub(1);
-        } else if key.code == KeyCode::Down {
+        } else if keys.matches(Action::SelectDown, key) {
             self.row = (self.row + 1).min(self.rows.len().saturating_sub(1));
         } else if let Some(row) = self.rows.get_mut(self.row) {
             let editor = if self.value_field {
@@ -158,7 +161,7 @@ impl HeaderEditor {
                 &mut row.name
             };
             if editor.text.len() < 4096 || typed_char(key).is_none() {
-                editor.key(*key);
+                editor.key_with(*key, keys);
             }
         }
         Outcome::Pending
@@ -209,18 +212,42 @@ impl HeaderEditor {
             )));
         }
 
-        let hint =
-            |text: &str| Line::from(fit(vec![Span::styled(format!(" {text}"), muted)], width));
+        let arrows = arrows(theme, Axis::Vertical);
         if compact {
-            lines.push(hint(
-                "^N add · ^D delete · Tab field · F2 env/literal · ^S save · Esc cancel",
+            lines.push(hint_line(
+                theme,
+                &[
+                    "Ctrl+S save".to_owned(),
+                    "Ctrl+O add".to_owned(),
+                    "Ctrl+D delete".to_owned(),
+                    "Tab field".to_owned(),
+                    "F2 env/literal".to_owned(),
+                    "Esc cancel".to_owned(),
+                ],
+                width,
             ));
         } else {
-            let arrows = arrows(theme, Axis::Vertical);
-            lines.push(hint(&format!(
-                "^N add · ^D delete · Tab field · {arrows} row · F2 env/literal"
-            )));
-            lines.push(hint("F9 inherit · ^E clear all · ^S/F10 save · Esc cancel"));
+            lines.push(hint_line(
+                theme,
+                &[
+                    "Ctrl+O add".to_owned(),
+                    "Ctrl+D delete".to_owned(),
+                    "Tab field".to_owned(),
+                    format!("{arrows} row"),
+                    "F2 env/literal".to_owned(),
+                ],
+                width,
+            ));
+            lines.push(hint_line(
+                theme,
+                &[
+                    "Ctrl+S/F10 save".to_owned(),
+                    "F9 inherit".to_owned(),
+                    "Ctrl+E clear all".to_owned(),
+                    "Esc cancel".to_owned(),
+                ],
+                width,
+            ));
         }
 
         let name_w = (width.saturating_sub(FIXED_COLUMNS) / 3).clamp(6, 28);
@@ -245,7 +272,7 @@ impl HeaderEditor {
         if self.rows.is_empty() {
             lines.push(Line::from(fit(
                 vec![Span::styled(
-                    " No header rows. Press Ctrl+N to add one.",
+                    " No header rows. Press Ctrl+O to add one.",
                     dim,
                 )],
                 width,
@@ -254,11 +281,7 @@ impl HeaderEditor {
             return lines;
         }
 
-        let mut room = height.saturating_sub(lines.len());
-        let overflow = self.rows.len() > room && room > 1;
-        if overflow {
-            room -= 1;
-        }
+        let room = height.saturating_sub(lines.len());
         let start = if room == 0 {
             self.row
         } else {
@@ -301,25 +324,15 @@ impl HeaderEditor {
                 selected && self.value_field,
                 "value",
             ));
-            if selected {
-                lines.push(filled(spans, width, theme.bg(Tok::SelectedBg)));
-            } else {
-                lines.push(Line::from(fit(spans, width)));
-            }
-        }
-        if overflow {
-            lines.push(Line::from(fit(
-                vec![Span::styled(
-                    format!(
-                        " row {} of {}  ·  {} scroll",
-                        self.row + 1,
-                        self.rows.len(),
-                        arrows(theme, Axis::Vertical)
-                    ),
-                    dim,
-                )],
-                width,
-            )));
+            let mut line = list_row(theme, spans, width.saturating_sub(1), selected);
+            line.spans.push(scroll_cell(
+                theme,
+                index - start,
+                room,
+                self.rows.len(),
+                start,
+            ));
+            lines.push(line);
         }
         lines.truncate(height.max(1));
         lines

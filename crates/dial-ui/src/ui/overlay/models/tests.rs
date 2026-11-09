@@ -1996,7 +1996,7 @@ fn wide_rows_show_price_per_million_and_speed_and_the_numbers_line_shows_use() {
         screen.contains("speed 42 t/s end-to-end median of 4"),
         "{screen}"
     );
-    assert!(screen.contains("avg $0.010/request"), "{screen}");
+    assert!(screen.contains("avg $0.01/request"), "{screen}");
     assert!(screen.contains("4 requests"), "{screen}");
 
     // A model without price or recorded use shows dashes, never an estimate.
@@ -2397,4 +2397,15 @@ fn direct_role_picker_reuses_role_filters_and_cancel_destination_without_assignm
     assert!(!o.show_role("not-a-role"));
     o.roles.retain(|status| status.role != TURN_DRAFTER);
     assert!(!o.show_role(TURN_DRAFTER));
+}
+
+#[test]
+fn download_footer_keeps_its_way_out_last() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.group = Group::Download;
+    let hints = o.footer(&rig.keys);
+    let last = hints.iter().rev().find(|h| !h.is_empty()).unwrap();
+    assert!(last.starts_with("Esc "), "{hints:?}");
+    assert!(hints.iter().any(|h| h == "F5 rescan"), "{hints:?}");
 }

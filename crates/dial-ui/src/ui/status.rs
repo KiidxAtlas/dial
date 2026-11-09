@@ -1,14 +1,17 @@
 //! The facts the status line can show. The controller fills this in; the status line renders from
 //! it. `None`/empty means *unknown* and is shown as absent, never as 0 or "free".
 
-use super::statusline::{elapsed, human};
+use super::text;
 
 /// ` · ~12s left` from the measured rate; nothing while the estimate is unknown or not positive.
 fn push_eta(label: &mut String, eta: Option<f64>) {
     if let Some(secs) = eta.filter(|s| s.is_finite() && *s > 0.0) {
-        label.push_str(&format!(" · ~{} left", elapsed(secs.ceil())));
+        label.push_str(&format!(" · ~{} left", text::duration_label(secs.ceil())));
     }
 }
+
+/// A running tool shows its elapsed time once it has run this long.
+const TOOL_ELAPSED_AFTER_SECS: f64 = 10.0;
 
 /// Friendly UI names; stored configuration and command arguments retain their raw values.
 pub fn approval_label(value: &str) -> &str {
@@ -166,6 +169,9 @@ pub struct StatusData {
     pub elapsed_secs: f64,
     /// What the running turn is doing right now (`thinking`, a tool name, …); empty when unknown.
     pub activity: String,
+    /// When the running tool named by `activity` started; a long run shows its elapsed time so
+    /// a slow tool reads as working rather than stuck. `None` when no tool runs.
+    pub tool_started: Option<std::time::Instant>,
     pub model_progress: Option<crate::llm::ModelProgress>,
     pub model_silence_secs: u64,
     /// Controller-owned wait; independent of model progress and inference timers.
@@ -201,9 +207,9 @@ impl StatusData {
         }
         if let Some(wait) = &self.background_wait {
             return format!(
-                "waiting for {} · {}s · results resume automatically",
+                "waiting for {} · {} · results resume automatically",
                 crate::ui::text::one_line(&wait.label),
-                wait.started.elapsed().as_secs()
+                text::duration_label(wait.started.elapsed().as_secs_f64())
             );
         }
         if let Some(retry) = &self.provider_retry {
@@ -211,11 +217,17 @@ impl StatusData {
                 .ready_at
                 .saturating_duration_since(std::time::Instant::now())
                 .as_secs_f64()
-                .ceil() as u64;
+                .ceil();
+            // Past the ready time the attempt is under way; a stuck `in 0s` reads as hung.
+            let next = if remaining > 0.0 {
+                format!("next attempt in {}", text::duration_label(remaining))
+            } else {
+                "retrying…".to_owned()
+            };
             return format!(
-                "provider retry {}/{} · next attempt in {remaining}s · /retry now · interrupt to stop",
+                "provider retry {}/{} · {next} · /retry now · interrupt to stop",
                 retry.attempt,
-                crate::ui::text::one_line(&retry.maximum)
+                crate::ui::text::one_line(&retry.maximum),
             );
         }
         match self.phase {
@@ -231,9 +243,15 @@ impl StatusData {
         }
         self.model_activity().unwrap_or_else(|| {
             if activity.trim().is_empty() {
-                "working".into()
-            } else {
-                activity
+                return "working".into();
+            }
+            match self.tool_started.map(|at| at.elapsed().as_secs_f64()) {
+                Some(secs)
+                    if secs >= TOOL_ELAPSED_AFTER_SECS && activity.starts_with("running ") =>
+                {
+                    format!("{activity} · {}", text::duration_label(secs.floor()))
+                }
+                _ => activity,
             }
         })
     }
@@ -268,7 +286,7 @@ impl StatusData {
                     _ => "processing prompt".into(),
                 };
                 if let Some(cached) = p.cached_tokens.filter(|n| *n > 0) {
-                    label.push_str(&format!(" · {} cached", human(cached)));
+                    label.push_str(&format!(" · {} cached", text::compact_count(cached)));
                 }
                 push_eta(&mut label, p.eta_secs);
                 label
@@ -318,10 +336,11 @@ impl StatusData {
         }
     }
 
+    /// A turn, compaction, compute wait or local model preparation holds the session.
     pub fn busy(&self) -> bool {
         matches!(
             self.phase,
-            Phase::Working | Phase::Compacting | Phase::WaitingCompute
+            Phase::Working | Phase::Compacting | Phase::WaitingCompute | Phase::Setup
         )
     }
 

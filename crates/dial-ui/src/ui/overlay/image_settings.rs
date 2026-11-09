@@ -9,8 +9,8 @@ use super::{
     DrawCtx, OverlayEvent,
     model_settings::{as_number, number_text},
     settings::{
-        Axis, arrows, editor_spans, filled, fit, hint, hint_line, other_scope, pair_label, panel,
-        pressed, scope_name,
+        Axis, arrows, editor_spans, fit, hint, hint_line, other_scope, pair_label, panel, pressed,
+        scope_name,
     },
 };
 use crate::config::image::{
@@ -456,7 +456,7 @@ impl ImageSettingsOverlay {
                 }
                 return self.apply(&text);
             }
-            if editor.key(*key) {
+            if editor.key_with(*key, keys) {
                 self.message = None;
             }
             return OverlayEvent::None;
@@ -700,7 +700,7 @@ impl ImageSettingsOverlay {
                 ));
             }
             out.push(if selected {
-                filled(spans, w, theme.bg(Tok::SelectedBg))
+                crate::ui::chrome::selected_row(theme, spans, w)
             } else {
                 Line::from(fit(spans, w))
             });

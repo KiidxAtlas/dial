@@ -125,15 +125,53 @@ impl Bridge<'_> {
     }
 
     /// Immediate feedback for an interrupt: the turn only stops at its next safe point, so name
-    /// the tool it is waiting on. Activity stays on this label until the turn settles.
-    fn show_stopping(&mut self) {
-        let activity = match self.pending.last() {
+    /// the tool it is waiting on, and why when the stop was not a plain stop key. Activity stays
+    /// on this label until the turn settles (`set_activity` holds it once the flag is up).
+    fn mark_stopping(&mut self, reason: Option<&str>) {
+        let mut activity = match self.pending.last() {
             Some((_, name, _)) => format!("stopping after {name}"),
             None => "stopping".to_owned(),
         };
-        // Set directly: `set_activity` holds the label once the interrupt flag is up.
+        if let Some(reason) = reason {
+            activity.push_str(" · ");
+            activity.push_str(reason);
+        }
         self.shell.status.activity = activity;
+        // The next repaint paints even when throttled. Painting from here would re-enter `pump`.
+        self.last_paint = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(self.started);
+    }
+
+    /// Raise the interrupt and show it at once. Safe outside `pump` only.
+    pub(super) fn show_stopping(&mut self, reason: Option<&str>) {
+        self.interrupt.store(true, Ordering::SeqCst);
+        self.mark_stopping(reason);
         self.repaint(true);
+    }
+
+    /// Raise the interrupt from inside `pump`; the enclosing repaint paints the label.
+    fn stop_from_pump(&mut self, reason: Option<&str>) {
+        self.interrupt.store(true, Ordering::SeqCst);
+        self.mark_stopping(reason);
+    }
+
+    /// While a submitted command waits for the turn to unwind, keep reading so a repeated stop
+    /// key still lands; every other event is held, in order, for the idle loop that runs next.
+    fn hold_input_while_stopping(&mut self) {
+        for _ in 0..64 {
+            if !poll(Duration::ZERO).unwrap_or(false) {
+                break;
+            }
+            let Ok(event) = read() else { break };
+            match &event {
+                Event::Key(key) if crate::app::shell::prompts::stop_key(&self.shell.keys, key) => {
+                    self.stop_from_pump(None);
+                }
+                Event::Resize(..) => self.shell.term.on_resize(),
+                _ => self.shell.held.push_back(event),
+            }
+        }
     }
 
     pub(super) fn set_activity(&mut self, activity: &str) {
@@ -152,9 +190,10 @@ impl Bridge<'_> {
             self.interrupt.store(true, Ordering::SeqCst);
             return;
         }
-        // A submitted command owns the next idle dispatch. Leave subsequent input in the
-        // terminal until the active operation has unwound, rather than overwriting it.
+        // A submitted command owns the next idle dispatch. Hold subsequent input for the idle
+        // loop rather than overwriting it, but keep honouring the stop key during a slow stop.
         if self.shell.startup.is_some() {
+            self.hold_input_while_stopping();
             return;
         }
         // Finished speech uses the same after-turn queue as a typed follow-up.
@@ -166,7 +205,7 @@ impl Bridge<'_> {
             self.shell.note("Collab", notice);
         }
         if crate::collab::room::take_aborts() {
-            self.interrupt.store(true, Ordering::SeqCst);
+            self.stop_from_pump(Some("stopped by a collab guest"));
         }
         for _ in 0..64 {
             if !poll(Duration::ZERO).unwrap_or(false) {
@@ -179,10 +218,12 @@ impl Bridge<'_> {
                 continue;
             }
             if self.shell.busy_overlay.is_some() {
-                let cancel = matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release
+                // The first stop key in an open panel only closes the panel; the turn keeps
+                // running. A second press (with no panel open) stops the turn.
+                let close = matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release
                     && self.shell.keys.matches(Action::Interrupt, key)
                     && !self.shell.keys.matches(Action::SelectCancel, key));
-                let result = if cancel {
+                let result = if close {
                     if let Some(state) = &mut self.shell.busy_overlay {
                         state.next = None;
                     }
@@ -191,11 +232,11 @@ impl Bridge<'_> {
                     self.shell.step_busy_overlay(self.app, Some(event))
                 };
                 match result {
-                    Ok(stop) if stop || cancel => {
-                        self.interrupt.store(true, Ordering::SeqCst);
+                    Ok(true) => {
+                        self.stop_from_pump(Some("then runs the panel's choice"));
                         return;
                     }
-                    Ok(_) => {}
+                    Ok(false) => {}
                     Err(_) => {
                         self.failed = true;
                         self.interrupt.store(true, Ordering::SeqCst);
@@ -210,7 +251,7 @@ impl Bridge<'_> {
                     match shell.composer_key(key) {
                         ComposerEvent::Action(Action::CommandPalette) => {
                             if shell.route_busy_command(self.app, "/palette".into()) {
-                                self.interrupt.store(true, Ordering::SeqCst);
+                                self.stop_from_pump(Some("then runs your command"));
                                 return;
                             }
                         }
@@ -218,12 +259,11 @@ impl Bridge<'_> {
                             shell.route_busy_command(self.app, "/controls".into());
                         }
                         ComposerEvent::Interrupt | ComposerEvent::Exit => {
-                            self.interrupt.store(true, Ordering::SeqCst);
-                            self.show_stopping();
+                            self.stop_from_pump(None);
                         }
                         ComposerEvent::Submit(text) => {
                             if shell.route_busy_command(self.app, text) {
-                                self.interrupt.store(true, Ordering::SeqCst);
+                                self.stop_from_pump(Some("then sends your message"));
                                 return;
                             }
                             continue;
@@ -255,6 +295,12 @@ impl Bridge<'_> {
                         }
                         ComposerEvent::Action(Action::SubagentsHub) => {
                             shell.route_busy_command(self.app, "/agents".into());
+                        }
+                        ComposerEvent::Action(Action::SubagentsRecent) => {
+                            shell.busy_recent_worker(self.app);
+                        }
+                        ComposerEvent::Action(Action::RateGood | Action::RateBad) => {
+                            shell.rating_unavailable_during_turn();
                         }
                         ComposerEvent::Action(Action::Settings) => {
                             shell.route_busy_command(self.app, "/settings".into());

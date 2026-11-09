@@ -135,8 +135,18 @@ fn turn_outcomes_map_to_activity() {
 fn the_tab_circle_follows_the_state_and_idle_has_none() {
     assert_eq!(Activity::Idle.marker(), "");
     assert_eq!(Activity::Working.marker(), "\u{1F7E0}");
-    assert_eq!(Activity::Waiting.marker(), Activity::Failed.marker());
-    assert_ne!(Activity::Done.marker(), Activity::Working.marker());
+    // Every active state has its own circle: input requests are not failures.
+    let circles = [
+        Activity::Working,
+        Activity::Waiting,
+        Activity::Done,
+        Activity::Failed,
+    ]
+    .map(Activity::marker);
+    for (i, a) in circles.iter().enumerate() {
+        assert!(!a.is_empty());
+        assert!(circles[i + 1..].iter().all(|b| a != b), "{circles:?}");
+    }
     let mut writer = writer(iterm(false));
     let out = writer.update(&Signals {
         activity: Activity::Working,

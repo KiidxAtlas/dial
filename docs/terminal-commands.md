@@ -4,7 +4,7 @@ Find actions through the goal-first palette, slash completion and command help.
 
 [Terminal overview](terminal-interface.md) · [Documentation index](README.md)
 
-- **Action palette:** `Ctrl-P`, `Alt-K` or `/palette` starts with a short list of goals: start or
+- **Action palette:** `Alt-K`, `F1` or `/palette` starts with a short list of goals: start or
   continue work, review changes, manage ongoing work, configure Dial, or browse all actions.
   Choose a goal to drill into relevant commands; return to the goal list before closing.
   Type at any point to search every registered action, including advanced commands and enabled
@@ -41,6 +41,9 @@ Find actions through the goal-first palette, slash completion and command help.
 Related actions share one entry point. Every older spelling still runs; redundant spellings are
 hidden from menus.
 
+Every panel shows its keys with **F1** or **?**, and typing `/` in a panel's search field is never
+swallowed. Lists in Settings and Providers stop at their first and last rows rather than wrapping.
+
 - **`/mode`** picks plan mode, approval, vibe or skillful mode. `/plan` and `/approval` stay listed.
 - **`/dirs`** adds, removes or lists workspace directories (`/add-dir`, `/remove-dir` still work).
 - **`/collab`** hosts, joins, leaves, stops or lists live collaboration rooms (`/join`, `/leave`).
@@ -58,7 +61,8 @@ hidden from menus.
 - **`/stats`** opens searchable Usage / cost, Tokens, Sessions and Tools tabs across sessions.
   `/stats <range>` and `/stats --port <port>` behave as before; `/usage` (provider quotas) and
   `/cost` (this runtime's accounting) stay separate.
-- **`/inbox`** lists this session's notifications; selecting one marks it read. **`/doctor`** lists
+- **`/inbox`** lists this session's notifications; `Enter` reads a notice and marks it read, and
+  **Mark all read** (or `/inbox read-all`) clears the unread count. **`/doctor`** lists
   local diagnostics and reviews a fix before applying it. **`/accounts`** lists saved logins
   without showing credentials. **`/set <key> [value] [--project]`** shows a setting and its source
   or saves a validated value.

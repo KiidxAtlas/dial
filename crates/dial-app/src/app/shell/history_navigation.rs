@@ -41,7 +41,7 @@ impl Shell {
     ) -> Result<Step> {
         let args = args.trim();
         if args == "results" {
-            return match self.take_search_panel() {
+            return match self.take_search_panel(agent.layout().unwrap_or(&app.layout)) {
                 Some(panel) => self.open(app, agent, Which::HistorySearch(panel)),
                 None => {
                     self.note(

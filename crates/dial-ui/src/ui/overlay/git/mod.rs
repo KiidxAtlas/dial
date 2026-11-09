@@ -19,13 +19,20 @@ use crate::{
         chrome::{self, Section},
         keys::{Action, Keymap},
         text,
+        theme::{Theme, Tok},
     },
 };
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use model::*;
-use ratatui::{Frame, widgets::Paragraph};
+use ratatui::{
+    Frame,
+    layout::Alignment,
+    style::Modifier,
+    text::{Line, Span},
+    widgets::Paragraph,
+};
 use render::plain_char;
 use std::{
     cell::{Cell, RefCell},
@@ -315,65 +322,55 @@ impl GitOverlay {
                 chrome::panel_block_titled(ctx.theme, Section::Tools, "Git", "keyboard shortcuts");
             let inner = block.inner(area);
             frame.render_widget(block, area);
-            frame.render_widget(Paragraph::new(help::lines(ctx.theme)), inner);
+            frame.render_widget(
+                Paragraph::new(help::lines(ctx.theme, usize::from(inner.width))),
+                inner,
+            );
             return;
         }
-        let extra = match &self.commit {
-            Some(commit) => format!("commit {}", commit.short),
-            None => self.branch.clone().unwrap_or_else(|| "detached".to_owned()),
-        };
-        let extra = if self.revision.is_some() {
-            format!("{extra} · Status / Diff · Tab")
-        } else {
-            let tabs = [GitTab::Status, GitTab::Diff, GitTab::Commit, GitTab::Log]
-                .map(|tab| {
-                    let label = match tab {
-                        GitTab::Status => "Status",
-                        GitTab::Diff => "Diff",
-                        GitTab::Commit => "Commit",
-                        GitTab::Log => "Log",
-                    };
-                    if tab == self.tab() {
-                        format!("[{label}]")
-                    } else {
-                        label.to_owned()
-                    }
-                })
-                .join(" / ");
-            format!("{extra} · {tabs} · Tab")
-        };
-        let block = chrome::panel_block_titled(ctx.theme, Section::Tools, "Git", &extra);
+        let block = chrome::panel_block_titled(ctx.theme, Section::Tools, "Git", "")
+            .title_top(self.title_tabs(ctx.theme).alignment(Alignment::Right));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.area
             .set((usize::from(inner.width), usize::from(inner.height)));
         if self.log_open {
-            let lines: Vec<ratatui::text::Line<'static>> = match &self.recent {
-                Ok(entries) if entries.is_empty() => vec!["No commits yet.".into()],
-                Ok(entries) => entries
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (_, label))| {
-                        format!(
-                            "{} {}",
-                            if index == self.log_cursor { "›" } else { " " },
-                            text::one_line(label)
-                        )
-                        .into()
-                    })
-                    .collect(),
-                Err(error) => {
-                    vec![format!("Could not read recent commits: {}", text::one_line(error)).into()]
-                }
-            };
-            let top = self
-                .log_cursor
-                .saturating_sub(usize::from(inner.height).saturating_sub(1));
-            frame.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), inner);
+            let lines = self.log_lines(inner.width, inner.height, ctx);
+            frame.render_widget(Paragraph::new(lines), inner);
             return;
         }
         let lines = self.compose(inner.width, inner.height, ctx);
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The title's right edge: the branch or commit, then the tab strip in the shared tab style.
+    fn title_tabs(&self, theme: &Theme) -> Line<'static> {
+        let place = match &self.commit {
+            Some(commit) => format!("commit {}", commit.short),
+            None => self.branch.clone().unwrap_or_else(|| "detached".to_owned()),
+        };
+        let tabs: &[GitTab] = if self.revision.is_some() {
+            &[GitTab::Status, GitTab::Diff]
+        } else {
+            &[GitTab::Status, GitTab::Diff, GitTab::Commit, GitTab::Log]
+        };
+        let muted = theme.fg(Tok::Muted).add_modifier(Modifier::ITALIC);
+        let mut spans = vec![Span::styled(format!("{} ", text::one_line(&place)), muted)];
+        for tab in tabs {
+            let label = match tab {
+                GitTab::Status => "Status",
+                GitTab::Diff => "Diff",
+                GitTab::Commit => "Commit",
+                GitTab::Log => "Log",
+            };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                label.to_owned(),
+                chrome::tab_style(theme, *tab == self.tab()),
+            ));
+        }
+        spans.push(Span::raw(" "));
+        Line::from(spans)
     }
 
     /// Native image placements for the frame just drawn, in frame cell coordinates. Compose
@@ -430,6 +427,16 @@ impl GitOverlay {
                 self.log_cursor = self.log_cursor.saturating_sub(1);
             } else if keys.matches(Action::SelectDown, key) {
                 self.log_cursor = (self.log_cursor + 1).min(count.saturating_sub(1));
+            } else if keys.matches(Action::SelectPageUp, key) {
+                let page = self.area.get().1.saturating_sub(1).max(1);
+                self.log_cursor = self.log_cursor.saturating_sub(page);
+            } else if keys.matches(Action::SelectPageDown, key) {
+                let page = self.area.get().1.saturating_sub(1).max(1);
+                self.log_cursor = (self.log_cursor + page).min(count.saturating_sub(1));
+            } else if key.code == KeyCode::Home {
+                self.log_cursor = 0;
+            } else if key.code == KeyCode::End {
+                self.log_cursor = count.saturating_sub(1);
             } else if super::panel_keys::matches(keys, Action::SelectConfirm, key)
                 && let Ok(entries) = &self.recent
                 && let Some((sha, _)) = entries.get(self.log_cursor)

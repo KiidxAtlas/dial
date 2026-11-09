@@ -6,7 +6,7 @@ A short loop: ask, steer, review, and keep what works.
 
 Run `dial` in your project directory. Type a concrete request and press **Enter**.
 Include the outcome you want and any limits: “Fix this failing test without changing the API.”
-Use `@` to attach files. Open **Ctrl+P** when you know what you want to do but not its command.
+Use `@` to attach files. Open the command palette (**Alt+K** or **F1**) when you know what you want to do but not its command.
 
 The home screen previews recent conversations when there is room. Press **Down** to focus
 one, then **Enter** to resume it; **Up** returns to the input. Safety and setup warnings
@@ -45,7 +45,7 @@ its unfinished tasks. Tell Dial what to retry or change rather than starting ove
 
 ## Settings and models
 
-Use `/settings` for preferences and **Ctrl+P** to discover actions.
+Use `/settings` for preferences and the command palette (**Alt+K** or **F1**) to discover actions.
 Use `/models` for model selection, roles, downloads, favorites, and filters—all in one panel.
 Keep permission and sandbox choices appropriate to the project, and read approval prompts
 before allowing risky actions.

@@ -687,7 +687,8 @@ fn policy_prompt_and_cancelled_reusable_response_do_not_create_grants() {
             self.1.push(explanation.reason);
         }
         fn approve(&mut self, _: &str, summary: &str) -> Decision {
-            assert!(summary.contains("Policy: operator approval required"));
+            // The prompt itself says approval is required; no policy line is appended.
+            assert!(!summary.contains("Policy:"));
             self.0.store(true, std::sync::atomic::Ordering::Release);
             Decision::AllowAlways
         }
@@ -742,6 +743,56 @@ fn finite_batch_surface_never_converts_persistent_choices_into_grants() {
     let mut ui = Prompt(Decision::Allow, 0);
     assert_eq!(ui.approve_batch(&calls, &cancel), vec![false; 2]);
     assert_eq!(ui.1, 0, "cancelled batch must not prompt");
+}
+
+#[test]
+fn batch_rows_summarize_targets_and_sizes_without_raw_contents() {
+    let call = |name: &str, arguments: serde_json::Value| ToolCall {
+        id: "call-7f3a".into(),
+        name: name.into(),
+        arguments,
+        malformed_arguments: false,
+    };
+    let body = "line\n".repeat(400);
+    let cases = [
+        (
+            call(
+                "write",
+                serde_json::json!({"path": "src/big.rs", "content": body}),
+            ),
+            "write src/big.rs · 400 lines, 2.0 KiB",
+        ),
+        (
+            call(
+                "edit",
+                serde_json::json!({"input": "[src/a.rs#3FA9]\nPUT 4.=4:\n+    let x = 1;\n+    let y = 2;"}),
+            ),
+            "edit src/a.rs · 2 new lines",
+        ),
+        (
+            call(
+                "ast_edit",
+                serde_json::json!({"path": "src/c.rs", "pattern": "x"}),
+            ),
+            "ast_edit src/c.rs",
+        ),
+    ];
+    for (call, expected) in cases {
+        let line = batch_call_line(&call);
+        assert_eq!(line, expected);
+        assert!(!line.contains("call-7f3a") && !line.contains("let x"));
+    }
+}
+
+#[test]
+fn plan_mode_denial_names_plan_mode_for_the_model() {
+    assert!(Denial::ReadOnly.message_in(true).contains("plan mode"));
+    assert!(Denial::ReadOnly.message_in(true).starts_with("denied"));
+    assert_eq!(
+        Denial::ReadOnly.message_in(false),
+        Denial::ReadOnly.message()
+    );
+    assert_eq!(Denial::User.message_in(true), Denial::User.message());
 }
 
 #[test]

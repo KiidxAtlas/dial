@@ -65,6 +65,7 @@ fn absent_settings_metadata_does_not_invent_a_receipt() {
     apply_body(
         &mut worker,
         &serde_json::json!({"model": "original"}),
+        "",
         Phase::Running,
         0,
     );
@@ -80,11 +81,11 @@ fn status_mapping_covers_every_phase() {
     );
     assert_eq!(
         AgentStatus::from_phase(Phase::Blocked),
-        AgentStatus::Waiting
+        AgentStatus::Blocked
     );
     assert_eq!(
         AgentStatus::from_phase(Phase::NeedsInput),
-        AgentStatus::Waiting
+        AgentStatus::NeedsInput
     );
     assert_eq!(AgentStatus::from_phase(Phase::Completed), AgentStatus::Done);
     assert_eq!(
@@ -115,6 +116,105 @@ fn status_mapping_covers_every_phase() {
     );
     assert_eq!(AgentStatus::Done.label(), "completed");
     assert_ne!(AgentStatus::Cancelled, AgentStatus::Interrupted);
+}
+
+/// A worker that returned `needs_input` or `blocked` has ended: it is finished, needs the
+/// operator, is resumable when a transcript exists, is never steered or stopped, and is not
+/// counted as running. Only a live `waiting` phase keeps a worker live.
+#[test]
+fn terminal_input_and_blocked_outcomes_are_finished_resumable_and_not_running() {
+    for (wire, status, label) in [
+        ("needs_input", AgentStatus::NeedsInput, "needs input"),
+        ("blocked", AgentStatus::Blocked, "blocked"),
+    ] {
+        assert_eq!(AgentStatus::from_wire(wire), status);
+        assert_eq!(status.label(), label);
+        assert!(status.is_finished(), "{wire}");
+        let mut worker = entry("w", None, status, None);
+        assert!(worker.needs_attention(), "{wire}");
+        worker.transcript = Some("w.jsonl".into());
+        finish_projection(&mut worker, &HashSet::from(["w".to_owned()]), 0);
+        assert!(worker.resumable && !worker.steerable && !worker.cancellable);
+        assert_eq!(totals(&[worker]).running, 0, "{wire}");
+    }
+    assert_ne!(
+        AgentStatus::NeedsInput.label(),
+        AgentStatus::Waiting.label()
+    );
+    let mut live = AgentEntry::default();
+    apply_body(
+        &mut live,
+        &serde_json::json!({"phase": "waiting"}),
+        "",
+        Phase::Running,
+        0,
+    );
+    assert_eq!(live.status, AgentStatus::Waiting);
+    assert!(!live.status.is_finished());
+    assert_eq!(totals(&[live]).running, 1);
+}
+
+#[test]
+fn status_counts_bucket_every_status_once() {
+    let agents: Vec<AgentEntry> = [
+        AgentStatus::Running,
+        AgentStatus::Waiting,
+        AgentStatus::NeedsInput,
+        AgentStatus::Failed,
+        AgentStatus::Interrupted,
+        AgentStatus::Blocked,
+        AgentStatus::Done,
+        AgentStatus::Answered,
+        AgentStatus::Cancelled,
+    ]
+    .into_iter()
+    .map(|status| entry("w", None, status, None))
+    .collect();
+    let counts = StatusCounts::of(&agents);
+    assert_eq!(
+        counts,
+        StatusCounts {
+            total: 9,
+            live: 2,
+            running: 1,
+            needs_input: 2,
+            trouble: 3,
+            done: 2,
+            stopped: 1,
+        }
+    );
+    assert_eq!(
+        counts.running + counts.needs_input + counts.trouble + counts.done + counts.stopped,
+        counts.total
+    );
+}
+
+#[test]
+fn finished_body_keeps_its_reply_as_the_result_and_running_one_does_not() {
+    let mut worker = AgentEntry::default();
+    apply_body(&mut worker, &Value::Null, "partial", Phase::Running, 0);
+    assert_eq!(worker.result, None);
+    apply_body(
+        &mut worker,
+        &Value::Null,
+        "\n  Found 3 call sites.\nAll in parser.rs\n",
+        Phase::Completed,
+        0,
+    );
+    assert_eq!(
+        worker.result.as_deref(),
+        Some("Found 3 call sites. All in parser.rs")
+    );
+}
+
+#[test]
+fn transcript_records_are_untimed_activity() {
+    let events = activity_of_message(
+        "w",
+        0,
+        &serde_json::json!({"role": "assistant", "content": "done"}),
+    );
+    assert!(!events.is_empty() && events.iter().all(|event| !event.timed));
 }
 
 #[test]
@@ -230,6 +330,7 @@ fn activity_filter_and_scope_cycle_and_admit() {
     let event = ActivityEvent {
         agent_id: "kid".into(),
         at_ms: 1,
+        timed: true,
         kind: ActivityKind::Response,
         title: String::new(),
         summary: String::new(),
@@ -648,6 +749,8 @@ fn attention_uses_observed_lifecycle_or_rejected_settings_not_pending_changes() 
     for (status, expected) in [
         (AgentStatus::Running, false),
         (AgentStatus::Waiting, true),
+        (AgentStatus::NeedsInput, true),
+        (AgentStatus::Blocked, true),
         (AgentStatus::Done, false),
         (AgentStatus::Failed, true),
         (AgentStatus::Cancelled, false),
@@ -681,11 +784,11 @@ fn attention_uses_observed_lifecycle_or_rejected_settings_not_pending_changes() 
 #[test]
 fn interrupted_body_keeps_explicit_cancellation_receipt_but_not_stale_running_state() {
     let mut worker = entry("w", None, AgentStatus::Cancelled, None);
-    apply_body(&mut worker, &Value::Null, Phase::Interrupted, 0);
+    apply_body(&mut worker, &Value::Null, "", Phase::Interrupted, 0);
     assert_eq!(worker.status, AgentStatus::Cancelled);
-    apply_body(&mut worker, &Value::Null, Phase::Running, 0);
+    apply_body(&mut worker, &Value::Null, "", Phase::Running, 0);
     assert_eq!(worker.status, AgentStatus::Running);
-    apply_body(&mut worker, &Value::Null, Phase::Interrupted, 0);
+    apply_body(&mut worker, &Value::Null, "", Phase::Interrupted, 0);
     assert_eq!(worker.status, AgentStatus::Interrupted);
 }
 
@@ -710,6 +813,7 @@ fn recorded_model_explanation_projects_header_final_and_runtime_without_reconstr
         apply_body(
             &mut entry,
             &serde_json::json!({"steps":3}),
+            "",
             Phase::Running,
             0,
         );
@@ -717,6 +821,7 @@ fn recorded_model_explanation_projects_header_final_and_runtime_without_reconstr
         apply_body(
             &mut entry,
             &serde_json::json!({"model_explanation":"explicit replacement receipt"}),
+            "",
             Phase::Running,
             0,
         );

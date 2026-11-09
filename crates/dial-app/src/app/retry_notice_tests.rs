@@ -12,6 +12,18 @@ fn retry_notices_are_recognized_and_other_text_is_not() {
 }
 
 #[test]
+fn a_recovered_request_is_closed_with_one_line_naming_the_attempt() {
+    let retry = RetryNotice::parse("transient: reset (after 1.0s); retrying in 2.0s (attempt 2/5)")
+        .unwrap();
+    let text = RetryNotice::recovered_text(retry.attempt);
+    assert_eq!(
+        text,
+        "The model request succeeded on attempt 2; the turn continues."
+    );
+    assert!(!text.contains('\n'));
+}
+
+#[test]
 fn malformed_retry_timing_or_attempts_never_create_a_countdown() {
     for tail in [
         "NaNs (attempt 1/2)",

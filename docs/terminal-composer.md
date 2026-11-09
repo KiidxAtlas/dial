@@ -28,20 +28,28 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   containing another `/` (a pasted path such as `/Users/me/notes.md`) never opens the command
   menu, so `Enter` sends it as typed, and while busy it queues like any other message.
 - A configurable status line shows model, role, path, Git state, context, token usage/rate, approval,
-  sandbox and session state. The default layout adapts to width (path drops below 120 columns, branch
-  and cost below 80); `Alt+S` or `F11` (`app.status.expand`) temporarily shows every segment. Presets
+  sandbox and session state. It keeps the same segments while idle and busy. The default layout adapts
+  to width (path drops below 120 columns, branch and cost below 80); narrow layouts keep the workers
+  segment (with a warning when a worker is waiting for you), the inbox and the mode. `Alt+S` or `F11`
+  (`app.status.expand`) temporarily shows every segment, also while a turn runs. Presets
   and custom left/right segments still apply when configured. Learning diagnostics are available in the explicit improvement views.
+  The activity label names what the model is doing (**Reasoning**, **Writing**, **Preparing** *tool*),
+  and a provider retry reads **retrying…** rather than counting down to zero; once a retried request
+  succeeds, one **Recovered** line closes the retry note. A tool that has run for 10 seconds shows its
+  elapsed time (**running bash · 1m 15s**). The terminal tab title
+  uses a blue circle when Dial is waiting for you.
 - The default status line leads with the approval mode as a colored dot and plain label
   (`● Ask first`, `Edit freely`, `Full auto`, `Read-only`): green for ask and read-only, orange for
   full auto. Config, CLI and `/approval` values stay `ask`, `write`, `auto` and `readonly`.
 - **Work panel.** While a plan has open steps on a terminal at least 90 columns wide, one compact
   rounded card sits above the composer. It is as tall as its content and at most 100 columns wide.
-  Its tab strip shows `plan`, `evidence` and `approvals`, switched with `Ctrl+X` (or `Alt+W` or
+  Its tab strip shows `plan`, `evidence` and `mode`, switched with `Ctrl+X` (or `Alt+W` or
   `F12`; rebind `app.work.tab`). The plan tab lists the steps with status dots (a green check for
   done, an orange dot for the step in progress, a hollow ring for pending) and the focused step's
   recorded reason or finding; when the card is short it keeps the focused step and drops reason
-  lines first. Evidence lists references recorded so far, labelled as agent observations, not
-  verification. Approvals shows the approval mode and sandbox. At 60–89 columns a collapsed plan-only
+  lines first. Evidence lists references recorded so far, newest and focused first with a `+N more`
+  count for the rest, labelled as agent observations, not verification. Mode shows the approval mode
+  and sandbox. At 60–89 columns a collapsed plan-only
   card shows the current and next step; narrower terminals keep the one-line focus summary. The panel
   only reads the plan; it never changes it.
 - The launch input is a rounded box that asks "What are we building?". It shows no status line
@@ -50,8 +58,8 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   `rust-best-practices · references/handbook-11.md`, so separate reference reads do not look like
   repeated loads of the core skill.
 - The `cost` segment shows the observed API cost of the running turn and the session, such as
-  `$0.0412 turn · $1.20 session`. Amounts use the `$` form of `/cost` (four decimals below a
-  dollar, cents above). While a turn runs, the segment counts spend observed since the turn
+  `$0.04 turn · $1.20 session`. Amounts show cents from a cent upward and four decimals below
+  one (`$0.0041`). While a turn runs, the segment counts spend observed since the turn
   started, including workers and background work that settles meanwhile. When the turn ends it
   shows that turn's exact ledger figure until the next turn starts. The session total includes
   workers and is omitted when it equals the turn. The segment is hidden when the cost is unknown
@@ -61,7 +69,8 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   line after the token, rate, learning, usage, session and time segments. `/cost` keeps the full
   breakdown.
 - Local inference shows **loading model**, **processing prompt**, then a live **generating tokens**
-  counter and tokens/second in the composer. Dial's MLX runners report engine counts, including
+  counter and tokens/second in the composer; preparing a local model also shows as activity.
+  Dial's MLX runners report engine counts, including
   reasoning and tool tokens; the text runner also reports prompt processing progress. Other local
   servers use estimates marked `~` until reported usage arrives. Counters reset for each request.
   Text-embedded tool syntax stays hidden from the transcript, but its streamed bytes still advance
@@ -86,29 +95,41 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   presets, band, box or line composer, styled headings/code/diffs, expandable tool results, and
   `NO_COLOR`.
 - Activity reads apart at a glance. Commands, code cells, edits and web calls are framed cards
-  with the exit code and time on the bottom edge. Runs of reads and searches fold into `Read (N)` /
+  with the exit code and time on the bottom edge; shell and code cards are framed from the start
+  and show a live elapsed time after one second. A failed command shows its last output lines, and
+  hidden-line counts refer to source lines. Denied and stopped calls show a muted `⊘ denied` or
+  `⊘ stopped` rather than a failure. Runs of reads and searches fold into `Read (N)` /
   `Search (N)` trees. Notes sent to other agents show as quoted `✉ IRC` lines with delivery
-  receipts. Skill and tool loading stays in the quiet `◆` context lane.
+  receipts. Skill and tool loading stays in the quiet `◆` context lane. Collapsed reasoning reads
+  `◇ reasoning · N lines (Ctrl+T shows)`. Markdown list bullets render as `•`, code blocks with a
+  `│` gutter and task lists as `☑`/`☐`.
+- Durations read `45s`, `12m34s` or `1h15m`, and large counts are shortened (`1.5k`).
 - Unicode-aware multiline editing, bracketed paste, persistent per-project prompt history and history
-  search. Secret provider inputs are masked and never enter prompt history.
+  search. `Up`/`Down` (or `Ctrl+P`/`Ctrl+N`) first step through queued messages, then prompt history.
+  Secret provider inputs are masked and never enter prompt history.
+- The newline hint shows `Shift+Enter` only when the terminal speaks the kitty keyboard protocol;
+  otherwise Shift+Enter arrives as plain Enter, so the hint shows `Ctrl+J`.
 - Pasted text stays in the draft. Buffered unbracketed paste preserves line breaks, and an immediate
   trailing Enter after bracketed paste is ignored. Press Enter after the paste settles to send it.
-- **Clipboard images:** the paste-image key (`app.clipboard.pasteImage`) attaches the clipboard image
-  as a quoted PNG path in the draft. Sources by platform: macOS reads the pasteboard (PNG, TIFF,
+  A large paste collapses into a placeholder that Backspace or Delete removes as one unit.
+- **Clipboard images:** the paste-image key (`app.clipboard.pasteImage`; `Ctrl+V`, `Alt+V` on Windows)
+  attaches the clipboard image as an `[Image #n]` chip in the draft. Sources by platform: macOS reads the pasteboard (PNG, TIFF,
   JPEG, including screenshots) and then an image file copied in Finder; Windows and WSL read the
   Windows clipboard through `powershell.exe`; Wayland uses `wl-paste` and X11 uses `xclip`. Termux
   has no clipboard image API (`termux-clipboard-get` is text only) and reports that explicitly.
   Every image is normalized to PNG and downscaled to fit the 5 MiB attachment limit. If nothing
   usable is found, the error lists each reader that was tried and why it produced no image.
-- Questions and approvals quarantine input queued before the dialog opens, so a buffered Enter
-  cannot approve an unseen action. A question opened over a nonempty draft starts with draft
-  focus: Enter edits that draft, Tab/Escape moves to the choices, and Ctrl+C cancels the question.
+- Questions and approvals quarantine input queued before the dialog opens, and ignore answer keys
+  for about 350 ms after the prompt appears, so a buffered Enter or letter cannot answer an unseen
+  prompt. Navigation and cancellation work immediately. A question opened over a nonempty draft starts with draft
+  focus: Enter edits that draft, Tab/Escape moves to the choices, and Esc or Ctrl+C cancels the question.
   If a question or approval arrives while a full-screen menu is open during a turn, the menu
   temporarily yields to the inline prompt. Its state is kept and it reopens after the prompt;
   menu navigation and any composer draft are preserved.
 - In question dialogs, Enter in **Other/custom input** submits the answer (or advances to the next
-  question). Shift+Enter inserts a newline. Enter in **Note** saves the note and returns to the
-  choices without submitting.
+  question). Shift+Enter (or Ctrl+J) inserts a newline. Enter in **Note** saves the note and returns to the
+  choices without submitting. Esc cancels the dialog. The attach-image key (`Ctrl+V`; `Alt+V` on
+  Windows) attaches an image path; `Ctrl+A` stays line start.
 - **Inline suggestions:** command arguments offer valid choices as dim ghost text even before you have
   used them: `/understanding ` suggests `architecture`, `/skills s` suggests `sources`, and
   `/skills enable ` suggests an installed skill name (including disabled skills). Built-in choices

@@ -17,6 +17,60 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+- Safer interaction with the agent. Approval and question prompts ignore answer keys for a moment
+  after they appear, saving a project-wide grant asks for confirmation, and Ctrl+C at a prompt
+  denies and stops the turn (Esc or `n` only deny). Keys typed just before a prompt are no longer
+  replayed after the turn. The busy chooser picks with digits instead of plain letters, Ctrl+C with
+  a draft clears it before stopping, the first Ctrl+C in a panel opened mid-turn only closes it,
+  and Esc cancels a question. Approvals lead with the action; batch approvals list one line per
+  change; plan approval reads "Review plan" and renders the plan as markdown
+  ([composer](docs/composer.md), [shortcuts](docs/terminal-shortcuts.md)).
+- Keys are consistent across panels: the command palette defaults to Alt+K/F1 so Ctrl+P/Ctrl+N
+  browse history and move list selections everywhere; the session picker pins with Ctrl+B and the
+  headers editor adds rows with Ctrl+O; pickers, dialogs and panel text fields follow remapped
+  keys; every panel has F1/`?` key help; the newline hint shows Ctrl+J when Shift+Enter cannot be
+  sent; the shortcuts panel records a chord after Tab and names `config.toml [keys]` as the save
+  location.
+- Transcript states are accurate: denied and stopped tool calls render muted instead of failed,
+  progress follows each call, spinners animate on every card, failures show their last output
+  lines, shell cards keep one shape with a live timer, and task cards settle when the call returns.
+  Resumed sessions no longer show harness messages as user text, and pasted indentation is kept.
+- Workers that end needing input or blocked are shown as finished and needing attention (and can
+  be continued), stay pinned until opened, show their result in the hub, and are named "worker"
+  throughout. The status line keeps one layout while busy, names what the model is doing, and keeps
+  workers and inbox on narrow terminals; extra rows share a height budget at small sizes; the
+  update notice unpins after five minutes. Panels share one selection, tab, footer and scroll style,
+  and durations, counts and costs use one format ([subagents](docs/subagents.md),
+  [terminal](docs/terminal-interface.md)).
+- Peer send receipts clarify that queued messages were accepted into the recipient's inbox, not
+  acknowledged or guaranteed to wake an idle session. Automatic terminal wake-up remains conditional
+  on recipient settings and current eligibility; the receipt does not establish either.
+- A failing check no longer ends the turn with `Specialist schemas are loaded only by tool_load`
+  under the default compact tool offer. Diagnostic capability routing now leaves the stable offer
+  unchanged instead of failing; specialists still load through `tool_load`.
+- A compound shell command that exits zero after an earlier step printed a recognised failure (for
+  example `step 2>&1; ls` where `step` was `not found`) now names that failure in a one-line note;
+  the exit status is unchanged ([shell](docs/shell.md)).
+- Tools accept more of the call shapes models actually send. Top-level `const`/`let`/`class` in a
+  JavaScript eval cell can be redefined by a later or retried cell, and under Node a cell
+  variable can shadow a builtin module name such as `fs` ([execution](docs/execution-and-web.md)).
+  An object or array field sent as a JSON string is decoded, `verify` treats `targets: []` as
+  omitted, `glob` accepts an absolute pattern under the workspace root, and a file reference
+  copied with its `#TAG` names the same file ([tools](docs/tools.md)).
+- Failure guidance is more specific: a missing program names a known substitute or package
+  ([shell](docs/shell.md)); in unattended runs an outside-workspace refusal says that
+  `request_directory` cannot be approved ([directory access](docs/directory-access.md)); and a
+  Python eval that cannot start says when JavaScript eval is available.
+- Fewer surprises while Dial works. After a busy Ctrl+C clears a draft, the hint offers `Ctrl+-` to
+  restore it; a panel opened during a turn says on its blank bottom row that Dial is still working
+  and that Ctrl+C closes the panel. Saving a project-wide grant states what it covers, the project
+  root it applies to, that it lasts until revoked, and that non-matching calls still ask. Worker
+  notices quote the first line of a worker's question or blocker, and the worker view header says
+  how to continue it. A tool running for 10 seconds shows its elapsed time in the status line, and a
+  model request that succeeds after provider retries adds one **Recovered** line
+  ([shortcuts](docs/terminal-shortcuts.md), [tools](docs/tools.md), [turns](docs/terminal-turns.md),
+  [composer](docs/terminal-composer.md)).
+
 ## [0.3.1] - 2026-11-06
 
 - Sessions compacted with Anthropic native compaction no longer fail every later request with

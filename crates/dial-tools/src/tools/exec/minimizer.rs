@@ -765,5 +765,29 @@ pub fn silent_exit_meaning(command: &str, code: i32) -> Option<&'static str> {
     }
 }
 
+pattern!(
+    SHELL_NOT_FOUND,
+    r"(: command not found|^(\S+: )?(\d+: )?\S+: not found)$"
+);
+
+/// Failure lines that an earlier step of a compound command or pipeline printed although the
+/// whole command exited zero (`step 2>&1; ls`): the reported status belongs to the last step, not
+/// to the step that failed. Uses the digest's failure vocabulary plus the shell's own missing-program
+/// report. A sole command's status is its own, so it gets none. At most two clipped lines; this is an
+/// observation, not proof the work failed.
+pub fn masked_failure(command: &str, text: &str) -> Option<String> {
+    if bash_interceptor::sole_command(command).is_some() {
+        return None;
+    }
+    let failures: Vec<String> = clean_terminal(text)
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| FAILURE_HEAD.is_match(line) || SHELL_NOT_FOUND.is_match(line.trim_start()))
+        .take(2)
+        .map(clip)
+        .collect();
+    (!failures.is_empty()).then(|| failures.join(" | "))
+}
+
 #[cfg(test)]
 mod tests;

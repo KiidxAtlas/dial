@@ -174,7 +174,32 @@ fn thrown_error_is_reported_with_name_and_message() {
 }
 
 #[test]
-fn redeclaration_gets_hint() {
+fn edited_cells_redeclare_top_level_names_after_rewriting() {
+    let cells = crate::tools::exec::eval::tests::REDECLARED_CELLS;
+    let frames = drive(
+        &cells
+            .iter()
+            .enumerate()
+            .map(|(id, code)| {
+                json!({"id": id, "code": crate::tools::exec::eval::cells::redeclarable(code)})
+            })
+            .collect::<Vec<_>>(),
+    );
+    let result = |id: usize| {
+        frames
+            .iter()
+            .find(|frame| frame.get("id") == Some(&json!(id)) && frame.get("result").is_some())
+            .expect("result frame")["result"]
+            .clone()
+    };
+    assert_eq!(result(0)["error"], Value::Null, "{}", result(0));
+    assert!(result(1)["error"].as_str().is_some());
+    assert_eq!(result(2)["error"], Value::Null, "{}", result(2));
+    assert_eq!(result(2)["value"], json!("17"));
+}
+
+#[test]
+fn redeclaration_without_rewriting_gets_hint() {
     let frames = drive(&[
         json!({"id": 1, "code": "let dup = 1;"}),
         json!({"id": 2, "code": "let dup = 2;"}),

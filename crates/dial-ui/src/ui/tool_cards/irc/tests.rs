@@ -38,6 +38,7 @@ fn sent(name: &str, input: &str, output: &str, state: ToolState) -> Tool {
         elapsed: Some(0.01),
         todo: None,
         agents: Vec::new(),
+        outcome: None,
     }
 }
 
@@ -81,6 +82,23 @@ fn a_broadcast_lists_each_receipt_and_why_one_was_refused() {
         assert_eq!(rows[2].trim_end(), "   |- a [queued]");
         assert_eq!(rows[3].trim_end(), "   `- c [refused] - not running");
         assert!(rows.iter().all(|r| r.is_ascii()), "{rows:?}");
+    });
+}
+
+#[test]
+fn ascii_glyphs_keep_received_notes_ascii() {
+    ctx_with(true, false, |ctx| {
+        for body in [
+            "Message from scout#1 to parent: done with the review",
+            "Project peer 490adb sent a coordination message.",
+        ] {
+            let rows = rendered(&incoming_notice(body, 60, ctx).unwrap());
+            assert!(
+                rows[0].starts_with('@') && rows[0].contains("<-"),
+                "{rows:?}"
+            );
+            assert!(rows.iter().all(|r| r.is_ascii()), "{rows:?}");
+        }
     });
 }
 

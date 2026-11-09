@@ -29,7 +29,9 @@ even when a normal launch root remains available.
 Directory capability requests always require an actual interactive decision,
 including in auto approval modes. There is no “always allow” or “allow project”
 option. Denial, cancellation, or a directory changing during the popup leaves the
-workspace unchanged. Hermetic and unattended surfaces cannot grant access.
+workspace unchanged. Hermetic and unattended surfaces cannot grant access; in those runs a file
+tool's outside-workspace refusal adds a note that `request_directory` cannot be approved, so the
+model reports the missing access instead of requesting it.
 The tool is discoverable through `tool_search` / `tool_load` when not offered.
 `/add-dir`, `--add-dir`, `/remove-dir`, and `/dirs` remain available.
 

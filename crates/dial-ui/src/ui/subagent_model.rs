@@ -43,7 +43,7 @@ const PERSISTENT_FOLLOW_ROUNDS: usize = 1;
 pub enum AgentStatus {
     #[default]
     Running,
-    /// Blocked on an approval or a question.
+    /// Live: still running, but blocked on an approval or a question.
     Waiting,
     Done,
     /// A reply was delivered without claiming completed work.
@@ -52,6 +52,10 @@ pub enum AgentStatus {
     Cancelled,
     /// Work ended without an explicit cancellation receipt.
     Interrupted,
+    /// Ended asking the operator for input; continuable with `resume` when a transcript exists.
+    NeedsInput,
+    /// Ended blocked on something it could not do itself; continuable like [`Self::NeedsInput`].
+    Blocked,
 }
 
 impl AgentStatus {
@@ -62,24 +66,23 @@ impl AgentStatus {
             Self::Done => "completed",
             Self::Answered => "answered",
             Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
+            Self::Cancelled => "stopped",
             Self::Interrupted => "interrupted",
+            Self::NeedsInput => "needs input",
+            Self::Blocked => "blocked",
         }
     }
 
     pub fn is_finished(self) -> bool {
-        matches!(
-            self,
-            Self::Done | Self::Answered | Self::Failed | Self::Cancelled | Self::Interrupted
-        )
+        !matches!(self, Self::Running | Self::Waiting)
     }
 
     /// Roster order: work that needs the operator first (input requests, then failures), then
     /// live work, then the rest of the finished work.
     pub fn rank(self) -> u8 {
         match self {
-            Self::Waiting => 0,
-            Self::Failed | Self::Interrupted => 1,
+            Self::Waiting | Self::NeedsInput => 0,
+            Self::Failed | Self::Interrupted | Self::Blocked => 1,
             Self::Running => 2,
             Self::Done | Self::Answered => 3,
             Self::Cancelled => 4,
@@ -90,8 +93,8 @@ impl AgentStatus {
     /// Lists that keep a stable order still float these to the top.
     pub fn attention(self) -> u8 {
         match self {
-            Self::Waiting => 0,
-            Self::Failed | Self::Interrupted => 1,
+            Self::Waiting | Self::NeedsInput => 0,
+            Self::Failed | Self::Interrupted | Self::Blocked => 1,
             _ => 2,
         }
     }
@@ -99,7 +102,10 @@ impl AgentStatus {
     fn from_phase(phase: Phase) -> Self {
         match phase {
             Phase::Running => Self::Running,
-            Phase::Blocked | Phase::NeedsInput => Self::Waiting,
+            // Both are terminal outcomes of a worker run, not a live wait: the worker has
+            // returned and only a `resume` continues it.
+            Phase::Blocked => Self::Blocked,
+            Phase::NeedsInput => Self::NeedsInput,
             Phase::Completed => Self::Done,
             Phase::Answered => Self::Answered,
             Phase::Failed | Phase::Incomplete => Self::Failed,
@@ -113,6 +119,51 @@ impl AgentStatus {
             Self::Cancelled
         } else {
             Self::from_phase(Phase::from_status(status))
+        }
+    }
+}
+
+/// Workers per status bucket. Every count shown for a set of workers (hub title, pinned block
+/// header, status segment) comes from here, so the surfaces never disagree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatusCounts {
+    pub total: usize,
+    /// Not finished: running or live waiting.
+    pub live: usize,
+    /// Running and not waiting on anyone.
+    pub running: usize,
+    /// Asking the operator: live waiting or ended needing input.
+    pub needs_input: usize,
+    /// Failed, interrupted or blocked.
+    pub trouble: usize,
+    /// Completed or answered.
+    pub done: usize,
+    /// Stopped by a cancellation.
+    pub stopped: usize,
+}
+
+impl StatusCounts {
+    pub fn of<'a>(agents: impl IntoIterator<Item = &'a AgentEntry>) -> Self {
+        let mut counts = Self::default();
+        for agent in agents {
+            counts.add(agent.status);
+        }
+        counts
+    }
+
+    fn add(&mut self, status: AgentStatus) {
+        self.total += 1;
+        if !status.is_finished() {
+            self.live += 1;
+        }
+        match status {
+            AgentStatus::Running => self.running += 1,
+            AgentStatus::Waiting | AgentStatus::NeedsInput => self.needs_input += 1,
+            AgentStatus::Failed | AgentStatus::Interrupted | AgentStatus::Blocked => {
+                self.trouble += 1;
+            }
+            AgentStatus::Done | AgentStatus::Answered => self.done += 1,
+            AgentStatus::Cancelled => self.stopped += 1,
         }
     }
 }
@@ -160,6 +211,9 @@ pub struct AgentEntry {
     pub task: String,
     /// `tool · args`, or the latest intent, while running.
     pub current: Option<String>,
+    /// First lines of the final reply once finished (the question for `NeedsInput`, the reason
+    /// for `Failed` or `Blocked`).
+    pub result: Option<String>,
     /// `(attempt, max)` of a provider retry in progress.
     pub retry: Option<(u32, u32)>,
     pub steps: u64,
@@ -179,8 +233,8 @@ pub struct AgentEntry {
     pub artifacts: Vec<(String, String)>,
     /// Isolation backend plus branch or path.
     pub isolation: Option<String>,
-    /// Inbound messages in the recent mailbox window.
-    pub unread: usize,
+    /// Messages sent to this worker in the recent mailbox window (not a read/unread state).
+    pub inbound: usize,
     /// Can receive a steering message now.
     pub steerable: bool,
     /// Finished and continuable with `resume`.
@@ -212,7 +266,12 @@ pub enum ActivityKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActivityEvent {
     pub agent_id: String,
+    /// Ordering key. A real wall-clock time only when `timed`; otherwise the owning worker's
+    /// latest activity, so untimed transcript events keep their recorded order.
     pub at_ms: u64,
+    /// Whether `at_ms` was recorded for this event. Transcript records and mailbox letters carry
+    /// no time of their own, so the feed shows no age for them.
+    pub timed: bool,
     pub kind: ActivityKind,
     pub title: String,
     pub summary: String,
@@ -340,8 +399,14 @@ impl HubCache {
         }
 
         for body in runtime.bodies("worker") {
-            let (node_id, phase, data) =
-                body.read(|node| (node.id.clone(), node.result.phase, node.result.data.clone()));
+            let (node_id, phase, data, text) = body.read(|node| {
+                (
+                    node.id.clone(),
+                    node.result.phase,
+                    node.result.data.clone(),
+                    node.result.text.clone(),
+                )
+            });
             let data = data.unwrap_or(Value::Null);
             let id = data["id"]
                 .as_str()
@@ -364,7 +429,7 @@ impl HubCache {
                     agents.len() - 1
                 }
             };
-            apply_body(&mut agents[index], &data, phase, now);
+            apply_body(&mut agents[index], &data, &text, phase, now);
         }
 
         for agent in &mut agents {
@@ -372,14 +437,14 @@ impl HubCache {
         }
         sort_agents(&mut agents);
 
-        let mut unread_by_id: HashMap<String, usize> = HashMap::new();
+        let mut inbound_by_id: HashMap<String, usize> = HashMap::new();
         let mut traffic_events: Vec<ActivityEvent> = Vec::new();
         let mut seen_traffic: HashSet<(String, String, String)> = HashSet::new();
         if let Some(control) = live {
             for agent in &agents {
                 for letter in control.traffic(&agent.id) {
                     if letter.to == agent.id {
-                        *unread_by_id.entry(agent.id.clone()).or_default() += 1;
+                        *inbound_by_id.entry(agent.id.clone()).or_default() += 1;
                     }
                     let key = (
                         letter.from.clone(),
@@ -390,6 +455,7 @@ impl HubCache {
                         traffic_events.push(ActivityEvent {
                             agent_id: agent.id.clone(),
                             at_ms: agent.last_activity_ms.or(agent.started_ms).unwrap_or(now),
+                            timed: false,
                             kind: ActivityKind::Message,
                             title: format!("{} → {}", letter.from, letter.to),
                             summary: crate::ui::text::clip(
@@ -403,7 +469,7 @@ impl HubCache {
             }
         }
         for agent in &mut agents {
-            agent.unread = unread_by_id.get(&agent.id).copied().unwrap_or(0);
+            agent.inbound = inbound_by_id.get(&agent.id).copied().unwrap_or(0);
         }
 
         let mut activity = Vec::new();
@@ -419,11 +485,27 @@ impl HubCache {
         }
         self.feeds
             .retain(|path, _| recent.iter().any(|summary| &summary.path == path));
+        // Transcripts keep no result in their status record; the last reply stands in for it.
+        for agent in agents
+            .iter_mut()
+            .filter(|agent| agent.status.is_finished() && agent.result.is_none())
+        {
+            agent.result = activity
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.agent_id == agent.id
+                        && event.kind == ActivityKind::Response
+                        && !event.summary.trim().is_empty()
+                })
+                .map(|event| event.summary.clone());
+        }
         for agent in &agents {
             if let Some(started) = agent.started_ms {
                 activity.push(ActivityEvent {
                     agent_id: agent.id.clone(),
                     at_ms: started,
+                    timed: true,
                     kind: ActivityKind::Lifecycle,
                     title: "started".into(),
                     summary: agent.task.clone(),
@@ -434,13 +516,14 @@ impl HubCache {
                 activity.push(ActivityEvent {
                     agent_id: agent.id.clone(),
                     at_ms: agent.last_activity_ms.or(agent.started_ms).unwrap_or(now),
-                    kind: if agent.status == AgentStatus::Failed {
+                    timed: agent.last_activity_ms.is_some() || agent.started_ms.is_some(),
+                    kind: if matches!(agent.status, AgentStatus::Failed | AgentStatus::Blocked) {
                         ActivityKind::Error
                     } else {
                         ActivityKind::Lifecycle
                     },
                     title: agent.status.label().into(),
-                    summary: agent.current.clone().unwrap_or_default(),
+                    summary: agent.result.clone().unwrap_or_default(),
                     entry: None,
                 });
             }
@@ -495,6 +578,9 @@ fn entry_from_transcript(
     }
     entry.started_ms = header["started_ms"].as_u64();
     entry.parent = header["parent"].as_str().map(str::to_owned);
+    entry.result = status_record
+        .and_then(|status| status["result"].as_str())
+        .and_then(result_line);
     entry.steps = status_record
         .and_then(|status| status["steps"].as_u64())
         .or_else(|| header["steps"].as_u64())
@@ -526,7 +612,7 @@ fn entry_from_transcript(
     entry
 }
 
-fn apply_body(entry: &mut AgentEntry, data: &Value, phase: Phase, now: u64) {
+fn apply_body(entry: &mut AgentEntry, data: &Value, text: &str, phase: Phase, now: u64) {
     let set = |slot: &mut String, key: &str| {
         if let Some(value) = data[key].as_str().filter(|value| !value.is_empty()) {
             *slot = value.to_owned();
@@ -608,6 +694,27 @@ fn apply_body(entry: &mut AgentEntry, data: &Value, phase: Phase, now: u64) {
         entry.current = None;
         entry.retry = None;
     }
+    if entry.status.is_finished()
+        && let Some(result) = data["result"]
+            .as_str()
+            .and_then(result_line)
+            .or_else(|| result_line(text))
+    {
+        entry.result = Some(result);
+    }
+}
+
+/// The first non-empty lines of a final reply, joined onto one line and clipped for display.
+fn result_line(text: &str) -> Option<String> {
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line = crate::ui::text::clip(&crate::ui::text::one_line(&joined), 320);
+    (!line.trim().is_empty()).then_some(line)
 }
 
 fn finish_projection(agent: &mut AgentEntry, live: &HashSet<String>, now: u64) {
@@ -841,18 +948,18 @@ pub enum ActionOutcome {
 
 /// Steer a running background worker: the text is delivered before its next model request.
 pub fn steer(live: Option<&LiveTaskControl>, id: &str, text: &str) -> Result<()> {
-    let live = live.ok_or_else(|| anyhow!("no live subagents in this session"))?;
+    let live = live.ok_or_else(|| anyhow!("no running workers in this session"))?;
     live.send(id, text)
         .map(|_| ())
-        .map_err(|error| anyhow!("cannot steer {id}: {error}"))
+        .map_err(|error| anyhow!("cannot message worker {id}: {error}"))
 }
 
-/// Cancel a running background worker.
+/// Stop a running background worker.
 pub fn cancel(live: Option<&LiveTaskControl>, id: &str) -> Result<()> {
-    let live = live.ok_or_else(|| anyhow!("no live subagents in this session"))?;
+    let live = live.ok_or_else(|| anyhow!("no running workers in this session"))?;
     live.cancel(id)
         .map(|_| ())
-        .map_err(|error| anyhow!("cannot cancel {id}: {error}"))
+        .map_err(|error| anyhow!("cannot stop worker {id}: {error}"))
 }
 
 /// Handle a hub action string. `None` means the action is not a subagent action.
@@ -869,7 +976,7 @@ pub fn act(action: &str, live: Option<&LiveTaskControl>) -> Option<Result<Action
             let (axis, value) = update
                 .split_once('\n')
                 .ok_or_else(|| anyhow!("missing setting value"))?;
-            let live = live.ok_or_else(|| anyhow!("no live subagents in this session"))?;
+            let live = live.ok_or_else(|| anyhow!("no running workers in this session"))?;
             let result = match axis {
                 "model" => live.configure(id, Some(value), None)?,
                 "thinking" => live.configure(id, None, Some(value))?,
@@ -880,7 +987,7 @@ pub fn act(action: &str, live: Option<&LiveTaskControl>) -> Option<Result<Action
     }
     if let Some(id) = action.strip_prefix("subagent-cancel:") {
         return Some(
-            cancel(live, id).map(|()| ActionOutcome::Banner(format!("cancel sent to {id}"))),
+            cancel(live, id).map(|()| ActionOutcome::Banner(format!("stop sent to {id}"))),
         );
     }
     if let Some(body) = action.strip_prefix("subagent-message:") {
@@ -915,6 +1022,7 @@ pub fn act(action: &str, live: Option<&LiveTaskControl>) -> Option<Result<Action
 fn totals(agents: &[AgentEntry]) -> Totals {
     let mut totals = Totals {
         total: agents.len(),
+        running: StatusCounts::of(agents).live,
         ..Totals::default()
     };
     for agent in agents {
@@ -924,16 +1032,14 @@ fn totals(agents: &[AgentEntry]) -> Totals {
         totals.requests += agent.requests;
         totals.tool_calls += agent.tool_calls;
         totals.agent_ms += agent.elapsed_ms.unwrap_or(0);
-        if agent.status == AgentStatus::Running || agent.status == AgentStatus::Waiting {
-            totals.running += 1;
-        }
     }
     totals
 }
 
 impl HubCache {
     /// Advances the feed of one transcript by at most the round budget and returns its events,
-    /// timed by the agent. A persistent cache spends [`PERSISTENT_FOLLOW_ROUNDS`] reads per
+    /// ordered at the agent's latest activity (records carry no time of their own, so they are
+    /// returned untimed). A persistent cache spends [`PERSISTENT_FOLLOW_ROUNDS`] reads per
     /// refresh, so a long or still-growing transcript never stalls the view; the rest is followed
     /// on later refreshes from the same position. A failed read drops the feed (the next call
     /// rebuilds it) and is counted, never reported as an empty fresh transcript.
@@ -1005,13 +1111,14 @@ fn push_bounded(events: &mut VecDeque<ActivityEvent>, new: Vec<ActivityEvent>) {
     }
 }
 
-/// Activity events of one archived message. `index` is its `#entry` deep-link index. Times are
-/// placeholders; [`HubCache::feed_activity`] assigns the agent's time when it reads the feed.
+/// Activity events of one archived message. `index` is its `#entry` deep-link index. Records
+/// carry no time; [`HubCache::feed_activity`] gives them the agent's time as an ordering key only.
 fn activity_of_message(agent_id: &str, index: usize, message: &Value) -> Vec<ActivityEvent> {
     let text = message_text(message);
     let event = |kind: ActivityKind, title: String, summary: String| ActivityEvent {
         agent_id: agent_id.to_owned(),
         at_ms: 0,
+        timed: false,
         kind,
         title,
         summary,

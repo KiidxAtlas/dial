@@ -74,7 +74,7 @@ fn one_compact_card_lists_steps_beside_the_tab_strip_at_capped_width() {
             "○ Write the docs",
             " plan ",
             " evidence ",
-            " approvals ",
+            " mode ",
         ] {
             assert!(joined.contains(needle), "{needle:?} in {joined}");
         }
@@ -116,15 +116,46 @@ fn tabs_show_the_focused_step_evidence_and_approval_mode() {
         "{evidence}"
     );
 
-    let approvals = plain(&render(Tab::Approvals, 120, 12)).join("\n");
+    let mode = plain(&render(Tab::Mode, 120, 12)).join("\n");
     assert!(
-        approvals.contains("● Ask first")
-            && approvals.contains("sandbox workspace")
-            && approvals.contains("Shift+Tab cycles the mode"),
-        "{approvals}"
+        mode.contains("● Ask first")
+            && mode.contains("sandbox workspace")
+            && mode.contains("Shift+Tab cycles the mode"),
+        "{mode}"
     );
     assert_eq!(Tab::Plan.next(), Tab::Evidence);
-    assert_eq!(Tab::Approvals.next(), Tab::Plan);
+    assert_eq!(Tab::Mode.next(), Tab::Plan);
+}
+
+#[test]
+fn evidence_lists_newest_steps_first_and_counts_what_the_card_cuts() {
+    let mut todo = TodoList::new();
+    let tasks: Vec<_> = (0..4)
+        .map(|i| json!({"content": format!("step {i}")}))
+        .collect();
+    todo.call(&json!({"op": "set", "tasks": tasks}));
+    for i in 0..3 {
+        todo.call(&json!({"op": "done", "evidence": [format!("ref {i}a"), format!("ref {i}b")]}));
+    }
+    // Plenty of room: every reference, newest step first.
+    let all = plain(&render_todo(&todo, Tab::Evidence, 120, 40)).join("\n");
+    assert!(!all.contains("more reference"), "{all}");
+    assert!(
+        all.find("step 2").unwrap() < all.find("step 0").unwrap(),
+        "{all}"
+    );
+    // Eight rows: borders, tabs, the caveat, three rows and the overflow count.
+    let view = render_todo(&todo, Tab::Evidence, 120, 8);
+    let text = plain(&view);
+    assert_eq!(view.len(), 8, "{text:?}");
+    let joined = text.join("\n");
+    assert!(
+        joined.contains("step 2") && joined.contains("ref 2b"),
+        "{joined}"
+    );
+    assert!(!joined.contains("step 0"), "{joined}");
+    // Shown: step 2, ref 2a, ref 2b; the other four references are counted.
+    assert!(joined.contains("+4 more references"), "{joined}");
 }
 
 #[test]

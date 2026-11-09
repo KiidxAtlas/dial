@@ -21,7 +21,7 @@ use crate::ui::{
     keys::{Action, Keymap},
     subagent_model::{
         ActivityEvent, ActivityFilter, ActivityKind, ActivityScope, AgentEntry, AgentStatus,
-        HubSnapshot, Totals, TreeRow, epoch_ms, matches_filter, tree_rows,
+        HubSnapshot, StatusCounts, Totals, TreeRow, epoch_ms, matches_filter, tree_rows,
     },
     text,
     theme::{Sym, Theme, Tok},
@@ -184,11 +184,10 @@ impl SubagentsOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
-        if self.panel_keys.handle(
-            event,
-            self.search.is_some() || self.compose.is_some(),
-            false,
-        ) {
+        if self
+            .panel_keys
+            .handle_key(event, self.search.is_some() || self.compose.is_some())
+        {
             return OverlayEvent::None;
         }
         if let Event::Paste(text) = event {
@@ -445,7 +444,7 @@ impl SubagentsOverlay {
             return;
         }
         let why = if agent.status.is_finished() {
-            "cannot be resumed (no retained transcript)"
+            "cannot be continued (no saved transcript)"
         } else {
             "cannot take messages right now"
         };
@@ -718,7 +717,7 @@ impl SubagentsOverlay {
             frame,
             ctx,
             "Workers",
-            "/ searches · Enter opens a worker · x reviews cancellation · m writes a message",
+            "x x  stop a running worker\nm  message or continue a worker\nt  tree view\nr  role settings\n1 / 2  workers or activity tab",
             true,
             true,
         ) {
@@ -791,10 +790,10 @@ impl SubagentsOverlay {
         let tokens = t.tokens_in + t.tokens_out;
         let mut parts = Vec::new();
         if t.cost_usd > 0.0 {
-            parts.push(money(t.cost_usd));
+            parts.push(text::usd(t.cost_usd));
         }
         if tokens > 0 {
-            parts.push(format!("{} tok", compact(tokens)));
+            parts.push(format!("{} tok", text::compact_count(tokens)));
         }
         if t.requests > 0 {
             parts.push(format!("{} req", t.requests));
@@ -1057,10 +1056,15 @@ impl SubagentsOverlay {
                 theme.fg(Tok::Dim),
             ));
         }
-        if agent.unread > 0 {
-            let envelope = if ascii { "msg" } else { "✉" };
+        if agent.inbound > 0 {
+            // A count of letters sent to it, not a read state: nothing here marks them read.
+            let envelope = if ascii { "" } else { "✉ " };
             left.push(Span::styled(
-                format!("  {envelope} {}", agent.unread),
+                format!(
+                    "  {envelope}{} msg{}",
+                    agent.inbound,
+                    if agent.inbound == 1 { "" } else { "s" }
+                ),
                 theme.fg(Tok::Accent),
             ));
         }
@@ -1092,6 +1096,7 @@ impl SubagentsOverlay {
         );
 
         // What the worker is doing now, or why it stopped; usage numbers otherwise.
+        let result = agent.result.as_deref().map(text::one_line);
         let detail = match (&agent.status, &agent.current, &agent.retry) {
             (AgentStatus::Running | AgentStatus::Waiting, Some(current), retry) => {
                 let lead = if agent.status == AgentStatus::Waiting {
@@ -1107,13 +1112,19 @@ impl SubagentsOverlay {
                 }
                 d
             }
-            (AgentStatus::Failed, Some(current), _) => {
-                format!("failed: {}", text::one_line(current))
+            (status, _, _) if status.is_finished() && result.is_some() => {
+                let result = result.unwrap_or_default();
+                match status {
+                    AgentStatus::Failed => format!("failed: {result}"),
+                    AgentStatus::NeedsInput => format!("needs input: {result}"),
+                    AgentStatus::Blocked => format!("blocked: {result}"),
+                    _ => format!("{} {result}", if ascii { "=>" } else { "→" }),
+                }
             }
             _ => metrics(agent, epoch_ms()).join(&sep(theme)),
         };
         let detail_tok = match agent.status {
-            AgentStatus::Waiting => Tok::Warning,
+            AgentStatus::Waiting | AgentStatus::NeedsInput | AgentStatus::Blocked => Tok::Warning,
             AgentStatus::Failed => Tok::Error,
             _ => Tok::Dim,
         };
@@ -1192,14 +1203,19 @@ impl SubagentsOverlay {
             }
         }
 
-        // A finished worker has no "current" step; its last recorded step reads as the outcome.
+        // A finished worker has no "current" step; its final reply reads as the outcome.
         let current = agent
             .current
             .as_deref()
             .map(text::one_line)
             .filter(|c| !c.trim().is_empty());
-        match (agent.status, current) {
-            (AgentStatus::Running, current) => {
+        let result = agent
+            .result
+            .as_deref()
+            .map(text::one_line)
+            .filter(|c| !c.trim().is_empty());
+        match agent.status {
+            AgentStatus::Running => {
                 lines.push(heading("Now", w, theme));
                 lines.extend(kv_wrapped(
                     "doing",
@@ -1208,23 +1224,30 @@ impl SubagentsOverlay {
                     theme,
                 ));
             }
-            (AgentStatus::Waiting, current) => {
+            AgentStatus::Waiting | AgentStatus::NeedsInput => {
                 lines.push(heading("Needs your input", w, theme));
                 lines.extend(kv_wrapped(
                     "asks",
                     current
                         .as_deref()
+                        .or(result.as_deref())
                         .unwrap_or("input requested; no prompt details recorded"),
                     w,
                     theme,
                 ));
-                lines.push(field(" Press Enter to open it and reply.", w, theme));
+                let next = if agent.steerable || agent.resumable {
+                    " Press Enter to open it and reply."
+                } else {
+                    " No saved transcript; this worker cannot be continued."
+                };
+                lines.push(field(next, w, theme));
             }
-            (_, Some(current)) => {
-                lines.push(heading("Outcome", w, theme));
-                lines.extend(kv_wrapped("last", &current, w, theme));
+            _ => {
+                if let Some(result) = result.as_deref() {
+                    lines.push(heading("Outcome", w, theme));
+                    lines.extend(kv_wrapped("result", result, w, theme));
+                }
             }
-            (_, None) => {}
         }
         if let Some((n, max)) = agent.retry {
             lines.push(kv("retry", &format!("attempt {n}/{max}"), w, theme));
@@ -1308,9 +1331,13 @@ impl SubagentsOverlay {
             lines.push(heading("Recent activity", w, theme));
         }
         for event in recent.iter().rev().take(RECENT_ACTIVITY).rev() {
+            let age = if event.timed {
+                format!("{} ago", ago(event.at_ms, now))
+            } else {
+                String::new()
+            };
             let line = format!(
-                " {:>7} {} {}",
-                format!("{} ago", ago(event.at_ms, now)),
+                " {age:>7} {} {}",
                 kind_glyph(event.kind, theme),
                 text::one_line(&event.title)
             );
@@ -1397,7 +1424,17 @@ impl SubagentsOverlay {
             };
             let mut spans = vec![
                 Span::styled(format!("{pointer} "), theme.fg(Tok::Accent)),
-                Span::styled(cell(&ago(event.at_ms, now), 5), theme.fg(Tok::Dim)),
+                Span::styled(
+                    cell(
+                        &if event.timed {
+                            ago(event.at_ms, now)
+                        } else {
+                            String::new()
+                        },
+                        5,
+                    ),
+                    theme.fg(Tok::Dim),
+                ),
                 Span::styled(
                     cell(&self.name_of(&event.agent_id), agent_w),
                     theme.fg(Tok::Text),
@@ -1442,7 +1479,10 @@ fn plain(key: &KeyEvent) -> bool {
 fn status_glyph(status: AgentStatus, theme: &Theme) -> (String, Tok) {
     match status {
         AgentStatus::Running => (theme.sym(Sym::Working).to_string(), Tok::Accent),
-        AgentStatus::Waiting => (theme.sym(Sym::Warn).to_string(), Tok::Warning),
+        AgentStatus::Waiting | AgentStatus::NeedsInput => {
+            (theme.sym(Sym::Warn).to_string(), Tok::Warning)
+        }
+        AgentStatus::Blocked => (theme.sym(Sym::Blocked).to_string(), Tok::Warning),
         AgentStatus::Done => (theme.sym(Sym::Check).to_string(), Tok::Success),
         AgentStatus::Answered => (theme.sym(Sym::Dot).to_string(), Tok::Muted),
         AgentStatus::Failed => (theme.sym(Sym::Cross2).to_string(), Tok::Error),
@@ -1491,24 +1531,29 @@ fn badge_of(agent: &AgentEntry, theme: &Theme) -> String {
     }
 }
 
-/// Panel title counts: `5 workers · 1 needs input · 4 running`. Buckets with no workers are left
-/// out, and the attention buckets come first.
+/// Panel title counts: `5 workers · 1 needs input · 1 needs attention · 3 running`. Buckets with
+/// no workers are left out, and the attention buckets come first. Buckets come from
+/// [`StatusCounts`], the one count every worker surface uses.
 fn status_counts(agents: &[AgentEntry], sep: &str) -> String {
     if agents.is_empty() {
         return "none yet".to_owned();
     }
-    let count = |status: AgentStatus| agents.iter().filter(|a| a.status == status).count();
-    let total = agents.len();
+    let counts = StatusCounts::of(agents);
+    let total = counts.total;
     let mut parts = vec![format!(
         "{total} worker{}",
         if total == 1 { "" } else { "s" }
     )];
-    for (status, label) in [
-        (AgentStatus::Waiting, "needs input"),
-        (AgentStatus::Failed, "failed"),
-        (AgentStatus::Running, "running"),
+    let attention = if counts.trouble == 1 {
+        "needs attention"
+    } else {
+        "need attention"
+    };
+    for (n, label) in [
+        (counts.needs_input, "needs input"),
+        (counts.trouble, attention),
+        (counts.running, "running"),
     ] {
-        let n = count(status);
         // "3 workers · 3 running" says the same thing twice; the total alone is enough then.
         if n > 0 && n < total {
             parts.push(format!("{n} {label}"));
@@ -1555,10 +1600,12 @@ fn status_phrase(status: AgentStatus) -> &'static str {
     match status {
         AgentStatus::Running => "running",
         AgentStatus::Waiting => "needs your input",
+        AgentStatus::NeedsInput => "finished; needs your input",
+        AgentStatus::Blocked => "finished blocked",
         AgentStatus::Done => "completed",
         AgentStatus::Answered => "answered",
         AgentStatus::Failed => "failed",
-        AgentStatus::Cancelled => "cancelled",
+        AgentStatus::Cancelled => "stopped",
         AgentStatus::Interrupted => "interrupted",
     }
 }
@@ -1570,7 +1617,7 @@ fn usage_rows(agent: &AgentEntry, w: usize, theme: &Theme) -> Vec<(&'static str,
         rows.push(("elapsed", duration(ms)));
     }
     if let Some(cost) = agent.cost_usd {
-        rows.push(("cost", money(cost)));
+        rows.push(("cost", text::usd(cost)));
     }
     match (agent.tokens_in, agent.tokens_out) {
         (None, None) => {}
@@ -1578,9 +1625,9 @@ fn usage_rows(agent: &AgentEntry, w: usize, theme: &Theme) -> Vec<(&'static str,
             "tokens",
             format!(
                 "in {}{}out {}",
-                i.map_or("?".into(), compact),
+                i.map_or("?".into(), text::compact_count),
                 sep(theme),
-                o.map_or("?".into(), compact)
+                o.map_or("?".into(), text::compact_count)
             ),
         )),
     }
@@ -1609,7 +1656,7 @@ fn usage_rows(agent: &AgentEntry, w: usize, theme: &Theme) -> Vec<(&'static str,
 fn metrics(agent: &AgentEntry, now: u64) -> Vec<String> {
     let mut parts = Vec::new();
     if let Some(cost) = agent.cost_usd {
-        parts.push(money(cost));
+        parts.push(text::usd(cost));
     }
     if let Some(ms) = agent.elapsed_ms {
         parts.push(duration(ms));
@@ -1622,7 +1669,10 @@ fn metrics(agent: &AgentEntry, now: u64) -> Vec<String> {
     }
     match (agent.tokens_in, agent.tokens_out) {
         (None, None) => {}
-        (i, o) => parts.push(format!("{} tok", compact(i.unwrap_or(0) + o.unwrap_or(0)))),
+        (i, o) => parts.push(format!(
+            "{} tok",
+            text::compact_count(i.unwrap_or(0) + o.unwrap_or(0))
+        )),
     }
     if let Some((used, window)) = agent.context.filter(|(_, window)| *window > 0) {
         parts.push(format!("ctx {}%", used * 100 / window));
@@ -1708,8 +1758,8 @@ fn gauge(used: u64, window: u64, w: usize) -> String {
         "{}{} {pct}% {}/{}",
         "█".repeat(filled_cells),
         "░".repeat(cells - filled_cells),
-        compact(used),
-        compact(window)
+        text::compact_count(used),
+        text::compact_count(window)
     )
 }
 
@@ -1731,28 +1781,7 @@ fn ago(at_ms: u64, now: u64) -> String {
 }
 
 fn duration(ms: u64) -> String {
-    let secs = ms / 1000;
-    match secs {
-        0..60 => format!("{:.1}s", ms as f64 / 1000.0),
-        60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
-        _ => format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60),
-    }
-}
-
-fn money(usd: f64) -> String {
-    if usd >= 0.01 {
-        format!("${usd:.2}")
-    } else {
-        format!("${usd:.4}")
-    }
-}
-
-fn compact(n: u64) -> String {
-    match n {
-        0..1_000 => n.to_string(),
-        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),
-        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
-    }
+    text::duration_label(ms as f64 / 1000.0)
 }
 
 #[cfg(test)]

@@ -131,6 +131,8 @@ pub const INITIAL_GUIDANCE: &str = "Visual evidence may help this task. Decide w
 // Guidance selected by typed failure classification, not by model interpretation.
 pub(crate) const EFFECTS_UNKNOWN: &str = "Inspect affected state before any retry. Partial work may exist; do not infer rollback or replay the operation.";
 pub(crate) const PERMISSION_OR_POLICY: &str = "Respect the reported boundary. Do not switch tools to bypass it; finish reachable work and report the exact missing permission or prerequisite.";
+/// Appended where a path refusal suggests `request_directory` but no one can approve it.
+pub(crate) const DIRECTORY_REQUEST_UNAVAILABLE: &str = "\n<dial-notice kind=\"directory_request_unavailable\">This run has no interactive approver, so `request_directory` cannot be granted here; do not call it for this path. The path stays outside the workspace for file tools: finish the reachable work and report this path as the missing access if the task needs it.</dial-notice>";
 pub(crate) const INTERRUPTED: &str = "Preserve completed effects. Do not automatically replay the interrupted operation; follow the user's direction and inspect state if continuation is requested.";
 pub(crate) const TIMEOUT: &str = "Inspect the recorded process/task state and completed output. Continue with a narrower bounded operation only when its effects are understood; a timeout is not a code diagnosis.";
 pub(crate) const NOT_EXECUTED: &str = "Resolve the reported ordering, cancellation or prerequisite before making a new call. Do not report this operation as executed.";
@@ -155,9 +157,43 @@ pub(crate) fn shell_tool_mistake(name: &str, next: &str) -> String {
 }
 
 pub(crate) fn missing_program(name: &str) -> String {
+    let substitute = program_substitute(name)
+        .map(|hint| format!(" Known substitute: {hint}."))
+        .unwrap_or_default();
     format!(
-        "\n<dial-notice kind=\"missing_program\">`{name}` was not found in the command's execution environment. Use recorded availability when supplied, after checking compatibility; otherwise check alternatives together once (for example `command -v python3 perl node`) in that same environment rather than searching an unchanged PATH repeatedly.</dial-notice>"
+        "\n<dial-notice kind=\"missing_program\">`{name}` was not found in the command's execution environment.{substitute} Use recorded availability when supplied, after checking compatibility; otherwise check alternatives together once (for example `command -v python3 perl node`) in that same environment rather than searching an unchanged PATH repeatedly. After installing a missing program, re-run the step that needed it.</dial-notice>"
     )
+}
+
+/// Widely available stand-ins or the package that provides a commonly missing program. Advice
+/// only: the substitute's presence in that environment is not checked.
+fn program_substitute(name: &str) -> Option<&'static str> {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    if base == "python" || base.starts_with("python3") {
+        return Some(
+            "for computation without Python, `eval` with language `js` (when offered; it needs no Python install) or `perl`",
+        );
+    }
+    Some(match base {
+        "xxd" | "hexdump" => "`od -A x -t x1z FILE` prints a hex dump",
+        "file" => {
+            "`head -c 16 FILE | od -A x -t x1z` shows the magic bytes; the `file` package provides it"
+        }
+        "dpkg-source" => {
+            "the `dpkg-dev` package provides it (needed by `apt-get source` to unpack)"
+        }
+        "patch" => {
+            "`git apply` applies unified diffs where git exists; the `patch` package provides it"
+        }
+        "wget" => "`curl -fLO URL`",
+        "curl" => "`wget URL`, or `python3 -c` with urllib",
+        "unzip" => "`python3 -m zipfile -e ARCHIVE DIR` or `bsdtar -xf ARCHIVE`",
+        "xz" | "unxz" => "the `xz-utils` package provides it (tar needs it for .tar.xz)",
+        "make" | "gcc" | "cc" | "g++" => {
+            "the `build-essential` package (Debian/Ubuntu) provides the C toolchain"
+        }
+        _ => return None,
+    })
 }
 
 pub(crate) fn launch_diagnostic_advice(facts: &str, next: &str) -> String {

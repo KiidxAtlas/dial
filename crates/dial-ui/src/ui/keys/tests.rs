@@ -581,7 +581,7 @@ fn editor_actions_form_their_own_context_without_default_collisions() {
         &key(KeyCode::Char('p'), KeyModifiers::CONTROL)
     ));
     assert!(map.matches(
-        Action::CommandPalette,
+        Action::SelectUp,
         &key(KeyCode::Char('p'), KeyModifiers::CONTROL)
     ));
     assert!(map.matches(
@@ -760,4 +760,74 @@ fn reload_keys_reads_config_and_retains_live_bindings_after_invalid_edits() {
             None => fs::remove_file(path).unwrap(),
         }
     }
+}
+
+#[test]
+fn ctrl_p_is_navigation_only_and_the_palette_has_its_own_chords() {
+    let map = Keymap::defaults();
+    let ctrl_p = key(KeyCode::Char('p'), KeyModifiers::CONTROL);
+    assert_eq!(map.actions_for(&ctrl_p), [Action::SelectUp]);
+    assert!(map.matches(
+        Action::CommandPalette,
+        &key(KeyCode::F(1), KeyModifiers::NONE)
+    ));
+    assert!(map.matches(
+        Action::CommandPalette,
+        &key(KeyCode::Char('k'), KeyModifiers::ALT)
+    ));
+}
+
+#[test]
+fn recorded_keys_round_trip_and_reject_what_cannot_be_written() {
+    for (code, mods, expected) in [
+        (
+            KeyCode::Char('K'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            "Ctrl+Shift+K",
+        ),
+        (KeyCode::Char('?'), KeyModifiers::SHIFT, "?"),
+        (KeyCode::BackTab, KeyModifiers::SHIFT, "Shift+Tab"),
+        (KeyCode::F(5), KeyModifiers::NONE, "F5"),
+        (KeyCode::Char(' '), KeyModifiers::CONTROL, "Ctrl+Space"),
+        (KeyCode::Enter, KeyModifiers::ALT, &native_alt("Enter")),
+    ] {
+        let chord = Chord::from_key(&key(code, mods)).unwrap();
+        assert_eq!(chord.display(), expected);
+        assert!(chord.matches(&key(code, mods)), "{expected}");
+    }
+    assert!(Chord::from_key(&key(KeyCode::Insert, KeyModifiers::NONE)).is_none());
+    assert!(Chord::from_key(&key(KeyCode::CapsLock, KeyModifiers::NONE)).is_none());
+}
+
+#[test]
+fn hints_skip_chords_a_legacy_terminal_cannot_send() {
+    let map = Keymap::defaults();
+    assert_eq!(map.reachable_label(Action::Newline, true), "Shift+Enter");
+    assert_eq!(map.reachable_label(Action::Newline, false), "Ctrl+J");
+    assert_eq!(map.reachable_label(Action::Settings, false), "Ctrl+4");
+    assert_eq!(map.reachable_label(Action::Submit, false), "Enter");
+}
+
+#[test]
+fn editing_chords_taken_by_composer_shortcuts_are_reported() {
+    let mut map = Keymap::defaults();
+    map.rebind(Action::ModelSelect, &["Ctrl+K"]).unwrap();
+    assert_eq!(
+        map.shadowed(Action::EditorDeleteToLineEnd),
+        [(Chord::parse("Ctrl+K").unwrap(), Action::ModelSelect)]
+    );
+    assert!(map.shadowed(Action::EditorLineStart).is_empty());
+    assert!(
+        map.shadowed(Action::ModelSelect).is_empty(),
+        "only editing actions"
+    );
+    let row = map
+        .hotkeys()
+        .into_iter()
+        .find(|row| row.id == Action::EditorDeleteToLineEnd.id())
+        .unwrap();
+    assert_eq!(
+        row.keys,
+        "Ctrl+K (Ctrl+K in the composer: Open the model selector)"
+    );
 }

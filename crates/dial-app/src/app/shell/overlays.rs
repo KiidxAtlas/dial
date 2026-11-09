@@ -295,7 +295,9 @@ impl Shell {
                 id,
                 entry,
                 from_hub,
-            } => ActiveOverlay::SubagentViewer(Box::new(
+            } => ActiveOverlay::SubagentViewer(Box::new({
+                // Opening a finished worker answers its pinned attention row.
+                self.workers.dismiss(&id);
                 crate::ui::overlay::subagent_viewer::SubagentViewer::new(
                     id,
                     self.session_id.clone(),
@@ -304,8 +306,8 @@ impl Shell {
                     self.ui.clone(),
                     std::time::Instant::now(),
                 )
-                .with_editors(self.worker_editors.clone()),
-            )),
+                .with_editors(self.worker_editors.clone())
+            })),
             Which::Extensions => ActiveOverlay::Extensions(Box::new(
                 crate::app::commands::extensions_browser::overlay(
                     app.layout(),
@@ -894,8 +896,8 @@ impl Shell {
             let id = payload.split('\n').next().unwrap_or_default().to_owned();
             self.pending_resume = Some(payload.to_owned());
             self.note(
-                "Subagents",
-                "The resume starts after the current turn finishes.",
+                "Workers",
+                "The worker continues after the current turn finishes.",
             );
             self.start_busy_overlay(
                 app,

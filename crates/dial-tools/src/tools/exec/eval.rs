@@ -28,6 +28,7 @@ pub const BATCH_CALLBACK: &str = "dial.batch";
 
 use super::kernel::fork_fence_prefix;
 
+pub(super) mod cells;
 #[cfg(all(feature = "embedded-js", unix))]
 mod embedded;
 #[cfg(all(feature = "embedded-js", unix))]
@@ -291,10 +292,12 @@ impl JsRuntime {
                     check_operation(end, &self.interrupt, cancel)?;
                     slot.as_mut().unwrap().prelude_language =
                         Some(crate::tools::exec::preludes::PreludeLanguage::Js);
+                    // Re-running an edited cell must not fail on its own earlier declarations.
+                    let code = cells::redeclarable(code);
                     native_cell(
                         slot.as_mut().unwrap(),
                         &scope,
-                        code,
+                        &code,
                         dispatch,
                         &handoff,
                         effect_started,
@@ -531,9 +534,23 @@ impl EvalTool {
                 .run(ctx, action, args, cancel, adopt, dispatch, effect_started),
             "py" => self
                 .python
-                .run(ctx, action, args, cancel, adopt, dispatch, effect_started),
+                .run(ctx, action, args, cancel, adopt, dispatch, effect_started)
+                .map_err(|error| python_unavailable_hint(error, ctx)),
             other => Err(format!("unsupported eval language {other:?}; use js or py")),
         }
+    }
+}
+
+/// A Python interpreter that cannot be found or started is not the end of eval: when JavaScript
+/// resolves, the error says so. Other Python failures are returned unchanged.
+fn python_unavailable_hint(error: String, ctx: &ToolContext) -> String {
+    let launcher_failed = error.contains("kernel.python");
+    if launcher_failed && installed_languages(ctx.workspace.root(), ctx.config).contains(&"js") {
+        format!(
+            "{error}\nJavaScript eval is available in this session: rerun the cell with language \"js\" (or omit language) instead of installing Python."
+        )
+    } else {
+        error
     }
 }
 

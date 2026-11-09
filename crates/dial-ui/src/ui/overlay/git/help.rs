@@ -1,14 +1,9 @@
 //! The `?` keyboard reference for the git overlay. Lists only the keys `GitOverlay::key` and
 //! its edit mode handle.
 
-use crate::ui::{
-    chrome,
-    theme::{Theme, Tok},
-};
-use ratatui::{
-    style::Modifier,
-    text::{Line, Span},
-};
+use super::super::panel_keys::{SheetGroup, sheet};
+use crate::ui::theme::Theme;
+use ratatui::text::Line;
 
 /// One sheet row: the key names that trigger it and what they do.
 pub(super) struct Binding {
@@ -26,27 +21,27 @@ pub(super) const GROUPS: &[Group] = &[
         title: "Move",
         rows: &[
             Binding {
-                keys: &["up", "down", "k", "j"],
+                keys: &["Up", "Down", "k", "j"],
                 label: "Move the cursor one row",
             },
             Binding {
-                keys: &["pgup", "pgdn"],
+                keys: &["PgUp", "PgDn"],
                 label: "Move the cursor a page",
             },
             Binding {
-                keys: &["home", "end", "g", "G"],
+                keys: &["Home", "End", "g", "G"],
                 label: "First or last row of the diff",
             },
             Binding {
-                keys: &["left", "right", "h", "l"],
+                keys: &["Left", "Right", "h", "l"],
                 label: "Scroll the diff sideways",
             },
             Binding {
-                keys: &["enter"],
+                keys: &["Enter"],
                 label: "Next hunk in the diff; focus the diff from the sidebar",
             },
             Binding {
-                keys: &["tab"],
+                keys: &["Tab"],
                 label: "Switch Status / Diff / Commit / Log tabs (Shift+Tab goes back)",
             },
             Binding {
@@ -54,7 +49,7 @@ pub(super) const GROUPS: &[Group] = &[
                 label: "Next or previous file",
             },
             Binding {
-                keys: &["alt+down", "alt+up"],
+                keys: &["Alt+Down", "Alt+Up"],
                 label: "Next or previous hunk, crossing files",
             },
         ],
@@ -63,7 +58,7 @@ pub(super) const GROUPS: &[Group] = &[
         title: "Stage",
         rows: &[
             Binding {
-                keys: &["space"],
+                keys: &["Space"],
                 label: "Stage or unstage the selected file (sidebar) or hunk (diff)",
             },
             Binding {
@@ -79,19 +74,19 @@ pub(super) const GROUPS: &[Group] = &[
                 label: "Discard the hunk under the cursor",
             },
             Binding {
-                keys: &["delete"],
+                keys: &["Delete"],
                 label: "Discard the file (press twice)",
             },
             Binding {
-                keys: &["shift+up", "shift+down", "m"],
+                keys: &["Shift+Up", "Shift+Down", "m"],
                 label: "Extend a line range in the diff, or mark the lines",
             },
             Binding {
-                keys: &["space", "s", "u", "x"],
+                keys: &["Space", "s", "u", "x"],
                 label: "Stage, unstage or discard the marked lines",
             },
             Binding {
-                keys: &["esc"],
+                keys: &["Esc"],
                 label: "Clear the line marks",
             },
             Binding {
@@ -133,19 +128,19 @@ pub(super) const GROUPS: &[Group] = &[
                 label: "Write the commit message",
             },
             Binding {
-                keys: &["ctrl+g"],
+                keys: &["Ctrl+G"],
                 label: "Generate the commit message with AI",
             },
             Binding {
-                keys: &["ctrl+s"],
+                keys: &["Ctrl+S"],
                 label: "Commit (in the message field)",
             },
             Binding {
-                keys: &["ctrl+t"],
+                keys: &["Ctrl+T"],
                 label: "Toggle amend (in the message field)",
             },
             Binding {
-                keys: &["tab", "esc"],
+                keys: &["Tab", "Esc"],
                 label: "Leave the message field",
             },
         ],
@@ -158,46 +153,28 @@ pub(super) const GROUPS: &[Group] = &[
                 label: "Show or hide this sheet",
             },
             Binding {
-                keys: &["q", "esc"],
+                keys: &["q", "Esc"],
                 label: "Close the panel",
             },
         ],
     },
 ];
 
-/// The sheet body, sized to its content; the panel frame supplies the border and title.
-pub(super) fn lines(theme: &Theme) -> Vec<Line<'static>> {
-    let keys_text = |binding: &Binding| binding.keys.join(" / ");
-    let key_w = GROUPS
+/// The sheet body `width` cells wide, drawn by the shared panel key sheet; the panel supplies the
+/// title.
+pub(super) fn lines(theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    let groups: Vec<SheetGroup<'_>> = GROUPS
         .iter()
-        .flat_map(|group| group.rows)
-        .map(|binding| keys_text(binding).chars().count())
-        .max()
-        .unwrap_or(0);
-    let mut out = Vec::new();
-    for (index, group) in GROUPS.iter().enumerate() {
-        if index > 0 {
-            out.push(Line::default());
-        }
-        out.push(Line::from(vec![
-            Span::raw(" "),
-            chrome::label(theme, group.title),
-        ]));
-        for binding in group.rows {
-            out.push(Line::from(vec![
-                Span::styled(
-                    format!("   {:<key_w$}", keys_text(binding)),
-                    theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  {}", binding.label), theme.fg(Tok::Text)),
-            ]));
-        }
-    }
-    out.push(Line::default());
-    let mut footer = vec![Span::raw(" ")];
-    footer.extend(chrome::key_hint_spans(theme, &[("?/Esc", "close")]));
-    out.push(Line::from(footer));
-    out
+        .map(|group| SheetGroup {
+            title: group.title,
+            rows: group
+                .rows
+                .iter()
+                .map(|binding| (binding.keys.join(" / "), binding.label.to_owned()))
+                .collect(),
+        })
+        .collect();
+    sheet(theme, &groups, "", "?/Esc", width)
 }
 
 #[cfg(test)]

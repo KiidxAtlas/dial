@@ -4,7 +4,7 @@
 //! this panel never touches a process itself.
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{filled, hint, hint_line, panel, pressed},
+    settings::{filled, hint, hint_line, list_row, panel, pressed, scroll_cell},
 };
 use crate::ui::{
     chrome::Section,
@@ -128,7 +128,7 @@ impl JobsOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
-        if self.attached.is_none() && self.panel_keys.handle(event, false, false) {
+        if self.attached.is_none() && self.panel_keys.handle_key(event, false) {
             return OverlayEvent::None;
         }
         if let Some(name) = self.attached.clone() {
@@ -422,11 +422,6 @@ impl JobsOverlay {
         let status_w = (w / 6).clamp(7, 14);
         for (index, job) in self.jobs.iter().enumerate().skip(scroll).take(list_h) {
             let selected = index == self.cursor;
-            let fill = if selected {
-                theme.bg(Tok::SelectedBg).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
             let (dot, tok) = if job.running {
                 (theme.sym(Sym::Working), Tok::Success)
             } else {
@@ -445,28 +440,35 @@ impl JobsOverlay {
             if job.terminal && w >= 60 {
                 meta.push_str("pty ");
             }
-            let used = 3 + 2 + name_w + text::width(&meta);
-            out.push(filled(
+            let used = 3 + 2 + name_w + text::width(&meta) + 1;
+            out.push(list_row(
+                theme,
                 vec![
-                    Span::styled(format!(" {pointer} "), theme.fg(Tok::Accent).patch(fill)),
-                    Span::styled(format!("{dot} "), theme.fg(tok).patch(fill)),
-                    Span::styled(
-                        pad(&job.name, name_w, ascii),
-                        theme.fg(Tok::Text).patch(fill),
-                    ),
-                    Span::styled(meta, theme.fg(Tok::Muted).patch(fill)),
+                    Span::styled(format!(" {pointer} "), theme.fg(Tok::Accent)),
+                    Span::styled(format!("{dot} "), theme.fg(tok)),
+                    Span::styled(pad(&job.name, name_w, ascii), theme.fg(Tok::Text)),
+                    Span::styled(meta, theme.fg(Tok::Muted)),
                     Span::styled(
                         text::ellipsize(
                             &text::one_line(&job.command),
                             w.saturating_sub(used),
                             ascii,
                         ),
-                        theme.fg(Tok::Dim).patch(fill),
+                        theme.fg(Tok::Dim),
                     ),
                 ],
-                w,
-                fill,
+                w.saturating_sub(1),
+                selected,
             ));
+            if let Some(row) = out.last_mut() {
+                row.spans.push(scroll_cell(
+                    theme,
+                    index - scroll,
+                    list_h,
+                    self.jobs.len(),
+                    scroll,
+                ));
+            }
         }
         while out.len() < h.saturating_sub(2) {
             out.push(Line::default());

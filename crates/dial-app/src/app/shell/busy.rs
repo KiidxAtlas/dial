@@ -85,7 +85,7 @@ impl Shell {
             return false;
         }
         if name == "search" && args == "results" {
-            if let Some(panel) = self.take_search_panel() {
+            if let Some(panel) = self.take_search_panel(&app.layout) {
                 if let Err(error) = self.start_busy_overlay(app, Which::HistorySearch(panel)) {
                     self.note("Search", format!("{error:#}"));
                 }
@@ -124,6 +124,46 @@ impl Shell {
             self.deferred.push_back(text);
             false
         }
+    }
+
+    /// F7 during a turn: the same next-recent worker choice as idle, opened as a busy panel.
+    pub(in crate::app) fn busy_recent_worker(&mut self, app: &App) {
+        let running: Vec<&str> = self
+            .workers
+            .agents()
+            .iter()
+            .filter(|worker| !worker.status.is_finished())
+            .map(|worker| worker.id.as_str())
+            .collect();
+        let all: Vec<&str> = self
+            .workers
+            .agents()
+            .iter()
+            .map(|worker| worker.id.as_str())
+            .collect();
+        let pool = if running.is_empty() { all } else { running };
+        let Some(id) = crate::ui::worker_pins::next_recent(&pool, self.recent_worker.as_deref())
+        else {
+            self.route_busy_command(app, "/agents".into());
+            return;
+        };
+        self.recent_worker = Some(id.clone());
+        let viewer = Which::SubagentViewer {
+            id,
+            entry: None,
+            from_hub: false,
+        };
+        if let Err(error) = self.start_busy_overlay(app, viewer) {
+            self.note("Workers", format!("{error:#}"));
+        }
+    }
+
+    /// Ratings apply to a finished turn; while one runs, "the last turn" would be ambiguous.
+    pub(in crate::app) fn rating_unavailable_during_turn(&mut self) {
+        self.note(
+            "Teaching",
+            "Rating is available after the turn: press the key again once it finishes.",
+        );
     }
 
     /// Run a command that needs only the shell and app, never the agent, so it works while a turn
@@ -442,7 +482,7 @@ impl Shell {
         lines.push(String::new());
         lines.push("Run /hotkeys when idle to open the shortcut editor.".to_owned());
         lines.push(format!(
-            "Remap in {}/keybindings.toml, for example:  \"app.model.select\" = \"Ctrl+K\"",
+            "Remap in the [keys] table of {}/config.toml, for example:  \"app.model.select\" = \"Ctrl+K\"",
             app_home_hint()
         ));
         lines.join("\n")

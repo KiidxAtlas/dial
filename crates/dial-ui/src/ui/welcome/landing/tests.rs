@@ -319,5 +319,9 @@ fn first_run_guidance_fits_and_respects_ascii_glyphs() {
     let lines = plain(&view.rows);
     assert!(lines.iter().all(|line| line.is_ascii()));
     let text = lines.join("\n");
-    assert!(text.contains("Type a request") && text.contains("Ctrl+P") && text.contains("/models"));
+    assert!(
+        text.contains("Type a request")
+            && text.contains("F1 opens actions")
+            && text.contains("/models")
+    );
 }

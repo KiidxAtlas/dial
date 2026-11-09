@@ -61,7 +61,7 @@ not repaint).
 | **Feed** | Edit previews and changed paths, language-server advisories, turn outcomes, `/review` results and screenshots | — |
 | **Plan** | The agent's task list with blocked/dropped reasons, findings and evidence | — |
 | **Jobs** | Background (`bg`) processes and slash-command jobs such as `/update`, `/gc` or `/benchmark`, with their recent output | `x` stops the selected job |
-| **Workers** | Subagents with status, current step, usage and recent activity | `x` cancels the selected worker |
+| **Workers** | Workers with status, current step, usage and recent activity | `x` stops the selected worker |
 | **Threads** | `/btw` side threads, including the answer streaming now | `x` stops the streaming answer |
 | **Peers** | Other Dial sessions in this checkout, their claims and overlaps with yours | `Enter` opens the chat with the selected peer; `m` writes a message to it |
 

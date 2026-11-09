@@ -17,11 +17,16 @@
 //! spilled rows with the block's current rendering before spilling, but a change *after* the spill
 //! cannot be undone, so the remainder is taken by row count and may repeat or skip a row.
 use super::{
-    Rows, markdown,
+    Rows,
+    chrome::StateMark,
+    markdown,
     markdown::truncate_spans,
     text,
     theme::{Sym, Theme, Tok},
-    tool_cards::{AgentRow, Tool, ToolState, lookup_group, lookup_tree, may_join, tool_rows},
+    tool_cards::{
+        AgentRow, Tool, ToolOutcome, ToolState, lookup_group, lookup_tree, may_join, spinner_style,
+        state_mark, tool_rows,
+    },
 };
 use crate::llm::model_config::UiConfig;
 use ratatui::{
@@ -150,6 +155,15 @@ struct Spill {
     key: Option<(u16, bool)>,
 }
 
+/// A block's cached rendering. `animated` lists the `(row, span)` positions of running spinners,
+/// which every tick re-glyphs and re-styles in place instead of rendering the block again.
+struct Rendered {
+    key: RenderKey,
+    tick: u64,
+    rows: std::sync::Arc<Rows>,
+    animated: Vec<(usize, usize)>,
+}
+
 struct Block {
     kind: Kind,
     timestamp: Option<String>,
@@ -158,13 +172,17 @@ struct Block {
     markdown: std::cell::RefCell<StreamingRows>,
     shared: Option<crate::runtime::Body>,
     revision: std::cell::Cell<u64>,
-    rendered: std::cell::RefCell<Option<(RenderKey, u64, std::sync::Arc<Rows>)>>,
+    rendered: std::cell::RefCell<Option<Rendered>>,
     /// Visible byte prefix of a streaming answer under `ui.smooth_reveal`. `None` shows all
     /// text. Inactive blocks ignore it, so every structural boundary flushes the full text.
     revealed: Option<usize>,
     /// A lookup run may not reach back across this block's start: it opens a new turn, or the
     /// block that stood between it and its predecessor was removed.
     breaks_run: bool,
+    /// When a tool call started, for the live elapsed time of a running card.
+    started: Option<Instant>,
+    /// The reasoning toggle's key label, named by a collapsed reasoning block's hint.
+    thinking_key: Option<Arc<str>>,
 }
 
 #[derive(PartialEq)]
@@ -179,6 +197,8 @@ struct RenderKey {
     revision: u64,
     shared_revision: u64,
     active: bool,
+    /// Whole seconds a running call has run, so its live elapsed fact re-renders once a second.
+    live_secs: u64,
 }
 
 impl Block {
@@ -194,6 +214,18 @@ impl Block {
             rendered: std::cell::RefCell::new(None),
             revealed: None,
             breaks_run: false,
+            started: None,
+            thinking_key: None,
+        }
+    }
+
+    /// Whole seconds this running call has been running; `0` for anything else.
+    fn live_secs(&self) -> u64 {
+        match self.started {
+            Some(at) if self.tool_phase(|state, _| state == ToolState::Running) == Some(true) => {
+                at.elapsed().as_secs()
+            }
+            _ => 0,
         }
     }
 
@@ -273,6 +305,7 @@ impl Block {
     }
 
     fn render(&self, w: u16, ctx: &TranscriptCtx) -> std::sync::Arc<Rows> {
+        let live_secs = self.live_secs();
         let key = RenderKey {
             width: w,
             theme: ctx.theme.clone(),
@@ -287,28 +320,31 @@ impl Block {
                 .as_ref()
                 .map_or(0, crate::runtime::Body::revision),
             active: self.active,
+            live_secs,
         };
         {
             let mut slot = self.rendered.borrow_mut();
-            if let Some((old, tick, rows)) = slot.as_mut()
-                && *old == key
+            if let Some(cache) = slot.as_mut()
+                && cache.key == key
             {
-                let spinning = matches!(&self.kind, Kind::Tool(t) if t.state == ToolState::Running);
-                if spinning && *tick != ctx.tick {
-                    // The cache is the only owner here, so the spinner glyph is patched in place.
-                    let old_glyph = ctx.theme.spinner(*tick);
-                    if let Some(span) = std::sync::Arc::make_mut(rows)
-                        .iter_mut()
-                        .flat_map(|r| r.spans.iter_mut())
-                        .find(|s| s.content == old_glyph)
-                    {
-                        span.content = ctx.theme.spinner(ctx.tick).to_owned().into();
+                if cache.tick != ctx.tick && !cache.animated.is_empty() {
+                    // The cache is the only owner here, so every spinner (the call's own and its
+                    // workers') is re-glyphed and re-styled in place.
+                    let glyph = ctx.theme.spinner(ctx.tick).to_owned();
+                    let pulse = super::fx::pulse(ctx.theme, ctx.tick);
+                    let rows = std::sync::Arc::make_mut(&mut cache.rows);
+                    for &(row, span) in &cache.animated {
+                        if let Some(span) = rows.get_mut(row).and_then(|r| r.spans.get_mut(span)) {
+                            span.content = glyph.clone().into();
+                            span.style = span.style.patch(pulse);
+                        }
                     }
-                    *tick = ctx.tick;
+                    cache.tick = ctx.tick;
                 }
-                return std::sync::Arc::clone(rows);
+                return std::sync::Arc::clone(&cache.rows);
             }
         }
+        let toggle = self.thinking_key.as_deref();
         let mut rows = match &self.kind {
             Kind::User(t) => Arc::new(user_rows(t, w, ctx)),
             Kind::Assistant(t) => match &self.shared {
@@ -323,14 +359,19 @@ impl Block {
                     .render(self.visible(t), w, ctx.theme),
             },
             Kind::Thinking(t) => Arc::new(match &self.shared {
-                Some(b) => b.read(|n| prose_rows(Prose::Thinking, &n.result.text, w, ctx)),
-                None => prose_rows(Prose::Thinking, t, w, ctx),
+                Some(b) => b.read(|n| prose_rows(Prose::Thinking, &n.result.text, w, ctx, toggle)),
+                None => prose_rows(Prose::Thinking, t, w, ctx, toggle),
             }),
             // Work rows put their own status glyph in the shared icon gutter.
-            Kind::Tool(_) => Arc::new(
-                self.tool_view()
-                    .map_or_else(Vec::new, |view| tool_rows(&view, w, ctx)),
-            ),
+            Kind::Tool(_) => Arc::new(self.tool_view().map_or_else(Vec::new, |view| {
+                if live_secs >= 1 {
+                    let mut view = view.into_owned();
+                    view.elapsed = Some(live_secs as f64);
+                    tool_rows(&view, w, ctx)
+                } else {
+                    tool_rows(&view, w, ctx)
+                }
+            })),
             Kind::Notice { title, text } => Arc::new(super::notice::rows(title, text, w, ctx)),
             Kind::Event(event) => Arc::new(super::lanes::rows(event, w, ctx)),
             Kind::Error(t) => Arc::new(error_rows(t, w, ctx)),
@@ -340,7 +381,17 @@ impl Block {
         if self.timestamp.is_some() {
             self.timestamp_rows(Arc::make_mut(&mut rows), w, ctx);
         }
-        *self.rendered.borrow_mut() = Some((key, ctx.tick, Arc::clone(&rows)));
+        let animated = if matches!(self.kind, Kind::Tool(_)) {
+            spinner_spans(&rows, ctx)
+        } else {
+            Vec::new()
+        };
+        *self.rendered.borrow_mut() = Some(Rendered {
+            key,
+            tick: ctx.tick,
+            rows: Arc::clone(&rows),
+            animated,
+        });
         rows
     }
 
@@ -353,7 +404,11 @@ impl Block {
             Kind::Assistant(_) => "Assistant",
             _ => return,
         };
-        let header = format!("{label} · {} UTC", timestamp.replace('T', " "));
+        let header = format!(
+            "{label} {} {} UTC",
+            ctx.theme.sym(Sym::Dot),
+            timestamp.replace('T', " ")
+        );
         rows.insert(
             0,
             Line::from(Span::styled(
@@ -383,7 +438,7 @@ impl Block {
             while !text.is_char_boundary(end) {
                 end -= 1;
             }
-            let mut rows = prose_rows(kind, &text[..end], w, ctx);
+            let mut rows = prose_rows(kind, &text[..end], w, ctx, self.thinking_key.as_deref());
             self.timestamp_rows(&mut rows, w, ctx);
             rows.len()
         })
@@ -418,7 +473,13 @@ impl Block {
             let prefix = if cached {
                 std::borrow::Cow::Borrowed(markdown.prefix.as_ref())
             } else {
-                std::borrow::Cow::Owned(prose_rows(kind, &text[..cut], w, ctx))
+                std::borrow::Cow::Owned(prose_rows(
+                    kind,
+                    &text[..cut],
+                    w,
+                    ctx,
+                    self.thinking_key.as_deref(),
+                ))
             };
             let p = header.len() + prefix.len();
             if p > skip
@@ -431,6 +492,23 @@ impl Block {
         }
         None
     }
+}
+
+/// `(row, span)` positions of the running spinners in freshly rendered `rows`: the spinner glyph
+/// for this tick in the spinner's color.
+fn spinner_spans(rows: &Rows, ctx: &TranscriptCtx) -> Vec<(usize, usize)> {
+    let glyph = ctx.theme.spinner(ctx.tick);
+    let fg = spinner_style(ctx.theme, ctx.tick).fg;
+    rows.iter()
+        .enumerate()
+        .flat_map(|(r, row)| {
+            row.spans
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.content == glyph && s.style.fg == fg)
+                .map(move |(s, _)| (r, s))
+        })
+        .collect()
 }
 
 /// Cache only complete top-level blocks. References and HTML can retroactively change earlier
@@ -481,16 +559,13 @@ impl StreamingRows {
             // Links, generics, comparisons and inline HTML are in nearly every coding reply. The
             // line heuristic cannot see HTML blocks that span blank lines, so it used to give up and
             // re-render the whole remaining reply on every frame. The parser's own top-level block
-            // boundaries are safe for them; block structure does not depend on the width.
+            // boundaries are safe for them; block structure does not depend on the width. The parser
+            // reads sanitized text (tabs expanded), so its cut is mapped back to the raw source.
             let clean = text::sanitize(tail);
-            if clean == tail {
-                markdown::render_split(&clean, width, theme)
-                    .1
-                    .map(|(cut, _)| cut)
-                    .filter(|&cut| cut > 0 && starts_paragraph(cut))
-            } else {
-                None
-            }
+            markdown::render_split(&clean, width, theme)
+                .1
+                .and_then(|(cut, _)| raw_offset(tail, &clean, cut))
+                .filter(|&cut| cut > 0 && starts_paragraph(cut))
         } else {
             stable_cuts(tail, 0)
                 .into_iter()
@@ -514,6 +589,22 @@ impl StreamingRows {
         let tail = answer_rows(&source[self.cut..], width, theme, self.prefix.is_empty());
         join_rows(&self.prefix, tail)
     }
+}
+
+/// The byte offset in `raw` whose sanitized prefix is `clean[..cut]`, for a `cut` at a line start.
+/// Sanitizing keeps every newline, so the offset follows the same count of newlines; the prefix is
+/// checked, and `None` returned when an escape sequence spans the line break.
+fn raw_offset(raw: &str, clean: &str, cut: usize) -> Option<usize> {
+    if raw == clean {
+        return Some(cut);
+    }
+    let lines = clean.get(..cut)?.matches('\n').count();
+    let at = if lines == 0 {
+        0
+    } else {
+        raw.match_indices('\n').nth(lines - 1)?.0 + 1
+    };
+    (text::sanitize(&raw[..at]) == clean[..cut]).then_some(at)
 }
 
 /// `prefix` followed by `tail`, separated by a blank row when both are non-empty. Without a tail the
@@ -691,14 +782,15 @@ fn user_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     rows
 }
 
-fn prose_rows(kind: Prose, raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
+fn prose_rows(kind: Prose, raw: &str, w: u16, ctx: &TranscriptCtx, toggle: Option<&str>) -> Rows {
     match kind {
         Prose::Assistant => answer_rows(raw, w, ctx.theme, true),
-        Prose::Thinking => thinking_rows(raw, w, ctx),
+        Prose::Thinking => thinking_rows(raw, w, ctx, toggle),
     }
 }
 
-fn thinking_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
+/// Reasoning: its own mark when collapsed (never the prompt's `›`), with the key that shows it.
+fn thinking_rows(raw: &str, w: u16, ctx: &TranscriptCtx, toggle: Option<&str>) -> Rows {
     let w = w as usize;
     let clean = text::sanitize(raw);
     let body = clean.trim();
@@ -708,10 +800,15 @@ fn thinking_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     let style = ctx.theme.fg(Tok::ThinkingText);
     if !ctx.ui.show_thinking {
         let n = body.lines().filter(|l| !l.trim().is_empty()).count();
+        let lines = format!("{n} line{}", if n == 1 { "" } else { "s" });
+        let hint = match toggle {
+            Some(key) => format!("{lines} ({key} shows)"),
+            None => format!("{lines} hidden"),
+        };
         let label = format!(
-            "{}reasoning ({n} line{})",
-            in_gutter(ctx.theme.sym(Sym::Pointer)),
-            if n == 1 { "" } else { "s" }
+            "{}reasoning {} {hint}",
+            in_gutter(ctx.theme.sym(Sym::Reasoning)),
+            ctx.theme.sym(Sym::Dot),
         );
         return vec![fitted(vec![Span::styled(label, style)], w, ctx.theme)];
     }
@@ -775,15 +872,6 @@ fn error_rows(body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
         .collect()
 }
 
-fn compact_count(n: u64) -> String {
-    match n {
-        0..1_000 => n.to_string(),
-        1_000..10_000 => format!("{:.1}K", n as f64 / 1_000.0),
-        10_000..1_000_000 => format!("{}K", (n as f64 / 1_000.0).round() as u64),
-        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
-    }
-}
-
 /// The turn's closing line: how it ended (its mark in the icon gutter), what it changed, how long
 /// it took and what it cost, with the follow-up commands at the right edge when files changed.
 fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
@@ -821,18 +909,21 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
                 | "canceled"
         );
         let phase = crate::runtime::Phase::from_status(&o.status);
-        let word = if known { phase.label() } else { "unknown" };
-        let (tok, mark) = match phase {
-            _ if !known => (Tok::Warning, Sym::Warn),
-            crate::runtime::Phase::Completed => (Tok::Success, Sym::Check),
-            crate::runtime::Phase::Answered => (Tok::Muted, Sym::Dot),
-            crate::runtime::Phase::Failed => (Tok::Error, Sym::Cross2),
-            crate::runtime::Phase::Interrupted => (Tok::Muted, Sym::Cross2),
-            crate::runtime::Phase::Running => (Tok::Accent, Sym::Working),
-            _ => (Tok::Warning, Sym::Warn),
+        // The same state table as tool and worker rows.
+        let mark = match o.status.as_str() {
+            "cancelled" | "canceled" => Some(StateMark::Cancelled),
+            _ => state_mark(phase, None),
+        };
+        let (tok, glyph, word) = match mark {
+            _ if !known => (Tok::Warning, theme.sym(Sym::Warn), "unknown"),
+            // A delivered answer is not acceptance that the work is complete: neutral, like a
+            // settled tool row, never the success check.
+            Some(StateMark::Answered) => (Tok::Muted, theme.sym(Sym::Dot), "answered"),
+            Some(mark) => (mark.tok(), mark.glyph(theme), mark.word()),
+            None => (Tok::Warning, theme.sym(Sym::Warn), phase.label()),
         };
         // The outcome's mark takes the gutter so the end of a turn is findable at a glance.
-        left[0] = gutter(theme.sym(mark), theme.fg(tok));
+        left[0] = gutter(glyph, theme.fg(tok));
         push(
             &mut left,
             word.to_owned(),
@@ -852,7 +943,11 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
         if o.open_tasks > 0 {
             push(
                 &mut left,
-                format!("{} open tasks", o.open_tasks),
+                format!(
+                    "{} open task{}",
+                    o.open_tasks,
+                    if o.open_tasks == 1 { "" } else { "s" }
+                ),
                 theme.fg(Tok::Warning),
             );
         }
@@ -860,20 +955,20 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
     if timing {
         push(
             &mut left,
-            format!("{:.1}s", s.elapsed_secs),
+            text::duration_label_precise(s.elapsed_secs),
             theme.fg(Tok::Muted),
         );
         if let Some(n) = s.prompt_tokens {
             push(
                 &mut left,
-                format!("{} in", compact_count(n)),
+                format!("{} in", text::compact_count(n)),
                 theme.fg(Tok::Muted),
             );
         }
         if let Some(n) = s.output_tokens {
             push(
                 &mut left,
-                format!("{} out", compact_count(n)),
+                format!("{} out", text::compact_count(n)),
                 theme.fg(Tok::Muted),
             );
         }
@@ -930,6 +1025,8 @@ pub struct Transcript {
     outcome: Option<TurnOutcome>,
     /// A turn just ended: a trailing lookup run is complete, and the next block starts a new run.
     sealed: bool,
+    /// The reasoning toggle's key label, given to every reasoning block; see `set_thinking_key`.
+    thinking_key: Option<Arc<str>>,
 }
 
 /// Blocks are separated by one blank row, except consecutive members of the work group (tool
@@ -1092,6 +1189,7 @@ impl Transcript {
             retiring: None,
             outcome: None,
             sealed: false,
+            thinking_key: None,
         }
     }
 
@@ -1139,7 +1237,29 @@ impl Transcript {
     /// Appends a block. The first block after a finished turn starts a new lookup run.
     fn push_block(&mut self, mut block: Block) {
         block.breaks_run = std::mem::take(&mut self.sealed);
+        if matches!(block.kind, Kind::Thinking(_)) {
+            block.thinking_key.clone_from(&self.thinking_key);
+        }
+        if matches!(block.kind, Kind::Tool(_)) {
+            block.started = Some(Instant::now());
+        }
         self.blocks.push(block);
+    }
+
+    /// Names the reasoning toggle's key in collapsed reasoning blocks, as the keymap shows it.
+    /// Cheap when unchanged, so a paint may call it every frame.
+    pub fn set_thinking_key(&mut self, label: &str) {
+        if self.thinking_key.as_deref() == Some(label) {
+            return;
+        }
+        let key: Arc<str> = Arc::from(label);
+        self.thinking_key = Some(Arc::clone(&key));
+        for block in &mut self.blocks {
+            if matches!(block.kind, Kind::Thinking(_)) {
+                block.thinking_key = Some(Arc::clone(&key));
+                block.revision.set(block.revision.get().saturating_add(1));
+            }
+        }
     }
 
     pub fn push_user(&mut self, text: &str) {
@@ -1277,12 +1397,17 @@ impl Transcript {
         self.close_streaming_text();
         // A card already showing this call's arguments as they streamed in becomes the started
         // call in place, so the transcript never holds two cards for one call.
-        if let Some(tool) = self.live_running_tool(id) {
-            tool.name = name.to_owned();
-            tool.summary = summary.to_owned();
-            tool.presentation = crate::agent::legacy_tool_presentation(name, summary, input);
-            tool.input = input.to_owned();
-            tool.progress = None;
+        if let Some(index) = self.live_running_index(id) {
+            let block = &mut self.blocks[index];
+            // The call itself starts now, not when its arguments began streaming.
+            block.started = Some(Instant::now());
+            if let Kind::Tool(tool) = &mut block.kind {
+                tool.name = name.to_owned();
+                tool.summary = summary.to_owned();
+                tool.presentation = crate::agent::legacy_tool_presentation(name, summary, input);
+                tool.input = input.to_owned();
+                tool.progress = None;
+            }
             self.invalidate_tail();
             return;
         }
@@ -1299,6 +1424,7 @@ impl Transcript {
                 elapsed: None,
                 todo: None,
                 agents: Vec::new(),
+                outcome: None,
             }),
             true,
         );
@@ -1334,6 +1460,7 @@ impl Transcript {
                 elapsed: None,
                 todo: None,
                 agents: Vec::new(),
+                outcome: None,
             }),
             true,
         );
@@ -1341,13 +1468,18 @@ impl Transcript {
 
     /// The running card for call `id` in the live tail, if one exists.
     fn live_running_tool(&mut self, id: &str) -> Option<&mut Tool> {
-        self.blocks[self.cursor..]
-            .iter_mut()
-            .rev()
-            .find_map(|b| match &mut b.kind {
-                Kind::Tool(t) if t.id == id && t.state == ToolState::Running => Some(t),
-                _ => None,
-            })
+        let index = self.live_running_index(id)?;
+        match &mut self.blocks[index].kind {
+            Kind::Tool(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Index of the running card for call `id` in the live tail.
+    fn live_running_index(&self, id: &str) -> Option<usize> {
+        (self.cursor..self.blocks.len()).rev().find(|&i| {
+            matches!(&self.blocks[i].kind, Kind::Tool(t) if t.id == id && t.state == ToolState::Running)
+        })
     }
 
     /// Retain the newest partial argument text, so a long streamed write stays bounded.
@@ -1402,20 +1534,13 @@ impl Transcript {
         }
     }
 
-    /// Replace the in-place status of the pending card for tool `name` with its latest `progress`
+    /// Replace the in-place status of the pending card for call `id` with its latest `progress`
     /// event. A snapshot, not a log: each event overwrites the last, so the card stays one bounded
-    /// block however long the tool runs.
-    pub fn tool_progress(&mut self, name: &str, text: &str) {
+    /// block however long the tool runs. Keyed by call, so two running calls of one tool never
+    /// overwrite each other's status.
+    pub fn tool_progress(&mut self, id: &str, text: &str) {
         self.invalidate_tail();
-        let Some(tool) =
-            self.blocks[self.cursor..]
-                .iter_mut()
-                .rev()
-                .find_map(|b| match &mut b.kind {
-                    Kind::Tool(t) if t.name == name && t.state == ToolState::Running => Some(t),
-                    _ => None,
-                })
-        else {
+        let Some(tool) = self.live_running_tool(id) else {
             return;
         };
         const LIMIT: usize = 16 * 1024;
@@ -1462,12 +1587,20 @@ impl Transcript {
     }
 
     pub fn tool_end(&mut self, id: &str, output: &str, is_error: bool, elapsed_secs: f64) {
+        self.tool_end_with(id, output, ToolOutcome::from_error(is_error), elapsed_secs);
+    }
+
+    /// Settle call `id` with how it ended: denied and cancelled calls render as stopped, not failed.
+    pub fn tool_end_with(
+        &mut self,
+        id: &str,
+        output: &str,
+        outcome: ToolOutcome,
+        elapsed_secs: f64,
+    ) {
         self.invalidate_tail();
-        let state = if is_error {
-            ToolState::Failed
-        } else {
-            ToolState::Completed
-        };
+        let state = outcome.state();
+        let is_error = outcome != ToolOutcome::Ok;
         let found = self.blocks[self.cursor..]
             .iter_mut()
             .rev()
@@ -1480,6 +1613,7 @@ impl Transcript {
         match found {
             Some((active, tool, shared)) => {
                 tool.state = state;
+                tool.outcome = Some(outcome);
                 if !shared {
                     tool.output = output.to_owned();
                 }
@@ -1511,6 +1645,7 @@ impl Transcript {
                         elapsed: Some(elapsed_secs),
                         todo: None,
                         agents: Vec::new(),
+                        outcome: Some(outcome),
                     }),
                     false,
                 );
@@ -1560,7 +1695,10 @@ impl Transcript {
             tool.agents = jobs
                 .iter()
                 .map(|job| {
-                    let state = ToolState::from_status(job["status"].as_str().unwrap_or("failed"));
+                    // A record without a status was just started; a missing status is not a failure.
+                    let state = job["status"]
+                        .as_str()
+                        .map_or(ToolState::Running, ToolState::from_status);
                     let preview = job
                         .get("result")
                         .map(|result| {
@@ -1570,29 +1708,13 @@ impl Transcript {
                                 .unwrap_or_else(|| result.to_string())
                         })
                         .unwrap_or_default();
-                    AgentRow {
-                        name: job["name"]
-                            .as_str()
-                            .or_else(|| job["id"].as_str())
-                            .unwrap_or("worker")
-                            .to_owned(),
-                        agent: job["agent"].as_str().unwrap_or("").to_owned(),
-                        model: job["model"].as_str().unwrap_or("").to_owned(),
-                        task: job["task"]
-                            .as_str()
-                            .or_else(|| job["assignment"]["task"].as_str())
-                            .unwrap_or("")
-                            .to_owned(),
+                    AgentRow::from_record(
+                        job,
+                        job["id"].as_str().unwrap_or("worker"),
                         state,
-                        current_tool: job["phase"]
-                            .as_str()
-                            .filter(|_| state == ToolState::Running)
-                            .map(str::to_owned),
-                        tools: job["tools"].as_u64().unwrap_or(0),
-                        steps: job["steps"].as_u64().unwrap_or(0),
-                        elapsed_ms: job["elapsed_ms"].as_u64(),
-                        preview: text::sanitize(&preview),
-                    }
+                        job["elapsed_ms"].as_u64(),
+                        &preview,
+                    )
                 })
                 .collect();
             block.revision.set(block.revision.get().saturating_add(1));
@@ -1600,7 +1722,9 @@ impl Transcript {
     }
 
     /// Mirror the workers each live `task` call spawned into its card. A worker belongs to the task
-    /// call whose runtime body is its parent; `now_ms` dates running agents' elapsed time.
+    /// call whose runtime body is its parent; `now_ms` dates running agents' elapsed time. This never
+    /// holds a card back: once its call returns the card settles, workers still running show as
+    /// continuing in the background, and their live state belongs to the worker pins.
     pub fn sync_agents(&mut self, workers: &[crate::runtime::Node], now_ms: u64) {
         for block in self.blocks[self.cursor..].iter_mut() {
             let Some(id) = block.shared.as_ref().map(|b| b.read(|n| n.id.clone())) else {
@@ -1619,11 +1743,6 @@ impl Transcript {
                     let d = w.result.data.clone().unwrap_or_default();
                     let state = w.result.phase;
                     let running = state == ToolState::Running;
-                    let current_tool = d["phase"]
-                        .as_str()
-                        .and_then(|p| p.strip_prefix("tool: "))
-                        .filter(|_| running)
-                        .map(str::to_owned);
                     // A running worker's elapsed time is shown in whole seconds; at millisecond
                     // resolution the row compared unequal on every paint and the whole task card
                     // re-rendered every frame while any worker ran.
@@ -1643,18 +1762,7 @@ impl Transcript {
                     } else {
                         d["result"].as_str().unwrap_or(&w.result.text)
                     };
-                    AgentRow {
-                        name: d["name"].as_str().unwrap_or(&w.label).to_owned(),
-                        agent: d["agent"].as_str().unwrap_or("").to_owned(),
-                        model: d["model"].as_str().unwrap_or("").to_owned(),
-                        task: d["task"].as_str().unwrap_or("").to_owned(),
-                        state,
-                        current_tool,
-                        tools: d["tools"].as_u64().unwrap_or(0),
-                        steps: d["steps"].as_u64().unwrap_or(0),
-                        elapsed_ms,
-                        preview: text::sanitize(preview),
-                    }
+                    AgentRow::from_record(&d, &w.label, state, elapsed_ms, preview)
                 })
                 .collect();
             // Status/wait calls refer to existing workers but own no child nodes. Keep their
@@ -1662,10 +1770,6 @@ impl Transcript {
             if rows.is_empty() {
                 continue;
             }
-            // A spawn call can return before its workers finish. Keep the card live until the
-            // owned workers settle, so progress is never frozen prematurely in scrollback.
-            block.active = t.state == ToolState::Running
-                || rows.iter().any(|row| row.state == ToolState::Running);
             if rows != t.agents {
                 t.agents = rows;
                 block.revision.set(block.revision.get().saturating_add(1));
@@ -2218,7 +2322,84 @@ pub struct Replay {
     open: std::collections::HashMap<String, String>,
 }
 
+/// Message keys that mark a user-role message the harness wrote (reminders, summaries, carried
+/// context, worker results), with the lane it replays in; `None` keeps plumbing out of view.
+const HARNESS_MARKERS: &[(&str, Option<crate::agent::ui::ui_event::EventKind>)] = {
+    use crate::agent::ui::ui_event::EventKind::*;
+    &[
+        ("dial_compaction_summary", Some(Compaction)),
+        ("dial_compaction_notes", Some(Compaction)),
+        ("dial_compaction_files", Some(Compaction)),
+        ("dial_compaction_critical", Some(Compaction)),
+        ("dial_snapcompact", Some(Compaction)),
+        ("dial_branch_summary", Some(Compaction)),
+        ("dial_context_rollover", Some(ContextReset)),
+        ("dial_continuation", Some(Continue)),
+        ("dial_generated_user", Some(Continue)),
+        ("dial_exploration_reminder", Some(Investigation)),
+        ("dial_worker_result", Some(Subagent)),
+        ("dial_side_result", Some(Subagent)),
+        ("dial_reminder", Some(Recovery)),
+        ("dial_transient", None),
+        ("dial_portable_rules", None),
+        ("dial_context_notes", None),
+    ]
+};
+
+/// Harness corrections sent as unmarked user messages; their opening words are controller-owned.
+const HARNESS_PREFIXES: &[&str] = &[
+    "<dial-notice",
+    "Your tool call was unreadable:",
+    "That looked like a tool call written as plain text",
+];
+
+/// What a user's answer to a recovery question was sent as; only the answer is theirs.
+const RECOVERY_DIRECTION: &str = "Recovery direction from the user: ";
+
+/// `text` without the `<dial-notice …>` envelope tags.
+fn strip_notice_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let next_tag = |s: &str| {
+        [s.find("<dial-notice"), s.find("</dial-notice")]
+            .into_iter()
+            .flatten()
+            .min()
+    };
+    while let Some(at) = next_tag(rest) {
+        out.push_str(&rest[..at]);
+        rest = rest[at..].split_once('>').map_or("", |(_, after)| after);
+    }
+    out.push_str(rest);
+    out.trim().to_owned()
+}
+
 impl Replay {
+    /// Classifies a user-role record: `Ok(Some(event))` for harness text shown in its lane,
+    /// `Ok(None)` for harness plumbing that stays hidden, `Err(text)` for what the user typed.
+    fn harness(
+        message: &Value,
+        text: &str,
+    ) -> Result<Option<crate::agent::ui::ui_event::UiEvent>, ()> {
+        use crate::agent::ui::ui_event::{EventKind, UiEvent};
+        let marked = HARNESS_MARKERS.iter().find(|(key, _)| {
+            message
+                .get(*key)
+                .is_some_and(|value| !value.is_null() && *value != false)
+        });
+        if let Some((_, kind)) = marked {
+            return Ok(kind.map(|kind| UiEvent::new(kind, strip_notice_tags(text))));
+        }
+        let trimmed = text.trim_start();
+        if HARNESS_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+            return Ok(Some(UiEvent::new(
+                EventKind::Recovery,
+                strip_notice_tags(text),
+            )));
+        }
+        Err(())
+    }
+
     /// Apply one message record. Returns the block index the record's first block was created at,
     /// so callers can map a record to a row.
     pub fn push(&mut self, transcript: &mut Transcript, message: &Value) -> usize {
@@ -2226,10 +2407,27 @@ impl Replay {
         match message["role"].as_str() {
             Some("user") => {
                 // A drafted message shows what the user typed, not the prompt sent in its place.
-                let text = crate::storage::session::typed_text(message)
-                    .or_else(|| message["content"].as_str());
+                let typed = crate::storage::session::typed_text(message);
+                let content = message["content"].as_str().map(str::to_owned).or_else(|| {
+                    message["content"].as_array().map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|p| p["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                });
+                let text = typed.map(str::to_owned).or(content);
                 if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
-                    transcript.push_user(text);
+                    // Harness-written user-role messages are never shown as the user's words.
+                    match Self::harness(message, &text) {
+                        Ok(Some(event)) => transcript.event(&event),
+                        Ok(None) => {}
+                        Err(()) => match text.strip_prefix(RECOVERY_DIRECTION) {
+                            Some(rest) => transcript.push_user(rest.lines().next().unwrap_or("")),
+                            None => transcript.push_user(&text),
+                        },
+                    }
                 }
             }
             Some("assistant") => {
@@ -2278,12 +2476,14 @@ impl Replay {
                         .as_str()
                         .or_else(|| message["content"].as_str())
                         .unwrap_or("");
-                    let failed = child["is_error"].as_bool().unwrap_or_else(|| {
-                        output.starts_with("invalid tool call")
-                            || output.starts_with("denied")
-                            || output.starts_with("error")
-                    });
-                    transcript.tool_end(id, output, failed, 0.0);
+                    let outcome = match child["is_error"].as_bool() {
+                        Some(is_error) => ToolOutcome::from_error(is_error),
+                        None if output.starts_with("denied") => ToolOutcome::Denied,
+                        None => ToolOutcome::from_error(
+                            output.starts_with("invalid tool call") || output.starts_with("error"),
+                        ),
+                    };
+                    transcript.tool_end_with(id, output, outcome, 0.0);
                     if let Ok(view) =
                         serde_json::from_value::<crate::runtime::presentation::Presentation>(
                             message["dial_tool_presentation"]["view"].clone(),

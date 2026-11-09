@@ -105,7 +105,8 @@ impl Shell {
         let mut scope = (false, PICKER_SESSION_LIMIT);
         let show_empty = direct && !query.is_empty();
         let mut picker =
-            Self::load_session_picker(&layout, &current, tree, scope, query, show_empty)?;
+            Self::load_session_picker(&layout, &current, tree, scope, query, show_empty)?
+                .with_keys(&self.keys);
         if picker.sessions.is_empty() {
             self.note("Sessions", "no sessions yet");
             return Ok(None);
@@ -352,7 +353,7 @@ impl Shell {
         if let Some(notice) = notice {
             next.set_notice(notice);
         }
-        *picker = next;
+        *picker = next.with_keys(picker.keys());
         Ok(())
     }
 

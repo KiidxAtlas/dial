@@ -1,5 +1,5 @@
 //! The work panel: one compact rounded card above the composer. Its first row is the tab strip
-//! (`plan`, `evidence`, `approvals`); the rows below it come from the active tab. The plan tab
+//! (`plan`, `evidence`, `mode`); the rows below it come from the active tab. The plan tab
 //! lists as many steps as the card has rows for, always including the focused step, then the
 //! focused step's recorded reason or finding. The card is as tall as its content, at most
 //! [`MAX_WIDTH`] columns wide, and it yields to the focus summary of [`super::tasks::rows`] below
@@ -35,17 +35,18 @@ pub enum Tab {
     #[default]
     Plan,
     Evidence,
-    Approvals,
+    /// The approval mode and sandbox. Pending approvals ask inline, never here.
+    Mode,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Plan, Tab::Evidence, Tab::Approvals];
+    pub const ALL: [Tab; 3] = [Tab::Plan, Tab::Evidence, Tab::Mode];
 
     pub fn next(self) -> Tab {
         match self {
             Tab::Plan => Tab::Evidence,
-            Tab::Evidence => Tab::Approvals,
-            Tab::Approvals => Tab::Plan,
+            Tab::Evidence => Tab::Mode,
+            Tab::Mode => Tab::Plan,
         }
     }
 
@@ -53,12 +54,12 @@ impl Tab {
         match self {
             Tab::Plan => "plan",
             Tab::Evidence => "evidence",
-            Tab::Approvals => "approvals",
+            Tab::Mode => "mode",
         }
     }
 }
 
-/// Session facts the approvals tab shows, and the key labels the panel advertises.
+/// Session facts the mode tab shows, and the key labels the panel advertises.
 pub struct Facts<'a> {
     pub approval: &'a str,
     pub sandbox: &'a str,
@@ -201,50 +202,70 @@ fn detail(
             out
         }
         Tab::Evidence => {
-            let mut out = Vec::new();
-            for task in todo.tasks().iter().filter(|t| !t.evidence.is_empty()) {
-                out.push(vec![
-                    Span::styled(
-                        format!("{} ", theme.sym(Sym::Check)),
-                        theme.fg(Tok::Success),
-                    ),
-                    Span::styled(text::one_line(&task.content), theme.fg(Tok::Text)),
-                ]);
+            // The focused step's references first, then the newest steps', so the cut at the card
+            // height drops the oldest and says how much it dropped.
+            let tasks = todo.tasks();
+            let focus = focus_index(tasks);
+            let mut order: Vec<usize> = focus.into_iter().collect();
+            order.extend((0..tasks.len()).rev().filter(|i| Some(*i) != focus));
+            let mut entries: Vec<(Vec<Span<'static>>, bool)> = Vec::new();
+            for task in order
+                .into_iter()
+                .map(|i| &tasks[i])
+                .filter(|t| !t.evidence.is_empty())
+            {
+                entries.push((
+                    vec![
+                        Span::styled(
+                            format!("{} ", theme.sym(Sym::Check)),
+                            theme.fg(Tok::Success),
+                        ),
+                        Span::styled(text::one_line(&task.content), theme.fg(Tok::Text)),
+                    ],
+                    false,
+                ));
                 for reference in &task.evidence {
-                    out.push(vec![
-                        Span::raw("  "),
-                        Span::styled(text::one_line(reference), theme.fg(Tok::Muted)),
-                    ]);
+                    entries.push((
+                        vec![
+                            Span::raw("  "),
+                            Span::styled(text::one_line(reference), theme.fg(Tok::Muted)),
+                        ],
+                        true,
+                    ));
                 }
             }
-            if out.is_empty() {
-                out.push(line("no evidence recorded yet".into(), Tok::Muted));
+            if entries.is_empty() {
+                return vec![line("no evidence recorded yet".into(), Tok::Muted)];
+            }
+            // Recorded references are the agent's observations, not a verification result.
+            let mut out = vec![line("agent observations, not verified".into(), Tok::Muted)];
+            let room = avail.saturating_sub(1);
+            if entries.len() <= room {
+                out.extend(entries.into_iter().map(|(spans, _)| spans));
             } else {
-                // Recorded references are the agent's observations, not a verification result.
-                out.insert(
-                    0,
-                    line("agent observations, not verified".into(), Tok::Muted),
-                );
+                let keep = room.saturating_sub(1);
+                let hidden = entries[keep..].iter().filter(|(_, r)| *r).count();
+                out.extend(entries.into_iter().take(keep).map(|(spans, _)| spans));
+                out.push(line(
+                    format!(
+                        "+{hidden} more reference{}",
+                        if hidden == 1 { "" } else { "s" }
+                    ),
+                    Tok::Dim,
+                ));
             }
             out
         }
-        Tab::Approvals => {
+        Tab::Mode => {
             let mode = text::one_line(facts.approval.trim());
             if mode.is_empty() {
                 return vec![line("approval mode unknown".into(), Tok::Muted)];
             }
-            let dot = match mode.as_str() {
-                "ask" | "readonly" => Tok::Success,
-                "auto" => Tok::Warning,
-                _ => Tok::Accent,
-            };
-            let mut out = vec![vec![
-                Span::styled(format!("{} ", theme.sym(Sym::Bullet)), theme.fg(dot)),
-                Span::styled(
-                    super::status::approval_label(&mode).to_owned(),
-                    theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
-                ),
-            ]];
+            let mut chip = chrome::approval_spans(theme, &mode);
+            if let Some(name) = chip.last_mut() {
+                name.style = name.style.add_modifier(Modifier::BOLD);
+            }
+            let mut out = vec![chip];
             let meaning = welcome::approval_meaning(&mode);
             if !meaning.is_empty() {
                 out.push(line(meaning.into(), Tok::Muted));

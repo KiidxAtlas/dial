@@ -23,7 +23,7 @@ Defaults collapse reasoning, omit per-turn statistics and leave the workspace-ch
 
 Automatic runtime-update results stay in quiet chrome, with the report available through `/setup updates`; they are not appended to the conversation.
 
-Ctrl+P opens goal-first action navigation; typing searches every registered command. The empty slash menu remains a command-oriented shortcut. It opens upward from the input (12 rows by default, `ui.autocomplete_items`); `/` groups everyday commands by category, naming each group once, then lists the rest. Typed queries rank fuzzy matches across all commands. Compute and learning controls stay searchable. The live work summary shows Now, Blocked and Next; `/todo` opens the full read-only plan and recorded evidence. Busy draft submission opens a local intent chooser before any message is routed; empty Enter no longer interrupts queued work without an explicit choice. `/agents`, `/hub` and `/jobs` open the worker panel; `/jobs <id>` still shows status and `/agents definitions` lists definitions. `/bg` remains an alias for the process panel.
+The command palette (Alt+K or F1) opens goal-first action navigation; typing searches every registered command. The empty slash menu remains a command-oriented shortcut. It opens upward from the input (12 rows by default, `ui.autocomplete_items`); `/` groups everyday commands by category, naming each group once, then lists the rest. Typed queries rank fuzzy matches across all commands. Compute and learning controls stay searchable. The live work summary shows Now, Blocked and Next; `/todo` opens the full read-only plan and recorded evidence. Busy draft submission opens a local intent chooser before any message is routed; empty Enter no longer interrupts queued work without an explicit choice. `/agents`, `/hub` and `/jobs` open the worker panel; `/jobs <id>` still shows status and `/agents definitions` lists definitions. `/bg` remains an alias for the process panel.
 
 Composer and history-search editing use the configured editor bindings, including Unicode-aware
 word movement. The worker panel ignores key-release events; holding the cancellation key cannot
@@ -31,7 +31,7 @@ confirm its own prompt. Page keys navigate the roster in narrow layouts. Worker 
 draft backspace remove whole graphemes. Tight pinned summaries put input requests first and keep a
 worker visible before its optional live preview; status comes before long names and task text.
 
-Focused worker transcripts have independent editors. Escape returns to the hub without losing a draft; `/back` leaves the worker view, and Ctrl+C interrupts only its selected worker. `/model` and `/thinking` target that worker and show whether a change is queued or applied. The main composer and model are unchanged.
+Focused worker transcripts have independent editors. Escape returns to the hub without losing a draft; `/back` leaves the worker view, and Ctrl+C stops only its selected worker after a confirming second press. `/model` and `/thinking` target that worker and show whether a change is queued or applied. The main composer and model are unchanged.
 
 Until the first message, a live home sits in the viewport above the composer (`crates/dial-ui/src/ui/welcome.rs`): a block wordmark over a `┈` axis and its reflection, borderless model, project, approval and sandbox facts, and recent sessions or starters, side by side from 110 columns and in one compact column below 24 rows. Shorter terminals shed the reflection, then the large wordmark, then contextual facts before the selected action, and window the list around that action. Down from an empty draft selects a row, Enter resumes the session or loads the starter into the draft for editing, and Esc returns to the draft. When the conversation gets its first user message, the home is committed to scrollback as one summary line.
 
@@ -74,7 +74,7 @@ Panel motion comprises the start-up wordmark sweep (`fx::SWEEP`, 0.7 s), a 140 m
 
 `ui.smooth_reveal = true` optionally reveals streaming assistant text in grapheme-safe increments, independently of panel motion. It defaults to false. A newest grapheme is held until its successor is known; tool, turn-end and interruption boundaries flush the complete retained text.
 
-Optional capabilities are configured through `/setup` on demand; fresh launches do not interrupt chat with an optional setup dialog. A task card stays live until its owned workers finish. Text-only interfaces retain worker start/end notices, while the TUI uses the shared card. Native images reserve a separator cell so tighter transcript spacing does not drop their graphics payload.
+Optional capabilities are configured through `/setup` on demand; fresh launches do not interrupt chat with an optional setup dialog. A task card settles when the task call returns; workers still running then read *continuing in background*. Text-only interfaces retain worker start/end notices, while the TUI uses the shared card. Native images reserve a separator cell so tighter transcript spacing does not drop their graphics payload.
 
 Run the UI test suite with `make test-module MOD=ui::` from the repository root (the UI lives in `crates/dial-ui`). Rendering code is pure where possible, so component behavior can be exercised with the ratatui test backend.
 

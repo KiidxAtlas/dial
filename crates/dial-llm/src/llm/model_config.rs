@@ -710,11 +710,11 @@ pub const ROLES: &[(&str, &str)] = &[
     ("main", "Conversation and coding agent"),
     (
         "small",
-        "Fast background work: compaction, commit messages, architecture synthesis and solve workers; assigned small also serves scout and custom read-only subagents",
+        "Fast background work: compaction, commit messages, architecture synthesis and solve workers; assigned small also serves scout and custom read-only workers",
     ),
     (
         "task",
-        "Implementation tasks and worker subagents; fallback for scout, custom read-only, reviewer, test-runner and planner subagents when their preferred role is unassigned",
+        "Implementation tasks and workers; fallback for scout, custom read-only, reviewer, test-runner and planner workers when their preferred role is unassigned",
     ),
     (
         "coach",
@@ -722,7 +722,7 @@ pub const ROLES: &[(&str, &str)] = &[
     ),
     (
         "tester",
-        "Review and verification: reviewer and test-runner subagents and review workflows",
+        "Review and verification: reviewer and test-runner workers and review workflows",
     ),
     (
         "memory",

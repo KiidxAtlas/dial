@@ -2043,6 +2043,7 @@ dependencies = [
  "unicode-width 0.2.0",
  "ureq",
  "url",
+ "vt100",
 ]
 
 [[package]]

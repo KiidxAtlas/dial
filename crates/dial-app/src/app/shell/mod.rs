@@ -117,6 +117,9 @@ pub(super) struct Shell {
     pub(super) restart_requested: bool,
     /// A provider retry was already explained in this turn; later attempts update nothing new.
     pub(super) retry_noted: bool,
+    /// Attempt number of the last provider retry of the running request; the request's
+    /// successful usage report takes it and notes the recovery once.
+    pub(super) retry_attempt: Option<u32>,
     /// Bound only while the foreground model request is running.
     pub(super) retry_control: Option<crate::llm::provider::RetryControl>,
     pub(super) smithery_resume: Option<crate::app::commands::smithery::Resume>,

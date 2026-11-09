@@ -1062,6 +1062,8 @@ pub enum Denial {
     Rule,
 }
 impl Denial {
+    /// Model-facing text for the tool result. Never shown as a user notice: the user sees the
+    /// policy explanation (or made the decision themselves).
     pub fn message(&self) -> &'static str {
         match self {
             Self::ReadOnly => {
@@ -1075,6 +1077,71 @@ impl Denial {
             }
         }
     }
+
+    /// [`message`](Self::message), naming plan mode when that is what made the session read-only.
+    pub fn message_in(&self, plan_mode: bool) -> &'static str {
+        match self {
+            Self::ReadOnly if plan_mode => {
+                "denied: plan mode is read-only until the user approves a plan; this tool changes things. Keep investigating, then submit the plan with exit_plan."
+            }
+            _ => self.message(),
+        }
+    }
+}
+
+/// One compact line per call for a multi-call approval: the tool, its target and a size
+/// summary, never the raw arguments (a whole file's contents would bury the list).
+pub fn batch_call_line(call: &ToolCall) -> String {
+    let args = &call.arguments;
+    let text = |key: &str| args[key].as_str().unwrap_or("");
+    let size = |bytes: usize| {
+        if bytes < 1024 {
+            format!("{bytes} B")
+        } else {
+            format!("{:.1} KiB", bytes as f64 / 1024.0)
+        }
+    };
+    let line = match call.name.as_str() {
+        "write" => {
+            let content = text("content");
+            format!(
+                "write {} · {} lines, {}",
+                text("path"),
+                content.lines().count(),
+                size(content.len())
+            )
+        }
+        "edit" => {
+            let input = text("input");
+            let mut paths: Vec<&str> = input
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix('[')?.strip_suffix(']'))
+                .map(|header| header.split('#').next().unwrap_or(header))
+                .collect();
+            paths.dedup();
+            let target = if paths.is_empty() {
+                text("path").to_owned()
+            } else {
+                paths.join(", ")
+            };
+            let rows = input.lines().filter(|line| line.starts_with('+')).count();
+            format!("edit {target} · {rows} new lines")
+        }
+        _ if !text("path").is_empty() => format!("{} {}", call.name, text("path")),
+        _ => {
+            let described = crate::agent::describe(call);
+            let mut chars = described.chars();
+            let mut shown: String = chars.by_ref().take(160).collect();
+            if chars.next().is_some() {
+                shown.push('…');
+            }
+            format!("{} {shown}", call.name)
+        }
+    };
+    crate::storage::redact::redact_text(&line)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn denied_by_rule(rules: &[PermissionRule], call: &ToolCall, root: &Path) -> bool {
@@ -1522,13 +1589,7 @@ fn authorize_inner(
                 summary.to_owned()
             };
             explain(ui, call, PolicyReason::PromptRequired);
-            let summary = format!(
-                "{summary}\n{}",
-                PolicyExplanation {
-                    reason: PolicyReason::PromptRequired,
-                    rule_scope: None
-                }
-            );
+            // The prompt itself says approval is required; the summary stays the action alone.
             let grant = approval_grant(call);
             let decision = ui.approve_call_with_preview(
                 &call.id,

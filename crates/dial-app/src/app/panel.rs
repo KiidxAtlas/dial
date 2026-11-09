@@ -12,6 +12,13 @@ use ratatui::text::{Line, Span};
 /// Title of the agent's stop panel. The summary/raw toggle applies only to this panel.
 pub(super) const RECOVERY_PANEL: &str = "Recovery needs direction";
 
+/// Title of the plan review panel. Its body is markdown (the plan) up to `MARKDOWN_END`.
+pub(super) const PLAN_PANEL: &str = "Review plan";
+
+/// Ends the markdown part of a plan panel's body: what follows (key hints, the draft) stays plain
+/// text. A C0 control, so `text::sanitize` drops it wherever the body is shown as plain text.
+pub(super) const MARKDOWN_END: char = '\u{1f}';
+
 /// Below this size an option's scope and the detail viewport cannot both be shown.
 /// Confirmation must remain paused (not implicitly accepted) until the panel fits again.
 pub(super) fn panel_has_room(width: u16, height: usize) -> bool {
@@ -108,14 +115,12 @@ pub(super) fn panel_rows_window(
             border,
         ),
     ]));
-    let lines = text::wrap_words(&text::sanitize(body), inner);
+    let body_rows = panel_body_lines(theme, title, body, inner);
+    let lines = body_rows.len();
     let body_limit = panel_body_limit(options.len(), height);
-    let offset = offset.min(lines.len().saturating_sub(body_limit));
-    for line in lines.iter().skip(offset).take(body_limit) {
-        rows.push(pad_row(vec![Span::styled(
-            text::clip(line, inner),
-            theme.fg(Tok::ToolOutput),
-        )]));
+    let offset = offset.min(lines.saturating_sub(body_limit));
+    for line in body_rows.into_iter().skip(offset).take(body_limit) {
+        rows.push(pad_row(line.spans));
     }
     let option_limit = options.len().min(height.saturating_sub(5).max(1));
     let start = selected
@@ -152,12 +157,12 @@ pub(super) fn panel_rows_window(
     }
     // Most important first; whole pieces drop at narrow widths instead of being cut mid-word.
     let mut hints = vec!["Enter confirm".to_owned(), "Esc cancel".to_owned()];
-    if lines.len() > body_limit {
+    if lines > body_limit {
         hints.push(format!(
             "PgUp/PgDn details {}-{} of {}",
             offset + 1,
-            (offset + body_limit).min(lines.len()),
-            lines.len()
+            (offset + body_limit).min(lines),
+            lines
         ));
     }
     let dot = format!(" {} ", theme.sym(Sym::Dot));
@@ -183,6 +188,45 @@ pub(super) fn panel_rows_window(
 /// Text columns inside a modal panel's border and padding.
 pub(super) fn panel_inner(width: u16) -> usize {
     (width as usize).saturating_sub(4).max(1)
+}
+
+/// A panel's sanitized body rows at `inner` columns: the scroll unit of the renderer and the page
+/// keys alike. The plan panel renders its plan as markdown (headings, lists, code) like the
+/// transcript does; every other body, and the plan panel's tail, is word-wrapped plain text.
+pub(super) fn panel_body_lines(
+    theme: &crate::ui::theme::Theme,
+    title: &str,
+    body: &str,
+    inner: usize,
+) -> Rows {
+    let plain = |body: &str| -> Rows {
+        text::wrap_words(&text::sanitize(body), inner)
+            .iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    text::clip(line, inner),
+                    theme.fg(Tok::ToolOutput),
+                ))
+            })
+            .collect()
+    };
+    if title != PLAN_PANEL {
+        return plain(body);
+    }
+    let (markdown, rest) = body.split_once(MARKDOWN_END).unwrap_or((body, ""));
+    let width = u16::try_from(inner).unwrap_or(u16::MAX);
+    let mut rows = crate::ui::markdown::render(markdown, width, theme, theme.ascii());
+    while rows.last().is_some_and(|row| row.width() == 0) {
+        rows.pop();
+    }
+    let rest = rest.trim_start_matches('\n');
+    if !rest.is_empty() {
+        if !rows.is_empty() {
+            rows.push(Line::default());
+        }
+        rows.extend(plain(rest));
+    }
+    rows
 }
 
 /// Body rows a modal panel shows for `options` choices within `height` rows: the same budget the renderer and

@@ -2197,6 +2197,58 @@ fn modal_details_scroll_and_selection_stays_visible_at_small_sizes() {
 }
 
 #[test]
+fn plan_review_panel_renders_the_plan_as_markdown_and_keeps_its_tail_plain() {
+    use crate::app::panel::{MARKDOWN_END, PLAN_PANEL, panel_body_lines};
+    use crate::ui::theme::Sym;
+    let theme = Theme::dark();
+    let bullet = theme.sym(Sym::ListBullet);
+    let body = format!(
+        "# Steps\n\n- **first** item\n- second item\n{MARKDOWN_END}\n\nEsc or n keeps *planning*"
+    );
+    let rows = panel_body_lines(&theme, PLAN_PANEL, &body, 40);
+    let shown: Vec<String> = rows.iter().map(ToString::to_string).collect();
+    let heading = rows
+        .iter()
+        .find(|row| row.to_string().contains("Steps"))
+        .expect("heading row");
+    assert!(!heading.to_string().contains('#'), "{shown:?}");
+    assert!(
+        heading.spans.iter().any(|span| span
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)),
+        "{shown:?}"
+    );
+    for item in ["first item", "second item"] {
+        let row = shown.iter().find(|row| row.contains(item)).expect("item");
+        assert!(row.trim_start().starts_with(bullet), "{shown:?}");
+        assert!(!row.contains("**") && !row.trim_start().starts_with('-'));
+    }
+    // The key hints after the marker stay literal text, and the marker itself never shows.
+    assert!(
+        shown.iter().any(|row| row == "Esc or n keeps *planning*"),
+        "{shown:?}"
+    );
+    assert!(shown.iter().all(|row| !row.contains(MARKDOWN_END)));
+    // Other panels keep plain wrapped text; the panel and its page keys count the same rows.
+    let plain = panel_body_lines(&theme, "Allow bash?", "# not a heading", 40);
+    assert_eq!(plain[0].to_string(), "# not a heading");
+    let panel = panel_rows_window(
+        &theme,
+        44,
+        64,
+        PanelView {
+            title: PLAN_PANEL,
+            body: &body,
+            options: &[("Approve plan", 'y')],
+            selected: 0,
+            offset: 0,
+        },
+    );
+    assert_eq!(panel.len(), rows.len().min(panel_body_limit(1, 64)) + 4);
+}
+
+#[test]
 fn paging_long_approval_details_reaches_every_line_at_any_height() {
     let theme = Theme::mono();
     let options = [

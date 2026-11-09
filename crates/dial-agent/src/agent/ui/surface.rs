@@ -187,13 +187,14 @@ pub trait Ui {
         if calls.is_empty() || cancel.load(Ordering::Acquire) {
             return vec![false; calls.len()];
         }
-        let mut summary = String::from(
-            "Approve these exact calls once? This is not an atomic transaction; calls can partially succeed. No reusable permission is granted.\n",
+        let mut summary = format!(
+            "{} changes are ready. Approving applies once to each exact change listed; nothing is saved, and changes can partly succeed.\n",
+            calls.len()
         );
         for call in calls {
             summary.push_str(&format!(
-                "\n{} · {}\n{}\n",
-                call.id, call.name, call.arguments
+                "\n{}",
+                crate::agent::safety::approval::batch_call_line(call)
             ));
         }
         let allowed = self.approve_call("finite-batch", "batch", &summary, Some(cancel))

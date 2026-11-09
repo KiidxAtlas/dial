@@ -176,7 +176,7 @@ fn read_amendment(shell: &mut Shell, title: &str) -> Option<String> {
                 KeyCode::Esc => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 _ => {
-                    editor.key(key);
+                    editor.key_with(key, &shell.keys);
                 }
             },
             Ok(Event::Paste(value)) => editor.insert(&text::one_line(&value)),

@@ -1,7 +1,9 @@
 //! Tool cards lay out the portable presentation supplied by each tool definition.
 //! The shared execution phase owns settlement; expanded cards retain full evidence.
 use super::{
-    Rows, markdown,
+    Rows,
+    chrome::StateMark,
+    markdown,
     markdown::truncate_spans,
     text,
     theme::{Sym, Theme, Tok},
@@ -11,8 +13,54 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+use serde_json::Value;
 
 pub use crate::runtime::Phase as ToolState;
+
+/// How a finished call ended, as the controller reported it. A call stopped by someone (denied by
+/// the user or a rule, cancelled by an interrupt) is not a failure: it renders muted with its own
+/// word instead of the error red of a failed call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Ok,
+    Failed,
+    /// Refused by the approval gate (the user, a permission rule or read-only mode).
+    Denied,
+    /// Withheld by another dispatch gate (an earlier failed preview, a prerequisite).
+    Blocked,
+    /// Stopped by an interrupt before it finished.
+    Cancelled,
+}
+
+impl ToolOutcome {
+    /// The outcome the controller recorded in the result's execution facts. Approval denials are
+    /// the blocked results whose controller-owned message starts with `denied`.
+    pub fn of(output: &crate::runtime::tool_output::ToolOutput) -> Self {
+        use crate::runtime::execution::ToolStatus;
+        match output.execution.status {
+            Some(ToolStatus::Aborted) => Self::Cancelled,
+            Some(ToolStatus::Blocked) if output.text.starts_with("denied") => Self::Denied,
+            Some(ToolStatus::Blocked) => Self::Blocked,
+            _ if output.is_error => Self::Failed,
+            _ => Self::Ok,
+        }
+    }
+
+    /// A result known only as success or error.
+    pub fn from_error(is_error: bool) -> Self {
+        if is_error { Self::Failed } else { Self::Ok }
+    }
+
+    /// The lifecycle phase the card settles into.
+    pub fn state(self) -> ToolState {
+        match self {
+            Self::Ok => ToolState::Completed,
+            Self::Failed => ToolState::Failed,
+            Self::Denied | Self::Blocked => ToolState::Blocked,
+            Self::Cancelled => ToolState::Interrupted,
+        }
+    }
+}
 
 /// One tool call as the transcript tracks it.
 #[derive(Clone)]
@@ -33,6 +81,8 @@ pub struct Tool {
     pub todo: Option<Vec<(crate::agent::workflow::todo::Task, bool)>>,
     /// For a `task` call: the subagents it spawned, as last observed.
     pub agents: Vec<AgentRow>,
+    /// How the call ended, once it reported back; refines the phase's word and mark.
+    pub outcome: Option<ToolOutcome>,
 }
 
 /// One spawned subagent as its task card shows it.
@@ -55,30 +105,100 @@ pub struct AgentRow {
     pub preview: String,
 }
 
+impl AgentRow {
+    /// One worker from its typed record `d`, whichever path observed it (a status/wait result or
+    /// the live runtime node), so both paths name, phase and preview a worker the same way.
+    pub(super) fn from_record(
+        d: &Value,
+        fallback_name: &str,
+        state: ToolState,
+        elapsed_ms: Option<u64>,
+        preview: &str,
+    ) -> Self {
+        let running = state == ToolState::Running;
+        AgentRow {
+            name: d["name"].as_str().unwrap_or(fallback_name).to_owned(),
+            agent: d["agent"].as_str().unwrap_or("").to_owned(),
+            model: d["model"].as_str().unwrap_or("").to_owned(),
+            task: d["task"]
+                .as_str()
+                .or_else(|| d["assignment"]["task"].as_str())
+                .unwrap_or("")
+                .to_owned(),
+            state,
+            // Only a tool phase (`tool: read`) names what runs now; other phases are not tools.
+            current_tool: d["phase"]
+                .as_str()
+                .and_then(|p| p.strip_prefix("tool: "))
+                .filter(|_| running)
+                .map(str::to_owned),
+            tools: d["tools"].as_u64().unwrap_or(0),
+            steps: d["steps"].as_u64().unwrap_or(0),
+            elapsed_ms,
+            preview: text::sanitize(preview),
+        }
+    }
+}
+
 // ---- tools ---------------------------------------------------------------------------------
+
+/// The one state table for work rows: [`StateMark`] gives glyph, color and word. `None` marks the
+/// states without a shared mark (incomplete, needs input), which keep the warning sign and their
+/// own word.
+pub(super) fn state_mark(state: ToolState, outcome: Option<ToolOutcome>) -> Option<StateMark> {
+    Some(match (state, outcome) {
+        (ToolState::Blocked, Some(ToolOutcome::Denied)) => StateMark::Denied,
+        (ToolState::Interrupted, Some(ToolOutcome::Cancelled)) => StateMark::Cancelled,
+        (ToolState::Running, _) => StateMark::Running,
+        (ToolState::Completed, _) => StateMark::Done,
+        (ToolState::Answered, _) => StateMark::Answered,
+        (ToolState::Failed, _) => StateMark::Failed,
+        (ToolState::Interrupted, _) => StateMark::Interrupted,
+        (ToolState::Blocked, _) => StateMark::Blocked,
+        (ToolState::Incomplete | ToolState::NeedsInput, _) => return None,
+    })
+}
+
+/// The state's one word (`done`, `denied`, `needs input`, …).
+pub(super) fn state_word(state: ToolState, outcome: Option<ToolOutcome>) -> &'static str {
+    state_mark(state, outcome).map_or(state.label(), StateMark::word)
+}
+
+fn state_tok(state: ToolState, outcome: Option<ToolOutcome>) -> Tok {
+    state_mark(state, outcome).map_or(Tok::Warning, StateMark::tok)
+}
+
+/// Style of a running call's spinner at `tick`: the accent breathing through the brand colors,
+/// matching the status-line spinner. The transcript's render cache re-styles these spans per tick.
+pub(super) fn spinner_style(theme: &Theme, tick: u64) -> Style {
+    theme
+        .fg(Tok::Accent)
+        .patch(crate::ui::fx::pulse(theme, tick))
+}
 
 /// The icon in a work row's gutter. A settled call is a quiet dot so the answer around it leads;
 /// only running, failed and unfinished calls draw the eye.
 fn phase_glyph(state: ToolState, ctx: &TranscriptCtx) -> (String, Style) {
+    outcome_glyph(state, None, ctx)
+}
+
+fn outcome_glyph(
+    state: ToolState,
+    outcome: Option<ToolOutcome>,
+    ctx: &TranscriptCtx,
+) -> (String, Style) {
     let theme = ctx.theme;
     match state {
-        // A running call breathes through the brand colors, matching the status-line spinner.
         ToolState::Running => (
             theme.spinner(ctx.tick).to_owned(),
-            theme
-                .fg(Tok::Accent)
-                .patch(crate::ui::fx::pulse(theme, ctx.tick)),
+            spinner_style(theme, ctx.tick),
         ),
         ToolState::Completed => (theme.sym(Sym::Dot).to_owned(), theme.fg(Tok::Dim)),
         ToolState::Answered => (theme.sym(Sym::Dot).to_owned(), theme.fg(Tok::Muted)),
-        ToolState::Failed => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Error)),
-        ToolState::Interrupted => (
-            if theme.ascii() { "-" } else { "⊘" }.to_owned(),
-            theme.fg(Tok::Muted),
-        ),
-        ToolState::Incomplete | ToolState::Blocked | ToolState::NeedsInput => {
-            (theme.sym(Sym::Warn).to_owned(), theme.fg(Tok::Warning))
-        }
+        _ => match state_mark(state, outcome) {
+            Some(mark) => (mark.glyph(theme).to_owned(), theme.fg(mark.tok())),
+            None => (theme.sym(Sym::Warn).to_owned(), theme.fg(Tok::Warning)),
+        },
     }
 }
 
@@ -90,10 +210,12 @@ fn is_context(t: &Tool) -> bool {
 
 fn tool_glyph(t: &Tool, ctx: &TranscriptCtx) -> (String, Style) {
     if is_context(t) && t.state == ToolState::Completed {
-        let glyph = if ctx.theme.ascii() { "*" } else { "◆" };
-        return (glyph.to_owned(), ctx.theme.fg(Tok::SectionLearn));
+        return (
+            super::lanes::context_glyph(ctx.theme).to_owned(),
+            ctx.theme.fg(Tok::SectionLearn),
+        );
     }
-    phase_glyph(t.state, ctx)
+    outcome_glyph(t.state, t.outcome, ctx)
 }
 
 pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
@@ -141,7 +263,7 @@ fn mcp_card(t: &Tool, server: &str, action: &str, w: usize, ctx: &TranscriptCtx)
             theme,
         )];
     }
-    let separator = if theme.ascii() { ":" } else { "·" };
+    let separator = theme.sym(Sym::Dot);
     let mut frame = frame::Frame::new(
         vec![Span::styled(
             format!("MCP {separator} {}", text::one_line(server)),
@@ -201,7 +323,7 @@ struct Fact {
 }
 
 /// The `+a −b` totals an edit's change preview reports, when it carries them.
-fn change_totals(t: &Tool, ascii: bool) -> Option<String> {
+fn change_totals(t: &Tool, theme: &Theme) -> Option<String> {
     if t.state == ToolState::Failed {
         return None;
     }
@@ -215,35 +337,74 @@ fn change_totals(t: &Tool, ascii: bool) -> Option<String> {
     if !added.starts_with('+') || !removed.starts_with('-') {
         return None;
     }
-    let minus = if ascii { "-" } else { "−" };
-    Some(format!("{added} {minus}{}", &removed[1..]))
+    Some(format!(
+        "{added} {}{}",
+        theme.sym(Sym::Minus),
+        &removed[1..]
+    ))
+}
+
+/// What a worker row shows for a running worker once its task call returned: it continues in the
+/// background, and its live state belongs to the worker pins, not to frozen transcript rows.
+const BACKGROUND: &str = "background";
+
+/// The word a worker row's chip and the card's tally use. `live` is whether the task call that
+/// owns the row is still running.
+fn agent_word(a: &AgentRow, live: bool) -> &'static str {
+    if a.state == ToolState::Running && !live {
+        BACKGROUND
+    } else {
+        state_word(a.state, None)
+    }
+}
+
+/// Worker counts by displayed state, in one fixed order. A card whose workers all finished cleanly
+/// says nothing: "3 done" under a settled card is just noise.
+fn worker_tally(agents: &[AgentRow], live: bool) -> Vec<String> {
+    const ORDER: &[&str] = &[
+        "running",
+        BACKGROUND,
+        "failed",
+        "interrupted",
+        "stopped",
+        "denied",
+        "blocked",
+        "incomplete",
+        "needs input",
+        "answered",
+        "done",
+    ];
+    let words: Vec<&str> = agents.iter().map(|a| agent_word(a, live)).collect();
+    if words.iter().all(|w| *w == "done") {
+        return Vec::new();
+    }
+    ORDER
+        .iter()
+        .filter_map(|word| {
+            let n = words.iter().filter(|w| *w == word).count();
+            (n > 0).then(|| {
+                if *word == BACKGROUND {
+                    format!("{n} in background")
+                } else {
+                    format!("{n} {word}")
+                }
+            })
+        })
+        .collect()
 }
 
 /// Facts shown at the right edge of the header: size of the change or result, run time, exit code.
 fn facts(t: &Tool, theme: &Theme) -> Vec<Fact> {
     let keep = |text: String| Fact { text, drop: 0 };
     let mut out = Vec::new();
-    if t.presentation.body == crate::runtime::presentation::BodyStyle::Workers
-        && !t.agents.is_empty()
-    {
-        let count = |state: ToolState| t.agents.iter().filter(|a| a.state == state).count();
-        let (running, failed, done) = (
-            count(ToolState::Running),
-            count(ToolState::Failed),
-            count(ToolState::Completed),
+    if t.presentation.body == crate::runtime::presentation::BodyStyle::Workers {
+        out.extend(
+            worker_tally(&t.agents, t.state == ToolState::Running)
+                .into_iter()
+                .map(keep),
         );
-        // Totals only once the workers disagree: "3 done" under a settled card is just noise.
-        if done > 0 && done < t.agents.len() {
-            out.push(keep(format!("{done} done")));
-        }
-        if running > 0 {
-            out.push(keep(format!("{running} running")));
-        }
-        if failed > 0 {
-            out.push(keep(format!("{failed} failed")));
-        }
     }
-    if let Some(totals) = change_totals(t, theme.ascii()) {
+    if let Some(totals) = change_totals(t, theme) {
         out.push(keep(totals));
     }
     // Tool-owned facts may join parts with `·`; the ASCII preset keeps its own separator.
@@ -260,20 +421,23 @@ fn facts(t: &Tool, theme: &Theme) -> Vec<Fact> {
         && !(t.state == ToolState::Failed && exit_code)
     {
         // Only failure has an unmistakable glyph of its own (✗), so only its word can yield to
-        // the target; interrupted, blocked and incomplete always say what happened.
+        // the target; interrupted, denied, blocked and incomplete always say what happened.
         out.push(Fact {
-            text: t.state.label().into(),
+            text: state_word(t.state, t.outcome).into(),
             drop: u8::from(t.state == ToolState::Failed),
         });
     }
-    if let Some(secs) = t
-        .elapsed
-        .filter(|s| *s >= 0.05 && t.state != ToolState::Running)
-    {
-        out.push(Fact {
-            text: elapsed_label(secs),
+    match t.elapsed {
+        // A running call counts up in whole seconds once it has run for a second.
+        Some(secs) if t.state == ToolState::Running && secs >= 1.0 => out.push(Fact {
+            text: text::duration_label(secs),
             drop: 2,
-        });
+        }),
+        Some(secs) if t.state != ToolState::Running && secs >= 0.05 => out.push(Fact {
+            text: text::duration_label_precise(secs),
+            drop: 2,
+        }),
+        _ => {}
     }
     out
 }
@@ -299,23 +463,14 @@ fn same_path(a: &str, b: &str) -> bool {
 /// One line of plain output word-wrapped to `max` cells with its indentation kept: continuation
 /// rows hang under the line's own text, so compiler carets and nested output stay aligned.
 fn wrap_indented(line: &str, max: usize) -> Vec<String> {
-    let max = max.max(1);
-    let body = line.trim_start_matches(' ');
-    if body.is_empty() {
-        return vec![String::new()];
-    }
-    let indent = (line.len() - body.len()).min(max / 2);
-    let pad = " ".repeat(indent);
-    text::wrap_words(body, max - indent)
-        .into_iter()
-        .map(|row| format!("{pad}{row}"))
-        .collect()
+    text::wrap_words(line, max.max(1))
 }
 
 /// Rows previewing what a `write` created: numbered `+` lines from the call's own content.
 fn write_preview(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, usize)> {
-    let content = written_content(t)?;
+    let content = text::sanitize(&written_content(t)?);
     let theme = ctx.theme;
+    let mark = ellipsis(theme);
     let lines: Vec<&str> = content.lines().collect();
     let gutter_w = lines.len().max(1).to_string().len();
     let limit = if ctx.tools_expanded {
@@ -328,17 +483,16 @@ fn write_preview(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, u
         .take(limit)
         .enumerate()
         .map(|(i, line)| {
-            Line::from(vec![
-                Span::styled(format!("{:>gutter_w$} ", i + 1), theme.fg(Tok::Dim)),
-                Span::styled(
-                    text::ellipsize(
-                        &format!("+ {line}"),
-                        inner.saturating_sub(gutter_w + 1).max(1),
-                        theme.ascii(),
-                    ),
-                    theme.fg(Tok::DiffAdded),
-                ),
-            ])
+            let mut spans = vec![Span::styled(
+                format!("{:>gutter_w$} ", i + 1),
+                theme.fg(Tok::Dim),
+            )];
+            spans.extend(truncate_spans(
+                vec![Span::styled(format!("+ {line}"), theme.fg(Tok::DiffAdded))],
+                inner.saturating_sub(gutter_w + 1).max(1),
+                &mark,
+            ));
+            Line::from(spans)
         })
         .collect();
     let hidden = lines.len().saturating_sub(rows.len());
@@ -347,16 +501,19 @@ fn write_preview(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, u
 
 /// One tool call: a header row (status glyph in the gutter, bold verb, muted target, facts at the
 /// right edge), then, when it says something, the body hanging off a `└` under the verb: the diff
-/// for edits, the new lines for writes, output for commands, the first error lines for failures.
+/// for edits, the new lines for writes, output for commands, the last error lines for failures.
 /// Heavy calls (commands, code cells, edits, network calls) whose body says something are drawn in
-/// a frame instead, see [`framed_card`].
+/// a frame instead, see [`framed_card`]. Commands and code cells are framed from the moment they
+/// start, so a card never changes shape (or verb) when its first output arrives.
 fn card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     if let Some(family) = family(t)
         && w >= frame::MIN_W
         && !quiet(t, ctx)
     {
         let (body, hidden) = body_rows(t, w - frame::CHROME_W, ctx);
-        if !body.is_empty() {
+        let framed_from_start = matches!(family, Family::Shell | Family::Code)
+            && t.presentation.body != crate::runtime::presentation::BodyStyle::Quiet;
+        if !body.is_empty() || framed_from_start {
             return framed_card(t, family, body, hidden, w, ctx);
         }
     }
@@ -416,17 +573,18 @@ fn quiet(t: &Tool, ctx: &TranscriptCtx) -> bool {
         && t.presentation.body == crate::runtime::presentation::BodyStyle::Quiet
 }
 
-/// What a call's body shows at `inner` cells: the first error lines for failures, the diff for
-/// edits, the new lines for writes, otherwise its output. Returns the rows and how many were hidden.
+/// What a call's body shows at `inner` cells: the last error lines for failures (errors end with
+/// their cause), the diff for edits, the new lines for writes, otherwise its output. Returns the
+/// rows and how many source lines were hidden after them.
 fn body_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> (Rows, usize) {
     if t.state == ToolState::Failed {
-        output_rows(t, inner, ctx, Some(COMPACT_ERROR_ROWS))
+        output_rows(t, inner, ctx, true)
     } else if let Some(diff) = diff_rows(t, inner, ctx) {
         diff
     } else if t.presentation.body == crate::runtime::presentation::BodyStyle::Write {
-        write_preview(t, inner, ctx).unwrap_or_else(|| output_rows(t, inner, ctx, None))
+        write_preview(t, inner, ctx).unwrap_or_else(|| output_rows(t, inner, ctx, false))
     } else {
-        output_rows(t, inner, ctx, None)
+        output_rows(t, inner, ctx, false)
     }
 }
 
@@ -566,7 +724,7 @@ fn card_with(t: &Tool, w: usize, ctx: &TranscriptCtx, verb_text: String) -> Rows
     if t.presentation.body == crate::runtime::presentation::BodyStyle::Workers
         && !t.agents.is_empty()
     {
-        rows.extend(agent_tree(&t.agents, w, ctx));
+        rows.extend(agent_tree(&t.agents, t.state == ToolState::Running, w, ctx));
         return rows;
     }
     let inner = w.saturating_sub(GUTTER + 2).max(1);
@@ -576,7 +734,7 @@ fn card_with(t: &Tool, w: usize, ctx: &TranscriptCtx, verb_text: String) -> Rows
     } else {
         Tok::Dim
     });
-    let hook = if theme.ascii() { "`" } else { "└" };
+    let hook = theme.sym(Sym::Hook);
     let mut first = true;
     let mut rail = || {
         let glyph = if std::mem::take(&mut first) {
@@ -676,11 +834,7 @@ pub(super) fn lookup_tree(tools: &[&Tool], w: u16, ctx: &TranscriptCtx) -> Rows 
         theme.fg(Tok::Dim),
     ));
     let mut rows = vec![fitted(head, w, theme)];
-    let (branch, last) = if theme.ascii() {
-        ("|-", "`-")
-    } else {
-        ("├─", "└─")
-    };
+    let (branch, last) = (theme.sym(Sym::TreeBranch), theme.sym(Sym::TreeLast));
     let sep = format!(" {} ", theme.sym(Sym::Dot));
     for (i, t) in tools.iter().enumerate() {
         let rail = format!(
@@ -708,33 +862,28 @@ pub(super) fn lookup_tree(tools: &[&Tool], w: u16, ctx: &TranscriptCtx) -> Rows 
     rows
 }
 
-fn duration_label(ms: u64) -> String {
-    let secs = ms / 1000;
-    match secs {
-        0 => format!("{:.1}s", ms as f64 / 1000.0),
-        1..60 => format!("{secs}s"),
-        60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
-        _ => format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60),
-    }
-}
-
 /// The agents a `task` call spawned, as a tree: per agent a status row (glyph, name, type, model,
 /// assignment, tool count and time at the right), then one hook row under it with the tool it is
-/// running now, or, once settled, the first line of what it reported.
-fn agent_tree(agents: &[AgentRow], w: usize, ctx: &TranscriptCtx) -> Rows {
+/// running now, or, once settled, the first line of what it reported. `live` is whether the task
+/// call is still running: once it returned, a worker still running is drawn as a static
+/// "continuing in background" row, because these rows freeze in scrollback.
+fn agent_tree(agents: &[AgentRow], live: bool, w: usize, ctx: &TranscriptCtx) -> Rows {
     let theme = ctx.theme;
     let mark = ellipsis(theme);
     let ascii = theme.ascii();
-    let (branch, last, pipe, hook) = if ascii {
-        ("|-", "`-", "| ", "`")
-    } else {
-        ("├─", "└─", "│ ", "·")
-    };
+    let (branch, last) = (theme.sym(Sym::TreeBranch), theme.sym(Sym::TreeLast));
+    let pipe = format!("{} ", theme.sym(Sym::TreeStem));
+    let hook = theme.sym(Sym::Dot);
     let rail = theme.fg(Tok::Border);
     let mut rows = Vec::new();
     for (i, a) in agents.iter().enumerate() {
         let is_last = i + 1 == agents.len();
-        let (glyph, glyph_style) = phase_glyph(a.state, ctx);
+        let background = a.state == ToolState::Running && !live;
+        let (glyph, glyph_style) = if background {
+            (theme.sym(Sym::Pending).to_owned(), theme.fg(Tok::Muted))
+        } else {
+            phase_glyph(a.state, ctx)
+        };
         let mut facts = Vec::new();
         // The explicit chip below carries phase; right-side facts are counts and time only.
         if a.tools > 0 {
@@ -743,7 +892,7 @@ fn agent_tree(agents: &[AgentRow], w: usize, ctx: &TranscriptCtx) -> Rows {
             facts.push(format!("step {}", a.steps));
         }
         if let Some(ms) = a.elapsed_ms {
-            facts.push(duration_label(ms));
+            facts.push(text::duration_label(ms as f64 / 1000.0));
         }
         let facts = facts.join(&format!(" {} ", theme.sym(Sym::Dot)));
         let mut left = vec![
@@ -760,20 +909,12 @@ fn agent_tree(agents: &[AgentRow], w: usize, ctx: &TranscriptCtx) -> Rows {
             ),
         ];
         left.push(Span::raw(" "));
-        left.push(frame::chip(
-            theme,
-            if a.state == ToolState::Completed {
-                "done"
-            } else {
-                a.state.label()
-            },
-            match a.state {
-                ToolState::Failed => Tok::Error,
-                ToolState::Running => Tok::Accent,
-                ToolState::Completed => Tok::Dim,
-                _ => Tok::Warning,
-            },
-        ));
+        let chip_tok = match a.state {
+            _ if background => Tok::Muted,
+            ToolState::Completed => Tok::Dim,
+            state => state_tok(state, None),
+        };
+        left.push(frame::chip(theme, agent_word(a, live), chip_tok));
         // The kind is only worth a badge when the name does not already say it (`scout#1`).
         let kind = a.agent.trim();
         if !kind.is_empty()
@@ -802,11 +943,13 @@ fn agent_tree(agents: &[AgentRow], w: usize, ctx: &TranscriptCtx) -> Rows {
             row.push(Span::raw(
                 " ".repeat(w.saturating_sub(left_w + right_w).max(1)),
             ));
-            row.push(Span::styled(facts, theme.fg(Tok::Muted)));
+            // Same quiet token as a tool card's facts.
+            row.push(Span::styled(facts, theme.fg(Tok::Dim)));
         }
         rows.push(fitted(row, w, theme));
 
         let detail = match (&a.current_tool, a.state) {
+            _ if background => Some(("continuing in background".to_owned(), theme.fg(Tok::Dim))),
             (Some(tool), ToolState::Running) => Some((text::one_line(tool), theme.fg(Tok::Muted))),
             // Between tool calls a running worker is waiting on its model.
             (None, ToolState::Running) if a.preview.is_empty() => {
@@ -819,7 +962,7 @@ fn agent_tree(agents: &[AgentRow], w: usize, ctx: &TranscriptCtx) -> Rows {
             _ => None,
         };
         if let Some((detail, style)) = detail {
-            let indent = format!("   {}  ", if is_last { "  " } else { pipe });
+            let indent = format!("   {}  ", if is_last { "  " } else { pipe.as_str() });
             let lead = format!("{indent}{hook} ");
             let room = w.saturating_sub(text::width(&lead)).max(1);
             let detail = text::sanitize(&detail);
@@ -970,34 +1113,36 @@ fn diff_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, usize
     let limit = if ctx.tools_expanded {
         usize::MAX
     } else {
-        ctx.ui.tool_output_lines
+        ctx.ui.tool_output_lines.max(1)
     };
     // The header already names a single edited file and its `+a −b` totals.
     let header_target = target(t);
     let single_file = items.iter().filter(|i| matches!(i, Row::File(_))).count() == 1;
-    let totals_in_header = change_totals(t, theme.ascii()).is_some();
+    let totals_in_header = change_totals(t, theme).is_some();
     let code_w = inner.saturating_sub(gutter + 1).max(1);
-    let mut all: Rows = Vec::new();
+    // Rows per source line, so the hidden count names lines rather than wrapped rows.
+    let mut all: Vec<Rows> = Vec::new();
     for item in items {
         match item {
             Row::File(path) if single_file && same_path(&header_target, path) => {}
             Row::Note(text) if totals_in_header && text.starts_with("updated (") => {}
-            Row::File(path) => all.extend(text::wrap(
+            Row::File(path) => all.push(text::wrap(
                 vec![Line::from(Span::styled(
                     path.to_owned(),
                     theme.fg(Tok::Accent),
                 ))],
                 inner.max(1),
             )),
-            Row::Note(text) => all.extend(
+            Row::Note(text) => all.push(
                 text::wrap_words(text, inner.max(1))
                     .into_iter()
-                    .map(|row| Line::from(Span::styled(row, theme.fg(Tok::Dim)))),
+                    .map(|row| Line::from(Span::styled(row, theme.fg(Tok::Dim))))
+                    .collect(),
             ),
-            Row::Gap => all.push(Line::from(Span::styled(
+            Row::Gap => all.push(vec![Line::from(Span::styled(
                 format!("{:>gutter$}", theme.sym(Sym::Ellipsis)),
                 theme.fg(Tok::Dim),
-            ))),
+            ))]),
             Row::Line(sign, n, text) => {
                 let style = match sign {
                     '+' => theme.fg(Tok::DiffAdded),
@@ -1007,22 +1152,62 @@ fn diff_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, usize
                 let number = format!("{:>gutter$} ", n.map_or(String::new(), |n| n.to_string()));
                 let code = vec![Line::from(Span::styled(format!("{sign}{text}"), style))];
                 // Wrapped code hangs under the code column, never under the line numbers.
-                for (k, piece) in text::wrap(code, code_w).into_iter().enumerate() {
-                    let lead = if k == 0 {
-                        number.clone()
-                    } else {
-                        " ".repeat(gutter + 1)
-                    };
-                    let mut spans = vec![Span::styled(lead, theme.fg(Tok::Dim))];
-                    spans.extend(piece.spans);
-                    all.push(Line::from(spans));
-                }
+                let rows = text::wrap(code, code_w)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, piece)| {
+                        let lead = if k == 0 {
+                            number.clone()
+                        } else {
+                            " ".repeat(gutter + 1)
+                        };
+                        let mut spans = vec![Span::styled(lead, theme.fg(Tok::Dim))];
+                        spans.extend(piece.spans);
+                        Line::from(spans)
+                    })
+                    .collect();
+                all.push(rows);
             }
         }
     }
-    let hidden = all.len().saturating_sub(limit);
-    all.truncate(limit);
-    Some((all, hidden))
+    Some(take_lines(all, limit, false))
+}
+
+/// Whole source lines (each given as its wrapped rows) that fit in `limit` rows, taken from the
+/// start, or from the end for `tail`, and how many source lines are not shown in full. A first line
+/// taller than `limit` shows its first (or, for `tail`, last) `limit` rows.
+fn take_lines(lines: Vec<Rows>, limit: usize, tail: bool) -> (Rows, usize) {
+    let total = lines.len();
+    let mut kept: Vec<Rows> = Vec::new();
+    let mut used = 0usize;
+    let mut partial = false;
+    let ordered: Box<dyn Iterator<Item = Rows>> = if tail {
+        Box::new(lines.into_iter().rev())
+    } else {
+        Box::new(lines.into_iter())
+    };
+    for mut line in ordered {
+        if used.saturating_add(line.len()) <= limit {
+            used += line.len();
+            kept.push(line);
+            continue;
+        }
+        if kept.is_empty() {
+            if tail {
+                line.drain(..line.len() - limit);
+            } else {
+                line.truncate(limit);
+            }
+            kept.push(line);
+            partial = true;
+        }
+        break;
+    }
+    let full = kept.len() - usize::from(partial);
+    if tail {
+        kept.reverse();
+    }
+    (kept.into_iter().flatten().collect(), total - full)
 }
 
 /// Diff-aware spans for one line of `edit` / `write` output: `+`/`-` hunks, `@@`, the `[path#TAG]`
@@ -1061,9 +1246,10 @@ fn split_trailer(output: &str) -> String {
         .join("\n")
 }
 
-/// Tool output wrapped to `inner` cells and capped at `limit` rows (the configured tool output
-/// length when `None`); returns the visible rows and how many were hidden.
-fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx, limit: Option<usize>) -> (Rows, usize) {
+/// Tool output wrapped to `inner` cells and capped at the configured tool output length. `tail`
+/// keeps the last lines instead of the first (a failure's cause is at its end) and puts the hint
+/// for the earlier lines above them; otherwise returns the rows and how many source lines follow.
+fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx, tail: bool) -> (Rows, usize) {
     let source = match (&t.progress, t.state) {
         (Some(progress), ToolState::Running) => progress.as_str(),
         _ if !ctx.tools_expanded => t.presentation.preview.as_deref().unwrap_or(&t.output),
@@ -1086,68 +1272,58 @@ fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx, limit: Option<usize>
     let limit = if ctx.tools_expanded {
         usize::MAX
     } else {
-        limit.unwrap_or(ctx.ui.tool_output_lines)
+        ctx.ui.tool_output_lines.max(1)
     };
-    let mut rows: Rows = Vec::new();
-    let mut total = 0;
-    for line in body.trim_start_matches('\n').split('\n') {
-        let spans = if diffy {
-            edit_spans(theme, line)
-        } else {
-            vec![Span::styled(
-                line.to_owned(),
-                if err {
+    let lines: Vec<Rows> = body
+        .trim_start_matches('\n')
+        .split('\n')
+        .map(|line| {
+            // Output wraps at word boundaries and keeps its indentation; edit previews are code.
+            if diffy {
+                text::wrap(vec![Line::from(edit_spans(theme, line))], inner.max(1))
+            } else {
+                let style = if err {
                     theme.fg(Tok::Error)
                 } else {
                     theme.fg(Tok::ToolOutput)
-                },
-            )]
-        };
-        // Output wraps at word boundaries and keeps its indentation; edit previews are code.
-        let wrapped_rows: Rows = if diffy {
-            text::wrap(vec![Line::from(spans)], inner.max(1))
-        } else {
-            let style = spans.first().map(|s| s.style).unwrap_or_default();
-            wrap_indented(line, inner)
-                .into_iter()
-                .map(|text| Line::from(Span::styled(text, style)))
-                .collect()
-        };
-        for wrapped in wrapped_rows {
-            total += 1;
-            if rows.len() < limit {
-                rows.push(wrapped);
+                };
+                wrap_indented(line, inner)
+                    .into_iter()
+                    .map(|text| Line::from(Span::styled(text, style)))
+                    .collect()
             }
-        }
+        })
+        .collect();
+    let (rows, hidden) = take_lines(lines, limit, tail);
+    if tail && hidden > 0 {
+        let mut out = vec![Line::from(more_hint(
+            hidden,
+            "earlier",
+            ctx.expand_key,
+            theme,
+        ))];
+        out.extend(rows);
+        return (out, 0);
     }
-    let hidden = total - rows.len();
     (rows, hidden)
 }
 
 pub(super) fn hidden_hint(hidden: usize, expand_key: &str, theme: &Theme) -> Span<'static> {
-    // The shortcut is the user's own binding, so it is named as the keymap shows it.
+    more_hint(hidden, "more", expand_key, theme)
+}
+
+/// `… 3 more lines (Ctrl+O expands)`. The shortcut is the user's own binding, so it is named as the
+/// keymap shows it.
+fn more_hint(hidden: usize, which: &str, expand_key: &str, theme: &Theme) -> Span<'static> {
     Span::styled(
         format!(
-            "{} {hidden} more line{} ({expand_key} expands)",
+            "{} {hidden} {which} line{} ({expand_key} expands)",
             ellipsis(theme),
             if hidden == 1 { "" } else { "s" }
         ),
         theme.fg(Tok::Dim),
     )
 }
-
-fn elapsed_label(secs: f64) -> String {
-    if secs < 10.0 {
-        format!("{secs:.2}s")
-    } else if secs < 100.0 {
-        format!("{secs:.1}s")
-    } else {
-        format!("{secs:.0}s")
-    }
-}
-
-/// Rows of a compact (one-line) tool's error shown before Ctrl+O expands it.
-const COMPACT_ERROR_ROWS: usize = 2;
 
 mod check;
 mod frame;

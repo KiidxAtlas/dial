@@ -354,17 +354,38 @@ pub fn route(agent: Option<&AgentEntry>) -> Route {
         return Route::Resume;
     }
     match agent.status {
-        AgentStatus::Cancelled => Route::Unavailable("Cancelled workers cannot continue"),
+        AgentStatus::Cancelled => Route::Unavailable("Stopped workers cannot continue"),
         AgentStatus::Interrupted => {
             Route::Unavailable("No saved continuation is available for this interrupted worker")
         }
         AgentStatus::Running | AgentStatus::Waiting => {
             Route::Unavailable("This worker cannot take a message right now")
         }
+        AgentStatus::NeedsInput | AgentStatus::Blocked => {
+            Route::Unavailable("No saved transcript; this worker cannot be continued")
+        }
         AgentStatus::Done | AgentStatus::Answered | AgentStatus::Failed => {
             Route::Unavailable("This worker cannot be continued")
         }
     }
+}
+
+/// Header words for a worker that waits on the operator: what it needs, then what continues
+/// it. Empty for workers that need nothing.
+pub fn handoff_facts(agent: &AgentEntry) -> Vec<&'static str> {
+    let need = match agent.status {
+        // A live wait is an approval or question prompt; a reply would not answer it.
+        AgentStatus::Waiting => return vec!["needs your input"],
+        AgentStatus::NeedsInput => "needs your input",
+        AgentStatus::Blocked => "blocked",
+        _ => return Vec::new(),
+    };
+    let next = match route(Some(agent)) {
+        Route::Resume => "reply below to continue it",
+        Route::Steer => "reply below",
+        Route::Unavailable(_) => "see its last message",
+    };
+    vec![need, next]
 }
 
 struct Cache {
@@ -390,6 +411,8 @@ impl WorkerEditors {
 }
 
 pub struct SubagentViewer {
+    /// F1 key help; `?` types into the always-focused draft.
+    panel_keys: super::panel_keys::PanelKeys,
     id: String,
     session_id: String,
     from_hub: bool,
@@ -433,6 +456,7 @@ impl SubagentViewer {
         now: Instant,
     ) -> Self {
         Self {
+            panel_keys: super::panel_keys::PanelKeys::default(),
             editor_key: format!("{session_id}/{id}"),
             editors: None,
             pending_submit: false,
@@ -542,6 +566,10 @@ impl SubagentViewer {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap, now: Instant) -> OverlayEvent {
+        // The draft always has focus, so only F1 opens the key help here.
+        if self.panel_keys.handle_key(event, true) {
+            return OverlayEvent::None;
+        }
         match event {
             Event::Key(key) if pressed(key) => self.key(key, keys, now),
             // Pasted steering goes into the draft (the editor sanitizes it); it never submits.
@@ -603,7 +631,7 @@ impl SubagentViewer {
             }
             self.cancel_armed = Some(now);
             self.notice = Some(format!(
-                "Press Ctrl+C again within {} s to cancel this worker",
+                "Press Ctrl+C again within {} s to stop this worker",
                 CANCEL_CONFIRM.as_secs()
             ));
             return OverlayEvent::None;
@@ -728,6 +756,16 @@ impl SubagentViewer {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        if self.panel_keys.draw(
+            frame,
+            ctx,
+            "Worker",
+            "Ctrl+C twice  stop this worker\n/model <profile or model>  change this worker's model\n/thinking <level>  change this worker's thinking\n/back  return",
+            false,
+            false,
+        ) {
+            return;
+        }
         let name = self
             .agent
             .as_ref()
@@ -870,9 +908,7 @@ impl SubagentViewer {
                 ),
                 format!(
                     "Cost: {}",
-                    agent
-                        .cost_usd
-                        .map_or_else(|| "unknown".into(), |cost| format!("${cost:.4}"))
+                    agent.cost_usd.map_or_else(|| "unknown".into(), text::usd)
                 ),
                 format!(
                     "Reported steps/requests/tool calls: {}/{}/{}",
@@ -881,6 +917,10 @@ impl SubagentViewer {
                 format!(
                     "Current activity: {}",
                     agent.current.as_deref().map_or("unknown".into(), known)
+                ),
+                format!(
+                    "Result: {}",
+                    agent.result.as_deref().map_or("none yet".into(), known)
                 ),
                 format!(
                     "Isolation: {}",
@@ -1065,9 +1105,10 @@ impl SubagentViewer {
                 fx::pulse(theme, ctx.status.tick),
             ),
             // A worker blocked on the operator must not look busy.
-            AgentStatus::Waiting | AgentStatus::Interrupted => {
-                (theme.sym(Sym::Warn).to_owned(), theme.fg(Tok::Warning))
-            }
+            AgentStatus::Waiting
+            | AgentStatus::NeedsInput
+            | AgentStatus::Blocked
+            | AgentStatus::Interrupted => (theme.sym(Sym::Warn).to_owned(), theme.fg(Tok::Warning)),
             AgentStatus::Done => (theme.sym(Sym::Check).to_owned(), theme.fg(Tok::Success)),
             AgentStatus::Answered => (theme.sym(Sym::Dot).to_owned(), theme.fg(Tok::Muted)),
             AgentStatus::Failed => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Error)),
@@ -1084,17 +1125,15 @@ impl SubagentViewer {
         ];
         // The panel title already names the status; repeat it here only when it asks for action.
         let mut facts = vec![agent.agent.clone()];
-        if agent.status == AgentStatus::Waiting {
-            facts.push("needs your input".to_owned());
-        }
+        facts.extend(handoff_facts(agent).into_iter().map(str::to_owned));
         if !agent.model.is_empty() {
             facts.push(agent.model.clone());
         }
         if let Some(ms) = agent.elapsed_ms {
-            facts.push(format_elapsed(ms));
+            facts.push(text::duration_label(ms as f64 / 1000.0));
         }
         if let Some(cost) = agent.cost_usd {
-            facts.push(format!("${cost:.3}"));
+            facts.push(text::usd(cost));
         }
         for fact in facts.into_iter().filter(|fact| !fact.is_empty()) {
             spans.push(Span::styled(
@@ -1203,11 +1242,12 @@ impl SubagentViewer {
             segments.push(hint(ctx.keys, Action::Submit, verb));
         }
         if self.agent.as_ref().is_some_and(|agent| agent.cancellable) {
-            segments.push("Ctrl+C abort worker".to_owned());
+            segments.push("Ctrl+C stop worker".to_owned());
         }
         segments.push(hint(ctx.keys, Action::SubagentsHub, "all workers"));
+        segments.push("F1 keys".to_owned());
+        // The way out stays last, so a narrow footer drops the other hints before it.
         segments.push(hint(ctx.keys, Action::SelectCancel, esc));
-        segments.push("/model · /thinking · /back".to_owned());
         rows.push(hint_line(theme, &segments, width));
         rows
     }
@@ -1224,18 +1264,6 @@ impl Drop for SubagentViewer {
                 );
             }
         }
-    }
-}
-
-/// `12s`, `3m 04s`, `1h 02m`.
-pub fn format_elapsed(ms: u64) -> String {
-    let secs = ms / 1000;
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 

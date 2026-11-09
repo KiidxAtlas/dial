@@ -212,7 +212,7 @@ pub const COMMANDS: &[CommandSpec] = &[
             },
         ],
         during_turn: DuringTurn::Now,
-        note: Some("Opens now; m messages or resumes a worker, x x cancels a running one."),
+        note: Some("Opens now; m messages or continues a worker, x x stops a running one."),
         help_order: Some(21),
         ..CommandSpec::new(
             "workers",
@@ -556,7 +556,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         during_turn: DuringTurn::Now,
-        note: Some("Opens now; m messages or resumes a worker, x x cancels a running one."),
+        note: Some("Opens now; m messages or continues a worker, x x stops a running one."),
         help_order: Some(8),
         ..CommandSpec::new(
             "agents",
@@ -572,7 +572,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "message",
             "<id> <text>",
-            "steer a live subagent",
+            "message a running worker",
             Category::Work,
             Surface::Builtin,
         )
@@ -583,7 +583,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "cancel",
             "<id>",
-            "cancel a live subagent",
+            "stop a running worker",
             Category::Work,
             Surface::Builtin,
         )
@@ -1747,7 +1747,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "cleanse",
             "[request] [--all] [--tests] [-n N] [-m model]",
-            "Run project checkers and repair their diagnostics with worker subagents",
+            "Run project checkers and repair their diagnostics with workers",
             Category::Modes,
             Surface::Group,
         )

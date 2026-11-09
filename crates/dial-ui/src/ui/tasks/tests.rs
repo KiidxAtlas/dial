@@ -303,3 +303,20 @@ fn progress_view_is_explicitly_unavailable_while_busy_and_when_state_is_unreadab
     assert!(text.contains("Deliverables: none recorded"), "{text}");
     assert!(text.contains("Workers: none"), "{text}");
 }
+
+#[test]
+fn in_progress_and_blocked_steps_have_distinct_state_colors() {
+    let theme = Theme::dark();
+    let mut todo = list(json!([{"content": "stuck"}, {"content": "now"}]));
+    todo.call(&json!({"op": "block", "reason": "needs a key"}));
+    todo.call(&json!({"op": "start"}));
+    let tasks = todo.tasks();
+    assert_eq!(tasks[0].status, Status::Blocked, "{tasks:?}");
+    assert_eq!(tasks[1].status, Status::InProgress, "{tasks:?}");
+    let blocked = task_spans(&tasks[0], "", &theme, None, false);
+    let active = task_spans(&tasks[1], "", &theme, None, false);
+    assert_eq!(active[1].style, theme.fg(chrome::StateMark::Running.tok()));
+    assert_eq!(blocked[1].style, theme.fg(chrome::StateMark::Blocked.tok()));
+    assert_eq!(blocked[1].content, chrome::StateMark::Blocked.glyph(&theme));
+    assert_ne!(active[1].style, blocked[1].style);
+}

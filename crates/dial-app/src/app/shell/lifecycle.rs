@@ -68,6 +68,7 @@ impl Shell {
             extensions_job: None,
             restart_requested: false,
             retry_noted: false,
+            retry_attempt: None,
             retry_control: None,
             smithery_resume: None,
             commit_job: None,

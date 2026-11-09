@@ -155,7 +155,7 @@ fn a_full_answer_stays_editable_and_oversized_pastes_are_refused() {
 
     // The attachment path field uses its own, smaller limit for paste too.
     dialog.key(
-        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
         &keys,
     );
     dialog.paste(&"p".repeat(MAX_PATH + 1));
@@ -327,4 +327,57 @@ fn inspecting_untimed_questions_keeps_them_untimed_and_preserves_custom_input() 
             .is_none()
     );
     assert_eq!(dialog.rows(100, 30), before);
+}
+
+#[test]
+fn esc_cancels_from_the_choices_and_text_fields_keep_ctrl_a_as_line_start() {
+    let single = request(1, None);
+    let keys = Keymap::defaults();
+    let mut dialog = Dialog::new(&single, Path::new("/tmp"));
+    assert!(
+        dialog.rows(80, 30).last().unwrap().ends_with("Esc cancel"),
+        "the advertised way out is last"
+    );
+    assert!(matches!(
+        dialog.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys),
+        Some(QuestionOutcome::Cancelled)
+    ));
+
+    let mut dialog = Dialog::new(&single, Path::new("/tmp"));
+    dialog.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &keys);
+    for c in "ab".chars() {
+        dialog.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &keys);
+    }
+    dialog.key(
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        &keys,
+    );
+    dialog.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), &keys);
+    let Mode::Text(_, editor) = &dialog.mode else {
+        panic!("Ctrl+A stays in the text field")
+    };
+    assert_eq!(editor.text, "xab", "Ctrl+A moved to the line start");
+    // Esc in a text field only leaves the field.
+    assert!(
+        dialog
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keys)
+            .is_none()
+    );
+    assert!(matches!(dialog.mode, Mode::Choices));
+}
+
+#[test]
+fn choice_navigation_and_hints_follow_the_keymap() {
+    let multi = request(2, None);
+    let mut keys = Keymap::defaults();
+    keys.rebind(Action::SelectDown, &["F5"]).unwrap();
+    keys.rebind(Action::SelectConfirm, &["F6"]).unwrap();
+    let mut dialog = Dialog::new(&multi, Path::new("/tmp")).with_keys(&keys);
+    let footer = dialog.rows(80, 30).last().unwrap().clone();
+    assert!(footer.starts_with("↑/F5 choose · F6 select"), "{footer}");
+    let start = dialog.cursor;
+    dialog.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &keys);
+    assert_eq!(dialog.cursor, start, "the unbound default does nothing");
+    dialog.key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &keys);
+    assert_eq!(dialog.cursor, start + 1);
 }

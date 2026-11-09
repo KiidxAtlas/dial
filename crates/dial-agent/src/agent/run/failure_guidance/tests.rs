@@ -21,6 +21,21 @@ fn process(code: i32) -> ProcessOutcome {
     }
 }
 #[test]
+fn an_unapprovable_directory_request_is_named_once_without_changing_the_boundary() {
+    let refusal = ToolOutput::err(
+        "path \"/etc/x\" is outside the workspace; call request_directory with path \"/etc\" to ask for a yes/no access approval, then retry the tool.",
+    );
+    let notice = directory_request_unavailable(&refusal, false).unwrap();
+    assert!(notice.contains("directory_request_unavailable"), "{notice}");
+    assert!(notice.contains("do not call it"), "{notice}");
+    assert!(!notice.contains("bash"), "{notice}");
+    assert_eq!(directory_request_unavailable(&refusal, true), None);
+    assert_eq!(
+        directory_request_unavailable(&ToolOutput::err("no such file"), false),
+        None
+    );
+}
+#[test]
 fn typed_boundaries_override_printed_success_and_never_offer_permission_bypass() {
     let call = call("bash");
     for (status, kind) in [
@@ -373,6 +388,16 @@ fn a_missing_program_gets_a_single_batched_probe_hint() {
         "{advice}"
     );
     assert!(advice.contains("command -v"), "{advice}");
+    assert!(advice.contains("language `js`"), "{advice}");
+    let dash =
+        missing_program_recovery(&python, &missing_with("sh: 1: xxd: not found", |_| {})).unwrap();
+    assert!(dash.contains("`xxd`") && dash.contains("od -A x"), "{dash}");
+    let unknown = missing_program_recovery(
+        &python,
+        &missing_with("bash: frobnicate: command not found", |_| {}),
+    )
+    .unwrap();
+    assert!(!unknown.contains("Known substitute"), "{unknown}");
     let zsh = missing_with("zsh: command not found: node", |_| {});
     assert!(
         missing_program_recovery(&python, &zsh)

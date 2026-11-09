@@ -8,7 +8,10 @@ use ratatui::{
 };
 
 use super::{
-    Rows, chrome, text,
+    Rows, chrome,
+    keys::{Action as Key, Keymap},
+    overlay::settings::scroll_cell,
+    text,
     theme::{Sym, Theme, Tok},
 };
 use crate::storage::session::{TreeNode, TreeNodeKind};
@@ -27,6 +30,10 @@ pub struct Picker {
     found: Vec<usize>,
     /// Position in `found`.
     selected: usize,
+    /// List movement, confirm and cancel follow the user's keymap.
+    keys: Keymap,
+    /// F1 shows the key sheet instead of the list.
+    help: bool,
 }
 
 /// The conversation to the selected node, rendered by the transcript the main view uses at the
@@ -54,6 +61,8 @@ impl Picker {
             query: String::new(),
             found: Vec::new(),
             selected: 0,
+            keys: Keymap::defaults(),
+            help: false,
         };
         picker.refilter();
         picker.selected = picker
@@ -62,6 +71,12 @@ impl Picker {
             .position(|&i| picker.nodes[i].current)
             .unwrap_or(picker.found.len().saturating_sub(1));
         picker
+    }
+
+    /// Uses the user's keymap for list movement, confirm and cancel.
+    pub fn with_keys(mut self, keys: &Keymap) -> Self {
+        self.keys = keys.clone();
+        self
     }
 
     pub fn query(&self) -> &str {
@@ -184,34 +199,74 @@ impl Picker {
         let last = self.found.len().saturating_sub(1);
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
+                // F1 toggles the key sheet; while it shows, Esc or Enter closes it too.
+                if key.code == KeyCode::F(1)
+                    || (self.help && matches!(key.code, KeyCode::Esc | KeyCode::Enter))
+                {
+                    self.help = !self.help;
+                    return Action::None;
+                }
+                if self.help {
+                    return Action::None;
+                }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                // Ctrl+arrows step by turn or to the parent before the keymap's plain moves.
                 match key.code {
-                    KeyCode::Esc if self.query.is_empty() => return Action::Cancel,
-                    KeyCode::Esc => {
-                        self.query.clear();
-                        self.refilter();
+                    KeyCode::Up if ctrl => {
+                        self.step_turn(false);
+                        return Action::None;
                     }
+                    KeyCode::Down if ctrl => {
+                        self.step_turn(true);
+                        return Action::None;
+                    }
+                    KeyCode::Left if ctrl => {
+                        self.select_parent();
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+                let keys = &self.keys;
+                if keys.matches(Key::SelectCancel, key) || key.code == KeyCode::Esc {
+                    if self.query.is_empty() {
+                        return Action::Cancel;
+                    }
+                    self.query.clear();
+                    self.refilter();
+                    return Action::None;
+                }
+                if keys.matches(Key::SelectUp, key) {
+                    self.selected = self.selected.saturating_sub(1);
+                    return Action::None;
+                }
+                if keys.matches(Key::SelectDown, key) {
+                    self.selected = (self.selected + 1).min(last);
+                    return Action::None;
+                }
+                if keys.matches(Key::SelectPageUp, key) {
+                    self.selected = self.selected.saturating_sub(page);
+                    return Action::None;
+                }
+                if keys.matches(Key::SelectPageDown, key) {
+                    self.selected = (self.selected + page).min(last);
+                    return Action::None;
+                }
+                if keys.matches(Key::SelectConfirm, key) || key.code == KeyCode::Enter {
+                    if let Some(&index) = self.found.get(self.selected) {
+                        return Action::Select(index);
+                    }
+                    return Action::None;
+                }
+                match key.code {
                     KeyCode::Char('c') if ctrl => return Action::Cancel,
                     KeyCode::Char('u') if ctrl => {
                         self.query.clear();
                         self.refilter();
                     }
-                    KeyCode::Up if ctrl => self.step_turn(false),
-                    KeyCode::Down if ctrl => self.step_turn(true),
-                    KeyCode::Left if ctrl => self.select_parent(),
-                    KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-                    KeyCode::Down => self.selected = (self.selected + 1).min(last),
                     KeyCode::Left => self.step_sibling(false),
                     KeyCode::Right => self.step_sibling(true),
-                    KeyCode::PageUp => self.selected = self.selected.saturating_sub(page),
-                    KeyCode::PageDown => self.selected = (self.selected + page).min(last),
                     KeyCode::Home => self.selected = 0,
                     KeyCode::End => self.selected = last,
-                    KeyCode::Enter => {
-                        if let Some(&index) = self.found.get(self.selected) {
-                            return Action::Select(index);
-                        }
-                    }
                     KeyCode::Backspace => {
                         self.query.pop();
                         self.refilter();
@@ -239,6 +294,43 @@ impl Picker {
     /// Renders the picker. `preview` is the conversation to the selected node, already rendered
     /// by the caller at [`Picker::preview_width`]; the picker only lays it out.
     pub fn rows(&self, cols: usize, height: usize, theme: &Theme, preview: &Preview) -> Rows {
+        if self.help && height >= 5 && cols >= 12 {
+            let groups = [crate::ui::overlay::panel_keys::SheetGroup {
+                title: "Keys",
+                rows: vec![
+                    (
+                        "Up/Down".into(),
+                        "move (the list keys follow your keymap)".into(),
+                    ),
+                    ("PgUp/PgDn".into(), "move a page".into()),
+                    (
+                        "Left/Right".into(),
+                        "other branch from the same message".into(),
+                    ),
+                    ("Ctrl+Up/Down".into(), "previous or next turn".into()),
+                    ("Ctrl+Left".into(), "parent message".into()),
+                    ("Enter".into(), "move the conversation here".into()),
+                    ("Ctrl+U".into(), "clear the search".into()),
+                    ("F1".into(), "show or hide these keys".into()),
+                    ("Esc".into(), "clear the search, then close".into()),
+                ],
+            }];
+            let sheet = crate::ui::overlay::panel_keys::sheet(
+                theme,
+                &groups,
+                "",
+                "F1/Esc",
+                cols.saturating_sub(4),
+            );
+            return chrome::framed_lines(
+                theme,
+                chrome::Section::Dial,
+                "Session tree · keys",
+                "",
+                sheet,
+                cols,
+            );
+        }
         if height == 0 || cols == 0 {
             return Vec::new();
         }
@@ -286,8 +378,26 @@ impl Picker {
             )));
         }
         let start = self.selected.saturating_sub(list_rows.saturating_sub(1));
-        for (position, &index) in self.found.iter().enumerate().skip(start).take(list_rows) {
-            body.push(self.row(&self.nodes[index], position == self.selected, width, theme));
+        let overflow = self.found.len() > list_rows;
+        let row_w = if overflow {
+            width.saturating_sub(1)
+        } else {
+            width
+        };
+        for (row, (position, &index)) in self
+            .found
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(list_rows)
+            .enumerate()
+        {
+            let mut line = self.row(&self.nodes[index], position == self.selected, row_w, theme);
+            if overflow {
+                line.spans
+                    .push(scroll_cell(theme, row, list_rows, self.found.len(), start));
+            }
+            body.push(line);
         }
         if context_rows > 0 {
             body.push(self.context_header(preview.messages, width, theme));
@@ -313,16 +423,10 @@ impl Picker {
             (arrows, "move"),
             (sides, "branch"),
             ("Enter", "go here"),
+            ("F1", "keys"),
             ("Esc", esc),
         ];
-        let sep = if theme.ascii() { " | " } else { " · " };
-        let mut spans = Vec::new();
-        if !position.is_empty() {
-            spans.push(Span::styled(position, theme.fg(Tok::Muted)));
-            spans.push(Span::styled(sep, theme.fg(Tok::Dim)));
-        }
-        spans.extend(chrome::key_hint_spans(theme, &hints));
-        body.push(Line::from(spans));
+        body.push(chrome::hint_line_after(theme, &position, &hints, width));
         let extra = format!(
             "{} node{}",
             self.nodes.len(),
@@ -428,11 +532,6 @@ impl Picker {
             + text::width(&fork);
         let room = width.saturating_sub(fixed).max(4);
         let preview = text::ellipsize(&text::one_line(&node.text), room, theme.ascii());
-        let fill = if selected {
-            theme.bg(Tok::SelectedBg)
-        } else {
-            Default::default()
-        };
         let body_tok = if node.on_active_branch {
             Tok::Text
         } else {
@@ -440,26 +539,20 @@ impl Picker {
         };
         let tail = text::width(here) + text::width(&fork);
         let used = fixed - tail + text::width(&preview);
-        Line::from(vec![
-            Span::styled(lead, theme.fg(Tok::Accent).patch(fill)),
-            Span::styled(label, theme.fg(Tok::Warning).patch(fill)),
-            Span::styled(format!("{who}: "), theme.fg(Tok::Muted).patch(fill)),
-            Span::styled(
-                preview,
-                theme
-                    .fg(body_tok)
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    })
-                    .patch(fill),
-            ),
-            Span::styled(fork, theme.fg(Tok::Dim).patch(fill)),
-            Span::styled(here, theme.fg(Tok::Accent).patch(fill)),
-            Span::styled(" ".repeat(width.saturating_sub(used + tail)), fill),
-        ])
-        .style(fill)
+        let spans = vec![
+            Span::styled(lead, theme.fg(Tok::Accent)),
+            Span::styled(label, theme.fg(Tok::Warning)),
+            Span::styled(format!("{who}: "), theme.fg(Tok::Muted)),
+            Span::styled(preview, theme.fg(body_tok)),
+            Span::styled(fork, theme.fg(Tok::Dim)),
+            Span::styled(here, theme.fg(Tok::Accent)),
+            Span::raw(" ".repeat(width.saturating_sub(used + tail))),
+        ];
+        if selected {
+            chrome::selected_row(theme, spans, width)
+        } else {
+            Line::from(spans)
+        }
     }
 }
 

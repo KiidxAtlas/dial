@@ -71,6 +71,71 @@ fn word_wrap_breaks_on_spaces_and_hard_splits_long_words() {
 }
 
 #[test]
+fn word_wrap_keeps_leading_indentation_as_a_hanging_indent() {
+    let cases: &[(&str, usize, &[&str])] = &[
+        ("    at foo (a.rs:1)", 40, &["    at foo (a.rs:1)"]),
+        ("  aaa bbb ccc", 9, &["  aaa bbb", "  ccc"]),
+        ("def f():\n    return 1", 20, &["def f():", "    return 1"]),
+        // The indent never takes more than half a row, so the text still has room.
+        ("          abcdef", 6, &["   abc", "   def"]),
+        ("    ", 10, &[""]),
+    ];
+    for (input, max, want) in cases {
+        assert_eq!(wrap_words(input, *max), *want, "{input:?} at {max}");
+        assert!(wrap_words(input, *max).iter().all(|r| width(r) <= *max));
+    }
+}
+
+#[test]
+fn formatters_use_one_compact_form() {
+    let durations: &[(f64, &str, &str)] = &[
+        (0.0, "0s", "0s"),
+        (-3.0, "0s", "0s"),
+        (f64::NAN, "0s", "0s"),
+        (0.04, "0s", "<0.1s"),
+        (0.42, "0s", "0.4s"),
+        (3.24, "3s", "3.2s"),
+        (9.96, "9s", "10s"),
+        (45.7, "45s", "45s"),
+        (754.0, "12m34s", "12m34s"),
+        (3599.0, "59m59s", "59m59s"),
+        (4500.0, "1h15m", "1h15m"),
+        (3720.0, "1h02m", "1h02m"),
+    ];
+    for (secs, whole, precise) in durations {
+        assert_eq!(duration_label(*secs), *whole, "{secs}");
+        assert_eq!(duration_label_precise(*secs), *precise, "{secs}");
+    }
+    let counts: &[(u64, &str)] = &[
+        (0, "0"),
+        (999, "999"),
+        (1_000, "1k"),
+        (1_500, "1.5k"),
+        (9_999, "9.9k"),
+        (172_400, "172k"),
+        (1_250_000, "1.2M"),
+        (42_000_000, "42M"),
+        (u64::MAX, "18446744073709M"),
+    ];
+    for (n, want) in counts {
+        assert_eq!(compact_count(*n), *want, "{n}");
+    }
+    let amounts: &[(f64, &str)] = &[
+        (0.0, "$0.00"),
+        (f64::NAN, "$0.00"),
+        (0.00004, "<$0.0001"),
+        (0.0041, "$0.0041"),
+        (0.0412, "$0.04"),
+        (0.5, "$0.50"),
+        (1.0, "$1.00"),
+        (12.345, "$12.35"),
+    ];
+    for (amount, want) in amounts {
+        assert_eq!(usd(*amount), *want, "{amount}");
+    }
+}
+
+#[test]
 fn tiny_widths_never_exceed_their_cell_limit() {
     for max in 0..4 {
         for ascii in [false, true] {

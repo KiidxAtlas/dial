@@ -12,8 +12,48 @@ use crate::platform;
 use crate::ui::status::Phase;
 use crate::ui::transcript::TurnStats;
 use anyhow::Result;
+use serde_json::Value;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+
+/// Provider and transport failures are worth resending as-is; `/retry` does exactly that.
+fn retryable_class(class: &str) -> bool {
+    matches!(class, "transient" | "rate_limited")
+}
+
+/// The completion footer for a turn that ended in an error. A summary recorded by this turn
+/// (`fresh`) is kept, so changed files and checks still show; only a turn that failed before
+/// recording one gets the generic handoff. Provider/transport errors point at `/retry`.
+pub(super) fn failed_turn_outcome(
+    fresh: Option<&Value>,
+    latency: &Value,
+    error_class: &str,
+) -> crate::ui::transcript::TurnOutcome {
+    let retry = retryable_class(error_class);
+    let Some(summary) = fresh else {
+        let next = if retry {
+            "Next: /retry resends the request once the provider recovers."
+        } else {
+            "Next: inspect /review-file and /evidence before continuing; shell effects may be outside /undo."
+        };
+        return crate::ui::transcript::TurnOutcome {
+            status: "failed".into(),
+            handoff: vec![
+                "Full handoff unavailable: the turn ended before completion was recorded.".into(),
+                next.into(),
+            ],
+            ..Default::default()
+        };
+    };
+    let mut outcome = crate::app::shell::turn_report::outcome(summary, latency);
+    if retry {
+        outcome.handoff.retain(|line| !line.starts_with("Next:"));
+        outcome
+            .handoff
+            .push("Next: /retry resends the request once the provider recovers.".into());
+    }
+    outcome
+}
 
 enum TurnInput<'a> {
     User(&'a str),
@@ -68,6 +108,25 @@ impl Shell {
         }
     }
 
+    /// A message whose turn never started (the compute/preparation wait was cancelled or failed)
+    /// goes back to the composer, ahead of anything typed meanwhile, instead of being lost.
+    fn restore_unsent(&mut self, text: &str, cancelled: bool) {
+        let draft = self.composer.draft();
+        if draft.trim().is_empty() {
+            self.composer.set_draft(text);
+        } else if !draft.starts_with(text) {
+            self.composer.set_draft(&format!("{text}\n\n{draft}"));
+        }
+        self.note(
+            "Not sent",
+            if cancelled {
+                "Cancelled while waiting for compute; your message is back in the composer."
+            } else {
+                "The turn could not start; your message is back in the composer."
+            },
+        );
+    }
+
     pub(in crate::app) fn run_turn(
         &mut self,
         app: &App,
@@ -116,6 +175,7 @@ impl Shell {
             app.interrupt.store(false, Ordering::SeqCst);
         }
         self.retry_noted = false;
+        self.retry_attempt = None;
         self.stop_speech();
         self.live_tasks = Some(agent.live_task_control());
         self.background_control = agent.background_control();
@@ -125,9 +185,6 @@ impl Shell {
         self.status.elapsed_secs = 0.0;
         if automatic {
             self.note("Automatic continuation", text);
-        } else {
-            self.transcript
-                .push_user_at(text, &crate::storage::session::timestamp_now());
         }
         self.composer.set_busy(true);
         self.status.phase = Phase::Working;
@@ -144,6 +201,8 @@ impl Shell {
                 if automatic {
                     agent.cancel_peer_wake();
                     agent.cancel_monitor_wake();
+                } else {
+                    self.restore_unsent(text, true);
                 }
                 self.composer.set_busy(false);
                 self.loop_mode.pause();
@@ -155,11 +214,21 @@ impl Shell {
                     agent.cancel_monitor_wake();
                 }
                 self.transcript.error(&format!("{error:#}"));
+                if !automatic {
+                    self.restore_unsent(text, false);
+                }
                 self.composer.set_busy(false);
                 self.loop_mode.pause();
                 return Ok(Step::Done);
             }
         }
+        // Shown once the turn really starts, so a cancelled wait never leaves an unsent message.
+        if !automatic {
+            self.transcript
+                .push_user_at(text, &crate::storage::session::timestamp_now());
+        }
+        // Distinguishes this turn's recorded summary from an older one when the turn errors.
+        let summary_before = agent.session().control_state()["turn_summary"].clone();
         self.status.phase = Phase::Working;
         self.turn_output_tokens = 0;
         self.status.output_tokens = 0;
@@ -201,6 +270,10 @@ impl Shell {
         self.status.model_silence_secs = 0;
         self.status.background_wait = None;
         self.status.provider_retry = None;
+        self.status.tool_started = None;
+        self.retry_attempt = None;
+        self.request_phase = Default::default();
+        self.retry_control = None;
         let elapsed = started.elapsed().as_secs_f64();
         self.live_cost = None;
         self.refresh_status(app, agent);
@@ -269,23 +342,30 @@ impl Shell {
         if matches!(&result, Ok(report) if !report.interrupted) {
             self.auto_speak(app, agent);
         }
-        if result.is_ok() {
-            let control = agent.session().control_state();
-            self.transcript
+        let control = agent.session().control_state();
+        let latency = &control["efficiency"]["inference_latency"];
+        match &result {
+            Ok(_) => self
+                .transcript
                 .completion(crate::app::shell::turn_report::outcome(
                     &control["turn_summary"],
-                    &control["efficiency"]["inference_latency"],
-                ));
-        } else {
-            // A fatal error may precede durable completion. Never reuse an older turn's summary.
-            self.transcript.completion(crate::ui::transcript::TurnOutcome {
-                status: "failed".into(),
-                handoff: vec![
-                    "Full handoff unavailable: the turn ended before completion was recorded.".into(),
-                    "Next: inspect /review-file and /evidence before continuing; shell effects may be outside /undo.".into(),
-                ],
-                ..Default::default()
-            });
+                    latency,
+                )),
+            Err(error) => {
+                // A fatal error may precede durable completion. Never reuse an older turn's summary.
+                let recorded = &control["turn_summary"];
+                let fresh =
+                    (recorded.is_object() && *recorded != summary_before).then_some(recorded);
+                let class = fresh
+                    .and_then(|summary| summary["error_class"].as_str())
+                    .map_or_else(
+                        || crate::llm::errors::classify(error).label(),
+                        |class| class,
+                    )
+                    .to_owned();
+                self.transcript
+                    .completion(failed_turn_outcome(fresh, latency, &class));
+            }
         }
         self.transcript.turn_stats(TurnStats {
             clock: local_time("%Y-%m-%d %H:%M:%S"),
@@ -308,3 +388,6 @@ impl Shell {
         Ok(Step::Done)
     }
 }
+
+#[cfg(test)]
+mod tests;

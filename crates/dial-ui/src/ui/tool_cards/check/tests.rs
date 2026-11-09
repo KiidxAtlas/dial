@@ -40,6 +40,7 @@ fn run(command: &str, output: &str, failed: bool) -> Tool {
         elapsed: Some(12.4),
         todo: None,
         agents: Vec::new(),
+        outcome: None,
     }
 }
 

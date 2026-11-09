@@ -322,7 +322,7 @@ status_left = ["spinner", "model", "path", "git"]
 status_right = ["context"]
 status_separator = "powerline-thin"
 composer_shape = "band"            # band | box | line
-symbols = "auto"                   # auto | unicode | nerd | ascii
+symbols = "auto"                   # auto | unicode | nerd | ascii (auto: ascii on TERM=dumb/linux or a non-UTF-8 locale)
 show_tools = true
 history_limit = 0
 

@@ -608,9 +608,23 @@ pub(in crate::tools) fn conventional_test(path: &std::path::Path) -> bool {
         || stem.ends_with("Tests")
 }
 
+/// An absolute pattern that names a place under the workspace root (`/app/data/*.csv` with root
+/// `/app` or `/`) is the same pattern written relative to it; others stay absolute and are refused.
+fn root_relative<'a>(ws: &Workspace, pattern: &'a str) -> std::borrow::Cow<'a, str> {
+    let root = ws.root().to_string_lossy();
+    let root = root.trim_end_matches('/');
+    match pattern
+        .strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        Some(rest) if pattern.starts_with('/') && !rest.is_empty() => rest.to_owned().into(),
+        _ => pattern.into(),
+    }
+}
+
 pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
     let pattern = req_str(args, "pattern")?;
-    let glob = Glob::new(pattern)?;
+    let glob = Glob::new(&root_relative(ws, pattern))?;
     let roots = scopes(ws, args)?;
     let resume = cursor(args, ws)?;
     if resume.as_ref().is_some_and(|(_, consumed)| *consumed != 0) {
@@ -722,7 +736,7 @@ pub(in crate::tools) fn glob_source_targets(
     let (Ok(roots), Ok(pattern)) = (scopes(ws, args), req_str(args, "pattern")) else {
         return Vec::new();
     };
-    let Ok(glob) = Glob::new(pattern) else {
+    let Ok(glob) = Glob::new(&root_relative(ws, pattern)) else {
         return Vec::new();
     };
     crate::tools::code::navigation::source_paths(ws, text)

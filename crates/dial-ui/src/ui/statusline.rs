@@ -28,7 +28,26 @@ const CONTEXT_BAR_CELLS: usize = 6;
 const CONTEXT_HOT: f64 = 0.70;
 
 /// Compact active session controls; focus opens the existing keyboard-navigable editors.
+#[cfg(test)]
 pub fn controls_row(
+    data: &StatusData,
+    keys: &super::keys::Keymap,
+    theme: &Theme,
+    width: u16,
+) -> Line<'static> {
+    let custom = UiConfig {
+        status: StatusPreset::Custom,
+        status_left: Vec::new(),
+        status_right: Vec::new(),
+        ..UiConfig::default()
+    };
+    controls_row_with(&custom, data, keys, theme, width)
+}
+
+/// [`controls_row`] beside the status line `cfg` draws at `width`: approval and reasoning appear
+/// only when that line does not already show them, so one fact is never stated twice.
+pub fn controls_row_with(
+    cfg: &UiConfig,
     data: &StatusData,
     keys: &super::keys::Keymap,
     theme: &Theme,
@@ -39,19 +58,36 @@ pub fn controls_row(
         Some(false) => "off",
         None => "unknown",
     };
-    let reasoning = if data.thinking.is_empty() {
-        "provider default"
-    } else {
-        &data.thinking
+    let (left, right) = segments_for(cfg, data, usize::from(width));
+    let shown = |segment: &str| {
+        left.iter()
+            .chain(&right)
+            .any(|name| canonical(name).is_some_and(|(name, _)| name == segment))
     };
-    let label = format!(
-        "{} Controls · Planning {} · Approval {} · Reasoning(main) {} · Assistance {}",
+    let mut label = format!(
+        "{} Controls · Planning {}",
         keys.label(super::keys::Action::StatusFocus),
         on(data.planning),
-        super::status::approval_label(&data.approval),
-        reasoning,
-        on(data.assistance),
     );
+    if !shown("approval") {
+        label.push_str(&format!(
+            " · Approval {}",
+            super::status::approval_label(&data.approval)
+        ));
+    }
+    // Reasoning is on the line as the thinking chip, or inside the request settings that replace it.
+    let reasoning_shown = !data.thinking.is_empty()
+        && shown("thinking")
+        && (data.inference.is_empty() || shown("inference"));
+    if !reasoning_shown {
+        let reasoning = if data.thinking.is_empty() {
+            "provider default"
+        } else {
+            &data.thinking
+        };
+        label.push_str(&format!(" · Reasoning(main) {reasoning}"));
+    }
+    label.push_str(&format!(" · Assistance {}", on(data.assistance)));
     let label = if data.controls_pending {
         format!("Saved changes after turn (not active) · {label}")
     } else {
@@ -110,6 +146,44 @@ pub fn segments(cfg: &UiConfig) -> (Vec<String>, Vec<String>) {
         ),
         StatusPreset::Custom => (cfg.status_left.clone(), cfg.status_right.clone()),
     }
+}
+
+/// The segments the status line shows at `width` for this state: the one layout both the idle and
+/// the busy composer use, so segments never jump when a turn starts or ends. Progress has its own
+/// row ([`activity_row`]), so `spinner` is never laid into the border. The adaptive default keeps
+/// the workers, inbox and input-mode chips at every width (the fitter sheds the path and git
+/// first) and shows the full set while [`StatusData::status_expanded`] is on.
+pub fn segments_for(cfg: &UiConfig, data: &StatusData, width: usize) -> (Vec<String>, Vec<String>) {
+    let names = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    let (left, right) = if cfg.status == StatusPreset::Default {
+        if data.status_expanded {
+            segments(&UiConfig {
+                status: StatusPreset::Full,
+                ..cfg.clone()
+            })
+        } else if width < 80 {
+            (
+                names(&["model", "approval", "mode"]),
+                names(&["inbox", "workers", "context"]),
+            )
+        } else if width < 120 {
+            (
+                names(&["model", "approval", "mode", "git"]),
+                names(&["inbox", "workers", "cost", "context"]),
+            )
+        } else {
+            segments(cfg)
+        }
+    } else {
+        segments(cfg)
+    };
+    let metadata = |names: Vec<String>| {
+        names
+            .into_iter()
+            .filter(|name| !canonical(name).is_some_and(|(name, _)| name == "spinner"))
+            .collect()
+    };
+    (metadata(left), metadata(right))
 }
 
 /// The rule and corner glyphs of a composer border.
@@ -202,12 +276,13 @@ pub fn activity_row(
         theme.spinner(data.tick)
     };
     let tone = if waiting { Tok::Warning } else { Tok::Text };
-    let mut label = if data.stopping() {
-        data.activity_label()
+    let setup = data.phase == super::status::Phase::Setup;
+    let mut label = if data.stopping() || setup {
+        sentence(&data.activity_label())
     } else if data.phase == super::status::Phase::Compacting {
         "Compacting".into()
     } else if data.phase == super::status::Phase::WaitingCompute {
-        "Waiting · local compute".into()
+        sentence(&data.activity_label())
     } else if data.background_wait.is_some() || data.provider_retry.is_some() {
         data.activity_label()
     } else if let Some(progress) = &data.model_progress {
@@ -218,17 +293,27 @@ pub fn activity_row(
             {
                 (Some(done), Some(total)) if total > 0 => format!(
                     "Processing · {}/{} tok",
-                    human(done.min(total)),
-                    human(total)
+                    text::compact_count(done.min(total)),
+                    text::compact_count(total)
                 ),
-                (_, Some(total)) => format!("Processing · {} tok", human(total)),
+                (_, Some(total)) => format!("Processing · {} tok", text::compact_count(total)),
                 _ => "Processing".into(),
             },
             InferencePhase::Generating => {
                 let prefix = if progress.estimated { "~" } else { "" };
-                let mut label = "Generating".to_owned();
+                // What the stream is producing (`reasoning`, `writing`, `preparing edit`) names
+                // the phase; the token counts are its detail.
+                let activity = text::one_line(data.activity.trim());
+                let mut label = if activity == "reasoning"
+                    || activity == "writing"
+                    || activity.starts_with("preparing ")
+                {
+                    sentence(&activity)
+                } else {
+                    "Generating".to_owned()
+                };
                 if let Some(tokens) = progress.output_tokens {
-                    label.push_str(&format!(" · {prefix}{} tok", human(tokens)));
+                    label.push_str(&format!(" · {prefix}{} tok", text::compact_count(tokens)));
                 }
                 if let Some(rate) = progress
                     .tokens_per_second
@@ -240,9 +325,16 @@ pub fn activity_row(
             }
         }
     } else {
-        format!("Working · {}", data.activity_label())
+        let activity = data.activity_label();
+        if activity.trim().is_empty() || activity.trim().eq_ignore_ascii_case("working") {
+            "Working".into()
+        } else {
+            format!("Working · {activity}")
+        }
     };
-    if data.background_wait.is_none()
+    // Preparation runs before the turn clock starts, so it shows no elapsed time.
+    if !setup
+        && data.background_wait.is_none()
         && data.provider_retry.is_none()
         && data.elapsed_secs.is_finite()
         && data.elapsed_secs >= 0.0
@@ -250,7 +342,7 @@ pub fn activity_row(
         let (phase, detail) = label.split_once(" · ").unwrap_or((&label, ""));
         label = format!(
             "{phase} {}{}",
-            elapsed(data.elapsed_secs),
+            text::duration_label(data.elapsed_secs),
             if detail.is_empty() {
                 String::new()
             } else {
@@ -282,6 +374,14 @@ pub fn activity_row(
     ]))
 }
 
+/// `text` with its first letter capitalised, as the activity row's phase word is.
+fn sentence(text: &str) -> String {
+    let text = text.trim();
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
 // ---------------------------------------------------------------------------------------------
 // Segments
 // ---------------------------------------------------------------------------------------------
@@ -358,7 +458,7 @@ impl Seg {
 fn canonical(name: &str) -> Option<(&'static str, u8)> {
     Some(match name.trim().to_ascii_lowercase().as_str() {
         "model" => ("model", 100),
-        "mode" => ("mode", 45),
+        "mode" => ("mode", 65),
         "context" => ("context", 90),
         "spinner" => ("spinner", 80),
         "thinking" | "reasoning" => ("thinking", 85),
@@ -366,7 +466,7 @@ fn canonical(name: &str) -> Option<(&'static str, u8)> {
         "path" => ("path", 60),
         "role" => ("role", 55),
         "git" => ("git", 50),
-        "approval" => ("approval", 45),
+        "approval" => ("approval", 62),
         "sandbox" => ("sandbox", 44),
         "tokens" => ("tokens", 40),
         "cost" => ("cost", 42),
@@ -376,7 +476,7 @@ fn canonical(name: &str) -> Option<(&'static str, u8)> {
         "session" => ("session", 20),
         "time" => ("time", 20),
         "workers" => ("workers", 70),
-        "inbox" => ("inbox", 15),
+        "inbox" => ("inbox", 65),
         _ => return None,
     })
 }
@@ -477,7 +577,7 @@ impl Env<'_> {
                     if !label.is_empty() {
                         label.push(' ');
                     }
-                    label.push_str(&elapsed(data.elapsed_secs));
+                    label.push_str(&text::duration_label(data.elapsed_secs));
                 }
                 let mut part = if data.model_progress.is_some() {
                     self.shrinkable(label, Tok::Text, Shrink::Tail)
@@ -657,7 +757,7 @@ impl Env<'_> {
                     "{}{}{}",
                     self.theme.sym(Sym::ArrowDown),
                     if estimated { "~" } else { "" },
-                    human(tokens)
+                    text::compact_count(tokens)
                 );
                 self.seg(
                     name,
@@ -691,32 +791,31 @@ impl Env<'_> {
                     ],
                 )
             }
-            // `● ask`: a status dot in the mode's safety color, then the mode, as in the concept's
-            // footer. Without icons the word label stands in for the dot.
+            // `● Ask first`: the shared approval chip (dot in the mode's safety color, friendly
+            // name), as every surface draws it. Without icons the word label stands in for the dot.
             "approval" => {
                 let value = text::one_line(&data.approval);
                 let value = value.trim();
                 if value.is_empty() {
                     return None;
                 }
-                let dot = match value {
-                    "ask" | "readonly" => Tok::Success,
-                    "auto" => Tok::Warning,
-                    _ => Tok::StatusApproval,
-                };
-                let mark = if self.theme.ascii() {
-                    Some(self.part("approval ", Tok::StatusApproval))
-                } else {
-                    Some(self.part(format!("{} ", self.theme.sym(Sym::Bullet)), dot))
-                };
-                self.seg(
-                    name,
-                    importance,
-                    vec![
-                        mark,
-                        Some(self.part(super::status::approval_label(value), Tok::StatusApproval)),
-                    ],
-                )
+                let mut parts: Vec<Option<Part>> = super::chrome::approval_spans(self.theme, value)
+                    .into_iter()
+                    .map(|span| {
+                        Some(Part {
+                            text: span.content.into_owned(),
+                            style: span.style,
+                            shrink: None,
+                            shimmer: None,
+                        })
+                    })
+                    .collect();
+                if self.theme.ascii()
+                    && let Some(mark) = parts.first_mut()
+                {
+                    *mark = Some(self.part("approval ", Tok::StatusApproval));
+                }
+                self.seg(name, importance, parts)
             }
             "sandbox" => {
                 let value = text::one_line(&data.sandbox);
@@ -781,24 +880,37 @@ impl Env<'_> {
                 )
             }
             "workers" => {
-                let tally = data.workers.as_ref().filter(|t| t.running > 0)?;
-                self.seg(
-                    name,
-                    importance,
-                    vec![Some(self.part(tally.label(), Tok::StatusTokens))],
-                )
+                let tally = data
+                    .workers
+                    .as_ref()
+                    .filter(|t| t.running > 0 || t.waiting > 0)?;
+                // A worker asking for input turns the segment to the warning tone and says so.
+                let (label, tok) = if tally.waiting > 0 {
+                    (
+                        format!(
+                            "{} {} {} waiting",
+                            tally.label(),
+                            self.theme.sym(Sym::Dot),
+                            tally.waiting
+                        ),
+                        Tok::Warning,
+                    )
+                } else {
+                    (tally.label(), Tok::StatusTokens)
+                };
+                self.seg(name, importance, vec![Some(self.part(label, tok))])
             }
             "cost" => {
                 let turn = data.turn_cost.filter(|c| c.is_finite() && *c > 0.0)?;
-                let mut label = format!("{} turn", usd(turn));
+                let mut label = format!("{} turn", text::usd(turn));
                 if let Some(session) = data
                     .session_cost
-                    .filter(|c| c.is_finite() && *c > turn && usd(*c) != usd(turn))
+                    .filter(|c| c.is_finite() && *c > turn && text::usd(*c) != text::usd(turn))
                 {
                     label.push_str(&format!(
                         " {} {} session",
                         self.theme.sym(Sym::Dot),
-                        usd(session)
+                        text::usd(session)
                     ));
                 }
                 self.seg(
@@ -839,7 +951,10 @@ impl Env<'_> {
                     .into_iter()
                     .chain([self.part(
                         if data.context_window > 0 {
-                            format!("{} ctx", human(u64::from(data.context_window)))
+                            format!(
+                                "{} ctx",
+                                text::compact_count(u64::from(data.context_window))
+                            )
                         } else {
                             "ctx ?".to_owned()
                         },
@@ -871,8 +986,8 @@ impl Env<'_> {
         parts.push(self.part(
             format!(
                 " {approx}{}/{}",
-                human(used),
-                human(u64::from(data.context_window))
+                text::compact_count(used),
+                text::compact_count(u64::from(data.context_window))
             ),
             Tok::Muted,
         ));
@@ -881,48 +996,6 @@ impl Env<'_> {
             importance,
             parts,
         }
-    }
-}
-
-/// `12s`, `1m05s`, `1h02m`.
-pub(super) fn elapsed(secs: f64) -> String {
-    let total = secs as u64;
-    match total {
-        0..=59 => format!("{total}s"),
-        60..=3599 => format!("{}m{:02}s", total / 60, total % 60),
-        _ => format!("{}h{:02}m", total / 3600, total % 3600 / 60),
-    }
-}
-
-/// Observed USD in the `$` form of `/cost` and the cost notices, short enough for the line:
-/// four decimals below a dollar (`$0.0412`), cents above (`$1.20`); a positive amount that
-/// rounds to nothing is `<$0.0001`, never a misleading zero.
-pub(super) fn usd(amount: f64) -> String {
-    if amount >= 1.0 {
-        format!("${amount:.2}")
-    } else if amount < 0.000_05 {
-        "<$0.0001".to_owned()
-    } else {
-        format!("${amount:.4}")
-    }
-}
-
-/// `3.9k`, `32k`, `1.2M`: floored so the used amount never looks larger than it is.
-pub(super) fn human(n: u64) -> String {
-    let scaled = |unit: u64, suffix: &str| {
-        let tenths = n * 10 / unit;
-        if tenths.is_multiple_of(10) {
-            format!("{}{suffix}", tenths / 10)
-        } else {
-            format!("{}.{}{suffix}", tenths / 10, tenths % 10)
-        }
-    };
-    match n {
-        0..=999 => n.to_string(),
-        1_000..=9_999 => scaled(1_000, "k"),
-        10_000..=999_999 => format!("{}k", n / 1_000),
-        1_000_000..=9_999_999 => scaled(1_000_000, "M"),
-        _ => format!("{}M", n / 1_000_000),
     }
 }
 
@@ -1170,37 +1243,7 @@ fn compose(
         theme,
         home: std::env::var("HOME").ok(),
     };
-    let (left_names, right_names) = segments(cfg);
-    // Progress has one dedicated row, rather than competing with metadata in the border.
-    let (left_names, right_names) = if cfg.status == StatusPreset::Default {
-        let names = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect();
-        if data.status_expanded {
-            let full = UiConfig {
-                status: StatusPreset::Full,
-                ..cfg.clone()
-            };
-            segments(&full)
-        } else if width < 80 {
-            (names(&["model", "approval"]), names(&["context"]))
-        } else if width < 120 {
-            (
-                names(&["model", "approval", "git"]),
-                names(&["cost", "context"]),
-            )
-        } else {
-            (left_names, right_names)
-        }
-    } else {
-        (left_names, right_names)
-    };
-    let left_names: Vec<_> = left_names
-        .into_iter()
-        .filter(|name| name != "spinner")
-        .collect();
-    let right_names: Vec<_> = right_names
-        .into_iter()
-        .filter(|name| name != "spinner")
-        .collect();
+    let (left_names, right_names) = segments_for(cfg, data, width);
     let build = |names: &[String]| {
         names
             .iter()

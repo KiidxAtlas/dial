@@ -95,7 +95,7 @@ pub(super) fn irc_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> 
             (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Error))
         }
         ToolState::Completed => (
-            if ascii { "@" } else { "✉" }.to_owned(),
+            theme.sym(Sym::Envelope).to_owned(),
             theme.fg(Tok::SectionConnect),
         ),
         state => phase_glyph(state, ctx),
@@ -122,7 +122,7 @@ pub(super) fn irc_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> 
         .into_iter()
         .map(|text| super::Fact { text, drop: 0 })
         .collect();
-    let arrow = if ascii { "->" } else { "➤" };
+    let arrow = theme.sym(Sym::ArrowRight);
     let target = if to.is_empty() {
         arrow.to_owned()
     } else {
@@ -154,7 +154,8 @@ pub(super) fn irc_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> 
 
     // What was said, quoted under the header.
     let indent = " ".repeat(GUTTER);
-    let bar = if ascii { "| " } else { "▏ " };
+    let bar = format!("{} ", theme.sym(Sym::QuoteBar));
+    let bar = bar.as_str();
     let room = w.saturating_sub(GUTTER + text::width(bar)).max(1);
     let lines: Vec<String> = text::sanitize(&body)
         .lines()
@@ -188,13 +189,9 @@ pub(super) fn irc_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> 
 
     // A lone queued receipt only repeats the header; a broadcast or a refusal earns the tree.
     if receipts.len() > 1 || refused > 0 {
-        let (branch, last) = if ascii {
-            ("|-", "`-")
-        } else {
-            ("├─", "└─")
-        };
+        let (branch, last) = (theme.sym(Sym::TreeBranch), theme.sym(Sym::TreeLast));
         let rail = theme.fg(Tok::Border);
-        let dash = if ascii { "-" } else { "—" };
+        let dash = theme.sym(Sym::Dash);
         for (i, r) in receipts.iter().enumerate() {
             let fork = if i + 1 == receipts.len() {
                 last
@@ -239,11 +236,12 @@ pub(in crate::ui) fn incoming_notice(body: &str, w: u16, ctx: &TranscriptCtx) ->
         return Some(Vec::new());
     }
     let theme = ctx.theme;
-    let (envelope, arrow, bar, dot) = if theme.ascii() {
-        ("@", "<-", "| ", ":")
-    } else {
-        ("✉", "⟵", "▏ ", "·")
-    };
+    let (envelope, arrow, bar, dot) = (
+        theme.sym(Sym::Envelope),
+        theme.sym(Sym::ArrowLeft),
+        format!("{} ", theme.sym(Sym::QuoteBar)),
+        theme.sym(Sym::Dot),
+    );
     let mut head = gutter_span(envelope.into(), theme.fg(Tok::SectionConnect));
     head.push(Span::styled(
         format!("{:<VERB_W$} ", "IRC"),

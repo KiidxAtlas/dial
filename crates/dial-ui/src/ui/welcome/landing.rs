@@ -163,7 +163,7 @@ pub fn frame(
     if info.tour && view.selected.is_none() && budget.saturating_sub(context.len()) >= 4 {
         for hint in [
             "1  Type a request in your own words",
-            "2  Enter sends · Ctrl+P opens actions",
+            "2  Enter sends · F1 opens actions",
             "3  /models picks a model · Esc dismisses",
         ] {
             context.push(centered(

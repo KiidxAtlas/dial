@@ -259,17 +259,33 @@ impl Shell {
     }
 
     /// Consume only the latest valid result. Call through ordinary overlay admission so a
-    /// late result cannot steal focus from a newly started draft or a running turn.
+    /// late result cannot steal focus from a newly started draft or a running turn. Rows show
+    /// session titles read from the matching journals in `layout`; a session that cannot be read
+    /// keeps its short id.
     pub(in crate::app) fn take_search_panel(
         &mut self,
+        layout: &Layout,
     ) -> Option<crate::ui::overlay::history_search::HistorySearchOverlay> {
         let (query, hits) = self.search.ready.take()?;
+        let mut titles = std::collections::HashMap::new();
+        for hit in &hits {
+            if titles.contains_key(&hit.session_id) {
+                continue;
+            }
+            let title = Session::find_prefix(layout, &hit.session_id)
+                .ok()
+                .and_then(|found| found.into_iter().find(|s| s.id == hit.session_id))
+                .map(|s| s.title)
+                .unwrap_or_default();
+            titles.insert(hit.session_id.clone(), title);
+        }
         Some(
             crate::ui::overlay::history_search::HistorySearchOverlay::new(
                 query,
                 hits,
                 self.search.origin.is_some(),
-            ),
+            )
+            .with_titles(titles),
         )
     }
 

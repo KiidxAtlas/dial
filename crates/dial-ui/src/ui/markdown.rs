@@ -663,18 +663,19 @@ impl<'a> Renderer<'a> {
             }
             Event::TaskListMarker(done) => {
                 let (mark, style) = if done {
-                    ("[x] ", self.theme.fg(Tok::Success))
+                    (self.theme.sym(Sym::TaskDone), self.theme.fg(Tok::Success))
                 } else {
-                    ("[ ] ", self.theme.fg(Tok::Muted))
+                    (self.theme.sym(Sym::TaskOpen), self.theme.fg(Tok::Muted))
                 };
+                let mark = format!("{mark} ");
                 if let Some(frame) = self
                     .frames
                     .iter_mut()
                     .rev()
                     .find(|f| matches!(f.kind, FrameKind::Item))
                 {
+                    frame.indent = text::width(&mark);
                     frame.marker = vec![Span::styled(mark, style)];
-                    frame.indent = text::width(mark);
                 }
             }
         }
@@ -750,7 +751,8 @@ impl<'a> Renderer<'a> {
                     self.top().rows.push(Line::default());
                 }
                 if marker.is_empty() {
-                    marker = format!("{} ", self.theme.sym(Sym::Bullet));
+                    // Not the answer's own `●` lead: a list under it would read as two answers.
+                    marker = format!("{} ", self.theme.sym(Sym::ListBullet));
                 }
                 let mut frame = Frame::new(FrameKind::Item, false);
                 frame.indent = text::width(&marker);
@@ -993,7 +995,8 @@ impl<'a> Renderer<'a> {
                 rows.extend(text::wrap(vec![line], avail));
             }
         } else {
-            let bar = theme.sym(Sym::Quote);
+            // A code bar, distinct from the quote bar that reasoning and blockquotes hang off.
+            let bar = theme.sym(Sym::CodeBar);
             let gutter = theme.fg(Tok::MdCodeBorder);
             let inner = avail - 2;
             let label = text::ellipsize(lang, inner, theme.ascii());

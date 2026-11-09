@@ -376,6 +376,54 @@ fn symbol_presets_overrides_and_spinner() {
 }
 
 #[test]
+fn auto_symbols_fall_back_to_ascii_where_unicode_cannot_render() {
+    use Glyphs::*;
+    type Vars = &'static [(&'static str, &'static str)];
+    let cases: &[(Vars, Option<Glyphs>, Glyphs)] = &[
+        (&[], None, Unicode),
+        (&[("LANG", "en_US.UTF-8")], None, Unicode),
+        (&[("LANG", "C.utf8")], Some(Nerd), Nerd),
+        (&[("LANG", "C")], Some(Nerd), Ascii),
+        (&[("LANG", "POSIX")], None, Ascii),
+        (&[("LANG", "en_US.ISO-8859-1")], None, Ascii),
+        // LC_ALL beats LC_CTYPE beats LANG; an empty value does not count as set.
+        (&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")], None, Ascii),
+        (
+            &[("LC_ALL", ""), ("LC_CTYPE", "en_US.UTF-8"), ("LANG", "C")],
+            None,
+            Unicode,
+        ),
+        (&[("LC_CTYPE", "C"), ("LANG", "en_US.UTF-8")], None, Ascii),
+        (&[("TERM", "dumb"), ("LANG", "en_US.UTF-8")], None, Ascii),
+        (
+            &[("TERM", "linux"), ("LANG", "en_US.UTF-8")],
+            Some(Nerd),
+            Ascii,
+        ),
+        (
+            &[("TERM", "xterm-256color"), ("DIAL_NERD_FONT", "1")],
+            None,
+            Nerd,
+        ),
+    ];
+    for (vars, preferred, want) in cases {
+        assert_eq!(
+            auto_glyphs(&*env(vars), *preferred),
+            *want,
+            "{vars:?} with {preferred:?}"
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let posix = ThemeManager::with_env(
+        dir.path(),
+        &UiConfig::default(),
+        Some(true),
+        env(&[("LANG", "C")]),
+    );
+    assert_eq!(posix.current().glyphs(), Ascii, "the manager resolves auto");
+}
+
+#[test]
 fn auto_theme_picks_the_slot_for_the_terminal_background() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = UiConfig {

@@ -7,7 +7,7 @@ pub mod model;
 use super::{
     DrawCtx, OverlayEvent,
     providers::key_footer,
-    settings::{filled, pair_label, typed_char},
+    settings::{list_row, pair_label, scroll_cell, typed_char},
 };
 use crate::ui::{
     chrome::{self, Section, Status},
@@ -167,10 +167,9 @@ impl ExtensionsOverlay {
 
     /// Route one key. Returns an action for the app or the controller to run.
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
-        if self.panel_keys.handle(
+        if self.panel_keys.handle_key(
             event,
             self.browser.searching() || self.browser.form.is_some(),
-            false,
         ) {
             return OverlayEvent::None;
         }
@@ -527,7 +526,15 @@ impl ExtensionsOverlay {
                 } else {
                     let start = cursor.saturating_sub(body_h.saturating_sub(1));
                     for (i, row) in rows.iter().enumerate().skip(start).take(body_h) {
-                        lines.push(row_line(ctx.theme, row, i == cursor, w));
+                        let mut line = row_line(ctx.theme, row, i == cursor, w.saturating_sub(1));
+                        line.spans.push(scroll_cell(
+                            ctx.theme,
+                            i - start,
+                            body_h,
+                            rows.len(),
+                            start,
+                        ));
+                        lines.push(line);
                     }
                 }
             }
@@ -846,12 +853,7 @@ fn row_line(
         format!("  {}", crate::ui::text::one_line(&row.summary)),
         theme.fg(Tok::Muted),
     ));
-    let style: Style = if selected {
-        chrome::selected_style(theme)
-    } else {
-        Style::default()
-    };
-    filled(spans, width, style)
+    list_row(theme, spans, width, selected)
 }
 
 fn details_lines(theme: &crate::ui::theme::Theme, row: &Row) -> Vec<Line<'static>> {

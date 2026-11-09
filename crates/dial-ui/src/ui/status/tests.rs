@@ -25,6 +25,29 @@ fn silence_is_visible_in_every_model_phase_and_clears_on_progress() {
 }
 
 #[test]
+fn a_long_running_tool_shows_its_elapsed_time_and_a_fresh_one_does_not() {
+    let now = std::time::Instant::now();
+    let mut status = StatusData {
+        phase: Phase::Working,
+        activity: "running bash".into(),
+        tool_started: Some(now),
+        ..StatusData::default()
+    };
+    assert_eq!(status.activity_label(), "running bash");
+    status.tool_started = now.checked_sub(std::time::Duration::from_secs(75));
+    let label = status.activity_label();
+    assert!(
+        label.starts_with("running bash · ") && label != "running bash",
+        "{label}"
+    );
+    // Only tool activity carries the clock; stopping and model text never do.
+    status.activity = "thinking".into();
+    assert_eq!(status.activity_label(), "thinking");
+    status.activity = "stopping after bash".into();
+    assert_eq!(status.activity_label(), "stopping after bash");
+}
+
+#[test]
 fn prompt_fraction_needs_real_counts_and_clamps_to_the_total() {
     let mut p = ModelProgress::new(InferencePhase::Processing);
     let mut status = StatusData::default();
@@ -149,10 +172,17 @@ fn controller_wait_and_retry_override_stale_telemetry_without_inventing_progress
     let label = status.activity_label();
     assert!(
         label.contains("retry 4/10")
-            && label.contains("next attempt in 0s")
+            && label.contains("retrying…")
+            && !label.contains("next attempt in 0s")
             && label.contains("/retry"),
         "{label}"
     );
+    // Before the ready time the countdown shows.
+    if let Some(retry) = status.provider_retry.as_mut() {
+        retry.ready_at = Instant::now() + Duration::from_secs(30);
+    }
+    let label = status.activity_label();
+    assert!(label.contains("next attempt in"), "{label}");
     status.activity = "stopping".into();
     assert_eq!(status.activity_label(), "stopping");
     status.provider_retry = None;

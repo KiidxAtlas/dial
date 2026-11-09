@@ -378,11 +378,14 @@ fn one_table_preserves_the_legacy_command_contract() {
     const EXTENSIONS_STATS_MENU_CHANGES: &[&str] = &["extensions", "hooks"];
     // Approved next-UX changes have exact replacement contracts below.
     const UX_MENU_CHANGES: &[&str] = &["model", "search", "context"];
+    // The worker vocabulary rewords these descriptions; asserted exactly below.
+    const WORKER_WORDING_CHANGES: &[&str] = &["message", "cancel", "cleanse"];
     let excluded = |name: &str| {
         HUB_MENU_CHANGES.contains(&name)
             || EXTENSIONS_STATS_MENU_CHANGES.contains(&name)
             || GIT_ACTIVITY_MENU_CHANGES.contains(&name)
             || UX_MENU_CHANGES.contains(&name)
+            || WORKER_WORDING_CHANGES.contains(&name)
     };
     let unchanged_hub_row = |row: &&Value| !excluded(row[0].as_str().unwrap());
     let entries: Vec<_> = command_entries(&[], &[])
@@ -405,6 +408,21 @@ fn one_table_preserves_the_legacy_command_contract() {
         .cloned()
         .collect();
     assert_eq!(json!(entries), json!(expected_entries));
+    // Worker vocabulary: only the descriptions change ("worker" noun, "stop" verb).
+    for (name, description) in [
+        ("message", "message a running worker"),
+        ("cancel", "stop a running worker"),
+        (
+            "cleanse",
+            "Run project checkers and repair their diagnostics with workers",
+        ),
+    ] {
+        let entry = command_entries(&[], &[])
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .unwrap();
+        assert_eq!(entry.description, description, "/{name}");
+    }
     let rpc = json!(super::command_registry::builtin_commands());
     let unchanged_rpc = |rows: &Value| {
         rows.as_array()
@@ -412,6 +430,7 @@ fn one_table_preserves_the_legacy_command_contract() {
             .iter()
             .filter(|row| {
                 !UX_MENU_CHANGES.contains(&row[0].as_str().unwrap())
+                    && !WORKER_WORDING_CHANGES.contains(&row[0].as_str().unwrap())
                     && !matches!(row[0].as_str(), Some("attachments" | "draft"))
             })
             .cloned()
@@ -444,7 +463,14 @@ fn one_table_preserves_the_legacy_command_contract() {
             row[2].as_str().unwrap(),
             "{name}"
         );
-        assert_eq!(during_turn_note(name), row[3].as_str().unwrap(), "{name}");
+        // The worker vocabulary rewords the worker panel's note; its policy is unchanged.
+        let note = match row[3].as_str().unwrap() {
+            "Opens now; m messages or resumes a worker, x x cancels a running one." => {
+                "Opens now; m messages or continues a worker, x x stops a running one."
+            }
+            other => other,
+        };
+        assert_eq!(during_turn_note(name), note, "{name}");
         for (arg, expected) in args.iter().zip(row[4].as_array().unwrap()) {
             let arg = arg.as_str().unwrap();
             assert_eq!(

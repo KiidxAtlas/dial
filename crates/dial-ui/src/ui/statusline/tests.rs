@@ -137,7 +137,7 @@ fn activity_row_fits_all_widths_and_preserves_silence_and_custom_preferences() {
     assert!(plain(&row).contains("no progress for 27s"));
     status.activity = "stopping".into();
     let row = activity_row(&UiConfig::default(), &status, &Theme::dark(), 40).unwrap();
-    assert!(plain(&row).contains("stopping"));
+    assert!(plain(&row).contains("Stopping"));
     assert!(!plain(&row).contains("processing"));
     let custom = UiConfig {
         status_left: vec!["model".into()],
@@ -517,8 +517,10 @@ fn unknown_facts_are_absent_and_an_unknown_context_is_never_zero() {
     };
     let line = plain(&render(&UiConfig::default(), &unknown, 100));
     assert!(
-        line.contains(&format!("{} ctx", human(u64::from(unknown.context_window))))
-            && !line.contains("0%"),
+        line.contains(&format!(
+            "{} ctx",
+            text::compact_count(u64::from(unknown.context_window))
+        )) && !line.contains("0%"),
         "before the first request the window is shown, never a usage of zero: {line:?}"
     );
     let no_window = StatusData {
@@ -749,10 +751,10 @@ fn context_ruler_is_six_cells_and_human_units_are_floored() {
     assert!(line_at(3900, 32_768).contains("3.9k/32k"));
     assert!(line_at(4000, 131_072).contains("4k/131k"));
     assert!(line_at(1_250_000, 2_000_000).contains("1.2M/2M"));
-    assert_eq!(human(999), "999");
-    assert_eq!(elapsed(5.9), "5s");
-    assert_eq!(elapsed(65.0), "1m05s");
-    assert_eq!(elapsed(3720.0), "1h02m");
+    assert_eq!(text::compact_count(999), "999");
+    assert_eq!(text::duration_label(5.9), "5s");
+    assert_eq!(text::duration_label(65.0), "1m05s");
+    assert_eq!(text::duration_label(3720.0), "1h02m");
 }
 
 #[test]
@@ -966,7 +968,7 @@ fn workers_segment_shows_running_out_of_total_and_hides_when_idle() {
         workers: Some(crate::ui::worker_pins::WorkerTally {
             running: 2,
             total: 3,
-            cost_usd: None,
+            ..Default::default()
         }),
         ..data()
     };
@@ -976,6 +978,7 @@ fn workers_segment_shows_running_out_of_total_and_hides_when_idle() {
             running: 2,
             total: 3,
             cost_usd: Some(0.14),
+            ..Default::default()
         }),
         ..data()
     };
@@ -987,11 +990,30 @@ fn workers_segment_shows_running_out_of_total_and_hides_when_idle() {
         workers: Some(crate::ui::worker_pins::WorkerTally {
             running: 0,
             total: 3,
-            cost_usd: None,
+            ..Default::default()
         }),
         ..data()
     };
     assert!(!plain(&render(&cfg_with(StatusPreset::Default), &idle, 160)).contains("workers"));
+    // A worker asking for input keeps the segment, in the warning tone, at every default width.
+    let asking = StatusData {
+        workers: Some(crate::ui::worker_pins::WorkerTally {
+            running: 0,
+            total: 3,
+            waiting: 1,
+            ..Default::default()
+        }),
+        ..data()
+    };
+    for width in [70, 100, 160] {
+        let line = render(&cfg_with(StatusPreset::Default), &asking, width);
+        let span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("1 waiting"))
+            .unwrap_or_else(|| panic!("{width}: {:?}", plain(&line)));
+        assert_eq!(span.style, Theme::dark().fg(Tok::Warning), "{width}");
+    }
 }
 
 #[test]
@@ -1008,7 +1030,7 @@ fn cost_segment_shows_turn_and_session_spend_in_every_preset_that_lists_it() {
     ] {
         let line = plain(&render(&cfg_with(preset), &priced, 200));
         assert!(
-            line.contains("$0.0412 turn · $1.20 session"),
+            line.contains("$0.04 turn · $1.20 session"),
             "{preset:?}: {line:?}"
         );
     }
@@ -1021,7 +1043,7 @@ fn cost_segment_shows_turn_and_session_spend_in_every_preset_that_lists_it() {
         status_right: vec!["cost".to_owned()],
         ..UiConfig::default()
     };
-    assert!(plain(&render(&custom, &priced, 120)).contains("$0.0412 turn"));
+    assert!(plain(&render(&custom, &priced, 120)).contains("$0.04 turn"));
     // The first turn of a session is the session: the total is not repeated.
     let first = StatusData {
         turn_cost: Some(0.0412),
@@ -1030,7 +1052,7 @@ fn cost_segment_shows_turn_and_session_spend_in_every_preset_that_lists_it() {
     };
     let line = plain(&render(&custom, &first, 120));
     assert!(
-        line.contains("$0.0412 turn") && !line.contains("session"),
+        line.contains("$0.04 turn") && !line.contains("session"),
         "{line:?}"
     );
     // A turn without a known session total still shows its own spend.
@@ -1072,11 +1094,11 @@ fn cost_segment_is_hidden_when_the_turn_cost_is_unknown_or_zero() {
 
 #[test]
 fn cost_amounts_use_the_dollar_form_and_never_round_spend_to_zero() {
-    assert_eq!(usd(0.0412), "$0.0412");
-    assert_eq!(usd(0.00004), "<$0.0001");
-    assert_eq!(usd(0.5), "$0.5000");
-    assert_eq!(usd(1.0), "$1.00");
-    assert_eq!(usd(12.345), "$12.35");
+    assert_eq!(text::usd(0.0412), "$0.04");
+    assert_eq!(text::usd(0.00004), "<$0.0001");
+    assert_eq!(text::usd(0.5), "$0.50");
+    assert_eq!(text::usd(1.0), "$1.00");
+    assert_eq!(text::usd(12.345), "$12.35");
 }
 
 #[test]
@@ -1146,4 +1168,97 @@ fn default_status_adapts_and_expands_without_changing_custom_layouts() {
     let expanded = plain(&render(&custom, &status, 100));
     status.toggle_status_expanded();
     assert_eq!(expanded, plain(&render(&custom, &status, 100)));
+}
+
+#[test]
+fn busy_and_idle_lines_share_one_layout_and_the_expand_toggle_works_while_busy() {
+    let idle = StatusData {
+        approval: "ask".into(),
+        inbox_unread: 2,
+        ..data()
+    };
+    let busy = StatusData {
+        phase: Phase::Working,
+        activity: "thinking".into(),
+        elapsed_secs: 3.0,
+        ..idle.clone()
+    };
+    for preset in ALL_PRESETS {
+        let cfg = cfg_with(preset);
+        for width in [60, 100, 160] {
+            assert_eq!(
+                plain(&render(&cfg, &idle, width)),
+                plain(&render(&cfg, &busy, width)),
+                "{preset:?} at {width}"
+            );
+        }
+    }
+    let mut expanded = busy.clone();
+    expanded.toggle_status_expanded();
+    let cfg = UiConfig::default();
+    assert_ne!(
+        plain(&render(&cfg, &busy, 160)),
+        plain(&render(&cfg, &expanded, 160))
+    );
+    // Below 120 columns the inbox and an input-mode chip survive; the path goes first.
+    let shell = StatusData {
+        mode: crate::ui::status::InputMode::Shell,
+        ..busy
+    };
+    let line = plain(&render(&cfg, &shell, 100));
+    assert!(
+        line.contains("2 unread") && line.contains("SHELL"),
+        "{line}"
+    );
+    assert!(!line.contains("projects/dial"), "{line}");
+}
+
+#[test]
+fn activity_row_names_the_phase_from_what_the_turn_is_doing() {
+    use crate::llm::{InferencePhase, ModelProgress};
+    let row = |data: &StatusData| {
+        plain(&activity_row(&UiConfig::default(), data, &Theme::dark(), 120).unwrap())
+    };
+    let mut progress = ModelProgress::new(InferencePhase::Generating);
+    progress.output_tokens = Some(64);
+    let mut status = StatusData {
+        phase: Phase::Working,
+        elapsed_secs: 4.0,
+        model_progress: Some(progress),
+        ..data()
+    };
+    for (activity, phase) in [
+        ("reasoning", "Reasoning 4s · 64 tok"),
+        ("writing", "Writing 4s · 64 tok"),
+        ("preparing edit", "Preparing edit 4s · 64 tok"),
+        ("thinking", "Generating 4s · 64 tok"),
+    ] {
+        status.activity = activity.into();
+        assert!(row(&status).contains(phase), "{activity}: {}", row(&status));
+    }
+    // Without telemetry or an activity the row says only that it works.
+    status.model_progress = None;
+    status.activity.clear();
+    let working = row(&status);
+    assert!(
+        working.contains("Working 4s") && !working.contains("working"),
+        "{working}"
+    );
+    // A compute wait shows what it waits for, from the shared activity label.
+    status.phase = Phase::WaitingCompute;
+    status.activity = "waiting for compute · /compute opens controls".into();
+    let waiting = row(&status);
+    assert!(
+        waiting.contains("Waiting for compute 4s · /compute opens controls"),
+        "{waiting}"
+    );
+    // Local model preparation is busy: it gets the row, with no stale turn clock.
+    status.phase = Phase::Setup;
+    status.activity = "preparing local model · Ctrl+C stops".into();
+    assert!(status.busy());
+    let setup = row(&status);
+    assert!(
+        setup.contains("Preparing local model · Ctrl+C stops") && !setup.contains("4s"),
+        "{setup}"
+    );
 }

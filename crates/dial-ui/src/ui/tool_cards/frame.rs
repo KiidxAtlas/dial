@@ -148,13 +148,13 @@ fn clip(spans: Vec<Span<'static>>, w: usize, mark: &str) -> Line<'static> {
 
 /// A status or metadata chip, `⟦done⟧` (`[done]` in ASCII), in one foreground color.
 pub(in crate::ui) fn chip(theme: &Theme, label: &str, tok: Tok) -> Span<'static> {
-    let (open, close) = if theme.ascii() {
-        ("[", "]")
-    } else {
-        ("⟦", "⟧")
-    };
     Span::styled(
-        format!("{open}{}{close}", text::one_line(label)),
+        format!(
+            "{}{}{}",
+            theme.sym(Sym::ChipOpen),
+            text::one_line(label),
+            theme.sym(Sym::ChipClose)
+        ),
         theme.fg(tok),
     )
 }

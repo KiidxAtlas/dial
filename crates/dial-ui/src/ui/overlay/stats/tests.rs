@@ -41,3 +41,32 @@ fn tabs_search_help_and_escape_preserve_report_navigation() {
         OverlayEvent::Close
     ));
 }
+
+#[test]
+fn long_reports_scroll_by_wrapped_row_with_an_indicator_and_themed_tabs() {
+    let rig = Rig::new();
+    let report = (0..40)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut panel = StatsOverlay::new(vec![("Usage", report), ("Tools", "bash 3".into())]);
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    let first = screen(&render(60, 16, |f| panel.draw(f, &ctx)));
+    assert!(!first.contains("[Usage]"), "tabs use the shared tab style");
+    assert!(first.contains("Usage"));
+    let thumb = rig.theme.sym(crate::ui::theme::Sym::ScrollThumb);
+    assert!(
+        first.contains(thumb),
+        "an overflowing report shows a scroll thumb"
+    );
+    assert!(first.contains("Esc close"), "the way out is in the footer");
+    panel.handle(&key(KeyCode::End), &rig.keys);
+    let last = screen(&render(60, 16, |f| panel.draw(f, &ctx)));
+    assert!(last.contains("line 39"));
+    assert!(!last.contains("line 0 "));
+}

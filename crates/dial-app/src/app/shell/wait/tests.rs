@@ -137,3 +137,57 @@ fn maintenance_wait_dismisses_history_search_but_escape_never_cancels() {
         WaitFlow::Cancel
     );
 }
+
+#[test]
+fn first_stop_key_closes_a_wait_panel_and_only_the_next_cancels() {
+    let (_home, _project, app, mut shell) = shell();
+    shell.composer.set_busy(true);
+    shell.keys.rebind(Action::ProviderSetup, &["F6"]).unwrap();
+    let f6 = KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE);
+    assert_eq!(shell.wait_key(&app, f6).unwrap(), WaitFlow::Continue);
+    assert!(shell.busy_overlay.is_some());
+    let stop = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(
+        shell.wait_event(&app, stop.clone()).unwrap(),
+        WaitFlow::Continue
+    );
+    assert!(shell.busy_overlay.is_none());
+    assert_eq!(shell.wait_event(&app, stop).unwrap(), WaitFlow::Cancel);
+}
+
+#[test]
+fn busy_shortcuts_answer_instead_of_being_ignored_during_a_wait() {
+    let (_home, _project, app, mut shell) = shell();
+    shell.composer.set_busy(true);
+    let f6 = KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE);
+    for action in [Action::EditExternal, Action::RateGood, Action::RateBad] {
+        shell.keys.rebind(action, &["F6"]).unwrap();
+        assert_eq!(shell.wait_key(&app, f6).unwrap(), WaitFlow::Continue);
+        shell.keys.rebind(action, &[]).unwrap();
+    }
+    // The external editor follows the turn rule: deferred until the work finishes.
+    assert!(shell.deferred_editor);
+    let ctx = crate::ui::transcript::TranscriptCtx {
+        theme: shell.themes.current(),
+        ui: &shell.ui,
+        tick: 0,
+        tools_expanded: false,
+        expand_key: "expand",
+    };
+    let notes = shell
+        .transcript
+        .document(200, &ctx)
+        .0
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(notes.contains("External editor opens after the current turn."));
+    assert!(notes.contains("Rating is available after the turn"));
+    // With no workers yet, the recent-worker key opens the workers hub as a live panel.
+    shell.keys.rebind(Action::SubagentsRecent, &["F6"]).unwrap();
+    assert_eq!(shell.wait_key(&app, f6).unwrap(), WaitFlow::Continue);
+    assert!(shell.busy_overlay.is_some());
+    assert!(shell.startup.is_none());
+    shell.finish_busy_overlay(&app).unwrap();
+}

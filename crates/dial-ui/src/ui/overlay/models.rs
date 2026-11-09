@@ -206,6 +206,7 @@ struct FavoriteEntry {
 }
 
 pub struct ModelOverlay {
+    panel_keys: super::panel_keys::PanelKeys,
     discovery: Option<Discovery>,
     roles: Vec<RoleStatus>,
     /// Memory backend needs the memory role (see `with_memory_required`).
@@ -332,15 +333,14 @@ fn source_label(source: RoleSource) -> &'static str {
 /// A list row of exactly `w` cells; the selected one gets the selection fill and its colors.
 fn selected_row(
     theme: &Theme,
-    mut spans: Vec<Span<'static>>,
+    spans: Vec<Span<'static>>,
     w: usize,
     selected: bool,
 ) -> Line<'static> {
     if !selected {
         return filled(spans, w, Style::default());
     }
-    chrome::select_spans(theme, &mut spans);
-    filled(spans, w, theme.bg(Tok::SelectedBg))
+    chrome::selected_row(theme, spans, w)
 }
 
 fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
@@ -579,16 +579,6 @@ fn fmt_rate(tok_per_s: f64) -> String {
     }
 }
 
-fn fmt_usd(usd: f64) -> String {
-    if usd >= 1.0 {
-        format!("${usd:.2}")
-    } else if usd >= 0.01 {
-        format!("${usd:.3}")
-    } else {
-        format!("${usd:.4}")
-    }
-}
-
 /// Orders known values with `cmp` and puts unknown ones last.
 fn known_first<T>(a: Option<T>, b: Option<T>, cmp: impl Fn(T, T) -> Ordering) -> Ordering {
     match (a, b) {
@@ -728,6 +718,7 @@ fn nonzero(count: usize) -> String {
 impl ModelOverlay {
     pub fn new(discovery: Option<Discovery>, roles: Vec<RoleStatus>, scope: Scope) -> Self {
         ModelOverlay {
+            panel_keys: Default::default(),
             memory_required: false,
             memory_optional: false,
             laya_decision: laya_decision_entry(None),
@@ -1366,6 +1357,9 @@ impl ModelOverlay {
     // ---- input ----------------------------------------------------------------------------
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if self.panel_keys.handle_key(event, true) {
+            return OverlayEvent::None;
+        }
         match event {
             Event::Key(key) if pressed(key) => self.key(key, keys),
             Event::Paste(text) if self.headers_editor.is_some() => {
@@ -1978,6 +1972,9 @@ impl ModelOverlay {
     // ---- drawing --------------------------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        if self.panel_keys.draw(frame, ctx, "Models", "Typing searches the models; Shift+F2 filters, Shift+F3 sorts and F5 rescans providers.\nF7 tunes the selected model; Ctrl+F marks a favorite; Ctrl+S switches save scope.", true, false) {
+            return;
+        }
         let extra = super::settings::scope_caption(
             self.scope,
             &self.project_name,
@@ -3018,7 +3015,7 @@ impl ModelOverlay {
                     None => "speed -".to_owned(),
                 }];
                 parts.push(match usage.avg_cost_usd() {
-                    Some(cost) => format!("avg {}/request", fmt_usd(cost)),
+                    Some(cost) => format!("avg {}/request", text::usd(cost)),
                     None if usage.totals.subscription_requests > 0 => "subscription".to_owned(),
                     None => "avg cost -".to_owned(),
                 });
@@ -3034,7 +3031,7 @@ impl ModelOverlay {
                     parts.push(format!("{rate:.0}% errors"));
                 }
                 if usage.totals.priced_requests > 0 {
-                    parts.push(format!("{} total", fmt_usd(usage.totals.cost_usd)));
+                    parts.push(format!("{} total", text::usd(usage.totals.cost_usd)));
                 }
                 parts.join(&format!(" {dot} "))
             }
@@ -3128,10 +3125,14 @@ impl ModelOverlay {
         }
         if self.group == Group::Download {
             let mut hints = self.downloads.borrow().footer(keys);
+            // The download footer ends with its way out; it stays last so a narrow footer never
+            // drops it.
+            let way_out = hints.pop();
             if !self.narrow && !self.downloads.borrow().has_picker() {
                 hints.push(self.groups_hint(keys));
             }
             hints.push("F5 rescan".to_owned());
+            hints.extend(way_out);
             return hints;
         }
         if self.nothing_discovered() {

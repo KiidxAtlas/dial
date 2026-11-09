@@ -6,7 +6,9 @@
 //! Typed search always covers every registered command; the category tabs stay one key away.
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{editor_spans, filled, hint_line, panel, pressed, tab_strip, typed_char},
+    settings::{
+        editor_spans, filled, hint_line, panel, pressed, scroll_cell, tab_strip, typed_char,
+    },
 };
 use crate::ui::{
     chrome::{self, Section},
@@ -78,7 +80,7 @@ const GOALS: &[Goal] = &[
     },
     Goal {
         title: "Manage ongoing work",
-        blurb: "background agents, processes, live watch, queued messages and todos",
+        blurb: "workers, processes, live watch, queued messages and todos",
         commands: &[
             "workers",
             "processes",
@@ -233,7 +235,7 @@ fn action_label(command: &CommandEntry) -> &str {
         "permissions" => "Manage tool permissions",
         "approval" => "Choose when Dial asks",
         "effort" => "Choose thinking effort",
-        "workers" => "Manage background agents",
+        "workers" => "Manage workers",
         "processes" => "Manage running processes",
         "queue" => "Edit queued messages",
         "skills" => "Manage skills",
@@ -614,7 +616,7 @@ impl PaletteOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
-        if self.panel_keys.handle(event, true, true) {
+        if self.panel_keys.handle_key(event, true) {
             return OverlayEvent::None;
         }
         if let Event::Paste(value) = event {
@@ -693,7 +695,7 @@ impl PaletteOverlay {
                     args
                 ));
             }
-            editor.key(*key);
+            editor.key_with(*key, keys);
             return OverlayEvent::None;
         }
         if let Some(spec) = &self.choice
@@ -761,7 +763,7 @@ impl PaletteOverlay {
         } else if let Some(c) = typed_char(key) {
             self.search.insert(&c.to_string());
             self.reset_selection();
-        } else if self.search.key(*key) {
+        } else if self.search.key_with(*key, keys) {
             self.reset_selection();
         }
         OverlayEvent::None
@@ -856,11 +858,7 @@ impl PaletteOverlay {
             .as_ref()
             .map_or("Actions", |spec| {
                 if self.progress.is_some() {
-                    if self.progress_tab {
-                        "Plan | [Progress]"
-                    } else {
-                        "[Plan] | Progress"
-                    }
+                    "Plan"
                 } else {
                     spec.title.as_str()
                 }
@@ -877,9 +875,25 @@ impl PaletteOverlay {
         let inner = (area.width >= 5 && area.height >= 5).then(|| {
             chrome::panel_block_titled(ctx.theme, Section::Dial, &title, &extra).inner(area)
         });
-        panel(frame, ctx.theme, Section::Dial, &title, &extra, |w, h| {
-            self.compose(w, h, ctx)
-        });
+        if self.progress.is_some() && inner.is_some() {
+            // Plan and Progress are tabs: the title row carries them in the shared tab style.
+            let tabs = Line::from(vec![
+                Span::styled("Plan", chrome::tab_style(ctx.theme, !self.progress_tab)),
+                Span::raw("  "),
+                Span::styled("Progress", chrome::tab_style(ctx.theme, self.progress_tab)),
+            ]);
+            let block =
+                chrome::panel_block_titled(ctx.theme, Section::Dial, "", &extra).title_top(tabs);
+            let body = block.inner(area);
+            frame.render_widget(block, area);
+            let mut lines = self.compose(body.width, body.height, ctx);
+            lines.truncate(usize::from(body.height));
+            frame.render_widget(ratatui::widgets::Paragraph::new(lines), body);
+        } else {
+            panel(frame, ctx.theme, Section::Dial, &title, &extra, |w, h| {
+                self.compose(w, h, ctx)
+            });
+        }
         if let Some(inner) = inner
             && self.arguments.is_none()
         {
@@ -1226,7 +1240,7 @@ impl PaletteOverlay {
                     };
                     let right = if w < 64 { String::new() } else { right };
                     let right_w = text::width(&right);
-                    let description_w = w.saturating_sub(name_w + right_w + 6);
+                    let description_w = w.saturating_sub(name_w + right_w + 7);
                     let description = if description_w == 0 {
                         String::new()
                     } else {
@@ -1264,7 +1278,11 @@ impl PaletteOverlay {
                             span.style = span.style.fg(theme.fg(Tok::Dim).fg.unwrap_or_default());
                         }
                     }
-                    out.push(filled(spans, w, fill));
+                    // The last column carries the shared scroll indicator when the list overflows.
+                    let mut line = filled(spans, w.saturating_sub(1), fill);
+                    line.spans
+                        .push(scroll_cell(theme, row, list_h, rows.len(), self.scroll));
+                    out.push(line);
                 } else if row == 0 {
                     // The empty message names the way out, so it wraps rather than clipping it.
                     let room = w.saturating_sub(2).max(1);

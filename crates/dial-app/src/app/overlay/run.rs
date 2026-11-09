@@ -224,6 +224,19 @@ pub(in crate::app) fn draw_overlay_frame(
         preview_status: &preview,
     };
     overlay.draw(frame, &ctx);
+    // A panel opened during a turn: say that Dial keeps working and what the stop key does here.
+    if env.status.busy() {
+        let stop = env.keys.label(crate::ui::keys::Action::Interrupt);
+        if !stop.is_empty() {
+            let area = frame.area();
+            crate::ui::chrome::stamp_bottom_hint(
+                frame.buffer_mut(),
+                area,
+                themes.current(),
+                &format!("Dial is still working · {stop} closes this panel"),
+            );
+        }
+    }
     overlay.native_placements()
 }
 

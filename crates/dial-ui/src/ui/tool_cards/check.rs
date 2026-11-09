@@ -12,8 +12,8 @@
 //! (failing tests, the first errors and where they are). A clean pass is one row. The expand key
 //! shows the ordinary card with the complete output.
 use super::{
-    Fact, GUTTER, Rows, Tool, ToolState, VERB_W, elapsed_label, fit_facts, gutter_span,
-    hidden_hint, phase_glyph, plural,
+    Fact, GUTTER, Rows, Tool, ToolState, VERB_W, fit_facts, gutter_span, hidden_hint, phase_glyph,
+    plural,
 };
 use crate::ui::{
     text,
@@ -199,7 +199,7 @@ pub(super) fn check_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows
     }
     if let Some(secs) = t.elapsed.filter(|s| *s >= 0.05) {
         facts.push(Fact {
-            text: elapsed_label(secs),
+            text: text::duration_label_precise(secs),
             drop: 2,
         });
     }

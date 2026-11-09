@@ -28,6 +28,10 @@ fn expansion_is_exact_and_preserves_selectors_without_interpolation() {
         assert!(ws.resolve(&format!("@f1{suffix}")).is_err());
         assert!(ws.file_handle_path(&format!("@f1{suffix}")).is_err());
     }
+    // A content tag copied from an edit header names the same file, with or without a selector.
+    assert_eq!(ws.expand_file_handle("@f1#6687").unwrap(), "src.rs");
+    assert_eq!(ws.expand_file_handle("@f1#3FA9:1-9").unwrap(), "src.rs:1-9");
+    assert_eq!(ws.expand_file_handle("@f1#zz").unwrap(), "@f1#zz");
     for literal in [
         "./@f1",
         "@f1/x",

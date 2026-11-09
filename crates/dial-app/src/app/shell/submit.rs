@@ -27,25 +27,28 @@ impl Shell {
         }
     }
 
-    /// `Alt+Shift+A`: the transcript of the most recently active running worker. Repeated presses
-    /// cycle through the running workers in roster order. With none running, it cycles through all
-    /// workers, and with no workers it opens the hub.
+    /// `Alt+Shift+A`: the worker named by the newest worker notice, if any; otherwise the
+    /// transcript of the most recently active running worker. Repeated presses cycle through the
+    /// running workers in roster order. With none running, it cycles through all workers, and with
+    /// no workers it opens the hub.
     pub(super) fn open_recent_worker(&mut self, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
-        let running: Vec<&str> = self
-            .workers
-            .agents()
-            .iter()
-            .filter(|a| !a.status.is_finished())
-            .map(|a| a.id.as_str())
-            .collect();
-        let all: Vec<&str> = self
-            .workers
-            .agents()
-            .iter()
-            .map(|a| a.id.as_str())
-            .collect();
-        let pool = if running.is_empty() { all } else { running };
-        let id = crate::ui::worker_pins::next_recent(&pool, self.recent_worker.as_deref());
+        let id = self.workers.take_focus().or_else(|| {
+            let running: Vec<&str> = self
+                .workers
+                .agents()
+                .iter()
+                .filter(|a| !a.status.is_finished())
+                .map(|a| a.id.as_str())
+                .collect();
+            let all: Vec<&str> = self
+                .workers
+                .agents()
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect();
+            let pool = if running.is_empty() { all } else { running };
+            crate::ui::worker_pins::next_recent(&pool, self.recent_worker.as_deref())
+        });
         let Some(id) = id else {
             return self.open(app, agent, Which::Subagents);
         };

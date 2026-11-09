@@ -83,7 +83,16 @@ fn split_handle(input: &str) -> Option<(&str, &str)> {
         return None;
     }
     let end = 2 + digits;
-    let suffix = &input[end..];
+    let mut suffix = &input[end..];
+    // A content tag copied from an edit header (`@f7#3FA9`) is a freshness witness, not part of
+    // the path; it is dropped so the handle still names its file.
+    if let Some(tagged) = suffix.strip_prefix('#') {
+        let tag = tagged.bytes().take_while(u8::is_ascii_hexdigit).count();
+        if tag == 0 {
+            return None;
+        }
+        suffix = &tagged[tag..];
+    }
     if suffix.is_empty() || (suffix.starts_with(':') && !suffix.chars().any(char::is_whitespace)) {
         Some((&input[..end], suffix))
     } else {

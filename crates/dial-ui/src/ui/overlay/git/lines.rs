@@ -168,7 +168,7 @@ impl GitOverlay {
     }
 
     /// Whether the cursor's hunk has marks or an open range.
-    fn selecting(&self) -> bool {
+    pub(super) fn selecting(&self) -> bool {
         self.active_sel()
             .is_some_and(|sel| sel.anchor.is_some() || !sel.marked.is_empty())
     }
@@ -356,19 +356,16 @@ impl GitOverlay {
         }
     }
 
-    /// Hint-line entries for the line keys, shown in the diff.
-    pub(super) fn line_hints(&self) -> Vec<String> {
+    /// Hint-line entries for the line keys, shown in the diff. While lines are marked, Esc clears
+    /// them: the caller makes that its way-out hint (see [`GitOverlay::selecting`]).
+    pub(super) fn line_hints(&self, arrows: &str) -> Vec<String> {
         if !self.line_ops_allowed() {
             return Vec::new();
         }
         if self.selecting() {
-            vec![
-                "space stage lines".to_owned(),
-                "x discard lines".to_owned(),
-                "esc clear lines".to_owned(),
-            ]
+            vec!["Space stage lines".to_owned(), "x discard lines".to_owned()]
         } else {
-            vec!["shift+↑/↓ select".to_owned(), "m mark line".to_owned()]
+            vec![format!("Shift+{arrows} select"), "m mark line".to_owned()]
         }
     }
 

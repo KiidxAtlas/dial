@@ -311,7 +311,8 @@ fn selection_scrolls_into_view_and_narrow_ascii_panels_stay_ascii() {
     overlay.handle(&key(KeyCode::End), &rig.keys);
     let screen = shown(&mut overlay, &rig, 40, 14);
     assert!(screen.contains("0000000b"), "last peer visible:\n{screen}");
-    assert!(screen.contains("module11/file.rs"), "{screen}");
+    // The last column is the scroll indicator, so the claim path loses one cell.
+    assert!(screen.contains("module11/file.r"), "{screen}");
     assert!(
         !screen
             .chars()

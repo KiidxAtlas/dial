@@ -142,8 +142,8 @@ fn terminal_signals_follow_the_session_state() {
     assert!(terminal_signals(&ui, &status, Activity::Idle, true).is_none());
 }
 
-/// The state circles `tab_title` can add (orange working, green done, red waiting or failed).
-const CIRCLES: [&str; 3] = ["\u{1F7E0}", "\u{1F7E2}", "\u{1F534}"];
+/// The state circles `tab_title` can add (orange working, green done, blue waiting, red failed).
+const CIRCLES: [&str; 4] = ["\u{1F7E0}", "\u{1F7E2}", "\u{1F535}", "\u{1F534}"];
 
 #[test]
 fn the_tab_title_ends_with_the_state_circle_after_the_session_scope() {
@@ -197,6 +197,132 @@ fn every_active_state_keeps_its_circle_on_selected_and_unselected_tabs() {
                 unselected.contains(activity.marker()),
                 "unselected: {unselected} ({activity:?})"
             );
+        }
+    }
+}
+
+#[test]
+fn bottom_chrome_leaves_the_transcript_most_of_an_80x24_terminal() {
+    // A typical conversation composer: activity row, top border, one input row, hints, controls.
+    let composer = 5;
+    let budget = aux_budget(24, composer);
+    assert!(budget <= 24 * 2 / 5, "{budget}");
+    assert!(
+        24 - composer - budget >= 10,
+        "transcript keeps {}",
+        24 - composer - budget
+    );
+    // Tiny terminals give the chrome nothing rather than starving the transcript.
+    for rows in 0..12 {
+        assert!(aux_budget(rows, composer) + composer + 3 <= rows.max(composer + 3));
+    }
+    // A tall terminal still makes room for the plan card and the pinned workers.
+    assert!(aux_budget(60, composer) >= 20);
+
+    // The whole paint at 80x24 with a long plan and the rail on stays inside the budget.
+    let (_home, _project, _app, mut shell) = super::super::testkit::shell();
+    shell.term = crate::ui::term::with_writer(Box::new(std::io::sink()), (80, 24));
+    shell.ui.session_rail = true;
+    let tasks: Vec<_> = (0..20)
+        .map(|i| serde_json::json!({"content": format!("step {i}")}))
+        .collect();
+    shell
+        .todo
+        .call(&serde_json::json!({"op": "set", "tasks": tasks}));
+    shell.paint(None).unwrap();
+}
+
+/// Shared capture of everything the inline terminal writes, replayed into a screen emulator.
+#[derive(Clone, Default)]
+struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The whole main screen at 80x24 with every kind of chrome between the transcript and the
+/// composer (pinned workers, an update notice, the queue strip, the status rows): the chrome
+/// stays inside its budget, the transcript keeps its rows above it, and every element is drawn
+/// whole, in order, without a row wrapping into the next.
+#[test]
+fn the_full_main_screen_at_80x24_keeps_the_transcript_and_whole_rows() {
+    use crate::llm::model_config::SymbolPreset;
+    use crate::ui::subagent_model::{AgentEntry, AgentStatus, HubSnapshot};
+    for preset in [SymbolPreset::Ascii, SymbolPreset::Unicode] {
+        let (_home, _project, _app, mut shell) = super::super::testkit::shell();
+        shell.ui.symbols = preset;
+        let ui = shell.ui.clone();
+        shell.themes.apply_config(&ui, None).unwrap();
+        let capture = Capture::default();
+        shell.term = crate::ui::term::with_writer(Box::new(capture.clone()), (80, 24));
+        shell.home = None;
+        let agents = (0..4)
+            .map(|i| AgentEntry {
+                id: format!("w{i}"),
+                name: format!("worker{i}"),
+                task: format!("a long task description for worker {i} that runs past the edge"),
+                status: AgentStatus::Running,
+                ..AgentEntry::default()
+            })
+            .collect();
+        shell.workers = crate::ui::worker_pins::WorkerBoard::from_snapshot(HubSnapshot {
+            agents,
+            ..Default::default()
+        });
+        shell.runtime_updates.retain_report("report".into());
+        shell.composer.set_busy(true);
+        shell.composer.set_draft("queued follow-up message");
+        shell.composer.submit_voice();
+        shell.status.phase = crate::ui::status::Phase::Working;
+        shell.transcript.push_user("hello");
+        let reply: String = (0..40).map(|i| format!("reply line {i}\n\n")).collect();
+        shell.transcript.assistant_delta(&reply);
+        for _ in 0..3 {
+            shell.paint(None).unwrap();
+        }
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(&capture.0.lock().unwrap());
+        let screen = parser.screen();
+        let rows: Vec<String> = screen.rows(0, 80).collect();
+        let at = |what: &str| {
+            let found: Vec<usize> = (0..rows.len())
+                .filter(|&i| rows[i].to_lowercase().contains(what))
+                .collect();
+            assert_eq!(found.len(), 1, "{what:?} once ({preset:?}): {rows:#?}");
+            found[0]
+        };
+        let workers = at("4 active");
+        let more = at("+3 more");
+        let notice = at("runtime update report ready");
+        let queue = at("queued follow-up message");
+        let working = at("working");
+        let controls = at("ctrl+c stop");
+        assert!(
+            workers < more && more < notice && notice < queue && queue < working,
+            "chrome in order ({preset:?}): {rows:#?}"
+        );
+        assert_eq!(controls, 23, "the composer ends on the last row: {rows:#?}");
+        // Everything above the chrome is transcript, its newest row included.
+        assert!(workers >= 10, "transcript keeps {workers} rows: {rows:#?}");
+        assert!(
+            rows[..workers]
+                .iter()
+                .all(|r| r.trim().is_empty() || r.contains("reply line")),
+            "{rows:#?}"
+        );
+        assert!(rows[..workers].iter().any(|r| r.contains("reply line 39")));
+        assert!(
+            (0..24).all(|i| !screen.row_wrapped(i)),
+            "a row ran into the next ({preset:?}): {rows:#?}"
+        );
+        if preset == SymbolPreset::Ascii {
+            assert!(rows.iter().all(|r| r.is_ascii()), "{rows:#?}");
         }
     }
 }

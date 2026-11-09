@@ -52,6 +52,7 @@ fn event(agent: &str, kind: ActivityKind, title: &str, entry: Option<usize>) -> 
     ActivityEvent {
         agent_id: agent.into(),
         at_ms: epoch_ms(),
+        timed: true,
         kind,
         title: title.into(),
         summary: format!("{title} summary"),
@@ -482,9 +483,7 @@ fn activity_tab_renders_its_table() {
 
 #[test]
 fn helpers_format_units() {
-    assert_eq!(compact(1_500), "1.5k");
-    assert_eq!(money(0.0012), "$0.0012");
-    assert_eq!(duration(65_000), "1m 05s");
+    assert_eq!(duration(65_000), "1m05s", "the shared duration form");
     assert_eq!(ago(0, 125_000), "2m");
     assert_eq!(gauge(50, 100, 60), "██████░░░░░░ 50% 50/100");
 }
@@ -951,4 +950,61 @@ fn footer_offers_only_actions_the_selected_worker_supports() {
     let footer = hub.footer(&ctx);
     assert!(footer.iter().any(|s| s == "x stop worker"), "{footer:?}");
     assert!(footer.iter().any(|s| s == "m message"), "{footer:?}");
+}
+
+/// Title counts come from one helper: interrupted and blocked workers count as needing
+/// attention, terminal input requests as needing input, never as running.
+#[test]
+fn title_counts_cover_interrupted_blocked_and_terminal_input_requests() {
+    let agents = vec![
+        agent("a", AgentStatus::Running),
+        agent("b", AgentStatus::Interrupted),
+        agent("c", AgentStatus::Blocked),
+        agent("d", AgentStatus::NeedsInput),
+    ];
+    assert_eq!(
+        status_counts(&agents, " · "),
+        "4 workers · 1 needs input · 2 need attention · 1 running"
+    );
+}
+
+/// A finished worker shows its reply in the inspector and on its roster card; messages sent to
+/// it are a plain count, not an unread badge; untimed events show no invented age.
+#[test]
+fn finished_worker_shows_its_result_and_message_count_without_fake_ages() {
+    let theme = Theme::dark();
+    let mut done = agent("task-1", AgentStatus::Done);
+    done.result = Some("Found three call sites in parser.rs".into());
+    done.inbound = 2;
+    let mut untimed = event("task-1", ActivityKind::Tool, "grep", Some(0));
+    untimed.timed = false;
+    untimed.at_ms = 0;
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(HubSnapshot {
+        agents: vec![done],
+        activity: vec![untimed],
+        ..Default::default()
+    });
+    let text = screen(&mut hub, &theme, 140, 40).join("\n");
+    assert!(text.contains("Outcome"), "{text}");
+    assert!(text.contains("Found three call sites"), "{text}");
+    assert!(text.contains("2 msgs"), "{text}");
+    assert!(!text.contains(" ago"), "untimed events have no age: {text}");
+}
+
+#[test]
+fn terminal_input_request_without_transcript_does_not_promise_a_reply() {
+    let theme = Theme::dark();
+    let mut ask = agent("task-1", AgentStatus::NeedsInput);
+    ask.result = Some("Which branch should I target?".into());
+    ask.resumable = false;
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(snapshot(vec![ask.clone()]));
+    let text = screen(&mut hub, &theme, 140, 40).join("\n");
+    assert!(text.contains("Which branch should I target?"), "{text}");
+    assert!(text.contains("cannot be continued"), "{text}");
+    ask.resumable = true;
+    hub.set_snapshot(snapshot(vec![ask]));
+    let text = screen(&mut hub, &theme, 140, 40).join("\n");
+    assert!(text.contains("Press Enter to open it and reply"), "{text}");
 }

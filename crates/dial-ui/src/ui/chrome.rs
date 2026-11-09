@@ -14,7 +14,7 @@ use ratatui::{
 
 use super::{
     text,
-    theme::{Theme, Tok},
+    theme::{Sym, Theme, Tok},
 };
 
 /// Section identity. Each section has one foreground token: the color of its label, its panel-title
@@ -132,6 +132,169 @@ pub fn key_hint_spans(theme: &Theme, hints: &[(&str, &str)]) -> Vec<Span<'static
     spans
 }
 
+/// Footer key hints fitted to `width` cells: `(key, label)` pairs as [`key_hint_spans`] draws them.
+/// The last pair is the way out and always stays; when the row is too narrow the hints before it
+/// are dropped whole, nearest the end first, so a label is never cut mid-word. Pairs with neither
+/// key nor label are skipped. A last hint that cannot fit even alone is clipped with an ellipsis.
+pub fn hint_line(theme: &Theme, hints: &[(&str, &str)], width: usize) -> Line<'static> {
+    hint_line_after(theme, "", hints, width)
+}
+
+/// [`hint_line`] after a muted `lead` such as a list position (`3/12`), which stays in front of the
+/// hints and is never dropped.
+pub fn hint_line_after(
+    theme: &Theme,
+    lead: &str,
+    hints: &[(&str, &str)],
+    width: usize,
+) -> Line<'static> {
+    let sep = if theme.ascii() { " | " } else { " · " };
+    let lead = text::one_line(lead);
+    let mut keep: Vec<(&str, &str)> = hints
+        .iter()
+        .copied()
+        .filter(|(key, label)| !key.is_empty() || !label.is_empty())
+        .collect();
+    let build = |keep: &[(&str, &str)]| {
+        let mut spans = Vec::new();
+        if !lead.is_empty() {
+            spans.push(Span::styled(lead.clone(), theme.fg(Tok::Muted)));
+            if !keep.is_empty() {
+                spans.push(Span::styled(sep, theme.fg(Tok::Dim)));
+            }
+        }
+        spans.extend(key_hint_spans(theme, keep));
+        spans
+    };
+    let cells =
+        |spans: &[Span<'static>]| spans.iter().map(|s| text::width(&s.content)).sum::<usize>();
+    let mut spans = build(&keep);
+    while keep.len() > 1 && cells(&spans) > width {
+        keep.remove(keep.len() - 2);
+        spans = build(&keep);
+    }
+    Line::from(super::markdown::truncate_spans(
+        spans,
+        width,
+        theme.sym(Sym::Ellipsis),
+    ))
+}
+
+/// The colored dot and friendly name of an approval mode, `● Ask first`, in the one color mapping
+/// every surface uses (see [`approval_tok`]). The name comes from
+/// [`super::status::approval_label`]; an unknown mode shows its raw value.
+pub fn approval_spans(theme: &Theme, mode: &str) -> Vec<Span<'static>> {
+    let mode = text::one_line(mode.trim());
+    vec![
+        Span::styled(
+            format!("{} ", theme.sym(Sym::Bullet)),
+            theme.fg(approval_tok(&mode)),
+        ),
+        Span::styled(
+            super::status::approval_label(&mode).to_owned(),
+            theme.fg(Tok::Text),
+        ),
+    ]
+}
+
+/// Safety color of an approval mode: modes that ask before changing anything (`ask`, `readonly`)
+/// are success, `write` is the accent, `auto` (no questions asked) is a warning, unknown is muted.
+pub fn approval_tok(mode: &str) -> Tok {
+    match mode.trim() {
+        "ask" | "readonly" => Tok::Success,
+        "write" => Tok::Accent,
+        "auto" => Tok::Warning,
+        _ => Tok::Muted,
+    }
+}
+
+/// The lifecycle state of a run, tool, task, agent or question, with one glyph, color and word on
+/// every surface. Stopped-by-someone states (interrupted, cancelled, denied) are muted, never error
+/// red: only `Failed` is an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StateMark {
+    Running,
+    Waiting,
+    Done,
+    Answered,
+    Failed,
+    Interrupted,
+    Cancelled,
+    Denied,
+    Blocked,
+}
+
+impl StateMark {
+    pub const ALL: &'static [StateMark] = &[
+        StateMark::Running,
+        StateMark::Waiting,
+        StateMark::Done,
+        StateMark::Answered,
+        StateMark::Failed,
+        StateMark::Interrupted,
+        StateMark::Cancelled,
+        StateMark::Denied,
+        StateMark::Blocked,
+    ];
+
+    /// The state's symbol token; its glyph follows the theme's preset and overrides.
+    pub fn sym(self) -> Sym {
+        match self {
+            StateMark::Running => Sym::Working,
+            StateMark::Waiting => Sym::Pending,
+            StateMark::Done | StateMark::Answered => Sym::Check,
+            StateMark::Failed => Sym::Cross2,
+            StateMark::Interrupted | StateMark::Cancelled | StateMark::Denied => Sym::Interrupted,
+            StateMark::Blocked => Sym::Blocked,
+        }
+    }
+
+    pub fn glyph(self, theme: &Theme) -> &str {
+        theme.sym(self.sym())
+    }
+
+    pub fn tok(self) -> Tok {
+        match self {
+            StateMark::Running => Tok::Accent,
+            StateMark::Waiting
+            | StateMark::Interrupted
+            | StateMark::Cancelled
+            | StateMark::Denied => Tok::Muted,
+            StateMark::Done | StateMark::Answered => Tok::Success,
+            StateMark::Failed => Tok::Error,
+            StateMark::Blocked => Tok::Warning,
+        }
+    }
+
+    /// The one lowercase word for the state.
+    pub fn word(self) -> &'static str {
+        match self {
+            StateMark::Running => "running",
+            StateMark::Waiting => "waiting",
+            StateMark::Done => "done",
+            StateMark::Answered => "answered",
+            StateMark::Failed => "failed",
+            StateMark::Interrupted => "interrupted",
+            StateMark::Cancelled => "stopped",
+            StateMark::Denied => "denied",
+            StateMark::Blocked => "blocked",
+        }
+    }
+
+    /// The glyph alone in the state's color.
+    pub fn mark_span(self, theme: &Theme) -> Span<'static> {
+        Span::styled(self.glyph(theme).to_owned(), theme.fg(self.tok()))
+    }
+
+    /// `✓ done`: glyph and word in the state's color.
+    pub fn chip_span(self, theme: &Theme) -> Span<'static> {
+        Span::styled(
+            format!("{} {}", self.glyph(theme), self.word()),
+            theme.fg(self.tok()),
+        )
+    }
+}
+
 /// Style of one tab in any panel's tab strip: the active tab is a soft pill (the panel inset fill)
 /// with an accent, bold and underlined label; the others are muted words. Themes without an inset
 /// fill keep the plain accent label, so a tab strip reads the same in every panel.
@@ -223,7 +386,6 @@ pub fn framed_lines(
     rows: Vec<Line<'static>>,
     width: usize,
 ) -> Vec<Line<'static>> {
-    use super::theme::Sym;
     if width < 6 {
         return rows;
     }
@@ -267,12 +429,60 @@ pub fn framed_lines(
     out
 }
 
+/// Writes `hint` muted and right-aligned into the last row of `area`, but only when that row is
+/// blank (the panel's bottom padding) and wide enough: it never covers panel content. Returns
+/// whether it was drawn.
+pub fn stamp_bottom_hint(
+    buf: &mut ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    theme: &Theme,
+    hint: &str,
+) -> bool {
+    let hint = format!("{} ", text::one_line(hint));
+    let needed = text::width(&hint) as u16;
+    if area.height < 3 || area.width < needed.saturating_add(4) {
+        return false;
+    }
+    let y = area.bottom() - 1;
+    let blank = (area.left()..area.right()).all(|x| {
+        buf.cell((x, y))
+            .is_some_and(|cell| cell.symbol().trim().is_empty())
+    });
+    if !blank {
+        return false;
+    }
+    let x = area.right() - needed;
+    buf.set_string(
+        x,
+        y,
+        &hint,
+        surface(theme).patch(theme.fg(Tok::Muted).add_modifier(Modifier::ITALIC)),
+    );
+    true
+}
+
 /// Style for a row that is the selected one in a list: the selection fill with bold body text.
 pub fn selected_style(theme: &Theme) -> Style {
     theme
         .fg(Tok::Text)
         .patch(theme.bg(Tok::SelectedBg))
         .add_modifier(Modifier::BOLD)
+}
+
+/// The selected list row: `spans` restyled by [`select_spans`], clipped with an ellipsis to `width`
+/// cells, then filled with the selection background to exactly `width` cells. The one selected-row
+/// look for every list.
+pub fn selected_row(theme: &Theme, spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut spans = super::markdown::truncate_spans(spans, width, theme.sym(Sym::Ellipsis));
+    select_spans(theme, &mut spans);
+    let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+    if used < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used),
+            theme.bg(Tok::SelectedBg),
+        ));
+    }
+    Line::from(spans).style(theme.bg(Tok::SelectedBg))
 }
 
 /// Restyles the spans of the selected list row the way the menus draw it: the selection fill under

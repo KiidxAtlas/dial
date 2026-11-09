@@ -88,7 +88,11 @@ fn the_selected_row_is_highlighted_and_stays_visible_when_the_list_scrolls() {
         rows.iter().any(|row| row.contains("X-Header-10")),
         "{rows:?}"
     );
-    assert!(rows.last().unwrap().contains("row 11 of 12"), "{rows:?}");
+    let thumb = theme.sym(crate::ui::theme::Sym::ScrollThumb);
+    assert!(
+        rows.iter().any(|row| row.ends_with(thumb)),
+        "scroll indicator: {rows:?}"
+    );
     let selected = lines
         .iter()
         .position(|line| text(std::slice::from_ref(line))[0].contains("X-Header-10"))
@@ -127,7 +131,7 @@ fn literal_rows_warn_and_validation_errors_are_shown() {
             .any(|row| row.contains("unencrypted"))
     );
     editor.key(
-        &key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        &key(KeyCode::Char('o'), KeyModifiers::CONTROL),
         &Keymap::defaults(),
     );
     assert!(matches!(
@@ -180,7 +184,7 @@ fn ctrl_s_saves_where_f10_is_taken_by_the_terminal() {
     assert!(
         text(&editor.lines(&Theme::dark(), 100, 6))
             .iter()
-            .any(|row| row.contains("^S save")),
+            .any(|row| row.contains("Ctrl+S save")),
         "the compact hint names the portable save key"
     );
 }
@@ -191,4 +195,41 @@ fn title_names_the_model_and_role_being_edited() {
     let editor = HeaderEditor::new(&None).titled("qwen → role main".into());
     let rows = text(&editor.lines(&theme, 100, 20));
     assert!(rows[0].contains("qwen → role main"), "{rows:?}");
+}
+
+#[test]
+fn ctrl_n_and_ctrl_p_move_rows_and_ctrl_o_adds_one() {
+    let keys = Keymap::defaults();
+    let mut editor = HeaderEditor::new(&headers(3));
+    editor.key(&key(KeyCode::Char('n'), KeyModifiers::CONTROL), &keys);
+    editor.key(&key(KeyCode::Char('n'), KeyModifiers::CONTROL), &keys);
+    assert_eq!(editor.row, 2);
+    editor.key(&key(KeyCode::Char('p'), KeyModifiers::CONTROL), &keys);
+    assert_eq!(editor.row, 1);
+    assert_eq!(editor.rows.len(), 3, "Ctrl+N no longer adds a row");
+    editor.key(&key(KeyCode::Char('o'), KeyModifiers::CONTROL), &keys);
+    assert_eq!(editor.rows.len(), 4);
+    let rows = text(&editor.lines(&Theme::dark(), 100, 20));
+    assert!(
+        rows.iter().any(|row| row.contains("Ctrl+O add")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn header_fields_follow_remapped_editing_keys() {
+    let mut keys = Keymap::defaults();
+    keys.rebind(Action::EditorDeleteToLineStart, &["F7"])
+        .unwrap();
+    let mut editor = HeaderEditor::new(&headers(1));
+    editor.key(&key(KeyCode::Char('u'), KeyModifiers::CONTROL), &keys);
+    assert_eq!(
+        editor.rows[0].name.text, "X-Header-0",
+        "old chord is unbound"
+    );
+    editor.key(&key(KeyCode::F(7), KeyModifiers::NONE), &keys);
+    assert_eq!(editor.rows[0].name.text, "");
+    editor.key(&key(KeyCode::Tab, KeyModifiers::NONE), &keys);
+    editor.key(&key(KeyCode::F(7), KeyModifiers::NONE), &keys);
+    assert_eq!(editor.rows[0].value.text, "");
 }

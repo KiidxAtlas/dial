@@ -196,7 +196,7 @@ impl ActivityOverlay {
     pub(super) fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
         let attached =
             matches!(&*self.panel, ActiveOverlay::Jobs(panel) if panel.attached().is_some());
-        if !attached && self.keys.handle(event, true, false) {
+        if !attached && self.keys.handle_key(event, true) {
             return OverlayEvent::None;
         }
         if let Event::Key(key) = event

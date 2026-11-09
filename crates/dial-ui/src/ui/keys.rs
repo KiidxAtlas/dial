@@ -19,7 +19,11 @@
 //! macOS terminals type symbols for Option chords unless Option is set to send Meta/Esc+, and
 //! Windows Terminal claims `Alt+Enter` (fullscreen), so every default Option/Alt application chord
 //! also has a Ctrl or function-key alternative (`Ctrl+Q`, `Ctrl+L`, `F2`–`F9`).
-//! Model selection uses Ctrl+K on macOS so it works without changing terminal Option settings.
+//! Model selection uses Ctrl+K on macOS so it works without changing terminal Option settings;
+//! the composer gives that chord to the model selector, so cut-to-line-end is flagged as shadowed
+//! there (see [`Keymap::shadowed`]) and keeps working in dialog fields.
+//! `Ctrl+P`/`Ctrl+N` are list and history navigation everywhere; the command palette uses `Alt+K`
+//! and `F1` so it never competes with them.
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{collections::HashSet, fs, path::Path};
 
@@ -188,6 +192,31 @@ impl Action {
         Action::EditorYankPop,
         Action::EditorUndo,
         Action::EditorRedo,
+    ];
+
+    /// Application shortcuts the composer reports before ordinary editing, in priority order.
+    /// A chord they share with an editing action is shadowed while the composer has focus.
+    pub const COMPOSER_APP: [Action; 20] = [
+        Action::CommandPalette,
+        Action::ModelSelect,
+        Action::ModelRoles,
+        Action::ModelFavoriteNext,
+        Action::ProviderSetup,
+        Action::Settings,
+        Action::ToolsExpand,
+        Action::ToolsToggle,
+        Action::ThinkingToggle,
+        Action::StatusExpand,
+        Action::StatusFocus,
+        Action::WorkTab,
+        Action::ApprovalCycle,
+        Action::DisplayReset,
+        Action::EditExternal,
+        Action::PasteImage,
+        Action::VoiceInput,
+        Action::SubagentsRecent,
+        Action::RateGood,
+        Action::RateBad,
     ];
 
     pub fn id(self) -> &'static str {
@@ -391,7 +420,8 @@ impl Action {
             Action::HistorySearch => &["Ctrl+R"],
             Action::EditExternal => &["Ctrl+G"],
             Action::DisplayReset => &["Ctrl+L", "Alt+L"],
-            Action::CommandPalette => &["Ctrl+P", "Alt+K"],
+            // Ctrl+P is list/history navigation (with Ctrl+N), so the palette uses chords of its own.
+            Action::CommandPalette => &["Alt+K", "F1"],
             // Function keys back up Option chords, which macOS terminals often turn into symbols.
             Action::ModelSelect if cfg!(target_os = "macos") => &["Ctrl+K", "Alt+M", "F2"],
             Action::ModelSelect => &["Alt+M", "F2"],
@@ -525,6 +555,43 @@ impl Chord {
         }
         code.map(|code| Chord { code, mods })
             .ok_or_else(|| format!("chord {text:?} names no key"))
+    }
+
+    /// The chord a pressed key would be written as, for recording a binding. `None` for keys that
+    /// cannot be written back as a chord (modifier-only, media keys, Insert, …).
+    pub fn from_key(key: &KeyEvent) -> Option<Chord> {
+        let mut mods =
+            key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let code = match key.code {
+            KeyCode::BackTab => {
+                mods |= KeyModifiers::SHIFT;
+                KeyCode::Tab
+            }
+            KeyCode::Char(c) if c.is_ascii_alphabetic() => KeyCode::Char(c.to_ascii_lowercase()),
+            // A plain symbol already includes its Shift (`?`, not `Shift+/`).
+            KeyCode::Char(c) => {
+                if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                    mods -= KeyModifiers::SHIFT;
+                }
+                KeyCode::Char(c)
+            }
+            other => other,
+        };
+        let chord = Chord { code, mods };
+        (Chord::parse(&chord.config_name()).ok() == Some(chord)).then_some(chord)
+    }
+
+    /// Whether a terminal can only report this chord with the kitty keyboard protocol. Legacy
+    /// terminals send Shift+Enter and Ctrl+Enter as plain Enter, and drop Shift/Ctrl from several keys.
+    pub fn needs_enhancement(&self) -> bool {
+        let ctrl = self.mods.contains(KeyModifiers::CONTROL);
+        let shift = self.mods.contains(KeyModifiers::SHIFT);
+        match self.code {
+            KeyCode::Enter | KeyCode::Backspace | KeyCode::Esc => ctrl || shift,
+            KeyCode::Char(c) if ctrl && shift => c.is_ascii_alphabetic() || c == ' ',
+            KeyCode::Char(',' | '.' | ';' | '\'' | '=' | '/') => ctrl,
+            _ => false,
+        }
     }
 
     pub fn matches(&self, key: &KeyEvent) -> bool {
@@ -1035,6 +1102,36 @@ impl Keymap {
             .map(Chord::display)
             .unwrap_or_default()
     }
+
+    /// Like [`Keymap::label`], but skips chords the terminal cannot report: without the kitty
+    /// keyboard protocol `Shift+Enter` arrives as Enter, so the newline hint names `Ctrl+J`.
+    pub fn reachable_label(&self, action: Action, enhanced: bool) -> String {
+        self.chords(action)
+            .iter()
+            .find(|chord| enhanced || !chord.needs_enhancement())
+            .map(Chord::display)
+            .unwrap_or_default()
+    }
+
+    /// Chords of an editing action that a composer shortcut takes first, with that shortcut.
+    /// Shown in `/hotkeys` and the shortcut editor so a shadowed key is never a mystery.
+    pub fn shadowed(&self, action: Action) -> Vec<(Chord, Action)> {
+        if action.group() != "Editor" {
+            return Vec::new();
+        }
+        self.chords(action)
+            .iter()
+            .filter_map(|chord| {
+                let key = KeyEvent::new(chord.code, chord.mods);
+                Action::COMPOSER_APP
+                    .iter()
+                    .chain(&[Action::SubagentsHub, Action::HistorySearch])
+                    .copied()
+                    .find(|app| self.triggers(*app, &key))
+                    .map(|app| (*chord, app))
+            })
+            .collect()
+    }
     /// All chords joined for help text (`"Ctrl+, / Ctrl+4"`).
     pub fn labels(&self, action: Action) -> String {
         self.chords(action)
@@ -1056,7 +1153,15 @@ impl Keymap {
                 keys: if self.chords(*a).is_empty() {
                     "unbound".into()
                 } else {
-                    self.labels(*a)
+                    let mut keys = self.labels(*a);
+                    for (chord, by) in self.shadowed(*a) {
+                        keys.push_str(&format!(
+                            " ({} in the composer: {})",
+                            chord.display(),
+                            by.describe()
+                        ));
+                    }
+                    keys
                 },
             })
             .collect()

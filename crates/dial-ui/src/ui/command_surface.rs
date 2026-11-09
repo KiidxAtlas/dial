@@ -97,7 +97,7 @@ impl Category {
             Category::Session => "Sessions",
             Category::Model => "Models",
             Category::Review => "Changes & review",
-            Category::Work => "Tasks & agents",
+            Category::Work => "Tasks & workers",
             Category::Modes => "Modes",
             Category::Context => "Context & memory",
             Category::Integrations => "Integrations",

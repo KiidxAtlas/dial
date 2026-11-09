@@ -9,7 +9,10 @@ use ratatui::{
 };
 
 use super::{
-    Rows, chrome, text,
+    Rows, chrome,
+    keys::{Action as Key, Keymap},
+    overlay::settings::scroll_cell,
+    text,
     theme::{Sym, Theme, Tok},
 };
 use crate::storage::session::SessionInfo;
@@ -74,6 +77,10 @@ pub struct Picker {
     selected: usize,
     found: Vec<usize>,
     searchable: Vec<String>,
+    /// List movement, confirm and cancel follow the user's keymap.
+    keys: Keymap,
+    /// F1 shows the key sheet instead of the list.
+    help: bool,
 }
 
 impl Picker {
@@ -119,6 +126,8 @@ impl Picker {
             selected: 0,
             found: Vec::new(),
             searchable,
+            keys: Keymap::defaults(),
+            help: false,
         };
         if !tree {
             picker.order_pins_first();
@@ -132,6 +141,17 @@ impl Picker {
         self.all_projects = all_projects;
         self.total = total.max(self.sessions.len());
         self
+    }
+
+    /// Uses the user's keymap for list movement, confirm and cancel.
+    pub fn with_keys(mut self, keys: &Keymap) -> Self {
+        self.keys = keys.clone();
+        self
+    }
+
+    /// The keymap the picker follows, carried over when the controller rebuilds it.
+    pub fn keys(&self) -> &Keymap {
+        &self.keys
     }
 
     /// Sessions another dial process holds open. They stay listed but cannot be resumed.
@@ -303,24 +323,60 @@ impl Picker {
         let page = self.page_size(height);
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
+                // F1 toggles the key sheet; while it shows, Esc or Enter closes it too.
+                if key.code == KeyCode::F(1)
+                    || (self.help && matches!(key.code, KeyCode::Esc | KeyCode::Enter))
+                {
+                    self.help = !self.help;
+                    return Action::None;
+                }
+                if self.help {
+                    return Action::None;
+                }
                 if self.rename.is_some() {
                     return self.handle_rename(key);
                 }
                 self.notice = None;
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 let selected = self.found.get(self.selected).copied();
-                match key.code {
-                    // Esc clears a query first; a second press on the empty search closes.
-                    KeyCode::Esc => {
-                        if self.query.is_empty() {
-                            return Action::Cancel;
-                        }
-                        self.query.clear();
-                        self.refilter_keeping_selection();
+                let keys = &self.keys;
+                let last = self.found.len().saturating_sub(1);
+                // Cancel clears a query first; a second press on the empty search closes.
+                if keys.matches(Key::SelectCancel, key) || key.code == KeyCode::Esc {
+                    if self.query.is_empty() {
+                        return Action::Cancel;
                     }
+                    self.query.clear();
+                    self.refilter_keeping_selection();
+                    return Action::None;
+                }
+                if keys.matches(Key::SelectUp, key) {
+                    self.selected = self.selected.saturating_sub(1);
+                    return Action::None;
+                }
+                if keys.matches(Key::SelectDown, key) {
+                    self.selected = (self.selected + 1).min(last);
+                    return Action::None;
+                }
+                if keys.matches(Key::SelectPageUp, key) {
+                    self.selected = self.selected.saturating_sub(page);
+                    return Action::None;
+                }
+                if keys.matches(Key::SelectPageDown, key) {
+                    self.selected = (self.selected + page).min(last);
+                    return Action::None;
+                }
+                if keys.matches(Key::SelectConfirm, key) || key.code == KeyCode::Enter {
+                    if let Some(index) = self.gated(selected, Need::Resume) {
+                        return Action::Resume(index);
+                    }
+                    return Action::None;
+                }
+                match key.code {
                     KeyCode::Char('c') if ctrl => return Action::Cancel,
                     KeyCode::Char('t') if ctrl => return Action::ThisSession,
-                    KeyCode::Char('p') if ctrl => {
+                    // Pin is Ctrl+B: Ctrl+P and Ctrl+N move the selection.
+                    KeyCode::Char('b') if ctrl => {
                         if let Some(index) = self.gated(selected, Need::Pin) {
                             return Action::Pin(index);
                         }
@@ -354,22 +410,8 @@ impl Picker {
                         self.show_empty = !self.show_empty;
                         self.refilter(id.as_deref());
                     }
-                    KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-                    KeyCode::Down => {
-                        self.selected = (self.selected + 1).min(self.found.len().saturating_sub(1))
-                    }
-                    KeyCode::PageUp => self.selected = self.selected.saturating_sub(page),
-                    KeyCode::PageDown => {
-                        self.selected =
-                            (self.selected + page).min(self.found.len().saturating_sub(1))
-                    }
                     KeyCode::Home => self.selected = 0,
-                    KeyCode::End => self.selected = self.found.len().saturating_sub(1),
-                    KeyCode::Enter => {
-                        if let Some(index) = self.gated(selected, Need::Resume) {
-                            return Action::Resume(index);
-                        }
-                    }
+                    KeyCode::End => self.selected = last,
                     KeyCode::Char('u') if ctrl => {
                         self.query.clear();
                         self.refilter_keeping_selection();
@@ -483,6 +525,45 @@ impl Picker {
     }
 
     pub fn rows(&self, cols: usize, height: usize, theme: &Theme) -> Rows {
+        if self.help && height >= 5 && cols >= 12 {
+            let groups = [crate::ui::overlay::panel_keys::SheetGroup {
+                title: "Keys",
+                rows: vec![
+                    (
+                        "Up/Down".into(),
+                        "move (the list keys follow your keymap)".into(),
+                    ),
+                    ("PgUp/PgDn".into(), "move a page".into()),
+                    ("Enter".into(), "resume the session".into()),
+                    ("Ctrl+B".into(), "pin or unpin".into()),
+                    ("Ctrl+R".into(), "rename".into()),
+                    ("Ctrl+F".into(), "fork".into()),
+                    ("Ctrl+D".into(), "delete".into()),
+                    ("Ctrl+G".into(), "this project / all projects".into()),
+                    ("Ctrl+A".into(), "load every session".into()),
+                    ("Tab".into(), "show or hide empty sessions".into()),
+                    ("Ctrl+T".into(), "browse this session".into()),
+                    ("Ctrl+U".into(), "clear the search".into()),
+                    ("F1".into(), "show or hide these keys".into()),
+                    ("Esc".into(), "clear the search, then close".into()),
+                ],
+            }];
+            let sheet = crate::ui::overlay::panel_keys::sheet(
+                theme,
+                &groups,
+                "",
+                "F1/Esc",
+                cols.saturating_sub(4),
+            );
+            return chrome::framed_lines(
+                theme,
+                chrome::Section::Dial,
+                "Resume · keys",
+                "",
+                sheet,
+                cols,
+            );
+        }
         if height == 0 || cols == 0 {
             return Vec::new();
         }
@@ -602,13 +683,33 @@ impl Picker {
             .position(|unit| *unit == Unit::Item(self.selected))
             .unwrap_or(0);
         let start = selected_unit.saturating_sub(visible.saturating_sub(1));
-        for unit in units.iter().skip(start).take(visible) {
+        // A list longer than the window gets the shared scroll indicator in its last column.
+        let overflow = units.len() > visible;
+        let row_w = if overflow {
+            width.saturating_sub(1)
+        } else {
+            width
+        };
+        for (row, unit) in units.iter().skip(start).take(visible).enumerate() {
+            let first = body.len();
             match unit {
                 Unit::Header(group) => body.push(Line::from(Span::styled(
-                    clip(group),
+                    text::ellipsize(group, row_w, theme.ascii()),
                     theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
                 ))),
-                Unit::Item(position) => self.item_rows(*position, width, compact, theme, &mut body),
+                Unit::Item(position) => self.item_rows(*position, row_w, compact, theme, &mut body),
+            }
+            if overflow {
+                for (n, line) in body[first..].iter_mut().enumerate() {
+                    let used: usize = line.spans.iter().map(|s| text::width(&s.content)).sum();
+                    line.spans
+                        .push(Span::raw(" ".repeat(row_w.saturating_sub(used))));
+                    line.spans.push(if n == 0 {
+                        scroll_cell(theme, row, visible, units.len(), start)
+                    } else {
+                        Span::raw(" ")
+                    });
+                }
             }
         }
         if !compact && let Some(&index) = self.found.get(self.selected) {
@@ -701,12 +802,11 @@ impl Picker {
             "clear search"
         };
         if self.rename.is_some() {
-            body.extend(hint_line(
+            body.push(chrome::hint_line_after(
                 theme,
                 "",
                 &[("Enter", "save title"), ("Esc", "cancel rename")],
                 width,
-                true,
             ));
         } else if self.found.is_empty() {
             let mut hints = Vec::new();
@@ -718,14 +818,13 @@ impl Picker {
             }
             hints.push(("Ctrl+G", other_scope));
             hints.push(("Esc", esc));
-            body.extend(hint_line(theme, "", &hints, width, true));
+            body.push(chrome::hint_line_after(theme, "", &hints, width));
         } else if compact {
-            body.extend(hint_line(
+            body.push(chrome::hint_line_after(
                 theme,
                 &position,
-                &[("Enter", "resume"), ("Ctrl+P", "pin"), ("Esc", esc)],
+                &[("Enter", "resume"), ("Ctrl+B", "pin"), ("Esc", esc)],
                 width,
-                true,
             ));
         } else {
             let arrows = if theme.ascii() { "Up/Down" } else { "↑↓" };
@@ -734,13 +833,13 @@ impl Picker {
                 primary.push(("Ctrl+A", "load all"));
             }
             primary.push(("Esc", esc));
-            body.extend(hint_line(theme, &position, &primary, width, true));
+            body.push(chrome::hint_line_after(theme, &position, &primary, width));
             // Secondary actions, offered only when they can run on the highlighted session.
             let selected = self.found.get(self.selected).copied();
             let allowed = |need| selected.is_some_and(|index| self.blocked(index, need).is_none());
             let pinned =
                 selected.is_some_and(|index| self.pinned.contains(&self.sessions[index].id));
-            let mut secondary = vec![("Ctrl+P", if pinned { "unpin" } else { "pin" })];
+            let mut secondary = vec![("Ctrl+B", if pinned { "unpin" } else { "pin" })];
             if allowed(Need::Rename) {
                 secondary.push(("Ctrl+R", "rename"));
             }
@@ -755,7 +854,8 @@ impl Picker {
             if !self.query.is_empty() {
                 secondary.push(("Ctrl+U", "clear search"));
             }
-            body.extend(hint_line(theme, "", &secondary, width, false));
+            secondary.push(("F1", "keys"));
+            body.push(chrome::hint_line_after(theme, "", &secondary, width));
         }
         let rows = if wide {
             let pane = self.pane(pane_width, theme);
@@ -783,7 +883,7 @@ impl Picker {
         chrome::framed_lines(
             theme,
             chrome::Section::Dial,
-            if self.tree { "Session tree" } else { "Resume" },
+            if self.tree { "Session forks" } else { "Resume" },
             &extra,
             rows,
             cols,
@@ -855,33 +955,17 @@ impl Picker {
         let title = text::ellipsize(&title, room, theme.ascii());
         let gap =
             width.saturating_sub(text::width(&title) + text::width(&flags) + text::width(&age) + 2);
-        let fill = if selected {
-            theme.bg(Tok::SelectedBg)
+        let spans = vec![
+            Span::styled(format!("{marker} {flags}"), theme.fg(Tok::Accent)),
+            Span::styled(title, theme.fg(Tok::Text)),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(age, theme.fg(Tok::Muted)),
+        ];
+        body.push(if selected {
+            chrome::selected_row(theme, spans, width)
         } else {
-            Default::default()
-        };
-        body.push(
-            Line::from(vec![
-                Span::styled(
-                    format!("{marker} {flags}"),
-                    theme.fg(Tok::Accent).patch(fill),
-                ),
-                Span::styled(
-                    title,
-                    theme
-                        .fg(if selected { Tok::Accent } else { Tok::Text })
-                        .add_modifier(if selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        })
-                        .patch(fill),
-                ),
-                Span::styled(" ".repeat(gap), fill),
-                Span::styled(age, theme.fg(Tok::Muted).patch(fill)),
-            ])
-            .style(fill),
-        );
+            Line::from(spans)
+        });
         if !compact {
             let preview = if !s.last_message.trim().is_empty() {
                 &s.last_message
@@ -965,49 +1049,6 @@ impl Picker {
 /// Whether the preview pane has room beside the list.
 fn wide(cols: usize, height: usize) -> bool {
     cols >= PREVIEW_MIN_COLS && height >= PREVIEW_MIN_ROWS
-}
-
-/// Key hints on one row of `width` cells after an optional `lead` (the list position). Hints that
-/// do not fit are dropped whole rather than cut mid-word: from the one before the last when
-/// `keep_last` (the way out stays visible), otherwise from the end. `None` when nothing fits.
-fn hint_line(
-    theme: &Theme,
-    lead: &str,
-    hints: &[(&str, &str)],
-    width: usize,
-    keep_last: bool,
-) -> Option<Line<'static>> {
-    let sep = if theme.ascii() { " | " } else { " · " };
-    let cells = |keep: &[(&str, &str)]| {
-        let parts = keep.len() + usize::from(!lead.is_empty());
-        text::width(lead)
-            + keep
-                .iter()
-                .map(|(key, label)| text::width(key) + 1 + text::width(label))
-                .sum::<usize>()
-            + text::width(sep) * parts.saturating_sub(1)
-    };
-    let mut keep = hints.to_vec();
-    while !keep.is_empty() && cells(&keep) > width {
-        let at = if keep_last && keep.len() > 1 {
-            keep.len() - 2
-        } else {
-            keep.len() - 1
-        };
-        keep.remove(at);
-    }
-    if keep.is_empty() && lead.is_empty() {
-        return None;
-    }
-    let mut spans = Vec::new();
-    if !lead.is_empty() {
-        spans.push(Span::styled(lead.to_owned(), theme.fg(Tok::Muted)));
-        if !keep.is_empty() {
-            spans.push(Span::styled(sep, theme.fg(Tok::Dim)));
-        }
-    }
-    spans.extend(chrome::key_hint_spans(theme, &keep));
-    Some(Line::from(spans))
 }
 
 /// Joins a list row with the matching preview row, keeping a separator column in every row.

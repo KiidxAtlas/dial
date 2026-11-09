@@ -7,7 +7,10 @@
 //! [`OverlayEvent::Action`] strings ([`PeerAction::encode`]); the panel never touches the registry.
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{Axis, arrows, editor_spans, filled, hint, hint_line, panel, pressed, typed_char},
+    settings::{
+        Axis, arrows, editor_spans, filled, fit, hint, hint_line, list_row, panel, pressed,
+        scroll_cell, typed_char,
+    },
 };
 use crate::ui::{
     chrome::Section,
@@ -107,6 +110,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 }
 
 pub struct PeersOverlay {
+    panel_keys: super::panel_keys::PanelKeys,
     view: PeersView,
     cursor: usize,
     /// The message being typed to the selected peer.
@@ -122,6 +126,7 @@ const REFRESH_EVERY: Duration = Duration::from_secs(2);
 impl PeersOverlay {
     pub fn new(view: PeersView) -> Self {
         Self {
+            panel_keys: Default::default(),
             view,
             cursor: 0,
             compose: None,
@@ -176,6 +181,9 @@ impl PeersOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        if self.panel_keys.handle_key(event, self.compose.is_some()) {
+            return OverlayEvent::None;
+        }
         if self.compose.is_some() {
             return self.handle_compose(event, keys);
         }
@@ -249,6 +257,9 @@ impl PeersOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
+        if self.panel_keys.draw(frame, ctx, "Project peers", "Enter writes a message to the selected session; it reaches that session's model at its next request.\nClaims show which files each session is working on; overlapping claims are marked.", false, false) {
+            return;
+        }
         let dot = ctx.theme.sym(Sym::Dot);
         let overlapping = self
             .view
@@ -315,7 +326,25 @@ impl PeersOverlay {
         let footer = 1 + usize::from(self.compose.is_some()) + usize::from(self.message.is_some());
         let room = h.saturating_sub(footer);
         let offset = selected.1.saturating_sub(room).min(selected.0);
-        let mut out: Vec<Line<'static>> = lines.into_iter().skip(offset).take(room).collect();
+        let total = lines.len();
+        let mut out: Vec<Line<'static>> = lines
+            .into_iter()
+            .skip(offset)
+            .take(room)
+            .enumerate()
+            .map(|(row, mut line)| {
+                if total > room {
+                    line.spans = fit(line.spans, w.saturating_sub(1));
+                    let used: usize = line.spans.iter().map(|s| text::width(&s.content)).sum();
+                    line.spans.push(Span::raw(
+                        " ".repeat(w.saturating_sub(1).saturating_sub(used)),
+                    ));
+                    line.spans
+                        .push(scroll_cell(theme, row, room, total, offset));
+                }
+                line
+            })
+            .collect();
         while out.len() < room {
             out.push(Line::default());
         }
@@ -397,11 +426,6 @@ fn session_lines(
 ) -> Vec<Line<'static>> {
     let ascii = theme.ascii();
     let is_selected = selected == Some(true);
-    let fill = if is_selected {
-        theme.bg(Tok::SelectedBg).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
     let working = row.phase == "working";
     let (dot, tok) = if working {
         (theme.sym(Sym::Working), Tok::Success)
@@ -420,30 +444,27 @@ fn session_lines(
         phase
     };
     let head = [
-        Span::styled(format!(" {pointer} "), theme.fg(Tok::Accent).patch(fill)),
-        Span::styled(format!("{dot} "), theme.fg(tok).patch(fill)),
-        Span::styled(
-            text::pad(short(&row.id), 10),
-            theme.fg(Tok::Text).patch(fill),
-        ),
+        Span::styled(format!(" {pointer} "), theme.fg(Tok::Accent)),
+        Span::styled(format!("{dot} "), theme.fg(tok)),
+        Span::styled(text::pad(short(&row.id), 10), theme.fg(Tok::Text)),
         Span::styled(
             text::pad(&text::ellipsize(&phase, 9, ascii), 10),
-            theme.fg(tok).patch(fill),
+            theme.fg(tok),
         ),
     ];
     let used: usize = head.iter().map(|span| text::width(&span.content)).sum();
     let summary = text::one_line(&row.summary);
     let summary = if summary.trim().is_empty() {
-        Span::styled("no task summary", theme.fg(Tok::Dim).patch(fill))
+        Span::styled("no task summary", theme.fg(Tok::Dim))
     } else {
         Span::styled(
             text::ellipsize(&summary, w.saturating_sub(used), ascii),
-            theme.fg(Tok::Muted).patch(fill),
+            theme.fg(Tok::Muted),
         )
     };
     let mut spans = head.to_vec();
     spans.push(summary);
-    let mut out = vec![filled(spans, w, fill)];
+    let mut out = vec![list_row(theme, spans, w, is_selected)];
     out.extend(claim_lines(theme, &row.claims, w));
     out
 }

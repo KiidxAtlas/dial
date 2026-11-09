@@ -781,3 +781,24 @@ fn todo_tabs_preserve_plan_selection_and_never_execute_progress() {
         matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/todo show 2")
     );
 }
+
+#[test]
+fn palette_search_and_arguments_follow_remapped_editing_keys() {
+    let mut keys = Keymap::defaults();
+    keys.rebind(Action::EditorDeleteToLineStart, &["F7"])
+        .unwrap();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    palette.handle(&Event::Paste("foo bar".into()), &keys);
+    palette.handle(
+        &Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        &keys,
+    );
+    assert_eq!(palette.search.text, "foo bar", "old chord is unbound");
+    palette.handle(&plain(KeyCode::F(7)), &keys);
+    assert_eq!(palette.search.text, "");
+
+    palette.arguments = Some((0, Editor::default()));
+    palette.handle(&Event::Paste("some args".into()), &keys);
+    palette.handle(&plain(KeyCode::F(7)), &keys);
+    assert_eq!(palette.arguments.as_ref().unwrap().1.text, "");
+}

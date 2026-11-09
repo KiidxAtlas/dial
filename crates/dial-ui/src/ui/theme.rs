@@ -395,6 +395,28 @@ symbols!(
     IconTools,
     IconReasoning,
     IconEmbedding,
+    // shared state marks, trees, chips and prose blocks
+    Interrupted,
+    Pending,
+    Blocked,
+    TreeBranch,
+    TreeLast,
+    TreeStem,
+    Hook,
+    ChipOpen,
+    ChipClose,
+    CodeBar,
+    Reasoning,
+    ListBullet,
+    TaskDone,
+    TaskOpen,
+    Minus,
+    // agent-to-agent message lane
+    Envelope,
+    ArrowRight,
+    ArrowLeft,
+    QuoteBar,
+    Dash,
 );
 
 /// Which glyph set is active (after `auto` has been resolved).
@@ -869,6 +891,32 @@ pub fn detect_color_mode(env: &dyn Fn(&str) -> Option<String>) -> ColorMode {
     ColorMode::Ansi16
 }
 
+/// The glyph set `symbols: auto` resolves to, from an environment snapshot. A terminal that cannot
+/// show Unicode gets ASCII whatever the theme prefers: `TERM` is `dumb` or `linux` (the Linux
+/// console), or the effective locale (`LC_ALL`, then `LC_CTYPE`, then `LANG`, the first one set and
+/// non-empty) is not UTF-8. With no locale set at all the encoding is unknown and Unicode is kept.
+/// Otherwise the theme's preference wins, then `DIAL_NERD_FONT`, then Unicode.
+pub fn auto_glyphs(env: &dyn Fn(&str) -> Option<String>, preferred: Option<Glyphs>) -> Glyphs {
+    let term = env("TERM").unwrap_or_default();
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|key| env(key).filter(|v| !v.is_empty()));
+    let utf8 = locale.is_none_or(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains("utf-8") || value.contains("utf8")
+    });
+    if matches!(term.as_str(), "dumb" | "linux") || !utf8 {
+        return Glyphs::Ascii;
+    }
+    preferred.unwrap_or_else(|| {
+        if env("DIAL_NERD_FONT").is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes")) {
+            Glyphs::Nerd
+        } else {
+            Glyphs::Unicode
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------------------------
 // JSON themes
 
@@ -1304,15 +1352,7 @@ impl ThemeManager {
             SymbolPreset::Nerd => Glyphs::Nerd,
             SymbolPreset::Unicode => Glyphs::Unicode,
             SymbolPreset::Ascii => Glyphs::Ascii,
-            SymbolPreset::Auto => theme.preferred_glyphs.unwrap_or_else(|| {
-                if (self.env)("DIAL_NERD_FONT")
-                    .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-                {
-                    Glyphs::Nerd
-                } else {
-                    Glyphs::Unicode
-                }
-            }),
+            SymbolPreset::Auto => auto_glyphs(&*self.env, theme.preferred_glyphs),
         };
         let mut theme = theme.with_glyphs(glyphs);
         if cfg.color_blind {
@@ -1581,6 +1621,46 @@ fn symbol(glyphs: Glyphs, s: Sym) -> &'static str {
             IconCommand | IconSkill | IconSettings | IconProvider | IconLocal | IconKeyboard
             | IconTab | IconFile,
         ) => "",
+        (Ascii, Interrupted) => "-",
+        (_, Interrupted) => "⊘",
+        (Ascii, Pending) => "o",
+        (_, Pending) => "○",
+        (Ascii, Blocked) => "#",
+        (_, Blocked) => "■",
+        (Ascii, TreeBranch) => "|-",
+        (_, TreeBranch) => "├─",
+        (Ascii, TreeLast) => "`-",
+        (_, TreeLast) => "└─",
+        (Ascii, TreeStem) => "|",
+        (_, TreeStem) => "│",
+        (Ascii, Hook) => "`",
+        (_, Hook) => "└",
+        (Ascii, ChipOpen) => "[",
+        (_, ChipOpen) => "⟦",
+        (Ascii, ChipClose) => "]",
+        (_, ChipClose) => "⟧",
+        (Ascii, CodeBar) => "|",
+        (_, CodeBar) => "│",
+        (Ascii, Reasoning) => "~",
+        (_, Reasoning) => "◇",
+        (Ascii, ListBullet) => "-",
+        (_, ListBullet) => "•",
+        (Ascii, TaskDone) => "[x]",
+        (_, TaskDone) => "☑",
+        (Ascii, TaskOpen) => "[ ]",
+        (_, TaskOpen) => "☐",
+        (Ascii, Minus) => "-",
+        (_, Minus) => "−",
+        (Ascii, Envelope) => "@",
+        (_, Envelope) => "✉",
+        (Ascii, ArrowRight) => "->",
+        (_, ArrowRight) => "➤",
+        (Ascii, ArrowLeft) => "<-",
+        (_, ArrowLeft) => "⟵",
+        (Ascii, QuoteBar) => "|",
+        (_, QuoteBar) => "▏",
+        (Ascii, Dash) => "-",
+        (_, Dash) => "—",
     }
 }
 

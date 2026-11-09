@@ -259,4 +259,9 @@ impl RetryNotice {
             delay,
         })
     }
+
+    /// The one line that closes a retry explanation once the request finally succeeds.
+    pub(super) fn recovered_text(attempt: u32) -> String {
+        format!("The model request succeeded on attempt {attempt}; the turn continues.")
+    }
 }

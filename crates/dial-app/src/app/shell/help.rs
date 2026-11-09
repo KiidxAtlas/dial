@@ -257,8 +257,13 @@ impl Shell {
         }
         if !folded.is_empty() {
             lines.push(String::new());
+            let search = if palette.is_empty() {
+                String::new()
+            } else {
+                format!(" {palette} searches everything.")
+            };
             lines.push(format!(
-                "More commands in {}. /help all lists them; Ctrl+P searches everything.",
+                "More commands in {}. /help all lists them;{search}",
                 folded.join(" and ")
             ));
         }

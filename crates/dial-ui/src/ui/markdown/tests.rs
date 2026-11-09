@@ -218,7 +218,7 @@ fn links_show_dim_url_unless_it_is_the_text() {
 fn fenced_code_has_a_gutter_and_plain_language_label() {
     let rows = md("```rust\nlet x = 1;\n```", 20);
     let text = plain(&rows);
-    let bar = theme().sym(Sym::Quote).to_owned();
+    let bar = theme().sym(Sym::CodeBar).to_owned();
     assert_eq!(text, [format!("{bar} RUST"), format!("{bar} let x = 1;")]);
     assert!(
         rows.iter()
@@ -232,7 +232,7 @@ fn code_lines_wrap_inside_the_gutter() {
     let rows = md("    aaaaaaaaaaaaaaaaaaaa", 12);
     assert_fits(&rows, 12);
     let text = plain(&rows);
-    let bar = theme().sym(Sym::Quote).to_owned();
+    let bar = theme().sym(Sym::CodeBar).to_owned();
     assert!(text.len() >= 2, "{text:?}");
     assert!(text.iter().all(|l| l.starts_with(bar.as_str())), "{text:?}");
 }
@@ -273,7 +273,7 @@ fn lists_nest_with_hanging_indents() {
     );
     assert_fits(&rows, 16);
     let text = plain(&rows);
-    let bullet = theme().sym(Sym::Bullet).to_owned();
+    let bullet = theme().sym(Sym::ListBullet).to_owned();
     assert!(text[0].starts_with(&format!("{bullet} alpha")), "{text:?}");
     assert!(
         text[1].starts_with("  gamma"),
@@ -296,8 +296,13 @@ fn ordered_lists_keep_their_numbers() {
 #[test]
 fn task_lists_show_checkboxes() {
     let rows = md("- [x] done\n- [ ] todo", 30);
-    assert_eq!(plain(&rows), ["[x] done", "[ ] todo"]);
-    assert_eq!(style_of(&rows, "[x]").fg, theme().fg(Tok::Success).fg);
+    let theme = theme();
+    let (done, open) = (theme.sym(Sym::TaskDone), theme.sym(Sym::TaskOpen));
+    assert_eq!(
+        plain(&rows),
+        [format!("{done} done"), format!("{open} todo")]
+    );
+    assert_eq!(style_of(&rows, done).fg, theme.fg(Tok::Success).fg);
 }
 
 #[test]
@@ -583,6 +588,6 @@ fn ascii_mode_frames_diagrams_with_ascii_glyphs() {
 #[test]
 fn other_fences_keep_their_language_label_with_extra_info() {
     let text = plain(&md("```rust,ignore title\nlet x = 1;\n```", 30));
-    let bar = theme().sym(Sym::Quote).to_owned();
+    let bar = theme().sym(Sym::CodeBar).to_owned();
     assert_eq!(text[0], format!("{bar} RUST"));
 }

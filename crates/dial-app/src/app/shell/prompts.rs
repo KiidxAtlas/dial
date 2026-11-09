@@ -2,11 +2,14 @@
 //!
 //! A question has two focus states. Choices own the keyboard: letters are hotkeys and Enter
 //! answers. The composer draft owns the keyboard while it has focus, so typing never approves
-//! anything. A non-empty draft starts with focus, and Tab hands focus between the two.
+//! anything. A non-empty draft starts with focus, and Tab hands focus between the two in every
+//! prompt. Answers typed before a prompt was visible never answer it: keys already queued are
+//! parked, and Enter/hotkeys are ignored for [`TYPE_AHEAD_GUARD`] after the prompt first paints.
+//! Esc cancels the prompt (an approval is denied); the stop key also stops the running turn.
 
 use crate::app::panel::{
-    PanelView, RECOVERY_PANEL, panel_body_limit, panel_has_room, panel_inner, panel_rows_window,
-    panel_scroll,
+    PanelView, RECOVERY_PANEL, panel_body_limit, panel_body_lines, panel_has_room, panel_inner,
+    panel_rows_window, panel_scroll,
 };
 use crate::app::shell::{Shell, TICK};
 use crate::ui::composer::ComposerEvent;
@@ -14,6 +17,49 @@ use crate::ui::input::{poll, read};
 use crate::ui::keys::Action;
 use crate::ui::text;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::time::{Duration, Instant};
+
+/// How long after a prompt first paints Enter and answer hotkeys are ignored, so keys typed for
+/// the composer just before the prompt appeared cannot answer it.
+pub(in crate::app) const TYPE_AHEAD_GUARD: Duration = Duration::from_millis(350);
+
+/// Type-ahead protection shared by every in-turn prompt (choices, questions dialog, ask_user).
+#[derive(Default)]
+pub(in crate::app) struct TypeAhead {
+    shown: Option<Instant>,
+}
+
+impl TypeAhead {
+    /// Record the first paint; later paints keep the original time.
+    pub(in crate::app) fn painted(&mut self, now: Instant) {
+        self.shown.get_or_insert(now);
+    }
+
+    /// Whether `key` would answer the prompt and arrived too soon after it became visible.
+    /// Navigation, paging, focus changes and cancellation are never blocked.
+    pub(in crate::app) fn blocks(&self, key: &KeyEvent, now: Instant) -> bool {
+        let answers = match key.code {
+            KeyCode::Enter => true,
+            KeyCode::Char(_) => !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+            _ => false,
+        };
+        answers
+            && self
+                .shown
+                .is_none_or(|shown| now.saturating_duration_since(shown) < TYPE_AHEAD_GUARD)
+    }
+}
+
+/// The key that stops the running turn from inside a prompt. Esc stays "cancel this prompt"
+/// even when the interrupt is rebound to it.
+pub(in crate::app) fn stop_key(keys: &crate::ui::keys::Keymap, key: &KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release
+        && key.code != KeyCode::Esc
+        && ((key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            || keys.matches(Action::Interrupt, key))
+}
 
 /// Where keystrokes go while a question is open.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -210,12 +256,16 @@ impl Shell {
         }
     }
 
-    /// Keys typed before a question appeared are parked for the main loop, so they cannot answer
-    /// the question. The composer keeps any draft text it already holds.
-    pub(in crate::app) fn park_pending_input(&mut self) {
+    /// Keys typed before a question appeared must not answer it. Text keeps editing the draft;
+    /// the stop key is reported (`true`) so the caller can stop the turn at once; anything else
+    /// (Enter, shortcuts, navigation) is dropped rather than replayed after the prompt, where it
+    /// could submit a new turn.
+    pub(in crate::app) fn park_pending_input(&mut self) -> bool {
+        let mut stop = false;
         while matches!(poll(std::time::Duration::ZERO), Ok(true)) {
             match read() {
                 Ok(Event::Paste(text)) => self.composer_paste(&text),
+                Ok(Event::Key(key)) if stop_key(&self.keys, &key) => stop = true,
                 Ok(Event::Key(key))
                     if key.kind != KeyEventKind::Release
                         && (key.modifiers - KeyModifiers::SHIFT).is_empty()
@@ -232,10 +282,12 @@ impl Shell {
                 {
                     self.draft_key(key);
                 }
-                Ok(event) => self.held.push_back(event),
+                Ok(Event::Resize(..)) => self.term.on_resize(),
+                Ok(_) => {}
                 Err(_) => break,
             }
         }
+        stop
     }
 
     /// A modal choice drawn in place of the composer. `None` means the user cancelled.
@@ -280,7 +332,13 @@ impl Shell {
         if options.is_empty() {
             return None;
         }
-        self.park_pending_input();
+        if self.park_pending_input() {
+            // The stop key was pressed before the prompt appeared: stop, never answer.
+            if let Some(flag) = cancel {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+            return None;
+        }
         // The terminal tab shows that Dial waits for an answer while the panel is up.
         let was_waiting = std::mem::replace(&mut self.awaiting_user, true);
         let answer = self.ask_loop(title, body, options, cancel, selected);
@@ -300,6 +358,14 @@ impl Shell {
         let mut selected = selected.min(options.len().saturating_sub(1));
         let mut show_raw = false;
         let mut focus = self.initial_focus();
+        let mut guard = TypeAhead::default();
+        // Ctrl+C (the stop key) denies like Esc and also stops the running turn.
+        let stop = |flag: Option<&std::sync::atomic::AtomicBool>| {
+            if let Some(flag) = flag {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+            None
+        };
         loop {
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
                 return None;
@@ -318,8 +384,8 @@ impl Shell {
             } else {
                 body.to_owned()
             };
-            shown = format!("{ATTENTION_HINT}\n\n{shown}");
-            let draft = self.composer.draft();
+            // The action leads; the Attention hint follows it instead of pushing it down.
+            shown = format!("{shown}\n\n{ATTENTION_HINT}");
             if let Some(note) = self.draft_note(focus) {
                 shown = format!("{shown}\n\n{note}");
             }
@@ -339,6 +405,7 @@ impl Shell {
             if self.paint(Some(rows)).is_err() {
                 return None;
             }
+            guard.painted(Instant::now());
             if !poll(TICK).ok()? {
                 continue;
             }
@@ -357,10 +424,10 @@ impl Shell {
                     if !panel_has_room(cols, height.saturating_sub(6) as usize) {
                         // A tiny viewport cannot show what a confirmation would authorize. Keep
                         // cancellation available, but never act on Enter or an approval hotkey.
-                        if self.keys.matches(Action::Dismiss, &key)
-                            || key.code == KeyCode::Esc
-                            || (key.code == KeyCode::Char('c') && ctrl)
-                        {
+                        if stop_key(&self.keys, &key) {
+                            return stop(cancel);
+                        }
+                        if self.keys.matches(Action::Dismiss, &key) || key.code == KeyCode::Esc {
                             return None;
                         }
                         continue;
@@ -370,8 +437,13 @@ impl Shell {
                     let down = self.keys.matches(Action::SelectPageDown, &key);
                     if down || self.keys.matches(Action::SelectPageUp, &key) {
                         let (cols, height) = self.term.size();
-                        let lines =
-                            text::wrap_words(&text::sanitize(&shown), panel_inner(cols)).len();
+                        let lines = panel_body_lines(
+                            self.themes.current(),
+                            title,
+                            &shown,
+                            panel_inner(cols),
+                        )
+                        .len();
                         let visible =
                             panel_body_limit(options.len(), height.saturating_sub(6) as usize);
                         body_offset = panel_scroll(body_offset, lines, visible, down);
@@ -381,7 +453,7 @@ impl Shell {
                         match self.draft_step(key) {
                             DraftStep::Stay => {}
                             DraftStep::Choices => focus = Focus::Choices,
-                            DraftStep::Cancel => return None,
+                            DraftStep::Cancel => return stop(cancel),
                         }
                         continue;
                     }
@@ -390,10 +462,13 @@ impl Shell {
                         body_offset = 0;
                         continue;
                     }
+                    if stop_key(&self.keys, &key) {
+                        return stop(cancel);
+                    }
                     if self.keys.matches(Action::Dismiss, &key) {
                         return None;
                     }
-                    if key.code == KeyCode::Tab && !draft.is_empty() {
+                    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                         focus = Focus::Draft;
                         continue;
                     }
@@ -405,14 +480,14 @@ impl Shell {
                         selected = (selected + 1) % options.len();
                         continue;
                     }
+                    if guard.blocks(&key, Instant::now()) {
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Up => selected = (selected + options.len() - 1) % options.len(),
-                        KeyCode::Down | KeyCode::Tab => {
-                            selected = (selected + 1) % options.len();
-                        }
+                        KeyCode::Down => selected = (selected + 1) % options.len(),
                         KeyCode::Enter => return Some(selected),
                         KeyCode::Esc => return None,
-                        KeyCode::Char('c') if ctrl => return None,
                         KeyCode::Char(c) if !ctrl => {
                             if let Some(index) = options.iter().position(|(_, hotkey)| {
                                 *hotkey != ' ' && hotkey.eq_ignore_ascii_case(&c)
@@ -424,7 +499,11 @@ impl Shell {
                     }
                 }
                 Ok(Event::Resize(..)) => self.term.on_resize(),
-                Ok(Event::Paste(text)) if focus == Focus::Draft => self.composer_paste(&text),
+                // Pasted text is never an answer: it goes to the draft, which takes focus.
+                Ok(Event::Paste(text)) => {
+                    self.composer_paste(&text);
+                    focus = Focus::Draft;
+                }
                 Ok(_) => {}
                 Err(_) => return None,
             }

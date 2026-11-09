@@ -14,6 +14,7 @@ fn tool(name: &str, state: ToolState) -> Tool {
         elapsed: Some(0.8),
         todo: None,
         agents: Vec::new(),
+        outcome: None,
     }
 }
 
@@ -198,7 +199,7 @@ fn narrow_mcp_headers_drop_timing_before_the_target() {
     );
     let rows = plain(&tool_rows(&t, 38, &ctx_for(&theme, &ui, false)));
     assert!(
-        rows[0].contains("MCP : docs"),
+        rows[0].contains("MCP - docs"),
         "server named in the frame: {rows:?}"
     );
     let head = &rows[1];
@@ -210,10 +211,10 @@ fn narrow_mcp_headers_drop_timing_before_the_target() {
         head.starts_with("| x") && head.contains("failed"),
         "{head:?}"
     );
-    assert!(!head.contains("1.10s"), "timing gives way first: {head:?}");
+    assert!(!head.contains("1.1s"), "timing gives way first: {head:?}");
     // With room, everything is shown.
     let wide = plain(&tool_rows(&t, 100, &ctx_for(&theme, &ui, false)));
-    assert!(wide[1].contains("failed") && wide[1].contains("1.10s"));
+    assert!(wide[1].contains("failed") && wide[1].contains("1.1s"));
 }
 
 #[test]
@@ -345,52 +346,130 @@ fn worker_cards_show_phase_chips_totals_time_and_reports() {
             tools_expanded: false,
             expand_key: "ctrl+o",
         };
-        let mut t = tool("task", ToolState::Completed);
-        t.presentation.label = "Workers".into();
-        t.presentation.body = crate::runtime::presentation::BodyStyle::Workers;
-        t.agents = [
-            ("scout", ToolState::Completed, "Found the parser branch."),
-            ("reviewer", ToolState::Running, "Reviewing parser"),
-            ("tester", ToolState::Failed, "Fixture unavailable."),
-        ]
-        .into_iter()
-        .map(|(name, state, preview)| AgentRow {
-            name: name.into(),
-            state,
-            preview: preview.into(),
-            elapsed_ms: Some(2400),
-            tools: 3,
-            ..Default::default()
-        })
-        .collect();
-        let rows = plain(&tool_rows(&t, 120, &ctx));
-        for fact in ["1 done", "1 running", "1 failed"] {
-            assert!(rows[0].contains(fact), "{rows:?}");
-        }
-        for (name, phase) in [
-            ("scout", "done"),
-            ("reviewer", "running"),
-            ("tester", "failed"),
+        // While the call runs its worker is live; once the call returned the same worker is
+        // drawn as continuing in the background, because the card freezes in scrollback.
+        for (call, running_word, running_fact) in [
+            (ToolState::Running, "running", "1 running"),
+            (ToolState::Completed, "background", "1 in background"),
         ] {
-            let chip = if ascii {
-                format!("[{phase}]")
-            } else {
-                format!("⟦{phase}⟧")
-            };
-            assert!(
-                rows.iter()
-                    .any(|r| r.contains(name) && r.contains(&chip) && r.contains("2s")),
+            let mut t = tool("task", call);
+            t.presentation.label = "Workers".into();
+            t.presentation.body = crate::runtime::presentation::BodyStyle::Workers;
+            t.agents = [
+                ("scout", ToolState::Completed, "Found the parser branch."),
+                ("reviewer", ToolState::Running, "Reviewing parser"),
+                ("tester", ToolState::Failed, "Fixture unavailable."),
+                ("fixer", ToolState::Interrupted, ""),
+            ]
+            .into_iter()
+            .map(|(name, state, preview)| AgentRow {
+                name: name.into(),
+                state,
+                preview: preview.into(),
+                elapsed_ms: Some(2400),
+                tools: 3,
+                ..Default::default()
+            })
+            .collect();
+            let rows = plain(&tool_rows(&t, 140, &ctx));
+            for fact in ["1 done", running_fact, "1 failed", "1 interrupted"] {
+                assert!(rows[0].contains(fact), "{rows:?}");
+            }
+            for (name, phase) in [
+                ("scout", "done"),
+                ("reviewer", running_word),
+                ("tester", "failed"),
+                ("fixer", "interrupted"),
+            ] {
+                let chip = if ascii {
+                    format!("[{phase}]")
+                } else {
+                    format!("⟦{phase}⟧")
+                };
+                assert!(
+                    rows.iter()
+                        .any(|r| r.contains(name) && r.contains(&chip) && r.contains("2s")),
+                    "{rows:?}"
+                );
+            }
+            if !ascii {
+                let spinning = rows.iter().any(|r| r.contains(theme.spinner(0)));
+                assert_eq!(spinning, call == ToolState::Running, "{rows:?}");
+            }
+            assert_eq!(
+                rows.iter().any(|r| r.contains("continuing in background")),
+                call != ToolState::Running,
                 "{rows:?}"
             );
+            assert!(rows.iter().any(|r| r.contains("Found the parser branch.")));
+            assert!(rows.iter().any(|r| r.contains("Fixture unavailable.")));
+            for width in [0, 1, 8, 24, 60] {
+                assert!(
+                    tool_rows(&t, width, &ctx)
+                        .iter()
+                        .all(|r| text::line_width(r) <= width as usize)
+                );
+            }
         }
-        assert!(rows.iter().any(|r| r.contains("Found the parser branch.")));
-        assert!(rows.iter().any(|r| r.contains("Fixture unavailable.")));
-        for width in [0, 1, 8, 24, 60] {
-            assert!(
-                tool_rows(&t, width, &ctx)
-                    .iter()
-                    .all(|r| text::line_width(r) <= width as usize)
-            );
-        }
+    }
+}
+
+#[test]
+fn outcomes_follow_the_recorded_execution_status() {
+    use crate::runtime::execution::ToolStatus;
+    for (status, text, is_error, want) in [
+        (None, "ok", false, ToolOutcome::Ok),
+        (None, "boom", true, ToolOutcome::Failed),
+        (
+            Some(ToolStatus::Blocked),
+            "denied by the user.",
+            true,
+            ToolOutcome::Denied,
+        ),
+        (
+            Some(ToolStatus::Blocked),
+            "invalid tool call: x",
+            true,
+            ToolOutcome::Blocked,
+        ),
+        (
+            Some(ToolStatus::Aborted),
+            "interrupted",
+            true,
+            ToolOutcome::Cancelled,
+        ),
+    ] {
+        let mut output = crate::runtime::tool_output::ToolOutput {
+            text: text.into(),
+            is_error,
+            data: None,
+            execution: Default::default(),
+        };
+        output.execution.status = status;
+        assert_eq!(ToolOutcome::of(&output), want, "{text}");
+    }
+}
+
+#[test]
+fn hidden_counts_name_source_lines_and_failures_keep_their_tail() {
+    let row = |s: &str| Line::from(s.to_owned());
+    // Three source lines: one wraps to three rows.
+    let lines = || {
+        vec![
+            vec![row("a1"), row("a2"), row("a3")],
+            vec![row("b")],
+            vec![row("c")],
+        ]
+    };
+    let text = |rows: Rows| plain(&rows).join(",");
+    for (limit, tail, shown, hidden) in [
+        (3, false, "a1,a2,a3", 2),
+        (2, false, "a1,a2", 3),
+        (2, true, "b,c", 1),
+        (9, true, "a1,a2,a3,b,c", 0),
+        (1, true, "c", 2),
+    ] {
+        let (rows, n) = take_lines(lines(), limit, tail);
+        assert_eq!((text(rows).as_str(), n), (shown, hidden), "{limit} {tail}");
     }
 }

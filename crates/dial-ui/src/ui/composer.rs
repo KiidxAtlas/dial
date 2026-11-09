@@ -35,29 +35,9 @@ const MAX_INPUT_ROWS: usize = 10;
 /// Under this many cells the composer degrades to a bare input row.
 const MIN_BOX_WIDTH: usize = 8;
 const MAX_NAME_COLUMN: usize = 24;
-/// App-level shortcuts the composer reports instead of handling.
-const APP_ACTIONS: [Action; 20] = [
-    Action::CommandPalette,
-    Action::ModelSelect,
-    Action::ModelRoles,
-    Action::ModelFavoriteNext,
-    Action::ProviderSetup,
-    Action::Settings,
-    Action::ToolsExpand,
-    Action::ToolsToggle,
-    Action::ThinkingToggle,
-    Action::StatusExpand,
-    Action::StatusFocus,
-    Action::WorkTab,
-    Action::ApprovalCycle,
-    Action::DisplayReset,
-    Action::EditExternal,
-    Action::PasteImage,
-    Action::VoiceInput,
-    Action::SubagentsRecent,
-    Action::RateGood,
-    Action::RateBad,
-];
+/// App-level shortcuts the composer reports instead of handling (owned by the keymap, so the
+/// shortcut editor can flag editing chords they shadow).
+const APP_ACTIONS: [Action; 20] = Action::COMPOSER_APP;
 
 /// Two presses of one key inside this window count as a double tap.
 const DOUBLE_TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
@@ -398,6 +378,11 @@ pub struct Composer {
     vocab_cancel: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// A load or save problem with the learned words, reported once by the app.
     word_notice: Option<String>,
+    /// Whether the terminal speaks the kitty keyboard protocol; `None` asks the live terminal.
+    /// Hints never advertise a chord the terminal cannot report (Shift+Enter on legacy terminals).
+    keyboard_enhanced: Option<bool>,
+    /// A busy Ctrl+C just cleared the draft; the next one stops the turn (hint only).
+    stop_armed: bool,
 }
 
 impl Composer {
@@ -450,6 +435,8 @@ impl Composer {
             vocab_generation: 0,
             vocab_cancel: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             word_notice: None,
+            keyboard_enhanced: None,
+            stop_armed: false,
         };
         for entry in history {
             composer.push_history(entry);
@@ -515,7 +502,16 @@ impl Composer {
         let owner = file.into_temp_path();
         let path = owner.to_string_lossy().into_owned();
         self.pasted_images.push(owner);
-        self.handle_paste(&format!("\"{path}\""));
+        // The image belongs to the draft, never to an open history-search query.
+        self.search = None;
+        self.choice = None;
+        self.exit_armed = false;
+        // A chip stands in for the temporary path; it expands to the quoted path on submit.
+        self.paste_count += 1;
+        let placeholder = format!("[Image #{}]", self.paste_count);
+        self.editor.insert(&placeholder);
+        self.pastes.push((placeholder, format!("\"{path}\"")));
+        self.refresh();
         Ok(())
     }
 
@@ -665,6 +661,7 @@ impl Composer {
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
         self.exit_armed = false;
+        self.stop_armed = false;
         if !busy {
             self.choice = None;
         }
@@ -960,6 +957,44 @@ impl Composer {
         self.choice.is_some()
     }
 
+    /// Pins whether the terminal reports enhanced keys (tests and terminals detected elsewhere);
+    /// `None` reads the live terminal state.
+    pub fn set_keyboard_enhanced(&mut self, enhanced: Option<bool>) {
+        self.keyboard_enhanced = enhanced;
+    }
+
+    fn keyboard_enhanced(&self) -> bool {
+        self.keyboard_enhanced
+            .unwrap_or_else(super::term::reports_key_releases)
+    }
+
+    /// A collapsed paste or image chip that touches the cursor on the side `forward` deletes
+    /// toward, as its byte range. Such chips are deleted whole, never character by character.
+    fn chip_at_cursor(&self, forward: bool) -> Option<(usize, usize)> {
+        let text = &self.editor.text;
+        let cursor = self.editor.cursor;
+        self.pastes.iter().find_map(|(marker, _)| {
+            if forward {
+                text[cursor..]
+                    .starts_with(marker.as_str())
+                    .then(|| (cursor, cursor + marker.len()))
+            } else {
+                text[..cursor]
+                    .ends_with(marker.as_str())
+                    .then(|| (cursor - marker.len(), cursor))
+            }
+        })
+    }
+
+    /// Deletes a whole chip at the cursor as one undoable edit. False when there is none.
+    fn delete_chip(&mut self, forward: bool) -> bool {
+        let Some((start, end)) = self.chip_at_cursor(forward) else {
+            return false;
+        };
+        self.editor.delete_range(start, end);
+        true
+    }
+
     /// Whether a local input layer should get the dismiss key before an enclosing wait cancels.
     pub fn dismisses_interrupt(&self, key: &KeyEvent, keys: &Keymap) -> bool {
         keys.matches(Action::Dismiss, key)
@@ -990,7 +1025,8 @@ impl Composer {
         let lines = clean.trim_end_matches('\n').split('\n').count();
         if lines > PASTE_COLLAPSE_LINES || clean.chars().count() > PASTE_COLLAPSE_CHARS {
             self.paste_count += 1;
-            let placeholder = format!("[Pasted text #{} +{lines} lines]", self.paste_count);
+            let noun = if lines == 1 { "line" } else { "lines" };
+            let placeholder = format!("[Pasted text #{} +{lines} {noun}]", self.paste_count);
             self.editor.insert(&placeholder);
             self.pastes.push((placeholder, clean));
         } else {
@@ -1013,6 +1049,7 @@ impl Composer {
         if self.busy && key.kind == KeyEventKind::Repeat && ctx.keys.matches(Action::Submit, &key) {
             return ComposerEvent::None;
         }
+        self.stop_armed = false;
         // Stopping is global even while a completion, history search or chooser is open.
         // A user-mapped dismiss chord still belongs to the local layer first.
         if self.busy
@@ -1020,6 +1057,21 @@ impl Composer {
             && !self.dismisses_interrupt(&key, ctx.keys)
         {
             self.editor.cancel_jump();
+            // With a draft, the shared Ctrl+C clears it first (like idle); the next press stops.
+            if self.search.is_none()
+                && !self.editor.text.is_empty()
+                && ctx.keys.matches(Action::ClearDraft, &key)
+            {
+                if self.history_index.is_some() {
+                    self.leave_history();
+                }
+                if !self.editor.text.is_empty() {
+                    self.set_draft("");
+                }
+                self.stop_armed = true;
+                self.refresh();
+                return ComposerEvent::None;
+            }
             return ComposerEvent::Interrupt;
         }
         // A pending Ctrl-] jump takes the next typed letter; any other key cancels it before dispatch.
@@ -1058,13 +1110,8 @@ impl Composer {
             self.clear();
             return ComposerEvent::None;
         }
-        if self.editor.text.is_empty() && key.code == KeyCode::Up {
-            self.restore_queued_edit();
-            if let Some((text, follow_up)) = self.queued.pop_back() {
-                let index = self.queued.len();
-                self.begin_queued_edit(index, text, follow_up);
-                return ComposerEvent::None;
-            }
+        if self.step_queue(&key, keys) {
+            return ComposerEvent::None;
         }
         if keys.triggers(Action::FollowUp, &key) {
             if !self.busy {
@@ -1141,8 +1188,9 @@ impl Composer {
                 };
             }
             // Like readline: Ctrl-D in a draft deletes the character under the cursor.
-            self.editor
-                .key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+            if !self.delete_chip(true) {
+                self.editor.apply(Action::EditorDeleteForward);
+            }
             return ComposerEvent::None;
         }
         if keys.matches(Action::Newline, &key) {
@@ -1171,8 +1219,65 @@ impl Composer {
             self.step_menu(if page_up { -step } else { step }, false, rows);
             return ComposerEvent::None;
         }
+        let backward = keys.matches(Action::EditorDeleteBackward, &key)
+            || keys.matches(Action::EditorDeleteWordBackward, &key);
+        let forward = keys.matches(Action::EditorDeleteForward, &key)
+            || keys.matches(Action::EditorDeleteWordForward, &key);
+        if (backward || forward) && self.delete_chip(forward) {
+            return ComposerEvent::None;
+        }
         self.editor.key_with(key, keys);
         ComposerEvent::None
+    }
+
+    /// Up/Down step through queued messages before history: Up on an empty draft edits the newest
+    /// queued message, Up again the one before it, and past the oldest it continues into history.
+    /// Down walks back toward the newest and then to an empty draft. Only an unchanged (or cleared)
+    /// queue edit steps, so typed changes are never discarded by an arrow key.
+    fn step_queue(&mut self, key: &KeyEvent, keys: &Keymap) -> bool {
+        let up = keys.matches(Action::SelectUp, key);
+        if !(up || keys.matches(Action::SelectDown, key)) || self.menu_open() {
+            return false;
+        }
+        let text = &self.editor.text;
+        let at_edge = if up {
+            !text[..self.editor.cursor].contains('\n')
+        } else {
+            !text[self.editor.cursor..].contains('\n')
+        };
+        if let Some(edit) = &self.editing_queue
+            && self.history_index.is_none()
+        {
+            if !at_edge || !(text.is_empty() || *text == edit.text) {
+                return false;
+            }
+            let index = edit.index;
+            self.set_draft("");
+            let next = if up {
+                index.checked_sub(1)
+            } else {
+                Some(index + 1).filter(|next| *next < self.queued.len())
+            };
+            match next {
+                Some(next) => {
+                    if let Some((text, follow_up)) = self.queued.remove(next) {
+                        self.begin_queued_edit(next, text, follow_up);
+                    }
+                }
+                // Past the oldest queued message: on into prompt history.
+                None if up => self.browse_history(true),
+                None => {}
+            }
+            return true;
+        }
+        if up && text.is_empty() && self.history_index.is_none() && !self.queued.is_empty() {
+            let index = self.queued.len() - 1;
+            if let Some((text, follow_up)) = self.queued.remove(index) {
+                self.begin_queued_edit(index, text, follow_up);
+            }
+            return true;
+        }
+        false
     }
 
     /// Speech belongs to the draft, not an open history-search query.
@@ -1320,22 +1425,24 @@ impl Composer {
             self.choice = None;
             return Some(ComposerEvent::None);
         }
-        // These shortcuts belong only to the draft chooser, not the underlying editor.
-        if options == DRAFT_CHOICES {
-            let redirect = (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::CONTROL)
-                || (key.code == KeyCode::Char('r') && key.modifiers.is_empty());
-            let worker = key.code == KeyCode::Char('w')
-                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL);
-            if redirect || worker {
-                self.choice = None;
-                return Some(self.send_explicit(if redirect {
-                    SteerKind::Steer
-                } else {
-                    SteerKind::Independent
-                }));
+        // Digits pick an option directly; Ctrl+Enter (kitty keyboard protocol only) redirects.
+        // Letters and editing chords never act here: they close the chooser and reach the draft.
+        let direct = match key.code {
+            KeyCode::Char(c @ '1'..='9') if key.modifiers.is_empty() => {
+                Some(c as usize - '1' as usize).filter(|index| *index < options.len())
             }
-        }
-        if keys.matches(Action::SelectUp, &key) || keys.matches(Action::SelectDown, &key) {
+            KeyCode::Enter
+                if key.modifiers == KeyModifiers::CONTROL && options == DRAFT_CHOICES =>
+            {
+                options
+                    .iter()
+                    .position(|option| *option == BusyChoice::Redirect)
+            }
+            _ => None,
+        };
+        if direct.is_none()
+            && (keys.matches(Action::SelectUp, &key) || keys.matches(Action::SelectDown, &key))
+        {
             let next = if keys.matches(Action::SelectUp, &key) {
                 selected.saturating_sub(1)
             } else {
@@ -1346,9 +1453,9 @@ impl Composer {
             }
             return Some(ComposerEvent::None);
         }
-        if keys.matches(Action::Submit, &key) {
+        if direct.is_some() || keys.matches(Action::Submit, &key) {
             self.choice = None;
-            let event = match options[selected] {
+            let event = match options[direct.unwrap_or(selected)] {
                 BusyChoice::Auto => self.submit_queued(false),
                 BusyChoice::Redirect => self.send_explicit(SteerKind::Steer),
                 BusyChoice::Independent => self.send_explicit(SteerKind::Independent),
@@ -2001,23 +2108,9 @@ impl Composer {
         };
 
         let activity = statusline::activity_row(ctx.ui, ctx.status, theme, width);
-        let mut status_ui;
-        let header_ui = if activity.is_some() {
-            status_ui = ctx.ui.clone();
-            let (left, right) = statusline::segments(ctx.ui);
-            let metadata = |names: Vec<String>| {
-                names
-                    .into_iter()
-                    .filter(|name| !name.trim().eq_ignore_ascii_case("spinner"))
-                    .collect()
-            };
-            status_ui.status = crate::llm::model_config::StatusPreset::Custom;
-            status_ui.status_left = metadata(left);
-            status_ui.status_right = metadata(right);
-            &status_ui
-        } else {
-            ctx.ui
-        };
+        // Idle and busy share one status layout (`statusline::segments_for`), so the border keeps
+        // its segments when a turn starts or ends and the expand toggle works while busy.
+        let header_ui = ctx.ui;
         let activity_rows = usize::from(activity.is_some());
         let mut rows: Rows = activity.into_iter().collect();
         let tint = theme.bg(Tok::UserBg);
@@ -2161,7 +2254,9 @@ impl Composer {
         }
 
         if !landing && ctx.status.planning.is_some() {
-            rows.push(statusline::controls_row(ctx.status, ctx.keys, theme, width));
+            rows.push(statusline::controls_row_with(
+                ctx.ui, ctx.status, ctx.keys, theme, width,
+            ));
         }
         let mut cursor = cursor;
         if let Some(search) = &self.search {
@@ -2344,7 +2439,8 @@ impl Composer {
         let w = if panel { w - 4 } else { w };
         let pointer = theme.sym(Sym::Pointer);
         let blank_pointer = " ".repeat(text::width(pointer));
-        let prefix = text::width(pointer) + 1;
+        // Pointer, space, option number, space.
+        let prefix = text::width(pointer) + 3;
         let label_col = choice
             .options
             .iter()
@@ -2386,6 +2482,7 @@ impl Composer {
                         accent,
                     ),
                     Span::raw(" "),
+                    Span::styled(format!("{} ", i + 1), theme.fg(Tok::Muted)),
                     Span::styled(label.clone(), theme.fg(Tok::Text)),
                 ];
                 if inline {
@@ -2401,7 +2498,7 @@ impl Composer {
             rows.push(finish_row(
                 vec![Span::styled(
                     format!(
-                        "{blank_pointer} {}",
+                        "{blank_pointer}   {}",
                         text::ellipsize(option.detail(), w.saturating_sub(prefix), theme.ascii())
                     ),
                     theme.fg(Tok::Muted),
@@ -2410,18 +2507,20 @@ impl Composer {
             ));
         }
         if !queue {
-            for shortcut in [
-                "r / Ctrl+Enter hard redirect",
-                "w / Ctrl+W worker; /worker <message>",
-            ] {
-                rows.push(finish_row(
-                    vec![Span::styled(
-                        text::ellipsize(shortcut, w, theme.ascii()),
-                        theme.fg(Tok::Muted),
-                    )],
-                    w,
-                ));
+            let dash = if theme.ascii() { "-" } else { "–" };
+            let dot = theme.sym(Sym::Dot);
+            let mut shortcut = format!("1{dash}{total} pick directly");
+            if self.keyboard_enhanced() {
+                shortcut.push_str(&format!(" {dot} Ctrl+Enter redirect"));
             }
+            shortcut.push_str(&format!(" {dot} /worker <message> starts a worker"));
+            rows.push(finish_row(
+                vec![Span::styled(
+                    text::ellipsize(&shortcut, w, theme.ascii()),
+                    theme.fg(Tok::Muted),
+                )],
+                w,
+            ));
         }
         if panel {
             rows = super::chrome::framed_lines(
@@ -2457,22 +2556,26 @@ impl Composer {
             return Vec::new();
         }
         let keys = ctx.keys;
+        let enhanced = self.keyboard_enhanced();
         let label = |action: Action| {
             keys.chords(action)
                 .iter()
                 .find(|chord| {
                     let key = KeyEvent::new(chord.code, chord.mods);
+                    // A chord the terminal cannot report is never advertised (Shift+Enter
+                    // without the kitty keyboard protocol arrives as plain Enter).
+                    (enhanced || !chord.needs_enhancement())
                     // State-specific actions must not advertise a shadowed shortcut.
-                    !(self.search.is_none()
-                        && ((self.editing_queue.is_some()
-                            && key.code == KeyCode::Esc
-                            && action != Action::Dismiss)
-                            || (self.busy
-                                && action != Action::FollowUp
-                                && keys.matches(Action::FollowUp, &key))
-                            || (action == Action::Interrupt
-                                && keys.matches(Action::Dismiss, &key)
-                                && (self.menu_open() || self.ghost().is_some()))))
+                        && !(self.search.is_none()
+                            && ((self.editing_queue.is_some()
+                                && key.code == KeyCode::Esc
+                                && action != Action::Dismiss)
+                                || (self.busy
+                                    && action != Action::FollowUp
+                                    && keys.matches(Action::FollowUp, &key))
+                                || (action == Action::Interrupt
+                                    && keys.matches(Action::Dismiss, &key)
+                                    && (self.menu_open() || self.ghost().is_some()))))
                 })
                 .map(|chord| chord.display())
                 .unwrap_or_default()
@@ -2504,10 +2607,36 @@ impl Composer {
         let plain = |what: String| Some(Hint { key: None, what });
         let mut pieces = Vec::new();
         if self.busy {
-            pieces.extend([
-                hint(Action::Dismiss, "close"),
-                hint(Action::Interrupt, "stop"),
-            ]);
+            // Esc is advertised only when it closes something no other hint names: an inline
+            // suggestion. Menus, the chooser, search and queue edits carry their own Esc hint.
+            if self.search.is_none()
+                && self.choice.is_none()
+                && self.editing_queue.is_none()
+                && !self.menu_open()
+                && self.ghost().is_some()
+            {
+                pieces.push(hint(Action::Dismiss, "close"));
+            }
+            // Mirrors `handle_key`: a shared Ctrl+C clears a draft before it stops the turn.
+            let clears = self.search.is_none()
+                && !self.editor.text.is_empty()
+                && keys.chords(Action::Interrupt).first().is_some_and(|chord| {
+                    keys.matches(Action::ClearDraft, &KeyEvent::new(chord.code, chord.mods))
+                });
+            pieces.push(hint(
+                Action::Interrupt,
+                if clears {
+                    "clear draft"
+                } else if self.stop_armed {
+                    "again stops"
+                } else {
+                    "stop"
+                },
+            ));
+            // The draft a busy Ctrl+C just cleared is one undo away.
+            if self.stop_armed && !clears {
+                pieces.push(hint(Action::EditorUndo, "restore draft"));
+            }
         }
         if self.choice.is_some() {
             pieces.extend([
@@ -3397,7 +3526,7 @@ fn accent_for(session: &str) -> Tok {
 fn expand_pastes(draft: &str, pastes: &[(String, String)]) -> String {
     let mut out = String::with_capacity(draft.len());
     let mut rest = draft;
-    while let Some(at) = rest.find("[Pasted text #") {
+    while let Some(at) = rest.find('[') {
         out.push_str(&rest[..at]);
         let tail = &rest[at..];
         match pastes

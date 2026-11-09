@@ -232,7 +232,13 @@ the same containment and fd-3 JSON protocol. Node uses its persistent REPL evalu
 declarations and top-level `await`; the embedded engine keeps lexical bindings across cells,
 supports top-level `await` and ES built-ins including BigInt, and has no `require`, `process`,
 `module` or other Node APIs. Its asynchronous completion value comes from rewriting a trailing
-expression statement, so it can differ from Node in edge cases. Runtime and syntax failures are
+expression statement, so it can differ from Node in edge cases. In both runtimes a top-level
+`const`, `let` or `class` declaration is rewritten to a reassignable binding before the cell runs,
+so re-running an edited cell (or retrying one that threw after declaring a name) redefines the name
+instead of failing with a redeclaration error; nested scopes, strings and comments are unchanged.
+Under Node, assigning to a name that a builtin module also uses (`fs`, `path`, …) replaces the
+lazily loaded module for that namespace. A Python cell whose interpreter cannot be resolved or
+started says when JavaScript eval is available instead. Runtime and syntax failures are
 reported as cell errors without discarding an otherwise healthy namespace. Node 26 uses the public
 REPL error hook, while earlier supported releases use the legacy REPL error path. Strings crossing the
 JSON transport are normalized to well-formed Unicode, including truncated output and nested values.

@@ -9,7 +9,7 @@ use super::{
 use crate::ui::{
     chrome::Section,
     editor::Editor,
-    keys::{Action, Keymap},
+    keys::{Action, Chord, Keymap},
     text,
     theme::{Sym, Tok},
 };
@@ -27,6 +27,8 @@ pub struct ShortcutOverlay {
     scroll: usize,
     page: usize,
     edit: Option<(Action, Editor)>,
+    /// While editing: the next key pressed is written into the chord field.
+    recording: bool,
     message: Option<(String, bool)>,
 }
 
@@ -48,6 +50,7 @@ impl ShortcutOverlay {
             scroll: 0,
             page: 8,
             edit: None,
+            recording: false,
             message: None,
         }
     }
@@ -85,6 +88,7 @@ impl ShortcutOverlay {
         self.message = Some(match result {
             Ok(message) => {
                 self.edit = None;
+                self.recording = false;
                 (text::one_line(&message), true)
             }
             Err(message) => (text::one_line(&message), false),
@@ -92,7 +96,7 @@ impl ShortcutOverlay {
     }
 
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
-        if self.panel_keys.handle(event, true, true) {
+        if self.panel_keys.handle_key(event, true) {
             return OverlayEvent::None;
         }
         if let Event::Paste(value) = event {
@@ -113,8 +117,32 @@ impl ShortcutOverlay {
         if !pressed(key) {
             return OverlayEvent::None;
         }
+        if self.recording && self.edit.is_some() && keys.matches(Action::SelectCancel, key) {
+            // Esc leaves recording (type `Esc` to bind it); a second Esc leaves the editor.
+            self.recording = false;
+            self.message = None;
+            return OverlayEvent::None;
+        }
+        if self.recording
+            && self.edit.is_some()
+            && let Some(chord) = Chord::from_key(key)
+        {
+            self.recording = false;
+            if let Some((_, editor)) = &mut self.edit {
+                let separator = if editor.text.trim().is_empty() {
+                    ""
+                } else {
+                    " "
+                };
+                let text = format!("{}{separator}{}", editor.text.trim_end(), chord.display());
+                editor.set(&text);
+            }
+            self.message = Some((format!("Recorded {}", chord.display()), true));
+            return OverlayEvent::None;
+        }
         if super::panel_keys::matches(keys, Action::SelectCancel, key) {
             self.message = None;
+            self.recording = false;
             if self.edit.take().is_some() {
                 return OverlayEvent::None;
             }
@@ -134,7 +162,12 @@ impl ShortcutOverlay {
                     chords: editor.text.split_whitespace().map(str::to_owned).collect(),
                 };
             }
-            if editor.key(*key) {
+            if keys.matches(Action::SectionNext, key) {
+                self.recording = true;
+                self.message = Some(("Press the key to record…".into(), true));
+                return OverlayEvent::None;
+            }
+            if editor.key_with(*key, keys) {
                 self.message = None;
             }
             return OverlayEvent::None;
@@ -159,7 +192,9 @@ impl ShortcutOverlay {
                 editor.set(&chords(keys, action));
                 self.edit = Some((action, editor));
             }
-        } else if key.code == KeyCode::Delete {
+        } else if key.code == KeyCode::Delete && self.search.cursor == self.search.text.len() {
+            // Forward-delete has nothing to remove at the end of the search, so Delete restores
+            // the selected action there; elsewhere in the query it edits the search text.
             if let Some(&action) = rows.get(self.cursor) {
                 if !keys.is_customized(action) {
                     // Nothing to restore: say so instead of saving an identical keymap.
@@ -176,7 +211,7 @@ impl ShortcutOverlay {
             self.search.insert(&c.to_string());
             self.cursor = 0;
             self.scroll = 0;
-        } else if self.search.key(*key) {
+        } else if self.search.key_with(*key, keys) {
             self.cursor = 0;
             self.scroll = 0;
         }
@@ -189,7 +224,7 @@ impl ShortcutOverlay {
             frame,
             ctx,
             "Keyboard shortcuts",
-            "Type to filter · Enter edits a binding · save validates the chord before applying",
+            "Type to filter · Enter edits a binding · Tab records a key · save validates the chord before applying",
             false,
             true,
         ) {
@@ -237,9 +272,19 @@ impl ShortcutOverlay {
                 Tok::Muted,
             ));
             out.push(line(
-                " Saved globally in keybindings.toml; no project override.".into(),
+                " Saved globally in config.toml [keys]; no project override.".into(),
                 Tok::Muted,
             ));
+            for (chord, by) in ctx.keys.shadowed(*action) {
+                out.push(line(
+                    format!(
+                        " {} is taken by \"{}\" in the composer.",
+                        chord.display(),
+                        by.describe()
+                    ),
+                    Tok::Warning,
+                ));
+            }
             out.push(line(
                 " Conflicts are rejected; confirm/cancel controls cannot be disabled.".into(),
                 Tok::Muted,
@@ -367,6 +412,16 @@ impl ShortcutOverlay {
                     format!(" Defaults: {}", action.defaults().join(" ")),
                     Tok::Muted,
                 ));
+                for (chord, by) in ctx.keys.shadowed(action) {
+                    out.push(line(
+                        format!(
+                            " {} is taken by \"{}\" in the composer.",
+                            chord.display(),
+                            by.describe()
+                        ),
+                        Tok::Warning,
+                    ));
+                }
             }
         }
         if let Some((message, ok)) = &self.message {
@@ -379,6 +434,11 @@ impl ShortcutOverlay {
         let hints = if editing {
             vec![
                 hint(ctx.keys, Action::SelectConfirm, "save globally"),
+                if self.recording {
+                    "press a key".into()
+                } else {
+                    hint(ctx.keys, Action::SectionNext, "record key")
+                },
                 "empty disables".into(),
                 hint(ctx.keys, Action::SelectCancel, "cancel"),
             ]
@@ -399,7 +459,9 @@ impl ShortcutOverlay {
                 },
                 "type to search".into(),
                 // Restoring is only offered where it would change something.
-                if selected.is_some_and(|action| ctx.keys.is_customized(action)) {
+                if selected.is_some_and(|action| ctx.keys.is_customized(action))
+                    && self.search.cursor == self.search.text.len()
+                {
                     "Delete restore defaults".into()
                 } else {
                     String::new()

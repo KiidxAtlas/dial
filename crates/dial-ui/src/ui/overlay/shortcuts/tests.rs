@@ -283,3 +283,54 @@ fn clipped_descriptions_end_in_an_ellipsis() {
     let shown = screen(&draw(&mut ShortcutOverlay::new(), &rig, 60, 20));
     assert!(shown.contains('…'), "{shown}");
 }
+
+#[test]
+fn delete_edits_the_search_mid_query_and_restores_only_at_its_end() {
+    let mut keys = Keymap::defaults();
+    keys.rebind(Action::Settings, &["F8"]).unwrap();
+    let mut overlay = ShortcutOverlay::new();
+    select(&mut overlay, Action::Settings);
+    overlay.search.cursor = 0;
+    assert!(matches!(
+        overlay.handle(&key(KeyCode::Delete), &keys),
+        OverlayEvent::None
+    ));
+    assert_eq!(overlay.search.text, &Action::Settings.id()[1..]);
+    select(&mut overlay, Action::Settings);
+    assert!(matches!(
+        overlay.handle(&key(KeyCode::Delete), &keys),
+        OverlayEvent::Rebind {
+            action: Action::Settings,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn tab_records_the_next_key_into_the_chord_field_and_esc_leaves_recording() {
+    let keys = Keymap::defaults();
+    let mut overlay = ShortcutOverlay::new();
+    select(&mut overlay, Action::Settings);
+    overlay.handle(&key(KeyCode::Enter), &keys);
+    overlay.handle(&key(KeyCode::Tab), &keys);
+    assert!(overlay.recording);
+    overlay.handle(
+        &Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+        &keys,
+    );
+    assert!(!overlay.recording);
+    assert_eq!(
+        overlay.edit.as_ref().unwrap().1.text,
+        "Ctrl+, Ctrl+4 Ctrl+K"
+    );
+    overlay.handle(&key(KeyCode::Tab), &keys);
+    overlay.handle(&key(KeyCode::Esc), &keys);
+    assert!(
+        !overlay.recording && overlay.edit.is_some(),
+        "Esc only stops recording"
+    );
+    let rig = Rig::new();
+    let shown = screen(&draw(&mut overlay, &rig, 100, 16));
+    assert!(shown.contains("config.toml [keys]"), "{shown}");
+    assert!(!shown.contains("keybindings.toml"), "{shown}");
+}

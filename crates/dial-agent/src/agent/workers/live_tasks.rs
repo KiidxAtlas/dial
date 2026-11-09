@@ -119,6 +119,8 @@ fn body_status(body: &crate::runtime::Body) -> Value {
 
 /// Publishes settings state on the running worker body as typed data. The header reads `model`, which
 /// changes only when `applied_model` is given, so a requested-but-unapplied model never shows as active.
+/// `phase` stays the worker's own progress (`tool: X`, `generating`); the settings line lives in
+/// `config`, so a settings change never hides what the worker is doing.
 fn publish_settings(
     body: &crate::runtime::Body,
     slot: &control::SettingsSlot,
@@ -130,8 +132,8 @@ fn publish_settings(
         .data
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
-    data["phase"] = json!(slot.status());
     data["config"] = slot.metadata();
+    data["config_status"] = json!(slot.status());
     if let Some(model) = applied_model {
         data["model"] = json!(model);
     }

@@ -358,7 +358,7 @@ fn prepare_child_call(
         }
         if let Err(denial) = approver.borrow_mut().authorize_from(
             call,
-            &describe(call),
+            &format!("[{}] {}", job.label, describe(call)),
             approval::needs_approval(env.ext, call),
             provenance,
             env.interrupt,

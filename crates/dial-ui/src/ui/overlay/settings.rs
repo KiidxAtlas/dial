@@ -150,9 +150,19 @@ pub(super) fn match_style(theme: &Theme, base: Style) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Style of a selected row: the subtle selection fill with bold text.
-pub(super) fn selected_fill(theme: &Theme) -> Style {
-    chrome::selected_style(theme)
+/// A list row of exactly `width` cells: the one shared selected-row look
+/// ([`chrome::selected_row`]) when `selected`, otherwise the spans as they are.
+pub(super) fn list_row(
+    theme: &Theme,
+    spans: Vec<Span<'static>>,
+    width: usize,
+    selected: bool,
+) -> Line<'static> {
+    if selected {
+        chrome::selected_row(theme, spans, width)
+    } else {
+        filled(spans, width, Style::default())
+    }
 }
 
 /// Style of a tab-bar cell; shared with every panel through [`chrome::tab_style`].
@@ -161,7 +171,7 @@ pub(super) fn tab_style(theme: &Theme, active: bool) -> Style {
 }
 
 /// One scrollbar cell for list row `row` of `rows` visible, `total` items, first visible `offset`.
-pub(super) fn scroll_cell(
+pub(crate) fn scroll_cell(
     theme: &Theme,
     row: usize,
     rows: usize,
@@ -187,29 +197,18 @@ pub(super) fn scroll_cell(
     }
 }
 
-/// Footer hints: each segment's first word is the key (amber bold), the rest its label. When they do
-/// not fit, segments are dropped from the one before the last (the last is always the "close" hint)
-/// until they do.
+/// Footer hints from `"key label"` segments (the first word is the key), drawn by
+/// [`chrome::hint_line`] one cell in from the edge: the last segment (the way out) always stays and
+/// the ones before it are dropped whole when they do not fit.
 pub(super) fn hint_line(theme: &Theme, segments: &[String], width: usize) -> Line<'static> {
-    let mut keep: Vec<&str> = segments
-        .iter()
-        .map(String::as_str)
-        .filter(|s| !s.is_empty())
-        .collect();
-    while keep.len() > 1 && spans_width(&hint_key_spans(theme, &keep)) + 1 > width {
-        keep.remove(keep.len() - 2);
-    }
-    let mut spans = vec![Span::raw(" ")];
-    spans.extend(hint_key_spans(theme, &keep));
-    Line::from(fit(spans, width))
-}
-
-fn hint_key_spans(theme: &Theme, segments: &[&str]) -> Vec<Span<'static>> {
     let pairs: Vec<(&str, &str)> = segments
         .iter()
+        .filter(|s| !s.is_empty())
         .map(|s| s.split_once(' ').unwrap_or((s, "")))
         .collect();
-    chrome::key_hint_spans(theme, &pairs)
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(chrome::hint_line(theme, &pairs, width.saturating_sub(1)).spans);
+    Line::from(fit(spans, width))
 }
 
 /// `Key` labels for "a/b" style hints; empty when the action is unbound.
@@ -1947,10 +1946,9 @@ impl SettingsOverlay {
         if self.bulk_review.is_some() {
             return self.bulk_handle(event, keys);
         }
-        if self.panel_keys.handle(
+        if self.panel_keys.handle_key(
             event,
             !matches!(self.mode, Mode::Browse) || !self.search.is_empty(),
-            true,
         ) {
             return OverlayEvent::None;
         }
@@ -2051,18 +2049,11 @@ impl SettingsOverlay {
         }
         let count = self.visible().len();
         let last = count.saturating_sub(1);
+        // Lists stop at their ends, as every other panel's do; Home and End jump there.
         if keys.matches(Action::SelectUp, key) {
-            self.cursor = if self.cursor == 0 {
-                last
-            } else {
-                self.cursor - 1
-            };
+            self.cursor = self.cursor.saturating_sub(1);
         } else if keys.matches(Action::SelectDown, key) {
-            self.cursor = if self.cursor >= last {
-                0
-            } else {
-                self.cursor + 1
-            };
+            self.cursor = (self.cursor + 1).min(last);
         } else if keys.matches(Action::SelectPageUp, key) {
             self.cursor = self.cursor.saturating_sub(self.page);
         } else if keys.matches(Action::SelectPageDown, key) {
@@ -2091,6 +2082,10 @@ impl SettingsOverlay {
         } else if let Some(c) = typed_char(key) {
             if self.search.is_empty() && c == ' ' {
                 return self.activate();
+            }
+            // Typing already searches, so a leading `/` (the search key elsewhere) is not text.
+            if self.search.is_empty() && c == '/' {
+                return OverlayEvent::None;
             }
             self.search.push(c);
             self.cursor = 0;
@@ -2653,7 +2648,7 @@ impl SettingsOverlay {
                 editor.set(&next);
                 self.notes.remove(def.path);
             }
-        } else if editor.key(*key) {
+        } else if editor.key_with(*key, keys) {
             self.notes.remove(def.path);
         }
         OverlayEvent::None
@@ -2911,7 +2906,14 @@ impl SettingsOverlay {
         if let Some(review) = &mut self.bulk_review {
             review.display_ready = false;
         }
-        if self.panel_keys.draw(frame, ctx, "Settings", "Ctrl+S changes save scope · Ctrl+O filters saved overrides across categories · Delete resets the selected setting · Ctrl+L reviews available setup", true, true) {
+        if self.panel_keys.draw(
+            frame,
+            ctx,
+            "Settings",
+            "Type to search every setting; there is no separate search key.\nCtrl+S changes save scope · Ctrl+O filters saved overrides across categories · Delete resets the selected setting · Ctrl+L reviews available setup",
+            true,
+            false,
+        ) {
             return;
         }
         let scope = match self.scope {
@@ -3326,20 +3328,15 @@ impl SettingsOverlay {
                     } else {
                         theme.sym(Sym::RadioOff)
                     };
-                    let fill = if *on {
-                        selected_fill(theme)
+                    let spans = vec![Span::styled(
+                        format!("      {pointer} {}", text::one_line(name)),
+                        theme.fg(if *on { Tok::Text } else { Tok::Muted }),
+                    )];
+                    if *on {
+                        chrome::selected_row(theme, spans, list_w)
                     } else {
-                        Style::default()
-                    };
-                    let style = if *on { fill } else { theme.fg(Tok::Muted) };
-                    filled(
-                        vec![Span::styled(
-                            format!("      {pointer} {}", text::one_line(name)),
-                            style,
-                        )],
-                        list_w,
-                        fill,
-                    )
+                        filled(spans, list_w, Style::default())
+                    }
                 }
                 Some(Item::Row(i)) => {
                     let selected = *i == self.cursor;
@@ -3507,11 +3504,7 @@ impl SettingsOverlay {
         w: usize,
         positions: &[usize],
     ) -> Line<'static> {
-        let fill = if selected {
-            selected_fill(theme)
-        } else {
-            Style::default()
-        };
+        let fill = Style::default();
         let base = |tok: Tok| theme.fg(tok).patch(fill);
         let pointer = if selected {
             theme.sym(Sym::Pointer)
@@ -3673,7 +3666,11 @@ impl SettingsOverlay {
         };
         spans.extend(value_spans);
         spans.extend(tag_spans);
-        filled(spans, w, fill)
+        if selected {
+            chrome::selected_row(theme, spans, w)
+        } else {
+            filled(spans, w, fill)
+        }
     }
 
     fn footer(&self, keys: &Keymap) -> Vec<String> {

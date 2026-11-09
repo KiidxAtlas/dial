@@ -7,8 +7,12 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+/// How long the chrome line stays pinned for one release; then that release is remembered as seen
+/// and only the inbox keeps the notice.
+const SHOW_FOR_SECS: u64 = 5 * 60;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
-/// `<unix seconds of the last attempt>\n<latest tag, empty when unknown>`.
+/// `<unix seconds of the last attempt>\n<latest tag, empty when unknown>[\n<tag whose chrome line
+/// was already shown>]`.
 #[cfg(test)]
 const STAMP: &str = "dial-release-check";
 
@@ -17,8 +21,19 @@ pub(super) struct ReleaseNotice {
     loaded: bool,
     checked_at: Option<u64>,
     latest: Option<String>,
+    /// The release whose chrome line was shown its full time, in this or an earlier session.
+    seen: Option<String>,
+    /// When this session first pinned the chrome line for `latest`.
+    shown_since: Option<u64>,
     pending: Option<Receiver<Option<String>>>,
     message: Option<String>,
+}
+
+fn stamp_text(checked_at: u64, latest: &str, seen: Option<&str>) -> String {
+    match seen {
+        Some(seen) => format!("{checked_at}\n{latest}\n{seen}\n"),
+        None => format!("{checked_at}\n{latest}\n"),
+    }
 }
 
 /// The chrome line for `latest`, or `None` when this executable is not older.
@@ -36,18 +51,22 @@ fn message(latest: &str, current: &str, plan: &UpdatePlan) -> Option<String> {
     ))
 }
 
-fn read_stamp(path: &Path) -> (Option<u64>, Option<String>) {
+fn read_stamp(path: &Path) -> (Option<u64>, Option<String>, Option<String>) {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return (None, None);
+        return (None, None, None);
     };
     let mut lines = text.lines();
     let checked_at = lines.next().and_then(|line| line.trim().parse().ok());
-    let latest = lines
-        .next()
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())
-        .and_then(|tag| release::tag(tag).ok());
-    (checked_at, latest)
+    let mut tag = || {
+        lines
+            .next()
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .and_then(|tag| release::tag(tag).ok())
+    };
+    let latest = tag();
+    let seen = tag();
+    (checked_at, latest, seen)
 }
 
 fn due(now: u64, last: u64) -> bool {
@@ -57,9 +76,15 @@ fn due(now: u64, last: u64) -> bool {
 }
 
 impl ReleaseNotice {
-    /// Background maintenance is editor chrome, never conversation history.
+    /// The update message for the inbox while a newer release exists.
     pub fn notice(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    /// The pinned chrome line: shown for [`SHOW_FOR_SECS`] once per release, never forever. The
+    /// inbox keeps the message after the line leaves.
+    pub fn chrome_notice(&self) -> Option<&str> {
+        self.message.as_deref().filter(|_| self.seen != self.latest)
     }
 
     /// Loads the cached result and starts a due check. Returns whether the notice changed.
@@ -78,11 +103,11 @@ impl ReleaseNotice {
         now: u64,
         query: impl FnOnce() -> anyhow::Result<String> + Send + 'static,
     ) -> bool {
-        let before = self.message.clone();
+        let before = (self.message.clone(), self.chrome_notice().is_some());
         let stamp = crate::config::paths::release_check_file(user_dir);
         if !self.loaded {
             self.loaded = true;
-            (self.checked_at, self.latest) = read_stamp(&stamp);
+            (self.checked_at, self.latest, self.seen) = read_stamp(&stamp);
         }
         if let Some(receiver) = &self.pending {
             match receiver.try_recv() {
@@ -100,6 +125,7 @@ impl ReleaseNotice {
             let (send, receive) = mpsc::channel();
             self.pending = Some(receive);
             let known = self.latest.clone();
+            let seen = self.seen.clone();
             std::thread::spawn(move || {
                 // A failed query is quiet and throttled like a successful one; the previous
                 // answer stays cached so an offline launch still shows a known update.
@@ -111,7 +137,7 @@ impl ReleaseNotice {
                     .unwrap_or_default();
                 let _ = crate::config::settings_store::write_private(
                     &stamp,
-                    format!("{now}\n{saved}\n").as_bytes(),
+                    stamp_text(now, &saved, seen.as_deref()).as_bytes(),
                 );
                 let _ = send.send(latest);
             });
@@ -120,7 +146,34 @@ impl ReleaseNotice {
             .latest
             .as_deref()
             .and_then(|latest| message(latest, release::CURRENT, &release::current_plan()));
-        self.message != before
+        self.retire_chrome(user_dir, now);
+        (self.message.clone(), self.chrome_notice().is_some()) != before
+    }
+
+    /// Counts the pinned line's time and, once it has been up long enough, records the release as
+    /// seen in the stamp so later launches do not pin it again.
+    fn retire_chrome(&mut self, user_dir: &Path, now: u64) {
+        if self.chrome_notice().is_none() {
+            self.shown_since = None;
+            return;
+        }
+        let since = *self.shown_since.get_or_insert(now);
+        // The background check rewrites the stamp; record the release once it has finished.
+        if now.saturating_sub(since) < SHOW_FOR_SECS || self.pending.is_some() {
+            return;
+        }
+        self.seen = self.latest.clone();
+        self.shown_since = None;
+        let stamp = crate::config::paths::release_check_file(user_dir);
+        let _ = crate::config::settings_store::write_private(
+            &stamp,
+            stamp_text(
+                self.checked_at.unwrap_or(now),
+                self.latest.as_deref().unwrap_or_default(),
+                self.seen.as_deref(),
+            )
+            .as_bytes(),
+        );
     }
 }
 

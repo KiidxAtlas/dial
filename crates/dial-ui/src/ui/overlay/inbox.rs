@@ -120,22 +120,70 @@ impl Inbox {
             .map(|entry| entry.category.settings_path())
     }
 
+    /// Marks every notice read; returns how many were unread.
+    pub fn read_all(&mut self) -> usize {
+        let mut count = 0;
+        for entry in self.entries.iter_mut().filter(|entry| entry.unread) {
+            entry.unread = false;
+            count += 1;
+        }
+        count
+    }
+
+    /// The inbox picker. Enter on a notice reads it at once (shows it in the transcript and marks
+    /// it read); unread notices carry the picker's `unread` mark and the cursor starts on the
+    /// newest one. Mark-all-read and the notification settings for each category present follow
+    /// the notices. Every row runs `/inbox open <value>`.
     pub fn choices(&self) -> ChoiceSpec {
-        ChoiceSpec {
-            title: format!("Inbox · {} unread", self.unread()),
-            command: "inbox".into(),
-            summary: "Session notifications; Enter opens a notice's Read and notification settings actions. Opening the inbox or preferences never marks notices read.".into(),
-            items: self.entries.iter().rev().map(|entry| ChoiceItem {
-                value: format!("notice {}", entry.id),
-                label: format!("{}{}", if entry.unread { "Unread · " } else { "" }, entry.title),
+        let unread = self.unread();
+        let mut items: Vec<ChoiceItem> = self
+            .entries
+            .iter()
+            .rev()
+            .map(|entry| ChoiceItem {
+                value: entry.id.to_string(),
+                label: entry.title.clone(),
                 detail: entry.text.clone(),
+                current: entry.unread,
+            })
+            .collect();
+        if unread > 0 {
+            items.push(ChoiceItem {
+                value: "read-all".into(),
+                label: "Mark all read".into(),
+                detail: format!(
+                    "Mark {unread} notice{} read without showing them",
+                    if unread == 1 { "" } else { "s" }
+                ),
                 current: false,
-            }).chain(std::iter::once(ChoiceItem {
-                value: "notifications".into(),
-                label: "Notification settings".into(),
-                detail: "Change notification preferences without reading or dismissing notices".into(),
-                current: false,
-            })).collect(),
+            });
+        }
+        for (category, label) in [
+            (Category::Error, "Error notification settings"),
+            (Category::Completion, "Completion notification settings"),
+        ] {
+            if let Some(entry) = self.entries.iter().rev().find(|e| e.category == category) {
+                items.push(ChoiceItem {
+                    value: format!("notifications {}", entry.id),
+                    label: label.into(),
+                    detail: "Change these notification preferences without reading notices".into(),
+                    current: false,
+                });
+            }
+        }
+        items.push(ChoiceItem {
+            value: "notifications".into(),
+            label: "Notification settings".into(),
+            detail: "Change notification preferences without reading or dismissing notices".into(),
+            current: false,
+        });
+        ChoiceSpec {
+            title: format!("Inbox · {unread} unread"),
+            command: "inbox".into(),
+            verb: "open",
+            summary: "Session notifications; Enter shows a notice and marks it read. Opening the inbox or preferences never marks notices read.".into(),
+            current_tag: Some("unread".into()),
+            items,
             ..Default::default()
         }
     }

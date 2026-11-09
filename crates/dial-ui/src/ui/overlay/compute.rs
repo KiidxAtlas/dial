@@ -1,7 +1,7 @@
 //! Live compute, organized by models, jobs, services and tools.
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{Axis, arrows, filled, fit, panel, selected_fill, typed_char},
+    settings::{Axis, arrows, filled, fit, panel, typed_char},
 };
 use crate::ui::{
     chrome::{self, Section},
@@ -637,20 +637,22 @@ impl ComputeOverlay {
                 let available = h.saturating_sub(output.len() + 2);
                 let scroll = selected_row.saturating_sub(available.saturating_sub(1));
                 for (i, row) in rows.into_iter().enumerate().skip(scroll).take(available) {
-                    let fill = if self.menu.is_none() && i == selected_row {
-                        selected_fill(ctx.theme)
-                    } else {
-                        Style::default()
-                    };
+                    let selected = self.menu.is_none() && i == selected_row;
                     output.push(match row {
                         ListRow::Heading(name) => section_heading(ctx.theme, &name, w),
+                        // Process rows keep their status color under the selection fill: the
+                        // green of a running process is the row's meaning, not decoration.
                         ListRow::Text(line, token) => filled(
                             vec![Span::styled(
                                 format!(" {}", text::one_line(&line)),
                                 ctx.theme.fg(token),
                             )],
                             w,
-                            fill,
+                            if selected {
+                                chrome::selected_style(ctx.theme)
+                            } else {
+                                Style::default()
+                            },
                         ),
                     });
                 }

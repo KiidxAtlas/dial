@@ -88,7 +88,7 @@ impl Shell {
                     WaitFlow::Cancel => {
                         self.note(
                             "Cancelled",
-                            "An improvement or training job holds local compute exclusively.",
+                            "Stopped waiting for local compute: an improvement or training job holds it exclusively.",
                         );
                         return Ok(false);
                     }
@@ -107,10 +107,12 @@ impl Shell {
     ) -> Result<bool> {
         let mut slot = None;
         start_streaming_job(&mut slot, "Local models", work);
-        self.status.phase = Phase::Setup;
+        // Restore the caller's phase: a command that prepares then runs keeps its own phase.
+        let prior = std::mem::replace(&mut self.status.phase, Phase::Setup);
         self.composer.set_busy(true);
         let outcome = self.preparation_events(app, &mut slot);
         self.composer.set_busy(false);
+        self.status.phase = prior;
         outcome
     }
 
@@ -155,21 +157,21 @@ impl Shell {
         }
     }
 
-    /// One terminal event during a blocking wait. An open panel gets it first, as in the idle
-    /// loop: Escape closes the panel, while the configured interrupt cancels the wait. Otherwise
-    /// keys, paste and resize use the composer and command routing that turns use, so typed and
-    /// queued work is kept rather than discarded.
+    /// One terminal event during a blocking wait. An open panel gets it first, as in a turn:
+    /// Escape or the first stop key closes the panel, and only a stop key with no panel open
+    /// cancels the wait. Otherwise keys, paste and resize use the composer and command routing
+    /// that turns use, so typed and queued work is kept rather than discarded.
     fn wait_event(&mut self, app: &App, event: Event) -> Result<WaitFlow> {
         if self.busy_overlay.is_some() {
-            let interrupt = matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release
+            let close = matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release
                 && self.keys.matches(Action::Interrupt, key)
                 && !self.keys.matches(Action::SelectCancel, key));
-            if interrupt {
+            if close {
                 if let Some(state) = &mut self.busy_overlay {
                     state.next = None;
                 }
                 self.finish_busy_overlay(app)?;
-                return Ok(WaitFlow::Cancel);
+                return Ok(WaitFlow::Continue);
             }
             return Ok(if self.step_busy_overlay(app, Some(event))? {
                 WaitFlow::Stop
@@ -218,6 +220,14 @@ impl Shell {
             }
             ComposerEvent::Action(Action::Settings) => self.wait_command(app, "/settings"),
             ComposerEvent::Action(Action::SubagentsHub) => self.wait_command(app, "/agents"),
+            ComposerEvent::Action(Action::SubagentsRecent) => {
+                self.busy_recent_worker(app);
+                WaitFlow::Continue
+            }
+            ComposerEvent::Action(Action::RateGood | Action::RateBad) => {
+                self.rating_unavailable_during_turn();
+                WaitFlow::Continue
+            }
             ComposerEvent::Action(Action::ToolsExpand) => {
                 self.tools_expanded = !self.tools_expanded;
                 self.display_reset();
@@ -252,8 +262,10 @@ impl Shell {
                 self.voice_press(app);
                 WaitFlow::Continue
             }
+            // One rule while Dial is busy: the external editor opens once the work finishes.
             ComposerEvent::Action(Action::EditExternal) => {
-                self.edit_externally();
+                self.deferred_editor = true;
+                self.note("Editor", "External editor opens after the current turn.");
                 WaitFlow::Continue
             }
             ComposerEvent::Action(Action::PasteImage) => {

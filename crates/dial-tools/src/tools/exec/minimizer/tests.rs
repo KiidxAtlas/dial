@@ -164,6 +164,35 @@ fn silent_exit_codes_with_a_conventional_meaning_are_explained() {
 }
 
 #[test]
+fn an_earlier_failure_masked_by_a_zero_exit_is_named() {
+    let missing = "Fetched 142 kB\nsh: 1: dpkg-source: not found\narchive.tar.xz\n";
+    let masked = masked_failure("fetch-source pkg 2>&1; ls", missing).unwrap();
+    assert_eq!(masked, "sh: 1: dpkg-source: not found");
+    assert!(masked_failure("./configure; make", "bash: autoreconf: command not found\n").is_some());
+    let build = "cc -c main.c\nerror: linker `cc` not found\nmain.o\n";
+    assert!(
+        masked_failure("make 2>&1 | tail -5", build)
+            .unwrap()
+            .starts_with("error: linker")
+    );
+    // A sole command's zero status is its own; ordinary output names no failure.
+    assert_eq!(masked_failure("fetch-source pkg", missing), None);
+    assert_eq!(
+        masked_failure("make 2>&1; ls", "cc -O main.c\nmain.o\n"),
+        None
+    );
+    assert_eq!(
+        masked_failure(
+            "grep -rn 'error: ' src | head",
+            "src/a.rs:3: let x = \"error: \";\n"
+        ),
+        None
+    );
+    let long = format!("error: {}\n", "x".repeat(400));
+    assert!(masked_failure("make; ls", &long).unwrap().chars().count() <= DIGEST_LINE_CHARS);
+}
+
+#[test]
 fn only_a_single_simple_command_is_filtered() {
     let text = big((0..60).map(|i| format!("   Compiling crate{i} v1.0.{i}")));
     for command in [

@@ -263,6 +263,49 @@ fn routing_steers_running_workers_and_resumes_finished_ones() {
         Route::Unavailable(_)
     ));
     assert!(matches!(route(None), Route::Unavailable(_)));
+    // A worker that ended needing input or blocked continues through resume when it can.
+    for status in [AgentStatus::NeedsInput, AgentStatus::Blocked] {
+        let continuable = AgentEntry {
+            resumable: true,
+            ..agent(status)
+        };
+        assert_eq!(route(Some(&continuable)), Route::Resume, "{status:?}");
+        assert!(matches!(
+            route(Some(&agent(status))),
+            Route::Unavailable(reason) if reason.contains("No saved transcript")
+        ));
+    }
+}
+
+#[test]
+fn waiting_or_blocked_workers_name_their_need_and_how_to_continue() {
+    let resumable = |status| AgentEntry {
+        resumable: true,
+        ..agent(status)
+    };
+    assert_eq!(
+        handoff_facts(&resumable(AgentStatus::Blocked)),
+        ["blocked", "reply below to continue it"]
+    );
+    assert_eq!(
+        handoff_facts(&resumable(AgentStatus::NeedsInput)),
+        ["needs your input", "reply below to continue it"]
+    );
+    assert_eq!(
+        handoff_facts(&agent(AgentStatus::Blocked)),
+        ["blocked", "see its last message"],
+        "never offer a reply that cannot be delivered"
+    );
+    assert!(handoff_facts(&resumable(AgentStatus::Done)).is_empty());
+    assert!(handoff_facts(&agent(AgentStatus::Running)).is_empty());
+    assert_eq!(
+        handoff_facts(&AgentEntry {
+            steerable: true,
+            ..agent(AgentStatus::Waiting)
+        }),
+        ["needs your input"],
+        "a live prompt is answered at the prompt, not by a reply"
+    );
 }
 
 #[test]

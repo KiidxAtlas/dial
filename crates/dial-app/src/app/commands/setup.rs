@@ -35,7 +35,25 @@ pub(super) fn run_command(
     args: &str,
 ) -> Option<Result<Step>> {
     if name == "inbox" {
-        if args.trim() == "notifications" {
+        // The picker sends `/inbox open <value>`; typed commands may omit the verb.
+        let args = args.trim();
+        let args = args.strip_prefix("open ").unwrap_or(args).trim();
+        if args == "read-all" {
+            let count = shell.inbox.read_all();
+            shell.note(
+                "Inbox",
+                if count == 0 {
+                    "No unread notices.".to_owned()
+                } else {
+                    format!(
+                        "Marked {count} notice{} read.",
+                        if count == 1 { "" } else { "s" }
+                    )
+                },
+            );
+            return Some(Ok(Step::Done));
+        }
+        if args == "notifications" {
             return Some(shell.open(app, agent, Which::SettingsAt("ui.notify".into())));
         }
         if let Some(id) = args

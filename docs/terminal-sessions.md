@@ -20,17 +20,18 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   every journal; **Ctrl-A** loads all of them, and a search that matches nothing in the loaded set
   says so.
   Keys: **Ctrl-U** clears search; **Esc** clears a non-empty search first and closes on the next
-  press; **Ctrl-P** pins/unpins; **Ctrl-R** renames the selected session (edit the title in the
+  press; **Ctrl-B** pins/unpins (**Ctrl-P**/**Ctrl-N** move the selection); **Ctrl-R** renames the selected session (edit the title in the
   search line, **Enter** saves); **Ctrl-F** forks it; **Ctrl-D** deletes it after confirmation (the
   current session is deleted with `/delete`); **Ctrl-G** toggles this project and all projects (all
   projects shows each session's project directory; resuming a session from another project is
   refused with a pointer to `/move`); **Home/End** and **PageUp/PageDown** navigate; **Enter**
-  resumes. A session another Dial process has open is marked `[open elsewhere]`; choosing it creates
+  resumes; **F1** shows the picker's key help. Picker navigation follows your keymap (`/hotkeys`).
+  A session another Dial process has open is marked `[open elsewhere]`; choosing it creates
   an independent sibling fork and identifies the source, without taking over its writer or changing its bytes.
   `/resume <id-prefix>` opens a unique ID directly, including empty sessions; an ambiguous prefix
   opens the picker with that prefix as its search. Choosing the current session notes
   `Already in session`. After a resume, the note shows the title, model, last activity and the
-  recorded state. `/tree forks` shows fork depth across sessions: each fork is indented under its
+  recorded state. `/tree forks` opens the picker titled **Session forks**, showing fork depth across sessions: each fork is indented under its
   parent, and siblings are ordered most recent first; it includes empty sessions initially. The picker
   keeps up to 200 conversations and 200 empty sessions; listing occurs once per open, and each action
   reloads the list rather than running per keystroke.
@@ -48,9 +49,11 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   history size. No search-latency improvement is asserted.
   Results retain their text transcript summary and can be inspected with `/search results`: use
   **Up/Down** to select a hit, **PageUp/PageDown** to read the full bounded matching message,
-  and **Enter** to open its conversation through normal safe resume. The preview identifies the
+  and **Enter** to open its conversation through normal safe resume. Each hit shows its session's
+  title, and **/** starts a filter over the listed hits. The preview identifies the
   immutable matching entry; inspecting it never rewinds or appends branch markers, including for
-  matches on abandoned branches. **Esc** closes the panel without touching the composer.
+  matches on abandoned branches. **Esc** closes the panel without touching the composer; **F1** or
+  **?** shows its keys.
   `/search open <id>` opens a conversation directly; `/search back` returns to the conversation
   where the search excursion started. Drafts stay bound to their conversations, not to search hits.
   The first index query after upgrading rebuilds the advisory full-text cache to retain entry IDs.

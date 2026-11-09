@@ -199,49 +199,139 @@ pub fn wrap(lines: Vec<Line<'static>>, max: usize) -> Vec<Line<'static>> {
 
 /// Word-aware wrap of plain text into rows of at most `max` cells (words longer than a row are
 /// hard-split). Used for prose; code and tables must use [`wrap`].
+///
+/// A paragraph's leading spaces are kept as a hanging indent (capped at half the row): its first
+/// row starts with them and continuation rows hang under the paragraph's own text, so pasted code,
+/// stack traces and compiler carets keep their shape.
 pub fn wrap_words(text: &str, max: usize) -> Vec<String> {
     if max == 0 {
         return Vec::new();
     }
     let mut rows = Vec::new();
     for paragraph in text.split('\n') {
-        let mut row = String::new();
-        for word in paragraph.split(' ') {
-            let w = width(word);
-            if w > max {
-                if !row.is_empty() {
-                    rows.push(std::mem::take(&mut row));
-                }
-                let mut piece = String::new();
-                for g in word.graphemes(true) {
-                    // As in `wrap`: a grapheme wider than a whole row becomes `?`.
-                    let g = if width(g) > max { "?" } else { g };
-                    if !piece.is_empty() && width(&piece) + width(g) > max {
-                        rows.push(std::mem::take(&mut piece));
-                    }
-                    piece.push_str(g);
-                }
-                row = piece;
-                continue;
-            }
-            let needed = if row.is_empty() {
-                w
-            } else {
-                width(&row) + 1 + w
-            };
-            if needed > max {
-                rows.push(std::mem::take(&mut row));
-                row.push_str(word);
-            } else {
-                if !row.is_empty() {
-                    row.push(' ');
-                }
-                row.push_str(word);
-            }
+        let body = paragraph.trim_start_matches(' ');
+        if body.is_empty() {
+            rows.push(String::new());
+            continue;
         }
-        rows.push(row);
+        let indent = (paragraph.len() - body.len()).min(max / 2);
+        if indent == 0 {
+            wrap_paragraph(body, max, &mut rows);
+            continue;
+        }
+        let pad = " ".repeat(indent);
+        let start = rows.len();
+        wrap_paragraph(body, max - indent, &mut rows);
+        for row in &mut rows[start..] {
+            row.insert_str(0, &pad);
+        }
     }
     rows
+}
+
+/// [`wrap_words`] of one paragraph with no leading spaces, appended to `rows`.
+fn wrap_paragraph(paragraph: &str, max: usize, rows: &mut Vec<String>) {
+    let mut row = String::new();
+    for word in paragraph.split(' ') {
+        let w = width(word);
+        if w > max {
+            if !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+            }
+            let mut piece = String::new();
+            for g in word.graphemes(true) {
+                // As in `wrap`: a grapheme wider than a whole row becomes `?`.
+                let g = if width(g) > max { "?" } else { g };
+                if !piece.is_empty() && width(&piece) + width(g) > max {
+                    rows.push(std::mem::take(&mut piece));
+                }
+                piece.push_str(g);
+            }
+            row = piece;
+            continue;
+        }
+        let needed = if row.is_empty() {
+            w
+        } else {
+            width(&row) + 1 + w
+        };
+        if needed > max {
+            rows.push(std::mem::take(&mut row));
+            row.push_str(word);
+        } else {
+            if !row.is_empty() {
+                row.push(' ');
+            }
+            row.push_str(word);
+        }
+    }
+    rows.push(row);
+}
+
+/// A span of time in whole seconds, in the one compact form every surface uses: `0s`, `45s`,
+/// `12m34s`, `1h15m`. Partial seconds are dropped (an elapsed clock never runs ahead); negative or
+/// non-finite input reads as `0s`. Use [`duration_label_precise`] for measured run times.
+pub fn duration_label(secs: f64) -> String {
+    let total = if secs.is_finite() && secs > 0.0 {
+        secs as u64
+    } else {
+        0
+    };
+    match total {
+        0..=59 => format!("{total}s"),
+        60..=3599 => format!("{}m{:02}s", total / 60, total % 60),
+        _ => format!("{}h{:02}m", total / 3600, total % 3600 / 60),
+    }
+}
+
+/// [`duration_label`] with tenths under ten seconds (`<0.1s`, `0.4s`, `3.2s`), for measured run
+/// times of tools and turns where a fast result is worth telling apart.
+pub fn duration_label_precise(secs: f64) -> String {
+    if !(secs.is_finite() && secs > 0.0) {
+        return "0s".to_owned();
+    }
+    let tenths = (secs * 10.0).round() as u64;
+    match tenths {
+        0 => "<0.1s".to_owned(),
+        1..=99 => format!("{}.{}s", tenths / 10, tenths % 10),
+        _ => duration_label(secs.max(10.0)),
+    }
+}
+
+/// A count in the one compact form every surface uses: `999`, `1.5k`, `32k`, `172k`, `1.2M`, `42M`.
+/// Floored, so a used amount never looks larger than it is.
+pub fn compact_count(n: u64) -> String {
+    let scaled = |unit: u64, suffix: &str| {
+        let tenths = n / (unit / 10);
+        if tenths.is_multiple_of(10) {
+            format!("{}{suffix}", tenths / 10)
+        } else {
+            format!("{}.{}{suffix}", tenths / 10, tenths % 10)
+        }
+    };
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=9_999 => scaled(1_000, "k"),
+        10_000..=999_999 => format!("{}k", n / 1_000),
+        1_000_000..=9_999_999 => scaled(1_000_000, "M"),
+        _ => format!("{}M", n / 1_000_000),
+    }
+}
+
+/// Observed USD in the one `$` form of the status line, worker rows and cost notices: cents
+/// (`$0.14`, `$12.35`), with four decimals only below a cent (`$0.0041`) so small local spend still
+/// reads. Zero (or unknown garbage) is `$0.00`; a positive amount that rounds to nothing is
+/// `<$0.0001`, never a misleading zero.
+pub fn usd(amount: f64) -> String {
+    if !(amount.is_finite() && amount > 0.0) {
+        "$0.00".to_owned()
+    } else if amount >= 0.01 {
+        format!("${amount:.2}")
+    } else if amount < 0.000_05 {
+        "<$0.0001".to_owned()
+    } else {
+        format!("${amount:.4}")
+    }
 }
 
 /// Right-align `right` against `left` on a row of exactly `total` cells, dropping `left` characters

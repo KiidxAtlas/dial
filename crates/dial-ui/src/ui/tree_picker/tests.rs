@@ -233,3 +233,28 @@ fn select_parent_terminates_on_a_cyclic_parent_chain() {
         "no ancestor is visible, so the selection stays put"
     );
 }
+
+#[test]
+fn f1_shows_the_key_sheet_and_esc_returns_to_the_list() {
+    let theme = Theme::dark();
+    let mut picker = Picker::new(Vec::new());
+    assert!(matches!(
+        picker.handle(&key(KeyCode::F(1)), 24),
+        Action::None
+    ));
+    let rows = picker.rows(80, 24, &theme, &Preview::empty());
+    let text: String = rows
+        .iter()
+        .flat_map(|row| row.spans.iter().map(|s| s.content.to_string()))
+        .collect();
+    assert!(text.contains("Session tree · keys"), "{text}");
+    assert!(text.contains("Ctrl+Left"), "{text}");
+    assert!(
+        matches!(picker.handle(&key(KeyCode::Esc), 24), Action::None),
+        "Esc closes help first"
+    );
+    assert!(matches!(
+        picker.handle(&key(KeyCode::Esc), 24),
+        Action::Cancel
+    ));
+}

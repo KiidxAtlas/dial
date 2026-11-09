@@ -46,7 +46,8 @@ failures (including checkpoint failures) are not reset by this recovery.
   Todo findings and references are labelled as agent observations, not verification.
 
 - While a turn runs, submitting a non-command draft opens **a send-action chooser** by default.
-  Nothing is sent merely by opening it; Escape preserves the draft. Arrow keys and Enter select:
+  Nothing is sent merely by opening it; Escape preserves the draft. Arrow keys and Enter select, or
+  press digits `1`–`4` to pick an option directly:
   **Let Dial choose (auto)** (uses configured routing; may redirect or request a worker),
   **Redirect current task now** (explicit steering at the next safe point), **After this turn**
   (queued follow-up that leaves the current task unchanged), or **Run independently** (requests a
@@ -56,7 +57,9 @@ failures (including checkpoint failures) are not reset by this recovery.
   send directly on Enter; selecting a chooser action never changes this preference. Empty Enter
   with queued work still asks before stopping, regardless of preference. Automatic routing defaults
   to steering without an extra model call; `[message_routing] route = "classify"` opts into a routing
-  judge, and a failed decision steers. `r`/`Ctrl+Enter` and `w`/`Ctrl+W` remain direct redirect/worker shortcuts.
+  judge, and a failed decision steers. `Ctrl+Enter` redirects directly when the terminal supports the
+  kitty keyboard protocol. Plain letters and editing chords such as `Ctrl+W` close the chooser and
+  reach the draft, so typing is never swallowed.
   Redirect cancels the pending model request or discards its stale response before its tool calls
   run; an already running tool may finish. Completed results are retained and unstarted actions
   skipped. `/worker <message>` uses the same independent route; while idle it submits a normal task.
@@ -71,8 +74,12 @@ failures (including checkpoint failures) are not reset by this recovery.
   and counts the rest.
   Empty Enter with queued work opens a separate choice, defaulting to **Keep working**;
   stopping to send the oldest message requires explicitly selecting that option and confirming.
-  `Up` edits the last queued message (`/queue` edits any item). Saving an edit preserves its queue
+  `Up` steps through queued messages before prompt history and edits the selected one (`/queue`
+  edits any item). Saving an edit preserves its queue
   position and route; Esc restores the original. Interrupting preserves the draft and queue.
+  While a turn runs with a draft in the composer, the first `Ctrl+C` clears the draft (the hint
+  reads "Ctrl+C again stops") and the next stops the turn. In a panel opened during a turn, the first
+  `Ctrl+C` only closes the panel.
   The status line reports stopping immediately; interrupted turns do not send a finished notification.
   Slash commands never become model steering: `/hotkeys`, `/todo`, `/skills`, `/commands`, `/context`, `/search`, `/workers`, `/message`,
   `/cancel`, `/policy`, `/reliability`, and `/improve status|jobs|stop` run at once without stopping the turn.
@@ -97,7 +104,8 @@ failures (including checkpoint failures) are not reset by this recovery.
   return to the provider list while discovery runs, rather than silently closing the panel.
   During compute waits and local-model preparation, provider/model/settings navigation, tool and
   reasoning visibility, tool expansion, screen reset and dictation remain available. Escape only
-  dismisses a local completion/search/send chooser; `Ctrl+C` (or `/cancel`) cancels the wait. Screen
+  dismisses a local completion/search/send chooser; `Ctrl+C` (or `/cancel`) cancels the wait and
+  returns your message to the composer. Screen
   reset works immediately during inference instead of waiting for the turn to finish.
 
 - Edited, blocked, interrupted and failed turns end with an **actionable completion footer** from
@@ -106,14 +114,15 @@ failures (including checkpoint failures) are not reset by this recovery.
   never means passing. Missing freshness/verdicts remain unverified; recorded shell tests are not
   silently promoted to configured checks. Detail is bounded; `/evidence check`, `/todo` and
   `/review-file` expose the owning evidence. Plain completed answers remain quiet. These are
-  observations from `turn_summary`, not permission to retry or replay completed work.
+  observations from `turn_summary`, not permission to retry or replay completed work. Turns that
+  failed on a provider or transport error suggest `/retry`.
 - Settled test and build commands (`cargo test`, `cargo clippy`, `make test-*`, `pytest`, `tsc`, …)
   show a **Test** or **Build** card instead of their raw log: counts at the right of the header, then
   only failing test names or the first errors with their `file:line` locations. The expand key
   (`Ctrl+O`) shows the ordinary card with the complete output. Output the card cannot attribute (a
   crash with no test or error lines, a job moved to the background) keeps the ordinary card.
 - Resuming displays durable todos and recorded check statuses; these are history, not fresh test
-  results. Completed tools are not replayed automatically. `/review` reviews a frozen local or GitHub
+  results. Messages Dial injected into the conversation are not shown as your text. Completed tools are not replayed automatically. `/review` reviews a frozen local or GitHub
   PR scope with source-backed findings (the captured diff is split on `diff --git` file boundaries into
   chunks of at most 20,000 bytes, byte-splitting only a single larger file; chunks run concurrently as
   read-only `reviewer` tasks up to `task.max_concurrency`, and an interrupt cancels all of them. Findings are
@@ -156,7 +165,8 @@ failures (including checkpoint failures) are not reset by this recovery.
   clock, with no invented job percentage or ETA. Results or messages resume the turn without model
   polling; new input changes direction. Interrupting ends the agent turn, not the background job.
   Use Activity (`/activity`) to inspect and explicitly cancel owned work. Provider retry status shows
-  its observed attempt and monotonic delay until the next request; `/retry` skips that delay,
+  its observed attempt and the delay until the next request, reading **retrying…** once it is due;
+  `/retry` skips that delay,
   while the interrupt key stops the agent request. Neither operation replays completed tools.
   `/model restart` explicitly confirms unloading only Dial's managed local main model, which reloads
   with the same selection next request. Busy turns, running children and external endpoints are
@@ -166,7 +176,12 @@ failures (including checkpoint failures) are not reset by this recovery.
   before enabling edits. `/permissions` lists scoped rules; for example,
   `/permissions allow --persist bash cargo test` persists a project rule outside the workspace.
   Deny rules take precedence, including in automatic approval mode.
-  Approval prompts show the exact policy-derived reusable matcher and lifetime before consent.
+  Approval prompts lead with the action and show the exact policy-derived reusable matcher and
+  lifetime before consent. Answer keys are ignored for about 350 ms after a prompt appears. `Esc`
+  or `n` denies; `Ctrl+C` denies and stops the turn. Choosing the project scope asks for
+  confirmation because it persists. A batch of changes lists one line per change with
+  **Approve all**, **Choose one by one** and **Deny all**. Plan approval reads **Review plan** with
+  **Approve plan** and **Keep planning (give feedback)**.
   Shell rules match the displayed normalized argv prefix; later arguments may vary, while
   destructive forms remain excluded. Session grants are not saved; project grants persist into
   future sessions until revoked. Unsupported shell shapes, destructive commands, directory-access
@@ -178,8 +193,9 @@ failures (including checkpoint failures) are not reset by this recovery.
 The optional **workspace rail** above the composer shows per-file additions/deletions, including
 pre-existing changes; new files are labelled `new` and binary diffs `binary`. It starts off.
 `/changes` lists the cached workspace snapshot.
-**Pinned workers** sit above the composer and show running and recently finished workers: a header with the active and done counts, up to three rows in collapsed mode, a live line with the latest output (when `ui.worker_live_preview` is on) and an elapsed clock after five seconds. `ui.pinned_workers` selects `collapsed` (default), `full` (more rows) or `off`. The block is hidden on terminals shorter than 16 rows. The `workers` status segment shows `running/total workers`, adding `· $cost` once a worker reports cost; the block, the segment and the hub read the same snapshot. When a worker finishes, needs input or fails while no subagent view is open, one short notice names it and points to `Alt+A`. `Alt+A` opens the subagent hub. `Alt+Shift+A` opens the transcript of the most recently active running worker; press it again to cycle through the running workers. With none running it cycles through all workers, and with none it opens the hub. Double-Left on an empty composer also opens the hub. Pinned rows are not clickable: mouse capture is enabled only while a full-screen panel is open. Rebind `app.subagents.recent` to change the transcript key.
-Toggle the block in `/settings` → Appearance → Display. Ctrl-P and the empty slash menu start with everyday
+**Pinned workers** sit above the composer and show running and recently finished workers: a header with the active and done counts, up to three rows in collapsed mode, a live line with the latest output (when `ui.worker_live_preview` is on) and an elapsed clock after five seconds. Workers that finished needing input or blocked are marked as needing attention, stay pinned until you open them and can be resumed from their transcript. `ui.pinned_workers` selects `collapsed` (default), `full` (more rows) or `off`. The block is hidden on terminals shorter than 16 rows. The `workers` status segment shows `running/total workers`, adding `· $cost` once a worker reports cost; the block, the segment and the hub read the same snapshot, and the hub shows each worker's result. Unread worker messages show as `✉ N msgs`. When a worker finishes, needs input or fails, one short notice names the worker, quotes the first line of its question or blocker (needs input, blocked or failed), and points to `Alt+A`; the worker view header then says what continues it (reply below, or see its last message when it cannot be continued); notices raised while the hub or a worker view is open are kept rather than lost. `Alt+A` opens the worker hub. `Alt+Shift+A` opens the worker named by the newest notice; otherwise it opens the transcript of the most recently active running worker, and pressing it again cycles through the running workers. With none running it cycles through all workers, and with none it opens the hub. Double-Left on an empty composer also opens the hub. In worker views, `Ctrl+C` stops the selected worker after a confirming second press. Pinned rows are not clickable: mouse capture is enabled only while a full-screen panel is open. Rebind `app.subagents.recent` to change the transcript key.
+A task card settles when the task call returns; workers still running then read *continuing in background*.
+Toggle the block in `/settings` → Appearance → Display. The command palette (`Alt+K` or `F1`) and the empty slash menu start with everyday
 actions; advanced controls remain searchable. `/workers`, `/processes` and `/compute` group work
 controls. The evidence-expansion shortcut (Ctrl+O by default; rebind it in `/hotkeys`) expands
 earlier reads, searches, checks and worker reports. Card hints show the current binding.

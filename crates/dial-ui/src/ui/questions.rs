@@ -16,19 +16,68 @@ const MAX_PATH: usize = 4096;
 
 /// Apply an editing key unless it would grow the text past `limit`. Deletion, cursor movement and
 /// undo always work, so a field filled to its limit stays editable.
-fn edit_within(editor: &mut Editor, key: KeyEvent, limit: usize) {
+fn edit_within(editor: &mut Editor, key: KeyEvent, limit: usize, keys: &Keymap) {
     let before = editor.text.len();
     // A typed character adds at most four bytes; chords (yank, for example) can add more.
     let may_overflow = before + 4 > limit || !(key.modifiers - KeyModifiers::SHIFT).is_empty();
     if !may_overflow {
-        editor.key(key);
+        editor.key_with(key, keys);
         return;
     }
     let mut trial = editor.clone();
-    trial.key(key);
+    trial.key_with(key, keys);
     if trial.text.len() <= limit || trial.text.len() <= before {
         *editor = trial;
     }
+}
+
+/// Key names for the dialog's hint rows, taken from the keymap so remapped keys are advertised.
+/// Arrow keys keep their arrow glyphs.
+struct Hints {
+    select: String,
+    confirm: String,
+    cancel: String,
+    back: String,
+    next: String,
+    newline: String,
+    attach: String,
+    interrupt: String,
+}
+
+impl Hints {
+    fn new(keys: &Keymap) -> Hints {
+        let name = |action: Action| match keys.label(action).as_str() {
+            "Up" => "↑".to_owned(),
+            "Down" => "↓".to_owned(),
+            "Left" => "←".to_owned(),
+            "Right" => "→".to_owned(),
+            other => other.to_owned(),
+        };
+        let (up, down) = (name(Action::SelectUp), name(Action::SelectDown));
+        Hints {
+            select: if up == "↑" && down == "↓" {
+                "↑↓".to_owned()
+            } else {
+                [up, down]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            },
+            confirm: name(Action::SelectConfirm),
+            cancel: name(Action::SelectCancel),
+            back: name(Action::TabPrev),
+            next: name(Action::TabNext),
+            newline: keys.reachable_label(Action::Newline, super::term::reports_key_releases()),
+            attach: name(Action::PasteImage),
+            interrupt: name(Action::Interrupt),
+        }
+    }
+}
+
+/// `"Esc cancel"`, or nothing when the action is unbound.
+fn keyed(key: &str, what: &str) -> Option<String> {
+    (!key.is_empty()).then(|| format!("{key} {what}"))
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +102,7 @@ pub struct Dialog<'a> {
     deadline: Option<Instant>,
     paused_timeout: Option<Duration>,
     feedback: String,
+    hints: Hints,
 }
 impl<'a> Dialog<'a> {
     pub fn new(request: &'a QuestionRequest, root: &Path) -> Self {
@@ -68,7 +118,13 @@ impl<'a> Dialog<'a> {
             deadline: None,
             paused_timeout: None,
             feedback: String::new(),
+            hints: Hints::new(&Keymap::defaults()),
         }
+    }
+    /// Advertise the user's key bindings (the dialog also picks them up from the first key).
+    pub fn with_keys(mut self, keys: &Keymap) -> Self {
+        self.hints = Hints::new(keys);
+        self
     }
     pub fn presented(&mut self) -> Result<(), String> {
         if !self.presented {
@@ -195,9 +251,10 @@ impl<'a> Dialog<'a> {
         if key.kind == KeyEventKind::Release {
             return None;
         }
+        self.hints = Hints::new(keys);
         let text_mode = matches!(self.mode, Mode::Text(..) | Mode::Attach(..));
-        // Interrupt (Ctrl+C, and Esc from the choices) cancels the turn; inside a text field Esc only
-        // leaves the field, which is SelectCancel.
+        // Interrupt (Ctrl+C) cancels the turn from anywhere, and SelectCancel (Esc) cancels it from
+        // the choices; inside a text field Esc only leaves the field.
         if keys.matches(Action::Interrupt, &key)
             && !(text_mode && keys.matches(Action::SelectCancel, &key))
         {
@@ -209,7 +266,13 @@ impl<'a> Dialog<'a> {
                 _ if keys.matches(Action::SelectCancel, &key) => {
                     self.presented = false;
                 }
-                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                _ if keys.matches(Action::Newline, &key) => {
+                    if editor.text.len() < questions::MAX_TEXT {
+                        editor.insert("\n");
+                    }
+                    self.mode = Mode::Text(field, editor);
+                }
+                _ if keys.matches(Action::SelectConfirm, &key) => {
                     let answer = &mut self.answers[self.page];
                     match field {
                         Field::Custom => {
@@ -225,17 +288,12 @@ impl<'a> Dialog<'a> {
                     }
                     self.presented = false;
                 }
-                KeyCode::Enter => {
-                    if editor.text.len() < questions::MAX_TEXT {
-                        editor.insert("\n");
-                    }
-                    self.mode = Mode::Text(field, editor);
-                }
-                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+A stays line start; attaching an image path uses the attach-image key.
+                _ if keys.matches(Action::PasteImage, &key) => {
                     self.mode = Mode::Attach(field, editor, Editor::default())
                 }
                 _ => {
-                    edit_within(&mut editor, key, questions::MAX_TEXT);
+                    edit_within(&mut editor, key, questions::MAX_TEXT, keys);
                     self.mode = Mode::Text(field, editor);
                 }
             },
@@ -243,7 +301,7 @@ impl<'a> Dialog<'a> {
                 _ if keys.matches(Action::SelectCancel, &key) => {
                     self.mode = Mode::Text(field, answer_editor)
                 }
-                KeyCode::Enter => {
+                _ if keys.matches(Action::SelectConfirm, &key) => {
                     let count: usize = self
                         .answers
                         .iter()
@@ -278,25 +336,44 @@ impl<'a> Dialog<'a> {
                     }
                 }
                 _ => {
-                    edit_within(&mut path_editor, key, MAX_PATH);
+                    edit_within(&mut path_editor, key, MAX_PATH, keys);
                     self.mode = Mode::Attach(field, answer_editor, path_editor);
                 }
             },
             Mode::Choices => {
                 let count = self.request.questions[self.page].options.len();
+                let toggle = keys.matches(Action::SelectConfirm, &key)
+                    || (key.code == KeyCode::Char(' ') && key.modifiers.is_empty());
                 match key.code {
-                    KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
-                    KeyCode::Down => self.cursor = (self.cursor + 1).min(count + 3),
-                    KeyCode::Left if self.page > 0 => self.change_page(self.page - 1),
-                    KeyCode::Right => return self.advance(),
-                    KeyCode::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(5),
-                    KeyCode::PageDown => {
+                    _ if keys.matches(Action::SelectCancel, &key) => {
+                        return Some(QuestionOutcome::Cancelled);
+                    }
+                    _ if keys.matches(Action::SelectUp, &key) => {
+                        self.cursor = self.cursor.saturating_sub(1)
+                    }
+                    _ if keys.matches(Action::SelectDown, &key) => {
+                        self.cursor = (self.cursor + 1).min(count + 3)
+                    }
+                    _ if keys.matches(Action::TabPrev, &key) => {
+                        if self.page > 0 {
+                            self.change_page(self.page - 1)
+                        }
+                    }
+                    _ if keys.matches(Action::TabNext, &key) => return self.advance(),
+                    _ if keys.matches(Action::SelectPageUp, &key) => {
+                        self.preview_scroll = self.preview_scroll.saturating_sub(5)
+                    }
+                    _ if keys.matches(Action::SelectPageDown, &key) => {
                         self.preview_scroll = self.preview_scroll.saturating_add(5)
                     }
-                    KeyCode::Char('o') => self.start_text(Field::Custom),
-                    KeyCode::Char('n') => self.start_text(Field::Note),
-                    KeyCode::Char('c') => return Some(QuestionOutcome::Chat),
-                    KeyCode::Enter | KeyCode::Char(' ') => {
+                    KeyCode::Char('o') if key.modifiers.is_empty() => {
+                        self.start_text(Field::Custom)
+                    }
+                    KeyCode::Char('n') if key.modifiers.is_empty() => self.start_text(Field::Note),
+                    KeyCode::Char('c') if key.modifiers.is_empty() => {
+                        return Some(QuestionOutcome::Chat);
+                    }
+                    _ if toggle => {
                         if self.cursor < count {
                             let question = &self.request.questions[self.page];
                             let label = question.options[self.cursor].label.clone();
@@ -370,10 +447,23 @@ impl<'a> Dialog<'a> {
                     .into(),
                 );
                 let enter = match field {
-                    Field::Custom => "Enter submits",
-                    Field::Note => "Enter saves",
+                    Field::Custom => "submit",
+                    Field::Note => "save",
                 };
-                rows.push(format!("{enter} · Shift+Enter newline · Ctrl+A attach image path · Esc returns · Ctrl+C cancels turn"));
+                let hints = &self.hints;
+                rows.push(
+                    [
+                        keyed(&hints.confirm, enter),
+                        keyed(&hints.newline, "newline"),
+                        keyed(&hints.attach, "attach image path"),
+                        keyed(&hints.interrupt, "cancel turn"),
+                        keyed(&hints.cancel, "back"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                );
                 let before = &editor.text[..editor.cursor];
                 let after = &editor.text[editor.cursor..];
                 let lines = text::wrap_words(&format!("{before}│{after}"), width.max(1));
@@ -391,7 +481,16 @@ impl<'a> Dialog<'a> {
                 rows.push(
                     "Explicit human image path (PNG/JPEG/GIF/WebP; no clipboard ingestion)".into(),
                 );
-                rows.push("Enter attaches verified reference · Esc returns".into());
+                rows.push(
+                    [
+                        keyed(&self.hints.confirm, "attach verified reference"),
+                        keyed(&self.hints.cancel, "back"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                );
                 rows.push(editor.text.clone());
             }
             Mode::Choices => {
@@ -462,17 +561,26 @@ impl<'a> Dialog<'a> {
                     rows.push(format!("Note: {}", text::one_line(note)));
                 }
                 // Only keys that do something on this page are advertised.
-                let mut keys = vec!["↑↓ choose", "Enter select"];
+                let hints = &self.hints;
+                let mut keys = vec![
+                    keyed(&hints.select, "choose"),
+                    keyed(&hints.confirm, "select"),
+                ];
                 if self.page > 0 {
-                    keys.push("← back");
+                    keys.push(keyed(&hints.back, "back"));
                 }
-                keys.push(if self.page + 1 == total {
-                    "→ done"
-                } else {
-                    "→ next"
-                });
-                keys.extend(["o other", "n note", "c chat", "Esc cancel"]);
-                rows.push(keys.join(" · "));
+                keys.push(keyed(
+                    &hints.next,
+                    if self.page + 1 == total {
+                        "done"
+                    } else {
+                        "next"
+                    },
+                ));
+                keys.extend(["o other", "n note", "c chat"].map(|hint| Some(hint.to_owned())));
+                // The way out goes last.
+                keys.push(keyed(&hints.cancel, "cancel"));
+                rows.push(keys.into_iter().flatten().collect::<Vec<_>>().join(" · "));
             }
         }
         if !self.feedback.is_empty() {

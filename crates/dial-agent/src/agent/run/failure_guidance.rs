@@ -426,9 +426,17 @@ pub(in crate::agent) fn missing_program_recovery(
     }
     let program = output.text.lines().find_map(|line| {
         let line = line.trim();
+        // bash `NAME: command not found`, zsh `command not found: NAME`, dash `sh: 1: NAME: not found`.
         let name = match line.strip_suffix(": command not found") {
             Some(prefix) => prefix.rsplit(": ").next()?,
-            None => line.rsplit_once("command not found: ")?.1,
+            None => match line.rsplit_once("command not found: ") {
+                Some((_, name)) => name,
+                None => line
+                    .strip_suffix(": not found")
+                    .filter(|prefix| prefix.contains(": "))?
+                    .rsplit(": ")
+                    .next()?,
+            },
         };
         let valid = !name.is_empty()
             && name
@@ -437,6 +445,21 @@ pub(in crate::agent) fn missing_program_recovery(
         valid.then(|| name.to_owned())
     })?;
     Some(policy::missing_program(&program))
+}
+
+/// A file tool refused a path outside the workspace and suggested `request_directory`, but this
+/// run has no interactive approver (`approvable` false), so that request would only fail. Names
+/// the fact; the boundary and its policy guidance are unchanged.
+pub(in crate::agent) fn directory_request_unavailable(
+    output: &ToolOutput,
+    approvable: bool,
+) -> Option<String> {
+    (!approvable
+        && output
+            .text
+            .contains("outside the workspace; call request_directory"))
+    .then_some(policy::DIRECTORY_REQUEST_UNAVAILABLE)
+    .map(str::to_owned)
 }
 
 #[cfg(test)]

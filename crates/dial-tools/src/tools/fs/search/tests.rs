@@ -127,6 +127,10 @@ fn glob_patterns_sort_and_cap() {
     assert_eq!(text("nothing*"), "no matches");
     assert!(run(&ws, "glob", json!({"pattern": "../*"})).is_error);
     assert!(run(&ws, "glob", json!({"pattern": "/etc/*"})).is_error);
+    // An absolute pattern under the workspace root is the same root-relative pattern.
+    let root = ws.root().to_string_lossy().into_owned();
+    assert_eq!(text(&format!("{root}/src/*.rs")), "src/a.rs\nsrc/b.rs\n");
+    assert!(run(&ws, "glob", json!({"pattern": format!("{root}x/*")})).is_error);
     let refused = run(&ws, "grep", json!({"pattern": "x", "path": ".git"}));
     assert!(refused.is_error);
     assert!(

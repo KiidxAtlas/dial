@@ -196,6 +196,19 @@ const kernel = repl.start({ input, output: sink, terminal: false, prompt: '', us
 const context = kernel.context;
 if (!vm.isContext(context)) throw new Error('Node REPL did not create a vm context');
 for (const name of ['require', 'module', 'exports', 'process', '__filename', '__dirname']) delete context[name];
+// Under `node -e` the REPL's lazy builtin-module globals (`fs`, `path`, ...) ignore assignment, so
+// `var fs = 1` or `fs = 2` in a cell silently kept the module. Assigning one now replaces it.
+const builtinModules = new Set(require('node:module').builtinModules);
+for (const name of Object.getOwnPropertyNames(context)) {
+  const descriptor = Object.getOwnPropertyDescriptor(context, name);
+  if (!builtinModules.has(name) || typeof descriptor?.get !== 'function' || !descriptor.configurable) continue;
+  Object.defineProperty(context, name, {
+    get: descriptor.get,
+    set(value) { Object.defineProperty(context, name, { value, writable: true, configurable: true, enumerable: true }); },
+    configurable: true,
+    enumerable: false,
+  });
+}
 context.tool = tool;
 context.__dial_prelude__ = async (name, parameters) => callback('prelude', { name, parameters }).data;
 context.__dial_check__ = (name, passed) => callback('check', { name, passed });

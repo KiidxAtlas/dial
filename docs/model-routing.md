@@ -100,7 +100,7 @@ In the picker, `Tab` switches between the sidebar and list; `Enter` or `Right` e
 | Role | Used for | Falls back to |
 |---|---|---|
 | `main` | Conversation and coding agent | Always assigned (the session model) |
-| `task` | Implementation tasks and worker subagents | For task-tool delegation: `coach`, then `small`, then `main` |
+| `task` | Implementation tasks and workers | For task-tool delegation: `coach`, then `small`, then `main` |
 | `small` | Compaction, commit messages (all tiers), architecture synthesis, solve patch-search workers; preferred when assigned for scout and custom read-only subagents | `main` for maintenance; task-tool subagents follow `task` when `small` is unassigned |
 | `decision` | Typed judgments for automatic thinking, judged rules, and busy-message routing; chat model or the Laya engine | `small`, then `main` |
 | `coach` | Planning, escalation, advisor/completion review, feedback proposals, experience teacher, and edit repair | Plan mode: `main`; planner subagents: `task`, `small`, `main`; other consumers retain their activation gates |

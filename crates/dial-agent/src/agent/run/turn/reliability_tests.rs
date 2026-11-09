@@ -1759,3 +1759,51 @@ fn presentation_reduced_source_results_cannot_authorize_read_reuse() {
         );
     });
 }
+
+/// Under the default stable offer (`assistance.compact_tools = true`), a failing check is an
+/// observed diagnostic gap. The offer stays fixed (specialists load only through `tool_load`), so
+/// the gap routes nothing and the turn continues to the model's correction instead of failing.
+#[test]
+fn a_failing_check_under_the_stable_offer_continues_the_turn() {
+    use crate::runtime::tool_output::ToolOutput;
+    use crate::tools::integrations::ext::{Tool, ToolContext};
+    struct Diagnostics;
+    impl Tool for Diagnostics {
+        fn name(&self) -> &str {
+            "dap_stable_probe"
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"dap_stable_probe","description":"Debugger runtime diagnostics for a launched program","parameters":{"type":"object","properties":{}}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            true
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            panic!("gap routing must never execute a capability")
+        }
+    }
+    let server = llm::fake::serve(vec![
+        response("", Some(("bash", json!({"command":"exit 1","check":true})))),
+        slots(),
+        response("The check fails; the defect is reproduced.", None),
+    ]);
+    crate::agent::run::tool_exposure::default_offer_tests::with_default_agent(
+        "approval='auto'\n[compaction]\nenabled=false\n[verification]\nenabled=false\n[verification.review]\nenabled=false",
+        |agent| {
+            assert!(agent.stable_tool_offer());
+            connect(agent, &server.url);
+            agent.ext.register(Arc::new(Diagnostics));
+            let offered = agent.offered();
+            let report = agent
+                .turn("Reproduce the failing check.", &mut NullUi)
+                .expect("a failing check must not end the turn with an error");
+            assert!(
+                report.text.contains("defect is reproduced"),
+                "{}",
+                report.text
+            );
+            assert_eq!(agent.offered(), offered, "the stable offer must not change");
+        },
+    );
+    assert_eq!(completion_requests(&server).len(), 2);
+}
