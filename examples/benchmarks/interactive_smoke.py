@@ -469,6 +469,14 @@ class Terminal:
         self.run("send-keys", "-t", "smoke", key)
         time.sleep(0.3)
 
+    def answer(self, key):
+        """Answer a prompt that just appeared, after Dial's 350 ms type-ahead guard has passed.
+        Returns when the key was sent, so latency measured from it excludes the guard wait."""
+        time.sleep(0.5)
+        sent = time.monotonic()
+        self.key(key)
+        return sent
+
     def wait_panel(self, opened=True, timeout=12):
         deadline = time.monotonic() + timeout
         expected = "1" if opened else "0"
@@ -647,9 +655,9 @@ def workers_case(server, binary, captures):
             terminal.key("x")
             terminal.wait("Press x again")
             terminal.key("x")
-            terminal.wait("· cancelled")
+            terminal.wait("· stopped")
             terminal.capture("workers-cancelled")
-            terminal.key("Tab")
+            terminal.key("2")
             terminal.wait("Alpha-summary-ready")
             terminal.capture("workers-activity")
         finally:
@@ -835,7 +843,7 @@ def refused_connection_case(_server, binary, captures):
                 terminal.wait("mock-main")
                 terminal.command("/setup choose verify-coding")
                 terminal.wait("Check coding/tool compatibility", history=False)
-                terminal.key("v")
+                terminal.answer("v")
                 terminal.wait("Endpoint unavailable", timeout=30)
                 assert server.chat_requests == 0, "refused socket unexpectedly served HTTP"
                 terminal.capture("refused-socket-diagnostic-failure")
@@ -852,7 +860,7 @@ def refused_connection_case(_server, binary, captures):
                 started = time.monotonic()
                 terminal.command("/setup choose verify-coding")
                 terminal.wait("Check coding/tool compatibility", history=False)
-                terminal.key("v")
+                terminal.answer("v")
                 terminal.wait("Structured tool roundtrip verified", timeout=25)
                 assert server.chat_requests == server.diagnostic_requests == 2, "explicit retry duplicated work"
                 assert_no_project_edits(project)
@@ -937,14 +945,13 @@ def coding_diagnostic_case(server, binary, captures):
             before = server.chat_requests
             terminal.command("/setup choose verify-coding")
             terminal.wait("Check coding/tool compatibility", history=False)
-            terminal.key("Enter")  # Default is Cancel, never implicit model spending.
+            terminal.answer("Enter")  # Default is Cancel, never implicit model spending.
             terminal.wait_panel(False)
             terminal.command("/setup choose verify-coding")
             terminal.wait("Check coding/tool compatibility", history=False)
             assert server.chat_requests == before, "diagnostic Cancel sent a request"
             diagnostic_before = server.diagnostic_requests
-            started = time.monotonic()
-            terminal.key("v")
+            started = terminal.answer("v")
             terminal.wait("Structured tool roundtrip verified", timeout=25)
             assert server.diagnostic_requests - diagnostic_before == 2, "diagnostic exceeded its two-request contract"
             assert server.chat_requests - before == 2, "unexpected diagnostic or chat dispatch"
@@ -1020,8 +1027,7 @@ def recovery_preview_case(server, binary, captures):
             assert server.chat_requests == before, "preview Cancel dispatched work"
             terminal.command("/draft restore")
             terminal.wait("Review saved input", history=False)
-            restored = time.monotonic()
-            terminal.key("r")
+            restored = terminal.answer("r")
             terminal.wait("Input restored and held")
             terminal.wait("PTY-RECOVERY-HELD-DRAFT", history=False)
             assert server.chat_requests == before, "restore automatically sent the recovered draft"
@@ -1092,9 +1098,9 @@ def main():
             terminal.command(f"/review-file {turn} a.txt")
             terminal.wait("Review file")
             terminal.capture("selective-review-dialog")
-            terminal.key("r")
+            terminal.answer("r")
             terminal.wait("Revert file?")
-            terminal.key("r")
+            terminal.answer("r")
             terminal.wait("Restored only the selected file")
             terminal.wait("checkpoint for /undo files.")
             assert (project / "a.txt").read_text() == "original-a"

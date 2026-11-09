@@ -362,6 +362,7 @@ fn edited_js_cells_redeclare_their_top_level_names() {
 }
 
 /// Declares, throws after declaring `fs`, then re-declares everything; the last value is 17.
+#[cfg(any(target_os = "macos", all(feature = "embedded-js", unix)))]
 pub(super) const REDECLARED_CELLS: [&str; 3] = [
     "const a = 1; class C {}; let t = 3;",
     "const fs = undefinedName.x;",

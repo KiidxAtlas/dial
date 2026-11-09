@@ -70,6 +70,11 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   model request that succeeds after provider retries adds one **Recovered** line
   ([shortcuts](docs/terminal-shortcuts.md), [tools](docs/tools.md), [turns](docs/terminal-turns.md),
   [composer](docs/terminal-composer.md)).
+- Workers a `task` call left running in the background announce their finish, failure or question
+  again, and stay in the pinned worker block. Before, such a worker could end with only an inbox
+  count, because its task card had stopped updating when the call returned.
+- Security: the bundled SQLite is updated to 3.54.1 (`rusqlite` 0.41), fixing RUSTSEC-2026-0459,
+  where a crafted database and `-wal` file pair could return stale process memory.
 
 ## [0.3.1] - 2026-11-06
 

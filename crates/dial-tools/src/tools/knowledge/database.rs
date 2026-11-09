@@ -127,7 +127,7 @@ fn capture(ws: &Workspace, path: &str) -> Result<Vec<u8>> {
     no_companions(ws, path)?;
     Ok(bytes)
 }
-fn controls(conn: &Connection) -> Result<()> {
+fn controls(conn: &mut Connection) -> Result<()> {
     conn.busy_timeout(Duration::ZERO)?;
     conn.execute_batch(
         "PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA temp_store=MEMORY;",
@@ -157,7 +157,7 @@ fn controls(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
-fn restrict(conn: &Connection, tables: Vec<String>) -> Result<()> {
+fn restrict(conn: &mut Connection, tables: Vec<String>) -> Result<()> {
     conn.authorizer(Some(
         move |ctx: rusqlite::hooks::AuthContext<'_>| match ctx.action {
             AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
@@ -243,7 +243,7 @@ fn rows(conn: &Connection, sql: &str, limit: usize) -> Result<Value> {
         count > 0 && count <= MAX_COLUMNS,
         "result must have 1..=64 columns"
     );
-    let columns: Vec<_> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let columns: Vec<_> = stmt.column_names().map(str::to_owned).collect();
     let mut cursor = stmt.query([])?;
     let mut output = Vec::new();
     let mut size = serde_json::to_vec(&columns)?.len();
@@ -354,11 +354,11 @@ pub(crate) fn inspect_snapshot(
     let mut temporary = tempfile::NamedTempFile::new()?;
     temporary.write_all(payload)?;
     temporary.flush()?;
-    let conn = Connection::open_with_flags(
+    let mut conn = Connection::open_with_flags(
         temporary.path(),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    controls(&conn)?;
+    controls(&mut conn)?;
     let virtuals: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_schema WHERE upper(sql) LIKE '%CREATE VIRTUAL TABLE%'",
         [],
@@ -375,7 +375,7 @@ pub(crate) fn inspect_snapshot(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     ensure!(tables.len() <= 1000, "database schema exceeds 1000 objects");
     drop(names);
-    restrict(&conn, tables)?;
+    restrict(&mut conn, tables)?;
     let sql = sql.context("sql required")?;
     // EXPLAIN must not mask the original statement's read-only status.
     ensure!(conn.prepare(sql)?.readonly(), "statement is not read-only");

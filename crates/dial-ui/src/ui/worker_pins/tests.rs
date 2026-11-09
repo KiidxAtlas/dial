@@ -422,3 +422,28 @@ fn viewing_a_worker_drops_its_notices_and_holds_the_others() {
     assert!(!shown.iter().any(|l| l.contains("seen")), "{shown:?}");
     assert!(shown.iter().any(|l| l.contains("other")), "{shown:?}");
 }
+
+#[test]
+fn a_task_card_owns_its_workers_only_while_the_call_runs() {
+    use crate::runtime::Phase;
+    let tree = Tree::default();
+    let call = tree.start("tool", "task", None);
+    let call_id = call.read(|node| node.id.clone());
+    let worker = tree.start("worker", "scout", Some(call_id));
+    worker.settle(
+        String::new(),
+        Some(serde_json::json!({"id": "task-1"})),
+        Phase::Running,
+    );
+    let detached = tree.start("worker", "solo", None);
+    detached.settle(
+        String::new(),
+        Some(serde_json::json!({"id": "task-2"})),
+        Phase::Running,
+    );
+    assert_eq!(card_owned(&tree), HashSet::from(["task-1".to_owned()]));
+    // The call returned with the worker still running in the background: its card is frozen
+    // scrollback now, so the board must announce the worker's finish itself.
+    call.settle("started".into(), None, Phase::Completed);
+    assert!(card_owned(&tree).is_empty());
+}

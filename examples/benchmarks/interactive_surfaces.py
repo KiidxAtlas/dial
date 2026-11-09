@@ -213,7 +213,7 @@ def tree_case(server, binary, captures, root):
         chat_before_nav = server.chat_requests
 
         terminal.draft("PARKED-DRAFT-MARKER")
-        terminal.key("C-p")
+        terminal.key("M-k")
         # /tree is a hidden compatibility command, not a searchable palette entry.
         type_text(terminal, "sessions")
         # tmux otherwise collapses S-Enter to plain Enter; encode the modified key explicitly.

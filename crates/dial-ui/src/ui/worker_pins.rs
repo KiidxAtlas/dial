@@ -60,7 +60,7 @@ pub struct WorkerBoard {
     /// `(id, name, outcome, reason)` still owed a notice. The reason is the worker's own question
     /// or blocker, so a notice says what is needed without opening the worker.
     pending: Vec<(String, String, Outcome, Option<String>)>,
-    /// Workers a `task` call card owns (worker bodies with a parent node).
+    /// Workers a running `task` call card owns (worker bodies whose parent call is still live).
     card_owned: HashSet<String>,
     /// Finished workers the operator already opened; they leave the pinned block.
     dismissed: HashSet<String>,
@@ -111,22 +111,7 @@ impl WorkerBoard {
         }
         self.refreshed_at = Some(now);
         let snapshot = self.cache.snapshot(layout, session_id, runtime, live);
-        self.card_owned = runtime
-            .bodies("worker")
-            .iter()
-            .filter_map(|body| {
-                body.read(|node| {
-                    node.parent.as_ref()?;
-                    Some(
-                        node.result
-                            .data
-                            .as_ref()
-                            .and_then(|data| data["id"].as_str())
-                            .map_or_else(|| node.id.clone(), str::to_owned),
-                    )
-                })
-            })
-            .collect();
+        self.card_owned = card_owned(runtime);
         self.observe(&snapshot);
         self.snapshot = snapshot;
         true
@@ -177,6 +162,34 @@ impl WorkerBoard {
         }
         self.primed = true;
     }
+}
+
+/// Workers a `task` call card owns: those whose parent call is still running. Once the call
+/// returns, its card freezes as "continuing in background", so the board announces them again.
+fn card_owned(runtime: &Tree) -> HashSet<String> {
+    let live_calls: HashSet<String> = runtime
+        .bodies("tool")
+        .iter()
+        .filter_map(|body| {
+            body.read(|node| node.result.phase.is_running().then(|| node.id.clone()))
+        })
+        .collect();
+    runtime
+        .bodies("worker")
+        .iter()
+        .filter_map(|body| {
+            body.read(|node| {
+                live_calls.contains(node.parent.as_ref()?).then_some(())?;
+                Some(
+                    node.result
+                        .data
+                        .as_ref()
+                        .and_then(|data| data["id"].as_str())
+                        .map_or_else(|| node.id.clone(), str::to_owned),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Longest worker reason quoted in a notice; the hub and viewer show the rest.
