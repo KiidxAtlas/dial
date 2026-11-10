@@ -210,12 +210,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     @staticmethod
     def goal(transcript, required=True):
-        matches = re.findall(r"(?:acceptance goal[^\n]*?exactly|actual task goal is)\s+([A-Z]+-\d+)", transcript, re.IGNORECASE)
-        if not matches:
-            if required:
-                raise ValueError("original goal was not preserved in the conversation")
+        lowered = transcript.lower()
+        acceptance_cursor = 0
+        actual_cursor = 0
+        while True:
+            acceptance = lowered.find("acceptance goal", acceptance_cursor)
+            actual = lowered.find("actual task goal is", actual_cursor)
+            if acceptance < 0 and actual < 0:
+                break
+            if actual < 0 or 0 <= acceptance < actual:
+                line_end = transcript.find("\n", acceptance)
+                if line_end < 0:
+                    line_end = len(transcript)
+                marker = lowered.find("exactly", acceptance + len("acceptance goal"), line_end)
+                while marker >= 0:
+                    goal = Handler._goal_token(transcript, marker + len("exactly"))
+                    if goal is not None:
+                        return goal
+                    marker = lowered.find("exactly", marker + 1, line_end)
+                acceptance_cursor = line_end + 1
+            else:
+                goal = Handler._goal_token(transcript, actual + len("actual task goal is"))
+                if goal is not None:
+                    return goal
+                actual_cursor = actual + len("actual task goal is")
+        if required:
+            raise ValueError("original goal was not preserved in the conversation")
+        return None
+
+    @staticmethod
+    def _goal_token(text, position):
+        start = position
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position == start:
             return None
-        return matches[0]
+        goal_start = position
+        while position < len(text) and text[position].isalpha():
+            position += 1
+        if position == goal_start or position >= len(text) or text[position] != "-":
+            return None
+        position += 1
+        number_start = position
+        while position < len(text) and text[position].isdigit():
+            position += 1
+        return text[goal_start:position] if position > number_start else None
 
     @staticmethod
     def text(content):
