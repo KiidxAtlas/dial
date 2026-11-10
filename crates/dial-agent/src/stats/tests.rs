@@ -255,6 +255,7 @@ fn rollups_sum_exactly_and_derive_rates() {
         tool: "read".into(),
         duration_ms: 10,
         error: false,
+        error_class: None,
     })
     .unwrap();
     db.record_tool(&ToolRecord {
@@ -266,6 +267,7 @@ fn rollups_sum_exactly_and_derive_rates() {
         tool: "read".into(),
         duration_ms: 30,
         error: true,
+        error_class: None,
     })
     .unwrap();
 
@@ -476,6 +478,7 @@ fn trace_returns_only_the_requested_session() {
         tool: "read".into(),
         duration_ms: 5,
         error: false,
+        error_class: None,
     })
     .unwrap();
     db.sync_sessions(home.path()).unwrap();

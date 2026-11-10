@@ -186,34 +186,80 @@ fn grep_searches_a_retained_artifact_body_and_refuses_selectors() {
     let selected = grep(&ws, json!({"pattern": "x", "path": format!("{uri}:1+2")}));
     assert!(selected.contains("without a selector"), "{selected}");
     let context = grep(&ws, json!({"pattern": "x", "path": uri, "context": 1}));
-    assert!(
-        context.contains("not supported for artifact:// grep"),
-        "{context}"
+    assert_eq!(
+        context,
+        format!("{uri}-1-compiling a\n{uri}:2:warning: unused x\n{uri}-3-finished\n")
     );
 }
 
 #[test]
-fn a_missing_scope_among_several_is_named_with_suggestions() {
+fn artifact_context_rows_never_repeat_and_separate_distant_groups() {
+    let (_dir, ws) = workspace();
+    let state = tempfile::tempdir().unwrap();
+    let ws = ws.with_artifacts(crate::storage::artifact::ArtifactStore::new(state.path()).unwrap());
+    let uri = ws
+        .artifacts()
+        .unwrap()
+        .retain("hit a\nhit b\nc\nd\ne\nf\nhit g\n")
+        .unwrap();
+    let out = grep(&ws, json!({"pattern": "^hit", "path": uri, "context": 1}));
+    assert_eq!(
+        out,
+        format!("{uri}:1:hit a\n{uri}:2:hit b\n{uri}-3-c\n--\n{uri}-6-f\n{uri}:7:hit g\n")
+    );
+    let paged = grep(
+        &ws,
+        json!({"pattern": "^hit", "path": uri, "context": 1, "skip": 1, "limit": 1}),
+    );
+    assert_eq!(
+        paged,
+        format!(
+            "{uri}-1-hit a\n{uri}:2:hit b\n{uri}-3-c\n[results capped; increase skip to continue]\n"
+        )
+    );
+}
+
+#[test]
+fn a_missing_scope_among_several_is_skipped_and_named_with_suggestions() {
     let (dir, ws) = workspace();
     fs::create_dir_all(dir.path().join("src/agent")).unwrap();
     fs::write(dir.path().join("src/agent/dispatch.rs"), "fn tool() {}\n").unwrap();
     fs::write(dir.path().join("src/agent/turn.rs"), "fn turn() {}\n").unwrap();
-    let out = grep(
+    let out = run(
         &ws,
+        "grep",
         json!({"pattern": "fn", "path": "src/agent/dispatch.rs;src/agent/tool_dispatch.rs"}),
     );
+    assert!(!out.is_error, "{}", out.text);
     assert!(
-        out.contains("searching \"src/agent/tool_dispatch.rs\"")
-            && out.contains("Did you mean")
-            && out.contains("src/agent/dispatch.rs")
-            && out.contains("Only scope \"src/agent/tool_dispatch.rs\" is missing"),
-        "{out}"
+        out.text.contains("src/agent/dispatch.rs:1:fn tool() {}")
+            && out
+                .text
+                .contains("[scope not searched] searching \"src/agent/tool_dispatch.rs\"")
+            && out.text.contains("Did you mean"),
+        "{}",
+        out.text
     );
-    let single = grep(
+    let listed = run(
         &ws,
-        json!({"pattern": "fn", "path": "src/agent/tool_dispatch.rs"}),
+        "glob",
+        json!({"pattern": "*.rs", "path": "src/agent;src/missing"}),
     );
-    assert!(!single.contains("Only scope"), "{single}");
+    assert!(!listed.is_error, "{}", listed.text);
+    assert!(
+        listed.text.contains("src/agent/turn.rs")
+            && listed
+                .text
+                .contains("[scope not searched] searching \"src/missing\""),
+        "{}",
+        listed.text
+    );
+    // With no scope left there is nothing to answer from, so the call still fails.
+    for path in ["src/agent/tool_dispatch.rs", "src/nope;src/agent/gone.rs"] {
+        let none = run(&ws, "grep", json!({"pattern": "fn", "path": path}));
+        assert!(none.is_error, "{}", none.text);
+        assert!(!none.text.contains("[scope not searched]"), "{}", none.text);
+    }
 }
 
 #[test]

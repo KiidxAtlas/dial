@@ -22,6 +22,10 @@ For the source directory map, offline checks and fixture ownership, start with
 [the benchmark tooling index](../examples/benchmarks/README.md). Runnable non-benchmark samples
 are listed in [the examples index](../examples/README.md).
 
+The scripted provider extracts acceptance goals with a line-by-line scan rather than a
+backtracking wildcard, so repeated goal prefixes in supplied conversation text do not
+stall the offline harness. `test_smoke.py` covers both goal preservation and this input.
+
 Local benchmark workspaces and reports live in `benchmarks/`, outside Cargo's disposable
 `target/`. See [the local workspace map](../benchmarks/README.md). Downloaded datasets,
 environments, binaries and private traces stay ignored by Git and Docker; committed tooling
@@ -357,6 +361,30 @@ python3 -m unittest discover -s examples/benchmarks -p 'test_*.py'
 
 The smoke uses a loopback scripted provider with baseline and compact-tool configurations.
 It verifies orchestration and graders, **not real-model performance**.
+
+### Release slice
+
+`examples/benchmarks/release-slice.toml` fixes the suites a release candidate is measured on:
+`quality`, `reliability`, `representative`, `local-tasks`, `recovery` and `tool-effectiveness`
+(27 cases), each case run three times per configuration (81 case runs). It is a plan, not a run:
+
+```sh
+python3 examples/benchmarks/release_slice.py --profile local --label v0.3.4
+python3 examples/benchmarks/release_slice.py --profile hosted --label v0.3.4
+```
+
+The script validates the manifest against the committed suites and profiles and prints one
+`dial benchmark` and one `reliability.py` command per suite, writing under
+`benchmarks/release-slice/<label>/`. It never starts Dial or contacts a model. The hosted profile
+(`release-slice-hosted-profiles.toml`, `allow_remote = true`) spends provider quota when you run the
+printed commands; the local profile needs the ID of an already loaded model.
+
+The manifest refuses fewer than three repetitions, a suite whose case count differs from the
+pinned one, and profiles whose repetitions or remote policy disagree with it. Changing the suite
+list, a case count or the repetitions changes the denominator: bump `name` and do not compare
+against reports recorded under the old name. Report `pass_hat_k` at `k = 3` (all three trials
+pass) next to pass@1; a single-attempt result, such as the Harbor comparison sheets, is not a
+reliability estimate and must not be worded as one. No release-slice run has been recorded yet.
 
 ### Core-reliability acceptance protocol
 
@@ -958,7 +986,7 @@ Both agents get the issue and the same Docker test helper, not reference patches
 acceptance tests. The helper sends a working-tree patch into a fresh container without mounting
 the host workspace or Docker socket. Hidden acceptance is applied only by the final grader.
 
-The CLI runner requires POSIX process groups. Dial's default shell sandbox can block the Docker
+The CLI runner requires POSIX process groups. With `sandbox.mode` set to `dev` or `strict`, Dial's shell sandbox can block the Docker
 socket. Only with explicit operator approval, add `--dial-sandbox-off` to `prepare` for those child
 trials; it is off by default in the adapter and is recorded in the frozen command templates.
 This removes Dial's shell confinement and permits host access, matching omp's auto-approved host

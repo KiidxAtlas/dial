@@ -1,5 +1,5 @@
 pkgbase = dial-bin
-	pkgdesc = Sandboxed coding agent for the terminal with undo and test evidence; runs local or hosted models
+	pkgdesc = Coding agent for the terminal with undo, test evidence and an optional OS sandbox; runs local or hosted models
 	pkgver = 0.3.1
 	pkgrel = 1
 	url = https://github.com/KiidxAtlas/dial

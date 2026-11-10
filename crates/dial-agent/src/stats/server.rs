@@ -47,6 +47,15 @@ pub(crate) fn serve_routes(
     label: &str,
     route: impl Fn(&str) -> Response,
 ) -> Result<()> {
+    serve_requests(listener, label, |request| answer_request(request, &route))
+}
+
+/// Serves bounded HTTP requests after the loopback Host gate, including JSON action bodies.
+pub(crate) fn serve_requests(
+    listener: TcpListener,
+    label: &str,
+    route: impl Fn(&str) -> Response,
+) -> Result<()> {
     let port = listener.local_addr()?.port();
     for incoming in listener.incoming() {
         let mut stream = match incoming {
@@ -68,15 +77,26 @@ pub(crate) fn serve_routes(
                 Ok(0) | Err(_) => break,
                 Ok(n) => request.extend_from_slice(&chunk[..n]),
             }
-            if request.windows(4).any(|w| w == b"\r\n\r\n") || request.len() >= 8192 {
+            if request.len() >= 73728 {
                 break;
+            }
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let length = content_length(&headers).unwrap_or(0);
+                if end > 8192 || length > 65536 || request.len() >= end + 4 + length {
+                    break;
+                }
             }
         }
         if request.is_empty() {
             continue;
         }
         let line = String::from_utf8_lossy(&request);
-        let (status, content_type, body) = answer(port, &line, &route);
+        let (status, content_type, body) = if !loopback_host(&line, port) {
+            ("403 Forbidden", TEXT, "unexpected Host header\n".to_owned())
+        } else {
+            route(&line)
+        };
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -119,16 +139,39 @@ fn respond(user_dir: &Path, port: u16, request: &str) -> Response {
 }
 
 /// Answers one raw HTTP request with `route` once the `Host` gate admits it.
+#[cfg(test)]
 pub(crate) fn answer(port: u16, request: &str, route: impl Fn(&str) -> Response) -> Response {
     if !loopback_host(request, port) {
         return ("403 Forbidden", TEXT, "unexpected Host header\n".to_owned());
     }
+    answer_request(request, route)
+}
+
+fn answer_request(request: &str, route: impl Fn(&str) -> Response) -> Response {
     let target = request
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/");
     route(target)
+}
+
+/// Declared body size; duplicate, invalid and chunked lengths are refused.
+pub(crate) fn content_length(headers: &str) -> Option<usize> {
+    let mut length = None;
+    for line in headers.lines().skip(1).take_while(|line| !line.is_empty()) {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if length.is_some() {
+                return None;
+            }
+            length = Some(value.trim().parse().ok()?);
+        }
+    }
+    length
 }
 
 /// Maps a request target (`/path?query`) to `(status, content type, body)`.

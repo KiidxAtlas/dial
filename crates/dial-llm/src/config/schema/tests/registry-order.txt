@@ -185,6 +185,7 @@ assistance.local.loop_penalty
 assistance.local.suggestions
 assistance.local.time_budget
 weights.model
+weights.knowledge
 assistance.tool_grammar
 assistance.constrained_repair
 assistance.repair_hints

@@ -6,8 +6,6 @@
 use crate::config::tools::kernel::KernelConfig;
 
 use super::background::{AdoptedJob, CellJob};
-#[cfg(windows)]
-use super::sandbox::Sandbox;
 use crate::tools::integrations::ext::{ToolCallback, ToolContext};
 use crate::tools::{ToolOutput, Workspace, exec::preludes};
 use parking_lot::Mutex;
@@ -142,22 +140,6 @@ impl PythonRuntime {
                 if code.len() > MAX_CODE {
                     return Err(format!("code exceeds {MAX_CODE} bytes"));
                 }
-                #[cfg(windows)]
-                if !ctx.workspace.unsandboxed {
-                    let isolation = ctx
-                        .workspace
-                        .sandbox
-                        .clone()
-                        .unwrap_or_else(Sandbox::detect)
-                        .available()
-                        .err()
-                        .unwrap_or_else(|| {
-                            "Windows filesystem/network isolation is unavailable".into()
-                        });
-                    return Err(format!(
-                        "Windows Python kernels require the explicit unsandboxed setting because filesystem/network isolation is unavailable: {isolation}"
-                    ));
-                }
                 let result = (|| {
                     if slot.as_mut().is_some_and(|s| !s.alive()) {
                         slot.take();
@@ -195,22 +177,21 @@ impl PythonRuntime {
                         check_operation(end, &self.interrupt, cancel)?;
                         #[cfg(windows)]
                         let mut command = {
-                            let mut command = Command::new(&launch.python);
-                            command
-                                .args(["-I", "-S", "-u", "-c"])
-                                .arg(PYTHON_DRIVER)
-                                .args(launch.site.iter())
-                                .env_clear()
-                                .current_dir(ctx.workspace.root());
-                            for (key, value) in std::env::vars_os() {
-                                if super::sandbox::child_env_allowed(
-                                    &key.to_string_lossy(),
-                                    &value.to_string_lossy(),
-                                ) {
-                                    command.env(key, value);
-                                }
+                            let python = launch
+                                .python
+                                .to_str()
+                                .ok_or("Python executable path is not UTF-8")?;
+                            let mut args: Vec<String> = ["-I", "-S", "-u", "-c", PYTHON_DRIVER]
+                                .map(String::from)
+                                .into();
+                            for site in launch.site.iter() {
+                                args.push(
+                                    site.to_str()
+                                        .ok_or("kernel site-packages path is not UTF-8")?
+                                        .to_owned(),
+                                );
                             }
-                            command
+                            windows_kernel_command(ctx.workspace, python, &args)?
                         };
                         #[cfg(not(windows))]
                         let mut command = {
@@ -606,6 +587,7 @@ fn probe_fork_containment(label: &str) -> Result<(), String> {
 /// fence in the launcher, and a sandboxed macOS command carries it in its workspace profile:
 /// Seatbelt refuses to apply a second, different profile inside one. Only an unsandboxed macOS
 /// command gets the fence as its own `sandbox-exec` profile.
+#[cfg(not(windows))]
 pub(super) fn fork_fence_prefix(workspace: &Workspace) -> String {
     #[cfg(target_os = "linux")]
     let nested = {
@@ -631,9 +613,42 @@ pub(super) fn fenced_command(workspace: &Workspace, script: &str) -> Result<Comm
     super::shell::shell_command_fenced(workspace, script, workspace.root())
 }
 
+/// Windows kernels launch their interpreter directly (no POSIX shell line), through Dial's
+/// launcher with [`CHILD_FENCE_ARG`] as the process-fork fence: with the allowlisted environment
+/// when unsandboxed, else at Low integrity. Each driver keeps its protocol on stdout.
+///
+/// [`CHILD_FENCE_ARG`]: super::sandbox::low_integrity::CHILD_FENCE_ARG
 #[cfg(windows)]
-pub(super) fn fenced_command(workspace: &Workspace, script: &str) -> Result<Command, String> {
-    super::shell::shell_command(workspace, script, workspace.root())
+pub(super) fn windows_kernel_command(
+    workspace: &Workspace,
+    program: &str,
+    args: &[String],
+) -> Result<Command, String> {
+    use super::sandbox::low_integrity::CHILD_FENCE_ARG;
+    let mut command = if workspace.unsandboxed {
+        let exe = std::env::current_exe().map_err(|e| format!("locating Dial: {e}"))?;
+        let mut command = Command::new(exe);
+        command
+            .arg(CHILD_FENCE_ARG)
+            .arg(program)
+            .args(args)
+            .env_clear();
+        for (key, value) in std::env::vars_os() {
+            if super::sandbox::child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy()) {
+                command.env(key, value);
+            }
+        }
+        command
+    } else {
+        // The sandboxed launcher runs `LAUNCH_ARG CHILD_FENCE_ARG program args…`: Low integrity
+        // first, then the fenced program.
+        let mut fenced = Vec::with_capacity(args.len() + 1);
+        fenced.push(program.to_owned());
+        fenced.extend(args.iter().cloned());
+        super::shell::windows_sandboxed(workspace, CHILD_FENCE_ARG, &fenced)?
+    };
+    command.current_dir(workspace.root());
+    Ok(command)
 }
 
 /// Cell deadline with host-callback time excluded. A controller callback runs on the caller's

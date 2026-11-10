@@ -9,8 +9,8 @@ use std::sync::atomic::AtomicBool;
 /// Private re-exec entry point; it is not a user-facing command.
 pub const OWNER_ARG: &str = "--dial-background-owner";
 
-#[cfg(unix)]
-mod unix;
+#[cfg(any(unix, windows))]
+mod owner;
 
 pub(super) fn dispatch(
     ws: &Workspace,
@@ -18,16 +18,16 @@ pub(super) fn dispatch(
     cancel: &AtomicBool,
     interrupt: &AtomicBool,
 ) -> Result<ToolOutput, String> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        unix::dispatch(ws, args, cancel, interrupt)
+        owner::dispatch(ws, args, cancel, interrupt)
             .map_err(|error| format!("durable bg: {error:#}"))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (ws, args, cancel, interrupt);
         Err(
-            "durable bg is currently supported only on Unix; ordinary session jobs are unchanged"
+            "durable bg is supported only on Unix and Windows; ordinary session jobs are unchanged"
                 .into(),
         )
     }
@@ -35,9 +35,9 @@ pub(super) fn dispatch(
 
 /// Run the private owner. Invalid or missing launch input fails closed, without starting a job.
 pub fn owner_main() -> i32 {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        match unix::owner_main() {
+        match owner::owner_main() {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("background owner: {error:#}");
@@ -45,7 +45,7 @@ pub fn owner_main() -> i32 {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         1
     }

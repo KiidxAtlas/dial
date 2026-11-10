@@ -183,6 +183,15 @@ class MetalHooks(unittest.TestCase):
             with s.hook(model,0,s.steering_callback([1.]+[0.]*15,.5)):raise RuntimeError('cancel')
         self.assertIs(model.layers[0],original)
 
+    def test_tuple_layer_outputs_hook_only_the_hidden_state(self):
+        # Gemma 4 decoder layers return (h, shared_kv, offset); extras must pass through unchanged.
+        mx=self.mx;h=mx.ones((1,2,4));extras=('kv',7)
+        layer=lambda x:(h,)+extras
+        wrapped=s.wrap(layer,s.steering_callback([1.,0.,0.,0.],.5))
+        out=wrapped(h)
+        self.assertEqual(out[1:],extras)
+        self.assertAlmostEqual(float(out[0][0,0,0]),1.5);self.assertAlmostEqual(float(out[0][0,0,1]),1.)
+
     def test_real_generation_and_server_confirmation(self):
         from mlx_lm.tokenizer_utils import TokenizerWrapper
         from tokenizers import Tokenizer

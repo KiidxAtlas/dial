@@ -157,6 +157,7 @@ fn otlp_json_payloads_have_the_protocol_shape() {
         tool: "read".into(),
         duration: Duration::from_millis(12),
         error: true,
+        error_class: None,
         end: SystemTime::now(),
     })));
     exporter.observe(&Event::Turn(Turn {
@@ -165,6 +166,9 @@ fn otlp_json_payloads_have_the_protocol_shape() {
         outcome: "completed".into(),
         steps: 2,
         duration: Duration::from_secs(3),
+        interrupted: false,
+        error_class: None,
+        changed_files: 0,
         end: SystemTime::now(),
     }));
     let payloads: BTreeMap<String, Value> = exporter
@@ -348,6 +352,7 @@ fn execution_event(execution: &crate::runtime::execution::Execution) -> Event {
         tool: "bg".into(),
         duration: Duration::ZERO,
         error: false,
+        error_class: None,
         end: SystemTime::now(),
     }))
 }

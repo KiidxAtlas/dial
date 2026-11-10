@@ -226,6 +226,9 @@ impl Background {
         lock(&self.table)
     }
 
+    /// Appended when a session start names `lifetime`, which only durable jobs honour.
+    const SESSION_LIFETIME_NOTE: &str = "\n[lifetime ignored: this is a session job, which runs until it exits, is killed or the session ends; start with persist=true for a job that stops after `lifetime` and survives restarts]";
+
     fn dispatch(
         &self,
         ws: &Workspace,
@@ -239,8 +242,16 @@ impl Background {
         if opt_bool(args, "persist")? {
             return durable::dispatch(ws, args, cancel, &self.interrupt);
         }
+        // A session job has no deadline of its own. A start that names one still starts the job
+        // the caller asked for and says so, instead of failing and stranding the waits after it.
         if present(args, "lifetime") {
-            return Err("lifetime requires explicit persist=true".into());
+            if req_str(args, "action")? != "start" {
+                return Err("lifetime requires explicit persist=true".into());
+            }
+            opt_u64(args, "lifetime")?;
+            let mut output = self.start(ws, args, on_event, cancel)?;
+            output.text.push_str(Self::SESSION_LIFETIME_NOTE);
+            return Ok(output);
         }
         match req_str(args, "action")? {
             "start" => self.start(ws, args, on_event, cancel),
@@ -1238,7 +1249,7 @@ impl Tool for Background {
                 }, "description": "start: authorized tool call instead of command; only name may accompany it"},
                 "name": {"type": "string", "description": "start: optional unique name (letters, digits, - _ .); other actions: which job"},
                 "cwd": {"type": "string", "description": "start: working directory (default workspace root)"},
-                "persist": {"type": "boolean", "description": "Unix only: a named pipe job that survives restarts until `lifetime`; pass true on every call for it. No PTY, stdin or ready."},
+                "persist": {"type": "boolean", "description": "Unix and Windows: a named pipe job that survives restarts until `lifetime`; pass true on every call for it. No PTY, stdin or ready."},
                 "lifetime": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "persist start: seconds before the job is stopped (default 3600)"},
                 "pty": {"type": "boolean", "description": "start: run in a terminal (default false); enables input"},
                 "stdin": {"type": "boolean", "description": "start without PTY: keep a stdin pipe open (default false)"},

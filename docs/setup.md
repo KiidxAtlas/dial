@@ -35,6 +35,8 @@ or an empty response never count as verified. A nonempty response verifies text 
 tool support or quality. Evidence is in-memory for this session and exact configuration; changing the
 model, endpoint or configuration makes old evidence unknown. Provider errors are reduced to actionable
 categories rather than exposing raw server bodies, endpoint credentials or authentication headers.
+HTTP status hints match whole numeric codes, not digit substrings in local endpoint ports;
+a refused connection on port `40123`, for example, is an endpoint failure, not an authentication failure.
 
 Managed-local checks reuse Dial's existing compute owner. After confirmation, idle resident models
 are released before the diagnostic acquires the existing compute lock exclusively. Active child

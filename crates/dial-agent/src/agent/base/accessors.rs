@@ -22,6 +22,10 @@ impl<'a> Agent<'a> {
     pub fn session(&self) -> &Session {
         &self.session
     }
+    /// Record an explicit user verdict on this session's finished turns in the stats ledger.
+    pub fn record_feedback(&self, kind: crate::telemetry::FeedbackKind, turns: u64) {
+        crate::telemetry::feedback(self.config, self.hermetic, self.session.id(), kind, turns);
+    }
     /// The project this agent is working in; `/move` re-roots it, so callers must not use startup layout.
     pub fn layout(&self) -> Option<&Layout> {
         self.layout.as_ref()

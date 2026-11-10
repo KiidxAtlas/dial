@@ -235,9 +235,14 @@ impl<'a> Agent<'a> {
             self.config,
             self.hermetic,
             self.session.id(),
-            &outcome,
-            u64::from(steps),
-            turn_clock.elapsed(),
+            crate::telemetry::TurnEnd {
+                outcome: &outcome,
+                steps: u64::from(steps),
+                elapsed: turn_clock.elapsed(),
+                interrupted: result.as_ref().is_ok_and(|report| report.interrupted),
+                error_class: error_class.as_str(),
+                changed_files: changed_files.len(),
+            },
         );
         let edit = self.step_checks.status();
         let summary = json!({"outcome":outcome,"steps":steps,"error":error,"error_class":error_class,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":state["reliability"]["verification_results"],"checks_current":self.step_checks.checks_current(),"evidence":state["completion_evidence"],"uncheckpointed_shell_commands":edit["uncheckpointed_shell_commands"],"uncheckpointed_extension_calls":edit["uncheckpointed_extension_calls"],"review":"/review-file","undo":"/undo"});
@@ -269,6 +274,18 @@ impl<'a> Agent<'a> {
                 report.outcome == TurnOutcome::Completed && !report.interrupted
             }),
         );
+        if !self.hermetic && self.config.weights.knowledge {
+            let observation = crate::weights::knowledge::Observation {
+                outcome: &outcome,
+                steps: u64::from(steps),
+                elapsed: turn_clock.elapsed(),
+            };
+            if let Err(error) =
+                crate::weights::knowledge::observe(self.config, observation, &self.interrupt)
+            {
+                observed.diagnostic(&format!("Model knowledge not updated: {error:#}"));
+            }
+        }
         self.monitor_turn_settled(origin, &result);
         result
     }

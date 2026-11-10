@@ -43,15 +43,17 @@ pub(super) fn read(
     };
     #[cfg(windows)]
     let mut command = {
-        if !ws.unsandboxed {
-            return Err("PDF parsing on Windows requires an OS sandbox; set sandbox.mode = \"off\" only if you explicitly accept running the PDF converter unsandboxed".into());
+        let mut args: Vec<String> = ["-layout", "-enc", "UTF-8"].map(String::from).into();
+        args.extend(pages.split_whitespace().map(String::from));
+        args.extend(["-", "-"].map(String::from));
+        if ws.unsandboxed {
+            let mut command = Command::new("pdftotext");
+            command.args(&args);
+            command
+        } else {
+            // The Low-integrity child reads the already-open descriptor; no path is reopened.
+            crate::tools::exec::shell::windows_sandboxed(ws, "pdftotext", &args)?
         }
-        let mut command = Command::new("pdftotext");
-        command
-            .args(["-layout", "-enc", "UTF-8"])
-            .args(pages.split_whitespace())
-            .args(["-", "-"]);
-        command
     };
     let (mut reader, writer) = io::pipe().map_err(|e| e.to_string())?;
     command

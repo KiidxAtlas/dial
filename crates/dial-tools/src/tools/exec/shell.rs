@@ -1272,9 +1272,10 @@ fn run_bash(
     })
 }
 
-/// Build the platform shell command in `cwd`. POSIX commands use the workspace sandbox policy or
-/// its explicit unsandboxed opt-out; Windows PowerShell requires that opt-out because native
-/// filesystem/network isolation is unavailable. Stdio and process ownership belong to the caller.
+/// Build the platform shell command in `cwd`. Commands use the workspace sandbox policy or its
+/// explicit unsandboxed opt-out; on Windows the sandbox is the Low-integrity Dev backend.
+/// Stdio and process ownership belong to the caller.
+#[cfg(not(windows))]
 pub(in crate::tools) fn shell_command(
     ws: &Workspace,
     script: &str,
@@ -1436,6 +1437,31 @@ fn embedded_invocation(
     }
 }
 
+/// Refuses Windows sandbox settings the Low-integrity backend cannot enforce.
+#[cfg(windows)]
+pub(in crate::tools) fn windows_enforceable(ws: &Workspace) -> Result<(), String> {
+    if ws.network_rules().is_some() {
+        return Err("sandbox.network_allow and sandbox.network_deny cannot be enforced on Windows; clear them or set sandbox.mode = \"off\"".into());
+    }
+    Ok(())
+}
+
+/// `program args…` under the workspace's Windows sandbox. The Low-integrity launcher rebuilds
+/// the allowlisted environment and TEMP itself.
+#[cfg(windows)]
+pub(in crate::tools) fn windows_sandboxed(
+    ws: &Workspace,
+    program: &str,
+    args: &[String],
+) -> Result<std::process::Command, String> {
+    windows_enforceable(ws)?;
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    ws.sandbox
+        .clone()
+        .unwrap_or_else(super::sandbox::Sandbox::detect)
+        .command_with_policy(&ws.root, &ws.sandbox_policy(), program, &arg_refs)
+}
+
 /// Background PTYs alone retain a new private terminal session through the sandbox.
 pub(in crate::tools) fn shell_command_mode(
     ws: &Workspace,
@@ -1466,7 +1492,7 @@ fn shell_command_with_state(
     #[cfg(windows)]
     {
         if !ws.unsandboxed {
-            return Err("Windows command isolation is unavailable; enable the explicit unsandboxed command setting to run bash, PowerShell or the built-in shell".into());
+            windows_enforceable(ws)?;
         }
         if owned_terminal.is_some() {
             return Err("Windows PTY commands require the ConPTY process interface".into());
@@ -1504,12 +1530,33 @@ fn shell_command_with_state(
                 spawn
             }
         };
-        spawn.env_clear();
-        for (key, value) in std::env::vars_os() {
-            if child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy()) {
-                spawn.env(key, value);
+        let mut spawn = if ws.unsandboxed {
+            spawn.env_clear();
+            for (key, value) in std::env::vars_os() {
+                if child_env_allowed(&key.to_string_lossy(), &value.to_string_lossy()) {
+                    spawn.env(key, value);
+                }
             }
-        }
+            spawn
+        } else {
+            let args: Vec<String> = spawn
+                .get_args()
+                .map(|arg| arg.to_str().map(str::to_owned))
+                .collect::<Option<_>>()
+                .ok_or("command arguments are not UTF-8")?;
+            let built = spawn
+                .get_program()
+                .to_str()
+                .ok_or_else(|| "shell path is not UTF-8".to_string())
+                .and_then(|program| windows_sandboxed(ws, program, &args));
+            match built {
+                Ok(sandboxed) => sandboxed,
+                Err(error) => {
+                    crate::embedded_shell::discard_script(&args);
+                    return Err(error);
+                }
+            }
+        };
         crate::tools::exec::cargo_target::apply(&mut spawn, ws.cargo_target_dir());
         spawn
             .current_dir(cwd)

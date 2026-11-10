@@ -109,8 +109,9 @@ pub enum Approval {
     /// Workspace edits, file writes and non-destructive shell commands run without a prompt;
     /// destructive commands (recursive deletes, history-rewriting git, privilege escalation,
     /// piping downloads into a shell) and tools that leave the workspace still ask.
-    #[default]
     Write,
+    /// Runs everything without asking; explicit deny rules still apply.
+    #[default]
     Auto,
     /// Read-only tools only.
     Readonly,
@@ -135,9 +136,10 @@ impl Approval {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
+    /// No confinement (the default).
+    #[default]
     Off,
     /// Shell can read most of the system but not secrets or dial state, and write only the project.
-    #[default]
     Dev,
     /// Workspace-only reads and writes, no network.
     Strict,
@@ -162,7 +164,7 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            mode: SandboxMode::Dev,
+            mode: SandboxMode::Off,
             allow_network: true,
             extra_write: vec![],
             network_allow: vec![],

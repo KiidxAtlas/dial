@@ -1,0 +1,41 @@
+# Release slice: the fixed set of suites a release candidate is measured on, with repeated trials.
+#
+# This file is a plan, not a run. `release_slice.py` validates it and prints the commands; nothing
+# contacts a model until a person runs those commands. The hosted profile spends provider quota.
+#
+# Changing the suite list, a case count or the repetitions changes the denominator, so bump `name`
+# and do not compare the result against reports recorded under the previous name.
+version = 1
+name = "release-slice-v1"
+# Every case runs this many times per configuration. One attempt cannot tell a dependable
+# configuration from a lucky one, so the slice refuses anything below three.
+repetitions = 3
+
+[profiles]
+hosted = "release-slice-hosted-profiles.toml"
+local = "release-slice-local-profiles.toml"
+
+# `cases` pins each suite's size so that an added or removed case is a deliberate slice revision.
+[[suites]]
+path = "quality.toml"
+cases = 6
+
+[[suites]]
+path = "reliability.toml"
+cases = 3
+
+[[suites]]
+path = "representative.toml"
+cases = 3
+
+[[suites]]
+path = "local-tasks.toml"
+cases = 6
+
+[[suites]]
+path = "recovery.toml"
+cases = 4
+
+[[suites]]
+path = "tool-effectiveness.toml"
+cases = 5

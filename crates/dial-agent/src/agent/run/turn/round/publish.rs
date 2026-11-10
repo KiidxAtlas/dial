@@ -94,7 +94,7 @@ impl Agent<'_> {
             &call.name,
             tool_seconds,
             status,
-            &output.execution,
+            &output,
         );
         if let Some(uri) = &artifact {
             crate::agent::workflow::efficiency::evidence_link(&mut body, uri, dropped);

@@ -72,6 +72,31 @@ fn diagnostic_error_hints_never_copy_secrets_server_bodies_or_urls() {
 }
 
 #[test]
+fn refused_endpoint_ports_are_not_authentication_status_codes() {
+    for port in [40123, 40321, 40400] {
+        let error = anyhow::anyhow!(
+            "request failed for http://127.0.0.1:{port}/v1/chat/completions: connection refused"
+        );
+        assert!(
+            failure_hint(&error).starts_with("Endpoint unavailable"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn standalone_http_status_codes_keep_their_failure_hints() {
+    for (status, expected) in [
+        (401, "Authentication unavailable"),
+        (403, "Authentication unavailable"),
+        (404, "Model unavailable"),
+    ] {
+        let error = anyhow::anyhow!("HTTP status {status}");
+        assert!(failure_hint(&error).starts_with(expected), "{error}");
+    }
+}
+
+#[test]
 fn bounded_diagnostic_requires_a_nonempty_response_and_sends_no_tools_or_history() {
     for (status, text, succeeds) in [(200, "OK", true), (200, "", false), (401, "secret", false)] {
         let server = fake::serve(vec![fake::json(

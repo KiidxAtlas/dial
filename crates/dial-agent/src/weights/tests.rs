@@ -45,11 +45,53 @@ fn operations_round_trip_and_unknown_names_are_refused() {
     assert!(Operation::parse("train").is_err());
     assert!(!Operation::Map.loads_model() && !Operation::Stats.loads_model());
     assert!(Operation::Analyze.loads_model() && !Operation::Analyze.budgeted());
+    assert!(Operation::Investigate.loads_model() && !Operation::Investigate.budgeted());
     assert!(Operation::Activations.loads_model() && Operation::Trace.loads_model());
     assert!(Operation::Generate.loads_model() && Operation::Direction.loads_model());
     // An edit rewrites tensors without a forward pass: it belongs to an experiment but is free.
     assert!(!Operation::Edit.loads_model() && Operation::Edit.budgeted());
     assert!(!Operation::Trace.budgeted() && Operation::Generate.budgeted());
+}
+
+#[test]
+fn investigation_validates_budget_cases_and_unique_layers() {
+    assert_eq!(
+        arguments(Operation::Investigate, &json!({})).unwrap(),
+        json!({"budget":24})
+    );
+    for input in [
+        json!({"budget":0}),
+        json!({"budget":257}),
+        json!({"budget":11}),
+        json!({"layers":[]}),
+        json!({"layers":[0,0]}),
+        json!({"layers":[-1]}),
+        json!({"cases":[]}),
+        json!({"layers":[0,1],"budget":12}),
+    ] {
+        assert!(
+            arguments(Operation::Investigate, &input).is_err(),
+            "{input}"
+        );
+    }
+    let cases =
+        json!([{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":"a"}]}]);
+    assert_eq!(
+        arguments(
+            Operation::Investigate,
+            &json!({"cases":cases,"layers":[0],"budget":3,"ignored":true})
+        )
+        .unwrap(),
+        json!({"cases":cases,"layers":[0],"budget":3})
+    );
+    let text = render(
+        &json!({"op":"investigate", "case_count":1,"forward_passes":3,"budget":3,
+        "restoration_checked":true, "layers":[{"layer":0,"delta":0.5,"cases":[{"case":0,"probe":"copy","delta":0.5}]}],
+        "limits":"No individual-weight semantics established."}),
+    );
+    assert!(text.contains("3 / 3 single-case forward passes"));
+    assert!(text.contains("case 0 (copy)"));
+    assert!(text.contains("No individual-weight semantics"));
 }
 
 #[test]
@@ -156,6 +198,38 @@ fn arguments_keep_only_validated_worker_fields() {
             Operation::Direction,
             json!({"positive":[case.clone()],"negative":[case.clone()],"name":"../x"}),
             Err("name must be"),
+        ),
+        (
+            Operation::Direction,
+            json!({"positive":[case.clone()],"name":"stop","span":{"last":64,"before":"think_end"}}),
+            Ok(
+                json!({"positive":[case.clone()],"span":{"last":64,"before":"think_end"},"site":"mlp","name":"stop"}),
+            ),
+        ),
+        (
+            Operation::Direction,
+            json!({"positive":[case.clone()],"name":"stop"}),
+            Err("or a `span`"),
+        ),
+        (
+            Operation::Direction,
+            json!({"positive":[case.clone()],"name":"stop","span":{"last":0}}),
+            Err("span needs"),
+        ),
+        (
+            Operation::Direction,
+            json!({"positive":[case.clone()],"name":"stop","span":{"last":4,"before":"start"}}),
+            Err("before answer_end or think_end"),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"e2","method":"add","direction":"stop","layers":[3],"alpha":0.1}),
+            Ok(json!({"method":"add","name":"e2","direction":"stop","layers":[3],"alpha":0.1})),
+        ),
+        (
+            Operation::Edit,
+            json!({"name":"e2","method":"add","direction":"stop","layers":[3],"columns":8}),
+            Err("columns applies only"),
         ),
         (
             Operation::Edit,
@@ -425,6 +499,65 @@ fn render_summarises_each_operation() {
                               "induction_heads":[{"layer":0,"head":1,"induction":0.7}]},
                    "layers":[{"layer":0,"importance":1.5}]}),
             "induction head: layer 0 head 1",
+        ),
+        (
+            json!({"op":"analyze","model_id":"m","layer_count":1,"probes":24,"baseline_loss":2.0,
+                   "findings":["Layers 0 matter most."],
+                   "summary":{"most_important_layers":[0],"least_important_layers":[0],
+                              "answer_forms_at":{"code":0}},
+                   "layers":[{"layer":0,"importance":1.5,"attention_type":"sliding","specialty":"code",
+                              "lens":{"agreement":0.5},
+                              "experts":{"unused":3,"specialists":[{"expert":7,"category":"code","lift":3.0}]},
+                              "structure":{"down":{"effective_rank":0.25},"up":{"effective_rank":0.5}}}]}),
+            "  - Layers 0 matter most.",
+        ),
+        (
+            json!({"op":"analyze","model_id":"m","summary":{
+                       "explanations":[{"kind":"expert","layer":4,"expert":30,"explanation":"Spanish words",
+                                        "explanation_score":0.89,"control_score":0.44}]},
+                   "layers":[{"layer":4,"importance":0.5,
+                              "writes":{"promotes":[{"token":" de","share":0.3},{"token":"la","share":0.2}]},
+                              "linear_attention":{"memory":{"median_half_life":12.4}}}]}),
+            "   4 writes \" de\" \"la\" · memory half-life 12 tokens",
+        ),
+        (
+            json!({"op":"analyze","model_id":"m","summary":{
+                       "checked_parts":[{"kind":"expert","layer":4,"expert":30,"explanation":"Spanish words",
+                                         "explanation_score":0.62,"control_score":0.1,"confirmed":false,
+                                         "checks":{"causal":true,"replicated":false,"category":null},
+                                         "causal":{"effect":0.25,"control_effect":0.01,"texts":14,"z":4.2}}]},
+                   "layers":[]}),
+            "  layer 4 expert 30: \"Spanish words\" · unconfirmed (replicated failed; category untested: too few texts) · removal moves the output 0.2500 nats where it fires vs 0.0100 for an equally active part (14 held-out texts, z 4.2) · explanation 0.62 vs neutral 0.10",
+        ),
+        (
+            json!({"op":"analyze","model_id":"m","summary":{},
+                   "layers":[{"layer":0,"importance":1.5,"attention_type":"sliding","specialty":"code",
+                              "lens":{"agreement":0.5},
+                              "experts":{"unused":3,"specialists":[{"expert":7,"category":"code","lift":3.0}]},
+                              "structure":{"down":{"effective_rank":0.25},"up":{"effective_rank":0.5}}}]}),
+            "   0 sliding attention · serves code · lens 50% · experts e7 code ×3.0 · 3 experts unused · lowest rank down 25%",
+        ),
+        (
+            json!({"op":"analyze","model_id":"m","summary":{},"layers":[],"explainer":"anthropic/x"}),
+            "Explanations written and rated by anthropic/x; the analyzed model did every measurement.",
+        ),
+        (
+            json!({"op":"direction","model_id":"m","positive":4,"negative":null,"site":"mlp",
+                   "span":{"last":64,"before":"think_end"},"suggested_layers":[3,5],"layers":[]}),
+            "4 positive conversations, the span against the rest of each answer · last 64 tokens before think_end",
+        ),
+        (
+            json!({"op":"evaluate","model_id":"m","edit":"e","passed":false,"wins":6,"losses":0,"ties":2,
+                   "cases":8,"p_value":0.03,"base":{},"edited":{},
+                   "lengths":{"tokens":{"mean":-120.0,"low":-180.0,"high":-60.0},"thinking_tokens":null},
+                   "control":{"wins":1,"losses":1,"ties":6,"beaten":false,
+                              "lengths":{"tokens":{"mean":-5.0,"low":-20.0,"high":10.0}}}}),
+            "Mean answer tokens, edit − base: -120.0 (95% CI -180.0 to -60.0) · edit − control: -5.0 (95% CI -20.0 to +10.0)\nAgainst a norm-matched random edit: 1 wins, 1 losses, 6 ties · the direction did no better",
+        ),
+        (
+            json!({"op":"evaluate","model_id":"m","edit":"e","passed":true,"base":{},"edited":{},
+                   "control_unavailable":"a scale edit has no measured direction to randomize"}),
+            "No random control: a scale edit has no measured direction to randomize",
         ),
     ];
     for (value, expected) in cases {

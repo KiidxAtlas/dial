@@ -113,8 +113,8 @@ resolve before the model generates a helper. Discovery reports a missing prerequ
 neither resolves. These are executable-path observations: interpreter version, containment and
 actual execution still need validation. Loading `eval` installs no interpreter; its status,
 reset and cancel actions remain loadable without one. JavaScript runs on operator-installed
-Node 22+ when `eval.node` resolves; otherwise on Dial's embedded QuickJS engine (unix builds with
-the default `embedded-js` feature), which needs no installed interpreter. Python 3.8+ still needs
+Node 22+ when `eval.node` resolves; otherwise on Dial's embedded QuickJS engine (built with
+the default `embedded-js` feature on all platforms), which needs no installed interpreter. Python 3.8+ still needs
 the existing [dependency setup](setup.md), including in benchmark containers.
 Do not assume a configured absolute eval launcher is also available by name in the shell.
 

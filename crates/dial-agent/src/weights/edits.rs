@@ -249,6 +249,22 @@ pub fn experiment(config: &Config, name: &str) -> Result<Value> {
     Ok(summary(&ledger(config, &valid_name(name, "experiment")?)?))
 }
 
+/// The saved file of direction `name`, which must belong to `experiment`.
+fn measured_direction(config: &Config, name: &str, experiment: Option<&str>) -> Result<PathBuf> {
+    let measured: DirectionRecord =
+        load(&direction_record_path(config, name))?.with_context(|| {
+            format!("no direction named {name}; measure one with the direction operation first")
+        })?;
+    ensure!(
+        Some(measured.experiment.as_str()) == experiment,
+        "direction {name} belongs to experiment {}; an edit must use a direction from its own experiment",
+        measured.experiment
+    );
+    let source = direction_path(config, name);
+    ensure!(source.is_file(), "direction {name} has no saved file");
+    Ok(source)
+}
+
 /// Turn validated `name`/`direction` fields into state-directory paths for the worker. The caller
 /// holds the job lock.
 pub(super) fn prepare(
@@ -262,6 +278,7 @@ pub(super) fn prepare(
         .as_str()
         .unwrap_or("project_out")
         .to_owned();
+    let uses_direction = !matches!(method.as_str(), "scale" | "steering");
     let mut take = |key: &str| {
         request
             .as_object_mut()
@@ -281,25 +298,19 @@ pub(super) fn prepare(
             request["output"] = json!(path);
             Ok(Some(Created::Direction { name }))
         }
+        Operation::Try if uses_direction => {
+            let direction = take("direction")?;
+            request["direction"] = json!(measured_direction(config, &direction, experiment)?);
+            Ok(None)
+        }
         Operation::Edit => {
             let name = take("name")?;
-            let direction = if method == "scale" || method == "steering" {
-                method.clone()
-            } else {
+            let direction = if uses_direction {
                 let direction = take("direction")?;
-                let measured: DirectionRecord = load(&direction_record_path(config, &direction))?
-                    .with_context(|| {
-                        format!("no direction named {direction}; measure one with the direction operation first")
-                    })?;
-                ensure!(
-                    Some(measured.experiment.as_str()) == experiment,
-                    "direction {direction} belongs to experiment {}; an edit must use a direction from its own experiment",
-                    measured.experiment
-                );
-                let source = direction_path(config, &direction);
-                ensure!(source.is_file(), "direction {direction} has no saved file");
-                request["direction"] = json!(source);
+                request["direction"] = json!(measured_direction(config, &direction, experiment)?);
                 direction
+            } else {
+                method.clone()
             };
             let dir = edits_dir(config);
             private_dir(&dir)?;
@@ -475,11 +486,16 @@ fn details(result: &Value) -> Value {
                 "max_requantization_error": noise(&changes),
             })
         }
-        _ => {
+        method => {
             let layers = result["layers"].as_array().cloned().unwrap_or_default();
+            let numbers: BTreeSet<u64> =
+                layers.iter().filter_map(|l| l["layer"].as_u64()).collect();
+            let writers: BTreeSet<&str> =
+                layers.iter().filter_map(|l| l["writer"].as_str()).collect();
             json!({
-            "method": "project_out",
-            "layers": layers.iter().map(|l| l["layer"].clone()).collect::<Vec<_>>(),
+            "method": if method == Some("add") { "add" } else { "project_out" },
+            "layers": numbers,
+            "writers": writers,
             "columns": result["columns"],
             "alpha": result["alpha"],
             "edited_params": result["edited_params"],
@@ -658,9 +674,60 @@ fn quality(base: &Value, edited: &Value) -> (Value, Option<String>) {
     }
 }
 
+/// Paired bootstrap resamples behind each confidence interval.
+const BOOTSTRAP_RESAMPLES: usize = 2000;
+
+/// Mean of `diffs` with a 95% paired-bootstrap percentile interval. The resampling stream is fixed,
+/// so the same evaluation always reports the same interval.
+fn bootstrap(diffs: &[f64]) -> Value {
+    if diffs.is_empty() {
+        return Value::Null;
+    }
+    let count = diffs.len();
+    let mean = diffs.iter().sum::<f64>() / count as f64;
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut means: Vec<f64> = (0..BOOTSTRAP_RESAMPLES)
+        .map(|_| {
+            (0..count)
+                .map(|_| diffs[(next() % count as u64) as usize])
+                .sum::<f64>()
+                / count as f64
+        })
+        .collect();
+    means.sort_by(f64::total_cmp);
+    let at = |q: f64| means[((BOOTSTRAP_RESAMPLES - 1) as f64 * q).round() as usize];
+    json!({"mean": mean, "low": at(0.025), "high": at(0.975), "cases": count})
+}
+
+/// Per-case `key` differences `after - before` over cases where both are numbers.
+fn paired(before: &Value, after: &Value, key: &str) -> Vec<f64> {
+    let rows = |run: &Value| run["cases"].as_array().cloned().unwrap_or_default();
+    rows(before)
+        .iter()
+        .zip(rows(after).iter())
+        .filter_map(|(b, a)| Some(a[key].as_f64()? - b[key].as_f64()?))
+        .collect()
+}
+
+/// Mean answer-length and thinking-length changes with paired bootstrap intervals.
+fn lengths(before: &Value, after: &Value) -> Value {
+    json!({
+        "tokens": bootstrap(&paired(before, after, "tokens")),
+        "thinking_tokens": bootstrap(&paired(before, after, "thinking_tokens")),
+    })
+}
+
 /// [`compare`] plus the probe-loss quality gate: a significant win that damages general text is
-/// still not admitted.
-fn admit(base: &Value, edited: &Value) -> Result<Value> {
+/// still not admitted. With a `control` generation (the norm-matched random edit) the edit must
+/// also win more cases against the control than it loses, so a gain any edit of that size would
+/// have produced is not credited to the direction.
+fn admit(base: &Value, edited: &Value, control: Option<&Value>) -> Result<Value> {
     let mut value = compare(base, edited)?;
     let (quality, reason) = quality(base, edited);
     if value["passed"] == true
@@ -670,12 +737,114 @@ fn admit(base: &Value, edited: &Value) -> Result<Value> {
         value["reason"] = json!(reason);
     }
     value["quality"] = quality;
+    value["lengths"] = lengths(base, edited);
+    if let Some(control) = control {
+        let against = compare(control, edited)?;
+        let beaten = against["wins"].as_u64() > against["losses"].as_u64();
+        if value["passed"] == true && !beaten {
+            value["passed"] = json!(false);
+            value["reason"] = json!(
+                "the edit did not beat the norm-matched random control: an edit of the same size in a random direction did as well"
+            );
+        }
+        value["control"] = json!({
+            "wins": against["wins"],
+            "losses": against["losses"],
+            "ties": against["ties"],
+            "p_value": against["p_value"],
+            "beaten": beaten,
+            "summary": control["summary"],
+            "lengths": lengths(control, edited),
+            "base_lengths": lengths(base, control),
+        });
+    }
     Ok(value)
 }
 
 #[cfg(test)]
 pub(super) fn admit_for_tests(base: &Value, edited: &Value) -> Value {
-    admit(base, edited).unwrap()
+    admit(base, edited, None).unwrap()
+}
+
+/// Where an evaluation writes its temporary control copy.
+fn control_path(config: &Config, name: &str) -> PathBuf {
+    directory(config).join("controls").join(name)
+}
+
+/// The worker request for the norm-matched random control of an edit made from a direction, or
+/// the reason there is none. The seed is fixed per edit name, so a rerun builds the same control.
+fn control_request(made: &Value, name: &str, output: &Path) -> Result<Value, String> {
+    let request = &made["request"];
+    let method = request["method"].as_str().unwrap_or("");
+    if !matches!(method, "project_out" | "add") {
+        return Err(match made["method"].as_str() {
+            Some(method @ ("scale" | "steering" | "combine")) => {
+                format!("a {method} edit has no measured direction to randomize")
+            }
+            _ => "the edit was made before controls were recorded; make it again".to_owned(),
+        });
+    }
+    if !request["direction"]
+        .as_str()
+        .is_some_and(|path| Path::new(path).is_file())
+    {
+        return Err("the edit's direction file is gone".to_owned());
+    }
+    let digest = Sha256::digest(name.as_bytes());
+    let seed = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    let mut out = request.clone();
+    for key in ["columns", "alpha"] {
+        if out[key].is_null()
+            && let Some(fields) = out.as_object_mut()
+        {
+            fields.remove(key);
+        }
+    }
+    out["control_seed"] = json!(seed);
+    out["output"] = json!(output);
+    // The control has the real edit's norm; its rounding noise is reported, not refused.
+    out["allow_noisy"] = json!(true);
+    Ok(out)
+}
+
+/// Generate with the norm-matched control copy of edit `name`, built from its base and removed
+/// afterwards. `Ok(Err(reason))` when the edit has no control.
+fn control_generation(
+    config: &Config,
+    record: &EditRecord,
+    made: &Value,
+    name: &str,
+    request: &Value,
+    cancel: &AtomicBool,
+) -> Result<Result<Value, String>> {
+    let output = control_path(config, name);
+    let edit = match control_request(made, name, &output) {
+        Ok(edit) => edit,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    private_dir(output.parent().context("controls directory")?)?;
+    if output.exists() {
+        std::fs::remove_dir_all(&output)?;
+    }
+    let generated = call_worker(config, &record.base, Operation::Edit, edit, None, cancel)
+        .and_then(|_| {
+            call_worker(
+                config,
+                &output,
+                Operation::Generate,
+                request.clone(),
+                None,
+                cancel,
+            )
+        });
+    let removed = if output.exists() {
+        std::fs::remove_dir_all(&output)
+    } else {
+        Ok(())
+    };
+    let generated = generated?;
+    removed.with_context(|| format!("removing control copy {}", output.display()))?;
+    Ok(Ok(generated))
 }
 
 /// Evaluate edit `input.edit` against its base on held-out `input.cases` (generation cases, with
@@ -743,11 +912,15 @@ pub fn evaluate(
             config,
             &record.output,
             Operation::Generate,
-            request,
+            request.clone(),
             None,
             cancel,
         )?;
-        let mut value = admit(&base, &edited)?;
+        let control = control_generation(config, &record, &made, &name, &request, cancel)?;
+        let mut value = admit(&base, &edited, control.as_ref().ok())?;
+        if let Err(reason) = &control {
+            value["control_unavailable"] = json!(reason);
+        }
         let fingerprint = fingerprint(&record.output)?;
         record.evaluation = Some(json!({
             "passed": value["passed"],
@@ -758,6 +931,9 @@ pub fn evaluate(
             "cases": value["cases"],
             "p_value": value["p_value"],
             "quality": value["quality"],
+            "lengths": value["lengths"],
+            "control": value["control"],
+            "control_unavailable": value["control_unavailable"],
             "rows": value["rows"],
             "fingerprint": fingerprint,
             "at": now(),

@@ -64,7 +64,7 @@ enum TurnInput<'a> {
 
 impl Shell {
     /// Alt+Up / Alt+Down: rate the last finished turn for "Teach this model".
-    pub(super) fn rate_last_turn(&mut self, app: &App, good: bool) {
+    pub(super) fn rate_last_turn(&mut self, app: &App, agent: &Agent<'_>, good: bool) {
         let Some(store) = app.store.as_ref() else {
             let message = if !app.config.improve.teach {
                 TEACH_OFF.to_owned()
@@ -93,6 +93,14 @@ impl Shell {
         };
         match store.outcome(&outcome) {
             Ok(()) => {
+                agent.record_feedback(
+                    if good {
+                        crate::telemetry::FeedbackKind::RatedGood
+                    } else {
+                        crate::telemetry::FeedbackKind::RatedBad
+                    },
+                    1,
+                );
                 self.teach_pending
                     .retain(|change| change.trajectory != trajectory);
                 self.note(

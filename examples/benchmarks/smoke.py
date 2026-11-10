@@ -210,12 +210,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     @staticmethod
     def goal(transcript, required=True):
-        matches = re.findall(r"(?:acceptance goal[^\n]*?exactly|actual task goal is)\s+([A-Z]+-\d+)", transcript, re.IGNORECASE)
-        if not matches:
-            if required:
-                raise ValueError("original goal was not preserved in the conversation")
-            return None
-        return matches[0]
+        # Scan each line once instead of retrying a wildcard suffix at every
+        # untrusted "acceptance goal" prefix. Preserve the first matching anchor.
+        token = re.compile(r"\s+([A-Z]+-\d+)", re.IGNORECASE)
+        offset = 0
+        for line in transcript.split("\n"):
+            anchor = re.search("acceptance goal", line, re.IGNORECASE)
+            acceptance = anchor.start() if anchor else -1
+            actual = None
+            for marker in re.finditer(r"actual task goal is|exactly", line, re.IGNORECASE):
+                is_actual = marker.group().lower() != "exactly"
+                if not is_actual and (acceptance < 0 or marker.start() < acceptance):
+                    continue
+                match = token.match(transcript, offset + marker.end())
+                if match is None:
+                    continue
+                if not is_actual or acceptance < 0 or marker.start() < acceptance:
+                    return match.group(1)
+                if actual is None:
+                    actual = match.group(1)
+            if actual is not None:
+                return actual
+            offset += len(line) + 1
+        if required:
+            raise ValueError("original goal was not preserved in the conversation")
+        return None
 
     @staticmethod
     def text(content):

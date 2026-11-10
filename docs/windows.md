@@ -96,16 +96,31 @@ takeown /F "$env:USERPROFILE\.dial" /R /D Y
 
 ## Security
 
-Windows does not provide macOS Seatbelt or the Linux namespace sandbox used by Dial. Shell and tool execution therefore must not be treated as sandboxed on Windows. Windows shell, browser, PDF, and Python-kernel execution is fail-closed unless `sandbox.mode = "off"` is explicitly set in the configuration. Enabling this setting permits commands to run with the current user's normal Windows privileges; do so only for trusted workspaces and commands. It does not provide filesystem or network confinement.
+Windows does not provide macOS Seatbelt or the Linux namespace sandbox. Instead, `sandbox.mode = "dev"` runs shell commands (PowerShell, Git Bash and the built-in shell, foreground and background) at **Low integrity**: Dial re-executes itself as a launcher that lowers its own token, and the command inherits it. Dial labels the workspace and each `sandbox.extra_write` directory Low so commands can create, edit and delete there; it labels existing protected paths (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.gnupg`, the gcloud and GitHub CLI AppData folders, and Dial's own state) Medium with no-read-up, so commands can neither read nor write them; and it labels each project's existing `.git` Medium, so hooks and config cannot be changed in place. These labels are stored in the folders' security settings and stay after Dial exits; ordinary programs are unaffected, but any other Low-integrity process can also write the labeled project. On first use a fixed PowerShell self-test checks every rule through the real launcher; if any check fails, sandboxed commands are refused, never run unconfined.
 
-Windows shell commands are PowerShell source executed by Windows PowerShell; POSIX shell scripts are not translated. Process groups use Windows Job Objects, and background PTY jobs use ConPTY. The Python kernel is available only with `sandbox.mode = "off"`: its trusted driver installs the native `ProcessChildProcessPolicy` no-child-process mitigation before evaluating user code, but Windows filesystem/network isolation is unavailable.
+Limits of the Windows `dev` sandbox: reads elsewhere on the disk and network access are not confined, so `strict`, `sandbox.allow_network = false` and `sandbox.network_allow`/`network_deny` are refused rather than weakened. A command can rename a protected `.git` away and create a new one (only in-place changes are blocked). Files moved, not copied, into the project keep their old label. The uv, pip, npm and Go caches are redirected to `%LOCALAPPDATA%\dial\sandbox`, which is labelled writable, so those installs work without extra configuration. Other folders outside the project, such as `~/.cargo` for cargo's registry, need `sandbox.extra_write`.
+
+The browser, PDF parsing (`pdftotext`) and both `eval` kernels also run under `dev`. The browser's Node driver is written to its state folder, and that folder is made writable. The Python and JavaScript kernels (Node or the embedded QuickJS engine) start through Dial's launcher, which installs the native `ProcessChildProcessPolicy` no-child-process mitigation before user code runs. They also run at Low integrity when the sandbox is on. With `sandbox.mode = "off"`, the default, everything runs with your normal Windows privileges; the kernels keep the no-child-process mitigation.
+
+Windows shell commands are PowerShell source executed by Windows PowerShell; POSIX shell scripts are not translated. Process groups use Windows Job Objects, and background PTY jobs use ConPTY, sandboxed like other commands. Durable background jobs are supported; see [background services](background-services.md).
 
 Python environment discovery uses Windows layouts: virtualenv packages come from `<venv>/Lib/site-packages`, while the trusted base interpreter comes from an absolute `executable`/`base-executable` or `home` in `pyvenv.cfg`, not the `Scripts/python.exe` redirector. Conda uses `<prefix>/python.exe`. Base interpreters and conda installations must still resolve outside the workspace and pass the normal interpreter preflight; environment discovery does not relax those checks.
+
+## File edits and checkpoints
+
+An edit refused with `write to "…" blocked by the harness` and Windows error 24
+("The program issued a command but the command length is incorrect") can come from
+checkpoint creation, not a shell command or an oversized patch. Earlier builds supplied an
+undersized native rename buffer for one-character checkpoint names such as `files/0`.
+The current code includes the native structure's minimum size. If using an affected build,
+update to a release containing this fix or rebuild from the fixed source; shortening the patch
+or switching shells does not address this cause. Checkpoint failures still block the edit so
+the original file is not changed without undo coverage.
 
 ## Known limitations
 
 - MLX/Apple Silicon inference is unavailable. Use a local server such as LM Studio or Ollama, or a hosted provider instead.
-- PTY terminal behavior and half-close differ from Unix; ConPTY resize is supported, but managed PTY stdin half-close is unavailable.
-- The Windows security boundary is not equivalent to Unix sandboxing; never enable unsandboxed execution for untrusted input.
+- PTY terminal behavior differs from Unix. ConPTY resize is supported. ConPTY has no half-close, so `close_stdin` on a terminal job sends Ctrl+Z, Enter, which ends input only for programs reading the console in line mode.
+- The Windows `dev` sandbox (Low integrity) confines writes but not reads or network; it is weaker than the macOS and Linux sandboxes. Never run untrusted input with `sandbox.mode = "off"`.
 - Atomically published private files flush staged file contents before replacement. Windows does not document an unprivileged parent-directory flush or write-through rename equivalent to POSIX `fsync` on a directory, so a successful replacement is atomic for concurrent readers but its directory entry is not guaranteed to survive sudden power loss.
 - Dial replaces and deletes its own files with POSIX semantics on NTFS/ReFS, so a file another process has open (with delete sharing) can still be replaced, and a deleted name is freed at once. When a program opens a file without delete sharing (some editors, backup and sync tools), Dial retries for about 0.3 s and then reports Windows error 32, "being used by another process". Close that program, or move the project out of a synced folder such as OneDrive.

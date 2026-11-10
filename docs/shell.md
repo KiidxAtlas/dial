@@ -62,7 +62,7 @@ Limits of the built-in shell:
 - `sed` supports only the `s/RE/REPLACEMENT/[g]` substitution, with `-n` and `-e`. Other sed commands need the system shell.
 - Patterns in `grep` and `sed` use Rust regular-expression syntax, not the full POSIX basic/extended grammar.
 - `xargs` runs external programs only. A name that exists only as a shell builtin is not found and exits 127.
-- On Windows, bash, PowerShell, and the built-in shell all run only with the explicit unsandboxed command setting, because native isolation is unavailable there.
+- On Windows, bash, PowerShell, and the built-in shell all run only with `sandbox.mode = "off"` (the default), because native isolation is unavailable there.
 
 ## Per-session Cargo build output
 

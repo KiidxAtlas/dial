@@ -770,11 +770,16 @@ pattern!(
     r"(: command not found|^(\S+: )?(\d+: )?\S+: not found)$"
 );
 
+// A compiler or tool diagnostic separates its `error:` head from the message; a data row whose
+// first field happens to be `error` (`error:interrupted|30`, `error:fatal,6`) does not.
+pattern!(ERROR_FIELD, r"^error(\[E\d+\])?:\S");
+
 /// Failure lines that an earlier step of a compound command or pipeline printed although the
 /// whole command exited zero (`step 2>&1; ls`): the reported status belongs to the last step, not
 /// to the step that failed. Uses the digest's failure vocabulary plus the shell's own missing-program
-/// report. A sole command's status is its own, so it gets none. At most two clipped lines; this is an
-/// observation, not proof the work failed.
+/// report, minus rows of data that merely start with an `error:` field. A sole command's status is
+/// its own, so it gets none. At most two clipped lines; this is an observation, not proof the work
+/// failed.
 pub fn masked_failure(command: &str, text: &str) -> Option<String> {
     if bash_interceptor::sole_command(command).is_some() {
         return None;
@@ -782,7 +787,10 @@ pub fn masked_failure(command: &str, text: &str) -> Option<String> {
     let failures: Vec<String> = clean_terminal(text)
         .lines()
         .map(str::trim_end)
-        .filter(|line| FAILURE_HEAD.is_match(line) || SHELL_NOT_FOUND.is_match(line.trim_start()))
+        .filter(|line| {
+            (FAILURE_HEAD.is_match(line) && !ERROR_FIELD.is_match(line))
+                || SHELL_NOT_FOUND.is_match(line.trim_start())
+        })
         .take(2)
         .map(clip)
         .collect();

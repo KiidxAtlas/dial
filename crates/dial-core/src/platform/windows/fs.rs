@@ -514,7 +514,13 @@ fn set_name(
     }
     // FILE_RENAME_INFORMATION(_EX) / FILE_LINK_INFORMATION on 64-bit Windows: a 4-byte
     // ReplaceIfExists/Flags field, the root handle at 8, the name byte length at 16, the name at 20.
-    let mut buffer = vec![0u8; 20 + name.len() * 2];
+    // NtSetInformationFile also requires the full native structure (including tail padding).
+    // A one-unit name such as checkpoint blob "0" otherwise supplies only 22 bytes, not 24,
+    // and Windows reports ERROR_BAD_LENGTH even though no shell command is involved.
+    use windows_sys::Wdk::Storage::FileSystem::{FILE_LINK_INFORMATION, FILE_RENAME_INFORMATION};
+    let minimum =
+        mem::size_of::<FILE_RENAME_INFORMATION>().max(mem::size_of::<FILE_LINK_INFORMATION>());
+    let mut buffer = vec![0u8; (20 + name.len() * 2).max(minimum)];
     let root_handle = root.as_raw_handle() as usize;
     buffer[8..8 + mem::size_of::<usize>()].copy_from_slice(&root_handle.to_ne_bytes());
     buffer[16..20].copy_from_slice(&((name.len() * 2) as u32).to_ne_bytes());

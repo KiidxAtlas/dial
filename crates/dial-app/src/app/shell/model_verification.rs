@@ -37,15 +37,20 @@ pub(in crate::app) fn identity(config: &Config) -> Option<u64> {
 pub(in crate::app) fn failure_hint(error: &anyhow::Error) -> &'static str {
     // Classify without copying server bodies, URLs, headers or credentials to the transcript.
     let text = format!("{error:#}").to_ascii_lowercase();
+    // Ports and identifiers containing these digits are not HTTP status codes.
+    let has_status = |status| {
+        text.split(|c: char| !c.is_ascii_digit())
+            .any(|part| part == status)
+    };
     if text.contains("auth")
         || text.contains("credential")
-        || text.contains("401")
-        || text.contains("403")
+        || has_status("401")
+        || has_status("403")
     {
         "Authentication unavailable or rejected. Open Providers to repair sign-in or the API key."
     } else if text.contains("connect") || text.contains("refused") || text.contains("dns") {
         "Endpoint unavailable. Check the provider URL and start the local server, or check network access."
-    } else if text.contains("model") || text.contains("404") {
+    } else if text.contains("model") || has_status("404") {
         "Model unavailable or not configured. Open Models to choose an installed or provider-supported model."
     } else if text.contains("timeout") || text.contains("timed out") {
         "The model did not respond within the diagnostic budget. Check its running state and try again."

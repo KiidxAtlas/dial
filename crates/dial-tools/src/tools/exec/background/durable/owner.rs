@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::{
     fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     net::{UnixListener, UnixStream},
@@ -22,6 +23,108 @@ use std::time::{Duration, Instant};
 const MAX_WIRE: u64 = 512 * 1024;
 const MAX_LIFETIME: u64 = 86400;
 const MAX_JOBS: usize = 8;
+
+/// The owner's control endpoint in the private job directory. Unix: a mode-0600 socket.
+/// Windows: a loopback TCP port and a random token in an owner-only record; a connection must
+/// present the token first, so control authority remains reading the private directory.
+#[cfg(unix)]
+const CONTROL: &str = "control.sock";
+#[cfg(windows)]
+const CONTROL: &str = "control.json";
+#[cfg(unix)]
+type Stream = UnixStream;
+#[cfg(windows)]
+type Stream = std::net::TcpStream;
+#[cfg(windows)]
+const TOKEN_LEN: usize = 64;
+
+#[cfg(windows)]
+#[derive(Serialize, Deserialize)]
+struct Endpoint {
+    port: u16,
+    token: String,
+}
+
+#[cfg(unix)]
+fn connect(directory: &Path) -> Result<Stream> {
+    Ok(UnixStream::connect(directory.join(CONTROL))?)
+}
+
+#[cfg(windows)]
+fn connect(directory: &Path) -> Result<Stream> {
+    let endpoint: Endpoint = read_json(&directory.join(CONTROL))?;
+    ensure!(
+        endpoint.token.len() == TOKEN_LEN,
+        "invalid durable control endpoint"
+    );
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], endpoint.port));
+    let mut stream = Stream::connect_timeout(&address, Duration::from_secs(3))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    stream.write_all(endpoint.token.as_bytes())?;
+    Ok(stream)
+}
+
+/// The owner's listening side of [`CONTROL`].
+struct Control {
+    #[cfg(unix)]
+    listener: UnixListener,
+    #[cfg(windows)]
+    listener: std::net::TcpListener,
+    #[cfg(windows)]
+    token: String,
+}
+
+impl Control {
+    #[cfg(unix)]
+    fn bind(directory: &Path) -> Result<Self> {
+        let listener = UnixListener::bind(directory.join(CONTROL))?;
+        fs::set_permissions(directory.join(CONTROL), fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self { listener })
+    }
+
+    #[cfg(windows)]
+    fn bind(directory: &Path) -> Result<Self> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        listener.set_nonblocking(true)?;
+        let token = crate::hex(&rand::random::<[u8; TOKEN_LEN / 2]>());
+        publish(
+            &directory.join(CONTROL),
+            &Endpoint {
+                port: listener.local_addr()?.port(),
+                token: token.clone(),
+            },
+        )?;
+        Ok(Self { listener, token })
+    }
+
+    /// The next waiting connection; Windows drops one that does not present the token.
+    fn accept(&self) -> Result<Option<Stream>> {
+        let stream = match self.listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        // An accepted socket can inherit the listener's non-blocking mode.
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+        stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+        #[cfg(windows)]
+        {
+            let mut presented = [0u8; TOKEN_LEN];
+            let matches = (&stream).read_exact(&mut presented).is_ok()
+                && presented
+                    .iter()
+                    .zip(self.token.as_bytes())
+                    .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                    == 0;
+            if !matches {
+                return Ok(None);
+            }
+        }
+        Ok(Some(stream))
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct Launch {
@@ -80,13 +183,24 @@ fn private_dir(path: &Path) -> Result<()> {
     let directory = private_fs::open_dir_nofollow(path)?;
     ensure!(
         private_fs::owned_by_current_user(&directory)? && private_fs::is_owner_only(&directory)?,
-        "control directory must be owned by this user and mode 0700"
+        "control directory must be owned by this user and private to them"
     );
     Ok(())
 }
 
+/// Create one owner-only directory; fails if it already exists.
+fn make_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return fs::DirBuilder::new().mode(0o700).create(path);
+    #[cfg(windows)]
+    {
+        fs::create_dir(path)?;
+        private_fs::set_owner_only(path)
+    }
+}
+
 fn create_dir(path: &Path) -> Result<()> {
-    match fs::DirBuilder::new().mode(0o700).create(path) {
+    match make_dir(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
@@ -107,8 +221,11 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 
 fn publish(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("record parent")?)?;
+    #[cfg(unix)]
     temp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
+    #[cfg(windows)]
+    private_fs::set_owner_only_file(temp.as_file())?;
     serde_json::to_writer(&mut temp, value)?;
     crate::platform::fs::sync_file(temp.as_file())?;
     temp.persist(path).map_err(|error| error.error)?;
@@ -181,14 +298,22 @@ fn confirmed_dead(owner: ProcId) -> bool {
     if let Some(current) = ProcId::of(owner.pid) {
         return current != owner;
     }
-    // Unlike an unreadable start identity, ESRCH confirms there is no process at this PID.
-    // SAFETY: signal zero only probes existence; it never delivers a signal.
-    (unsafe { libc::kill(owner.pid, 0) }) < 0
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    #[cfg(unix)]
+    {
+        // Unlike an unreadable start identity, ESRCH confirms there is no process at this PID.
+        // SAFETY: signal zero only probes existence; it never delivers a signal.
+        (unsafe { libc::kill(owner.pid, 0) }) < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    // The owner runs as this user, so its process object opens unless it is gone.
+    #[cfg(windows)]
+    {
+        !owner.same_process()
+    }
 }
 
 fn forget(directory: &Path) -> Result<()> {
-    for file in ["owner.json", "ready.json", "finished.json", "control.sock"] {
+    for file in ["owner.json", "ready.json", "finished.json", CONTROL] {
         let path = directory.join(file);
         if path.exists() {
             fs::remove_file(path)?;
@@ -248,7 +373,7 @@ fn request_inner(directory: &Path, ws: &Workspace, args: &Value) -> Result<ToolO
         );
     }
     let exchange = (|| -> Result<ToolOutput> {
-        let mut stream = UnixStream::connect(directory.join("control.sock"))?;
+        let mut stream = connect(directory)?;
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
         stream.set_write_timeout(Some(Duration::from_secs(3)))?;
         // Recheck after connecting, before sending control authority to the endpoint.
@@ -405,14 +530,11 @@ fn start_with_owner(
         return Ok(refusal);
     }
     // Serialize admission across independent controllers. Never prune or relaunch a live job.
-    let lock = private_fs::open_nofollow(
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600),
-        &registry.join(".lock"),
-    )?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lock = private_fs::open_nofollow(&options, &registry.join(".lock"))?;
     lock.try_lock()
         .map_err(std::io::Error::from)
         .context("another controller is admitting a durable job")?;
@@ -423,19 +545,12 @@ fn start_with_owner(
         "at most 8 retained durable jobs; kill a finished named job to forget its record"
     );
     let directory = registry.join(name);
+    #[cfg(unix)]
     ensure!(
-        directory
-            .join("control.sock")
-            .as_os_str()
-            .as_encoded_bytes()
-            .len()
-            < 104,
+        directory.join(CONTROL).as_os_str().as_encoded_bytes().len() < 104,
         "private socket path exceeds Unix limit; use a shorter job name or private DIAL_HOME path"
     );
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&directory)
-        .context("job name already retained or cannot be created")?;
+    make_dir(&directory).context("job name already retained or cannot be created")?;
     drop(lock);
     let (strict, mut deny, writes, network) = match ws.sandbox_policy() {
         Policy::Strict {
@@ -476,7 +591,7 @@ fn start_with_owner(
     spawn
         .args([
             "--exact",
-            "tools::exec::background::durable::unix::tests::owner_fixture",
+            "tools::exec::background::durable::owner::tests::owner_fixture",
             "--nocapture",
         ])
         .env("DIAL_BG_TEST_OWNER", "1");
@@ -485,6 +600,7 @@ fn start_with_owner(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // SAFETY: setsid is async-signal-safe and touches no Rust state in the pre-exec child.
+    #[cfg(unix)]
     unsafe {
         spawn.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -494,7 +610,25 @@ fn start_with_owner(
             }
         });
     }
-    let mut child = match spawn.spawn() {
+    #[cfg(unix)]
+    let spawned = spawn.spawn();
+    // A new process group with its own hidden console, so closing the controller's console does
+    // not end it; it also leaves a containing job when that job allows breakaway.
+    #[cfg(windows)]
+    let spawned = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        spawn.creation_flags(
+            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+        );
+        spawn.spawn().or_else(|_| {
+            spawn.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+            spawn.spawn()
+        })
+    };
+    let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
             let _ = fs::remove_dir(&directory);
@@ -525,30 +659,59 @@ fn start_with_owner(
     }
     let launch_result = (|| -> Result<ToolOutput> {
         let end = Instant::now() + Duration::from_secs(10);
-        let mut stdin = child.stdin.take().context("owner launch pipe missing")?;
+        let stdin = child.stdin.take().context("owner launch pipe missing")?;
         let payload = serde_json::to_vec(&launch)?;
         ensure!(
             payload.len() as u64 <= MAX_WIRE,
             "owner launch contract exceeds transfer limit"
         );
-        crate::platform::io::set_nonblocking(&stdin)?;
-        let mut remaining = payload.as_slice();
-        while !remaining.is_empty() {
-            ensure!(
-                Instant::now() < end && !cancel.load(Ordering::Acquire),
-                "launch acknowledgement interrupted; command is not retried; inspect durable list"
-            );
-            match stdin.write(remaining) {
-                Ok(0) => bail!("owner launch pipe closed; command is not retried"),
-                Ok(written) => remaining = &remaining[written..],
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    crate::platform::io::wait_writable(&stdin, Duration::from_millis(25))?;
+        #[cfg(unix)]
+        {
+            let mut stdin = stdin;
+            crate::platform::io::set_nonblocking(&stdin)?;
+            let mut remaining = payload.as_slice();
+            while !remaining.is_empty() {
+                ensure!(
+                    Instant::now() < end && !cancel.load(Ordering::Acquire),
+                    "launch acknowledgement interrupted; command is not retried; inspect durable list"
+                );
+                match stdin.write(remaining) {
+                    Ok(0) => bail!("owner launch pipe closed; command is not retried"),
+                    Ok(written) => remaining = &remaining[written..],
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        crate::platform::io::wait_writable(&stdin, Duration::from_millis(25))?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error.into()),
             }
         }
-        drop(stdin);
+        // Windows anonymous pipes expose no writable readiness: write from a helper thread, which
+        // closes the pipe when done, and stop waiting at the same deadline.
+        #[cfg(windows)]
+        {
+            use std::sync::mpsc::RecvTimeoutError;
+            let (sent, written) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut stdin = stdin;
+                let _ = sent.send(stdin.write_all(&payload));
+            });
+            loop {
+                match written.recv_timeout(Duration::from_millis(25)) {
+                    Ok(result) => {
+                        result.context("owner launch pipe closed; command is not retried")?;
+                        break;
+                    }
+                    Err(RecvTimeoutError::Timeout) => ensure!(
+                        Instant::now() < end && !cancel.load(Ordering::Acquire),
+                        "launch acknowledgement interrupted; command is not retried; inspect durable list"
+                    ),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        bail!("owner launch pipe closed; command is not retried")
+                    }
+                }
+            }
+        }
         loop {
             if directory.join("ready.json").exists() || directory.join("finished.json").exists() {
                 return request(&directory, ws, &json!({"action":"list"}));
@@ -622,12 +785,7 @@ fn run_owner(launch: Launch) -> Result<()> {
         (1..=MAX_LIFETIME).contains(&launch.lifetime),
         "invalid lifetime"
     );
-    let listener = UnixListener::bind(launch.directory.join("control.sock"))?;
-    fs::set_permissions(
-        launch.directory.join("control.sock"),
-        fs::Permissions::from_mode(0o600),
-    )?;
-    listener.set_nonblocking(true)?;
+    let control = Control::bind(&launch.directory)?;
     let mut ws = Workspace::new(&launch.root)?
         .with_policy(if launch.strict {
             Policy::Strict {
@@ -691,10 +849,8 @@ fn run_owner(launch: Launch) -> Result<()> {
             )?;
             break;
         }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-                stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+        match control.accept()? {
+            Some(mut stream) => {
                 let result = (|| -> Result<ToolOutput> {
                     let args: Value = serde_json::from_reader((&mut stream).take(4096))?;
                     match args["action"].as_str() {
@@ -713,13 +869,10 @@ fn run_owner(launch: Launch) -> Result<()> {
                 );
                 let _ = serde_json::to_writer(&mut stream, &reply);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(25))
-            }
-            Err(error) => return Err(error.into()),
+            None => std::thread::sleep(Duration::from_millis(25)),
         }
     }
-    let _ = fs::remove_file(launch.directory.join("control.sock"));
+    let _ = fs::remove_file(launch.directory.join(CONTROL));
     Ok(())
 }
 
@@ -747,5 +900,6 @@ fn snapshot(bg: &Background, ws: &Workspace) -> Result<ToolOutput> {
         .map_err(anyhow::Error::msg)
 }
 
-#[cfg(test)]
+// The fixtures exercise Unix ownership, modes, symlinks and signals.
+#[cfg(all(test, unix))]
 mod tests;

@@ -21,6 +21,14 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &WeightsCommand) -> Result
             let value = weights::status(&config);
             return print(&value, *json, weights::render_status);
         }
+        WeightsCommand::Knowledge { refresh, json } => {
+            let value = if *refresh {
+                weights::knowledge::refresh(&config, &cancel)?
+            } else {
+                weights::knowledge::stored_report(&config)?
+            };
+            return print(&value, *json, weights::knowledge::render);
+        }
         WeightsCommand::Open { port } => return open(&config, *port),
         WeightsCommand::Experiment { name, budget, json } => {
             let value = match budget {
@@ -89,7 +97,33 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &WeightsCommand) -> Result
             return Ok(());
         }
         WeightsCommand::Map { json } => (Operation::Map, json!({}), None, *json),
-        WeightsCommand::Analyze { json } => (Operation::Analyze, json!({}), None, *json),
+        WeightsCommand::Analyze { json, explainer } => {
+            let explainer = match explainer {
+                Some(explainer) => explainer.clone(),
+                None => pick_explainer(&config, *json)?,
+            };
+            (
+                Operation::Analyze,
+                json!({ "explainer": explainer }),
+                None,
+                *json,
+            )
+        }
+        WeightsCommand::Investigate {
+            cases,
+            layers,
+            budget,
+            json,
+        } => {
+            let mut input = json!({"budget": budget});
+            if let Some(path) = cases {
+                input["cases"] = read(path)?;
+            }
+            if !layers.is_empty() {
+                input["layers"] = json!(layers);
+            }
+            (Operation::Investigate, input, None, *json)
+        }
         WeightsCommand::Improve { .. } => {
             anyhow::bail!("`weights improve` starts a session and is handled before this point")
         }
@@ -141,11 +175,14 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &WeightsCommand) -> Result
             positive,
             negative,
             site,
+            span_last,
+            span_before,
             json,
         } => (
             Operation::Direction,
             json!({"experiment": experiment, "name": name, "positive": read(positive)?,
-                   "negative": read(negative)?, "site": site}),
+                   "negative": negative.as_deref().map(read).transpose()?, "site": site,
+                   "span": span_last.map(|last| json!({"last": last, "before": span_before.as_deref().unwrap_or("answer_end")}))}),
             None,
             *json,
         ),
@@ -171,6 +208,7 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &WeightsCommand) -> Result
             cases,
             neutral,
             doses,
+            method,
             direction,
             layers,
             changes,
@@ -188,6 +226,7 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &WeightsCommand) -> Result
                     input["changes"] = read(changes)?;
                 }
                 None => {
+                    input["method"] = json!(method);
                     input["direction"] = json!(direction);
                     input["layers"] = json!(layers);
                     input["columns"] = json!(columns);
@@ -199,6 +238,7 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &WeightsCommand) -> Result
         WeightsCommand::Edit {
             name,
             experiment,
+            method,
             direction,
             layers,
             bundle,
@@ -207,10 +247,10 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &WeightsCommand) -> Result
             changes,
             columns,
             alpha,
+            allow_noisy,
             json,
-        } => (
-            Operation::Edit,
-            match (changes, bundle) {
+        } => {
+            let mut input = match (changes, bundle) {
                 (Some(changes), _) => json!({"experiment": experiment, "name": name,
                     "method": "scale", "changes": read(changes)?}),
                 (None, Some(bundle)) => json!({"experiment": experiment, "name": name,
@@ -218,13 +258,15 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &WeightsCommand) -> Result
                     "data": absolute(data.as_deref().context("--data is required with --bundle")?)?,
                     "strength": strength}),
                 (None, None) => {
-                    json!({"experiment": experiment, "name": name, "direction": direction,
+                    json!({"experiment": experiment, "name": name, "method": method, "direction": direction,
                     "layers": layers, "columns": columns, "alpha": alpha})
                 }
-            },
-            None,
-            *json,
-        ),
+            };
+            if *allow_noisy {
+                input["allow_noisy"] = json!(true);
+            }
+            (Operation::Edit, input, None, *json)
+        }
     };
     let value = weights::run(&config, Some(layout), op, &input, adapter, &cancel)?;
     print(&value, json, weights::render)
@@ -301,6 +343,46 @@ fn cases(
         None => println!("{text}"),
     }
     Ok(())
+}
+
+/// Asks which model writes and rates the explanations, when a person is at the terminal and there
+/// is a choice; otherwise the analyzed model explains itself. A number picks a listed model; any
+/// other text is a model selector such as provider/model.
+fn pick_explainer(config: &Config, json: bool) -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let choices = weights::explainer::choices(config);
+    if json || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(weights::explainer::SELF.into());
+    }
+    let mut err = std::io::stderr().lock();
+    writeln!(
+        err,
+        "Which model should write and rate the part explanations? The analyzed model still does every measurement."
+    )?;
+    for (number, choice) in choices.iter().enumerate() {
+        writeln!(
+            err,
+            "  {}. {} · {}",
+            number + 1,
+            choice.label,
+            choice.detail
+        )?;
+    }
+    write!(err, "Number, or another model as provider/model [1]: ")?;
+    err.flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(choices[0].value.clone());
+    }
+    match line.parse::<usize>() {
+        Ok(number) => choices
+            .get(number.wrapping_sub(1))
+            .map(|choice| choice.value.clone())
+            .with_context(|| format!("choose 1-{}", choices.len())),
+        Err(_) => Ok(line.to_owned()),
+    }
 }
 
 fn open(config: &Config, port: u16) -> Result<()> {

@@ -142,6 +142,10 @@ def wrap(layer, callback, observe=None):
         def __call__(self,*args,**kwargs):
             if observe is not None:observe(*args,**kwargs)
             result=self.inner(*args,**kwargs)
+            # Some decoder layers return extras after the hidden state (Gemma 4: `(h, shared_kv,
+            # offset)`); the callback sees and replaces only the hidden state.
+            if isinstance(result,tuple) and result:
+                return (callback(result[0]),)+result[1:]
             return callback(result)
     return Wrapped()
 
@@ -600,16 +604,37 @@ def generate_case(model,tokenizer,case,limit,tail=0):
     from mlx_lm import stream_generate
     from mlx_lm.sample_utils import make_sampler
     tokens=prompt(tokenizer,case['messages'],tools=case.get('tools'));mx.random.seed(42)
-    begin=time.monotonic();first=None;text='';count=0;tool_complete=None;finish=None
+    begin=time.monotonic();first=None;text='';count=0;tool_complete=None;finish=None;ids=[]
     for item in stream_generate(model,tokenizer,prompt=tokens,max_tokens=limit,sampler=make_sampler(temp=0.0)):
         if first is None:first=time.monotonic()-begin
         text+=item.text;count+=1;finish=getattr(item,'finish_reason',None) or finish
+        if getattr(item,'token',None) is not None:ids.append(int(item.token))
         if case.get('expected_tool') and tool_complete is None and parse_tool(text,tokenizer):tool_complete=time.monotonic()-begin
     passed,tool_ok=check_case(case,text,tokenizer)
     repeated=repeat_ratio(text)
-    result={'passed':passed,'tool_valid':tool_ok,'first_token_secs':first or time.monotonic()-begin,'tool_call_complete_secs':tool_complete,'seconds':time.monotonic()-begin,'tokens':count,'repeat_ratio':repeated,'finish_reason':finish or 'stop'}
+    result={'passed':passed,'tool_valid':tool_ok,'first_token_secs':first or time.monotonic()-begin,'tool_call_complete_secs':tool_complete,'seconds':time.monotonic()-begin,'tokens':count,'repeat_ratio':repeated,'finish_reason':finish or 'stop','thinking_tokens':thinking_tokens(tokenizer,list(tokens),ids)}
     if tail:result['tail']=text[-tail:]
     return result
+
+
+def find_run(tokens,pattern):
+    """Start of the first occurrence of `pattern` in `tokens`, or None."""
+    width=len(pattern)
+    for index in range(len(tokens)-width+1):
+        if tuple(tokens[index:index+width])==pattern:return index
+    return None
+
+
+def thinking_tokens(tokenizer,prompt_ids,ids):
+    """Generated tokens spent thinking: up to the end-of-thinking marker, or all of them when thinking
+    began (in the prompt's tail or the answer) and never ended. None when the tokenizer has no markers."""
+    start=tuple(getattr(tokenizer,'think_start_tokens',None) or ());end=tuple(getattr(tokenizer,'think_end_tokens',None) or ())
+    if not start or not end:return None
+    closed=find_run(ids,end)
+    if closed is not None:return closed
+    tail=prompt_ids[-(len(start)+4):]
+    opened=find_run(tail,start) is not None and find_run(tail,end) is None
+    return len(ids) if opened or find_run(ids,start) is not None else 0
 
 
 def repeat_ratio(text):

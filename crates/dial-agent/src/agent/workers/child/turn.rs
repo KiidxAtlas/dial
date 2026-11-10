@@ -2461,7 +2461,7 @@ impl<'a> ChildTurn<'a> {
                 } else {
                     tools::ToolStatus::from_output(&output)
                 },
-                &output.execution,
+                &output,
             );
             if let Some(uri) = &artifact {
                 crate::agent::workflow::efficiency::evidence_link(&mut body, uri, dropped);

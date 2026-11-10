@@ -1,6 +1,8 @@
 # Optional learning and harness improvement
 
-Coding and learning have separate lifecycles. Normal terminal, print, RPC and ACP launches use configured model/harness settings and do not approve training examples, apply learned versions, start Laya/automatic learned-skill capture, generate project-learning summaries, run startup model evaluations, monitor learning adapters, or queue improvement at startup/exit. Durable ordinary sessions retain bounded request/target observations for later explicit session teaching, including hosted source models; retention alone never starts training. Legacy automatic-learning preferences remain on disk and cannot opt a coding session back into this work. **Teach this model**, below, additionally records local live trajectories and serves admitted versions.
+Coding and learning have separate lifecycles. Normal terminal, print, RPC and ACP launches use configured model/harness settings and do not approve training examples, apply learned versions, start Laya/automatic learned-skill capture, generate project-learning summaries, run startup model evaluations, monitor learning adapters, or queue improvement at startup/exit.
+
+Durable ordinary sessions retain bounded request/target observations for later explicit session teaching, including hosted source models; retention alone never starts training. Legacy automatic-learning preferences remain on disk and cannot opt a coding session back into this work. **Teach this model**, below, additionally records local live trajectories and serves admitted versions.
 
 ## Teach this model
 
@@ -40,9 +42,15 @@ most twice per session.
 2. Select your trainable local model B with `/switch`, then run `/improve session` to approve the active session branch for B. Alternatively, `/improve session <model-selector>` names B without changing your coding model. Selectors use the same provider/model or configured-profile resolution as `/switch`.
 3. Dial retains source session, turn and provider/model identities, and imports approved source snapshots into B's learning store—not into B's measured performance history. Reopening with `/resume` or `/sessions`, or approving an inherited fork again, does not duplicate those source turns. Existing lower source scores are preserved; an unavailable referenced source store is reported rather than silently treated as approval.
 4. The existing curator selects bounded successful assistant targets with their recorded request context and tool schemas. It deduplicates, strips foreign-model reasoning, rejects malformed/oversize records and sealed-evaluation prompts, and keeps related prompts/trajectories together in train or validation. Explicit session approvals do not require `training.learn_from`, and are not limited by the automatic sibling-model mixing percentage.
-5. With Enabled and training on, the command queues background curation, training and evaluation for **B**; it no longer uses turn count as a proxy for training-record readiness. B's model-default dataset paths and adapter history are isolated from A's; explicitly configured shared dataset paths remain shared. The LoRA still requires supported local MLX weights, sufficient curated training data, a separate validation split, available compute/budget and a passing evaluation gate before activation. The background job reports insufficient data without training. A source session stays entirely on one side of the split, so one session alone cannot supply both training and validation. Merely completing a training run does not establish improved quality.
+5. With Enabled and training on, the command queues background curation, training and evaluation for **B**; it no longer uses turn count as a proxy for training-record readiness. B's model-default dataset paths and adapter history are isolated from A's; explicitly configured shared dataset paths remain shared.
 
-Request retention is opt-in (off by default) and bounded to the latest eight eligible request/target snapshots and 1 MiB per turn, in the private session journal. Failed, incomplete, interrupted, ephemeral and hermetic turns do not supply these ordinary-session records. Observations stay out of provider conversation history and do not authorize training until you approve the session. They can contain the same private code and text as the conversation; do not approve material you are not allowed to use for training. Source attribution is not a claim that Dial can predict which example will improve B most.
+   The LoRA still requires supported local MLX weights, sufficient curated training data, a separate validation split, available compute/budget and a passing evaluation gate before activation. The background job reports insufficient data without training. A source session stays entirely on one side of the split, so one session alone cannot supply both training and validation.
+
+   Merely completing a training run does not establish improved quality.
+
+Request retention is opt-in (off by default) and bounded to the latest eight eligible request/target snapshots and 1 MiB per turn, in the private session journal. Failed, incomplete, interrupted, ephemeral and hermetic turns do not supply these ordinary-session records. Observations stay out of provider conversation history and do not authorize training until you approve the session.
+
+They can contain the same private code and text as the conversation; do not approve material you are not allowed to use for training. Source attribution is not a claim that Dial can predict which example will improve B most.
 
 Version 3 records reference a session-scoped dictionary that stores each exact schema array once by its wire-content hash. Forks retain the dictionary; the importer expands references losslessly and still accepts historical expanded v1 and per-turn dictionary v2 records. Each request snapshot records the conversation in the message layout the route actually sent. On loopback Chat Completions endpoints that is one merged initial system message rather than separate system blocks, so a snapshot matches the request the model saw.
 
@@ -50,7 +58,11 @@ Older sessions without retained snapshots can still approve saved local trajecto
 
 Run `dial improve status` to inspect learning, `dial improve cycle` for an explicit gated cycle, or `dial improve train` for explicit training. Inside the terminal, bare `/improve` opens a panel with Status, Jobs, Versions and Setup tabs: Tab and Shift+Tab switch tabs, Up and Down select, Enter acts and Esc closes. Stopping a job and rolling back a version ask for Enter first. `/improve status` prints the same facts as text. `/improve settings` and `/improve models` open the learning controls.
 
-`/improve jobs`, `/improve status` and `/improve stop <state_id>` run at once even while a turn is running. A bare `/improve stop` lists the running job ids instead of guessing one. `/improve versions` and `/improve tasks` print one line per item; `/improve versions` marks the live version. `/improve rollback [version]` makes the previous version (the parent of the live one) live again after a confirmation, with the same checks as `dial improve rollback`; a version other than that parent is refused. `/improve cycle` and `/improve train` start in the background and post one note when they finish. These operations retain compute, power, budget and evaluation gates. Learning workers yield to coding at their existing safe handoff boundaries.
+`/improve jobs`, `/improve status` and `/improve stop <state_id>` run at once even while a turn is running. A bare `/improve stop` lists the running job ids instead of guessing one. `/improve versions` and `/improve tasks` print one line per item; `/improve versions` marks the live version.
+
+`/improve rollback [version]` makes the previous version (the parent of the live one) live again after a confirmation, with the same checks as `dial improve rollback`; a version other than that parent is refused. `/improve cycle` and `/improve train` start in the background and post one note when they finish. These operations retain compute, power, budget and evaluation gates.
+
+Learning workers yield to coding at their existing safe handoff boundaries.
 
 **Enabled is the switch that gates starting work.** `/improve cycle`, `/improve train`, `/improve session` (when it would train) and the panel's start action refuse while Enabled (`[improve] enabled`, in `/improve settings`) is off, and say so. `/improve enable` and `/improve disable` pause or resume a model's scheduling but do not change Enabled.
 
@@ -89,19 +101,47 @@ the active stage and elapsed cycle time. The learning views show stage progress
 count while waiting for the worker; it does not yet stream per-iteration progress or predict a finish
 time. Eligibility also depends on verified training data, so an elapsed cooldown is not a training ETA.
 
-1. **Observe and monitor explicit evaluations.** Keep evaluation tool events, repaired calls and completed evaluation conversations. The event-feature logistic probe ranks risky steps when enough externally scored trajectories exist and its held-out AUC is informative; predicted risk remains separate from ground-truth scores. Historical learning-enabled trajectories retain their human verdicts and undo rejections; normal coding journals do not create new learning trajectories. A turn that ends cleanly after its last edit, with every behavioral check run in that turn passing, is recorded automatically as `checks:behavioral` score 100; a later `/outcome` or `/undo` replaces it. `/improve` shows previously recorded verified turns and explicit evaluation results. Shell exit codes alone are telemetry, not task-success labels.
+1. **Observe and monitor explicit evaluations.** Keep evaluation tool events, repaired calls and completed evaluation conversations. The event-feature logistic probe ranks risky steps when enough externally scored trajectories exist and its held-out AUC is informative; predicted risk remains separate from ground-truth scores.
+
+   Historical learning-enabled trajectories retain their human verdicts and undo rejections; normal coding journals do not create new learning trajectories. A turn that ends cleanly after its last edit, with every behavioral check run in that turn passing, is recorded automatically as `checks:behavioral` score 100; a later `/outcome` or `/undo` replaces it.
+
+   `/improve` shows previously recorded verified turns and explicit evaluation results. Shell exit codes alone are telemetry, not task-success labels.
 2. **Practice with external checks.** Run 24 generated file-editing, scripting, search and structured-data tasks in disposable, strictly sandboxed workspaces. Files, JSON values, answers and command results are checked deterministically. Later cycles prioritize train families with low verified pass rates, high risk scores or recent tool-error categories; gate/anchor families never enter self-play.
 3. **Build training data.** Harvest successful verifier-scored trajectories plus schema-invalid tool attempts that were later corrected and executed without error. A bounded preference pair keeps the malformed assistant response as rejected and the verified correction as chosen; other raw failures are not preference labels. Conversations remain in one train/validation split, and held-out prompts are excluded. `learn_from_sessions = false` excludes future harvesting of live conversations and repairs.
    Reasoning models retain `reasoning_content` on the final assistant target, not earlier turns. The worker uses the model's native reasoning template when available, otherwise its thinking markers; models without either omit that field. Training, preference scoring and likelihood screening share the same token boundary and target mask.
    Canonical inference/training messages omit harness-only metadata such as durable undo checkpoint links.
    Those links remain in the session journal for undo; strict message validation still rejects unsupported fields.
 4. **Train locally.** An isolated feedback-model invocation proposes harness changes. Bounded mutations explore prompts, notes, tool selection, temperature, step budgets and edit mode. For supported local MLX models, LoRA resumes from the active adapter on up to 32 new verified records plus 16 accepted replay records; validation is capped at 32. A small reference-free preference pass adds chosen SFT loss plus a 0.1-weighted pairwise logistic ranking loss on repair pairs. The base model stays frozen; rejected candidates do not advance the training watermark.
-5. **Validate before activation.** Evaluate against fresh primary and general tasks, plus a frozen anchor suite. The primary (`tools`) suite is adaptive per model within a cycle: the baseline is scored at tier 0, and if it passes at least 90% of its cases (integer arithmetic, so 89.9% stays and 90.0% advances), the suite escalates to tier 1 and the baseline is scored again, then to tier 2 (the cap). The candidate runs on the final tier against the same baseline. Tier 1 adds five gate-only hard families (`refactor_behavior`, `search_then_edit`, `config_chain`, `bugfix_tests`, `multi_file_chain`) to the gate slots; tier 2 draws only from those hard families. Tier 0 excludes them, so its mixture is unchanged. The chosen tier is recorded on the `tools` score in the admission report. Escalation is not persisted across cycles and applies only to auto-generated suites; manual `[gate]` suites are not tiered. Admission requires primary improvement, enough paired wins, and an exact one-sided sign test on the primary suite (its level is `alpha` divided by the cycle's candidate count; at least `ceil(log(alpha)/log(1/2))` discordant pairs are needed, four at alpha 0.1, so smaller suites cannot pass). Guard suites (every non-primary suite) are judged statistically in automatic cycles: a guard is rejected as **Regressed** when its point drop exceeds the tolerance (one percentage point), and as **Unproven** when the point drop passes but a one-sided upper bound on the drop does not. The bound uses Clopper-Pearson limits on the discordant paired cases (the discordance rate and the share of discordant cases favouring the baseline, each at half the guard level; the guard level is `alpha` divided by the candidate and guard counts). Consequence, stated plainly: a guard with no discordant cases only bounds the drop by the discordance rate, so a clean guard needs about 300 to 440 paired cases to show a one-point tolerance at the default alpha (299 with one guard suite, 408 with three, 437 with four). With the default generated guard sizes (about 20 cases) **automatic admission is blocked** until guard suites are much larger or the tolerance is raised. Nothing here proves zero regression: a zero tolerance can never be shown from finite samples. Manual `[gate]` suites keep the legacy point rule (`alpha` = 1, documented and unchanged). Retry-excluded pairs are removed from both sides and never counted as losses. The anchor also limits cumulative drift from the original version, compared on the anchor cases the candidate was actually scored on. Private case contents and failed evaluator details never go to the feedback model.
-6. **Serve or reject.** At most one candidate is admitted per cycle, with an atomic SQLite baseline check. Rejected candidates never become active. New turns pick up admitted versions; adapter changes restart the local server. The live monitor is observational. It compares only task-matched prompts (the same prompt text, with the same explicit score source class, on the active version and its parent), using explicit user verdicts and passing behavioral checks; commits, verifier outcomes, self-play and errored or unfinished turns never count. Retries of one prompt are averaged into a single matched prompt, not independent samples. Below `monitor_min_turns` matched prompts it records insufficient evidence. Above that, a one-sided lower bound on the net share of matched prompts that got worse (Clopper-Pearson, alpha spent per new look so repeated checks stay valid, with no look counted for unchanged data) is recorded as an observed, unconfirmed regression. It **never rolls back automatically**: an identical prompt does not prove the same code, context or tests, and no anchored corroboration exists for live data yet. Use `dial improve rollback` after reviewing `last_monitor`.
+5. **Validate before activation.** Evaluate against fresh primary and general tasks, plus a frozen anchor suite. The primary (`tools`) suite is adaptive per model within a cycle: the baseline is scored at tier 0, and if it passes at least 90% of its cases (integer arithmetic, so 89.9% stays and 90.0% advances), the suite escalates to tier 1 and the baseline is scored again, then to tier 2 (the cap).
+
+   The candidate runs on the final tier against the same baseline. Tier 1 adds five gate-only hard families (`refactor_behavior`, `search_then_edit`, `config_chain`, `bugfix_tests`, `multi_file_chain`) to the gate slots; tier 2 draws only from those hard families. Tier 0 excludes them, so its mixture is unchanged. The chosen tier is recorded on the `tools` score in the admission report.
+
+   Escalation is not persisted across cycles and applies only to auto-generated suites; manual `[gate]` suites are not tiered. Admission requires primary improvement, enough paired wins, and an exact one-sided sign test on the primary suite (its level is `alpha` divided by the cycle's candidate count; at least `ceil(log(alpha)/log(1/2))` discordant pairs are needed, four at alpha 0.1, so smaller suites cannot pass).
+
+   Guard suites (every non-primary suite) are judged statistically in automatic cycles: a guard is rejected as **Regressed** when its point drop exceeds the tolerance (one percentage point), and as **Unproven** when the point drop passes but a one-sided upper bound on the drop does not.
+
+   The bound uses Clopper-Pearson limits on the discordant paired cases (the discordance rate and the share of discordant cases favouring the baseline, each at half the guard level; the guard level is `alpha` divided by the candidate and guard counts).
+
+   Consequence, stated plainly: a guard with no discordant cases only bounds the drop by the discordance rate, so a clean guard needs about 300 to 440 paired cases to show a one-point tolerance at the default alpha (299 with one guard suite, 408 with three, 437 with four).
+
+   With the default generated guard sizes (about 20 cases) **automatic admission is blocked** until guard suites are much larger or the tolerance is raised. Nothing here proves zero regression: a zero tolerance can never be shown from finite samples. Manual `[gate]` suites keep the legacy point rule (`alpha` = 1, documented and unchanged). Retry-excluded pairs are removed from both sides and never counted as losses.
+
+   The anchor also limits cumulative drift from the original version, compared on the anchor cases the candidate was actually scored on. Private case contents and failed evaluator details never go to the feedback model.
+6. **Serve or reject.** At most one candidate is admitted per cycle, with an atomic SQLite baseline check. Rejected candidates never become active. New turns pick up admitted versions; adapter changes restart the local server. The live monitor is observational.
+
+   It compares only task-matched prompts (the same prompt text, with the same explicit score source class, on the active version and its parent), using explicit user verdicts and passing behavioral checks; commits, verifier outcomes, self-play and errored or unfinished turns never count. Retries of one prompt are averaged into a single matched prompt, not independent samples.
+
+   Below `monitor_min_turns` matched prompts it records insufficient evidence. Above that, a one-sided lower bound on the net share of matched prompts that got worse (Clopper-Pearson, alpha spent per new look so repeated checks stay valid, with no look counted for unchanged data) is recorded as an observed, unconfirmed regression.
+
+   It **never rolls back automatically**: an identical prompt does not prove the same code, context or tests, and no anchored corroboration exists for live data yet. Use `dial improve rollback` after reviewing `last_monitor`.
 
 LoRA is enabled by default but requires a supported checkpoint, **24 examples** in the bounded delta/replay batch, a nonempty validation split and a **6-hour training interval**. Training defaults to **32 iterations**. A candidate must still pass the full sealed gate before activation. Data-poor cycles can still evaluate harness changes; no gain is guaranteed.
 
-**Gate measurement under infrastructure failure.** Each gate case is measured as a baseline/candidate pair. A transient provider or transport failure (rate limit, 5xx, timeout, lost connection, model load failure) is retried twice, after 2 s and 8 s. If it persists, the whole pair is excluded from both versions, so they are always compared on the same cases; the admission reason records how many pairs were excluded and the failure category (never prompts or output). Failures caused by the model's own output (thinking loops, rejected tool-call JSON, context overflow) still count as unsolved for the candidate. Operator stops, budgets, authentication or quota errors, and unrecognized failures abort the evaluation as before. If more than 20% of a private suite is excluded, the evaluation does not complete and nothing is admitted. The cumulative-drift anchor is never cached from a partial measurement: if it cannot be measured, the candidate is rejected for that cycle and retried later.
+**Gate measurement under infrastructure failure.** Each gate case is measured as a baseline/candidate pair. A transient provider or transport failure (rate limit, 5xx, timeout, lost connection, model load failure) is retried twice, after 2 s and 8 s.
+
+If it persists, the whole pair is excluded from both versions, so they are always compared on the same cases; the admission reason records how many pairs were excluded and the failure category (never prompts or output). Failures caused by the model's own output (thinking loops, rejected tool-call JSON, context overflow) still count as unsolved for the candidate.
+
+Operator stops, budgets, authentication or quota errors, and unrecognized failures abort the evaluation as before. If more than 20% of a private suite is excluded, the evaluation does not complete and nothing is admitted. The cumulative-drift anchor is never cached from a partial measurement: if it cannot be measured, the candidate is rejected for that cycle and retried later.
 
 Evaluation attempts use one shared typed cache: measured solved/unsolved cases and model failures
 are retained for both gate follow-up comparisons and model profiles. Infrastructure exclusions are
@@ -135,7 +175,13 @@ Dial also retrieves up to two similar externally verified live tasks as advisory
 
 The MLX-LM server adapter preserves malformed model tool calls as explicitly invalid, non-executable calls rather than allowing the pinned upstream formatter to crash on missing arguments. These errors remain visible to the agent and the learning pipeline. Its prompt (KV prefix) cache is bounded to a quarter of physical memory (`--prompt-cache-bytes`); mlx-lm's default holds up to ten caches with no byte limit, which can push weights into swap on unified memory.
 
-**Schema-constrained tool calls.** For local MLX-LM models, Dial's server constrains decoding only inside tool-call spans, for the tool-parser formats that mlx-lm ships with: `json_tools` (`<tool_call>{"name": …, "arguments": …}</tool_call>`, e.g. Qwen2.5/Qwen3/Hermes templates), `gemma4` (`<|tool_call>call:NAME{…}<tool_call|>`, strings in `<|"|>`), `function_gemma` (`<start_function_call>call:NAME{…}<end_function_call>`, strings in `<escape>`, and `}` is not allowed inside a string), `glm47` (`<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value>…</tool_call>`, where string values are checked only against enums and other values as JSON), `qwen3_coder` (Qwen3-Coder XML: `<tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>`, where values are raw text: strings are free apart from enums and a bare `null`, booleans must be `true`/`false`, and integer, number, object and array values are checked as JSON of that type when the parameter closes) and `mistral` (`[TOOL_CALLS]` followed by a JSON array of calls or `NAME[ARGS]{…}`, ending when its JSON is complete). Each sampled token must keep the call a valid prefix: syntax, a declared tool name, declared argument keys (unless `additionalProperties` allows extras), required keys before the object closes, value types, string enums, and array item types. The model's own distribution is sampled first; only a rejected token is resampled among valid alternatives, so calls that were already valid come out unchanged. Free text and thinking spans are not touched. `anyOf`/`oneOf`/`$ref` and numeric or length bounds are checked for syntax only, and Rust-side validation still has the final say. A dead end releases the constraint for that call, never stalling generation. It is disabled under speculative or draft-model decoding, distributed decoding, MLX-VLM, other tool formats (e.g. Llama 3 JSON or Kimi) and external servers. Because constrained calls are always executable, this reduces the malformed-call repair pairs available for preference training.
+**Schema-constrained tool calls.** For local MLX-LM models, Dial's server constrains decoding only inside tool-call spans, for the tool-parser formats that mlx-lm ships with: `json_tools` (`<tool_call>{"name": …, "arguments": …}</tool_call>`, e.g. Qwen2.5/Qwen3/Hermes templates), `gemma4` (`<|tool_call>call:NAME{…}<tool_call|>`, strings in `<|"|>`), `function_gemma` (`<start_function_call>call:NAME{…}<end_function_call>`, strings in `<escape>`, and `}` is not allowed inside a string), `glm47` (`<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value>…</tool_call>`, where string values are checked only against enums and other values as JSON), `qwen3_coder` (Qwen3-Coder XML: `<tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>`, where values are raw text: strings are free apart from enums and a bare `null`, booleans must be `true`/`false`, and integer, number, object and array values are checked as JSON of that type when the parameter closes) and `mistral` (`[TOOL_CALLS]` followed by a JSON array of calls or `NAME[ARGS]{…}`, ending when its JSON is complete).
+
+Each sampled token must keep the call a valid prefix: syntax, a declared tool name, declared argument keys (unless `additionalProperties` allows extras), required keys before the object closes, value types, string enums, and array item types. The model's own distribution is sampled first; only a rejected token is resampled among valid alternatives, so calls that were already valid come out unchanged.
+
+Free text and thinking spans are not touched. `anyOf`/`oneOf`/`$ref` and numeric or length bounds are checked for syntax only, and Rust-side validation still has the final say. A dead end releases the constraint for that call, never stalling generation. It is disabled under speculative or draft-model decoding, distributed decoding, MLX-VLM, other tool formats (e.g. Llama 3 JSON or Kimi) and external servers.
+
+Because constrained calls are always executable, this reduces the malformed-call repair pairs available for preference training.
 
 ```sh
 dial improve jobs                   # all project models, active locks, stage and recent log
@@ -231,7 +277,11 @@ and exact loopback endpoints are allowed by default; private LAN and public endp
 usage/cost accounting, and must be checked locally before becoming a correctness claim. Neither a
 solver win nor a stronger-model answer automatically becomes a verified training outcome.
 
-**Automatic escalation** runs only when `[escalation].enabled = true` and the `coach` role is assigned. After `auto_after_failed_rounds` (default `3`; `0` disables) consecutive failed tool rounds in one turn, Dial asks the coach role once for unverified advice, up to `max_auto_per_turn` times per turn (default `1`). It uses the same privacy gate, limits, and cost accounting as `escalate`. Approval follows the same decision as `escalate`: `ask` prompts you first, `readonly` and plan mode refuse, and a denial skips the call without contacting the coach model. A refusal, denial, or remote-disclosure refusal appears as a skipped notice and still uses the turn's allowance, so one refusal cannot repeat every round. The question contains the turn's user goal and recent failure messages only. Advice reaches the next model turn as a transient, clearly unverified user message, never as a system instruction, and it activates nothing. Both keys appear under `/settings` → Automatic escalation.
+**Automatic escalation** runs only when `[escalation].enabled = true` and the `coach` role is assigned. After `auto_after_failed_rounds` (default `3`; `0` disables) consecutive failed tool rounds in one turn, Dial asks the coach role once for unverified advice, up to `max_auto_per_turn` times per turn (default `1`). It uses the same privacy gate, limits, and cost accounting as `escalate`.
+
+Approval follows the same decision as `escalate`: `ask` prompts you first, `readonly` and plan mode refuse, and a denial skips the call without contacting the coach model. A refusal, denial, or remote-disclosure refusal appears as a skipped notice and still uses the turn's allowance, so one refusal cannot repeat every round. The question contains the turn's user goal and recent failure messages only.
+
+Advice reaches the next model turn as a transient, clearly unverified user message, never as a system instruction, and it activates nothing. Both keys appear under `/settings` → Automatic escalation.
 
 A local main model with a hosted coach model:
 
@@ -454,7 +504,8 @@ state directory (`weights/`):
 | Operation | What it reports | Loads the model |
 |---|---|---|
 | `map` | architecture, tensors, parameters and bytes per layer and component (attention, MLP, norms, embeddings), dtypes and quantization | no (safetensors headers) |
-| `analyze` | an atlas from built-in probe text: per-layer importance (loss rise when the layer is skipped), each attention head's role (induction/copy, previous-token, attention sink, mixed) and the busiest MLP neurons with the tokens they promote; takes no input and costs no experiment run | yes |
+| `analyze` | an atlas from 24 built-in probe texts in eight labelled categories (facts, code, maths, story, other languages, instructions, reasoning, repetition): per-layer importance (loss rise when the layer is skipped) overall and per category, with the category a layer serves most; a logit lens (from which layer the final prediction is among that layer's top 10 guesses); each attention head's role (induction/copy, previous-token, attention sink, current-token, same-token, local, long-range, mixed) and each layer's sliding or full attention span; the busiest MLP neurons with the tokens they promote, the snippets that fire them hardest and the category they favour; expert routing with the experts that favour one category and the experts never chosen; and each dense weight matrix's effective rank and outlier rows/columns. `findings` restates the clearest results in plain English (shown first in the terminal and on the dashboard). Takes no input and costs no experiment run; about 2½ minutes on a 26B mixture-of-experts model | yes |
+| `investigate` | bounded layer-output interventions, per-case answer-loss changes, and restored-baseline check; default four tiny diagnostic probes | yes |
 | `stats` | per-tensor norm, RMS, mean, std, absolute max and outlier ratio; per-layer norms (`--prefix` limits the tensors) | no (lazy reads, quantized weights dequantized in chunks) |
 | `activations` | per-layer contrast between 1–64 matched positive/negative conversations sharing a prompt, with a suggested steering layer | yes |
 | `trace` | answer-loss increase over 1–16 conversations with each layer skipped, or with each attention head of one layer removed (`--heads N`) | yes |
@@ -462,6 +513,7 @@ state directory (`weights/`):
 ```sh
 dial weights map
 dial weights analyze                              # what the layers, heads and neurons do
+dial weights investigate                          # bounded experiment, default 24 forward passes
 dial weights improve stop endless repetition in long lists   # the model runs the whole edit loop
 dial weights stats --prefix model.layers.12
 dial weights activations --pairs pairs.json      # [{"positive":[...messages], "negative":[...]}]
@@ -491,8 +543,103 @@ sensitivity plus a grid of attention heads, and refreshes while a job runs. `/im
 tab with the same per-layer bars. The agent can run the operations through the `model_weights` tool
 once it is listed in `integrations`; each call that reads the model needs approval.
 
+The browser dashboard's **Adjust weights** tab has a linked slider and number box for each
+listed tensor (run `map` or `stats` first), plus a tensor-name filter. These set whole-tensor
+scale factors in [-4, 4]: 1 leaves the tensor unchanged, 0 zeros it, and a negative value inverts
+it. Up to 32 changed tensors may be submitted together. Draft values update immediately and
+survive dashboard polling and tab switches, but are discarded on page reload; **Reset draft**
+does not change saved copies or the active model. Analysis measurements remain read-only.
+
+Enter an existing experiment name (`dial weights experiment NAME --budget N`). **Preview / Test**
+takes reference conversations as JSON (`[{"messages":[{"role":"user","content":"Question"},
+{"role":"assistant","content":"Reference answer"}]}]`), spends one experiment run, and scores
+the selected scale in memory without writing model files. **Apply to new copy** takes a new
+copy name and uses the normal scale-edit owner to write a separate checkpoint. Neither action
+promotes the copy or edits the base model. Evaluate and promote with the existing `evaluate`
+and `promote` commands; their held-out checks still apply. Progress/errors appear in the tab,
+and preview dose results appear under Experiments. Model work is explicit, not started by
+dragging a slider; quantization may round or reject small/noisy changes. The action endpoint
+accepts bounded JSON POSTs with a non-simple dashboard header and rejects foreign Origins.
+
 Results contain numbers and tensor names, never prompt or answer text. Inspections never write
 model files; [weight edits](#evaluation-gated-weight-edits) write a separate copy.
+
+### Experimental component investigation
+
+`dial weights investigate` (or `/weights investigate`) scores four built-in reference answers
+covering arithmetic, copying, JSON and code. It measures intact answer loss, temporarily replaces
+selected layers' residual outputs with their inputs, then scores the intact model again to check
+restoration. Original checkpoint files are never edited, no adapter is promoted, and no generated
+answer is treated as ground truth. The layer still executes: side outputs such as shared keys/values
+are not removed. This tests residual-output contributions, not complete removal of every layer effect.
+
+By default, at most four layers are spread across the decoder with a budget of **24 single-case
+forward passes**, including the initial and restored baselines. Lower budgets reduce automatic
+layer coverage; a budget insufficient for the requested layers is refused. `--budget` accepts 3–256.
+Each case is capped at 2,048 rendered tokens. The normal worker timeout and cancellation apply.
+
+```sh
+dial weights investigate --layers 0,10,20,29 --budget 24
+dial weights investigate --cases answered.json --layers 10,11 --budget 64 --json
+dial weights history --op investigate
+```
+
+`--cases` accepts 1–16 objects with `messages` ending in the reference assistant answer, as for
+`weights trace`. A positive loss delta means that answer became less likely under the intervention;
+it does **not** establish general quality, an expert's topic, a neuron's meaning, or a beneficial
+weight edit. The small built-in probes are diagnostics, not a validated benchmark. There are no
+confidence intervals or claims of universal specialization. Use diverse held-out cases to follow up.
+
+Results are retained by the existing weights history and latest-result store. JSON includes case
+fingerprints, baseline and restored losses, scored token counts, exact selected layers, per-case
+deltas and budget usage, but never custom prompt or answer text. If the intact baseline is not
+reproduced or model metadata changes during the run, the run fails without publishing a result.
+
+This requires a local MLX checkpoint and a compatible installed MLX runtime, not an LM Studio API
+endpoint. Use `--provider mlx --model /path/to/checkpoint` (or set `weights.model`) to select it.
+The worker loads its own model instance; running it while LM Studio holds the same large model may
+use substantial additional memory. It does not unload or modify LM Studio's running model.
+
+### Read-only model knowledge during use
+
+Enable `weights.knowledge` in Settings → Weights to collect a structural map and bounded
+turn observations automatically after normal agent turns (off by default). This reuses the
+header mapper: no model load, activation probes, downloads, training or weight edits. It needs
+an installed Python worker runtime. Each refresh is limited to five seconds; an unavailable
+runtime, busy weights job or invalid checkpoint produces a diagnostic, not a failed chat turn.
+Hermetic evaluation does not collect knowledge. The improvement stop switch also pauses refreshes.
+
+```toml
+[weights]
+knowledge = true
+# For LM Studio or another external server, explicitly identify the local checkpoint:
+model = "/absolute/path/to/local-MLX-checkpoint"
+```
+
+Use `/weights knowledge` or `dial weights knowledge` to read the saved report without accessing
+the model. `dial weights knowledge --refresh` maps it immediately; add `--json` to export the
+tensor-to-role mappings and retained observations. `/weights knowledge --refresh` runs the same
+command as a background job. The existing `model_weights` tool's `status` includes the summary.
+
+The report separates **metadata facts**, **structural inferences** from tensor naming conventions,
+and **agent-turn observations**. It explains local mathematical effects of edits and quantization
+group coupling, not which coefficient means “Python” or which expert is “good at reasoning.”
+Unknown names remain unknown. Normal usage never upgrades these explanations into causal claims.
+
+Private project state (`weights/knowledge.json`) retains the latest target's map and newest 64
+observations: timestamp, configured model/provider, turn outcome, step count and elapsed time.
+It copies no prompt, answer, tool arguments, endpoint or credential. Outcomes concern the whole
+configured agent route, not the checkpoint: an explicit target may differ from the serving model,
+and external-server identity, fallback routes and adapters are not verified. Turns in LM Studio
+outside Dial are not observed. This is not a model-quality benchmark.
+
+Maps are reused while the existing model metadata fingerprint matches; detected target or metadata
+changes reset observations so snapshots are not mixed. The fingerprint uses file metadata and
+selected configuration hashes, **not a hash of every weight byte**. Saved reports label their
+freshness and target mismatch; use `--refresh` after changing a checkpoint. This bounded snapshot
+is not a permanent archive of all models. Changing weights or claiming behavioral effects still
+requires separate, explicit experiments and evaluation.
+
 Only Dial-owned MLX safetensors checkpoints are supported: GGUF files, hosted providers and external
 endpoints are refused. Head tracing needs a standard attention layer; linear-attention layers of
 hybrid models (for example some Qwen3.5 layers) report that they have no heads to remove. Stored
@@ -514,11 +661,11 @@ becomes the project's model only after it beats the base model on held-out cases
 |---|---|---|
 | `experiment NAME --budget N` | creates an experiment with a budget of 1–256 model runs; without `--budget`, shows the experiment | 0 |
 | `generate` | greedy answers (temperature 0, seed 42) to 1–32 cases ending in a user turn; reports tokens, token-limit hits, repetition ratio and optional `required`/`forbidden` checks per case; `--tail N` shows the last N ≤ 400 characters of each answer | 1 |
-| `direction NAME` | per-layer unit direction between `--negative` (unwanted) and `--positive` (wanted) answers at the MLP output (`--site mlp`, default) or residual stream, with gap and separation per layer and suggested layers | 1 |
+| `direction NAME` | per-layer unit direction between `--negative` (unwanted) and `--positive` (wanted) answers at the MLP output (`--site mlp`, default) or residual stream, with gap and separation per layer and suggested layers. `--span-last N` measures only the last N answer tokens before the end of the answer, or before the end-of-thinking marker with `--span-before think_end`; with a span `--negative` may be left out, and the span is then contrasted with the other tokens of the same positive answers, before and after it. Each layer's MLP writers also get their mean input and output size, which `--method add` needs | 1 |
 | `attribute` | ranks attention heads and MLP neurons by the estimated rise in answer loss if each were removed (one backward pass over 1–16 `--cases` ending in the unwanted answer); with `--wanted` answers it ranks by the difference, so components that drive the unwanted answer without being needed for the wanted one come first | 1 |
 | `try` | scores an edit in memory at each of `--doses` (up to 5) and discards it: loss change on `--cases` and KL drift from the intact model on up to 8 `--neutral` answers; writes no model files | 1 |
-| `edit NAME` | new copy under `weights/edits/NAME` with the direction projected out of the top `--columns` (default 64) `down_proj` columns of each of `--layers` (1–16), scaled by `--alpha` (default 1) | 0 |
-| `evaluate EDIT --cases FILE` | runs the base and the edit on 8–32 held-out cases, compares them case by case, and records pass or fail | not charged |
+| `edit NAME` | new copy under `weights/edits/NAME` with the direction projected out of the top `--columns` (default 64) output-projection columns of every MLP writer of `--layers` (1–16): a dense `down_proj`, a shared expert's and each routed expert's. `--alpha` (default 1) scales the removal. `--method add` instead adds the direction to the same writers: W += α·n·d·uᵀ/‖u‖², where u and n are the writer's mean input and output size, so a typical input gets α·n (default α 0.1) more along d. Experts get their own u and n; experts never routed to are left alone. On quantized models a rank-one edit is often smaller than its requantization error and is refused unless `--allow-noisy` is given | 0 |
+| `evaluate EDIT --cases FILE` | runs the base and the edit on 8–32 held-out cases, compares them case by case, and records pass or fail. For `project_out` and `add` edits it also builds a norm-matched random control, runs it on the same cases and removes it | not charged |
 | `promote EDIT` / `revert` | sets the project's main model to the passing edit, or back to its base | — |
 
 ```sh
@@ -560,8 +707,70 @@ earlier edit with its parameters and requantization error so failed attempts are
 **Mixture-of-experts and hybrid models.** On Qwen3.5/3.6-style models `analyze` classifies the heads
 of the full-attention layers (the gated `q_proj` is split so only the query half is scored), reports
 per-layer expert routing (top experts by share and routing entropy) and the output RMS of
-linear-attention layers. `attribute` also ranks routed experts and shared experts, and a scale change
-may name `{layer, experts: [...]}` (those experts' `down_proj` slices) or `{layer, shared_expert: true}`.
+linear-attention layers. Gemma 4 mixture-of-experts models (a separate `router` and expert block
+beside an always-on dense MLP) get the same routing report. An expert is listed as favouring a
+category when its share of that category's routed slots is at least twice its overall share. Expert
+weight stacks are not decomposed for the rank report. `attribute` also ranks routed experts and
+shared experts on Qwen-style models, and a scale change may name `{layer, experts: [...]}` (those
+experts' `down_proj` slices) or `{layer, shared_expert: true}`.
+
+**Reading `analyze` results.** The labels come from a few short texts and fixed thresholds; treat
+them as leads for `attribute` and `try`, not proof. A negative importance means the probe loss fell
+when the layer was skipped, which happens on instruction-tuned models that score plain text badly.
+The logit lens reads each layer's hidden state through the final norm and output embedding, so on
+models whose middle layers do not read out that way (Gemma among them) the prediction appears only
+in the last layers.
+
+The observation passes (logit lens, heads, neurons, routing, expert profiles) read about 2,500
+tokens of text across the eight categories; layer skipping keeps the short set. Each layer's
+`writes` gives the change in the log-probability of the actual next token across that layer
+(`target_gain`) and the tokens its update pushes up or down more often than other layers do.
+On mixture-of-experts models, `experts.profiles` lists the busiest and most specialised experts:
+the input tokens and snippets that route to them and the tokens their mean output favours
+relative to the other profiled experts. On Qwen3.5/3.6 linear-attention layers,
+`linear_attention.memory` gives each head's measured half-life in tokens (from its decay gate on
+the text) and its write strength. Self-explanation (`summary.explanations`) asks the model to
+describe up to fourteen of the checked parts (largest measured effect first) from snippets in one
+half of the text, then tests the description on the other half: `explanation_score` is the rank
+correlation between how well the model says the description fits each held-out snippet and how
+strongly the part actually fires there (0 = chance, 1 = perfect). `control_score` repeats the test
+with a neutral description, and `hard_negative_score` is how often the description tells a real
+firing snippet from a look-alike (the same tokens where the part stays quiet; 0.5 = chance).
+
+**Choosing who explains.** `dial weights analyze` asks in a terminal which model writes and rates
+the explanations (`--explainer MODEL` skips the question; `@self`, the default, is the analyzed model).
+`/weights analyze` offers the same choice as a picker when another chat model is configured. An
+outside model, such as a hosted frontier model, gets one request per checked part asking for a short
+description from the first-half snippets, then two requests asking it to rate each shuffled held-out
+snippet from 0 to 10, once under its description and once under the neutral one. The worker scores
+those ratings exactly as it scores the analyzed model's own yes/no answers. The outside model sees
+only Dial's built-in probe text and never the activation values. The analyzed model still makes
+every measurement. A part the outside model fails to answer is left unexplained, with a note.
+`explainer` in the result, the terminal and the dashboard name the model that wrote the explanations.
+
+**Checked parts.** `analyze` checks parts by what removing them does before calling a label
+established. Up to 32 candidates (expert specialists, busy experts, neurons with a favoured
+category, the most active neurons; at most two per layer and kind) are screened on one half of the
+text, and the 16 with the largest effect are tested on the other half, so the test never reuses the
+text that picked them. A part is removed only at the positions where it fires (a neuron's
+activation set to zero; an expert's router logit masked so those tokens go to their next choice),
+and so is a matched control: the co-chosen expert with the closest router weight, or the neuron of
+the same layer with the closest activation at those positions. The effect is how far the
+next-token distribution moves there (KL in nats over the 64 likeliest tokens plus the rest as one
+bucket, a lower bound on the full KL), which is far less noisy than the loss of the single actual
+next token. The `causal` check passes when the part beats its control consistently across held-out
+texts (signed-rank z of at least 2); a part that fires in fewer than 6 held-out texts is first given
+greedy continuations of its category's texts, and if that is still too few its check is `null`
+(untested), not failed. `loss_change` says whether removal makes the actual next token less likely
+(positive) or more likely (negative). A part said to favour a category must change that
+category's held-out texts more than the rest (rank-sum z of at least 2, `category`), and the
+category must come out the same on each half of the text (`replicated`). An explanation passes when
+it beats the neutral control by 0.25 and tells look-alikes apart at least 60% of the time.
+`summary.checked_parts` lists each part with its `checks` and `confirmed` (every applicable check
+passed); `findings`, the terminal output and the dashboard say which labels are confirmed, which
+check failed or went untested, and which parts have the largest measured effects. The checks cost
+two passes (part and control) per firing text per candidate on its screening texts and on the
+held-out half.
 
 **Steering and combined edits.** `dial weights edit NAME --experiment E --bundle B --data D
 --strength S` folds a steering bundle from `dial steering` into the weights of a new copy (the rank-1
@@ -614,6 +823,15 @@ Once evaluated, those cases are held out: later runs of the experiment may not u
 good when the answer stops before the token limit and passes its checks, if it has any. The edit
 wins a case when only its answer is good, and loses one when only the base's is. The edit passes
 when it has at least 8 cases, more wins than losses, and a one-sided sign-test p ≤ 0.1.
+
+**Random control.** A small edit of any direction can change answers, so an edit made from a
+direction must also beat a control: the same edit along a random direction orthogonal to the
+measured one, with the same norm per tensor (fixed seed per edit name). The evaluation writes the
+control next to the edit, generates with it and deletes it. The edit passes only if it wins more
+cases against the control than it loses. Scale, steering and combined edits have no direction to
+randomize, and the result says so. The result also reports the mean change in answer tokens and in
+thinking tokens (counted up to the end-of-thinking marker, for models that have one), edit minus
+base and edit minus control, each with a paired-bootstrap 95% interval.
 
 **Copies.** The edit never changes the base model. Unchanged files are hard-linked into the copy, or
 copied when linking is not possible. Only the shards holding edited tensors are rewritten, and the

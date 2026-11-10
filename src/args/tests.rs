@@ -199,13 +199,85 @@ fn rules_cli_samples_are_exclusive_and_do_not_clash_with_global_flags() {
 }
 
 #[test]
+fn weights_direction_takes_a_span_instead_of_negatives_and_edit_takes_add() {
+    let cli = Cli::try_parse_from([
+        "dial",
+        "weights",
+        "direction",
+        "stop",
+        "--experiment",
+        "x",
+        "--positive",
+        "p.json",
+        "--span-last",
+        "64",
+        "--span-before",
+        "think_end",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Developer(DevCommand::Weights {
+            action: WeightsCommand::Direction { negative: None, span_last: Some(64), span_before: Some(ref before), .. }
+        })) if before == "think_end"
+    ));
+    assert!(
+        Cli::try_parse_from([
+            "dial",
+            "weights",
+            "direction",
+            "d",
+            "--experiment",
+            "x",
+            "--positive",
+            "p.json"
+        ])
+        .is_err()
+    );
+    let cli = Cli::try_parse_from([
+        "dial",
+        "weights",
+        "edit",
+        "e",
+        "--experiment",
+        "x",
+        "--method",
+        "add",
+        "--direction",
+        "stop",
+        "--layers",
+        "3,5",
+        "--alpha",
+        "0.1",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Developer(DevCommand::Weights {
+            action: WeightsCommand::Edit { method: Some(ref method), .. }
+        })) if method == "add"
+    ));
+}
+
+#[test]
 fn weights_analyze_and_improve_parse_without_extra_flags() {
     let cli = Cli::try_parse_from(["dial", "weights", "analyze", "--json"]).unwrap();
     assert!(matches!(
         cli.command,
         Some(Command::Developer(DevCommand::Weights {
-            action: WeightsCommand::Analyze { json: true }
+            action: WeightsCommand::Analyze {
+                json: true,
+                explainer: None
+            }
         }))
+    ));
+    let cli =
+        Cli::try_parse_from(["dial", "weights", "analyze", "--explainer", "openai/gpt-5"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Developer(DevCommand::Weights {
+            action: WeightsCommand::Analyze { json: false, explainer: Some(ref model) }
+        })) if model == "openai/gpt-5"
     ));
     let cli =
         Cli::try_parse_from(["dial", "weights", "improve", "stop", "endless", "loops"]).unwrap();

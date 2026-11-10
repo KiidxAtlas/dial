@@ -17,6 +17,68 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-11-10
+
+### Security
+
+- Removed polynomial-time goal parsing from the scripted benchmark provider; repeated untrusted acceptance-goal prefixes no longer stall the harness.
+
+### Added
+
+- The browser weights dashboard has linked sliders and numeric inputs for tensor scale drafts, filtering and reset, with explicit in-memory Preview/Test and Apply-to-new-copy actions. Existing experiment budgets, immutable base checkpoints and evaluation-gated promotion remain enforced.
+- `dial weights investigate` runs bounded, temporary layer-output ablations against built-in or supplied reference answers, checks restoration of the intact baseline, and saves case-specific effects without writing checkpoint weights.
+- `dial weights analyze` learns much more about a model: 24 probe texts in eight labelled categories give per-layer importance per category (and the category each layer serves most), a logit lens, four more attention-head roles (current-token, same-token, local, long-range) plus each layer's sliding/full attention span, the snippets that fire each top neuron, expert routing on Gemma 4 mixture-of-experts models with the experts that favour one category and those never chosen, and each dense weight matrix's effective rank and outlier dimensions. A plain-English `findings` list leads the terminal output and the dashboard. A run takes longer (about 2½ minutes on a 26B mixture-of-experts model, was about 30 seconds) and the probe text now starts with the tokenizer's BOS token.
+- `dial weights analyze` goes deeper: the observation passes read about 2,500 tokens of text; each layer reports what its update writes (the change in the right token's log-probability and the tokens it pushes up or down); mixture-of-experts models get expert profiles (the tokens and snippets routed to each busy or specialised expert and what it writes); Qwen3.5/3.6 linear-attention layers report each head's memory half-life; and the model describes its own experts and neurons in words, scored against held-out snippets and a neutral-description control.
+- `dial weights analyze` checks its labels before calling them established. Candidate experts and neurons are screened on one half of the probe text, and the 16 with the largest effect are tested on the other half. Each part is removed only where it fires, alongside an equally active control part removed at the same positions; the part must move the next-token distribution (KL over the likeliest tokens) more than its control, consistently across held-out texts (signed-rank test). Rarely firing parts get model-written continuations of their category's texts, and parts that still fire in too few texts are reported as untested rather than failed. A category claim must change that category's texts more than the rest, the category must hold on both halves of the text, and the self-explanation (now written for the checked parts with the largest effect) is tested on held-out snippets and look-alikes. `summary.checked_parts`, `findings`, the terminal and the dashboard mark each part confirmed, failed or untested, and list the largest measured effects in either direction.
+- `dial weights analyze` can have another model, such as a hosted frontier model, write and rate the part explanations while the analyzed model still makes every measurement. In a terminal it asks which model to use (`--explainer provider/model`, or `@self` for the analyzed model, skips the question), and `/weights analyze` shows a picker when other chat models are configured. The outside model sees only built-in probe text; its 0–10 ratings of shuffled held-out snippets are scored like the model's own answers, and the result, terminal and dashboard name the explainer.
+- Weight edits can now follow the "weight-space programming" recipe more closely. `dial weights direction --span-last N [--span-before think_end]` measures only the last tokens before the answer end or the end-of-thinking marker, and with a span no unwanted answers are needed: the span is contrasted with the rest of the same answers. `dial weights edit --method add` (tool `method: "add"`) adds the direction to each MLP writer at α (default 0.1) times its mean output size. `project_out` and `add` now edit every MLP writer of a layer, including the shared expert and each routed expert of a mixture-of-experts model, where they previously refused. `evaluate` builds a norm-matched random-direction control and requires the edit to beat it. It also reports answer and thinking token changes with paired-bootstrap 95% intervals. `generate` counts thinking tokens. Directions measured before this change cannot be used with `add`; measure them again. `dial weights edit --allow-noisy` accepts an edit smaller than its requantization error, as the tool's `allow_noisy` already did; rank-one edits of quantized expert stacks usually need it.
+- Opt-in `weights.knowledge` collects read-only local checkpoint maps and bounded, content-free agent-turn observations. `dial weights knowledge [--refresh] [--json]` and `/weights knowledge` separate structural role explanations from non-causal usage evidence; no weights or inference activations are modified.
+- `dial stats` reports turn outcomes: the settled share, the outcome breakdown, interrupted, undone and rated turns, and p50/p90 turn time (`turns` in `--json`). Only turns finished after this change are counted.
+- Errored tool calls record a fixed error class from typed result fields, shown per tool in `dial stats` and as `by_tool[].error_classes`. A failing `verify` check (`check_failed`) is now distinct from a `verify` call that could not run (`verify_refused`).
+- `examples/benchmarks/release-slice.toml` and `release_slice.py`: a fixed 27-case, three-repetition release slice with hosted and local profiles. The script validates the plan and prints the commands; it runs nothing. No release-slice run has been recorded.
+- `docs/plans/surface-inventory-2026-11.md` lists experimental flags and optional modes with the evidence available for each. Nothing was removed.
+
+### Changed
+
+- New defaults: `approval = "auto"` (no prompts; explicit deny rules in `/permissions` still win) and
+  `sandbox.mode = "off"` (shell commands run unconfined). Bash, PowerShell, `eval`, the browser and
+  PDF parsing therefore work out of the box on Windows. Set
+  `approval = "write"` and `sandbox.mode = "dev"` to restore the previous behavior.
+- Windows now has a `dev` sandbox. Shell commands (PowerShell, Git Bash and the built-in shell)
+  run at Low integrity: they can write and delete only inside the project and `sandbox.extra_write`,
+  can't read or write `~/.ssh`, cloud credential folders or Dial's state, and can't change `.git` in
+  place. Dial sets persistent integrity labels on those folders and runs a self-test on first use,
+  refusing commands if any check fails. `strict`, `allow_network = false` and domain filtering are
+  refused on Windows because Low integrity cannot confine reads or network.
+- Windows `dev` also covers the browser, PDF parsing and both `eval` kernels (Python and
+  JavaScript, including the embedded QuickJS engine, now built on Windows). Kernels run under a
+  no-child-process mitigation. The uv, pip, npm and Go caches are redirected to
+  `%LOCALAPPDATA%\dial\sandbox`, so those installs work without extra `extra_write` entries.
+- Durable background jobs (`bg` with `persist`) now work on Windows. The owner process is
+  controlled through a loopback port that requires a random token stored in its owner-only job
+  record.
+- `close_stdin` on a Windows terminal (`pty`) job now sends the console end-of-input sequence
+  (Ctrl+Z, Enter) instead of being refused.
+- README, quickstart, comparison, security, Docker and packaging descriptions now state that the OS sandbox is optional and off by default, matching the default above.
+- `CONTRIBUTING.md` asks for small, single-purpose commits, mechanical changes in their own commit, and named evidence for agent-loop default changes.
+- Long paragraphs in `docs/agent-loop.md` and `docs/improvement.md` are split at sentence boundaries; no wording changed.
+
+### Fixed
+
+- Windows edits no longer fail checkpoint creation with OS error 24 ("command length is incorrect"). Native rename/link buffers now include the minimum structure size for short names such as checkpoint blob `0`; this was unrelated to patch or shell-command length.
+- `dial weights try` and the `model_weights` `try` operation with a direction now find the saved direction. Before, they passed its name to the worker, which refused it.
+- Windows builds of `dial` compile again: the telemetry re-export was gated to Unix.
+- JavaScript `eval` on Windows no longer builds a POSIX shell line with an fd-3 redirect and a
+  macOS sandbox path; Node or the embedded engine is launched directly.
+- `dial weights` operations that hook decoder layers (`analyze`, `investigate`, `trace`,
+  `activations`, steering) work on Gemma 4 models. Their layers return `(h, shared_kv, offset)`
+  instead of a bare array, which failed with "unsupported transformer output".
+- Model diagnostics no longer mistake ports containing `401`, `403` or `404` for HTTP status codes when explaining a refused endpoint.
+- A zero-exit compound command whose output contains data rows starting with an `error:` field (for example `error:interrupted|30` from a query) no longer gets the "earlier output reports a failure" notice. Model-visible tool text changes only for such rows; the effect on model outcomes is unmeasured.
+- `grep` and `glob` with several `;`-separated scopes no longer fail when one scope does not exist. The existing scopes are searched and each missing one is named in a `[scope not searched]` row with its "Did you mean" suggestions. A call whose scopes are all missing still fails. In local transcripts this was 17 of 24 failed `grep` calls; the effect on model outcomes is unmeasured.
+- `grep` on an `artifact://` or `ssh://` text now honours `context` (up to 10 lines) in the same `path-line-text` row format as a file search, instead of refusing the call.
+- `bg` `start` with `lifetime` but without `persist=true` now starts the session job and appends a note that the lifetime is ignored, instead of failing with "lifetime requires explicit persist=true". The job runs until it exits, is killed or the session ends, as any session job does. In local transcripts the refusal was 10 of 19 failed `bg` calls, each followed by waits on a job that never started. Other actions still refuse a `lifetime` without `persist=true`.
+
 ## [0.3.3] - 2026-11-09
 
 - Updated vulnerable dependencies flagged by Dependabot. `zip` 9.0.4 → 9.0.5 fixes a critical archive-header parsing flaw that could lead to arbitrary file overwrite. In the MLX worker environment (`python/uv.lock`): Pillow 12.3.0 → 13.0.0, aiohttp 3.14.3 → 3.14.5, filelock 4.0.8 → 4.2.10 and certifi 2026.7.22 → 2026.10.23, which fix image-decoder memory-safety bugs, HTTP parsing issues, lock-file races and a compromised CA root.

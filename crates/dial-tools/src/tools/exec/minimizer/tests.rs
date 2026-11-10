@@ -188,6 +188,15 @@ fn an_earlier_failure_masked_by_a_zero_exit_is_named() {
         ),
         None
     );
+    // Query results whose first column is an `error:` label are data, not diagnostics.
+    assert_eq!(
+        masked_failure(
+            "sqlite3 s.db 'select finish, count(*) from requests group by 1'; echo done",
+            "tool_calls|4990\nerror:interrupted|30\nerror:fatal|6\ndone\n"
+        ),
+        None
+    );
+    assert!(masked_failure("make; ls", "error[E0063]: missing field\n").is_some());
     let long = format!("error: {}\n", "x".repeat(400));
     assert!(masked_failure("make; ls", &long).unwrap().chars().count() <= DIGEST_LINE_CHARS);
 }

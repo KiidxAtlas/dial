@@ -10,6 +10,8 @@ pub struct Config {
     /// main model, which must then itself be a Dial-owned local MLX model. Setting it lets any
     /// main model, including a hosted frontier model, drive edits to a different local model.
     pub model: String,
+    /// Collect a header map and bounded, non-causal turn observations after normal turns.
+    pub knowledge: bool,
 }
 
 impl Config {

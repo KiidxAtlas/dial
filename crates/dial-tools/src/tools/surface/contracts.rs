@@ -53,6 +53,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
         &["view", "layer", "record", "offset", "start", "format"],
     ),
     ("image_gen", &["image", "frame_count", "frame_duration_ms"]),
+    ("model_weights", &["span"]),
     (
         "data",
         &[
@@ -176,6 +177,7 @@ const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
     ("eval", "language", &["py"]),
     ("task", "action", &["verify"]),
     ("lsp", "action", &["request"]),
+    ("model_weights", "method", &["add"]),
     (
         "data",
         "action",

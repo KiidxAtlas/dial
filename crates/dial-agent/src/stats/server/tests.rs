@@ -159,3 +159,24 @@ fn list_routes_validate_limit_and_range() {
         );
     }
 }
+
+#[test]
+fn action_content_length_rejects_ambiguous_framing() {
+    assert_eq!(
+        content_length("POST / HTTP/1.1\r\nContent-Length: 12"),
+        Some(12)
+    );
+    assert_eq!(
+        content_length("POST / HTTP/1.1\r\nContent-Length: nope"),
+        None
+    );
+    assert_eq!(
+        content_length("POST / HTTP/1.1\r\nContent-Length: 12\r\ncontent-length: 12"),
+        None
+    );
+    assert_eq!(
+        content_length("POST / HTTP/1.1\r\nContent-Length: 12\r\nTransfer-Encoding: chunked"),
+        None
+    );
+    assert_eq!(content_length("GET / HTTP/1.1\r\nHost: localhost"), None);
+}

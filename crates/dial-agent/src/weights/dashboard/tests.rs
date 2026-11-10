@@ -14,6 +14,9 @@ fn page_serves_every_section_builder_without_innerhtml() {
         "routingSection",
         "experimentTimeline",
         "recentRuns",
+        "scaleEditor",
+        "scaleControl",
+        "submitScale",
     ] {
         assert!(body.contains(builder), "page is missing {builder}");
     }

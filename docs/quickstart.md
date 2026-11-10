@@ -10,8 +10,9 @@ curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.s
 ```
 
 On Windows use PowerShell: `irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 | iex`
-(see [Windows](windows.md)). On Linux, install `bubblewrap` (the installer prints the command if it
-is missing); without it shell commands are refused rather than run unsandboxed. Homebrew, Nix and
+(see [Windows](windows.md)). On Linux, install `bubblewrap` if you plan to turn the sandbox on (the
+installer prints the command if it is missing); with the sandbox on and `bubblewrap` missing, shell
+commands are refused rather than run unconfined. Homebrew, Nix and
 Docker options are in [Release and installation](release-and-install.md).
 
 ## 2. Pick a model
@@ -36,8 +37,9 @@ Type a concrete request with its limits and press Enter:
 the test in tests/test_parser.py fails, fix it without changing the public API
 ```
 
-Shell commands run inside the OS sandbox. While Dial works you can type a correction and choose
-whether it steers the current task or is queued; **Esc** interrupts.
+Shell commands run unconfined by default. Set `sandbox.mode = "dev"` to confine them to the OS
+sandbox on macOS and Linux/WSL2 ([shell](shell.md)). While Dial works you can type a correction and
+choose whether it steers the current task or is queued; **Esc** interrupts.
 
 ## 4. Review the evidence
 

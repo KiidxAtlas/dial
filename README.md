@@ -2,8 +2,8 @@
 
 # dial
 
-**A coding agent that runs every command in a sandbox, can undo every edit, and shows evidence
-before it says "done". It works with your own models or anyone else's.**
+**A coding agent that can undo every edit, shows evidence before it says "done", and can confine
+commands to an OS sandbox. It works with your own models or anyone else's.**
 
 [![CI](https://github.com/KiidxAtlas/dial/actions/workflows/ci.yml/badge.svg)](https://github.com/KiidxAtlas/dial/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/KiidxAtlas/dial?sort=semver)](https://github.com/KiidxAtlas/dial/releases/latest)
@@ -22,10 +22,11 @@ On first launch Dial asks which model to use. Then you tell it what you want.
 
 ## What makes it different
 
-- **Sandboxed by default.** On macOS and Linux/WSL2, shell commands run inside the OS sandbox
-  (`sandbox-exec` or bubblewrap), with optional per-domain network rules. If the sandbox is
-  missing, commands are refused rather than run unprotected. (Windows has no supported sandbox, so
-  commands there need an explicit opt-out.) A git guard stops subagents from running
+- **Optional OS sandbox.** Commands run unconfined by default. With `sandbox.mode = "dev"` or
+  `"strict"` on macOS and Linux/WSL2, shell commands run inside the OS sandbox
+  (`sandbox-exec` or bubblewrap), with optional per-domain network rules. On Windows, `dev`
+  runs commands, PowerShell included, at Low integrity so they can write only the project. If the
+  sandbox is missing, commands are refused rather than run unprotected. A git guard stops subagents from running
   `reset --hard`, `clean -f` and similar commands that would throw away your uncommitted work.
 - **Every edit can be undone.** Dial saves a file's original contents before changing it.
   `/undo`, `/rollback` and `/review-file` keep or revert changes, even after a restart.
@@ -55,7 +56,7 @@ On first launch Dial asks which model to use. Then you tell it what you want.
 | Windows (PowerShell)                  | `irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 \| iex`        |
 
 You don't need Rust. The installer checks release signatures. Homebrew, Nix, Docker and source
-builds are also supported. To update, run `dial update`. Linux needs `bubblewrap` for the sandbox.
+builds are also supported. To update, run `dial update`. On Linux the optional sandbox needs `bubblewrap`.
 For all options and requirements, see [docs/release-and-install.md](docs/release-and-install.md).
 
 ## Use it
@@ -77,7 +78,7 @@ Inside Dial:
 | `/review-file`          | Review, keep or undo changes |
 | `/help`                 | Commands and shortcuts       |
 
-The approval mode sets how much Dial does without asking: `ask`, `write` (the default), `auto` or
+The approval mode sets how much Dial does without asking: `ask`, `write`, `auto` (the default) or
 `readonly`. See [configuration](docs/configuration.md).
 
 ## Learn more

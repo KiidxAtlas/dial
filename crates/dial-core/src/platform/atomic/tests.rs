@@ -16,7 +16,8 @@ fn policies_replace_without_leaving_temporary_files() {
 #[test]
 fn deferred_checkpoint_writes_are_published_before_their_flush() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("record");
+    // Checkpoint blobs start at files/0: a one-unit name exercises Windows' native buffer minimum.
+    let path = dir.path().join("0");
     write_checkpoint(&path, b"old", 0o600).unwrap();
     let pending = write_checkpoint_deferred(&path, b"new", 0o600).unwrap();
     // Readers (and a restarted process) already see the complete record; no staging file remains.

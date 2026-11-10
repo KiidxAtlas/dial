@@ -116,8 +116,8 @@ New settings (previously hard-coded) default to the old behavior:
 `/settings` → **Tools** → **Web** (previously only the whole-table editor reached them).
 
 Reviewed and deliberately kept: the unlimited execution caps and `auto` context windows (see below;
-changing them would alter cost and behavior for existing users), `sandbox.mode = "dev"`,
-`approval = "write"`, `ssh.host_key_checking = "accept-new"`, and every telemetry, sharing and
+changing them would alter cost and behavior for existing users), `ssh.host_key_checking = "accept-new"`,
+and every telemetry, sharing and
 background-learning switch (telemetry and sharing stay off; learning only uses local models and
 requires AC power).
 
@@ -367,11 +367,11 @@ effort/budget and reasoning-guard limits. No sampler or thinking policy is chang
 
 ```toml
 model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
-approval = "write"        # ask | write | auto | readonly
+approval = "auto"         # ask | write | auto (default) | readonly
 integrations = ["bg", "web_fetch", "web_search", "lsp", "ast_search", "ast_edit", "dap"]
 context_window = "auto" # defaults to 32768 tokens; serving endpoints may cap to loaded context
 [sandbox]
-mode = "dev"              # dev | strict | off
+mode = "off"              # off (default) | dev | strict
 allow_network = true
 extra_write = ["~/.cargo", "~/.npm"]
 # network_allow = ["crates.io", "*.crates.io", "github.com"]  # optional: filter command traffic by domain

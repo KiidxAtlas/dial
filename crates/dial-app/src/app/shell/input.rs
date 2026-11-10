@@ -179,7 +179,7 @@ impl Shell {
             Action::ModelRoles => self.open(app, agent, Which::ModelRoles),
             Action::ModelFavoriteNext => self.command(app, agent, "/model next"),
             Action::RateGood | Action::RateBad => {
-                self.rate_last_turn(app, action == Action::RateGood);
+                self.rate_last_turn(app, agent, action == Action::RateGood);
                 Ok(Step::Done)
             }
             Action::ProviderSetup => self.open(app, agent, Which::Providers),

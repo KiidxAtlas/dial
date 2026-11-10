@@ -27,7 +27,10 @@ const LIMIT = 20000;
 const MAX_FRAME = 12 * 1024 * 1024;
 const MAX_CALLBACKS = 128;
 const operationStorage = new AsyncLocalStorage();
-const protocol = 3; // The trusted launcher preserves stdout here and routes native stdout to stderr.
+// The trusted launcher preserves stdout on fd 3 and routes native stdout to stderr. Windows has no
+// fd 3: the protocol is stdout itself, so Node's own stdout stream is pointed at stderr instead.
+const protocol = process.platform === 'win32' ? 1 : 3;
+if (protocol === 1) process.stdout.write = process.stderr.write.bind(process.stderr);
 let callbackSequence = 0;
 // Accessing Node's stdin stream can put the shared fd into nonblocking mode. Synchronous
 // callbacks must still wait for the controller; OS-owned cancellation/deadlines remain active.

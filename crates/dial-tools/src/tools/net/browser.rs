@@ -801,8 +801,8 @@ fn start(
         .available()
         .map_err(|e| format!("browser requires an OS sandbox: {e}"))?;
     #[cfg(windows)]
-    if ctx.config.sandbox.mode != SandboxMode::Off {
-        return Err("browser on Windows requires an OS sandbox; strict/dev isolation is unavailable. Set sandbox.mode = \"off\" only if you explicitly accept an unsandboxed browser.".into());
+    if ctx.config.sandbox.mode == SandboxMode::Strict {
+        return Err("browser on Windows supports sandbox.mode = \"dev\" (Low integrity) or \"off\"; strict isolation is unavailable".into());
     }
     let end = execution_deadline(timeout);
     let cdp = match config.cdp_url.as_deref() {
@@ -1173,17 +1173,48 @@ fn driver_command(
     )
 }
 
+/// Windows runs the driver from a file in the private state directory: the bundled source is
+/// larger than the 32,767-character command line. Under `dev`, Node and Chromium run at Low
+/// integrity with only the workspace policy's roots and the state directory writable.
 #[cfg(windows)]
 fn driver_command(
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
     node: &Path,
     _reads: &[PathBuf],
-    _state: &Path,
+    state: &Path,
     _network: bool,
 ) -> Result<Command, String> {
-    let mut command = Command::new(node);
-    command.arg("-e").arg(driver_source());
-    Ok(command)
+    use crate::tools::exec::sandbox::{Policy, Sandbox};
+    let script = state.join("driver.cjs");
+    std::fs::write(&script, driver_source()).map_err(|e| format!("writing browser driver: {e}"))?;
+    let workspace = ctx.workspace;
+    if workspace.unsandboxed {
+        let mut command = Command::new(node);
+        command.arg(&script);
+        return Ok(command);
+    }
+    crate::tools::exec::shell::windows_enforceable(workspace)?;
+    let Policy::Dev {
+        deny_read,
+        mut extra_write,
+        allow_network,
+    } = workspace.sandbox_policy()
+    else {
+        return Err("browser on Windows supports sandbox.mode = \"dev\" or \"off\"".into());
+    };
+    extra_write.push(state.to_path_buf());
+    let policy = Policy::Dev {
+        deny_read,
+        extra_write,
+        allow_network,
+    };
+    let node = node.to_str().ok_or("Node executable path is not UTF-8")?;
+    let script = script.to_str().ok_or("browser state path is not UTF-8")?;
+    workspace
+        .sandbox
+        .clone()
+        .unwrap_or_else(Sandbox::detect)
+        .command_with_policy(workspace.root(), &policy, node, &[script])
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]

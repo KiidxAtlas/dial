@@ -1834,3 +1834,42 @@ fn readiness_empty_output_keeps_zero_width_regex_semantics() {
             .is_none()
     );
 }
+
+#[test]
+fn a_session_start_naming_lifetime_starts_the_job_and_says_the_lifetime_is_ignored() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    let started = bg(
+        &tool,
+        &ws,
+        json!({"action":"start", "name":"long", "command":"sleep 30", "lifetime": 10800}),
+    );
+    assert!(!started.is_error, "{}", started.text);
+    assert!(
+        started.text.starts_with("started long (pid ")
+            && started
+                .text
+                .contains("[lifetime ignored: this is a session job"),
+        "{}",
+        started.text
+    );
+    assert_eq!(started.data.as_ref().unwrap()["job"]["name"], "long");
+    assert!(!bg(&tool, &ws, json!({"action":"kill", "name":"long"})).is_error);
+    // Only a start is lenient: the argument still means nothing on other session actions.
+    let listed = bg(&tool, &ws, json!({"action":"list", "lifetime": 60}));
+    assert!(
+        listed.is_error
+            && listed
+                .text
+                .contains("lifetime requires explicit persist=true"),
+        "{}",
+        listed.text
+    );
+    let invalid = bg(
+        &tool,
+        &ws,
+        json!({"action":"start", "name":"bad", "command":"sleep 30", "lifetime": "soon"}),
+    );
+    assert!(invalid.is_error, "{}", invalid.text);
+    assert!(!tool.has_live_work());
+}

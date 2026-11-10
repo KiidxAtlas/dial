@@ -240,3 +240,30 @@ fn writable_directory_opens_while_another_handle_denies_delete_sharing() {
     drop((root, held));
     std::fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn short_names_support_link_rename_and_replace() {
+    let base = scratch_dir("short-names");
+    let root = open_dir_nofollow_write(&base).unwrap();
+    for name in ["0", "9", "a", "é", "鸡", "10", "99", "100", "🐔"] {
+        let target = Path::new(name);
+        std::fs::write(base.join("source"), b"linked").unwrap();
+        link_beneath(&root, Path::new("source"), target)
+            .unwrap_or_else(|error| panic!("link to {name:?}: {error}"));
+        assert_eq!(std::fs::read(base.join(target)).unwrap(), b"linked");
+        remove_beneath(&root, target).unwrap();
+        rename_beneath(&root, Path::new("source"), target)
+            .unwrap_or_else(|error| panic!("rename to {name:?}: {error}"));
+        assert!(!base.join("source").exists());
+        assert_eq!(std::fs::read(base.join(target)).unwrap(), b"linked");
+        std::fs::write(base.join("staged"), b"replaced").unwrap();
+        replace_beneath(&root, Path::new("staged"), target)
+            .unwrap_or_else(|error| panic!("replace {name:?}: {error}"));
+        assert_eq!(std::fs::read(base.join(target)).unwrap(), b"replaced");
+        assert!(!base.join("staged").exists());
+        remove_beneath(&root, target).unwrap();
+    }
+    drop(root);
+    assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+    std::fs::remove_dir_all(&base).unwrap();
+}

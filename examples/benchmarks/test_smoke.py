@@ -28,6 +28,31 @@ class SummaryWindowTests(unittest.TestCase):
                 "BENCH_CASE=goal-compaction phase=finish"}]}, 1)
 
 
+class GoalParsingTests(unittest.TestCase):
+    def test_goal_forms_and_first_matching_anchor(self):
+        for transcript, expected in [
+            ("Acceptance goal: write exactly JADE-719", "JADE-719"),
+            ("ACTUAL TASK GOAL IS jade-719", "jade-719"),
+            ("acceptance goal with exactly no token; exactly JADE-719", "JADE-719"),
+            ("acceptance goal: actual task goal is RUBY-2; exactly JADE-719", "JADE-719"),
+            ("actual task goal is RUBY-2; acceptance goal exactly JADE-719", "RUBY-2"),
+            ("acceptance goal exactly\nJADE-719", "JADE-719"),
+            ("acceptance goal without a token\nactual task goal is RUBY-2", "RUBY-2"),
+        ]:
+            with self.subTest(transcript=transcript):
+                self.assertEqual(Handler.goal(transcript), expected)
+
+    def test_repeated_untrusted_prefixes_finish_promptly(self):
+        import pathlib
+        import subprocess
+        import sys
+        subprocess.run([sys.executable, "-c", (
+            "from smoke import Handler; "
+            "assert Handler.goal('acceptance goal ' * 30000, required=False) is None; "
+            "assert Handler.goal('acceptance goal ' * 30000 + 'exactly JADE-719') == 'JADE-719'"
+        )], cwd=pathlib.Path(__file__).parent, check=True, timeout=5)
+
+
 class RecoveryConversationTests(unittest.TestCase):
     def setUp(self):
         self.handler = Handler.__new__(Handler)

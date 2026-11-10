@@ -1,5 +1,5 @@
 class Dial < Formula
-  desc "Sandboxed coding agent with undo and test evidence for local or hosted models"
+  desc "Coding agent with undo, test evidence and an optional sandbox"
   homepage "https://dial.rootatlas.dev/"
   url "https://github.com/KiidxAtlas/dial/archive/refs/tags/v0.3.1.tar.gz"
   sha256 "e9eeac0d7e8535270ee018d7ad1aae1f01537cb043642a334d98b33ddd0f8b73"

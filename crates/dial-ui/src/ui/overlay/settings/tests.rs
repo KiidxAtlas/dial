@@ -873,7 +873,7 @@ fn search_filters_across_tabs_shows_location_and_escape_clears_before_closing() 
     let (path, value, _) = expect_set(choose_next(&mut o, &rig.keys));
     assert_eq!(
         (path.as_str(), value),
-        ("approval", Value::String("auto".into()))
+        ("approval", Value::String("readonly".into()))
     );
 }
 

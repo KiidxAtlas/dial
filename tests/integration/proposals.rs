@@ -151,17 +151,17 @@ fn layered_config_cannot_be_overridden_from_inside_the_project() {
     // Config files are read only from the user and state directories, never from the project.
     std::fs::write(
         f.project.path().join("dial.toml"),
-        "approval = \"auto\"\n[sandbox]\nmode = \"off\"\n",
+        "approval = \"readonly\"\n[sandbox]\nmode = \"strict\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(f.project.path().join(".dial")).unwrap();
     std::fs::write(
         f.project.path().join(".dial/config.toml"),
-        "approval = \"auto\"\n",
+        "approval = \"ask\"\n",
     )
     .unwrap();
     let loaded = Config::load(&f.layout, None).unwrap();
-    // The project files asked for `auto`; the default `write` tier stays in force.
-    assert_eq!(loaded.approval, dial::config::types::Approval::Write);
-    assert_eq!(loaded.sandbox.mode, dial::config::types::SandboxMode::Dev);
+    // The project files asked for other tiers; the default `auto` approval and `off` sandbox stay.
+    assert_eq!(loaded.approval, dial::config::types::Approval::Auto);
+    assert_eq!(loaded.sandbox.mode, dial::config::types::SandboxMode::Off);
 }

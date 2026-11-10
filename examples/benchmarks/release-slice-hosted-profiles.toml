@@ -1,0 +1,15 @@
+# Hosted profile for the release slice (release-slice.toml). Remote inference is an explicit opt-in:
+# allow_remote=true sends prompts to the hosted provider and spends its quota. Run it only
+# deliberately, with a configured provider, and never in CI.
+# Plan the commands with: python3 examples/benchmarks/release_slice.py --profile hosted
+[machine]
+repetitions = 3
+case_timeout_secs = 300
+minimum_correctness = 1.0
+allow_remote = true
+
+[[configurations]]
+name = "hosted-reference"
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+context_window = 32768

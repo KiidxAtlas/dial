@@ -54,12 +54,13 @@ project directory.
 
 ## Sandbox
 
-Dial runs commands under Bubblewrap, which needs unprivileged user namespaces and a fresh `/proc`
-mount. Docker's default seccomp profile blocks the first and its masked `/proc` paths block the
-second, so inside a default container Dial's sandbox probe fails and command execution is
-**disabled** with an error; it never falls back to running unsandboxed. The default recipes
-retain those protections. If you explicitly accept weaker container isolation, use the
-separate override:
+Commands run unconfined inside the container by default (`sandbox.mode = "off"`). With
+`sandbox.mode = "dev"` or `"strict"`, Dial runs commands under Bubblewrap, which needs
+unprivileged user namespaces and a fresh `/proc` mount. Docker's default seccomp profile blocks
+the first and its masked `/proc` paths block the second, so inside a default container the
+sandbox probe fails and command execution is **disabled** with an error; it never falls back to
+running unsandboxed. The default recipes retain those container protections. To use the sandbox
+inside a container, accepting weaker container isolation, use the separate override:
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.sandbox.yml run --rm dial

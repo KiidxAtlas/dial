@@ -284,9 +284,34 @@ impl Input {
                 "canonical PTY EOF sent; further managed input disabled (output remains open)",
             );
         }
+        // ConPTY has no half-close. A console in line-input mode ends input at Ctrl+Z, Enter,
+        // the counterpart of a canonical Unix VEOF; raw-mode programs need their own protocol.
         #[cfg(windows)]
         if matches!(handle, Handle::Terminal(_)) {
-            return Err("Windows ConPTY has no supported half-close operation".into());
+            let bytes = b"\x1a\r";
+            let mut written = 0;
+            while written < bytes.len() {
+                self.interrupted(end, cancel, interrupt, written)?;
+                match handle.write(&bytes[written..]) {
+                    Ok(0) => return Err("child closed console input".into()),
+                    Ok(n) => written += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        self.wait_writable(handle, end, cancel, interrupt, written)?
+                    }
+                    Err(e) => return Err(format!("sending console EOF: {e}")),
+                }
+            }
+            while !handle
+                .drain(Duration::from_millis(10))
+                .map_err(|e| format!("sending console EOF: {e}"))?
+            {
+                self.interrupted(end, cancel, interrupt, written)?;
+            }
+            slot.take();
+            return Ok(
+                "console EOF (Ctrl+Z, Enter) sent; further managed input disabled (output remains open); raw-mode programs need their own exit protocol or kill",
+            );
         }
         loop {
             self.interrupted(end, cancel, interrupt, 0)?;

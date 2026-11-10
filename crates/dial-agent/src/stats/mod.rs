@@ -15,7 +15,10 @@ use crate::config::stats::StatsConfig;
 pub mod local_models;
 pub mod requests;
 pub mod server;
+pub mod turns;
 pub mod user_metrics;
+
+pub use turns::{FeedbackRecord, TurnRecord, TurnTotals};
 
 use crate::platform;
 use anyhow::{Context, Result, bail};
@@ -105,6 +108,8 @@ pub struct ToolRecord {
     pub tool: String,
     pub duration_ms: u64,
     pub error: bool,
+    /// Fixed label for why an errored call failed; see [`crate::telemetry::error_class`].
+    pub error_class: Option<String>,
 }
 
 // ---------------------------------------------------------------- report types
@@ -163,6 +168,9 @@ pub struct ToolGroup {
     pub error_rate: Option<f64>,
     /// Outcome statuses of this tool's calls (`ok`, `error`, plus control outcomes).
     pub outcomes: Vec<NamedCount>,
+    /// Errored calls per error class, most frequent first. Rows recorded before classes existed
+    /// are not listed, so the counts can sum to less than the `error` outcome.
+    pub error_classes: Vec<NamedCount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -201,6 +209,7 @@ pub struct Report {
     pub by_project: Vec<Group>,
     pub by_tool: Vec<ToolGroup>,
     pub tool_outcomes: Vec<NamedCount>,
+    pub turns: TurnTotals,
     pub daily: Vec<Day>,
     pub sessions: SessionTotals,
     /// Tool calls counted from transcripts (includes history from before runtime recording).
@@ -367,6 +376,12 @@ CREATE TABLE IF NOT EXISTS session_tools(path TEXT NOT NULL, tool TEXT NOT NULL,
   PRIMARY KEY(path, tool)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS worker_sessions(session TEXT PRIMARY KEY, agent TEXT NOT NULL, ts INTEGER NOT NULL)
   WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS turns(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, session TEXT NOT NULL,
+  project TEXT NOT NULL, outcome TEXT NOT NULL, steps INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+  interrupted INTEGER NOT NULL, error_class TEXT, changed_files INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS turns_ts ON turns(ts);
+CREATE TABLE IF NOT EXISTS turn_feedback(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, session TEXT NOT NULL,
+  project TEXT NOT NULL, kind TEXT NOT NULL, turns INTEGER NOT NULL);
 ";
 
 fn private_dir(dir: &Path) -> Result<()> {
@@ -375,7 +390,7 @@ fn private_dir(dir: &Path) -> Result<()> {
 }
 
 /// Columns added after the first release; NULL (or the default) on rows recorded before them.
-const ADDED_COLUMNS: [(&str, &str, &str); 10] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 11] = [
     ("requests", "transport", "TEXT"),
     ("requests", "invalidation", "TEXT"),
     ("requests", "common_prompt_bytes", "INTEGER"),
@@ -390,6 +405,7 @@ const ADDED_COLUMNS: [(&str, &str, &str); 10] = [
         "subscription",
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    ("tool_outcomes", "error_class", "TEXT"),
 ];
 
 /// Idempotent and safe against a concurrent opener: the write lock is held across check and alter.
@@ -397,7 +413,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
         let mut existing = HashSet::new();
-        for table in ["requests", "request_hourly"] {
+        for table in ["requests", "request_hourly", "tool_outcomes"] {
             let names = conn
                 .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
                 .query_map([], |row| row.get::<_, String>(0))?
@@ -554,8 +570,8 @@ impl Db {
             crate::tools::ToolStatus::Ok
         });
         tx.execute(
-            "INSERT INTO tool_outcomes(call_id, status) VALUES(?1, ?2)",
-            params![call_id, status.as_str()],
+            "INSERT INTO tool_outcomes(call_id, status, error_class) VALUES(?1, ?2, ?3)",
+            params![call_id, status.as_str(), r.error_class],
         )?;
         tx.execute(
             "INSERT INTO tool_hourly VALUES(?1, ?2, ?3, 1, ?4, ?5)
@@ -707,6 +723,7 @@ impl Db {
                     avg_ms: (calls > 0).then(|| duration_ms as f64 / calls as f64),
                     error_rate: (calls > 0).then(|| errors as f64 * 100.0 / calls as f64),
                     outcomes: Vec::new(),
+                    error_classes: Vec::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
@@ -728,6 +745,27 @@ impl Db {
             if let Some(group) = tools.iter_mut().find(|g| g.tool == tool) {
                 group.outcomes.push(NamedCount {
                     name: status,
+                    count: count.max(0) as u64,
+                });
+            }
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT c.tool, o.error_class, COUNT(*) FROM tool_calls c JOIN tool_outcomes o ON o.call_id=c.id
+             WHERE c.ts >= ?1 AND o.error_class IS NOT NULL
+             GROUP BY c.tool, o.error_class ORDER BY c.tool, COUNT(*) DESC, o.error_class",
+        )?;
+        let rows = stmt.query_map([hour.saturating_mul(HOUR_MS)], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (tool, class, count) = row?;
+            if let Some(group) = tools.iter_mut().find(|g| g.tool == tool) {
+                group.error_classes.push(NamedCount {
+                    name: class,
                     count: count.max(0) as u64,
                 });
             }
@@ -850,6 +888,7 @@ impl Db {
             by_project,
             by_tool,
             tool_outcomes,
+            turns: self.turn_totals(since_ms.map(|_| hour.saturating_mul(HOUR_MS)))?,
             daily,
             sessions,
             transcript_tools,
@@ -1393,6 +1432,39 @@ pub fn render_text(report: &Report) -> String {
         s.sessions, s.projects, s.user_messages, s.assistant_messages, s.tool_calls,
         duration_text(s.active_ms), s.avg_session_ms.map_or("-".into(), |ms| duration_text(ms as u64)),
     ));
+    let t = &report.turns;
+    if t.turns > 0 {
+        let list = |rows: &[NamedCount]| {
+            rows.iter()
+                .map(|row| format!("{} {}", row.count, row.name))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        out.push_str(&format!(
+            "Turns {} · settled {} · {} · interrupted {} · undone {} · rated {} good / {} bad\n",
+            t.turns,
+            percent(t.settled_rate),
+            list(&t.outcomes),
+            t.interrupted,
+            t.undone_turns,
+            t.rated_good,
+            t.rated_bad,
+        ));
+        out.push_str(&format!(
+            "Turn time p50 {} · p90 {} · median steps {} · {} changed files\n",
+            t.duration_p50_ms.map_or("-".into(), duration_text),
+            t.duration_p90_ms.map_or("-".into(), duration_text),
+            t.median_steps
+                .map_or("-".into(), |steps| format!("{steps:.0}")),
+            t.changed_files_turns,
+        ));
+        if !t.error_classes.is_empty() {
+            out.push_str(&format!(
+                "Failed turns by cause: {}\n",
+                list(&t.error_classes)
+            ));
+        }
+    }
     let groups = |title: &str, rows: &[Group], out: &mut String| {
         if rows.is_empty() {
             return;
@@ -1419,12 +1491,24 @@ pub fn render_text(report: &Report) -> String {
         out.push_str("\nTools (timed at runtime)\n");
         for tool in &report.by_tool {
             out.push_str(&format!(
-                "  {:<28} {:>7} calls  {:>6} errors ({})  avg {}\n",
+                "  {:<28} {:>7} calls  {:>6} errors ({})  avg {}{}\n",
                 tool.tool,
                 tool.calls,
                 tool.errors,
                 percent(tool.error_rate),
                 tool.avg_ms.map_or("-".into(), |ms| format!("{ms:.0}ms")),
+                if tool.error_classes.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "  [{}]",
+                        tool.error_classes
+                            .iter()
+                            .map(|row| format!("{} {}", row.count, row.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
             ));
         }
     }

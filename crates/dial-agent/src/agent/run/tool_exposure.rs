@@ -1060,7 +1060,7 @@ impl<'a> Agent<'a> {
                     "bash" => Some(format!(
                         "Run a shell command in the project root; set relative `cwd` instead of prefixing `cd`. {} Normal approvals apply; inspect exit status. A foreground command returns when it finishes or reaches `timeout` (seconds); `background: true` starts a server, watcher or long job as a `bg` job.",
                         if cfg!(windows) {
-                            "Windows has no isolation: execution requires `sandbox.mode = \"off\"`."
+                            "Windows `dev` sandbox runs commands at Low integrity: writes confined to the project; `strict` is unavailable."
                         } else {
                             "May be sandboxed: writes confined to the project, network possibly blocked, temp files in `$TMPDIR`."
                         }

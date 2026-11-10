@@ -10,8 +10,8 @@ output.
 
 | | Dial | omp |
 | --- | --- | --- |
-| Shell commands | Run inside the OS sandbox on macOS (`sandbox-exec`) and Linux/WSL2 (bubblewrap); refused if the sandbox is unavailable | Run with your user's full permissions; no OS sandbox |
-| Default approval mode | `write`: file edits proceed, other actions follow the approval rules | `yolo`: every tool call, including shell commands, is auto-approved |
+| Shell commands | Unconfined by default. With `sandbox.mode = "dev"` or `"strict"` they run inside the OS sandbox on macOS (`sandbox-exec`) and Linux/WSL2 (bubblewrap), and are refused if the sandbox is unavailable | Run with your user's full permissions; no OS sandbox |
+| Default approval mode | `auto`: every tool call runs without a prompt; deny rules still apply. `write`, `ask` and `readonly` are available | `yolo`: every tool call, including shell commands, is auto-approved |
 | Network access from commands | Optional per-domain allow/deny rules through a filtering proxy that refuses private and cloud-metadata addresses | Not filtered |
 | Undo file changes | Original contents saved on disk before each change; `/undo`, `/rollback`, `/review-file`, even after a restart | `checkpoint`/`rewind` trims conversation context; file changes are not restored |
 | Finishing a task | Completion is checked against observed work and test evidence | Guided by prompts and goal tools |
@@ -34,8 +34,8 @@ context compaction, and recovery of tool calls that a model wrote as plain text.
 - **Maturity.** omp has a much longer release history and a larger user base.
 - **Extensions.** omp has a TypeScript plugin and extension SDK distributed through npm, which is
   easier for most people to extend than Dial's hooks, skills and Rust SDK.
-- **Fewer platform requirements.** omp needs no sandbox setup on any OS. Dial requires bubblewrap
-  on Linux, and on Windows commands only run if you explicitly turn the sandbox off.
+- **Fewer platform requirements.** omp needs no sandbox setup on any OS. Dial's optional sandbox
+  requires bubblewrap on Linux and is unavailable on Windows.
 
 ## Sources in this repository
 

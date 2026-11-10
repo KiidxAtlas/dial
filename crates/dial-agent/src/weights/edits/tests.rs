@@ -177,6 +177,90 @@ fn probe_loss_rise_blocks_an_otherwise_significant_edit() {
 }
 
 #[test]
+fn the_edit_must_beat_its_norm_matched_random_control() {
+    let run = |good: &[bool], tokens: &[f64], thinking: &[Option<f64>]| {
+        json!({"cases": good.iter().zip(tokens).zip(thinking).map(|((good, tokens), thinking)| json!({
+            "hit_limit": !good, "passed": null, "tokens": tokens, "thinking_tokens": thinking})).collect::<Vec<_>>(),
+            "summary": {}})
+    };
+    let base = run(&[false; 8], &[500.0; 8], &[Some(400.0); 8]);
+    let edited = run(&[true; 8], &[200.0; 8], &[Some(100.0); 8]);
+    // A control that fixed the same cases: the gain is not the direction's.
+    let same = run(&[true; 8], &[210.0; 8], &[Some(110.0); 8]);
+    let value = admit(&base, &edited, Some(&same)).unwrap();
+    assert_eq!(value["passed"], false, "{value}");
+    assert!(value["reason"].as_str().unwrap().contains("random control"));
+    assert_eq!(value["control"]["beaten"], false);
+    assert_eq!(value["control"]["lengths"]["tokens"]["mean"], -10.0);
+    // A control that did nothing: the edit beats it and passes.
+    let value = admit(&base, &edited, Some(&base)).unwrap();
+    assert_eq!(
+        (value["passed"].as_bool(), value["control"]["wins"].as_u64()),
+        (Some(true), Some(8))
+    );
+    assert_eq!(value["lengths"]["thinking_tokens"]["mean"], -300.0);
+    // Without a control the earlier gates decide alone.
+    assert!(admit(&base, &edited, None).unwrap()["control"].is_null());
+    // Cases without a thinking count are left out of the thinking interval.
+    let unknown = run(&[true; 8], &[200.0; 8], &[None; 8]);
+    assert!(admit(&base, &unknown, None).unwrap()["lengths"]["thinking_tokens"].is_null());
+}
+
+#[test]
+fn bootstrap_interval_brackets_the_mean_and_is_reproducible() {
+    let diffs: Vec<f64> = (0..20).map(|n| f64::from(n) - 5.0).collect();
+    let value = bootstrap(&diffs);
+    let (mean, low, high) = (
+        value["mean"].as_f64().unwrap(),
+        value["low"].as_f64().unwrap(),
+        value["high"].as_f64().unwrap(),
+    );
+    assert!((mean - 4.5).abs() < 1e-12);
+    assert!(low < mean && mean < high, "{value}");
+    // The standard error is about 1.3, so the 95% interval spans roughly ±2.6.
+    assert!(
+        (1.5..4.0).contains(&(mean - low)) && (1.5..4.0).contains(&(high - mean)),
+        "{value}"
+    );
+    assert_eq!(bootstrap(&diffs), value);
+    assert_eq!(bootstrap(&[3.0; 5])["low"], 3.0);
+    assert!(bootstrap(&[]).is_null());
+}
+
+#[test]
+fn control_requests_repeat_the_edit_with_a_seed_and_skip_methods_without_a_direction() {
+    let dir = tempfile::tempdir().unwrap();
+    let direction = dir.path().join("d.safetensors");
+    std::fs::write(&direction, b"x").unwrap();
+    let made = json!({"method": "add", "request": {"method": "add", "direction": direction,
+        "layers": [3, 5], "columns": null, "alpha": 0.1}});
+    let out = Path::new("/c");
+    let request = control_request(&made, "e1", out).unwrap();
+    assert_eq!(request["layers"], json!([3, 5]));
+    assert!(request.get("columns").is_none());
+    assert_eq!(request["output"], json!(out));
+    assert_eq!(
+        request["control_seed"],
+        control_request(&made, "e1", out).unwrap()["control_seed"]
+    );
+    assert_ne!(
+        request["control_seed"],
+        control_request(&made, "e2", out).unwrap()["control_seed"]
+    );
+    let reason = control_request(&json!({"method": "scale"}), "e1", out).unwrap_err();
+    assert!(reason.contains("scale"), "{reason}");
+    let old =
+        control_request(&json!({"method": "project_out", "layers": []}), "e1", out).unwrap_err();
+    assert!(old.contains("make it again"), "{old}");
+    std::fs::remove_file(&direction).unwrap();
+    assert!(
+        control_request(&made, "e1", out)
+            .unwrap_err()
+            .contains("gone")
+    );
+}
+
+#[test]
 fn records_written_before_history_still_load() {
     let ledger: Ledger = serde_json::from_value(json!({"name": "old", "budget": 2, "used": 1,
         "created_at": 1, "runs": [{"op": "generate", "at": 1, "cost": 1, "prompts": []}]}))

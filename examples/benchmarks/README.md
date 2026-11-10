@@ -17,6 +17,9 @@ This index explains ownership; existing paths remain stable for suites, CI and i
 - **Suites** (`efficiency.toml`, `quality.toml`, `reliability.toml`, `representative.toml`,
   `tool-effectiveness.toml`, `interpretation.toml`, `local-tasks.toml`, `recovery.toml`,
   `capabilities.toml`, `compaction.toml`) declare cases and acceptance.
+- **Release slice** (`release-slice.toml`, `release_slice.py`) pins the suites, case counts and
+  three repetitions a release candidate is measured on. The script validates the plan and prints
+  commands; it never runs a model.
 - **Profiles** (`profiles.toml`, `local-measurement.toml`, `*-profiles.toml`) select agents,
   models and limits. They are not suites. Browser/MCP integration suites require explicitly
   provisioned integrations; ordinary offline checks do not install them.

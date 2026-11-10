@@ -250,8 +250,8 @@ pub(crate) struct Cli {
     /// Environment variable holding the endpoint's API key.
     #[arg(long, global = true, help_heading = section::MODEL)]
     pub(crate) api_key_env: Option<String>,
-    /// Tool approval: ask (before every edit and command), write (default: destructive or
-    /// outside-the-project actions ask), auto (never asks) or readonly.
+    /// Tool approval: ask (before every edit and command), write (destructive or
+    /// outside-the-project actions ask), auto (default: never asks) or readonly.
     #[arg(long, global = true, help_heading = section::SAFETY, value_parser = clap::builder::PossibleValuesParser::new(dial::config::types::Approval::NAMES.iter().copied()))]
     pub(crate) approval: Option<String>,
     /// Approve every tool call (same as --approval auto; also accepted as --yolo / --auto-approve).
@@ -355,8 +355,33 @@ pub(crate) enum WeightsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Read stored structural explanations and usage observations; optionally refresh headers.
+    Knowledge {
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Probe the model with built-in text and record what each layer, attention head and neuron does.
     Analyze {
+        #[arg(long)]
+        json: bool,
+        /// Model that writes and rates the part explanations: @self (the analyzed model, default)
+        /// or a configured model such as provider/model. Asked for in a terminal when omitted.
+        #[arg(long)]
+        explainer: Option<String>,
+    },
+    /// Measure effects of temporary layer-output ablations; never writes model weights.
+    Investigate {
+        /// Optional JSON conversations ending in reference assistant answers (default: built-in probes).
+        #[arg(long)]
+        cases: Option<PathBuf>,
+        /// Zero-based layers to test; default: up to four spread across the decoder.
+        #[arg(long, value_delimiter = ',')]
+        layers: Vec<u64>,
+        /// Maximum single-case forward passes, including baseline and restoration checks.
+        #[arg(long, default_value_t = 24)]
+        budget: u64,
         #[arg(long)]
         json: bool,
     },
@@ -438,12 +463,19 @@ pub(crate) enum WeightsCommand {
         /// JSON array of {messages} ending in a wanted assistant answer.
         #[arg(long)]
         positive: PathBuf,
-        /// JSON array of {messages} ending in an unwanted assistant answer.
-        #[arg(long)]
-        negative: PathBuf,
+        /// JSON array of {messages} ending in an unwanted assistant answer. Optional with
+        /// `--span-last`: the span is then contrasted with the rest of each positive answer.
+        #[arg(long, required_unless_present = "span_last")]
+        negative: Option<PathBuf>,
         /// Measure MLP outputs (`mlp`, default) or the residual stream (`residual`).
         #[arg(long)]
         site: Option<String>,
+        /// Measure only the last N answer tokens before `--span-before`.
+        #[arg(long)]
+        span_last: Option<u64>,
+        /// Anchor of the span: `answer_end` (default) or `think_end` (the end-of-thinking marker).
+        #[arg(long, requires = "span_last")]
+        span_before: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -461,7 +493,10 @@ pub(crate) enum WeightsCommand {
         /// Comma-separated edit strengths in (0, 2] (up to 5; default 1).
         #[arg(long, value_delimiter = ',')]
         doses: Vec<f64>,
-        /// Direction to project out.
+        /// `add` writes the direction into the MLP writers instead of projecting it out.
+        #[arg(long, conflicts_with = "changes")]
+        method: Option<String>,
+        /// Direction to project out or add.
         #[arg(long, required_unless_present = "changes", conflicts_with = "changes")]
         direction: Option<String>,
         /// Comma-separated zero-based layers to edit (1–16).
@@ -510,7 +545,10 @@ pub(crate) enum WeightsCommand {
         /// Experiment the edit belongs to (the direction's, when one is used).
         #[arg(long)]
         experiment: String,
-        /// Direction to project out.
+        /// `add` writes the direction into the MLP writers instead of projecting it out.
+        #[arg(long, conflicts_with_all = ["changes", "bundle"])]
+        method: Option<String>,
+        /// Direction to project out or add.
         #[arg(long, required_unless_present_any = ["changes", "bundle"], conflicts_with_all = ["changes", "bundle"])]
         direction: Option<String>,
         /// Comma-separated zero-based layers to edit (1–16).
@@ -528,12 +566,16 @@ pub(crate) enum WeightsCommand {
         /// Scale exact tensors directly: JSON array of {tensor, scale, rows?, columns?}.
         #[arg(long)]
         changes: Option<PathBuf>,
-        /// down_proj output columns edited per layer (default 64).
+        /// Output-projection columns edited per writer (project_out; default 64).
         #[arg(long)]
         columns: Option<u64>,
-        /// Fraction of the direction removed, in (0, 2] (default 1).
+        /// project_out: fraction of the direction removed, in (0, 2] (default 1). add: strength
+        /// relative to each writer's mean output size (default 0.1).
         #[arg(long)]
         alpha: Option<f64>,
+        /// Accept a quantized edit whose requantization error exceeds half the edit.
+        #[arg(long)]
+        allow_noisy: bool,
         #[arg(long)]
         json: bool,
     },

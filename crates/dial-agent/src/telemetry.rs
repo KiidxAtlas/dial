@@ -6,8 +6,10 @@
 //! tool output — so neither sink can leak conversation content. Recording never blocks or fails a
 //! turn: events go over a channel to one background thread, which batches OTLP records (flushed
 //! when a batch fills, every `flush_interval_secs`, and on `shutdown`).
+mod error_class;
 mod facts;
 use crate::config::telemetry::TelemetryConfig;
+pub use error_class::error_class;
 pub use facts::ExecutionFacts;
 
 use crate::config::types::Config;
@@ -65,6 +67,8 @@ pub struct Tool {
     pub tool: String,
     pub duration: Duration,
     pub error: bool,
+    /// Why an errored call failed, from typed result data only (see [`error_class`]).
+    pub error_class: Option<&'static str>,
     pub end: SystemTime,
 }
 
@@ -75,6 +79,52 @@ pub struct Turn {
     pub outcome: String,
     pub steps: u64,
     pub duration: Duration,
+    /// The user stopped the turn before it settled.
+    pub interrupted: bool,
+    /// Provider error class of a failed turn ([`crate::llm::errors`] label), when one ended it.
+    pub error_class: Option<String>,
+    /// Files with checkpointed changes when the turn ended.
+    pub changed_files: u64,
+    pub end: SystemTime,
+}
+
+/// How one user turn ended; the caller-supplied part of a [`Turn`] event.
+#[derive(Debug, Clone, Copy)]
+pub struct TurnEnd<'a> {
+    pub outcome: &'a str,
+    pub steps: u64,
+    pub elapsed: Duration,
+    pub interrupted: bool,
+    pub error_class: Option<&'a str>,
+    pub changed_files: usize,
+}
+
+/// An explicit user verdict on finished turns. Recorded as a count only: no message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackKind {
+    /// `/undo` rewound turns.
+    Undo,
+    RatedGood,
+    RatedBad,
+}
+
+impl FeedbackKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Undo => "undo",
+            Self::RatedGood => "rated_good",
+            Self::RatedBad => "rated_bad",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Feedback {
+    pub session: String,
+    pub project: String,
+    pub kind: FeedbackKind,
+    /// Turns the verdict covers (`/undo 3` is 3).
+    pub turns: u64,
     pub end: SystemTime,
 }
 
@@ -94,6 +144,7 @@ pub enum Event {
     Request(Box<Request>),
     Tool(Box<Tool>),
     Turn(Turn),
+    Feedback(Feedback),
     WorkerSession(WorkerSession),
 }
 
@@ -103,6 +154,7 @@ impl Event {
             Event::Request(r) => r.end,
             Event::Tool(t) => t.end,
             Event::Turn(t) => t.end,
+            Event::Feedback(f) => f.end,
             Event::WorkerSession(s) => s.end,
         }
     }
@@ -111,7 +163,7 @@ impl Event {
             Event::Request(r) => r.duration,
             Event::Tool(t) => t.duration,
             Event::Turn(t) => t.duration,
-            Event::WorkerSession(_) => Duration::ZERO,
+            Event::Feedback(_) | Event::WorkerSession(_) => Duration::ZERO,
         }
     }
 }
@@ -264,13 +316,13 @@ pub fn tool_with_effects(
             tool: name.into(),
             duration: Duration::try_from_secs_f64(seconds).unwrap_or_default(),
             error: status.failed() || effects == crate::tools::surface::outcome::Effects::Unknown,
+            error_class: None,
             end: SystemTime::now(),
         })),
     );
 }
 
-/// Record only controller-owned execution metadata, never tool payloads.
-#[allow(clippy::too_many_arguments)]
+/// Record only controller-owned execution metadata and a typed error class, never tool payloads.
 pub fn tool_output(
     config: &Config,
     hermetic: bool,
@@ -278,11 +330,12 @@ pub fn tool_output(
     name: &str,
     seconds: f64,
     status: crate::tools::ToolStatus,
-    execution: &crate::runtime::execution::Execution,
+    output: &crate::runtime::tool_output::ToolOutput,
 ) {
     if hermetic {
         return;
     }
+    let execution = &output.execution;
     emit(
         config,
         Event::Tool(Box::new(Tool {
@@ -295,20 +348,14 @@ pub fn tool_output(
             duration: Duration::try_from_secs_f64(seconds).unwrap_or_default(),
             error: status.failed()
                 || execution.effects == crate::runtime::execution::Effects::Unknown,
+            error_class: error_class(name, status, output),
             end: SystemTime::now(),
         })),
     );
 }
 
 /// One finished user turn (closes its trace).
-pub fn turn(
-    config: &Config,
-    hermetic: bool,
-    session: &str,
-    outcome: &str,
-    steps: u64,
-    elapsed: Duration,
-) {
+pub fn turn(config: &Config, hermetic: bool, session: &str, end: TurnEnd<'_>) {
     if hermetic {
         return;
     }
@@ -317,9 +364,29 @@ pub fn turn(
         Event::Turn(Turn {
             session: session.into(),
             project: project_key(config),
-            outcome: outcome.into(),
-            steps,
-            duration: elapsed,
+            outcome: end.outcome.into(),
+            steps: end.steps,
+            duration: end.elapsed,
+            interrupted: end.interrupted,
+            error_class: end.error_class.map(str::to_owned),
+            changed_files: end.changed_files as u64,
+            end: SystemTime::now(),
+        }),
+    );
+}
+
+/// The user undid or rated `turns` finished turns of `session`.
+pub fn feedback(config: &Config, hermetic: bool, session: &str, kind: FeedbackKind, turns: u64) {
+    if hermetic {
+        return;
+    }
+    emit(
+        config,
+        Event::Feedback(Feedback {
+            session: session.into(),
+            project: project_key(config),
+            kind,
+            turns,
             end: SystemTime::now(),
         }),
     );
@@ -577,8 +644,26 @@ fn record_stats(db: &mut crate::stats::Db, event: &Event) -> Result<()> {
             tool: t.tool.clone(),
             duration_ms: t.duration.as_millis() as u64,
             error: t.error,
+            error_class: t.error_class.map(str::to_owned),
         }),
-        Event::Turn(_) => Ok(()),
+        Event::Turn(t) => db.record_turn(&crate::stats::TurnRecord {
+            ts_ms: unix_ms(t.end),
+            session: t.session.clone(),
+            project: t.project.clone(),
+            outcome: t.outcome.clone(),
+            steps: t.steps,
+            duration_ms: t.duration.as_millis() as u64,
+            interrupted: t.interrupted,
+            error_class: t.error_class.clone(),
+            changed_files: t.changed_files,
+        }),
+        Event::Feedback(f) => db.record_feedback(&crate::stats::FeedbackRecord {
+            ts_ms: unix_ms(f.end),
+            session: f.session.clone(),
+            project: f.project.clone(),
+            kind: f.kind.as_str().to_owned(),
+            turns: f.turns,
+        }),
         Event::WorkerSession(s) => db.record_worker_session(&s.session, &s.agent, unix_ms(s.end)),
     }
 }
@@ -1218,8 +1303,9 @@ impl Exporter {
                     ));
                 }
             }
-            // Session attribution lives in the stats database; it is not a span or a metric.
-            Event::WorkerSession(_) => {}
+            // Session attribution and user verdicts live in the stats database; they are not
+            // spans or metrics.
+            Event::Feedback(_) | Event::WorkerSession(_) => {}
         }
     }
 
@@ -1239,6 +1325,9 @@ impl Exporter {
                 outcome: "interrupted".into(),
                 steps: 0,
                 duration,
+                interrupted: true,
+                error_class: None,
+                changed_files: 0,
                 end: now,
             }));
         }

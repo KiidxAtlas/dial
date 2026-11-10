@@ -250,8 +250,31 @@ fn bool_default(args: &Value, key: &str, default: bool) -> Result<bool, String> 
     }
 }
 
-/// Literal filenames win over semicolon splitting; validate every scope before searching.
+/// Search roots plus the scopes that were named but do not exist.
+struct Scopes {
+    roots: Vec<PathBuf>,
+    /// One diagnostic per missing scope, with nearby-path suggestions.
+    missing: Vec<String>,
+}
+
+impl Scopes {
+    /// Footer rows naming every scope that was not searched; empty when all were.
+    fn note(&self) -> String {
+        self.missing
+            .iter()
+            .map(|message| format!("[scope not searched] {message}\n"))
+            .collect()
+    }
+}
+
 fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
+    resolve_scopes(ws, args).map(|scopes| scopes.roots)
+}
+
+/// Literal filenames win over semicolon splitting; validate every scope before searching.
+/// A missing scope among several is skipped and reported, as long as one scope exists: the
+/// search of the others is still the answer the caller asked for.
+fn resolve_scopes(ws: &Workspace, args: &Value) -> Result<Scopes, String> {
     let input = opt_str(args, "path")?.unwrap_or(".");
     let literal = ws.resolve_read(input)?;
     let inputs = if literal.exists() {
@@ -262,8 +285,8 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
     if inputs.len() > 64 || inputs.iter().any(|s| s.is_empty()) {
         return Err("path accepts at most 64 non-empty semicolon-separated scopes".into());
     }
-    let multiple = inputs.len() > 1;
     let mut paths = Vec::new();
+    let mut missing = Vec::new();
     for input in inputs {
         let path = ws.resolve_read(input)?;
         // Reject even in-workspace symlink scopes rather than silently changing their identity.
@@ -297,17 +320,20 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
                 "search scopes must not enter .git or workspace scratch ({input:?}); search the workspace without that path, use `read` for a known file under it, or `bash` with `git` for repository metadata"
             ));
         }
-        fs::metadata(&path).map_err(|e| {
-            let mut message =
-                super::suggest::annotate(ws, io_message("searching", input, &e), &[input]);
-            if multiple {
-                message.push_str(&format!(
-                    "\nOnly scope {input:?} is missing; correct or drop it and keep the other scopes."
-                ));
+        match fs::metadata(&path) {
+            Ok(_) => paths.push(path),
+            Err(e) => {
+                let message =
+                    super::suggest::annotate(ws, io_message("searching", input, &e), &[input]);
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(message);
+                }
+                missing.push(message);
             }
-            message
-        })?;
-        paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return Err(missing.join("\n"));
     }
     paths.sort();
     paths.dedup();
@@ -317,7 +343,7 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
             roots.push(path);
         }
     }
-    Ok(roots)
+    Ok(Scopes { roots, missing })
 }
 
 /// Scheduling uses the same whole search scopes, including directory membership, as execution.
@@ -625,7 +651,12 @@ fn root_relative<'a>(ws: &Workspace, pattern: &'a str) -> std::borrow::Cow<'a, s
 pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
     let pattern = req_str(args, "pattern")?;
     let glob = Glob::new(&root_relative(ws, pattern))?;
-    let roots = scopes(ws, args)?;
+    let Scopes { roots, missing } = resolve_scopes(ws, args)?;
+    let unsearched = Scopes {
+        roots: Vec::new(),
+        missing,
+    }
+    .note();
     let resume = cursor(args, ws)?;
     if resume.as_ref().is_some_and(|(_, consumed)| *consumed != 0) {
         return Err("glob cursor.match must be 0".into());
@@ -721,6 +752,7 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
         );
         page.push_str(&excerpts);
     }
+    page.push_str(&unsearched);
     Ok(page)
 }
 
@@ -1746,50 +1778,18 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         if max == 0 {
             return Err(format!("limit must be 1..={MAX_GREP_MATCHES}"));
         }
-        if opt_u64(args, "context")?.unwrap_or(0) != 0 {
-            return Err(format!("context lines are not supported for {scheme} grep"));
-        }
-        let mut out = String::new();
-        let mut seen = 0usize;
-        let mut matched = 0usize;
-        let mut capped = false;
-        for (index, line) in text.lines().enumerate() {
-            if !matcher.is_match(line.as_bytes()) {
-                continue;
-            }
-            if seen < skip {
-                seen += 1;
-                continue;
-            }
-            if matched == max {
-                capped = true;
-                break;
-            }
-            matched += 1;
-            out.push_str(&format!("{path}:{}:{}\n", index + 1, line));
-            if out.len() >= MAX_GREP_OUTPUT {
-                let mut end = MAX_GREP_OUTPUT;
-                while !out.is_char_boundary(end) {
-                    end -= 1;
-                }
-                out.truncate(end);
-                out.push_str("\n[output capped]\n");
-                capped = true;
-                break;
-            }
-        }
-        if matched == 0 {
-            out.push_str("No matches.\n");
-        } else if capped {
-            out.push_str("[results capped; increase skip to continue]\n");
-        }
+        let context = opt_u64(args, "context")?
+            .unwrap_or(0)
+            .min(MAX_GREP_CONTEXT as u64) as usize;
+        let mut out = grep_text(&text, path, &matcher, skip, max, context);
         if preview {
             out.push_str(preview::UNAVAILABLE);
         }
         return Ok(out);
     }
     let mode = OutputMode::parse(args)?;
-    let roots = scopes(ws, args)?;
+    let resolved = resolve_scopes(ws, args)?;
+    let roots = &resolved.roots;
     let resume = cursor(args, ws)?;
     if mode != OutputMode::Lines && resume.as_ref().is_some_and(|(_, consumed)| *consumed != 0) {
         return Err("cursor.match must be 0 for output=\"files\" or \"count\"".into());
@@ -1858,7 +1858,7 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     let mut batch: Vec<PathBuf> = Vec::new();
     let batch_size = if batched { PARALLEL_BATCH } else { 1 };
     let workers = if batched { workers } else { 1 };
-    for root in &roots {
+    for root in roots {
         let pattern_root = ws.root_containing(root).unwrap_or(ws.root());
         let prefix = glob.as_ref().map_or_else(
             || pattern_root.to_path_buf(),
@@ -1892,7 +1892,7 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
             resume.as_ref().map(|(p, _)| p.clone()),
         );
         let mut reached = false;
-        for root in &roots {
+        for root in roots {
             let pattern_root = ws.root_containing(root).unwrap_or(ws.root());
             let prefix = glob.as_ref().map_or_else(
                 || pattern_root.to_path_buf(),
@@ -1912,15 +1912,78 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         .take()
         .or_else(|| walk.next.clone().map(|p| (p, 0)));
     let (coverage, complete) = (walk.coverage(), walk.is_complete());
-    if mode == OutputMode::Lines {
-        state.finish(ws, next, &coverage, complete)
+    let mut page = if mode == OutputMode::Lines {
+        state.finish(ws, next, &coverage, complete)?
     } else {
         let mut page = state.finish_summary(ws, next, &coverage, complete)?;
         if preview {
             page.push_str(preview::UNAVAILABLE);
         }
-        Ok(page)
+        page
+    };
+    page.push_str(&resolved.note());
+    Ok(page)
+}
+
+/// Line matches in one retained or remote text, in the row format of a file search: matches are
+/// `path:line:text`, context rows `path-line-text`, and `--` separates non-adjacent groups.
+fn grep_text(
+    text: &str,
+    path: &str,
+    matcher: &Regex,
+    skip: usize,
+    max: usize,
+    context: usize,
+) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut hits = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| matcher.is_match(line.as_bytes()))
+        .map(|(index, _)| index)
+        .skip(skip);
+    let page: Vec<usize> = hits.by_ref().take(max).collect();
+    let mut capped = hits.next().is_some();
+    let mut out = String::new();
+    // The last line already written, so overlapping context is never repeated.
+    let mut written: Option<usize> = None;
+    let context_rows = |out: &mut String, from: usize, to: usize| {
+        for (index, line) in lines.iter().enumerate().take(to).skip(from) {
+            out.push_str(&format!("{path}-{}-{line}\n", index + 1));
+        }
+    };
+    for (position, &hit) in page.iter().enumerate() {
+        let from = hit
+            .saturating_sub(context)
+            .max(written.map_or(0, |line| line + 1));
+        if context > 0 && written.is_some_and(|line| from > line + 1) {
+            out.push_str("--\n");
+        }
+        context_rows(&mut out, from, hit);
+        out.push_str(&format!("{path}:{}:{}\n", hit + 1, lines[hit]));
+        // Context after a match stops before the next match, which is written as its own row.
+        let until = (hit + context)
+            .min(lines.len() - 1)
+            .min(page.get(position + 1).map_or(usize::MAX, |next| next - 1));
+        context_rows(&mut out, hit + 1, until + 1);
+        written = Some(until.max(hit));
+        if out.len() >= MAX_GREP_OUTPUT {
+            let mut end = MAX_GREP_OUTPUT;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
+            out.push_str("\n[output capped]\n");
+            capped = true;
+            break;
+        }
     }
+    if page.is_empty() {
+        out.push_str("No matches.\n");
+    } else if capped {
+        out.push_str("[results capped; increase skip to continue]\n");
+    }
+    out
 }
 
 /// Largest retained artifact `grep` loads whole.

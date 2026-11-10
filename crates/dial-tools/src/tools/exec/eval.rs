@@ -5,15 +5,19 @@ use super::background::AdoptedJob;
 use super::kernel::{
     ActiveGuard, BackgroundPolicy, CellOutcome, CellScope, Deadline, Handoff, MAX_CODE,
     NativeProcess, PythonRuntime, busy_job, cell_label, check_operation, code_output, deadline,
-    execution_deadline, fenced_command, guarded_operation, lock_session, native_cell,
-    require_fork_containment, resolve_operator_executable, shell_quote, strip_runtime_injection,
+    execution_deadline, guarded_operation, lock_session, native_cell, require_fork_containment,
+    resolve_operator_executable, strip_runtime_injection,
 };
+#[cfg(not(windows))]
+use super::kernel::{fenced_command, fork_fence_prefix, shell_quote};
 use crate::config::tools::kernel::KernelConfig;
 use crate::config::types::Config;
 use crate::tools::integrations::ext::{Tool, ToolCallback, ToolContext, ToolEvent};
-use crate::tools::{ToolOutput, tool_schema};
+use crate::tools::{ToolOutput, Workspace, tool_schema};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use std::path::Path;
+use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
@@ -26,23 +30,71 @@ const DRIVER: &str = include_str!("eval/driver.cjs");
 /// Controllers without batch support refuse it, and the driver then calls each entry serially.
 pub const BATCH_CALLBACK: &str = "dial.batch";
 
-use super::kernel::fork_fence_prefix;
-
 pub(super) mod cells;
-#[cfg(all(feature = "embedded-js", unix))]
+#[cfg(feature = "embedded-js")]
 mod embedded;
-#[cfg(all(feature = "embedded-js", unix))]
+#[cfg(feature = "embedded-js")]
 pub use embedded::{WORKER_ARG as EMBEDDED_JS_WORKER_ARG, worker_main as embedded_js_worker_main};
 
 /// Whether JavaScript cells can run without an operator-installed Node: the embedded QuickJS engine
-/// is compiled in and re-executes `dial` itself (unix only; the fd-3 protocol pipe is unix-shaped).
+/// is compiled in and re-executes `dial` itself.
 pub const fn embedded_js_available() -> bool {
-    cfg!(all(feature = "embedded-js", unix))
+    cfg!(feature = "embedded-js")
+}
+
+/// The JavaScript kernel command: the operator's Node with the trusted driver, or (`None`) the
+/// embedded engine, under the process-fork fence. The shell preserves only the trusted protocol
+/// on fd 3, so native stdout/stderr cannot be interpreted as controller callbacks or result frames.
+#[cfg(not(windows))]
+fn js_kernel_command(workspace: &Workspace, node: Option<&Path>) -> Result<Command, String> {
+    let fence = fork_fence_prefix(workspace);
+    let script = match node {
+        Some(node) => format!(
+            "{fence} {} --no-addons -e {} 3>&1 1>&2",
+            shell_quote(node.to_str().ok_or("Node executable path is not UTF-8")?),
+            shell_quote(DRIVER),
+        ),
+        None => embedded_js_script(&fence)?,
+    };
+    fenced_command(workspace, &script)
+}
+
+/// Windows has no fd 3 for the protocol: it travels on stdout. The Node driver routes its own
+/// stream writes to stderr; the embedded engine exposes no I/O to cells at all.
+#[cfg(windows)]
+fn js_kernel_command(workspace: &Workspace, node: Option<&Path>) -> Result<Command, String> {
+    let (program, args) = match node {
+        Some(node) => (
+            node.to_str()
+                .ok_or("Node executable path is not UTF-8")?
+                .to_owned(),
+            vec!["--no-addons".to_owned(), "-e".to_owned(), DRIVER.to_owned()],
+        ),
+        None => embedded_js_invocation()?,
+    };
+    super::kernel::windows_kernel_command(workspace, &program, &args)
+}
+
+#[cfg(all(windows, feature = "embedded-js"))]
+fn embedded_js_invocation() -> Result<(String, Vec<String>), String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("locating dial for the embedded JavaScript engine: {error}"))?;
+    Ok((
+        exe.to_str()
+            .ok_or("dial executable path is not UTF-8")?
+            .to_owned(),
+        vec![EMBEDDED_JS_WORKER_ARG.to_owned()],
+    ))
+}
+
+#[cfg(all(windows, not(feature = "embedded-js")))]
+fn embedded_js_invocation() -> Result<(String, Vec<String>), String> {
+    Err("the embedded JavaScript engine is not built into this binary".into())
 }
 
 /// Shell line that serves JavaScript cells with the embedded engine: this `dial` binary re-executed
 /// under the same fork fence, with the protocol pipe on fd 3.
-#[cfg(all(feature = "embedded-js", unix))]
+#[cfg(all(feature = "embedded-js", not(windows)))]
 fn embedded_js_script(fence: &str) -> Result<String, String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("locating dial for the embedded JavaScript engine: {error}"))?;
@@ -53,7 +105,7 @@ fn embedded_js_script(fence: &str) -> Result<String, String> {
     ))
 }
 
-#[cfg(not(all(feature = "embedded-js", unix)))]
+#[cfg(all(not(feature = "embedded-js"), not(windows)))]
 fn embedded_js_script(_fence: &str) -> Result<String, String> {
     Err("the embedded JavaScript engine is not built into this binary".into())
 }
@@ -254,33 +306,21 @@ impl JsRuntime {
                     }
                     if slot.is_none() {
                         require_fork_containment("eval")?;
-                        let fence = fork_fence_prefix(ctx.workspace);
-                        // The shell preserves only the trusted protocol on fd 3. Native stdout/stderr
-                        // cannot be interpreted as controller callbacks or result frames.
-                        let (script, kernel) = match resolve_operator_executable(
+                        let (node, kernel) = match resolve_operator_executable(
                             ctx.workspace.root(),
                             &self.config.node,
                             "eval.node",
                         ) {
-                            Ok(node) => (
-                                format!(
-                                    "{fence} {} --no-addons -e {} 3>&1 1>&2",
-                                    shell_quote(
-                                        node.to_str().ok_or("Node executable path is not UTF-8")?
-                                    ),
-                                    shell_quote(DRIVER),
-                                ),
-                                "Node kernel (install/configure eval.node)",
-                            ),
+                            Ok(node) => (Some(node), "Node kernel (install/configure eval.node)"),
                             Err(node_error) => {
                                 if !embedded_js_available() {
                                     return Err(node_error);
                                 }
-                                (embedded_js_script(&fence)?, "embedded JavaScript engine")
+                                (None, "embedded JavaScript engine")
                             }
                         };
                         check_operation(end, &self.interrupt, cancel)?;
-                        let mut command = fenced_command(ctx.workspace, &script)?;
+                        let mut command = js_kernel_command(ctx.workspace, node.as_deref())?;
                         // Even the explicit filesystem-sandbox opt-out cannot inject code before the fence.
                         strip_runtime_injection(&mut command);
                         check_operation(end, &self.interrupt, cancel)?;

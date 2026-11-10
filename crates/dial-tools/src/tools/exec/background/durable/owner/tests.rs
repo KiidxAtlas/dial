@@ -63,7 +63,7 @@ fn owner_survives_controller_drop_reconnects_and_never_replays() {
     let status = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "tools::exec::background::durable::unix::tests::controller_fixture",
+            "tools::exec::background::durable::owner::tests::controller_fixture",
             "--nocapture",
         ])
         .env("DIAL_BG_CONTROLLER_ROOT", &ws.root)

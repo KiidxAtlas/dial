@@ -732,7 +732,7 @@ fn a_gate_check_whose_approval_is_denied_is_disclosed_with_the_accepted_answer()
         slots(),
         response("The note is written.", None),
     ]);
-    let config = FAILING_NOTE_CHECK.replacen("approval=\"auto\"\n", "", 1);
+    let config = FAILING_NOTE_CHECK.replacen("approval=\"auto\"\n", "approval=\"write\"\n", 1);
     let (report, gaps) = with_agent(&config, |agent| {
         connect(agent, &server.url);
         let report = agent.turn("Write the note", &mut NullUi).unwrap();

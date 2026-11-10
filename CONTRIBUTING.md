@@ -41,8 +41,16 @@ native-platform CI or hosted signing verification.
 
 ## Pull requests
 
-- One coherent change per PR. Describe the behaviour change and how you verified it, listing the
-  commands you ran and anything you could not exercise (for example real providers, Windows or MLX).
+- One coherent change per PR and per commit. Describe the behaviour change and how you verified it,
+  listing the commands you ran and anything you could not exercise (for example real providers,
+  Windows or MLX).
+- Keep commits reviewable. Aim for a few hundred changed lines; split anything larger along
+  ownership lines (one crate or module, then its callers, then docs). Mechanical changes (moves,
+  renames, formatting, generated files, lockfiles) go in their own commit with no behaviour change,
+  and the message says so. A commit that mixes a move with an edit hides the edit.
+- A commit that changes an agent-loop default (prompt wording, a threshold, a tool's default
+  behaviour, an `[experimental]` default) names its evidence in the message: the benchmark report
+  it rests on, or "unmeasured". See the next section.
 - Add regression tests for behaviour and error paths, in the sibling `tests.rs` of the module.
 - Update the relevant `docs/*.md` page and add a line under `## [Unreleased]` in `CHANGELOG.md`.
 - Adding a dependency: declare it in the root `[workspace.dependencies]` and make sure

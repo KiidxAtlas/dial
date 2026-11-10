@@ -26,5 +26,5 @@ In scope are weaknesses in Dial's own enforcement, for example:
 - tampering with release artifacts or the update signature check.
 
 Out of scope: behaviour of third-party model providers, MCP servers, operator tools and
-extensions you choose to trust (these run with the permissions you grant), and anything that
-requires the explicit unsandboxed mode.
+extensions you choose to trust (these run with the permissions you grant), and commands run with
+`sandbox.mode = "off"` (the default), which are not confined.

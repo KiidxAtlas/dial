@@ -14,6 +14,8 @@
 //!   `/weights map|stats|activations|trace|experiment|generate|direction|edit|evaluate` runs
 //!   `dial weights` as a background job, and `/weights promote NAME|revert` switches this
 //!   project's model to an edited copy that passed its evaluation, or back to its base.
+//!   `/weights analyze` first asks which model writes and rates the part explanations (the
+//!   analyzed model itself or another configured chat model) when there is a choice.
 use super::extensions::spawn_job_streaming;
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step};
@@ -47,6 +49,22 @@ pub(super) fn run(
         }
         "weights" if args.split_whitespace().next() == Some("improve") => {
             return Some(weights_improve(shell, app, agent, args));
+        }
+        "weights" if args == "knowledge" => {
+            shell.note(
+                "Model knowledge",
+                crate::weights::knowledge::render(
+                    &crate::weights::knowledge::stored_report(&app.config)
+                        .unwrap_or_else(|error| serde_json::json!({"error": format!("{error:#}")})),
+                ),
+            );
+            Ok(())
+        }
+        "weights"
+            if args.split_whitespace().next() == Some("analyze")
+                && !args.split_whitespace().any(|word| word == "--explainer") =>
+        {
+            return Some(weights_analyze(shell, app, agent, args));
         }
         "weights" => weights_job(shell, app, args),
         _ => return None,
@@ -441,6 +459,7 @@ fn weights_job(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
             | "prune"
             | "cases"
             | "next"
+            | "knowledge"
     ) {
         crate::weights::Operation::parse(op).context(
             "usage: /weights [status|open|map|stats|activations|trace|experiment NAME [--budget N]|generate --experiment E --cases FILE|direction NAME --experiment E --positive FILE --negative FILE|edit NAME --experiment E --direction D --layers 10,11|evaluate EDIT --cases FILE|promote EDIT|revert]",
@@ -545,6 +564,55 @@ fn weights_improve(
         );
     }
     step
+}
+
+/// `/weights analyze`: the analysis as a background job, after a picker of the model that writes
+/// and rates the part explanations when another chat model is configured. Each row reruns
+/// `/weights analyze --explainer MODEL`; with no choice the analyzed model explains itself.
+fn weights_analyze(
+    shell: &mut Shell,
+    app: &App,
+    agent: &mut Agent<'_>,
+    args: &str,
+) -> Result<Step> {
+    let explainers = crate::weights::explainer::choices(agent.effective_config());
+    if explainers.len() < 2 {
+        weights_job(shell, app, &format!("{args} --explainer @self"))?;
+        return Ok(Step::Done);
+    }
+    let rest = args
+        .trim()
+        .strip_prefix("analyze")
+        .unwrap_or_default()
+        .trim();
+    let items = explainers
+        .into_iter()
+        .enumerate()
+        .map(|(index, choice)| ChoiceItem {
+            value: format!("--explainer {} {rest}", choice.value)
+                .trim_end()
+                .to_owned(),
+            label: choice.label,
+            detail: choice.detail,
+            current: index == 0,
+        })
+        .collect();
+    let choices = ChoiceSpec {
+        title: "Weights · choose the model that explains the parts".into(),
+        command: "weights".into(),
+        verb: "analyze",
+        items,
+        prompt: "Filter models:".into(),
+        summary: "The analyzed model still does every measurement; the chosen model only sees built-in probe text."
+            .into(),
+        current_tag: Some("analyzed".into()),
+        ..Default::default()
+    };
+    shell.open(
+        app,
+        agent,
+        crate::app::overlay::Which::Choice(Box::new(choices)),
+    )
 }
 
 /// Roles that never answer chat, so they cannot drive the weight-editing loop.

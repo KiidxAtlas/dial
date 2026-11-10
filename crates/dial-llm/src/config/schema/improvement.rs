@@ -497,6 +497,15 @@ pub(super) static LEARNING: &[SettingDef] = &[
         Kind::Text,
     ),
     field!(
+        "weights.knowledge",
+        weights.knowledge,
+        IM,
+        "Weights",
+        "Read-only model knowledge",
+        "After normal turns, refresh the local target's header map and retain bounded outcome observations. No prompts, inference probes or weight edits. Requires the installed Python worker; external model identity remains unverified.",
+        Kind::Bool,
+    ),
+    field!(
         "assistance.tool_grammar",
         assistance.tool_grammar,
         IM,

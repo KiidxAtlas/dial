@@ -9,7 +9,6 @@ pub mod repl;
 pub mod rpc;
 pub mod schedule;
 
-#[cfg(unix)]
 pub(crate) use dial_agent::telemetry;
 pub(crate) use dial_agent::{
     adaptive, agent, commit, learn, reliability, stats, steering, weights,

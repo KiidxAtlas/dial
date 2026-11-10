@@ -1072,6 +1072,7 @@ impl Shell {
         match crate::app::commands::branch::rewind_approved(app, agent, approval) {
             Ok(rewound) => {
                 lines.push(format!("dropped {} message(s)", rewound.dropped));
+                agent.record_feedback(crate::telemetry::FeedbackKind::Undo, turns as u64);
                 lines.extend(rewound.note);
                 if let Some(checkpoints) = agent.checkpoints()
                     && let Err(error) = checkpoints

@@ -1,7 +1,9 @@
-//! OS confinement for model-facing commands: macOS `sandbox-exec`, Linux/WSL2 `bubblewrap`.
+//! OS confinement for model-facing commands: macOS `sandbox-exec`, Linux/WSL2 `bubblewrap`,
+//! Windows Low integrity (Dev mode only).
 //!
 //! Linux/WSL2 uses a bounded filesystem view even in Dev mode; see `sandbox/linux.rs`.
-//! The profiles and residual limits below describe the unchanged macOS backend.
+//! Windows labels writable and protected paths and runs commands at Low integrity; see
+//! `sandbox/low_integrity.rs`. The profiles and residual limits below describe the macOS backend.
 //!
 //! The profile is deny-by-default. Reads are limited to the system locations
 //! needed to run bash, coreutils, Homebrew python and git; reads and writes are
@@ -79,6 +81,8 @@
 pub mod fork_fence;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod linux;
+#[cfg(any(windows, test))]
+pub mod low_integrity;
 pub mod netproxy;
 
 /// The filtering proxy a sandboxed command must route through, if any.
@@ -91,7 +95,7 @@ use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -105,7 +109,7 @@ pub(super) struct CommandMode {
     pub fork_fence: bool,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// Eval's process-fork fence inside the command's own profile; Seatbelt cannot nest a second one.
@@ -221,11 +225,8 @@ impl Sandbox {
         return linux::command_mode(workspace, policy, program, args, mode, proxy);
         #[cfg(windows)]
         {
-            let _ = (workspace, policy, program, args, mode, proxy);
-            Err(
-                "Windows command isolation is unavailable; refusing to run a sandboxed command"
-                    .into(),
-            )
+            let _ = (mode, proxy);
+            low_integrity::command(workspace, policy, program, args, std::env::vars_os(), None)
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
@@ -347,19 +348,16 @@ impl Sandbox {
                 allow_network,
             } => (*allow_network, deny_read, extra_write.clone()),
         };
-        #[cfg(not(windows))]
         let mut extra_write = extra_write;
         // Toolchains (uv, pip, npm, go) refuse to start when their home-directory cache is
         // read-only; give them a dial-owned cache instead of widening writes to the real one.
-        #[cfg(not(windows))]
         let cache = toolchain_cache_root().filter(|root| std::fs::create_dir_all(root).is_ok());
-        #[cfg(not(windows))]
         if let Some(root) = &cache
             && !extra_write.iter().any(|path| root.starts_with(path))
         {
             extra_write.push(root.clone());
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         let policy = &Policy::Dev {
             deny_read: deny_read.clone(),
             extra_write: extra_write.clone(),
@@ -368,8 +366,8 @@ impl Sandbox {
         let extra_write = &extra_write;
         #[cfg(windows)]
         {
-            let _ = (allow_network, deny_read, extra_write, env, proxy);
-            Err("Windows filesystem/network isolation is unavailable; refusing to run a sandboxed command".into())
+            let _ = (deny_read, extra_write, proxy, mode);
+            low_integrity::command(workspace, policy, program, args, env, cache.as_deref())
         }
         #[cfg(not(windows))]
         {
@@ -430,11 +428,18 @@ impl Sandbox {
     pub fn probe_policy(workspace: &Path, policy: &Policy) -> Sandbox {
         #[cfg(windows)]
         {
-            let _ = (workspace, policy);
-            Sandbox::Unavailable(
-                "Windows command isolation is unavailable; sandboxed execution is disabled"
-                    .to_string(),
-            )
+            let _ = workspace;
+            if let Policy::Dev {
+                allow_network: true,
+                ..
+            } = policy
+            {
+                low_integrity::probe()
+            } else {
+                Sandbox::Unavailable(
+                    "Windows supports only sandbox.mode = \"dev\" with network allowed".to_string(),
+                )
+            }
         }
         #[cfg(target_os = "linux")]
         return linux::probe_policy(workspace, policy);
@@ -1099,7 +1104,6 @@ pub fn child_env_allowed(name: &str, value: &str) -> bool {
 
 /// Cache variables a Dev command gets pointed at [`toolchain_cache_root`] (the empty
 /// subdirectory means the root itself), unless already set to a writable location.
-#[cfg(not(windows))]
 const TOOLCHAIN_CACHES: &[(&str, &str)] = &[
     ("XDG_CACHE_HOME", ""),
     ("UV_CACHE_DIR", "uv"),
@@ -1111,23 +1115,27 @@ const TOOLCHAIN_CACHES: &[(&str, &str)] = &[
 /// A dial-owned cache that only sandboxed Dev commands use, so a cache poisoned inside the
 /// sandbox never reaches the user's unsandboxed toolchains. Outside the dial state and user
 /// dirs (which Dev denies) and outside the workspace (so it is not indexed or committed).
-#[cfg(not(windows))]
 fn toolchain_cache_root() -> Option<PathBuf> {
+    // Windows keeps per-user caches under %LOCALAPPDATA%, not the profile root.
+    #[cfg(windows)]
+    let home = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    #[cfg(not(windows))]
     let home = PathBuf::from(std::env::var_os("HOME")?);
     if !home.is_absolute() || home.parent().is_none() {
         return None;
     }
+    #[cfg(windows)]
+    let base = home;
     // Not `$XDG_CACHE_HOME`: on Linux it could name a system tree bubblewrap refuses to make writable.
     #[cfg(target_os = "macos")]
     let base = home.join("Library/Caches");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     let base = home.join(".cache");
     Some(base.join("dial").join("sandbox"))
 }
 
 /// Point each cache variable in [`TOOLCHAIN_CACHES`] below `root` unless its current value
 /// is already inside one of the `writable` roots.
-#[cfg(not(windows))]
 fn redirect_toolchain_caches(
     env: &mut Vec<(OsString, OsString)>,
     root: &Path,
@@ -1253,7 +1261,12 @@ fn probe() -> Sandbox {
     linux::probe()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn probe() -> Sandbox {
+    low_integrity::probe()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn probe() -> Sandbox {
     if !cfg!(target_os = "macos") {
         return Sandbox::Unavailable("sandbox-exec exists only on macOS".to_string());
@@ -1267,7 +1280,7 @@ fn probe() -> Sandbox {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn self_test() -> Result<(), String> {
     let scratch = tempfile::tempdir().map_err(|e| format!("creating scratch dir: {e}"))?;
     let base = scratch
@@ -1305,7 +1318,7 @@ fn self_test() -> Result<(), String> {
 
 /// Run `/bin/bash -c script _ args…` under `profile` in `cwd` with a minimal
 /// environment, bounded to 15 seconds. Returns the exit code and stdout.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn run_probe(
     profile: &str,
     cwd: &Path,

@@ -347,6 +347,7 @@ fn refuses_when_the_sandbox_has_no_network() {
     let mut strict = Config::default();
     strict.sandbox.mode = SandboxMode::Strict;
     let mut offline = Config::default();
+    offline.sandbox.mode = SandboxMode::Dev;
     offline.sandbox.allow_network = false;
     for config in [&strict, &offline] {
         let fetched = run(&fetch_tool(), config, json!({"url": server.base}));

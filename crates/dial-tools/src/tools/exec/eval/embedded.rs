@@ -6,11 +6,11 @@
 //! result frames). QuickJS is an ECMAScript engine, not Node: there are no Node APIs or modules.
 
 use std::cell::RefCell;
-use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::fd::FromRawFd;
 use std::rc::Rc;
 use std::time::Duration;
+#[cfg(unix)]
+use std::{fs::File, os::fd::FromRawFd};
 
 use ast_grep_core::AstGrep;
 use ast_grep_language::SupportLang;
@@ -239,8 +239,13 @@ pub fn serve(input: Box<dyn Read>, output: Box<dyn Write>) -> Result<(), String>
 pub fn worker_main() -> i32 {
     // SAFETY: the launcher maps the protocol pipe to fd 3 for this process only, so nothing else
     // owns that descriptor and this `File` becomes its sole owner.
-    let output = unsafe { File::from_raw_fd(3) };
-    match serve(Box::new(io::stdin()), Box::new(output)) {
+    #[cfg(unix)]
+    let output: Box<dyn Write> = Box::new(unsafe { File::from_raw_fd(3) });
+    // Windows has no fd 3: the protocol travels on stdout. Cells have no I/O of their own here,
+    // so nothing else writes to it.
+    #[cfg(not(unix))]
+    let output: Box<dyn Write> = Box::new(io::stdout());
+    match serve(Box::new(io::stdin()), output) {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(io::stderr(), "{error}");

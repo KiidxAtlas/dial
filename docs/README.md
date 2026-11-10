@@ -64,6 +64,7 @@ not by crate ownership. In the terminal, `/help <topic>` prints a focused docume
 - [Autoresearch and archive](autoresearch-and-archive.md) — Understand automated research and archive workflows.
 - [Local benchmark improvement batch](benchmark-measurements.md) — Interpret benchmark measurements and their limitations.
 - [Benchmarks and measurement](benchmarks.md) — Run benchmark suites and inspect evaluation reports.
+- [Surface inventory, November 2026](plans/surface-inventory-2026-11.md) — Review experimental flags and optional modes with the evidence available for each.
 - [Client compatibility and conformance](client-contracts.md) — Understand client-facing contracts and protocol behavior.
 - [Experimental evidence foundation](evidence.md) — Understand evidence identity, retention and verification boundaries.
 - [LLM transport behavior](llm-transport.md) — Inspect model protocols, request profiles, caching and retries.
@@ -89,9 +90,10 @@ not by crate ownership. In the terminal, `/help <topic>` prints a focused docume
   install a daemon. The browser and `eval` tools require OS containment and fail closed without it.
 - Live memory and skill edits are your working state and are not gated; only the admitted harness is.
 - Operator tools are trusted programs and are not sandboxed during live work; they are excluded from
-  automatic evaluation. On macOS and Linux/WSL2, `bash` runs inside the OS sandbox (Linux needs
-  bubblewrap and unprivileged user namespaces, and refuses to run commands without them rather than
-  falling back). On Windows, `bash` is unavailable for live use unless `sandbox.mode = "off"`;
+  automatic evaluation. `bash` runs unconfined by default. With `sandbox.mode = "dev"` or
+  `"strict"` on macOS and Linux/WSL2 it runs inside the OS sandbox (Linux needs bubblewrap and
+  unprivileged user namespaces, and refuses to run commands without them rather than falling
+  back). Windows has no sandbox backend, so `bash` there runs only with `sandbox.mode = "off"`;
   generated evaluations always require the strict sandbox.
 
 See also [Architecture](../ARCHITECTURE.md) for crate ownership and invariants, and

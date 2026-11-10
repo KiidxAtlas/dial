@@ -41,6 +41,8 @@ const MAX_EDIT_SCALE: f64 = 4.0;
 const MAX_DOSES: usize = 5;
 const MAX_ATTRIBUTION_ROWS: usize = 100;
 const MAX_NEUTRAL_CASES: usize = 8;
+/// Most tokens a direction `span` selects before its anchor.
+const MAX_SPAN: u64 = 1024;
 /// Stored and returned tensor rows; per-layer aggregates always cover the whole checkpoint.
 const MAX_TENSOR_ROWS: usize = 4096;
 
@@ -67,10 +69,12 @@ pub enum Operation {
     Attribute,
     /// An atlas of what each layer, attention head and neuron does, from built-in probe text.
     Analyze,
+    /// Bounded case-specific layer-output interventions with an intact restoration check.
+    Investigate,
 }
 
 impl Operation {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Map,
         Self::Stats,
         Self::Activations,
@@ -81,6 +85,7 @@ impl Operation {
         Self::Try,
         Self::Attribute,
         Self::Analyze,
+        Self::Investigate,
     ];
 
     pub fn name(self) -> &'static str {
@@ -95,6 +100,7 @@ impl Operation {
             Self::Try => "try",
             Self::Attribute => "attribute",
             Self::Analyze => "analyze",
+            Self::Investigate => "investigate",
         }
     }
 
@@ -104,7 +110,7 @@ impl Operation {
             .find(|op| op.name() == name)
             .with_context(|| {
                 format!(
-                    "unknown weights operation {name:?}; expected map, stats, analyze, activations, trace, generate, direction, edit, try or attribute"
+                    "unknown weights operation {name:?}; expected map, stats, analyze, investigate, activations, trace, generate, direction, edit, try or attribute"
                 )
             })
     }
@@ -120,6 +126,7 @@ impl Operation {
                 | Self::Try
                 | Self::Attribute
                 | Self::Analyze
+                | Self::Investigate
         )
     }
 
@@ -226,6 +233,44 @@ pub fn arguments(op: Operation, input: &Value) -> Result<Value> {
     let mut out = json!({});
     match op {
         Operation::Map | Operation::Analyze => {}
+        Operation::Investigate => {
+            let budget = field("budget")
+                .map_or(Some(24), Value::as_u64)
+                .filter(|n| (3..=256).contains(n))
+                .context("investigate budget must be 3–256 single-case forward passes")?;
+            out["budget"] = json!(budget);
+            let cases = if field("cases").is_some() {
+                let cases = conversations(field("cases"), "cases", MAX_CASES, "assistant")?;
+                out["cases"] = json!(cases);
+                cases.len()
+            } else {
+                4
+            };
+            let layers = if let Some(value) = field("layers") {
+                let layers = value.as_array().context("layers must be an array")?;
+                ensure!(
+                    (1..=16).contains(&layers.len())
+                        && layers
+                            .iter()
+                            .all(|v| v.as_u64().is_some_and(|n| n < MAX_LAYER))
+                        && layers
+                            .iter()
+                            .filter_map(Value::as_u64)
+                            .collect::<BTreeSet<_>>()
+                            .len()
+                            == layers.len(),
+                    "investigate layers must be 1–16 distinct zero-based indices"
+                );
+                out["layers"] = json!(layers);
+                layers.len()
+            } else {
+                1
+            };
+            ensure!(
+                (cases * (layers + 2)) as u64 <= budget,
+                "investigate budget must cover every case for baseline, selected layers and restoration"
+            );
+        }
         Operation::Stats => {
             if let Some(prefix) = field("prefix") {
                 let prefix = prefix.as_str().context("prefix must be a string")?;
@@ -322,8 +367,40 @@ pub fn arguments(op: Operation, input: &Value) -> Result<Value> {
             }
         }
         Operation::Direction => {
-            for key in ["positive", "negative"] {
-                out[key] = json!(conversations(field(key), key, MAX_PAIRS, "assistant")?);
+            out["positive"] = json!(conversations(
+                field("positive"),
+                "positive",
+                MAX_PAIRS,
+                "assistant"
+            )?);
+            if let Some(span) = field("span") {
+                let last = span["last"]
+                    .as_u64()
+                    .filter(|n| (1..=MAX_SPAN).contains(n))
+                    .with_context(|| format!("span needs `last`: 1–{MAX_SPAN} tokens"))?;
+                let before = span["before"].as_str().unwrap_or("answer_end");
+                ensure!(
+                    matches!(before, "answer_end" | "think_end")
+                        && span.as_object().is_some_and(|fields| fields
+                            .keys()
+                            .all(|key| key == "last" || key == "before")),
+                    "span must be {{last, before?}} with before answer_end or think_end"
+                );
+                out["span"] = json!({"last": last, "before": before});
+            }
+            match field("negative") {
+                Some(negative) => {
+                    out["negative"] = json!(conversations(
+                        Some(negative),
+                        "negative",
+                        MAX_PAIRS,
+                        "assistant"
+                    )?);
+                }
+                None => ensure!(
+                    out.get("span").is_some(),
+                    "direction needs `negative` conversations, or a `span` to contrast with the rest of the positive answers"
+                ),
             }
             let site = field("site").map_or(Some("mlp"), Value::as_str);
             ensure!(
@@ -424,17 +501,17 @@ fn edit_fields(input: &Value, out: &mut Value) -> Result<()> {
                 .context("allow_noisy must be true or false")?
         );
     }
-    match field("method").map_or(Some("project_out"), Value::as_str) {
-        Some("project_out") => {}
+    let method = match field("method").map_or(Some("project_out"), Value::as_str) {
+        Some(method @ ("project_out" | "add")) => method,
         Some("scale") => {
             out["method"] = json!("scale");
             out["changes"] = scale_changes(field("changes"))?;
             return Ok(());
         }
         Some("steering") => return steering_fields(input, out),
-        _ => bail!("method must be project_out, scale or steering"),
-    }
-    out["method"] = json!("project_out");
+        _ => bail!("method must be project_out, add, scale or steering"),
+    };
+    out["method"] = json!(method);
     out["direction"] = json!(name(field("direction"), "direction")?);
     let layers = field("layers")
         .and_then(Value::as_array)
@@ -453,6 +530,10 @@ fn edit_fields(input: &Value, out: &mut Value) -> Result<()> {
     );
     out["layers"] = json!(layers);
     if let Some(columns) = field("columns") {
+        ensure!(
+            method == "project_out",
+            "columns applies only to method project_out"
+        );
         let columns = columns
             .as_u64()
             .filter(|n| (1..=MAX_EDIT_COLUMNS).contains(n))
@@ -734,14 +815,27 @@ pub fn run(
         adapter.as_ref().is_none_or(|path| path.is_dir()),
         "adapter must be a directory"
     );
+    let explainer = if matches!(op, Operation::Analyze) {
+        explainer::selected(config, input)?
+    } else {
+        None
+    };
+    if explainer.is_some() {
+        request["explainer"] = json!("external");
+    }
     job(config, layout, cancel, move || {
         let created = edits::prepare(config, op, &mut request, experiment.as_deref())?;
         let charged = experiment
             .as_deref()
             .map(|name| edits::charge(config, name, op, &request))
             .transpose()?;
-        let result = call_worker(config, &model, op, request, adapter.as_deref(), cancel);
-        let mut value = bounded(result?);
+        let mut value = call_worker(config, &model, op, request, adapter.as_deref(), cancel)?;
+        if let Some((selection, explainer_config)) = &explainer
+            && value.get("explanation_requests").is_some()
+        {
+            value = explained(config, &model, selection, explainer_config, value, cancel)?;
+        }
+        let mut value = bounded(value);
         value["created_at"] = json!(crate::learn::improve::now());
         if let Some(charged) = charged {
             value["experiment"] = charged;
@@ -756,6 +850,35 @@ pub fn run(
         write_private(&result_path(config, op), value.to_string().as_bytes())?;
         Ok(value)
     })
+}
+
+/// Has `explainer` describe and rate the parts in an analyze result's `explanation_requests`, then
+/// has the worker score the answers and rewrite the summary (no model load).
+fn explained(
+    config: &Config,
+    model: &Path,
+    selection: &crate::llm::model_config::ModelSelection,
+    explainer: &Config,
+    result: Value,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    let progress = progress_path(config);
+    let phase = format!("{} is explaining the parts", selection.display_name());
+    let (answers, note) = explainer::answer(explainer, &result, cancel, &|done, total| {
+        let _ = write_private(
+            &progress,
+            json!({"phase": phase, "completed": done, "total": total})
+                .to_string()
+                .as_bytes(),
+        );
+    });
+    let request = json!({
+        "result": result,
+        "answers": answers,
+        "explainer": format!("{}/{}", selection.provider, selection.model),
+        "note": note,
+    });
+    call_worker_named(config, model, "explained", request, None, cancel)
 }
 
 /// Keep stored and returned results bounded: the per-tensor list is capped, aggregates are not.
@@ -809,6 +932,10 @@ pub fn status(config: &Config) -> Value {
         .ok()
         .flatten()
         .unwrap_or(Value::Null);
+    out["knowledge"] = match knowledge::stored_report(config) {
+        Ok(value) => value,
+        Err(error) => json!({"error": format!("{error:#}")}),
+    };
     out
 }
 
@@ -818,6 +945,7 @@ pub fn is_empty(status: &Value) -> bool {
         && status["evaluate"].is_null()
         && status["edits"].as_array().is_none_or(Vec::is_empty)
         && status["progress"].is_null()
+        && status["knowledge"].is_null()
 }
 
 /// One labelled bar per row of `key`, scaled to the largest magnitude.
@@ -851,6 +979,120 @@ pub fn bars(rows: &[Value], label: &str, key: &str, width: usize) -> Vec<String>
         .collect()
 }
 
+/// One checked part of an `analyze` result: its label, verdict and the evidence behind it.
+fn checked_part(item: &Value) -> String {
+    let part = match item["kind"].as_str() {
+        Some("expert") => format!("expert {}", item["expert"]),
+        _ => format!("neuron {}", item["neuron"]),
+    };
+    let label = item["explanation"]
+        .as_str()
+        .map(|text| format!("{text:?}"))
+        .or_else(|| item["category"].as_str().map(|c| format!("{c} text")))
+        .unwrap_or_else(|| "unlabelled".into());
+    let named = |passed: Option<bool>| -> Vec<&str> {
+        item["checks"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, value)| value.as_bool() == passed)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    };
+    let verdict = if item["confirmed"].as_bool() == Some(true) {
+        "confirmed".to_owned()
+    } else {
+        let mut reasons = Vec::new();
+        let failed = named(Some(false));
+        if !failed.is_empty() {
+            reasons.push(format!("{} failed", failed.join(", ")));
+        }
+        let untested = named(None);
+        if !untested.is_empty() {
+            reasons.push(format!("{} untested: too few texts", untested.join(", ")));
+        }
+        format!("unconfirmed ({})", reasons.join("; "))
+    };
+    let causal = &item["causal"];
+    let z = causal["z"]
+        .as_f64()
+        .map_or_else(|| "n/a".to_owned(), |z| format!("{z:.1}"));
+    let mut line = format!(
+        "  layer {} {part}: {label} · {verdict} · removal moves the output {:.4} nats where it fires vs {:.4} \
+         for an equally active part ({} held-out texts, z {z})",
+        item["layer"],
+        causal["effect"].as_f64().unwrap_or(f64::NAN),
+        causal["control_effect"].as_f64().unwrap_or(f64::NAN),
+        causal["texts"].as_u64().unwrap_or(0),
+    );
+    if let Some(score) = item["explanation_score"].as_f64() {
+        line += &format!(
+            " · explanation {score:.2} vs neutral {:.2}",
+            item["control_score"].as_f64().unwrap_or(0.0)
+        );
+    }
+    line
+}
+
+/// One `analyze` layer row as text: attention span, the category it serves most, logit-lens
+/// agreement, expert specialists and its least-used weight matrix. None when nothing is known.
+fn layer_detail(row: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(kind) = row["attention_type"].as_str() {
+        parts.push(format!("{kind} attention"));
+    }
+    if let Some(category) = row["specialty"].as_str() {
+        parts.push(format!("serves {category}"));
+    }
+    if let Some(agreement) = row["lens"]["agreement"].as_f64() {
+        parts.push(format!("lens {:.0}%", agreement * 100.0));
+    }
+    let specialists: Vec<String> = row["experts"]["specialists"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3)
+        .map(|item| {
+            format!(
+                "e{} {} ×{:.1}",
+                item["expert"],
+                item["category"].as_str().unwrap_or("?"),
+                item["lift"].as_f64().unwrap_or(f64::NAN)
+            )
+        })
+        .collect();
+    if !specialists.is_empty() {
+        parts.push(format!("experts {}", specialists.join(", ")));
+    }
+    if let Some(unused) = row["experts"]["unused"].as_u64().filter(|n| *n > 0) {
+        parts.push(format!("{unused} experts unused"));
+    }
+    let writes: Vec<String> = row["writes"]["promotes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3)
+        .filter_map(|item| item["token"].as_str())
+        .map(|token| format!("{token:?}"))
+        .collect();
+    if !writes.is_empty() {
+        parts.push(format!("writes {}", writes.join(" ")));
+    }
+    if let Some(half_life) = row["linear_attention"]["memory"]["median_half_life"].as_f64() {
+        parts.push(format!("memory half-life {half_life:.0} tokens"));
+    }
+    if let Some((name, rank)) = row["structure"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, part)| Some((name, part["effective_rank"].as_f64()?)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+    {
+        parts.push(format!("lowest rank {name} {:.0}%", rank * 100.0));
+    }
+    (!parts.is_empty()).then(|| format!("{:>4} {}", row["layer"].to_string(), parts.join(" · ")))
+}
+
 /// Compact terminal summary of one result.
 pub fn render(value: &Value) -> String {
     let op = value["op"].as_str().unwrap_or("unknown");
@@ -876,6 +1118,34 @@ pub fn render(value: &Value) -> String {
             ));
             out.push("Parameters per layer:".into());
             out.extend(bars(&rows("layers"), "layer", "params", 24));
+        }
+        "investigate" => {
+            out.push(format!(
+                "{} cases · {} / {} single-case forward passes · restoration checked: {}",
+                value["case_count"],
+                value["forward_passes"],
+                value["budget"],
+                value["restoration_checked"]
+            ));
+            out.push("Mean answer-loss change when the layer's residual output is replaced by its input (positive = reference answers less likely):".into());
+            out.extend(bars(&rows("layers"), "layer", "delta", 24));
+            for layer in rows("layers") {
+                if let Some(cases) = layer["cases"].as_array() {
+                    for case in cases {
+                        out.push(format!(
+                            "  layer {} · case {} ({}) · loss delta {}",
+                            layer["layer"],
+                            case["case"],
+                            case["probe"].as_str().unwrap_or("custom"),
+                            case["delta"]
+                        ));
+                    }
+                }
+            }
+            if let Some(limits) = value["limits"].as_str() {
+                out.push(limits.into());
+            }
+            out.push("Use --json for case fingerprints, baseline losses and measured per-case effects; `weights history` retains this run.".into());
         }
         "stats" => {
             out.push("Weight norm per layer:".into());
@@ -921,9 +1191,29 @@ pub fn render(value: &Value) -> String {
             out.extend(bars(&rows("cases"), "case", "tokens", 24));
         }
         "direction" => {
+            let contrast = if value["negative"].is_null() {
+                format!(
+                    "{} positive conversations, the span against the rest of each answer",
+                    value["positive"]
+                )
+            } else {
+                format!(
+                    "{} positive / {} negative conversations",
+                    value["positive"], value["negative"]
+                )
+            };
+            let span = if value["span"].is_object() {
+                format!(
+                    " · last {} tokens before {}",
+                    value["span"]["last"],
+                    value["span"]["before"].as_str().unwrap_or("answer_end")
+                )
+            } else {
+                String::new()
+            };
             out.push(format!(
-                "{} positive / {} negative conversations · site {} · suggested layers {}",
-                value["positive"], value["negative"], value["site"], value["suggested_layers"]
+                "{contrast}{span} · site {} · suggested layers {}",
+                value["site"], value["suggested_layers"]
             ));
             out.push("Separation per layer (gap in pooled standard deviations):".into());
             out.extend(bars(&rows("layers"), "layer", "separation", 24));
@@ -940,10 +1230,22 @@ pub fn render(value: &Value) -> String {
                     "sum of {} edits",
                     value["sources"].as_array().map_or(0, Vec::len)
                 ),
+                Some("add") => format!(
+                    "direction added at alpha {} of each writer's output size",
+                    value["alpha"]
+                ),
                 _ => format!(
                     "{} columns per layer · alpha {}",
                     value["columns"], value["alpha"]
                 ),
+            };
+            let how = if value["control_seed"].is_u64() {
+                format!(
+                    "{how} · norm-matched random control (seed {})",
+                    value["control_seed"]
+                )
+            } else {
+                how
             };
             out.push(format!(
                 "{} · {} · {} parameters edited, {} rewritten ({} of the model){}",
@@ -972,16 +1274,35 @@ pub fn render(value: &Value) -> String {
                     ));
                 }
             } else {
+                // project_out and add edit each MLP writer of a layer, so name the writer per row.
+                let layers = rows("layers");
+                let labelled = |key: &str| {
+                    bars(&layers, "layer", key, 24)
+                        .into_iter()
+                        .zip(&layers)
+                        .map(|(line, row)| match row["writer"].as_str() {
+                            Some(writer) => format!("{line} · {writer}"),
+                            None => line,
+                        })
+                        .collect::<Vec<_>>()
+                };
                 out.push("Edit norm per layer:".into());
-                out.extend(bars(&rows("layers"), "layer", "edit_norm", 24));
+                out.extend(labelled("edit_norm"));
                 if value["quantized"] == true {
                     out.push("Requantization error per layer:".into());
-                    out.extend(bars(&rows("layers"), "layer", "requantization_error", 24));
+                    out.extend(labelled("requantization_error"));
                 }
             }
         }
         "analyze" => {
             let summary = &value["summary"];
+            let findings = rows("findings");
+            if !findings.is_empty() {
+                out.push("What the analysis found:".into());
+                for line in &findings {
+                    out.push(format!("  - {}", line.as_str().unwrap_or("")));
+                }
+            }
             out.push(format!(
                 "{} layers · {} probe texts · baseline loss {} · most important layers {} · least important {}",
                 value["layer_count"],
@@ -1004,8 +1325,46 @@ pub fn render(value: &Value) -> String {
                     head["induction"].as_f64().unwrap_or(f64::NAN)
                 ));
             }
+            if let Some(forms) = summary["answer_forms_at"].as_object() {
+                let parts: Vec<String> = forms
+                    .iter()
+                    .map(|(category, layer)| format!("{category} {layer}"))
+                    .collect();
+                out.push(format!(
+                    "Prediction settles at layer: {}",
+                    parts.join(" · ")
+                ));
+            }
             out.push("Loss increase when the layer is skipped:".into());
             out.extend(bars(&rows("layers"), "layer", "importance", 24));
+            let details: Vec<String> = rows("layers").iter().filter_map(layer_detail).collect();
+            if !details.is_empty() {
+                out.push("Per layer:".into());
+                out.extend(details);
+            }
+            let checked = summary["checked_parts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if !checked.is_empty() {
+                out.push(
+                    "Checked parts (confirmed = every check that applies passed: removing the part where it \
+                     fires changes the output more than removing an equally active part, on held-out text; \
+                     its category holds on both halves of the text; and its explanation ranks held-out \
+                     snippets better than a neutral description):"
+                        .into(),
+                );
+                for item in checked.iter().take(12) {
+                    out.push(checked_part(item));
+                }
+            }
+            match value["explainer"].as_str() {
+                Some("self") => out.push("Explanations written and rated by the analyzed model itself.".into()),
+                Some(explainer) => out.push(format!(
+                    "Explanations written and rated by {explainer}; the analyzed model did every measurement."
+                )),
+                None => {}
+            }
             for note in value["notes"].as_array().into_iter().flatten() {
                 out.push(format!("Note: {}", note.as_str().unwrap_or("")));
             }
@@ -1103,6 +1462,45 @@ pub fn render(value: &Value) -> String {
                     summary["passed"],
                     summary["checked"]
                 ));
+            }
+            let interval = |value: &Value| {
+                format!(
+                    "{:+.1} (95% CI {:+.1} to {:+.1})",
+                    value["mean"].as_f64().unwrap_or(f64::NAN),
+                    value["low"].as_f64().unwrap_or(f64::NAN),
+                    value["high"].as_f64().unwrap_or(f64::NAN)
+                )
+            };
+            for (label, key) in [("answer", "tokens"), ("thinking", "thinking_tokens")] {
+                let change = &value["lengths"][key];
+                if change.is_object() {
+                    let against = &value["control"]["lengths"][key];
+                    out.push(format!(
+                        "Mean {label} tokens, edit − base: {}{}",
+                        interval(change),
+                        if against.is_object() {
+                            format!(" · edit − control: {}", interval(against))
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+            }
+            let control = &value["control"];
+            if control.is_object() {
+                out.push(format!(
+                    "Against a norm-matched random edit: {} wins, {} losses, {} ties · {}",
+                    control["wins"],
+                    control["losses"],
+                    control["ties"],
+                    if control["beaten"] == true {
+                        "the direction did better"
+                    } else {
+                        "the direction did no better"
+                    }
+                ));
+            } else if let Some(reason) = value["control_unavailable"].as_str() {
+                out.push(format!("No random control: {reason}"));
             }
             let quality = &value["quality"];
             if let Some(change) = quality["relative_change"].as_f64() {
@@ -1219,6 +1617,10 @@ fn describe(details: &Value) -> String {
                 .join(" + "),
             details["edited_params"]
         ),
+        Some("add") => format!(
+            " · add along direction layers {} · alpha {} · {} params{noise}",
+            details["layers"], details["alpha"], details["edited_params"]
+        ),
         Some(_) => format!(
             " · project_out layers {} · {} columns · alpha {} · {} params{noise}",
             details["layers"], details["columns"], details["alpha"], details["edited_params"]
@@ -1279,6 +1681,9 @@ pub fn render_status(status: &Value) -> String {
         out.push(String::new());
         out.push(render(result));
     }
+    if !status["knowledge"].is_null() {
+        out.push(knowledge::render(&status["knowledge"]));
+    }
     let edits = status["edits"].as_array().cloned().unwrap_or_default();
     if !edits.is_empty() {
         out.push(String::new());
@@ -1312,8 +1717,10 @@ pub fn improvement_prompt(goal: &str) -> String {
 
 pub mod dashboard;
 mod edits;
+pub mod explainer;
 mod guide;
 mod history;
+pub mod knowledge;
 pub mod tool;
 
 #[cfg(test)]
