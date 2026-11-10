@@ -15,6 +15,16 @@ test-bin dial dial cmd::update::tests::
 test-lib dial-core platform::
 # Background job process identity and Windows job-object group ownership.
 test-lib dial-core platform::procinfo
+# In-process shell stop: Windows terminates external commands carrying the run token.
+test-lib dial-tools embedded_shell::inprocess::tests::
+# sys:// views from Toolhelp, process parameters and IP Helper tables.
+test-lib dial-tools tools::fs::system::
+# dial run: job-aware pipe relay with bounded descendant drain.
+test-lib dial-app cli::run::tests::windows_
+# SFTP protocol safety and optional coverage path handling / shell environment rendering.
+test-lib dial-tools tools::integrations::ssh::sftp::
+test-lib dial-tools tools::exec::shell::backend_tests::environment_prefix
+test-lib dial-agent agent::verify::coverage::
 # Document transactions commit proposals to real files in temporary workspaces. The
 # `tools::edit::edit_transaction` module has no tests of its own (unix, windows and mod alike).
 test-lib dial-tools tools::edit::document_transaction

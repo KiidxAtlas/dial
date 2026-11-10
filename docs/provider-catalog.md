@@ -185,6 +185,32 @@ DIAL_TEST_OSAURUS_MODEL="your-installed-model-id" cargo test --locked -p dial-ll
 
 SambaNova (`SAMBANOVA_API_KEY`, `https://api.sambanova.ai/v1`) and Inception (`INCEPTION_API_KEY`, `https://api.inceptionlabs.ai/v1`) are OpenAI-compatible chat-completions providers with bundled model cards (SambaNova `gpt-oss-120b`; Inception `mercury-2`, `mercury-2.5`, `mercury-3`). Inception's `minimal` reasoning rung is sent on the wire as `instant` (declared per model by the catalog's `m` effort-wire map); `low`, `medium` and `high` send their own names.
 
+**Hosted OpenAI-compatible providers and gateways.** These chat-completions providers need only their API key; models come from each provider's live `/models` list (no bundled model cards), and none is probed until its key is set:
+
+| Provider id | Service | Key variable | Base URL |
+|---|---|---|---|
+| `chutes` | Chutes | `CHUTES_API_KEY` | `https://llm.chutes.ai/v1` |
+| `featherless` | Featherless | `FEATHERLESS_API_KEY` | `https://api.featherless.ai/v1` |
+| `friendli` | Friendli serverless | `FRIENDLI_TOKEN` | `https://api.friendli.ai/serverless/v1` |
+| `github-models` | GitHub Models | `GITHUB_MODELS_TOKEN`, or the shared `GITHUB_TOKEN` (needs the `models:read` permission) | `https://models.github.ai/inference` |
+| `hyperbolic` | Hyperbolic | `HYPERBOLIC_API_KEY` | `https://api.hyperbolic.xyz/v1` |
+| `nebius` | Nebius Token Factory | `NEBIUS_API_KEY` | `https://api.tokenfactory.nebius.com/v1` |
+| `ovhcloud` | OVHcloud AI Endpoints | `OVHCLOUD_API_KEY` | `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1` |
+| `portkey` | Portkey gateway | `PORTKEY_API_KEY` | `https://api.portkey.ai/v1` |
+| `requesty` | Requesty router | `REQUESTY_API_KEY` | `https://router.requesty.ai/v1` |
+| `scaleway` | Scaleway Generative APIs | `SCALEWAY_API_KEY` or `SCW_SECRET_KEY` | `https://api.scaleway.ai/v1` |
+| `upstage` | Upstage | `UPSTAGE_API_KEY` | `https://api.upstage.ai/v1` |
+
+Gateway model ids keep the gateway's own naming: Requesty uses `provider/model` (for example `openai/gpt-5`), and Portkey uses Model Catalog ids (`@provider-slug/model`). A self-hosted LiteLLM proxy is not bundled because its address is yours: configure it as an ordinary chat-completions endpoint (for example `base_url = "http://localhost:4000"` with its master key in `api_key_env`).
+
+When a provider lists several key variables, Dial reads the first one that is set, in the order shown; with none set it reports the first. For example Command Code accepts `COMMAND_CODE_API_KEY`, `COMMANDCODE_API_KEY` or `CMD_API_KEY`, and Ollama Cloud (`ollama-cloud`, native Ollama API at `https://ollama.com`) accepts `OLLAMA_API_KEY` or the older `OLLAMA_CLOUD_API_KEY`.
+
+**Perplexity.** `perplexity-agent` is Perplexity's Agent API (`PERPLEXITY_API_KEY`, `https://api.perplexity.ai/v1`), spoken over the Responses protocol. It serves third-party models under ids such as `openai/gpt-5.5` and supports custom function tools. The `search_results` items it returns alongside an answer are dropped: the cited answer is in the message text, and the items are neither executed nor replayed. The older Sonar chat-completions API at the bare host is not bundled because it has no function tools, which an agent needs.
+
+**StepFun regions.** `stepfun` is the global platform (`https://api.stepfun.ai/v1`) and `stepfun-cn` is the China platform (`https://api.stepfun.com/v1`). Keys are issued per platform; both rows read `STEPFUN_API_KEY`.
+
+**OpenCode Zen and Go.** `opencode-zen` and `opencode-go` serve each model over the wire its upstream speaks. Claude models use Anthropic Messages, GPT models use Responses, Gemini models on Zen use the Gemini API, and the rest use chat completions. The bundled model cards record this per model, and Dial selects it automatically on the bundled endpoint. An explicit `protocol` or a custom base URL overrides it. Every request to `opencode.ai` carries a stable `x-opencode-session` header (the Dial session id) and a `dial/<version>` User-Agent, which OpenCode Go requires.
+
 TypeSafe System One is a judgment-only backend, not a chat provider. Assign it to the `decision` role (`provider = "typesafe"`, `model = "jev-latest"` by default) and set `TYPESAFE_API_KEY`; `TYPESAFE_BASE_URL` overrides `https://api.typesafe.ai`. Thinking judgments then POST `{base}/v1/systemone` with a typed `choice` question. A missing key is reported when a judgment runs; it is never silently replaced by another model.
 
 **GitLab Duo Agent** (`gitlab-duo-agent`, protocol `gitlab-duo-agent`, `https://gitlab.com`) runs GitLab's Duo Agent Platform workflows over a WebSocket. Authenticate with `GITLAB_TOKEN` (personal access token with `api` scope) or the `gitlab-duo-agent` OAuth sign-in. Set `GITLAB_DUO_PROJECT` to a full project path (`group/subgroup/project`) to choose the project; when unset, Dial uses the first project where the user has Developer or higher access. Nested projects resolve their root group from the namespace's full path. Dial creates a workflow for the conversation and streams the agent's checkpoint text as it arrives. Server-side `runMCPTool` actions become ordinary Dial tool calls, so approvals, sandbox confinement and tool output apply unchanged; results return to the same workflow. Workflow approval statuses that carry a tool action surface as that tool call through the normal approval gate, and a denial is sent back as the tool result. An approval status with no tool action still fails the turn. Workflows are reused across turns of one session. Resetting, cancelling or forgetting a session sends a best-effort REST stop (5-second cap) before closing the socket. Step-limit and transient "Duo Agent Platform" errors restart the workflow with the transcript (at most four step-limit restarts and one transient retry); text already streamed in the turn is not repeated after a restart.

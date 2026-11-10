@@ -75,8 +75,7 @@ const CLT_DIR: &str = "/Library/Developer/CommandLineTools";
 pub const BG_OFFERED_HINT: &str = " `bg wait` returns its output; no polling.";
 /// Adoption hint when `bg` is loadable but not offered. The agent replaces it with
 /// [`BG_OFFERED_HINT`] when it loads `bg` for the next request itself.
-pub const BG_LOAD_HINT: &str =
-    " Load the Dial `bg` tool with `tool_load` to wait for or stop it; no polling.";
+pub const BG_LOAD_HINT: &str = " Load the Dial `bg` tool with `tool_search` names:[\"bg\"] to wait for or stop it; no polling.";
 
 /// Helper languages the session prompt reports, each with the program names that provide it.
 const SHELL_INTERPRETERS: &[(&str, &[&str])] = &[
@@ -741,16 +740,23 @@ pub fn bash_tool_streaming_with_adopter(
         return Err("bash pty=true requires the managed bg registry; use the native execution boundary or bg start with pty=true".into());
     }
     with_bash_interceptor(ws, args, |command| {
-        run_bash(
+        let trace = trace::prepare(ws, args, command)?;
+        let mut output = run_bash(
             ws,
             args,
-            command,
+            trace
+                .as_ref()
+                .map_or(command, |trace| trace.command.as_str()),
             timeout_secs,
             auto_background_secs,
             on_output,
             cancel,
             on_adopt,
-        )
+        )?;
+        if let Some(trace) = trace {
+            trace.finish(&mut output);
+        }
+        Ok(output)
     })
 }
 
@@ -841,7 +847,7 @@ pub(super) fn bash_tool_pty(
                 .bash_interceptor()
                 .is_none_or(|(_, offered)| offered.iter().any(|tool| tool == "bg"));
             if !bg_offered {
-                output.text.push_str("\nLoad the Dial `bg` tool with `tool_load` (it is not a shell command) to control this terminal.");
+                output.text.push_str("\nLoad the Dial `bg` tool with `tool_search` names:[\"bg\"] (it is not a shell command) to control this terminal.");
             }
             if !output
                 .process_outcome()
@@ -1044,7 +1050,7 @@ fn run_bash(
                 };
                 let manage = if offered("bg") {
                     BG_OFFERED_HINT
-                } else if offered("tool_load") {
+                } else if offered("tool_search") || offered("tool_load") {
                     BG_LOAD_HINT
                 } else {
                     " No polling."
@@ -1364,6 +1370,57 @@ fn runner_for(ws: &Workspace) -> Result<Runner, String> {
         );
     }
     Ok(runner)
+}
+
+/// One variable a caller adds to a command's environment through [`environment_prefix`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnvEntry {
+    /// `name=value`.
+    Set(String, String),
+    /// `name=value` followed by the variable's current value, if any, joined with the platform
+    /// path-list separator (`;` on Windows, `:` elsewhere).
+    Prepend(String, String),
+}
+
+/// `command` preceded by statements that add `entries` to its environment, in the syntax of the
+/// shell this workspace runs commands with: POSIX `export` for bash and the built-in shell,
+/// `$env:` assignments for PowerShell. Dial rebuilds a command's environment from an allowlist, so
+/// the shell line is the only place an extra variable can enter without changing the tool schema.
+pub fn environment_prefix(
+    ws: &Workspace,
+    entries: &[EnvEntry],
+    command: &str,
+) -> Result<String, String> {
+    Ok(render_environment(&runner_for(ws)?, entries, command))
+}
+
+fn render_environment(runner: &Runner, entries: &[EnvEntry], command: &str) -> String {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    if *runner == Runner::PowerShell {
+        let quote = |text: &str| format!("'{}'", text.replace('\'', "''"));
+        let statements: Vec<String> = entries
+            .iter()
+            .map(|entry| match entry {
+                EnvEntry::Set(name, value) => format!("$env:{name} = {}", quote(value)),
+                EnvEntry::Prepend(name, value) => format!(
+                    "$env:{name} = {} + $(if ($env:{name}) {{ '{separator}' + $env:{name} }} else {{ '' }})",
+                    quote(value)
+                ),
+            })
+            .collect();
+        return format!("{}\n{command}", statements.join("; "));
+    }
+    let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
+    let assignments: Vec<String> = entries
+        .iter()
+        .map(|entry| match entry {
+            EnvEntry::Set(name, value) => format!("{name}={}", quote(value)),
+            EnvEntry::Prepend(name, value) => {
+                format!("{name}={}\"${{{name}:+{separator}${name}}}\"", quote(value))
+            }
+        })
+        .collect();
+    format!("export {}\n{command}", assignments.join(" "))
 }
 
 /// The bash `auto` and `system` use: `/bin/bash` on Unix; on Windows Git for Windows' `bash.exe`
@@ -1696,6 +1753,7 @@ fn shell_command_with_state(
 
 mod inprocess;
 mod missing_program;
+mod trace;
 
 #[cfg(test)]
 mod backend_tests;

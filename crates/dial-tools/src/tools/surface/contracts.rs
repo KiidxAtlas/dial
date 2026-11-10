@@ -23,15 +23,18 @@ pub struct HistoricalCall {
 /// Optional built-in properties added after release whose absence keeps the old meaning, so
 /// history recorded before them stays valid. Removing a pinned property recovers that identity.
 const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
-    ("bash", &["session", "pty", "check", "check_paths"]),
+    ("bash", &["session", "pty", "check", "check_paths", "trace"]),
     ("bg", &["persist", "lifetime", "call"]),
     ("monitor", &["run"]),
-    ("grep", &["output", "preview"]),
+    ("grep", &["output", "preview", "ast", "lang"]),
     ("glob", &["preview"]),
     ("edit", &["allow_syntax_errors", "verify"]),
     ("write", &["allow_syntax_errors", "verify", "encoding"]),
-    ("read", &["format", "retain"]),
+    ("read", &["format", "retain", "fetch", "raw", "max_chars"]),
     ("ast_edit", &["allow_syntax_errors"]),
+    ("skill", &["action", "description", "body", "scope"]),
+    ("checkpoint", &["action", "report"]),
+    ("ask", &["action", "path", "reason", "sensitive"]),
     (
         "task",
         &[
@@ -44,7 +47,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ),
     ("find", &["related"]),
     ("lsp", &["payload"]),
-    ("tool_search", &["load"]),
+    ("tool_search", &["load", "names", "unload"]),
     ("eval", &["background", "title"]),
     ("verify", &["acceptance"]),
     ("web_search", &["domains", "exclude_domains", "fetch_top"]),
@@ -801,7 +804,15 @@ fn controller_compatible(
 ) -> bool {
     if !matches!(
         old.name.as_str(),
-        "working_state" | "verify" | "task" | "todo" | "finish"
+        "working_state"
+            | "verify"
+            | "task"
+            | "todo"
+            | "finish"
+            | "ask"
+            | "checkpoint"
+            | "skill"
+            | "tool_search"
     ) || new.name != old.name
         || old.revision != 1
         || new.revision != 1
@@ -832,7 +843,51 @@ fn controller_compatible(
             })
         });
     }
+    if old.name == "tool_search" {
+        let mut without_load = schema.clone();
+        if let Some(properties) = without_load
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.remove("load");
+        }
+        if identities(&[without_load], registry).get(&old.name) == Some(old) {
+            return true;
+        }
+    }
     let mut before = schema.clone();
+    if matches!(
+        old.name.as_str(),
+        "ask" | "checkpoint" | "skill" | "tool_search"
+    ) {
+        let properties = before
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut);
+        let Some(properties) = properties else {
+            return false;
+        };
+        match old.name.as_str() {
+            "ask" => {
+                properties.retain(|key, _| key == "questions");
+                before["function"]["parameters"]["required"] = json!(["questions"]);
+            }
+            "checkpoint" => {
+                properties.retain(|key, _| key == "goal");
+                before["function"]["parameters"]["required"] = json!(["goal"]);
+            }
+            "skill" => {
+                properties.retain(|key, _| matches!(key.as_str(), "name" | "file"));
+            }
+            "tool_search" => {
+                properties.remove("names");
+                properties.remove("unload");
+                before["function"]["parameters"]["required"] = json!(["query"]);
+            }
+            _ => return false,
+        }
+        return identities(std::slice::from_ref(&before), registry).get(&old.name) == Some(old)
+            || registry_additive_compatible(old, new, &[before], registry);
+    }
     if old.name == "working_state" {
         let Some(properties) = before
             .pointer_mut("/function/parameters/properties")
@@ -961,6 +1016,37 @@ const TASK_POOL_ACTIONS: &[&str] = &["create", "push", "peek", "close"];
 /// [`TASK_OPTIONAL`]. `None` unless the current schema has the pool actions (optionally followed
 /// by `verify`), the only shape these variants are derived from.
 fn task_variants(schema: &Value) -> Option<Vec<Value>> {
+    let question = schema
+        .pointer("/function/parameters/properties/question")
+        .cloned();
+    let mut before_questions = schema.clone();
+    let properties = before_questions
+        .pointer_mut("/function/parameters/properties")?
+        .as_object_mut()?;
+    if properties.remove("question").is_some() {
+        let actions = properties
+            .get_mut("action")?
+            .get_mut("enum")?
+            .as_array_mut()?;
+        let question_actions = [
+            "question",
+            "question_status",
+            "question_wait",
+            "question_cancel",
+        ];
+        if !question_actions
+            .iter()
+            .all(|action| actions.contains(&json!(action)))
+        {
+            return None;
+        }
+        actions.retain(|action| {
+            !action
+                .as_str()
+                .is_some_and(|action| question_actions.contains(&action))
+        });
+    }
+    let schema = &before_questions;
     let properties = schema.pointer("/function/parameters/properties")?;
     let pooled: Vec<&str> = TASK_RELEASED_ACTIONS
         .iter()
@@ -1008,6 +1094,30 @@ fn task_variants(schema: &Value) -> Option<Vec<Value>> {
             }
         }
         variants.push(variant);
+    }
+    if let Some(question) = question {
+        let with_questions: Vec<Value> = variants
+            .iter()
+            .map(|variant| {
+                let mut variant = variant.clone();
+                variant["function"]["parameters"]["properties"]["question"] = question.clone();
+                if let Some(actions) =
+                    variant["function"]["parameters"]["properties"]["action"]["enum"].as_array_mut()
+                {
+                    actions.extend(
+                        [
+                            "question",
+                            "question_status",
+                            "question_wait",
+                            "question_cancel",
+                        ]
+                        .map(|action| json!(action)),
+                    );
+                }
+                variant
+            })
+            .collect();
+        variants.extend(with_questions);
     }
     variants.sort_by_cached_key(Value::to_string);
     variants.dedup();
@@ -1076,6 +1186,96 @@ pub fn project_history(
                 let (call_index, arguments, target) = merged;
                 let projected = projected.get_or_insert_with(|| messages.to_vec());
                 projected[index]["tool_calls"][call_index]["function"]["name"] = json!("todo");
+                projected[index]["tool_calls"][call_index]["function"]["arguments"] =
+                    json!(arguments.to_string());
+                projected[index]["dial_tool_contracts"][id] = json!(target);
+                continue;
+            }
+            if !id.starts_with("callback:")
+                && !current.contains_key(&old.name)
+                && let Some((call_index, _)) = paired_call(messages, index, id)
+            {
+                let raw = &message["tool_calls"][call_index]["function"]["arguments"];
+                let arguments = match raw.as_str() {
+                    Some(text) => serde_json::from_str(text)?,
+                    None => raw.clone(),
+                };
+                if let Some((successor, arguments)) =
+                    registry.historical_mcp_projection(old, &arguments)
+                    && let Some(target) = current.get(&successor)
+                {
+                    let projected = projected.get_or_insert_with(|| messages.to_vec());
+                    projected[index]["tool_calls"][call_index]["function"]["name"] =
+                        json!(successor);
+                    projected[index]["tool_calls"][call_index]["function"]["arguments"] =
+                        json!(arguments.to_string());
+                    projected[index]["dial_tool_contracts"][id] = json!(target);
+                    continue;
+                }
+            }
+            if let Some(successor) = crate::tools::surface::facade::successor_of(&old.name)
+                .filter(|_| !current.contains_key(&old.name))
+            {
+                // Callback identities are never replayed; a successor outside this request leaves
+                // the call inert until it is loaded, like any call to an unoffered tool.
+                if id.starts_with("callback:") {
+                    continue;
+                }
+                let Some(target) = current.get(successor) else {
+                    continue;
+                };
+                let owner = registry.get(&old.name);
+                let controller = matches!(
+                    old.name.as_str(),
+                    "tool_load" | "skill_manage" | "rewind" | "side_request" | "request_directory"
+                );
+                ensure!(
+                    owner.is_some() || controller,
+                    "tool {} was consolidated into {successor} but is unavailable",
+                    old.name
+                );
+                ensure!(
+                    old.revision == owner.map_or(1, |owner| owner.contract_revision()),
+                    "tool {} contract revision {} has no consolidation projection",
+                    old.name,
+                    old.revision
+                );
+                if let Some(owner) = owner {
+                    let schema = owner.schema();
+                    let identity = identities(std::slice::from_ref(&schema), registry)
+                        .remove(&old.name)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("missing owner identity for {}", old.name)
+                        })?;
+                    ensure!(
+                        old == &identity
+                            || registry_additive_compatible(old, &identity, &[schema], registry)
+                            || owner.accepts_historical_contract(old),
+                        "tool {} history has an unrecognised legacy contract; no consolidation projection",
+                        old.name
+                    );
+                }
+                let (call_index, _) = paired_call(messages, index, id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tool {} history is unpaired; no consolidation projection",
+                        old.name
+                    )
+                })?;
+                let raw = &message["tool_calls"][call_index]["function"]["arguments"];
+                let arguments: Value = match raw.as_str() {
+                    Some(text) => serde_json::from_str(text)?,
+                    None => raw.clone(),
+                };
+                let (_, arguments) =
+                    crate::tools::surface::facade::successor_call(&old.name, &arguments)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "tool {} history has an unrecognised legacy shape; no consolidation projection",
+                                old.name
+                            )
+                        })?;
+                let projected = projected.get_or_insert_with(|| messages.to_vec());
+                projected[index]["tool_calls"][call_index]["function"]["name"] = json!(successor);
                 projected[index]["tool_calls"][call_index]["function"]["arguments"] =
                     json!(arguments.to_string());
                 projected[index]["dial_tool_contracts"][id] = json!(target);

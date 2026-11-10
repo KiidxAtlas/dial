@@ -471,7 +471,7 @@ impl ExtensionsOverlay {
             // Confirm / job / message bar.
             if let Some(intent) = &browser.confirm {
                 lines.push(Line::from(Span::styled(
-                    format!("{}? Enter confirm · Esc cancel", intent.describe()),
+                    format!(" {}?", intent.describe()),
                     ctx.theme.fg(Tok::Warning),
                 )));
             } else {
@@ -539,7 +539,14 @@ impl ExtensionsOverlay {
                 }
             }
 
-            let hints: Vec<(String, String)> = if browser.form.is_some() {
+            let hints: Vec<(String, String)> = if browser.confirm.is_some() {
+                // A pending confirmation owns Enter and Esc: say what they do now, not what
+                // they do while browsing.
+                vec![
+                    (ctx.keys.label(Action::SelectConfirm), "confirm".to_owned()),
+                    (ctx.keys.label(Action::SelectCancel), "cancel".to_owned()),
+                ]
+            } else if browser.form.is_some() {
                 vec![
                     (ctx.keys.label(Action::SelectConfirm), "submit".to_owned()),
                     ("Tab".to_owned(), "next".to_owned()),

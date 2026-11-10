@@ -83,6 +83,52 @@ class PackagingTests(unittest.TestCase):
         self.assertTrue(any("sha256" in p for p in packaging.formula_problems(broken)))
 
 
+
+class ChangelogReferenceTests(unittest.TestCase):
+    LOG = "## [Unreleased]\n\n## [0.3.0] - 2026-11-05\n\n- Notes.\n\n## [0.1.0]\n\n- History.\n"
+    HISTORY = "[0.1.0]: https://github.com/KiidxAtlas/dial/commit/198734a\n"
+
+    def test_missing_and_stale_links_are_repaired_without_rewriting_history(self):
+        for refs in ("", self.HISTORY,
+                     self.HISTORY + "[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.2.0...HEAD\n"):
+            with self.subTest(refs=refs):
+                source = self.LOG + refs
+                self.assertTrue(packaging.changelog_problems(source))
+                repaired = packaging.update_changelog_references(source)
+                self.assertEqual(packaging.changelog_problems(repaired), [])
+                self.assertIn("[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.0...HEAD", repaired)
+                self.assertIn("[0.3.0]: https://github.com/KiidxAtlas/dial/tree/v0.3.0", repaired)
+                if refs:
+                    self.assertIn(self.HISTORY, repaired)
+                self.assertEqual(packaging.update_changelog_references(repaired), repaired)
+
+    def test_ambiguous_or_malformed_changelogs_fail_closed(self):
+        valid = packaging.update_changelog_references(self.LOG + self.HISTORY)
+        for source in ("", "## [Unreleased]\n", "## [0.3.0]\nNotes.\n",
+                       self.LOG.replace("[0.3.0]", "[not-a-version]"),
+                       self.LOG + "## [0.3.0]\nDuplicate.\n",
+                       valid + "[0.3.0]: https://example.com/duplicate\n",
+                       valid + "[unreleased]: https://example.com/duplicate\n",
+                       valid.replace("/tree/v0.3.0", "/tree/v0.2.0"),
+                       valid.replace("/commit/198734a", "/commit/not-a-revision"),
+                       valid.replace("[0.3.0]: https://github.com/KiidxAtlas/dial/tree/v0.3.0", "[0.3.0]:")):
+            with self.subTest(source=source):
+                self.assertTrue(packaging.changelog_problems(source))
+                with self.assertRaises(ValueError):
+                    packaging.update_changelog_references(source)
+
+    def test_packaging_check_includes_reference_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Formula").mkdir()
+            (root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.3.0"\n')
+            (root / "flake.nix").write_text(GOOD_FLAKE)
+            (root / "Formula/dial.rb").write_text(GOOD_FORMULA)
+            (root / "CHANGELOG.md").write_text(self.LOG)
+            _, problems = packaging.check(root)
+            self.assertTrue(problems)
+            self.assertTrue(all("CHANGELOG.md" in p for p in problems))
+
 class ReleaseBuildIdentityTests(unittest.TestCase):
     def test_release_build_requires_an_explicit_revision_without_git_metadata(self):
         source = Path(__file__).resolve().parent.parent / "crates/dial-build-info/build.rs"
@@ -204,6 +250,38 @@ class AurUpdateTests(unittest.TestCase):
             self.updater.update_pkgbuild(self.pkgbuild, "0.4.0",
                                          {"dial-v0.4.0-x86_64-unknown-linux-gnu.tar.gz": "1" * 64})
 
+
+
+class SourceIgnoreTests(unittest.TestCase):
+    def test_source_inputs_remain_visible_but_local_outputs_stay_ignored(self):
+        root = Path(__file__).resolve().parent.parent
+        sources = [
+            "benchmarks/README.md",
+            "examples/benchmarks/README.md",
+            "examples/benchmarks/new-suite.toml",
+            "examples/benchmarks/test_new_suite.py",
+            "examples/benchmarks/new-fixture/input.json",
+        ]
+        outputs = [
+            "benchmarks/private-trial/journal.jsonl",
+            "target/debug/dial",
+            "scratch/report.json",
+            "examples/benchmarks/__pycache__/grader.pyc",
+            "examples/benchmarks/new-fixture/__pycache__/grader.pyc",
+            "examples/benchmarks/.DS_Store",
+        ]
+        with tempfile.TemporaryDirectory(prefix="dial-source-ignore-") as directory:
+            fixture = Path(directory)
+            (fixture / ".gitignore").write_bytes((root / ".gitignore").read_bytes())
+            subprocess.run(["git", "init", "--quiet", str(fixture)], check=True,
+                           capture_output=True)
+            result = subprocess.run(
+                ["git", "-c", "core.excludesFile=", "check-ignore", "--no-index", "--stdin"],
+                cwd=fixture, input="\n".join(sources + outputs) + "\n",
+                capture_output=True, text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(result.stdout.splitlines()), set(outputs))
 
 
 class ArtifactFormatTests(unittest.TestCase):

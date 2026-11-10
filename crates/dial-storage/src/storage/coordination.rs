@@ -202,14 +202,12 @@ impl Participant {
         Ok(letter)
     }
 
-    /// Letters this instance sent that are still queued in `to`'s inbox: its model has not
-    /// received them yet. Empty once `to` is gone.
+    /// Letters this instance sent that are still queued in `to`'s inbox. Absence means
+    /// collection, not confirmed model reading; an unavailable recipient is an error.
     pub fn undelivered(&self, to: &str) -> Result<Vec<Letter>> {
         ensure!(valid_id(to), "recipient must be an exact peer instance id");
         let _transaction = transaction(&self.dir)?;
-        if !is_live(&self.dir, to)? {
-            return Ok(Vec::new());
-        }
+        ensure!(is_live(&self.dir, to)?, "recipient {to} is no longer live");
         Ok(load(&self.dir, to)?
             .inbox
             .into_iter()

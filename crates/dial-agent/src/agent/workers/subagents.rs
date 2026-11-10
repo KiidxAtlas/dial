@@ -142,6 +142,8 @@ pub fn toolset(spec: &AgentSpec, enabled: &[String], ext: &Registry) -> Vec<Stri
         .filter(|name| {
             let probe = if *name == "git" {
                 json!({"action": "status"})
+            } else if let Some(probe) = crate::tools::surface::facade::probe(name) {
+                probe
             } else {
                 json!({})
             };
@@ -157,6 +159,8 @@ pub fn toolset(spec: &AgentSpec, enabled: &[String], ext: &Registry) -> Vec<Stri
                                 | "git"
                                 | "ast_search"
                                 | "code_history"
+                                | "history"
+                                | "inspect"
                         ) || !crate::config::tools::integrations::INTEGRATION_TOOLS
                             .contains(name))))
         })
@@ -229,7 +233,7 @@ pub fn schema(config: &Config) -> Value {
         format!("{presets}\nCustom agents:{custom}")
     };
     let description = format!(
-        "Delegate independent work. tasks[] shares context; start returns live ids, wait collects results. Unspecified agents are read-only and use the main model; choose scout for bounded routine lookups, reviewer for audits, planner for open-ended analysis, worker for implementation. source_session attaches a selected session record to a read-only audit without granting private-directory access. Types:{types}{presets}"
+        "Delegate independent work: tasks[] shares context; start returns live ids, wait collects results. Default: read-only on main model. scout: routine lookup; reviewer: audit; planner: analysis; worker: implementation. source_session attaches a record to a read-only audit, never directory permission. Types:{types}{presets}"
     );
     let mut entry_properties = json!({
         "acceptance_checks":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1},"description":"Names of configured checks, not shell commands. A mutating worker's changes merge only when these pass."},
@@ -265,12 +269,16 @@ pub fn schema(config: &Config) -> Value {
         "required":["task","solution_space"],"additionalProperties":false});
     let mut properties = serde_json::Map::from_iter([
         (
+            "question".into(),
+            json!({"type":"string","minLength":1,"maxLength":8000,"description":"question only: tool-free question over an immutable session snapshot."}),
+        ),
+        (
             "action".into(),
-            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close","verify"],"description":"run (default) waits for all tasks; start returns live ids; resume continues a stopped worker; status/wait/cancel manage jobs; create/push/peek/close manage pools; verify reruns a contract node's checks."}),
+            json!({"type":"string","enum":["run","start","resume","status","wait","cancel","create","push","peek","close","verify","question","question_status","question_wait","question_cancel"],"description":"run(default): await tasks; start: live ids; resume: continue worker; status/wait/cancel: jobs; create/push/peek/close: pools; verify: contract checks. question: tool-free snapshot question; question_* manages only side questions."}),
         ),
         (
             "id".into(),
-            json!({"type":"string","description":"task-N or pool-N; omit on status/wait for all jobs."}),
+            json!({"type":"string","description":"task-N/pool-N; omit on status/wait for all. side-N required for question_wait/question_cancel; optional for question_status."}),
         ),
         (
             "message".into(),
@@ -278,7 +286,7 @@ pub fn schema(config: &Config) -> Value {
         ),
         (
             "timeout".into(),
-            json!({"type":"integer","minimum":0,"maximum":120,"description":"wait only: seconds to block (default 30)."}),
+            json!({"type":"integer","minimum":0,"maximum":120,"description":"wait seconds(default 30,max 120); question_wait(default 5,max 30) stops early for input without cancelling."}),
         ),
         (
             "task".into(),
@@ -830,8 +838,11 @@ impl Job<'_> {
                 self.acceptance_checks.join(", ")
             ));
         }
-        if tools.iter().any(|name| name == "codebase_memory") {
-            out.push_str("Use saved codebase context to locate the affected area without rediscovering the whole repository. Reuse current source evidence; inspect only missing or stale context. Use codebase_memory to recall; do not save findings with remember: the parent records reusable findings after it integrates your result, so report them in your answer instead.\n");
+        if tools
+            .iter()
+            .any(|name| name == "codebase_memory" || name == "memory")
+        {
+            out.push_str("Use saved codebase context, when offered (`codebase_memory`, or `memory` with store=codebase), to locate the affected area without rediscovering the whole repository. Reuse current source evidence; inspect only missing or stale context. Recall only; do not save findings with remember: the parent records reusable findings after it integrates your result, so report them in your answer instead.\n");
             out.push_str("Before proposing or making nontrivial changes, identify the owning module, relevant architecture documents, and existing helpers or analogous implementations to reuse. Cite source locations; justify any new abstraction. Review changes for duplicated logic and boundary violations. Distinguish documented intent from observed code and surface conflicts. Keep investigation task-local.\n");
         }
         out.push_str(&format!("Tools available: {}.\n", tools.join(", ")));

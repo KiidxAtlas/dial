@@ -891,6 +891,55 @@ fn strict_required_subset_cannot_discharge_an_unrelated_failed_check() {
 }
 
 #[test]
+fn failed_check_blocks_completion_until_rerun_when_no_automatic_pass_will_recheck_it() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    assert!(!config.verification.automatic_checks);
+    let mut agent = hermetic_agent(&config, root.path());
+    let failing = verify::verification::FocusedCheck {
+        name: "acceptance: correctness".into(),
+        command: "grep -q fixed state || { echo assertion failed; exit 1; }".into(),
+        timeout_secs: 5,
+    };
+    let weaker = verify::verification::FocusedCheck {
+        name: "acceptance: structure".into(),
+        command: "true".into(),
+        timeout_secs: 5,
+    };
+    agent.step_checks.mutations += 1;
+    agent.run_checks(std::slice::from_ref(&failing), &mut NullUi);
+    // A later effect and a passing check under another name do not discharge the failure.
+    agent.step_checks.mutations += 1;
+    agent.run_checks(std::slice::from_ref(&weaker), &mut NullUi);
+    agent.hermetic = false;
+    let refusal = agent.completion_blockers().unwrap_err();
+    assert!(refusal.contains("focused checks failed"), "{refusal}");
+    assert!(refusal.contains("acceptance: correctness"), "{refusal}");
+    std::fs::write(root.path().join("state"), "fixed").unwrap();
+    agent.run_checks(std::slice::from_ref(&failing), &mut NullUi);
+    assert!(agent.step_checks.failed_checks.is_empty());
+    assert!(agent.completion_blockers().is_ok());
+}
+
+#[test]
+fn automatic_pass_still_defers_a_failure_followed_by_new_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.verification.automatic_checks = true;
+    let mut agent = hermetic_agent(&config, root.path());
+    let failing = verify::verification::FocusedCheck {
+        name: "unit".into(),
+        command: "echo assertion failed; exit 1".into(),
+        timeout_secs: 5,
+    };
+    agent.run_checks(std::slice::from_ref(&failing), &mut NullUi);
+    agent.hermetic = false;
+    assert!(agent.completion_blockers().is_err());
+    agent.step_checks.mutations += 1;
+    assert!(agent.completion_blockers().is_ok());
+}
+
+#[test]
 fn finite_approval_choices_are_exact_consumed_and_never_reusable() {
     let root = tempfile::tempdir().unwrap();
     let config = Config::default();

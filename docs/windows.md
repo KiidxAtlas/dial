@@ -106,6 +106,22 @@ Windows shell commands are PowerShell source executed by Windows PowerShell; POS
 
 Python environment discovery uses Windows layouts: virtualenv packages come from `<venv>/Lib/site-packages`, while the trusted base interpreter comes from an absolute `executable`/`base-executable` or `home` in `pyvenv.cfg`, not the `Scripts/python.exe` redirector. Conda uses `<prefix>/python.exe`. Base interpreters and conda installations must still resolve outside the workspace and pass the normal interpreter preflight; environment discovery does not relax those checks.
 
+## Diagnostics and foreground monitoring
+
+`read` supports `sys://procs`, `sys://procs/<pid>` and `sys://ports` through native process
+snapshots and socket tables. Command line and working directory visibility depend on process
+access rights; elevated and other users' processes may reveal only their image name. Open files
+are not listed on Windows. Optional changed-line coverage supports Python and Node checks with
+PowerShell or a configured Bash-compatible shell.
+
+`dial run` captures merged stdout/stderr through a bounded Job Object pipe relay with inherited
+stdin and a two-second descendant drain window. It does not provide PTY/color semantics on
+Windows. See [application monitoring](application-monitoring.md). SSH URL reads/writes to Windows
+hosts without a POSIX shell use SFTP; see [SSH](ssh.md) for partial-write semantics.
+
+These parity ports have macOS unit-test and Windows cross-compilation coverage; native Windows
+runtime verification is still pending. They do not change the sandbox's security guarantees.
+
 ## File edits and checkpoints
 
 An edit refused with `write to "…" blocked by the harness` and Windows error 24

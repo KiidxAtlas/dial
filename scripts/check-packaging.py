@@ -5,6 +5,7 @@
 - `Formula/dial.rb` is release-fed: it may lag unreleased source, so its version is not compared
   with Cargo. It must still be self-consistent: every archive URL is versioned by `#{version}`
   and each URL is followed by a sha256 line.
+- `CHANGELOG.md` release headings must have unique references; Unreleased compares the latest release to HEAD.
 
 Exit status is non-zero and each problem is printed when a check fails.
 """
@@ -24,6 +25,66 @@ FLAKE_LITERAL = re.compile(r'^\s*version\s*=\s*"[^"]*"\s*;', re.MULTILINE)
 FORMULA_VERSION = re.compile(r'^  version "([^"]+)"$', re.MULTILINE)
 FORMULA_URL = re.compile(r'^\s*url "([^"]+)"$', re.MULTILINE)
 FORMULA_SHA = re.compile(r'^\s*sha256 (?::no_check|"[^"]*")$', re.MULTILINE)
+CHANGELOG_REPOSITORY = "https://github.com/KiidxAtlas/dial"
+CHANGELOG_VERSION = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+
+
+def changelog_metadata(text):
+    """Parse the release headings and their reference definitions, refusing ambiguity."""
+    headings = re.findall(r"^## \[([^\]\n]+)\](?: - \d{4}-\d{2}-\d{2})?[ \t]*$", text, re.M)
+    if (not headings or headings[0] != "Unreleased" or len(headings) < 2
+            or len(headings) != len(set(headings))
+            or any(not re.fullmatch(CHANGELOG_VERSION, v) for v in headings[1:])
+            or len(re.findall(r"^## ", text, re.M)) != len(headings)):
+        raise ValueError("CHANGELOG.md needs one leading [Unreleased] and unique stable release headings")
+    refs = {}
+    for match in re.finditer(r"^\[([^\]\n]+)\]:[^\n]*$", text, re.M):
+        label = match.group(1)
+        if label.lower() == "unreleased" or re.fullmatch(CHANGELOG_VERSION, label):
+            key = "Unreleased" if label.lower() == "unreleased" else label
+            if key in refs:
+                raise ValueError(f"CHANGELOG.md has duplicate [{key}] references")
+            refs[key] = match
+    return headings[1:], refs
+
+
+def changelog_problems(text):
+    try:
+        versions, refs = changelog_metadata(text)
+    except ValueError as error:
+        return [str(error)]
+    problems = []
+    for label in ["Unreleased", *versions]:
+        if label not in refs:
+            problems.append(f"CHANGELOG.md is missing [{label}] reference")
+            continue
+        url = refs[label].group(0).split(":", 1)[1].strip()
+        if label == "Unreleased":
+            valid = url == f"{CHANGELOG_REPOSITORY}/compare/v{versions[0]}...HEAD"
+        else:
+            valid = (url == f"{CHANGELOG_REPOSITORY}/tree/v{label}"
+                     or re.fullmatch(re.escape(CHANGELOG_REPOSITORY) + r"/commit/[0-9a-f]{7,40}", url))
+        if not valid:
+            problems.append(f"CHANGELOG.md has a stale or invalid [{label}] reference")
+    return problems
+
+
+def update_changelog_references(text):
+    """Repair the moving comparison and absent release links, retaining historical commit links."""
+    versions, refs = changelog_metadata(text)
+    unreleased = f"[Unreleased]: {CHANGELOG_REPOSITORY}/compare/v{versions[0]}...HEAD"
+    if "Unreleased" in refs:
+        match = refs["Unreleased"]
+        text = text[:match.start()] + unreleased + text[match.end():]
+    else:
+        text = text.rstrip() + "\n\n" + unreleased + "\n"
+    missing = [f"[{v}]: {CHANGELOG_REPOSITORY}/tree/v{v}" for v in versions if v not in refs]
+    if missing:
+        text = text.rstrip() + "\n" + "\n".join(missing) + "\n"
+    problems = changelog_problems(text)
+    if problems:
+        raise ValueError("; ".join(problems))
+    return text
 
 
 def cargo_version(cargo_text):
@@ -60,6 +121,7 @@ def check(root=ROOT):
     cargo = cargo_version((root / "Cargo.toml").read_text(encoding="utf-8"))
     problems = flake_problems((root / "flake.nix").read_text(encoding="utf-8"))
     problems += formula_problems((root / "Formula" / "dial.rb").read_text(encoding="utf-8"))
+    problems += changelog_problems((root / "CHANGELOG.md").read_text(encoding="utf-8"))
     return cargo, problems
 
 

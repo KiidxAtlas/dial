@@ -14,6 +14,7 @@ pub(in crate::tools) mod search;
 pub(in crate::tools) mod select;
 pub(in crate::tools) mod suggest;
 pub(in crate::tools) mod summary;
+pub mod system;
 pub mod video;
 pub mod visual;
 pub(crate) mod walk;

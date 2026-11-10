@@ -735,6 +735,9 @@ pub struct ExperimentalOverrides {
     pub repro_first: Option<crate::config::types::ReproFirst>,
     /// 0..=16 isolated check runs.
     pub edit_bisection_runs: Option<u8>,
+    /// 0..=16 sampled mutants.
+    pub mutation_runs: Option<u8>,
+    pub changed_line_coverage: Option<bool>,
     /// 0..=10 non-improving edit rounds.
     pub outcome_gradient_rounds: Option<u8>,
     pub streaming_dispatch: Option<bool>,
@@ -746,6 +749,10 @@ impl ExperimentalOverrides {
         ensure!(
             self.edit_bisection_runs.is_none_or(|runs| runs <= 16),
             "configuration experimental.edit_bisection_runs must be 0..=16"
+        );
+        ensure!(
+            self.mutation_runs.is_none_or(|runs| runs <= 16),
+            "configuration experimental.mutation_runs must be 0..=16"
         );
         ensure!(
             self.outcome_gradient_rounds

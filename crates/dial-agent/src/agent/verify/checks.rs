@@ -436,6 +436,22 @@ impl<'a> Agent<'a> {
         let args = json!({"command":check.command,"timeout":check.timeout_secs});
         let inputs_before = self.capture_check_inputs(check);
         let revision_before = self.step_checks.revision();
+        let coverage = (self.config.experimental.changed_line_coverage
+            && self.step_checks.mutations > 0
+            && self.behavioral_check(&check.name)
+            && !self.step_checks.evidence.is_repro(&check.command))
+        .then(|| self.turn_versions_now())
+        .flatten()
+        .and_then(|versions| verify::coverage::prepare(self.workspace.root(), &versions))
+        .and_then(|probe| {
+            let wrapped = probe.wrap(&self.workspace, &check.command)?;
+            Some((probe, wrapped))
+        });
+        // Collectors are injected through the environment; evidence keeps the declared command.
+        let run_args = coverage.as_ref().map_or_else(
+            || args.clone(),
+            |(_, wrapped)| json!({"command":wrapped,"timeout":check.timeout_secs}),
+        );
         // Long generated commands (an interpreter path plus inline code) say nothing the check name does not.
         let title = if check.command.len() <= 80 {
             format!("Verify {}: {}", check.name, check.command)
@@ -508,9 +524,9 @@ impl<'a> Agent<'a> {
                         self.step_checks.note_repro_run();
                     }
                     // A check must finish to verify anything; it is never auto-backgrounded.
-                    self.run_foreground_tool("bash", &args, ui)
+                    self.run_foreground_tool("bash", &run_args, ui)
                         .unwrap_or_else(|| {
-                            tools::execute(&self.workspace, "bash", &args, check.timeout_secs)
+                            tools::execute(&self.workspace, "bash", &run_args, check.timeout_secs)
                         })
                 }
             }
@@ -519,7 +535,20 @@ impl<'a> Agent<'a> {
                 crate::agent::safety::approval::denied_check_output(&check.name, &denial)
             }
         };
-        self.settle_focused_check(check, inputs_before, revision_before, started, output, ui)
+        let coverage_line = coverage
+            .as_ref()
+            .and_then(|(probe, _)| probe.report(&check.name));
+        drop(coverage);
+        let mut output =
+            self.settle_focused_check(check, inputs_before, revision_before, started, output, ui);
+        if let Some(line) = coverage_line
+            && self.step_checks.evidence.latest_status(&check.command)
+                == Some(verify::verification::CheckStatus::Passed)
+        {
+            output.text.push('\n');
+            output.text.push_str(&line);
+        }
+        output
     }
 
     /// Bind only the native capture belonging to this result. Rendered text can be filtered,
@@ -1327,7 +1356,7 @@ impl<'a> Agent<'a> {
             ));
         }
         if !self.side_questions.running_ids().is_empty() {
-            return Err("cannot complete while side questions are running; use side_request wait or cancel and collect their results".into());
+            return Err("cannot complete while side questions are running; use `task` action=question_wait or question_cancel and collect their results".into());
         }
         if self.side_questions.has_undelivered() {
             return Err("cannot complete before completed side-question results have been delivered to the conversation".into());
@@ -1354,25 +1383,33 @@ impl<'a> Agent<'a> {
             return Err("cannot complete while live tasks are running; wait with `task wait` or continue independent work, then try again".into());
         }
         // Every effect generation counts: a shell or extension repair after a failure is new work that the
-        // outer verification pass rechecks, so only a failure with no newer effect is refused here.
+        // automatic post-turn verification pass reruns together with the retained failures. Only that pass
+        // may defer a failure; without it nothing reruns the check, so the failure blocks until it passes.
         let unchecked_effects = self.step_checks.mutations > self.step_checks.checked
             || self.step_checks.uncheckpointed_shell_commands
                 > self.step_checks.checked_shell_commands
             || self.step_checks.uncheckpointed_extension_calls
                 > self.step_checks.checked_extension_calls;
+        let rechecked_after_turn = self.config.verification.enabled
+            && self.config.verification.automatic_checks
+            && unchecked_effects;
         // Failures that say nothing about this turn's code (see `disclosed_failure`) are disclosed
         // with the accepted answer; any other current failure still refuses completion.
         let diagnosis = self.diagnosis_requested();
-        if !self.hermetic
-            && self.step_checks.failed
-            && (!self.config.verification.enabled || !unchecked_effects)
-            && self
+        if !self.hermetic && self.step_checks.failed && !rechecked_after_turn {
+            let blocking = self
                 .step_checks
                 .failed_checks
                 .iter()
-                .any(|check| self.disclosed_failure(check, diagnosis).is_none())
-        {
-            return Err("Cannot complete: focused checks failed and no new edits are awaiting a fresh check. Repair, rerun the failed check, or report a blocker.".into());
+                .filter(|check| self.disclosed_failure(check, diagnosis).is_none())
+                .map(|check| check.name.as_str())
+                .collect::<Vec<_>>();
+            if !blocking.is_empty() {
+                return Err(format!(
+                    "Cannot complete: focused checks failed and have not passed since: {}. A check registered under another name does not discharge them. Repair, rerun the failed check (or replace it under the same name), or report a blocker.",
+                    blocking.join(", ")
+                ));
+            }
         }
         if let Some(reason) = self.workflow_contracts.blocker() {
             return Err(reason);

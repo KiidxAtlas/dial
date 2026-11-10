@@ -842,6 +842,56 @@ fn store_bounds_snapshots_and_unions_seen() {
 }
 
 #[test]
+fn new_versions_keep_witnesses_only_for_unchanged_lines() {
+    let mut store = EditStore::default();
+    let path = Path::new("/w/a.txt");
+    store.record(path, "a\nb\nc\nd\n", &[(1, 3)]);
+    // Another writer inserts a first line and changes `b`; only `d` is displayed afterwards.
+    let after = "new\na\nB\nc\nd\n";
+    store.record(path, after, &[(5, 5)]);
+    assert_eq!(
+        store.witness_flags(path, after),
+        vec![false, true, false, true, true]
+    );
+    // A rewrite too different to map carries nothing.
+    let rewrite = "x\ny\nz\n";
+    store.record(path, rewrite, &[]);
+    assert_eq!(store.witness_flags(path, rewrite), vec![false; 3]);
+    // Notebook projections stay pinned to their raw revision.
+    let notebook = Path::new("/w/a.ipynb");
+    store.record_version(notebook, "x = 1\n", Some([1; 32]), &[(1, 1)]);
+    store.record_version(notebook, "x = 1\ny = 2\n", Some([2; 32]), &[]);
+    assert_eq!(
+        store.witness_flags_version(notebook, "x = 1\ny = 2\n", Some([2; 32])),
+        vec![false, false]
+    );
+}
+
+#[test]
+fn edit_after_another_writer_keeps_lines_seen_before_the_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let path = ws.resolve("a.txt").unwrap();
+    fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+    ws.store()
+        .record(&path, "one\ntwo\nthree\nfour\n", &[(1, 4)]);
+    // Another session changes line 4; the model reads only that line of the new version.
+    let changed = "one\ntwo\nthree\nFOUR\n";
+    fs::write(&path, changed).unwrap();
+    let tag = ws.store().record(&path, changed, &[(4, 4)]);
+    edit(&ws, &format!("[a.txt#{tag}]\nPUT 2.=2:\n+TWO\n")).unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "one\nTWO\nthree\nFOUR\n"
+    );
+    // A line changed by the other writer and never displayed still needs a read.
+    fs::write(&path, "one\nTWO\nTHREE\nFOUR\n").unwrap();
+    let tag = ws.store().record(&path, "one\nTWO\nTHREE\nFOUR\n", &[]);
+    let error = edit(&ws, &format!("[a.txt#{tag}]\nPUT 3.=3:\n+3\n")).unwrap_err();
+    assert!(error.contains("have not been shown by a read"), "{error}");
+}
+
+#[test]
 fn resume_rehydrates_witnesses_from_a_multi_path_read() {
     // Benchmark follow-up turns run in a new process: a `paths` read from the previous turn must
     // still count as read, or the first edit is refused with "no read of this file is recorded".

@@ -155,24 +155,24 @@ pub(super) fn panel_rows_window(
             Span::styled(label, style),
         ]));
     }
-    // Most important first; whole pieces drop at narrow widths instead of being cut mid-word.
-    let mut hints = vec!["Enter confirm".to_owned(), "Esc cancel".to_owned()];
-    if lines > body_limit {
-        hints.push(format!(
-            "PgUp/PgDn details {}-{} of {}",
+    // Shared footer vocabulary: the action first, the way out last; the shared fitter drops whole
+    // hints from the middle at narrow widths, so Esc is never the hint that disappears.
+    let details = (lines > body_limit).then(|| {
+        format!(
+            "details {}-{} of {}",
             offset + 1,
             (offset + body_limit).min(lines),
             lines
-        ));
+        )
+    });
+    let mut hints = vec![("Enter", "confirm")];
+    if let Some(details) = &details {
+        hints.push(("PgUp/PgDn", details.as_str()));
     }
-    let dot = format!(" {} ", theme.sym(Sym::Dot));
-    while hints.len() > 1 && text::width(&hints.join(&dot)) > inner {
-        hints.pop();
-    }
-    rows.push(pad_row(vec![Span::styled(
-        hints.join(&dot),
-        theme.fg(Tok::Dim),
-    )]));
+    hints.push(("Esc", "cancel"));
+    rows.push(pad_row(
+        crate::ui::chrome::hint_line(theme, &hints, inner).spans,
+    ));
     rows.push(Line::from(Span::styled(
         format!(
             "{}{}{}",

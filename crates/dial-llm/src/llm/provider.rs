@@ -414,6 +414,12 @@ impl Backend {
         &self.kind
     }
 
+    /// Inspect the wire protocol requests will use, without dispatching one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_protocol(&self) -> Option<ApiProtocol> {
+        self.protocol
+    }
+
     /// Control only the pending retry wait for this backend, never an active inference call.
     pub fn retry_control(&self) -> RetryControl {
         self.retry_control.clone()
@@ -2025,6 +2031,11 @@ impl Backend {
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.as_str()))
             }));
+            // OpenCode routes by conversation and rejects Go requests without a session header.
+            if llm::opencode::is_endpoint(url) {
+                let opencode = llm::opencode::headers(self.session_id.as_deref(), &headers);
+                headers.extend(opencode);
+            }
             // Strict local templates accept only one initial system message. Decide the layout
             // once from the resolved route, without rewriting saved history; the reply reports it.
             let wire_form = if matches!(wire, Wire::ChatCompletions)

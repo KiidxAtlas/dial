@@ -178,7 +178,7 @@ fn probe(pid: i32) -> Option<(u64, bool)> {
 }
 
 #[cfg(windows)]
-mod win {
+pub(in crate::platform) mod win {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::{
         Foundation::{FILETIME, HANDLE},
@@ -189,11 +189,11 @@ mod win {
     };
     // STILL_ACTIVE from <minwinbase.h>: the code a running process reports.
     const STILL_ACTIVE: u32 = 259;
-    pub(super) const QUERY_ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION;
+    pub(in crate::platform) const QUERY_ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION;
     pub(super) const KILL_ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE;
 
     /// Opens `pid` with `access`. The handle pins the process object for its whole lifetime.
-    pub(super) fn open(pid: i32, access: u32) -> Option<OwnedHandle> {
+    pub(in crate::platform) fn open(pid: i32, access: u32) -> Option<OwnedHandle> {
         // SAFETY: OpenProcess takes scalar arguments; null is handled before ownership transfer.
         let raw = unsafe { OpenProcess(access, 0, pid as u32) };
         // SAFETY: a non-null OpenProcess result is a fresh handle uniquely owned here.
@@ -201,7 +201,7 @@ mod win {
     }
 
     /// (start time, exited) read from an already-open handle, so identity and kill share one object.
-    pub(super) fn times(handle: &OwnedHandle) -> Option<(u64, bool)> {
+    pub(in crate::platform) fn times(handle: &OwnedHandle) -> Option<(u64, bool)> {
         let raw = handle.as_raw_handle() as HANDLE;
         let zero = FILETIME {
             dwLowDateTime: 0,

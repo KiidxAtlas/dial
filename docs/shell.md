@@ -8,6 +8,13 @@ Commands are placed in a dedicated process group. The tool combines stdout and s
 
 The sandbox may deny network access or writes outside the project. Use the command's `$TMPDIR` for temporary files. Do not retry a denied command unchanged; adapt it to the sandbox or explain the limitation.
 
+`trace: true` (Linux with `strace` installed) runs the command under `strace -f` and appends a
+summary: programs executed, abnormal exits and fatal signals, paths looked up but not found,
+permission failures, network connects and binds, and files written and read. Library, locale and
+interpreter search probes are filtered out, and the summary reports how many were. The raw trace
+stays under `.tmp/` for `grep`. Tracing cannot be combined with `background`, `pty` or `session`.
+On other platforms, or without `strace`, the call is refused and nothing runs.
+
 System Bash enriches missing-command diagnostics for known Python, pip and Node alternatives using
 builtin lookup in the failing command's current PATH/cwd; it never runs a candidate to probe it.
 Availability is not compatibility. Existing operator missing-command handlers and ERR traps are
@@ -62,7 +69,7 @@ Limits of the built-in shell:
 - `sed` supports only the `s/RE/REPLACEMENT/[g]` substitution, with `-n` and `-e`. Other sed commands need the system shell.
 - Patterns in `grep` and `sed` use Rust regular-expression syntax, not the full POSIX basic/extended grammar.
 - `xargs` runs external programs only. A name that exists only as a shell builtin is not found and exits 127.
-- On Windows, bash, PowerShell, and the built-in shell all run only with `sandbox.mode = "off"` (the default), because native isolation is unavailable there.
+- On Windows, shell commands support `sandbox.mode = "dev"` through Low integrity or run unconfined with `"off"` (the default). General reads and network access cannot be confined; `"strict"` is refused. See [Windows security](windows.md#security).
 
 ## Per-session Cargo build output
 
@@ -81,7 +88,7 @@ Commands Dial runs (`bash`, the built-in shell and background shell jobs) set `C
 
 Differences and limits:
 
-- Timeout and interrupt abort the script at its next `await` (every external command, pipe or `sleep`) and attempt to kill the process groups of external commands the run started (Unix; found with `ps` and a per-run `DIAL_INPROCESS_RUN` marker in the command environment). Discovery and cleanup share a 500 ms deadline and 1 MiB output budget, in addition to bounded executor kill/reap overhead and the shell's separate 500 ms shutdown grace. A command that calls `setsid` or clears its environment escapes the kill. Discovery/cleanup failure is reported as uncertain effects rather than proof that all processes stopped; repeated termination and Drop reuse the settled cleanup result. External cleanup is unsupported on Windows and is reported as uncertain there.
+- Timeout and interrupt abort the script at its next `await` (every external command, pipe or `sleep`) and attempt to kill the external commands the run started, found by a per-run `DIAL_INPROCESS_RUN` marker in the command environment. Unix kills the marked process groups (found with `ps`); Windows terminates every process started during the run whose environment block holds the marker (read through a Toolhelp snapshot and the process parameters), which also reaches descendants that inherited it. Discovery and cleanup share a 500 ms deadline and 1 MiB output budget, in addition to bounded executor kill/reap overhead and the shell's separate 500 ms shutdown grace. A command that calls `setsid` or clears its environment escapes the kill. Discovery/cleanup failure is reported as uncertain effects rather than proof that all processes stopped; repeated termination and Drop reuse the settled cleanup result.
 - A builtin loop that never yields (for example `while :; do :; done`) cannot be interrupted from outside its thread. Dial reports the timeout, abandons the thread and notes it in the output with unknown effects; the thread keeps using CPU until Dial exits. Shell-thread completion and external-process cleanup are independent facts. Use `system` or `embedded` when a hard kill matters.
 - In-process execution has no automatic background handoff. Explicit `async`/`background` requests use the child-process built-in shell instead, where the automatic-background threshold applies regardless of `timeout` (a shorter timeout still kills the command). Named `session`s also use the child-process shell, subject to their restrictions below.
 

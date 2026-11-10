@@ -37,9 +37,35 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - Errored tool calls record a fixed error class from typed result fields, shown per tool in `dial stats` and as `by_tool[].error_classes`. A failing `verify` check (`check_failed`) is now distinct from a `verify` call that could not run (`verify_refused`).
 - `examples/benchmarks/release-slice.toml` and `release_slice.py`: a fixed 27-case, three-repetition release slice with hosted and local profiles. The script validates the plan and prints the commands; it runs nothing. No release-slice run has been recorded.
 - `docs/plans/surface-inventory-2026-11.md` lists experimental flags and optional modes with the evidence available for each. Nothing was removed.
+- Context hygiene replaces new large exact repeats of successful read-only results with stable archive pointers before context pressure, without extra model calls or changing the earlier cached prefix. The original results remain in the session archive; errors, mutations and preserved-thinking replay are protected.
+- `read` accepts `sys://procs`, `sys://procs/<pid>`, `sys://ports` and `sys://host`: live, read-only process, listening-socket and host/toolchain state (`/proc` on Linux, `ps`/`lsof` on macOS; command lines redacted). The session environment section now includes a compact machine and installed-tool inventory.
+- `bash` takes an optional `trace: true` (Linux with `strace`) that appends a summary of executed programs, failed exits, missing paths, permission failures, network activity and files written. It is listed as an additive property, so recorded sessions still resume.
+- Eval helpers `dial.search` and `dial.compare` with `dial.gen` generators (JavaScript and Python) do property and differential counterexample search, trying edge cases first and shrinking failures.
+- `experimental.mutation_runs` (default 0) reports single-line mutants of the turn's changed lines that a passing behavioral check fails to detect. `experimental.changed_line_coverage` (default off) names changed Python/JavaScript lines a passing behavioral check never executed. Both are evidence only.
+- Windows parity ports: changed-line coverage uses the configured shell's environment syntax; in-process shell stops attempt token-checked external-process cleanup; `sys://` process/socket views use Toolhelp and IP Helper; `dial run` gains a bounded Job Object pipe relay; SSH URL transfers use SFTP on Windows hosts without a POSIX shell. Native Windows runtime verification is pending; strict/read/network sandbox parity remains unavailable and fails closed.
+- Computer runs gain `win.findOne(query)` (JavaScript), which returns the first matching element or throws naming the query.
+- `peers list` exposes `sent[].status` as `delivered`, `collected` or `unavailable`. Inbox collection does not establish model reading or acknowledgment; legacy `read` is false while queued and null otherwise. The side pane retains these distinctions, including unknown legacy snapshots.
+- Shell and browser results add short advisory notices for three misread command shapes: exit 1 from a final `grep`/`rg` filter that matched nothing (`filter_exit`), a bare `&` job in `bash` that is stopped when the call returns (`async_job`), and a browser request with no listener (`nothing_listening`). Statuses and barriers are unchanged.
+- A failed `eval` cell that tried to start a program (Python `subprocess`/`os.fork`, Node `child_process`) now carries an `eval_no_subprocess` notice: kernels block process creation by design, so the command should run with `bash`. Previously the model saw only a raw `PermissionError: [Errno 1] Operation not permitted` traceback. The block, status and retry barriers are unchanged.
+- Tool error statistics classify shell exit 127 as `command_not_found` and 126 as `not_executable` instead of a generic `nonzero_exit`.
+- CI checks unused workspace dependencies with pinned, checksum-verified cargo-machete; `make lint-deps` runs the same audit locally, and preflight reports when the tool is unavailable.
+- Public API compatibility review and contract tests retain template partial registration and settings-publication aliases. `learn::download` is deprecated in favor of `llm::download`, with the old path still available and no removal release scheduled.
+- Bundled OpenAI-compatible providers: Chutes, Featherless, Friendli, GitHub Models, Hyperbolic, Nebius Token Factory, OVHcloud AI Endpoints, Portkey, Requesty, Scaleway and Upstage; each needs only its API key.
+- Bundled Perplexity Agent API (`perplexity-agent`, Responses protocol) and StepFun China (`stepfun-cn`) providers.
+- OpenCode Zen and Go route each bundled model over its upstream wire (Anthropic Messages, Responses, Gemini or chat completions) instead of sending everything as chat completions.
 
 ### Changed
 
+- Release-bound main CI builds unsigned platform archives alongside tests; tags promote the exact successful CI artifacts with commit/version/public-key checks and a safe rebuild fallback. Release caches are reusable from main, PR container builds no longer export duplicate caches, and release containers reuse the signed Linux binary instead of compiling again. Downstream failures report that binaries are already published; website token/endpoint errors remain visible with repair guidance. An optional native Intel macOS runner label can be configured without changing test coverage.
+- Intel macOS main CI jobs share a lock-keyed pip wheel cache, avoiding repeated `cryptography` source builds after a successful cache save while retaining hash-verified installation. PRs, candidate packaging and tag fallback builds do not create additional pip caches.
+- The `x86_64-apple-darwin` release candidate is cross-compiled on an Apple Silicon runner and smoke-tested under Rosetta 2, removing the roughly 24-minute Intel build from the release critical path. Native Intel testing in CI is unchanged.
+- Dependabot groups minor and patch updates into one PR per ecosystem, so a weekly update wave no longer starts a separate CI run (each holding three macOS jobs) per dependency. Major and security updates still open individual PRs.
+
+- A failed `bg` call that named a job (for example a `wait` on a job that did not exist yet) is no longer withheld by the retry barrier after that job actually changes: a successful `start` or `kill` of the same name, or `kill` with `all`, releases it. Failures naming other jobs, failed starts and observations do not release anything.
+- Within one parent or worker batch, a failed `bg start` skips later `wait`, `output`, `input`, `close_stdin` and `resize` actions on the same job name as unexecuted prerequisites. `kill`, `list`, other jobs and a name that is already running are unaffected.
+- `tool.batch` in parent and worker code cells groups consecutive read-only entries and runs each group in parallel. A serial entry (a write or an approval-gated call) no longer makes the whole batch serial; it only separates the read groups around it. Entry order, per-entry approval and result shapes are unchanged.
+- The compact `bg` schema now states that `persist` must be passed on every call and excludes PTY, stdin and `ready`, and that a `ready` host needs a port and both conditions must hold. The hosted core offer stays within its byte budget.
+- `read` with `paths` adds structured per-target results (`status` of `read`, `failed` or `omitted`, with counts and `complete`), ends its text with a summary line when any target was not read, and fails only when no target was read. It previously reported success even when every target failed.
 - New defaults: `approval = "auto"` (no prompts; explicit deny rules in `/permissions` still win) and
   `sandbox.mode = "off"` (shell commands run unconfined). Bash, PowerShell, `eval`, the browser and
   PDF parsing therefore work out of the box on Windows. Set
@@ -62,6 +88,11 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - README, quickstart, comparison, security, Docker and packaging descriptions now state that the OS sandbox is optional and off by default, matching the default above.
 - `CONTRIBUTING.md` asks for small, single-purpose commits, mechanical changes in their own commit, and named evidence for agent-loop default changes.
 - Long paragraphs in `docs/agent-loop.md` and `docs/improvement.md` are split at sentence boundaries; no wording changed.
+- Consolidated the model-facing tool catalog: `inspect` readers, `history` sessions/code-change search, `dap` adapters, `bg` watches, `evidence` research/experiments, `memory store=codebase`, and `git forge=github|gitlab`. Web fetching is `read fetch=true`; structural search is `grep ast=true`. Tool loading, skill management, investigation rewind, side questions and directory requests now use `tool_search`, `skill`, `checkpoint`, `task` and `ask`; MCP prompt/resource access shares one context tool per server. `session_search` stays its own tool because compaction recovery names it. Prompts, discovery, shell-recovery guidance, outside-workspace refusals and the CI-polling hint use the successors; with questions disabled (`ask.enabled = false`, print runs) `ask` stays out of the first-request offer and its directory action loads through `tool_search`. Each call retains its original validation, bounds and approval owner; member names remain configuration and permission identities. Historical calls project without replay. See [tools.md](docs/tools.md#tool-roster-safety-and-context-sources).
+- Work-state and recovery presentation now prioritizes unfinished obligations and verification gaps over optional review; no-edit checks remain visible, Attention opens the selected blocked step, and recorded references no longer use passing-check styling. Retry guidance preserves committed edits and scopes continuation to unfinished operations, never the whole turn.
+- Steering preserves every message in a batched redirect, in order. Composer acknowledgments distinguish controller receipt from recording the current instruction; neither claims provider receipt, cancellation or model compliance.
+- Shared footer fitting preserves the exit hint ahead of long status text. Process output, recovery panels and the side pane use the shared fitter; extension confirmations advertise confirmation/cancellation rather than browse actions.
+- Setup, Providers and Models distinguish configuration, availability metadata, text diagnostics and synthetic tool compatibility. Unknown/cached state is neutral; changed endpoints invalidate stale metadata success.
 
 ### Fixed
 
@@ -79,6 +110,24 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - `grep` and `glob` with several `;`-separated scopes no longer fail when one scope does not exist. The existing scopes are searched and each missing one is named in a `[scope not searched]` row with its "Did you mean" suggestions. A call whose scopes are all missing still fails. In local transcripts this was 17 of 24 failed `grep` calls; the effect on model outcomes is unmeasured.
 - `grep` on an `artifact://` or `ssh://` text now honours `context` (up to 10 lines) in the same `path-line-text` row format as a file search, instead of refusing the call.
 - `bg` `start` with `lifetime` but without `persist=true` now starts the session job and appends a note that the lifetime is ignored, instead of failing with "lifetime requires explicit persist=true". The job runs until it exits, is killed or the session ends, as any session job does. In local transcripts the refusal was 10 of 19 failed `bg` calls, each followed by waits on a job that never started. Other actions still refuse a `lifetime` without `persist=true`.
+- Maintenance: removed an unused direct SHA-1 dependency and unreferenced screenshots/GIF recipe; fixed ignore rules that hid new benchmark sources, added regression coverage, and refreshed entrypoint and Windows containment guidance. No model-outcome change is claimed.
+- Release preparation now repairs Unreleased comparison and missing version-reference links without rewriting historical commit links; packaging checks reject reference drift, and malformed or duplicate references refuse preparation before source writes.
+- Computer run parameters and examples now distinguish executable `code` from invoked `fn` source and document the run scope. Calling an element helper such as `click()` on the array returned by `find()`/`children()` now fails with the fix (select one element) instead of `input.click is not a function`, and `win.bounds()` explains that window bounds is a property. Nothing is sent in either case; approval, read-only and retry guards are unchanged.
+- A failed browser operation no longer dumps other tabs' unrelated history (for example a stale dev server's HMR errors and requests blocked between operations) into its error; it reports the cause from this operation, the acted-on tab's recent events and a count of quiet tabs.
+- Starting a background job with `bg` now releases retry barriers on failed calls with no file dependency, so a browse or request refused before the server listened can be retried once it is up. Failures tied to files, access grants or other named jobs keep their barriers.
+- A retry-barrier refusal is reported as a correctable repeat (`retry_barrier`) instead of a permission boundary that said not to retry, and it quotes at most 600 characters of the original error rather than repeating the whole diagnostic.
+- `grep` searches a pattern that is not valid Rust regex syntax (for example `foo(`) as literal text and says so, instead of failing. Explicit `literal: true` and valid regexes are unchanged; oversized regexes still fail.
+- `session_search` argument errors name the unknown argument and the accepted ones, and a missing query points to `query:""` for raw history.
+- Hashline edits no longer refuse lines the model already saw after a file changes elsewhere. When a read recorded a new version (for example after another session's edit), only the newly displayed rows counted, so an edit to an unchanged, earlier-read line asked for a reread. Unchanged witnessed lines now carry into the new version; changed and inserted lines, truncated rows and notebook raw revisions still require a read. In local sessions this was 4 of 42 unread-line refusals; the other 38 targeted lines never displayed or since changed.
+- OpenCode Go requests send the `x-opencode-session` header it requires; they were refused with `MissingSessionID` before.
+- A built-in provider's alternate key variables (for example `GITHUB_TOKEN` for GitHub Models, `SCW_SECRET_KEY` for Scaleway, `CMD_API_KEY` for Command Code) are read when the primary one is unset; only the first name was ever read before.
+- Ollama Cloud reads Ollama's documented `OLLAMA_API_KEY`, keeping `OLLAMA_CLOUD_API_KEY` as an alternate.
+- Providers keeps a rejected endpoint's own error (for example "Invalid endpoint URL") instead of reporting "Endpoint changed since the last metadata scan".
+- Turn reports stay quiet when the only news is current, passing checks; blocked obligations no longer repeat "(blocked)"; the compact summary no longer lists "outstanding obligations" alongside the open-task count.
+- Peer receipts keep an observed "Collected" state after the recipient ends; "Receipt unavailable" is shown neutrally rather than as a warning.
+- The Jobs output footer uses the ASCII separator under the ASCII glyph preset.
+- A failed check no longer stops blocking completion just because the model edited something or ran another check afterwards when `verification.automatic_checks` is off (the default), since nothing would rerun it. It now blocks until it is rerun and passes. Registering a weaker acceptance helper under a new name no longer discharges it, and the refusal names the failing checks.
+
 
 ## [0.3.3] - 2026-11-09
 
@@ -2551,7 +2600,17 @@ Historical source-version milestone: no matching local release tag is available.
 - Live steering prioritized and repeated agent work guarded (`ac4fb95`).
 - Clippy autofixes applied (`21c514c`).
 
-[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/KiidxAtlas/dial/tree/v0.3.4
+[0.3.3]: https://github.com/KiidxAtlas/dial/tree/v0.3.3
+[0.3.2]: https://github.com/KiidxAtlas/dial/tree/v0.3.2
+[0.3.1]: https://github.com/KiidxAtlas/dial/tree/v0.3.1
+[0.3.0]: https://github.com/KiidxAtlas/dial/tree/v0.3.0
+[0.2.11]: https://github.com/KiidxAtlas/dial/tree/v0.2.11
+[0.2.10]: https://github.com/KiidxAtlas/dial/tree/v0.2.10
+[0.2.9]: https://github.com/KiidxAtlas/dial/tree/v0.2.9
+[0.2.8]: https://github.com/KiidxAtlas/dial/tree/v0.2.8
+[0.2.7]: https://github.com/KiidxAtlas/dial/tree/v0.2.7
 [0.2.6]: https://github.com/KiidxAtlas/dial/tree/v0.2.6
 [0.2.5]: https://github.com/KiidxAtlas/dial/tree/v0.2.5
 [0.2.4]: https://github.com/KiidxAtlas/dial/tree/v0.2.4

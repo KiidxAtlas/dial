@@ -381,23 +381,37 @@ impl JobsOverlay {
                     .map(|(_, c)| usize::from(c));
                 out.push(screen_row(&content, cursor, w, theme.fg(Tok::Text)));
             }
-            let segments = [
-                if interactive {
-                    "Ctrl+] detach (keeps running)"
-                } else {
-                    "Esc back"
-                }
-                .to_owned(),
-                if interactive {
-                    "Ctrl+C signals this terminal only".to_owned()
-                } else if terminal {
-                    "process exited; read-only".to_owned()
-                } else {
-                    "read-only; ↑↓/PgUp/PgDn scroll; End follow".to_owned()
-                },
-            ];
+            // State words lead, muted; key hints follow with the way out last, so narrow footers
+            // drop the middle hints, never the exit.
+            let arrows = super::settings::arrows(theme, super::settings::Axis::Vertical);
+            let (lead, segments) = if interactive {
+                (
+                    String::new(),
+                    vec![
+                        "Ctrl+C signals this terminal only".to_owned(),
+                        "Ctrl+] detach (keeps running)".to_owned(),
+                    ],
+                )
+            } else if terminal {
+                (
+                    format!(
+                        "process exited{}read-only",
+                        crate::ui::chrome::separator(theme)
+                    ),
+                    vec![hint(ctx.keys, Action::SelectCancel, "back")],
+                )
+            } else {
+                (
+                    "read-only".to_owned(),
+                    vec![
+                        format!("{arrows}/PgUp/PgDn scroll"),
+                        "End follow".to_owned(),
+                        hint(ctx.keys, Action::SelectCancel, "back"),
+                    ],
+                )
+            };
             out.truncate(h.saturating_sub(1));
-            out.push(hint_line(theme, &segments, w));
+            out.push(super::settings::hint_line_after(theme, &lead, &segments, w));
             return out;
         }
         if self.jobs.is_empty() {

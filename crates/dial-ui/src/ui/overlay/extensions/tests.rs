@@ -1,5 +1,34 @@
 use super::*;
 
+#[test]
+fn pending_confirmation_footer_describes_confirmation_not_browsing() {
+    use crate::ui::overlay::settings::testkit::{Rig, key, render, screen, status_preview};
+    use crossterm::event::KeyCode;
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    for width in [38, 60, 120] {
+        let mut overlay = ExtensionsOverlay::new();
+        overlay.browser.set_rows(
+            Tab::Mcp,
+            vec![row("fixture", Origin::Installed, State::Enabled)],
+        );
+        overlay.handle(&key(KeyCode::Char('x')), &rig.keys);
+        assert!(overlay.browser.confirm.is_some());
+        let shown = screen(&render(width, 30, |frame| overlay.draw(frame, &ctx)));
+        assert!(shown.contains("Esc cancel"), "width {width}: {shown}");
+        assert!(!shown.contains("Esc close"), "width {width}: {shown}");
+        assert!(!shown.contains("r refresh"), "width {width}: {shown}");
+        overlay.handle(&key(KeyCode::Esc), &rig.keys);
+        assert!(overlay.browser.confirm.is_none());
+        assert_eq!(overlay.browser.visible(Tab::Mcp).len(), 1);
+    }
+}
+
 fn row(id: &str, origin: Origin, state: State) -> Row {
     Row {
         id: id.into(),

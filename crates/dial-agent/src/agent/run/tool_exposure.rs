@@ -9,11 +9,23 @@ mod task_context;
 mod task_routing;
 pub(in crate::agent) use task_routing::ToolRouting;
 
+pub(in crate::agent) fn controller_name(name: &str) -> &str {
+    match name {
+        "tool_load" => "tool_search",
+        "skill_manage" => "skill",
+        "rewind" => "checkpoint",
+        "side_request" => "task",
+        "request_directory" => "ask",
+        _ => name,
+    }
+}
+
 impl<'a> Agent<'a> {
     /// Initial built-in schemas stay below this bound on lean and local model routes.
     const CORE_SCHEMA_BYTES: usize = 12 * 1024;
     /// Hosted routes ([`Self::hosted_route`]) have room for delegation and job control up front.
-    const HOSTED_CORE_SCHEMA_BYTES: usize = 24 * 1024;
+    /// Raised from 24 KiB when `bash.trace` left the core offer without headroom for `task`.
+    const HOSTED_CORE_SCHEMA_BYTES: usize = 25 * 1024;
     /// The stable first-request offer, in priority order: each tool joins while it fits the route's
     /// budget. `bg` is the only way to wait for or stop a command that became a background job.
     /// Basic workspace operations precede questions, which precede optional execution helpers.
@@ -21,7 +33,6 @@ impl<'a> Agent<'a> {
     /// when containment is available and a cell runtime resolves ([`Self::automatic_eval_ready`]).
     const CORE_TOOLS: &[&str] = &[
         "tool_search",
-        "tool_load",
         "finish",
         "read",
         "edit",
@@ -96,7 +107,7 @@ impl<'a> Agent<'a> {
 
     /// Minimal first-request offer: after the full set cannot fit the context window, on the small
     /// local tier, or after a local escalation (`local_profile`).
-    const LEAN_TOOLS: [&str; 11] = [
+    const LEAN_TOOLS: [&str; 10] = [
         "read",
         "write",
         "edit",
@@ -107,7 +118,6 @@ impl<'a> Agent<'a> {
         "finish",
         "verify",
         "tool_search",
-        "tool_load",
     ];
 
     /// Initial tool budget under the lean local profile. A configured 0 (unlimited) becomes this bound.
@@ -184,7 +194,7 @@ impl<'a> Agent<'a> {
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .map(str::to_owned)
+            .map(|name| controller_name(name).to_owned())
             .collect()
     }
 
@@ -192,7 +202,39 @@ impl<'a> Agent<'a> {
     pub(in crate::agent) fn tool_eligible(&self, name: &str) -> bool {
         self.plan_tool_available(name)
             && self.modes.vibe_allows(name)
-            && self.modes.launch.allows_tool(name)
+            && (self.modes.launch.allows_tool(name)
+                || crate::tools::surface::facade::successor_of(name)
+                    .is_some_and(|successor| self.modes.launch.allows_tool(successor))
+                || [
+                    "tool_load",
+                    "skill_manage",
+                    "rewind",
+                    "side_request",
+                    "request_directory",
+                ]
+                .iter()
+                .any(|owner| {
+                    controller_name(owner) == name && self.modes.launch.allows_tool(owner)
+                }))
+    }
+
+    pub(in crate::agent) fn controller_operation_available(&self, owner: &str) -> bool {
+        if matches!(owner, "side_request" | "request_directory") && self.hermetic {
+            return false;
+        }
+        self.plan_tool_available(owner)
+            && self.modes.vibe_allows(owner)
+            && (self.modes.launch.allows_tool(owner)
+                || crate::tools::surface::facade::successor_of(owner)
+                    .is_some_and(|successor| self.modes.launch.allows_tool(successor)))
+            && (self.catalog_owners().iter().any(|name| name == owner)
+                || crate::tools::surface::facade::successor_of(owner).is_some_and(|successor| {
+                    self.config
+                        .active_model_profile()
+                        .and_then(|profile| profile.tools.as_ref())
+                        .is_some_and(|allowed| allowed.iter().any(|name| name == successor))
+                        && self.catalog().iter().any(|name| name == successor)
+                }))
     }
 
     /// Activate tools chosen by discovery. In compact discovery mode they join the bounded working set and the
@@ -202,7 +244,7 @@ impl<'a> Agent<'a> {
         if self.stable_tool_offer() {
             anyhow::ensure!(
                 names.is_empty(),
-                "Specialist schemas are loaded only by tool_load; tool_search describes them without changing the offer"
+                "Specialist schemas are loaded only by tool_search names; a tool_search query describes them without changing the offer"
             );
             return Ok(());
         }
@@ -253,9 +295,18 @@ impl<'a> Agent<'a> {
         requested: &[String],
         unload: &[String],
     ) -> std::result::Result<(), String> {
+        let requested: Vec<String> = requested
+            .iter()
+            .map(|name| controller_name(name).to_owned())
+            .collect();
+        let unload: Vec<String> = unload
+            .iter()
+            .map(|name| controller_name(name).to_owned())
+            .collect();
+        let (requested, unload) = (requested.as_slice(), unload.as_slice());
         if let Some(name) = requested.iter().find(|name| unload.contains(name)) {
             return Err(format!(
-                "tool_load cannot load and unload {name} in the same call; no selection changed"
+                "tool_search cannot load and unload {name} in the same call; no selection changed"
             ));
         }
         if requested
@@ -272,7 +323,9 @@ impl<'a> Agent<'a> {
                 .chain(unload)
                 .any(|name| !catalog.contains(name))
         {
-            return Err("tool_load contains an unavailable tool; use tool_search first".into());
+            return Err(
+                "tool_search names contains an unavailable tool; search with a query first".into(),
+            );
         }
         if let Some(name) = requested.iter().find(|name| !self.tool_eligible(name)) {
             return Err(format!(
@@ -568,6 +621,24 @@ impl<'a> Agent<'a> {
         out
     }
 
+    /// Tool names the bash interceptor may point at: the offered tools plus the members each
+    /// offered consolidated tool reaches (`github` through `git`), so hints keep working after
+    /// a member is folded. The interceptor names the successor's route for folded members.
+    pub(in crate::agent) fn interceptor_tools(&self, offered: &[String]) -> Vec<String> {
+        let mut names = offered.to_vec();
+        for successor in offered {
+            names.extend(
+                self.ext
+                    .folded_members(successor)
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// `bg` is in the catalog and eligible but not in the current offer, and `tool_load` is, so
     /// text that names `bg` must say it is a Dial tool to load first.
     pub(in crate::agent) fn bg_loadable(&self) -> bool {
@@ -582,7 +653,9 @@ impl<'a> Agent<'a> {
             && self.catalog().iter().any(|name| name == "bg")
             && self.tool_eligible("bg")
             && !offered.iter().any(|name| name == "bg")
-            && offered.iter().any(|name| name == "tool_load")
+            && offered
+                .iter()
+                .any(|name| matches!(name.as_str(), "tool_search" | "tool_load"))
     }
 
     /// The tool list a child agent's allowlist is intersected with: the harness selection plus
@@ -597,7 +670,7 @@ impl<'a> Agent<'a> {
         let pinned = self.config.harness.tools != config::tools::default_tools();
         if !pinned && !self.hermetic && !self.lean_tools {
             let catalog = self.catalog();
-            for tool in ["lsp", "git", "ast_search", "code_history", "dep_source"] {
+            for tool in ["lsp", "git", "ast_search", "history", "dep_source"] {
                 if catalog.iter().any(|name| name == tool) && !out.iter().any(|name| name == tool) {
                     out.push(tool.into());
                 }
@@ -671,8 +744,8 @@ impl<'a> Agent<'a> {
             .chain(self.enabled_tools.iter())
             .chain(discovered.iter())
             .chain(request_tools.iter())
-            .filter(|n| catalog.contains(n))
-            .cloned()
+            .map(|name| controller_name(name).to_owned())
+            .filter(|name| catalog.contains(name))
             .collect();
         // The selected backend's memory tools are core: offered up front (including `reflect`
         // and `learn`, which the default harness list does not name) and kept by the compact,
@@ -909,6 +982,12 @@ impl<'a> Agent<'a> {
             if name == "eval" && !eval_ready() {
                 continue;
             }
+            // With questions disabled (`ask.enabled`, e.g. print mode), `ask` carries only the
+            // folded directory action; it stays loadable through `tool_search` instead of
+            // advertising a question action up front that would only be refused.
+            if name == "ask" && !self.config.ask.enabled {
+                continue;
+            }
             // Delegation is a hosted-route default; an unattended run defers it unless the
             // operator prefers subagents. Peer messaging joins with it (one budget decision).
             let delegation = name == "task";
@@ -986,6 +1065,63 @@ impl<'a> Agent<'a> {
         self.full_schemas_with(names, None)
     }
 
+    /// Combine controller-owned routes with an extension facade without replacing either
+    /// owner's contract. Per-route validation still uses the owner's unmerged schema.
+    fn with_controller_route(
+        mut schema: Value,
+        member: &Value,
+        selector: &str,
+        value: &str,
+        required_selector: bool,
+    ) -> Value {
+        let parameters = &mut schema["function"]["parameters"];
+        let properties = parameters["properties"]
+            .as_object_mut()
+            .expect("tool properties");
+        for (key, property) in member["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("member properties")
+        {
+            match properties.get_mut(key) {
+                Some(existing) if existing != property => {
+                    *existing = json!({"anyOf":[existing.clone(),property]})
+                }
+                Some(_) => {}
+                None => {
+                    properties.insert(key.clone(), property.clone());
+                }
+            }
+        }
+        let selected = properties
+            .entry(selector.to_owned())
+            .or_insert_with(|| json!({"type":"string","enum":[]}));
+        if let Some(values) = selected["enum"].as_array_mut()
+            && !values.iter().any(|entry| entry == value)
+        {
+            values.push(json!(value));
+        }
+        let member_required = member["function"]["parameters"]["required"].as_array();
+        let mut required = parameters["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        required.retain(|field| member_required.is_some_and(|fields| fields.contains(field)));
+        if required_selector {
+            required.push(json!(selector));
+        }
+        parameters["required"] = json!(required);
+        let description = schema["function"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        schema["function"]["description"] = json!(format!(
+            "{description}\n{selector}={value}: {}",
+            member["function"]["description"]
+                .as_str()
+                .unwrap_or_default()
+        ));
+        schema
+    }
+
     /// `bg_note` forces the `bash` note that `bg` is a loadable Dial tool; `None` decides it from
     /// the current offer ([`Self::bg_loadable`]).
     fn full_schemas_with(&self, names: &[String], bg_note: Option<bool>) -> Result<Vec<Value>> {
@@ -1008,7 +1144,13 @@ impl<'a> Agent<'a> {
                 "session_search" if self.experimental_context_owner() || self.exploration_owner() => session::session_search_tool::schema_owned(),
                 crate::storage::memory_backend::TOOL_NAME if self.memory_runtime.is_some()
                     && crate::storage::memory_backend::schema(&self.config.memory).is_some() =>
-                    crate::storage::memory_backend::schema(&self.config.memory).expect("selected memory tool has a schema"),
+                    {
+                        let schema = crate::storage::memory_backend::schema(&self.config.memory).expect("selected memory tool has a schema");
+                        match self.ext.get("codebase_memory") {
+                            Some(member) => Self::with_controller_route(schema, &member.schema(), "store", "codebase", false),
+                            None => schema,
+                        }
+                    },
                 n if config::tools::BUILTIN.contains(&n) => tools::schemas(&[n], mode)?.remove(0),
                 n if self.ext.contains(n) => self.ext.get(n).map(|tool| tool.schema()).context("extension tool vanished")?,
                 "experience" => crate::agent::model::assistance::schema(),
@@ -1029,7 +1171,7 @@ impl<'a> Agent<'a> {
                 "skill" => skills::skill_tool::schema(),
                 "skill_manage" => skills::manage_tool::schema(),
                 "session_search" => session::session_search_tool::schema(),
-                "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Find a tool the offer lacks: search eligible tools by capability or exact name, or name them with `select:a,b`. Returns each match's description, parameters, readiness and status. `load: true` also loads the exact or top matches for the next request (tool_load's checks). A miss returns catalog page 0; follow next_query (\"*:N\", zero-based) while present. Never executes tools or grants permission. Legacy noncompact mode may activate exact matches.","parameters":{"type":"object","properties":{"query":{"type":"string"},"load":{"type":"boolean"}},"required":["query"],"additionalProperties":false}}}),
+                "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Discover or load tools without granting permissions. Search query by capability/exact name, select:a,b, or * (paged catalog); load:true loads search matches next request. Alternatively names:[exact names] explicitly loads and unload:[exact names] unpins schemas. Selection takes effect next request, never in this batch. Returns readiness and status; a miss lists catalog page 0.","parameters":{"type":"object","properties":{"query":{"type":"string"},"load":{"type":"boolean"},"names":{"type":"array","maxItems":32,"items":{"type":"string"}},"unload":{"type":"array","maxItems":32,"items":{"type":"string"}}},"additionalProperties":false}}}),
                 "tool_load" => json!({"type":"function","function":{"name":"tool_load","description":"Explicitly enable or unload exact eligible tool names. Changes take effect next round, never in this batch, and grant no permissions.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":32,"items":{"type":"string"}},"unload":{"type":"array","maxItems":32,"items":{"type":"string"}}},"additionalProperties":false}}}),
                 "exit_plan" => json!({"type":"function","function":{"name":"exit_plan","description":"Ask the user to approve this plan and leave plan mode.","parameters":{"type":"object","properties":{"plan":{"type":"string","minLength":1}},"required":["plan"],"additionalProperties":false}}}),
                 other => {
@@ -1086,7 +1228,7 @@ impl<'a> Agent<'a> {
                     .unwrap_or_default()
                     .to_owned();
                 schema["function"]["description"] = json!(format!(
-                    "{description} `bg` is a Dial tool, not a shell command, and is not offered yet: Dial loads it for the next request when a command becomes a background job, or load it with `tool_load`."
+                    "{description} `bg` is a Dial tool, not a shell command, and is not offered yet: Dial loads it for the next request when a command becomes a background job, or load it with `tool_search`."
                 ));
             }
             // An offered `eval` may have only one runtime installed (a Node-only or Python-only
@@ -1427,7 +1569,8 @@ const PARAMETER_DESCRIPTION_WORDS: usize = 15;
 
 /// Offer Dial-owned schemas lean: every parameter keeps its name, type, enum, bounds and required
 /// status; only [`DESCRIBED_PARAMETER_TOOLS`] keep a short explanation of each top-level parameter
-/// ([`short_parameter_description`]). Shared by the parent loop and subagents; the complete
+/// ([`short_parameter_description`]). An option's compatibility rules therefore belong in the
+/// first sentence of its source description. Shared by the parent loop and subagents; the complete
 /// explanations return in argument errors ([`parameter_help`]). Contract identities ignore
 /// descriptions, so recorded sessions are unaffected.
 pub(in crate::agent) fn bare_schemas(

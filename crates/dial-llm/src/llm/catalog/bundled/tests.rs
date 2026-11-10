@@ -96,6 +96,185 @@ fn bundled_data_parses_and_registers_legacy_and_new_providers() {
 }
 
 #[test]
+fn hosted_openai_compatible_providers_resolve_to_their_documented_origins() {
+    for (id, url, env) in [
+        ("chutes", "https://llm.chutes.ai/v1", "CHUTES_API_KEY"),
+        (
+            "featherless",
+            "https://api.featherless.ai/v1",
+            "FEATHERLESS_API_KEY",
+        ),
+        (
+            "friendli",
+            "https://api.friendli.ai/serverless/v1",
+            "FRIENDLI_TOKEN",
+        ),
+        (
+            "github-models",
+            "https://models.github.ai/inference",
+            "GITHUB_MODELS_TOKEN",
+        ),
+        (
+            "hyperbolic",
+            "https://api.hyperbolic.xyz/v1",
+            "HYPERBOLIC_API_KEY",
+        ),
+        (
+            "nebius",
+            "https://api.tokenfactory.nebius.com/v1",
+            "NEBIUS_API_KEY",
+        ),
+        (
+            "ovhcloud",
+            "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+            "OVHCLOUD_API_KEY",
+        ),
+        ("portkey", "https://api.portkey.ai/v1", "PORTKEY_API_KEY"),
+        (
+            "requesty",
+            "https://router.requesty.ai/v1",
+            "REQUESTY_API_KEY",
+        ),
+        ("scaleway", "https://api.scaleway.ai/v1", "SCALEWAY_API_KEY"),
+        ("upstage", "https://api.upstage.ai/v1", "UPSTAGE_API_KEY"),
+    ] {
+        assert_eq!(
+            provider_endpoint(id),
+            Some((url, Some(env), ApiProtocol::ChatCompletions)),
+            "{id}"
+        );
+        assert!(!builtin_provider(id).unwrap().listed, "{id}");
+    }
+    // The generic GitHub token is read for GitHub Models but stays a shared, not origin-bound, key.
+    let github = builtin_provider("github-models").unwrap();
+    assert_eq!(github.shared_env, ["GITHUB_TOKEN"]);
+    assert!(!github.env.iter().any(|key| key == "GITHUB_TOKEN"));
+    assert!(
+        builtin_provider("scaleway")
+            .unwrap()
+            .env
+            .iter()
+            .any(|key| key == "SCW_SECRET_KEY")
+    );
+}
+
+#[test]
+fn alternate_credential_names_are_read_when_the_primary_is_unset() {
+    let set = |names: &'static [&'static str]| move |key: &str| names.contains(&key);
+    let command = builtin_provider("commandcode").unwrap();
+    assert_eq!(command.key_env(set(&[])), Some("COMMAND_CODE_API_KEY"));
+    assert_eq!(command.key_env(set(&["CMD_API_KEY"])), Some("CMD_API_KEY"));
+    let github = builtin_provider("github-models").unwrap();
+    assert_eq!(github.key_env(set(&["GITHUB_TOKEN"])), Some("GITHUB_TOKEN"));
+    assert_eq!(
+        github.key_env(set(&["GITHUB_TOKEN", "GITHUB_MODELS_TOKEN"])),
+        Some("GITHUB_MODELS_TOKEN")
+    );
+    let ollama = builtin_provider("ollama-cloud").unwrap();
+    assert_eq!(ollama.key_env(set(&[])), Some("OLLAMA_API_KEY"));
+    assert_eq!(
+        ollama.key_env(set(&["OLLAMA_CLOUD_API_KEY"])),
+        Some("OLLAMA_CLOUD_API_KEY")
+    );
+}
+
+#[test]
+fn perplexity_agent_and_stepfun_regions_use_their_documented_endpoints() {
+    let endpoint = |id: &str| {
+        let p = builtin_provider(id).unwrap();
+        (p.base_url.as_str(), p.env[0].as_str(), p.protocol)
+    };
+    assert_eq!(
+        endpoint("perplexity-agent"),
+        (
+            "https://api.perplexity.ai/v1",
+            "PERPLEXITY_API_KEY",
+            ApiProtocol::Responses
+        )
+    );
+    assert_eq!(
+        endpoint("stepfun"),
+        (
+            "https://api.stepfun.ai/v1",
+            "STEPFUN_API_KEY",
+            ApiProtocol::ChatCompletions
+        )
+    );
+    assert_eq!(
+        endpoint("stepfun-cn"),
+        (
+            "https://api.stepfun.com/v1",
+            "STEPFUN_API_KEY",
+            ApiProtocol::ChatCompletions
+        )
+    );
+    // The bare `perplexity` id belongs to the Perplexity sign-in flow, not an API-key row.
+    assert!(builtin_provider("perplexity").is_none());
+}
+
+#[test]
+fn bundled_models_take_their_declared_wire_only_on_the_bundled_endpoint() {
+    let zen = "https://opencode.ai/zen/v1";
+    let wire = |model: &str| model_protocol("opencode-zen", zen, None, model);
+    assert_eq!(wire("claude-opus-4-8"), Some(ApiProtocol::Anthropic));
+    assert_eq!(wire("gpt-5.5"), Some(ApiProtocol::Responses));
+    assert_eq!(wire("gemini-3.5-flash"), Some(ApiProtocol::Gemini));
+    // Rows without a declared wire, and unknown models, keep the provider's protocol.
+    assert_eq!(wire("glm-5.2"), None);
+    assert_eq!(wire("not-a-bundled-model"), None);
+    // The bundled default protocol and a trailing slash still count as the bundled route.
+    assert_eq!(
+        model_protocol(
+            "opencode-zen",
+            "https://opencode.ai/zen/v1/",
+            Some(ApiProtocol::ChatCompletions),
+            "claude-opus-4-8"
+        ),
+        Some(ApiProtocol::Anthropic)
+    );
+    // An operator-chosen protocol or endpoint is never rewritten.
+    for (base, protocol) in [
+        (zen, Some(ApiProtocol::Responses)),
+        ("https://proxy.example.com/v1", None),
+    ] {
+        assert_eq!(
+            model_protocol("opencode-zen", base, protocol, "claude-opus-4-8"),
+            None
+        );
+    }
+    assert_eq!(model_protocol("custom", zen, None, "claude-opus-4-8"), None);
+    assert_eq!(
+        model_protocol(
+            "opencode-go",
+            "https://opencode.ai/zen/go/v1",
+            None,
+            "gpt-5.6-luna"
+        ),
+        Some(ApiProtocol::Responses)
+    );
+    // Model rules that hold on the Messages API come with the routed Claude rows.
+    assert!(
+        bundled_model("opencode-zen", "claude-opus-5")
+            .unwrap()
+            .has(ModelFact::NoSampling)
+    );
+}
+
+#[test]
+fn declared_wires_stay_on_routable_protocols_of_bundled_providers() {
+    for (provider, models) in catalog() {
+        for entry in &models.entries {
+            if let Some(protocol) = entry.protocol {
+                assert!(routable(protocol), "{provider}/{}", entry.id);
+                let builtin = builtin_provider(provider)
+                    .unwrap_or_else(|| panic!("{provider}/{} has no bundled endpoint", entry.id));
+                assert!(routable(builtin.protocol), "{provider}");
+            }
+        }
+    }
+}
+
+#[test]
 fn first_party_rows_price_direct_sessions() {
     for (provider, model) in [
         ("anthropic", "claude-opus-4-6"),

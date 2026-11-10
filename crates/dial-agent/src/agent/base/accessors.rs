@@ -538,7 +538,7 @@ impl<'a> Agent<'a> {
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .map(str::to_owned)
+            .map(|name| crate::agent::run::tool_exposure::controller_name(name).to_owned())
             .collect();
         self.todo = TodoList::default();
         if let Some(snapshot) = state.get("todo")
@@ -592,6 +592,19 @@ impl<'a> Agent<'a> {
     }
     pub(in crate::agent) fn catalog(&self) -> Vec<String> {
         let mut names: Vec<String> = self
+            .catalog_owners()
+            .into_iter()
+            .map(|name| crate::agent::run::tool_exposure::controller_name(&name).to_owned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The operation inventory before controller names are folded. Used only for operation
+    /// admission: exposing a legacy member's successor must not expose its unrelated actions.
+    pub(in crate::agent) fn catalog_owners(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
             .version
             .harness
             .tools
@@ -644,6 +657,8 @@ impl<'a> Agent<'a> {
                         .is_some_and(|memory| memory.offers_tool()))
         });
         names.retain(|name| name != "ask" || self.config.ask.enabled);
+        // Consolidated members are offered through their successor (`facade::GROUPS`).
+        names.retain(|name| !self.ext.is_folded(name));
         // `verify` runs the verification gate's selection; `revert_edit` needs the checkpoint journal.
         names.retain(|name| match name.as_str() {
             "verify" => self.config.verification.enabled,

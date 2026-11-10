@@ -159,6 +159,28 @@ pub(super) static EXPERIMENTS: &[SettingDef] = &[
         },
     ),
     field!(
+        "experimental.mutation_runs",
+        experimental.mutation_runs,
+        EX,
+        "Verification",
+        "Test strength mutants",
+        "Once per turn, after a behavioral check (declared in verification.behavioral_checks or a verify test target) passes, run it against up to this many single-line mutants of the turn's changed lines (flipped operator, swapped boolean, integer off by one) in isolated copies, each capped at 60 seconds. Mutants the check still passes are reported as untested behavior. 0 disables.",
+        Kind::Int {
+            min: 0,
+            max: 16,
+            step: 1
+        },
+    ),
+    field!(
+        "experimental.changed_line_coverage",
+        experimental.changed_line_coverage,
+        EX,
+        "Verification",
+        "Changed-line coverage",
+        "When a behavioral check (declared in verification.behavioral_checks or a verify test target) runs after edits to Python or JavaScript files, collect line coverage through the environment (a PYTHONPATH sitecustomize collector, NODE_V8_COVERAGE) and, if it passes, name changed lines it never executed. The command text is unchanged; other languages report nothing.",
+        Kind::Bool,
+    ),
+    field!(
         "experimental.outcome_gradient_rounds",
         experimental.outcome_gradient_rounds,
         EX,

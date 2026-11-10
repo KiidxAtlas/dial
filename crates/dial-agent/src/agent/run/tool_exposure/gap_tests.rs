@@ -25,11 +25,7 @@ fn with_agent<T>(overlay: &str, run: impl FnOnce(&mut Agent<'_>) -> T) -> T {
 fn configured_adapter_catalog_stays_eligible_without_starting_an_adapter() {
     with_configured_agent("", |agent| {
         let candidates = agent.eligible_candidates();
-        assert!(
-            candidates
-                .iter()
-                .any(|(name, _, _)| name.starts_with("dap_"))
-        );
+        assert!(candidates.iter().any(|(name, _, _)| name == "dap"));
         let activated = agent
             .activate_gap_capabilities(CapabilityGap::DiagnosticFailure, &mut BTreeSet::new())
             .unwrap();
@@ -99,15 +95,15 @@ fn observed_gap_offers_a_matching_eligible_tool_once_per_turn() {
     with_agent("", |agent| {
         register(
             agent,
-            "dap_gapprobe",
+            "gapprobe",
             "Debugger runtime diagnostics for a launched program",
         );
         let mut spent = BTreeSet::new();
         let first = agent
             .activate_gap_capabilities(CapabilityGap::DiagnosticFailure, &mut spent)
             .unwrap();
-        assert!(first.contains(&"dap_gapprobe".to_owned()), "{first:?}");
-        assert!(agent.offered().contains(&"dap_gapprobe".to_owned()));
+        assert!(first.contains(&"gapprobe".to_owned()), "{first:?}");
+        assert!(agent.offered().contains(&"gapprobe".to_owned()));
         let repeat = agent
             .activate_gap_capabilities(CapabilityGap::DiagnosticFailure, &mut spent)
             .unwrap();
@@ -121,21 +117,21 @@ fn gap_routing_honours_unloads_and_pinned_selections() {
     with_agent("", |agent| {
         register(
             agent,
-            "dap_unloaded",
+            "probe_unloaded",
             "Debugger runtime diagnostics for a launched program",
         );
-        agent.tool_routing.unload(&["dap_unloaded".to_owned()]);
+        agent.tool_routing.unload(&["probe_unloaded".to_owned()]);
         let mut spent = BTreeSet::new();
         let out = agent
             .activate_gap_capabilities(CapabilityGap::DiagnosticFailure, &mut spent)
             .unwrap();
-        assert!(!out.contains(&"dap_unloaded".to_owned()), "{out:?}");
-        assert!(!agent.offered().contains(&"dap_unloaded".to_owned()));
+        assert!(!out.contains(&"probe_unloaded".to_owned()), "{out:?}");
+        assert!(!agent.offered().contains(&"probe_unloaded".to_owned()));
     });
     with_agent("[harness]\ntools=['read','bash']", |agent| {
         register(
             agent,
-            "dap_pinned",
+            "probe_pinned",
             "Debugger runtime diagnostics for a launched program",
         );
         let mut spent = BTreeSet::new();
@@ -143,7 +139,7 @@ fn gap_routing_honours_unloads_and_pinned_selections() {
             .activate_gap_capabilities(CapabilityGap::DiagnosticFailure, &mut spent)
             .unwrap();
         assert!(out.is_empty(), "{out:?}");
-        assert!(!agent.offered().contains(&"dap_pinned".to_owned()));
+        assert!(!agent.offered().contains(&"probe_pinned".to_owned()));
     });
 }
 
@@ -152,12 +148,12 @@ fn gap_routing_honours_unloads_and_pinned_selections() {
 #[test]
 fn eligible_candidates_list_registered_capabilities_without_activating_them() {
     with_agent("", |agent| {
-        register(agent, "dap_listed", "Debugger runtime diagnostics");
+        register(agent, "probe_listed", "Debugger runtime diagnostics");
         let before = agent.offered();
         let candidates = agent.eligible_candidates();
         let entry = candidates
             .iter()
-            .find(|(name, _, _)| name == "dap_listed")
+            .find(|(name, _, _)| name == "probe_listed")
             .expect("eligible capability is listed");
         assert_eq!(entry.1, "Debugger runtime diagnostics");
         assert!(entry.2.contains("diagnostics"), "{}", entry.2);
@@ -170,7 +166,7 @@ fn readiness_is_fresh_and_never_hides_explicit_discovery_or_grants_approval() {
     with_agent("", |agent| {
         let state = Arc::new(AtomicU8::new(2));
         agent.ext.register(Arc::new(Capability {
-            name: "dap_changing".into(),
+            name: "probe_changing".into(),
             description: "Debugger runtime diagnostics".into(),
             readiness: state.clone(),
         }));
@@ -180,26 +176,26 @@ fn readiness_is_fresh_and_never_hides_explicit_discovery_or_grants_approval() {
                 agent
                     .automatic_candidates()
                     .iter()
-                    .any(|entry| entry.0 == "dap_changing"),
+                    .any(|entry| entry.0 == "probe_changing"),
                 automatic
             );
             assert!(
                 agent
                     .eligible_candidates()
                     .iter()
-                    .any(|entry| entry.0 == "dap_changing")
+                    .any(|entry| entry.0 == "probe_changing")
             );
             assert!(
                 agent
                     .ext
-                    .get("dap_changing")
+                    .get("probe_changing")
                     .unwrap()
                     .needs_approval(&json!({}))
             );
         }
         state.store(2, Ordering::Relaxed);
-        agent.activate_tools(&["dap_changing".into()]).unwrap();
-        assert!(agent.offered().contains(&"dap_changing".into()));
+        agent.activate_tools(&["probe_changing".into()]).unwrap();
+        assert!(agent.offered().contains(&"probe_changing".into()));
     });
 }
 
@@ -207,11 +203,11 @@ fn readiness_is_fresh_and_never_hides_explicit_discovery_or_grants_approval() {
 fn gap_prefers_ready_equivalents_and_unknown_remains_a_candidate() {
     with_agent("", |agent| {
         for (name, state) in [
-            ("dap_a_missing", 2),
-            ("dap_b_unknown", 0),
-            ("dap_c_unknown", 0),
-            ("dap_d_unknown", 0),
-            ("dap_z_ready", 1),
+            ("probe_a_missing", 2),
+            ("probe_b_unknown", 0),
+            ("probe_c_unknown", 0),
+            ("probe_d_unknown", 0),
+            ("probe_z_ready", 1),
         ] {
             agent.ext.register(Arc::new(Capability {
                 name: name.into(),
@@ -222,10 +218,13 @@ fn gap_prefers_ready_equivalents_and_unknown_remains_a_candidate() {
         let activated = agent
             .activate_gap_capabilities(CapabilityGap::DiagnosticFailure, &mut BTreeSet::new())
             .unwrap();
-        assert_eq!(activated.first().map(String::as_str), Some("dap_z_ready"));
+        assert_eq!(activated.first().map(String::as_str), Some("probe_z_ready"));
         assert_eq!(activated.len(), 3);
-        assert!(activated.contains(&"dap_b_unknown".into()), "{activated:?}");
-        assert!(!activated.contains(&"dap_a_missing".into()));
+        assert!(
+            activated.contains(&"probe_b_unknown".into()),
+            "{activated:?}"
+        );
+        assert!(!activated.contains(&"probe_a_missing".into()));
     });
 }
 
@@ -236,7 +235,7 @@ fn loadable_list_omits_known_blockers_but_discovery_keeps_them() {
     with_agent("", |agent| {
         let state = Arc::new(AtomicU8::new(2));
         agent.ext.register(Arc::new(Capability {
-            name: "dap_blocked".into(),
+            name: "probe_blocked".into(),
             description: "Debugger runtime diagnostics".into(),
             readiness: state.clone(),
         }));
@@ -246,7 +245,7 @@ fn loadable_list_omits_known_blockers_but_discovery_keeps_them() {
                 .discoverable_tools(&offered)
                 .iter()
                 .any(|(name, description)| {
-                    name == "dap_blocked" || description.contains("dap_blocked")
+                    name == "probe_blocked" || description.contains("probe_blocked")
                 })
         };
         assert!(!listed(agent));
@@ -254,7 +253,7 @@ fn loadable_list_omits_known_blockers_but_discovery_keeps_them() {
             agent
                 .eligible_candidates()
                 .iter()
-                .any(|entry| entry.0 == "dap_blocked")
+                .any(|entry| entry.0 == "probe_blocked")
         );
         for usable in [0, 1, 4] {
             state.store(usable, Ordering::Relaxed);
@@ -262,7 +261,7 @@ fn loadable_list_omits_known_blockers_but_discovery_keeps_them() {
         }
         state.store(3, Ordering::Relaxed);
         assert!(!listed(agent));
-        agent.activate_tools(&["dap_blocked".into()]).unwrap();
-        assert!(agent.offered().contains(&"dap_blocked".into()));
+        agent.activate_tools(&["probe_blocked".into()]).unwrap();
+        assert!(agent.offered().contains(&"probe_blocked".into()));
     });
 }

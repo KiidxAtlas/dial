@@ -77,9 +77,12 @@ terminal stdin is relayed in cooked mode so redirected stdout cannot background-
 Stream ordering is the merged OS pipe ordering;
 the wrapper does not preserve separate stderr output. There is no capture of another
 terminal or an already-running arbitrary PID: launch under `dial run` or provide a log file.
-`dial run` currently refuses on Windows before creating capture state or starting any child;
-use an application log file with `monitor` `path` instead. A Windows implementation requires
-a job-aware relay with bounded descendant drain; no unbounded blocking fallback is used.
+On Windows, `dial run` always uses the pipe mode: the child leads a new console process group
+inside a Job Object, stdout/stderr are merged through one pipe read on a relay thread, and stdin
+is inherited. There is no PTY, so applications see redirected output (no forced color). The first
+Ctrl-C is forwarded as Ctrl-Break to the child's group; a second ends the wrapper, and closing its
+job kills the tree. Descendants retaining output after leader exit get the same two-second drain
+window, after which the job is terminated.
 
 Capture is owner-private under the project's external Dial state, not in the checkout.
 It keeps at most the latest 256 KiB per run, up to 32 live wrappers, plus bounded protocol

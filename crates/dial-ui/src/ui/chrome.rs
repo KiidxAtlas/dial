@@ -140,21 +140,42 @@ pub fn hint_line(theme: &Theme, hints: &[(&str, &str)], width: usize) -> Line<'s
     hint_line_after(theme, "", hints, width)
 }
 
-/// [`hint_line`] after a muted `lead` such as a list position (`3/12`), which stays in front of the
-/// hints and is never dropped.
+/// The separator between footer segments: ` · `, or ` | ` under the ASCII glyph preset.
+pub fn separator(theme: &Theme) -> &'static str {
+    if theme.ascii() { " | " } else { " · " }
+}
+
+/// [`hint_line`] after a muted `lead` such as a list position (`3/12`). The lead stays in front
+/// of the hints but is clipped or omitted before the final (exit) hint can be hidden.
 pub fn hint_line_after(
     theme: &Theme,
     lead: &str,
     hints: &[(&str, &str)],
     width: usize,
 ) -> Line<'static> {
-    let sep = if theme.ascii() { " | " } else { " · " };
+    let sep = separator(theme);
     let lead = text::one_line(lead);
     let mut keep: Vec<(&str, &str)> = hints
         .iter()
         .copied()
         .filter(|(key, label)| !key.is_empty() || !label.is_empty())
         .collect();
+    let exit_width = keep.last().map_or(0, |hint| {
+        key_hint_spans(theme, &[*hint])
+            .iter()
+            .map(|s| text::width(&s.content))
+            .sum::<usize>()
+    });
+    let lead_room = if keep.is_empty() {
+        width
+    } else {
+        width.saturating_sub(exit_width + text::width(sep))
+    };
+    let lead: String =
+        super::markdown::truncate_spans(vec![Span::raw(lead)], lead_room, theme.sym(Sym::Ellipsis))
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
     let build = |keep: &[(&str, &str)]| {
         let mut spans = Vec::new();
         if !lead.is_empty() {

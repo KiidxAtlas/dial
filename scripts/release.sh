@@ -29,7 +29,10 @@ cd "$(git rev-parse --show-toplevel)"
 if [[ "$tag_only" == 0 ]]; then
   # Validate everything that can refuse before changing either source file.
   RELEASE_VERSION="$version" python3 - <<'PY'
-import datetime, os, pathlib, re
+import datetime, importlib.util, os, pathlib, re
+spec = importlib.util.spec_from_file_location('check_packaging', 'scripts/check-packaging.py')
+packaging = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packaging)
 version = os.environ['RELEASE_VERSION']
 cargo = pathlib.Path('Cargo.toml')
 text = cargo.read_text()
@@ -42,6 +45,7 @@ log = changelog.read_text()
 heading = '## [Unreleased]\n'
 if log.count(heading) != 1:
     raise SystemExit('CHANGELOG.md must have exactly one [Unreleased] section')
+new_cargo = text
 if match.group(1) == version:
     print(f'Already prepared at {version}; checking existing release metadata.')
 else:
@@ -51,12 +55,22 @@ else:
     rest = log[start:]
     nxt = re.search(r'^## \[', rest, re.M)
     entries = rest[:nxt.start()] if nxt else rest
+    entries = re.split(r'^\[[^\]\n]+\]:', entries, maxsplit=1, flags=re.M)[0]
     if not entries.strip():
         raise SystemExit('the [Unreleased] section is empty; describe the release first')
     body = re.sub(r'^version = "[^"]+"', f'version = "{version}"', section.group(1), count=1, flags=re.M)
-    cargo.write_text(text[:section.start(1)] + body + text[section.end(1):])
+    new_cargo = text[:section.start(1)] + body + text[section.end(1):]
     date = datetime.date.today().isoformat()
-    changelog.write_text(log[:start] + f'\n## [{version}] - {date}\n' + rest)
+    log = log[:start] + f'\n## [{version}] - {date}\n' + rest
+try:
+    log = packaging.update_changelog_references(log)
+    versions, _ = packaging.changelog_metadata(log)
+    if versions[0] != version:
+        raise ValueError(f'CHANGELOG.md latest release must be {version}')
+except ValueError as error:
+    raise SystemExit(str(error))
+cargo.write_text(new_cargo)
+changelog.write_text(log)
 PY
   # Resolve workspace versions only. This does not compile, upgrade external dependencies,
   # or silently fall back to the network. On failure keep the edits for inspection/retry.

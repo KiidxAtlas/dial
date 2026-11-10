@@ -1,0 +1,17 @@
+# Uses only the verified archive staged by scripts/stage-container.py.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates bubblewrap git \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 dial \
+    && install -d -o dial -g dial /workspace /home/dial/.dial
+COPY dial /usr/local/bin/dial
+COPY LICENSE /usr/share/doc/dial/LICENSE
+COPY THIRD_PARTY_NOTICES /usr/share/doc/dial/THIRD_PARTY_NOTICES
+COPY Silver.LICENSE /usr/share/doc/dial/Silver.LICENSE
+COPY Unscii.LICENSE /usr/share/doc/dial/Unscii.LICENSE
+USER dial
+# Dial's private state (settings, sessions, credentials). Mount a volume here to keep it.
+ENV DIAL_HOME=/home/dial/.dial
+VOLUME /home/dial/.dial
+WORKDIR /workspace
+ENTRYPOINT ["dial"]

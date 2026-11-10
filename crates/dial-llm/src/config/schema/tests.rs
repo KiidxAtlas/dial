@@ -476,6 +476,7 @@ fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
         "experimental.turn_optimizer",
         "experimental.turn_drafter_diagrams",
         "experimental.check_predictions",
+        "experimental.changed_line_coverage",
     ];
     let setting = |path: &str| {
         registry()
@@ -491,6 +492,7 @@ fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
     }
     for path in [
         "experimental.edit_bisection_runs",
+        "experimental.mutation_runs",
         "experimental.outcome_gradient_rounds",
     ] {
         assert_eq!(setting(path).tab, "Experimental");
@@ -544,6 +546,9 @@ fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
     assert!(opted_in.experimental.fault_witness);
     let mut out_of_range = Config::default();
     out_of_range.experimental.outcome_gradient_rounds = 11;
+    assert!(out_of_range.validate().is_err());
+    let mut out_of_range = Config::default();
+    out_of_range.experimental.mutation_runs = 17;
     assert!(out_of_range.validate().is_err());
 }
 

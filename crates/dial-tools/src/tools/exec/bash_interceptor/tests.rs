@@ -655,6 +655,16 @@ fn ci_poll_hint_fires_on_unfinished_status_or_sleep_loop() {
         ci_poll_hint(&config, &["github"], view, running)
             .is_some_and(|hint| hint.contains("run_watch"))
     );
+    // Folded under an offered `git`, the hint names the route the model can actually call.
+    let folded = ci_poll_hint(&config, &["git", "github"], view, running).expect("folded github");
+    assert!(
+        folded.contains("`git` with forge `github`") && folded.contains("run_watch"),
+        "{folded}"
+    );
+    assert!(
+        ci_poll_hint(&config, &["github"], view, running)
+            .is_some_and(|hint| hint.contains("call `github` op"))
+    );
     assert!(
         ci_poll_hint(&config, &[], view, running)
             .is_some_and(|hint| hint.contains("gh run watch") && !hint.contains("`bg`"))

@@ -44,6 +44,9 @@ pub mod atomic;
 pub mod interrupt;
 pub mod power;
 pub mod process_record;
+/// Windows process listing, PEB-backed command line/cwd/environment reads and socket owners.
+#[cfg(windows)]
+pub mod processes;
 pub mod procinfo;
 /// Event-driven waits: pipe readiness, child exit, and cancellation wakeups.
 pub mod wake;

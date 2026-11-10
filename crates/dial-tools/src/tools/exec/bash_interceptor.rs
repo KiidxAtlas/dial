@@ -259,7 +259,12 @@ pub fn ci_poll_hint(
         return None;
     }
     Some(if available_tools.contains(&"github") {
-        "[hint] To wait for CI, call `github` op `run_watch` once (it returns when the run ends, with failed-job logs) instead of polling `gh run`.".to_owned()
+        // `github` folded under an offered `git` is reached through its forge selector.
+        if available_tools.contains(&"git") {
+            "[hint] To wait for CI, call `git` with forge `github` and op `run_watch` once (it returns when the run ends, with failed-job logs) instead of polling `gh run`.".to_owned()
+        } else {
+            "[hint] To wait for CI, call `github` op `run_watch` once (it returns when the run ends, with failed-job logs) instead of polling `gh run`.".to_owned()
+        }
     } else if available_tools.contains(&"bg") {
         "[hint] To wait for CI, run `gh run watch <id> --exit-status > /dev/null` once: it moves to the background, you are notified when the run ends, and `bg` action `wait` blocks on it. Do not poll `gh run`.".to_owned()
     } else {

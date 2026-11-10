@@ -89,8 +89,17 @@ whose source dependencies overlap or cannot be established, including checks and
 Diagnostic reads, job observations and proven-disjoint native actions remain available. Results
 already prefetched or executed retain their actual outcomes. The next model request may inspect
 or correct the prerequisite within the same permissions; no operation is replayed automatically.
+A failed `bg start` is likewise a prerequisite of later `wait`, `output`, `input`, `close_stdin` and
+`resize` actions on the same job name in that batch: they are skipped unexecuted, because the job
+does not exist. `kill`, `list` and actions on other jobs still run, and a start refused because
+the name is already running does not skip actions on the running job.
 An observational native no-op does not advance the source-mutation revision solely because its
 tool is named `edit`, `write` or `ast_edit`.
+
+Failure recovery preserves committed paths even when a later recording step failed; source-contract
+advice must not describe those edits as unapplied. Correct the named cause and continue only the
+failed or unfinished operation, not the whole turn. Unknown effects require inspection, and
+controller-owned permission/interruption boundaries still decide whether continuation is allowed.
 
 Tool-loading receipts describe effective next-request availability, not just requested pins.
 Loading and unloading the same tool in one request is refused before mutation; removing a pin
@@ -240,6 +249,18 @@ record permits retrieval again. This is exact-record admission, not semantic mer
 ambient byte budget. Automatic semantic/Hindsight recall also admits facts against the latest user
 subject, not arbitrary words from prior assistant discussion; explicit recall remains broad.
 
+With efficiency enabled, foreground and worker requests also replace newly encountered large,
+exact repeats of successful read-only tool results with short artifact pointers before context
+pressure. Tool name, parsed arguments and output text must all match; the earlier full result
+and already-sent prefix stay unchanged. Each pointer retains that call's own archived output
+and states that it is not a fresh verification claim. This is deterministic context hygiene,
+not a model-generated summary or a skipped execution: no extra model request is made and the
+session archive remains intact. Errors, uncertain effects, mutations, images, opaque provider
+replay, explicit artifact retrievals and small outputs are excluded. Resource-tagged reads keep
+their existing supersession policy. New pointers are disabled for preserved-thinking models
+and hermetic foreground requests; existing pointers stay byte-stable across routing/settings
+changes. This does not deduplicate semantically similar results or summarize unique evidence.
+
 Ordinary coding tasks no longer carry unrelated `web_search`/`web_fetch` schemas. Explicit web
 research or URL intent routes the relevant tools locally before inference; missing matches remain
 discoverable with `tool_search`/`tool_load`, and explicit pins, configured tool restrictions and
@@ -331,7 +352,13 @@ turn `Incomplete`:
 - any check or requested run failure when the request asks why something fails without asking for
   a repair ("run X and tell me why it fails") and nothing was edited.
 
-A failure introduced by this turn's edits still refuses completion. The first run of a check before
+A failure introduced by this turn's edits still refuses completion. Later edits or shell/extension
+effects defer a failed check only when `automatic_checks` is on, because the post-turn pass then
+reruns it. With `automatic_checks` off (the default), nothing reruns it for the model, so the check
+blocks completion until it is rerun and passes. A passing check registered under a different name,
+including a weaker `verify` acceptance helper, does not discharge it; replacing an acceptance
+helper under the same name does. When this blocker ends the turn `Incomplete` after the completion
+nudge, the report keeps the nudge's observed check output. The first run of a check before
 the instruction's first edit, shell effect or extension effect becomes that check's baseline, also
 when `automatic_checks` is off.
 
@@ -623,8 +650,9 @@ ordinary diagnostics; this coaching never grants filesystem, network or executio
 
 Duplicate recovery withholds only the exact repeated call, including reads. Different ranges and files remain available, changed source identities clear the affected restriction, and new user steering resets the turn's recovery state. A withheld call is reported explicitly as unexecuted; its cached observation still contributes to the shared repetition bound rather than being misclassified as a new execution failure.
 
-Failed-operation retry summaries retain up to 1,600 characters of the original multiline diagnostic,
-before recovery notices are appended; a refusal does not replace it with another refusal. For shell
+Failed-operation retry summaries quote up to 600 characters of the original multiline diagnostic
+(lines kept; the full text stays in the earlier result), before recovery notices are appended; a
+refusal does not replace it with another refusal. For shell
 checks declaring `check_paths`, those workspace-relative files take precedence over the whole-Git-tree
 fallback: unrelated edits do not release the retry barrier, but a change to a declared input does,
 including an external repair outside Git. Checks without declared inputs retain the existing
@@ -685,7 +713,7 @@ as follow-up input rather than silently steering the foreground task. These choi
 worker permissions or bypass isolation, approval, or concurrency limits.
 
 Any routable queued message (not only Steer now) also stops the current wait early: `task wait`,
-`side_request wait`, `bg wait`, and a foreground `bash` command that has not yet moved to the
+`task action=question_wait`, `bg wait`, and a foreground `bash` command that has not yet moved to the
 background. The awaited work keeps running and its result still arrives at a later request
 boundary; the wait reports that it stopped for a new message, and the message is routed at the
 next step boundary. Input deferred until after the turn does not stop waits.
@@ -705,7 +733,7 @@ events and side-question completion notify it; registration precedes state inspe
 losing a completion between checking and sleeping. Spurious wakes and ordinary progress do not
 trigger inference. A local check at most every 250 ms keeps legacy host input, UI heartbeats,
 approvals and budget checks responsive; it does not send model polling requests. Explicit
-`task wait` and `side_request wait` also use this wake channel and preserve their timeout
+`task wait` and `task action=question_wait` also use this wake channel and preserve their timeout
 meanings. `bg wait` retains its existing event-driven exit/regex/readiness conditions.
 
 Completion only resumes the existing turn: results keep their ordinary delivery and trust
@@ -773,7 +801,12 @@ failed file operations that depend on a changed path; unrelated file failures an
 stay withheld. Operations without known file inputs (including arbitrary shell commands) retain
 the whole-workspace mutation/tree-change fallback, not guessed command dependencies. New steering
 or coordination starts a new recovery context. Failed post-commit operations retain their effects
-but do not release the barrier. This is normalized-call guarding, not semantic equivalence checking:
+but do not release the barrier. A failed `bg` call that named a job is released when that job's
+lifecycle actually changes: a successful `start` or `kill` of the same name, or `kill` with
+`all`. Observations and failed starts do not release it, and failures naming other jobs stay
+withheld. A successful `bg` `start` also releases failures with no known file, access or job
+dependency (for example a browse or `curl` refused before a server listened); file-, access- and
+other-job failures stay withheld. This is normalized-call guarding, not semantic equivalence checking:
 changed scripts can still repeat the same underlying mistake.
 Already-started parallel operations keep their real results; the guard does not retroactively
 claim they were unexecuted. Successful results containing background warnings (for example,
@@ -783,6 +816,17 @@ their existing admission requirements still govern the next call.
 When a refused retry's shell error points at the command line itself (for example `No module
 named …` or `command not found`), the refusal also names the rejected command and asks for its
 program, module and path names and argument spacing to be corrected.
+A retry-barrier refusal is reported with the `retry_barrier` recovery kind in parent and worker
+sessions alike: it is a correctable repeat, not a permission boundary, so its guidance asks for
+changed arguments or a changed dependency rather than reporting a missing permission.
+
+Shell, browser and `eval` results carry a short advisory notice for command shapes models misread:
+`filter_exit` when exit status 1 came from a final `grep`/`rg` filter that matched nothing (the
+earlier stages' statuses are hidden without `pipefail`), `async_job` when a `bash` command starts a
+bare `&` job (the call's process group is stopped when it returns; use `bg` for servers),
+`nothing_listening` when a browser request found no listener, and `eval_no_subprocess` when an
+`eval` cell failed trying to start a program (kernels block process creation by design; run the
+command with `bash`). Statuses, barriers and effects are unchanged.
 
 An identical call set repeated across consecutive replies is a separate, history-derived guard.
 At five repeats the model receives a redirect and at six a stronger notice; the next identical
@@ -1526,9 +1570,26 @@ opt-in, independent of normal verification. Enable or disable each independently
   fails after edits to two or more files, halves of those files are reverted to their content at
   the last pass in isolated copies to name the file whose change broke it, within this many runs
   (the first run confirms that reverting everything restores the pass).
-  Both counterfactual settings are evidence only: they never change check status or the real
-  workspace. Copies exclude dependency and build directories, so compiled checks rebuild from
-  cold, and shell effects outside checkpoints are not reverted.
+- `experimental.mutation_runs` (0–16, 0 = off): once per turn, after a behavioral check passes
+  (named in `verification.behavioral_checks`, or a test runner selected for a `verify` target),
+  up to this many single-line mutants of lines the turn added or changed (a flipped comparison or
+  boolean operator, swapped `true`/`false`, an integer off by one; never inside strings or
+  comments) are run against it in isolated copies, each capped at 60 seconds. Mutants the check
+  still passes are listed in the check output (`path:line` with the original and mutated text)
+  and under `test_strength` in `counterfactual_checks`: either a missing test case or equivalent
+  code. Two consecutive inconclusive runs stop the sample.
+- `experimental.changed_line_coverage` (default off): when that kind of behavioral check runs
+  after edits to Python (`.py`) or JavaScript (`.js`, `.mjs`, `.cjs`) files, line coverage is
+  collected through the environment only: a `sitecustomize` collector on `PYTHONPATH`
+  (`sys.monitoring` on Python 3.12+, else `sys.settrace`, restricted to the changed files; an
+  existing project `sitecustomize` still runs) and `NODE_V8_COVERAGE`. The recorded command is
+  unchanged. If the check passes, its output names changed lines it never executed and changed
+  files it never loaded. Interpreters started with `-I`/`-S`, processes that exit through
+  `os._exit` and other languages report nothing. The scratch directory is removed
+  before the check inputs are recaptured.
+  All these counterfactual and coverage settings are evidence only: they never change check
+  status, repair credit or the real workspace. Copies exclude dependency and build directories,
+  so compiled checks rebuild from cold, and shell effects outside checkpoints are not reverted.
 - `experimental.repro_first` (`off`, `advise`, `gate`; default `advise`): on a debugging task whose
   request explicitly asks for verification (a word starting with "verif", such as "verify" or
   "verification"), the first edit to a non-test, non-documentation source file before any

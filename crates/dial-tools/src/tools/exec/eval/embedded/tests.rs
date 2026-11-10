@@ -53,6 +53,24 @@ fn embedded_binary_helpers_preserve_endian_and_full_width_integers() {
         "{result}"
     );
 }
+
+#[test]
+fn embedded_property_search_shrinks_and_compares_without_node() {
+    let source = format!(
+        "{}\nconst r = await dial.search(xs => xs.reduce((a, b) => a + b, 0) < 50, {{gen: dial.gen.array(dial.gen.int(0, 100))}});\n\
+         const c = await dial.compare(s => /^a/.test(s), s => s.startsWith('a'), {{gen: dial.gen.string({{alphabet: 'ab'}})}});\n\
+         const d = await dial.compare(x => Math.abs(x), x => x, {{gen: dial.gen.int()}});\n\
+         JSON.stringify([r.passed, r.counterexample, c.passed, d.passed, d.counterexample])",
+        include_str!("../portable.js")
+    );
+    let result = cell(&source);
+    assert_eq!(result["error"], Value::Null, "{result}");
+    assert_eq!(
+        result["value"],
+        json!("'[false,[50],true,false,-1]'"),
+        "{result}"
+    );
+}
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::io::{self, Cursor, Write};

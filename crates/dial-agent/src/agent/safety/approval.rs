@@ -381,6 +381,41 @@ pub(in crate::agent) fn top_level_segments(command: &str) -> Option<Vec<&str>> {
     })
 }
 
+/// The program filtering the last pipeline of a command (`… | grep x`), when it is a line
+/// filter whose exit status 1 means only "no line matched". Advice only.
+pub(in crate::agent) fn final_pipe_filter(command: &str) -> Option<&'static str> {
+    let last = *top_level_segments(command)?.last()?;
+    let stages = pipe_stages(last)?;
+    if stages.len() < 2 {
+        return None;
+    }
+    let first = shell::scan(stages.last()?)?
+        .into_iter()
+        .find_map(|token| match token.kind {
+            shell::Kind::Word { value, .. } => Some(value),
+            shell::Kind::Operator(_) => None,
+        })?;
+    let program = first.rsplit('/').next()?;
+    ["grep", "egrep", "fgrep", "rg", "ag"]
+        .into_iter()
+        .find(|filter| *filter == program)
+}
+
+/// Whether a command starts an asynchronous job with a bare `&` (not `&&`, `2>&1` or `&>`).
+pub(in crate::agent) fn starts_async_job(command: &str) -> bool {
+    let Some(tokens) = shell::scan(command) else {
+        return false;
+    };
+    let text = |token: &shell::Token| &command[token.span.clone()];
+    tokens.iter().enumerate().any(|(index, token)| {
+        matches!(token.kind, shell::Kind::Operator(shell::Operator::Other))
+            && text(token) == "&"
+            && index > 0
+            && !matches!(text(&tokens[index - 1]), ">" | "<")
+            && tokens.get(index + 1).is_none_or(|next| text(next) != ">")
+    })
+}
+
 /// True when a bash command may change the workspace without a checkpoint: it is neither one plain
 /// inspection, nor a git review batch, nor a batch of plain inspections. Effect tracking only.
 pub(in crate::agent) fn opaque_shell_effect(command: &str) -> bool {
@@ -388,6 +423,8 @@ pub(in crate::agent) fn opaque_shell_effect(command: &str) -> bool {
 }
 
 pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
+    let (owner, own) = crate::tools::surface::facade::owner_view(name, args);
+    let (name, args) = (owner.as_str(), &own);
     match name {
         "experience" => args["action"] != "run",
         "edit_preview" => args["check"] != "type",
@@ -544,6 +581,10 @@ fn project_relative(root: &Path, input: &str) -> String {
 /// Paths a call targets, or `None` when the tool is not governed by path rules. An empty list means
 /// the target could not be determined.
 fn call_paths(call: &ToolCall, root: &Path) -> Option<Vec<String>> {
+    let mut own = call.clone();
+    (own.name, own.arguments) =
+        crate::tools::surface::facade::owner_view(&call.name, &call.arguments);
+    let call = &own;
     if !PATH_TOOLS.contains(&call.name.as_str()) {
         return None;
     }
@@ -724,7 +765,12 @@ impl PermissionRule {
     }
 
     pub(in crate::agent) fn matches(&self, call: &ToolCall, root: &Path) -> bool {
-        if self.tool != call.name {
+        // A consolidated call is judged as the member it reaches: rules saved for the member keep
+        // applying, and an allow rule for the successor never widens to its members. Deny rules for
+        // the successor still cover every member.
+        let owner = crate::tools::surface::facade::owner_view(&call.name, &call.arguments).0;
+        let applies = self.tool == owner || (self.effect == Effect::Deny && self.tool == call.name);
+        if !applies {
             return false;
         }
         if !self.paths.is_empty() {
@@ -1146,6 +1192,12 @@ pub fn batch_call_line(call: &ToolCall) -> String {
         .join(" ")
 }
 
+/// A `monitor` start, called directly or through its successor (`bg` action `watch`).
+fn starts_watch(call: &ToolCall) -> bool {
+    let (owner, own) = crate::tools::surface::facade::owner_view(&call.name, &call.arguments);
+    owner == "monitor" && own["action"] == "start"
+}
+
 pub fn denied_by_rule(rules: &[PermissionRule], call: &ToolCall, root: &Path) -> bool {
     rules
         .iter()
@@ -1329,7 +1381,7 @@ fn approval_grant(call: &ToolCall) -> ApprovalGrant {
                 "Directory access changes require one-time approval for the exact requested scope.",
             );
         }
-        if call.name == "monitor" && call.arguments["action"] == "start" {
+        if starts_watch(call) {
             return Err("Application watches require fresh, one-shot approval.");
         }
         let command_prefix = if call.name == "bash" {
@@ -1368,7 +1420,8 @@ fn approval_grant(call: &ToolCall) -> ApprovalGrant {
         };
         Ok(PermissionRule {
             effect: Effect::Allow,
-            tool: call.name.clone(),
+            // A consolidated call's grant names the member it reached, never the whole successor.
+            tool: crate::tools::surface::facade::owner_view(&call.name, &call.arguments).0,
             command_prefix,
             paths: Vec::new(),
         })
@@ -1540,7 +1593,7 @@ fn authorize_inner(
         return Err(Denial::Rule);
     }
     // A watch grants future automatic continuation; never reuse a broad tool grant or Auto mode.
-    if call.name == "monitor" && call.arguments["action"] == "start" {
+    if starts_watch(call) {
         if approval == Approval::Readonly {
             explain(ui, call, PolicyReason::ReadOnly);
             return Err(Denial::ReadOnly);
@@ -1550,8 +1603,13 @@ fn authorize_inner(
             "{summary}\nApprove this one-shot application watch? New matching output may wake Dial to diagnose and fix within the current task and existing permissions. No additional process control is granted. This approval is not reusable."
         );
         let grant = approval_grant(call);
-        let decision =
-            ui.approve_call_with_preview(&call.id, &call.name, &summary, &grant.preview, cancel);
+        let decision = ui.approve_call_with_preview(
+            &call.id,
+            &crate::tools::surface::facade::owner_view(&call.name, &call.arguments).0,
+            &summary,
+            &grant.preview,
+            cancel,
+        );
         if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
             return Err(Denial::User);
         }
@@ -1595,7 +1653,7 @@ fn authorize_inner(
             let grant = approval_grant(call);
             let decision = ui.approve_call_with_preview(
                 &call.id,
-                &call.name,
+                &crate::tools::surface::facade::owner_view(&call.name, &call.arguments).0,
                 &summary,
                 &grant.preview,
                 cancel,

@@ -183,6 +183,15 @@ main() {
     ((${#failed[@]} == 0)) || finish
   fi
   step fmt cargo fmt --check
+  if command -v cargo-machete >/dev/null 2>&1; then
+    if grep -q '^lint-deps:' Makefile; then
+      step lint-deps make lint-deps
+    else
+      skip lint-deps "snapshot predates the workspace dependency audit target"
+    fi
+  else
+    skip lint-deps "cargo install cargo-machete --locked --version 0.9.2"
+  fi
   if [[ "$quick" == 0 ]]; then
     step test-drivers pyrun make test-drivers
     if [[ -f "$dir/scripts/requirements-ci.lock" ]]; then

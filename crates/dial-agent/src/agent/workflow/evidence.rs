@@ -2,7 +2,9 @@
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 mod arguments;
+mod duplicates;
 pub(in crate::agent) use arguments::project_arguments;
+pub(in crate::agent) use duplicates::project_duplicates;
 /// Provider-neutral wire estimate, never billed usage. Include structured text, tool calls,
 /// native replay and images just as request sizing does; metadata is not model context.
 pub(in crate::agent) fn estimate(message: &Value) -> usize {
@@ -19,12 +21,17 @@ pub struct Supersession {
     resolved: HashMap<String, String>,
     arguments: HashMap<String, Value>,
     argument_boundary: u64,
+    seen_results: HashSet<String>,
+    duplicates: HashMap<String, String>,
 }
 
 impl Supersession {
     /// Whether the model still sees this result in full, without any projection placeholder.
     pub fn holds_full(&self, id: &str) -> bool {
-        !self.replaced.contains(id) && !self.pruned.contains(id) && !self.resolved.contains_key(id)
+        !self.replaced.contains(id)
+            && !self.pruned.contains(id)
+            && !self.resolved.contains_key(id)
+            && !self.duplicates.contains_key(id)
     }
 }
 
@@ -74,6 +81,10 @@ pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy)
         ..
     } = *policy;
     for message in messages.iter_mut() {
+        // Reapply frozen duplicate pointers even if efficiency settings or model routing changed.
+        if let Some(pointer) = memo.duplicates.get(&result_id(message)) {
+            message["content"] = json!(pointer);
+        }
         let Some(recall) = message
             .as_object_mut()
             .and_then(|m| m.remove("dial_recall"))
@@ -118,6 +129,9 @@ pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy)
     let mut latest: HashSet<String> = HashSet::new();
     let mut stale = vec![false; messages.len()];
     for i in (0..messages.len()).rev() {
+        if memo.duplicates.contains_key(&result_id(&messages[i])) {
+            continue;
+        }
         // Failed or unknown-effect results neither supersede earlier success nor lose diagnostics.
         if !successful(&messages[i]) {
             continue;
@@ -213,6 +227,7 @@ const OBSERVATIONS: &[&str] = &[
     "audio",
     "visual",
     "video",
+    "inspect",
 ];
 /// A result smaller than this is not worth a placeholder and a retrieval round trip.
 const PRUNE_MIN_TOKENS: usize = 1_000;
@@ -293,7 +308,15 @@ fn observation_calls(messages: &[Value]) -> HashMap<String, Value> {
         if name == "read"
             && arguments["path"]
                 .as_str()
-                .is_some_and(|path| path.starts_with("artifact://"))
+                .into_iter()
+                .chain(
+                    arguments["paths"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                )
+                .any(|path| path.starts_with("artifact://"))
         {
             continue;
         }
@@ -415,6 +438,7 @@ fn prune(
         .enumerate()
         .filter(|(i, message)| {
             (drop_useless || stale[*i])
+                && !memo.duplicates.contains_key(&result_id(message))
                 && !memo.pruned.contains(&result_id(message))
                 && fresh(*i, message)
         })
@@ -426,6 +450,9 @@ fn prune(
     let prune_new = batch >= PRUNE_BATCH_MIN_TOKENS;
     for i in 0..messages.len() {
         let id = result_id(&messages[i]);
+        if memo.duplicates.contains_key(&id) {
+            continue;
+        }
         let already = memo.pruned.contains(&id);
         // Only candidates are measured; the gross history is never copied for every step.
         if !already && !(prune_new && fresh(i, &messages[i]) && (drop_useless || stale[i])) {

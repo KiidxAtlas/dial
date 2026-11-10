@@ -192,7 +192,10 @@ impl<'a> ChildTurn<'a> {
         {
             names.retain(|name| allowed.contains(name));
         }
-        if !["checkpoint", "rewind", "session_search"]
+        for name in &mut names {
+            *name = crate::agent::run::tool_exposure::controller_name(name).to_owned();
+        }
+        if !["checkpoint", "session_search"]
             .iter()
             .all(|required| names.iter().any(|name| name == required))
         {
@@ -894,6 +897,19 @@ impl<'a> ChildTurn<'a> {
                 agent: None,
             },
         );
+        if env.config.efficiency.enabled
+            && !(crate::config::compaction::CompactionIdentity {
+                provider: &selection.provider,
+                model: &selection.model,
+                agent: None,
+            })
+            .preserved_thinking()
+        {
+            crate::agent::workflow::evidence::project_duplicates(
+                &model_request.messages,
+                &mut self.superseded,
+            );
+        }
         crate::agent::workflow::evidence::project(
             &mut model_request.messages,
             &mut self.superseded,
@@ -1626,7 +1642,7 @@ impl<'a> ChildTurn<'a> {
                 ));
             }
             if children.journal.borrow().exploration.busy() {
-                self.messages.push(json!({"role":"user","content":"Finish the active investigation by calling rewind with findings before a final answer. Actual effects and the request budget are not rolled back."}));
+                self.messages.push(json!({"role":"user","content":"Finish the active investigation with checkpoint action=rewind and report before a final answer. Actual effects and the request budget are not rolled back."}));
                 return Ok(ControlFlow::Break(crate::agent::run::engine::Tick::Again));
             }
             match finish(job, &reply.text) {
@@ -2307,6 +2323,11 @@ impl<'a> ChildTurn<'a> {
                 crate::agent::run::failure_guidance::missing_program_recovery(call, &output)
             }) {
                 output.text.push_str(&advice);
+            }
+            if let Some(hint) =
+                crate::agent::run::failure_guidance::command_shape_hint(call, &output)
+            {
+                output.text.push_str(&hint);
             }
             if matches!(call.name.as_str(), "bash" | "bg") {
                 let capabilities = crate::agent::run::failure_guidance::LaunchCapabilities::child(

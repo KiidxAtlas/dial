@@ -6,8 +6,10 @@
 //! - `experimental.edit_bisection_runs`: when a check that passed earlier this turn fails after
 //!   edits to two or more files, revert halves of those files (to their content at the last
 //!   pass) in copies to find which file's change broke it, within the configured run budget.
+//! - `experimental.mutation_runs`: once per turn, sampled mutants of the turn's changed lines are
+//!   run against a passing behavioral check ([`mutation`]); survivors mark untested behavior.
 //!
-//! Both are evidence only: they never change check status, repair credit or the real workspace.
+//! All are evidence only: they never change check status, repair credit or the real workspace.
 //! Copies exclude dependency and build directories, so compiled checks rebuild from cold. Shell
 //! effects outside checkpoints are not reverted, so results are labeled with that limit.
 
@@ -34,16 +36,20 @@ pub(in crate::agent) struct State {
     passing: BTreeMap<String, Overrides>,
     /// Check name to the latest bisection report.
     bisections: BTreeMap<String, Value>,
+    /// Check name to its mutation report; at most one entry per turn.
+    test_strength: BTreeMap<String, Value>,
 }
 
 impl State {
     pub(in crate::agent) fn evidence(&self) -> Value {
-        if self.witnesses.is_empty() && self.bisections.is_empty() {
+        if self.witnesses.is_empty() && self.bisections.is_empty() && self.test_strength.is_empty()
+        {
             return Value::Null;
         }
         json!({
             "fault_witness": self.witnesses,
             "edit_bisection": self.bisections,
+            "test_strength": self.test_strength,
             "limits": "Isolated copies revert checkpointed file edits only; shell effects are not reverted and dependency/build directories start empty.",
         })
     }
@@ -118,7 +124,7 @@ fn install(root: &Path, overrides: &Overrides) -> anyhow::Result<()> {
 }
 
 impl Agent<'_> {
-    fn turn_versions_now(&self) -> Option<Vec<TurnVersion>> {
+    pub(in crate::agent) fn turn_versions_now(&self) -> Option<Vec<TurnVersion>> {
         let (checkpoints, turn) = (self.checkpoints.as_ref()?, self.step_checks.turn?);
         checkpoints.turn_versions(turn).ok()
     }
@@ -156,8 +162,12 @@ impl Agent<'_> {
         ui: &mut dyn Ui,
     ) -> Option<String> {
         let experimental = &self.config.experimental;
-        let (witness, bisect_runs) = (experimental.fault_witness, experimental.edit_bisection_runs);
-        if (!witness && bisect_runs == 0)
+        let (witness, bisect_runs, mutation_runs) = (
+            experimental.fault_witness,
+            experimental.edit_bisection_runs,
+            experimental.mutation_runs,
+        );
+        if (!witness && bisect_runs == 0 && mutation_runs == 0)
             || self.step_checks.mutations == 0
             || self.step_checks.evidence.is_repro(&check.command)
             || self.interrupt.load(Ordering::SeqCst)
@@ -175,10 +185,17 @@ impl Agent<'_> {
                         .passing
                         .insert(check.command.clone(), snapshot);
                 }
-                if witness && behavioral(self.config, check) {
-                    return self.fault_witness(check, &versions, ui);
+                let mut lines = Vec::new();
+                if witness
+                    && behavioral(self.config, check)
+                    && let Some(line) = self.fault_witness(check, &versions, ui)
+                {
+                    lines.push(line);
                 }
-                None
+                if let Some(line) = self.test_strength(check, &versions, ui) {
+                    lines.push(line);
+                }
+                (!lines.is_empty()).then(|| lines.join("\n"))
             }
             CheckStatus::CodeFailed if bisect_runs > 0 => {
                 let passing = self
@@ -338,5 +355,6 @@ impl Agent<'_> {
     }
 }
 
+mod mutation;
 #[cfg(test)]
 mod tests;

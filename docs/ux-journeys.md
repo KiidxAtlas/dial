@@ -13,7 +13,7 @@ exercise a real model, download weights, sign in, or change the user's configura
 
 | Journey | Required observations | Evidence boundary |
 | --- | --- | --- |
-| Correct running work | Visible busy-send behavior; chooser cancellation preserves the draft; steering is recorded as pending/received/applied; queued work is not silently sent | Composer/controller tests plus real-PTY scripted provider |
+| Correct running work | Visible busy-send behavior; chooser cancellation preserves the draft; steering is shown as pending, received, then recorded as the current instruction, without claiming model compliance; queued work is not silently sent | Composer/controller tests plus real-PTY scripted provider |
 | Verify a model | Existing text check remains text-only; coding check requires separate default-Cancel consent; structured invocation and tool-result continuation are distinct; failed/cancelled probes never become verified | Diagnostic tests and scripted provider, not coding-quality certification |
 | Stop owned work | Current answer, workers and jobs retain separate scopes; requested stop differs from observed termination; retained output is inspectable; dismissing history does not stop running work | Background lifecycle tests and Jobs presentation; real external-service cleanup remains separate |
 | Recover input | Preview identifies saved draft and queued requests; cancellation and Keep current preserve input; replacement is explicitly reviewed; restored queue stays held; changed input invalidates review | Session-bound recovery/controller tests and crash/resume fixture |
@@ -29,8 +29,9 @@ synthetic data; screenshots do not establish native terminal key delivery or pro
 The PTY suite includes plain-Enter after-turn and redirect preferences, queue removal, default-Cancel
 diagnostic consent, a synthetic two-request roundtrip, an actual refused loopback connection repaired
 only by explicit retry, scripted expired credentials, test-owned SIGKILL draft recovery, and native
-process Stop/output/Dismiss. Runtime Cargo lease files are not model edits; the fixture rejects other
-project files and symlinks. Refused-connection recovery uses the coding diagnostic, not ordinary chat.
+process Stop/output/Dismiss, including 38-column retained-output Back navigation without replaying
+the process. Runtime Cargo lease files are not model edits; the fixture rejects other project files
+and symlinks. Refused-connection recovery uses the coding diagnostic, not ordinary chat.
 The suite's captures are terminal text, not native screenshots or evidence of real-provider quality.
 
 ## Measurement

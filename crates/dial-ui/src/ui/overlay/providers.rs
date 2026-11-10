@@ -385,6 +385,22 @@ impl ProviderOverlay {
             .as_ref()
             .map_or(&[], |d| d.providers.as_slice());
         for p in known {
+            let spec = self.configured.get(&p.id);
+            // Compare only a URL the scan actually probed. A scan that rejected the configured
+            // URL reports no URL; its own error state must stay visible, not a "changed" note.
+            let endpoint_changed = spec.is_some_and(|spec| {
+                !spec.base_url.is_empty()
+                    && p.base_url.as_deref().is_some_and(|url| {
+                        url.trim_end_matches('/') != spec.base_url.trim_end_matches('/')
+                    })
+            });
+            let (state, detail) = if spec.is_some_and(|spec| !spec.enabled) {
+                ("disabled", "Disabled in configuration")
+            } else if endpoint_changed {
+                ("unknown", "Endpoint changed since the last metadata scan")
+            } else {
+                (p.state.as_str(), p.detail.as_str())
+            };
             out.push(Entry {
                 id: p.id.clone(),
                 label: p.label.clone(),
@@ -394,23 +410,17 @@ impl ProviderOverlay {
                     .map(|spec| spec.base_url.clone())
                     .filter(|url| !url.is_empty())
                     .or_else(|| p.base_url.clone()),
-                state: p.state.clone(),
-                detail: p.detail.clone(),
-                models: p.models,
-                spec: self.configured.get(&p.id).cloned(),
+                state: state.to_owned(),
+                detail: detail.to_owned(),
+                models: if endpoint_changed { 0 } else { p.models },
+                spec: spec.cloned(),
             });
         }
         for (id, spec) in &self.configured {
             if out.iter().any(|e| &e.id == id) {
                 continue;
             }
-            let state = if !spec.enabled {
-                "disabled"
-            } else if self.discovery.is_some() {
-                "unavailable"
-            } else {
-                "checking"
-            };
+            let state = if !spec.enabled { "disabled" } else { "unknown" };
             out.push(Entry {
                 id: id.clone(),
                 label: if spec.label.is_empty() {
@@ -429,7 +439,8 @@ impl ProviderOverlay {
                 spec: Some(spec.clone()),
             });
         }
-        // What you can use now first, then what you set up, then everything still to set up.
+        // Metadata evidence (observed or cached) first, then configured routes; none of these
+        // proves inference. Cached rows render with a neutral chip, not success.
         out.sort_by_key(|entry| match entry.state.as_str() {
             "reachable" | "cached" => 0,
             _ if entry.spec.is_some() => 1,
@@ -1343,16 +1354,11 @@ impl ProviderOverlay {
 
     fn chip(&self, theme: &Theme, state: &str) -> Span<'static> {
         let status = match state {
-            "reachable" | "cached" => Status::Ready,
+            "reachable" => Status::Ready,
+            "cached" | "unknown" => Status::Missing,
             // Not configured yet is a neutral state, not a warning.
             "auth-required" => return chrome::status_chip(theme, Status::Missing, "not set up"),
             "disabled" => Status::Missing,
-            "checking" => {
-                return Span::styled(
-                    format!("{} {state}", theme.sym(Sym::Ellipsis)),
-                    theme.fg(Tok::Muted),
-                );
-            }
             _ => Status::Error,
         };
         chrome::status_chip(theme, status, state)
@@ -1775,7 +1781,7 @@ impl ProviderOverlay {
             Some(entry) => {
                 let summary = self.key_source_sentence(entry).unwrap_or_else(|| "source not reported".into());
                 let mut spans = vec![Span::styled(format!(" Endpoint: {} · Status: {} ({}) · Credential: {}", entry.base_url.as_deref().map(text::one_line).unwrap_or_else(|| "not HTTP / provider-managed".into()), text::one_line(&entry.state), text::one_line(&entry.detail), summary), theme.fg(Tok::Muted))];
-                spans.push(Span::styled(" · Enter: connection actions / explicit test where supported", theme.fg(Tok::Dim)));
+                spans.push(Span::styled(" · Metadata only; availability is not a text or tool test. /doctor shows session diagnostic evidence. Enter: actions", theme.fg(Tok::Dim)));
                 spans
             }
             None => vec![Span::styled(" Add an OpenAI-compatible endpoint: id, name, base URL and an optional key variable.".to_owned(), theme.fg(Tok::Muted))],

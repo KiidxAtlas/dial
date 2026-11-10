@@ -55,6 +55,7 @@ pub mod model_config;
 pub mod model_sampling;
 pub mod oauth;
 pub mod ollama;
+mod opencode;
 pub mod openrouter;
 pub mod policy;
 pub mod profiles;

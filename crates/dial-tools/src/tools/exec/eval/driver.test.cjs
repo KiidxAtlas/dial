@@ -75,6 +75,26 @@ for (const python of [false, true]) {
     assert.equal(calls.length, 3, 'dependent write must never run');
     assert.deepEqual(calls[1].arguments, {path:'new.bin',content:'AP8NCg==',encoding:'base64'});
   });
+
+  test(`portable search shrinks counterexamples and compare finds disagreements (${python ? 'Python' : 'Node'})`, () => {
+    const install = fs.readFileSync(path.join(__dirname, python ? 'portable.py' : 'portable.js'), 'utf8');
+    const sum = python
+      ? "r = dial.search(lambda xs: sum(xs) < 50, dial.gen.array(dial.gen.int(0, 100)))\n[r['passed'], r['counterexample']]"
+      : "const r = await dial.search(xs => xs.reduce((a, b) => a + b, 0) < 50, {gen: dial.gen.array(dial.gen.int(0, 100))}); JSON.stringify([r.passed, r.counterexample])";
+    const differ = python
+      ? "c = dial.compare(lambda x: abs(x), lambda x: x, dial.gen.int())\n[c['passed'], c['counterexample']]"
+      : "const c = await dial.compare(x => Math.abs(x), x => x, {gen: dial.gen.int()}); JSON.stringify([c.passed, c.counterexample])";
+    const agree = python
+      ? "dial.compare(lambda s: s.upper().lower(), lambda s: s.lower(), dial.gen.string(alphabet='abC'), runs=50)['passed']"
+      : "(await dial.compare(s => s.toUpperCase().toLowerCase(), s => s.toLowerCase(), {gen: dial.gen.string({alphabet: 'abC'}), runs: 50})).passed";
+    const frames = run([cell(0, install), cell(1, sum), cell(2, differ), cell(3, agree)], python);
+    const results = frames.filter(frame => frame.result).map(frame => frame.result);
+    assert.equal(results[1].error, null);
+    assert.match(results[1].value, python ? /\[False, \[50\]\]/ : /\[false,\[50\]\]/);
+    assert.match(results[2].value, python ? /\[False, -1\]/ : /\[false,-1\]/);
+    assert.match(results[3].value, python ? /True/ : /true/);
+    assert.equal(frames.filter(frame => frame.callback).length, 0);
+  });
 }
 
 test('Python shorthand preserves dictionary/keyword calls, validation and controller denial', () => {

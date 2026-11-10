@@ -201,13 +201,24 @@ pub(crate) fn scroll_cell(
 /// [`chrome::hint_line`] one cell in from the edge: the last segment (the way out) always stays and
 /// the ones before it are dropped whole when they do not fit.
 pub(super) fn hint_line(theme: &Theme, segments: &[String], width: usize) -> Line<'static> {
+    hint_line_after(theme, "", segments, width)
+}
+
+/// [`hint_line`] after a muted `lead` (a state such as `read-only` or a list position). The lead
+/// is clipped before the exit hint and is never drawn as a key.
+pub(super) fn hint_line_after(
+    theme: &Theme,
+    lead: &str,
+    segments: &[String],
+    width: usize,
+) -> Line<'static> {
     let pairs: Vec<(&str, &str)> = segments
         .iter()
         .filter(|s| !s.is_empty())
         .map(|s| s.split_once(' ').unwrap_or((s, "")))
         .collect();
     let mut spans = vec![Span::raw(" ")];
-    spans.extend(chrome::hint_line(theme, &pairs, width.saturating_sub(1)).spans);
+    spans.extend(chrome::hint_line_after(theme, lead, &pairs, width.saturating_sub(1)).spans);
     Line::from(fit(spans, width))
 }
 

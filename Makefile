@@ -22,7 +22,7 @@ DIAL ?= $(BUILD_DIR)/dial
 .DEFAULT_GOAL := help
 .PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline test-smoke test-mlx preflight preflight-quick hooks
 .PHONY: test-install test-build test-windows-contract test-packaging test-release-policy preflight-worktree
-.PHONY: release-check
+.PHONY: release-check lint-deps
 
 help:
 	@printf '%s\n' \
@@ -35,6 +35,7 @@ help:
 		'make test-integration  Run the single integration test binary (tests/integration)' \
 		'make test-module MOD=llm::provider  Run lib tests under one module path' \
 		'make lint     Run clippy with the CI lint gate' \
+		'make lint-deps  Detect unused workspace dependencies (requires cargo-machete; never fixes manifests)' \
 		'make test-rust TEST_PROFILE=dev  Run portable Rust tests (CI uses ci)' \
 		'make test-nextest  Run the Rust tests under cargo-nextest (no retries, hung-test timeouts; .config/nextest.toml)' \
 		'make test-drivers  Run browser, JavaScript eval and Python kernel transport contracts (Node 22+, Python 3)' \
@@ -102,6 +103,11 @@ test-nextest:
 lint:
 	$(CARGO) clippy --locked --workspace --all-targets $(CARGO_FEATURE_FLAGS) -- -D warnings
 
+# Scope the audit to workspace manifests, not standalone benchmark/architecture fixtures.
+# An absolute root manifest avoids cargo-machete 0.9.2's empty-parent path error.
+lint-deps:
+	$(CARGO) machete --skip-target-dir "$(CURDIR)/Cargo.toml" "$(CURDIR)/crates"
+
 test-drivers:
 	DIAL_TEST_PYTHON="$(PYTHON)" $(NODE) --test crates/dial-tools/src/tools/net/browser/driver.test.cjs crates/dial-tools/src/tools/exec/eval/driver.test.cjs assets/collab-web/viewer.test.cjs
 
@@ -162,4 +168,4 @@ preflight-worktree:
 
 hooks:
 	git config core.hooksPath .githooks
-	@printf '%s\n' 'pre-push now runs scripts/preflight.sh; DIAL_PREFLIGHT=quick or skip changes that per push.'
+	@printf '%s\n' 'pre-push now runs scripts/preflight.sh; use DIAL_PREFLIGHT=quick git push for compile/lint gates or DIAL_PREFLIGHT=skip git push to bypass once.'

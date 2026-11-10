@@ -202,6 +202,27 @@ pub(crate) fn ranges_from_flags(flags: &[bool]) -> Vec<(usize, usize)> {
     out
 }
 
+/// Witnessed lines of `before` that the edit line map matches, unchanged, in `after`, as ranges of
+/// `after`. Empty when nothing was witnessed or the change is too large to map safely.
+fn carried_witnesses(before: &str, prior: &Seen, after: &str) -> Vec<(usize, usize)> {
+    if prior.0.is_empty() {
+        return Vec::new();
+    }
+    let old: Vec<String> = split_lines(before).into_iter().map(str::to_owned).collect();
+    let new: Vec<String> = split_lines(after).into_iter().map(str::to_owned).collect();
+    let Some(map) = line_map(&old, &new) else {
+        return Vec::new();
+    };
+    let seen = prior.flags(old.len());
+    let mut flags = vec![false; new.len()];
+    for (base, current) in map.into_iter().enumerate() {
+        if let Some(current) = current {
+            flags[current] = seen[base];
+        }
+    }
+    ranges_from_flags(&flags)
+}
+
 // ------------------------------------------------------------------ session store
 
 #[derive(Clone, Debug)]
@@ -279,10 +300,23 @@ impl EditStore {
             snap.seen.normalize();
             snaps.push(snap);
         } else {
+            // Lines the model saw that survive unchanged into this version stay witnessed, as in
+            // stale-edit re-anchoring: a new version (for example after another session's edit)
+            // must not force a reread of unrelated, already-observed lines. Changed and inserted
+            // lines need a fresh display. Notebook snapshots stay pinned to their raw revision.
+            let mut witnessed = Seen::from_ranges(seen);
+            if raw_revision.is_none()
+                && let Some(prior) = snaps.iter().rev().find(|s| s.raw_revision.is_none())
+            {
+                for (a, b) in carried_witnesses(&prior.text, &prior.seen, lf) {
+                    witnessed.0.push((a, b));
+                }
+                witnessed.normalize();
+            }
             snaps.push(Snapshot {
                 tag: tag.clone(),
                 text: Arc::from(lf),
-                seen: Seen::from_ranges(seen),
+                seen: witnessed,
                 raw_revision,
                 digest,
                 observation_id: self.observation_id,

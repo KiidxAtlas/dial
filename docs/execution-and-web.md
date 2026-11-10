@@ -108,6 +108,33 @@ console.log({ count: rows.length, total });
 Choose independent checks for the actual task; this illustrative sum does not establish that
 arbitrary input records or every acceptance condition are correct.
 
+### Counterexample search
+
+`dial.search` and `dial.compare` look for an input that breaks a claim, instead of relying on the
+handful of cases you thought of. Inputs come from `dial.gen` generators: `int(lo, hi)`,
+`float(lo, hi)`, `string({alphabet, min, max})`, `array(gen, {min, max})`, `tuple(...gens)`,
+`record({key: gen})`, `pick(values)`, `oneOf(...gens)`, `bool()` and `constant(value)`, plus
+`.map(f)` and `.filter(keep)`. Edge cases (0, ±1, bounds, empty strings and arrays) are tried
+first, then seeded random inputs that grow with the run index. A failing input is shrunk toward a
+minimal one.
+
+```js
+// A property: returning false or throwing is a failure.
+var r = await dial.search(xs => sorted(xs).length === xs.length, {gen: dial.gen.array(dial.gen.int())});
+// Differential: a regex against a plain reference implementation.
+var line = dial.gen.tuple(dial.gen.pick(["10.0.0.1"]), dial.gen.pick(["2024-01-02"]), dial.gen.bool())
+  .map(([ip, date, swap]) => swap ? `${date} ${ip}` : `${ip} ${date}`);
+var c = await dial.compare(s => (s.match(re) || [])[0] ?? null, reference, {gen: line});
+// {passed:false, counterexample:"10.0.0.1 2024-01-02", failure:"Error: left null vs right \"2024-01-02\"", ...}
+```
+
+Options are `runs` (default 200), `seed` (default fixed, so results reproduce), `cases`
+(explicit inputs tried first), `timeoutMs` (default 10 s) and, for `compare`, `equal(a, b)`.
+In `compare`, both sides throwing counts as agreement. Python has the same names and is
+synchronous: the generator is passed positionally and options as keywords
+(`dial.compare(f, g, dial.gen.string(alphabet="ab"), runs=500)`, with `timeout` in seconds). A
+pass is evidence over the inputs tried, not proof.
+
 The environment prompt reports whether the configured JavaScript and Python eval launchers
 resolve before the model generates a helper. Discovery reports a missing prerequisite when
 neither resolves. These are executable-path observations: interpreter version, containment and
@@ -148,14 +175,16 @@ For many lookups whose results you only need to aggregate or filter, use one cel
 `tool.batch([{name, args}, ...])` (JavaScript and Python) returns the results in entry order, each
 a `{is_error, text, data}` object (a failed entry does not throw). In Python the entries are
 dictionaries (`tool.batch([{"name": "read", "args": {"path": "a.txt"}}])`) and the result list,
-like other callback receipts, also tolerates `await`. When every entry is an offered,
-hook-free, read-only call (`read`, `grep`, `glob`, safe `bash` inspections and the like), the
-parent controller runs them together through the ordinary parallel-read group, with one journal
-flush before and one after. Otherwise each entry is an ordinary serial callback with its own
-validation and approval. Each entry counts against the cell's callback limit. Worker cells
-handle batches through the worker's own parallel-read path: entries run together when every one is
-an offered, hook-free read that the worker's approver authorizes and portable rules admit;
-otherwise they run one at a time as ordinary worker callbacks. Steering that arrives during a
+like other callback receipts, also tolerates `await`. Consecutive entries that are offered,
+hook-free, read-only calls (`read`, `grep`, `glob`, safe `bash` inspections and the like) run
+together on the parent controller through the ordinary parallel-read group, with one journal
+flush before and one after each group. Any other entry is an ordinary serial callback with its own
+validation and approval, and it closes the read group before it; reads after it form a new group
+once it has settled. A single read between two serial entries is an ordinary callback too.
+Results keep entry order. Each entry counts against the cell's callback limit. Worker cells
+group batches the same way through the worker's own parallel-read path: a run of entries joins a
+group when each is an offered, hook-free read that the worker's approver authorizes and portable
+rules admit; other entries run one at a time as ordinary worker callbacks. Steering that arrives during a
 worker batch stays queued for the worker's next boundary. A controller without batch support
 refuses the reserved callback, and the driver then runs the entries one by one. A single read-only
 callback is journaled with its result (one flush) rather than before and after.
@@ -221,10 +250,12 @@ mandatory fence remains active with filesystem sandboxing explicitly off. With s
 Bubblewrap still supplies filesystem/network containment; it applies the fence after its own
 namespace setup. A trusted network bridge fences the final interpreter rather than its own startup.
 Missing kernel support or failed installation refuses execution; there is no uncontained fallback.
-Python on Windows retains the native no-child-process mitigation and requires the explicit
-unsandboxed setting because filesystem/network isolation is unavailable. JavaScript on Windows
-remains unsupported. Discovery and `status` report platform support, not approval or interpreter
-availability. Reset, cancel and status remain usable on unsupported platforms.
+On Windows, Python and JavaScript kernels (Node or embedded QuickJS) launch through Dial's
+native no-child-process mitigation. With `sandbox.mode = "dev"`, they also run at Low integrity;
+`"off"` retains the process fence but runs with the user's normal filesystem/network privileges.
+Windows cannot enforce `"strict"` or network isolation; see [Windows security](windows.md#security).
+Discovery and `status` report platform support, not approval or interpreter availability.
+Reset, cancel and status remain usable on unsupported platforms.
 
 JavaScript eval uses operator-installed Node 22 or newer when `eval.node` resolves. Otherwise it
 uses the embedded QuickJS engine, which runs as a re-exec of `dial` (hidden worker argument) under
@@ -269,6 +300,22 @@ oversized or interrupted transport is discarded rather than reused. No universal
 Integration names, defaults and legacy always-registered behavior live in `tools/catalog.rs` alongside
 the existing canonical schema catalog. Saved integration lists still retain browser, eval, find, autoresearch and archive; a saved `kernel` entry is renamed to `eval` when configuration is loaded or saved, and computer and notebook remain opt-in. These declarations describe
 availability only and never grant execution authority.
+
+## Computer run source and recovery
+
+Direct `computer` scripts use exactly one source field: `code` is a JavaScript function body
+(for example `return await desktop.windows();`), while `fn` is function source invoked with
+`({ desktop, wait, assert }, ...args)` (for example `async ({ desktop }) => await desktop.windows()`).
+The parameter schema describes both forms. Eval exposes `computer`; run scripts expose `desktop`.
+`find()` and `children()` return arrays of elements; select one (`const [el] = await win.find({ role:
+"textfield" })`) before calling `click()`, `focus()`, `setValue()` or another element helper. Calling an
+element helper on the array fails with that instruction and sends nothing. A window's `bounds` is a
+property, while elements have `await el.bounds()`; calling `win.bounds()` explains the difference.
+Pointer coordinates must come from a fresh full screenshot of the same window.
+
+An uncalled function in `code` still fails rather than being silently invoked. Correct the call
+instead of repeating it unchanged, and inspect the target before repeating input: statements
+before the error may already have acted. Approval, read-only enforcement and retry guards are unchanged.
 
 ## Browser
 

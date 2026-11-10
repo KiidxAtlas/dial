@@ -346,3 +346,51 @@ fn witness_budget_includes_other_checks_and_inconclusive_attempts() {
         );
     }
 }
+
+#[test]
+fn test_strength_reports_surviving_mutants_once_per_turn_without_touching_the_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let source = "limit = 5\nflag = True\n";
+    std::fs::write(root.path().join("val.py"), source).unwrap();
+    let mut config = Config::default();
+    config.experimental.mutation_runs = 4;
+    let check = FocusedCheck {
+        name: "unit".into(),
+        command: "grep -qx 'limit = 5' val.py || { echo 'AssertionError: limit changed'; exit 1; }"
+            .into(),
+        timeout_secs: 30,
+    };
+    let versions = [version("val.py", None, Some(source))];
+    assert!(
+        agent(&config, root.path())
+            .test_strength(&check, &versions, &mut NullUi)
+            .is_none(),
+        "undeclared checks are not behavioral"
+    );
+    config
+        .verification
+        .behavioral_checks
+        .push(check.name.clone());
+    let mut agent = agent(&config, root.path());
+    let line = agent.test_strength(&check, &versions, &mut NullUi).unwrap();
+    assert!(line.contains("1 of 2 sampled mutants"), "{line}");
+    assert!(
+        line.contains("val.py:2  `flag = True` -> `flag = False`"),
+        "{line}"
+    );
+    let report = &agent.step_checks.counterfactual.test_strength["unit"];
+    assert_eq!(
+        (report["killed"].as_u64(), report["mutants"].as_u64()),
+        (Some(1), Some(2))
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("val.py")).unwrap(),
+        source
+    );
+    assert!(
+        agent
+            .test_strength(&check, &versions, &mut NullUi)
+            .is_none(),
+        "once per turn"
+    );
+}

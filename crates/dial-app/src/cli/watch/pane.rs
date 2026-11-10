@@ -12,6 +12,7 @@ use super::state::{self, ChatRole, Job, JobKind, Request, Snapshot};
 use super::{Event, load_image, next_event};
 use crate::agent::workflow::todo::Status;
 use crate::config::paths::Layout;
+use crate::ui::chrome;
 use crate::ui::images::Thumbnail;
 use crate::ui::text;
 use crate::ui::theme::{Theme, Tok};
@@ -533,7 +534,10 @@ impl Pane {
         };
         frame.render_widget(Paragraph::new(tabs), tabs_area);
         frame.render_widget(Paragraph::new(Line::from(fresh)), fresh_area);
-        frame.render_widget(Paragraph::new(self.footer(theme)), footer);
+        frame.render_widget(
+            Paragraph::new(self.footer(theme, usize::from(footer.width))),
+            footer,
+        );
         self.page = body.height as usize;
         let lines = if self.tab == Tab::Feed {
             self.feed_view(body.width as usize, body.height as usize, theme)
@@ -633,40 +637,54 @@ impl Pane {
         }
     }
 
-    fn footer(&self, theme: &Theme) -> Line<'static> {
+    fn footer(&self, theme: &Theme, width: usize) -> Line<'static> {
         match &self.mode {
-            Mode::Confirm { prompt, .. } => Line::from(vec![
-                Span::styled(format!("{}? ", capitalize(prompt)), theme.fg(Tok::Warning)),
-                Span::styled("y confirm · n keep it running", theme.fg(Tok::Muted)),
-            ]),
-            Mode::Browse => match &self.status {
-                Some(status) => Line::styled(status.clone(), theme.fg(Tok::Accent)),
-                None => {
-                    if self.tab == Tab::Peers && self.chat.is_some() {
-                        return Line::styled(
-                            "Type a message · Enter send · Esc back · ↑↓ PgUp/PgDn scroll · Tab tabs",
-                            theme.fg(Tok::Muted),
-                        );
-                    }
-                    let action = match self.tab {
-                        Tab::Jobs | Tab::Workers | Tab::Threads => " · x stop",
-                        Tab::Peers => " · Enter open chat",
-                        Tab::Feed | Tab::Plan => "",
+            Mode::Confirm { prompt, .. } => footer_line(
+                theme,
+                Some(Span::styled(
+                    format!("{}?", capitalize(prompt)),
+                    theme.fg(Tok::Warning),
+                )),
+                &[("y", "confirm"), ("n", "keep it running")],
+                width,
+            ),
+            Mode::Browse => {
+                if self.tab == Tab::Peers && self.chat.is_some() {
+                    let note = match &self.status {
+                        Some(status) => Span::styled(status.clone(), theme.fg(Tok::Accent)),
+                        None => Span::styled("Type a message", theme.fg(Tok::Muted)),
                     };
-                    let outcome = self
+                    return footer_line(
+                        theme,
+                        Some(note),
+                        &[
+                            ("Enter", "send"),
+                            ("↑↓ PgUp/PgDn", "scroll"),
+                            ("Tab", "tabs"),
+                            ("Esc", "back"),
+                        ],
+                        width,
+                    );
+                }
+                let mut hints = vec![("←→", "tabs"), ("↑↓", "select"), ("PgUp/PgDn", "scroll")];
+                match self.tab {
+                    Tab::Jobs | Tab::Workers | Tab::Threads => hints.push(("x", "stop")),
+                    Tab::Peers => hints.push(("Enter", "open chat")),
+                    Tab::Feed | Tab::Plan => {}
+                }
+                hints.push(("q", "close"));
+                // The newest action outcome (a status just set, else the session's last
+                // recorded one) leads the row; the keys follow and the way out always stays.
+                let note = match &self.status {
+                    Some(status) => Some(Span::styled(status.clone(), theme.fg(Tok::Accent))),
+                    None => self
                         .state
                         .as_ref()
                         .and_then(|state| state.outcomes.last())
-                        .map(|last| format!(" · {last}"))
-                        .unwrap_or_default();
-                    Line::styled(
-                        format!(
-                            "←→ tabs · ↑↓ select · PgUp/PgDn scroll{action} · q close{outcome}"
-                        ),
-                        theme.fg(Tok::Muted),
-                    )
-                }
-            },
+                        .map(|last| Span::styled(last.clone(), theme.fg(Tok::Muted))),
+                };
+                footer_line(theme, note, &hints, width)
+            }
         }
     }
 
@@ -1122,7 +1140,7 @@ impl Pane {
                         out.field("Phase", &peer.phase);
                         out.optional("Task", Some(&peer.summary));
                         out.field("Messages", &peer.messages.len().to_string());
-                        out.list("Claims", &peer.scopes, Tok::Text);
+                        out.list("Advisory claims", &peer.scopes, Tok::Text);
                         out.list("Overlaps yours", &peer.overlapping, Tok::Warning);
                     }
                     None => {
@@ -1139,10 +1157,10 @@ impl Pane {
                 }
                 out.lines.push(Line::default());
                 out.text(
-                    "Enter opens the conversation. Messages wake idle, finished or blocked sessions.",
+                    "Enter opens the conversation. Automatic wake-up depends on peer settings and eligibility.",
                     Tok::Dim,
                 );
-                out.list("This session claims", &peers.scopes, Tok::Text);
+                out.list("This session's advisory claims", &peers.scopes, Tok::Text);
                 if peers.queued > 0 {
                     out.field("Unread peer mail", &peers.queued.to_string());
                 }
@@ -1327,7 +1345,7 @@ fn session_bubbles(state: &Snapshot, own: &str) -> Vec<Bubble> {
 }
 
 /// A peer thread: this session on the right (its model, or "You" for what the human typed here),
-/// the peer on the left. The newest outgoing message carries a read receipt.
+/// the peer on the left. The newest outgoing message carries an inbox receipt, never agreement.
 fn peer_bubbles(peer: &state::PeerRow, own: &str) -> Vec<Bubble> {
     let last_out = peer.messages.iter().rposition(|message| message.outgoing);
     peer.messages
@@ -1336,16 +1354,19 @@ fn peer_bubbles(peer: &state::PeerRow, own: &str) -> Vec<Bubble> {
         .map(|(n, message)| {
             let receipt = if message.outgoing {
                 (Some(n) == last_out).then(|| {
-                    if message.unread {
+                    // Unknown, not a failure: the peer may simply have ended.
+                    if !message.receipt_available {
+                        ("Receipt unavailable".to_owned(), Tok::Muted)
+                    } else if message.unread {
                         ("Delivered".to_owned(), Tok::Muted)
                     } else {
-                        ("Read".to_owned(), Tok::Success)
+                        ("Collected · read unconfirmed".to_owned(), Tok::Muted)
                     }
                 })
             } else {
                 message
                     .unread
-                    .then(|| (format!("Not yet read by {own}"), Tok::Warning))
+                    .then(|| (format!("Queued for {own}"), Tok::Warning))
             };
             Bubble {
                 side: if message.outgoing {
@@ -1400,6 +1421,25 @@ fn capitalize(text: &str) -> String {
         .next()
         .map(|first| first.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+/// Fit a note and key hints without hiding the final (exit) hint.
+fn footer_line(
+    theme: &Theme,
+    note: Option<Span<'static>>,
+    hints: &[(&str, &str)],
+    width: usize,
+) -> Line<'static> {
+    let Some(note) = note.filter(|note| !note.content.trim().is_empty()) else {
+        return chrome::hint_line(theme, hints, width);
+    };
+    let mut line = chrome::hint_line_after(theme, &note.content, hints, width);
+    if let Some(lead) = line.spans.first_mut()
+        && lead.style == theme.fg(Tok::Muted)
+    {
+        lead.style = note.style;
+    }
+    line
 }
 
 /// Runs the pane until the user closes it. The terminal is restored on every exit path.

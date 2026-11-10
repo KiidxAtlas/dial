@@ -167,8 +167,11 @@ docker build --build-arg DIAL_BUILD_REVISION="$(git rev-parse HEAD)" \
   --build-arg SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" -t dial .
 ```
 
-The release workflow supplies the tagged commit and `DIAL_RELEASE_PUBLIC_KEY` as build arguments
-so the container binary retains its source identity and trusted update key.
+The release workflow does not compile Dial again for the image. It verifies the signed manifest
+and Linux x86-64 GNU archive, stages only its binary and notices with `scripts/stage-container.py`,
+and assembles `Dockerfile.release` for `linux/amd64`. The binary retains the candidate's exact
+source identity and embedded update key. The source-building `Dockerfile` remains available for
+local development and CI. Published images are smoke-tested, then signed by immutable digest.
 
 ## Build from source
 
@@ -383,9 +386,12 @@ git push origin v0.3.0
 
 Preparation accepts a dirty checkout, sets the inherited workspace version, rolls nonempty
 Unreleased notes into the dated version section, and refreshes only workspace lock entries
-with offline Cargo resolution. It never compiles or silently downloads dependencies. An offline
-resolution failure leaves the metadata edits available for inspection and retry; it does not
-certify a prepared tree. An already-bumped version is checked rather than rolled a second time.
+with offline Cargo resolution. It also repairs the Unreleased comparison and missing release
+reference links, preserving historical commit links. Duplicate or malformed references are refused
+before source edits. Repeating preparation, even at the current version, repairs link drift
+without rolling the notes twice. `make test-packaging` and `make release-check` detect reference drift.
+Preparation never compiles or silently downloads dependencies. An offline resolution failure leaves
+the metadata edits available for inspection and retry; it does not certify a prepared tree.
 
 `make release-check RELEASE_TAG=v0.3.0` checks stable tag/version agreement, inherited member
 versions, local lock entries, exact nonempty release notes, packaging consistency, both release
@@ -404,15 +410,56 @@ commit, compile or push main. `--tag --push` additionally pushes the tag; bare `
 old `--no-check` bypass are refused. The workflow independently repeats exact-commit admission.
 
 CI's shared no-build readiness/format job gates every compiling matrix and the container build.
-The release gate checks version/notes/public keys before any platform build; an isolated
-`release-signing` environment job also validates private/public Ed25519 key agreement first.
-Build jobs never receive the private key. The final signing job still validates its inputs and
-requires its own environment approval if configured: early approval does not waive final signing
-protection. These jobs cannot establish repository protections from workflow source alone.
+On main, while the workspace version has no tag, CI also calls `release-build.yml` to compile
+unsigned candidates for all eight release targets **in parallel with the test/lint jobs**. This
+does not run for PRs or after that version is tagged. Candidate jobs validate public keys, package
+and smoke-test every archive, and record the exact commit, version and embedded public key.
+They receive no private signing key or protected environment access. All candidate jobs must
+succeed for that main CI run to pass; this uses more concurrent runner capacity on release-bound
+main pushes, so queue time still depends on the account's concurrency allowance.
 
-Release Rust caches are saved even after failure, and the container workflow explicitly exports
-and restores its release-layer cache. Cache availability and speedups are not guaranteed;
-Docker cache mounts are not themselves persisted by the layer-cache exporter.
+The tag workflow still requires successful push-to-main CI for the exact SHA. It promotes that
+CI run's complete, unexpired candidate artifact set rather than compiling again. PR artifacts,
+other commits, incomplete sets and identities with a changed public key cannot be promoted.
+Older CI runs, expired artifacts or a rotated public key use the same shared build workflow as a
+fallback. Authentication/API errors fail visibly rather than silently bypassing admission.
+The protected `release-signing` input check and final signing approval remain mandatory when
+configured. The final job rechecks candidate identity before signing; build jobs never receive
+the private key. Workflow source alone cannot establish hosted repository protections.
+
+Candidate Rust caches are saved from main, including after failure, so later main commits can
+restore them; tag-scoped fallback builds restore main caches without creating isolated tag caches.
+PR container builds restore the main layer cache but do not export competing PR cache entries.
+The release container no longer needs a Rust compilation cache. Cache availability and speedups
+are not guaranteed; Docker cache mounts are not themselves persisted by the layer-cache exporter.
+
+Intel macOS test jobs also cache pip downloads and locally built wheels, keyed by Python and
+`scripts/requirements-ci.lock`, so successful jobs can reuse the otherwise source-built
+`cryptography` wheel. Installation still requires the locked hashes. Only main CI enables this
+cache; PRs, candidate packaging and tag fallback builds do not, avoiding extra branch-scoped
+cache entries. A cold or evicted cache still builds normally.
+
+The `x86_64-apple-darwin` candidate is cross-compiled on an Apple Silicon `macos-15` runner
+instead of the Intel runner, whose release build took about 24 minutes and set the candidate
+critical path. Its packaged binary is format-checked and smoke-tested under Rosetta 2, which the
+job installs if missing. The full test suite still runs on native Intel hardware in CI.
+
+#### Runner capacity and downstream failures
+
+Intel macOS remains fully tested in CI. To benchmark a faster **native Intel macOS** test runner,
+set the repository variable `DIAL_MACOS_INTEL_RUNNER` to an available runner label; CI tests use
+it, defaulting to `macos-15-intel`. Candidate packaging cross-compiles and does not use it. Provisioning a paid runner or increasing
+the repository cache quota requires an owner decision; this change does not spend money or alter
+hosted settings. Do not send untrusted PRs to a persistent privileged self-hosted runner.
+
+The publish job writes the binary release URL to its summary before downstream jobs start. If
+website refresh, package metadata or container publication fails, rerun only the failed jobs with
+`gh run rerun <release-run-id> --failed`; do not retag, rebuild or republish successful binaries.
+Those jobs retain visible failures. Website HTTP 404 means the refresh route is absent or its
+server-side token is unset: deploy the route and set `NUXT_RELEASE_REFRESH_TOKEN` on dial-web to
+the same value as Dial's `DIAL_WEB_REFRESH_TOKEN` secret. HTTP 401 means the values do not match.
+The endpoint intentionally returns 404 without its server-side token; changing the Dial workflow
+alone cannot configure the separately hosted website. No token value should appear in logs.
 
 #### Checking a commit locally before pushing
 
@@ -449,16 +496,15 @@ on every commit pushed to a branch and refuses the push if it fails. `DIAL_PREFL
 push` runs only the compile and lint gates; `DIAL_PREFLIGHT=skip git push` (or `--no-verify`)
 bypasses it. Runs in one checkout are serialized.
 
-CI skips commits that only touch Markdown under `docs/`, root-level Markdown or the PR template.
-Changes to protocol files such as `docs/rpc-schema.json` still trigger CI. A release commit always
-changes `Cargo.toml`, so CI runs for it; do not tag a documentation-only commit.
+CI runs on main pushes and pull requests. Release candidates are built only on main while the
+workspace version is untagged; documentation-only updates after a tag do not rebuild candidates.
 
-`.github/workflows/release.yml` does not re-run the test suite. Each macOS and Linux build job
-first requires a successful `CI` run (formatting, clippy, the full Rust suite including the Linux
-sandbox probes, and the terminal smoke test, on macOS arm64, macOS Intel and Ubuntu) for the exact
-tagged commit, waiting while that run is in progress; with no successful run it fails. Push the
-commit to `main` and let CI pass before tagging. The jobs then build Apple Silicon/Intel Mac and
-Linux x86-64 and arm64 (glibc and musl) release binaries and smoke-test each extracted archive outside the checkout. Only
+`.github/workflows/release.yml` does not re-run the test suite. It requires a successful `CI` run
+(formatting, clippy, the full Rust suite including Linux sandbox probes, and terminal smoke tests)
+for the exact tagged commit, waiting while that run is in progress; without one it fails. Push
+the release-prepared commit to main and let CI and its parallel candidate builds pass before
+tagging. The tag workflow reuses those archives, or rebuilds through the identical shared workflow
+if candidates are unavailable. Every extracted archive is smoke-tested outside the checkout.
 after **all** platform builds (macOS arm64 and Intel, Linux x86-64 and arm64 in glibc and musl, Windows x86-64 and arm64) pass,
 does it create a GitHub release with the archives, bundled MIT license and README, a
 combined `SHA256SUMS` with its `SHA256SUMS.sig` and `SHA256SUMS.sshsig` signatures, and curated notes
@@ -498,8 +544,8 @@ not workflows already queued from an older commit.
 
 The Intel macOS CI job (`macos-15-intel`) runs format, build and the full test suite. The
 installed-binary smoke tests, real-terminal lifecycle scripts, slim build check and runtime
-overhead recording run on `macos-15` and Ubuntu only; the release workflow still builds and
-smoke-tests the packaged `x86_64-apple-darwin` archive.
+overhead recording run on `macos-15` and Ubuntu only; release candidates cross-compile the
+`x86_64-apple-darwin` archive on `macos-15` and smoke-test it under Rosetta 2.
 
 The workflow preserves repository visibility. Dial is MIT licensed; see `LICENSE` for
 permission to use, modify, and redistribute it.

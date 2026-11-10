@@ -396,6 +396,21 @@ pub fn remote_args(
     Ok(args)
 }
 
+/// Invoke a fixed subsystem through the same authentication and connection policy.
+pub(super) fn subsystem_command(
+    target: &Target,
+    settings: &Settings,
+    subsystem: &str,
+) -> Result<Command, String> {
+    validate_key(target.key.as_deref())?;
+    let control = control_for(settings)?;
+    let mut args = common_args(target, settings, control.as_deref(), true);
+    args.push("-s".into());
+    args.push(target.destination()?);
+    args.push(subsystem.into());
+    Ok(ssh_command(&args))
+}
+
 fn control_for(settings: &Settings) -> Result<Option<PathBuf>, String> {
     if supports_control_master() {
         ensure_control_dir(settings).map(Some)

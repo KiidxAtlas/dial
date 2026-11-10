@@ -111,6 +111,18 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
     let oauth = signed_route
         .then(|| llm::oauth::Binding::selected(&config.user_dir, provider))
         .flatten();
+    // A bundled model its provider serves over another wire (OpenCode's Claude models over
+    // Messages, GPT models over Responses) takes that protocol, but only on the provider's
+    // bundled API-key route; an operator-set endpoint or protocol is kept.
+    let model_protocol = match (&config.provider, &config.endpoint) {
+        (Some(provider), Some(endpoint)) if oauth.is_none() => llm::catalog::model_protocol(
+            provider,
+            &endpoint.base_url,
+            endpoint.protocol,
+            &config.model,
+        ),
+        _ => None,
+    };
     let kind = match (&config.provider, &config.endpoint) {
         (Some(provider), _) if provider == crate::llm::chatgpt::PROVIDER => {
             if let Some(endpoint) = &config.endpoint {
@@ -174,6 +186,7 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
             },
         },
     };
+    let model_protocol = model_protocol.filter(|_| matches!(kind, ProviderKind::Endpoint { .. }));
     let layout = Layout {
         project_root: config.project_root.clone(),
         project_dir: config.project_root.join(".dial"),
@@ -193,10 +206,8 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
     .with_remote_idle_timeout(config.remote_model_idle_timeout_secs)
     .with_codex_websocket(config.codex_websocket)
     .with_protocol(
-        config
-            .endpoint
-            .as_ref()
-            .and_then(|e| e.protocol)
+        model_protocol
+            .or_else(|| config.endpoint.as_ref().and_then(|e| e.protocol))
             .or_else(|| oauth.as_ref().map(|binding| binding.flow().protocol))
             .or_else(|| {
                 config

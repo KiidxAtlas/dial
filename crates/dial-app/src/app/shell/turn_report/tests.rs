@@ -194,11 +194,11 @@ fn next_steps_follow_turn_outcome_without_suggesting_unavailable_undo() {
         ),
         (
             json!({"outcome":"failed", "changed_files":["a.rs"]}),
-            "Next: send a follow-up message · /review-file · /undo (checkpointed edits only)",
+            "Next: send a follow-up message after inspecting the retained failure and effects; continue only unfinished work, not the whole turn · /review-file · /undo (checkpointed edits only)",
         ),
         (
             json!({"outcome":"failed", "changed_files":[]}),
-            "Next: send a follow-up message to continue",
+            "Next: send a follow-up message after inspecting the retained failure and effects; continue only unfinished work, not the whole turn",
         ),
     ] {
         let report = render(&summary, &no_timing()).unwrap();
@@ -262,7 +262,7 @@ fn blocked_handoff_names_specific_recorded_obligations_and_effect_limits() {
     }});
     let handoff = super::outcome(&summary, &Value::Null).handoff.join("\n");
     for expected in [
-        "Publish package (blocked)",
+        "Blocked: Signing identity unavailable — Publish package",
         "Signing identity unavailable",
         "Release artifact (open)",
         "Checks: none recorded",
@@ -273,6 +273,10 @@ fn blocked_handoff_names_specific_recorded_obligations_and_effect_limits() {
         assert!(handoff.contains(expected), "missing {expected}: {handoff}");
     }
     assert!(!handoff.contains("running"), "{handoff}");
+    assert!(
+        !handoff.contains("(blocked)"),
+        "the Blocked prefix states it once: {handoff}"
+    );
 }
 
 #[test]
@@ -283,6 +287,40 @@ fn completion_without_edits_is_quiet_unless_obligations_remain() {
     let handoff = super::outcome(&summary, &Value::Null).handoff.join("\n");
     assert!(handoff.contains("recorded open obligations"), "{handoff}");
     assert!(!handoff.contains("/undo"), "{handoff}");
+}
+
+#[test]
+fn current_passing_checks_alone_need_no_report_but_gaps_still_do() {
+    let clean = json!({"outcome":"answered", "changed_files":[], "open_tasks":0,
+        "checks_current":true, "recorded_checks":[{"name":"test", "status":"passed"}]});
+    assert_eq!(render(&clean, &no_timing()), None);
+    for (current, status) in [
+        (json!(false), "passed"),
+        (json!(null), "passed"),
+        (json!(true), "skipped"),
+    ] {
+        let gap = json!({"outcome":"answered", "changed_files":[], "open_tasks":0,
+            "checks_current":current, "recorded_checks":[{"name":"test", "status":status}]});
+        let report = render(&gap, &no_timing()).expect("verification gaps stay visible");
+        assert!(
+            line(&report, "Next:").contains("verification gaps"),
+            "{report}"
+        );
+    }
+}
+
+#[test]
+fn open_tasks_are_not_restated_as_outstanding_obligations_in_the_summary() {
+    let summary = json!({"outcome":"completed", "changed_files":["src/a.rs"], "open_tasks":1,
+        "evidence":{"outstanding_tasks":[{"content":"Ship change", "status":"pending"}]}});
+    let report = render(&summary, &no_timing()).unwrap();
+    let compact = line(&report, "Summary:");
+    assert!(compact.contains("1 open task"), "{report}");
+    assert!(!compact.contains("outstanding obligations"), "{report}");
+    assert!(
+        line(&report, "Outstanding:").contains("Ship change (pending)"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -395,4 +433,71 @@ fn measured_latency_refresh_keeps_a_single_handoff_with_next_action_last() {
             .any(|line| line.contains("generation 1.5 s over 2 requests"))
     );
     assert!(refreshed.handoff.last().unwrap().starts_with("Next:"));
+}
+
+#[test]
+fn next_action_prioritizes_open_work_and_verification_over_optional_review() {
+    for (extra, expected) in [
+        (json!({"open_tasks":1}), "outstanding work"),
+        (
+            json!({"evidence":{"deliverable_coverage":"open_obligations"}}),
+            "outstanding work",
+        ),
+        (
+            json!({"checks_current":true,"recorded_checks":[{"name":"test","status":"failed"}]}),
+            "failed checks",
+        ),
+        (
+            json!({"checks_current":false,"recorded_checks":[{"name":"test","status":"passed"}]}),
+            "verification gaps",
+        ),
+        (
+            json!({"checks_current":true,"recorded_checks":[{"name":"test","status":"skipped"}]}),
+            "verification gaps",
+        ),
+        (
+            json!({"recorded_checks":[{"name":"test","status":"passed"}]}),
+            "verification gaps",
+        ),
+    ] {
+        let mut summary = json!({"outcome":"completed","changed_files":["src/a.rs"]});
+        summary
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let handoff = super::outcome(&summary, &Value::Null).handoff.join("\n");
+        assert!(line(&handoff, "Next:").contains(expected), "{handoff}");
+        assert!(!line(&handoff, "Next:").contains("/undo"), "{handoff}");
+    }
+    // A no-edit answer must not hide recorded verification failures either.
+    let summary = json!({"outcome":"answered","changed_files":[],"checks_current":true,
+        "recorded_checks":[{"name":"test","status":"failed"}]});
+    let report = render(&summary, &Value::Null).unwrap();
+    assert!(line(&report, "Next:").contains("failed checks"), "{report}");
+}
+
+#[test]
+fn task_notes_are_not_blockers_without_a_blocked_status() {
+    for (status, prefix) in [
+        ("pending", "Outstanding:"),
+        ("in_progress", "Outstanding:"),
+        ("blocked", "Blocked:"),
+    ] {
+        let summary = json!({"outcome":"completed","changed_files":["src/a.rs"],"evidence":{
+            "outstanding_tasks":[{"content":"Ship change","status":status,"note":"Await review"}]
+        }});
+        let report = render(&summary, &Value::Null).unwrap();
+        assert!(
+            line(&report, prefix).contains("Await review — Ship change"),
+            "{report}"
+        );
+        assert!(
+            line(&report, "Summary:").contains("outstanding obligations"),
+            "{report}"
+        );
+        assert!(
+            line(&report, "Next:").contains("outstanding work"),
+            "{report}"
+        );
+    }
 }

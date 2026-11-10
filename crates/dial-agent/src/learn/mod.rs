@@ -6,6 +6,10 @@ pub mod compute;
 pub mod compute_controls;
 pub mod curriculum;
 pub mod distill;
+#[deprecated(
+    since = "0.3.4",
+    note = "use llm::download; this compatibility path remains available"
+)]
 pub mod download;
 pub mod gate;
 pub mod harvest;

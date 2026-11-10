@@ -2605,7 +2605,7 @@ fn full_schemas(env: Env, names: &[String]) -> Result<Vec<Value>> {
                 })
             }
             "checkpoint" | "rewind" => crate::agent::workflow::exploration::schema(name).context("unknown private exploration schema"),
-            "ask" => Ok(crate::agent::workflow::questions::schema()),
+            "ask" => Ok(crate::agent::workflow::questions::child_schema()),
             crate::storage::memory_backend::TOOL_NAME
                 if crate::storage::memory_backend::schema(&env.config.memory).is_some() =>
                 crate::storage::memory_backend::schema(&env.config.memory).context("selected memory backend does not offer this tool"),
@@ -2617,7 +2617,7 @@ fn full_schemas(env: Env, names: &[String]) -> Result<Vec<Value>> {
                 .get(n)
                 .map(|tool| tool.schema())
                 .context("extension tool vanished"),
-            "skill" => Ok(skills::skill_tool::schema()),
+            "skill" => Ok(skills::skill_tool::load_schema()),
             "task" => Ok(crate::agent::workers::subagents::nested_schema(env.config)),
             "message" => Ok(crate::agent::workers::live_tasks::message_schema(false)),
             other => bail!("subagents cannot use {other}"),

@@ -57,8 +57,8 @@ fn with_agent(f: impl FnOnce(&mut Agent<'_>, &Path)) {
 fn call(path: &Path, sensitive: bool) -> ToolCall {
     ToolCall {
         id: "directory-1".into(),
-        name: "request_directory".into(),
-        arguments: json!({"path":path,"reason":"test directory access","sensitive":sensitive}),
+        name: "ask".into(),
+        arguments: json!({"action":"directory","path":path,"reason":"test directory access","sensitive":sensitive}),
         malformed_arguments: false,
     }
 }
@@ -68,9 +68,10 @@ fn directory_access_auto_mode_still_requires_real_exact_allow_and_is_discoverabl
     with_agent(|agent, tmp| {
         let other = tmp.join("other");
         std::fs::create_dir(&other).unwrap();
-        assert!(agent.catalog().contains(&"request_directory".into()));
-        let schemas = agent.schemas(&["request_directory".into()]).unwrap();
-        assert_eq!(schemas[0]["function"]["name"], "request_directory");
+        assert!(agent.catalog().contains(&"ask".into()));
+        assert!(!agent.catalog().contains(&"request_directory".into()));
+        let schemas = agent.schemas(&["ask".into()]).unwrap();
+        assert_eq!(schemas[0]["function"]["name"], "ask");
         let mut answers = Answers {
             interactive: true,
             decisions: vec![Decision::Deny, Decision::AllowAlways, Decision::Allow],

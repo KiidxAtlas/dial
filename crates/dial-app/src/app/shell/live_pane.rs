@@ -493,6 +493,7 @@ fn peers(
                         outgoing: message.outgoing,
                         text: state::bounded(&message.text, state::TEXT_LIMIT),
                         unread: message.unread,
+                        receipt_available: message.receipt_available,
                         at_ms: message.at_ms,
                         by_user: message.by_user,
                     })

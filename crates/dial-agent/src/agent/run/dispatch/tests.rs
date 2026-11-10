@@ -339,18 +339,27 @@ fn code_cell_batches_run_read_only_entries_together_and_fall_back_to_serial_call
             "entry order is kept"
         );
 
-        // A non-read entry makes every entry an ordinary serial callback (NullUi denies).
+        // A non-read entry runs as an ordinary serial callback (NullUi denies); the reads on
+        // each side of it still run as read groups, and every entry keeps its slot.
         agent.approval = Approval::Ask;
         let mixed = batch(
             agent,
             json!([
                 {"name":"read","arguments":{"path":"a.txt"}},
+                {"name":"read","arguments":{"path":"a.txt"}},
                 {"name":"write","arguments":{"path":"b.txt","content":"x"}},
+                {"name":"read","arguments":{"path":"missing.txt"}},
+                {"name":"read","arguments":{"path":"a.txt"}},
             ]),
         );
         let results = mixed.data.unwrap();
-        assert!(results[0]["text"].as_str().unwrap().contains("alpha"));
-        assert_eq!(results[1]["is_error"], true);
+        let results = results.as_array().unwrap();
+        assert_eq!(results.len(), 5);
+        for index in [0, 1, 4] {
+            assert!(results[index]["text"].as_str().unwrap().contains("alpha"));
+        }
+        assert_eq!(results[2]["is_error"], true);
+        assert_eq!(results[3]["is_error"], true);
         assert!(!agent.workspace.root().join("b.txt").exists());
 
         let nested = batch(

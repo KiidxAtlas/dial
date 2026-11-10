@@ -1,6 +1,23 @@
 use super::*;
 use serde_json::json;
 
+#[test]
+fn recorded_references_never_look_like_passing_checks() {
+    let view = render(Tab::Evidence, 120, 12);
+    let shown = plain(&view).join("\n");
+    assert!(
+        !shown.contains('✓'),
+        "references are observations, not check verdicts: {shown}"
+    );
+    let theme = Theme::builtin("dial-dark").unwrap();
+    assert!(
+        view.iter()
+            .flat_map(|row| &row.spans)
+            .all(|span| span.style.fg != theme.fg(Tok::Success).fg)
+    );
+    assert!(shown.contains("not verified"), "{shown}");
+}
+
 fn plain(rows: &Rows) -> Vec<String> {
     rows.iter()
         .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())

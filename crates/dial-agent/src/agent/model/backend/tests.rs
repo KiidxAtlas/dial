@@ -292,3 +292,31 @@ fn explicit_subscription_refuses_custom_anthropic_endpoint() {
     select_auth(&mut fixture, llm::model_config::AuthMethod::OAuth);
     assert!(make_backend(&fixture.config).is_err());
 }
+
+#[test]
+fn bundled_model_wire_applies_only_on_the_bundled_route() {
+    use llm::model_config::ApiProtocol;
+    const ZEN: &str = "https://opencode.ai/zen/v1";
+    let protocol = |base: &str, protocol: Option<ApiProtocol>, model: &str| {
+        let mut fixture = Fixture::new("opencode-zen", base);
+        fixture.save_key(base);
+        fixture.config.model = model.into();
+        fixture.config.endpoint.as_mut().unwrap().protocol = protocol;
+        make_backend(&fixture.config).unwrap().test_protocol()
+    };
+    let chat = Some(ApiProtocol::ChatCompletions);
+    assert_eq!(
+        protocol(ZEN, chat, "claude-opus-4-8"),
+        Some(ApiProtocol::Anthropic)
+    );
+    assert_eq!(protocol(ZEN, None, "gpt-5.5"), Some(ApiProtocol::Responses));
+    assert_eq!(protocol(ZEN, chat, "glm-5.2"), chat);
+    assert_eq!(
+        protocol(ZEN, Some(ApiProtocol::Responses), "claude-opus-4-8"),
+        Some(ApiProtocol::Responses)
+    );
+    assert_eq!(
+        protocol("https://proxy.example/v1", chat, "claude-opus-4-8"),
+        chat
+    );
+}

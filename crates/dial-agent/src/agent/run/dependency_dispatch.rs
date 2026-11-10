@@ -192,9 +192,11 @@ fn footprint(
 
 /// Failed native mutations are prerequisites only for actions with overlapping or unknown
 /// resources. Diagnostic reads and proven-disjoint native work remain available in this batch.
+/// A failed `bg start` is likewise a prerequisite of later actions that operate on its job.
 #[derive(Default)]
 pub(in crate::agent) struct BatchPrerequisites {
     failed: Vec<(String, Option<Footprint>)>,
+    failed_jobs: Vec<String>,
 }
 
 impl BatchPrerequisites {
@@ -207,6 +209,18 @@ impl BatchPrerequisites {
         registry: &crate::tools::integrations::ext::Registry,
     ) {
         let resources = footprint_for(workspace, mode, registry, call);
+        if output.is_error
+            && output.execution.status != Some(tools::ToolStatus::Skipped)
+            && call.name == "bg"
+            && call.arguments["action"] == "start"
+            && let Some(name) = call.arguments["name"].as_str()
+            // A busy name means an existing job still answers to it (`bg` table refusal text).
+            && !output
+                .text
+                .contains(&format!("named {name:?} is already running"))
+        {
+            self.failed_jobs.push(name.to_owned());
+        }
         if output.is_error
             && output.execution.status != Some(tools::ToolStatus::Skipped)
             && (matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
@@ -223,6 +237,11 @@ impl BatchPrerequisites {
         registry: &crate::tools::integrations::ext::Registry,
         call: &ToolCall,
     ) -> Option<ToolOutput> {
+        if let Some(name) = self.failed_job_target(call) {
+            return Some(skipped(format!(
+                "This call was not executed: `bg start` for job `{name}` failed earlier in this batch, so the job does not exist. Inspect that failure, then start the job again in the next request; completed results are preserved."
+            )));
+        }
         if self.failed.is_empty() {
             return None;
         }
@@ -250,12 +269,34 @@ impl BatchPrerequisites {
                     (Some(failed), Some(resources)) => failed.conflicts(resources),
                     _ => true,
                 })?;
-        Some(ToolOutput::err(format!(
+        Some(skipped(format!(
             "This call was not executed: an earlier `{name}` mutation failed in this batch and this action has overlapping or unknown source dependencies. Inspect the failure and current source, then replan in the next request. Diagnostic reads and proven-disjoint native actions remain available; completed results are preserved."
-        ))
-        .with_status(tools::ToolStatus::Skipped)
-        .with_effects(tools::surface::outcome::Effects::None))
+        )))
     }
+
+    /// The failed job a later `bg` action would operate on. `kill` stays available: it may clear
+    /// a busy name that made the start fail.
+    fn failed_job_target<'a>(&'a self, call: &ToolCall) -> Option<&'a str> {
+        if call.name != "bg"
+            || !matches!(
+                call.arguments["action"].as_str(),
+                Some("wait" | "output" | "input" | "close_stdin" | "resize")
+            )
+        {
+            return None;
+        }
+        let name = call.arguments["name"].as_str()?;
+        self.failed_jobs
+            .iter()
+            .find(|failed| *failed == name)
+            .map(String::as_str)
+    }
+}
+
+fn skipped(text: String) -> ToolOutput {
+    ToolOutput::err(text)
+        .with_status(tools::ToolStatus::Skipped)
+        .with_effects(tools::surface::outcome::Effects::None)
 }
 
 impl Agent<'_> {

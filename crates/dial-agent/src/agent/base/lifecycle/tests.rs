@@ -42,11 +42,13 @@ fn capability_prose_only_asks_to_load_web_tools_that_are_not_offered() {
 #[test]
 fn skill_loader_line_names_only_offered_tools() {
     let catalog = "## Skills\n- review: reviews diffs\n";
-    let direct = super::with_skill_loader(catalog, &names(&["skill", "tool_load"]));
+    let direct = super::with_skill_loader(catalog, &names(&["skill", "tool_search"]));
     assert!(direct.contains("with the `skill` tool"), "{direct}");
-    let deferred = super::with_skill_loader(catalog, &names(&["tool_load"]));
+    // `skill` is not offered yet: the line says how to load it with the offered loader.
+    let deferred = super::with_skill_loader(catalog, &names(&["tool_search"]));
     assert!(
-        deferred.contains("`tool_load`") && !deferred.contains("with the `skill` tool"),
+        deferred.contains("`tool_search` names:[\"skill\"]")
+            && !deferred.contains("with the `skill` tool"),
         "{deferred}"
     );
     assert_eq!(super::with_skill_loader(catalog, &[]), catalog);

@@ -493,9 +493,9 @@ fn main() -> anyhow::Result<()> {
             handoff: vec![
                 "Changed: src/parser.rs, tests/parser.rs".into(),
                 "Checks: failed · freshness stale · parser-check failed".into(),
-                "Outstanding: inspect failing parser fixture (blocked)".into(),
+                "Blocked: inspect failing parser fixture".into(),
                 "Outside /undo: 1 shell command may have changed files".into(),
-                "Next: send a follow-up message · /review-file · /undo (checkpointed edits only)"
+                "Next: send a follow-up message after inspecting the retained failure and effects; continue only unfinished work, not the whole turn · /review-file · /undo (checkpointed edits only)"
                     .into(),
             ],
         });

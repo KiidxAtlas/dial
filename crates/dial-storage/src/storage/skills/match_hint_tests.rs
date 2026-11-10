@@ -21,9 +21,12 @@ fn names_skills_whose_name_or_description_shares_words_with_the_request() {
     assert!(hint.contains("pdf-forms may match"), "{hint}");
     assert!(!hint.contains("release"), "{hint}");
     assert!(hint.contains("load it with the `skill` tool"), "{hint}");
-    // Without the `skill` tool in the offer, the hint points at `tool_load` instead.
+    // Without `skill` in the offer, the hint points at exact `tool_search` loading.
     let hint = match_hint(&skills, "Please fill these PDF forms for me", false).unwrap();
-    assert!(hint.contains("`skill` tool with `tool_load`"), "{hint}");
+    assert!(
+        hint.contains("`skill` tool with `tool_search` names:[\"skill\"]"),
+        "{hint}"
+    );
     assert!(!hint.contains("load it with the `skill` tool"), "{hint}");
     // Three shared description words suggest a skill the request does not name.
     let hint = match_hint(

@@ -321,7 +321,9 @@ fn setup_choices(env: &Env) -> ChoiceSpec {
         ),
         current: false,
     }));
-    choice_spec("Setup · choose what you need", items)
+    let mut spec = choice_spec("Setup · choose what you need", items);
+    spec.summary = "Configured ≠ available ≠ text tested ≠ tool-compatible. Saving a route or finding model metadata proves neither inference nor tool support. /doctor shows session-only diagnostic evidence; tests are explicit opt-in actions.".into();
+    spec
 }
 
 /// The same local dependency and memory diagnostics used by `dial doctor`.
@@ -331,25 +333,25 @@ fn doctor_choices(env: &Env, config: &Config) -> ChoiceSpec {
     let mut items = vec![
         ChoiceItem {
             value: "models".into(),
-            label: format!("Core · Model {}", if configured { "configured" } else { "missing" }),
+            label: format!("1 · Configured · Model {}", if configured { "selected" } else { "missing" }),
             detail: format!("{}/{} · configuration only; open Models to select", crate::ui::text::one_line(&selection.provider), crate::ui::text::one_line(&selection.model)),
             current: false,
         },
         ChoiceItem {
             value: "providers".into(),
-            label: "Core · Authentication and endpoint".into(),
+            label: "2 · Available · Authentication and endpoint".into(),
             detail: "Unknown · metadata reachability is not inference readiness. Open Providers for credential source and an explicit metadata check.".into(),
             current: false,
         },
         ChoiceItem {
             value: "verify-model".into(),
-            label: "Core · Verify selected model response".into(),
+            label: "3 · Text tested · Verify selected model response".into(),
             detail: "Unknown · opt-in tiny inference request; review network/cost disclosure first".into(),
             current: false,
         },
         ChoiceItem {
             value: "verify-coding".into(),
-            label: "Core · Check coding/tool compatibility".into(),
+            label: "4 · Tool-compatible · Check synthetic roundtrip".into(),
             detail: "Unknown · separate opt-in synthetic tool roundtrip; review cost disclosure first".into(),
             current: false,
         },
@@ -370,7 +372,7 @@ fn doctor_choices(env: &Env, config: &Config) -> ChoiceSpec {
     }));
     let mut spec = choice_spec("Doctor · core readiness, then optional capabilities", items);
     spec.summary = format!(
-        "Configured ≠ metadata reachable ≠ inference verified. Results are cached/unknown unless explicitly tested. Open Providers for authentication source; no inference or installation runs from this page.\n{}\nOptional capabilities need not all be installed. Enter reviews a fix; nothing is installed without confirmation.",
+        "Configured ≠ available ≠ text tested ≠ tool-compatible. Metadata and installed weights are availability evidence only, not an inference test. Text and tool diagnostics are separate, session-only evidence for the exact tested configuration; unknown never means success. No inference or installation runs from this page.\n{}\nOptional capabilities need not all be installed. Enter reviews a fix; nothing is installed without confirmation.",
         crate::setup::memory::doctor_text(config)
     );
     spec

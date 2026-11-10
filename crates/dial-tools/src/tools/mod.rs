@@ -78,15 +78,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// one `tool_load` round, after which the tool stays offered for the session. An operator-pinned
 /// `[harness] tools` list, a hermetic run and the selection lent to subagents keep every selected
 /// tool offered.
-pub const DEFERRED_BY_DEFAULT: &[&str] = &[
-    "ast_search",
-    "lsp",
-    "git",
-    "mcp_servers",
-    "session_search",
-    "peers",
-    "side_request",
-];
+pub const DEFERRED_BY_DEFAULT: &[&str] = &["lsp", "git", "mcp_servers", "session_search", "peers"];
 
 const MAX_LIST: usize = 500;
 
@@ -1033,7 +1025,7 @@ impl Workspace {
                         .or_else(|| path.parent())
                         .unwrap_or(path);
                     io::Error::new(io::ErrorKind::PermissionDenied, format!(
-                        "path {input:?} is outside the workspace; call request_directory with path {:?} to ask for a yes/no access approval, then retry the tool. Normal directory access does not unlock protected Dial storage; that requires a separate sensitive request.",
+                        "path {input:?} is outside the workspace; call `ask` action=directory with path {:?} to ask for a yes/no access approval, then retry the tool. Normal directory access does not unlock protected Dial storage; that requires a separate sensitive request.",
                         project.display()
                     ))
                 })?
@@ -1308,7 +1300,7 @@ impl Workspace {
 const HASHLINE_READ_DESC: &str = "read: view a file or directory in any format (text, CSV, PDF, Office, \
 images, video, notebooks, archives). Ranges as a path suffix: `:50-100`, `:50+20`, `:50-`, `:-30`, \
 `:5-16,960-973`; `:outline` lists declarations, `:raw` is non-editable text; `paths` reads up to 16 targets at once. \
-Also `ssh://host/path`, `http(s)://`, `pr://N`, `issue://N`, `conflict://` and `artifact://H` (lines, `:info`, \
+Also `ssh://host/path`, `http(s)://`, `pr://N`, `issue://N`, `conflict://`, `artifact://H` (lines, `:info`, \
 `:annotations`, `:bytes=O+N`). Output is \
 a `[PATH#TAG]` header then `LINE:TEXT` rows; edit needs that TAG and may touch only shown lines. Stops at \
 48 KiB; the footer names the next range. Large or unfamiliar files: `grep` or `:outline` first, then read only the needed ranges, never page through. Excerpts already shown by glob/grep previews or earlier reads stay current: reuse them instead of rereading.";
@@ -1347,12 +1339,15 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                     REPLACE_READ_DESC
                 },
                 json!({
-                    "path": {"type": "string", "description": "Workspace path with an optional selector. Also: `ssh://host/path` and `http(s)://` URLs (approval required; archives take `:member`), `pr://N[/diff]` and `issue://N` (GitHub via gh), `conflict://` (unmerged paths) or `conflict://PATH` (merge hunks with edit anchors), `artifact://H` retained output (line ranges, `:info` retention, `:annotations` human feedback, `:bytes=O+N` exact base64 bytes)."},
+                    "path": {"type": "string", "description": "Workspace path with an optional selector. Also: `ssh://host/path` and `http(s)://` URLs (approval required; archives take `:member`), `pr://N[/diff]` and `issue://N` (GitHub via gh), `conflict://` (unmerged paths) or `conflict://PATH` (merge hunks with edit anchors), `artifact://H` retained output (line ranges, `:info` retention, `:annotations` human feedback, `:bytes=O+N` exact base64 bytes), `sys://` live host state."},
                     "offset": {"type": "integer", "minimum": 1, "description": "1-based line to start at (default 1); not together with a path selector."},
                     "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of lines (default 2000)."},
                     "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Several targets, each with its own selector, read in one call; use instead of path."},
                     "format": {"type":"string","enum":["text","base64"],"description":"Lossless local data, at most 1 MiB, in data.content; text output is a receipt. No selectors."},
                     "retain": {"type":"boolean","description":"With format: preserve exact source bytes as an artifact before recovery operations."},
+                    "fetch": {"type":"boolean","description":"For a single http(s) path: use configured page/markdown discovery and reader fallback (former web_fetch); no selectors/formats."},
+                    "raw": {"type":"boolean","description":"With fetch: return decoded body without HTML/JSON conversion."},
+                    "max_chars": {"type":"integer","minimum":1,"maximum":100000,"description":"With fetch: character cap (default 20000)."},
                 }),
                 &[],
             );
@@ -1403,6 +1398,8 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
              takes files, directories or `;`-separated scopes. Returns path:line:text; the footer names skipped or capped scopes and next_cursor.",
             json!({
                 "pattern": {"type": "string", "description": "Non-empty Rust regex such as `fn \\w+\\(` or `TODO|FIXME`; set literal for literal text."},
+                "ast": {"type":"boolean","description":"Structural ast-grep search: pattern is code; $VAR matches a node and $$$ARGS a node sequence (e.g. foo($A, $$$REST)). Only pattern/lang/path/limit apply. Preserves captures and source observations."},
+                "lang": {"type":"string","description":"With ast: language name; omit to infer from extensions."},
                 "literal": {"type": "boolean", "description": "Treat pattern as literal text (default false)."},
                 "path": {"type": "string", "description": "File, directory or semicolon-separated scopes, one `artifact://<hash>` retained output, or one `ssh://host/path` file (approval required)."},
                 "glob": {"type": "string", "description": "Only files whose workspace-relative path matches this glob."},
@@ -1435,6 +1432,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "pty": {"type": "boolean", "description": "Start as a terminal `bg` job (default false). Incompatible with session and timeout."},
                 "timeout": {"type": "integer", "minimum": 1, "description": "Seconds to wait before the command is killed (or moved to `bg` when `shell.auto_background_secs` is enabled and shorter)."},
                 "background": {"type": "boolean", "description": "Start as a `bg` job immediately (servers, watchers)."},
+                "trace": {"type": "boolean", "description": "Run this foreground command under strace -f on Linux and append a summary of programs executed, failed exits, missing paths, permission denials, network activity and files written."},
             }),
             &["command"],
         ),
@@ -1507,6 +1505,19 @@ fn read_streaming(
         return ToolOutput::err("tool arguments must be a JSON object");
     }
     exec::execution::run(cancel, || {
+        if args.get("fetch").and_then(Value::as_bool) == Some(true) {
+            return match context {
+                Some(context) => net::web::fetch_read(context, args, cancel),
+                None => ToolOutput::err(
+                    "page discovery fetch requires the controller's configured read context",
+                ),
+            };
+        }
+        if args.get("raw").is_some() || args.get("max_chars").is_some() {
+            return ToolOutput::err(
+                "raw and max_chars require fetch=true; ordinary reads use :raw and limit",
+            );
+        }
         if args.get("format").is_some() {
             return fs::data_io::read(ws, args).unwrap_or_else(ToolOutput::err);
         }
@@ -1515,6 +1526,10 @@ fn read_streaming(
         }
         if let Some(result) = fs::media::read(ws, args, cancel, context) {
             return result.unwrap_or_else(ToolOutput::err);
+        }
+        if present(args, "paths") {
+            return fs::files::read_paths_output(ws, args, cancel, budget)
+                .unwrap_or_else(ToolOutput::err);
         }
         match fs::files::read_tool_streaming(ws, args, cancel, budget) {
             Ok(text) => ToolOutput::ok(text),
@@ -1852,6 +1867,12 @@ fn dispatch(
         "read" => match fs::media::read(ws, args, &std::sync::atomic::AtomicBool::new(false), None)
         {
             Some(result) => result,
+            None if present(args, "paths") => fs::files::read_paths_output(
+                ws,
+                args,
+                &std::sync::atomic::AtomicBool::new(false),
+                fs::select::MAX_READ_OUTPUT,
+            ),
             None => fs::files::read_tool(ws, args).map(ToolOutput::ok),
         },
         "write" => {
@@ -1869,6 +1890,12 @@ fn dispatch(
         "edit" => edit::editing::edit_output(ws, args)
             .map_err(|error| fs::suggest::annotate_edit(ws, args, error)),
         "glob" => fs::search::glob_tool(ws, args).map(ToolOutput::ok),
+        "grep" if args.get("ast").and_then(Value::as_bool) == Some(true) => {
+            match surface::facade::member_call("grep", args) {
+                Some((_, own)) => Ok(edit::ast::search_output(ws, &own)),
+                None => Err("ast search accepts only pattern, lang, path and limit".into()),
+            }
+        }
         "grep" => fs::search::grep_tool(ws, args).map(ToolOutput::ok),
         "bash" => exec::shell::bash_tool(ws, args, timeout_secs),
         _ => Err(format!(

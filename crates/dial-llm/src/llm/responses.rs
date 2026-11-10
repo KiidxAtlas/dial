@@ -559,6 +559,9 @@ fn reply_from_output(response: &Value, partial: bool) -> Result<Reply> {
             }
             // Built-in web search runs inside the provider; it is kept as native output, never executed locally.
             Some("web_search_call") => {}
+            // Perplexity's Agent API reports provider-hosted search hits as their own item. The
+            // cited answer is in the message; the hits are neither executed nor replayed.
+            Some("search_results") => continue,
             _ => bail!("Responses returned an unsupported output item"),
         }
         // Preserve native IDs, call namespaces and encrypted reasoning for the next HTTP request.

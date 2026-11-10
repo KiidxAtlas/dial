@@ -47,16 +47,3 @@
 *~
 *.swp
 *.swo
-benchmarks/
-
-# Source benchmark cases belong in version control; generated benchmark runs stay ignored.
-!examples/benchmarks/
-examples/benchmarks/*
-!examples/benchmarks/lifecycle-efficiency.toml
-!examples/benchmarks/omp_gap.py
-!examples/benchmarks/test_omp_gap.py
-!examples/benchmarks/release-slice.toml
-!examples/benchmarks/release-slice-hosted-profiles.toml
-!examples/benchmarks/release-slice-local-profiles.toml
-!examples/benchmarks/release_slice.py
-!examples/benchmarks/test_release_slice.py

@@ -93,7 +93,7 @@ fn parent_schedules_nohook_reads_concurrently() {
         }
     }
     let server = serve(vec![
-        Reply::Call("tool_load", json!({"names":["harness_probe"]})),
+        Reply::Call("tool_search", json!({"names":["harness_probe"]})),
         Reply::Calls(vec![
             ("harness_probe", json!({"index":0})),
             ("harness_probe", json!({"index":1})),
@@ -1096,11 +1096,11 @@ fn discovery_and_a_valid_call_to_the_absent_tool_run_in_the_same_batch() {
 #[test]
 fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
     let server = serve(vec![
-        Reply::Call("tool_load", json!({"names":["web_fetch"]})),
+        Reply::Call("tool_search", json!({"names":["web_search"]})),
         Reply::Text("loaded"),
     ]);
     let mut e = env(&server.url, "auto");
-    e.config.integrations = vec!["web_fetch".into()];
+    e.config.integrations = vec!["web_search".into()];
     e.config.sandbox.allow_network = false;
     e.config.assistance.compact_tools = true;
     e.config.assistance.initial_tool_limit = 13;
@@ -1117,7 +1117,7 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
     };
     let initial = names(0);
     // Basic workspace tools remain available within the compact offer. Optional helpers cannot
-    // displace them; specialists such as `side_request` and `git` require explicit loading.
+    // displace them; specialists such as `git` require explicit loading.
     assert!(initial.len() <= 21, "{initial:?}");
     for core in [
         "read",
@@ -1126,16 +1126,15 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
         "grep",
         "bash",
         "finish",
-        "tool_load",
         "tool_search",
     ] {
         assert!(initial.contains(&core), "{core}");
     }
-    for deferred in ["find", "side_request", "git", "lsp", "peers"] {
+    for deferred in ["find", "git", "lsp", "peers"] {
         assert!(!initial.contains(&deferred), "{deferred}");
     }
-    assert!(!initial.contains(&"web_fetch"));
-    assert!(names(1).contains(&"web_fetch"));
+    assert!(!initial.contains(&"web_search"));
+    assert!(names(1).contains(&"web_search"));
     let report = a.efficiency_report();
     assert_eq!(
         report["usage"]["by_model"]["openai-compatible/scripted"]["main"]["requests"],
@@ -2615,10 +2614,10 @@ fn code_history_finds_a_diff_an_earlier_turn_made() {
             json!({"path":"marker.txt","content":"retry_backoff = 3\n"}),
         ),
         Reply::Text("Created marker."),
-        Reply::Call("tool_load", json!({"names":["code_history"]})),
+        Reply::Call("tool_search", json!({"names":["history"]})),
         Reply::Call(
-            "code_history",
-            json!({"action":"search","query":"retry_backoff"}),
+            "history",
+            json!({"source":"changes","action":"search","query":"retry_backoff"}),
         ),
         Reply::Text("Found it."),
     ]);
@@ -2632,8 +2631,8 @@ fn code_history_finds_a_diff_an_earlier_turn_made() {
     let (_, text, error) = ui
         .results
         .iter()
-        .find(|(name, _, _)| name == "code_history")
-        .expect("code_history ran");
+        .find(|(name, _, _)| name == "history")
+        .expect("history ran");
     assert!(!error, "{text}");
     assert!(
         text.contains("marker.txt (created +1 -0)") && text.contains("add the backoff marker"),
@@ -2905,7 +2904,7 @@ fn steering_after_finish_preserves_newly_loaded_tools() {
     }
     let server = serve(vec![
         Reply::Calls(vec![
-            ("tool_load", json!({"names":["skill"]})),
+            ("tool_search", json!({"names":["skill"]})),
             (
                 "finish",
                 json!({"outcome":"completed","summary":"First task done."}),
@@ -4605,7 +4604,7 @@ fn small_window_completes_first_turn_with_on_demand_tools() {
     assert_eq!(report.text, "done");
     // A fresh on-demand catalog leaves response headroom without removing required primitives.
     let names = tool_names(&server.requests.lock()[0]);
-    for tool in ["read", "edit", "finish", "tool_load"] {
+    for tool in ["read", "edit", "finish", "tool_search"] {
         assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");
     }
 }
@@ -4738,7 +4737,7 @@ fn roomy_window_keeps_the_full_tool_set_without_notice() {
         ui.notices
     );
     let names = tool_names(&server.requests.lock()[0]);
-    for tool in ["task", "read", "tool_load"] {
+    for tool in ["task", "read", "tool_search"] {
         assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");
     }
 }
@@ -5115,13 +5114,7 @@ fn each_agent_type_gets_its_own_prompt_and_tool_allowlist() {
                 assert!(
                     matches!(
                         extra.as_str(),
-                        "codebase_memory"
-                            | "find"
-                            | "dep_source"
-                            | "memory"
-                            | "archive"
-                            | "code_history"
-                            | "ask"
+                        "find" | "dep_source" | "memory" | "history" | "ask"
                     ),
                     "{agent_type} got non-read-only tool {extra}"
                 );
@@ -6116,12 +6109,12 @@ fn reasoning_guard_settings_load_defaults_and_validate_limits() {
 #[test]
 fn codebase_understanding_is_saved_across_new_sessions_and_invalidated_by_edits() {
     let server = serve(vec![
-        // `codebase_memory` is loadable rather than offered by default.
-        Reply::Call("tool_load", json!({"names":["codebase_memory"]})),
+        // Saved codebase understanding is reached through memory's codebase store.
+        Reply::Call("tool_search", json!({"names":["memory"]})),
         Reply::Call("read", json!({"path":"src/router.rs"})),
         Reply::Call(
-            "codebase_memory",
-            json!({"action":"remember","topic":"request routing","summary":"Router forwards requests into storage.","sources":["src/router.rs"]}),
+            "memory",
+            json!({"store":"codebase","action":"remember","topic":"request routing","summary":"Router forwards requests into storage.","sources":["src/router.rs"]}),
         ),
         Reply::Text("understood"),
         Reply::Text("reused"),
@@ -6617,7 +6610,11 @@ fn steering_during_reasoning_cancels_generation_without_interrupting_the_turn() 
         fn take_steering(&mut self) -> Vec<String> {
             if self.ready && !self.sent {
                 self.sent = true;
-                vec!["Stop the old task. Answer what is two plus two.".into()]
+                vec![
+                    "Stop the old task. Answer what is two plus two.".into(),
+                    "Keep the answer short.".into(),
+                    "Do not create any files.".into(),
+                ]
             } else {
                 vec![]
             }
@@ -6640,7 +6637,28 @@ fn steering_during_reasoning_cancels_generation_without_interrupting_the_turn() 
     assert!(!report.interrupted);
     assert_eq!(report.text, "Four.");
     assert!(!e.project.path().join("gate-leak.txt").exists());
-    assert_eq!(server.requests.lock().len(), 2);
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 2);
+    let users: Vec<_> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    let steering = [
+        "Stop the old task. Answer what is two plus two.",
+        "Keep the answer short.",
+        "Do not create any files.",
+    ];
+    for text in steering {
+        assert_eq!(users.iter().filter(|&&user| user == text).count(), 1);
+    }
+    let positions: Vec<_> = steering
+        .iter()
+        .map(|text| users.iter().position(|user| user == text).unwrap())
+        .collect();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
 }
 
 #[test]
@@ -7071,7 +7089,7 @@ fn explicit_browser_and_process_tools_load_without_starting_a_service() {
         return;
     }
     let server = serve(vec![
-        Reply::Call("tool_load", json!({"names":["browser","bg"]})),
+        Reply::Call("tool_search", json!({"names":["browser","bg"]})),
         Reply::Call("bg", json!({"action":"list"})),
         Reply::Call(
             "bg",
@@ -7854,7 +7872,7 @@ fn dynamic_extension_sdk_executes_with_approval_and_evidence() {
     }
     let server = serve(vec![
         Reply::Call("tool_search", json!({"query":"sdk_inspect"})),
-        Reply::Call("tool_load", json!({"names":["sdk_inspect"]})),
+        Reply::Call("tool_search", json!({"names":["sdk_inspect"]})),
         Reply::Call("sdk_inspect", json!({"path":"fixture.txt"})),
         Reply::Text("SDK result received"),
     ]);
@@ -7975,7 +7993,7 @@ fn known_unoffered_tools_load_and_a_valid_call_runs_through_approval_in_the_same
 fn web_search_is_discoverable_loadable_and_respects_network_restrictions() {
     let server = serve(vec![
         Reply::Call("tool_search", json!({"query":"web_search"})),
-        Reply::Call("tool_load", json!({"names":["web_search","web_fetch"]})),
+        Reply::Call("tool_search", json!({"names":["web_search","read"]})),
         Reply::Call("web_search", json!({"query":"Rust release notes"})),
         Reply::Text("Network access is disabled; no search results were retrieved."),
     ]);
@@ -8000,7 +8018,7 @@ fn web_search_is_discoverable_loadable_and_respects_network_restrictions() {
             .to_string()
             .contains("Search the web and return numbered results")
     );
-    for name in ["web_search", "web_fetch"] {
+    for name in ["web_search", "read"] {
         assert!(
             requests[2]["tools"]
                 .as_array()
@@ -8021,10 +8039,10 @@ fn web_search_is_discoverable_loadable_and_respects_network_restrictions() {
 fn explicit_loading_affects_the_next_request_and_invalid_names_are_rejected_atomically() {
     let server = serve(vec![
         Reply::Calls(vec![
-            ("tool_load", json!({"names":["web_fetch"]})),
-            ("web_fetch", json!({"url":"https://example.invalid"})),
+            ("tool_search", json!({"names":["web_search"]})),
+            ("web_search", json!({"query":"fixture"})),
         ]),
-        Reply::Call("tool_load", json!({"names":["web_search","not_a_tool"]})),
+        Reply::Call("tool_search", json!({"names":["lsp","not_a_tool"]})),
         Reply::Text("finished"),
     ]);
     let mut e = env(&server.url, "ask");
@@ -8036,25 +8054,25 @@ fn explicit_loading_affects_the_next_request_and_invalid_names_are_rejected_atom
         .unwrap();
     // Loading takes effect on the next request; the unoffered same-batch call is refused.
     assert_eq!(a.metrics().tool_contract_errors, 1);
-    assert!(a.tool_names().iter().any(|n| n == "web_fetch"));
-    assert!(!a.tool_names().iter().any(|n| n == "web_search"));
+    assert!(a.tool_names().iter().any(|n| n == "web_search"));
+    assert!(!a.tool_names().iter().any(|n| n == "lsp"));
     assert!(
         server.requests.lock()[1]["messages"]
             .to_string()
-            .contains("unknown or unavailable tool: web_fetch")
+            .contains("unknown or unavailable tool: web_search")
     );
 }
 
 #[test]
 fn specialist_schema_can_be_released_and_loaded_again() {
     let server = serve(vec![
-        Reply::Call("tool_load", json!({"names":["web_fetch"]})),
-        Reply::Call("tool_load", json!({"unload":["web_fetch"]})),
-        Reply::Call("tool_load", json!({"names":["web_fetch"]})),
+        Reply::Call("tool_search", json!({"names":["web_search"]})),
+        Reply::Call("tool_search", json!({"unload":["web_search"]})),
+        Reply::Call("tool_search", json!({"names":["web_search"]})),
         Reply::Text("finished"),
     ]);
     let mut e = env(&server.url, "ask");
-    e.config.integrations = vec!["web_fetch".into()];
+    e.config.integrations = vec!["web_search".into()];
     e.config.sandbox.allow_network = false;
     e.config.assistance.compact_tools = true;
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
@@ -8066,10 +8084,10 @@ fn specialist_schema_can_be_released_and_loaded_again() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|s| s["function"]["name"] == "web_fetch")
+            .any(|s| s["function"]["name"] == "web_search")
     };
     assert!(!has(0) && has(1) && !has(2) && has(3));
-    assert!(a.tool_names().iter().any(|n| n == "web_fetch"));
+    assert!(a.tool_names().iter().any(|n| n == "web_search"));
     // Loading/unloading changes the active contract, not unrelated schema definitions.
     let base_tools = requests[0]["tools"].as_array().unwrap();
     for request in requests.iter().skip(1) {
@@ -8471,7 +8489,7 @@ fn extension_batch_registration_is_atomic_including_unloaded_and_core_collisions
         }
     }
     let server = serve(vec![
-        Reply::Call("tool_load", json!({"names":["atomic-good"]})),
+        Reply::Call("tool_search", json!({"names":["atomic-good"]})),
         Reply::Call("atomic-good", json!({"path":"fixture.txt"})),
         Reply::Text("atomic SDK complete"),
     ]);

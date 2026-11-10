@@ -265,6 +265,10 @@ function hintWrongGlobal(error) {
 		error.message +=
 			"; direct computer run code uses the `desktop` global (for example `await desktop.windows()`). `computer.*` exists only in Eval code.";
 	}
+	if (error?.name === "TypeError" && /\.bounds is not a function$/.test(error.message ?? "")) {
+		error.message +=
+			"; a window's `bounds` is a property (`win.bounds` → {x, y, width, height}); only elements have the method `await el.bounds()`.";
+	}
 	return error;
 }
 
@@ -1432,10 +1436,27 @@ class El {
 
 	async children() {
 		const { signal } = this.#getContext();
-		return (await nativeCall(signal, () => this.#session.axChildren(this.ref))).map(
-			node => new El(this.#session, this.#getContext, node),
+		return elementList(
+			(await nativeCall(signal, () => this.#session.axChildren(this.ref))).map(node => new El(this.#session, this.#getContext, node)),
 		);
 	}
+}
+
+const ELEMENT_METHODS = Object.getOwnPropertyNames(El.prototype).filter(name => name !== "constructor");
+
+/** Element arrays from `find()`/`children()` reject element helpers with the fix instead of "x.click is not a function". */
+function elementList(elements) {
+	for (const method of ELEMENT_METHODS) {
+		Object.defineProperty(elements, method, {
+			enumerable: false,
+			value() {
+				throw new ToolError(
+					`\`${method}()\` was called on a list of ${elements.length} element(s), not on an element. find() and children() return arrays; select one first, e.g. \`const [el] = await win.find({ role: "textfield" }); await el.${method}(…)\`. Nothing was sent.`,
+				);
+			},
+		});
+	}
+	return elements;
 }
 
 class Win {
@@ -1592,9 +1613,20 @@ class Win {
 
 	async find(query) {
 		const { signal } = this.#getContext();
-		return (await nativeCall(signal, () => this.#session.axQuery(this.id, query))).map(
-			node => new El(this.#session, this.#getContext, node),
+		return elementList(
+			(await nativeCall(signal, () => this.#session.axQuery(this.id, query))).map(node => new El(this.#session, this.#getContext, node)),
 		);
+	}
+
+	/** The first element matching `query`; throws naming the query when nothing matches. */
+	async findOne(query) {
+		const [first] = await this.find({ ...query, limit: 1 });
+		if (!first) {
+			throw new ToolError(
+				`findOne(${JSON.stringify(query ?? {})}) matched no element; inspect win.ax() for the actual roles and titles. Nothing was sent.`,
+			);
+		}
+		return first;
 	}
 
 	async ref(ref) {

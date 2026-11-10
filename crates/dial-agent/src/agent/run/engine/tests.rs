@@ -1205,6 +1205,95 @@ fn an_access_barrier_survives_unrelated_commits_until_its_grant() {
 }
 
 #[test]
+fn a_job_lifecycle_change_releases_only_failures_that_named_that_job() {
+    let mut edits = Edits::new();
+    let wait = edits.call(
+        "bg",
+        serde_json::json!({"action":"wait","name":"small6","timeout":300}),
+    );
+    let other = edits.call("bg", serde_json::json!({"action":"output","name":"other"}));
+    for call in [&wait, &other] {
+        edits.settle(call, vec![], ToolOutput::err("no background process named"));
+        assert!(barred(&mut edits, call));
+    }
+    // A failed start and an observation change no job state.
+    let failed_start = edits.call(
+        "bg",
+        serde_json::json!({"action":"start","name":"small6","command":"x","lifetime":60}),
+    );
+    edits.settle(&failed_start, vec![], ToolOutput::err("refused"));
+    let list = edits.call("bg", serde_json::json!({"action":"list"}));
+    edits.settle(&list, vec![], ToolOutput::ok("no jobs".into()));
+    assert!(barred(&mut edits, &wait));
+
+    let start = edits.call(
+        "bg",
+        serde_json::json!({"action":"start","name":"small6","command":"x"}),
+    );
+    let mut started = ToolOutput::ok("started small6 (pid 1)".into());
+    started.data = Some(serde_json::json!({"job":{"name":"small6"}}));
+    edits.settle(&start, vec![], started);
+    assert!(!barred(&mut edits, &wait), "the job now exists");
+    assert!(
+        !barred(&mut edits, &failed_start),
+        "the start's own job changed"
+    );
+    assert!(barred(&mut edits, &other), "another job is unaffected");
+
+    let kill_all = edits.call("bg", serde_json::json!({"action":"kill","all":true}));
+    edits.settle(&kill_all, vec![], ToolOutput::ok("killed 1 job".into()));
+    assert!(!barred(&mut edits, &other));
+}
+
+#[test]
+fn a_started_server_releases_refused_requests_but_not_file_job_or_access_barriers() {
+    let mut edits = Edits::new();
+    let browse = edits.call(
+        "browser",
+        serde_json::json!({"action":"open","url":"http://localhost:3519/"}),
+    );
+    let curl = edits.call(
+        "bash",
+        serde_json::json!({"command":"curl -sf http://localhost:3519/"}),
+    );
+    let read = edits.call("read", serde_json::json!({"path": "missing.rs"}));
+    let other_job = edits.call("bg", serde_json::json!({"action":"output","name":"other"}));
+    for (call, error) in [
+        (
+            &browse,
+            "browser guarded HTTP request: io: Connection refused (os error 61)",
+        ),
+        (&curl, "curl: (7) Failed to connect to localhost port 3519"),
+        (&read, "missing file"),
+        (&other_job, "no background process named"),
+    ] {
+        edits.settle(call, vec![], ToolOutput::err(error));
+        assert!(barred(&mut edits, call), "{error}");
+    }
+    let failed_start = edits.call(
+        "bg",
+        serde_json::json!({"action":"start","name":"prod","command":"bad"}),
+    );
+    edits.settle(&failed_start, vec![], ToolOutput::err("refused"));
+    assert!(
+        barred(&mut edits, &browse),
+        "a failed start changes nothing"
+    );
+
+    let start = edits.call(
+        "bg",
+        serde_json::json!({"action":"start","name":"prod","command":"PORT=3519 node .output/server/index.mjs"}),
+    );
+    let mut started = ToolOutput::ok("started prod (pid 1)".into());
+    started.data = Some(serde_json::json!({"job":{"name":"prod"}}));
+    edits.settle(&start, vec![], started);
+    assert!(!barred(&mut edits, &browse), "the server may now answer");
+    assert!(!barred(&mut edits, &curl), "the server may now answer");
+    assert!(barred(&mut edits, &read), "a missing file is still missing");
+    assert!(barred(&mut edits, &other_job), "another job is unaffected");
+}
+
+#[test]
 fn nonexecuted_refusals_do_not_poison_an_otherwise_valid_retry() {
     use crate::runtime::execution::ToolStatus;
     for status in [ToolStatus::Blocked, ToolStatus::Skipped] {

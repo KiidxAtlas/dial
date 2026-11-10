@@ -136,6 +136,26 @@ test('network failures lead with the current operation cause, not stale tab fail
   assert(!h.run(`failureMessage(new Error('page crashed'),3)`).startsWith('Browser network failure:'));
 });
 
+test('failure evidence omits other tabs\' stale noise but keeps the acted-on tab', () => {
+  const h=harness();
+  h.run(`tabs.set(1,{page:{url(){return 'http://localhost:3517/'}},console:[{operation_id:17,type:'error',text:'[vite] failed to connect to websocket'}],dialogs:[],downloads:[],network:[
+    {kind:'blocked',operation_id:0,url:'http://localhost:3517/_nuxt/builds/meta/dev.json',error:'browser networking is paused between approved operations'}
+  ]})`);
+  h.run(`tabs.get(1).networkFailures = tabs.get(1).network`);
+  h.run(`tabs.set(2,{page:{url(){return 'about:blank'}},console:[],dialogs:[],downloads:[],network:[
+    {kind:'blocked',operation_id:20,url:'http://localhost:3519/',error:'browser guarded HTTP request: io: Connection refused (os error 61)'}
+  ]})`);
+  h.run(`tabs.get(2).networkFailures = tabs.get(2).network`);
+  const open=h.run(`failureMessage(new Error('page.goto: net::ERR_BLOCKED_BY_CLIENT'),20,undefined)`);
+  assert(open.startsWith('Browser network failure: browser guarded HTTP request: io: Connection refused'));
+  assert(!open.includes('paused between approved operations'), open);
+  assert(!open.includes('[vite]'), open);
+  assert(open.includes('1 other open tab(s) recorded nothing during this operation'), open);
+  const onStale=h.run(`failureMessage(new Error('click timed out'),21,1)`);
+  assert(onStale.includes('[vite] failed to connect'), 'the acted-on tab keeps its recent history');
+  assert(!onStale.includes('Connection refused'), "another tab's earlier failure is not this one");
+});
+
 test('events merge tab channels in sequence order and return only newer entries', () => {
   const h=harness();
   h.run(`tab={seq:0,console:[],network:[],dialogs:[],downloads:[],navigation:[]};

@@ -313,13 +313,27 @@ fn grep_is_a_case_sensitive_regex_by_default() {
 }
 
 #[test]
-fn grep_reports_invalid_regex_without_panicking() {
+fn grep_searches_invalid_regex_as_literal_text_and_says_so() {
     let (dir, ws) = workspace();
-    fs::write(dir.path().join("a.txt"), "x(\n").unwrap();
-    let bad = run(&ws, "grep", json!({"pattern": "x("}));
-    assert!(bad.is_error, "{}", bad.text);
-    // The same text is fine as a literal.
-    assert!(grep(&ws, json!({"pattern": "x(", "literal": true})).contains("a.txt:1:x("));
+    fs::write(dir.path().join("a.txt"), "x(\nfoo[0]\n").unwrap();
+    for (pattern, row) in [("x(", "a.txt:1:x("), ("foo[0", "a.txt:2:foo[0]")] {
+        let found = run(&ws, "grep", json!({"pattern": pattern}));
+        assert!(!found.is_error, "{}", found.text);
+        assert!(
+            found
+                .text
+                .starts_with("[pattern is not valid Rust regex syntax")
+                && found.text.contains("searched as literal text")
+                && found.text.contains(row),
+            "{}",
+            found.text
+        );
+    }
+    // An explicit literal search has no notice; a valid regex is never reinterpreted.
+    let literal = grep(&ws, json!({"pattern": "x(", "literal": true}));
+    assert!(literal.contains("a.txt:1:x(") && !literal.contains("not valid"));
+    assert!(grep(&ws, json!({"pattern": "x\\("})).contains("a.txt:1:x("));
+    // Size-limit failures are not syntax errors and still fail.
     let huge = run(&ws, "grep", json!({"pattern": "((a{100}){100}){100}"}));
     assert!(huge.is_error, "{}", huge.text);
     assert!(run(&ws, "grep", json!({"pattern": ""})).is_error);

@@ -1,6 +1,54 @@
 use super::*;
 use crossterm::event::KeyEventKind;
 
+#[test]
+fn output_footer_keeps_the_way_out_at_narrow_widths() {
+    let keys = Keymap::defaults();
+    let theme = crate::ui::theme::Theme::dark();
+    for (running, terminal, exit) in [
+        (true, true, "Ctrl+] detach"),
+        (false, true, "Esc back"),
+        (true, false, "Esc back"),
+    ] {
+        let mut overlay = JobsOverlay::new();
+        let mut job = row("fixture", running);
+        job.terminal = terminal;
+        overlay.set_jobs(vec![job]);
+        overlay.handle(&Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)), &keys);
+        for width in [38, 60, 100] {
+            let shown = draw_rows(&mut overlay, &theme, width, 12).join("\n");
+            assert!(shown.contains(exit), "width {width}: {shown}");
+            if running && terminal {
+                assert!(
+                    !shown.contains("Esc back"),
+                    "attached Esc belongs to the process: {shown}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn exited_output_footer_uses_the_theme_separator() {
+    let keys = Keymap::defaults();
+    let ascii = crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let mut overlay = JobsOverlay::new();
+    let mut job = row("fixture", false);
+    job.terminal = true;
+    overlay.set_jobs(vec![job]);
+    overlay.handle(&Event::Key(key(KeyCode::Enter, KeyModifiers::NONE)), &keys);
+    let rows = draw_rows(&mut overlay, &ascii, 100, 12);
+    let footer = rows
+        .iter()
+        .find(|row| row.contains("read-only"))
+        .expect("output footer");
+    assert!(
+        footer.contains("process exited | read-only | Esc back"),
+        "{footer}"
+    );
+    assert!(!footer.contains('·'), "{footer}");
+}
+
 fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
     KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Press)
 }

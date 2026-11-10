@@ -321,6 +321,8 @@ experimental.turn_drafter_diagrams
 experimental.fault_witness
 experimental.repro_first
 experimental.edit_bisection_runs
+experimental.mutation_runs
+experimental.changed_line_coverage
 experimental.outcome_gradient_rounds
 experimental.streaming_dispatch
 goal.progress_file

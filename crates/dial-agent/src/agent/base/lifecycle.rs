@@ -41,8 +41,8 @@ fn with_skill_loader(catalog: &str, tools: &[String]) -> String {
     }
     let loader = if has("skill") {
         "Load a skill by name with the `skill` tool."
-    } else if has("tool_load") {
-        "To load a skill, first `tool_load` the `skill` tool, then call it with the skill name."
+    } else if has("tool_search") || has("tool_load") {
+        "To load a skill, first load the `skill` tool with `tool_search` names:[\"skill\"], then call it with the skill name."
     } else {
         return catalog.to_owned();
     };
@@ -710,14 +710,24 @@ impl<'a> Agent<'a> {
         self.workspace = self
             .workspace
             .clone()
-            .with_bash_interceptor(self.config.bash_interceptor.clone(), offered.clone())
+            .with_bash_interceptor(
+                self.config.bash_interceptor.clone(),
+                self.interceptor_tools(&offered),
+            )
             .with_syntax_block(syntax_block);
         let stable = self.stable_tool_offer() && self.parts.system_template.is_none();
-        let policy_tools = if stable {
+        let mut policy_tools = if stable {
             self.stable_core_tools()
         } else {
             offered.clone()
         };
+        // Guidance that names a consolidated member stays while its successor is offered.
+        let members: Vec<String> = policy_tools
+            .iter()
+            .flat_map(|name| self.ext.folded_members(name))
+            .map(str::to_owned)
+            .collect();
+        policy_tools.extend(members);
         let discoverable = if stable {
             Vec::new()
         } else {
@@ -725,8 +735,8 @@ impl<'a> Agent<'a> {
         };
         // A window-overflow fallback needs the lean instructions as well as lean schemas.
         let lean = self.lean_tools || self.lean_local() || self.local_escalated();
-        let built =
-            crate::agent::window::prompt::system_messages(crate::agent::window::prompt::Inputs {
+        let built = crate::agent::window::prompt::system_messages(
+            crate::agent::window::prompt::Inputs {
                 cwd: self.workspace.root(),
                 runtimes: {
                     let mut runtimes = String::new();
@@ -734,12 +744,16 @@ impl<'a> Agent<'a> {
                     // place helpers can run, and that is when a wrong-language helper costs most.
                     if !self.hermetic && self.tool_eligible("bash") {
                         runtimes.push_str(&tools::exec::shell::interpreter_guidance());
+                        runtimes.push_str(&tools::fs::system::session_inventory().compact());
                     }
                     if !self.hermetic && self.tool_eligible("eval") {
                         runtimes.push_str(&tools::exec::eval::runtime_guidance(
                             self.workspace.root(),
                             self.config,
                         ));
+                        if self.config.eval.portable_helpers {
+                            runtimes.push_str("- Counterexample search in eval: `dial.search(prop, {gen})` and `dial.compare(f, g, {gen})` try edge cases and seeded random inputs from `dial.gen` (int, float, string, array, tuple, record, pick, oneOf, bool) and shrink a failure; compare a tricky implementation (a regex, a parser) against a plain reference.\n");
+                        }
                     }
                     runtimes
                 },
@@ -770,7 +784,8 @@ impl<'a> Agent<'a> {
                 } else {
                     self.config.experimental.reasoning_strategy
                 },
-            });
+            },
+        );
         let mut messages = match built {
             Ok(messages) => {
                 self.parts.system_template_error = None;

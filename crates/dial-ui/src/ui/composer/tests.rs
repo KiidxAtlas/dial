@@ -3756,9 +3756,15 @@ fn explicit_steer_is_separate_from_the_queue_and_reports_stages() {
     assert!(
         screen(&c, &env, 100)
             .join("\n")
-            .contains("received · stale reply cancelled")
+            .contains("received · awaiting a safe-point decision")
     );
     assert!(c.mark_explicit("use the v2 API", SteerStage::Applied));
+    let applied = screen(&c, &env, 100).join("\n");
+    assert!(
+        applied.contains("recorded · now the current instruction"),
+        "{applied}"
+    );
+    assert!(!applied.contains("reply cancelled"), "{applied}");
     assert!(
         !c.mark_explicit("use the v2 API", SteerStage::Received),
         "stages never go back"

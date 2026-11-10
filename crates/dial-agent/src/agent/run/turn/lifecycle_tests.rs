@@ -183,7 +183,7 @@ environment=[]
 fn unoffered_calls_do_not_implicitly_load_specialists_or_fail_the_session() {
     let server = serve(vec![
         response("", Some(("git", json!({"action":"status"})))),
-        response("", Some(("tool_load", json!({"names":["git"]})))),
+        response("", Some(("tool_search", json!({"names":["git"]})))),
         response("No repository was inspected.", None),
     ]);
     with_agent("[compaction]\nenabled=false", |agent| {

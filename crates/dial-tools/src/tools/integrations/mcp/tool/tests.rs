@@ -274,3 +274,136 @@ fn oversized_input_schemas_are_shortened_in_steps() {
     let wide = json!({"type":"object","properties":{"a":{"enum":[long]}}});
     assert_eq!(bounded_input_schema(&wide).0, json!({"type":"object"}));
 }
+
+#[test]
+fn context_consolidates_both_surfaces_without_losing_rpc_arguments_or_sync_identity() {
+    use crate::tools::integrations::mcp::load;
+    use crate::tools::integrations::mcp::tests::{config_with, fake_config};
+    use crate::tools::testkit;
+
+    let mut server = fake_config("context", 30);
+    server.lifecycle_hooks = vec!["turn_started".into()];
+    let config = config_with(vec![("fake", server)]);
+    let mut loaded = load(&config);
+    assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
+    loaded.live.sync();
+    let offered = loaded.live.offered_tools();
+    assert!(!offered.iter().any(|tool| matches!(
+        tool.name(),
+        "mcp__fake__read_resource" | "mcp__fake__get_prompt"
+    )));
+    let context = offered
+        .iter()
+        .find(|tool| tool.name() == "mcp__fake__context")
+        .unwrap();
+    assert!(offered.iter().any(|tool| tool.name() == "mcp__fake__echo"));
+    assert_eq!(context.lifecycle_hooks(), &["turn_started"]);
+    assert_eq!(context.lifecycle_channel(), Some("fake"));
+    let (_dir, workspace) = testkit::workspace();
+    let ctx = ToolContext {
+        workspace: &workspace,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    for (args, pointer, expected) in [
+        (
+            json!({"surface":"resource"}),
+            "/resources/0/uri",
+            json!("fake:///readme"),
+        ),
+        (
+            json!({"surface":"resource"}),
+            "/templates/0/uriTemplate",
+            json!("fake:///{name}"),
+        ),
+        (
+            json!({"surface":"resource","uri":"fake:///chosen"}),
+            "/contents/0/uri",
+            json!("fake:///chosen"),
+        ),
+        (
+            json!({"surface":"prompt"}),
+            "/prompts/0/name",
+            json!("review"),
+        ),
+        (
+            json!({"surface":"prompt","name":"chosen","arguments":{"topic":"rust"}}),
+            "/description",
+            json!("chosen"),
+        ),
+    ] {
+        assert!(context.needs_approval(&args));
+        assert!(!context.read_only_hint());
+        let output = context.call(&ctx, &args);
+        assert!(!output.is_error, "{}", output.text);
+        assert_eq!(
+            output.data.as_ref().unwrap().pointer(pointer),
+            Some(&expected)
+        );
+        if args.get("arguments").is_some() {
+            let forwarded: Value = serde_json::from_str(
+                output.data.as_ref().unwrap()["messages"][0]["content"]["text"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                forwarded,
+                json!({"name":"chosen","arguments":{"topic":"rust"}})
+            );
+        }
+    }
+    for args in [json!({}), json!({"surface":"tools"})] {
+        assert!(context.call(&ctx, &args).is_error);
+    }
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    let output = context.call_streaming(
+        &ctx,
+        &json!({"surface":"resource","uri":"fake:///chosen"}),
+        &|_| {},
+        &cancel,
+    );
+    assert!(output.is_error, "pre-cancelled reads must not dispatch");
+    assert!(loaded.live.sync().upserted.is_empty());
+    let after = loaded.live.offered_tools();
+    assert!(Arc::ptr_eq(
+        context,
+        after
+            .iter()
+            .find(|tool| tool.name() == context.name())
+            .unwrap()
+    ));
+}
+
+#[test]
+fn context_rejects_unadvertised_capabilities() {
+    use crate::tools::integrations::mcp::load;
+    use crate::tools::integrations::mcp::tests::{config_with, fake_config};
+    use crate::tools::testkit;
+
+    for (flags, unsupported) in [("resources-only", "prompt"), ("prompts-only", "resource")] {
+        let config = config_with(vec![("fake", fake_config(flags, 30))]);
+        let loaded = load(&config);
+        assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
+        let offered = loaded.live.offered_tools();
+        let context = offered
+            .iter()
+            .find(|tool| tool.name() == "mcp__fake__context")
+            .unwrap();
+        let (_dir, workspace) = testkit::workspace();
+        let ctx = ToolContext {
+            workspace: &workspace,
+            config: &config,
+            mutation_authorizer: None,
+            confirm: None,
+        };
+        let output = context.call(&ctx, &json!({"surface":unsupported}));
+        assert!(output.is_error);
+        assert!(
+            output.text.contains("does not currently advertise"),
+            "{}",
+            output.text
+        );
+    }
+}

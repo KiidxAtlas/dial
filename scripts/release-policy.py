@@ -40,6 +40,38 @@ def successful_main_ci(runs, revision):
         for run in runs
     )
 
+
+def successful_ci_run_id(runs, revision):
+    for run in runs:
+        run_id = run.get("databaseId")
+        if successful_main_ci([run], revision) and type(run_id) is int and run_id > 0:
+            return run_id
+    raise ValueError("no successful exact-commit main push CI run with a valid ID")
+
+
+RELEASE_TARGETS = (
+    "aarch64-apple-darwin", "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc",
+)
+
+
+def complete_candidate_artifacts(pages):
+    expected = {f"release-assets-{target}" for target in RELEASE_TARGETS} | {"release-assets-identity"}
+    artifacts = [artifact for page in pages for artifact in page["artifacts"]
+                 if artifact.get("name", "").startswith("release-assets-")]
+    return (len(artifacts) == len(expected)
+            and {artifact["name"] for artifact in artifacts} == expected
+            and all(artifact.get("expired") is False for artifact in artifacts))
+
+
+def candidate_identity(revision):
+    tag = os.environ["RELEASE_TAG"]
+    stable_version(tag)
+    return dict(revision=revision, tag=tag, public_key=os.environ["DIAL_RELEASE_PUBLIC_KEY"])
+
+
 def release_notes(tag, changelog):
     """Select exactly the tagged version's curated section, never Unreleased or other versions."""
     stable_version(tag)
@@ -160,7 +192,7 @@ def tool_problems():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("latest", "ci", "notes", "check", "keys", "tools"))
+    parser.add_argument("action", choices=("latest", "ci", "ci-run", "artifacts", "identity", "notes", "check", "keys", "tools"))
     parser.add_argument("identity", nargs="?")
     parser.add_argument("input", type=Path, nargs="?")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -183,6 +215,16 @@ def main():
     if args.identity is None or args.input is None:
         parser.error(f"{args.action} requires an identity and input file")
     text = args.input.read_text(encoding="utf-8")
+    if args.action == "ci-run":
+        print(successful_ci_run_id(json.loads(text), args.identity))
+        return 0
+    if args.action == "artifacts":
+        return 0 if complete_candidate_artifacts(json.loads(text)) else 1
+    if args.action == "identity":
+        if json.loads(text) != candidate_identity(args.identity):
+            print("release: candidate commit, tag or public key changed; rebuild candidates", file=sys.stderr)
+            return 1
+        return 0
     if args.action == "latest":
         print(f"latest={str(is_latest(args.identity, text.splitlines())).lower()}")
         return 0

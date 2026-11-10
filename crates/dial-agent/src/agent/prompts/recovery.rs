@@ -135,13 +135,27 @@ pub const INITIAL_GUIDANCE: &str = "Visual evidence may help this task. Decide w
 pub(crate) const EFFECTS_UNKNOWN: &str = "Inspect affected state before any retry. Partial work may exist; do not infer rollback or replay the operation.";
 pub(crate) const PERMISSION_OR_POLICY: &str = "Respect the reported boundary. Do not switch tools to bypass it; finish reachable work and report the exact missing permission or prerequisite.";
 /// Appended where a path refusal suggests `request_directory` but no one can approve it.
-pub(crate) const DIRECTORY_REQUEST_UNAVAILABLE: &str = "\n<dial-notice kind=\"directory_request_unavailable\">This run has no interactive approver, so `request_directory` cannot be granted here; do not call it for this path. The path stays outside the workspace for file tools: finish the reachable work and report this path as the missing access if the task needs it.</dial-notice>";
+pub(crate) const DIRECTORY_REQUEST_UNAVAILABLE: &str = "\n<dial-notice kind=\"directory_request_unavailable\">This run has no interactive approver, so `ask` action=directory cannot be granted here; do not request it for this path. The path stays outside the workspace for file tools: finish reachable work and report this path as the missing access if the task needs it.</dial-notice>";
 pub(crate) const INTERRUPTED: &str = "Preserve completed effects. Do not automatically replay the interrupted operation; follow the user's direction and inspect state if continuation is requested.";
 pub(crate) const TIMEOUT: &str = "Inspect the recorded process/task state and completed output. Continue with a narrower bounded operation only when its effects are understood; a timeout is not a code diagnosis.";
 pub(crate) const NOT_EXECUTED: &str = "Resolve the reported ordering, cancellation or prerequisite before making a new call. Do not report this operation as executed.";
 /// A call the offered contract refused before execution: unknown tool, missing or mistyped arguments,
 /// malformed JSON. This is a correctable mistake, never a permission boundary.
-pub(crate) const CALL_CONTRACT: &str = "This is not a permission boundary: the call did not match the offered tool contract and was not executed. Fix the named arguments, or use an offered tool (tool_search/tool_load for an eligible one), then retry. Do not resend the same arguments.";
+pub(crate) const CALL_CONTRACT: &str = "This is not a permission boundary: the call did not match the offered tool contract and was not executed. Fix the named arguments, or use an offered tool (tool_search with names:[exact name] for an eligible one), then retry. Do not resend the same arguments.";
+/// An identical repeat of a failed call, withheld by the retry barrier without running.
+pub(crate) const RETRY_BARRIER: &str = "This is not a permission boundary: the same call already failed and was not run again. Fix the cause in its original error by changing the arguments (path, program, module, spacing), or change the file or environment it depends on first. Do not resend it unchanged.";
+/// A browser request that found no listener.
+pub(crate) const NOTHING_LISTENING: &str = "Nothing accepted the connection at that address, so the server is not running or not listening there yet. Start it as a `bg` job and wait until it listens (`bg` `wait` with `until` matching its listening line, or a `ready` port), then browse again. A server started with `&` inside `bash` is stopped when that call returns.";
+/// A `&` job inside a foreground `bash` call.
+pub(crate) const ASYNC_JOB: &str = "A `&` job inside `bash` belongs to this call: its process group is stopped when the call returns, so a server or watcher started this way is not running afterwards. Start long-running processes with `bg` (action `start`, with `ready` such as a port) instead.";
+/// An `eval` cell that tried to start a program; kernels run under a mandatory process-fork fence.
+pub(crate) const EVAL_NO_SUBPROCESS: &str = "`eval` cells cannot start programs: Python and JavaScript kernels run under a process-creation block by design, so `subprocess`, `os.system`, `os.popen` or `child_process` fail the same way. Run the command (for example `git show`) with `bash`, which is the intended tool for programs and keeps its own approval and sandbox rules; then process its output in a cell if needed. Effects of earlier statements in this cell still need checking.";
+/// Exit status 1 from a final line filter in a pipeline.
+pub(crate) fn filter_exit(filter: &str) -> String {
+    format!(
+        "Exit status 1 came from the final `{filter}`: it matched no lines. Earlier pipeline stages' statuses, and any errors the filter removed, are hidden. Rerun without the filter (or add `; echo \"exit=${{PIPESTATUS[0]}}\"`) before concluding what the command did."
+    )
+}
 pub(crate) const VERIFICATION_ENVIRONMENT: &str = "Diagnose the named runner or environment prerequisite; do not edit application code to hide this failure or install dependencies without approval. Use an already available equivalent check or report the coverage gap.";
 pub(crate) const VERIFICATION_CODE: &str = "Use the observed failing assertion/compiler diagnostic to repair the affected behavior, then rerun that check after the final edit. Do not change the acceptance criterion to obtain a pass. Untouched code can still fail because of a change; establish causality before calling a failure pre-existing. Report confirmed unrelated failures without repairing them.";
 pub(crate) const VERIFICATION_FAILED_UNCLASSIFIED: &str = "The process failed, but its runner has no controller-selected setup classification. Inspect the diagnostic to distinguish an environment prerequisite from a code defect before editing application code; preserve the failing acceptance criterion. Untouched code can still fail because of a change; establish causality before calling a failure pre-existing.";

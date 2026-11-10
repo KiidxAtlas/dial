@@ -12,9 +12,9 @@
 //! [`RECONNECT_LADDER_MS`]; calls made while a server is down reconnect it on demand, bounded by a
 //! burst breaker ([`RECONNECT_BURST_LIMIT`] attempts per [`RECONNECT_BURST_WINDOW`]). Servers that
 //! declare
-//! `resources` or `prompts` also get `mcp__<name>__read_resource` and `mcp__<name>__get_prompt`,
-//! which list when called without arguments. Resource and prompt listings are cached until the
-//! server sends the matching list-changed notice.
+//! `resources` or `prompts` also get one `mcp__<name>__context` tool. Set `surface` to `resource`
+//! or `prompt`; omit `uri` or `name` respectively to list. Resource and prompt listings are cached
+//! until the server sends the matching list-changed notice.
 //!
 //! Remote servers that answer 401 can be signed in with OAuth (`/mcp login <name>`, see
 //! [`login`]); the grant is stored per server and refreshed on rejection.

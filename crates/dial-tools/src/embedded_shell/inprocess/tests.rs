@@ -75,6 +75,8 @@ fn controlled_run(done: Receiver<i32>) -> Run {
         done,
         code: None,
         token: "controlled".into(),
+        #[cfg(windows)]
+        started: 0,
         termination: None,
         #[cfg(feature = "embedded-shell")]
         abort: {
@@ -83,6 +85,50 @@ fn controlled_run(done: Receiver<i32>) -> Run {
                 .unwrap();
             runtime.spawn(std::future::pending::<()>()).abort_handle()
         },
+    }
+}
+
+/// A stopped run terminates the external command it started, found by its environment token.
+#[cfg(all(windows, feature = "embedded-shell"))]
+#[test]
+fn windows_stop_terminates_marked_external_commands() {
+    let (_reader, writer) = std::io::pipe().unwrap();
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let mut run = Run::start(Request {
+        script: "ping -n 60 127.0.0.1".into(),
+        cwd: std::env::temp_dir(),
+        env: vec![
+            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+            ("SystemRoot".into(), system_root),
+        ],
+        output: writer,
+    })
+    .unwrap();
+    let entry = format!("{TOKEN_ENV}={}", run.token);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let marked = loop {
+        let found: Vec<u32> = crate::platform::processes::snapshot()
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.image.eq_ignore_ascii_case("ping.exe"))
+            .filter(|p| {
+                crate::platform::processes::details(p.pid).is_some_and(|d| d.created >= run.started)
+            })
+            .map(|p| p.pid)
+            .collect();
+        if !found.is_empty() {
+            break found;
+        }
+        assert!(Instant::now() < deadline, "ping never started");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let result = run.terminate();
+    assert_eq!(result.cleanup_error, None);
+    for pid in marked {
+        assert!(
+            crate::platform::processes::details(pid).is_none_or(|d| d.exited),
+            "ping {pid} carrying {entry} survived the stop"
+        );
     }
 }
 

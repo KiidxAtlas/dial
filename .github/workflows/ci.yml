@@ -16,6 +16,9 @@ jobs:
   validate:
     name: No-build readiness
     runs-on: ubuntu-22.04
+    outputs:
+      candidate-tag: ${{ steps.candidate.outputs.tag }}
+      epoch: ${{ steps.candidate.outputs.epoch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -30,6 +33,35 @@ jobs:
         run: make release-check test-release-policy
       - name: Format before any compilation
         run: cargo fmt --check
+      - name: Unused Rust dependencies (cargo-machete 0.9.2)
+        run: |
+          set -euo pipefail
+          archive="$(mktemp)"
+          tool_dir="$(mktemp -d)"
+          trap 'rm -f "$archive"; rm -rf "$tool_dir"' EXIT
+          curl --proto '=https' --tlsv1.2 -fsSL https://github.com/bnjbvr/cargo-machete/releases/download/v0.9.2/cargo-machete-v0.9.2-x86_64-unknown-linux-musl.tar.gz -o "$archive"
+          echo "48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$tool_dir" --strip-components=1 cargo-machete-v0.9.2-x86_64-unknown-linux-musl/cargo-machete
+          PATH="$tool_dir:$PATH" make lint-deps
+      - name: Select untagged main release candidate
+        id: candidate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          tag="$(python3 -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+  release-candidates:
+    name: Unsigned release candidates
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.validate.outputs.candidate-tag != ''
+    uses: ./.github/workflows/release-build.yml
+    with:
+      tag: ${{ needs.validate.outputs.candidate-tag }}
+      epoch: ${{ needs.validate.outputs.epoch }}
 
   test:
     name: fmt, build, test (${{ matrix.os }})
@@ -37,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-15-intel, ubuntu-22.04]
+        os: [macos-15, "${{ vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel' }}", ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,6 +84,9 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
+          # Retain Intel's source-built cryptography wheel without PR/tag cache copies.
+          cache: ${{ github.ref == 'refs/heads/main' && runner.os == 'macOS' && runner.arch == 'X64' && 'pip' || '' }}
+          cache-dependency-path: scripts/requirements-ci.lock
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
@@ -120,17 +155,17 @@ jobs:
       # runner keeps it from being the CI long pole. Intel still builds and runs every test above,
       # and the release workflow builds and smoke-tests the packaged x86_64-apple-darwin archive.
       - name: Check slim build
-        if: matrix.os != 'macos-15-intel'
+        if: matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
         run: cargo check --locked --profile ci --no-default-features -p dial --bin dial
       - name: Install executable and verify artifact contracts
-        if: matrix.os != 'macos-15-intel'
+        if: matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
         timeout-minutes: 10
         run: |
           mkdir -p target/installed/bin
           install -m755 "${CARGO_TARGET_DIR:-target}/ci/dial" target/installed/bin/dial
           make test-smoke DIAL=target/installed/bin/dial
       - name: Real terminal and crash lifecycle
-        if: matrix.os != 'macos-15-intel'
+        if: matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
         timeout-minutes: 10
         run: |
           python3 examples/benchmarks/interactive_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/main
@@ -138,17 +173,17 @@ jobs:
           python3 examples/benchmarks/session_contention_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/contention
           python3 examples/benchmarks/side_lifecycle_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/side-lifecycle
       - name: Record runtime overhead
-        if: matrix.os != 'macos-15-intel'
+        if: matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
         continue-on-error: true
         run: cargo run --locked --profile ci --example runtime_baseline -- target/runtime-baseline.json
       - name: Preserve runtime baseline
-        if: always() && matrix.os != 'macos-15-intel'
+        if: always() && matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runtime-baseline-${{ matrix.os }}
           path: target/runtime-baseline.json
       - name: Preserve terminal failure evidence
-        if: failure() && matrix.os != 'macos-15-intel'
+        if: failure() && matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terminal-${{ matrix.os }}
@@ -237,7 +272,7 @@ jobs:
           load: true
           tags: dial:ci
           cache-from: type=gha,scope=docker
-          cache-to: type=gha,scope=docker,mode=max
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=docker,mode=max' || '' }}
       - name: Smoke test
         run: |
           docker run --rm dial:ci --version

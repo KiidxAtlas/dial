@@ -116,8 +116,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
         try:
+            self.end_headers()
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass  # SIGKILL and explicit cancellation deliberately close fixture connections.
@@ -179,7 +179,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             offered = any(tool.get("function", {}).get("name") == "bg" for tool in request.get("tools", []))
             if "bg" not in calls and not offered:
                 # Like a real provider, load job control when the budgeted core offer omits it.
-                message = self.call(index, "tool_load", {"names": ["bg"]})
+                message = self.load(index, "bg", request.get("tools", []))
             elif "bg" not in calls:
                 self.server.job_starts += 1
                 message = self.call(index, "bg", {"action": "start", "name": "pty-os-job",
@@ -282,7 +282,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 message = {"role": "assistant", "content": "Review-fixture-ready."}
         elif "todo" not in names and not any(tool.get("function", {}).get("name") == "todo" for tool in request.get("tools", [])):
             # Like a real provider, load a tool the route's budgeted core offer omits.
-            message = self.call(index, "tool_load", {"names": ["todo"]})
+            message = self.load(index, "todo", request.get("tools", []))
         elif names.count("todo") == 0:
             message = self.call(index, "todo", {"op": "set", "tasks": [{"content": "Inspect the isolated fixture"}]})
         elif names.count("todo") == 1:
@@ -360,14 +360,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def call(index, name, arguments):
         return {"role": "assistant", "content": "", "tool_calls": [{"id": "pty-call-" + str(index), "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}]}
 
+    def load(self, index, name, tools):
+        offered = {tool.get("function", {}).get("name") for tool in tools}
+        if "tool_search" in offered:
+            return self.call(index, "tool_search", {"names": [name]})
+        if "tool_load" in offered:
+            return self.call(index, "tool_load", {"names": [name]})
+        raise AssertionError(f"no offered loader for {name}: {sorted(offered)}")
+
     def workers(self, index, messages, tools):
         if any(m["role"] == "user" and m.get("content") == "PTY-WORKERS" for m in messages):
             with self.server.lock:
                 self.server.worker_parent_requests += 1
-            # Respect lazy exposure just like a real provider: tool_load enables task for
-            # the next request (discovery only describes it), rather than mistaking an unexecuted call for started workers.
+            # Respect lazy exposure: the offered loader enables task for the next request,
+            # rather than mistaking an unexecuted call for started workers.
             if not any(tool.get("function", {}).get("name") == "task" for tool in tools):
-                return self.call(index, "tool_load", {"names": ["task"]})
+                return self.load(index, "task", tools)
             names = [call["function"]["name"] for message in messages for call in message.get("tool_calls", [])]
             if "task" not in names:
                 return self.call(index, "task", {"action": "start", "tasks": [
@@ -388,7 +396,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def pool(self, index, messages, tools):
         if any(m["role"] == "user" and m.get("content") == "PTY-POOL" for m in messages):
             if not any(tool.get("function", {}).get("name") == "task" for tool in tools):
-                return self.call(index, "tool_load", {"names": ["task"]})
+                return self.load(index, "task", tools)
             calls = [json.loads(call["function"]["arguments"]) for message in messages
                      for call in message.get("tool_calls", []) if call["function"]["name"] == "task"]
             actions = [call.get("action") for call in calls]
@@ -447,21 +455,26 @@ class Terminal:
         history_args = ("-S", "-400") if history else ()
         return self.run("capture-pane", "-p", *history_args, "-t", "smoke")
 
-    def wait(self, fragment, timeout=12, history=True):
+    def wait(self, fragment, timeout=12, history=True, draft=False):
         deadline = time.monotonic() + timeout
         text = ""
         while time.monotonic() < deadline:
             text = self.text(history=history)
-            if fragment in text:
+            # The draft starts the composer line; anything after it (ghost completion, a box
+            # border) is allowed, while prose elsewhere never matches without the prefix.
+            found = (re.search(r"^[ \t]*[▎│›][ \t]+" + re.escape(fragment) + r"[^\n]*$",
+                               text, re.MULTILINE)
+                     if draft else fragment in text)
+            if found:
                 return text
             time.sleep(0.05)
         raise AssertionError(f"terminal never displayed {fragment!r}:\n{text}")
 
     def command(self, command, key="Enter"):
         self.run("send-keys", "-t", "smoke", "-l", "\x1b[200~" + command + "\x1b[201~")
-        # Observe paste consumption before starting the existing guard-settle period.
+        # Observe the composer, not prose such as "/draft previews" in a recovery banner.
         # Waiting from send-keys alone can batch paste and Enter on a busy UI loop.
-        self.wait(command, history=False)
+        self.wait(command, history=False, draft=True)
         time.sleep(0.5)
         self.run("send-keys", "-t", "smoke", key)
 
@@ -909,6 +922,16 @@ def os_job_case(server, binary, captures):
             terminal.wait("OS-JOB-OUTPUT-KEPT", history=False)
             terminal.wait("showing its last output", history=False)
             terminal.capture("os-job-stopped-output-retained", history=False)
+            terminal.run("resize-window", "-t", "smoke", "-x", "38", "-y", "16")
+            terminal.wait("Esc back", history=False)
+            narrow = terminal.capture("os-job-narrow-output-navigation", history=False)
+            assert "OS-JOB-OUTPUT-KEPT" in narrow, narrow
+            assert server.job_starts - before == 1, "narrow output navigation restarted the job"
+            terminal.key("Escape")
+            terminal.wait("Enter view output", history=False)
+            terminal.run("resize-window", "-t", "smoke", "-x", "110", "-y", "32")
+            terminal.key("Enter")
+            terminal.wait("OS-JOB-OUTPUT-KEPT", history=False)
             terminal.key("Escape")
             terminal.key("d")
             terminal.wait("dismissed pty-os-job from job history", history=False)
@@ -1016,7 +1039,8 @@ def recovery_preview_case(server, binary, captures):
             assert "PTY-RECOVERY-HELD-DRAFT" in json.dumps(saved), "draft never became durable"
             before = server.chat_requests
             terminal.crash_and_resume()
-            terminal.wait("mock-main")
+            # The old pane already contains mock-main; wait for this resumed session's banner.
+            terminal.wait("RECOVER INPUT", history=False)
             terminal.command("/draft preview")
             terminal.wait("Review saved input", history=False)
             terminal.wait("PTY-RECOVERY-HELD-DRAFT", history=False)
@@ -1245,6 +1269,7 @@ def main():
                 "recovery-preview-cancel-and-held-restore",
                 "busy-enter-redirect-without-stale-replay", "refused-socket-explicit-diagnostic-retry",
                 "os-job-stop-output-retained-and-dismiss-receipts",
+                "narrow-job-output-back-without-replay",
             ],
             "chat_requests": server.chat_requests,
             "side_requests": server.side_requests,

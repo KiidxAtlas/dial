@@ -317,7 +317,7 @@ pub(super) static LEARNING: &[SettingDef] = &[
         IM,
         "Local model assistance",
         "Compact tool interfaces",
-        "Stable core under a 12 KiB schema budget on hosted/local routes; specialists load only through tool_load. Off retains legacy automatic discovery/routing.",
+        "Stable core under a 12 KiB schema budget on hosted/local routes; specialists load only through tool_search. Off retains legacy automatic discovery/routing.",
         Kind::Bool,
     ),
     field!(

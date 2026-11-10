@@ -12,7 +12,7 @@ capabilities for a repeatable task. Guidance does not enforce approvals, verific
 | `.dial/skills/<name>/SKILL.md` | Active project-authored/imported procedures; ignored local state in this repository |
 | `$DIAL_HOME/skills/<name>/SKILL.md` (normally `~/.dial/skills`) | User procedures shared across projects |
 | `examples/skills/<name>/SKILL.md` | Versioned, portable examples maintained by this repository; not automatically enabled |
-| `crates/dial-storage/src/storage/skills.rs` | Metadata parsing, discovery, catalog/hints, `skill` and `skill_manage` tool contracts |
+| `crates/dial-storage/src/storage/skills.rs` | Metadata parsing, discovery, catalog/hints and the unified `skill` tool contract |
 | `crates/dial-storage/src/storage/skills/` | Copy imports, enablement, package sources, fetch and store lifecycle, sibling tests |
 | `src/cmd/skills.rs` | CLI wiring to the shared management implementation |
 
@@ -40,8 +40,11 @@ Use `<name>/SKILL.md` with a closed `---` frontmatter block. For newly authored 
 Dial accepts a small YAML subset, not arbitrary YAML execution or configuration. Optional absent
 `name` values in imported skills retain compatibility; an explicit mismatch is invalid. Unknown
 metadata may be preserved, but keys such as `allowed-tools` do not confer permissions or install
-dependencies. Do not rely on them as enforcement. `skill_manage` takes `name`, `description` and
-Markdown `body` separately; do not pass frontmatter in its body.
+dependencies. Do not rely on them as enforcement. `skill` with `action: "create"` or `"update"`
+takes `name`, `description` and Markdown `body` separately; do not pass frontmatter in its body.
+Use `action: "delete"` to remove an authored procedure. Reading remains the default (`action: "load"`)
+and accepts `name` plus an optional bundled `file`. Mutation actions retain their approval gates;
+the legacy `skill_manage` name remains a compatibility path, not a separate default catalog entry.
 
 ### Recommended pattern
 

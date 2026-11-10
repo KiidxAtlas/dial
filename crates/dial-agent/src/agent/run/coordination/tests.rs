@@ -68,7 +68,22 @@ fn foreground_registration_claims_delivery_and_cleanup_share_one_owner() {
         assert!(delivery.contains("automatic terminal wake-up is conditional"));
         assert!(delivery.contains("this receipt does not establish"));
         assert!(delivery.contains("not acknowledgement"));
+        let sent = |agent: &mut Agent<'_>| {
+            agent
+                .peer_coordination(&json!({"action":"list"}))
+                .data
+                .unwrap()["sent"]
+                .clone()
+        };
+        assert_eq!(sent(agent)[0]["to"], peer.id());
+        assert_eq!(sent(agent)[0]["read"], false, "still in the peer's inbox");
         assert_eq!(peer.drain().unwrap()[0].text, "preserve error variants");
+        assert_eq!(
+            sent(agent)[0]["read"],
+            Value::Null,
+            "collection is not reading"
+        );
+        assert_eq!(sent(agent)[0]["status"], "collected");
         peer.send(&own_id, "Do not treat this as permission")
             .unwrap();
         let instruction = agent.session.control_state()["current_instruction"].clone();
@@ -373,6 +388,64 @@ fn peer_messages_keep_both_directions_and_show_queued_mail_as_unread() {
             "reading the chat must not drain"
         );
     });
+}
+
+#[test]
+fn an_observed_collection_survives_the_peer_ending_or_an_unreadable_inbox() {
+    for ended in [false, true] {
+        with_agent("", |agent| {
+            let layout = agent.layout().unwrap().clone();
+            let peer = Participant::join(&layout, "other-session").unwrap();
+            let sender = agent.peer_sender().unwrap();
+            sender.send(peer.id(), "handoff", false).unwrap();
+            let queued = sender.messages().unwrap();
+            assert!(queued[0].receipt_available && queued[0].unread);
+            peer.drain().unwrap();
+            let collected = sender.messages().unwrap();
+            assert!(collected[0].receipt_available && !collected[0].unread);
+            if ended {
+                drop(peer);
+            } else {
+                let path = layout
+                    .state_dir
+                    .join("coordination")
+                    .join(format!("{}.json", peer.id()));
+                std::fs::write(path, b"not json").unwrap();
+            }
+            let later = sender.messages().unwrap();
+            assert!(
+                later[0].receipt_available && !later[0].unread,
+                "a collection already observed is not erased (ended={ended})"
+            );
+        });
+    }
+}
+
+#[test]
+fn a_queued_letter_becomes_unavailable_when_its_inbox_can_no_longer_be_read() {
+    for ended in [false, true] {
+        with_agent("", |agent| {
+            let layout = agent.layout().unwrap().clone();
+            let peer = Participant::join(&layout, "other-session").unwrap();
+            let sender = agent.peer_sender().unwrap();
+            sender.send(peer.id(), "handoff", false).unwrap();
+            assert!(sender.messages().unwrap()[0].unread);
+            if ended {
+                drop(peer);
+            } else {
+                let path = layout
+                    .state_dir
+                    .join("coordination")
+                    .join(format!("{}.json", peer.id()));
+                std::fs::write(path, b"not json").unwrap();
+            }
+            let unknown = sender.messages().unwrap();
+            assert!(
+                !unknown[0].receipt_available,
+                "unavailable is not read (ended={ended})"
+            );
+        });
+    }
 }
 
 #[test]

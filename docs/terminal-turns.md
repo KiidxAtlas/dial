@@ -63,12 +63,13 @@ failures (including checkpoint failures) are not reset by this recovery.
   Redirect cancels the pending model request or discards its stale response before its tool calls
   run; an already running tool may finish. Completed results are retained and unstarted actions
   skipped. `/worker <message>` uses the same independent route; while idle it submits a normal task.
-  Explicit messages are shown above the composer, one row each (`○ Steer  pending · acts at the
-  next safe point  “message”`, with ● received and ✓ applied), with the stage Dial actually reported:
-  *pending* (typed, not yet read by the agent; it acts at the next safe point), *received*
-  (the agent took it and is cancelling the stale reply) and *applied* (recorded as the current
-  instruction, or the worker started). If the turn ends before a message was applied it is queued
-  to send next rather than lost. They are not part of `/queue`.
+  Explicit messages are shown above the composer, one row each, with the controller stage:
+  *pending* (awaiting a safe point), *received* (dequeued by the controller, awaiting a safe-point
+  decision), and *recorded* (now the current instruction, or the requested worker started).
+  Receipt alone does not prove cancellation, provider receipt, or model compliance. Runtime
+  cancellation/discard events report their own observed effects. Batched redirects retain submission
+  order. If the turn ends before a message was recorded it is queued to send next rather than lost.
+  Steering rows are not part of `/queue`.
   `Ctrl+Q`, or `Option+Enter` on macOS (`Alt+Enter` elsewhere), still queues a follow-up directly.
   The queue above the composer previews up to three messages (`Queued  send after turn  “message”`)
   and counts the rest.
@@ -116,6 +117,11 @@ failures (including checkpoint failures) are not reset by this recovery.
   `/review-file` expose the owning evidence. Plain completed answers remain quiet. These are
   observations from `turn_summary`, not permission to retry or replay completed work. Turns that
   failed on a provider or transport error suggest `/retry`.
+  Recorded verification remains visible even when no files changed. `Next:` prioritizes retained
+  failure/effects, outstanding obligations and verification gaps before optional review/undo.
+  Continue only unfinished work after inspection; the footer never authorizes replay of the turn.
+  Notes are labelled `Blocked` only for explicitly blocked tasks. Attention opens the exact blocked
+  step; plan evidence uses neutral observation markers, not passing-check symbols.
 - Settled test and build commands (`cargo test`, `cargo clippy`, `make test-*`, `pytest`, `tsc`, …)
   show a **Test** or **Build** card instead of their raw log: counts at the right of the header, then
   only failing test names or the first errors with their `file:line` locations. The expand key

@@ -159,9 +159,11 @@ pub(crate) struct PeerMessage {
     /// Sent by this session; otherwise received from the peer.
     pub outgoing: bool,
     pub text: String,
-    /// Not received by its recipient's model yet: incoming mail still queued here, or outgoing
-    /// mail still queued in the peer's inbox.
+    /// Still queued in the recipient's inbox, not evidence of acknowledgment.
     pub unread: bool,
+    /// Whether the recipient inbox could be observed. Old snapshots have no receipt evidence.
+    #[serde(default)]
+    pub receipt_available: bool,
     /// When it was sent, in Unix milliseconds; 0 when unknown.
     #[serde(default)]
     pub at_ms: u64,

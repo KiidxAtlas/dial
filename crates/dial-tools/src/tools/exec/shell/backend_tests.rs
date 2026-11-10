@@ -137,3 +137,52 @@ fn configured_zero_cap_means_no_deadline_and_explicit_timeouts_are_capped() {
     assert_eq!(effective_timeout(Some(1000), 0), 1000);
     assert_eq!(effective_timeout(Some(1000), 120), 120);
 }
+
+#[test]
+fn environment_prefixes_use_the_runner_syntax_and_quote_values() {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let entries = [
+        EnvEntry::Set("A".into(), "it's".into()),
+        EnvEntry::Prepend("PYTHONPATH".into(), "/x y".into()),
+    ];
+    assert_eq!(
+        render_environment(&Runner::Bash(bash()), &entries, "run"),
+        format!(
+            "export A='it'\\''s' PYTHONPATH='/x y'\"${{PYTHONPATH:+{separator}$PYTHONPATH}}\"\nrun"
+        )
+    );
+    assert_eq!(
+        render_environment(&Runner::Embedded, &entries, "run"),
+        render_environment(&Runner::Bash(bash()), &entries, "run")
+    );
+    assert_eq!(
+        render_environment(&Runner::PowerShell, &entries, "run"),
+        format!(
+            "$env:A = 'it''s'; $env:PYTHONPATH = '/x y' + $(if ($env:PYTHONPATH) {{ '{separator}' + $env:PYTHONPATH }} else {{ '' }})\nrun"
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_environment_prefix_sets_and_prepends() {
+    let entries = [
+        EnvEntry::Set("DIAL_T".into(), "a 'b'".into()),
+        EnvEntry::Prepend("DIAL_P".into(), "/new".into()),
+    ];
+    let line = render_environment(
+        &Runner::Bash(bash()),
+        &entries,
+        r#"printf '%s|%s' "$DIAL_T" "$DIAL_P""#,
+    );
+    let run = |old: Option<&str>| {
+        let mut command = std::process::Command::new("/bin/bash");
+        command.arg("-c").arg(&line).env_remove("DIAL_P");
+        if let Some(old) = old {
+            command.env("DIAL_P", old);
+        }
+        String::from_utf8(command.output().unwrap().stdout).unwrap()
+    };
+    assert_eq!(run(None), "a 'b'|/new");
+    assert_eq!(run(Some("/old")), "a 'b'|/new:/old");
+}

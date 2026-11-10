@@ -4582,17 +4582,16 @@ pub mod session_search_tool {
             let object = args
                 .as_object()
                 .context("session_search arguments must be an object")?;
-            ensure!(
-                object.keys().all(|key| matches!(
-                    key.as_str(),
-                    "query" | "limit" | "history" | "entry_id" | "all_branches"
-                )),
-                "session_search received an unknown argument"
-            );
-            let query = object
-                .get("query")
-                .and_then(Value::as_str)
-                .context("session_search needs a query string")?;
+            const ACCEPTED: [&str; 5] = ["query", "limit", "history", "entry_id", "all_branches"];
+            if let Some(unknown) = object.keys().find(|key| !ACCEPTED.contains(&key.as_str())) {
+                bail!(
+                    "session_search received an unknown argument `{unknown}`; accepted: {}",
+                    ACCEPTED.join(", ")
+                );
+            }
+            let query = object.get("query").and_then(Value::as_str).context(
+                "session_search needs a `query` string (use query:\"\" with history:true for raw entries)",
+            )?;
             let history = match object.get("history") {
                 None => false,
                 Some(value) => value

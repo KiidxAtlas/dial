@@ -3,6 +3,8 @@ import base64 as _dial_base64
 import json as _dial_json
 import re as _dial_re
 import struct as _dial_struct
+import random as _dial_random
+import time as _dial_time
 
 
 def _dial_format(format):
@@ -12,6 +14,136 @@ def _dial_format(format):
         raise ValueError("at most 256 binary fields")
     return format
 
+
+def _dial_unique(values, current):
+    seen, out = {repr(current)}, []
+    for value in values:
+        key = repr(value)
+        if key not in seen:
+            seen.add(key)
+            out.append(value)
+    return out
+
+
+class _DialGen:
+    """One generator: draw(rng, size), shrink(value) -> smaller candidates, edges (tried first)."""
+
+    def __init__(self, draw, shrink=None, edges=()):
+        self.draw, self.shrink, self.edges = draw, shrink or (lambda value: []), list(edges)
+
+    def map(self, f):
+        return _DialGen(lambda r, size: f(self.draw(r, size)), None, [f(e) for e in self.edges])
+
+    def filter(self, keep):
+        def draw(r, size):
+            for _ in range(100):
+                value = self.draw(r, size)
+                if keep(value):
+                    return value
+            raise ValueError("gen.filter rejected 100 draws")
+        return _DialGen(draw, lambda v: [s for s in self.shrink(v) if keep(s)], [e for e in self.edges if keep(e)])
+
+
+class _DialGens:
+    def int(self, lo=-1000, hi=1000):
+        if not isinstance(lo, int) or not isinstance(hi, int) or lo > hi:
+            raise TypeError("gen.int expects integers lo <= hi")
+        target = min(max(0, lo), hi)
+
+        def draw(r, size):
+            span = min(hi - lo, max(1, size * size))
+            start = min(max(target - span // 2, lo), hi - span)
+            return start + r.randint(0, span) if r.random() < 0.8 else r.randint(lo, hi)
+
+        def shrink(v):
+            step = 0 if v == target else (1 if v > target else -1)
+            return _dial_unique([x for x in (target, v - int((v - target) / 2), v - step) if lo <= x <= hi], v)
+
+        return _DialGen(draw, shrink, _dial_unique([x for x in (0, 1, -1, lo, hi, lo + 1, hi - 1) if lo <= x <= hi], None))
+
+    def float(self, lo=-1e6, hi=1e6):
+        inside = lambda x: lo <= x <= hi
+        return _DialGen(
+            lambda r, size: (r.random() * 2 - 1) * size if r.random() < 0.5 else r.uniform(lo, hi),
+            lambda v: _dial_unique([x for x in (0.0, float(int(v)), v / 2) if inside(x)], v),
+            _dial_unique([x for x in (0.0, 0.5, -0.5, lo, hi) if inside(x)], None))
+
+    def array(self, item, min=0, max=20):
+        def draw(r, size):
+            return [item.draw(r, size) for _ in range(r.randint(min, _dial_min(max, min + size)))]
+
+        def shrink(xs):
+            out = []
+            if len(xs) > min:
+                half = _dial_max(min, len(xs) // 2)
+                out += [xs[:half], xs[len(xs) - half:]]
+                out += [xs[:i] + xs[i + 1:] for i in range(_dial_min(len(xs), 32))]
+            for i in range(_dial_min(len(xs), 32)):
+                out += [xs[:i] + [s] + xs[i + 1:] for s in item.shrink(xs[i])[:4]]
+            return _dial_unique(out, xs)
+
+        edges = ([[]] if min == 0 else []) + [[e] * _dial_max(1, min) for e in item.edges[:6]]
+        return _DialGen(draw, shrink, [e for e in edges if len(e) <= max])
+
+    def string(self, alphabet="".join(chr(c) for c in range(32, 127)), min=0, max=20):
+        chars = list(alphabet)
+        if not chars:
+            raise ValueError("gen.string needs a nonempty alphabet")
+        ch = _DialGen(lambda r, size: r.choice(chars), lambda c: [] if c == chars[0] else [chars[0]], chars[:3])
+        items = self.array(ch, min=min, max=max)
+        edges = ([""] if min == 0 else []) + [c * _dial_max(1, min) for c in chars[:3]]
+        return _DialGen(lambda r, size: "".join(items.draw(r, size)),
+                        lambda s: ["".join(xs) for xs in items.shrink(list(s))],
+                        _dial_unique([e for e in edges if len(e) <= max], None))
+
+    def tuple(self, *items):
+        def shrink(xs):
+            return _dial_unique([xs[:i] + (s,) + xs[i + 1:] for i, item in enumerate(items) for s in item.shrink(xs[i])[:8]], xs)
+        edges = []
+        if all(item.edges for item in items):
+            rest = tuple(item.edges[0] for item in items[1:])
+            edges = [(e,) + rest for e in items[0].edges]
+        return _DialGen(lambda r, size: tuple(item.draw(r, size) for item in items), shrink, edges)
+
+    def record(self, **shape):
+        keys = list(shape)
+        inner = self.tuple(*(shape[k] for k in keys))
+        build = lambda values: dict(zip(keys, values))
+        return _DialGen(lambda r, size: build(inner.draw(r, size)),
+                        lambda d: [build(v) for v in inner.shrink(tuple(d[k] for k in keys))],
+                        [build(e) for e in inner.edges])
+
+    def pick(self, values):
+        values = list(values)
+        if not values:
+            raise ValueError("gen.pick expects a nonempty sequence")
+        return _DialGen(lambda r, size: r.choice(values), lambda v: values[:values.index(v)][:4] if v in values else [], values[:1])
+
+    def oneOf(self, *items):
+        return _DialGen(lambda r, size: r.choice(items).draw(r, size), None, [e for item in items for e in item.edges[:3]])
+
+    one_of = oneOf
+
+    def bool(self):
+        return self.pick([False, True])
+
+    def constant(self, value):
+        return _DialGen(lambda r, size: value, None, [value])
+
+
+_dial_min, _dial_max = min, max
+
+
+def _dial_show(value):
+    text = repr(value)
+    return text if len(text) <= 400 else text[:400] + "…"
+
+
+def _dial_verdict(prop, value):
+    try:
+        return "property returned False" if prop(value) is False else None
+    except Exception as error:
+        return type(error).__name__ + ": " + str(error)
 
 class _Dial:
     def pack(self, format, values):
@@ -56,6 +188,64 @@ class _Dial:
 
     def check(self, name, passed):
         return __dial_check__(name, passed)
+
+    gen = _DialGens()
+
+    def search(self, prop, gen, *, runs=200, seed=0x5EED, cases=(), timeout=10.0, shrinks=400):
+        """Search for an input where prop returns False or raises: edge cases, then seeded random
+        inputs growing with the run index; a failure is shrunk toward a minimal input."""
+        if not callable(prop) or not isinstance(gen, _DialGen):
+            raise TypeError("dial.search(prop, gen, runs=, seed=, cases=, timeout=) needs a callable and a dial.gen generator")
+        r, deadline = _dial_random.Random(seed), _dial_time.monotonic() + timeout
+
+        def inputs():
+            yield from cases
+            yield from gen.edges
+            for i in range(runs):
+                yield gen.draw(r, 1 + i * 100 // _dial_max(1, runs))
+
+        tried = 0
+        for candidate in inputs():
+            if _dial_time.monotonic() > deadline:
+                return {"passed": True, "runs": tried, "seed": seed, "stopped": "timeout", "note": "No counterexample within the time budget; this is evidence, not proof."}
+            tried += 1
+            failure = _dial_verdict(prop, candidate)
+            if failure is None:
+                continue
+            smallest, steps, improved = candidate, 0, True
+            while improved and steps < shrinks and _dial_time.monotonic() <= deadline:
+                improved = False
+                for smaller in gen.shrink(smallest):
+                    steps += 1
+                    if steps > shrinks:
+                        break
+                    why = _dial_verdict(prop, smaller)
+                    if why is not None:
+                        smallest, failure, improved = smaller, why, True
+                        break
+            return {"passed": False, "runs": tried, "seed": seed, "counterexample": smallest, "failure": failure,
+                    "original": candidate, "shrinkSteps": steps, "shown": _dial_show(smallest)}
+        return {"passed": True, "runs": tried, "seed": seed, "note": "No counterexample found; this is evidence, not proof."}
+
+    def compare(self, left, right, gen, *, equal=None, **options):
+        """Search for an input where two implementations disagree (both raising counts as agreement)."""
+        def outcome(f, x):
+            try:
+                return ("value", f(x))
+            except Exception as error:
+                return ("raised", type(error).__name__)
+
+        def same(x):
+            a, b = outcome(left, x), outcome(right, x)
+            if a[0] == "raised" or b[0] == "raised":
+                agree = a[0] == b[0]
+            else:
+                agree = equal(a[1], b[1]) if equal else a[1] == b[1]
+            if not agree:
+                show = lambda o: "raised " + o[1] if o[0] == "raised" else _dial_show(o[1])
+                raise AssertionError("left " + show(a) + " vs right " + show(b))
+
+        return self.search(same, gen, **options)
 
     def batch(self, entries, *, collect=False):
         if not isinstance(collect, bool):

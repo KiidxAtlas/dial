@@ -582,3 +582,53 @@ fn preserved_thinking_models_never_rewrite_sent_history() {
             .starts_with("[Superseded")
     );
 }
+
+#[test]
+fn efficiency_projects_new_exact_repeats_before_pressure_but_preserves_opt_outs() {
+    for (enabled, hermetic, preserved) in [
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let routing = if preserved {
+            "provider='anthropic'\nmodel='claude-opus-5-5'\n"
+        } else {
+            ""
+        };
+        with_agent(
+            &format!("{routing}[efficiency]\nenabled={enabled}"),
+            |agent| {
+                agent.hermetic = hermetic;
+                let pair = |id: &str| {
+                    vec![
+                        json!({"role":"assistant","tool_calls":[{"id":id,"function":{"name":"grep","arguments":"{\"pattern\":\"needle\"}"}}]}),
+                        json!({"role":"tool","tool_call_id":id,"content":"needle: matching row\n".repeat(400),"dial_evidence":{"artifact":format!("artifact://{id}"),"is_error":false}}),
+                    ]
+                };
+                let mut history = pair("first");
+                let mut memo = Supersession::default();
+                let mut packet = PacketCache::default();
+                let mut first = history.clone();
+                agent
+                    .project_history(&mut first, &[], 0, &mut packet, &mut memo, None)
+                    .unwrap();
+                history.extend(pair("repeat"));
+                let mut second = history.clone();
+                agent
+                    .project_history(&mut second, &[], 0, &mut packet, &mut memo, None)
+                    .unwrap();
+                assert_eq!(&second[..2], &first[..2], "already-sent prefix");
+                assert_eq!(
+                    second[3]["content"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("[Exact repeat"),
+                    enabled && !hermetic && !preserved,
+                    "enabled={enabled}, hermetic={hermetic}, preserved={preserved}"
+                );
+                assert_eq!(second[2]["tool_calls"], history[2]["tool_calls"]);
+            },
+        );
+    }
+}

@@ -9,9 +9,11 @@
 //!
 //! * the script task is aborted, so no further builtin or command runs once the shell reaches an
 //!   `await` (every external command, pipe and sleep is one);
-//! * every external command starts in its own process group and carries a per-run token in its
-//!   environment; on a stop the groups led by a direct child of Dial that carry the token are
-//!   killed (found with `ps`, Unix only; on Windows only the task abort applies).
+//! * every external command carries a per-run token in its environment; on a stop, Unix kills
+//!   the process groups led by a direct child of Dial that carry it (found with `ps`; each
+//!   command starts in its own group), and Windows terminates every process started during the
+//!   run whose environment block holds it (Toolhelp snapshot plus a PEB read, one handle per check
+//!   and kill), which also reaches descendants that inherited the environment.
 //!
 //! Limits: a builtin loop that never awaits (for example `while :; do :; done`) cannot be
 //! interrupted from outside its thread, so the run is abandoned: Dial returns, and the thread
@@ -65,6 +67,9 @@ pub struct Run {
     done: Receiver<i32>,
     code: Option<i32>,
     token: String,
+    /// When the run started, as a FILETIME: Windows cleanup only considers newer processes.
+    #[cfg(windows)]
+    started: u64,
     termination: Option<Termination>,
     #[cfg(feature = "embedded-shell")]
     abort: tokio::task::AbortHandle,
@@ -75,6 +80,8 @@ impl Run {
     #[cfg(feature = "embedded-shell")]
     pub fn start(mut request: Request) -> Result<Self, String> {
         let token = format!("{:032x}", rand::random::<u128>());
+        #[cfg(windows)]
+        let started = crate::platform::processes::filetime_now();
         request.env.push((TOKEN_ENV.to_owned(), token.clone()));
         let (done_tx, done) = std::sync::mpsc::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -113,6 +120,8 @@ impl Run {
             done,
             code: None,
             token,
+            #[cfg(windows)]
+            started,
             termination: None,
             abort,
         })
@@ -146,6 +155,12 @@ impl Run {
 
     /// Stops the script and attempts bounded external cleanup. Cached, including on Drop.
     pub fn terminate(&mut self) -> Termination {
+        #[cfg(windows)]
+        {
+            let started = self.started;
+            self.terminate_with(|token, deadline| kill_marked_processes(token, started, deadline))
+        }
+        #[cfg(not(windows))]
         self.terminate_with(kill_marked_groups)
     }
 
@@ -219,12 +234,38 @@ fn cleanup_groups(
     Err("marked process groups remained after cleanup attempts".into())
 }
 
-#[cfg(not(unix))]
+/// Terminate every process started since `started` whose environment holds this run's token,
+/// repeating until a pass finds none (a dying parent may still start a child).
+#[cfg(windows)]
+fn kill_marked_processes(token: &str, started: u64, deadline: Instant) -> Result<(), String> {
+    use crate::platform::processes;
+    let entry = format!("{TOKEN_ENV}={token}");
+    let own = std::process::id();
+    for _ in 0..3 {
+        remaining(deadline)?;
+        let mut found = false;
+        let list = processes::snapshot().map_err(|e| format!("listing processes: {e}"))?;
+        for process in list {
+            if process.pid == own || process.pid <= 4 {
+                continue;
+            }
+            remaining(deadline)?;
+            found |= processes::kill_marked(process.pid, &entry, started)
+                .map_err(|e| format!("terminating marked process {}: {e}", process.pid))?;
+        }
+        if !found {
+            return Ok(());
+        }
+    }
+    Err("marked processes remained after cleanup attempts".into())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn kill_marked_groups(_token: &str, _deadline: Instant) -> Result<(), String> {
     Err("external-command cleanup is unavailable on this platform".into())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn remaining(deadline: Instant) -> Result<Duration, String> {
     deadline
         .checked_duration_since(Instant::now())

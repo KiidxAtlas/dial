@@ -53,6 +53,11 @@ pub fn error_class(tool: &str, status: ToolStatus, output: &ToolOutput) -> Optio
             "not_started"
         } else if process.signal.is_some() {
             "signalled"
+        } else if process.exit_code == Some(127) {
+            // POSIX shells reserve 127 and 126 for a program that could not be found or run.
+            "command_not_found"
+        } else if process.exit_code == Some(126) {
+            "not_executable"
         } else if process.exit_code.is_some_and(|code| code != 0) {
             "nonzero_exit"
         } else {

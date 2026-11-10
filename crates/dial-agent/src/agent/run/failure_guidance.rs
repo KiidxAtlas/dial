@@ -71,7 +71,7 @@ impl Candidate {
     fn load_guidance(&self) -> String {
         if self.availability == Capability::Loadable {
             format!(
-                "{} is eligible but not offered: use tool_load with {}, then wait for its schema before any permitted action. ",
+                "{} is eligible but not offered: use tool_search with {}, then wait for its schema before any permitted action. ",
                 self.tool,
                 json!({"names":[self.tool]})
             )
@@ -175,6 +175,13 @@ pub(in crate::agent) fn report(
     advice: &str,
     consecutive: u32,
 ) -> String {
+    // A native write can commit before a later recording step fails. In that case the
+    // source-contract fallback must not tell the model to treat committed work as unapplied.
+    let advice = if kind == SOURCE_KIND && !output.execution.changed_paths.is_empty() {
+        "Inspect the committed paths and original diagnostic; preserve applied work and correct only the remaining failure."
+    } else {
+        advice
+    };
     Advisory::new(call, kind, "execution.recovery", advice).attach(output);
     let effects = match output.execution.effects {
         Effects::None => "No effects recorded for this operation.",
@@ -203,7 +210,7 @@ pub(in crate::agent) fn report(
     if routine_exit {
         return recovery_notice(
             kind,
-            "Command failed; no committed file paths recorded (not proof that nothing changed). Correct the named cause before retrying; a workaround must still deliver the requested final state.",
+            "Command failed; no committed file paths recorded (not proof that nothing changed). Correct the cause before retrying only this operation, not the turn; preserve the requested final state.",
         );
     }
     // Any other first failure with known effects, no committed work, complete capture and a plain
@@ -233,13 +240,20 @@ pub(in crate::agent) fn report(
         Retry::AfterCorrection if recovery.committed_paths > 0 => {
             "Committed work is preserved: inspect it and correct the named cause; do not repeat the whole operation."
         }
-        Retry::AfterCorrection => "Retry only after correcting the named cause.",
-        Retry::AfterInspection => "Do not retry until the recorded state or process is inspected.",
+        Retry::AfterCorrection => {
+            "Retry only this failed operation after correcting the named cause, not the whole turn."
+        }
+        Retry::AfterInspection => {
+            "Do not retry until the recorded state or process is inspected; then continue only the unfinished operation, not the whole turn."
+        }
         Retry::OnlyByDirection => {
             "Do not replay automatically; resume only on the user's direction."
         }
         Retry::Withheld if kind == CALL_CONTRACT.0 => {
             "Fix the arguments and retry; no permission boundary withholds this call."
+        }
+        Retry::Withheld if kind == RETRY_BARRIER.0 => {
+            "Change the arguments, or first change what the call depends on; the identical call stays withheld."
         }
         Retry::Withheld => "A boundary withholds this operation; do not retry or bypass it.",
     };
@@ -269,6 +283,19 @@ pub(in crate::agent) fn provider_failure(error: &anyhow::Error) -> String {
 /// Classification for a call the controller refused against the offered contract before
 /// execution. The controller supplies this fact; diagnostic prose never selects it.
 pub(in crate::agent) const CALL_CONTRACT: (&str, &str) = ("call_contract", policy::CALL_CONTRACT);
+/// An identical call refused by the failed-operation retry barrier. It ran nothing and is a
+/// correctable repeat, never a permission boundary (worker refusals carry status Blocked).
+pub(in crate::agent) const RETRY_BARRIER: (&str, &str) = ("retry_barrier", policy::RETRY_BARRIER);
+
+/// A controller-authored retry-barrier refusal, recognized by its fixed lead.
+pub(in crate::agent) fn is_retry_barrier(output: &ToolOutput) -> bool {
+    output.is_error
+        && output
+            .text
+            .strip_prefix("invalid tool call: ")
+            .unwrap_or(&output.text)
+            .starts_with(crate::agent::run::engine::RETRY_BARRIER_LEAD)
+}
 
 pub(in crate::agent) fn classify(
     call: &ToolCall,
@@ -278,6 +305,7 @@ pub(in crate::agent) fn classify(
         return Some(("effects_unknown", policy::EFFECTS_UNKNOWN));
     }
     match ToolStatus::from_output(output) {
+        ToolStatus::Blocked if is_retry_barrier(output) => return Some(RETRY_BARRIER),
         ToolStatus::Blocked => {
             return Some(("permission_or_policy", policy::PERMISSION_OR_POLICY));
         }
@@ -447,7 +475,63 @@ pub(in crate::agent) fn missing_program_recovery(
     Some(policy::missing_program(&program))
 }
 
-/// A file tool refused a path outside the workspace and suggested `request_directory`, but this
+/// Command-shape facts a model routinely misreads, for `bash`, `browser` and `eval` results: a
+/// pipeline whose exit 1 came from a final line filter, a `&` job that the call's process-group
+/// cleanup stops, a browser request nothing was listening for, and an `eval` cell that tried to
+/// start a program under the kernel's process-fork fence. Advice only; status, barriers and
+/// effects are unchanged.
+pub(in crate::agent) fn command_shape_hint(call: &ToolCall, output: &ToolOutput) -> Option<String> {
+    let notice = |kind: &str, body: String| recovery_notice(kind, &body);
+    // A raised cell is reported with unknown effects, so this check precedes the effects guard.
+    if call.name == "eval" {
+        return (output.is_error && eval_spawn_denied(&output.text))
+            .then(|| notice("eval_no_subprocess", policy::EVAL_NO_SUBPROCESS.to_owned()));
+    }
+    if output.execution.effects == Effects::Unknown {
+        return None;
+    }
+    if call.name == "browser" {
+        let refused = output.is_error
+            && (output.text.contains("Connection refused")
+                || output.text.contains("ERR_CONNECTION_REFUSED"));
+        return refused.then(|| notice("nothing_listening", policy::NOTHING_LISTENING.to_owned()));
+    }
+    if call.name != "bash" {
+        return None;
+    }
+    let command = call.arguments["command"].as_str()?;
+    // `cmd & … wait` keeps its jobs inside the call on purpose.
+    if crate::agent::safety::approval::starts_async_job(command)
+        && !command.split_whitespace().any(|word| word == "wait")
+        && output.execution.process.as_ref().is_some_and(|p| p.started)
+    {
+        return Some(notice("async_job", policy::ASYNC_JOB.to_owned()));
+    }
+    let process = output.execution.process.as_ref()?;
+    let filtered = ToolStatus::from_output(output) == ToolStatus::Error
+        && process.started
+        && process.exit_code == Some(1)
+        && process.signal.is_none()
+        && !process.timed_out
+        && process.output_complete;
+    let filter = filtered
+        .then(|| crate::agent::safety::approval::final_pipe_filter(command))
+        .flatten()?;
+    Some(notice("filter_exit", policy::filter_exit(filter)))
+}
+
+/// A cell error from the process-fork fence: Python's `PermissionError` raised while forking or
+/// spawning, or Node's `EPERM` from `child_process`.
+fn eval_spawn_denied(text: &str) -> bool {
+    let python = text.contains("PermissionError")
+        && ["_fork_exec", "posix_spawn", "os.fork", "_execute_child"]
+            .iter()
+            .any(|marker| text.contains(marker));
+    let node = text.contains("EPERM") && text.contains("spawn");
+    python || node
+}
+
+/// A file tool refused a path outside the workspace and suggested a directory request, but this
 /// run has no interactive approver (`approvable` false), so that request would only fail. Names
 /// the fact; the boundary and its policy guidance are unchanged.
 pub(in crate::agent) fn directory_request_unavailable(
@@ -457,7 +541,7 @@ pub(in crate::agent) fn directory_request_unavailable(
     (!approvable
         && output
             .text
-            .contains("outside the workspace; call request_directory"))
+            .contains("outside the workspace; call `ask` action=directory"))
     .then_some(policy::DIRECTORY_REQUEST_UNAVAILABLE)
     .map(str::to_owned)
 }

@@ -360,6 +360,9 @@ pub struct Registry {
     pending_mcp: Option<Arc<super::mcp::Connecting>>,
     /// Set when servers were adopted, so the next [`Registry::sync_mcp`] reports a change.
     mcp_adopted: bool,
+    /// Raw owners of consolidated tools (`surface::facade::GROUPS`): every member and its native
+    /// successor. The successor's slot in `tools` holds their facade; members are not listed.
+    folded: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl Registry {
@@ -440,25 +443,155 @@ impl Registry {
     /// Share immutable definitions and multiplexed services (including MCP), but
     /// give every execution owner fresh workspace/process/native-tool state.
     pub fn fork_session(&self) -> Self {
-        let tools: BTreeMap<_, _> = self
-            .tools
-            .iter()
-            .map(|(name, tool)| {
-                (
-                    name.clone(),
-                    tool.fork_session().unwrap_or_else(|| Arc::clone(tool)),
-                )
-            })
-            .collect();
-        Self {
-            tools,
+        let fork = |tools: &BTreeMap<String, Arc<dyn Tool>>| -> BTreeMap<String, Arc<dyn Tool>> {
+            tools
+                .iter()
+                .map(|(name, tool)| {
+                    (
+                        name.clone(),
+                        tool.fork_session().unwrap_or_else(|| Arc::clone(tool)),
+                    )
+                })
+                .collect()
+        };
+        let mut forked = Self {
+            tools: fork(
+                &self
+                    .tools
+                    .iter()
+                    .filter(|(name, _)| crate::tools::surface::facade::group_of(name).is_none())
+                    .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
+                    .collect(),
+            ),
             notices: Vec::new(),
             mcp_instructions: self.mcp_instructions.clone(),
             origins: self.origins.clone(),
             mcp: self.mcp.clone(),
             pending_mcp: self.pending_mcp.clone(),
             mcp_adopted: self.mcp_adopted,
+            folded: fork(&self.folded),
+        };
+        for group in crate::tools::surface::facade::GROUPS {
+            forked.refold(group);
         }
+        forked
+    }
+
+    /// File a consolidated tool's raw owner and rebuild its group's model-facing entry.
+    fn fold(&mut self, name: &str) {
+        let Some(group) = crate::tools::surface::facade::group_of(name) else {
+            return;
+        };
+        if let Some(tool) = self.tools.remove(name) {
+            self.folded.insert(name.to_owned(), tool);
+        }
+        self.refold(group);
+    }
+
+    /// One facade under the successor's name while a member is present (and the successor too
+    /// when required); otherwise every owner stays listed under its own name.
+    fn refold(&mut self, group: &crate::tools::surface::facade::Group) {
+        let native = self.folded.get(group.successor).cloned();
+        if group.successor == "dap" {
+            use crate::tools::surface::facade::{Facade, Member};
+            let members: Vec<Member> = self
+                .folded
+                .iter()
+                .filter_map(|(name, tool)| {
+                    name.strip_prefix("dap_")
+                        .map(|adapter| Member::select("adapter", adapter, Arc::clone(tool)))
+                })
+                .collect();
+            if members.is_empty() {
+                if let Some(native) = native {
+                    self.tools.insert("dap".into(), native);
+                } else {
+                    self.tools.remove("dap");
+                    self.origins.remove("dap");
+                }
+            } else {
+                let description = native
+                    .as_ref()
+                    .or_else(|| members.first().map(|member| &member.tool))
+                    .map(|tool| {
+                        tool.schema()["function"]["description"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned()
+                    })
+                    .unwrap_or_default();
+                self.tools.insert(
+                    "dap".into(),
+                    Arc::new(Facade::new(
+                        "dap",
+                        description,
+                        group.selector_note,
+                        native,
+                        members,
+                    )),
+                );
+                self.origins
+                    .entry("dap".into())
+                    .or_insert(crate::tools::surface::catalog::Origin::Native);
+            }
+            return;
+        }
+        let present: Vec<(&'static str, Arc<dyn Tool>)> = group
+            .members
+            .iter()
+            .filter_map(|(name, _)| self.folded.get(*name).map(|tool| (*name, Arc::clone(tool))))
+            .collect();
+        let facade = crate::tools::surface::facade::build(group, native.clone(), &present);
+        match facade {
+            Some(facade) => {
+                for (name, _) in &present {
+                    self.tools.remove(*name);
+                }
+                if native.is_none() {
+                    self.origins.insert(
+                        group.successor.to_owned(),
+                        crate::tools::surface::catalog::Origin::Native,
+                    );
+                }
+                self.tools.insert(
+                    group.successor.to_owned(),
+                    Arc::new(facade) as Arc<dyn Tool>,
+                );
+            }
+            None => {
+                for (name, tool) in present
+                    .into_iter()
+                    .chain(native.into_iter().map(|tool| (group.successor, tool)))
+                {
+                    self.tools.insert(name.to_owned(), tool);
+                }
+                if !self.folded.contains_key(group.successor) {
+                    self.tools.remove(group.successor);
+                    self.origins.remove(group.successor);
+                }
+            }
+        }
+    }
+
+    /// Whether `name` is registered but reached only through its successor.
+    pub fn is_folded(&self, name: &str) -> bool {
+        (matches!(name, "web_fetch" | "ast_search") && self.tools.contains_key(name))
+            || (self.folded.contains_key(name) && !self.tools.contains_key(name))
+    }
+
+    /// Members reached through `successor` (registered, not listed under their own name).
+    pub fn folded_members(&self, successor: &str) -> Vec<&'static str> {
+        crate::tools::surface::facade::GROUPS
+            .iter()
+            .filter(|group| group.successor == successor)
+            .flat_map(|group| group.members.iter().map(|(name, _)| *name))
+            .filter(|name| self.folded.contains_key(*name) && !self.tools.contains_key(*name))
+            .collect()
+    }
+
+    /// A consolidated tool's own owner, by its own name (members and native successors).
+    pub fn owner(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.folded.get(name).or_else(|| self.tools.get(name))
     }
 
     /// Every tool dial ships, configured from `config`. `native` carries the tool groups owned by
@@ -602,7 +735,11 @@ impl Registry {
     /// Removes a tool and its origin; returns whether it was registered.
     pub fn remove(&mut self, name: &str) -> bool {
         self.origins.remove(name);
-        self.tools.remove(name).is_some()
+        let removed = self.folded.remove(name).is_some() | self.tools.remove(name).is_some();
+        if let Some(group) = crate::tools::surface::facade::group_of(name) {
+            self.refold(group);
+        }
+        removed
     }
     pub fn try_register(&mut self, tool: Arc<dyn Tool>) -> anyhow::Result<()> {
         crate::tools::surface::catalog::validate_tool(tool.as_ref())?;
@@ -615,13 +752,15 @@ impl Registry {
             tool.name().to_owned(),
             crate::tools::surface::catalog::Origin::Extension,
         );
-        self.tools.insert(tool.name().to_owned(), tool);
+        let name = tool.name().to_owned();
+        self.tools.insert(name.clone(), tool);
+        self.fold(&name);
         Ok(())
     }
     pub fn replace(&mut self, tool: Arc<dyn Tool>) -> anyhow::Result<()> {
         crate::tools::surface::catalog::validate_tool(tool.as_ref())?;
         let prior = self
-            .get(tool.name())
+            .owner(tool.name())
             .ok_or_else(|| anyhow::anyhow!("tool is not registered"))?;
         anyhow::ensure!(
             tool.contract_revision() >= prior.contract_revision(),
@@ -631,7 +770,9 @@ impl Registry {
             tool.name().to_owned(),
             crate::tools::surface::catalog::Origin::Extension,
         );
-        self.tools.insert(tool.name().to_owned(), tool);
+        let name = tool.name().to_owned();
+        self.tools.insert(name.clone(), tool);
+        self.fold(&name);
         Ok(())
     }
 
@@ -717,16 +858,31 @@ impl Registry {
     pub fn is_retired_mcp(&self, name: &str) -> bool {
         self.mcp.is_retired(name)
     }
+
+    /// Project an exact retired MCP wrapper identity without executing or authorizing it.
+    pub fn historical_mcp_projection(
+        &self,
+        recorded: &crate::tools::surface::contracts::Identity,
+        arguments: &Value,
+    ) -> Option<(String, Value)> {
+        self.mcp.historical_surface_projection(recorded, arguments)
+    }
+    /// The model-facing tool of `name`, or a consolidated member's own owner under its old name
+    /// (internal callers, approval of recorded calls).
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
-        self.tools.get(name)
+        self.tools.get(name).or_else(|| self.folded.get(name))
     }
 
+    /// Model-facing names: consolidated members are reached through their successor.
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.tools.keys().map(String::as_str)
+        self.tools
+            .keys()
+            .map(String::as_str)
+            .filter(|name| !self.is_folded(name))
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.tools.contains_key(name) || self.folded.contains_key(name)
     }
     /// Deliver only to tools that explicitly subscribed; hook failures cannot alter execution.
     pub fn fire_lifecycle(&self, event: &LifecycleEvent) {

@@ -20,7 +20,7 @@ use std::{
 mod bundled;
 pub use bundled::{
     ModelFact, ThinkingMode, builtin_provider, bundled_model, bundled_models, known_context_window,
-    model_capabilities, provider_endpoint,
+    model_capabilities, model_protocol, provider_endpoint,
 };
 
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;

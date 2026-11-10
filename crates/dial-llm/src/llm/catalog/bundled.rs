@@ -41,6 +41,46 @@ impl BuiltinProvider {
     pub fn env_keys(&self) -> impl Iterator<Item = &str> {
         self.env.iter().chain(&self.shared_env).map(String::as_str)
     }
+
+    /// The credential variable to read: the first of [`Self::env_keys`] that `is_set` reports,
+    /// else the primary one, so a documented alternate name (or a shared token) is honoured.
+    pub fn key_env(&self, is_set: impl Fn(&str) -> bool) -> Option<&str> {
+        self.env_keys()
+            .find(|key| is_set(key))
+            .or_else(|| self.env_keys().next())
+    }
+}
+
+/// Wire protocols a bundled model row may declare: key-authenticated HTTP wires only.
+pub(crate) fn routable(protocol: ApiProtocol) -> bool {
+    matches!(
+        protocol,
+        ApiProtocol::ChatCompletions
+            | ApiProtocol::Responses
+            | ApiProtocol::Anthropic
+            | ApiProtocol::Gemini
+    )
+}
+
+/// The wire protocol a bundled model declares (`w`) when it is reached through its provider's
+/// bundled endpoint, if it differs from the provider's. Applies only while the route is the
+/// provider default (same base URL, protocol unset or the provider's own), so an operator-chosen
+/// endpoint or protocol is never rewritten. `None` keeps the configured protocol.
+pub fn model_protocol(
+    provider: &str,
+    base_url: &str,
+    protocol: Option<ApiProtocol>,
+    model: &str,
+) -> Option<ApiProtocol> {
+    let builtin = builtin_provider(provider)?;
+    if base_url.trim_end_matches('/') != builtin.base_url.trim_end_matches('/')
+        || protocol.is_some_and(|protocol| protocol != builtin.protocol)
+    {
+        return None;
+    }
+    find(provider, model)?
+        .protocol
+        .filter(|declared| *declared != builtin.protocol)
 }
 
 #[derive(Deserialize)]
@@ -64,12 +104,13 @@ pub fn builtin_provider(id: &str) -> Option<&'static BuiltinProvider> {
         .find(|provider| provider.id == id)
 }
 
-/// Base URL, primary credential variable and wire protocol of a built-in provider id.
+/// Base URL, credential variable (the first of the provider's names that is set, else its primary
+/// one) and wire protocol of a built-in provider id.
 pub fn provider_endpoint(id: &str) -> Option<(&'static str, Option<&'static str>, ApiProtocol)> {
     builtin_provider(id).map(|provider| {
         (
             provider.base_url.as_str(),
-            provider.env_keys().next(),
+            provider.key_env(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty())),
             provider.protocol,
         )
     })
@@ -252,6 +293,8 @@ pub struct BundledModel {
     /// Base list price per token; `None` when the upstream card is unknown or variable.
     pub pricing: Option<TokenPricing>,
     pub list_price: Option<&'static ListPrice>,
+    /// Wire protocol this model needs when it differs from its provider's default.
+    pub protocol: Option<ApiProtocol>,
 }
 impl BundledModel {
     /// Whether this exact model's record documents `fact`.
@@ -298,6 +341,9 @@ struct Row {
     /// Documented request rules (`ModelFact`, kebab-case).
     #[serde(default)]
     f: Vec<ModelFact>,
+    /// Wire protocol, when the provider serves this model over a different one than its default.
+    #[serde(default)]
+    w: Option<ApiProtocol>,
 }
 #[derive(Deserialize)]
 struct ScheduleRow {
@@ -323,6 +369,7 @@ struct Entry {
     effort_wire: BTreeMap<ReasoningEffort, String>,
     facts: Vec<ModelFact>,
     price: Option<ListPrice>,
+    protocol: Option<ApiProtocol>,
 }
 struct ProviderModels {
     entries: Vec<Entry>,
@@ -400,6 +447,11 @@ static MODELS: LazyLock<HashMap<String, ProviderModels>> = LazyLock::new(|| {
                     index.entry(row.id.to_ascii_lowercase()).or_insert(i);
                     validate_effort_wire(&row)
                         .expect("bundled models.json effort wire map is valid");
+                    assert!(
+                        row.w.is_none_or(routable),
+                        "bundled models.json: {} declares a non-routable protocol",
+                        row.id
+                    );
                     Entry {
                         price: list_price(&row),
                         context_window: row.c.filter(|n| *n > 0),
@@ -411,6 +463,7 @@ static MODELS: LazyLock<HashMap<String, ProviderModels>> = LazyLock::new(|| {
                         default_effort: row.d,
                         effort_wire: row.m,
                         facts: row.f,
+                        protocol: row.w,
                         id: row.id,
                     }
                 })
@@ -448,6 +501,7 @@ fn to_bundled(provider: &'static str, entry: &'static Entry) -> BundledModel {
         facts: entry.facts.clone(),
         pricing: entry.price.as_ref().map(ListPrice::token_pricing),
         list_price: entry.price.as_ref(),
+        protocol: entry.protocol,
     }
 }
 

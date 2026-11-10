@@ -624,11 +624,12 @@ fn rewrite_child_call(
     }
 }
 
-/// `tool.batch([...])` from a worker code cell. When every entry is an offered, hook-free parallel
-/// read that this worker's approver authorizes and the portable-rule gate admits, the entries run
-/// together through the ordinary parallel-read group (the worker's own read path). Otherwise each
-/// entry is an ordinary serial callback (`serial`) with its own admission and approval. Results keep
-/// entry order. Steering that arrives meanwhile stays queued for the worker's round loop.
+/// `tool.batch([...])` from a worker code cell. Consecutive entries that are offered, hook-free
+/// parallel reads this worker's approver authorizes and the portable-rule gate admits run together
+/// through the ordinary parallel-read group (the worker's own read path). Every other entry is an
+/// ordinary serial callback (`serial`) with its own admission and approval, and closes the read
+/// group before it. Results keep entry order; each group is admitted only after the entries before
+/// it settled. Steering that arrives meanwhile stays queued for the worker's round loop.
 fn child_code_batch(
     context: &CallContext<'_, '_, '_>,
     parent: &llm::ToolCall,
@@ -641,27 +642,53 @@ fn child_code_batch(
     let hooks_free = ["pre_tool_use", "post_tool_use"]
         .iter()
         .all(|event| !crate::agent::safety::hooks::wanted(&env.config.hooks, event));
-    let shared = env.config.eval.parallel_batches
-        && hooks_free
-        && !calls.is_empty()
-        && calls.iter().all(|entry| {
-            entry.name != crate::tools::exec::eval::BATCH_CALLBACK
-                && names.contains(&entry.name)
-                && !matches!(entry.name.as_str(), "task" | "finish" | "exit_plan")
-                && approval::parallel_read(env.ext, &entry.name, &entry.arguments)
-                && call_form_error(entry, schemas, names).is_none()
-        })
-        && calls.iter().all(|entry| {
-            context
+    let shareable = |entry: &ToolCall| {
+        env.config.eval.parallel_batches
+            && hooks_free
+            && entry.name != crate::tools::exec::eval::BATCH_CALLBACK
+            && names.contains(&entry.name)
+            && !matches!(entry.name.as_str(), "task" | "finish" | "exit_plan")
+            && approval::parallel_read(env.ext, &entry.name, &entry.arguments)
+            && call_form_error(entry, schemas, names).is_none()
+            && context
                 .approver
                 .borrow_mut()
                 .authorize_with_cancel(entry, &summarize(entry), false, env.interrupt)
                 .is_ok()
-                && gate_intercept(context.callback_gate, env.workspace.root(), entry).is_none()
-        });
-    if !shared {
-        return calls.iter().map(serial).collect();
+            && gate_intercept(context.callback_gate, env.workspace.root(), entry).is_none()
+    };
+    let mut outputs = Vec::with_capacity(calls.len());
+    let mut index = 0;
+    while index < calls.len() {
+        let group = calls[index..]
+            .iter()
+            .take_while(|entry| shareable(entry))
+            .count();
+        // A lone read inside a mixed batch keeps the ordinary serial callback path.
+        if group > 1 || group == calls.len() {
+            outputs.extend(child_shared_reads(
+                context,
+                parent,
+                &calls[index..index + group],
+                steps,
+            ));
+            index += group;
+        } else {
+            outputs.push(serial(&calls[index]));
+            index += 1;
+        }
     }
+    outputs
+}
+
+/// One admitted group of worker callback reads through the parallel-read group.
+fn child_shared_reads(
+    context: &CallContext<'_, '_, '_>,
+    parent: &llm::ToolCall,
+    calls: &[ToolCall],
+    steps: u32,
+) -> Vec<ToolOutput> {
+    let env = context.env;
     for entry in calls {
         context.approver.borrow_mut().notice(&format!(
             "[{} callback] {}",
@@ -1059,10 +1086,21 @@ fn execute_child_call(
                         "private checkpoint tools are disabled"
                     );
                     anyhow::ensure!(
-                        ["checkpoint", "rewind", "session_search"]
+                        ["checkpoint", "session_search"]
                             .iter()
                             .all(|required| names.iter().any(|name| name == required)),
                         "private checkpoint requires both lifecycle tools and permitted raw session_search recovery"
+                    );
+                    let (owner, _) =
+                        crate::tools::surface::facade::owner_view(&call.name, &call.arguments);
+                    anyhow::ensure!(
+                        env.config
+                            .active_model_profile()
+                            .and_then(|profile| profile.tools.as_ref())
+                            .is_none_or(|allowed| allowed
+                                .iter()
+                                .any(|name| name == &owner || name == &call.name)),
+                        "private checkpoint operation is unavailable under this model tool allowlist"
                     );
                     let policy = child_policy(env, job, schemas, &journal.rule_policy)?;
                     let output = journal.exploration.request(

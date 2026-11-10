@@ -356,6 +356,9 @@ impl Agent<'_> {
                 output.text.push_str(&advice);
             }
         }
+        if let Some(hint) = crate::agent::run::failure_guidance::command_shape_hint(call, &output) {
+            output.text.push_str(&hint);
+        }
         if let Some(notice) = crate::agent::run::failure_guidance::directory_request_unavailable(
             &output,
             !self.hermetic && ui.interactive_input(),

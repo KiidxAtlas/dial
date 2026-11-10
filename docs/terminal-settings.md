@@ -96,9 +96,9 @@ Its header separates recorded active occupancy/limit and read-only loaded-server
 saved defaults. Missing server evidence says unknown. Usage estimates are labelled estimates.
 
 Models distinguishes the active model from the highlighted selection. Tuning a highlighted model
-does not assign it to main or a helper role. Assignment opens a masked effect review, including
-the exact saved keys and actual current-project overrides an all-project assignment removes.
-Cancellation and stale reviews do not publish changes or start downloads.
+does not assign it to main or a helper role. Selecting a model applies the assignment directly;
+there is no confirmation screen. Clearing a role still reviews its exact saved removals and
+inheritance effects before publication. Local preparation saves only on success.
 The role inspector groups model, declared reasoning override/inheritance and connection overrides.
 Headers are a visible masked action, not only a shortcut. Models, Providers and model tuning keep
 their named global/project destination visible. Controls shows the recorded reason for the main
@@ -179,6 +179,12 @@ The local-model outcome checklist links runtime setup, Models and explicit provi
 Browsing the checklist starts no installation, download or probe. Cached results are labelled last
 known; installed executables do not establish running-service health. Readiness beside memory/voice
 controls describes known prerequisites, not successful microphone, playback or live inference tests.
+
+Readiness uses distinct evidence levels: **Configured**, **Available**, **Text tested**, and
+**Tool-compatible**. Cached model metadata and saved credentials are not inference success.
+Unobserved or omitted endpoints remain unknown; changing an endpoint discards prior metadata
+success and model counts. Text and synthetic tool-roundtrip checks are separate opt-in diagnostics
+for the exact tested configuration, retained only for the session. Neither certifies coding quality.
 
 Implementation and verification of the forty approved outcomes is tracked separately in the
 [acceptance ledger](control-surface-acceptance.md); this page is not a claim of complete acceptance.

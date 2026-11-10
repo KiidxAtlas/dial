@@ -6,10 +6,14 @@ design and [`AGENTS.md`](AGENTS.md) lists the rules the build enforces.
 ## Setup
 
 - Rust: the toolchain is pinned in `rust-toolchain.toml` (rustup picks it up automatically).
-- Python 3.12 for the Python contracts and benchmark graders (`make test-python`,
-  `make test-bench-offline`). MLX checks are optional and Apple-Silicon only.
+- Python 3.12 matches CI for Python contracts and benchmark graders (`make test-python`,
+  `make test-bench-offline`). Supported package versions are declared in `python/pyproject.toml`;
+  MLX checks are optional and Apple-Silicon only.
 - Optional: [`cargo-nextest`](https://nexte.st) for `make test-nextest`, and `cargo-deny` for
   `cargo deny check` (CI runs it).
+- [`cargo-machete`](https://github.com/bnjbvr/cargo-machete) for `make lint-deps`
+  (`cargo install cargo-machete --locked --version 0.9.2`). CI uses a pinned, checksum-verified
+  binary; local preflight reports a skip when the tool is absent and never installs it.
 
 `make build` builds the binary; `make update` installs your checkout's build as the active `dial`.
 
@@ -23,6 +27,7 @@ constructor, and list it in `Registry::standard`. Crate layout and module owners
 cargo fmt --check
 make lint
 make test-rust          # or make test-nextest
+make lint-deps         # workspace dependency audit; requires cargo-machete
 ```
 
 Run the narrower tiers that match your change as well: `make test-drivers` for browser/eval/kernel
@@ -55,6 +60,8 @@ native-platform CI or hosted signing verification.
 - Update the relevant `docs/*.md` page and add a line under `## [Unreleased]` in `CHANGELOG.md`.
 - Adding a dependency: declare it in the root `[workspace.dependencies]` and make sure
   `cargo deny check` still passes (licenses and advisories are configured in `deny.toml`).
+- Public API cleanup follows the [compatibility review](docs/compatibility.md): migrate callers
+  and announce a replacement before deprecating; do not delete exported APIs based on text searches.
 
 ### Prompt wording, thresholds and recovery limits
 

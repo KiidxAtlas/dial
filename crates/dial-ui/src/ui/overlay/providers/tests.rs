@@ -172,6 +172,87 @@ fn overlay() -> ProviderOverlay {
 }
 
 #[test]
+fn cached_and_unknown_provider_evidence_is_neutral_not_success() {
+    let rig = Rig::new();
+    let o = overlay();
+    for state in ["cached", "unknown"] {
+        let chip = o.chip(&rig.theme, state);
+        assert_eq!(chip.style.fg, rig.theme.fg(Tok::Muted).fg, "{state}");
+        assert_ne!(chip.style.fg, rig.theme.fg(Tok::Success).fg, "{state}");
+    }
+}
+
+#[test]
+fn provider_configuration_changes_do_not_reuse_old_endpoint_success() {
+    for (enabled, url, expected, count) in [
+        (true, "https://llm.example.com/v1", "reachable", 3),
+        (true, "https://llm.example.com/v1/", "reachable", 3),
+        (true, "https://other.example.com/v1", "unknown", 0),
+        (false, "https://llm.example.com/v1", "disabled", 3),
+    ] {
+        let mut cfg = configured();
+        let spec = cfg.get_mut("work").unwrap();
+        spec.enabled = enabled;
+        spec.base_url = url.into();
+        let o = ProviderOverlay::new(
+            Some(Discovery {
+                models: vec![],
+                providers: vec![provider(
+                    "work",
+                    "Work",
+                    "reachable",
+                    3,
+                    Some("https://llm.example.com/v1"),
+                )],
+            }),
+            cfg,
+            Box::new(|_| false),
+            Scope::Global,
+        );
+        let entries = o.entries();
+        assert_eq!(entries[0].state, expected, "enabled={enabled}, url={url}");
+        assert_eq!(entries[0].models, count, "enabled={enabled}, url={url}");
+    }
+}
+
+#[test]
+fn a_scan_that_omits_a_configured_endpoint_does_not_prove_unavailability() {
+    let mut cfg = configured();
+    cfg.get_mut("work").unwrap().enabled = true;
+    let o = ProviderOverlay::new(
+        Some(Discovery::default()),
+        cfg,
+        Box::new(|_| false),
+        Scope::Global,
+    );
+    let entries = o.entries();
+    assert_eq!(entries[0].state, "unknown");
+    assert_eq!(entries[0].detail, "Not reported by the last scan");
+}
+
+#[test]
+fn a_rejected_endpoint_keeps_its_own_error_instead_of_a_changed_note() {
+    let mut cfg = configured();
+    let spec = cfg.get_mut("work").unwrap();
+    spec.enabled = true;
+    spec.base_url = "not a url".into();
+    let mut rejected = provider("work", "Work", "invalid", 0, None);
+    rejected.detail = "Invalid endpoint URL".into();
+    let o = ProviderOverlay::new(
+        Some(Discovery {
+            models: vec![],
+            providers: vec![rejected],
+        }),
+        cfg,
+        Box::new(|_| false),
+        Scope::Global,
+    );
+    let entries = o.entries();
+    assert_eq!(entries[0].state, "invalid");
+    assert_eq!(entries[0].detail, "Invalid endpoint URL");
+}
+
+#[test]
 fn pending_chatgpt_login_can_be_cancelled_explicitly() {
     let rig = Rig::new();
     let mut d = discovery();
@@ -888,14 +969,14 @@ fn discovery_update_keeps_the_highlighted_provider_and_reflects_new_state() {
 }
 
 #[test]
-fn before_discovery_configured_providers_show_as_checking() {
+fn before_discovery_configured_providers_show_as_unknown() {
     let rig = Rig::new();
     let mut cfg = configured();
     cfg.get_mut("work").unwrap().enabled = true;
     let mut o = ProviderOverlay::new(None, cfg, Box::new(|_| false), Scope::Project);
     let shown = draw(&mut o, &rig, 110, 24);
     assert!(
-        shown.contains("checking")
+        shown.contains("unknown")
             && shown.contains("Waiting for the first scan")
             && shown.contains("scope: project"),
         "{shown}"

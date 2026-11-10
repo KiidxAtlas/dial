@@ -32,6 +32,11 @@ work or infer semantic dependencies between tasks.
   conversation (see below). The model-facing send receipt confirms inbox acceptance only: it does
   not establish the recipient's automatic wake-up eligibility or settings. Queuing is not
   acknowledgement, and an ineligible idle recipient may need a new user turn to read the message.
+  `list` returns inbox receipts for this session's eight newest letters in `sent[].status`:
+  `delivered` means still queued in the observed inbox; `collected` means no longer there;
+  `unavailable` means the inbox could not be inspected (including an ended peer). Collection can
+  precede a model request and does not prove reading, acknowledgment, agreement or acceptance.
+  The legacy `read` field is false while queued and null otherwise, never an inferred true.
 - `clear` clears this session's claimed scopes, not its conversation or another peer's state.
 
 The subcommands write ordinary transcript notices. During a running turn, `/peers` and its

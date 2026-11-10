@@ -1965,6 +1965,35 @@ fn local_time_formats_like_strftime() {
 }
 
 #[test]
+fn recovery_footer_keeps_cancel_with_long_scroll_details() {
+    for width in [36, 38, 60, 100] {
+        let body = "retained diagnostic line\n".repeat(200);
+        let rows = panel_rows_window(
+            &Theme::dark(),
+            width,
+            12,
+            PanelView {
+                title: crate::app::panel::RECOVERY_PANEL,
+                body: &body,
+                options: &[("Keep current work", 'n')],
+                selected: 0,
+                offset: 0,
+            },
+        );
+        let shown = rows
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("Esc cancel"), "width {width}: {shown}");
+        assert!(
+            rows.iter()
+                .all(|row| text::line_width(row) <= usize::from(width))
+        );
+    }
+}
+
+#[test]
 fn policy_reason_renders_in_normal_and_narrow_approval_panels() {
     use crate::agent::safety::approval::{PolicyExplanation, PolicyReason};
     let explanation = PolicyExplanation {

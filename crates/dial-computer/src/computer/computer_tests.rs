@@ -61,6 +61,25 @@ fn computer_run_requires_exactly_one_source() {
 }
 
 #[test]
+fn computer_run_schema_explains_source_and_scope() {
+    let tool = Computer {
+        session: Arc::new(ComputerSession::new(current_cwd())),
+    };
+    let schema = tool.schema();
+    let properties = &schema["function"]["parameters"]["properties"];
+    let code = properties["code"]["description"].as_str().unwrap();
+    assert!(
+        code.contains("function body") && code.contains("desktop"),
+        "{code}"
+    );
+    let function = properties["fn"]["description"].as_str().unwrap();
+    assert!(
+        function.contains("async ({ desktop })") && function.contains("code"),
+        "{function}"
+    );
+}
+
+#[test]
 fn computer_inline_cap_keeps_head_and_tail() {
     let text: String = (0..10_000).map(|i| format!("line {i}\n")).collect();
     let capped = cap_inline(text.clone(), |_| Some("artifact://x".into()));
@@ -405,6 +424,10 @@ mod worker {
                             }
                         }
                         Some("capabilities") => json!({"backend": "fake"}),
+                        Some("axQuery") => json!([
+                            {"ref": "e1", "role": "textfield", "title": "Message"},
+                            {"ref": "e2", "role": "textfield", "title": "Search"}
+                        ]),
                         Some("controlState") => json!({"active": control_active}),
                         Some("releaseControl") => {
                             control_active = false;
@@ -537,6 +560,57 @@ mod worker {
         // Other ReferenceErrors stay untouched.
         let other = run_worker("return missing_name;", brave);
         assert_eq!(other["error"]["message"], "missing_name is not defined");
+    }
+
+    #[test]
+    fn computer_element_lists_and_window_bounds_report_the_shape_without_input() {
+        // A local model called element helpers on `find()`'s array and `bounds()` on a window.
+        for method in ["click()", "actions()", "focus()", "bounds()"] {
+            let code = format!(
+                "const win = await desktop.window('12086'); const input = await win.find({{ role: 'textfield' }}); await input.{method};"
+            );
+            let (result, natives) = run_worker_with_natives(&code, brave, false);
+            assert_eq!(result["ok"], false, "{result}");
+            let error = result["error"]["message"].as_str().unwrap();
+            assert!(error.contains("list of 2 element(s)"), "{error}");
+            assert!(error.contains("const [el] = await win.find"), "{error}");
+            assert!(
+                !natives.iter().any(|call| matches!(
+                    call["method"].as_str(),
+                    Some("axClick" | "axFocus" | "axNode")
+                )),
+                "{natives:?}"
+            );
+        }
+        let listed = run_worker(
+            "const win = await desktop.window('12086'); const [el] = await win.find({ role: 'textfield' }); return { title: el.title, n: (await win.find({})).length, json: JSON.stringify(await win.find({})) };",
+            brave,
+        );
+        assert_eq!(
+            listed["payload"]["returnValue"]["title"], "Message",
+            "{listed}"
+        );
+        assert_eq!(listed["payload"]["returnValue"]["n"], 2, "{listed}");
+        assert!(
+            !listed["payload"]["returnValue"]["json"]
+                .as_str()
+                .unwrap()
+                .contains("click"),
+            "{listed}"
+        );
+        let bounds = run_worker(
+            "const win = await desktop.window('12086'); return win.bounds();",
+            brave,
+        );
+        let error = bounds["error"]["message"].as_str().unwrap();
+        assert!(error.contains("`bounds` is a property"), "{error}");
+        let one = run_worker(
+            "const win = await desktop.window('12086'); const el = await win.findOne({ role: 'textfield' }); return el.title;",
+            brave,
+        );
+        assert_eq!(one["payload"]["returnValue"], "Message", "{one}");
+        let result = run_worker("throw new TypeError('unrelated failure');", brave);
+        assert_eq!(result["error"]["message"], "unrelated failure");
     }
 
     #[test]

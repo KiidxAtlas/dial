@@ -292,8 +292,10 @@ struct Mounted {
     names: BTreeMap<String, String>,
     /// Tools currently offered, by remote name.
     offered: BTreeMap<String, Offered>,
-    /// `read_resource` and `get_prompt` surfaces, registered once when mounted.
+    /// One resource/prompt context surface, registered once when mounted.
     surfaces: Vec<Arc<dyn Tool>>,
+    /// Exact names reserved by the old wrappers, before any remote tool names are allocated.
+    legacy_surfaces: Vec<(crate::tools::surface::contracts::Identity, SurfaceKind)>,
 }
 
 /// The registry's mirror of every connected server's tools, keyed by registered name.
@@ -309,34 +311,23 @@ impl Live {
     /// Adds a connected server. Its tools are registered by the next [`Live::sync`].
     pub(super) fn mount(&mut self, session: Arc<Session>, resources: bool, prompts: bool) {
         let server = session.name.clone();
-        let hooks = session.server.lifecycle_hooks.clone();
-        let mut surfaces: Vec<Arc<dyn Tool>> = Vec::new();
-        if resources {
-            let name = self.namer.name(&server, "read_resource");
-            surfaces.push(Arc::new(McpSurface::new(
-                name,
-                &server,
-                SurfaceKind::Resource,
-                session.clone(),
-                hooks.clone(),
-            )));
-        }
-        if prompts {
-            let name = self.namer.name(&server, "get_prompt");
-            surfaces.push(Arc::new(McpSurface::new(
-                name,
-                &server,
-                SurfaceKind::Prompt,
-                session.clone(),
-                hooks,
-            )));
+        let mut legacy_surfaces = Vec::new();
+        for (enabled, remote, kind) in [
+            (resources, "read_resource", SurfaceKind::Resource),
+            (prompts, "get_prompt", SurfaceKind::Prompt),
+        ] {
+            if enabled {
+                let name = self.namer.name(&server, remote);
+                legacy_surfaces.push((kind.historical_identity(name), kind));
+            }
         }
         self.servers.push(Mounted {
             session,
             applied: None,
             names: BTreeMap::new(),
             offered: BTreeMap::new(),
-            surfaces,
+            surfaces: Vec::new(),
+            legacy_surfaces,
         });
     }
 
@@ -364,16 +355,65 @@ impl Live {
         change.upserted.into_iter().map(|(_, tool)| tool).collect()
     }
 
+    /// Pure projection of a settled old resource/prompt wrapper call. Exact identities and the
+    /// names reserved at mount time distinguish wrappers from identically named remote tools.
+    /// This never executes or admits a call, and leaves the durable original untouched.
+    pub fn historical_surface_projection(
+        &self,
+        recorded: &crate::tools::surface::contracts::Identity,
+        arguments: &Value,
+    ) -> Option<(String, Value)> {
+        let mut view = self.clone();
+        view.reconcile(&mut Change::default());
+        for mounted in &view.servers {
+            if let Some((_, kind)) = mounted
+                .legacy_surfaces
+                .iter()
+                .find(|(old, _)| old == recorded)
+            {
+                let mut arguments = arguments.as_object()?.clone();
+                // Unknown fields were historically ignored. The new discriminator must come
+                // from the recorded wrapper identity, never from old argument data.
+                arguments.insert("surface".into(), json!(kind.selector()));
+                return Some((
+                    mounted.surfaces.first()?.name().to_owned(),
+                    Value::Object(arguments),
+                ));
+            }
+        }
+        None
+    }
+
     fn reconcile(&mut self, change: &mut Change) {
         let Live {
             namer,
             servers,
             retired,
         } = self;
+        // Reserve all remote names before allocating any new context wrapper. This reproduces
+        // the legacy order (all old wrappers, then remote catalogs) even for sanitized collisions.
+        for mounted in servers.iter_mut() {
+            for remote in mounted.session.catalog_snapshot().1 {
+                mounted
+                    .names
+                    .entry(remote.name.clone())
+                    .or_insert_with(|| namer.name(&mounted.session.name, &remote.name));
+            }
+        }
         for mounted in servers.iter_mut() {
             let revision = mounted.session.catalog_revision();
             if mounted.applied == Some(revision) {
                 continue;
+            }
+            if mounted.surfaces.is_empty() && !mounted.legacy_surfaces.is_empty() {
+                let server = mounted.session.name.clone();
+                let name = namer.name(&server, "context");
+                mounted.surfaces.push(Arc::new(McpSurface::new(
+                    name,
+                    &server,
+                    mounted.session.clone(),
+                    mounted.session.server.lifecycle_hooks.clone(),
+                )));
             }
             if mounted.applied.is_none() {
                 change.upserted.extend(
@@ -444,3 +484,6 @@ impl Live {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod historical_tests;

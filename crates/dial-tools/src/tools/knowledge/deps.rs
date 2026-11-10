@@ -821,7 +821,7 @@ fn authorize(ws: &Workspace, package: &Package, caches: &Caches) -> Result<PathB
         Ok(root)
     } else {
         Err(format!(
-            "{} is outside the workspace and the strict sandbox grants no reads there; call request_directory with path {:?} for a yes/no approval, then retry",
+            "{} is outside the workspace and the strict sandbox grants no reads there; call `ask` action=directory with path {:?} for a yes/no approval, then retry",
             root.display(),
             base.display()
         ))

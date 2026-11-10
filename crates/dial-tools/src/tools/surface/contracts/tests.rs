@@ -691,6 +691,55 @@ fn recorded_kernel_calls_with_an_explicit_language_are_refused() {
     assert!(project_history(&history, std::slice::from_ref(&current), &registry).is_err());
 }
 
+/// Consolidated members (`facade::GROUPS`) resume as calls of their successor with the selector
+/// that routes back to them; an already-selected shape is refused.
+#[test]
+fn recorded_consolidated_member_calls_project_onto_their_successor() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::config::types::Config {
+        project_root: dir.path().to_path_buf(),
+        user_dir: dir.path().join("user"),
+        state_dir: dir.path().join("state"),
+        integrations: Vec::new(),
+        ..crate::config::types::Config::default()
+    };
+    let registry = Registry::standard(&config, Vec::new());
+    let member = registry.get("runtime_inspect").unwrap();
+    let old = identities(&[member.schema()], &registry)["runtime_inspect"].clone();
+    let current = registry.get("inspect").unwrap().schema();
+    let history = vec![
+        json!({"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"runtime_inspect","arguments":"{\"action\":\"summary\",\"path\":\"t.json\"}"}}],"dial_tool_contracts":{"c1":old}}),
+        json!({"role":"tool","tool_call_id":"c1","content":"ok"}),
+    ];
+    let projected = project_history(&history, std::slice::from_ref(&current), &registry)
+        .unwrap()
+        .expect("a recorded member call must be projected onto its successor");
+    let call = &projected[0]["tool_calls"][0]["function"];
+    assert_eq!(call["name"], "inspect");
+    let arguments: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        arguments,
+        json!({"kind":"trace","action":"summary","path":"t.json"})
+    );
+    assert!(
+        project_history(&projected, std::slice::from_ref(&current), &registry)
+            .unwrap()
+            .is_none()
+    );
+    validate_history(&projected, std::slice::from_ref(&current), &registry).unwrap();
+
+    let mut selected = history;
+    selected[0]["tool_calls"][0]["function"]["arguments"] =
+        json!("{\"kind\":\"x\",\"action\":\"summary\"}");
+    assert!(project_history(&selected, std::slice::from_ref(&current), &registry).is_err());
+    // Without the successor in this request the call stays inert.
+    assert!(
+        project_history(&selected, &[], &registry)
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// The split memory tools merged into `memory`; a recorded call resumes as `memory` with the
 /// action that selected it, and an already-actioned shape is refused.
 #[test]

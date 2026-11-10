@@ -194,6 +194,48 @@ Private, loopback and link-local addresses are refused. The result is untrusted 
     }
 }
 
+/// Legacy page-fetch behavior reached through `read` with `fetch=true`: markdown discovery,
+/// configured reader fallback, raw bodies and the character cap keep the existing owner.
+pub(in crate::tools) fn fetch_read(
+    context: &ToolContext<'_>,
+    args: &Value,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> ToolOutput {
+    let Some((_, own)) = crate::tools::surface::facade::member_call("read", args) else {
+        return ToolOutput::err(
+            "fetch requires one http(s) path and cannot be combined with read selectors or formats",
+        );
+    };
+    let tool = WebFetch {
+        client: Arc::new(Client::new()),
+    };
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return ToolOutput::err("web fetch was cancelled");
+    }
+    // The page pipeline makes several requests on its shared client. Bridge the controller's
+    // borrowed cancellation flag for the whole pipeline, not just the first request.
+    std::thread::scope(|scope| {
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let client = &tool.client;
+        scope.spawn(move || {
+            loop {
+                match wait.recv_timeout(std::time::Duration::from_millis(20)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                            client.interrupt();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let output = tool.call(context, &own);
+        let _ = done.send(());
+        output
+    })
+}
+
 struct WebSearch {
     client: Arc<Client>,
 }

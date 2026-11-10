@@ -107,13 +107,15 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     }
     let mut optional: Vec<&str> = [
         ("skill", SKILL_RULE),
+        ("checkpoint", CHECKPOINT_RULE),
+        ("ask", ASK_RULE),
         ("codebase_memory", PROJECT_MAP_RULE),
         ("lsp", LSP_RULE),
         ("glob", SOURCE_PREVIEW_RULE),
         ("verify", ARTIFACT_CHECK_RULE),
     ]
     .into_iter()
-    .filter(|(tool, _)| has(tool))
+    .filter(|(tool, _)| has(tool) || (*tool == "codebase_memory" && has("memory")))
     .map(|(_, rule)| rule)
     .collect();
     if EVIDENCE_DATA_TOOLS.iter().any(|tool| has(tool)) {
@@ -137,14 +139,11 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     let mut focused = String::from(FOCUSED_WORK);
     focused.push_str(LEAN_WAITING);
     // Name a parallel helper only when it is offered, never a deferred one.
-    let helpers: Vec<&str> = [
-        ("side_request", LEAN_SIDE_REQUEST),
-        ("task", LEAN_TASK_START),
-    ]
-    .into_iter()
-    .filter(|(tool, _)| has(tool))
-    .map(|(_, clause)| clause)
-    .collect();
+    let helpers: Vec<&str> = [("task", LEAN_SIDE_REQUEST), ("task", LEAN_TASK_START)]
+        .into_iter()
+        .filter(|(tool, _)| has(tool))
+        .map(|(_, clause)| clause)
+        .collect();
     if !helpers.is_empty() {
         focused.push_str(&format!("\n- Meanwhile you may {}.", helpers.join(", or ")));
     }
@@ -175,7 +174,7 @@ fn scoped_guidance(offer: &Offer<'_>, concise: bool, prefer_subagents: bool) -> 
             out.push_str(PREVIEW_SERVER_RULES);
         }
     }
-    if has("monitor") {
+    if has("monitor") || has("bg") {
         out.push_str(MONITOR_RULES);
     }
     if has("task") {
@@ -349,15 +348,11 @@ fn environment_prompt(i: &Inputs<'_>, rendered: Option<&str>, notes: TurnNotes) 
     let offered = |name: &str| i.tools.iter().any(|tool| tool == name);
     // One statement of discovery, naming only the discovery tools actually offered.
     if offered("tool_search") {
-        let load = if offered("tool_load") && i.discoverable.is_empty() {
-            ", then `tool_load` its exact name to call it next round"
-        } else {
-            ""
-        };
+        let load = ", then load its exact name with `tool_search` names:[name] (or search with load:true) to call it next round";
         out.push_str(&format!("- Specialist and MCP tools: before declaring a capability unavailable, find one with `tool_search` by task or domain{load}; prefer it over a shell or web substitute. A miss returns a catalog page with a next_query to follow.\n"));
     }
     if !i.discoverable.is_empty() {
-        out.push_str("- Loadable tools, not in the schema yet: `tool_load` the exact name first and use the tool next round; Dial refuses calls to unloaded tools.\n");
+        out.push_str("- Loadable tools, not in the schema yet: use `tool_search` names:[exact name] first and call the tool next round; unload:[name] removes explicit activation. Loading grants no permission.\n");
         // Names alone suffice when `tool_search` can describe them on demand.
         let names_only = compact && i.tools.iter().any(|tool| tool == "tool_search");
         if i.context_overflow && i.template.is_none() && i.overrides.0.is_none() {

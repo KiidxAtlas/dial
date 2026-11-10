@@ -7,6 +7,28 @@ immutable evidence workflow:
 - **`network_inspect`** projects HTTP/API conversation metadata from HAR captures.
 - **`database`** inspects local SQLite schema, read-only query results and query plans.
 
+Live, read-only host state is also available without a specialist, through `read`:
+
+- `sys://procs` lists running processes, newest first (pid, parent, state, memory, age, command).
+  `sys://procs/<pid>` shows one process: working directory, executable, children, listening
+  sockets and open files.
+- `sys://ports` lists listening TCP and bound UDP sockets, with the owning process when visible.
+- `sys://host` shows the OS, kernel, CPU, memory, free disk, container, user and installed
+  toolchain versions.
+
+On Linux these come from `/proc`, so minimal containers without `ps` or `ss` still answer. macOS
+uses `ps` and `lsof`, which show only the current user's processes unless Dial runs as root.
+Windows reads a Toolhelp process snapshot, each process's parameters block (command line and
+working directory) and the IP Helper socket tables, with no external tools; processes of other
+users or elevated ones show only their image name unless Dial is elevated, and
+`sys://procs/<pid>` does not list open files there. Command lines are credential-redacted, and
+environment variables are never read. A compact form of the `sys://host` inventory (OS, CPUs,
+RAM, tools on `PATH` and common tools that are missing) is added to the session's environment
+section when `bash` is offered. It is collected once per process, from local `--version` probes
+with a 3-second deadline. On Windows, names are resolved through `PATHEXT` (`git` finds
+`git.exe`). A tool whose probe exits unsuccessfully, such as the Microsoft Store `python3` alias,
+is reported as not installed.
+
 ## Start with a question
 
 You do not need to learn tool names or write tool-call JSON. Put an authorized offline capture in

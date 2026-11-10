@@ -16,5 +16,7 @@ Crate-owned examples stay beside their owners: the [UI gallery](../crates/dial-u
 uses `cargo run -p dial-ui --example ux_gallery`; the
 [workspace-copy benchmark](../crates/dial-core/examples/workspace_copy_bench.rs) belongs to `dial-core`.
 
-Keep generated reports/captures under `target/` or `scratch/`. Do not delete fixture files as
-output: CI, integration tests and benchmark suites consume them at their current paths.
+Keep generated reports/captures under `target/` or `scratch/`; use the ignored `benchmarks/`
+workspace for retained benchmark runs, datasets and environments. New source suites and fixtures
+under `examples/benchmarks/` should stay visible to Git. Do not delete fixture files as output:
+CI, integration tests and benchmark suites consume them at their current paths.

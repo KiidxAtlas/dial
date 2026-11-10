@@ -311,7 +311,7 @@ pub(in crate::app) fn attention_choices_with_context(
                 .enumerate()
                 .filter(|(_, task)| task.status == crate::agent::workflow::todo::Status::Blocked)
                 .map(|(index, task)| ChoiceItem {
-                    value: "todo".into(),
+                    value: format!("todo show {}", index + 1),
                     label: format!("Todo · {} · blocked", index + 1),
                     detail: task.label(index + 1),
                     current: false,

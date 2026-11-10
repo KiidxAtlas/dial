@@ -160,7 +160,7 @@ fn hosted_and_local_core_offers_obey_the_byte_budget_and_ignore_task_routing() {
 }
 
 /// Unattended hosted runs (print mode, benchmarks) defer session helpers but keep a runnable
-/// `eval` in the first request, so code-heavy work needs no `tool_load` round.
+/// `eval` in the first request, so code-heavy work needs no `tool_search` load round.
 #[test]
 fn unattended_hosted_runs_offer_a_runnable_eval_up_front() {
     with_agent(HOSTED, |agent| {
@@ -225,7 +225,7 @@ fn searching_a_specialist_leaves_the_offer_and_cached_prefix_unchanged() {
                 .iter()
                 .any(|entry| entry["name"] == "git"
                     && entry["status"] == "not_loaded"
-                    && entry["next"].as_str().unwrap().contains("tool_load"))
+                    && entry["next"].as_str().unwrap().contains("tool_search"))
         );
         assert_eq!(agent.offered(), before);
         assert_eq!(agent.system_messages(), system);
@@ -423,6 +423,15 @@ fn core_tools_keep_short_parameter_descriptions_and_specialists_stay_bare() {
                         .all(|child| child.get("description").is_none())
                 }));
             }
+        }
+        // Option compatibility rules survive compaction, so a first call can get them right.
+        let persist = property(2, "persist").unwrap();
+        for rule in ["pass true on every call", "no pty/stdin/ready"] {
+            assert!(persist.contains(rule), "{persist}");
+        }
+        let ready = property(2, "ready").unwrap();
+        for rule in ["log regex", "host needs port", "both must hold"] {
+            assert!(ready.contains(rule), "{ready}");
         }
         assert!(property(4, "action").is_none());
     });

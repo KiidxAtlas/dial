@@ -173,7 +173,7 @@ fn advice_retains_effect_termination_and_policy_boundaries() {
 fn capabilities_choose_offered_deferred_or_blocked_advice() {
     for (bg, no_pty, expected, available) in [
         (Capability::Offered, false, "permitted bash launch", true),
-        (Capability::Loadable, false, "use tool_load", true),
+        (Capability::Loadable, false, "use tool_search", true),
         (Capability::Prohibited, false, "prohibited", false),
         (Capability::Unavailable, false, "unavailable", false),
         (Capability::Offered, true, "disabled by shell.no_pty", false),
@@ -251,13 +251,13 @@ fn parent_and_child_share_recovery_without_widening_child_allowlists() {
         );
         assert_eq!(
             agent
-                .launch_recovery_capabilities(&["bash".into(), "tool_load".into()])
+                .launch_recovery_capabilities(&["bash".into(), "tool_search".into()])
                 .bg,
             Capability::Loadable
         );
         assert_eq!(
             LaunchCapabilities::child(
-                &["bash".into(), "tool_load".into()],
+                &["bash".into(), "tool_search".into()],
                 agent.config,
                 &agent.ext
             )
@@ -319,7 +319,7 @@ fn existing_job_control_preserves_owner_and_loads_deferred_capabilities_first() 
             let advice = shell_launch_recovery(&call, &mut out, &caps).unwrap();
             if capability == Capability::Prohibited {
                 assert!(!advice.contains("Use permitted bg"));
-                assert!(!advice.contains("tool_load"));
+                assert!(!advice.contains("tool_search"));
             } else {
                 let mut identity = json!({"name":"same-name"});
                 if persist {
@@ -327,7 +327,7 @@ fn existing_job_control_preserves_owner_and_loads_deferred_capabilities_first() 
                 }
                 assert!(advice.contains(&identity.to_string()), "{advice}");
                 assert_eq!(
-                    advice.contains("tool_load"),
+                    advice.contains("tool_search"),
                     capability == Capability::Loadable
                 );
                 assert_eq!(advice.contains("input/resize"), !persist);
@@ -378,7 +378,7 @@ fn structured_launch_candidates_are_schema_valid_and_do_not_execute() {
                 assert!(candidate.get("arguments").is_none());
             }
             assert_eq!(
-                rendered.contains("tool_load"),
+                rendered.contains("tool_search"),
                 state == Capability::Loadable
             );
             let (kind, advice) = classify(&call, &out).unwrap();
@@ -403,7 +403,7 @@ fn structured_launch_candidates_are_schema_valid_and_do_not_execute() {
 #[test]
 fn shell_tool_coaching_distinguishes_parent_loader_from_fixed_worker_surface() {
     with_agent("", |agent| {
-        let names = vec!["bash".into(), "tool_load".into()];
+        let names = vec!["bash".into(), "tool_search".into()];
         let call = ToolCall {
             arguments: json!({"command":"bg"}),
             ..call()
@@ -417,8 +417,8 @@ fn shell_tool_coaching_distinguishes_parent_loader_from_fixed_worker_surface() {
             LaunchCapabilities::child_tool(name, &names, agent.config, &agent.ext)
         })
         .unwrap();
-        assert!(parent.contains("tool_load"));
-        assert!(worker.contains("prohibited") && !worker.contains("tool_load"));
+        assert!(parent.contains("tool_search"));
+        assert!(worker.contains("prohibited") && !worker.contains("tool_search"));
         assert_eq!(agent.recovery_capability("not-a-dial-tool", &names), None);
         assert_eq!(
             LaunchCapabilities::child_tool("not-a-dial-tool", &names, agent.config, &agent.ext),

@@ -48,7 +48,7 @@ On first launch Dial asks which model to use. Then you tell it what you want.
 </tr>
 </table>
 
-## `Install`
+## Install
 
 | Platform                              | Command                                                                                     |
 | ------------------------------------- | ------------------------------------------------------------------------------------------- |

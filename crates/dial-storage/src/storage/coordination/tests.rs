@@ -246,6 +246,9 @@ fn letters_carry_time_and_authorship_and_receipts_track_delivery() {
     let drained = recipient.drain().unwrap();
     assert_eq!(drained.len(), 2);
     assert!(sender.undelivered(recipient.id()).unwrap().is_empty());
+    let id = recipient.id().to_owned();
+    drop(recipient);
+    assert!(sender.undelivered(&id).is_err(), "ended is not collected");
 }
 
 #[test]

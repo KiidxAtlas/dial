@@ -186,3 +186,23 @@ fn bottom_hint_fills_only_a_blank_bottom_row() {
         "Ctrl+C closes"
     ));
 }
+
+#[test]
+fn long_footer_lead_never_hides_the_exit() {
+    for theme in [
+        Theme::dark(),
+        Theme::dark().with_glyphs(super::super::theme::Glyphs::Ascii),
+    ] {
+        for width in 9..80 {
+            let line = hint_line_after(
+                &theme,
+                "A very long outcome with 日本語 and a pending operation",
+                &[("Enter", "open"), ("Esc", "close")],
+                width,
+            );
+            let shown: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(shown.ends_with("Esc close"), "width {width}: {shown}");
+            assert!(text::line_width(&line) <= width, "width {width}: {shown}");
+        }
+    }
+}

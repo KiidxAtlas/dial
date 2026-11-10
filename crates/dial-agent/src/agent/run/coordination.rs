@@ -44,9 +44,11 @@ pub struct PeerMessage {
     /// Sent by this session; otherwise received from `peer`.
     pub outgoing: bool,
     pub text: String,
-    /// Not received by its recipient's model yet: for an incoming letter, still queued here; for
-    /// an outgoing one, still queued in the peer's inbox.
+    /// Still queued in the recipient's inbox (not evidence of human or model agreement).
     pub unread: bool,
+    /// The recipient's inbox was observed successfully. When false, `unread` cannot be used
+    /// to infer collection or reading. Inbox disappearance alone never confirms model reading.
+    pub receipt_available: bool,
     /// When the sender queued it, in Unix milliseconds; 0 when unknown.
     pub at_ms: u64,
     /// Typed by the human in this session's watch pane rather than by its model.
@@ -68,7 +70,8 @@ fn remember_sent(history: &History, to: &str, letter: &Letter) {
             peer: to.to_owned(),
             outgoing: true,
             text: letter.text.clone(),
-            unread: false,
+            unread: true,
+            receipt_available: false,
             at_ms: letter.at_ms,
             by_user: letter.human,
         },
@@ -83,6 +86,7 @@ fn remember_received(history: &History, letter: &Letter) {
             outgoing: false,
             text: letter.text.clone(),
             unread: false,
+            receipt_available: true,
             at_ms: letter.at_ms,
             by_user: false,
         },
@@ -164,38 +168,52 @@ fn board(participant: &Participant, own: Own, pending: usize) -> Result<PeerBoar
 }
 
 fn messages(participant: &Participant, history: &History) -> Result<Vec<PeerMessage>> {
-    let mut messages: Vec<PeerMessage> = history
+    // Inbox collection is observable; model reading and acknowledgment are not.
+    let mut recipients: Vec<String> = history
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .cloned()
-        .collect();
-    // Read receipts: an outgoing letter still in its recipient's inbox is unread there.
-    let mut recipients: Vec<String> = messages
         .iter()
         .filter(|message| message.outgoing)
         .map(|message| message.peer.clone())
         .collect();
     recipients.sort();
     recipients.dedup();
-    for to in recipients {
-        let Ok(waiting) = participant.undelivered(&to) else {
-            continue;
-        };
-        for message in messages
+    // Inboxes are read without holding the history lock; sends may record concurrently.
+    let observed: Vec<_> = recipients
+        .into_iter()
+        .map(|to| {
+            let waiting = participant.undelivered(&to);
+            (to, waiting)
+        })
+        .collect();
+    let mut history = history.lock().unwrap_or_else(|e| e.into_inner());
+    for (to, waiting) in &observed {
+        for message in history
             .iter_mut()
-            .filter(|message| message.outgoing && message.peer == to)
+            .filter(|message| message.outgoing && &message.peer == to)
         {
-            message.unread = waiting
-                .iter()
-                .any(|letter| letter.text == message.text && letter.at_ms == message.at_ms);
+            match waiting {
+                Ok(waiting) => {
+                    message.receipt_available = true;
+                    message.unread = waiting
+                        .iter()
+                        .any(|letter| letter.text == message.text && letter.at_ms == message.at_ms);
+                }
+                // An observed collection stays true after the peer ends or its inbox becomes
+                // unreadable. A still-queued letter's fate is now unknown, never upgraded.
+                Err(_) if message.receipt_available && !message.unread => {}
+                Err(_) => message.receipt_available = false,
+            }
         }
     }
+    let mut messages: Vec<PeerMessage> = history.iter().cloned().collect();
+    drop(history);
     messages.extend(participant.queued()?.into_iter().map(|letter| PeerMessage {
         peer: letter.from,
         outgoing: false,
         text: letter.text,
         unread: true,
+        receipt_available: true,
         at_ms: letter.at_ms,
         by_user: false,
     }));
@@ -540,9 +558,29 @@ impl Agent<'_> {
             .as_ref()
             .with_context(|| unavailable(state))?;
         match args["action"].as_str().unwrap_or("list") {
-            "list" => Ok(
-                json!({"id":participant.id(),"session_id":self.session.id(),"summary":state.summary,"phase":state.phase,"scopes":state.scopes,"peers":participant.peers()?}),
-            ),
+            "list" => {
+                // Inbox collection cannot establish reading, acceptance or agreement.
+                let sent: Vec<Value> = messages(participant, &state.history)?
+                    .into_iter()
+                    .filter(|message| message.outgoing)
+                    .rev()
+                    .take(8)
+                    .map(|message| {
+                        let status = if !message.receipt_available {
+                            "unavailable"
+                        } else if message.unread {
+                            "delivered"
+                        } else {
+                            "collected"
+                        };
+                        let read = (message.receipt_available && message.unread).then_some(false);
+                        json!({"to":message.peer,"status":status,"read":read,"at_ms":message.at_ms})
+                    })
+                    .collect();
+                Ok(
+                    json!({"id":participant.id(),"session_id":self.session.id(),"summary":state.summary,"phase":state.phase,"scopes":state.scopes,"peers":participant.peers()?,"sent":sent}),
+                )
+            }
             "send" => {
                 let to = args["to"]
                     .as_str()
@@ -551,7 +589,7 @@ impl Agent<'_> {
                 let letter = participant.send_letter(to, text, false)?;
                 remember_sent(&state.history, to, &letter);
                 Ok(
-                    json!({"to":to,"status":"queued","delivery":"accepted into recipient inbox for its next model-request boundary; automatic terminal wake-up is conditional on recipient settings and current eligibility, which this receipt does not establish; not acknowledgement"}),
+                    json!({"to":to,"status":"queued","delivery":"accepted into recipient inbox for its next model-request boundary; automatic terminal wake-up is conditional on recipient settings and current eligibility, which this receipt does not establish; not acknowledgement. `list` reports delivered, collected or unavailable in `sent[].status`; collection does not confirm model reading or agreement."}),
                 )
             }
             action @ ("claim" | "clear") => {

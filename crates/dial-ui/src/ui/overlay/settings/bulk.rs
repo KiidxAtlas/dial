@@ -211,9 +211,14 @@ impl SettingsOverlay {
             .take(room)
             .map(|s| Line::styled(s, ctx.theme.fg(Tok::Text)))
             .collect();
-        visible.push(Line::styled(
-            "↑↓ scroll · Enter next · Esc cancel",
-            ctx.theme.fg(Tok::Accent),
+        visible.push(hint_line(
+            ctx.theme,
+            &[
+                format!("{} scroll", arrows(ctx.theme, Axis::Vertical)),
+                "Enter next".to_owned(),
+                "Esc cancel".to_owned(),
+            ],
+            w,
         ));
         visible
     }

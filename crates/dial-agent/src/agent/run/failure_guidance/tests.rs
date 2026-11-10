@@ -23,11 +23,15 @@ fn process(code: i32) -> ProcessOutcome {
 #[test]
 fn an_unapprovable_directory_request_is_named_once_without_changing_the_boundary() {
     let refusal = ToolOutput::err(
-        "path \"/etc/x\" is outside the workspace; call request_directory with path \"/etc\" to ask for a yes/no access approval, then retry the tool.",
+        "path \"/etc/x\" is outside the workspace; call `ask` action=directory with path \"/etc\" to ask for a yes/no access approval, then retry the tool.",
     );
     let notice = directory_request_unavailable(&refusal, false).unwrap();
     assert!(notice.contains("directory_request_unavailable"), "{notice}");
-    assert!(notice.contains("do not call it"), "{notice}");
+    assert!(notice.contains("do not request it"), "{notice}");
+    assert!(
+        notice.contains("path stays outside the workspace"),
+        "{notice}"
+    );
     assert!(!notice.contains("bash"), "{notice}");
     assert_eq!(directory_request_unavailable(&refusal, true), None);
     assert_eq!(
@@ -263,6 +267,17 @@ fn rendered_committed_failure_preserves_work_and_never_promises_rollback() {
         text.contains("failure does not undo completed work"),
         "{text}"
     );
+    assert!(!text.contains("Treat the write as not applied"), "{text}");
+    assert!(
+        text.contains("correct only the remaining failure"),
+        "{text}"
+    );
+    let mut edited =
+        ToolOutput::err("post-commit recording failed").with_changes(["kept.rs".into()]);
+    let (kind, advice) = classify(&call("edit"), &edited).unwrap();
+    let text = report(&call("edit"), &mut edited, kind, advice, 1);
+    assert!(!text.contains("Treat the edit as not applied"), "{text}");
+    assert!(text.contains("preserve applied work"), "{text}");
     let mut no_paths = ToolOutput::err("unknown external prerequisite");
     let text = report(&call("bash"), &mut no_paths, kind, advice, 1);
     assert!(text.contains("not proof that nothing changed"), "{text}");
@@ -288,6 +303,10 @@ fn a_first_ordinary_shell_exit_gets_a_compact_recovery_line() {
         "{first}"
     );
     assert!(first.contains("not proof that nothing changed"), "{first}");
+    assert!(
+        first.contains("only this operation, not the turn"),
+        "{first}"
+    );
     assert!(first.len() < 300, "{} bytes: {first}", first.len());
     // A repeat keeps the full report with its streak count.
     let repeat = compact(127, 2);
@@ -341,7 +360,7 @@ fn a_known_tool_run_as_a_shell_command_gets_tool_load_guidance() {
         .expect("a started process missing a known tool name must be coached");
     assert!(advice.contains("tool_not_shell"), "{advice}");
     assert!(
-        advice.contains("`read`") && advice.contains("tool_load"),
+        advice.contains("`read`") && advice.contains("tool_search"),
         "{advice}"
     );
     // The second common spelling of the same controller-observed failure is also accepted.
@@ -362,7 +381,7 @@ fn a_dial_tool_name_shadowed_by_a_shell_builtin_gets_tool_load_guidance() {
     let advice = shell_tool_recovery(&shell("bg"), &mut no_job_control(1), known_bg)
         .expect("bg run through bash must be coached");
     assert!(
-        advice.contains("`bg`") && advice.contains("tool_load"),
+        advice.contains("`bg`") && advice.contains("tool_search"),
         "{advice}"
     );
     assert!(shell_tool_recovery(&shell("bg"), &mut no_job_control(0), known_bg).is_none());
@@ -612,7 +631,7 @@ fn structured_reports_preserve_producer_values_collisions_and_controller_facts()
 fn shell_recovery_follows_capability_state_without_inventing_arguments() {
     for (state, expected, load) in [
         (Capability::Offered, "Call it directly", false),
-        (Capability::Loadable, "use tool_load", true),
+        (Capability::Loadable, "use tool_search", true),
         (Capability::Prohibited, "prohibited", false),
         (Capability::Unavailable, "unavailable", false),
     ] {
@@ -624,7 +643,7 @@ fn shell_recovery_follows_capability_state_without_inventing_arguments() {
             shell_tool_recovery(&call, &mut output, |name| (name == "read").then_some(state))
                 .unwrap();
         assert!(rendered.contains(expected), "{rendered}");
-        assert_eq!(rendered.contains("tool_load"), load, "{rendered}");
+        assert_eq!(rendered.contains("tool_search"), load, "{rendered}");
         let record = &output.data.as_ref().unwrap()["recovery_advisory"][0];
         assert_eq!(record["category"], "tool_not_shell");
         let candidate = &record["candidates"][0];
@@ -656,4 +675,115 @@ fn failed_focused_check_with_no_diagnostic_is_not_code_or_unavailable() {
         classify(&call, &output).unwrap().0,
         "verification_failed_unclassified"
     );
+}
+
+#[test]
+fn a_retry_barrier_refusal_is_a_correctable_repeat_not_a_permission_boundary() {
+    let call = shell("python3 -m venv.venv");
+    let refusal = |text: &str| {
+        ToolOutput::err(text)
+            .with_status(ToolStatus::Blocked)
+            .with_effects(Effects::None)
+    };
+    let barrier = refusal(&format!(
+        "{} this unchanged `bash` call already failed and was not executed again.",
+        crate::agent::run::engine::RETRY_BARRIER_LEAD
+    ));
+    assert!(is_retry_barrier(&barrier));
+    let (kind, advice) = classify(&call, &barrier).unwrap();
+    assert_eq!(kind, "retry_barrier");
+    assert!(advice.contains("not a permission boundary"), "{advice}");
+    let mut output = barrier;
+    let text = report(&call, &mut output, kind, advice, 2);
+    assert!(!text.contains("do not retry or bypass"), "{text}");
+    assert!(!text.contains("missing permission"), "{text}");
+    assert!(text.contains("Change the arguments"), "{text}");
+    // A real policy refusal keeps its boundary guidance.
+    let denied = refusal("denied by policy");
+    assert!(!is_retry_barrier(&denied));
+    assert_eq!(classify(&call, &denied).unwrap().0, "permission_or_policy");
+}
+
+#[test]
+fn command_shape_hints_name_filter_exits_async_jobs_and_absent_listeners() {
+    let exit = |code| ToolOutput::err("").with_process(process(code));
+    let hint = |command: &str, output: &ToolOutput| command_shape_hint(&shell(command), output);
+    let filtered = hint("cargo test 2>&1 | grep -E '^test result'", &exit(1)).unwrap();
+    assert!(
+        filtered.contains("filter_exit") && filtered.contains("final `grep`"),
+        "{filtered}"
+    );
+    assert!(
+        hint("make && cargo test | /usr/bin/rg FAILED", &exit(1))
+            .unwrap()
+            .contains("`rg`")
+    );
+    for (command, code) in [
+        ("cargo test | grep ok", 2),
+        ("grep -rn x src", 1),
+        ("cargo test | tail -5", 1),
+        ("cargo test | grep ok; false", 1),
+    ] {
+        assert_eq!(hint(command, &exit(code)), None, "{command}");
+    }
+    let started = ToolOutput::ok("Listening".into()).with_process(process(0));
+    let job = hint("PORT=3519 node server.mjs &", &started).unwrap();
+    assert!(job.contains("async_job") && job.contains("`bg`"), "{job}");
+    assert!(hint("node a.js & node b.js & wait", &started).is_none());
+    for command in [
+        "make && make test",
+        "cargo test 2>&1",
+        "cmd &> log",
+        "cmd >& log",
+    ] {
+        assert!(hint(command, &started).is_none(), "{command}");
+    }
+    let browse = ToolCall {
+        name: "browser".into(),
+        ..shell("")
+    };
+    let refused = ToolOutput::err(
+        "Browser network failure: browser guarded HTTP request: io: Connection refused (os error 61)",
+    );
+    let advice = command_shape_hint(&browse, &refused).unwrap();
+    assert!(
+        advice.contains("nothing_listening") && advice.contains("`bg`"),
+        "{advice}"
+    );
+    assert!(command_shape_hint(&browse, &ToolOutput::err("page crashed")).is_none());
+}
+
+#[test]
+fn eval_spawn_denial_points_to_bash_without_matching_other_failures() {
+    let eval = ToolCall {
+        name: "eval".into(),
+        ..shell("")
+    };
+    // Observed macOS cell failure; a raised cell reports unknown effects.
+    let python = ToolOutput::err(
+        "Traceback (most recent call last):\n  File \"<dial-kernel>\", line 2, in <module>\n  File \"/usr/lib/python3.12/subprocess.py\", line 1885, in _execute_child\n    self.pid = _fork_exec(\nPermissionError: [Errno 1] Operation not permitted\n",
+    )
+    .with_effects(Effects::Unknown);
+    let advice = command_shape_hint(&eval, &python).unwrap();
+    assert!(
+        advice.contains("eval_no_subprocess") && advice.contains("`bash`"),
+        "{advice}"
+    );
+    let node = ToolOutput::err("Error: spawnSync git EPERM\n    at Object.spawnSync");
+    assert!(command_shape_hint(&eval, &node).is_some());
+    for text in [
+        "PermissionError: [Errno 13] Permission denied: '/etc/shadow'",
+        "Traceback: _fork_exec failed with ValueError",
+        "Error: EACCES: permission denied, open 'x'",
+    ] {
+        assert!(
+            command_shape_hint(&eval, &ToolOutput::err(text)).is_none(),
+            "{text}"
+        );
+    }
+    let mut succeeded = ToolOutput::ok("PermissionError _fork_exec in printed log".into());
+    succeeded.is_error = false;
+    assert!(command_shape_hint(&eval, &succeeded).is_none());
+    // The same text from another tool keeps that tool's own rules.
+    assert!(command_shape_hint(&shell("python3 x.py"), &python).is_none());
 }

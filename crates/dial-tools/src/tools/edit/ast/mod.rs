@@ -96,16 +96,21 @@ impl Tool for AstSearch {
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        match search(ctx.workspace, args) {
-            Ok((text, observations)) => {
-                let mut output = ToolOutput::ok(text);
-                if !observations.is_empty() {
-                    output.data = Some(json!({"source_observations":observations}));
-                }
-                output
+        search_output(ctx.workspace, args)
+    }
+}
+
+/// Structural search reached through `grep` with `ast=true`, preserving source observations.
+pub(in crate::tools) fn search_output(workspace: &Workspace, args: &Value) -> ToolOutput {
+    match search(workspace, args) {
+        Ok((text, observations)) => {
+            let mut output = ToolOutput::ok(text);
+            if !observations.is_empty() {
+                output.data = Some(json!({"source_observations": observations}));
             }
-            Err(message) => ToolOutput::err(message),
+            output
         }
+        Err(message) => ToolOutput::err(message),
     }
 }
 

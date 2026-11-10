@@ -75,11 +75,12 @@ send; `↑`/`↓` and `PgUp`/`PgDn` scroll, `Esc` clears the draft and then goes
   window: it starts at once when the session is idle and otherwise runs after the current turn.
 - **A peer** conversation sends to that session's model. Messages are labelled by model; ones
   you typed show as **You**, while the peer sees them as coming from this session. The newest of
-  yours shows **Delivered** until the peer's model receives it, then **Read**; a received message
-  still queued for this session shows **Not yet read by** this model. A message is sent at once,
-  even during a turn, and wakes the peer whether it is idle, finished, blocked or interrupted, or
-  starts its model when it has no task yet (see [session coordination](session-coordination.md)).
-  Until the session publishes a message it shows as **Sending…**.
+  yours shows **Delivered** while queued in the observed inbox, then **Collected · read unconfirmed**.
+  **Receipt unavailable** means the inbox cannot be inspected; old snapshots also remain unknown.
+  A received message still queued here shows **Queued for** this model. Collection can precede a
+  model request; it is not reading, acknowledgment or agreement. Sending is immediate even during a
+  turn; waking the recipient depends on its settings and eligibility (see
+  [session coordination](session-coordination.md)). Before publication the pane shows **Sending…**.
 
 History lives only in the running sessions' memory (the last 50 messages per peer) and disappears
 with the peer.

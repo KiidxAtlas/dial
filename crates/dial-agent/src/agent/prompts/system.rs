@@ -37,8 +37,8 @@ pub(in crate::agent) const FOCUSED_WORK: &str = "- For an advisory question, ans
 - For implementation, continue through the requested behavior and its checks; reopen discovery only for a concrete missing question or contradictory evidence.";
 pub(crate) const LEAN_WAITING: &str = "
 - While a long command runs, do independent work that leaves its inputs alone, or wait through the job controls; waiting is not verification.";
-pub(crate) const LEAN_SIDE_REQUEST: &str = "ask `side_request` a tool-free reasoning question";
-pub(crate) const LEAN_TASK_START: &str = "start a `task` for independent investigation";
+pub(crate) const LEAN_SIDE_REQUEST: &str = "use `task` action=question; question_status/question_wait/question_cancel manage tool-free reasoning";
+pub(crate) const LEAN_TASK_START: &str = "start `task` for independent work";
 
 pub(crate) const RULES: &str = "
 
@@ -67,8 +67,11 @@ pub(crate) const VISUAL_VERIFICATION: &str = "
 - For visual changes, inspect the rendered UI or fresh screenshots, since source and DOM text do not show appearance; disclose rendering you could not do.
 ";
 
-pub(crate) const SKILL_RULE: &str =
-    "Load a relevant skill with the first reads for substantial work.";
+pub(crate) const SKILL_RULE: &str = "Load relevant skills early; skill action=create/update/delete maintains procedures; no secrets.";
+pub(crate) const CHECKPOINT_RULE: &str =
+    "Use checkpoint action=rewind with report to drop exploration, never effects.";
+pub(crate) const ASK_RULE: &str =
+    "Request directory access with ask action=directory, not a question.";
 pub(crate) const PROJECT_MAP_RULE: &str =
     "Saved project maps locate code; they are not current behavior evidence.";
 pub(crate) const LSP_RULE: &str =
@@ -76,13 +79,13 @@ pub(crate) const LSP_RULE: &str =
 pub(crate) const SOURCE_PREVIEW_RULE: &str =
     "Use glob preview=true for discovery and file outlines or targeted ranges for large files.";
 pub(crate) const EVIDENCE_DATA_RULE: &str = "Check schema, units, keys and coverage for data or media, and recheck unclear OCR or audio before citing it.";
-pub(crate) const EVIDENCE_DATA_TOOLS: [&str; 3] = ["data", "document", "audio"];
+pub(crate) const EVIDENCE_DATA_TOOLS: [&str; 4] = ["inspect", "data", "document", "audio"];
 pub(in crate::agent) const CURRENT_USER_REQUEST: &str = "Latest admitted user request, restated by Dial as context. Follow it over conflicting older plans, keep compatible unfinished work, and resolve the actual requested target before changing it. If text_truncated is true, recover the full message from session history before relying on omitted scope.";
 pub(in crate::agent) const CHILD_FOCUSED_WORK: &str = "Investigate the assigned target using the handoff's paths and evidence before rediscovering it; batch independent reads and edits to disjoint owned files, use focused checks after edits settle, and report concrete findings, commands and gaps without treating successful calls as complete acceptance.";
 
 pub(crate) const PREVIEW_RULES: &str = "\n\n# Preview\nWeb/server UI: open actual running URL in `browser`; otherwise approved startup or disclose prerequisite.";
 pub(crate) const PREVIEW_SERVER_RULES: &str = " Temporary servers: `bg`, readiness, browser. Use managed jobs; do not bypass refusals or duplicate services. Stop only your temporary servers; preserve user services.";
-pub(crate) const MONITOR_RULES: &str = "\n\n# Application monitoring\n`monitor`: Dial `bg` jobs/project-evidenced logs only; no process scans. One-shot approval; no chat substitute/denial retry. New output only; expiry/match disarms. Rearm/restart/kill/takeover: fresh approval. Disclose unsupported terminals.";
+pub(crate) const MONITOR_RULES: &str = "\n\n# Application monitoring\nWatches (`bg` watch/watches/unwatch): Dial `bg` jobs/project-evidenced logs only; no process scans. One-shot approval; no chat substitute/denial retry. New output only; expiry/match disarms. Rearm/restart/kill/takeover: fresh approval. Disclose unsupported terminals.";
 pub(crate) const DELEGATION_RULES: &str = "\n\n# Delegation coordination\n- Workers lack this conversation: hand off observable outcomes, owned files, interfaces, evidence and check ownership, not transcripts or whole unrelated documents. For substantial implementation, use available `work_packet`/`acceptance_checks`; name uncovered criteria.\n- Keep one integration/shared-check owner. Start independent tasks together, do non-overlapping work, collect with `wait`. Message only for new requirements, not status.\n- Reuse delivered findings. Report incomplete/failed workers honestly. Finished workers supply candidates, not verified acceptance; check combined results after edits settle.\n- Respect scout/reviewer/planner read-only roles; workers implement, test-runners author/run/diagnose tests. Don't invent work to keep workers busy.";
 
 pub(crate) const SELECTIVE_DELEGATION_RULES: &str = "\n\n# Selective delegation\n- Keep coupled planning, implementation, tests and diagnosis in this loop. Specialist labels don't justify spawning models; long commands need background jobs, not subagents.\n- Delegate substantial independent parallel work, fresh-context review, or work that would crowd context. Use scouts for stalled scoping and test-runners for independent test work.";

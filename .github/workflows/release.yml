@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       epoch: ${{ steps.identity.outputs.epoch }}
+      candidates: ${{ steps.candidates.outputs.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,6 +52,7 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           echo "epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
       - name: Require successful push CI on main
+        id: ci
         env:
           GH_TOKEN: ${{ github.token }}
         timeout-minutes: 90
@@ -58,9 +60,10 @@ jobs:
           set -euo pipefail
           waited=0
           while :; do
-            gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --event push --branch main --json status,conclusion,event,headBranch,headSha > "$RUNNER_TEMP/ci-runs.json"
+            gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --event push --branch main --json status,conclusion,event,headBranch,headSha,databaseId > "$RUNNER_TEMP/ci-runs.json"
             runs="$(cat "$RUNNER_TEMP/ci-runs.json")"
             if python3 scripts/release-policy.py ci "$GITHUB_SHA" "$RUNNER_TEMP/ci-runs.json"; then
+              echo "run=$(python3 scripts/release-policy.py ci-run "$GITHUB_SHA" "$RUNNER_TEMP/ci-runs.json")" >> "$GITHUB_OUTPUT"
               break
             fi
             if ! jq -e 'any(.[]; .status != "completed")' <<<"$runs" >/dev/null && { [ "$runs" != '[]' ] || [ "$waited" -ge 300 ]; }; then
@@ -75,6 +78,25 @@ jobs:
             sleep 30
             waited=$((waited + 30))
           done
+      - name: Select complete unsigned candidates from exact-commit CI
+        id: candidates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN: ${{ steps.ci.outputs.run }}
+          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN/artifacts?per_page=100" > "$RUNNER_TEMP/artifacts.json"
+          if python3 scripts/release-policy.py artifacts "$GITHUB_SHA" "$RUNNER_TEMP/artifacts.json"; then
+            gh run download "$CI_RUN" -R "$GITHUB_REPOSITORY" -n release-assets-identity -D "$RUNNER_TEMP/candidate-identity"
+            if python3 scripts/release-policy.py identity "$GITHUB_SHA" "$RUNNER_TEMP/candidate-identity/candidate.json"; then
+              echo "run=$CI_RUN" >> "$GITHUB_OUTPUT"
+              echo "Reusing all eight tested platform archives from CI run $CI_RUN." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          echo "Candidates unavailable, expired or built with another public key; rebuilding all platforms." >> "$GITHUB_STEP_SUMMARY"
 
   signing-ready:
     name: Validate protected signing inputs before builds
@@ -100,177 +122,53 @@ jobs:
         run: python3 scripts/release-policy.py keys --private
 
   build:
-    name: Package ${{ matrix.target }}
+    name: Build missing release candidates
     needs: [gate, signing-ready]
-    env:
-      SOURCE_DATE_EPOCH: ${{ needs.gate.outputs.epoch }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-musl
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Linux sandbox
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap musl-tools
-      - name: Install OpenSSL 3 on macOS
-        if: runner.os == 'macOS'
-        run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.12'
-      - name: Install Rust
-        run: |
-          rustup show active-toolchain
-          rustup target add "${{ matrix.target }}"
-      - name: Install installer test dependencies
-        run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
-      - name: Select musl C compiler
-        if: contains(matrix.target, '-musl')
-        env:
-          RELEASE_TARGET: ${{ matrix.target }}
-        run: echo "CC_${RELEASE_TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: release-${{ matrix.target }}
-          cache-on-failure: true
-      - name: Test terminal installer
-        run: bash scripts/test-install.sh
-      - name: Build release binary
-        env:
-          MACOSX_DEPLOYMENT_TARGET: '13.0'
-          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
-        run: cargo build --release --locked -p dial --target "${{ matrix.target }}"
-      - name: Package and smoke-test outside the checkout
-        env:
-          RELEASE_TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          package="dial-${GITHUB_REF_NAME}-${RELEASE_TARGET}"
-          mkdir -p "dist/$package"
-          install -m 755 "target/$RELEASE_TARGET/release/dial" "dist/$package/dial"
-          cp LICENSE README.md THIRD_PARTY_NOTICES crates/dial-agent/src/agent/compact/snapcompact/fonts/Silver.LICENSE crates/dial-agent/src/agent/compact/snapcompact/fonts/Unscii.LICENSE "dist/$package/"
-          tar -czf "dist/$package.tar.gz" -C dist "$package"
-          smoke="$(mktemp -d "${RUNNER_TEMP:-$PWD/dist}/dial-smoke.XXXXXX")"
-          trap 'rm -rf "$smoke"' EXIT
-          tar -xzf "dist/$package.tar.gz" -C "$smoke"
-          python3 scripts/check-artifact.py --dial "$smoke/$package/dial" --target "$RELEASE_TARGET"
-          cd "$smoke/$package"
-          ./dial --version | awk 'NR==1 {print $1, $2}' | grep -Fx "dial ${GITHUB_REF_NAME#v}"
-          ./dial --help
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-assets-${{ matrix.target }}
-          path: |
-            dist/*.tar.gz
-            dist/*.zip
-          if-no-files-found: error
-
-  windows-build:
-    name: Build and package ${{ matrix.target }}
-    needs: [gate, signing-ready]
-    env:
-      SOURCE_DATE_EPOCH: ${{ needs.gate.outputs.epoch }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install pinned Rust
-        run: |
-          rustup show active-toolchain
-          rustup target add "${{ matrix.target }}"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: release-${{ matrix.target }}
-          cache-on-failure: true
-      - name: Build release binary
-        env:
-          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
-        run: cargo build --release --locked -p dial --target "${{ matrix.target }}"
-      - name: Package and smoke-test outside the checkout
-        shell: pwsh
-        env:
-          RELEASE_TARGET: ${{ matrix.target }}
-        run: |
-          $package = "dial-$env:GITHUB_REF_NAME-$env:RELEASE_TARGET"
-          $dir = "dist/$package"
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item "target/$env:RELEASE_TARGET/release/dial.exe" "$dir/dial.exe"
-          Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES, crates/dial-agent/src/agent/compact/snapcompact/fonts/Silver.LICENSE, crates/dial-agent/src/agent/compact/snapcompact/fonts/Unscii.LICENSE $dir
-          Compress-Archive -Path $dir -DestinationPath "dist/$package.zip"
-          $expected = "$env:GITHUB_REF_NAME".Substring(1)
-          # Capture all output first: piping into `Select-Object -First 1` stops the native
-          # command early and leaves $LASTEXITCODE unset, which failed this check.
-          $output = & "dist/$package/dial.exe" --version
-          $code = $LASTEXITCODE
-          $version = @($output)[0]
-          if ($code -ne 0 -or $version -notmatch ("^dial " + [regex]::Escape($expected) + "( |$)")) { throw "Packaged version check failed (exit $code): $version" }
-          & "dist/$package/dial.exe" --help
-          if ($LASTEXITCODE -ne 0) { throw "Packaged help check failed" }
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.12'
-      - name: Verify packaged binary format
-        shell: pwsh
-        env:
-          RELEASE_TARGET: ${{ matrix.target }}
-        run: python scripts/check-artifact.py --dial "dist/dial-$env:GITHUB_REF_NAME-$env:RELEASE_TARGET/dial.exe" --target "$env:RELEASE_TARGET" --format-only
-      - name: Test installer under Windows PowerShell 5.1
-        shell: powershell
-        env:
-          RELEASE_TARGET: ${{ matrix.target }}
-        run: ./scripts/test-install.ps1 -ArchivePath "$env:GITHUB_WORKSPACE/dist/dial-$env:GITHUB_REF_NAME-$env:RELEASE_TARGET.zip"
-      - name: Test installer under PowerShell 7
-        shell: pwsh
-        env:
-          RELEASE_TARGET: ${{ matrix.target }}
-        run: ./scripts/test-install.ps1 -ArchivePath "$env:GITHUB_WORKSPACE/dist/dial-$env:GITHUB_REF_NAME-$env:RELEASE_TARGET.zip"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-assets-${{ matrix.target }}
-          path: dist/*.zip
-          if-no-files-found: error
+    if: needs.gate.outputs.candidates == ''
+    uses: ./.github/workflows/release-build.yml
+    with:
+      tag: ${{ github.ref_name }}
+      epoch: ${{ needs.gate.outputs.epoch }}
 
   sign:
     name: Sign release manifest
-    needs: [build, windows-build]
+    needs: [gate, signing-ready, build]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.signing-ready.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ubuntu-22.04
     # Configure required reviewers and tag deployment rules in repository settings.
     environment: release-signing
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.gate.outputs.candidates == ''
         with:
           pattern: release-assets-*
           merge-multiple: true
           path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.gate.outputs.candidates != ''
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.gate.outputs.candidates }}
+          pattern: release-assets-*
+          merge-multiple: true
+          path: dist
+      - name: Recheck candidate commit, version and embedded public key
+        env:
+          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-policy.py identity "$GITHUB_SHA" dist/candidate.json
+          rm dist/candidate.json
       - name: Prepare installers and manifest (no private key)
         env:
           DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
@@ -375,6 +273,11 @@ jobs:
           python3 scripts/release-policy.py notes "$RELEASE_TAG" CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
           gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/SHA256SUMS.sig dist/SHA256SUMS.sshsig dist/install.sh dist/install.ps1 \
             --verify-tag --notes-file "$RUNNER_TEMP/release-notes.md" --latest="$IS_LATEST" --title "Dial $RELEASE_TAG"
+          {
+            echo "## Binary release published"
+            echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+            echo "Downstream website, package metadata and container jobs can be retried independently; do not rebuild published binaries."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   website:
     name: Show the new release on dial.rootatlas.dev
@@ -392,18 +295,23 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$DIAL_WEB_REFRESH_TOKEN" ]; then
-            echo "::warning title=Website not refreshed::DIAL_WEB_REFRESH_TOKEN is not set; dial.rootatlas.dev shows $RELEASE_TAG within an hour."
-            exit 0
-          fi
-          curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors --max-time 30 \
-            -X POST -H "Authorization: Bearer $DIAL_WEB_REFRESH_TOKEN" \
-            https://dial.rootatlas.dev/release/refresh > "$RUNNER_TEMP/release.json"
-          version="$(jq -r .version "$RUNNER_TEMP/release.json")"
-          if [ "$version" != "$RELEASE_TAG" ]; then
-            echo "::error title=Website shows $version::dial.rootatlas.dev returned $version after refreshing, expected $RELEASE_TAG." >&2
+            echo "::error title=Website refresh not configured::Set DIAL_WEB_REFRESH_TOKEN here and the same NUXT_RELEASE_REFRESH_TOKEN on the dial-web service. Binaries are already published."
             exit 1
           fi
-          echo "dial.rootatlas.dev now shows $RELEASE_TAG"
+          status="$(curl --silent --show-error --retry 3 --retry-connrefused --max-time 30 \
+            --output "$RUNNER_TEMP/release.json" --write-out '%{http_code}' \
+            -X POST -H "Authorization: Bearer $DIAL_WEB_REFRESH_TOKEN" \
+            https://dial.rootatlas.dev/release/refresh)"
+          if [ "$status" != 200 ]; then
+            echo "::error title=Website refresh HTTP $status::Binaries are already published. For 404, configure NUXT_RELEASE_REFRESH_TOKEN on dial-web and deploy the refresh route; for 401, match it to DIAL_WEB_REFRESH_TOKEN. Rerun this failed job only."
+            exit 1
+          fi
+          version="$(jq -r .version "$RUNNER_TEMP/release.json")"
+          if [ "$version" != "$RELEASE_TAG" ]; then
+            echo "::error title=Website stale::Website did not return the published release. Rerun this job only."
+            exit 1
+          fi
+          echo "Website now shows $RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
 
   packaging:
     name: Propose package metadata update
@@ -476,6 +384,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed-release-assets
+          path: dist
+      - name: Verify and stage the published Linux binary
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
+        run: python3 scripts/stage-container.py dist container-context
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
@@ -496,11 +416,9 @@ jobs:
         id: container-build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: .
-          build-args: |
-            DIAL_BUILD_REVISION=${{ github.sha }}
-            DIAL_RELEASE_PUBLIC_KEY=${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
-            SOURCE_DATE_EPOCH=${{ needs.gate.outputs.epoch }}
+          context: container-context
+          file: Dockerfile.release
+          platforms: linux/amd64
           provenance: mode=max
           sbom: true
           push: true
@@ -508,6 +426,16 @@ jobs:
           labels: ${{ steps.docker-meta.outputs.labels }}
           cache-from: type=gha,scope=docker-release
           cache-to: type=gha,scope=docker-release,mode=max
+      - name: Smoke-test published container
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+          IMAGE_DIGEST: ${{ steps.container-build.outputs.digest }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_REPOSITORY,,}@$IMAGE_DIGEST"
+          docker run --rm "$image" --version | awk 'NR==1 {print $1, $2}' | grep -Fx "dial ${RELEASE_TAG#v}"
+          docker run --rm "$image" --help >/dev/null
       - name: Install pinned Cosign
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.2; verifies pinned bootstrap checksum
         with:

@@ -179,6 +179,53 @@ fn read_budget_bounds_the_rows_and_the_multi_path_total() {
     );
 }
 
+#[test]
+fn multi_path_reads_report_each_target_and_fail_only_when_nothing_was_read() {
+    let (dir, ws) = workspace();
+    fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mixed = read_paths_output(
+        &ws,
+        &json!({"paths": ["a.txt", "missing.txt"]}),
+        &cancel,
+        4096,
+    )
+    .unwrap();
+    assert!(!mixed.is_error, "partial evidence is kept: {}", mixed.text);
+    assert!(mixed.text.contains("alpha"));
+    assert!(
+        mixed.text.ends_with("[paths: 1 read, 1 failed, 0 omitted]"),
+        "{}",
+        mixed.text
+    );
+    let data = mixed.data.unwrap();
+    assert_eq!(data["targets"][0], json!({"path":"a.txt","status":"read"}));
+    assert_eq!(
+        data["targets"][1],
+        json!({"path":"missing.txt","status":"failed"})
+    );
+    assert_eq!(data["complete"], false);
+
+    let failed = read_paths_output(
+        &ws,
+        &json!({"paths": ["gone.txt", "missing.txt"]}),
+        &cancel,
+        4096,
+    )
+    .unwrap();
+    assert!(failed.is_error, "{}", failed.text);
+    assert_eq!(failed.data.unwrap()["failed"], 2);
+
+    let clean = read_paths_output(&ws, &json!({"paths": ["a.txt"]}), &cancel, 4096).unwrap();
+    assert!(!clean.is_error && !clean.text.contains("[paths:"));
+    assert_eq!(clean.data.unwrap()["complete"], true);
+
+    // A budget too small for any row omits every target rather than reporting success.
+    let omitted = read_paths_output(&ws, &json!({"paths": ["a.txt"]}), &cancel, 1).unwrap();
+    assert!(omitted.is_error);
+    assert_eq!(omitted.data.unwrap()["targets"][0]["status"], "omitted");
+}
+
 fn numbered_file(dir: &tempfile::TempDir, name: &str, lines: usize) {
     let body: String = (1..=lines).map(|i| format!("line {i}\n")).collect();
     fs::write(dir.path().join(name), body).unwrap();

@@ -3,6 +3,27 @@ use crate::agent::workflow::todo::Task;
 use ratatui::{Terminal, backend::TestBackend};
 use state::{Peers, Thread, Worker};
 
+#[test]
+fn footer_retains_exit_after_long_outcome_and_confirmation() {
+    let theme = Theme::dark();
+    let mut pane = pane();
+    pane.status = Some("A long retained outcome with 日本語 that must not hide navigation".into());
+    for width in [12, 20, 38, 60, 120] {
+        let line = pane.footer(&theme, width);
+        let shown: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(shown.ends_with("q close"), "width {width}: {shown}");
+        assert!(text::line_width(&line) <= width, "width {width}: {shown}");
+    }
+    let line = footer_line(
+        &theme,
+        Some(Span::raw("Stop only this selected process?")),
+        &[("y", "confirm"), ("n", "keep it running")],
+        38,
+    );
+    let shown: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(shown.ends_with("n keep it running"), "{shown}");
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -70,6 +91,7 @@ fn state() -> Snapshot {
                         outgoing: true,
                         text: "I am editing the keymap".into(),
                         unread: false,
+                        receipt_available: true,
                         at_ms: 1_000,
                         by_user: true,
                     },
@@ -77,6 +99,7 @@ fn state() -> Snapshot {
                         outgoing: false,
                         text: "ok, I will stay in docs".into(),
                         unread: true,
+                        receipt_available: true,
                         at_ms: 1_200,
                         by_user: false,
                     },
@@ -234,10 +257,10 @@ fn a_peer_conversation_reads_like_a_text_thread_with_receipts() {
         "● claude-opus · 01234567 · working · shortcut fixes",
         "You · 1m",
         "I am editing the keymap",
-        "Read",
+        "Collected · read unconfirmed",
         "claude-opus · 1m",
         "ok, I will stay in docs",
-        "Not yet read by gpt-5",
+        "Queued for gpt-5",
         "claude-opus is working…",
         "› Message claude-opus…",
     ] {
@@ -252,6 +275,37 @@ fn a_peer_conversation_reads_like_a_text_thread_with_receipts() {
     };
     assert!(row("I am editing the keymap").trim_end().len() > 60);
     assert!(row("ok, I will stay in docs").starts_with(" ok"));
+}
+
+#[test]
+fn peer_receipts_distinguish_delivery_collection_and_unavailable_without_acknowledgment() {
+    for (available, unread, expected) in [
+        (true, true, "Delivered"),
+        (true, false, "Collected · read unconfirmed"),
+        (false, true, "Receipt unavailable"),
+        (false, false, "Receipt unavailable"),
+    ] {
+        let mut snapshot = state();
+        let peer = &mut snapshot.peers.rows[0];
+        peer.messages[0].receipt_available = available;
+        peer.messages[0].unread = unread;
+        let bubbles = peer_bubbles(peer, "own");
+        let receipt = bubbles[0].receipt.as_ref().unwrap();
+        assert_eq!(receipt.0, expected);
+        assert_eq!(
+            receipt.1,
+            Tok::Muted,
+            "receipt states are neutral, never warnings"
+        );
+    }
+    let legacy: state::PeerMessage = serde_json::from_value(serde_json::json!({
+        "outgoing": true, "text": "old handoff", "unread": false
+    }))
+    .unwrap();
+    assert!(
+        !legacy.receipt_available,
+        "old snapshots cannot establish reading"
+    );
 }
 
 #[test]
@@ -285,6 +339,7 @@ fn typing_in_a_conversation_sends_to_the_peer_and_shows_it_until_published() {
         outgoing: true,
         text: "hi there".into(),
         unread: true,
+        receipt_available: true,
         at_ms: crate::ui::subagent_model::epoch_ms(),
         by_user: true,
     });

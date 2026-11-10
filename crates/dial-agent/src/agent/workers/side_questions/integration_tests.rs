@@ -286,7 +286,7 @@ fn wait_then_delivery_then_poll_never_repeats_success_failure_or_cancellation_bo
 }
 
 #[test]
-fn side_request_is_loadable_by_the_parent_but_never_offered_to_children() {
+fn task_questions_are_loadable_by_the_parent_but_denied_to_children() {
     with_agent("", |agent| {
         let offered = agent.offered();
         assert!(!offered.iter().any(|n| n == "side_request"), "{offered:?}");
@@ -294,21 +294,36 @@ fn side_request_is_loadable_by_the_parent_but_never_offered_to_children() {
             agent
                 .discoverable_tools(&offered)
                 .iter()
-                .any(|(n, _)| n == "side_request")
+                .any(|(n, _)| n == "task")
         );
-        agent.activate_tools(&["side_request".into()]).unwrap();
-        assert!(
-            agent.offered().iter().any(|n| n == "side_request"),
-            "parent should be offered side_request once loaded: {:?}",
-            agent.offered()
-        );
-        assert!(
-            !agent
-                .offered_for_children()
-                .iter()
-                .any(|n| n == "side_request"),
-            "children must never inherit side_request"
-        );
+        agent.activate_tools(&["task".into()]).unwrap();
+        assert!(agent.offered().iter().any(|n| n == "task"));
+        let schema = agent.full_schemas(&["task".into()]).unwrap().remove(0);
+        let actions = schema["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap();
+        for action in [
+            "question",
+            "question_status",
+            "question_wait",
+            "question_cancel",
+        ] {
+            assert!(actions.contains(&json!(action)), "{schema}");
+        }
+        assert!(agent.controller_operation_available("side_request"));
+        let inherited = agent.offered_for_children();
+        assert!(!inherited.iter().any(|n| n == "side_request"));
+        for role in ["scout", "reviewer", "planner", "worker"] {
+            let allowed = crate::agent::workers::subagents::toolset(
+                crate::config::subagents::builtin(role).unwrap(),
+                &inherited,
+                &agent.ext,
+            );
+            assert!(
+                !allowed.iter().any(|n| n == "task" || n == "side_request"),
+                "{role} must not inherit parent side questions: {allowed:?}"
+            );
+        }
     });
 }
 

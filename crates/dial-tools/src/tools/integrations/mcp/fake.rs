@@ -63,9 +63,16 @@ pub fn run(flags: &str) -> ! {
                 } else {
                     "2025-03-26"
                 };
+                let mut capabilities = json!({"tools": {}});
+                if has("context") || has("resources-only") {
+                    capabilities["resources"] = json!({"subscribe": true});
+                }
+                if has("context") || has("prompts-only") {
+                    capabilities["prompts"] = json!({});
+                }
                 send(&json!({"jsonrpc": "2.0", "id": id, "result": {
                     "protocolVersion": version,
-                    "capabilities": {"tools": {}},
+                    "capabilities": capabilities,
                     "serverInfo": {"name": "fake", "version": "0"},
                 }}));
             }
@@ -96,6 +103,23 @@ pub fn run(flags: &str) -> ! {
                     send(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
                 }
             }
+            "resources/list" => send(&json!({"jsonrpc":"2.0", "id":id, "result":{
+                "resources":[{"uri":"fake:///readme", "name":"readme"}]
+            }})),
+            "resources/templates/list" => send(&json!({"jsonrpc":"2.0", "id":id, "result":{
+                "resourceTemplates":[{"uriTemplate":"fake:///{name}", "name":"file"}]
+            }})),
+            "resources/read" => send(&json!({"jsonrpc":"2.0", "id":id, "result":{
+                "contents":[{"uri":message["params"]["uri"], "text":"resource body"}]
+            }})),
+            "resources/subscribe" => send(&json!({"jsonrpc":"2.0", "id":id, "result":{}})),
+            "prompts/list" => send(&json!({"jsonrpc":"2.0", "id":id, "result":{
+                "prompts":[{"name":"review"}]
+            }})),
+            "prompts/get" => send(&json!({"jsonrpc":"2.0", "id":id, "result":{
+                "description":message["params"]["name"],
+                "messages":[{"role":"user", "content":{"type":"text", "text":message["params"].to_string()}}]
+            }})),
             _ => send(
                 &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "no such method"}}),
             ),

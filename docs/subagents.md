@@ -18,7 +18,7 @@ When the foreground agent has no independent work left, it can state what is pen
 without tools. The harness suspends inference until owned workers or side questions settle, a
 worker message arrives, or user input/cancellation/turn limits require attention. Results retain
 their ordinary exactly-once delivery; a wait is not verification. Explicit `task wait` and
-`side_request wait` use the platform wake channel and keep their existing timeout meanings.
+`task action=question_wait` (side questions) use the platform wake channel and keep their existing timeout meanings.
 See [event-driven continuation](agent-loop.md#event-driven-continuation).
 
 ### Tool-free side questions

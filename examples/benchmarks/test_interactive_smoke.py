@@ -67,6 +67,44 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(gate.release.is_set())
 
 
+class ResponseTests(unittest.TestCase):
+    def handler(self):
+        handler = object.__new__(Handler)
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        handler.wfile = mock.Mock()
+        return handler
+
+    def test_cancelled_connections_may_close_during_headers_or_body(self):
+        for stage in ("headers", "body"):
+            for error in (BrokenPipeError, ConnectionResetError):
+                with self.subTest(stage=stage, error=error):
+                    handler = self.handler()
+                    failing = handler.end_headers if stage == "headers" else handler.wfile.write
+                    failing.side_effect = error("cancelled fixture request")
+                    handler.respond({"ok": True})
+                    failing.assert_called_once()
+                    if stage == "headers":
+                        handler.wfile.write.assert_not_called()
+
+    def test_response_keeps_unexpected_errors_visible(self):
+        handler = self.handler()
+        handler.end_headers.side_effect = ValueError("invalid headers")
+        with self.assertRaisesRegex(ValueError, "invalid headers"):
+            handler.respond({"ok": True})
+
+    def test_response_serializes_body_and_length(self):
+        handler = self.handler()
+        body = {"ok": True}
+        data = json.dumps(body).encode()
+        handler.respond(body, 201)
+        handler.send_response.assert_called_once_with(201)
+        self.assertIn(mock.call("Content-Length", str(len(data))), handler.send_header.call_args_list)
+        handler.end_headers.assert_called_once()
+        handler.wfile.write.assert_called_once_with(data)
+
+
 class CommandTests(unittest.TestCase):
     def test_enter_follows_visible_paste_and_guard_settle(self):
         terminal = object.__new__(Terminal)
@@ -77,10 +115,25 @@ class CommandTests(unittest.TestCase):
             terminal.command("PTY-INPUT")
         self.assertEqual(trace.mock_calls, [
             mock.call.run("send-keys", "-t", "smoke", "-l", "\x1b[200~PTY-INPUT\x1b[201~"),
-            mock.call.wait("PTY-INPUT", history=False),
+            mock.call.wait("PTY-INPUT", history=False, draft=True),
             mock.call.sleep(0.5),
             mock.call.run("send-keys", "-t", "smoke", "Enter"),
         ])
+
+    def test_banner_command_prefix_is_not_paste_consumption(self):
+        for draft in ("▎  /draft preview\n", "│ /draft preview   │\n", " › /draft preview\n",
+                      " › /draft preview with ghost completion\n"):
+            with self.subTest(draft=draft):
+                terminal = object.__new__(Terminal)
+                terminal.run = mock.Mock()
+                terminal.text = mock.Mock(side_effect=[
+                    "RECOVER INPUT: /draft previews saved and current input\n",
+                    draft,
+                ])
+                with mock.patch("interactive_smoke.time.sleep"):
+                    terminal.command("/draft preview")
+                self.assertEqual(terminal.text.call_count, 2)
+                self.assertEqual(terminal.run.call_args, mock.call("send-keys", "-t", "smoke", "Enter"))
 
     def test_unconsumed_paste_never_sends_enter(self):
         terminal = object.__new__(Terminal)
@@ -164,9 +217,10 @@ class ScriptedProviderTests(unittest.TestCase):
     def test_os_job_script_starts_once_then_acknowledges_tool_receipt(self):
         prompt = [{"role": "user", "content": "PTY-OS-JOB"}]
         # Without bg in the offer, the script loads it rather than calling an unavailable tool.
-        load = self.post(prompt).respond.call_args.args[0]["choices"][0]["message"]["tool_calls"][0]
+        loader = [{"type": "function", "function": {"name": "tool_search"}}]
+        load = self.post(prompt, loader).respond.call_args.args[0]["choices"][0]["message"]["tool_calls"][0]
         self.assertEqual((load["function"]["name"], json.loads(load["function"]["arguments"])),
-                         ("tool_load", {"names": ["bg"]}))
+                         ("tool_search", {"names": ["bg"]}))
         self.assertEqual(self.server.job_starts, 0)
         offered = [{"type": "function", "function": {"name": "bg"}}]
         first = self.post(prompt, offered).respond.call_args.args[0]["choices"][0]
@@ -179,6 +233,16 @@ class ScriptedProviderTests(unittest.TestCase):
                            "content": "pty-os-job: running; OS-JOB-OUTPUT-KEPT"}], offered)
         self.assertEqual(result.respond.call_args.args[0]["choices"][0]["message"]["content"], "OS-JOB-STARTED")
         self.assertEqual(self.server.job_starts, 1)
+
+    def test_loader_uses_the_offered_contract_and_refuses_missing_loader(self):
+        handler = object.__new__(Handler)
+        for loader in ("tool_search", "tool_load"):
+            tools = [{"type": "function", "function": {"name": loader}}]
+            call = handler.load(7, "todo", tools)["tool_calls"][0]["function"]
+            self.assertEqual(call["name"], loader)
+            self.assertEqual(json.loads(call["arguments"]), {"names": ["todo"]})
+        with self.assertRaisesRegex(AssertionError, "no offered loader"):
+            handler.load(7, "todo", [])
 
 
 class RefusedEndpointTests(unittest.TestCase):

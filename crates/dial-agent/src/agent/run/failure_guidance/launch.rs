@@ -99,8 +99,11 @@ impl crate::agent::Agent<'_> {
         offered: &[String],
     ) -> Option<Capability> {
         self.catalog().iter().any(|tool| tool == name).then(|| {
-            let loader =
-                offered.iter().any(|tool| tool == "tool_load") && self.tool_eligible("tool_load");
+            // `tool_load` is folded into `tool_search` (`names`); either offered name loads.
+            let loader = offered
+                .iter()
+                .any(|tool| matches!(tool.as_str(), "tool_search" | "tool_load"))
+                && self.tool_eligible("tool_search");
             capability(
                 true,
                 self.tool_eligible(name)

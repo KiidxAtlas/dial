@@ -110,6 +110,9 @@ pub(in crate::agent) struct Engine {
     /// Namespace dependencies are repaired by an actual reset, not a printed reset claim.
     failed_eval:
         std::collections::HashMap<[u8; 32], (crate::runtime::execution::EvalNamespace, String)>,
+    /// Background-job dependencies (job name, call key). A failed `bg` call that named a job is
+    /// repaired by an actual lifecycle change of that job: a successful start or kill naming it.
+    failed_jobs: std::collections::HashMap<[u8; 32], (String, String)>,
     repeats: guard::RepeatGuard,
     investigation: investigation::InvestigationGuard,
     returned_reads: investigation::ReturnedReads,
@@ -399,14 +402,23 @@ impl Engine {
             && !self.witnesses_ready_since_failure(workspace, &identity)
         {
             let error = self.failed_errors.get(&identity);
+            // The full diagnostic is already in the earlier result; quote enough to name the
+            // cause, keeping its lines (compiler carets depend on them).
             let original = error
-                .map(|error| format!(" Its original error was: {error}"))
+                .map(|error| {
+                    let error = error.trim();
+                    let mut quoted: String = error.chars().take(600).collect();
+                    if quoted.len() < error.len() {
+                        quoted.push('…');
+                    }
+                    format!(" Its original error was: {quoted}")
+                })
                 .unwrap_or_default();
             let hint = error
                 .and_then(|error| malformed_command_hint(call, error))
                 .unwrap_or_default();
             return Some(format!(
-                "{RETRY_BARRIER_LEAD} this unchanged `{}` call already failed and was not executed again.{original}{hint} Inspect the retained diagnostic, use a different targeted observation, correct the arguments, or repair the source or environment (a successful state-changing command releases it) before retrying. Todo updates and compaction do not release this barrier.",
+                "{RETRY_BARRIER_LEAD} this unchanged `{}` call already failed and was not executed again.{original}{hint} This is not a permission boundary. Change the arguments to fix that cause, or first change what the call depends on (an edit, an install or a started `bg` job releases it). Do not resend it unchanged.",
                 call.name
             ));
         }
@@ -493,7 +505,13 @@ impl Engine {
         } = settlement;
         let original_diagnostic: String = output.text.chars().take(1600).collect();
         let classified = if contract_failed && outcome::effects(output) != Effects::Unknown {
-            Some(crate::agent::run::failure_guidance::CALL_CONTRACT)
+            Some(
+                if crate::agent::run::failure_guidance::is_retry_barrier(output) {
+                    crate::agent::run::failure_guidance::RETRY_BARRIER
+                } else {
+                    crate::agent::run::failure_guidance::CALL_CONTRACT
+                },
+            )
         } else {
             crate::agent::run::failure_guidance::classify(call, output)
         };
@@ -568,6 +586,10 @@ impl Engine {
             // command with unknown dependencies may then succeed, so its barrier is released;
             // failures tied to known files still wait for those files to change.
             self.release_for_change(&[]);
+        } else if succeeded && status_is_ok(output) && starts_background_job(call) {
+            // A started server changes reachable network state the same way: a browse or request
+            // refused before it listened may now succeed. Other jobs keep their name-scoped rule.
+            self.release_for_service_start();
         }
         // Native refusals can themselves return complete source rows. Reuse those witnesses;
         // neither a marker in prose nor a successful read receipt grants retry readiness.
@@ -593,6 +615,10 @@ impl Engine {
                     self.failed_eval
                         .insert(identity, (namespace, call_identity(call)));
                 }
+            }
+            if let Some(job) = background_job(call) {
+                self.failed_jobs
+                    .insert(identity, (job, call_identity(call)));
             }
             self.failed_witnesses.remove(&identity);
             if let Some(retry) =
@@ -641,6 +667,18 @@ impl Engine {
                     .failed_eval
                     .iter()
                     .filter(|(_, (failed_namespace, _))| *failed_namespace == namespace)
+                    .map(|(id, (_, key))| (*id, key.clone()))
+                    .collect();
+                for (id, key) in repaired {
+                    self.forget_failure(&id);
+                    self.checkpoint.release_key(&key);
+                }
+            }
+            if let Some(job) = job_lifecycle_change(call, output) {
+                let repaired: Vec<_> = self
+                    .failed_jobs
+                    .iter()
+                    .filter(|(_, (name, _))| job.as_deref().is_none_or(|job| job == name))
                     .map(|(id, (_, key))| (*id, key.clone()))
                     .collect();
                 for (id, key) in repaired {
@@ -868,6 +906,18 @@ impl Engine {
         }
     }
 
+    /// Releases unknown-dependency failures after a background job starts, except failures that
+    /// named a job (released only by that job's own lifecycle) and file- or access-tied ones.
+    fn release_for_service_start(&mut self) {
+        let jobs: Vec<[u8; 32]> = self.failed_jobs.keys().copied().collect();
+        let kept: Vec<[u8; 32]> = jobs
+            .into_iter()
+            .filter(|identity| self.failed.remove(identity))
+            .collect();
+        self.release_for_change(&[]);
+        self.failed.extend(kept);
+    }
+
     /// Drops every record of one failed operation; other failures keep their own barriers.
     fn forget_failure(&mut self, identity: &[u8; 32]) {
         self.failed.remove(identity);
@@ -879,6 +929,7 @@ impl Engine {
         self.failed_access.remove(identity);
         self.failed_errors.remove(identity);
         self.failed_eval.remove(identity);
+        self.failed_jobs.remove(identity);
     }
 }
 
@@ -900,7 +951,7 @@ fn inaccessible_read_targets(workspace: &Workspace, call: &ToolCall, text: &str)
         let mut candidate = path;
         loop {
             if let Err(error) = workspace.resolve(candidate)
-                && (error.contains("outside the workspace; call request_directory")
+                && (error.contains("outside the workspace; call `ask` action=directory")
                     || error.contains("enters protected Dial storage"))
                 && text.contains(&error)
             {
@@ -935,6 +986,40 @@ fn environment_changing_shell(call: &ToolCall) -> bool {
             .is_some_and(crate::agent::safety::approval::opaque_shell_effect)
 }
 
+/// The managed job a `bg` call names, other than a listing.
+fn background_job(call: &ToolCall) -> Option<String> {
+    if call.name != "bg" || call.arguments["action"] == "list" {
+        return None;
+    }
+    call.arguments["name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+/// A successful `bg` call that changed a job's lifecycle: `Some(Some(name))` for a start or kill
+/// of one job, `Some(None)` for `kill all`. Observations change no job state.
+fn job_lifecycle_change(call: &ToolCall, output: &ToolOutput) -> Option<Option<String>> {
+    if call.name != "bg" || output.is_error {
+        return None;
+    }
+    match call.arguments["action"].as_str()? {
+        "kill" if call.arguments["all"] == true => Some(None),
+        "start" => output
+            .data
+            .as_ref()
+            .and_then(|data| data["job"]["name"].as_str())
+            .map(str::to_owned)
+            .or_else(|| background_job(call))
+            .map(Some),
+        "kill" => background_job(call).map(Some),
+        _ => None,
+    }
+}
+/// A `bg` call that starts a job (success is checked by the caller).
+fn starts_background_job(call: &ToolCall) -> bool {
+    call.name == "bg" && call.arguments["action"] == "start"
+}
 fn status_is_ok(output: &ToolOutput) -> bool {
     crate::runtime::execution::ToolStatus::from_output(output)
         == crate::runtime::execution::ToolStatus::Ok

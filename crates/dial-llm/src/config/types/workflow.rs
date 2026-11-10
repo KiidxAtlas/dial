@@ -97,6 +97,12 @@ pub struct ExperimentalConfig {
     /// Isolated check runs allowed to locate the changed files that turned a passing focused check
     /// into a failing one; 0 disables bisection.
     pub edit_bisection_runs: u8,
+    /// Sampled mutants of this turn's changed lines run, once per turn, against a passing
+    /// behavioral check to report changes it does not detect; 0 disables.
+    pub mutation_runs: u8,
+    /// After a behavioral check passes, name the lines this turn changed (Python, JavaScript) that
+    /// the check never executed.
+    pub changed_line_coverage: bool,
     /// Consecutive edit rounds without a lower focused-check failure score before a no-progress
     /// note; 0 disables it.
     pub outcome_gradient_rounds: u8,
@@ -131,6 +137,8 @@ impl Default for ExperimentalConfig {
             fault_witness: false,
             repro_first: ReproFirst::default(),
             edit_bisection_runs: 0,
+            mutation_runs: 0,
+            changed_line_coverage: false,
             outcome_gradient_rounds: 0,
             streaming_dispatch: true,
             batch_approvals: false,

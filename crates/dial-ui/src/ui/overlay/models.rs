@@ -413,7 +413,7 @@ fn capability_detail(theme: &Theme, entry: &ModelEntry) -> String {
     {
         return "capabilities not reported".to_owned();
     }
-    capabilities
+    let reported = capabilities
         .iter()
         .map(|(icon, name, supported)| {
             format!(
@@ -427,7 +427,8 @@ fn capability_detail(theme: &Theme, entry: &ModelEntry) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("  ")
+        .join("  ");
+    format!("reported: {reported}")
 }
 
 fn capability_cell(theme: &Theme, entry: &ModelEntry, width: usize) -> String {
@@ -2975,7 +2976,7 @@ impl ModelOverlay {
         }
         second.extend([Span::styled(
             format!(
-                "  {} {}",
+                "  {} {} · catalog only; /doctor for text/tool tests",
                 theme.sym(Sym::Dot),
                 text::one_line(&entry.source)
             ),

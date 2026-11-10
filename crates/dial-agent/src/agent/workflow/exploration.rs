@@ -16,6 +16,11 @@ const MAX_GOAL_BYTES: usize = 8 * 1024;
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 
 pub(in crate::agent) fn schema(name: &str) -> Option<Value> {
+    if name == "checkpoint" {
+        return Some(
+            json!({"type":"function","function":{"name":"checkpoint","description":"Begin an investigation checkpoint with goal (action=start, default), then complete it with action=rewind and concise report. Intermediate messages leave active context only after durable paired tool results. The immutable archive, actual effects and usage remain. Never restores files or undoes effects; no nested checkpoints.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["start","rewind"]},"goal":{"type":"string","minLength":1,"maxLength":MAX_GOAL_BYTES},"report":{"type":"string","minLength":1,"maxLength":MAX_REPORT_BYTES}},"additionalProperties":false}}}),
+        );
+    }
     let (key, description, limit) = match name {
         "checkpoint" => (
             "goal",
@@ -100,6 +105,12 @@ impl Lifecycle {
         timestamp: String,
         cancel: &AtomicBool,
     ) -> ToolOutput {
+        let mut operation = call.clone();
+        let (name, arguments) =
+            crate::tools::surface::facade::owner_view(&call.name, &call.arguments);
+        operation.name = name;
+        operation.arguments = arguments;
+        let call = &operation;
         let result = (|| -> Result<ToolOutput> {
             ensure!(
                 !cancel.load(Ordering::SeqCst),
@@ -152,7 +163,7 @@ impl Lifecycle {
                 Ok(ToolOutput {
                     execution: Default::default(),
                     text: format!(
-                        "Checkpoint: {text}\nFinish exploration and call rewind with findings. Activation follows the durable paired tool-group boundary."
+                        "Checkpoint: {text}\nFinish exploration and call checkpoint action=rewind with report. Activation follows the durable paired tool-group boundary."
                     ),
                     is_error: false,
                     data: Some(
@@ -225,7 +236,7 @@ pub(in crate::agent) fn terminal_siblings(
         .as_array()
         .context("rewind group has no calls")?
         .iter()
-        .filter(|call| call["function"]["name"] != "rewind")
+        .filter(|call| call["id"] != rewind_id)
         .cloned()
         .collect();
     if calls.is_empty() {
@@ -505,3 +516,6 @@ impl Agent<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

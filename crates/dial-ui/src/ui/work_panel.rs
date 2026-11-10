@@ -216,10 +216,7 @@ fn detail(
             {
                 entries.push((
                     vec![
-                        Span::styled(
-                            format!("{} ", theme.sym(Sym::Check)),
-                            theme.fg(Tok::Success),
-                        ),
+                        Span::styled(format!("{} ", theme.sym(Sym::Bullet)), theme.fg(Tok::Muted)),
                         Span::styled(text::one_line(&task.content), theme.fg(Tok::Text)),
                     ],
                     false,

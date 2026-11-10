@@ -67,9 +67,18 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
     let stopped = !matches!(outcome, "completed" | "answered");
     let evidence = &summary["evidence"];
     let obligations = obligation_lines(evidence);
+    let outstanding = !obligations.is_empty() || obligations_missing(evidence);
+    let checks: &[Value] = summary["recorded_checks"]
+        .as_array()
+        .map_or(&[], Vec::as_slice);
+    let current = summary["checks_current"].as_bool();
+    // No checks, or current all-passing checks with nothing else to report, need no handoff.
+    let checks_clean = checks.is_empty()
+        || (current == Some(true) && checks.iter().all(|check| check["status"] == "passed"));
     if files.is_empty()
         && !stopped
         && obligations.is_empty()
+        && checks_clean
         && evidence["deliverable_coverage"] != "open_obligations"
         && summary["open_tasks"].as_u64().unwrap_or(0) == 0
         && summary["uncheckpointed_shell_commands"]
@@ -83,10 +92,6 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
     {
         return None;
     }
-    let checks: &[Value] = summary["recorded_checks"]
-        .as_array()
-        .map_or(&[], Vec::as_slice);
-    let current = summary["checks_current"].as_bool();
     let open = summary["open_tasks"].as_u64().unwrap_or(0);
     let count = |key: &str| summary[key].as_u64().unwrap_or(0);
     let (shell, extension) = (
@@ -128,20 +133,31 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
     if let Some(timing) = timing_line(latency) {
         lines.push(timing);
     }
-    lines.push(
-        match (stopped, files.is_empty()) {
-            (false, true) if shell + extension > 0 => {
-                "Next: inspect shell/extension effects; /undo does not cover them"
-            }
-            (false, true) => "Next: send a follow-up message to resolve open obligations",
-            (false, false) => "Next: /review-file · /undo (checkpointed edits only)",
-            (true, true) => "Next: send a follow-up message to continue",
-            (true, false) => {
-                "Next: send a follow-up message · /review-file · /undo (checkpointed edits only)"
-            }
-        }
-        .to_owned(),
-    );
+    // Recovery and outstanding work take precedence over optional review/undo. This is
+    // presentation of retained facts, never permission to replay a turn or its tools.
+    let next = if stopped {
+        "send a follow-up message after inspecting the retained failure and effects; continue only unfinished work, not the whole turn"
+    } else if outstanding || open > 0 {
+        "inspect /evidence for outstanding work, then send a follow-up message with the next scoped action"
+    } else if checks.iter().any(|check| check["status"] == "failed") {
+        "inspect /evidence for failed checks; resolve or disclose the cause before requesting scoped verification"
+    } else if !checks.is_empty()
+        && (current != Some(true) || checks.iter().any(|check| check["status"] != "passed"))
+    {
+        "inspect /evidence for verification gaps before requesting scoped verification"
+    } else if shell + extension > 0 {
+        "inspect shell/extension effects; /undo does not cover them"
+    } else if !files.is_empty() {
+        "/review-file · /undo (checkpointed edits only)"
+    } else {
+        "send a follow-up message"
+    };
+    let review = if stopped && !files.is_empty() {
+        " · /review-file · /undo (checkpointed edits only)"
+    } else {
+        ""
+    };
+    lines.push(format!("Next: {next}{review}"));
 
     let mut compact = Vec::new();
     if stopped {
@@ -154,6 +170,10 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
     compact.push(checks_state(checks, current));
     if open > 0 {
         compact.push(plural(open, "open task"));
+    }
+    // Open tasks already name the outstanding work; repeat obligations only when they add some.
+    if outstanding && open == 0 {
+        compact.push("outstanding obligations".to_owned());
     }
     if shell + extension > 0 {
         compact.push(format!(
@@ -286,13 +306,17 @@ fn obligation_lines(evidence: &Value) -> Vec<String> {
                 .or_else(|| task["id"].as_str())
                 .or_else(|| task.as_str())
                 .unwrap_or("unnamed obligation");
+            let blocked = task["status"] == "blocked";
+            // The `Blocked:` prefix already states that status; other statuses stay explicit.
             let status = task["status"]
                 .as_str()
+                .filter(|_| !blocked)
                 .map(|s| format!(" ({})", label(s)))
                 .unwrap_or_default();
+            let prefix = if blocked { "Blocked" } else { "Outstanding" };
             match task["note"].as_str() {
-                Some(note) => format!("Blocked: {} — {}{status}", label(note), label(description)),
-                None => format!("Outstanding: {}{status}", label(description)),
+                Some(note) => format!("{prefix}: {} — {}{status}", label(note), label(description)),
+                None => format!("{prefix}: {}{status}", label(description)),
             }
         })
         .collect();

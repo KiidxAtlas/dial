@@ -1036,7 +1036,7 @@ fn the_harness_can_withhold_tools_from_every_type() {
 /// leaves the package root, unlike other integrations they are denied.
 #[test]
 fn read_only_agents_get_dependency_source() {
-    let enabled: Vec<String> = ["read", "dep_source", "git", "ast_search"]
+    let enabled: Vec<String> = ["read", "dep_source", "git", "grep", "ast_edit"]
         .map(String::from)
         .into();
     let mut ext = Registry::new();
@@ -1053,7 +1053,12 @@ fn read_only_agents_get_dependency_source() {
     assert!(tools.contains(&"read".to_owned()));
     assert!(tools.contains(&"dep_source".to_owned()));
     assert!(tools.contains(&"git".to_owned()));
-    assert!(tools.contains(&"ast_search".to_owned()));
+    assert!(tools.contains(&"grep".to_owned()));
+    assert!(crate::agent::safety::approval::is_read_only(
+        &ext,
+        "grep",
+        &json!({"ast":true,"pattern":"foo($A)","lang":"rust"}),
+    ));
     assert!(!tools.contains(&"ast_edit".to_owned()));
 }
 

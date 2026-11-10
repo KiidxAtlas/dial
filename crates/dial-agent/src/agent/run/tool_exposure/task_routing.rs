@@ -601,11 +601,16 @@ fn explicit(query: &str, candidates: &[(String, String)]) -> Vec<String> {
         .iter()
         .filter(|(name, _)| {
             query.split_whitespace().any(|word| {
-                let matches = word.trim_matches(['`', ',', '.', '"', ';', ':']) == name;
+                let word_name = word.trim_matches(['`', ',', '.', '"', ';', ':']);
+                // A consolidated member's own name selects the successor that exposes it.
+                let matches = word_name == name
+                    || crate::tools::surface::facade::successor_of(word_name)
+                        == Some(name.as_str());
+                let name = &word_name.to_owned();
                 let common_word = [
                     "document", "data", "audio", "visual", "evidence", "database", "research",
                     "monitor", "task", "message", "goal", "video", "verify", "find", "finish",
-                    "memory",
+                    "memory", "inspect", "history",
                 ]
                 .contains(&name.as_str());
                 matches
@@ -629,10 +634,18 @@ fn select(
     let mut selected = Vec::new();
     // Explicit tool names are strong evidence even if no workflow rule covers that specialist.
     selected.extend(explicit(query, candidates));
+    // A consolidated member routes to the successor that now exposes it (`facade::GROUPS`).
+    let candidate = |name: &str| candidates.iter().any(|entry| entry.0 == name);
     selected.extend(
         native(query, &prose_words(query))
             .into_iter()
-            .filter(|name| candidates.iter().any(|entry| entry.0 == *name))
+            .filter_map(|name| {
+                if candidate(name) {
+                    return Some(name);
+                }
+                crate::tools::surface::facade::successor_of(name)
+                    .filter(|successor| candidate(successor))
+            })
             .map(str::to_owned),
     );
     let mut domain_terms = terms.clone();

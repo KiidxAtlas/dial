@@ -253,6 +253,53 @@ fn failed_mutations_skip_only_dependent_or_opaque_work_not_diagnostics() {
 }
 
 #[test]
+fn a_failed_job_start_skips_later_actions_on_that_job_only() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(root.path()).unwrap();
+    let registry = crate::tools::integrations::ext::Registry::default();
+    let mode = crate::config::types::EditMode::default();
+    let bg = |args: Value| ToolCall {
+        id: "later".into(),
+        name: "bg".into(),
+        arguments: args,
+        malformed_arguments: false,
+    };
+    let mut prerequisites = BatchPrerequisites::default();
+    prerequisites.observe(
+        &workspace,
+        mode,
+        &bg(json!({"action":"start","name":"small6","command":"x"})),
+        &ToolOutput::err("lifetime requires explicit persist=true"),
+        &registry,
+    );
+    prerequisites.observe(
+        &workspace,
+        mode,
+        &bg(json!({"action":"start","name":"busy","command":"x"})),
+        &ToolOutput::err(
+            "a process named \"busy\" is already running; kill it or pick another name",
+        ),
+        &registry,
+    );
+    for (args, skipped) in [
+        (json!({"action":"wait","name":"small6"}), true),
+        (json!({"action":"output","name":"small6"}), true),
+        (json!({"action":"input","name":"small6","text":"q"}), true),
+        (json!({"action":"kill","name":"small6"}), false),
+        (json!({"action":"list"}), false),
+        (json!({"action":"wait","name":"other"}), false),
+        (json!({"action":"wait","name":"busy"}), false),
+    ] {
+        let result = prerequisites.rejection(&workspace, mode, &registry, &bg(args.clone()));
+        assert_eq!(result.is_some(), skipped, "{args}");
+        if let Some(output) = result {
+            assert_eq!(output.execution.status, Some(tools::ToolStatus::Skipped));
+            assert!(output.text.contains("`small6`"), "{}", output.text);
+        }
+    }
+}
+
+#[test]
 fn checks_close_the_wave_after_the_verified_mutation() {
     let root = tempfile::tempdir().unwrap();
     let config = Config::default();

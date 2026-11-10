@@ -32,7 +32,7 @@ fn sent(tools: &[Value]) -> Vec<(Value, bool)> {
 fn loaded_history(text: &str) -> Vec<Value> {
     vec![
         json!({"role":"user","content":"inspect the symbol"}),
-        json!({"role":"assistant","content":"","tool_calls":[{"id":"call-load","type":"function","function":{"name":"tool_load","arguments":"{}"}}]}),
+        json!({"role":"assistant","content":"","tool_calls":[{"id":"call-load","type":"function","function":{"name":"tool_search","arguments":"{}"}}]}),
         json!({"role":"tool","tool_call_id":"call-load","content":text}),
     ]
 }
@@ -56,8 +56,7 @@ fn a_tool_load_changes_no_definition_on_a_deferring_route() {
             .iter()
             .map(name)
             .find(|tool| {
-                ["ast_search", "lsp", "git"].contains(tool)
-                    && agent.tool_readiness(tool).automatic_candidate()
+                ["lsp", "git"].contains(tool) && agent.tool_readiness(tool).automatic_candidate()
             })
             .expect("a deferred specialist is ready")
             .to_owned();
@@ -87,7 +86,7 @@ fn a_tool_load_changes_no_definition_on_a_deferring_route() {
 #[test]
 fn narrowing_and_unloads_keep_the_deferred_surface() {
     with_agent(HOSTED, |agent| {
-        let output = load_tools(agent, json!({"names":["ast_search"]}));
+        let output = load_tools(agent, json!({"names":["lsp"]}));
         assert!(!output.is_error, "{}", output.text);
         let (offer, mut full) = request(agent, loaded_history(&output.text));
         agent
@@ -106,19 +105,19 @@ fn narrowing_and_unloads_keep_the_deferred_surface() {
         let callable: Vec<&str> = callable.iter().map(name).collect();
         assert_eq!(callable, ["finish", "todo"]);
         // Unloading keeps the referenced definition in place and makes it uncallable.
-        let output = load_tools(agent, json!({"unload":["ast_search"]}));
+        let output = load_tools(agent, json!({"unload":["lsp"]}));
         assert!(!output.is_error, "{}", output.text);
         let (offer, mut unloaded) = request(agent, loaded_history("loaded earlier"));
         agent
             .wire_tool_surface(Exposure::Deferred, &offer, &mut unloaded)
             .unwrap();
         assert_eq!(sent(&full.tools), sent(&unloaded.tools));
-        let ast = unloaded
+        let lsp = unloaded
             .tools
             .iter()
-            .find(|tool| name(tool) == "ast_search")
+            .find(|tool| name(tool) == "lsp")
             .unwrap();
-        assert!(!tool_offer::mark_of(ast).callable);
+        assert!(!tool_offer::mark_of(lsp).callable);
     });
 }
 

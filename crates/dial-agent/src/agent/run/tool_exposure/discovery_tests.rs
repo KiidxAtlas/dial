@@ -75,7 +75,7 @@ fn rejected_arguments_route_to_the_unoffered_tool_that_declares_them() {
 }
 
 /// The bash description names `bg` as a Dial tool to load only when it is not offered and
-/// `tool_load` is.
+/// `tool_search` is.
 #[test]
 fn bash_description_says_to_load_bg_only_when_it_is_loadable() {
     const NOTE: &str = "`bg` is a Dial tool, not a shell command, and is not offered yet";
@@ -96,7 +96,7 @@ fn bash_description_says_to_load_bg_only_when_it_is_loadable() {
             "{:?}",
             agent.offered()
         );
-        assert!(agent.offered().contains(&"tool_load".to_owned()));
+        assert!(agent.offered().contains(&"tool_search".to_owned()));
         assert!(description(agent).contains(NOTE), "{}", description(agent));
     });
 }

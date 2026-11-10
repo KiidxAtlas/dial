@@ -355,63 +355,114 @@ fn monitor_start_requires_fresh_confirmation_even_with_auto_or_reusable_grants()
             self.decision
         }
     }
-    let call = file_call(
-        "monitor",
-        json!({"action":"start", "name":"site", "path":"site.log"}),
-    );
-    for mode in [Approval::Auto, Approval::Write, Approval::Ask] {
-        let mut rules = vec![rule(Effect::Allow, "monitor", &[])];
-        let mut ui = Confirm {
-            calls: 0,
-            decision: Decision::AllowAlways,
-        };
-        for _ in 0..2 {
+    for call in [
+        file_call(
+            "monitor",
+            json!({"action":"start", "name":"site", "path":"site.log"}),
+        ),
+        file_call(
+            "bg",
+            json!({"action":"watch", "name":"site", "path":"site.log"}),
+        ),
+    ] {
+        for mode in [Approval::Auto, Approval::Write, Approval::Ask] {
+            let mut rules = vec![rule(Effect::Allow, "monitor", &[])];
+            let mut ui = Confirm {
+                calls: 0,
+                decision: Decision::AllowAlways,
+            };
+            for _ in 0..2 {
+                assert!(matches!(
+                    authorize(mode, &mut rules, Path::new("/p"), &call, "", &mut ui),
+                    Ok(false)
+                ));
+            }
+            assert_eq!(ui.calls, 2);
+            assert_eq!(
+                rules.len(),
+                1,
+                "watch approval must not create reusable grants"
+            );
+            ui.decision = Decision::Deny;
             assert!(matches!(
                 authorize(mode, &mut rules, Path::new("/p"), &call, "", &mut ui),
-                Ok(false)
+                Err(Denial::User)
             ));
         }
-        assert_eq!(ui.calls, 2);
-        assert_eq!(
-            rules.len(),
-            1,
-            "watch approval must not create reusable grants"
-        );
-        ui.decision = Decision::Deny;
+        let mut rules = vec![rule(Effect::Deny, "monitor", &[])];
+        let mut ui = Confirm {
+            calls: 0,
+            decision: Decision::Allow,
+        };
         assert!(matches!(
-            authorize(mode, &mut rules, Path::new("/p"), &call, "", &mut ui),
-            Err(Denial::User)
+            authorize(
+                Approval::Auto,
+                &mut rules,
+                Path::new("/p"),
+                &call,
+                "",
+                &mut ui
+            ),
+            Err(Denial::Rule)
         ));
+        rules.clear();
+        assert!(matches!(
+            authorize(
+                Approval::Readonly,
+                &mut rules,
+                Path::new("/p"),
+                &call,
+                "",
+                &mut ui
+            ),
+            Err(Denial::ReadOnly)
+        ));
+        assert_eq!(ui.calls, 0);
     }
-    let mut rules = vec![rule(Effect::Deny, "monitor", &[])];
-    let mut ui = Confirm {
-        calls: 0,
-        decision: Decision::Allow,
-    };
-    assert!(matches!(
-        authorize(
-            Approval::Auto,
-            &mut rules,
-            Path::new("/p"),
-            &call,
-            "",
-            &mut ui
-        ),
-        Err(Denial::Rule)
-    ));
-    rules.clear();
-    assert!(matches!(
-        authorize(
-            Approval::Readonly,
-            &mut rules,
-            Path::new("/p"),
-            &call,
-            "",
-            &mut ui
-        ),
-        Err(Denial::ReadOnly)
-    ));
-    assert_eq!(ui.calls, 0);
+}
+
+#[test]
+fn consolidated_permissions_preserve_member_scope() {
+    let call = file_call("git", json!({"forge":"github", "op":"pr_view"}));
+    let root = Path::new("/p");
+    assert!(rule(Effect::Allow, "github", &[]).matches(&call, root));
+    assert!(rule(Effect::Deny, "github", &[]).matches(&call, root));
+    assert!(rule(Effect::Deny, "git", &[]).matches(&call, root));
+    assert!(!rule(Effect::Allow, "git", &[]).matches(&call, root));
+    assert!(!rule(Effect::Allow, "glab_mr", &[]).matches(&call, root));
+    assert_eq!(approval_grant(&call).rule.unwrap().tool, "github");
+}
+
+#[test]
+fn consolidated_path_rules_use_the_original_owners_path_contract() {
+    let root = Path::new("/p");
+    let fetched = file_call(
+        "read",
+        json!({"fetch":true,"path":"https://example.com/page"}),
+    );
+    let old = file_call("web_fetch", json!({"url":"https://example.com/page"}));
+    for effect in [Effect::Allow, Effect::Deny] {
+        let scoped = rule(effect, "web_fetch", &["**"]);
+        assert_eq!(scoped.matches(&fetched, root), scoped.matches(&old, root));
+    }
+    assert!(!rule(Effect::Allow, "web_fetch", &["**"]).matches(&fetched, root));
+    let structural = file_call(
+        "grep",
+        json!({"ast":true,"path":"src/main.rs","pattern":"foo($A)"}),
+    );
+    let old = file_call(
+        "ast_search",
+        json!({"path":"src/main.rs","pattern":"foo($A)"}),
+    );
+    for effect in [Effect::Allow, Effect::Deny] {
+        for scope in ["src/**", "docs/**"] {
+            let scoped = rule(effect, "ast_search", &[scope]);
+            assert_eq!(
+                scoped.matches(&structural, root),
+                scoped.matches(&old, root)
+            );
+        }
+    }
 }
 
 #[test]

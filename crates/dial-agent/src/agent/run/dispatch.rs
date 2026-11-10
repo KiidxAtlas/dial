@@ -4,6 +4,8 @@ use crate::config;
 use crate::agent::*;
 
 #[cfg(test)]
+mod controller_tests;
+#[cfg(test)]
 mod image_question_tests;
 pub(in crate::agent) mod result_budget;
 pub(in crate::agent::run) mod search_index;
@@ -83,7 +85,7 @@ fn activation_status(loaded: bool, offered_before: Option<bool>) -> (&'static st
     match (loaded, offered_before) {
         (false, _) => (
             "not_loaded",
-            "call tool_load with this exact name; it is callable on the request after that",
+            "call tool_search with names:[this exact name]; callable on the next request",
         ),
         (true, Some(true)) => (
             "already_offered",
@@ -198,7 +200,8 @@ pub(in crate::agent) fn capture_output_image(
     {
         return Ok(None);
     }
-    if matches!(call.name.as_str(), "browser" | "computer" | "github") {
+    let owner = crate::tools::surface::facade::owner_view(&call.name, &call.arguments).0;
+    if matches!(owner.as_str(), "browser" | "computer" | "github") {
         return crate::storage::artifact::capture_image(workspace.artifacts(), output);
     }
     let text = output.text.clone();
@@ -1217,6 +1220,21 @@ impl<'a> Agent<'a> {
                 .with_effects(crate::tools::surface::outcome::Effects::None);
         }
         let arguments_changed = arguments_changed || expanded.arguments != call.arguments;
+        let policy_call = expanded.clone();
+        // Controller facades keep the accepted/journaled call identity, but all execution and
+        // authorization below use the existing operation owner and its original arguments.
+        if matches!(
+            expanded.name.as_str(),
+            "tool_search" | "skill" | "checkpoint" | "task" | "ask"
+        ) || (expanded.name == "memory" && expanded.arguments["store"] == "codebase")
+        {
+            let (owner, arguments) =
+                crate::tools::surface::facade::owner_view(&expanded.name, &expanded.arguments);
+            expanded.name = owner;
+            expanded.arguments = arguments;
+        }
+        let controller_routed =
+            expanded.name != policy_call.name || expanded.arguments != policy_call.arguments;
         let call = &expanded;
         if call.name == "bash"
             && let Some(command) = call.arguments["command"].as_str()
@@ -1239,6 +1257,40 @@ impl<'a> Agent<'a> {
             .with_status(tools::ToolStatus::Blocked)
             .with_effects(crate::tools::surface::outcome::Effects::None)
         };
+        if matches!(
+            expanded.name.as_str(),
+            "tool_search"
+                | "tool_load"
+                | "skill"
+                | "skill_manage"
+                | "checkpoint"
+                | "rewind"
+                | "task"
+                | "side_request"
+                | "ask"
+                | "request_directory"
+        ) && !self.controller_operation_available(&expanded.name)
+        {
+            return denied(
+                "this controller operation is unavailable under the current mode or tool allowlist",
+            );
+        }
+        if expanded.name == "codebase_memory"
+            && (!self.ext.contains("codebase_memory")
+                || !(self.modes.launch.allows_tool("codebase_memory")
+                    || self.modes.launch.allows_tool("memory"))
+                || self
+                    .config
+                    .active_model_profile()
+                    .and_then(|profile| profile.tools.as_ref())
+                    .is_some_and(|allowed| {
+                        !allowed
+                            .iter()
+                            .any(|name| matches!(name.as_str(), "memory" | "codebase_memory"))
+                    }))
+        {
+            return denied("saved codebase memory is unavailable under the current tool allowlist");
+        }
         if self.edit_preview_intercepted {
             return denied(
                 "This callback was not executed: an earlier authorized edit preview failed in this assistant batch.",
@@ -1246,7 +1298,7 @@ impl<'a> Agent<'a> {
         }
         // Unchanged calls already passed the request contract at admission. Only a
         // hook rewrite invalidates that evidence; authority is always checked below.
-        if arguments_changed {
+        if arguments_changed || controller_routed {
             let names = std::slice::from_ref(&call.name);
             let schemas = match self.schemas(names) {
                 Ok(schemas) => schemas,
@@ -1285,10 +1337,18 @@ impl<'a> Agent<'a> {
         // pass the same one-shot human boundary before entering it.
         if provenance == crate::agent::safety::approval::CallProvenance::RecoveredText
             && matches!(call.name.as_str(), "request_directory" | "exit_plan")
-            && let Err(denial) = self.authorize_call_from(call, provenance, ui)
+            && let Err(denial) = self.authorize_call_from(&policy_call, provenance, ui)
         {
             *approval_denied = true;
             return denied(denial.message_in(self.plan_mode));
+        }
+        if crate::agent::safety::approval::denied_by_rule(
+            &self.always,
+            &policy_call,
+            self.workspace.root(),
+        ) {
+            *approval_denied = true;
+            return denied("denied by permission rule");
         }
         if call.name == "request_directory" {
             return self.request_directory(call, ui);
@@ -1330,7 +1390,7 @@ impl<'a> Agent<'a> {
                 }
             }
         }
-        if let Err(denial) = self.authorize_call_from(call, provenance, ui) {
+        if let Err(denial) = self.authorize_call_from(&policy_call, provenance, ui) {
             *approval_denied = true;
             if let Err(error) = self.record(self.cur_step, "tool_denied", json!({"name":call.name}))
             {
@@ -1806,7 +1866,7 @@ impl<'a> Agent<'a> {
                     let reason = if partial.is_empty() {
                         "No ranked match; inspect the eligible catalog before concluding a capability is unavailable. Listing grants no permission and loads no tools."
                     } else {
-                        "No tool matched most query terms; `search_matches` are the closest partial matches. Inspect them and the catalog before concluding a capability is unavailable, load one with tool_load, or search again with fewer, specific words. Matches and listing grant no permission and load no tools."
+                        "No tool matched most query terms; `search_matches` are the closest partial matches. Inspect them and the catalog before concluding a capability is unavailable, load one with tool_search names:[exact name], or search again with fewer, specific words. Matches and listing grant no permission and load no tools."
                     };
                     return match listing_output(0, &descriptions, &offered) {
                         Ok(mut output) => {
@@ -1898,14 +1958,14 @@ impl<'a> Agent<'a> {
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
-                    .map(str::to_owned)
+                    .map(|name| crate::agent::run::tool_exposure::controller_name(name).to_owned())
                     .collect();
                 let mut unload: Vec<String> = args["unload"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
-                    .map(str::to_owned)
+                    .map(|name| crate::agent::run::tool_exposure::controller_name(name).to_owned())
                     .collect();
                 requested.sort();
                 requested.dedup();
@@ -2132,7 +2192,16 @@ impl<'a> Agent<'a> {
                 };
             }
             crate::tools::integrations::ext::ToolCallback::Call { name, arguments } => {
-                (name, arguments)
+                // A consolidated member's own name still works in code: it runs as the successor
+                // call that reaches it, under the successor's scope and approval.
+                match crate::tools::surface::facade::successor_call(&name, &arguments) {
+                    Some((successor, call))
+                        if self.ext.is_folded(&name) && names.iter().any(|n| n == successor) =>
+                    {
+                        (successor.to_owned(), call)
+                    }
+                    _ => (name, arguments),
+                }
             }
         };
         if name == crate::tools::exec::eval::BATCH_CALLBACK {
@@ -2161,10 +2230,11 @@ impl<'a> Agent<'a> {
         self.execute_callback_from(backend, ui, &call, &schemas, source, gate)
     }
 
-    /// `tool.batch([...])` from a code cell. When every entry is an offered, hook-free,
-    /// rule-permitted parallel read, the entries run together through the ordinary parallel-read
-    /// group with one coalesced journal flush on each side; otherwise each entry is an ordinary
-    /// serial callback with its own admission and approval. Results keep entry order.
+    /// `tool.batch([...])` from a code cell. Consecutive entries that are offered, hook-free,
+    /// rule-permitted parallel reads run together through the ordinary parallel-read group with
+    /// one coalesced journal flush on each side; every other entry is an ordinary serial callback
+    /// with its own admission and approval, and closes the read group before it. Results keep
+    /// entry order, and each group is chosen only after the entries before it settled.
     fn code_callback_batch(
         &mut self,
         backend: &mut Backend,
@@ -2178,50 +2248,61 @@ impl<'a> Agent<'a> {
             Ok(calls) => calls,
             Err(refusal) => return ToolOutput::err(refusal),
         };
-        let hooks = self.tool_hooks();
-        let shared = self.config.eval.parallel_batches
-            && calls.iter().all(|call| {
-                call.name != crate::tools::exec::eval::BATCH_CALLBACK
-                    && names.contains(&call.name)
-                    && crate::agent::safety::approval::parallel_read(
-                        &self.ext,
-                        &call.name,
-                        &call.arguments,
-                    )
-                    && ["pre_tool_use", "post_tool_use"].iter().all(|event| {
-                        !crate::agent::safety::hooks::wanted_for_tool(hooks, event, &call.name)
-                    })
-                    && !crate::agent::safety::approval::denied_by_rule(
-                        &self.always,
-                        call,
-                        self.workspace.root(),
-                    )
-                    && (self.pending_check.is_none() || call.name != "bash")
-                    && image_question(call).is_none()
+        let mut outputs = Vec::with_capacity(calls.len());
+        let mut index = 0;
+        while index < calls.len() {
+            let group = calls[index..]
+                .iter()
+                .take_while(|call| self.shared_callback_read(call, names))
+                .count();
+            // A lone read inside a mixed batch keeps the ordinary serial callback path.
+            if group > 1 || group == calls.len() {
+                outputs.extend(self.code_callback_reads(
+                    &calls[index..index + group],
+                    names,
+                    ui,
+                    gate,
+                    source.owner,
+                ));
+                index += group;
+                continue;
+            }
+            let call = calls[index].clone();
+            index += 1;
+            outputs.push(if call.name == crate::tools::exec::eval::BATCH_CALLBACK {
+                ToolOutput::err("tool.batch entries cannot nest tool.batch")
+            } else {
+                self.code_callback_mode(
+                    backend,
+                    crate::tools::integrations::ext::ToolCallback::Call {
+                        name: call.name,
+                        arguments: call.arguments,
+                    },
+                    ui,
+                    gate,
+                    source.clone(),
+                )
             });
-        let outputs: Vec<ToolOutput> = if shared {
-            self.code_callback_reads(&calls, names, ui, gate, source.owner)
-        } else {
-            calls
-                .into_iter()
-                .map(|call| {
-                    if call.name == crate::tools::exec::eval::BATCH_CALLBACK {
-                        return ToolOutput::err("tool.batch entries cannot nest tool.batch");
-                    }
-                    self.code_callback_mode(
-                        backend,
-                        crate::tools::integrations::ext::ToolCallback::Call {
-                            name: call.name,
-                            arguments: call.arguments,
-                        },
-                        ui,
-                        gate,
-                        source.clone(),
-                    )
-                })
-                .collect()
-        };
+        }
         code_batch_output(outputs)
+    }
+
+    /// Whether one `tool.batch` entry may join a shared read group at this point in the batch.
+    fn shared_callback_read(&self, call: &ToolCall, names: &[String]) -> bool {
+        self.config.eval.parallel_batches
+            && call.name != crate::tools::exec::eval::BATCH_CALLBACK
+            && names.contains(&call.name)
+            && crate::agent::safety::approval::parallel_read(&self.ext, &call.name, &call.arguments)
+            && ["pre_tool_use", "post_tool_use"].iter().all(|event| {
+                !crate::agent::safety::hooks::wanted_for_tool(self.tool_hooks(), event, &call.name)
+            })
+            && !crate::agent::safety::approval::denied_by_rule(
+                &self.always,
+                call,
+                self.workspace.root(),
+            )
+            && (self.pending_check.is_none() || call.name != "bash")
+            && image_question(call).is_none()
     }
 
     /// Admitted read-only batch entries: per-entry form checks and portable-rule interception,
@@ -2457,7 +2538,7 @@ impl<'a> Agent<'a> {
         let jobs = self.awaited_background_jobs();
         let questions = self.side_questions.running_ids();
         if !questions.is_empty() && !self.interrupt.load(Ordering::Relaxed) {
-            self.background_notices.push(format!("[Side questions still running]\n{}\nContinue independent work or use bounded `side_request` wait; do not claim their answers are available yet.", questions.join("\n")));
+            self.background_notices.push(format!("[Side questions still running]\n{}\nContinue independent work or use a bounded `task` action=question_wait; do not claim their answers are available yet.", questions.join("\n")));
         }
         let workers = self.live_tasks.running_ids();
         if !self.interrupt.load(Ordering::Relaxed) {

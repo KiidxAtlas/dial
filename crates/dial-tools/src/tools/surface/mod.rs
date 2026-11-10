@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod contracts;
+pub mod facade;
 pub mod outcome;
 pub mod presentation;
 pub mod resources;

@@ -1543,6 +1543,15 @@ fn search_tool_formats_hits_and_reports_bad_args() {
     assert!(!session_search_tool::call(&e.layout, &json!({"query": "zzzz"})).is_error);
     assert!(session_search_tool::call(&e.layout, &json!({"limit": 3})).is_error);
     assert!(session_search_tool::call(&e.layout, &json!({"query": 7})).is_error);
+    let unknown =
+        session_search_tool::call_owned(Some(&e.layout), &s, &json!({"query": "x", "path": "y"}));
+    assert!(
+        unknown.is_error && unknown.text.contains("`path`") && unknown.text.contains("accepted:"),
+        "{}",
+        unknown.text
+    );
+    let missing = session_search_tool::call_owned(Some(&e.layout), &s, &json!({"history": true}));
+    assert!(missing.text.contains("query:\"\""), "{}", missing.text);
     let schema = session_search_tool::schema();
     assert_eq!(schema["function"]["name"], "session_search");
     assert_eq!(

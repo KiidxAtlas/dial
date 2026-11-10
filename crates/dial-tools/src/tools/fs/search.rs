@@ -790,6 +790,9 @@ pub(in crate::tools) fn grep_source_targets(
     preview::source_targets(ws, args, text)
 }
 
+/// Lead of a pattern that failed to parse; `grep_tool` then searches it as literal text.
+const REGEX_SYNTAX_ERROR: &str = "invalid or unsupported Rust regex";
+
 /// Compile once for bounded byte matching, on lines or whole files.
 /// `literal` escapes all metacharacters. Anchors work at line boundaries;
 /// regex compile memory and per-call input work are bounded separately.
@@ -805,7 +808,10 @@ fn build_matcher(pattern: &str, fixed_string: bool, ignore_case: bool) -> Result
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_DFA_LIMIT)
         .build()
-        .map_err(|e| format!("invalid or unsupported Rust regex: {e}\nLookaround and backreferences are unsupported; simplify the pattern or use `literal: true`."))
+        .map_err(|e| match e {
+            regex::Error::Syntax(_) => format!("{REGEX_SYNTAX_ERROR}: {e}\nLookaround and backreferences are unsupported; simplify the pattern or use `literal: true`."),
+            _ => format!("regex is too large to compile within the search budget: {e}\nNarrow the pattern or use `literal: true`."),
+        })
 }
 
 fn trim_eol(line: &[u8]) -> &[u8] {
@@ -1722,7 +1728,25 @@ pub(in crate::tools) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(MAX_GREP_WORKERS);
-    grep_with_workers(ws, args, workers)
+    match grep_with_workers(ws, args, workers) {
+        // A pattern that is not valid regex syntax is almost always meant literally (`foo(`,
+        // `a[0]`, `{x}`); search it as text instead of spending a round on the parse error.
+        Err(error) if error.starts_with(REGEX_SYNTAX_ERROR) && !opt_bool(args, "literal")? => {
+            let mut literal = args.clone();
+            literal["literal"] = Value::Bool(true);
+            let reason = error
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| line.starts_with("error:"))
+                .unwrap_or("parse error");
+            let found = grep_with_workers(ws, &literal, workers)?;
+            Ok(format!(
+                "[pattern is not valid Rust regex syntax ({reason}); it was searched as literal text. Pass `literal: true` for text, or fix the regex (no lookaround or backreferences).]\n{found}"
+            ))
+        }
+        other => other,
+    }
 }
 
 /// `grep` with an explicit worker count; one worker is the serial scan.

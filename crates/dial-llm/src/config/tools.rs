@@ -133,18 +133,7 @@ pub const EXTRA_TOOLS: &[&str] = &[
 pub fn default_tools() -> Vec<String> {
     BUILTIN
         .iter()
-        .chain(
-            [
-                "todo",
-                "task",
-                "side_request",
-                "skill",
-                "tool_search",
-                "tool_load",
-                "memory",
-            ]
-            .iter(),
-        )
+        .chain(["todo", "task", "skill", "tool_search", "memory"].iter())
         .map(|s| s.to_string())
         .collect()
 }

@@ -72,7 +72,7 @@ fn load(agent: &mut Agent<'_>, args: Value) {
         &mut backend,
         &ToolCall {
             id: "load-routing".into(),
-            name: "tool_load".into(),
+            name: "tool_search".into(),
             arguments: args,
             malformed_arguments: false,
         },
@@ -80,6 +80,33 @@ fn load(agent: &mut Agent<'_>, args: Value) {
     );
     agent.backend = Some(backend);
     assert!(!output.is_error, "{}", output.text);
+}
+
+#[test]
+fn consolidated_catalog_has_no_retired_registry_members() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        let catalog = agent.catalog();
+        eprintln!(
+            "Configured catalog ({}): {}",
+            catalog.len(),
+            catalog.join(", ")
+        );
+        assert!(!catalog.iter().any(|name| agent.ext.is_folded(name)));
+        assert!(catalog.iter().any(|name| name == "inspect"));
+        for retired in ["ast_search", "web_fetch", "tool_load"] {
+            assert!(
+                !catalog.iter().any(|name| name == retired),
+                "{retired}: {catalog:?}"
+            );
+        }
+        for (successor, option) in [("grep", "ast"), ("read", "fetch"), ("tool_search", "names")] {
+            let schema = agent.full_schemas(&[successor.into()]).unwrap().remove(0);
+            assert!(
+                schema["function"]["parameters"]["properties"][option].is_object(),
+                "{schema}"
+            );
+        }
+    });
 }
 
 #[test]
@@ -92,12 +119,9 @@ fn task_intents_select_native_specialists_without_discovery_calls() {
         ),
         (
             "Find and replace structural AST matches",
-            vec!["ast_search", "ast_edit"],
+            vec!["grep", "ast_edit"],
         ),
-        (
-            "Search for a syntax pattern across AST nodes",
-            vec!["ast_search"],
-        ),
+        ("Search for a syntax pattern across AST nodes", vec!["grep"]),
         (
             "Rename a function symbol and update its references",
             vec!["lsp"],
@@ -515,8 +539,9 @@ fn plain_system_questions_preserve_real_registry_policy_and_schema_budgets() {
         ] {
             assert!(agent.ext.get(specialist).unwrap().read_only_hint());
             agent.begin_tool_routing(query);
+            // Each reader is reached through `inspect` (`facade::GROUPS`).
             assert!(
-                agent.offered().iter().any(|name| name == specialist),
+                agent.offered().iter().any(|name| name == "inspect"),
                 "{query}"
             );
             assert!(agent.tool_routing.selected.len() <= TOOL_LIMIT);
@@ -536,7 +561,7 @@ fn plain_system_questions_preserve_real_registry_policy_and_schema_budgets() {
     });
     with_agent("[assistance]\nlean_local=true", |agent| {
         agent.begin_tool_routing("What tables are in exports/app.sqlite?");
-        assert!(!selected(agent, "database"));
+        assert!(!selected(agent, "inspect"));
     });
 }
 
@@ -545,7 +570,8 @@ fn plain_system_questions_preserve_real_registry_policy_and_schema_budgets() {
 #[test]
 fn output_only_csv_prompt_offers_no_source_specialists_and_costs_no_extra_schema_bytes() {
     with_agent("[assistance]\nlean_local=false", |agent| {
-        assert!(agent.catalog().iter().any(|tool| tool == "data"));
+        assert!(agent.catalog().iter().any(|tool| tool == "inspect"));
+        assert!(!agent.catalog().iter().any(|tool| tool == "data"));
         assert!(agent.catalog().iter().any(|tool| tool == "evidence"));
         let mut sizes = Vec::new();
         for query in [
@@ -553,7 +579,7 @@ fn output_only_csv_prompt_offers_no_source_specialists_and_costs_no_extra_schema
             "Analyze the plaintext logs in /app/logs and write a text file /app/summary.txt with counts per severity",
         ] {
             agent.begin_tool_routing(query);
-            for specialist in ["data", "document", "evidence"] {
+            for specialist in ["inspect", "data", "document", "evidence"] {
                 assert!(
                     !selected(agent, specialist),
                     "{query}: unexpectedly routed {specialist}: {:?}",
@@ -621,10 +647,11 @@ fn source_specialists_preserve_task_schema_caps_and_lean_routing() {
             register(agent, name, "Source capability");
         }
         agent.begin_tool_routing("Inspect PDF CSV audio and diagram sources online");
-        assert!(selected(agent, "document"));
-        assert!(selected(agent, "data"));
-        assert!(selected(agent, "audio"));
-        assert!(selected(agent, "visual"));
+        // The four readers fold into one offered `inspect`.
+        assert!(selected(agent, "inspect"));
+        for name in ["document", "data", "audio", "visual"] {
+            assert!(!selected(agent, name), "{name}");
+        }
         assert!(agent.tool_routing.selected.len() <= TOOL_LIMIT);
         assert!(
             agent
@@ -874,7 +901,7 @@ fn lean_local_routes_relevant_mcp_with_a_small_bounded_offer() {
 fn lean_research_protects_the_web_pair_from_incidental_mcp_matches() {
     with_agent("[assistance]\nlean_local=true", |agent| {
         register(agent, "web_search", "Search the public web for sources");
-        register(agent, "web_fetch", "Fetch a web page by URL");
+        // URL fetching is part of the built-in read surface.
         register(agent, "mcp__nuxt__list-blog-posts", "nuxt: List blog posts");
         register(
             agent,
@@ -898,7 +925,7 @@ fn lean_research_protects_the_web_pair_from_incidental_mcp_matches() {
                     .any(|tool| tool == name)
             };
             assert!(routed("web_search"), "{query}");
-            assert!(routed("web_fetch"), "{query}");
+            assert!(agent.offered().iter().any(|name| name == "read"), "{query}");
             assert!(
                 !routing
                     .selected
@@ -910,15 +937,14 @@ fn lean_research_protects_the_web_pair_from_incidental_mcp_matches() {
             );
             let offer = agent.offered();
             assert!(offer.iter().any(|name| name == "web_search"), "{query}");
-            assert!(offer.iter().any(|name| name == "web_fetch"), "{query}");
+            assert!(offer.iter().any(|name| name == "read"), "{query}");
         }
     });
 }
 #[test]
 fn restrictions_and_schema_budgets_are_enforced_before_selection() {
     {
-        let overlay =
-            "[harness]\ntools=['read','tool_search','tool_load']\n[assistance]\nlean_local=false";
+        let overlay = "[harness]\ntools=['read','tool_search']\n[assistance]\nlean_local=false";
         with_agent(overlay, |agent| {
             nuxt(agent);
             agent.begin_tool_routing("Nuxt routing");
@@ -1243,7 +1269,7 @@ fn task_prose_does_not_route_specialists_from_incidental_words() {
         "lsp",
         "monitor",
         "web_search",
-        "web_fetch",
+        "read",
     ]
     .map(|name| (name.to_owned(), "Capability".to_owned()));
     for query in [
@@ -1263,9 +1289,9 @@ fn task_prose_does_not_route_specialists_from_incidental_words() {
         ("Use the `task` tool to split this work", vec!["task"]),
         (
             "Search the web for nginx web server benchmarks",
-            vec!["web_search", "web_fetch"],
+            vec!["web_search", "read"],
         ),
-        ("Summarize https://example.com/notes", vec!["web_fetch"]),
+        ("Summarize https://example.com/notes", vec!["read"]),
         ("Check the rendered landing page design", vec!["browser"]),
         ("Verify the frontend layout", vec!["browser"]),
         ("Tail the server log for crashes", vec!["monitor"]),
@@ -1423,14 +1449,14 @@ fn tabular_deliverables_use_computation_routing_in_interactive_and_unattended_ru
         with_agent("[assistance]\nlean_local=false", |agent| {
             agent.modes.launch.unattended = unattended;
             agent.begin_tool_routing(query);
-            for name in ["data", "evidence"] {
+            for name in ["inspect", "evidence"] {
                 assert!(
                     !selected(agent, name),
                     "{name}: {:?}",
                     agent.tool_routing.selected
                 );
             }
-            assert!(agent.catalog().iter().any(|name| name == "data"));
+            assert!(agent.catalog().iter().any(|name| name == "inspect"));
         });
         for query in [
             "Use the `data` tool to profile orders.csv",
@@ -1443,7 +1469,7 @@ fn tabular_deliverables_use_computation_routing_in_interactive_and_unattended_ru
                 agent.modes.launch.unattended = unattended;
                 agent.begin_tool_routing(query);
                 assert!(
-                    selected(agent, "data"),
+                    selected(agent, "inspect"),
                     "{query}: {:?}",
                     agent.tool_routing.selected
                 );

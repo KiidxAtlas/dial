@@ -116,6 +116,16 @@ impl<'a> Agent<'a> {
         if !self.hermetic {
             crate::agent::window::file_handles::project(&self.workspace, messages);
         }
+        if economy
+            && !(crate::config::compaction::CompactionIdentity {
+                provider: &identity.provider,
+                model: &identity.model,
+                agent: None,
+            })
+            .preserved_thinking()
+        {
+            crate::agent::workflow::evidence::project_duplicates(messages, superseded);
+        }
         crate::agent::workflow::evidence::project(messages, superseded, &policy);
         if !self.hermetic
             && let Some(artifacts) = self.workspace.artifacts()

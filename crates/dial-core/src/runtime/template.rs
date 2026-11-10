@@ -109,9 +109,13 @@ enum Stop {
 /// Partials registered with [`register_partial`]; `{{> name}}` resolves here.
 static PARTIALS: RwLock<BTreeMap<String, Arc<Template>>> = RwLock::new(BTreeMap::new());
 
-/// Register a partial for `{{> name}}`. The source is parsed now,
-/// so a malformed partial fails at registration rather than mid-render.
-#[allow(dead_code)] // No production caller registers partials.
+/// Register a process-wide partial for `{{> name}}`, replacing any registration with that name.
+///
+/// Registrations are shared by all templates in this process. The source is parsed before
+/// publication, so a malformed replacement leaves the previous registration intact.
+///
+/// # Errors
+/// Returns an error if the partial source is malformed.
 pub fn register_partial(name: &str, source: &str) -> Result<()> {
     let template =
         Template::parse(source).map_err(|error| anyhow!("Invalid partial {name}: {error}"))?;

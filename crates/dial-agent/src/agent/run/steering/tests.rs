@@ -219,3 +219,57 @@ fn settle(agent: &mut Agent<'_>, live: &mut LiveSteering, ui: &mut Input, expect
         "journal accepted prefix, uncertain suffix and later input exactly once in submission order"
     );
 }
+
+#[test]
+fn local_replanning_preserves_every_message_in_a_drained_batch() {
+    for live_key in [None, Some("no-running-response-for-steering-batch")] {
+        with_agent("", |agent| {
+            let expected = [
+                "first instruction",
+                "second instruction",
+                "third instruction",
+            ];
+            let mut ui = Input {
+                interrupt: None,
+                new_input: None,
+                pending: vec![
+                    expected[0].into(),
+                    "  ".into(),
+                    expected[1].into(),
+                    expected[2].into(),
+                ],
+                applied: vec![],
+                beats: 0,
+            };
+            let mut live = LiveSteering::default();
+            assert!(
+                agent
+                    .steer_during_generation(&mut ui, live_key, &mut live)
+                    .unwrap()
+            );
+            assert!(live.replanning);
+            assert!(live.pending.is_empty());
+            assert_eq!(ui.applied, expected);
+            assert!(!agent.interrupt.load(Ordering::SeqCst));
+            assert_eq!(
+                agent.session.control_state()["current_instruction"],
+                expected[2]
+            );
+            // Repeated polls cannot journal or acknowledge the same input twice.
+            assert!(
+                !agent
+                    .steer_during_generation(&mut ui, live_key, &mut live)
+                    .unwrap()
+            );
+            assert_eq!(ui.applied, expected);
+            let mut messages = vec![];
+            agent.session.extend_messages(&mut messages);
+            let users: Vec<_> = messages
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .filter_map(|message| message["content"].as_str())
+                .collect();
+            assert_eq!(users, expected);
+        });
+    }
+}

@@ -1249,14 +1249,14 @@ impl Tool for Background {
                 }, "description": "start: authorized tool call instead of command; only name may accompany it"},
                 "name": {"type": "string", "description": "start: optional unique name (letters, digits, - _ .); other actions: which job"},
                 "cwd": {"type": "string", "description": "start: working directory (default workspace root)"},
-                "persist": {"type": "boolean", "description": "Unix and Windows: a named pipe job that survives restarts until `lifetime`; pass true on every call for it. No PTY, stdin or ready."},
-                "lifetime": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "persist start: seconds before the job is stopped (default 3600)"},
+                "persist": {"type": "boolean", "description": "Durable pipe job until `lifetime`; pass true on every call; no pty/stdin/ready. Unix and Windows; it survives Dial restarts."},
+                "lifetime": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "persist start: seconds until stopped (default 3600)"},
                 "pty": {"type": "boolean", "description": "start: run in a terminal (default false); enables input"},
                 "stdin": {"type": "boolean", "description": "start without PTY: keep a stdin pipe open (default false)"},
                 "rows": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY rows (default 24)"},
                 "cols": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY columns (default 80)"},
                 "text": {"type": "string", "description": "input: exact UTF-8 (max 64 KiB), no newline added; may hold control characters"},
-                "ready": {"type": "object", "additionalProperties": false, "description": "named start/wait: both conditions when both are given", "properties": {
+                "ready": {"type": "object", "additionalProperties": false, "description": "start/wait: log regex and/or owned port (host needs port); both must hold. Needs a named job.", "properties": {
                     "log": {"type": "string", "description": "regex in the job's output"},
                     "host": {"type": "string", "description": "numeric IP (default 127.0.0.1); needs port"},
                     "port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "TCP listener owned by the job; needs network approval (not for an unsandboxed job on loopback)"},

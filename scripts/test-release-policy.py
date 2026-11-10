@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Offline behavioral regression coverage for release admission and latest selection."""
 import importlib.util
+import base64
+import hashlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
+import textwrap
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -138,7 +143,7 @@ class ReleaseReadinessTests(unittest.TestCase):
     def release(self, *args, env_updates=None):
         scripts = self.root / "scripts"
         scripts.mkdir(exist_ok=True)
-        for name in ("release.sh", "release-policy.py"):
+        for name in ("release.sh", "release-policy.py", "check-packaging.py"):
             shutil.copy2(SCRIPT.with_name(name), scripts / name)
         tools = self.root / "bin"
         tools.mkdir(exist_ok=True)
@@ -173,6 +178,49 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertEqual((self.root / "calls").read_text().splitlines(),
                          ["git rev-parse --show-toplevel", "cargo update --workspace --offline"] * 2)
         self.assertEqual((self.root / "Cargo.toml").read_text(), self.manifest)
+        log = (self.root / "CHANGELOG.md").read_text()
+        self.assertIn("[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.3.0...HEAD", log)
+        self.assertEqual(log.count("[0.3.0]:"), 1)
+        result = self.release("0.3.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "CHANGELOG.md").read_text(), log)
+
+    def test_new_release_repairs_links_and_preserves_historical_commit_references(self):
+        path = self.root / "CHANGELOG.md"
+        history = "[0.1.0]: https://github.com/KiidxAtlas/dial/commit/198734a\n"
+        path.write_text('## [Unreleased]\n\n- New change.\n\n## [0.3.0]\n\n- Old notes.\n'
+                        '\n## [0.1.0]\n\n- Historical notes.\n\n' + history +
+                        '[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.2.0...HEAD\n')
+        # The Cargo shim does not resolve dependencies; supply the resolver's expected output.
+        lock = self.root / "Cargo.lock"
+        lock.write_text(lock.read_text().replace('"0.3.0"', '"0.4.0"'))
+        result = self.release("0.4.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        prepared = path.read_text()
+        self.assertIn('version = "0.4.0"', (self.root / "Cargo.toml").read_text())
+        self.assertIn("## [0.4.0] - ", prepared)
+        self.assertIn("- New change.", policy.release_notes("v0.4.0", prepared))
+        self.assertIn(history, prepared)
+        self.assertIn("[Unreleased]: https://github.com/KiidxAtlas/dial/compare/v0.4.0...HEAD", prepared)
+        self.assertIn("[0.3.0]: https://github.com/KiidxAtlas/dial/tree/v0.3.0", prepared)
+        result = self.release("0.4.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(path.read_text(), prepared)
+
+    def test_invalid_changelog_references_do_not_write_either_source_file(self):
+        for source in ('', '## [Unreleased]\n\n[Unreleased]: https://example.com\n',
+                       '## [Unreleased]\n- New.\n## [0.3.0]\n- Old.\n'
+                       '[0.3.0]: https://example.com/one\n[0.3.0]: https://example.com/two\n',
+                       '## [Unreleased]\n- New.\n## [0.3.0]\n- Old.\n[0.3.0]: broken\n'):
+            with self.subTest(source=source):
+                path = self.root / "CHANGELOG.md"
+                path.write_text(source)
+                result = self.release("0.4.0")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((self.root / "Cargo.toml").read_text(), self.manifest)
+                self.assertEqual(path.read_text(), source)
+                self.assertFalse(any(line.startswith("cargo ") for line in
+                                     (self.root / "calls").read_text().splitlines()))
 
     def test_prepare_refusal_does_not_partially_bump_manifest(self):
         result = self.release("0.4.0")  # Unreleased is empty.
@@ -235,7 +283,8 @@ class SigningReadinessTests(unittest.TestCase):
 class WindowsReleaseTests(unittest.TestCase):
     def test_windows_release_needs_no_azure_but_still_enters_signed_manifest(self):
         workflow = (SCRIPT.parent.parent / ".github/workflows/release.yml").read_text()
-        build = workflow.split("\n  windows-build:\n", 1)[1].split("\n  sign:\n", 1)[0]
+        candidates = (SCRIPT.parent.parent / ".github/workflows/release-build.yml").read_text()
+        build = candidates.split("\n  windows-build:\n", 1)[1]
         manifest = workflow.split("\n  sign:\n", 1)[1].split("\n  publish:\n", 1)[0]
         self.assertIn("name: release-assets-${{ matrix.target }}", build)
         self.assertIn("Test installer under Windows PowerShell 5.1", build)
@@ -244,11 +293,188 @@ class WindowsReleaseTests(unittest.TestCase):
         self.assertNotIn("\n  windows-sign:\n", workflow)
         self.assertNotIn("azure/artifact-signing-action@", workflow)
         self.assertNotIn("DIAL_WINDOWS_", workflow)
-        self.assertIn("needs: [build, windows-build]", manifest)
+        self.assertIn("needs: [gate, signing-ready, build]", manifest)
+        self.assertIn("needs.gate.result == 'success'", manifest)
+        self.assertIn("needs.signing-ready.result == 'success'", manifest)
+        self.assertIn("needs.build.result == 'success' || needs.build.result == 'skipped'", manifest)
         self.assertIn("pattern: release-assets-*", manifest)
         self.assertIn("environment: release-signing", manifest)
         self.assertIn("openssl pkeyutl -sign", manifest)
         self.assertIn("dist/SHA256SUMS", manifest)
+
+
+class CandidatePromotionTests(unittest.TestCase):
+    def test_ci_run_selection_never_promotes_pr_failed_or_other_commit(self):
+        good = dict(event="push", headBranch="main", headSha="abc", status="completed",
+                    conclusion="success", databaseId=123)
+        self.assertEqual(policy.successful_ci_run_id([good], "abc"), 123)
+        for changes in ({"event": "pull_request"}, {"headBranch": "other"}, {"headSha": "other"},
+                        {"status": "in_progress"}, {"conclusion": "failure"},
+                        {"databaseId": "123"}, {"databaseId": True}, {"databaseId": 0}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                policy.successful_ci_run_id([{**good, **changes}], "abc")
+
+    def test_all_eight_unexpired_platforms_and_identity_are_required(self):
+        artifacts = [dict(name=f"release-assets-{target}", expired=False) for target in policy.RELEASE_TARGETS]
+        artifacts.append(dict(name="release-assets-identity", expired=False))
+        self.assertTrue(policy.complete_candidate_artifacts([{"artifacts": artifacts[:4]}, {"artifacts": artifacts[4:]}]))
+        for invalid in (artifacts[:-1], artifacts[1:], artifacts + [artifacts[0]],
+                        [{**a, "expired": True} for a in artifacts],
+                        [{"name": a["name"]} for a in artifacts]):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(policy.complete_candidate_artifacts([{"artifacts": invalid}]))
+
+    def test_identity_cli_refuses_commit_version_and_public_key_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "candidate.json"
+            expected = dict(revision="abc", tag="v0.3.0", public_key="public-fixture")
+            for changes in ({}, {"revision": "other"}, {"tag": "v0.3.1"}, {"public_key": "changed"}):
+                path.write_text(json.dumps({**expected, **changes}))
+                result = subprocess.run([sys.executable, str(SCRIPT), "identity", "abc", str(path)],
+                                        env=dict(os.environ, RELEASE_TAG="v0.3.0", DIAL_RELEASE_PUBLIC_KEY="public-fixture"),
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, not changes, result.stderr)
+
+    def test_main_only_candidates_keep_private_keys_out_and_allow_safe_fallback(self):
+        root = SCRIPT.parent.parent
+        ci = (root / ".github/workflows/ci.yml").read_text()
+        candidates = (root / ".github/workflows/release-build.yml").read_text()
+        release = (root / ".github/workflows/release.yml").read_text()
+        self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/main'", ci)
+        self.assertIn("uses: ./.github/workflows/release-build.yml", ci)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", candidates)
+        self.assertNotIn("secrets.", candidates)
+        self.assertNotIn("environment: release-signing", candidates)
+        self.assertEqual(candidates.count("            target:"), len(policy.RELEASE_TARGETS))
+        for target in policy.RELEASE_TARGETS:
+            self.assertIn(f"target: {target}", candidates)
+        self.assertIn("if: needs.gate.outputs.candidates == ''", release)
+        self.assertIn("run-id: ${{ needs.gate.outputs.candidates }}", release)
+        self.assertIn('identity "$GITHUB_SHA" dist/candidate.json', release)
+        self.assertIn("file: Dockerfile.release", release)
+        self.assertIn("Smoke-test published container", release)
+
+    def test_intel_pip_cache_is_lock_keyed_main_only_and_keeps_hash_checks(self):
+        root = SCRIPT.parent.parent
+        for filename, job in (("ci.yml", "test"), ("release-build.yml", "build")):
+            with self.subTest(workflow=filename):
+                source = (root / ".github/workflows" / filename).read_text()
+                block = source.split(f"\n  {job}:\n", 1)[1].split("\n\n  ", 1)[0]
+                setup = block.split("uses: actions/setup-python@", 1)[1].split("\n      - ", 1)[0]
+                self.assertIn("python-version: '3.12'", setup)
+                self.assertIn("cache: ${{ github.ref == 'refs/heads/main' && runner.os == 'macOS' && runner.arch == 'X64' && 'pip' || '' }}", setup)
+                self.assertIn("cache-dependency-path: scripts/requirements-ci.lock", setup)
+                self.assertIn("--require-hashes -r scripts/requirements-ci.lock", block)
+
+
+class ContainerStagingTests(unittest.TestCase):
+    def setUp(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.key = Ed25519PrivateKey.generate()
+        self.public = self.key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+        self.tag = "v0.3.0"
+        self.package = f"dial-{self.tag}-x86_64-unknown-linux-gnu"
+        self.archive = self.root / f"{self.package}.tar.gz"
+        spec = importlib.util.spec_from_file_location("stage_container", SCRIPT.with_name("stage-container.py"))
+        self.stage = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.stage)
+
+    def archive_and_sign(self, extra=None, missing=None):
+        with tarfile.open(self.archive, "w:gz") as archive:
+            for name in sorted(self.stage.FILES - {missing}):
+                data = ("#!/bin/sh\necho 'dial 0.3.0'\n" if name == "dial" else name + "\n").encode()
+                member = tarfile.TarInfo(f"{self.package}/{name}")
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+            if extra is not None:
+                archive.addfile(extra, io.BytesIO(b""))
+        digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
+        self.sign(f"{digest}  {self.archive.name}\n".encode())
+
+    def sign(self, manifest):
+        (self.root / "SHA256SUMS").write_bytes(manifest)
+        (self.root / "SHA256SUMS.sig").write_bytes(base64.b64encode(self.key.sign(manifest)))
+
+    def test_known_archive_round_trip_and_cli(self):
+        self.archive_and_sign()
+        destination = self.root / "context"
+        result = subprocess.run([sys.executable, str(SCRIPT.with_name("stage-container.py")), str(self.root), str(destination)],
+                                env=dict(os.environ, RELEASE_TAG=self.tag, DIAL_RELEASE_PUBLIC_KEY_PEM=self.public),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({p.name for p in destination.iterdir()}, self.stage.FILES)
+        self.assertEqual((destination / "dial").read_bytes(), b"#!/bin/sh\necho 'dial 0.3.0'\n")
+        self.assertEqual((destination / "dial").stat().st_mode & 0o777, 0o755)
+        with self.assertRaises(ValueError):
+            self.stage.stage(self.root, destination, self.tag, self.public)
+
+    def test_signature_digest_and_duplicate_manifest_entries_fail_closed(self):
+        self.archive_and_sign()
+        manifest = (self.root / "SHA256SUMS").read_bytes()
+        cases = ("signature", "digest", "duplicate")
+        for case in cases:
+            self.archive_and_sign()
+            if case == "signature":
+                (self.root / "SHA256SUMS.sig").write_bytes(base64.b64encode(b"x" * 64))
+            elif case == "digest":
+                self.archive.write_bytes(self.archive.read_bytes() + b"tampered")
+            else:
+                self.sign(manifest * 2)
+            destination = self.root / case
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                self.stage.stage(self.root, destination, self.tag, self.public)
+            self.assertFalse(destination.exists())
+
+    def test_missing_traversal_and_symlink_archive_members_are_refused(self):
+        traversal = tarfile.TarInfo("../escape")
+        link = tarfile.TarInfo(f"{self.package}/unexpected")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../../escape"
+        for index, (extra, missing) in enumerate(((None, "LICENSE"), (traversal, None), (link, None))):
+            self.archive_and_sign(extra=extra, missing=missing)
+            destination = self.root / str(index)
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.stage.stage(self.root, destination, self.tag, self.public)
+            self.assertFalse(destination.exists())
+        self.assertFalse((self.root.parent / "escape").exists())
+
+    def test_release_image_preserves_runtime_without_a_compiler(self):
+        root = SCRIPT.parent.parent
+        source = (root / "Dockerfile").read_text().split("FROM debian:", 1)[1]
+        release = (root / "Dockerfile.release").read_text().split("FROM debian:", 1)[1]
+        expected = source.replace("COPY --from=build /out/dial", "COPY dial").replace(
+            "crates/dial-agent/src/agent/compact/snapcompact/fonts/", "")
+        self.assertEqual(release, expected)
+        self.assertNotIn("cargo", release)
+
+
+class WebsiteRefreshTests(unittest.TestCase):
+    def test_refresh_diagnoses_missing_endpoint_auth_and_stale_version_without_hiding_failures(self):
+        workflow = (SCRIPT.parent.parent / ".github/workflows/release.yml").read_text()
+        job = workflow.split("\n  website:\n", 1)[1].split("\n  packaging:\n", 1)[0]
+        script = textwrap.dedent(job.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            curl = root / "curl"
+            curl.write_text('#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\nif [ "$1" = --output ]; then shift; out="$1"; fi\nshift\ndone\nprintf \'{"version":"%s"}\' "$SITE_VERSION" > "$out"\nprintf "%s" "$HTTP_STATUS"\n')
+            curl.chmod(0o755)
+            for status, version, token, success in (("200", "v0.3.0", "fixture-token", True),
+                    ("404", "v0.3.0", "fixture-token", False), ("401", "v0.3.0", "fixture-token", False),
+                    ("200", "v0.2.9", "fixture-token", False), ("200", "v0.3.0", "", False)):
+                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                    env=dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
+                        RUNNER_TEMP=str(root), GITHUB_STEP_SUMMARY=str(root / "summary"),
+                        RELEASE_TAG="v0.3.0", SITE_VERSION=version, HTTP_STATUS=status, DIAL_WEB_REFRESH_TOKEN=token))
+                with self.subTest(status=status, version=version, configured=bool(token)):
+                    self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+                    self.assertNotIn("fixture-token", result.stdout + result.stderr)
+                    if status == "404":
+                        self.assertIn("NUXT_RELEASE_REFRESH_TOKEN", result.stdout)
+                        self.assertIn("Rerun this failed job only", result.stdout)
 
 
 if __name__ == "__main__":

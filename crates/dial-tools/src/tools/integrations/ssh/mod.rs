@@ -4,6 +4,7 @@ use crate::config::tools::ssh::SshConfig;
 mod config;
 mod connection;
 pub(crate) mod process;
+mod sftp;
 pub mod url;
 
 use super::ext::{Tool, ToolContext};
@@ -92,7 +93,10 @@ pub(crate) fn read_url(
             user_dir: user_dir.to_path_buf(),
             config: ssh.clone(),
         };
-        let shell = transfer_shell(&target, &settings, cancel)?;
+        let Some(shell) = transfer_shell(&target, &settings, cancel)? else {
+            return sftp::transfer(&target, &settings, &url.path, None, cancel)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        };
         let command = shell.wrap(&format!("cat -- {}", url.path.shell_word()));
         let done = connection::capture(
             &target,
@@ -138,7 +142,9 @@ pub(crate) fn write_url(
         user_dir: user_dir.to_path_buf(),
         config: ssh.clone(),
     };
-    let shell = transfer_shell(&target, &settings, cancel)?;
+    let Some(shell) = transfer_shell(&target, &settings, cancel)? else {
+        return sftp::transfer(&target, &settings, &url.path, Some(bytes), cancel).map(|_| ());
+    };
     let script = write_script(&url.path.shell_word());
     let command = shell.wrap(&script);
     let args = connection::remote_args(&target, &settings, &command, true)?;
@@ -164,25 +170,22 @@ fn write_script(path: &str) -> String {
     )
 }
 
-/// Verified connection plus the POSIX shell that runs transfer snippets. A host without one
-/// (Windows without a compat layer) is refused rather than sent a script its shell cannot parse.
+/// Verified connection and optional POSIX shell. Windows hosts without one use SFTP.
 fn transfer_shell(
     target: &Target,
     settings: &Settings,
     cancel: &AtomicBool,
-) -> Result<PosixShell, String> {
+) -> Result<Option<PosixShell>, String> {
     connection::ensure_connection(target, settings, cancel)?;
     let info = connection::host_info(target, settings, cancel)?;
-    info.transfer_shell.ok_or_else(|| match info.os {
-        Os::Windows => format!(
-            "SSH URL transfers are not supported on Windows host {} without a POSIX shell",
-            target.name
-        ),
-        _ => format!(
+    match (info.transfer_shell, info.os) {
+        (Some(shell), _) => Ok(Some(shell)),
+        (None, Os::Windows) => Ok(None),
+        _ => Err(format!(
             "no verified POSIX shell for SSH URL transfers on {}",
             target.name
-        ),
-    })
+        )),
+    }
 }
 pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(SshTool {

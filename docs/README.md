@@ -66,6 +66,7 @@ not by crate ownership. In the terminal, `/help <topic>` prints a focused docume
 - [Benchmarks and measurement](benchmarks.md) — Run benchmark suites and inspect evaluation reports.
 - [Surface inventory, November 2026](plans/surface-inventory-2026-11.md) — Review experimental flags and optional modes with the evidence available for each.
 - [Client compatibility and conformance](client-contracts.md) — Understand client-facing contracts and protocol behavior.
+- [Public API compatibility](compatibility.md) — Review retained Rust exports, deprecations and migration paths.
 - [Experimental evidence foundation](evidence.md) — Understand evidence identity, retention and verification boundaries.
 - [LLM transport behavior](llm-transport.md) — Inspect model protocols, request profiles, caching and retries.
 - [Requirement-aware evidence](requirement-verification.md) — Understand requirements, checks and recorded acceptance evidence.
@@ -80,21 +81,23 @@ not by crate ownership. In the terminal, `/help <topic>` prints a focused docume
 
 ## Known limits
 
-- Tool-calling quality depends on the model. 7B-class instruct models handle the tool set; sub-1B
-  models often emit unreadable calls (which become training signal rather than being hidden).
+- Tool-calling quality depends on the model and workload. Small local models can produce broken
+  calls; if results are poor, try a larger model. Parameter count alone does not guarantee reliability.
 - Local MLX inference and training require Apple Silicon. Intel Macs and Linux/WSL2 use hosted or
   OpenAI-compatible providers, or GGUF through llama.cpp.
 - Local compute is serialized across projects by default; see **Compute locks** in
   [Provider and model catalog](provider-catalog.md). Dial makes no claim of zero-downtime training.
 - Not every terminal supports modified Enter keys. `dial schedule` handles scheduling but does not
-  install a daemon. The browser and `eval` tools require OS containment and fail closed without it.
+  install a daemon.
 - Live memory and skill edits are your working state and are not gated; only the admitted harness is.
 - Operator tools are trusted programs and are not sandboxed during live work; they are excluded from
   automatic evaluation. `bash` runs unconfined by default. With `sandbox.mode = "dev"` or
   `"strict"` on macOS and Linux/WSL2 it runs inside the OS sandbox (Linux needs bubblewrap and
   unprivileged user namespaces, and refuses to run commands without them rather than falling
-  back). Windows has no sandbox backend, so `bash` there runs only with `sandbox.mode = "off"`;
-  generated evaluations always require the strict sandbox.
+  back). Windows supports `dev` through Low integrity, but cannot confine general reads or network
+  access and refuses `strict`; see [Windows security](windows.md#security). Browser and `eval`
+  containment requirements are platform-specific; see [execution tools](execution-and-web.md).
+  Generated evaluations always require the strict sandbox.
 
 See also [Architecture](../ARCHITECTURE.md) for crate ownership and invariants, and
 [contributor notes](../AGENTS.md) for repository conventions and checks.

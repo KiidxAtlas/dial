@@ -16,6 +16,7 @@ pub enum Scheme {
     Issue,
     Conflict,
     Artifact,
+    System,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +24,8 @@ pub enum Provenance {
     Workspace,
     Remote,
     ImmutableArtifact,
+    /// Live, read-only state of the machine Dial runs on.
+    Host,
 }
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Descriptor {
@@ -75,6 +78,13 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         accepts_line_arguments: true,
         requires_network: false,
     },
+    Descriptor {
+        scheme: Scheme::System,
+        prefix: "sys://",
+        provenance: Provenance::Host,
+        accepts_line_arguments: false,
+        requires_network: false,
+    },
 ];
 
 pub fn descriptor(scheme: Scheme) -> &'static Descriptor {
@@ -101,8 +111,9 @@ pub fn scheme(input: &str) -> Result<Scheme, String> {
                 artifact_target(input)?;
                 Ok(Scheme::Artifact)
             }
+            "sys" => Ok(Scheme::System),
             _ => Err(format!(
-                "unsupported resource scheme {prefix:?}; use a workspace path, ssh://, pr://, issue://, conflict:// or artifact://"
+                "unsupported resource scheme {prefix:?}; use a workspace path, ssh://, pr://, issue://, conflict://, artifact:// or sys://"
             )),
         };
     }

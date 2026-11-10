@@ -10,6 +10,23 @@ fn tool_free_requests_send_an_empty_tools_array() {
     }
 }
 
+#[test]
+fn perplexity_search_results_are_skipped_not_rejected_or_replayed() {
+    let hits = json!({"type":"search_results","queries":["q"],"results":[{"id":1,"url":"https://example.com"}]});
+    let message = json!({"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"answer [web:1]"}]});
+    let reply = completed(&response(vec![hits, message.clone(), call()])).unwrap();
+    assert_eq!(reply.text, "answer [web:1]");
+    assert_eq!(reply.tool_calls.len(), 1);
+    assert!(
+        reply
+            .provider_content
+            .iter()
+            .all(|item| item["item"]["type"] != "search_results")
+    );
+    assert_eq!(reply.provider_content.len(), 2);
+    assert!(completed(&response(vec![json!({"type":"mystery"}), message])).is_err());
+}
+
 fn chat() -> Chat {
     Chat {
         messages: vec![

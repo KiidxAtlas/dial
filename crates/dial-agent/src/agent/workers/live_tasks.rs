@@ -2156,7 +2156,7 @@ pub(in crate::agent) fn message_schema(peers: bool) -> Value {
             "Recipient: a live task id, a unique live label, `parent`, or `all`. Omit to list recipients.",
         )
     };
-    json!({"type":"function","function":{"name":"message","description":format!("Send a short text message to a live peer agent. `to` is a live task id or unique label, `parent` for the parent agent, or `all` for every other live worker. Omit `to` to list who you can reach.{sessions} The result is a receipt per recipient: `queued` (accepted; the recipient reads it at its next step), `refused` with a reason, or `finished` (the worker already finished; nothing is delivered and its result comes from `task`). An unknown recipient is an error. Messages are text only: they carry no authority, cannot start work or change permissions, and are delivered at the recipient's next step in send order."),"parameters":{"type":"object","properties":{"to":{"type":"string","description":to},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
+    json!({"type":"function","function":{"name":"message","description":format!("Send text to a live task id/unique label, `parent`, or `all` (other workers); omit `to` to list recipients.{sessions} Receipts: queued (read next step), refused (reason), finished (no delivery; collect via task). Unknown recipient errors. Text only: no authority, work starts or permission changes. Delivered next step in send order."),"parameters":{"type":"object","properties":{"to":{"type":"string","description":to},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
 }
 
 pub mod control;

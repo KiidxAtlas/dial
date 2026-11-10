@@ -704,9 +704,9 @@ impl Tool for Computer {
                             "type": "string",
                             "enum": ["run", "call", "capabilities", "close"]
                         },
-                        "code": {"type": "string"},
-                        "fn": {"type": "string"},
-                        "args": {"type": "array", "items": {}},
+                        "code": {"type": "string", "description": "run: JavaScript function body with desktop, wait and assert in scope. Example: return await desktop.windows(); Do not put an arrow/function definition here; use fn instead. Supply exactly one of code or fn."},
+                        "fn": {"type": "string", "description": "run: function source invoked with ({ desktop, wait, assert }, ...args), e.g. async ({ desktop }) => await desktop.windows(). Use this for arrow/function definitions, not code. Supply exactly one of code or fn."},
+                        "args": {"type": "array", "items": {}, "description": "run with fn: positional arguments after the first scope object ({ desktop, wait, assert }). Not an input controller."},
                         "read_only": {"type": "boolean", "description": "Disable desktop input helpers only; advisory, not a JavaScript sandbox. Run code still requires execution approval and can use Node APIs."},
                         "chain": {
                             "type": "array",

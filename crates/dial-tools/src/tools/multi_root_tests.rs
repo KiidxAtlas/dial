@@ -124,7 +124,11 @@ fn write_outside_every_root_is_blocked_with_no_effects() {
         output.text
     );
     assert_eq!(output.execution.effects, Effects::None);
-    assert!(output.text.contains("request_directory"), "{}", output.text);
+    assert!(
+        output.text.contains("`ask` action=directory"),
+        "{}",
+        output.text
+    );
     assert!(!target.exists());
     ws.add_root(other.path()).unwrap();
     let output = run(&ws, "write", json!({"path": target, "content": "x"}));

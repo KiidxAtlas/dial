@@ -181,7 +181,7 @@ fn discovery_results_state_load_status_and_the_exact_next_action() {
                 let (status, next) = if entry["enabled_next_round"] == true {
                     ("loaded_next_request", "exact name on the next request")
                 } else {
-                    ("not_loaded", "tool_load")
+                    ("not_loaded", "tool_search")
                 };
                 assert_eq!(entry["status"], status, "{entry:?}");
                 assert!(
@@ -332,7 +332,7 @@ fn listing_reports_status_and_never_activates_or_grants_eligibility() {
                 let (status, next) = if loaded {
                     ("offered", "exact name")
                 } else {
-                    ("not_loaded", "tool_load")
+                    ("not_loaded", "tool_search")
                 };
                 assert_eq!(entry["enabled_next_round"], loaded, "{entry:?}");
                 assert_eq!(entry["status"], status, "{entry:?}");
@@ -573,19 +573,33 @@ fn explicit_loading_keeps_large_eligible_selections_and_complete_receipts() {
         |agent| {
             register_probes(agent, "many_", 70);
             let names: Vec<_> = (0..70).map(|index| format!("many_{index:02}")).collect();
+            // `names` is bounded at 32 per call (the model-facing contract); a large selection
+            // arrives over several calls, each with a complete receipt, and all of it stays offered.
+            for batch in names.chunks(32) {
+                let output = crate::agent::run::tool_exposure::default_offer_tests::load_tools(
+                    agent,
+                    json!({"names":batch}),
+                );
+                assert!(!output.is_error, "{}", output.text);
+                let entries = output.data.as_ref().unwrap()["tools"].as_array().unwrap();
+                assert_eq!(entries.len(), batch.len());
+                for (entry, name) in entries.iter().zip(batch) {
+                    assert_eq!(entry["name"], *name);
+                    assert_eq!(entry["enabled_next_round"], true);
+                }
+            }
+            let offered = agent.offered();
+            for name in &names {
+                assert!(offered.contains(name), "{name}");
+            }
             let output = crate::agent::run::tool_exposure::default_offer_tests::load_tools(
                 agent,
                 json!({"names":names}),
             );
-            assert!(!output.is_error, "{}", output.text);
-            let entries = output.data.as_ref().unwrap()["tools"].as_array().unwrap();
-            assert_eq!(entries.len(), names.len());
-            let offered = agent.offered();
-            for (entry, name) in entries.iter().zip(&names) {
-                assert_eq!(entry["name"], *name);
-                assert_eq!(entry["enabled_next_round"], true);
-                assert!(offered.contains(name), "{name}");
-            }
+            assert!(
+                output.is_error,
+                "names beyond the declared bound are refused"
+            );
         },
     );
 }

@@ -168,7 +168,7 @@ enum BusyChoice {
 pub enum SteerStage {
     /// Typed here; the agent has not taken it yet (it acts at the next safe point).
     Pending,
-    /// The agent took it. Any stale model reply is being cancelled; running tools finish.
+    /// The controller took it; delivery or local replanning has not yet been confirmed.
     Received,
     /// Recorded as the current instruction (steering) or a worker was started (independent).
     Applied,
@@ -2301,13 +2301,13 @@ impl Composer {
                     ),
                     (SteerKind::Steer, SteerStage::Received) => (
                         "Steer",
-                        "received · stale reply cancelled, running tools finish",
+                        "received · awaiting a safe-point decision",
                         Tok::Accent,
                         Sym::Working,
                     ),
                     (SteerKind::Steer, SteerStage::Applied) => (
                         "Steer",
-                        "applied · now the current instruction",
+                        "recorded · now the current instruction",
                         Tok::Success,
                         Sym::Check,
                     ),

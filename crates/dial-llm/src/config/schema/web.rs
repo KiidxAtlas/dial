@@ -9,7 +9,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         TO,
         "Web",
         "Request timeout",
-        "Seconds one web_fetch or web_search request may take in total, redirects included. Raise it for slow documentation hosts; reading a URL through `read` keeps the 30-second default.",
+        "Seconds one web_search request or `read` fetch=true page fetch may take in total, redirects included. Raise it for slow documentation hosts; reading a URL through `read` without fetch keeps the 30-second default.",
         Kind::Int {
             min: 1,
             max: 600,

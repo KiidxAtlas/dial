@@ -9,6 +9,7 @@ mod automatic;
 mod benchmark;
 mod build_info;
 mod cli_print;
+mod compatibility;
 mod hashline;
 mod isolation;
 mod proposals;

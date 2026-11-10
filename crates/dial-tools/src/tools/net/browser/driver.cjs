@@ -678,11 +678,20 @@ async function run(request) {
   }
   return {tab:request.tab,frame:tab.frames.get(scope),url:clip(scope.url()),action:request.action,completed:true};
 }
-function failureMessage(error, id) {
-  const evidence = [...tabs].map(([tab,t]) => ({tab,url:clip(t.page.url()),console:t.console.slice(-10),network:t.network.slice(-20),network_failures:(t.networkFailures || []).slice(-10),dialogs:t.dialogs.slice(-10),downloads:t.downloads.slice(-10)}));
-  const failures = evidence.flatMap(tab=>tab.network_failures).filter(event=>event.operation_id===id);
+// Evidence from this operation only, plus the acted-on tab's recent tail. Other tabs' background
+// noise (a stale dev server's HMR retries, requests blocked between operations) is counted, not dumped.
+function failureMessage(error, id, target) {
+  const pick = (tab, list, limit) => (tab === target ? list : list.filter(event => event.operation_id === id)).slice(-limit);
+  let quiet = 0;
+  const evidence = [...tabs].flatMap(([tab,t]) => {
+    const entry = {tab,url:clip(t.page.url()),console:pick(tab,t.console,10),network:pick(tab,t.network,20),network_failures:pick(tab,t.networkFailures || [],10),dialogs:pick(tab,t.dialogs,10),downloads:pick(tab,t.downloads,10)};
+    if (tab !== target && !['console','network','network_failures','dialogs','downloads'].some(channel => entry[channel].length)) { quiet++; return []; }
+    return [entry];
+  });
+  const failures = [...tabs].flatMap(([,t]) => t.networkFailures || []).filter(event=>event.operation_id===id);
   const reason = failures.at(-1)?.error;
-  return cut((reason ? 'Browser network failure: '+reason+'\n' : '') + String(error.stack || error) + '\nBrowser failure evidence (untrusted page data): ' + JSON.stringify(evidence), 20000);
+  const omitted = quiet ? `\n${quiet} other open tab(s) recorded nothing during this operation and are omitted; their earlier events are unrelated to this failure (use action "events" with that tab to inspect them).` : '';
+  return cut((reason ? 'Browser network failure: '+reason+'\n' : '') + String(error.stack || error) + '\nBrowser failure evidence (untrusted page data): ' + JSON.stringify(evidence) + omitted, 20000);
 }
 function artifactsDir() {
   const dir = process.env.DIAL_BROWSER_ARTIFACTS;
@@ -761,7 +770,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
       await send({id:request.id,result});
     }
     catch (error) {
-      try { await send({id:request.id,result:{browser_error:failureMessage(error,request.id)}}); }
+      try { await send({id:request.id,result:{browser_error:failureMessage(error,request.id,request.tab)}}); }
       catch (_) { process.exit(1); }
     } finally {
       operationId = 0;

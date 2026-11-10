@@ -271,8 +271,8 @@ pub trait Ui {
     }
     /// Independent messages that could not start a worker. Surfaces keep them for after the turn.
     fn defer_pending_messages(&mut self, _messages: Vec<String>) {}
-    /// A steering message was journaled as the current instruction. Only called once it is
-    /// recorded, so surfaces can show "applied" truthfully.
+    /// A steering message was journaled as the current instruction. This confirms controller
+    /// state, not provider receipt, generation cancellation, or model compliance.
     fn steering_applied(&mut self, _text: &str) {}
     /// An undecided message was accepted for routing; surfaces can show it exactly once.
     fn pending_message_accepted(&mut self, _text: &str) {}

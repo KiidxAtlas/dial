@@ -462,6 +462,9 @@ fn read_target(
     if scheme == crate::tools::integrations::resources::Scheme::Conflict {
         return super::conflicts::read(ws, input, args, cancel, budget);
     }
+    if scheme == crate::tools::integrations::resources::Scheme::System {
+        return super::system::read(input, cancel);
+    }
     if let Some(path_text) = super::outline::target(ws, input) {
         if present(args, "offset") || present(args, "limit") {
             return Err("`:outline` does not accept offset/limit".into());
@@ -538,6 +541,35 @@ fn read_paths(
     cancel: &std::sync::atomic::AtomicBool,
     budget: usize,
 ) -> Result<String, String> {
+    read_paths_outcomes(ws, args, paths, cancel, budget).map(|(text, _)| text)
+}
+
+/// What happened to one `paths` target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::tools) enum TargetStatus {
+    Read,
+    Failed,
+    /// Not attempted: the shared output budget was spent.
+    Omitted,
+}
+
+impl TargetStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Failed => "failed",
+            Self::Omitted => "omitted",
+        }
+    }
+}
+
+fn read_paths_outcomes(
+    ws: &Workspace,
+    args: &Value,
+    paths: &Value,
+    cancel: &std::sync::atomic::AtomicBool,
+    budget: usize,
+) -> Result<(String, Vec<(String, TargetStatus)>), String> {
     if present(args, "path") {
         return Err("pass either path or paths, not both".into());
     }
@@ -550,12 +582,14 @@ fn read_paths(
             "paths accepts at most {MAX_READ_PATHS} targets; split the read"
         ));
     }
+    let targets = targets
+        .iter()
+        .map(|target| target.as_str().ok_or("paths must contain only strings"))
+        .collect::<Result<Vec<_>, _>>()?;
     let total = budget.min(MAX_READ_PATHS_BYTES);
     let mut out = String::new();
-    for (index, target) in targets.iter().enumerate() {
-        let Some(path) = target.as_str() else {
-            return Err("paths must contain only strings".into());
-        };
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for (index, path) in targets.iter().enumerate() {
         // Room left for this target; too little to show a row is left for a separate call.
         let Some(room) = total
             .checked_sub(out.len())
@@ -565,6 +599,11 @@ fn read_paths(
                 "[{} remaining paths omitted: output limit reached; read them in a separate call]",
                 targets.len() - index
             ));
+            outcomes.extend(
+                targets[index..]
+                    .iter()
+                    .map(|path| (path.to_string(), TargetStatus::Omitted)),
+            );
             break;
         };
         let mut single = args.clone();
@@ -572,13 +611,58 @@ fn read_paths(
             object.remove("paths");
             object.insert("path".into(), Value::String(path.to_string()));
         }
-        match read_tool_streaming(ws, &single, cancel, room) {
-            Ok(text) => out.push_str(&text),
-            Err(error) => out.push_str(&format!("[{path}] error: {error}")),
-        }
+        let status = match read_tool_streaming(ws, &single, cancel, room) {
+            Ok(text) => {
+                out.push_str(&text);
+                TargetStatus::Read
+            }
+            Err(error) => {
+                out.push_str(&format!("[{path}] error: {error}"));
+                TargetStatus::Failed
+            }
+        };
+        outcomes.push((path.to_string(), status));
         out.push_str("\n\n");
     }
-    Ok(out.trim_end().to_string())
+    Ok((out.trim_end().to_string(), outcomes))
+}
+
+/// `read` with `paths`: the combined text plus one structured status per target. Partial results
+/// stay successful observations; only a call that read no target at all is an error.
+pub(in crate::tools) fn read_paths_output(
+    ws: &Workspace,
+    args: &Value,
+    cancel: &std::sync::atomic::AtomicBool,
+    budget: usize,
+) -> Result<crate::tools::ToolOutput, String> {
+    let (mut text, outcomes) = read_paths_outcomes(ws, args, &args["paths"], cancel, budget)?;
+    let count = |status| outcomes.iter().filter(|(_, s)| *s == status).count();
+    let (read, failed, omitted) = (
+        count(TargetStatus::Read),
+        count(TargetStatus::Failed),
+        count(TargetStatus::Omitted),
+    );
+    if failed + omitted > 0 {
+        text.push_str(&format!(
+            "\n[paths: {read} read, {failed} failed, {omitted} omitted]"
+        ));
+    }
+    let targets: Vec<Value> = outcomes
+        .iter()
+        .map(|(path, status)| serde_json::json!({"path": path, "status": status.as_str()}))
+        .collect();
+    Ok(crate::tools::ToolOutput {
+        execution: Default::default(),
+        data: Some(serde_json::json!({
+            "targets": targets,
+            "read": read,
+            "failed": failed,
+            "omitted": omitted,
+            "complete": failed + omitted == 0,
+        })),
+        text,
+        is_error: read == 0,
+    })
 }
 
 const MAX_READ_PATHS: usize = 16;

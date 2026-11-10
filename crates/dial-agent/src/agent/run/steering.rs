@@ -159,11 +159,12 @@ impl<'a> Agent<'a> {
         // The drafter needs the backend this stream holds, so with the turn optimizer on every
         // message replans locally and is drafted before the next request.
         let live_key = live_key.filter(|_| !self.turn_optimizer_enabled());
+        let mut local_replan = false;
         for text in self.drain_steering(ui) {
             let Some(message) = self.prepare_steering(&text, ui) else {
                 continue;
             };
-            let ticket = match live_key {
+            let ticket = match live_key.filter(|_| !local_replan) {
                 Some(key) => llm::responses::input_items(std::slice::from_ref(&message))
                     .and_then(|input| llm::codex_ws::submit(key, input)),
                 None => Ok(None),
@@ -176,9 +177,13 @@ impl<'a> Agent<'a> {
                 ticket,
                 deadline: Instant::now() + LIVE_STEER_ACK,
             });
-            if local {
-                return self.replan_live_steering(ui, live);
-            }
+            // Drain the whole batch before returning: returning on the first local message
+            // would drop later instructions already taken from the UI. Once local replay is
+            // needed, preserve the remaining suffix locally rather than steering a stale stream.
+            local_replan |= local;
+        }
+        if local_replan {
+            return self.replan_live_steering(ui, live);
         }
         self.poll_live_steering(ui, live)
     }

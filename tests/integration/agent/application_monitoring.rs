@@ -4,10 +4,10 @@ use super::*;
 #[test]
 fn approved_application_monitor_wakes_and_repairs_under_existing_permissions() {
     let server = serve(vec![
-        Reply::Call("tool_load", json!({"names":["monitor"]})),
+        Reply::Call("tool_search", json!({"names":["bg"]})),
         Reply::Call(
-            "monitor",
-            json!({"action":"start","name":"site","path":"site.log"}),
+            "bg",
+            json!({"action":"watch","name":"site","path":"site.log"}),
         ),
         Reply::Text("Watching for new errors."),
         Reply::Call("read", json!({"path":"app.txt"})),
@@ -79,10 +79,10 @@ fn approved_application_monitor_wakes_and_repairs_under_existing_permissions() {
 #[test]
 fn denied_application_monitor_never_arms_in_auto_mode() {
     let server = serve(vec![
-        Reply::Call("tool_load", json!({"names":["monitor"]})),
+        Reply::Call("tool_search", json!({"names":["bg"]})),
         Reply::Call(
-            "monitor",
-            json!({"action":"start","name":"site","path":"site.log"}),
+            "bg",
+            json!({"action":"watch","name":"site","path":"site.log"}),
         ),
         Reply::Text("Monitoring was declined."),
     ]);
@@ -115,11 +115,8 @@ fn application_monitor_is_revoked_before_attached_root_removal() {
     let path = attached.path().join("site.log");
     std::fs::write(&path, "").unwrap();
     let server = serve(vec![
-        Reply::Call("tool_load", json!({"names":["monitor"]})),
-        Reply::Call(
-            "monitor",
-            json!({"action":"start","name":"site","path":path}),
-        ),
+        Reply::Call("tool_search", json!({"names":["bg"]})),
+        Reply::Call("bg", json!({"action":"watch","name":"site","path":path})),
         Reply::Text("Watching the attached log."),
     ]);
     let mut e = env(&server.url, "auto");

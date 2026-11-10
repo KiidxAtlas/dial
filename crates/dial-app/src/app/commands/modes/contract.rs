@@ -22,7 +22,7 @@ fn kickoff(task: &str) -> String {
     format!(
         "{task}\n\n\
 Work this as a task contract. Before changing anything:\n\
-1. Record the contract with `todo` op `state_update` (load `todo` with `tool_load` if it is not offered); in \
+1. Record the contract with `todo` op `state_update` (load `todo` with `tool_search` names:[\"todo\"] if it is not offered); in \
 `state`, `goal` is the task in one sentence; `constraints` lists what must not change; each \
 \"done when\" condition is one deliverable with status `open`, phrased as an observable check \
 (a test, command or behavior), not as a claim.\n\

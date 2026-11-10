@@ -89,7 +89,39 @@ pub enum QuestionOutcome {
 }
 
 pub fn schema() -> Value {
-    json!({"type":"function","function":{"name":"ask","description":"Ask the actual user one or more clarifying questions. Supports single/multiple choices, descriptions, text previews, Other/custom input, notes and Chat about this. Recommendations are badges, not human answers. Asking grants no filesystem or network permission. Runs exclusively; unattended surfaces abort honestly.","parameters":{"type":"object","properties":{"questions":{"type":"array","minItems":1,"maxItems":MAX_QUESTIONS,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":256},"question":{"type":"string","minLength":1,"maxLength":MAX_TEXT},"header":{"type":"string","maxLength":256},"options":{"type":"array","maxItems":MAX_OPTIONS,"items":{"type":"object","properties":{"label":{"type":"string","minLength":1,"maxLength":1024},"description":{"type":"string","maxLength":MAX_TEXT},"preview":{"type":"string","maxLength":MAX_TEXT}},"required":["label"],"additionalProperties":false}},"multi":{"type":"boolean"},"recommended":{"type":"integer","minimum":0,"maximum":MAX_OPTIONS-1}},"required":["id","question","options"],"additionalProperties":false}}},"required":["questions"],"additionalProperties":false}}})
+    let mut schema = json!({"type":"function","function":{"name":"ask","description":"Ask human questions (no permission grant), or action=directory with path/reason for a yes/no directory-access popup. Existing approvals, sandbox and protected-storage rules remain. sensitive=true requires a SECOND native-file-only approval; never shell or credential access. Exclusive; no unattended approval.","parameters":{"type":"object","properties":{"questions":{"type":"array","minItems":1,"maxItems":MAX_QUESTIONS,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":256},"question":{"type":"string","minLength":1,"maxLength":MAX_TEXT},"header":{"type":"string","maxLength":256},"options":{"type":"array","maxItems":MAX_OPTIONS,"items":{"type":"object","properties":{"label":{"type":"string","minLength":1,"maxLength":1024},"description":{"type":"string","maxLength":MAX_TEXT},"preview":{"type":"string","maxLength":MAX_TEXT}},"required":["label"],"additionalProperties":false}},"multi":{"type":"boolean"},"recommended":{"type":"integer","minimum":0,"maximum":MAX_OPTIONS-1}},"required":["id","question","options"],"additionalProperties":false}}},"additionalProperties":false}}});
+    let properties = schema["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .expect("ask properties");
+    properties.insert("action".into(), json!({"type":"string","enum":["questions","directory"],"description":"questions (default) requires questions; directory requires path and reason."}));
+    let directory = crate::agent::run::directory_access::schema();
+    for (key, value) in directory["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("directory properties")
+    {
+        properties.insert(key.clone(), value.clone());
+    }
+    schema
+}
+
+/// Children can ask the human questions, but cannot change the owner's directory grants.
+pub(in crate::agent) fn child_schema() -> Value {
+    let mut schema = schema();
+    let properties = schema["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .expect("ask properties");
+    for field in ["path", "reason", "sensitive"] {
+        properties.remove(field);
+    }
+    properties.insert(
+        "action".into(),
+        json!({"type":"string","enum":["questions"]}),
+    );
+    schema["function"]["parameters"]["required"] = json!(["questions"]);
+    schema["function"]["description"] = json!(
+        "Ask the actual user clarifying questions with choices, custom input, notes and previews. Questions never grant permission. Unattended surfaces abort honestly."
+    );
+    schema
 }
 
 /// Replace CR runs with one space and strip terminal/control injection, retaining ordinary newlines.
@@ -138,8 +170,9 @@ pub fn prepare(
     if args.to_string().len() > MAX_REQUEST_BYTES {
         return Err("ask arguments exceed 256 KiB".into());
     }
+    let (_, arguments) = crate::tools::surface::facade::owner_view("ask", args);
     let mut args: Arguments =
-        serde_json::from_value(args.clone()).map_err(|e| format!("invalid ask arguments: {e}"))?;
+        serde_json::from_value(arguments).map_err(|e| format!("invalid ask arguments: {e}"))?;
     if args.questions.is_empty() || args.questions.len() > MAX_QUESTIONS {
         return Err("ask needs 1..32 questions".into());
     }

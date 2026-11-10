@@ -191,7 +191,11 @@ fn attention_projects_only_explicit_todo_blockers_and_observed_compute_waits() {
             None,
             None,
         );
-        let blocker = spec.items.iter().find(|item| item.value == "todo").unwrap();
+        let blocker = spec
+            .items
+            .iter()
+            .find(|item| item.value == "todo show 3")
+            .unwrap();
         assert_eq!(blocker.label, "Todo · 3 · blocked");
         assert!(blocker.detail.contains("operator input required"));
         assert_eq!(
@@ -199,7 +203,7 @@ fn attention_projects_only_explicit_todo_blockers_and_observed_compute_waits() {
             if phase == Phase::WaitingCompute { 2 } else { 1 }
         );
         for (command, action) in [
-            ("todo", "command:/todo"),
+            ("todo show 3", "command:/todo show 3"),
             ("activity compute", "command:/activity compute"),
         ] {
             let mut selected = attention_choices_with_context(

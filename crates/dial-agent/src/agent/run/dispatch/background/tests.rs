@@ -173,10 +173,10 @@ fn real_data_tool_runs_through_the_same_job_owner() {
         for tool in tools::knowledge::data::tools(agent.config) {
             agent.ext.register(tool);
         }
-        agent.version.harness.tools.push("data".into());
-        agent.enabled_tools.insert("data".into());
+        agent.version.harness.tools.push("inspect".into());
+        agent.enabled_tools.insert("inspect".into());
         let launch = call(
-            json!({"action":"start","name":"stats","call":{"name":"data","arguments":{"path":"sample.csv","action":"aggregate","columns":["x"]}}}),
+            json!({"action":"start","name":"stats","call":{"name":"inspect","arguments":{"kind":"data","path":"sample.csv","action":"aggregate","columns":["x"]}}}),
         );
         let started = agent.dispatch(&mut backend(), &launch, &mut NullUi);
         assert!(!started.is_error, "{started:?}");

@@ -78,6 +78,14 @@ fn processes_are_classed_by_how_they_ended() {
     assert_eq!(class(&process(false, None, None)), Some("not_started"));
     assert_eq!(class(&process(true, None, Some(9))), Some("signalled"));
     assert_eq!(class(&process(true, Some(2), None)), Some("nonzero_exit"));
+    assert_eq!(
+        class(&process(true, Some(127), None)),
+        Some("command_not_found")
+    );
+    assert_eq!(
+        class(&process(true, Some(126), None)),
+        Some("not_executable")
+    );
     assert_eq!(class(&process(true, Some(0), None)), Some("tool_error"));
 }
 

@@ -541,7 +541,7 @@ pub fn match_hint(skills: &[Skill], text: &str, skill_offered: bool) -> Option<S
     let how = if skill_offered {
         "load it with the `skill` tool in the same response as your first reads, not as a round of its own"
     } else {
-        "load the `skill` tool with `tool_load` in the same response as your first reads, then load the skill with it"
+        "load the `skill` tool with `tool_search` names:[\"skill\"] alongside your first reads, then load the skill with it"
     };
     Some(format!(
         "Skill hint: {} may match this request. If a matching skill covers substantial multi-step work, {how}.",
@@ -629,7 +629,7 @@ fn available(skills: &[Skill]) -> String {
 pub mod skill_tool {
     use super::*;
 
-    pub fn schema() -> Value {
+    pub fn load_schema() -> Value {
         json!({
             "type": "function",
             "function": {
@@ -638,6 +638,7 @@ pub mod skill_tool {
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "action": {"type":"string","enum":["load"]},
                         "name": {"type": "string", "description": "Skill name from the catalog."},
                         "file": {"type": "string", "description": "Optional bundled file path relative to the skill directory."}
                     },
@@ -648,7 +649,31 @@ pub mod skill_tool {
         })
     }
 
+    pub fn schema() -> Value {
+        let mut schema = load_schema();
+        let management = super::manage_tool::schema();
+        let properties = schema["function"]["parameters"]["properties"]
+            .as_object_mut()
+            .expect("skill properties");
+        for (key, value) in management["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("management properties")
+        {
+            properties.insert(key.clone(), value.clone());
+        }
+        properties.insert("action".into(), json!({"type":"string","enum":["load","create","update","delete"],"description":"load (default) reads full instructions or a bundled file; create/update/delete manage reusable procedures. Never store secrets. Mutations retain their existing approval gates."}));
+        schema["function"]["description"] = json!(
+            "Load complete skill instructions or bundled files (max 64 KiB), or create/update/delete reusable procedures with action. Skills are guidance, never permission grants. Create requires description and body; project scope is default, user scope applies everywhere. Never store secrets."
+        );
+        schema
+    }
+
     pub fn call(layout: &Layout, args: &Value) -> ToolOutput {
+        if !matches!(args.get("action"), None | Some(Value::Null)) && args["action"] != "load" {
+            return fail(
+                "skill mutations require the owning controller's management handler; no skill was read or changed",
+            );
+        }
         let Some(name) = args.get("name").and_then(Value::as_str) else {
             return fail("missing \"name\"");
         };

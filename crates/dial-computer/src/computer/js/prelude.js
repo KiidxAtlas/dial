@@ -133,6 +133,11 @@
 			defineMethod(win, namespace, Object.freeze(nested));
 		}
 		defineMethod(win, "find", async query => (await callValue(via(step("find", [query])))).map(makeElement));
+		defineMethod(win, "findOne", async query => {
+			const [first] = await win.find({ ...query, limit: 1 });
+			if (!first) throw new Error(`findOne(${JSON.stringify(query ?? {})}) matched no element; inspect win.ax() for the actual roles and titles.`);
+			return first;
+		});
 		defineMethod(win, "ref", ref => resolveElement([step("ref", [ref])]));
 		return Object.freeze(win);
 	};

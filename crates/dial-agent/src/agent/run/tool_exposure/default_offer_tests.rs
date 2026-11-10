@@ -247,7 +247,7 @@ fn window_overflow_uses_the_lean_prompt_even_without_the_local_profile() {
             lean.len()
         );
         assert!(!lean.contains("# Visual verification"));
-        for tool in ["read", "edit", "finish", "tool_load"] {
+        for tool in ["read", "edit", "finish", "tool_search"] {
             assert!(agent.offered().iter().any(|name| name == tool));
         }
     });
@@ -315,7 +315,6 @@ fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
             "bg",
             "task",
             "memory",
-            "tool_load",
             "tool_search",
         ] {
             assert!(
@@ -404,7 +403,15 @@ fn unattended_launch_defers_session_helpers_but_lists_them_as_loadable() {
                 "{discoverable:?}"
             );
         }
-        for core in ["read", "edit", "write", "bash", "grep", "glob", "tool_load"] {
+        for core in [
+            "read",
+            "edit",
+            "write",
+            "bash",
+            "grep",
+            "glob",
+            "tool_search",
+        ] {
             assert!(
                 offered.iter().any(|name| name == core),
                 "{core}: {offered:?}"
@@ -447,7 +454,7 @@ fn unattended_launch_defers_memory_tools_but_keeps_them_loadable() {
             "{discoverable:?}"
         );
         assert!(
-            offered.iter().any(|name| name == "tool_load"),
+            offered.iter().any(|name| name == "tool_search"),
             "{offered:?}"
         );
     });
@@ -461,7 +468,7 @@ pub(in crate::agent) fn load_tools(agent: &mut Agent<'_>, arguments: Value) -> T
         &mut backend,
         &ToolCall {
             id: "call-load".into(),
-            name: "tool_load".into(),
+            name: "tool_search".into(),
             arguments,
             malformed_arguments: false,
         },
@@ -500,11 +507,11 @@ fn tool_load_offers_a_deferred_tool_next_round_and_unload_defers_it_again() {
         assert_eq!(entry["enabled_next_round"], false);
         assert_eq!(entry["status"], "not_loaded");
         assert_eq!(entry["retained_by_policy"], false);
-        assert!(entry["next"].as_str().unwrap().contains("tool_load"));
+        assert!(entry["next"].as_str().unwrap().contains("tool_search"));
         assert!(out.text.contains("not offered [lsp]"), "{}", out.text);
         let offered = agent.offered();
         assert!(!offered.iter().any(|name| name == "lsp"));
-        assert!(offered.iter().any(|name| name == "ast_search"));
+        assert!(offered.iter().any(|name| name == "grep"));
     });
 }
 
@@ -512,7 +519,7 @@ fn tool_load_offers_a_deferred_tool_next_round_and_unload_defers_it_again() {
 fn tool_load_reports_core_retention_and_deduplicates_selection_receipts() {
     for overlay in ["", "[assistance]\ncompact_tools=true"] {
         with_agent(overlay, |agent| {
-            let output = load_tools(agent, json!({"names":["read", "read", "ast_search"]}));
+            let output = load_tools(agent, json!({"names":["read", "read", "lsp"]}));
             assert!(!output.is_error, "{}", output.text);
             assert_eq!(
                 output.data.as_ref().unwrap()["tools"]
@@ -521,25 +528,23 @@ fn tool_load_reports_core_retention_and_deduplicates_selection_receipts() {
                     .len(),
                 2
             );
-            let output = load_tools(agent, json!({"unload":["read", "read", "ast_search"]}));
+            let output = load_tools(agent, json!({"unload":["read", "read", "lsp"]}));
             assert!(!output.is_error, "{}", output.text);
             let entries = output.data.as_ref().unwrap()["tools"].as_array().unwrap();
             assert_eq!(entries.len(), 2);
-            assert_eq!(entries[0]["name"], "ast_search");
+            assert_eq!(entries[0]["name"], "lsp");
             assert_eq!(entries[0]["enabled_next_round"], false);
             assert_eq!(entries[1]["name"], "read");
             assert_eq!(entries[1]["status"], "already_offered");
             assert_eq!(entries[1]["enabled_next_round"], true);
             assert_eq!(entries[1]["retained_by_policy"], true);
             assert!(
-                output
-                    .text
-                    .contains("offered [read]; not offered [ast_search]"),
+                output.text.contains("offered [read]; not offered [lsp]"),
                 "{}",
                 output.text
             );
             assert!(agent.offered().contains(&"read".to_owned()));
-            assert!(!agent.offered().contains(&"ast_search".to_owned()));
+            assert!(!agent.offered().contains(&"lsp".to_owned()));
         });
     }
 }
@@ -547,24 +552,24 @@ fn tool_load_reports_core_retention_and_deduplicates_selection_receipts() {
 #[test]
 fn tool_load_refuses_overlap_before_changing_pins_discovery_or_routing() {
     with_agent("[assistance]\ncompact_tools=true", |agent| {
-        assert!(!load_tools(agent, json!({"names":["ast_search"]})).is_error);
+        assert!(!load_tools(agent, json!({"names":["lsp"]})).is_error);
         let before = agent.session.control_state();
         let offered = agent.offered();
         for arguments in [
-            json!({"names":["ast_search"], "unload":["ast_search"]}),
-            json!({"names":["read", "ast_search", "read"], "unload":["read", "ast_search"]}),
+            json!({"names":["lsp"], "unload":["lsp"]}),
+            json!({"names":["read", "lsp", "read"], "unload":["read", "lsp"]}),
         ] {
             let output = load_tools(agent, arguments);
             assert!(output.is_error, "{}", output.text);
             assert!(
-                output.text.contains("cannot load and unload ast_search"),
+                output.text.contains("cannot load and unload lsp"),
                 "{}",
                 output.text
             );
             assert!(output.data.is_none());
             assert_eq!(agent.session.control_state(), before);
             assert_eq!(agent.offered(), offered);
-            assert!(!agent.tool_routing.is_suppressed("ast_search"));
+            assert!(!agent.tool_routing.is_suppressed("lsp"));
             assert!(!agent.enabled_tools.contains("read"));
         }
     });
@@ -573,13 +578,13 @@ fn tool_load_refuses_overlap_before_changing_pins_discovery_or_routing() {
 #[test]
 fn tool_load_persistence_failure_cannot_report_success_or_change_effective_offer() {
     with_agent("[assistance]\ncompact_tools=true", |agent| {
-        assert!(!load_tools(agent, json!({"names":["ast_search"]})).is_error);
+        assert!(!load_tools(agent, json!({"names":["lsp"]})).is_error);
         let path = agent.session.path().unwrap().to_owned();
         let snapshot = crate::storage::session::Session::read(&path).unwrap();
         agent.session = snapshot;
         let before = agent.session.control_state();
         let offered = agent.offered();
-        let output = load_tools(agent, json!({"names":["git"], "unload":["ast_search"]}));
+        let output = load_tools(agent, json!({"names":["git"], "unload":["lsp"]}));
         assert!(output.is_error, "{}", output.text);
         assert!(
             output.text.contains("persisting enabled tools"),
@@ -590,17 +595,17 @@ fn tool_load_persistence_failure_cannot_report_success_or_change_effective_offer
         assert_eq!(agent.session.control_state(), before);
         assert_eq!(agent.offered(), offered);
         assert!(!agent.enabled_tools.contains("git"));
-        assert!(!agent.tool_routing.is_suppressed("ast_search"));
+        assert!(!agent.tool_routing.is_suppressed("lsp"));
     });
 }
 
 #[test]
 fn tool_load_can_unload_ineligible_activation_without_promising_a_reload() {
     with_agent("[assistance]\ncompact_tools=true", |agent| {
-        let output = load_tools(agent, json!({"names":["ast_search"]}));
+        let output = load_tools(agent, json!({"names":["lsp"]}));
         assert!(!output.is_error, "{}", output.text);
-        agent.modes.launch.tools = Some(["tool_load".to_owned()].into());
-        let output = load_tools(agent, json!({"unload":["ast_search"]}));
+        agent.modes.launch.tools = Some(["tool_search".to_owned()].into());
+        let output = load_tools(agent, json!({"unload":["lsp"]}));
         assert!(!output.is_error, "{}", output.text);
         let entry = &output.data.as_ref().unwrap()["tools"][0];
         assert_eq!(entry["eligible"], false);
@@ -612,21 +617,18 @@ fn tool_load_can_unload_ineligible_activation_without_promising_a_reload() {
                 .unwrap()
                 .contains("loading cannot bypass this boundary")
         );
-        assert!(!agent.enabled_tools.contains("ast_search"));
-        assert!(!agent.offered().contains(&"ast_search".to_owned()));
+        assert!(!agent.enabled_tools.contains("lsp"));
+        assert!(!agent.offered().contains(&"lsp".to_owned()));
     });
 }
 
 #[test]
 fn pinned_harness_selection_keeps_deferred_tools_offered() {
     with_agent(
-        "[harness]\ntools=['read','edit','bash','memory','ast_search']\n[assistance]\nlean_local=false",
+        "[harness]\ntools=['read','edit','bash','memory','lsp']\n[assistance]\nlean_local=false",
         |agent| {
             let offered = agent.offered();
-            assert!(
-                offered.iter().any(|name| name == "ast_search"),
-                "{offered:?}"
-            );
+            assert!(offered.iter().any(|name| name == "lsp"), "{offered:?}");
         },
     );
 }
@@ -756,13 +758,13 @@ fn compact_discovery_pins_and_unloads_do_not_leave_hidden_activation_state() {
         |agent| {
             struct Quiet;
             impl Ui for Quiet {}
-            let name = "ast_search".to_owned();
+            let name = "lsp".to_owned();
             agent.activate_tools(std::slice::from_ref(&name)).unwrap();
             let mut backend = agent.backend.take().unwrap();
             for arguments in [json!({"names":[name]}), json!({"unload":[name]})] {
                 let call = ToolCall {
                     id: "pin-discovered".into(),
-                    name: "tool_load".into(),
+                    name: "tool_search".into(),
                     arguments,
                     malformed_arguments: false,
                 };
@@ -948,7 +950,7 @@ fn local_small_tier_offers_the_minimal_set_only_where_it_applies() {
         assert!(offered.iter().any(|name| name == "edit"), "{offered:?}");
         // Every other tool stays reachable through the loaders.
         assert!(
-            offered.iter().any(|name| name == "tool_load"),
+            offered.iter().any(|name| name == "tool_search"),
             "{offered:?}"
         );
     });
@@ -1200,14 +1202,8 @@ fn restrictions_apply_to_discovery_loading_and_late_offers() {
                 "plan" => agent.plan_mode = true,
                 "vibe" => agent.modes.vibe = true,
                 _ => {
-                    agent.modes.launch.tools = Some(
-                        [
-                            "read".to_owned(),
-                            "tool_load".to_owned(),
-                            "tool_search".to_owned(),
-                        ]
-                        .into(),
-                    )
+                    agent.modes.launch.tools =
+                        Some(["read".to_owned(), "tool_search".to_owned()].into())
                 }
             }
             let offered = agent.offered();
@@ -1244,7 +1240,7 @@ fn restrictions_apply_to_discovery_loading_and_late_offers() {
                 &mut backend,
                 &ToolCall {
                     id: "restricted-load".into(),
-                    name: "tool_load".into(),
+                    name: "tool_search".into(),
                     arguments: json!({"names":["bash"]}),
                     malformed_arguments: false,
                 },
@@ -1482,16 +1478,12 @@ fn the_parents_message_tool_reports_receipts_and_marks_finished_workers() {
 #[test]
 fn unrelated_coding_turn_does_not_pay_for_web_schemas() {
     with_agent("[assistance]\nlean_local=false", |agent| {
-        for name in ["web_fetch", "web_search"] {
-            agent.ext.register(Arc::new(WebCapability(name)));
-        }
+        agent.ext.register(Arc::new(WebCapability("web_search")));
         agent.begin_tool_routing("Fix the arithmetic bug in calc.py");
         let offered = agent.offered();
         let mut broad = offered.clone();
-        for name in ["web_fetch", "web_search"] {
-            assert!(agent.catalog().iter().any(|tool| tool == name));
-            broad.push(name.into());
-        }
+        assert!(agent.catalog().iter().any(|tool| tool == "web_search"));
+        broad.push("web_search".into());
         broad.sort();
         broad.dedup();
         let before = schema_bytes(agent, &broad);
@@ -1508,16 +1500,16 @@ fn unrelated_coding_turn_does_not_pay_for_web_schemas() {
                 .any(|(name, _)| name == "web_search")
         );
         agent.begin_tool_routing("Research this issue online");
-        for name in ["web_fetch", "web_search"] {
+        for name in ["read", "web_search"] {
             assert!(agent.offered().iter().any(|tool| tool == name));
         }
         assert!(
             agent.enabled_tools.is_empty(),
             "routing must not require a model discovery call"
         );
-        agent.activate_tools(&["web_fetch".into()]).unwrap();
+        agent.activate_tools(&["web_search".into()]).unwrap();
         agent.begin_tool_routing("Fix the arithmetic bug in calc.py");
-        assert!(agent.offered().iter().any(|tool| tool == "web_fetch"));
+        assert!(agent.offered().iter().any(|tool| tool == "web_search"));
     });
 }
 

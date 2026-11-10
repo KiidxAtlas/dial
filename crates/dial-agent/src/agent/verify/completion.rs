@@ -301,7 +301,14 @@ impl crate::agent::Agent<'_> {
                 return self.accept_completion(requested, lean, ui);
             }
             self.efficiency_metrics.incomplete_stops += 1;
-            return Decision::Incomplete(reason);
+            // A later blocker can preempt the reminder's own check run; keep its observed output.
+            let reminded = control["completion_gate"]["reason"]
+                .as_str()
+                .filter(|earlier| nudged && !earlier.is_empty() && *earlier != reason);
+            return Decision::Incomplete(match reminded {
+                Some(earlier) => format!("{reason}\nEarlier completion reminder: {earlier}"),
+                None => reason,
+            });
         }
         control = self.session.control_state();
         control["completion_gate"] =
@@ -507,7 +514,7 @@ impl CapabilitySearch {
 }
 
 /// The reminder `CapabilitySearch::remind` sends back with the rejected answer.
-pub(in crate::agent) const CAPABILITY_SEARCH_REMINDER: &str = "Your answer says something is not possible or not available, but you have not searched the tool catalog this turn. Tools you were not offered may provide it (an interactive terminal, a browser, a debugger and more are loadable). Call `tool_search` with the capability you need, load a match with `tool_load` and use it; if nothing fits, give the same answer again and name what you searched for.";
+pub(in crate::agent) const CAPABILITY_SEARCH_REMINDER: &str = "Your answer says something is not possible or not available, but you have not searched the tool catalog this turn. Tools you were not offered may provide it (an interactive terminal, a browser, a debugger and more are loadable). Call `tool_search` with the capability you need and load:true, or names:[exact match], then use it; if nothing fits, give the same answer again and name what you searched for.";
 
 /// Actual runtime check callbacks, not assertion words in source or printed claims. These are
 /// local check outcomes, never evidence that unrelated files or task requirements passed.

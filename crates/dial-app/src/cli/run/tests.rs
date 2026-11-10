@@ -253,20 +253,65 @@ fn redirected_stdout_relays_terminal_stdin_without_sigttin() {
 
 #[cfg(windows)]
 #[test]
-fn windows_refuses_before_creating_capture_or_starting_child() {
+fn windows_pipe_relay_captures_both_streams_and_returns_exit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");
     std::fs::create_dir(&root).unwrap();
     let layout = Layout::with_user_dir(&root, dir.path().join("private")).unwrap();
-    let args = RunArgs {
-        name: "app".into(),
-        command: vec!["cmd".into(), "/C".into(), "exit 0".into()],
-    };
+    let mut capture = Capture::start(&layout, "web").unwrap();
+    let mut reader = crate::storage::process_capture::Reader::attach(&layout, "web").unwrap();
+    let mut command = Command::new("cmd");
+    command.args([
+        "/D",
+        "/C",
+        "echo stdout-marker& echo stderr-marker 1>&2& exit /b 7",
+    ]);
+    assert_eq!(windows::execute(&mut command, &mut capture).unwrap(), 7);
+    capture.finish(None).unwrap();
+    let (bytes, closed) = reader.poll(4096).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
     assert!(
-        run(&layout, &args)
-            .unwrap_err()
-            .to_string()
-            .contains("only on Unix")
+        text.contains("stdout-marker") && text.contains("stderr-marker"),
+        "{text}"
     );
-    assert!(!layout.state_dir.join("runs").exists());
+    assert!(closed);
+    drop(capture);
+    let args = RunArgs {
+        name: "missing".into(),
+        command: vec![r"C:\dial-nonexistent-executable.exe".into()],
+    };
+    assert!(run(&layout, &args).is_err());
+}
+
+/// A descendant that keeps the output pipe after the leader exits is bounded by the drain
+/// window, and terminating the job ends it.
+#[cfg(windows)]
+#[test]
+fn windows_descendants_holding_output_are_bounded_and_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let layout = Layout::with_user_dir(&root, dir.path().join("private")).unwrap();
+    let mut capture = Capture::start(&layout, "web").unwrap();
+    let mut command = Command::new("cmd");
+    command.args(["/D", "/C", "start /b ping -n 60 127.0.0.1& exit /b 0"]);
+    let since = crate::platform::processes::filetime_now().saturating_sub(10_000_000);
+    let started = std::time::Instant::now();
+    let error = windows::execute(&mut command, &mut capture).unwrap_err();
+    assert!(
+        error.to_string().contains("output remained open"),
+        "{error:#}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let survivors: Vec<_> = crate::platform::processes::snapshot()
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.image.eq_ignore_ascii_case("ping.exe"))
+        .filter(|p| {
+            crate::platform::processes::details(p.pid)
+                .is_some_and(|d| !d.exited && d.created >= since)
+        })
+        .collect();
+    assert!(survivors.is_empty(), "{survivors:?}");
 }

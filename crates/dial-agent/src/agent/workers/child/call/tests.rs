@@ -230,6 +230,38 @@ fn worker_batches_with_an_approval_entry_run_serially_and_never_run_denied_entri
 }
 
 #[test]
+fn worker_mixed_batches_group_the_reads_on_each_side_of_a_serial_entry() {
+    let (output, reviewer) = run_cell(json!([[
+        {"name":"read","arguments":{"path":"a.txt"}},
+        {"name":"read","arguments":{"path":"b.txt"}},
+        {"name":"deploy","arguments":{}},
+        {"name":"read","arguments":{"path":"b.txt"}},
+        {"name":"read","arguments":{"path":"a.txt"}},
+    ]]));
+    let receipts = receipts(&output);
+    let results = receipts[0]["data"].as_array().unwrap();
+    assert_eq!(results.len(), 5);
+    for (index, expected) in [(0, "alpha"), (1, "beta"), (3, "beta"), (4, "alpha")] {
+        assert!(
+            results[index]["text"].as_str().unwrap().contains(expected),
+            "entry {index} keeps its slot: {}",
+            results[index]["text"]
+        );
+    }
+    assert_eq!(results[2]["is_error"], true);
+    assert_eq!(reviewer.asked, ["deploy"], "only the serial entry asked");
+    // Each shared read group starts its reads together, then hands progress back to the parent
+    // cell when it drains; the denied serial entry between them never starts.
+    assert_eq!(
+        reviewer.started,
+        [
+            "cell", "read", "read", "cell", "cell", "read", "read", "cell"
+        ],
+        "two read groups ran around the serial entry"
+    );
+}
+
+#[test]
 fn worker_batch_entries_count_against_the_cell_callback_limit() {
     let read = json!({"name":"read","arguments":{"path":"a.txt"}});
     let full: Vec<Value> = (0..CODE_CALLBACK_LIMIT).map(|_| read.clone()).collect();
