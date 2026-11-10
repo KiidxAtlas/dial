@@ -115,6 +115,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "write" in names:
                 return self.text("Completed the verified requested write."), "stop"
             return call("write", {"path": path, "content": content})
+        def load(tool, query):
+            # Search first, then load once: through tool_search names when it is offered (the
+            # current surface), else through the legacy tool_load.
+            if "tool_search" not in names:
+                return call("tool_search", {"query": query})
+            if names.count("tool_search") + names.count("tool_load") < 2:
+                offered = {item["function"]["name"] for item in request.get("tools", [])}
+                if "tool_search" in offered:
+                    return call("tool_search", {"names": [tool]})
+                return call("tool_load", {"names": [tool]})
+            return None
         if case in ("selector-recovery", "reuse-evidence"):
             reads = names.count("read")
             if case == "selector-recovery" and reads == 0:
@@ -134,10 +145,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return call("bash", {"command": command})
             available = {tool["function"]["name"] for tool in request.get("tools", [])}
             if "bg" not in available:
-                if "tool_search" not in names:
-                    return call("tool_search", {"query": "bg"})
-                if "tool_load" not in names:
-                    return call("tool_load", {"names": ["bg"]})
+                step = load("bg", "bg")
+                if step:
+                    return step
                 return self.text("Blocked: managed bg remains unavailable after discovery and loading. The probe has not completed; the required launch recovery cannot be verified."), "stop"
             if (terminal and len(launches) < 2):
                 return call("bash", {"command": command, "pty": True})
@@ -185,10 +195,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError("artifact pagination did not retrieve the actual secret")
             return write("artifact-result.txt", secret.group(1))
         if case == "dynamic-tool-discovery":
-            if "tool_search" not in names:
-                return call("tool_search", {"query": "find"})
-            if "tool_load" not in names:
-                return call("tool_load", {"names": ["find"]})
+            step = load("find", "find")
+            if step:
+                return step
             if "find" not in names:
                 available = {tool["function"]["name"] for tool in request.get("tools", [])}
                 if "find" not in available:

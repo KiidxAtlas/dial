@@ -117,6 +117,18 @@ class RecoveryConversationTests(unittest.TestCase):
                 self.assertNotIn("tool_calls", reply)
                 self.assertIn("Blocked:", reply["content"])
 
+    def test_launch_loading_uses_tool_search_names_when_offered(self):
+        import json
+        exchanges = [("bash", "[exit code: 1]"), ("tool_search", "bg available")]
+        call = self.next_call(self.request("stdin-launch-recovery", exchanges, tools=("tool_search",)))
+        self.assertEqual(call["name"], "tool_search")
+        self.assertEqual(json.loads(call["arguments"]), {"names": ["bg"]})
+        exchanges.append(("tool_search", "loaded; enabled next round"))
+        reply, finish = self.handler.reply(
+            self.request("stdin-launch-recovery", exchanges, tools=("tool_search",)), 99)
+        self.assertEqual(finish, "stop")
+        self.assertIn("Blocked:", reply["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
