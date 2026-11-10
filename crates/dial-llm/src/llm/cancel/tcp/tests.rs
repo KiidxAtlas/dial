@@ -5,6 +5,7 @@ fn next(after: Duration) -> NextTimeout {
     NextTimeout {
         after: ureq::unversioned::transport::time::Duration::Exact(after),
         reason: ureq::Timeout::RecvResponse,
+        ..NextTimeout::default()
     }
 }
 

@@ -5,7 +5,7 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use rand::RngCore;
+use rand::Rng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{

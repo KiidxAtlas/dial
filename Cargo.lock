@@ -1188,7 +1188,7 @@ dependencies = [
  "cached_proc_macro_types",
  "hashbrown 0.16.1",
  "once_cell",
- "parking_lot",
+ "parking_lot 0.12.5",
  "thiserror 2.0.21",
  "web-time",
 ]
@@ -1702,7 +1702,7 @@ dependencies = [
  "document-features",
  "filedescriptor",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustix 1.1.5",
  "signal-hook",
  "signal-hook-mio",
@@ -1955,7 +1955,7 @@ dependencies = [
  "dial-ui",
  "flate2",
  "libc",
- "parking_lot",
+ "parking_lot 0.13.0",
  "ring",
  "rusqlite",
  "serde",
@@ -1986,7 +1986,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
- "parking_lot",
+ "parking_lot 0.13.0",
  "png",
  "rand 0.10.3",
  "regex",
@@ -2029,7 +2029,7 @@ dependencies = [
  "image",
  "libc",
  "notify",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rand 0.10.3",
  "ratatui",
  "regex",
@@ -2080,7 +2080,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pipewire",
  "reis",
  "serde",
@@ -2108,7 +2108,7 @@ dependencies = [
  "ast-grep-language",
  "ignore",
  "libc",
- "parking_lot",
+ "parking_lot 0.13.0",
  "regex",
  "rustls",
  "serde",
@@ -2136,7 +2136,7 @@ dependencies = [
  "httpdate",
  "image",
  "libc",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rand 0.10.3",
  "regex",
  "ring",
@@ -2168,7 +2168,7 @@ dependencies = [
  "ignore",
  "image",
  "libc",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rand 0.10.3",
  "regex",
  "ring",
@@ -2214,7 +2214,7 @@ dependencies = [
  "jaq-std",
  "libc",
  "lzma-rs",
- "parking_lot",
+ "parking_lot 0.13.0",
  "quick-xml 0.42.0",
  "rand 0.10.3",
  "rars",
@@ -2265,7 +2265,7 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pulldown-cmark",
  "ratatui",
  "serde",
@@ -3973,6 +3973,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4730,8 +4739,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.4.14",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -4742,7 +4761,19 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link 0.2.1",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link 0.2.1",
 ]
@@ -5311,6 +5342,15 @@ name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
+name = "redox_syscall"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
 dependencies = [
  "bitflags 2.13.2",
 ]
@@ -5921,7 +5961,7 @@ version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
- "lock_api",
+ "lock_api 0.4.14",
 ]
 
 [[package]]
@@ -6113,7 +6153,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9048a889effe34a5cddee0af7f53285198b16dca3be510858d38dfdb3e62a04e"
 dependencies = [
  "bitflags 2.13.2",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustix 1.1.5",
  "signal-hook",
  "windows-sys 0.61.2",

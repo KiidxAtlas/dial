@@ -429,6 +429,8 @@ impl<T: Transport> Transport for CancelTransport<T> {
             let slice = NextTimeout {
                 after: remaining.min(Duration::from_millis(100)).into(),
                 reason: timeout.reason,
+                per_read: timeout.per_read,
+                per_write: timeout.per_write,
             };
             match self.inner.await_input(slice) {
                 Err(ureq::Error::Timeout(_)) => continue,

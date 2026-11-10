@@ -6,7 +6,7 @@ use super::{
 use crate::config::settings_store::{locked, locked_cancellable, locked_for, write_private};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

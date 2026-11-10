@@ -13,7 +13,7 @@
 //!
 //! Prompts read like a user's request and never name a tool: the agent picks its own tools.
 use super::verify::Check;
-use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
+use rand::{RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
