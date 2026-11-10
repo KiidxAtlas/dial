@@ -1,6 +1,6 @@
 # Maintainer: KiidxAtlas
 pkgname=dial-bin
-pkgver=0.3.1
+pkgver=0.3.3
 pkgrel=1
 pkgdesc="Sandboxed coding agent for the terminal with undo and test evidence; runs local or hosted models"
 arch=('x86_64' 'aarch64')
@@ -13,8 +13,8 @@ provides=('dial')
 conflicts=('dial')
 source_x86_64=("https://github.com/KiidxAtlas/dial/releases/download/v${pkgver}/dial-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
 source_aarch64=("https://github.com/KiidxAtlas/dial/releases/download/v${pkgver}/dial-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
-sha256sums_x86_64=('a778ae8e74079504774f4e63f82fdadc8cce38f33296c9b43f6af0c7ceaf90e2')
-sha256sums_aarch64=('0a44480e55bc58064e11e7bf43126b0122381292dfb82cd0bbee5944d94f82b7')
+sha256sums_x86_64=('b8b75ffcf080e97c3018899f0064276b7b0926aad1ad6b822cae7251246e7add')
+sha256sums_aarch64=('450c039038d165e60b806e51744b297b366cda982b974f76928db796d4f5ff85')
 
 package() {
   cd "dial-v${pkgver}-${CARCH}-unknown-linux-gnu"
