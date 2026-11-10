@@ -21,6 +21,13 @@ class SummaryWindowTests(unittest.TestCase):
         reply, _ = self.reply("The actual task goal is JADE-719")
         self.assertEqual(Handler.goal(reply["content"]), "JADE-719")
 
+    def test_acceptance_goal_phrase_retains_the_observed_goal(self):
+        self.assertEqual(Handler.goal("acceptance goal must be exactly JADE-719"), "JADE-719")
+
+    def test_repeated_acceptance_goal_text_does_not_match_a_goal(self):
+        transcript = "acceptance goal " * 4000
+        self.assertIsNone(Handler.goal(transcript, required=False))
+
     def test_final_reply_still_refuses_a_missing_goal(self):
         handler = Handler.__new__(Handler)
         with self.assertRaises(ValueError):
