@@ -17,10 +17,6 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
-### Fixed
-
-- Local servers that buffer tool-call arguments (such as LM Studio) no longer trip the 30-second `request_recovery` silence watchdog while the model writes a large tool call. While a call is open with no streamed arguments, the limit is extended to a bounded 600 seconds.
-
 ## [0.3.4] - 2026-11-10
 
 ### Security
@@ -101,6 +97,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 ### Fixed
 
 - Read-only model-knowledge mapping uses its five-second cap when the general worker timeout is unlimited, rather than accidentally imposing a one-second deadline on Python startup. Explicit shorter limits remain enforced.
+- Local servers that buffer tool-call arguments (such as LM Studio) no longer trip the 30-second `request_recovery` silence watchdog while the model writes a large tool call. While a call is open with no streamed arguments, the limit is extended to a bounded 600 seconds.
 - Windows edits no longer fail checkpoint creation with OS error 24 ("command length is incorrect"). Native rename/link buffers now include the minimum structure size for short names such as checkpoint blob `0`; this was unrelated to patch or shell-command length.
 - `dial weights try` and the `model_weights` `try` operation with a direction now find the saved direction. Before, they passed its name to the worker, which refused it.
 - Windows builds of `dial` compile again: the telemetry re-export was gated to Unix.
