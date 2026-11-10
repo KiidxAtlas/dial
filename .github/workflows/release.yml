@@ -509,7 +509,7 @@ jobs:
           cache-from: type=gha,scope=docker-release
           cache-to: type=gha,scope=docker-release,mode=max
       - name: Install pinned Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2; verifies pinned bootstrap checksum
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.2; verifies pinned bootstrap checksum
         with:
           cosign-release: v3.0.6
       - name: Sign immutable container digest with GitHub OIDC
