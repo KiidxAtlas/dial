@@ -121,7 +121,7 @@ cpal = "0.16"
 block2 = "=0.6.2"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 foreign-types = "=0.5.0"
-objc2 = "=0.6.4"
+objc2 = "=0.6.5"
 objc2-app-kit = "=0.3.2"
 objc2-application-services = "=0.3.2"
 objc2-core-foundation = "=0.3.2"
