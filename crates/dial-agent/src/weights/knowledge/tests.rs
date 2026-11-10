@@ -14,6 +14,17 @@ fn observation(steps: u64) -> Observation<'static> {
 }
 
 #[test]
+fn mapping_timeout_uses_cap_for_unlimited_and_preserves_shorter_limits() {
+    for (configured, expected) in [(0, 5), (1, 1), (3, 3), (5, 5), (60, 5)] {
+        assert_eq!(
+            mapping_timeout_secs(configured),
+            expected,
+            "configured={configured}"
+        );
+    }
+}
+
+#[test]
 fn observations_are_bounded_content_free_and_reset_on_identity_change() {
     let config = Config::default();
     let mut value = Value::Null;

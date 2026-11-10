@@ -605,8 +605,9 @@ use substantial additional memory. It does not unload or modify LM Studio's runn
 Enable `weights.knowledge` in Settings → Weights to collect a structural map and bounded
 turn observations automatically after normal agent turns (off by default). This reuses the
 header mapper: no model load, activation probes, downloads, training or weight edits. It needs
-an installed Python worker runtime. Each refresh is limited to five seconds; an unavailable
-runtime, busy weights job or invalid checkpoint produces a diagnostic, not a failed chat turn.
+an installed Python worker runtime. Each refresh is limited to five seconds (including when
+the general worker timeout is unlimited); explicit shorter worker timeouts are preserved. An
+unavailable runtime, busy weights job or invalid checkpoint produces a diagnostic, not a failed chat turn.
 Hermetic evaluation does not collect knowledge. The improvement stop switch also pauses refreshes.
 
 ```toml

@@ -65,6 +65,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- Read-only model-knowledge mapping uses its five-second cap when the general worker timeout is unlimited, rather than accidentally imposing a one-second deadline on Python startup. Explicit shorter limits remain enforced.
 - Windows edits no longer fail checkpoint creation with OS error 24 ("command length is incorrect"). Native rename/link buffers now include the minimum structure size for short names such as checkpoint blob `0`; this was unrelated to patch or shell-command length.
 - `dial weights try` and the `model_weights` `try` operation with a direction now find the saved direction. Before, they passed its name to the worker, which refused it.
 - Windows builds of `dial` compile again: the telemetry re-export was gated to Unix.

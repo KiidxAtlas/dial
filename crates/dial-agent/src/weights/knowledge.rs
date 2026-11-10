@@ -58,6 +58,15 @@ pub(crate) fn observe(
     Ok(())
 }
 
+fn mapping_timeout_secs(configured: u64) -> u64 {
+    // Zero means unlimited for the general worker, not a one-second mapping deadline.
+    if configured == 0 {
+        5
+    } else {
+        configured.min(5)
+    }
+}
+
 fn update(
     config: &Config,
     observation: Option<Observation<'_>>,
@@ -78,7 +87,7 @@ fn update(
         "model knowledge requires the installed Python worker runtime"
     );
     let mut worker_config = config.clone();
-    worker_config.worker_timeout_secs = config.worker_timeout_secs.clamp(1, 5);
+    worker_config.worker_timeout_secs = mapping_timeout_secs(config.worker_timeout_secs);
     let response = worker::call_controlled(
         &worker_config,
         &json!({"op": "weights_map", "model": model, "known_model_id": known}),
