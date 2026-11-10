@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Security
+
+- Updated vulnerable dependencies flagged by Dependabot. `zip` 9.0.4 → 9.0.5 fixes a critical archive-header parsing flaw that could lead to arbitrary file overwrite. In the MLX worker environment (`python/uv.lock`): Pillow 12.3.0 → 13.0.0, aiohttp 3.14.3 → 3.14.5, filelock 4.0.8 → 4.2.10 and certifi 2026.7.22 → 2026.10.23, which fix image-decoder memory-safety bugs, HTTP parsing issues, lock-file races and a compromised CA root.
+
 ## [0.3.3] - 2026-11-09
 
 - Windows: replacing or deleting Dial's private files (sessions, settings, state) no longer fails with "access is denied" or "being used by another process" while another process, such as a second Dial window or a reader, has the file open. Renames and deletes now use POSIX semantics on NTFS/ReFS, and fall back to the old calls on filesystems without them. A sharing violation from a brief scan by antivirus, indexing or sync tools is retried for about 0.3 s before it is reported (`docs/windows.md`).
