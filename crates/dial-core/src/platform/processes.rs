@@ -236,8 +236,27 @@ fn parameters(process: HANDLE) -> Option<usize> {
     read_pointer(process, info.peb + layout::PARAMETERS).filter(|&address| address != 0)
 }
 
+/// Attempts to read a live process's environment before reporting it unreadable.
+const ENVIRONMENT_ATTEMPTS: u32 = 5;
+
 /// The remote environment block as `NAME=value` entries.
+///
+/// A process that changes its environment (as a starting process may) replaces the block and
+/// frees the old one, so a read racing that swap fails transiently; retry from the pointer.
 fn environment(process: HANDLE) -> io::Result<Vec<String>> {
+    let mut attempt = 1;
+    loop {
+        match read_environment(process) {
+            Err(_) if attempt < ENVIRONMENT_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn read_environment(process: HANDLE) -> io::Result<Vec<String>> {
     let unreadable = || io::Error::other("process environment is unreadable");
     let params = parameters(process).ok_or_else(unreadable)?;
     let mut address = read_pointer(process, params + layout::ENVIRONMENT).ok_or_else(unreadable)?;
