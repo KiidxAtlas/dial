@@ -623,3 +623,84 @@ fn anthropic_signed_thinking_activity_prevents_false_silence_retries() {
         "active inference must not be replayed"
     );
 }
+
+#[test]
+fn buffered_tool_arguments_are_not_a_silent_stall() {
+    struct QuietUi;
+    impl Ui for QuietUi {}
+    // LM Studio sends a call's name, then holds every argument byte until the call is complete.
+    let opened = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",
+        "function":{"name":"write","arguments":""}}]}}]});
+    let arguments = json!({"choices":[{"delta":{"tool_calls":[{"index":0,
+        "function":{"arguments":"{\"path\":\"game.py\",\"content\":\"print(1)\"}"}}]}}]});
+    let server = llm::fake::serve(vec![llm::fake::Script::SseSlow {
+        pieces: vec![
+            format!("data: {opened}\n\n"),
+            format!(
+                "data: {arguments}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})
+            ),
+        ],
+        pause: Duration::from_millis(1600),
+    }]);
+    let mut backend = Backend::new(
+        ProviderKind::Endpoint {
+            base_url: format!("{}/v1", server.url),
+            model: "test".into(),
+            api_key: None,
+        },
+        PathBuf::new(),
+        10,
+    );
+    let request = Chat {
+        messages: vec![json!({"role":"user","content":"write the game"})],
+        tools: vec![
+            json!({"type":"function","function":{"name":"write","parameters":{"type":"object"}}}),
+        ],
+        temperature: 0.0,
+        max_tokens: 128,
+        seed: None,
+    };
+    let recovery = crate::config::types::RequestRecoveryConfig {
+        silence_secs: 1,
+        retry_once: false,
+    };
+    let reply = chat_with_ui(
+        &mut backend,
+        None,
+        &request,
+        ChatOptions {
+            timeout: 10,
+            render_text: false,
+            context_tokens: None,
+            policy: None,
+            recovery: Some(&recovery),
+        },
+        Arc::new(AtomicBool::new(false)),
+        &mut QuietUi,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(reply.tool_calls[0].name, "write");
+    assert_eq!(
+        reply.tool_calls[0].arguments,
+        json!({"path":"game.py","content":"print(1)"})
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the buffered call was not cancelled"
+    );
+}
+
+#[test]
+fn buffered_tool_arguments_extend_but_keep_a_bound() {
+    assert_eq!(generation_silence_limit(30, false), 30);
+    assert_eq!(
+        generation_silence_limit(30, true),
+        BUFFERED_TOOL_ARGUMENTS_PATIENCE_SECS
+    );
+    // A larger configured limit is never shortened, and disabled stays disabled.
+    assert_eq!(generation_silence_limit(900, true), 900);
+    assert_eq!(generation_silence_limit(0, true), 0);
+}

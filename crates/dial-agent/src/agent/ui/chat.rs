@@ -107,6 +107,25 @@ pub(in crate::agent) fn silence_exceeded(
         && idle.as_secs() >= limit_secs
 }
 
+/// Generation-silence bound while a tool call is open but none of its arguments have streamed.
+/// Some local servers (LM Studio) send a call's name, then hold every argument byte until the call
+/// is complete, so writing a large file is silent by design. Mirrors the Anthropic open-call ping
+/// patience: generous, but still bounded so a truly stuck server is recovered.
+pub(in crate::agent) const BUFFERED_TOOL_ARGUMENTS_PATIENCE_SECS: u64 = 600;
+
+/// The generation-silence limit in force: `limit_secs`, extended while a tool call's arguments
+/// are buffered server-side. `0` (disabled) stays disabled; a larger configured limit is kept.
+pub(in crate::agent) fn generation_silence_limit(
+    limit_secs: u64,
+    buffering_tool_arguments: bool,
+) -> u64 {
+    if buffering_tool_arguments && limit_secs > 0 {
+        limit_secs.max(BUFFERED_TOOL_ARGUMENTS_PATIENCE_SECS)
+    } else {
+        limit_secs
+    }
+}
+
 /// High-water marks: repeated status/rate reports are not evidence of inference progress.
 #[derive(Default)]
 struct TelemetryProgress {
@@ -474,6 +493,8 @@ pub(in crate::agent) fn chat_attempt_with_ui(
         let mut last_tick = Instant::now();
         let mut last_progress = Instant::now();
         let mut generating = false;
+        // A tool call is open (its name arrived) and no argument bytes have streamed since.
+        let mut buffering_tool_arguments = false;
         let mut telemetry = TelemetryProgress::default();
         // True while the provider waits out a retry delay (`Retry { waiting: true }`).
         let mut backing_off = false;
@@ -537,6 +558,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     });
                     last_progress = Instant::now();
                     generating = false;
+                    buffering_tool_arguments = false;
                     telemetry = TelemetryProgress::default();
                     backing_off = waiting;
                     if waiting {
@@ -731,6 +753,12 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                         generating = true;
                         ui.request_phase(RequestPhase::Generating);
                     }
+                    if !delta.is_empty() {
+                        buffering_tool_arguments = false;
+                    } else if !name.is_empty() {
+                        last_progress = Instant::now();
+                        buffering_tool_arguments = true;
+                    }
                     if let Some(progress) = &mut progress {
                         progress.text(&delta, last_progress);
                         ui.model_progress(&progress.value);
@@ -832,7 +860,7 @@ pub(in crate::agent) fn chat_attempt_with_ui(
                     cancel_request.store(true, Ordering::SeqCst);
                 } else if stalled.is_none()
                     && silence_exceeded(
-                        silence_limit,
+                        generation_silence_limit(silence_limit, buffering_tool_arguments),
                         local_model,
                         generating,
                         backing_off,

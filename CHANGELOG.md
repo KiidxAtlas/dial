@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Fixed
+
+- Local servers that buffer tool-call arguments (such as LM Studio) no longer trip the 30-second `request_recovery` silence watchdog while the model writes a large tool call. While a call is open with no streamed arguments, the limit is extended to a bounded 600 seconds.
+
 ## [0.3.4] - 2026-11-10
 
 ### Security

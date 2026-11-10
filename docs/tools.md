@@ -260,7 +260,7 @@ the successor when a session resumes.
 
   ```toml
   [request_recovery]
-  silence_secs = 30  # 0 disables this watchdog and permits unlimited silent waiting
+  silence_secs = 30  # 0 disables this watchdog and permits unlimited silent waiting; at least 600 while a tool call's arguments are buffered server-side
   retry_once = true  # false requires direction without an automatic retry
   ```
 - **Reasoning gate.** Dial-owned MLX-LM requests with recognized thinking markers close the thinking span inside the same generation when token blocks repeat four times, reasoning reaches three quarters of the configured byte/time allowance, or thinking consumes half the output-token budget. Sampling then continues into an answer or tool call with the existing KV cache; this does not end the task or change `harness.max_steps`. Only reasoning is controlled: repeated answer text and tool arguments remain untouched. Speculative/distributed inference, MLX-VLM and external providers retain the client fallback below.
