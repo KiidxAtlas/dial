@@ -1,6 +1,4 @@
 use super::*;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[test]
 fn only_loopback_http_addresses_are_started() {
@@ -24,6 +22,8 @@ fn only_loopback_http_addresses_are_started() {
 #[cfg(unix)]
 mod lifecycle {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A stand-in server: `spawn` launches a real sleeping process group and makes it reachable.
     #[derive(Default)]
