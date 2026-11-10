@@ -153,6 +153,12 @@ impl Capture {
         live.set_len(0)?;
         live.write_all(snapshot.generation.as_bytes())?;
         crate::platform::fs::sync_file(&live)?;
+        // Windows byte-range locks are mandatory, so readers cannot read the held lock file;
+        // they read the generation from this unlocked companion instead.
+        atomic::write_private_volatile(
+            &generation_path(&dir, slot),
+            snapshot.generation.as_bytes(),
+        )?;
         let capture = Self {
             path,
             snapshot,
@@ -240,6 +246,10 @@ fn lock_file(path: &Path) -> Result<File> {
 
 use std::io::{Read, Write};
 
+fn generation_path(dir: &Path, slot: u8) -> PathBuf {
+    dir.join(format!("slot-{slot}.generation"))
+}
+
 fn slot_busy(dir: &Path, slot: u8, generation: &str) -> Result<bool> {
     let mut file = platform_fs::open_nofollow_nonblocking(
         OpenOptions::new().read(true).write(true),
@@ -249,6 +259,16 @@ fn slot_busy(dir: &Path, slot: u8, generation: &str) -> Result<bool> {
     match std::fs::File::try_lock(&file).map_err(std::io::Error::from) {
         Ok(()) => Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            if atomic::read_private(&generation_path(dir, slot))?.as_deref()
+                == Some(generation.as_bytes())
+            {
+                return Ok(true);
+            }
+            if !cfg!(unix) {
+                return Ok(false);
+            }
+            // Wrappers from before the companion file recorded the generation only in the lock
+            // file, which is readable while held where locks are advisory.
             let mut bytes = Vec::new();
             std::io::Read::by_ref(&mut file)
                 .take(33)

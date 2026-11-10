@@ -59,6 +59,10 @@ def run_contract(tests, skips, profile, dry_run=False):
         print(f"SKIPPED {name}: {reason}", flush=True)
 
     skip_args = [arg for name, _ in skips for arg in ("--skip", name)]
+    # Every filter runs even after one fails, so a single CI run reports all Windows failures;
+    # the first failure's exit status is preserved.
+    status = 0
+    failed = []
     for target, filter_name in tests:
         command = ["cargo", "test", "--locked", "--profile", profile, *target,
                    filter_name, "--", *skip_args]
@@ -70,7 +74,9 @@ def run_contract(tests, skips, profile, dry_run=False):
         print(result.stdout, end="", flush=True)
         if result.returncode != 0:
             print(f"Windows contract failed in filter `{filter_name}`", file=sys.stderr)
-            return result.returncode
+            status = status or result.returncode
+            failed.append(filter_name)
+            continue
         # Cargo may run several harnesses, most of which legitimately match nothing. Require
         # actual execution across their summaries, not merely a successful build or listing.
         passed = sum(int(count) for count in re.findall(
@@ -78,9 +84,14 @@ def run_contract(tests, skips, profile, dry_run=False):
         if passed == 0:
             print(f"Windows contract filter `{filter_name}` executed no tests "
                   "(after platform gates, skips and ignored tests)", file=sys.stderr)
-            return 1
+            status = status or 1
+            failed.append(filter_name)
+            continue
         print(f"VERIFIED {filter_name}: {passed} tests passed", flush=True)
-    return 0
+    if failed:
+        print("Windows contract failures: " + ", ".join(f"`{name}`" for name in failed),
+              file=sys.stderr)
+    return status
 
 
 def main():

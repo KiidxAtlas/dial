@@ -108,6 +108,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   `activations`, steering) work on Gemma 4 models. Their layers return `(h, shared_kv, offset)`
   instead of a bare array, which failed with "unsupported transformer output".
 - Model diagnostics no longer mistake ports containing `401`, `403` or `404` for HTTP status codes when explaining a refused endpoint.
+- On Windows, attaching to a live `dial run` capture no longer fails with OS error 33 ("another process has locked a portion of the file"). Readers identify the running wrapper from an unlocked companion file instead of the held slot lock, which Windows locks block from being read.
 - A zero-exit compound command whose output contains data rows starting with an `error:` field (for example `error:interrupted|30` from a query) no longer gets the "earlier output reports a failure" notice. Model-visible tool text changes only for such rows; the effect on model outcomes is unmeasured.
 - `grep` and `glob` with several `;`-separated scopes no longer fail when one scope does not exist. The existing scopes are searched and each missing one is named in a `[scope not searched]` row with its "Did you mean" suggestions. A call whose scopes are all missing still fails. In local transcripts this was 17 of 24 failed `grep` calls; the effect on model outcomes is unmeasured.
 - `grep` on an `artifact://` or `ssh://` text now honours `context` (up to 10 lines) in the same `path-line-text` row format as a file search, instead of refusing the call.

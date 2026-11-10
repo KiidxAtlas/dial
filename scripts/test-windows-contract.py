@@ -95,12 +95,14 @@ class WindowsContractTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(contract.run_contract(tests, [], "ci"), 1)
 
-    def test_cargo_failure_is_preserved_and_stops_the_suite(self):
-        result, run, output, error = self.run_fixture("compile failed\n", code=101)
+    def test_cargo_failure_is_preserved_and_later_filters_still_run(self):
+        tests = [(["--workspace", "--lib"], name) for name in ("broken::", "platform::")]
+        result, run, output, error = self.run_fixture("compile failed\n", code=101, tests=tests)
         self.assertEqual(result, 101)
-        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_count, 2)
         self.assertIn("compile failed", output)
-        self.assertIn("Windows contract failed", error)
+        self.assertIn("Windows contract failed in filter `broken::`", error)
+        self.assertIn("Windows contract failures: `broken::`, `platform::`", error)
 
     def test_print_is_explicitly_unverified_and_does_not_run_cargo(self):
         result, run, output, _ = self.run_fixture("", dry_run=True)
