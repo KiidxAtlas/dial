@@ -3279,9 +3279,11 @@ fn finish_completed_waits_for_live_task_results() {
             json!({"outcome":"blocked","summary":"Waiting on investigation","reason":"The live investigation is still running."}),
         ),
     ]);
+    // The child must still be running when the main turn calls `finish`; under a loaded parallel
+    // test run the turn setup alone has exceeded 400 ms, so keep a wide margin.
     let side = serve_fn(
         Arc::new(|_| {
-            thread::sleep(Duration::from_millis(400));
+            thread::sleep(Duration::from_millis(3000));
             Reply::Text("investigation result")
         }),
         None,
