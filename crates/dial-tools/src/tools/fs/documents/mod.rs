@@ -10,9 +10,16 @@ mod epub;
 mod isolate;
 use isolate::Job;
 pub use isolate::{WORKER_ARG as DOCUMENT_WORKER_ARG, worker_main as document_worker_main};
+mod certificate;
+mod columnar;
+mod executable;
 mod json;
+mod mail;
 mod office;
+mod opendocument;
 mod pdf;
+mod property_list;
+mod spreadsheet;
 mod sqlite;
 #[cfg(test)]
 mod tests;
@@ -72,6 +79,37 @@ pub(in crate::tools) fn kind(path: &str) -> Option<&'static str> {
         .any(|s| lower.ends_with(s))
     {
         Some("sqlite")
+    } else if [
+        ".so", ".dylib", ".dll", ".exe", ".o", ".obj", ".a", ".lib", ".node", ".bundle",
+    ]
+    .iter()
+    .any(|s| lower.ends_with(s))
+    {
+        Some("object")
+    } else if let Some(format) = [
+        (".parquet", "parquet"),
+        (".arrow", "arrow"),
+        (".arrows", "arrow"),
+        (".feather", "arrow"),
+        (".ipc", "arrow"),
+        (".xls", "spreadsheet"),
+        (".xlsb", "spreadsheet"),
+        (".xlsm", "spreadsheet"),
+        (".ods", "spreadsheet"),
+        (".odt", "opendocument"),
+        (".odp", "opendocument"),
+        (".eml", "mail"),
+        (".mbox", "mbox"),
+    ]
+    .iter()
+    .find_map(|(suffix, format)| lower.ends_with(suffix).then_some(*format))
+    {
+        Some(format)
+    } else if [".pem", ".crt", ".cer", ".der", ".csr"]
+        .iter()
+        .any(|s| lower.ends_with(s))
+    {
+        Some("x509")
     } else if let Some(format) = [
         (".7z", "7z"),
         (".rar", "rar"),
@@ -94,6 +132,26 @@ pub(in crate::tools) fn read_streaming(
     ws: &Workspace,
     args: &Value,
     cancel: &AtomicBool,
+) -> Option<Result<String, String>> {
+    read_streaming_impl(ws, args, cancel, None)
+}
+
+/// Read a file whose content (not its name) identified `format`, such as an extensionless
+/// SQLite database or ELF binary.
+pub(in crate::tools) fn read_streaming_as(
+    ws: &Workspace,
+    args: &Value,
+    cancel: &AtomicBool,
+    format: &'static str,
+) -> Option<Result<String, String>> {
+    read_streaming_impl(ws, args, cancel, Some(format))
+}
+
+fn read_streaming_impl(
+    ws: &Workspace,
+    args: &Value,
+    cancel: &AtomicBool,
+    forced: Option<&'static str>,
 ) -> Option<Result<String, String>> {
     let input = match req_str(args, "path") {
         Ok(s) => s,
@@ -176,7 +234,7 @@ pub(in crate::tools) fn read_streaming(
                     .map_or((target, None), |(a, b)| (a, Some(b)))
             })
     };
-    let format = kind(base)?;
+    let format = forced.or_else(|| kind(base))?;
     Some((|| {
         let offset = opt_u64(args, "offset")?.unwrap_or(1);
         let limit = opt_u64(args, "limit")?.unwrap_or(200);
@@ -202,7 +260,8 @@ pub(in crate::tools) fn read_streaming(
                 cancel,
             )?;
             opened.validate(ws)?;
-            Arc::new(text)
+            let sidecars = crate::tools::fs::binary::sqlite_sidecars(ws, base);
+            Arc::new(format!("{sidecars}{text}"))
         } else {
             cache::extracted(&opened, ws, format, member, || {
                 if format == "pdf" {
@@ -243,6 +302,34 @@ pub(in crate::tools) fn is_archive(format: &str) -> bool {
         format,
         "zip" | "tar" | "gzip" | "xz" | "bz2" | "zst" | "7z" | "rar" | "cab" | "iso"
     )
+}
+
+/// Formats decoded straight from the authorized bytes in the worker. `None` for other formats.
+fn read_payload(
+    format: &str,
+    payload: &[u8],
+    member: Option<&str>,
+) -> Option<Result<String, String>> {
+    let without_member = |read: fn(&[u8]) -> Result<String, String>| {
+        Some(match member {
+            Some(member) => Err(format!(
+                "{format} files have no :{member} selector; read the whole file"
+            )),
+            None => read(payload),
+        })
+    };
+    match format {
+        "x509" => without_member(certificate::read),
+        "object" => without_member(executable::read),
+        "plist" => without_member(property_list::read),
+        "mail" => without_member(mail::message),
+        "mbox" => Some(mail::mbox(payload, member)),
+        "parquet" => Some(columnar::parquet(payload, member)),
+        "arrow" => Some(columnar::arrow(payload, member)),
+        "spreadsheet" => Some(spreadsheet::read(payload, member)),
+        "opendocument" => without_member(opendocument::read),
+        _ => None,
+    }
 }
 
 /// Read an archive held in memory (a URL download) through the isolated parser. `name` is the URL

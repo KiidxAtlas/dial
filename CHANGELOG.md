@@ -25,6 +25,7 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Added
 
+- `read` decodes binary and structured files by content and extension: hex dumps with `:bytes=O+N` for any local binary; SQLite WAL/journal sidecar status (a damaged WAL is reported, never discarded); certificates, CSRs and public keys (private keys are never echoed); ELF/Mach-O/PE/ar summaries; Parquet and Arrow schema plus paged rows (`:rows=O+N`); `.xls`/`.xlsb`/`.ods` sheets and `.odt`/`.odp` text; binary plists as XML; and `.eml`/`.mbox` messages ([tools](docs/tools.md)).
 - `read page.html:img` and `read notes.md:img` render HTML and Markdown to a screenshot through an installed headless Chrome/Chromium, so the agent can look at what it built. Rendering is offline and sealed: network, file and frame loads are blocked and only inline content appears. It requires the same confirmation as other converter reads ([tools](docs/tools.md)).
 - Approved watches (`bg action=watch`) gain `after_secs` timers that wake the idle session later (for example to recheck a deploy or CI run), `on_exit` for a job or named run that finishes without a matching line, and a `note` echoed when the watch fires ([application monitoring](docs/application-monitoring.md#timed-wake-ups)).
 - `/providers` now lists every bundled hosted provider (OpenCode Zen and Go, Cerebras, Together, Fireworks and others), not just the seven probed by default. One without a credential is shown as not set up and is not contacted. It is probed once its environment variable is set or an API key is saved.

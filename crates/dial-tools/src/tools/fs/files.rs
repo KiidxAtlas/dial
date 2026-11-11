@@ -475,6 +475,13 @@ fn read_target(
         }
         return super::outline::read(ws, path_text, budget);
     }
+    let local = ws.expand_file_handle(input)?;
+    if let Some((base, spec)) = super::binary::split_bytes_selector(ws, &local) {
+        if present(args, "offset") || present(args, "limit") {
+            return Err("`:bytes=O+N` selects bytes; do not combine it with offset/limit".into());
+        }
+        return super::binary::read_bytes(ws, base, spec, budget);
+    }
     let notebook_target = select::split_target(ws, input)
         .ok()
         .is_some_and(|(path, _)| crate::tools::edit::edit_source::notebook_path(Path::new(path)));
@@ -520,6 +527,27 @@ fn read_target(
             "Image: {path_text} ({} bytes; attached to the next model request when vision is available)",
             meta.len()
         ));
+    }
+    if !sel.raw
+        && let Some(binary) = super::binary::sniff(ws, path_text)
+    {
+        let what = binary.kind.map_or("binary data", |k| k.name);
+        if offset.is_some() || sel.selects_lines() || present(args, "limit") {
+            return Err(format!(
+                "{path_text} is binary ({what}); line selectors do not apply. Use `{path_text}:bytes=O+N` for a hex range or `:raw` for lossy text"
+            ));
+        }
+        if let Some(format) = binary.kind.and_then(|k| k.format) {
+            match super::documents::read_streaming_as(ws, args, cancel, format) {
+                Some(Ok(text)) => return Ok(text),
+                Some(Err(error)) => {
+                    let view = binary.render(ws, path_text, budget)?;
+                    return Ok(format!("[decoding as {what} failed: {error}]\n{view}"));
+                }
+                None => {}
+            }
+        }
+        return binary.render(ws, path_text, budget);
     }
     // Only an unqualified whole-file read may be summarized; any selector, offset or limit is a
     // request for those exact lines.

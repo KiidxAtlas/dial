@@ -61,6 +61,16 @@ lzma-rs.workspace = true
 ruzstd.workspace = true
 sevenz-rust2.workspace = true
 rars.workspace = true
+x509-parser.workspace = true
+object.workspace = true
+parquet.workspace = true
+arrow-ipc.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-cast.workspace = true
+calamine.workspace = true
+plist.workspace = true
+mail-parser.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal = { workspace = true, optional = true }

@@ -1297,8 +1297,10 @@ impl Workspace {
     }
 }
 
-const HASHLINE_READ_DESC: &str = "read: view a file or directory in any format (text, CSV, PDF, Office, \
-images, video, notebooks, archives). Ranges as a path suffix: `:50-100`, `:50+20`, `:50-`, `:-30`, \
+const HASHLINE_READ_DESC: &str = "read: view a file or directory in any format (text, CSV, PDF, Office incl. \
+legacy .xls/.ods/.odt, images, video, notebooks, archives, read-only SQLite with WAL/journal status, Parquet/Arrow, \
+certificates, executables, plists, e-mail; other binaries as hex). Ranges as a path suffix: `:50-100`, `:50+20`, `:50-`, `:-30`, \
+`:bytes=O+N` (hex), \
 `:5-16,960-973`; `:outline` lists declarations, `:raw` is non-editable text; `paths` reads up to 16 targets at once. \
 Also `ssh://host/path`, `http(s)://`, `pr://N`, `issue://N`, `conflict://`, `artifact://H` (lines, `:info`, \
 `:annotations`, `:bytes=O+N`). Output is \
@@ -1321,8 +1323,10 @@ Move code: `CUT 3.=5 @tmp` then `PUT >9 @tmp` (across files too; `PUT N.=M @tmp`
 Example: `[src/main.rs#3FA9]` then `PUT 4.=4:` and `+    let total = a + b;` on separate lines.
 One section per file; put every planned change to every file in one call. Success returns the fresh [PATH#TAG] and changed lines. If the file changed since your read, edits re-anchor when their lines are unchanged; otherwise you get the current lines: after a stale-anchor failure, re-read the target range (or use those lines and their new TAG) before retrying."#;
 
-const REPLACE_READ_DESC: &str = "read: view a file or directory in any format (text, CSV, PDF, Office, \
-images, video, notebooks, archives). Ranges as a path suffix: `:50-100`, `:50+150`, `:50-`, `:-60`, \
+const REPLACE_READ_DESC: &str = "read: view a file or directory in any format (text, CSV, PDF, Office incl. \
+legacy .xls/.ods/.odt, images, video, notebooks, archives, read-only SQLite with WAL/journal status, Parquet/Arrow, \
+certificates, executables, plists, e-mail; other binaries as hex). Ranges as a path suffix: `:50-100`, `:50+150`, `:50-`, `:-60`, \
+`:bytes=O+N` (hex), \
 `:5-16,960-973`; `:outline` lists declarations; `paths` reads up to 16 targets. Also `artifact://H` (lines, \
 `:info`, `:annotations`, `:bytes=O+N`). Lines are numbered. Stops at \
 48 KiB; the footer names the next range. Large or unfamiliar files: `grep` or `:outline` first, then read only the needed ranges, never page through.";
