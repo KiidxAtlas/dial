@@ -66,8 +66,8 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
           # Cross-compiled on Apple Silicon: the Intel runner's build took ~24 min and set the
-          # candidate critical path. The smoke test runs the binary under Rosetta; native Intel
-          # testing stays in ci.yml (DIAL_MACOS_INTEL_RUNNER).
+          # candidate critical path. The smoke test runs the binary under Rosetta; CI does not
+          # run the test suite on Intel hardware.
           - os: macos-15
             target: x86_64-apple-darwin
             cache-suffix: -arm64-host

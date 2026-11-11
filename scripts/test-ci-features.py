@@ -20,14 +20,10 @@ def selections(matrix):
 
 
 class FeatureMatrixTests(unittest.TestCase):
-    def test_push_matrix_covers_boundaries_single_features_and_defaults(self):
+    def test_push_matrix_covers_boundaries_and_defaults(self):
         selected = selections(features.matrix())
-        self.assertEqual(len(selected), 9)
-        self.assertEqual(len(set(selected)), len(selected))
-        for required in [frozenset(), *(frozenset([name]) for name in features.FEATURES),
-                         frozenset(features.FEATURES),
-                         frozenset(["aws", "voice", "embedded-shell", "embedded-js", "desktop"])]:
-            self.assertIn(required, selected)
+        self.assertEqual(selected, [frozenset(), frozenset(features.FEATURES[:-1]),
+                                    frozenset(features.FEATURES)])
         self.assertTrue(set(selected) < set(selections(features.matrix(True))))
 
     def test_matrix_tracks_the_workspace_feature_contract(self):

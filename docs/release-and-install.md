@@ -433,33 +433,30 @@ PR container builds restore the main layer cache but do not export competing PR 
 The release container no longer needs a Rust compilation cache. Cache availability and speedups
 are not guaranteed; Docker cache mounts are not themselves persisted by the layer-cache exporter.
 
-Intel macOS test jobs also cache pip downloads and locally built wheels, keyed by Python and
-`scripts/requirements-ci.lock`, so successful jobs can reuse the otherwise source-built
-`cryptography` wheel. Installation still requires the locked hashes. Only main CI enables this
-cache; PRs, candidate packaging and tag fallback builds do not, avoiding extra branch-scoped
-cache entries. A cold or evicted cache still builds normally.
+Release candidate jobs also cache pip downloads and locally built wheels, keyed by Python and
+`scripts/requirements-ci.lock`, so the Intel macOS packaging job can reuse its source-built
+`cryptography` wheel. Installation still requires the locked hashes. Only main enables this
+cache; PRs and tag fallback builds do not, avoiding extra branch-scoped cache entries. A cold or
+evicted cache still builds normally.
 
 The `x86_64-apple-darwin` candidate is cross-compiled on an Apple Silicon `macos-15` runner
 instead of the Intel runner, whose release build took about 24 minutes and set the candidate
 critical path. Its packaged binary is format-checked and smoke-tested under Rosetta 2, which the
-job installs if missing. The full test suite still runs on native Intel hardware in CI.
+job installs if missing.
 
 #### Runner capacity and downstream failures
 
-Intel macOS remains fully tested in CI. To benchmark a faster **native Intel macOS** test runner,
-set the repository variable `DIAL_MACOS_INTEL_RUNNER` to an available runner label; CI tests use
-it, defaulting to `macos-15-intel`. Candidate packaging cross-compiles and does not use it. Provisioning a paid runner or increasing
-the repository cache quota requires an owner decision; this change does not spend money or alter
-hosted settings. Do not send untrusted PRs to a persistent privileged self-hosted runner.
+Intel macOS is still built, smoke-tested and published, but CI no longer runs the test suite on
+Intel hardware: that job took 30 to 60 minutes and held every release behind it. Intel-specific
+regressions that the Rosetta smoke test does not exercise can therefore reach a release.
+Provisioning a paid runner or increasing the repository cache quota requires an owner decision.
+Do not send untrusted PRs to a persistent privileged self-hosted runner.
 
 The publish job writes the binary release URL to its summary before downstream jobs start. If
-website refresh, package metadata or container publication fails, rerun only the failed jobs with
+package metadata or container publication fails, rerun only the failed jobs with
 `gh run rerun <release-run-id> --failed`; do not retag, rebuild or republish successful binaries.
-Those jobs retain visible failures. Website HTTP 404 means the refresh route is absent or its
-server-side token is unset: deploy the route and set `NUXT_RELEASE_REFRESH_TOKEN` on dial-web to
-the same value as Dial's `DIAL_WEB_REFRESH_TOKEN` secret. HTTP 401 means the values do not match.
-The endpoint intentionally returns 404 without its server-side token; changing the Dial workflow
-alone cannot configure the separately hosted website. No token value should appear in logs.
+Those jobs retain visible failures. The release workflow does not refresh dial.rootatlas.dev;
+the site picks up a new release when its cached copy of GitHub's latest release expires.
 
 #### Checking a commit locally before pushing
 
@@ -526,26 +523,30 @@ The Unix CI smoke tier stages the executable already produced by the workspace b
 CI caches compiled dependencies per job with `Swatinem/rust-cache`. Caches are saved only from
 `main`, and also after a failing run, so one red test does not force the next run on that OS to
 rebuild from scratch. The repository's 10 GB cache quota evicts the least recently used entries
-first, so the Linux feature-powerset jobs share one cache per runner image, saved only by the
-all-features combination; per-combination caches crowded out the macOS test caches.
+first, so the Linux feature jobs share one cache per runner image, saved only by the
+largest combination on that image; per-combination caches crowded out the macOS test caches.
 
-Push and pull-request CI run eight representative Linux feature selections: minimal, each
-of the five optional features alone, the default feature set, and all features. PipeWire
-already enables desktop, so its individual selection covers that pair without a duplicate job.
-`.github/workflows/linux-features.yml` owns the shared compile job and runs
-the exhaustive 32-combination powerset weekly (Monday 04:23 UTC). Maintainers can also
-dispatch **Linux feature coverage** manually, with exhaustive coverage enabled by default;
-run that tier before a release when full feature-interaction evidence is needed. It does
-not run the other platform suites again. Feature compilation is capped at four concurrent
-jobs per run to leave capacity for platform CI. PipeWire selections retain Ubuntu 24.04;
-other selections retain Ubuntu 22.04. Representative coverage does not prove every optional
-feature interaction; the exhaustive tier retains that coverage. This changes future runs,
-not workflows already queued from an older commit.
+Push and pull-request CI compile three Linux feature selections: minimal (no optional
+features), the default feature set, and all features. `.github/workflows/linux-features.yml`
+owns the shared compile job and runs the exhaustive 32-combination powerset weekly (Monday
+04:23 UTC). Maintainers can also dispatch **Linux feature coverage** manually, with exhaustive
+coverage enabled by default; run that tier before a release when a change touches feature
+gating. Per-push coverage does not prove that each optional feature compiles alone or with
+every other; a gating mistake can surface only in the weekly run. PipeWire selections use
+Ubuntu 24.04; other selections use Ubuntu 22.04.
 
-The Intel macOS CI job (`macos-15-intel`) runs format, build and the full test suite. The
-installed-binary smoke tests, real-terminal lifecycle scripts, slim build check and runtime
-overhead recording run on `macos-15` and Ubuntu only; release candidates cross-compile the
-`x86_64-apple-darwin` archive on `macos-15` and smoke-test it under Rosetta 2.
+CI runs format, build and the full test suite on `macos-15` and Ubuntu. The installed-binary
+smoke tests, real-terminal lifecycle scripts, slim build check and runtime overhead recording
+run on Ubuntu only; `make preflight` runs the smoke and real-terminal suites on a developer's
+macOS host. Release candidates cross-compile the `x86_64-apple-darwin` archive on `macos-15` and
+smoke-test it under Rosetta 2.
+
+The musl compile checks run on pull requests and on pushes that do not build release
+candidates; a main push that builds candidates compiles both musl targets there instead. The
+source container image (`.github/workflows/docker.yml`) builds only when the Dockerfiles,
+compose files, `Cargo.lock`, the toolchain pin or that workflow change. Source changes that break
+only the container build are caught by the release workflow, which builds and smoke-tests the
+published image.
 
 The workflow preserves repository visibility. Dial is MIT licensed; see `LICENSE` for
 permission to use, modify, and redistribute it.

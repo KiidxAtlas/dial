@@ -276,42 +276,8 @@ jobs:
           {
             echo "## Binary release published"
             echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
-            echo "Downstream website, package metadata and container jobs can be retried independently; do not rebuild published binaries."
+            echo "Downstream package metadata and container jobs can be retried independently; do not rebuild published binaries."
           } >> "$GITHUB_STEP_SUMMARY"
-
-  website:
-    name: Show the new release on dial.rootatlas.dev
-    needs: publish
-    if: needs.publish.outputs.latest == 'true'
-    runs-on: ubuntu-22.04
-    permissions: {}
-    steps:
-      - name: Refresh the site's cached release
-        # dial-web caches GitHub's latest release for an hour; this replaces it at once.
-        # The token matches NUXT_RELEASE_REFRESH_TOKEN on the dial-web Railway service.
-        env:
-          DIAL_WEB_REFRESH_TOKEN: ${{ secrets.DIAL_WEB_REFRESH_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [ -z "$DIAL_WEB_REFRESH_TOKEN" ]; then
-            echo "::error title=Website refresh not configured::Set DIAL_WEB_REFRESH_TOKEN here and the same NUXT_RELEASE_REFRESH_TOKEN on the dial-web service. Binaries are already published."
-            exit 1
-          fi
-          status="$(curl --silent --show-error --retry 3 --retry-connrefused --max-time 30 \
-            --output "$RUNNER_TEMP/release.json" --write-out '%{http_code}' \
-            -X POST -H "Authorization: Bearer $DIAL_WEB_REFRESH_TOKEN" \
-            https://dial.rootatlas.dev/release/refresh)"
-          if [ "$status" != 200 ]; then
-            echo "::error title=Website refresh HTTP $status::Binaries are already published. For 404, configure NUXT_RELEASE_REFRESH_TOKEN on dial-web and deploy the refresh route; for 401, match it to DIAL_WEB_REFRESH_TOKEN. Rerun this failed job only."
-            exit 1
-          fi
-          version="$(jq -r .version "$RUNNER_TEMP/release.json")"
-          if [ "$version" != "$RELEASE_TAG" ]; then
-            echo "::error title=Website stale::Website did not return the published release. Rerun this job only."
-            exit 1
-          fi
-          echo "Website now shows $RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
 
   packaging:
     name: Propose package metadata update

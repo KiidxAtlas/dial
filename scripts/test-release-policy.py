@@ -11,7 +11,6 @@ import subprocess
 import sys
 import tempfile
 import tarfile
-import textwrap
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -356,7 +355,7 @@ class CandidatePromotionTests(unittest.TestCase):
 
     def test_intel_pip_cache_is_lock_keyed_main_only_and_keeps_hash_checks(self):
         root = SCRIPT.parent.parent
-        for filename, job in (("ci.yml", "test"), ("release-build.yml", "build")):
+        for filename, job in (("release-build.yml", "build"),):
             with self.subTest(workflow=filename):
                 source = (root / ".github/workflows" / filename).read_text()
                 block = source.split(f"\n  {job}:\n", 1)[1].split("\n\n  ", 1)[0]
@@ -450,31 +449,6 @@ class ContainerStagingTests(unittest.TestCase):
             "crates/dial-agent/src/agent/compact/snapcompact/fonts/", "")
         self.assertEqual(release, expected)
         self.assertNotIn("cargo", release)
-
-
-class WebsiteRefreshTests(unittest.TestCase):
-    def test_refresh_diagnoses_missing_endpoint_auth_and_stale_version_without_hiding_failures(self):
-        workflow = (SCRIPT.parent.parent / ".github/workflows/release.yml").read_text()
-        job = workflow.split("\n  website:\n", 1)[1].split("\n  packaging:\n", 1)[0]
-        script = textwrap.dedent(job.split("        run: |\n", 1)[1])
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            curl = root / "curl"
-            curl.write_text('#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\nif [ "$1" = --output ]; then shift; out="$1"; fi\nshift\ndone\nprintf \'{"version":"%s"}\' "$SITE_VERSION" > "$out"\nprintf "%s" "$HTTP_STATUS"\n')
-            curl.chmod(0o755)
-            for status, version, token, success in (("200", "v0.3.0", "fixture-token", True),
-                    ("404", "v0.3.0", "fixture-token", False), ("401", "v0.3.0", "fixture-token", False),
-                    ("200", "v0.2.9", "fixture-token", False), ("200", "v0.3.0", "", False)):
-                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                    env=dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
-                        RUNNER_TEMP=str(root), GITHUB_STEP_SUMMARY=str(root / "summary"),
-                        RELEASE_TAG="v0.3.0", SITE_VERSION=version, HTTP_STATUS=status, DIAL_WEB_REFRESH_TOKEN=token))
-                with self.subTest(status=status, version=version, configured=bool(token)):
-                    self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
-                    self.assertNotIn("fixture-token", result.stdout + result.stderr)
-                    if status == "404":
-                        self.assertIn("NUXT_RELEASE_REFRESH_TOKEN", result.stdout)
-                        self.assertIn("Rerun this failed job only", result.stdout)
 
 
 if __name__ == "__main__":

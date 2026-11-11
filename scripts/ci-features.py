@@ -15,8 +15,10 @@ def matrix(exhaustive=False):
             for combination in itertools.combinations(FEATURES, size)
         ]
     else:
-        # PipeWire already enables desktop, so a second desktop+PipeWire row is redundant.
-        selections = [(), *((feature,) for feature in FEATURES), FEATURES[:-1], FEATURES]
+        # Push and PR CI check the boundaries and what users install: no optional features, the
+        # default set and all features. Single features and other combinations are left to the
+        # weekly exhaustive run.
+        selections = [(), FEATURES[:-1], FEATURES]
     return {"include": [
         {
             "name": " + ".join(features) or "minimal",

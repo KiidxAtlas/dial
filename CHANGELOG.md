@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Changed
+
+- CI is shorter: the Intel macOS test job is gone (the Intel build is still cross-compiled, smoke-tested under Rosetta and published), the installed-binary, real-terminal, slim-build and runtime-overhead checks run on Ubuntu only, per-push Linux feature checks cover minimal, default and all features (the full powerset still runs weekly), the container image builds only when container inputs change, and main pushes that build release candidates skip the duplicate musl checks. The release workflow no longer runs the dial.rootatlas.dev refresh job, which failed on every release.
+
 ## [0.3.4] - 2026-11-10
 
 ### Security
