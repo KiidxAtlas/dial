@@ -200,6 +200,9 @@ struct StepChecks {
     /// Revision at which a shell test/build command (`is_check_command`) last passed; evidence for
     /// the completion gate when the model verifies through `bash` rather than `check`.
     shell_check_passed: Option<verify::evidence::Revision>,
+    /// `bash` calls marked `check` that ran to an exit this turn, as `(command, passed, revision)`,
+    /// so the turn report lists them beside focused checks.
+    shell_check_runs: Vec<(String, bool, verify::evidence::Revision)>,
     /// Model-authored acceptance helpers, distinct from operator/task-provided checks.
     registered_acceptance: Vec<verify::verification::FocusedCheck>,
     registered_checked: Option<verify::evidence::Revision>,
@@ -439,6 +442,8 @@ pub struct Agent<'a> {
     last_auto_thinking: Option<String>,
     workflow_metrics: std::cell::RefCell<crate::learn::workflow::Metrics>,
     efficiency_metrics: workflow::efficiency::Metrics,
+    /// Session-wide count of prompt-prefix resets by cause; see [`Agent::prefix_resets`].
+    prefix_resets: std::collections::BTreeMap<&'static str, u64>,
     workflow_started: Instant,
     task_policy: crate::learn::task_policy::Policy,
     request_phase: crate::adaptive::State,

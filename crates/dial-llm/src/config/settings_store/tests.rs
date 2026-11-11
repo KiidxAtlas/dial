@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::schema;
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Layout) {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -661,6 +662,90 @@ fn model_review_does_not_advertise_or_publish_unselected_layer_migrations() {
         assert_eq!(
             std::fs::read(&layout.config_files()[unselected]).unwrap(),
             legacy
+        );
+    }
+}
+
+#[test]
+fn reset_provider_clears_inherited_fields_and_survives_reload() {
+    let (_home, _project, layout) = fixture();
+    let providers: toml::Table = toml::from_str(
+        r#"
+[docker-model-runner]
+label = "Docker"
+base_url = "http://127.0.0.1:12434/engines/v1"
+api_key_env = "DOCKER_TEST_KEY"
+api_key_envs = ["DOCKER_TEST_KEY_2"]
+headers = [{name = "X-Test", value = { literal = "fixture" }}]
+"#,
+    )
+    .unwrap();
+    save_config(
+        &layout,
+        Scope::Global,
+        &[Change::Set {
+            path: "providers".into(),
+            value: providers.into(),
+        }],
+    )
+    .unwrap();
+    reset_provider(&layout, Scope::Project, "docker-model-runner").unwrap();
+    let loaded = load_config(&layout, &toml::Table::new()).unwrap();
+    let reset = &loaded.providers["docker-model-runner"];
+    assert!(reset.is_reset());
+    assert!(reset.api_key_env.as_deref().is_none_or(str::is_empty));
+    assert!(reset.api_key_envs.is_empty());
+    assert!(reset.headers.as_ref().is_none_or(Vec::is_empty));
+    assert!(
+        schema::get(
+            &load_layer(&layout, Scope::Global).unwrap(),
+            "providers.docker-model-runner.base_url"
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn reset_provider_global_clears_project_override_but_keeps_other_providers() {
+    let (_home, _project, layout) = fixture();
+    for scope in [Scope::Global, Scope::Project] {
+        for id in ["mlx-serve", "keep"] {
+            save_config(
+                &layout,
+                scope,
+                &[Change::Set {
+                    path: format!("providers.{id}.base_url"),
+                    value: "http://127.0.0.1:11234/v1".into(),
+                }],
+            )
+            .unwrap();
+        }
+    }
+    reset_provider(&layout, Scope::Global, "mlx-serve").unwrap();
+    let loaded = load_config(&layout, &toml::Table::new()).unwrap();
+    assert!(loaded.providers["mlx-serve"].is_reset());
+    assert!(loaded.providers["keep"].enabled);
+    let project = load_layer(&layout, Scope::Project).unwrap();
+    assert!(schema::get(&project, "providers.mlx-serve").is_none());
+    assert!(schema::get(&project, "providers.keep").is_some());
+}
+
+#[test]
+fn reset_provider_accepts_local_reset_records_but_not_local_endpoints() {
+    let (_home, _project, layout) = fixture();
+    for id in ["mlx", "apple"] {
+        reset_provider(&layout, Scope::Global, id).unwrap();
+        assert!(load_config(&layout, &toml::Table::new()).unwrap().providers[id].is_reset());
+        assert!(
+            save_config(
+                &layout,
+                Scope::Global,
+                &[Change::Set {
+                    path: format!("providers.{id}.base_url"),
+                    value: "https://example.test".into()
+                }]
+            )
+            .is_err()
         );
     }
 }

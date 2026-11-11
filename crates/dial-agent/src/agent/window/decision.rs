@@ -12,7 +12,10 @@ use serde_json::Value;
 pub struct ContextDecision {
     pub provider: String,
     pub model: String,
+    /// Window the history budget is planned against (the model window, or the efficiency cap).
     pub window: u32,
+    /// The selected model's own window, as the status line shows it.
+    pub model_window: u32,
     pub response_reserve: u64,
     pub prompt_budget: u64,
     /// None means automatic compaction is disabled, not that the trigger is zero.
@@ -72,6 +75,7 @@ impl Agent<'_> {
             provider: selection.provider,
             model: selection.model,
             window,
+            model_window: self.context_window(),
             response_reserve: u64::from(window).saturating_sub(budget),
             prompt_budget: budget,
             trigger,

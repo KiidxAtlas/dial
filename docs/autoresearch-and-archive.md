@@ -22,3 +22,5 @@ The benchmark command runs inside Dial's strict workspace sandbox; it has no net
 ## Archive
 
 Archive reads recent projects and bounded session previews from Dial state directories, and reads deduplicated submitted prompts and journaled idle recaps from the user's `history.db`. The `archive` tool is read-only; cross-project history requires approval. `/archive` browses recent projects, sessions, and prompt history. Prompt history is global across projects; repeated normalized prompts update recency and use count rather than creating duplicates.
+
+A single-session view (`history source=sessions action=session id=<prefix>`) also lists that session's failures, oldest first: tool calls that returned an error (including harness refusals such as a changed tool contract), with the call's clipped arguments, and turns that ended failed or interrupted, with their error. Recovery notices and retry hints are stripped so the cause stays visible. The transcript is streamed line by line, so any size is covered; `limit` keeps the newest failures and the section heading reports the total found.

@@ -362,24 +362,81 @@ impl OverlayEnv<'_> {
             }
             OverlayEvent::AddProvider { id, spec, scope } => {
                 *self.scope = scope;
-                let outcome = self.save(&provider_changes(&id, &spec), scope);
+                let changes = if matches!(id.as_str(), "mlx" | "apple") && spec.enabled {
+                    vec![Change::Remove {
+                        path: format!("providers.{id}"),
+                    }]
+                } else {
+                    provider_changes(&id, &spec)
+                };
+                let outcome = self.save(&changes, scope);
                 if let (Ok(config), ActiveOverlay::Providers(providers)) = (&outcome, &mut *overlay)
                 {
                     providers.set_configured(config.providers.clone());
                 }
+                if let Ok(config) = &outcome {
+                    self.catalog.refresh_config(self.app, config);
+                }
                 self.report(overlay, outcome.map(|_| format!("provider {id} updated")));
-                self.catalog.refresh(self.app);
             }
             OverlayEvent::RemoveProvider { id, scope } => {
                 *self.scope = scope;
-                let outcome = self.save(
-                    &[Change::Remove {
-                        path: format!("providers.{id}"),
-                    }],
-                    scope,
-                );
-                self.report(overlay, outcome.map(|_| format!("provider {id} removed")));
-                self.catalog.refresh(self.app);
+                let outcome = (|| -> Result<String> {
+                    let config = self.app.reload()?;
+                    let mut urls = Vec::new();
+                    for layer in [
+                        settings_store::Scope::Global,
+                        settings_store::Scope::Project,
+                    ] {
+                        let table = settings_store::load_layer(&self.app.layout, layer)?;
+                        if let Some(base) =
+                            crate::config::schema::get(&table, &format!("providers.{id}.base_url"))
+                                .and_then(toml::Value::as_str)
+                        {
+                            urls.push(base.to_owned());
+                        }
+                    }
+                    if let Some(spec) = config.providers.get(&id) {
+                        urls.push(spec.base_url.clone());
+                    }
+                    if let Some(found) = self.catalog.get() {
+                        urls.extend(
+                            found
+                                .providers
+                                .iter()
+                                .filter(|p| p.id == id)
+                                .filter_map(|p| p.base_url.clone()),
+                        );
+                    }
+                    // Cancel a pending login before it can save credentials again.
+                    let auth_name = crate::llm::oauth::flow(&id)
+                        .map(|flow| flow.name)
+                        .unwrap_or(match id.as_str() {
+                            "anthropic" => "Claude",
+                            "chatgpt" => "ChatGPT",
+                            "openrouter" => "OpenRouter",
+                            _ => "",
+                        });
+                    if self
+                        .auth_job
+                        .as_ref()
+                        .is_some_and(|job| job.label == auth_name)
+                    {
+                        self.auth_job.take();
+                    }
+                    self.app.reset_provider(scope, &id)?;
+                    let fresh = self.reload_saved()?;
+                    if let ActiveOverlay::Providers(providers) = &mut *overlay {
+                        providers.set_configured(fresh.providers.clone());
+                    }
+                    self.catalog.refresh_config(self.app, &fresh);
+                    catalog::remove_provider_credentials(&self.app.layout.user_dir, &id, &urls)
+                        .map_err(|error| anyhow::anyhow!("Provider reset saved, but saved-key/sign-in cleanup failed: {error:#}"))?;
+                    Ok(format!(
+                        "{id} reset to not set up; saved keys and sign-ins removed. Environment variables, external servers and model files are unchanged."
+                    ))
+                })();
+                self.report(overlay, outcome);
             }
             OverlayEvent::SaveCredential {
                 provider,

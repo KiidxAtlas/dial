@@ -135,7 +135,8 @@ enum Kind {
     Event(crate::agent::ui::ui_event::UiEvent),
     Error(String),
     Image(super::images::Thumbnail),
-    Stats(TurnStats),
+    /// The turn's closing line, with what its tool calls did for the recap card.
+    Stats(TurnStats, recap::Recap),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -376,7 +377,9 @@ impl Block {
             Kind::Event(event) => Arc::new(super::lanes::rows(event, w, ctx)),
             Kind::Error(t) => Arc::new(error_rows(t, w, ctx)),
             Kind::Image(image) => Arc::new(image.rows(w, ctx.theme)),
-            Kind::Stats(s) => Arc::new(stats_rows(s, w, ctx)),
+            Kind::Stats(s, recap) => {
+                Arc::new(recap::card(s, recap, w, ctx).unwrap_or_else(|| stats_rows(s, w, ctx)))
+            }
         };
         if self.timestamp.is_some() {
             self.timestamp_rows(Arc::make_mut(&mut rows), w, ctx);
@@ -808,8 +811,9 @@ fn thinking_rows(raw: &str, w: u16, ctx: &TranscriptCtx, toggle: Option<&str>) -
         );
         return vec![fitted(vec![Span::styled(label, style)], w, ctx.theme)];
     }
-    // Reasoning hangs off a quote bar in the icon gutter, quieter than the answer's `●`.
-    let rail = in_gutter(ctx.theme.sym(Sym::Quote));
+    // Reasoning hangs off a dotted rail in the icon gutter: quieter than the answer's `●` and
+    // distinct from the composer's solid `▎` edge, so it never reads as typed input.
+    let rail = in_gutter(if ctx.theme.ascii() { ":" } else { "┊" });
     let lead = text::width(&rail);
     if w <= lead + 4 {
         return vec![fitted(
@@ -838,6 +842,9 @@ pub(super) fn in_gutter(mark: &str) -> String {
     )
 }
 
+/// Narrowest width that draws an error as a card; narrower errors stay red gutter rows.
+const ERROR_CARD_MIN: usize = 32;
+
 fn error_rows(body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     let w = w as usize;
     let clean = text::sanitize(body);
@@ -847,6 +854,26 @@ fn error_rows(body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     }
     let theme = ctx.theme;
     let style = theme.fg(Tok::Error);
+    // Wide enough: a red card titled with the cross, the message inside in body text.
+    if w >= ERROR_CARD_MIN {
+        let mut card = super::tool_cards::frame::Frame::new(
+            vec![
+                Span::styled(theme.sym(Sym::Cross2).to_owned(), style),
+                Span::raw(" "),
+                Span::styled("Error", style.add_modifier(Modifier::BOLD)),
+            ],
+            style,
+        );
+        let inner = w - super::tool_cards::frame::CHROME_W;
+        card.sections.push((
+            None,
+            text::wrap_words(body, inner)
+                .into_iter()
+                .map(|row| Line::from(Span::styled(row, theme.fg(Tok::Text))))
+                .collect(),
+        ));
+        return card.rows(theme, w);
+    }
     let glyph = in_gutter(theme.sym(Sym::Cross2));
     let gw = text::width(&glyph);
     let room = w.saturating_sub(gw).max(1);
@@ -866,6 +893,41 @@ fn error_rows(body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
             )
         })
         .collect()
+}
+
+/// How a turn's reported `status` reads: its color, mark and word. An outcome the agent did not
+/// name is reported as unknown, never as a failure or success; a delivered answer is neutral.
+fn outcome_mark(status: &str, theme: &Theme) -> (Tok, String, &'static str) {
+    let known = matches!(
+        status,
+        "running"
+            | "pending"
+            | "done"
+            | "completed"
+            | "answered"
+            | "blocked"
+            | "needs_input"
+            | "incomplete"
+            | "failed"
+            | "interrupted"
+            | "cancelled"
+            | "canceled"
+    );
+    let phase = crate::runtime::Phase::from_status(status);
+    // The same state table as tool and worker rows.
+    let mark = match status {
+        "cancelled" | "canceled" => Some(StateMark::Cancelled),
+        _ => state_mark(phase, None),
+    };
+    let (tok, glyph, word) = match mark {
+        _ if !known => (Tok::Warning, theme.sym(Sym::Warn), "unknown"),
+        // A delivered answer is not acceptance that the work is complete: neutral, like a
+        // settled tool row, never the success check.
+        Some(StateMark::Answered) => (Tok::Muted, theme.sym(Sym::Dot), "answered"),
+        Some(mark) => (mark.tok(), mark.glyph(theme), mark.word()),
+        None => (Tok::Warning, theme.sym(Sym::Warn), phase.label()),
+    };
+    (tok, glyph.to_owned(), word)
 }
 
 /// The turn's closing line: how it ended (its mark in the icon gutter), what it changed, how long
@@ -888,38 +950,9 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
     };
     let mut changed = 0;
     if let Some(o) = &s.outcome {
-        // An outcome the agent did not name is reported as unknown, never as a failure or success.
-        let known = matches!(
-            o.status.as_str(),
-            "running"
-                | "pending"
-                | "done"
-                | "completed"
-                | "answered"
-                | "blocked"
-                | "needs_input"
-                | "incomplete"
-                | "failed"
-                | "interrupted"
-                | "cancelled"
-                | "canceled"
-        );
-        let phase = crate::runtime::Phase::from_status(&o.status);
-        // The same state table as tool and worker rows.
-        let mark = match o.status.as_str() {
-            "cancelled" | "canceled" => Some(StateMark::Cancelled),
-            _ => state_mark(phase, None),
-        };
-        let (tok, glyph, word) = match mark {
-            _ if !known => (Tok::Warning, theme.sym(Sym::Warn), "unknown"),
-            // A delivered answer is not acceptance that the work is complete: neutral, like a
-            // settled tool row, never the success check.
-            Some(StateMark::Answered) => (Tok::Muted, theme.sym(Sym::Dot), "answered"),
-            Some(mark) => (mark.tok(), mark.glyph(theme), mark.word()),
-            None => (Tok::Warning, theme.sym(Sym::Warn), phase.label()),
-        };
+        let (tok, glyph, word) = outcome_mark(&o.status, theme);
         // The outcome's mark takes the gutter so the end of a turn is findable at a glance.
-        left[0] = gutter(glyph, theme.fg(tok));
+        left[0] = gutter(&glyph, theme.fg(tok));
         push(
             &mut left,
             word.to_owned(),
@@ -1023,6 +1056,17 @@ pub struct Transcript {
     sealed: bool,
     /// The reasoning toggle's key label, given to every reasoning block; see `set_thinking_key`.
     thinking_key: Option<Arc<str>>,
+    /// Block starts in the rows of the last `retire_settled` call; see `take_block_starts`.
+    block_starts: Vec<BlockStart>,
+}
+
+/// Where a whole block begins in a run of committed rows: `row` is the offset of its first row
+/// (its leading blank separator when `gap`), `block` its index in the transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockStart {
+    pub row: usize,
+    pub block: usize,
+    pub gap: bool,
 }
 
 /// Blocks are separated by one blank row, except consecutive members of the work group (tool
@@ -1186,6 +1230,7 @@ impl Transcript {
             outcome: None,
             sealed: false,
             thinking_key: None,
+            block_starts: Vec::new(),
         }
     }
 
@@ -1441,32 +1486,50 @@ impl Transcript {
             return;
         }
         self.invalidate_tail();
-        if let Some(tool) = self.live_running_tool(id) {
-            Self::append_partial(&mut tool.input, delta);
-            tool.progress = Some(Self::tail_within(&tool.input, Self::PREVIEW_LIMIT).to_owned());
+        if let Some(index) = self.live_running_index(id) {
+            if let Kind::Tool(tool) = &mut self.blocks[index].kind {
+                Self::append_partial(&mut tool.input, delta);
+                Self::show_partial(tool);
+            }
             return;
         }
         self.close_streaming_text();
         let mut input = String::new();
         Self::append_partial(&mut input, delta);
-        let progress = Some(Self::tail_within(&input, Self::PREVIEW_LIMIT).to_owned());
-        self.push(
-            Kind::Tool(Tool {
-                id: id.to_owned(),
-                name: name.to_owned(),
-                summary: name.to_owned(),
-                presentation: crate::agent::legacy_tool_presentation(name, name, ""),
-                input,
-                state: ToolState::Running,
-                output: String::new(),
-                progress,
-                elapsed: None,
-                todo: None,
-                agents: Vec::new(),
-                outcome: None,
-            }),
-            true,
-        );
+        let mut tool = Tool {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            summary: name.to_owned(),
+            presentation: crate::agent::legacy_tool_presentation(name, name, ""),
+            input,
+            state: ToolState::Running,
+            output: String::new(),
+            progress: None,
+            elapsed: None,
+            todo: None,
+            agents: Vec::new(),
+            outcome: None,
+        };
+        Self::show_partial(&mut tool);
+        self.push(Kind::Tool(tool), true);
+        // Nothing runs yet: the clock starts with `tool_start`, so a queued call shows no timer.
+        if let Some(block) = self.blocks.last_mut() {
+            block.started = None;
+        }
+    }
+
+    /// What a card whose arguments are still arriving shows. Once they parse, the card reads like
+    /// the call it will be (`$ cargo test`, not `$ bash` over raw JSON) and says it has not
+    /// started; until then the newest partial text is its body.
+    fn show_partial(tool: &mut Tool) {
+        if serde_json::from_str::<serde_json::Value>(&tool.input).is_ok_and(|v| v.is_object()) {
+            tool.presentation =
+                crate::agent::legacy_tool_presentation(&tool.name, &tool.name, &tool.input);
+            tool.summary = tool.presentation.target.clone();
+            tool.progress = Some("waiting to start".to_owned());
+        } else {
+            tool.progress = Some(Self::tail_within(&tool.input, Self::PREVIEW_LIMIT).to_owned());
+        }
     }
 
     /// The running card for call `id` in the live tail, if one exists.
@@ -1935,7 +1998,22 @@ impl Transcript {
         if stats.outcome.is_none() {
             stats.outcome = self.outcome.take();
         }
-        self.push(Kind::Stats(stats), false);
+        // What this turn's calls did: every tool block since the user's message.
+        let start = self
+            .blocks
+            .iter()
+            .rposition(|b| matches!(b.kind, Kind::User(_)))
+            .map_or(0, |i| i + 1);
+        let mut recap = recap::Recap::default();
+        for block in &self.blocks[start..] {
+            if let Kind::Tool(tool) = &block.kind {
+                block.tool_phase(|state, presentation| recap.note(&tool.name, state, presentation));
+                if let Some(view) = block.tool_view() {
+                    recap.note_result(&view);
+                }
+            }
+        }
+        self.push(Kind::Stats(stats, recap), false);
     }
 
     /// Finalize every streaming block; a tool that never reported back is shown as interrupted.
@@ -2022,6 +2100,7 @@ impl Transcript {
         retire: Retire,
     ) -> (Rows, Vec<(usize, super::images::NativeImage)>) {
         let mut out: Rows = Vec::new();
+        self.block_starts.clear();
         let mut images = Vec::new();
         let mut finished = 0;
         while self.cursor < self.blocks.len() {
@@ -2066,6 +2145,13 @@ impl Transcript {
             };
             if !out.is_empty() && out.len() + needed > retire.rows {
                 break;
+            }
+            if next == 0 && !frozen.is_empty() {
+                self.block_starts.push(BlockStart {
+                    row: out.len(),
+                    block: index,
+                    gap,
+                });
             }
             if let Some(native) = native {
                 if gap {
@@ -2276,9 +2362,23 @@ impl Transcript {
     /// streaming one), rendered afresh at `width`. After a display reset, commit this and keep
     /// using `take_settled` / `live` unchanged: nothing is repeated and nothing is lost.
     pub fn committed_rows(&self, width: u16, ctx: &TranscriptCtx) -> Rows {
+        self.committed_rows_from(None, width, ctx).0
+    }
+
+    /// [`committed_rows`](Self::committed_rows) from the block `from` starts (its leading blank row
+    /// included), with the start of every whole block in the result. Rendering only the tail keeps
+    /// a resize reflow of the visible rows cheap however long the conversation is.
+    pub fn committed_rows_from(
+        &self,
+        from: Option<&BlockStart>,
+        width: u16,
+        ctx: &TranscriptCtx,
+    ) -> (Rows, Vec<BlockStart>) {
+        let (first, lead_gap) = from.map_or((0, false), |start| (start.block, start.gap));
         let mut out = Vec::new();
+        let mut starts = Vec::new();
         let mut prev: Option<bool> = None;
-        for (i, block) in self.blocks.iter().enumerate() {
+        for (i, block) in self.blocks.iter().enumerate().skip(first) {
             if i > self.cursor {
                 break;
             }
@@ -2287,9 +2387,18 @@ impl Transcript {
             } else {
                 self.rows_in_range(i, width, ctx, self.cursor..self.blocks.len())
             };
-            let gap = prev.is_some_and(|p| gap_between(p, block.is_tool()));
+            let gap = if i == first {
+                lead_gap
+            } else {
+                prev.is_some_and(|p| gap_between(p, block.is_tool()))
+            };
             if i < self.cursor {
                 if !rows.is_empty() {
+                    starts.push(BlockStart {
+                        row: out.len(),
+                        block: i,
+                        gap,
+                    });
                     if gap {
                         out.push(blank_row());
                     }
@@ -2312,7 +2421,14 @@ impl Transcript {
                 out.extend(rows.iter().take(n).cloned());
             }
         }
-        out
+        (out, starts)
+    }
+
+    /// Where whole blocks begin in the rows the last [`retire_settled`](Self::retire_settled) calls
+    /// returned (offsets into each call's rows, oldest first). The terminal keeps them so a resize
+    /// can reprint the visible tail from a block boundary.
+    pub fn take_block_starts(&mut self) -> Vec<BlockStart> {
+        std::mem::take(&mut self.block_starts)
     }
 }
 
@@ -2504,6 +2620,8 @@ impl Replay {
         first
     }
 }
+
+mod recap;
 
 #[cfg(test)]
 mod tests;

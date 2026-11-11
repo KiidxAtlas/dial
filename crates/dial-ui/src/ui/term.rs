@@ -2,7 +2,9 @@
 //!
 //! Finalized rows are written once to the *normal* screen buffer, so the terminal scrolls them into
 //! its own scrollback. Only the live bottom region (the viewport: composer, menus, streaming text)
-//! is repainted in place. Every paint is one write wrapped in synchronized output (`?2026`):
+//! is repainted in place. When the width changes and settles, the blocks still on screen are
+//! reprinted at the new width; scrollback is left as printed ([`InlineTerminal::reflow`]).
+//! Every paint is one write wrapped in synchronized output (`?2026`):
 //!
 //! 1. hide the cursor, disable autowrap;
 //! 2. move up to the top of the previous viewport (relative movement only: the terminal may have
@@ -115,6 +117,10 @@ pub fn termination_requested() -> bool {
 /// The live region: rows to repaint, where the hardware cursor goes, and an optional window title.
 /// Scrollback bytes committed per frame, well under the output queue's frame limit.
 const HISTORY_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// How long the width must stay unchanged before the scrollback is reprinted at it.
+pub const REFLOW_SETTLE: Duration = Duration::from_millis(150);
+/// History rows whose widths are kept for a reflow: more than any screen holds.
+const HISTORY_LOG_ROWS: usize = 1024;
 
 pub struct Viewport<'a> {
     pub rows: &'a [Line<'static>],
@@ -153,6 +159,21 @@ pub struct InlineTerminal {
     last_size: (u16, u16),
     /// Erase from the viewport top down before painting (resize, overlay return).
     force_erase: bool,
+    /// Width the scrollback rows were printed at; `None` while nothing was printed since the last
+    /// display reset.
+    history_width: Option<u16>,
+    /// When the last width change away from `history_width` was seen (reflow wait).
+    reflow_since: Option<std::time::Instant>,
+    /// Cell widths of the newest written history rows, oldest first (at most `HISTORY_LOG_ROWS`).
+    history_log: std::collections::VecDeque<usize>,
+    /// Where transcript blocks begin among the history rows (absolute row numbers, ascending).
+    block_starts: std::collections::VecDeque<super::transcript::BlockStart>,
+    /// Rows the next paint climbs from the cursor before erasing: set by a reflow.
+    reflow_up: Option<usize>,
+    /// The next `commit` holds transcript rows (set by `mark_blocks`).
+    owned_next: bool,
+    /// End of the newest rows committed from outside the transcript (absolute row number).
+    foreign_until: usize,
     deferred_paint: bool,
     title: Option<String>,
     last_frame: Option<Frame>,
@@ -274,6 +295,13 @@ impl InlineTerminal {
             cursor_row: 0,
             last_size: (size.0.max(1), size.1.max(1)),
             force_erase: false,
+            history_width: None,
+            reflow_since: None,
+            history_log: std::collections::VecDeque::new(),
+            block_starts: std::collections::VecDeque::new(),
+            reflow_up: None,
+            owned_next: false,
+            foreign_until: 0,
             deferred_paint: false,
             title: None,
             last_frame: None,
@@ -296,7 +324,9 @@ impl InlineTerminal {
 
     /// Retry display work even when no more model or input events arrive.
     pub fn needs_repaint(&self) -> bool {
-        self.deferred_paint || self.overlay.as_ref().is_some_and(|session| session.redraw)
+        self.deferred_paint
+            || self.reflow_since.is_some()
+            || self.overlay.as_ref().is_some_and(|session| session.redraw)
     }
 
     /// Preserve redraw intent when composition is deferred by terminal backpressure.
@@ -344,7 +374,12 @@ impl InlineTerminal {
     }
 
     /// Queue finalized rows; they are written to scrollback exactly once on the next paint.
+    /// Rows not preceded by [`mark_blocks`](Self::mark_blocks) do not belong to the transcript;
+    /// a reflow never reprints across them.
     pub fn commit(&mut self, rows: Vec<Line<'static>>) {
+        if !std::mem::take(&mut self.owned_next) {
+            self.foreign_until = self.history_written + self.pending.len() + rows.len();
+        }
         self.pending.extend(rows);
     }
 
@@ -371,8 +406,142 @@ impl InlineTerminal {
     }
 
     /// Call on `Event::Resize`: the next paint erases conservatively from the recorded viewport top.
+    /// A width change also starts the reflow wait (see [`InlineTerminal::reflow_due`]).
     pub fn on_resize(&mut self) {
         self.force_erase = true;
+        let cols = self.size().0;
+        self.reflow_since = self
+            .history_width
+            .is_some_and(|printed| printed != cols)
+            .then(std::time::Instant::now);
+    }
+
+    /// Whether the rows still on screen should be reprinted at the current width: rows were
+    /// printed at another width and the size has been stable for [`REFLOW_SETTLE`]. A drag emits
+    /// many resize events; this waits until it settles. True once per settled change; the caller
+    /// then calls [`reflow`](Self::reflow). Never while a panel owns the alternate screen or
+    /// committed rows still wait to be written; the wait resumes afterwards.
+    pub fn reflow_due(&mut self) -> bool {
+        let Some(since) = self.reflow_since else {
+            return false;
+        };
+        if self
+            .history_width
+            .is_none_or(|printed| printed == self.size().0)
+        {
+            self.reflow_since = None;
+            return false;
+        }
+        if self.overlay.is_some() || !self.pending.is_empty() || since.elapsed() < REFLOW_SETTLE {
+            return false;
+        }
+        self.reflow_since = None;
+        true
+    }
+
+    /// Record where whole transcript blocks begin in rows about to be committed (offsets into the
+    /// next [`commit`](Self::commit)). A reflow reprints from one of these boundaries.
+    pub fn mark_blocks(&mut self, starts: Vec<super::transcript::BlockStart>) {
+        self.owned_next = true;
+        let base = self.history_written + self.pending.len();
+        self.block_starts.extend(
+            starts
+                .into_iter()
+                .map(|start| super::transcript::BlockStart {
+                    row: base + start.row,
+                    ..start
+                }),
+        );
+    }
+
+    /// Reprint the blocks still wholly on screen at the current width, without touching scrollback.
+    ///
+    /// Rows are pre-wrapped, so the terminal cannot reflow them itself. The scrollback belongs to
+    /// the terminal and stays as printed; only the screen is rewritten. Each logged row takes
+    /// `ceil(width / cols)` physical rows (terminals re-wrap long rows on narrowing; the same model
+    /// the viewport repaint uses), so the rows that fit above the viewport are known. The first
+    /// block that begins among them is the seam: the next paint moves up to it, erases below and
+    /// writes `render(seam)`'s rows (the block onward, rendered at the new width) and the
+    /// viewport in one synchronized write. A block cut by the screen's top edge keeps its old
+    /// wrapping, so nothing is repeated or lost. Returns whether anything was reprinted.
+    pub fn reflow(
+        &mut self,
+        render: impl FnOnce(
+            &super::transcript::BlockStart,
+        ) -> (Vec<Line<'static>>, Vec<super::transcript::BlockStart>),
+    ) -> bool {
+        let (cols, rows) = self.size();
+        self.history_width = Some(cols);
+        if self.overlay.is_some() || !self.pending.is_empty() {
+            return false;
+        }
+        let width = cols as usize;
+        let physical = |w: usize| w.div_ceil(width).max(1);
+        let viewport: usize = self.painted_widths.iter().map(|&w| physical(w)).sum();
+        let above_cursor: usize = self
+            .painted_widths
+            .iter()
+            .take(self.cursor_row as usize)
+            .map(|&w| physical(w))
+            .sum();
+        // Rows above the viewport. The terminal's answer is authoritative: re-wrapping on a
+        // narrowing can push rows into scrollback before the viewport shrinks again, so the
+        // screen need not end at the viewport. Without an answer, assume it does.
+        let cursor_row = if self.real {
+            let _ = self.flush_output();
+            crossterm::cursor::position()
+                .ok()
+                .map(|(_, row)| usize::from(row))
+        } else {
+            None
+        };
+        let room = match cursor_row {
+            Some(row) => row.saturating_sub(above_cursor),
+            None => (rows as usize).saturating_sub(viewport),
+        };
+        // Oldest history row wholly on screen, walking up from the newest.
+        let mut used = 0;
+        let mut first = self.history_written;
+        for (i, &w) in self.history_log.iter().enumerate().rev() {
+            if used + physical(w) > room {
+                break;
+            }
+            used += physical(w);
+            first = self.history_written - self.history_log.len() + i;
+        }
+        let Some(seam) = self
+            .block_starts
+            .iter()
+            .find(|start| {
+                start.row >= first.max(self.foreign_until) && start.row < self.history_written
+            })
+            .copied()
+        else {
+            return false;
+        };
+        let skip = seam.row - (self.history_written - self.history_log.len());
+        let climb: usize = self
+            .history_log
+            .iter()
+            .skip(skip)
+            .map(|&w| physical(w))
+            .sum();
+        let up = above_cursor + climb;
+        if up > (rows as usize).saturating_sub(1) || cursor_row.is_some_and(|row| up > row) {
+            return false;
+        }
+        let (fresh, starts) = render(&seam);
+        self.history_log.truncate(skip);
+        self.history_written = seam.row;
+        self.block_starts.retain(|start| start.row < seam.row);
+        self.mark_blocks(starts);
+        self.owned_next = false;
+        self.pending = fresh;
+        self.pending_images.clear();
+        self.reflow_up = Some(up);
+        self.force_erase = true;
+        self.last_frame = None;
+        true
     }
 
     /// Number of history rows flushed to the terminal so far.
@@ -468,7 +637,10 @@ impl InlineTerminal {
         let width_changed = cols != self.last_size.0;
         let erase_first = self.force_erase || (cols, rows) != self.last_size;
         // After a narrowing, the terminal may have re-wrapped old rows into more physical rows.
-        let up = if width_changed {
+        let up = if let Some(up) = self.reflow_up.take() {
+            // A reflow climbs past the viewport to the first visible block it reprints.
+            up
+        } else if width_changed {
             self.painted_widths
                 .iter()
                 .take(self.cursor_row as usize)
@@ -578,6 +750,16 @@ impl InlineTerminal {
         self.out.flush()?;
 
         self.history_written += history.len();
+        if !history.is_empty() && self.history_width.is_none() {
+            self.history_width = Some(cols);
+        }
+        self.history_log.extend(history.iter().map(|(_, w)| *w));
+        let excess = self.history_log.len().saturating_sub(HISTORY_LOG_ROWS);
+        self.history_log.drain(..excess);
+        let oldest = self.history_written - self.history_log.len();
+        while self.block_starts.front().is_some_and(|s| s.row < oldest) {
+            self.block_starts.pop_front();
+        }
         let committed = history.len();
         self.pending.drain(..committed);
         self.pending_images.retain_mut(|(at, _, _)| {
@@ -622,6 +804,13 @@ impl InlineTerminal {
         self.cursor_row = 0;
         self.force_erase = false;
         self.last_size = self.size();
+        self.history_width = None;
+        self.reflow_since = None;
+        self.history_log.clear();
+        self.block_starts.clear();
+        self.reflow_up = None;
+        self.owned_next = false;
+        self.foreign_until = 0;
         UP_ROWS.store(0, Ordering::SeqCst);
         Ok(())
     }

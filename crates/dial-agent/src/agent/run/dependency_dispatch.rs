@@ -24,6 +24,13 @@ pub(in crate::agent) fn footprint_for(
     if bookkeeping(call) {
         return Some(Footprint::default());
     }
+    // A shell command's inputs are unknowable, so a read-only one (the parallel-read form: no
+    // session, terminal or background job) reads every root; any other command stays a barrier.
+    if call.name == "bash" {
+        return crate::agent::safety::approval::parallel_read(registry, "bash", &call.arguments)
+            .then(|| crate::tools::surface::resources::workspace_read(workspace))
+            .flatten();
+    }
     crate::tools::surface::resources::resolve(
         workspace,
         mode,

@@ -276,7 +276,7 @@ impl Agent<'_> {
             state["preserved_inputs"] = preserved;
             self.session.set_control_state(state)?;
             self.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Review,
-                format!("Initial task preservation retained {count} bounded root-level source files as independent artifacts. Hidden, credential-like, linked and oversized sources are excluded; this is not an atomic live-database snapshot. If an input disappears or shrinks, its retained reference will be reported. Recover actual evidence; never invent missing records or report guessed data as recovered.")))?;
+                format!("Initial task preservation retained {count} bounded root-level source files as independent artifacts for recovery; they do not make changes to the originals safe. Hidden, credential-like, linked and oversized sources are excluded; this is not an atomic live-database snapshot. Look at inputs with read-only tools (read, xxd, sqlite3 -readonly) before running a program that may rewrite them. If an input disappears or shrinks, its retained reference will be reported. Recover actual evidence; never invent missing records or report guessed data as recovered.")))?;
         }
         let names = self.offered();
         let schemas = self.schemas(&names)?;

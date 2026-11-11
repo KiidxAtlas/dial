@@ -185,6 +185,21 @@ pub struct DownloadFailure {
     pub detail: String,
 }
 
+/// What the discovered catalog says about one installed model. Matching an installed path against
+/// catalog entries canonicalizes both through the file system, so it is worked out once when the
+/// installed list or the catalog changes, never while drawing or handling a key.
+#[derive(Clone, Copy, Debug, Default)]
+struct InstalledFacts {
+    /// Downloaded from the Images shelf, or an image model in the catalog.
+    image: bool,
+    /// A catalog entry for it accepts or produces images.
+    image_capable: bool,
+    /// A catalog entry for it cannot chat (an embedder, for example).
+    not_chat: bool,
+    /// The first served, available image entry for it: what Enter assigns on the Images shelf.
+    image_entry: Option<usize>,
+}
+
 /// Session-owned Get models state. Panels borrow the same manager across closing and reopening.
 /// The final owner dropping the manager cancels a running download.
 pub struct ModelDownloads {
@@ -224,6 +239,8 @@ pub struct ModelDownloads {
     image_repos: BTreeSet<String>,
     /// Set after a download finishes; the panel takes it and asks the controller to rescan.
     rescan: bool,
+    /// [`InstalledFacts`] per row of `dashboard.models`, refreshed by [`ModelDownloads::classify_installed`].
+    installed_facts: Vec<InstalledFacts>,
 }
 
 /// A session retains one handle while Models views come and go. This shares the existing manager,
@@ -272,7 +289,7 @@ impl ModelDownloads {
 
     fn with(dashboard: Dashboard, source: Option<Source>) -> Self {
         let family = download::default_family();
-        Self {
+        let mut group = Self {
             source,
             dashboard,
             shelf: Shelf::Hub(family),
@@ -297,7 +314,65 @@ impl ModelDownloads {
             pulled_rx: None,
             discovered: Vec::new(),
             rescan: false,
-        }
+            installed_facts: Vec::new(),
+        };
+        group.classify_installed();
+        group
+    }
+
+    /// Matches every installed model against the catalog and the downloaded images once. Only
+    /// entries that can change a classification are canonicalized, so a large hosted catalog costs
+    /// a filter, not a file-system lookup per entry.
+    fn classify_installed(&mut self) {
+        let relevant: Vec<(usize, PathBuf)> = self
+            .known_models
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.metadata.kind == crate::llm::catalog::ModelKind::Image
+                    || entry.supports_images()
+                    || !entry.supports_chat()
+            })
+            .map(|(index, entry)| (index, canonical_path(&entry.selection.model)))
+            .collect();
+        let images: Vec<PathBuf> = self
+            .downloaded_images
+            .iter()
+            .map(|path| canonical_path(path))
+            .collect();
+        self.installed_facts = self
+            .dashboard
+            .models
+            .iter()
+            .map(|row| {
+                let path = canonical_path(&row.path);
+                let mut facts = InstalledFacts {
+                    image: images.iter().any(|known| path.starts_with(known)),
+                    ..InstalledFacts::default()
+                };
+                for (index, listed) in &relevant {
+                    if !path.starts_with(listed) {
+                        continue;
+                    }
+                    let entry = &self.known_models[*index];
+                    facts.image |= entry.metadata.kind == crate::llm::catalog::ModelKind::Image;
+                    facts.image_capable |= entry.supports_images();
+                    facts.not_chat |= !entry.supports_chat();
+                    if facts.image_entry.is_none()
+                        && entry.available
+                        && entry.supports_images()
+                        && entry.selection.base_url.is_some()
+                    {
+                        facts.image_entry = Some(*index);
+                    }
+                }
+                facts
+            })
+            .collect();
+    }
+
+    fn facts(&self, index: usize) -> InstalledFacts {
+        self.installed_facts.get(index).copied().unwrap_or_default()
     }
 
     /// Shows the embedding shelf without reading Ollama's model list (tests only).
@@ -349,6 +424,7 @@ impl ModelDownloads {
             .filter(|entry| entry.is_embedding())
             .cloned()
             .collect();
+        self.classify_installed();
     }
 
     /// Whether a download finished since the last call, so the controller should rescan.
@@ -372,6 +448,7 @@ impl ModelDownloads {
             self.dashboard =
                 local_models::collect(&source.layout, &source.settings, crate::stats::now_ms());
         }
+        self.classify_installed();
         if self.shelf == Shelf::Embedding {
             self.refresh_pulled();
         }
@@ -711,18 +788,12 @@ impl ModelDownloads {
             .models
             .iter()
             .enumerate()
-            .filter(|(_, row)| {
-                let image = self.is_image_path(&row.path);
+            .filter(|(index, row)| {
+                let facts = self.facts(*index);
                 let compatible = if self.shelf == Shelf::Images {
-                    image
-                        || self.known_models.iter().any(|entry| {
-                            entry.supports_images() && same_model(&entry.selection.model, &row.path)
-                        })
+                    facts.image || facts.image_capable
                 } else {
-                    !image
-                        && !self.known_models.iter().any(|entry| {
-                            same_model(&entry.selection.model, &row.path) && !entry.supports_chat()
-                        })
+                    !facts.image && !facts.not_chat
                 };
                 compatible
                     && (any_format || row.format == Some(family.label()))
@@ -730,16 +801,6 @@ impl ModelDownloads {
             })
             .map(|(index, _)| index)
             .collect()
-    }
-
-    fn is_image_path(&self, path: &str) -> bool {
-        self.downloaded_images
-            .iter()
-            .any(|known| same_model(known, path))
-            || self.known_models.iter().any(|entry| {
-                entry.metadata.kind == crate::llm::catalog::ModelKind::Image
-                    && same_model(&entry.selection.model, path)
-            })
     }
 
     /// Discovered embedding models matching the query, as indexes into `discovered`.
@@ -890,13 +951,12 @@ impl ModelDownloads {
         }
         match self.current() {
             Some(Pick::Installed(index)) => match self.dashboard.models.get(index) {
-                Some(row) if self.shelf == Shelf::Images || self.is_image_path(&row.path) => {
-                    if let Some(entry) = self.known_models.iter().find(|entry| {
-                        entry.available
-                            && entry.supports_images()
-                            && entry.selection.base_url.is_some()
-                            && same_model(&entry.selection.model, &row.path)
-                    }) {
+                Some(_) if self.shelf == Shelf::Images || self.facts(index).image => {
+                    if let Some(entry) = self
+                        .facts(index)
+                        .image_entry
+                        .and_then(|entry| self.known_models.get(entry))
+                    {
                         Step::UseImage(entry.selection.clone())
                     } else {
                         self.message = "Image weights are in the Hugging Face cache. Import/serve them in MLX-Serve, then F5 rescan and choose the endpoint in Images.".into();
@@ -1414,6 +1474,7 @@ impl ModelDownloads {
             self.downloaded_images.insert(path.to_owned());
             self.shelf = Shelf::Images;
         }
+        self.classify_installed();
         if !memory && !image {
             self.shelf = Shelf::Hub(family);
         }
@@ -1720,10 +1781,12 @@ fn window_start(cursor: usize, height: usize) -> usize {
 /// Whether the installed model at `listed` is the one a download produced (`downloaded` may be a file
 /// inside that directory, as GGUF downloads are).
 fn same_model(listed: &str, downloaded: &str) -> bool {
-    let canonical =
-        |path: &str| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-    let (listed, downloaded) = (canonical(listed), canonical(downloaded));
-    downloaded == listed || downloaded.starts_with(&listed)
+    canonical_path(downloaded).starts_with(canonical_path(listed))
+}
+
+/// The canonical form of `path`, or `path` itself when it does not resolve (a hosted model id).
+fn canonical_path(path: &str) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
 /// `1.5 GiB`, `312 MiB`, `8 KiB` or `12 B`.

@@ -8,18 +8,18 @@ fn execution_gap_experiments_have_explicit_defaults_and_validate_bounds() {
             && defaults.eval.auto_offer
             && defaults.eval.parallel_batches
     );
-    assert!(
-        defaults.efficiency.preserve_task_inputs && defaults.verification.auto_registered_checks
-    );
+    assert!(defaults.verification.auto_registered_checks);
+    assert!(!defaults.efficiency.preserve_task_inputs);
     assert!(!defaults.experimental.adaptive_output_effort);
     assert_eq!(defaults.compaction.argument_projection_tokens, 0);
-    let configured: crate::config::types::Config = toml::from_str("[eval]\nportable_helpers=false\nauto_offer=false\nparallel_batches=false\n[efficiency]\npreserve_task_inputs=false\nevidence_stall_rounds=0\nsmall_case_guard=false\n[verification]\nauto_registered_checks=false\n").unwrap();
+    let configured: crate::config::types::Config = toml::from_str("[eval]\nportable_helpers=false\nauto_offer=false\nparallel_batches=false\n[efficiency]\npreserve_task_inputs=true\nevidence_stall_rounds=0\nsmall_case_guard=false\n[verification]\nauto_registered_checks=false\n").unwrap();
     assert!(
         !configured.eval.portable_helpers
             && !configured.eval.auto_offer
             && !configured.eval.parallel_batches
     );
     assert!(!configured.verification.auto_registered_checks);
+    assert!(configured.efficiency.preserve_task_inputs);
     let mut invalid = defaults;
     invalid.efficiency.evidence_stall_rounds = 257;
     assert!(invalid.validate().is_err());

@@ -167,6 +167,82 @@ fn ambient_motion_keeps_the_mark_alive_without_changing_its_size() {
 }
 
 #[test]
+fn the_bezel_traces_in_with_a_comet_before_the_needle_swings() {
+    let theme = Theme::builtin("dial-dark").unwrap();
+    let (trace, level) = mark::boot_phases(0.0);
+    assert_eq!(
+        (trace, level),
+        (0.0, 0.0),
+        "nothing is drawn at the first frame"
+    );
+    let (trace, level) = mark::boot_phases(0.3);
+    assert!(trace > 0.5 && trace < 1.0 && level < 0.5, "{trace} {level}");
+    assert_eq!(mark::boot_phases(1.0), (1.0, 1.0));
+    let dots = |rows: &Vec<Vec<Span<'static>>>| -> u32 {
+        rows.iter()
+            .flatten()
+            .flat_map(|s| s.content.chars())
+            .map(|c| (c as u32).saturating_sub(0x2800).count_ones())
+            .sum()
+    };
+    let frames: Vec<u32> = [0.0, 0.15, 0.3, 0.6, 1.0]
+        .iter()
+        .map(|p| dots(&mark::lockup(&theme, *p, 0)))
+        .collect();
+    assert!(
+        frames.windows(2).all(|w| w[0] <= w[1] + 8),
+        "the mark fills in as it powers up: {frames:?}"
+    );
+    // The untuned wordmark is already there, dim; the bezel and ticks are not.
+    assert!(frames[0] + 100 < frames[4], "{frames:?}");
+    for p in [0.0, 0.2, 0.45, 0.7, 0.95] {
+        for row in mark::lockup(&theme, p, 0) {
+            let width: usize = row.iter().map(|s| text::width(&s.content)).sum();
+            assert_eq!(width, mark::LOCKUP.0, "boot frames keep the lockup width");
+        }
+    }
+}
+
+#[test]
+fn the_tagline_types_in_without_moving_and_context_stands_in_cards() {
+    let theme = Theme::builtin("dial-dark").unwrap();
+    let mut info = info();
+    info.version = "0.4.2".into();
+    let full = tagline(&info, &theme, 1.0);
+    let half = tagline(&info, &theme, 0.2);
+    let width =
+        |spans: &Vec<Span<'static>>| spans.iter().map(|s| text::width(&s.content)).sum::<usize>();
+    assert_eq!(
+        width(&full),
+        width(&half),
+        "typing never shifts the centered row"
+    );
+    let text_of =
+        |spans: &Vec<Span<'static>>| spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+    assert!(text_of(&full).starts_with("v0.4.2"), "{}", text_of(&full));
+    assert!(text_of(&half).trim_end().len() < text_of(&full).len());
+
+    let view = render_home(120, 40, Some(0), "");
+    let rows = plain(&view.rows);
+    let all = rows.join("\n");
+    assert!(all.contains(TAGLINE), "{all}");
+    let tl = theme.sym(Sym::BoxTl);
+    let heads: Vec<&String> = rows.iter().filter(|r| r.contains(tl)).collect();
+    assert!(
+        heads.iter().any(|r| r.contains("heads up")),
+        "warnings stand in their own card: {all}"
+    );
+    assert!(
+        heads.iter().any(|r| r.contains("START WITH")),
+        "the list's heading rides its card's top edge: {all}"
+    );
+    assert!(
+        all.contains("to pick one"),
+        "the hint rides the bottom edge: {all}"
+    );
+}
+
+#[test]
 fn resizing_keeps_input_and_selected_actions_visible_without_overflow() {
     for width in [1, 12, 38, 60, 80, 140] {
         for height in [12, 16, 20, 40] {

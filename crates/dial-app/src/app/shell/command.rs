@@ -545,10 +545,11 @@ impl Shell {
                     }
                 }
                 let mode = format!("{:?}", agent.approval()).to_lowercase();
+                let label = crate::ui::status::approval_label(&mode);
                 let meaning = agent.approval().description();
                 self.note(
                     "Approval",
-                    format!("mode: {mode} · {meaning}\nChange it with /approval ask|write|auto|readonly or Shift+Tab."),
+                    format!("{label} ({mode}) · {meaning}\nChange it with /approval ask|write|auto|readonly or Shift+Tab."),
                 );
             }
             "outcome" => self.outcome_command(app, args),
@@ -773,6 +774,19 @@ impl Shell {
     }
 
     fn permissions_command(&mut self, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        if args == "why" {
+            let text = if self.policy_log.is_empty() {
+                "No tool call has passed the approval policy in this session yet.".to_owned()
+            } else {
+                let rows: Vec<&str> = self.policy_log.iter().rev().map(String::as_str).collect();
+                format!(
+                    "Most recent first. Each row names the rule that decided the call and what would change it.\n{}",
+                    rows.join("\n")
+                )
+            };
+            self.note("Permissions", text);
+            return Ok(Step::Done);
+        }
         self.note("Permissions", PERMISSION_PATH_SCOPE);
         if let Some(rest) = args.strip_prefix("remove ") {
             let mut words = rest.split_whitespace();
@@ -870,7 +884,7 @@ impl Shell {
                 },
             );
         } else {
-            self.note("Permissions", "usage: /permissions; /permissions allow|deny [--persist] <tool> [prefix words | --path <glob>…]; /permissions remove <number> [--persist]");
+            self.note("Permissions", "usage: /permissions; /permissions why; /permissions allow|deny [--persist] <tool> [prefix words | --path <glob>…]; /permissions remove <number> [--persist]");
         }
         Ok(Step::Done)
     }
@@ -884,56 +898,110 @@ impl Shell {
             );
             return Ok(Step::Done);
         }
-        // Summary first; the accounting detail (attempts, reports, pricing coverage) follows
-        // per role as `key: value` rows.
-        let describe = |role: &str, c: &usage::Counts| {
-            format!(
-                "{role}\n  cost: {} · requests: {} · retries: {} · failed: {}\n  tokens in: {} · out: {} · cached reads: {} · cache writes: {} · reasoning: {}\n  priced: {} · unpriced: {} · local: {} · subscription: {}\n  attempts: {} · accepted: {} · discarded: {} · without complete usage: {} · usage reports: {} · cache reports: {} · reasoning reports: {}",
+        // Summary first, then one short block per role that made requests. Accounting detail
+        // (pricing mix, discarded or unreported attempts) appears only when it says something.
+        let describe = |role: &str, c: &usage::Counts| -> Option<String> {
+            if c.requests == 0 && c.transport_attempts == 0 {
+                return None;
+            }
+            let mut rows = vec![format!(
+                "{role}: {} · {} request{}{}{}",
                 c.cost_label(),
                 c.requests,
-                c.retries,
-                c.failed_requests,
-                c.input,
-                c.output,
-                c.cache_read,
-                c.cache_write,
-                c.reasoning,
-                c.priced_requests,
-                c.unpriced_requests,
-                c.local_requests,
-                c.subscription_requests,
-                c.transport_attempts,
-                c.successful_requests,
-                c.discarded_attempts,
-                c.unreported_attempts,
-                c.reported_responses,
-                c.cache_reported_responses,
-                c.reasoning_reported_responses,
-            )
+                if c.requests == 1 { "" } else { "s" },
+                if c.retries > 0 {
+                    format!(" · {} retries", c.retries)
+                } else {
+                    String::new()
+                },
+                if c.failed_requests > 0 {
+                    format!(" · {} failed", c.failed_requests)
+                } else {
+                    String::new()
+                },
+            )];
+            let mut tokens = vec![format!("in {}", c.input), format!("out {}", c.output)];
+            if c.cache_read + c.cache_write > 0 {
+                tokens.push(format!(
+                    "cache read {} / write {}",
+                    c.cache_read, c.cache_write
+                ));
+            }
+            if c.reasoning > 0 {
+                tokens.push(format!("reasoning {}", c.reasoning));
+            }
+            rows.push(format!("  tokens   {}", tokens.join(" · ")));
+            rows.push(format!(
+                "  cache    {}",
+                cache_line(c).trim_start_matches("cache hit rate: ")
+            ));
+            let billing: Vec<String> = [
+                (c.priced_requests, "priced"),
+                (c.unpriced_requests, "unpriced"),
+                (c.local_requests, "local"),
+                (c.subscription_requests, "subscription"),
+            ]
+            .into_iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, label)| format!("{n} {label}"))
+            .collect();
+            if !billing.is_empty() {
+                rows.push(format!("  billing  {}", billing.join(" · ")));
+            }
+            if c.discarded_attempts > 0
+                || c.unreported_attempts > 0
+                || c.transport_attempts != c.successful_requests
+            {
+                rows.push(format!(
+                    "  attempts {} sent · {} accepted · {} discarded · {} without complete usage",
+                    c.transport_attempts,
+                    c.successful_requests,
+                    c.discarded_attempts,
+                    c.unreported_attempts
+                ));
+            }
+            Some(rows.join("\n"))
         };
         let turn_label = turn
             .coverage
             .turn_id
             .map_or_else(|| "this turn".to_owned(), |id| format!("turn {id}"));
         let mut text = format!(
-            "Session: {} · requests: {} · tokens in: {} · out: {}\nCurrent {turn_label}: {}\nCoverage: {}\n\n{}\n\n{}",
+            "Session: {} · requests: {} · tokens in: {} · out: {}\nCurrent {turn_label}: {}\nCoverage: {}",
             total.all.cost_label(),
             total.all.requests,
             total.all.input,
             total.all.output,
             turn.all.cost_label(),
             total.coverage.history,
+        );
+        for block in [
             describe("Main agent", &total.main),
             describe("Workers", &total.workers),
-        );
-        for (model, counts) in &total.by_model {
-            text.push_str(&format!(
-                "\n\nModel {model}\n{}\n{}",
-                describe("  Main agent", &counts.main).replace("\n  ", "\n    "),
-                describe("  Workers", &counts.workers).replace("\n  ", "\n    ")
-            ));
+        ]
+        .into_iter()
+        .flatten()
+        {
+            text.push_str(&format!("\n\n{block}"));
         }
-        text.push_str("\n\nMissing usage or prices are unknown, not free; local and subscription usage is not an invoice estimate. Caps stop on observed cost before the next step; in-flight workers and discarded attempts can add unobserved charges. Accounting for earlier (resumed) sessions is unavailable.");
+        if let Some(line) = prefix_reset_line(agent.prefix_resets()) {
+            text.push_str(&format!("\n\n{line}"));
+        }
+        // Per-model blocks only add information when more than one model served requests.
+        if total.by_model.len() > 1 {
+            for (model, counts) in &total.by_model {
+                for block in [
+                    describe(&format!("{model} · main"), &counts.main),
+                    describe(&format!("{model} · workers"), &counts.workers),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    text.push_str(&format!("\n\n{block}"));
+                }
+            }
+        }
+        text.push_str("\n\nMissing usage or prices are unknown, not free; subscription and local use is not invoice-priced. Caps act on observed cost; in-flight workers and discarded attempts can add charges. Earlier (resumed) sessions are not counted.");
         self.note("Cost and usage", text);
         Ok(Step::Done)
     }
@@ -1246,6 +1314,51 @@ impl Shell {
         self.note("Context", text);
         Ok(Step::Done)
     }
+}
+
+/// Share of prompt tokens served from the provider's prompt cache. Prompt totals include cached
+/// reads; responses that reported no cache fields count as uncached, so this is a lower bound.
+fn cache_line(counts: &usage::Counts) -> String {
+    if counts.cache_reported_responses == 0 {
+        return "cache hit rate: not reported by the provider".to_owned();
+    }
+    if counts.input == 0 {
+        return "cache hit rate: unknown (no prompt tokens reported)".to_owned();
+    }
+    let rate = counts.cache_read.min(counts.input) as f64 * 100.0 / counts.input as f64;
+    let partial = if counts.cache_reported_responses < counts.reported_responses {
+        format!(
+            "at least {rate:.0}% of prompt tokens (cache reported on {} of {} responses)",
+            counts.cache_reported_responses, counts.reported_responses
+        )
+    } else {
+        format!("{rate:.0}% of prompt tokens")
+    };
+    format!("cache hit rate: {partial}")
+}
+
+/// Main-agent requests whose prompt did not extend the previous one, by cause. Each one made a
+/// provider prompt cache start over from the changed part; `None` when every request extended
+/// the one before it.
+fn prefix_reset_line(resets: &std::collections::BTreeMap<&str, u64>) -> Option<String> {
+    let label = |cause: &str| match cause {
+        "model_changed" => "model switched",
+        "system_changed" => "instructions changed",
+        "tools_changed" => "tool list changed",
+        "history_changed" => "earlier messages rewritten (compaction or pruning)",
+        _ => "other",
+    };
+    let parts = resets
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(cause, count)| format!("{} {count}", label(cause)))
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| {
+        format!(
+            "Prompt cache restarts (main agent): {}. Each makes the provider re-read the prompt from the changed part; keeping the model, instructions and tools fixed during a session keeps the cache warm.",
+            parts.join(" · ")
+        )
+    })
 }
 
 #[cfg(test)]

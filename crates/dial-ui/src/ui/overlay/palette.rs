@@ -195,6 +195,44 @@ enum Row {
     Unified(usize),
 }
 
+/// Keeps word-matched rows below subsequence matches, whose scores are far smaller.
+const PHRASE_BELOW_FUZZY: i32 = 1_000_000;
+/// Words that carry no intent in a phrase such as "undo the last edit".
+const FILLER: &[&str] = &[
+    "the", "and", "for", "that", "this", "with", "what", "how", "did", "does", "can", "please",
+    "last", "from", "into", "you", "are", "was", "want",
+];
+
+/// Word match for a query of two or more words: counts the query's meaningful words that start
+/// a word of `text` (or the reverse, for "edits" against "edit"). At least half must match.
+fn phrase_score(query: &str, text: &str) -> Option<i32> {
+    let split = |value: &str| -> Vec<String> {
+        value
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| word.len() >= 3)
+            .map(str::to_owned)
+            .collect()
+    };
+    if query.split_whitespace().count() < 2 {
+        return None;
+    }
+    let wanted: Vec<String> = split(query)
+        .into_iter()
+        .filter(|word| !FILLER.contains(&word.as_str()))
+        .collect();
+    let have = split(text);
+    let matched = wanted
+        .iter()
+        .filter(|word| {
+            have.iter()
+                .any(|other| other.starts_with(*word) || word.starts_with(other))
+        })
+        .count();
+    (matched > 0 && matched * 2 >= wanted.len())
+        .then(|| matched as i32 * 10 - (wanted.len() - matched) as i32)
+}
+
 fn group(command: &CommandEntry) -> &'static str {
     if command.kind != CommandKind::Builtin {
         return "Extensions";
@@ -514,7 +552,21 @@ impl PaletteOverlay {
                         (entry.command.name.eq_ignore_ascii_case(query), true, score)
                     }
                     (None, Some((score, _))) => (false, false, score),
-                    _ => return None,
+                    // A plain phrase ("undo the last edit") is no subsequence of any entry;
+                    // match its words instead, ranked below every fuzzy match.
+                    _ => (
+                        false,
+                        false,
+                        phrase_score(
+                            query,
+                            &format!(
+                                "{} {} {}",
+                                entry.command.name,
+                                action_label(&entry.command),
+                                entry.command.description
+                            ),
+                        )? - PHRASE_BELOW_FUZZY,
+                    ),
                 };
                 Some((index, score))
             })
@@ -1309,9 +1361,22 @@ impl PaletteOverlay {
                                 .into(),
                         )
                     }
+                    // The row already shows the blurb; the detail names what the goal opens.
                     Row::Goal(goal) => (
                         format!(" {}", GOALS[goal].title),
-                        GOALS[goal].blurb.to_owned(),
+                        {
+                            let names: Vec<String> = self
+                                .entries
+                                .iter()
+                                .filter(|entry| GOALS[goal].holds(&entry.command))
+                                .map(|entry| format!("/{}", entry.command.name))
+                                .collect();
+                            if names.is_empty() {
+                                GOALS[goal].blurb.to_owned()
+                            } else {
+                                format!("Opens {}", names.join(", "))
+                            }
+                        },
                         " Enter opens this goal. Your chat draft is preserved.".to_owned(),
                     ),
                     Row::AllActions => (

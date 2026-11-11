@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 const MAX_ENTRIES: usize = 50_000;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
-const WALK_BUDGET: Duration = Duration::from_secs(2);
+// Background-only: slow disks get more time without lifting memory/work bounds.
+const WALK_BUDGET: Duration = Duration::from_secs(10);
 const CACHE_TTL: Duration = Duration::from_secs(30);
 
 type Request = (u64, PathBuf);
@@ -24,14 +25,56 @@ pub(super) struct Files {
     root: Option<PathBuf>,
     requested: Instant,
     running: bool,
-    /// Digest of the last listing handed out. The 30 s rescan usually finds the same files; an
-    /// unchanged listing is not handed out again, so it neither restarts the composer's vocabulary
-    /// scan nor repeats a "partial" notice.
+    /// Unchanged rescans must not restart the composer's vocabulary scan.
     delivered: Option<u64>,
+    /// Warning identity is independent of paths, and resets only on a root change.
+    warned: Vec<Cause>,
 }
 pub(super) struct Listing {
     pub paths: Vec<String>,
     pub diagnostic: Option<String>,
+    causes: Vec<Cause>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Cause {
+    Entries(usize),
+    Bytes(usize),
+    Time(Duration),
+    Unreadable,
+}
+
+fn diagnostic(causes: &[Cause]) -> Option<String> {
+    if causes.is_empty() {
+        return None;
+    }
+    let reasons: Vec<_> = causes.iter().map(|cause| match cause {
+        Cause::Entries(limit) => format!("scan reached {limit} entries (files and directories); exclude generated/dependency directories with .gitignore or .ignore"),
+        Cause::Bytes(limit) => format!("cached path names reached the {limit}-byte budget; exclude generated/dependency directories with .gitignore or .ignore"),
+        Cause::Time(limit) => format!("scan reached its {}-second time budget; try a narrower project root or ignore large generated directories", limit.as_secs_f64()),
+        Cause::Unreadable => "one or more paths could not be read; check that the project exists and its directories are readable".into(),
+    }).collect();
+    Some(format!(
+        "File completion is partial: {}. Type a path explicitly to attach files outside this cache.",
+        reasons.join("; ")
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct Limits {
+    entries: usize,
+    bytes: usize,
+    time: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            entries: MAX_ENTRIES,
+            bytes: MAX_BYTES,
+            time: WALK_BUDGET,
+        }
+    }
 }
 impl Files {
     pub fn new() -> Self {
@@ -73,6 +116,7 @@ impl Files {
             requested: Instant::now() - CACHE_TTL,
             running: false,
             delivered: None,
+            warned: Vec::new(),
         }
     }
     pub fn stop(&self) {
@@ -90,6 +134,9 @@ impl Files {
         if !changed && (self.running || self.requested.elapsed() < CACHE_TTL) {
             return;
         }
+        if changed {
+            self.warned.clear();
+        }
         let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.root = Some(root.to_owned());
         self.requested = Instant::now();
@@ -101,7 +148,7 @@ impl Files {
     }
     pub fn poll(&mut self) -> Option<Listing> {
         let result = self.result.lock().unwrap().take();
-        if let Some((generation, listing)) = result
+        if let Some((generation, mut listing)) = result
             && generation == self.shared.generation.load(Ordering::Acquire)
         {
             self.running = false;
@@ -110,13 +157,21 @@ impl Files {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 self.root.hash(&mut hasher);
                 listing.paths.hash(&mut hasher);
-                listing.diagnostic.hash(&mut hasher);
+                listing.causes.hash(&mut hasher);
                 hasher.finish()
             };
             if self.delivered == Some(digest) {
                 return None;
             }
             self.delivered = Some(digest);
+            let new_causes: Vec<_> = listing
+                .causes
+                .iter()
+                .copied()
+                .filter(|cause| !self.warned.contains(cause))
+                .collect();
+            listing.diagnostic = diagnostic(&new_causes);
+            self.warned.extend(new_causes);
             return Some(listing);
         }
         None
@@ -130,17 +185,17 @@ impl Drop for Files {
     }
 }
 fn walk(root: &std::path::Path, cancelled: impl Fn() -> bool) -> Option<Listing> {
-    walk_bounded(root, cancelled, MAX_ENTRIES)
+    walk_bounded(root, cancelled, Limits::default())
 }
 fn walk_bounded(
     root: &std::path::Path,
     cancelled: impl Fn() -> bool,
-    max_entries: usize,
+    limits: Limits,
 ) -> Option<Listing> {
     let start = Instant::now();
     let mut paths = Vec::new();
     let mut bytes = 0;
-    let mut incomplete = false;
+    let mut causes = Vec::new();
     for (seen, entry) in ignore::WalkBuilder::new(root)
         .follow_links(false)
         .require_git(false)
@@ -150,14 +205,20 @@ fn walk_bounded(
         if cancelled() {
             return None;
         }
-        if seen >= max_entries || bytes >= MAX_BYTES || start.elapsed() >= WALK_BUDGET {
-            incomplete = true;
+        if seen >= limits.entries {
+            causes.push(Cause::Entries(limits.entries));
+            break;
+        }
+        if start.elapsed() >= limits.time {
+            causes.push(Cause::Time(limits.time));
             break;
         }
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
-                incomplete = true;
+                if !causes.contains(&Cause::Unreadable) {
+                    causes.push(Cause::Unreadable);
+                }
                 continue;
             }
         };
@@ -169,8 +230,8 @@ fn walk_bounded(
             if path.chars().any(|c| c.is_control() || c.is_whitespace()) {
                 continue;
             }
-            if bytes + path.len() > MAX_BYTES {
-                incomplete = true;
+            if bytes + path.len() > limits.bytes {
+                causes.push(Cause::Bytes(limits.bytes));
                 break;
             }
             bytes += path.len();
@@ -181,7 +242,11 @@ fn walk_bounded(
         return None;
     }
     paths.sort();
-    Some(Listing { paths, diagnostic: incomplete.then(|| "File completion is partial: traversal reached its time/size limit or an unreadable path. Type a path explicitly to attach files outside this cache.".into()) })
+    Some(Listing {
+        paths,
+        diagnostic: diagnostic(&causes),
+        causes,
+    })
 }
 
 #[cfg(test)]

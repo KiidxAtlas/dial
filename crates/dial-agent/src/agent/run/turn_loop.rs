@@ -245,7 +245,32 @@ impl<'a> Agent<'a> {
             },
         );
         let edit = self.step_checks.status();
-        let summary = json!({"outcome":outcome,"steps":steps,"error":error,"error_class":error_class,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":state["reliability"]["verification_results"],"checks_current":self.step_checks.checks_current(),"evidence":state["completion_evidence"],"uncheckpointed_shell_commands":edit["uncheckpointed_shell_commands"],"uncheckpointed_extension_calls":edit["uncheckpointed_extension_calls"],"review":"/review-file","undo":"/undo"});
+        // Shell commands run as checks (`bash` with `check`) are checks too; each command keeps its
+        // latest result, which is current only if nothing changed after it ran.
+        let mut recorded_checks = state["reliability"]["verification_results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let revision = self.step_checks.revision();
+        let mut shell_checks: Vec<(&str, bool, bool)> = Vec::new();
+        for (command, passed, at) in &self.step_checks.shell_check_runs {
+            shell_checks.retain(|(seen, _, _)| seen != command);
+            shell_checks.push((command, *passed, *at == revision));
+        }
+        for (command, passed, _) in &shell_checks {
+            recorded_checks.push(json!({
+                "name": command,
+                "status": if *passed { "passed" } else { "failed" },
+                "kind": "shell",
+            }));
+        }
+        let checks_current = self.step_checks.checks_current()
+            || (state["reliability"]["verification_results"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+                && !shell_checks.is_empty()
+                && shell_checks.iter().all(|(_, _, current)| *current));
+        let summary = json!({"outcome":outcome,"steps":steps,"error":error,"error_class":error_class,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":recorded_checks,"checks_current":checks_current,"evidence":state["completion_evidence"],"uncheckpointed_shell_commands":edit["uncheckpointed_shell_commands"],"uncheckpointed_extension_calls":edit["uncheckpointed_extension_calls"],"review":"/review-file","undo":"/undo"});
         observed.completion(&summary);
         let mut control = self.session.control_state();
         control["turn_summary"] = summary;

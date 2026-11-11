@@ -65,6 +65,31 @@ fn model_change_updates_status_and_home_without_resetting_navigation() {
 }
 
 #[test]
+fn a_local_gguf_model_shows_gguf_not_mlx_in_the_status_and_home() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("qwen3-8b-Q4_K_M.gguf");
+    std::fs::write(&file, b"GGUF\x03\0\0\0").unwrap();
+    let config = Config {
+        model: file.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    assert_eq!(config.selection().provider, "mlx");
+    let mut status = StatusData::default();
+    let mut home = Some(Home::new(WelcomeInfo::default(), Vec::new(), false));
+    update_model_status(&mut status, &mut home, &config);
+    assert_eq!(status.provider, "gguf");
+    assert_eq!(status.model, "qwen3-8b-Q4_K_M.gguf");
+    assert_eq!(home.as_ref().unwrap().info.provider, "gguf");
+
+    status.inference = "last request controls".into();
+    update_model_status(&mut status, &mut home, &config);
+    assert_eq!(
+        status.inference, "last request controls",
+        "an unchanged GGUF model is not treated as a switch"
+    );
+}
+
+#[test]
 fn a_command_report_on_the_home_screen_ends_the_home_so_it_is_visible() {
     let (_home, _project, _app, mut shell) = super::super::testkit::shell();
     shell.home = Some(Home::new(WelcomeInfo::default(), Vec::new(), false));

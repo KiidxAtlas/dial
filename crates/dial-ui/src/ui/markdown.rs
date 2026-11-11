@@ -416,18 +416,23 @@ impl Wrapper {
             if self.used > 0 {
                 self.break_line();
             }
-            for span in word {
-                for g in span.content.graphemes(true) {
-                    let (g, gw) = if text::width(g) > self.max {
-                        ("?", 1)
-                    } else {
-                        (g, text::width(g))
-                    };
-                    if self.used + gw > self.max {
-                        self.break_line();
+            for (piece, piece_w) in split_long_word(word, self.max) {
+                if self.used > 0 && self.used + piece_w > self.max {
+                    self.break_line();
+                }
+                for span in piece {
+                    for g in span.content.graphemes(true) {
+                        let (g, gw) = if text::width(g) > self.max {
+                            ("?", 1)
+                        } else {
+                            (g, text::width(g))
+                        };
+                        if self.used + gw > self.max {
+                            self.break_line();
+                        }
+                        push_merged(&mut self.row, g, span.style);
+                        self.used += gw;
                     }
-                    push_merged(&mut self.row, g, span.style);
-                    self.used += gw;
                 }
             }
             return;
@@ -472,6 +477,107 @@ impl Wrapper {
         }
         self.out
     }
+}
+
+/// Split a word wider than `max` after its last `-` or `/` that keeps the head within `max`, so
+/// `garbage-collected` wraps as `garbage-` / `collected` rather than mid-syllable. Pieces still
+/// wider than `max` are hard-split by the caller.
+fn split_long_word(word: Vec<Span<'static>>, max: usize) -> Vec<(Vec<Span<'static>>, usize)> {
+    let mut graphemes: Vec<(String, Style)> = Vec::new();
+    for span in &word {
+        for g in span.content.graphemes(true) {
+            graphemes.push((g.to_owned(), span.style));
+        }
+    }
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    while start < graphemes.len() {
+        let mut used = 0;
+        let mut cut = None;
+        let mut end = start;
+        while end < graphemes.len() {
+            let w = text::width(&graphemes[end].0);
+            if used + w > max {
+                break;
+            }
+            used += w;
+            end += 1;
+            if matches!(graphemes[end - 1].0.as_str(), "-" | "/") && end < graphemes.len() {
+                cut = Some(end);
+            }
+        }
+        let stop = if end >= graphemes.len() {
+            graphemes.len()
+        } else {
+            cut.unwrap_or(graphemes.len())
+        };
+        let mut spans = Vec::new();
+        let mut width = 0;
+        for (g, style) in &graphemes[start..stop] {
+            push_merged(&mut spans, g, *style);
+            width += text::width(g);
+        }
+        pieces.push((spans, width));
+        start = stop;
+    }
+    pieces
+}
+
+/// Widest single word in a cell: the width a column needs so no word is split mid-way.
+fn longest_word(cell: &[Span<'static>]) -> usize {
+    let flat: String = cell.iter().map(|s| s.content.as_ref()).collect();
+    flat.split_whitespace().map(text::width).max().unwrap_or(0)
+}
+
+/// Wrap one code line to `inner` cells, preferring the last space after the indentation, and
+/// return `(row, continued)` pairs so the caller can mark continuation rows.
+fn wrap_code_line(line: Line<'static>, inner: usize) -> Vec<(Line<'static>, bool)> {
+    let mut graphemes: Vec<(String, Style)> = Vec::new();
+    for span in line.spans {
+        for g in span.content.graphemes(true) {
+            let g = if text::width(g) > inner { "?" } else { g };
+            graphemes.push((g.to_owned(), span.style));
+        }
+    }
+    let indent = graphemes.iter().take_while(|(g, _)| g == " ").count();
+    let mut rows = Vec::new();
+    let mut start = 0;
+    loop {
+        let max = if rows.is_empty() {
+            inner
+        } else {
+            inner.saturating_sub(2).max(1)
+        };
+        let mut used = 0;
+        let mut end = start;
+        let mut space = None;
+        while end < graphemes.len() {
+            let w = text::width(&graphemes[end].0);
+            if used + w > max {
+                break;
+            }
+            used += w;
+            if graphemes[end].0 == " " && end > indent && end > start {
+                space = Some(end + 1);
+            }
+            end += 1;
+        }
+        let stop = if end >= graphemes.len() {
+            graphemes.len()
+        } else {
+            space.filter(|&s| s > start).unwrap_or(end.max(start + 1))
+        };
+        let mut spans = Vec::new();
+        for (g, style) in &graphemes[start..stop] {
+            push_merged(&mut spans, g, *style);
+        }
+        rows.push((Line::from(spans), !rows.is_empty()));
+        start = stop;
+        if start >= graphemes.len() {
+            break;
+        }
+    }
+    rows
 }
 
 /// Word-aware wrap of styled inline content. `\n` spans are hard breaks.
@@ -1006,9 +1112,16 @@ impl<'a> Renderer<'a> {
                     chrome::label(theme, &label),
                 ]));
             }
+            let continued = Span::styled(
+                if theme.ascii() { "> " } else { "\u{21aa} " },
+                theme.fg(Tok::MdCodeBorder),
+            );
             for line in lines {
-                for wrapped in text::wrap(vec![line], inner) {
+                for (wrapped, more) in wrap_code_line(line, inner) {
                     let mut spans = vec![Span::styled(format!("{bar} "), gutter)];
+                    if more {
+                        spans.push(continued.clone());
+                    }
                     spans.extend(wrapped.spans);
                     rows.push(Line::from(spans));
                 }
@@ -1057,7 +1170,24 @@ impl<'a> Renderer<'a> {
         if avail <= overhead || floor > room {
             return self.table_records(&head, &body, avail);
         }
-        let widths = fit_columns(&natural, room);
+        let words: Vec<usize> = (0..columns)
+            .map(|i| {
+                std::iter::once(&head[i])
+                    .chain(body.iter().map(|r| &r[i]))
+                    .map(|c| longest_word(c))
+                    .max()
+                    .unwrap_or(1)
+                    .clamp(1, natural[i])
+            })
+            .collect();
+        // Columns never shrink below their longest word when that fits; otherwise the widest
+        // words give way first.
+        let floors = if words.iter().sum::<usize>() <= room {
+            words
+        } else {
+            fit_columns(&words, &vec![0; columns], room)
+        };
+        let widths = fit_columns(&natural, &floors, room);
         let border = self.theme.fg(Tok::MdCodeBorder);
         let theme = self.theme;
         let h = theme.sym(Sym::BoxH);
@@ -1353,26 +1483,31 @@ fn cell_width(cell: &[Span<'static>]) -> usize {
     flat.split('\n').map(text::width).max().unwrap_or(0)
 }
 
-/// Shrink the widest columns first (water-filling) so the sum fits `room`; spare cells go to the
-/// leftmost shrunk columns. Callers guarantee `sum(min(natural, MIN_COLUMN)) <= room`.
-fn fit_columns(natural: &[usize], room: usize) -> Vec<usize> {
+/// Shrink the widest columns first (water-filling) so the sum fits `room`, never below a column's
+/// `floor`; spare cells go to the leftmost shrunk columns. Callers guarantee that
+/// `sum(max(floor, min(natural, MIN_COLUMN))) <= room`.
+fn fit_columns(natural: &[usize], floors: &[usize], room: usize) -> Vec<usize> {
     if natural.iter().sum::<usize>() <= room {
         return natural.to_vec();
     }
-    let (mut lo, mut hi) = (
-        MIN_COLUMN,
-        natural.iter().copied().max().unwrap_or(MIN_COLUMN),
-    );
+    let at = |level: usize| -> Vec<usize> {
+        natural
+            .iter()
+            .zip(floors)
+            .map(|(&n, &f)| n.min(level).max(f.min(n)))
+            .collect()
+    };
+    let (mut lo, mut hi) = (1, natural.iter().copied().max().unwrap_or(MIN_COLUMN));
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
-        if natural.iter().map(|&w| w.min(mid)).sum::<usize>() <= room {
+        if at(mid).iter().sum::<usize>() <= room {
             lo = mid;
         } else {
             hi = mid - 1;
         }
     }
-    let mut widths: Vec<usize> = natural.iter().map(|&w| w.min(lo)).collect();
-    let mut spare = room - widths.iter().sum::<usize>();
+    let mut widths = at(lo);
+    let mut spare = room.saturating_sub(widths.iter().sum::<usize>());
     for (w, &n) in widths.iter_mut().zip(natural) {
         if spare == 0 {
             break;

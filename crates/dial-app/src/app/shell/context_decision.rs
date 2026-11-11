@@ -11,32 +11,58 @@ pub(super) fn render_context(agent: &Agent<'_>, pending: &[Value]) -> Result<Str
 }
 
 fn render_decision(report: &ContextDecision) -> String {
+    // The status line shows the model window; say plainly when the history budget is smaller.
+    let window = if report.model_window > report.window {
+        format!(
+            "{} tokens (model) · history planned against {} (efficiency cap)",
+            group_digits(u64::from(report.model_window)),
+            group_digits(u64::from(report.window))
+        )
+    } else {
+        format!("{} tokens", group_digits(u64::from(report.window)))
+    };
     let mut text = format!(
-        "Selected: {}/{}\nWindow: {} · usable prompt budget: {} · response reserve: {} tokens\nAutomatic compaction trigger: {}\n\nEstimated next request: {} tokens ({} queued/draft messages included)\n  Fixed overhead (empty-history projection): {}\n  History + pending input (potentially reclaimable, not promised savings): {}",
+        "Model: {}/{}\nWindow: {window}\nPrompt budget: {} · response reserve: {}\nAuto-compact at: {}\n\nNext request (estimate): {} tokens{}\n  fixed overhead: {}\n  history + pending input: {}",
         report.provider,
         report.model,
-        group_digits(u64::from(report.window)),
         group_digits(report.prompt_budget),
         group_digits(report.response_reserve),
         report.trigger.map_or_else(
-            || "disabled (manual context control)".to_owned(),
+            || "off (manual context control)".to_owned(),
             |n| format!("{} tokens", group_digits(n))
         ),
         group_digits(report.next_tokens),
-        report.pending_messages,
+        if report.pending_messages > 0 {
+            format!(
+                " ({} queued/draft messages included)",
+                report.pending_messages
+            )
+        } else {
+            String::new()
+        },
         group_digits(report.fixed_tokens),
         group_digits(report.history_tokens),
     );
     if let Some(last) = &report.last_request {
         text.push_str(&format!(
-            "\n\nLast sent request, separate estimate: {} tokens",
+            "\n\nLast sent request (estimate): {} tokens",
             group_digits(last.total_tokens())
         ));
-        for row in last.rows() {
-            text.push_str(&format!("\n  {}: {}", row.label, group_digits(row.tokens)));
+        let rows = last.rows();
+        let label_w = rows
+            .iter()
+            .map(|r| r.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        for row in rows {
+            text.push_str(&format!(
+                "\n  {:<label_w$}  {:>9}",
+                row.label,
+                group_digits(row.tokens)
+            ));
         }
     } else {
-        text.push_str("\n\nLast sent request: unavailable (no request recorded).");
+        text.push_str("\n\nLast sent request: none yet.");
     }
     text.push_str("\n\nRecommendation: ");
     if report.fixed_tokens >= report.prompt_budget {
@@ -46,9 +72,9 @@ fn render_decision(report: &ContextDecision) -> String {
     {
         text.push_str("Review /compact to summarize eligible older history. If the recent tail or pending input is large, shorten that input or choose a larger-window /model instead.");
     } else {
-        text.push_str("There is estimated headroom; compaction is not needed solely for capacity. /compact can still be reviewed manually.");
+        text.push_str("There is headroom; compaction is not needed.");
     }
-    text.push_str("\nEstimates are not provider usage: tokenization, request-time guidance, model routing and tool offers may change. Draft text is not submitted by this report; attachment expansion is not predicted. Fixed overhead includes request guidance and is not an exact irreducible minimum.");
+    text.push_str("\nCounts are Dial's estimates, not provider usage.");
     if report.approximate_media {
         text.push_str(" Images and provider-native replay are present: their token cost is approximate/opaque, not an exact capacity guarantee.");
     }

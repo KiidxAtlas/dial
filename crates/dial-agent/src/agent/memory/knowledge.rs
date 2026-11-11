@@ -308,7 +308,7 @@ impl<'a> Agent<'a> {
             main.take().expect("checked main backend")
         };
         if let Some(selection) = &separate {
-            ui.role("small", &selection.display_name());
+            ui.role("small", &selection.display_label());
         }
         let adapter = if separate.is_some() {
             None
@@ -373,7 +373,7 @@ impl<'a> Agent<'a> {
             backend.release();
             self.role_backends.insert("small".into(), backend);
             self.backend = main;
-            ui.role("main", &self.effective_config().selection().display_name());
+            ui.role("main", &self.effective_config().selection().display_label());
         } else {
             self.backend = Some(backend);
         }

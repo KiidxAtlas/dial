@@ -85,6 +85,16 @@ impl Tool for DepSource {
         Concurrency::Shared
     }
 
+    /// Manifests, lockfiles and installed packages may lie anywhere in the workspace; shared
+    /// caches outside every root are not native write targets.
+    fn resources(
+        &self,
+        workspace: &Workspace,
+        _args: &Value,
+    ) -> Option<crate::tools::surface::resources::Access> {
+        Some(crate::tools::surface::resources::workspace_reads(workspace))
+    }
+
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         run(ctx.workspace, args, &Caches::from_env()).map_or_else(ToolOutput::err, ToolOutput::ok)
     }

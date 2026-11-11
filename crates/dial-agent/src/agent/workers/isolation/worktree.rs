@@ -1,8 +1,8 @@
 //! `git worktree` isolation backend.
 //!
 //! The worker's tree is a detached checkout of HEAD created by `git worktree add`, then made to
-//! match the project: git-excluded paths are removed, and every uncommitted, untracked and
-//! ignored-but-not-excluded file is copied from the project. The parent repository only gains a
+//! match the project: git-excluded paths are removed, and every uncommitted and untracked file is
+//! copied from the project. Gitignored, untracked files stay out, as in every backend. The parent repository only gains a
 //! worktree administrative directory, which is removed when the isolated copy is released.
 
 use crate::workspace_copy::is_excluded_source_path;
@@ -63,7 +63,7 @@ impl Drop for Link {
 
 /// Create the checkout at `dest` (which must not exist) and make it match `project`.
 ///
-/// Copies of uncommitted, untracked and ignored-but-not-excluded files are charged against
+/// Copies of uncommitted and untracked files are charged against
 /// `max_bytes`; exceeding it fails the whole population.
 ///
 /// `scratch` holds an empty hooks directory: `git worktree add` runs the parent's hooks unless
@@ -130,6 +130,10 @@ pub(super) fn populate(
         let entry = entry?;
         ensure_status_entry(&entry)?;
         let (code, path) = entry.split_at(3);
+        // Gitignored, untracked paths stay out of isolated copies (see `IgnoredPaths`).
+        if code == "!! " {
+            continue;
+        }
         sync_path(project, dest, path, &mut remaining)
             .map_err(|error| io_error("copying a changed file", error))?;
         // Renames and copies carry the original path as the next NUL-separated token.

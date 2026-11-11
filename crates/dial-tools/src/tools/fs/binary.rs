@@ -145,7 +145,7 @@ pub(in crate::tools) fn identify(head: &[u8]) -> Option<Kind> {
         return kind("WebP image", None);
     }
     if starts(b"RIFF") && head.get(8..12) == Some(b"WAVE") {
-        return kind("WAV audio", None);
+        return kind("WAV audio", Some("wav"));
     }
     if starts(b"OggS") {
         return kind("Ogg media", None);
@@ -172,7 +172,7 @@ pub(in crate::tools) fn identify(head: &[u8]) -> Option<Kind> {
         return kind("HDF5 file", None);
     }
     if starts(b"\x93NUMPY") {
-        return kind("NumPy array (.npy)", None);
+        return kind("NumPy array (.npy)", Some("npy"));
     }
     if starts(b"GGUF") {
         return kind("GGUF model weights", None);
@@ -180,11 +180,11 @@ pub(in crate::tools) fn identify(head: &[u8]) -> Option<Kind> {
     if starts(b"dex\n") {
         return kind("Android Dalvik executable", None);
     }
-    if starts(&[0x00, 0x01, 0x00, 0x00, 0x00]) || starts(b"OTTO") {
-        return kind("TrueType/OpenType font", None);
+    if starts(&[0x00, 0x01, 0x00, 0x00, 0x00]) || starts(b"OTTO") || starts(b"ttcf") {
+        return kind("TrueType/OpenType font", Some("font"));
     }
     if starts(b"wOFF") || starts(b"wOF2") {
-        return kind("WOFF font", None);
+        return kind("WOFF font", Some("font"));
     }
     if starts(&[0x30, 0x82]) && head.get(4..6) == Some(&[0x30, 0x82]) {
         return kind("DER-encoded ASN.1 (certificate or key)", Some("x509"));

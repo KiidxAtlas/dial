@@ -414,6 +414,13 @@ impl<'a> Agent<'a> {
     pub fn last_auto_thinking(&self) -> Option<&str> {
         self.last_auto_thinking.as_deref()
     }
+    /// Requests this session whose prompt did not extend the previous request, by the first part
+    /// that changed (`model_changed`, `system_changed`, `tools_changed`, `history_changed`).
+    /// A local, provider-neutral comparison: it says where a provider's prefix cache had to start
+    /// over, not how much the provider actually billed as uncached.
+    pub fn prefix_resets(&self) -> &std::collections::BTreeMap<&'static str, u64> {
+        &self.prefix_resets
+    }
     pub fn efficiency_report(&self) -> Value {
         self.session.control_state()["efficiency"].clone()
     }

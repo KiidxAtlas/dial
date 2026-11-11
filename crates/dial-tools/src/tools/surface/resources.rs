@@ -182,6 +182,21 @@ pub fn external_read(tool: &dyn crate::tools::integrations::ext::Tool, args: &Va
         && !tool.manages_workspace_serialization()
 }
 
+/// Every root the workspace may write, as directory reads: the conservative footprint of a read
+/// whose exact inputs are unknown but which cannot write (a read-only shell command, a working-tree
+/// VCS read, a dependency lookup). It conflicts with every native write and with no other read.
+pub fn workspace_reads(workspace: &Workspace) -> Access {
+    Access {
+        reads: workspace.roots().map(Path::to_path_buf).collect(),
+        writes: Vec::new(),
+    }
+}
+
+/// [`workspace_reads`] resolved through the ordinary confinement boundary.
+pub fn workspace_read(workspace: &Workspace) -> Option<Footprint> {
+    footprint(workspace, &workspace_reads(workspace))
+}
+
 /// Resolve a native or explicitly declared extension call. Unknown or ambiguous resources are
 /// absent, so callers keep the operation behind a serial barrier.
 pub fn resolve(
@@ -236,6 +251,10 @@ pub fn resolve(
             resources
         }
     };
+    footprint(workspace, &access)
+}
+
+fn footprint(workspace: &Workspace, access: &Access) -> Option<Footprint> {
     if access.reads.len() + access.writes.len() == 0
         || access.reads.len() + access.writes.len() > 128
     {

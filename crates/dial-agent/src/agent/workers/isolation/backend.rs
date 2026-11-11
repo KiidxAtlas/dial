@@ -16,7 +16,7 @@ pub enum Backend {
     Clone,
     /// Linux overlayfs mount over the project; changes are the upper directory.
     Overlay,
-    /// Detached `git worktree` checkout of HEAD plus the project's uncommitted and ignored files.
+    /// Detached `git worktree` checkout of HEAD plus the project's uncommitted, unignored files.
     Worktree,
     /// Plain file-by-file copy of the project.
     Copy,

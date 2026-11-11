@@ -24,6 +24,7 @@ import inspect
 import io
 import json
 import signal
+import re
 import site
 import traceback
 
@@ -88,7 +89,7 @@ class Capture(io.TextIOBase):
         return len(text)
 
     def value(self):
-        return "".join(self.parts) + (f"\n[truncated {self.dropped} characters]" if self.dropped else "")
+        return "".join(self.parts) + (f"\n[truncated {self.dropped} characters; the start was kept. Keep large results in a variable and print slices or summaries]" if self.dropped else "")
 
 
 class ToolError(RuntimeError):
@@ -278,6 +279,17 @@ class ToolProxy:
 tool = ToolProxy()
 
 
+def helper_hint(error):
+    """Name the `dial.` form when a bare portable-helper name such as readText is undefined."""
+    if not isinstance(error, NameError):
+        return ""
+    match = re.search(r"name '([A-Za-z_][A-Za-z0-9_]*)' is not defined", str(error))
+    helpers = namespace.get("dial")
+    if not match or helpers is None or not hasattr(helpers, match.group(1)):
+        return ""
+    return "\n[dial] Portable helpers are methods of `dial`, not globals: use dial.%s(...)." % match.group(1)
+
+
 def execute(tree, mode):
     compiled = compile(tree, "<dial-kernel>", mode, flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
     value = eval(compiled, namespace)
@@ -316,6 +328,9 @@ while True:
                     result["value"] = repr(value)[:LIMIT]
     except BaseException as error:
         result["error"] = traceback.format_exc()[-LIMIT:]
+        hint = helper_hint(error)
+        if hint:
+            result["error"] += hint
         if getattr(error, "result", None) is not None:
             result["tool_error"] = error.result
     finally:

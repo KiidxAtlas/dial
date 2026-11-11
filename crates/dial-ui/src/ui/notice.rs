@@ -77,6 +77,16 @@ pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows
     if w == 0 || (title.is_empty() && body.is_empty()) {
         return Vec::new();
     }
+    let body = if body.is_empty() {
+        EMPTY.to_owned()
+    } else {
+        body
+    };
+    if let Some(severity) = severity_of(title)
+        && w >= CARD_MIN
+    {
+        return severity_card(title, &body, severity, w, theme, section);
+    }
     let mut rows = Vec::new();
     let indent = if title.is_empty() {
         0
@@ -85,17 +95,85 @@ pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows
         INDENT.min(w - 1)
     };
     let room = w.saturating_sub(indent).max(1);
-    let body = if body.is_empty() {
-        EMPTY.to_owned()
+    for row in body_rows(&body, room, theme, section) {
+        let mut spans = vec![Span::raw(" ".repeat(indent))];
+        spans.extend(row);
+        rows.push(fitted(spans, w, theme));
+    }
+    rows
+}
+
+/// How urgent a notice reads from its title: warnings and failures get a card, other notices
+/// (command results, reports) stay quiet labelled rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Severity {
+    Warning,
+    Error,
+}
+
+fn severity_of(title: &str) -> Option<Severity> {
+    let t = title.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| t.contains(w));
+    if has(&["error", "failed", "failure", "blocked"]) {
+        Some(Severity::Error)
+    } else if has(&[
+        "warn",
+        "heads up",
+        "outstanding",
+        "attention",
+        "unavailable",
+    ]) {
+        Some(Severity::Warning)
     } else {
-        body
+        None
+    }
+}
+
+/// Narrowest width that draws a warning or failure notice as a card.
+const CARD_MIN: usize = 32;
+
+/// A warning or failure notice as a rounded card in its severity's color: its mark and title on
+/// the top edge, the body laid out as usual inside.
+fn severity_card(
+    title: &str,
+    body: &str,
+    severity: Severity,
+    w: usize,
+    theme: &Theme,
+    section: Section,
+) -> Rows {
+    let (tok, glyph) = match severity {
+        Severity::Warning => (Tok::Warning, theme.sym(Sym::Warn)),
+        Severity::Error => (Tok::Error, theme.sym(Sym::Cross2)),
     };
+    let mut card = super::tool_cards::frame::Frame::new(
+        vec![
+            Span::styled(glyph.to_owned(), theme.fg(tok)),
+            Span::raw(" "),
+            Span::styled(title.to_owned(), theme.fg(tok).add_modifier(Modifier::BOLD)),
+        ],
+        theme.fg(tok),
+    );
+    let inner = w - super::tool_cards::frame::CHROME_W;
+    card.sections.push((
+        None,
+        body_rows(body, inner, theme, section)
+            .into_iter()
+            .map(Line::from)
+            .collect(),
+    ));
+    card.rows(theme, w)
+}
+
+/// The body laid out line by line at `room` cells: blank runs collapse to one blank row.
+fn body_rows(body: &str, room: usize, theme: &Theme, section: Section) -> Vec<Row> {
+    let mut rows = Vec::new();
     let lines: Vec<&str> = body.lines().collect();
     let mut after_blank = false;
     for (i, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             if !after_blank {
-                rows.push(Line::default());
+                rows.push(Vec::new());
             }
             after_blank = true;
             continue;
@@ -105,11 +183,7 @@ pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows
             .iter()
             .find(|l| !l.trim().is_empty())
             .map(|l| lead(l));
-        for row in layout(line, next_lead, room, theme, section) {
-            let mut spans = vec![Span::raw(" ".repeat(indent))];
-            spans.extend(row);
-            rows.push(fitted(spans, w, theme));
-        }
+        rows.extend(layout(line, next_lead, room, theme, section));
     }
     rows
 }

@@ -406,6 +406,27 @@ fn page_footer(
     Ok(format!("[coverage: {coverage}]\n[page: {page}]\n"))
 }
 
+/// The body of a page with no matches. When files were only partly scanned or unreadable, absence
+/// is unknown beyond the scanned bytes, which a bare "no matches" would hide.
+fn empty_body(partial: usize, unreadable: usize) -> String {
+    if partial == 0 && unreadable == 0 {
+        return "no matches\n".to_string();
+    }
+    let mut gaps = Vec::new();
+    if partial > 0 {
+        gaps.push(format!(
+            "{partial} file(s) scanned only up to the 4 MiB limit"
+        ));
+    }
+    if unreadable > 0 {
+        gaps.push(format!("{unreadable} file(s) unreadable"));
+    }
+    format!(
+        "no matches in the scanned bytes, but {}: absence there is unknown. Page a large text file with read format=text offset/limit, or search it with bash\n",
+        gaps.join(" and ")
+    )
+}
+
 fn finish_page(
     mut text: String,
     ws: &Workspace,
@@ -1300,7 +1321,7 @@ impl GrepState {
             };
             let footer = page_footer(ws, next.as_ref(), self.skip, &coverage)?;
             let body = if self.summary_files == 0 {
-                "no matches\n".to_string()
+                empty_body(self.oversized, self.unreadable)
             } else if self.mode == OutputMode::Count {
                 format!(
                     "{} {} in {} {}\n",
@@ -1657,7 +1678,7 @@ impl GrepState {
                 )
                 .ok_or_else(too_large)?;
             let body_len = if self.out.is_empty() {
-                "no matches\n".len()
+                empty_body(self.oversized, self.unreadable).len()
             } else {
                 self.out.len()
             };
@@ -1698,7 +1719,8 @@ impl GrepState {
         };
         let returned_body = self.out.len();
         if self.out.is_empty() {
-            self.out.push_str("no matches\n");
+            self.out
+                .push_str(&empty_body(self.oversized, self.unreadable));
         }
         // Footer validation and all row removals precede any witness publication.
         // The fixed warning reserve cannot evict a row after it has been recorded.

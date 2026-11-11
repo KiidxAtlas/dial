@@ -906,6 +906,10 @@ fn opaque_shell_effect_counts_only_unverified_batches() {
         ("for f in *; do ls \"$f\"; done", true),
         ("sh -c 'ls'", true),
         ("ls \\\n; rm x", true),
+        ("ls -la; echo ---; git log --oneline", false),
+        ("git show HEAD --stat", false),
+        ("git log --output=x.patch", true),
+        ("git checkout main; ls", true),
     ] {
         assert_eq!(opaque_shell_effect(command), opaque, "{command}");
     }

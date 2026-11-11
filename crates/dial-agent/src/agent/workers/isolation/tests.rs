@@ -224,6 +224,78 @@ fn copy_backend_merges_back_and_is_removed() {
     round_trip(Preference::Copy, "copy");
 }
 
+/// A gitignored data directory (benchmark runs, downloads) over every isolation limit must not
+/// stop a worker from starting. It stays out of the copy, and edits there are never merged.
+fn ignored_data_does_not_block_a_worker(preference: Preference, expected_backend: &str) {
+    let (dir, ws) = git_project();
+    fs::write(
+        dir.path().join(".gitignore"),
+        "target/\n/benchmarks/*\n!/benchmarks/README.md\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("benchmarks/run")).unwrap();
+    fs::write(dir.path().join("benchmarks/README.md"), "kept").unwrap();
+    fs::File::create(dir.path().join("benchmarks/run/dial-checkout"))
+        .unwrap()
+        .set_len(MAX_BYTES as u64 + 1)
+        .unwrap();
+    let config = crate::config::task::TaskConfig {
+        isolation_source_bytes: 1024,
+        ..Default::default()
+    };
+    let iso = Isolated::with_config(&ws, &config, preference)
+        .expect("gitignored data must not block the worker");
+    let root = iso.root().to_path_buf();
+    assert!(
+        !root.join("benchmarks/run").exists(),
+        "ignored data is not copied"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("benchmarks/README.md")).unwrap(),
+        "kept",
+        "an unignored file inside the directory is still copied"
+    );
+    fs::write(root.join("a.txt"), "a2").unwrap();
+    fs::create_dir_all(root.join("benchmarks/run")).unwrap();
+    fs::write(root.join("benchmarks/run/notes.txt"), "worker").unwrap();
+    let merge = iso.merge(&ws, &AtomicBool::new(false));
+    assert!(
+        merge.conflicts.is_empty() && merge.errors.is_empty(),
+        "{merge:?}"
+    );
+    assert!(
+        merge.backend.starts_with(expected_backend),
+        "{}",
+        merge.backend
+    );
+    assert_eq!(merge.applied, vec![PathBuf::from("a.txt")]);
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "a2");
+    assert!(!dir.path().join("benchmarks/run/notes.txt").exists());
+    assert_eq!(
+        fs::metadata(dir.path().join("benchmarks/run/dial-checkout"))
+            .unwrap()
+            .len(),
+        MAX_BYTES as u64 + 1,
+        "the project's ignored data is untouched"
+    );
+}
+
+#[test]
+fn ignored_data_does_not_block_a_copy_worker() {
+    ignored_data_does_not_block_a_worker(Preference::Copy, "copy");
+}
+
+#[test]
+fn ignored_data_does_not_block_a_worktree_worker() {
+    ignored_data_does_not_block_a_worker(Preference::Worktree, "worktree");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ignored_data_does_not_block_a_clone_worker() {
+    ignored_data_does_not_block_a_worker(Preference::Clone, "clone");
+}
+
 /// Sparse files keep the oversized fixtures cheap: only the logical length is set.
 #[test]
 fn oversized_project_file_is_reported_by_path_before_any_copy() {

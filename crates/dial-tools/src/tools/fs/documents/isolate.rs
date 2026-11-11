@@ -380,6 +380,8 @@ fn execute(job: &Job, payload: &[u8]) -> Result<String, String> {
                     name,
                     member.as_deref().ok_or("JSON query missing")?,
                 ),
+                // A downloaded database snapshot; live files use `Job::Sqlite` on their path.
+                "sqlite" => super::sqlite::read(file.path(), member.as_deref()),
                 _ => Err(format!("unsupported snapshot document format {format:?}")),
             }
         }

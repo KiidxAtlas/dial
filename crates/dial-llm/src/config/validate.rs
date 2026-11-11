@@ -485,6 +485,9 @@ impl Config {
                         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
                 "invalid provider id"
             );
+            if provider.is_reset() {
+                continue;
+            }
             ensure!(
                 id != "mlx" && id != crate::llm::apple::PROVIDER,
                 "{id} is reserved for a built-in local provider"

@@ -1,9 +1,10 @@
 //! The launch mark: a braille knob beside a geometric braille "dial". Shapes are distance tests
 //! sampled on the braille dot grid (2×4 dots per cell), so the needle turns smoothly while the
-//! mark settles at start-up: the needle swings up from its stop, the ticks it passes light up and
-//! the wordmark tunes in from left to right. Progress `>= 1.0` is the resting frame. After that
-//! an optional ambient clock keeps the mark quietly alive: the needle breathes and a glint of
-//! light crosses now and then.
+//! mark powers up at start-up: the bezel traces itself in clockwise behind a bright comet, the
+//! needle swings up from its stop as the trace passes, the ticks it passes light up, and the
+//! wordmark tunes in from left to right under a travelling glow. Progress `>= 1.0` is the resting
+//! frame. After that an optional ambient clock keeps the mark quietly alive: the needle breathes
+//! and a glint of light crosses now and then.
 use super::*;
 
 /// Dot offsets of a braille cell with their bit in U+2800.
@@ -76,7 +77,25 @@ fn level(progress: f32) -> f32 {
     1.0 + (C1 + 1.0) * t.powi(3) + C1 * t.powi(2)
 }
 
-fn knob(x: f32, y: f32, level: f32, sway: f32) -> Option<Ink> {
+/// Share of the start-up spent tracing the bezel, and when the needle starts to follow it.
+const TRACE_SPAN: f32 = 0.55;
+const NEEDLE_DELAY: f32 = 0.2;
+/// Degrees of bezel behind the trace head drawn bright, like a comet's tail.
+const COMET: f32 = 34.0;
+
+/// `(trace, level)` at start-up `progress`: how much of the bezel is drawn (`0..=1`) and how far
+/// the needle has turned. Both are exactly `1.0` from `1.0` on, so the resting frame is unchanged.
+fn phases(progress: f32) -> (f32, f32) {
+    if !(0.0..1.0).contains(&progress) {
+        return (1.0, 1.0);
+    }
+    let t = (progress / TRACE_SPAN).clamp(0.0, 1.0);
+    let trace = 1.0 - (1.0 - t).powi(3);
+    let needle = ((progress - NEEDLE_DELAY) / (1.0 - NEEDLE_DELAY)).max(0.0);
+    (trace, level(needle).max(0.0))
+}
+
+fn knob(x: f32, y: f32, level: f32, sway: f32, trace: f32) -> Option<Ink> {
     let (dx, dy) = (x - CENTER.0, y - CENTER.1);
     let r = dx.hypot(dy);
     let reach = ARC * REST * level + sway;
@@ -87,18 +106,23 @@ fn knob(x: f32, y: f32, level: f32, sway: f32) -> Option<Ink> {
     }
     // Position along the travel; the opening at the bottom lies beyond `ARC`.
     let along = (dy.atan2(dx).to_degrees() - START).rem_euclid(360.0);
-    if (r - 14.5).abs() <= 1.0 && along <= ARC {
-        return Some(Ink::Ring);
+    let head = ARC * trace;
+    if (r - 14.5).abs() <= 1.0 && along <= ARC.min(head) {
+        // While the bezel traces in, its leading stretch burns bright.
+        return Some(if trace < 1.0 && along >= head - COMET {
+            Ink::Needle
+        } else {
+            Ink::Ring
+        });
     }
     (0..TICKS).find_map(|k| {
         let at = ARC * k as f32 / (TICKS - 1) as f32;
-        (segment(x, y, polar(8.5, START + at), polar(10.5, START + at)) <= 0.75).then_some(
-            if at <= reach + 0.5 {
+        (at <= head && segment(x, y, polar(8.5, START + at), polar(10.5, START + at)) <= 0.75)
+            .then_some(if at <= reach + 0.5 {
                 Ink::Lit
             } else {
                 Ink::Idle
-            },
-        )
+            })
     })
 }
 
@@ -168,6 +192,16 @@ fn wordmark_cells(level: f32) -> Cells {
     })
 }
 
+/// Width of the glow that rides the wordmark's tuning edge during start-up.
+const TUNE_BAND: f32 = 3.0;
+
+/// The cell the wordmark is tuned up to at start-up `level`, while it is still tuning.
+fn tuning_edge(progress: f32, level: f32) -> Option<f32> {
+    (0.0..1.0)
+        .contains(&progress)
+        .then(|| level.clamp(0.0, 1.0) * WORDMARK.0 as f32)
+}
+
 /// A wordmark-sized glint of light crosses the mark once per [`GLINT_PERIOD`] ambient ticks.
 const GLINT_PERIOD: u64 = 96;
 /// How many ambient ticks one crossing takes; the rest of the period is still.
@@ -204,12 +238,12 @@ fn shine(theme: &Theme, rows: &mut [Vec<Span<'static>>], head: Option<f32>) {
 /// The knob and wordmark side by side, exactly [`LOCKUP`] cells. `idle` counts the slow ambient
 /// ticks since the mark settled: the needle sways and a glint crosses; `0` is the resting frame.
 pub(super) fn lockup(theme: &Theme, progress: f32, idle: u64) -> Vec<Vec<Span<'static>>> {
-    let level = level(progress);
+    let (trace, level) = phases(progress);
     let sway = sway(idle);
     let head = glint(idle, LOCKUP.0);
     let mut knob = paint(
         theme,
-        &cells(KNOB, |x, y| knob(x, y, level, sway)),
+        &cells(KNOB, |x, y| knob(x, y, level, sway, trace)),
         0,
         LOCKUP.0,
     );
@@ -220,6 +254,11 @@ pub(super) fn lockup(theme: &Theme, progress: f32, idle: u64) -> Vec<Vec<Span<'s
         &mut word,
         head.map(|head| head - (KNOB.0 / 2 + GAP) as f32),
     );
+    if let Some(edge) = tuning_edge(progress, level) {
+        for row in &mut word {
+            fx::brighten(theme, row, edge, TUNE_BAND);
+        }
+    }
     knob.into_iter()
         .enumerate()
         .map(|(row, mut spans)| {
@@ -234,9 +273,20 @@ pub(super) fn lockup(theme: &Theme, progress: f32, idle: u64) -> Vec<Vec<Span<'s
 }
 
 /// The wordmark alone, exactly [`WORDMARK`] cells, for windows too small for the knob. Its glint
-/// follows the same `idle` clock as [`lockup`].
+/// follows the same `idle` clock as [`lockup`], and it tunes in under the same glow.
 pub(super) fn wordmark(theme: &Theme, progress: f32, idle: u64) -> Vec<Vec<Span<'static>>> {
-    let mut word = paint(theme, &wordmark_cells(level(progress)), 0, WORDMARK.0);
+    let (_, level) = phases(progress);
+    let mut word = paint(theme, &wordmark_cells(level), 0, WORDMARK.0);
     shine(theme, &mut word, glint(idle, WORDMARK.0));
+    if let Some(edge) = tuning_edge(progress, level) {
+        for row in &mut word {
+            fx::brighten(theme, row, edge, TUNE_BAND);
+        }
+    }
     word
+}
+
+#[cfg(test)]
+pub(super) fn boot_phases(progress: f32) -> (f32, f32) {
+    phases(progress)
 }

@@ -349,6 +349,48 @@ pub fn save_config(
     save_config_with_project_resets(layout, scope, changes, &[], None)
 }
 
+/// Reset a provider in the selected scope; Global also clears this project's override.
+/// Keep an empty disabled record so built-ins and environment keys cannot reconnect it.
+pub fn reset_provider(
+    layout: &Layout,
+    scope: Scope,
+    id: &str,
+) -> Result<crate::config::types::Config> {
+    ensure!(
+        !id.is_empty()
+            && id.len() <= 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "invalid provider id"
+    );
+    let path = format!("providers.{id}");
+    let mut reset = toml::Table::try_from(crate::llm::model_config::ProviderSpec {
+        enabled: false,
+        ..Default::default()
+    })?;
+    // Explicit empty overrides mask credential/transport fields inherited from Global.
+    reset.insert("api_key_env".into(), "".into());
+    reset.insert("api_key_envs".into(), toml::Value::Array(vec![]));
+    reset.insert("headers".into(), toml::Value::Array(vec![]));
+    reset.insert(
+        "protocol".into(),
+        crate::llm::model_config::ApiProtocol::builtin(id)
+            .as_str()
+            .into(),
+    );
+    save_config_with_project_resets(
+        layout,
+        scope,
+        &[Change::Set {
+            path: path.clone(),
+            value: reset.into(),
+        }],
+        &[Change::Remove { path }],
+        None,
+    )
+}
+
 /// Explicit Global model choices clear only this project's override for the chosen role.
 pub fn save_model_config(
     layout: &Layout,

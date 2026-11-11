@@ -478,6 +478,57 @@ fn capability_cell(theme: &Theme, entry: &ModelEntry, width: usize) -> String {
     )
 }
 
+/// Widths of the model list's fixed columns, which appear as the row gets wider. The row renderer
+/// and the column labels on the search line share them, so the labels sit over their values.
+struct Columns {
+    state_w: usize,
+    lora_w: usize,
+    ctx_w: usize,
+    speed_w: usize,
+    price_w: usize,
+    caps_w: usize,
+}
+
+impl Columns {
+    fn new(w: usize, learning: bool) -> Self {
+        Self {
+            state_w: if w >= 60 { 20 } else { 0 },
+            lora_w: if learning && w >= 90 {
+                19
+            } else if w >= 72 {
+                10
+            } else {
+                0
+            },
+            ctx_w: if w >= 40 { 7 } else { 0 },
+            speed_w: if w >= 96 { 9 } else { 0 },
+            price_w: if w >= 108 { 14 } else { 0 },
+            caps_w: if w >= 28 { 8 } else { 0 },
+        }
+    }
+
+    /// Column titles in row order (context, price, speed, LoRA, state, capabilities); the
+    /// capability title is right-aligned like its badges.
+    fn labels(&self) -> String {
+        let mut out = String::new();
+        for (width, title) in [
+            (self.ctx_w, "ctx"),
+            (self.price_w, "price"),
+            (self.speed_w, "speed"),
+            (self.lora_w, "LoRA"),
+            (self.state_w, "state"),
+        ] {
+            if width > 0 {
+                out.push_str(&text::pad(title, width));
+            }
+        }
+        if self.caps_w > 0 {
+            out.push_str(&format!("{:>width$} ", "caps", width = self.caps_w - 1));
+        }
+        out
+    }
+}
+
 /// `loaded`, `loads on first use`, `embedding`, `unavailable` or `available`, from what the catalog reported.
 fn state_of(entry: &ModelEntry) -> &'static str {
     let source = entry.source.to_lowercase();
@@ -2178,7 +2229,7 @@ impl ModelOverlay {
                     right_w,
                 ))
             } else {
-                self.search_line(theme, right_w)
+                self.search_line(theme, right_w, list_w)
             });
         }
         let top_rows = right_top.len();
@@ -2403,29 +2454,35 @@ impl ModelOverlay {
         Line::from(fit(spans, w))
     }
 
-    fn search_line(&self, theme: &Theme, w: usize) -> Line<'static> {
+    /// The search prompt; the rest of the row labels the list's columns, aligned with them.
+    fn search_line(&self, theme: &Theme, w: usize, list_w: usize) -> Line<'static> {
         let prompt = Span::styled(
             format!(" {} ", theme.sym(Sym::Prompt)),
             theme.fg(Tok::Accent),
         );
-        Line::from(fit(
-            if self.search.is_empty() {
-                vec![
-                    prompt,
-                    Span::styled("Type to search models".to_owned(), theme.fg(Tok::Dim)),
-                ]
-            } else {
-                vec![
-                    prompt,
-                    Span::styled(text::one_line(&self.search), theme.fg(Tok::Text)),
-                    Span::styled(
-                        " ".to_owned(),
-                        theme.fg(Tok::Text).add_modifier(Modifier::REVERSED),
-                    ),
-                ]
-            },
-            w,
-        ))
+        let mut spans = if self.search.is_empty() {
+            vec![
+                prompt,
+                Span::styled("Type to search models".to_owned(), theme.fg(Tok::Dim)),
+            ]
+        } else {
+            vec![
+                prompt,
+                Span::styled(text::one_line(&self.search), theme.fg(Tok::Text)),
+                Span::styled(
+                    " ".to_owned(),
+                    theme.fg(Tok::Text).add_modifier(Modifier::REVERSED),
+                ),
+            ]
+        };
+        let labels = Columns::new(list_w, self.learning).labels();
+        let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+        let labels_w = text::width(&labels);
+        if !labels.trim().is_empty() && used + 2 + labels_w <= list_w {
+            spans.push(Span::raw(" ".repeat(list_w - labels_w - used)));
+            spans.push(Span::styled(labels, theme.fg(Tok::Dim)));
+        }
+        Line::from(fit(spans, w))
     }
 
     fn left_column(&self, theme: &Theme, width: usize, rows: usize) -> Vec<Vec<Span<'static>>> {
@@ -2626,18 +2683,14 @@ impl ModelOverlay {
         } else {
             state_of(entry)
         };
-        let state_w = if w >= 60 { 20 } else { 0 };
-        let lora_w = if self.learning && w >= 90 {
-            19
-        } else if w >= 72 {
-            10
-        } else {
-            0
-        };
-        let ctx_w = if w >= 40 { 7 } else { 0 };
-        let speed_w = if w >= 96 { 9 } else { 0 };
-        let price_w = if w >= 108 { 14 } else { 0 };
-        let caps_w = if w >= 28 { 8 } else { 0 };
+        let Columns {
+            state_w,
+            lora_w,
+            ctx_w,
+            speed_w,
+            price_w,
+            caps_w,
+        } = Columns::new(w, self.learning);
         let prefix_w = text::width(&pointer) + text::width(&marker) + 2;
         let name_w =
             w.saturating_sub(prefix_w + caps_w + state_w + lora_w + ctx_w + speed_w + price_w);

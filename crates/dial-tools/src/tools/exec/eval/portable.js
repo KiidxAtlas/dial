@@ -163,6 +163,15 @@ var dial = (() => {
     unpack: (...args) => __dial_binary__.unpack(...args),
     read,
     readText: async path => (await read(path)).content,
+    readLines: async (path, offset = 1, limit) => (await tool.read({path, format:'text', offset, ...(limit === undefined ? {} : {limit})})).data,
+    lines: async function* (path, offset = 1) {
+      while (offset !== null && offset !== undefined) {
+        const page = (await tool.read({path, format:'text', offset})).data;
+        const text = page.content.replace(/\r?\n$/, '');
+        if (page.lines) yield* text.split(/\r?\n/);
+        offset = page.next_offset;
+      }
+    },
     readJson: async path => JSON.parse((await read(path)).content),
     readBytes: async path => decode((await read(path, {encoding:'base64'})).content),
     writeText: async (path, content) => tool.write({path, content}),

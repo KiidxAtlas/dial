@@ -2660,3 +2660,64 @@ fn model_card_front_matter_declares_a_purpose_exactly() {
         ModelKind::Unknown
     );
 }
+
+#[test]
+fn reset_provider_credentials_remove_canonical_and_custom_keys_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let custom = "https://custom.example.test/v1";
+    let canonical = "http://127.0.0.1:11234/v1";
+    for url in [custom, canonical, "https://keep.example.test/v1"] {
+        save_credential(dir.path(), url, "fixture-key").unwrap();
+    }
+    remove_provider_credentials(dir.path(), "mlx-serve", &[format!("{custom}/")]).unwrap();
+    assert!(credential_token(dir.path(), custom).unwrap().is_none());
+    assert!(credential_token(dir.path(), canonical).unwrap().is_none());
+    assert!(
+        credential_token(dir.path(), "https://keep.example.test/v1")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn reset_provider_stays_unconfigured_despite_saved_selections() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let configured: BTreeMap<_, _> = LOCAL_SERVERS
+        .iter()
+        .map(|&(id, ..)| id)
+        .chain(KNOWN.iter().map(|row| row.0))
+        .chain(["chatgpt", "mlx", "apple"])
+        .map(|id| {
+            (
+                id.to_owned(),
+                ProviderSpec {
+                    enabled: false,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    let selections: Vec<_> = ["docker-model-runner", "mlx-serve"]
+        .into_iter()
+        .map(|id| ModelSelection {
+            provider: id.into(),
+            model: "old-model".into(),
+            base_url: Some("http://127.0.0.1:1/v1".into()),
+            ..Default::default()
+        })
+        .collect();
+    let found = discover(&layout, &configured, &selections);
+    for id in ["docker-model-runner", "mlx-serve", "mlx"] {
+        let status = found.providers.iter().find(|p| p.id == id).unwrap();
+        assert_eq!(status.state, "not-set-up", "{id}");
+        assert_eq!(status.models, 0, "{id}");
+        assert!(
+            !found
+                .models
+                .iter()
+                .any(|entry| entry.selection.provider == id)
+        );
+    }
+}

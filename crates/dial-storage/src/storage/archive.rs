@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -36,6 +36,9 @@ const PROMPT_PREVIEW: usize = 160;
 const PROMPT_DETAIL: usize = 600;
 const RECAP_PREVIEW: usize = 240;
 const TITLE_CHARS: usize = 80;
+/// Characters of a failure's error text and of its call's arguments shown in a session view.
+const FAILURE_TEXT: usize = 400;
+const FAILURE_ARGS: usize = 160;
 /// Session files scanned per requested row when listing every project's sessions; empty sessions
 /// are skipped, so a few extra are read, but never the whole archive.
 const SCAN_FACTOR: usize = 4;
@@ -542,6 +545,27 @@ pub struct ArchiveSessionDetail {
     pub recaps: Vec<ArchiveRecap>,
     /// Newest `limit` prompts submitted in this session, oldest first.
     pub prompts: Vec<ArchivePrompt>,
+    /// Newest `limit` failed tool calls and failed or interrupted turns, oldest first.
+    pub failures: Vec<ArchiveFailure>,
+    /// Every failure found in the transcript, including those beyond `limit`.
+    pub failures_total: usize,
+}
+
+/// One failure recorded in a session transcript: a tool call that returned an error (including
+/// harness refusals), or a turn that ended failed or interrupted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveFailure {
+    /// The record's timestamp as written (RFC 3339), empty when the record has none.
+    pub at: String,
+    /// `"tool"` or `"turn"`.
+    pub kind: &'static str,
+    /// The failed tool, or the turn's outcome (`failed`, `interrupted`, ...).
+    pub name: String,
+    /// The failed call's arguments, clipped; absent for turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+    /// The error text on one line, with harness recovery notices removed.
+    pub text: String,
 }
 
 /// Records plus their text rendering.
@@ -628,6 +652,156 @@ fn lines(bytes: &[u8], drop_head: bool, drop_tail: bool) -> Vec<Value> {
         .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
         .filter_map(|line| serde_json::from_slice(line).ok())
         .collect()
+}
+
+/// Error text without Dial's recovery notices and retry hints, which repeat on every failure and
+/// hide the cause.
+fn failure_text(text: &str) -> String {
+    let mut kept = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<dial-notice") {
+        kept.push_str(&rest[..start]);
+        match rest[start..].find("</dial-notice>") {
+            Some(end) => rest = &rest[start + end + "</dial-notice>".len()..],
+            None => {
+                rest = "";
+            }
+        }
+    }
+    kept.push_str(rest);
+    let kept: Vec<&str> = kept
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !line.starts_with("Retry barrier:")
+                && !line.starts_with("Recovery checkpoint:")
+                && !line.starts_with("[Complete tool evidence")
+        })
+        .collect();
+    clip(&one_line(&kept.join("\n")), FAILURE_TEXT)
+}
+
+/// Whether a transcript line can hold a failure or the tool call a failure refers to; lets the
+/// scan skip parsing the bulk of a large transcript.
+fn may_hold_failure(line: &[u8]) -> bool {
+    let has = |needle: &[u8]| line.windows(needle.len()).any(|window| window == needle);
+    has(b"\"tool_calls\"") || has(b"\"is_error\":true") || has(b"\"completion\"")
+}
+
+/// Failed tool results and failed or interrupted turns in a session transcript, streamed one line
+/// at a time so a transcript of any size is covered. Returns the newest `limit`, oldest first, and
+/// the total found.
+fn scan_failures(
+    reader: impl BufRead,
+    limit: usize,
+) -> std::io::Result<(Vec<ArchiveFailure>, usize)> {
+    let mut calls: HashMap<String, (String, String)> = HashMap::new();
+    let mut found = std::collections::VecDeque::with_capacity(limit);
+    let mut total = 0;
+    let mut push = |failure: ArchiveFailure| {
+        total += 1;
+        if found.len() == limit {
+            found.pop_front();
+        }
+        found.push_back(failure);
+    };
+    for line in reader.split(b'\n') {
+        let line = line?;
+        if !may_hold_failure(&line) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let at = record["ts"].as_str().unwrap_or_default().to_owned();
+        match record["type"].as_str() {
+            Some("message") => {
+                let message = &record["message"];
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    let (Some(id), Some(name)) =
+                        (call["id"].as_str(), call["function"]["name"].as_str())
+                    else {
+                        continue;
+                    };
+                    let arguments = match &call["function"]["arguments"] {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    calls.insert(
+                        id.to_owned(),
+                        (name.to_owned(), clip(&one_line(&arguments), FAILURE_ARGS)),
+                    );
+                }
+                if message["role"] == "tool" && message["is_error"] == true {
+                    let call = message["tool_call_id"]
+                        .as_str()
+                        .and_then(|id| calls.remove(id));
+                    let (name, arguments) = match call {
+                        Some((name, arguments)) => (name, Some(arguments)),
+                        None => ("tool".to_owned(), None),
+                    };
+                    push(ArchiveFailure {
+                        at,
+                        kind: "tool",
+                        name,
+                        arguments,
+                        text: failure_text(&content_text(message)),
+                    });
+                }
+            }
+            Some("runtime") if record["node"]["kind"] == "completion" => {
+                let data = &record["node"]["result"]["data"];
+                let outcome = data["evidence"]["execution_outcome"].as_str();
+                let error = data["error"]
+                    .as_str()
+                    .filter(|error| !error.trim().is_empty());
+                if error.is_none() && matches!(outcome, None | Some("completed")) {
+                    continue;
+                }
+                let class = data["error_class"].as_str();
+                let text = match (error, class) {
+                    (Some(error), Some(class)) => format!("{class}: {error}"),
+                    (Some(error), None) => error.to_owned(),
+                    (None, _) => String::new(),
+                };
+                push(ArchiveFailure {
+                    at,
+                    kind: "turn",
+                    name: outcome.unwrap_or("failed").to_owned(),
+                    arguments: None,
+                    text: failure_text(&text),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok((found.into(), total))
+}
+
+/// The "Failures" section of a session view.
+fn failure_lines(failures: &[ArchiveFailure], total: usize) -> Vec<String> {
+    if failures.is_empty() {
+        return vec!["No failed tool calls or failed turns recorded.".into()];
+    }
+    let shown = if total > failures.len() {
+        format!("latest {} of {total}", failures.len())
+    } else {
+        count(total, "failure")
+    };
+    let mut lines = vec![format!("Failures ({shown}), oldest first:")];
+    for failure in failures {
+        // RFC 3339 `YYYY-MM-DDTHH:MM:SS...`: the time of day is enough within one session.
+        let at = failure.at.get(11..19).unwrap_or(&failure.at);
+        let mut line = format!("- {at} {} {}", failure.kind, failure.name);
+        if let Some(arguments) = &failure.arguments {
+            line.push_str(&format!(" {arguments}"));
+        }
+        if !failure.text.is_empty() {
+            line.push_str(&format!(" -> {}", failure.text));
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 /// Whether the final record of `window` is complete JSON. A window that begins inside a record
@@ -1142,6 +1316,16 @@ impl Archive {
                 ));
             }
         }
+        let (failures, failures_total) = File::open(&file)
+            .and_then(|handle| scan_failures(BufReader::new(handle), limit))
+            .with_context(|| {
+                format!(
+                    "reading failures from {}",
+                    shorten_path(&file.display().to_string())
+                )
+            })?;
+        lines.push(String::new());
+        lines.extend(failure_lines(&failures, failures_total));
         let parent = session.parent.clone();
         Ok(View {
             text: lines.join("\n"),
@@ -1150,6 +1334,8 @@ impl Archive {
                 parent,
                 recaps,
                 prompts,
+                failures,
+                failures_total,
             },
         })
     }

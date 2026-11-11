@@ -185,6 +185,11 @@ failures (including checkpoint failures) are not reset by this recovery.
   before enabling edits. `/permissions` lists scoped rules; for example,
   `/permissions allow --persist bash cargo test` persists a project rule outside the workspace.
   Deny rules take precedence, including in automatic approval mode.
+  `/permissions why` lists the 20 most recent approval-policy decisions of this session, newest
+  first: the rule that decided each call (mode, saved rule, hook, your answer) and the control
+  that would change it. It covers approval policy only, not model routing or completion checks.
+  Approval prompts also say what `/undo` covers: `write`, `edit` and `ast_edit` are checkpointed,
+  shell commands only when `shell.undo_snapshot` is on, and other tools have no checkpoint.
   Approval prompts lead with the action and show the exact policy-derived reusable matcher and
   lifetime before consent. Answer keys are ignored for about 350 ms after a prompt appears. `Esc`
   or `n` denies; `Ctrl+C` denies and stops the turn. Choosing the project scope asks for

@@ -25,6 +25,26 @@ fn custom_foreground_checks_record_real_failure_and_success_without_runner_names
                 state["reliability"]["stats"]["passing_checks"], 1,
                 "{state}"
             );
+            // The turn report lists both shell checks with their latest verdicts.
+            let checks = state["turn_summary"]["recorded_checks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let verdicts: Vec<(&str, &str)> = checks
+                .iter()
+                .filter(|check| check["kind"] == "shell")
+                .map(|check| {
+                    (
+                        check["name"].as_str().unwrap_or_default(),
+                        check["status"].as_str().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                verdicts,
+                [("exit 7", "failed"), ("exit 0", "passed")],
+                "{state}"
+            );
         },
     );
 }

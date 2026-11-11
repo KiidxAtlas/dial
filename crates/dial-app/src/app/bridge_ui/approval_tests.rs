@@ -1,7 +1,7 @@
 use super::*;
 use agent::safety::approval::{ApprovalPreview, PolicyExplanation, PolicyReason};
 
-const HINT: &str = "Esc or n denies · Ctrl+C denies and stops the turn";
+const HINT: &str = "n or Esc denies · Ctrl+C denies and stops the turn";
 
 #[test]
 fn reusable_choices_lead_with_the_action_and_carry_lifetimes_in_labels() {
@@ -16,13 +16,22 @@ fn reusable_choices_lead_with_the_action_and_carry_lifetimes_in_labels() {
                 .into(),
         ),
         unavailable_reason: None,
+        undo: "Checkpointed: /undo restores the previous file contents.".into(),
     };
     let prompt = approval_prompt("cargo test foo", &preview, HINT);
     assert!(prompt.body.starts_with("cargo test foo"));
+    // Reversibility is stated directly under the action, before any scope text.
     assert!(
         prompt
             .body
-            .contains("would cover: bash normalized argv starts with [cargo, test].")
+            .starts_with("cargo test foo\n\nCheckpointed: /undo restores"),
+        "{}",
+        prompt.body
+    );
+    assert!(
+        prompt
+            .body
+            .contains("project covers: bash normalized argv starts with [cargo, test].")
     );
     assert!(!prompt.body.contains("Lifetime:") && !prompt.body.contains("Policy:"));
     assert!(prompt.body.ends_with(HINT));
@@ -48,6 +57,7 @@ fn unavailable_scopes_cannot_be_selected_or_promised() {
         session: None,
         project: None,
         unavailable_reason: Some("Compound commands require fresh approval".into()),
+        undo: String::new(),
     };
     let prompt = approval_prompt("cargo test && echo done", &preview, HINT);
     assert!(
@@ -55,7 +65,7 @@ fn unavailable_scopes_cannot_be_selected_or_promised() {
             .body
             .contains("Compound commands require fresh approval")
     );
-    assert!(prompt.scope.is_none() && !prompt.body.contains("would cover"));
+    assert!(prompt.scope.is_none() && !prompt.body.contains("project covers"));
     assert_eq!(
         prompt
             .options
@@ -129,4 +139,26 @@ fn policy_denials_use_user_wording_and_quiet_bookkeeping() {
     ] {
         assert!(policy_notice("bash", &explain(reason)).is_none());
     }
+}
+
+#[test]
+fn policy_log_rows_name_the_deciding_rule_and_the_control_that_changes_it() {
+    let row = |reason, scope: Option<&str>| {
+        policy_log_row(
+            "bash",
+            &PolicyExplanation {
+                reason,
+                rule_scope: scope.map(str::to_owned),
+            },
+        )
+    };
+    assert_eq!(
+        row(PolicyReason::AllowRule, Some("bash cargo test")),
+        "bash: Policy: allowed by a saved permission rule (bash cargo test). To change: remove the rule with /permissions remove <number>."
+    );
+    assert_eq!(
+        row(PolicyReason::AutomaticMode, None),
+        "bash: Policy: allowed by automatic approval mode. To change: choose /approval ask or /approval write to be prompted."
+    );
+    assert!(row(PolicyReason::ReadOnly, None).ends_with("leave read-only mode with /approval."));
 }

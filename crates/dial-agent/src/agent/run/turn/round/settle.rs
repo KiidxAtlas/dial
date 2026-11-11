@@ -155,6 +155,7 @@ impl Agent<'_> {
             }
         }
         let mut shell_check_passed = false;
+        let mut shell_check_run = None;
         let check_failed = is_check && crate::agent::verify::verification::check_failed(&output);
         if is_check
             && let Some(process) = output.process_outcome()
@@ -162,16 +163,17 @@ impl Agent<'_> {
             && !process.cancelled
             && (process.exit_code.is_some() || process.timed_out || process.signal.is_some())
         {
-            if output.is_error
+            let passed = !(output.is_error
                 || check_failed
                 || process.exit_code != Some(0)
-                || !process.output_complete
-            {
-                turn.reliability.failing_checks += 1;
-            } else {
+                || !process.output_complete);
+            if passed {
                 turn.reliability.passing_checks += 1;
                 shell_check_passed = true;
+            } else {
+                turn.reliability.failing_checks += 1;
             }
+            shell_check_run = Some(passed);
         }
         outcome.observed_check_failure |= check_failed;
         self.step_checks.reproduced |= check_failed;
@@ -309,6 +311,16 @@ impl Agent<'_> {
         // Bound after this call's own shell effect, like the ledger's observations.
         if shell_check_passed {
             self.step_checks.shell_check_passed = Some(self.step_checks.revision());
+        }
+        if let Some(passed) = shell_check_run {
+            let command = call.arguments["command"]
+                .as_str()
+                .unwrap_or(&call.name)
+                .to_owned();
+            let revision = self.step_checks.revision();
+            self.step_checks
+                .shell_check_runs
+                .push((command, passed, revision));
         }
         let review_stamp = crate::agent::run::enrichment::Stamp {
             revision: self.step_checks.revision(),

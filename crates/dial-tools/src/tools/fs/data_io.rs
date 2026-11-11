@@ -7,21 +7,26 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_BYTES: usize = 1024 * 1024;
+/// Lines one ranged text read returns at most (also bounded by [`MAX_BYTES`]).
+const MAX_LINES: u64 = 100_000;
 
 /// Structured data is returned to code, while the model-facing text stays a compact receipt.
 pub(in crate::tools) fn read(ws: &Workspace, args: &Value) -> Result<ToolOutput, String> {
-    if ["paths", "offset", "limit"]
-        .iter()
-        .any(|key| args.get(key).is_some())
-    {
-        return Err(
-            "data reads require one literal local path without selectors or line ranges".into(),
-        );
+    if args.get("paths").is_some() {
+        return Err("data reads require one literal local path without selectors".into());
     }
     let input = crate::tools::req_str(args, "path")?;
     let format = crate::tools::req_str(args, "format")?;
     if !matches!(format, "text" | "base64") {
         return Err("read format must be text or base64".into());
+    }
+    if args.get("offset").is_some() || args.get("limit").is_some() {
+        if format != "text" || args["retain"] == true || input.starts_with("artifact://") {
+            return Err(
+                "offset/limit page a local file's lines with format=text, without retain".into(),
+            );
+        }
+        return read_lines(ws, input, args);
     }
     let bytes = if input.starts_with("artifact://") {
         if args["retain"] == true {
@@ -33,11 +38,15 @@ pub(in crate::tools) fn read(ws: &Workspace, args: &Value) -> Result<ToolOutput,
             .map_err(|error| format!("reading artifact bytes: {error:#}"))?
     } else {
         crate::tools::knowledge::evidence::source::read_bounded(ws, input, MAX_BYTES as u64)
-            .map_err(|error| format!("reading data: {error:#}"))?
+            .map_err(|error| {
+                format!(
+                    "reading data: {error:#}; for a larger text file page its lines with offset/limit"
+                )
+            })?
     };
     if bytes.len() > MAX_BYTES {
         return Err(
-            "data reads are limited to 1 MiB; use ordinary ranged reads for larger files".into(),
+            "data reads are limited to 1 MiB; page a larger text file with offset/limit".into(),
         );
     }
     let content = if format == "base64" {
@@ -57,6 +66,64 @@ pub(in crate::tools) fn read(ws: &Workspace, args: &Value) -> Result<ToolOutput,
     };
     let mut data = json!({"path":input,"encoding":format,"bytes":bytes.len(),
         "sha256":format!("{:x}", Sha256::digest(&bytes)),"artifact":artifact});
+    let text = data.to_string();
+    data["content"] = json!(content);
+    Ok(ToolOutput {
+        text,
+        data: Some(data),
+        is_error: false,
+        execution: Default::default(),
+    })
+}
+
+/// Lines `offset..offset+limit` (1-based) of a text file of any size, streamed and returned
+/// exactly (line endings kept) up to [`MAX_BYTES`]. `next_offset` continues the page; it is null
+/// at the end of the file.
+fn read_lines(ws: &Workspace, input: &str, args: &Value) -> Result<ToolOutput, String> {
+    use std::io::BufRead;
+    let offset = crate::tools::opt_u64(args, "offset")?.unwrap_or(1);
+    if offset == 0 {
+        return Err("offset is 1-based".into());
+    }
+    let limit = crate::tools::opt_u64(args, "limit")?
+        .unwrap_or(MAX_LINES)
+        .clamp(1, MAX_LINES);
+    let file = crate::tools::knowledge::evidence::source::open_admitted(ws, input)
+        .map_err(|error| format!("reading data: {error:#}"))?;
+    let mut reader = std::io::BufReader::new(file);
+    let (mut line_no, mut taken) = (0u64, 0u64);
+    let (mut content, mut line) = (Vec::new(), Vec::new());
+    let mut next = None;
+    loop {
+        line.clear();
+        if reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("reading data: {error}"))?
+            == 0
+        {
+            break;
+        }
+        line_no += 1;
+        if line_no < offset {
+            continue;
+        }
+        if taken == limit || (taken > 0 && content.len() + line.len() > MAX_BYTES) {
+            next = Some(line_no);
+            break;
+        }
+        if line.len() > MAX_BYTES {
+            return Err(format!(
+                "line {line_no} alone exceeds 1 MiB; read it with format=base64 or a shell tool"
+            ));
+        }
+        content.extend_from_slice(&line);
+        taken += 1;
+    }
+    let content = String::from_utf8(content)
+        .map_err(|_| "these lines are not UTF-8; use format=base64 on a smaller file")?;
+    let mut data = json!({"path":input,"encoding":"text","offset":offset,"lines":taken,
+        "bytes":content.len(),"sha256":format!("{:x}", Sha256::digest(content.as_bytes())),
+        "next_offset":next});
     let text = data.to_string();
     data["content"] = json!(content);
     Ok(ToolOutput {

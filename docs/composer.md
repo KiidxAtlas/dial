@@ -6,7 +6,7 @@ Collapsed-paste payloads survive draft replacement, clear, undo and redo. They a
 
 Successful submission or queueing ends that draft's undo/redo and paste-payload lifetime. History retains the expanded prompt; a placeholder typed into a later draft cannot resurrect a previously sent payload.
 
-`Ctrl+R` searches recent in-memory prompts immediately and queries the configured history provider with the entered case-insensitive substring (up to 500 matching results, not just the newest 500 prompts). Provider lookups are debounced and serialized off the input thread, with only the newest pending query retained. Responses from dismissed searches, older queries or replaced providers are ignored. While a lookup runs, existing matches remain usable.
+`Ctrl+R` opens above the input (like the `/` menu), lists each prompt once, and searches recent in-memory prompts immediately and queries the configured history provider with the entered case-insensitive substring (up to 500 matching results, not just the newest 500 prompts). Provider lookups are debounced and serialized off the input thread, with only the newest pending query retained. Responses from dismissed searches, older queries or replaced providers are ignored. While a lookup runs, existing matches remain usable.
 
 Autocomplete candidates are ranked on worker threads and delivered back to the composer tagged with the originating query. Results are only applied while that query still matches the active menu. Refresh project candidates outside keystroke handling with `Composer::set_files` and `Composer::set_commands`.
 

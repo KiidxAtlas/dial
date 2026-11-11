@@ -634,11 +634,18 @@ impl Picker {
         };
         if height >= 7 && !nothing_listed {
             let status = if self.show_empty {
-                format!("All sessions · {scope} · Ctrl+T this session")
+                format!("All sessions · {scope}")
             } else if empty > 0 {
-                format!("Conversations · {scope} · Tab shows {empty} empty · Ctrl+T this session")
+                format!("Conversations · {scope} · Tab shows {empty} empty")
             } else {
-                format!("Conversations · {scope} · Ctrl+T this session")
+                format!("Conversations · {scope}")
+            };
+            // The fork-browser key is in the F1 sheet; it joins the line only when it fits whole.
+            let browse = " · Ctrl+T this session";
+            let status = if text::width(&status) + text::width(browse) <= width {
+                format!("{status}{browse}")
+            } else {
+                status
             };
             body.push(line(status, Tok::Muted));
         }
@@ -916,13 +923,14 @@ impl Picker {
         } else {
             " "
         };
-        // Wide rows spell the markers out; narrow rows keep one-character glyphs visible.
+        // Wide rows spell the markers out; narrow rows keep one-character glyphs visible. The
+        // detail strip below the list explains an in-use session in full.
         let flags = if width >= 44 {
             let mut flags = String::new();
             for (on, word) in [
                 (pinned, "[pin] "),
                 (current, "[current] "),
-                (open, "[open elsewhere] "),
+                (open, "[in use] "),
             ] {
                 if on {
                     flags.push_str(word);
@@ -972,13 +980,25 @@ impl Picker {
             } else {
                 &s.first_message
             };
+            // Across projects, the second line says which project before what was last asked.
+            let project = if self.all_projects {
+                let name = s
+                    .project
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&s.project);
+                format!("{name} · ")
+            } else {
+                String::new()
+            };
             body.push(clip(
                 &format!(
-                    "  {}",
+                    "  {project}{}",
                     if preview.trim().is_empty() {
-                        "No conversation messages"
+                        "No conversation messages".to_owned()
                     } else {
-                        preview
+                        format!("last: {}", preview.trim())
                     }
                 ),
                 Tok::Muted,

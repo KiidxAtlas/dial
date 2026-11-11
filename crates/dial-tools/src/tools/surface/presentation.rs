@@ -177,6 +177,30 @@ pub fn render_result(name: &str, args: &Value, output: &ToolOutput) -> Presentat
                     view.facts.push(plural(n, "line"));
                 }
             }
+            // A search card says what it found, as a read card says how much it read.
+            "grep" => {
+                let hits = output
+                    .text
+                    .lines()
+                    .filter(|line| {
+                        let mut parts = line.splitn(3, ':');
+                        let (_, number) = (parts.next(), parts.next());
+                        parts.next().is_some()
+                            && number.is_some_and(|n| {
+                                !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                            })
+                    })
+                    .count();
+                if hits > 0 {
+                    view.facts.push(if hits == 1 {
+                        "1 match".to_owned()
+                    } else {
+                        format!("{hits} matches")
+                    });
+                } else if output.text.trim_start().starts_with("no matches") {
+                    view.facts.push("no matches".into());
+                }
+            }
             // The collapsed card shows the chosen answers; the model still gets the full record.
             "ask" => {
                 let answers: Vec<String> = output

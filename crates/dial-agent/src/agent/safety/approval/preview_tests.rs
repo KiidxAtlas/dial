@@ -225,3 +225,23 @@ fn preview_masks_credentials_without_changing_the_actual_matcher() {
     assert_eq!(rules[0].command_prefix, ["custom", credential.as_str()]);
     assert!(rules[0].matches(&requested, Path::new("/project")));
 }
+
+#[test]
+fn preview_states_what_undo_covers_for_each_kind_of_call() {
+    let undo = |name: &str, arguments: Value| approval_grant(&call(name, arguments)).preview.undo;
+    assert!(undo("edit", json!({"input": "x"})).starts_with("Checkpointed:"));
+    assert!(undo("write", json!({"path": "a", "content": "b"})).starts_with("Checkpointed:"));
+    let shell = undo("bash", json!({"command": "cargo build"}));
+    assert!(
+        shell.contains("only when shell.undo_snapshot is on"),
+        "{shell}"
+    );
+    assert!(!shell.starts_with("Destructive"));
+    let destructive = undo("bash", json!({"command": "rm -rf target"}));
+    assert!(
+        destructive.starts_with("Destructive or privileged command."),
+        "{destructive}"
+    );
+    assert!(destructive.contains("shell.undo_snapshot"));
+    assert!(undo("web_fetch", json!({"url": "https://example.com"})).starts_with("No checkpoint:"));
+}

@@ -26,7 +26,7 @@ pub(crate) const TOOL_POLICY: &str = "
 - Produce data and generated files with code that also checks the result.
 - Keep tool arguments short; omit narration comments in scripts and prefer edit for localized changes.";
 pub(crate) const LEAN_BATCHING: &str = "
-- Send independent reads and searches as parallel tool calls in one response, along with disjoint edits and routine todo updates; sequence dependent steps, verify after the edits a check covers, and reuse unchanged evidence.";
+- Send independent reads and searches as parallel tool calls in one response, along with disjoint edits and routine todo updates; `&&`-chain dependent commands, verify after the edits a check covers, and reuse unchanged evidence.";
 pub(crate) const LEAN_ONE_CALL: &str = "
 - This route allows one tool call per response: read its result before choosing the next action.";
 /// Present only when the presentation itself limits calls per response.
@@ -53,7 +53,7 @@ pub(crate) const TESTING_DECISIONS: &str = "
 - Prove new algorithms/formats on tiny known-answer/round-trip cases; keep tests meaningful and temporary outputs out of deliverables.
 - Reuse passing checks while inputs and acceptance criteria are unchanged. If a new helper disagrees, minimize the helper and artifact before rewriting previously passing code.
 - Test doubles and unavailable runtimes do not establish live behavior.";
-pub(crate) const ARTIFACT_CHECK_RULE: &str = "For standalone artifacts without a test suite, use verify acceptance: {name, command} for one focused format/constraint check that fails on violations. Avoid empty verification and unrelated test searches. Helpers do not replace task/operator checks; disclose remaining gaps.";
+pub(crate) const ARTIFACT_CHECK_RULE: &str = "For standalone artifacts without a test suite, send verify acceptance with the write: {name, command} for one focused format/constraint check that fails on violations. Avoid empty verification and unrelated test searches. Helpers don't replace task/operator checks; disclose gaps.";
 pub(crate) const DELIVERY: &str = "
 
 # Delivery

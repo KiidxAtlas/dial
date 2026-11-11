@@ -286,6 +286,13 @@ fn items(info: &WelcomeInfo) -> usize {
     }
 }
 
+/// The list section as its parts: the heading, the visible rows and the hint under them.
+struct ListParts {
+    heading: Vec<Span<'static>>,
+    rows: Vec<Vec<Span<'static>>>,
+    hint: Option<Vec<Span<'static>>>,
+}
+
 /// The list section (label, rows, hint) as unpadded lines; `room` is the width it may use.
 fn list_lines(
     info: &WelcomeInfo,
@@ -294,6 +301,31 @@ fn list_lines(
     room: usize,
     limit: usize,
 ) -> Vec<Vec<Span<'static>>> {
+    let mut out = Vec::new();
+    if limit == 0 {
+        return out;
+    }
+    let parts = list_parts(info, theme, view, room, limit.saturating_sub(2).max(1));
+    if limit > 1 {
+        out.push(parts.heading);
+    }
+    out.extend(parts.rows);
+    if let Some(hint) = parts.hint
+        && out.len() < limit
+    {
+        out.push(hint);
+    }
+    out
+}
+
+/// The list's heading, at most `cap` rows (windowed around the selection) and its hint.
+fn list_parts(
+    info: &WelcomeInfo,
+    theme: &Theme,
+    view: &View,
+    room: usize,
+    cap: usize,
+) -> ListParts {
     let ascii = theme.ascii();
     let muted = theme.fg(Tok::Muted);
     let pad = |n: usize| Span::raw(" ".repeat(n));
@@ -315,12 +347,8 @@ fn list_lines(
             theme.fg(Tok::Text)
         }
     };
-    let mut out = Vec::new();
-    if limit == 0 {
-        return out;
-    }
     let total = items(info);
-    let shown = total.min(limit.saturating_sub(2).max(1));
+    let shown = total.min(cap.max(1));
     let start = view
         .selected
         .unwrap_or(0)
@@ -341,33 +369,43 @@ fn list_lines(
 
     // first visit to this project: things to try
     if info.recent.is_empty() {
-        if limit > 1 {
-            out.push(heading("start with"));
-        }
-        for (i, starter) in STARTERS.iter().enumerate().skip(start).take(shown) {
+        let rows = STARTERS
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(shown)
             // Bullets, not numbers: digits typed into the composer are text, not a starter pick.
-            out.push(vec![
-                pad(1),
-                marker(i),
-                Span::styled(format!("  {starter}"), body(i)),
-            ]);
-        }
-        if view.live && out.len() < limit {
+            .map(|(i, starter)| {
+                vec![
+                    pad(1),
+                    marker(i),
+                    Span::styled(format!("  {starter}"), body(i)),
+                ]
+            })
+            .collect();
+        let hint = view.live.then(|| {
             let down = if ascii { "Down" } else { "\u{2193}" };
-            out.push(vec![
+            vec![
                 pad(1),
                 Span::styled(format!("{down} to pick one, Enter to edit it"), muted),
-            ]);
-        }
+            ]
+        });
+        return ListParts {
+            heading: heading("start with"),
+            rows,
+            hint,
+        };
     }
 
     // recent sessions: a label, then title … age
-    if !info.recent.is_empty() {
-        if limit > 1 {
-            out.push(heading("recent"));
-        }
-        let room = room.min(RECENT_MAX).saturating_sub(1);
-        for (i, (title, age)) in info.recent.iter().enumerate().skip(start).take(shown) {
+    let room = room.min(RECENT_MAX).saturating_sub(1);
+    let rows = info
+        .recent
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(shown)
+        .map(|(i, (title, age))| {
             let title = text::one_line(title);
             let age = text::one_line(age);
             let age_w = text::width(&age);
@@ -383,14 +421,15 @@ fn list_lines(
             } else {
                 spans.push(Span::styled(title, body(i)));
             }
-            out.push(spans);
-        }
-        let hint = text::one_line(info.resume_hint.trim());
-        if !hint.is_empty() && out.len() < limit {
-            out.push(vec![pad(1), Span::styled(hint, muted)]);
-        }
+            spans
+        })
+        .collect();
+    let hint = text::one_line(info.resume_hint.trim());
+    ListParts {
+        heading: heading("recent"),
+        rows,
+        hint: (!hint.is_empty()).then(|| vec![pad(1), Span::styled(hint, muted)]),
     }
-    out
 }
 
 fn layout(

@@ -545,6 +545,10 @@ fn sessions_cli_renames_exports_and_lists_across_projects() {
         },
     )
     .unwrap();
+    // The listing hides sessions without messages, so the remote one needs a conversation.
+    remote
+        .append(json!({"role":"user","content":"Elsewhere"}))
+        .unwrap();
     remote.rename("Other project").unwrap();
     let local = run(&["sessions"]);
     assert!(!String::from_utf8_lossy(&local.stdout).contains("Other project"));

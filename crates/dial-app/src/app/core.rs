@@ -191,6 +191,17 @@ impl App {
         self.adopt_settings(changes, role)
     }
 
+    /// Persist provider reset and replace this session's pinned provider definition too.
+    pub(crate) fn reset_provider(&self, scope: Scope, id: &str) -> Result<()> {
+        settings_store::reset_provider(&self.layout, scope, id)?;
+        self.adopt_settings(
+            &[Change::Remove {
+                path: format!("providers.{id}"),
+            }],
+            None,
+        )
+    }
+
     pub(crate) fn save_settings_checked(
         &self,
         scope: Scope,

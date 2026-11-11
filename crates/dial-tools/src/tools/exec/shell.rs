@@ -68,6 +68,8 @@ const BASH_TAIL: usize = 4 * 1024;
 const FULL_FILTER_MAX: u64 = 4 * 1024 * 1024;
 /// Diagnostic lines kept from the omitted middle (a compiler's first error is often there).
 const BASH_DIAGNOSTICS: usize = 3 * 1024;
+/// Farthest a cut moves to reach a line boundary; a longer line is cut by bytes instead.
+const BASH_LINE_SLACK: usize = 512;
 #[cfg(not(windows))]
 const CLT_DIR: &str = "/Library/Developer/CommandLineTools";
 
@@ -324,6 +326,7 @@ struct Capture {
     head: Vec<u8>,
     tail: Vec<u8>,
     total: usize,
+    newlines: usize,
     diagnostics: crate::tools::code::diagnostics::Collector,
 }
 
@@ -333,6 +336,7 @@ impl Capture {
             head: Vec::new(),
             tail: Vec::new(),
             total: 0,
+            newlines: 0,
             diagnostics: crate::tools::code::diagnostics::Collector::new(BASH_DIAGNOSTICS),
         }
     }
@@ -346,6 +350,7 @@ impl Capture {
 
     fn push(&mut self, mut chunk: &[u8]) {
         self.total += chunk.len();
+        self.newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
         if self.head.len() < BASH_HEAD {
             let take = (BASH_HEAD - self.head.len()).min(chunk.len());
             self.head.extend_from_slice(&chunk[..take]);
@@ -366,7 +371,6 @@ impl Capture {
         if self.tail.len() > BASH_TAIL {
             self.drop_front(self.tail.len() - BASH_TAIL);
         }
-        self.diagnostics.finish();
         let mut dropped = self.total - self.head.len() - self.tail.len();
         if dropped == 0 {
             // Head and tail are contiguous: decode them together so a character that straddles
@@ -375,6 +379,37 @@ impl Capture {
             all.extend_from_slice(&self.tail);
             return String::from_utf8_lossy(&all).into_owned();
         }
+        // Move both cuts to nearby line boundaries, so the view shows whole lines and the
+        // omission can be named as a line range of the complete output.
+        let slack = self.tail.len().min(BASH_LINE_SLACK);
+        let tail_at_line = match self.tail[..slack].iter().position(|byte| *byte == b'\n') {
+            Some(newline) => {
+                self.drop_front(newline + 1);
+                dropped += newline + 1;
+                true
+            }
+            None => false,
+        };
+        self.diagnostics.finish();
+        let floor = self.head.len().saturating_sub(BASH_LINE_SLACK);
+        if let Some(newline) = self.head[floor..].iter().rposition(|byte| *byte == b'\n') {
+            let keep = floor + newline + 1;
+            // The collector never saw the head, so a diagnostic line that starts there stays.
+            let fragment = String::from_utf8_lossy(&self.head[keep..]);
+            if !crate::tools::code::diagnostics::is_diagnostic(&fragment) {
+                dropped += self.head.len() - keep;
+                self.head.truncate(keep);
+            }
+        }
+        let count = |bytes: &[u8]| bytes.iter().filter(|byte| **byte == b'\n').count();
+        let first_line = count(&self.head) + 1;
+        // A tail that starts inside a line leaves that line partly omitted.
+        let last_line = self.newlines - count(&self.tail) + usize::from(!tail_at_line);
+        let range = if last_line > first_line {
+            format!(" (lines {first_line}-{last_line})")
+        } else {
+            format!(" (line {first_line})")
+        };
         // Around an omission, trim each side back to whole characters and count the rest as omitted.
         let head_end = complete_utf8_prefix(&self.head);
         let tail_start = self
@@ -387,6 +422,9 @@ impl Capture {
         self.head.truncate(head_end);
         self.tail.drain(..tail_start);
         let mut text = String::from_utf8_lossy(&self.head).into_owned();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
         let (kept, lines, overflow) = self.diagnostics.kept();
         if dropped > 0 && lines > 0 {
             let more = if overflow > 0 {
@@ -394,9 +432,11 @@ impl Capture {
             } else {
                 String::new()
             };
-            text.push_str(&format!("\n[... {dropped} bytes of output omitted; {lines} diagnostic line(s) from that part follow{more} ...]\n{kept}[... end of omitted-part diagnostics ...]\n"));
+            text.push_str(&format!("[... {dropped} bytes of output omitted{range}; {lines} diagnostic line(s) from that part follow{more} ...]\n{kept}[... end of omitted-part diagnostics ...]\n"));
         } else if dropped > 0 {
-            text.push_str(&format!("\n[... {dropped} bytes of output omitted ...]\n"));
+            text.push_str(&format!(
+                "[... {dropped} bytes of output omitted{range} ...]\n"
+            ));
         }
         text.push_str(&String::from_utf8_lossy(&self.tail));
         text

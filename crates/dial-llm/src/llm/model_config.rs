@@ -506,6 +506,13 @@ impl Default for ProviderSpec {
     }
 }
 
+impl ProviderSpec {
+    /// An empty disabled record remembers an explicit reset, suppressing auto-discovery.
+    pub fn is_reset(&self) -> bool {
+        !self.enabled && self.label.is_empty() && self.base_url.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SymbolPreset {
@@ -870,7 +877,39 @@ impl ModelSelection {
             None => format!("{}/{}", self.provider, name),
         }
     }
+
+    /// The provider shown to people. Dial's own local runtime keeps the id `mlx` (configs and saved
+    /// records select it as `provider = "mlx"`), but it serves a GGUF model on llama.cpp, which is
+    /// also how it runs on Windows and Linux, so that model reads `gguf`, as in `/models`
+    /// ([`crate::llm::catalog::ModelEntry::display_provider`]). For display only: identities,
+    /// saved worker records and [`Self::display_name`] keep the configured provider id.
+    pub fn display_provider(&self) -> &str {
+        if self.provider == "mlx"
+            && self.base_url.is_none()
+            && super::local_format::serves_with_llama_cpp(&self.model)
+        {
+            "gguf"
+        } else {
+            &self.provider
+        }
+    }
+
+    /// [`Self::display_name`] with [`Self::display_provider`] in front, for status and progress
+    /// text. Never compare or persist it; use `display_name` for that.
+    pub fn display_label(&self) -> String {
+        let name = self.display_name();
+        let shown = self.display_provider();
+        if shown == self.provider {
+            return name;
+        }
+        match name.strip_prefix(&format!("{}/", self.provider)) {
+            Some(rest) => format!("{shown}/{rest}"),
+            None => name,
+        }
+    }
 }
 
 #[cfg(test)]
 mod context_tests;
+#[cfg(test)]
+mod display_tests;

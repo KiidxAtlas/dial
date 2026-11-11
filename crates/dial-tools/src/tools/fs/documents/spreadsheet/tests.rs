@@ -8,11 +8,14 @@ fn ods() -> Vec<u8> {
 }
 
 #[test]
-fn ods_sheets_render_as_tab_separated_rows() {
+fn ods_sheets_render_as_aligned_tables() {
     let out = read(&ods(), None).unwrap();
     assert!(out.starts_with("Sheets: Data, Notes\n"), "{out}");
     assert!(out.contains("[sheet Data: 2 rows x 2 columns"), "{out}");
-    assert!(out.contains("name\ttotal\napples\t42\n"), "{out}");
+    assert!(
+        out.contains("# | A      | B\n--+--------+------\n1 | name   | total\n2 | apples | 42\n"),
+        "{out}"
+    );
     let notes = read(&ods(), Some("sheet=2")).unwrap();
     assert!(
         notes.contains("hello") && !notes.contains("apples"),
@@ -24,4 +27,19 @@ fn ods_sheets_render_as_tab_separated_rows() {
             .unwrap_err()
             .contains("Data, Notes")
     );
+}
+
+#[test]
+fn column_letters_roll_over_like_spreadsheets() {
+    for (index, name) in [
+        (0, "A"),
+        (25, "Z"),
+        (26, "AA"),
+        (51, "AZ"),
+        (52, "BA"),
+        (701, "ZZ"),
+        (702, "AAA"),
+    ] {
+        assert_eq!(column_name(index), name);
+    }
 }

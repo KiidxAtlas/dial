@@ -158,20 +158,56 @@ impl Facade {
     }
 
     /// The member's own validation: its exact bounds, required fields and strictness. A refusal
-    /// carries the member's complete description, which the compact facade schema summarizes.
+    /// carries the member's complete description, which the compact facade schema summarizes, and
+    /// names the selector whose member does offer a refused action.
     fn validated(&self, owner: &Arc<dyn Tool>, own: &Value) -> Result<(), String> {
         let schema = owner.schema();
         crate::tools::surface::catalog::validate_arguments(&schema, own).map_err(|error| {
             format!(
-                "{} ({}): {error}\nContract: {}\nParameters: {}",
+                "{} ({}): {error}{}\nContract: {}\nParameters: {}",
                 self.name,
                 owner.name(),
+                self.action_elsewhere(owner, own),
                 schema["function"]["description"]
                     .as_str()
                     .unwrap_or_default(),
                 schema["function"]["parameters"]
             )
         })
+    }
+
+    /// `"\naction=show belongs to source=changes"` when the selected member lacks `own`'s action
+    /// but another selector member offers it; empty otherwise.
+    fn action_elsewhere(&self, owner: &Arc<dyn Tool>, own: &Value) -> String {
+        let Some(action) = own.get("action").and_then(Value::as_str) else {
+            return String::new();
+        };
+        let offers = |tool: &Arc<dyn Tool>| {
+            tool.schema()
+                .pointer("/function/parameters/properties/action/enum")
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.iter().any(|value| value == action))
+        };
+        if offers(owner) {
+            return String::new();
+        }
+        let selectors: Vec<String> = self
+            .members
+            .iter()
+            .filter(|member| !Arc::ptr_eq(&member.tool, owner) && offers(&member.tool))
+            .filter_map(|member| match &member.route {
+                Route::Select { field, value } => Some(format!("{field}={value}")),
+                Route::Action { .. } => None,
+            })
+            .collect();
+        if selectors.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\naction={action} belongs to {}; resend with that selector",
+                selectors.join(" or ")
+            )
+        }
     }
 
     fn rebuilt(

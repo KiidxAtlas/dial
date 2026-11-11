@@ -364,11 +364,34 @@ pub(in crate::agent) fn safe_review_batch(command: &str) -> bool {
     })
 }
 
-/// Effect tracking only: a `;`, `&&` or newline batch whose every segment passes `safe_bash` runs only
-/// inspections. The shared lexer supplies quote-aware boundaries; malformed input is unsafe.
-/// Approval never uses this batch exemption.
+/// Effect tracking only: a `;`, `&&` or newline batch whose every segment passes `safe_bash` or is
+/// a history inspection runs only inspections. The shared lexer supplies quote-aware boundaries;
+/// malformed input is unsafe. Approval never uses this batch exemption.
 pub(in crate::agent) fn read_only_inspection_batch(command: &str) -> bool {
-    top_level_segments(command).is_some_and(|segments| segments.iter().all(|s| safe_bash(s)))
+    top_level_segments(command).is_some_and(|segments| {
+        segments
+            .iter()
+            .all(|s| safe_bash(s) || history_inspection(s))
+    })
+}
+
+/// Effect tracking only: `git log`, `show`, `rev-parse`, `ls-files`, `blame`, `shortlog` or
+/// `describe` read history and the index without writing the work tree. Options that write a file
+/// (`--output`) or run an external diff are excluded. Approval keeps the exact `safe_bash` forms.
+fn history_inspection(command: &str) -> bool {
+    let Some(words) = shell_words(command) else {
+        return false;
+    };
+    words[0] == "git"
+        && words.get(1).is_some_and(|sub| {
+            matches!(
+                sub.as_str(),
+                "log" | "show" | "rev-parse" | "ls-files" | "blame" | "shortlog" | "describe"
+            )
+        })
+        && !words[2..]
+            .iter()
+            .any(|w| w.starts_with("--output") || w == "--ext-diff" || w.starts_with("--exec"))
 }
 
 /// Split at unquoted `;`, `&&` and newlines; malformed quoting or escapes fail closed.
@@ -1363,6 +1386,29 @@ pub struct ApprovalPreview {
     pub session: Option<String>,
     pub project: Option<String>,
     pub unavailable_reason: Option<String>,
+    /// Whether `/undo` can take this call back, stated before consent.
+    pub undo: String,
+}
+
+/// What `/undo` covers for this call. Checkpoints hold file edits made through the editing tools;
+/// this function cannot see `shell.undo_snapshot`, so shell coverage is stated conditionally.
+fn undo_coverage(call: &ToolCall) -> String {
+    const SHELL: &str = "/undo restores files a shell command changed only when shell.undo_snapshot is on; effects outside the project are never restored.";
+    let tool = crate::tools::surface::facade::owner_view(&call.name, &call.arguments).0;
+    match tool.as_str() {
+        "write" | "edit" | "ast_edit" => {
+            "Checkpointed: /undo restores the previous file contents.".into()
+        }
+        "bash"
+            if call.arguments["command"]
+                .as_str()
+                .is_some_and(destructive_bash) =>
+        {
+            format!("Destructive or privileged command. {SHELL}")
+        }
+        "bash" => SHELL.into(),
+        _ => "No checkpoint: /undo does not revert anything this call changes.".into(),
+    }
 }
 
 struct ApprovalGrant {
@@ -1448,6 +1494,7 @@ fn approval_grant(call: &ToolCall) -> ApprovalGrant {
             session: matcher.as_ref().map(|text| format!("{text} Lifetime: rest of this session only; not saved.")),
             project: matcher.map(|text| format!("{text} Lifetime: saved for this project, including future sessions, until revoked.")),
             unavailable_reason,
+            undo: undo_coverage(call),
         },
     }
 }

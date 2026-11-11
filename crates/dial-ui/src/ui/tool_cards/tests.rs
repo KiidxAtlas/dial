@@ -372,9 +372,18 @@ fn worker_cards_show_phase_chips_totals_time_and_reports() {
             })
             .collect();
             let rows = plain(&tool_rows(&t, 140, &ctx));
+            // Framed: the tally sits on the bottom edge as one chip per state.
+            let (top, bottom) = if ascii { ('+', '+') } else { ('╭', '╰') };
+            assert!(rows[0].starts_with(top), "{rows:?}");
+            let foot = rows.last().unwrap();
+            assert!(foot.starts_with(bottom), "{rows:?}");
             for fact in ["1 done", running_fact, "1 failed", "1 interrupted"] {
-                assert!(rows[0].contains(fact), "{rows:?}");
+                assert!(foot.contains(fact), "{rows:?}");
             }
+            // Too narrow for a frame: the tally moves back into the gutter header.
+            let narrow = plain(&tool_rows(&t, 39, &ctx));
+            assert!(!narrow[0].starts_with(top), "{narrow:?}");
+            assert!(narrow[0].contains("Workers"), "{narrow:?}");
             for (name, phase) in [
                 ("scout", "done"),
                 ("reviewer", running_word),
@@ -472,4 +481,28 @@ fn hidden_counts_name_source_lines_and_failures_keep_their_tail() {
         let (rows, n) = take_lines(lines(), limit, tail);
         assert_eq!((text(rows).as_str(), n), (shown, hidden), "{limit} {tail}");
     }
+}
+
+#[test]
+fn one_hidden_line_is_shown_instead_of_a_hint() {
+    let theme = ascii_theme();
+    let ui = UiConfig {
+        tool_output_lines: 2,
+        ..UiConfig::default()
+    };
+    let t = settled(
+        "bash",
+        r#"{"command":"./x"}"#,
+        "one\ntwo\nthree",
+        false,
+        0.2,
+    );
+    let rows = plain(&tool_rows(&t, 60, &ctx_for(&theme, &ui, false))).join("\n");
+    assert!(
+        rows.contains("three") && !rows.contains("more line"),
+        "{rows}"
+    );
+    let t = settled("bash", r#"{"command":"./x"}"#, "1\n2\n3\n4", false, 0.2);
+    let rows = plain(&tool_rows(&t, 60, &ctx_for(&theme, &ui, false))).join("\n");
+    assert!(rows.contains("2 more lines"), "{rows}");
 }

@@ -59,6 +59,13 @@ pub(crate) fn profile_capped_output(backend: &Backend, requested: u32) -> u32 {
 pub fn make_backend(config: &Config) -> Result<Backend> {
     config.require_model()?;
     let provider = config.provider.as_deref().unwrap_or_default();
+    ensure!(
+        !config
+            .providers
+            .get(&config.selection().provider)
+            .is_some_and(llm::model_config::ProviderSpec::is_reset),
+        "provider is not set up; configure it in /providers before using its models"
+    );
     let method = config
         .providers
         .get(provider)

@@ -168,6 +168,24 @@ class _Dial:
     def readText(self, path):
         return self.read(path)["content"]
 
+    def readLines(self, path, offset=1, limit=None):
+        """One page of a text file of any size: {content, lines, offset, next_offset}; the page is
+        at most 1 MiB, and next_offset is None at the end of the file."""
+        args = {"path": path, "format": "text", "offset": offset}
+        if limit is not None:
+            args["limit"] = limit
+        return tool.read(**args)["data"]
+
+    def lines(self, path, offset=1):
+        """Every line of a text file of any size from `offset`, without line endings, paged 1 MiB at a time."""
+        while offset is not None:
+            page = self.readLines(path, offset)
+            content = page["content"]
+            if content:
+                for line in (content[:-1] if content.endswith("\n") else content).split("\n"):
+                    yield line[:-1] if line.endswith("\r") else line
+            offset = page["next_offset"]
+
     def readJson(self, path):
         return _dial_json.loads(self.readText(path))
 

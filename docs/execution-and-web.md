@@ -71,6 +71,14 @@ confinement and execution records:
 
 - `read(path)` returns exact UTF-8 content, byte count and SHA-256. `readText`, `readJson` and
   `readBytes` return decoded values. Data reads require one literal local path, limited to 1 MiB.
+- `readLines(path, offset, limit)` pages a text file of any size by line (1-based `offset`, at
+  most 1 MiB per page; `next_offset` continues and is null at the end), and `lines(path)` iterates
+  every line (a generator in Python, an async iterator in JavaScript). These page session JSONL
+  and logs that exceed the 1 MiB whole-file limit. The underlying call is
+  `read {path, format: "text", offset, limit}`.
+- Helpers are methods of `dial`, not globals: in Python an undefined bare helper such as
+  `readText(...)` fails with a hint naming `dial.readText(...)`. Truncated cell output keeps its
+  start and says how many characters were dropped.
 - `writeText`/`writeJson` use the text editor transaction. `writeBytes` stages a new binary file,
   limited to 1 MiB. Its parent must exist; it never overwrites an existing output or source.
 - `run(command, options)` calls `bash`. Mark an acceptance command with `check: true`, preserve

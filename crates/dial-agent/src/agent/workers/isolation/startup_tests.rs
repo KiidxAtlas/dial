@@ -32,9 +32,15 @@ fn copy_startup_hashes_content_once_instead_of_twice() {
     let config = config();
     take_hashes();
     // The old pipeline hashed the source, then rehashed different copied inodes.
-    let source_snapshot = snapshot(source.path(), None, &config).unwrap();
+    let source_snapshot = snapshot(source.path(), None, &IgnoredPaths::default(), &config).unwrap();
     let copied = crate::workspace_copy::copy_project_plain(source.path()).unwrap();
-    snapshot(copied.path(), Some(&source_snapshot), &config).unwrap();
+    snapshot(
+        copied.path(),
+        Some(&source_snapshot),
+        &IgnoredPaths::default(),
+        &config,
+    )
+    .unwrap();
     assert_eq!(take_hashes(), (4, 384 * 1024));
 
     let project = Workspace::new(source.path()).unwrap();
@@ -60,14 +66,14 @@ fn preflight_bounds_do_not_read_content() {
         },
     ] {
         take_hashes();
-        assert!(preflight(source.path(), &config).is_err());
+        assert!(preflight(source.path(), &IgnoredPaths::default(), &config).is_err());
         assert_eq!(take_hashes(), (0, 0));
     }
     fs::File::create(source.path().join("huge"))
         .unwrap()
         .set_len(MAX_BYTES as u64 + 1)
         .unwrap();
-    assert!(preflight(source.path(), &config()).is_err());
+    assert!(preflight(source.path(), &IgnoredPaths::default(), &config()).is_err());
     assert_eq!(take_hashes(), (0, 0));
 }
 
@@ -80,13 +86,20 @@ fn baseline_hashes_content_changed_after_preflight_and_rechecks_bounds() {
         isolation_source_bytes: 4,
         ..config()
     };
-    let paths = preflight(source.path(), &config).unwrap();
+    let paths = preflight(source.path(), &IgnoredPaths::default(), &config).unwrap();
     // A same-size replacement after preflight must become the actual worker baseline,
     // not inherit an obsolete source hash. This also models a mutable overlay lower layer.
     fs::remove_file(&path).unwrap();
     fs::write(&path, "new").unwrap();
     let copied = crate::workspace_copy::copy_project_plain(source.path()).unwrap();
-    let before = snapshot_preserving(copied.path(), None, Some(&paths), &config).unwrap();
+    let before = snapshot_preserving(
+        copied.path(),
+        None,
+        Some(&paths),
+        &IgnoredPaths::default(),
+        &config,
+    )
+    .unwrap();
     assert_eq!(
         before[Path::new("a")].hash,
         <[u8; 32]>::from(Sha256::digest(b"new"))
@@ -98,9 +111,25 @@ fn baseline_hashes_content_changed_after_preflight_and_rechecks_bounds() {
     ));
 
     fs::write(copied.path().join("a"), "grown").unwrap();
-    let error = snapshot_preserving(copied.path(), None, Some(&paths), &config).unwrap_err();
+    let error = snapshot_preserving(
+        copied.path(),
+        None,
+        Some(&paths),
+        &IgnoredPaths::default(),
+        &config,
+    )
+    .unwrap_err();
     assert!(format!("{error:#}").contains("limited to 4 bytes"));
     fs::write(copied.path().join("a"), "new").unwrap();
     fs::write(copied.path().join("added"), "xx").unwrap();
-    assert!(snapshot_preserving(copied.path(), None, Some(&paths), &config).is_err());
+    assert!(
+        snapshot_preserving(
+            copied.path(),
+            None,
+            Some(&paths),
+            &IgnoredPaths::default(),
+            &config
+        )
+        .is_err()
+    );
 }

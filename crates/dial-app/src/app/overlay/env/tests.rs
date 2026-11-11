@@ -614,3 +614,77 @@ fn stop_key_leaves_every_panel_while_escape_steps_back_one() {
         "Ctrl+C leaves the panels, not one level"
     );
 }
+
+#[test]
+fn removing_builtin_provider_refreshes_config_and_clears_saved_key() {
+    use crate::ui::overlay::OverlayEvent;
+    let (_home, _project, app) = app();
+    let url = "http://127.0.0.1:11234/v1";
+    crate::llm::catalog::save_credential(&app.layout.user_dir, url, "fixture-key").unwrap();
+    let mut keys = Keymap::defaults();
+    let mut themes = ThemeManager::new(&app.layout.user_dir, &app.config.ui, None);
+    let mut catalog = Catalog::new();
+    let runtime = crate::runtime::Tree::default();
+    let status = StatusData::default();
+    let mut history = Vec::new();
+    let mut auth_job = None;
+    let mut extensions_pending = None;
+    let mut extensions_job = None;
+    let mut scope = Scope::Global;
+    let mut env = OverlayEnv {
+        history: &mut history,
+        runtime: &runtime,
+        todo: &Default::default(),
+        model_downloads: None,
+        compute_monitor: None,
+        first_run: false,
+        live_tasks: None,
+        verify_lora: None,
+        auth_job: &mut auth_job,
+        last_setup_failure: &mut None,
+        extensions_pending: &mut extensions_pending,
+        extensions_job: &mut extensions_job,
+        background_control: None,
+        pty_approval: Approval::Write,
+        app: &app,
+        themes: &mut themes,
+        keys: &mut keys,
+        status: &status,
+        catalog: &mut catalog,
+        scope: &mut scope,
+        dark: None,
+        latest: None,
+        next: None,
+        seen_generation: 0,
+        release_compute: None,
+        peer_source: None,
+    };
+    let mut overlay =
+        ActiveOverlay::Providers(crate::ui::overlay::providers::ProviderOverlay::new(
+            None,
+            BTreeMap::new(),
+            Box::new(|_| true),
+            Scope::Global,
+        ));
+    for id in ["mlx-serve", "docker-model-runner"] {
+        assert!(!env.apply(
+            OverlayEvent::RemoveProvider {
+                id: id.into(),
+                scope: Scope::Global
+            },
+            &mut overlay
+        ));
+        assert!(env.latest.as_ref().unwrap().providers[id].is_reset());
+        assert!(
+            settings_store::load_config(&app.layout, &toml::Table::new())
+                .unwrap()
+                .providers[id]
+                .is_reset()
+        );
+    }
+    assert!(
+        crate::llm::catalog::credential_token(&app.layout.user_dir, url)
+            .unwrap()
+            .is_none()
+    );
+}

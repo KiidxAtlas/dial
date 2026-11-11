@@ -40,6 +40,26 @@ pub(in crate::app) fn outcome(
     }
 }
 
+/// Adds the turn's observed API cost to a report that already has details, above `Next:`.
+/// A plain answer keeps its empty footer, and unpriced or local usage adds no line.
+pub(in crate::app) fn with_cost(
+    mut outcome: crate::ui::transcript::TurnOutcome,
+    turn: &crate::llm::usage::Counts,
+) -> crate::ui::transcript::TurnOutcome {
+    if outcome.handoff.is_empty() || turn.observed_cost_usd.is_none() {
+        return outcome;
+    }
+    let at = outcome
+        .handoff
+        .iter()
+        .position(|line| line.starts_with("Next:"))
+        .unwrap_or(outcome.handoff.len());
+    outcome
+        .handoff
+        .insert(at, format!("Cost: {}", turn.cost_label()));
+    outcome
+}
+
 /// Single-line, bounded untrusted labels. Redaction happens before truncation so secrets are not
 /// made unrecognizable to the redactor; terminal protocols are removed before display.
 fn label(raw: &str) -> String {
@@ -124,10 +144,15 @@ pub(super) fn render(summary: &Value, latency: &Value) -> Option<String> {
         lines.push("Outstanding: recorded open obligations; inspect /evidence".to_owned());
     }
     if shell + extension > 0 {
+        // Name only the kinds that occurred; "and 0 extension calls" is noise.
+        let effects: Vec<String> = [(shell, "shell command"), (extension, "extension call")]
+            .into_iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, noun)| plural(n, noun))
+            .collect();
         lines.push(format!(
-            "Outside /undo: {} and {} may have changed files",
-            plural(shell, "shell command"),
-            plural(extension, "extension call")
+            "Outside /undo: {} may have changed files",
+            effects.join(" and ")
         ));
     }
     if let Some(timing) = timing_line(latency) {

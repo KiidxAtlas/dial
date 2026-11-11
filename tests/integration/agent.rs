@@ -3223,7 +3223,7 @@ fn failed_call_in_a_batch_prevents_finish_completed() {
         report
             .text
             .contains("Completion cannot follow a failed or refused call")
-            && report.text.contains("No completion was recorded"),
+            && report.text.starts_with("Incomplete:"),
         "{}",
         report.text
     );

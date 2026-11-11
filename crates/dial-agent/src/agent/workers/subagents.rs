@@ -2095,7 +2095,7 @@ pub(in crate::agent) fn run(
             is_error: true,
         };
     }
-    let main_model = env.config.selection().display_name();
+    let main_model = env.config.selection().display_label();
     // Every job runs on its role's model. All roles are resolved before any job starts, so a bad
     // model profile fails the whole call before anything runs.
     let mut plans: Vec<(&str, Config, Harness, Vec<&Job>)> = Vec::new();
@@ -2132,7 +2132,7 @@ pub(in crate::agent) fn run(
     let mut parallel_jobs: Vec<(&Job, Env)> = Vec::new();
     let mut serial: Vec<Vec<&Job>> = Vec::with_capacity(plans.len());
     for (key, role, harness, jobs) in &plans {
-        ui.role(key, &role.selection().display_name());
+        ui.role(key, &role.selection().display_label());
         let env = Env {
             config: role,
             harness,

@@ -17,6 +17,42 @@ fn directory_delta_reports_disappearing_and_shrinking_sources() {
         "{note}"
     );
 }
+
+#[test]
+fn captured_output_is_cut_at_line_boundaries_and_names_the_omitted_lines() {
+    let mut capture = Capture::new();
+    let mut expected = String::new();
+    for line in 1..=4000 {
+        let text = format!("line {line} of the output\n");
+        capture.push(text.as_bytes());
+        expected.push_str(&text);
+    }
+    let text = capture.finish();
+    let (head, rest) = text.split_once("\n[... ").unwrap();
+    let (notice, tail) = rest.split_once(" ...]\n").unwrap();
+    let number = |line: &str| line.split(' ').nth(1).unwrap().parse::<usize>().unwrap();
+    let last_shown = number(head.lines().last().unwrap());
+    let first_resumed = number(tail.lines().next().unwrap());
+    // Both sides are whole lines of the original, and the notice names exactly the gap.
+    assert!(expected.starts_with(&format!("{head}\n")), "{head}");
+    assert!(expected.ends_with(tail), "{tail}");
+    assert!(
+        notice.ends_with(&format!("(lines {}-{})", last_shown + 1, first_resumed - 1)),
+        "{notice}"
+    );
+    let omitted: usize = notice.split(' ').next().unwrap().parse().unwrap();
+    assert_eq!(omitted, expected.len() - head.len() - 1 - tail.len());
+
+    // One line longer than the slack is still cut by bytes and reported as a single line.
+    let mut capture = Capture::new();
+    capture.push(&vec![b'x'; BASH_HEAD + 4 * BASH_TAIL]);
+    let text = capture.finish();
+    assert!(
+        text.contains("bytes of output omitted (line 1) ...]"),
+        "{}",
+        &text[BASH_HEAD..BASH_HEAD + 80]
+    );
+}
 #[cfg(target_os = "macos")]
 use crate::tools::execute;
 use crate::tools::testkit::*;

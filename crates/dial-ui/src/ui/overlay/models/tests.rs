@@ -2426,3 +2426,26 @@ fn long_model_rows_shorten_the_provider_before_the_model_name() {
     let (shown, _) = fit_model_name(full, "lm-studio", 12, false, &[]);
     assert!(text::width(&shown) <= 12 && shown.ends_with('…'), "{shown}");
 }
+
+#[test]
+fn model_list_columns_are_labelled_above_their_values() {
+    let rig = Rig::new();
+    let mut d = discovery();
+    d.models[1] = priced(d.models[1].clone(), 3e-6, 15e-6);
+    let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+    o.cursor = names(&o).iter().position(|n| n == "qwen-chat").unwrap();
+    let screen = draw(&mut o, &rig, 140, 24);
+    let header = screen
+        .lines()
+        .find(|l| l.contains("Type to search models"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    for label in ["ctx", "price", "state", "caps"] {
+        assert!(header.contains(label), "missing {label:?}\n{screen}");
+    }
+    let row = screen.lines().find(|l| l.contains("$3/$15")).unwrap();
+    let column = |line: &str, needle: &str| {
+        let at = line.find(needle).unwrap();
+        line[..at].chars().count()
+    };
+    assert_eq!(column(header, "price"), column(row, "$3/$15"), "{screen}");
+}

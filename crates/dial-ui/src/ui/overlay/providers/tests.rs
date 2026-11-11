@@ -638,8 +638,8 @@ fn menu_offers_actions_that_fit_the_provider() {
         assert!(shown.contains(needle), "{needle}\n{shown}");
     }
     assert!(
-        !shown.contains("Remove provider"),
-        "built-in providers cannot be removed"
+        shown.contains("Remove provider"),
+        "built-ins must support confirmed reset"
     );
     // Choose a model hands over to the model selector.
     match send(&mut o, &rig, key(KeyCode::Enter)) {
@@ -735,7 +735,8 @@ fn removing_a_configured_provider_needs_confirmation() {
     select(&mut o, "work");
     assert!(matches!(send(&mut o, &rig, ch('x')), OverlayEvent::None));
     assert!(
-        draw(&mut o, &rig, 110, 24).contains("Remove provider Work (work) from the global config?")
+        draw(&mut o, &rig, 110, 24)
+            .contains("Reset provider Work (work) to not set up in the global config?")
     );
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Esc)),
@@ -750,11 +751,13 @@ fn removing_a_configured_provider_needs_confirmation() {
         }
         other => panic!("{other:?}"),
     }
-    // Built-ins explain why they cannot be removed.
-    o.cursor = 1;
+    // Built-ins use the same confirmed reset without an explicit config entry.
+    select(&mut o, "lm-studio");
     send(&mut o, &rig, ch('x'));
-    assert!(matches!(o.mode, Mode::List));
-    assert!(draw(&mut o, &rig, 120, 24).contains("built in and is not in your config"));
+    assert!(matches!(o.mode, Mode::Confirm(_, Removal::Provider)));
+    assert!(
+        matches!(send(&mut o, &rig, key(KeyCode::Enter)), OverlayEvent::RemoveProvider { id, .. } if id == "lm-studio")
+    );
 }
 
 #[test]
@@ -1438,4 +1441,74 @@ fn response_verification_is_a_separate_explicit_selected_model_action() {
     assert!(
         matches!(send(&mut overlay, &rig, key(KeyCode::Enter)), OverlayEvent::Action(action) if action == "command:setup choose verify-model")
     );
+}
+
+#[test]
+fn reset_builtin_servers_are_immediately_not_set_up_and_can_be_set_up_again() {
+    let rig = Rig::new();
+    for (id, label, url) in [
+        (
+            "docker-model-runner",
+            "Docker Model Runner",
+            "http://127.0.0.1:12434/engines/v1",
+        ),
+        ("mlx-serve", "MLX-Serve", "http://127.0.0.1:11234/v1"),
+    ] {
+        let mut o = ProviderOverlay::new(
+            Some(Discovery {
+                models: vec![],
+                providers: vec![provider(id, label, "reachable", 5, Some(url))],
+            }),
+            BTreeMap::new(),
+            Box::new(|_| true),
+            Scope::Global,
+        );
+        select(&mut o, id);
+        send(&mut o, &rig, ch('x'));
+        assert!(draw(&mut o, &rig, 160, 24).contains("saved URL-scoped keys and sign-ins"));
+        assert!(
+            matches!(send(&mut o, &rig, key(KeyCode::Enter)), OverlayEvent::RemoveProvider { id: removed, .. } if removed == id)
+        );
+        o.set_configured(BTreeMap::from([(
+            id.into(),
+            ProviderSpec {
+                enabled: false,
+                ..Default::default()
+            },
+        )]));
+        select(&mut o, id);
+        let entry = o.selected().unwrap();
+        assert_eq!(entry.state, "not-set-up");
+        assert_eq!(
+            entry.models, 0,
+            "stale discovery success must not survive reset"
+        );
+        assert!(draw(&mut o, &rig, 160, 24).contains("not set up"));
+        send(&mut o, &rig, key(KeyCode::Enter));
+        pick(&mut o, "Set up provider");
+        match send(&mut o, &rig, key(KeyCode::Enter)) {
+            OverlayEvent::AddProvider {
+                id: restored, spec, ..
+            } => {
+                assert_eq!(restored, id);
+                assert!(spec.enabled);
+                assert_eq!(spec.base_url, url);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn cancelling_builtin_provider_reset_changes_nothing() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    select(&mut o, "lm-studio");
+    send(&mut o, &rig, ch('x'));
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Esc)),
+        OverlayEvent::None
+    ));
+    assert_eq!(o.selected().unwrap().state, "reachable");
+    assert!(!o.configured.contains_key("lm-studio"));
 }

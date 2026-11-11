@@ -1179,7 +1179,15 @@ impl Composer {
         }
         if keys.matches(Action::HistorySearch, &key) {
             // Search every remembered prompt, as `ui.history_limit` promises (0 = unlimited).
-            let entries = self.history.iter().rev().cloned().collect();
+            // Newest first, each prompt once: a repeated `/cost` keeps only its latest place.
+            let mut seen = std::collections::HashSet::new();
+            let entries = self
+                .history
+                .iter()
+                .rev()
+                .filter(|entry| seen.insert(entry.trim().to_owned()))
+                .cloned()
+                .collect();
             self.search = Some(Search {
                 query: Editor::default(),
                 entries,
@@ -2296,6 +2304,16 @@ impl Composer {
             };
             hints.insert(0, Hint { key: None, what });
         }
+        if !landing
+            && ctx.ui.hints
+            && ctx.status.planning.is_some()
+            && statusline::controls_facts(ctx.ui, ctx.status, usize::from(width)).is_empty()
+        {
+            hints.push(Hint {
+                key: Some(ctx.keys.label(Action::StatusFocus)),
+                what: "controls".to_owned(),
+            });
+        }
         if banded {
             // The card closes on a padded row; the status line and hints sit quietly beneath it.
             rows.push(band(vec![edge()]));
@@ -2336,16 +2354,27 @@ impl Composer {
             ));
         }
 
-        if !landing && ctx.status.planning.is_some() {
+        // The controls key alone is one more footer hint; only real facts earn their own row.
+        if !landing
+            && ctx.status.planning.is_some()
+            && !statusline::controls_facts(ctx.ui, ctx.status, usize::from(width)).is_empty()
+        {
             rows.push(statusline::controls_row_with(
                 ctx.ui, ctx.status, ctx.keys, theme, width,
             ));
         }
         let mut cursor = cursor;
         if let Some(search) = &self.search {
+            // Like the command menu, history search opens upward, above the input, with its
+            // query row next to the box, so it never lands below the footer.
             let (list, col) = self.search_rows(search, w, ctx);
-            cursor = (rows.len() as u16, col as u16);
-            rows.extend(list);
+            let mut list = list.into_iter();
+            let head = list.next();
+            let mut above: Rows = list.collect();
+            above.extend(head);
+            cursor = ((above.len() - 1) as u16, col as u16);
+            above.append(&mut rows);
+            rows = above;
         } else if let Some(menu) = &self.menu {
             // The menu opens upward, into the space above the input, so the input never moves
             // down and the closest rows to the cursor are the selected command's details.
@@ -2866,7 +2895,8 @@ impl Composer {
             .min(if menu.file_start.is_some() || menu.arguments.is_some() {
                 w.saturating_sub(6)
             } else {
-                MAX_NAME_COLUMN
+                // A long skill name gives way before the descriptions do.
+                MAX_NAME_COLUMN.min((w / 3).max(8))
             });
         let pointer = theme.sym(Sym::Pointer);
         let blank_pointer = " ".repeat(text::width(pointer));
@@ -2950,6 +2980,18 @@ impl Composer {
                 } else {
                     ""
                 };
+                let full_description = unavailable
+                    .or(busy_effect.as_deref())
+                    .unwrap_or(&command.description);
+                // A group tag only goes where it costs no description text: a narrow list keeps
+                // the words and leaves the grouping to the order.
+                let group = if text::width(full_description) + text::width(group) + 2
+                    > budget.saturating_sub(used)
+                {
+                    ""
+                } else {
+                    group
+                };
                 let group_w = if group.is_empty() {
                     0
                 } else {
@@ -2957,13 +2999,7 @@ impl Composer {
                 };
                 let room = budget.saturating_sub(used + group_w);
                 if room > 0 {
-                    let description = text::ellipsize(
-                        unavailable
-                            .or(busy_effect.as_deref())
-                            .unwrap_or(&command.description),
-                        room,
-                        theme.ascii(),
-                    );
+                    let description = text::ellipsize(full_description, room, theme.ascii());
                     let description_w = text::width(&description);
                     spans.extend(highlighted(
                         &description,
@@ -3582,10 +3618,23 @@ fn rank_until(
                 stopped.set(true);
                 return None;
             }
-            let name = text::fuzzy(query, &command.name);
+            // A scattered subsequence (`settings` in `skill:file-structure-cleanup`) is noise for
+            // commands: their names must match tightly or at a word start, their descriptions as
+            // a word piece. File paths keep plain fuzzy matching (`mrs` finds `src/main.rs`).
+            let name = text::fuzzy(query, &command.name).filter(|(_, hits)| {
+                command.kind == CommandKind::File
+                    || tier(&command.name) > 0
+                    || hits.first().zip(hits.last()).is_none_or(|(first, last)| {
+                        let span = last - first + 1;
+                        let n = query.chars().count();
+                        n < 3 || span <= n + n / 2 + 1
+                    })
+            });
             // A file's description is the same for every file, so matching it would offer every
             // file for any query that happens to fit "project file".
-            let desc = if command.kind == CommandKind::File {
+            let desc = if command.kind == CommandKind::File
+                || !command.description.to_lowercase().contains(&lower)
+            {
                 None
             } else {
                 text::fuzzy(query, &command.description)

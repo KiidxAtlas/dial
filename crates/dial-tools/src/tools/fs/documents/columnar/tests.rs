@@ -1,6 +1,6 @@
 use super::*;
 use arrow_array::{Int64Array, StringArray};
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
 fn batch() -> RecordBatch {
@@ -37,18 +37,21 @@ fn parquet_schema_and_pages_of_rows() {
         "{out}"
     );
     assert!(
-        out.contains("[rows 0..100 of 250]\n{\"id\":0,\"name\":\"row-0\"}\n"),
+        out.contains("[rows 0..100 of 250]\n#  | id | name\n---+----+-------\n0  | 0  | row-0\n"),
         "{out}"
     );
-    assert!(out.contains("{\"id\":3,\"name\":null}"), "{out}");
+    assert!(out.contains("\n3  | 3  | NULL\n"), "{out}");
     assert!(out.contains("[more rows: :rows=100+100]"), "{out}");
 
     let tail = parquet(&bytes, Some("rows=240+50")).unwrap();
-    assert!(
-        tail.contains("[rows 240..250 of 250]\n{\"id\":240,"),
-        "{tail}"
-    );
+    assert!(tail.contains("[rows 240..250 of 250]\n"), "{tail}");
+    assert!(tail.contains("\n240 | 240 | row-240\n"), "{tail}");
     assert!(!tail.contains("more rows"), "{tail}");
+    let past = parquet(&bytes, Some("rows=300+5")).unwrap();
+    assert!(
+        past.contains("[rows 300..300 of 250]\n# | id | name\n"),
+        "{past}"
+    );
     assert!(parquet(&bytes, Some("rows=0+0")).is_err());
     assert!(parquet(&bytes, Some("sheet1")).is_err());
 }
@@ -76,7 +79,9 @@ fn arrow_ipc_files_and_streams_read_the_same_rows() {
         "{from_file}"
     );
     assert!(
-        from_file.contains("[rows 11..13 of 250]\n{\"id\":11,\"name\":\"row-11\"}\n{\"id\":12,"),
+        from_file.contains(
+            "[rows 11..13 of 250]\n#  | id | name\n---+----+-------\n11 | 11 | row-11\n12 | 12 |"
+        ),
         "{from_file}"
     );
     let from_stream = arrow(&stream, Some("rows=11+2")).unwrap();

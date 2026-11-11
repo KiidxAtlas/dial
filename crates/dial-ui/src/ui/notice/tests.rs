@@ -227,3 +227,33 @@ fn turn_report_is_compact_until_tools_are_expanded() {
     assert!(full.contains("a.rs") && full.contains("Outcome:"));
     assert!(!full.contains("Summary:"));
 }
+
+#[test]
+fn warnings_and_failures_are_cards_in_their_severity_color() {
+    let env = Env::new();
+    let theme = &env.theme;
+    for (title, tok) in [
+        ("Outstanding work", Tok::Warning),
+        ("Heads up", Tok::Warning),
+        ("Check failed", Tok::Error),
+    ] {
+        let card = rows(
+            title,
+            "Blocked: credentials missing\nretry later",
+            60,
+            &env.ctx(),
+        );
+        let lines = plain(&card);
+        assert!(lines[0].starts_with(theme.sym(Sym::BoxTl)) && lines[0].contains(title));
+        assert!(lines.last().unwrap().starts_with(theme.sym(Sym::BoxBl)));
+        assert!(lines.iter().all(|l| text::width(l) == 60), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("credentials missing")));
+        assert_eq!(card[0].spans[0].style.fg, theme.fg(tok).fg, "{title}");
+        // Narrow terminals keep the labelled rows.
+        let narrow = plain(&rows(title, "retry later", CARD_MIN as u16 - 1, &env.ctx()));
+        assert!(!narrow[0].starts_with(theme.sym(Sym::BoxTl)), "{narrow:?}");
+    }
+    // Ordinary command results stay quiet.
+    let help = plain(&rows("Help", "/review  review changes", 60, &env.ctx()));
+    assert!(!help[0].starts_with(theme.sym(Sym::BoxTl)), "{help:?}");
+}

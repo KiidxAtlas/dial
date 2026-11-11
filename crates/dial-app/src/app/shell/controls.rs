@@ -77,7 +77,7 @@ impl Shell {
                     "Active: {}/{} · saved: {} · Why this main model (recorded): {}",
                     status.provider,
                     status.model,
-                    saved.selection().display_name(),
+                    saved.selection().display_label(),
                     status.main_model_explanation.as_deref().unwrap_or("unavailable (not recorded)")
                 ),
             ),
@@ -131,7 +131,7 @@ impl Shell {
                         status.assistance != Some(saved.assistance.enabled)
                     }
                     "model" => {
-                        saved.selection().display_name()
+                        saved.selection().display_label()
                             != format!(
                                 "{}/{}",
                                 status.provider,

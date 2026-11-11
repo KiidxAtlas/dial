@@ -1,29 +1,35 @@
 //! The check lane: test and build commands (`cargo test`, `pytest`, `cargo clippy`, `tsc`, …).
 //!
 //! ```text
-//! ✗  Test    cargo test -p dial-ui          412 passed · 2 failed · 12.4s
-//!    ✗ ui::notice::tests::turn_report_is_compact
-//!    ✗ ui::tool_cards::tests::wraps
-//!    … 380 more lines (ctrl+o expands)
-//! ·  Build   cargo clippy --all-targets              3 warnings · 41s
+//! ✓  Test    cargo test -p dial-ui                       412 passed · 12.4s
+//! ╭─ ✗ Test · cargo test -p dial-ui ──────────────────────────────────────╮
+//! │ ✗ ui::notice::tests::turn_report_is_compact                           │
+//! │ ✗ ui::tool_cards::tests::wraps                                        │
+//! ╰─ 410 passed · 2 failed · 12.4s · 380 more lines (ctrl+o expands) ─────╯
 //! ```
 //!
-//! A run reads as its result, not its log: counts in the header, then only what needs attention
-//! (failing tests, the first errors and where they are). A clean pass is one row. The expand key
-//! shows the ordinary card with the complete output.
+//! A run reads as its result, not its log. A clean pass is one row with its counts. A run that
+//! needs attention (failing tests, errors with where they are) is a red card, amber when it only
+//! warns, with the counts and the hidden log on its bottom edge; narrow terminals keep the same
+//! content as indented rows. The expand key shows the ordinary card with the complete output.
 use super::{
-    Fact, GUTTER, Rows, Tool, ToolState, VERB_W, fit_facts, gutter_span, hidden_hint, phase_glyph,
-    plural,
+    Fact, GUTTER, Rows, Tool, ToolState, VERB_W, fit_facts, frame, gutter_span, hidden_hint,
+    phase_glyph, plural,
 };
 use crate::ui::{
     text,
     theme::{Sym, Tok},
     transcript::{TranscriptCtx, fitted},
 };
-use ratatui::{style::Modifier, text::Span};
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span},
+};
 
 /// Failing tests or errors listed before the rest are counted.
 const LISTED: usize = 5;
+/// Narrowest width that frames a run needing attention; below it the rows stay unframed.
+const CARD_MIN: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Kind {
@@ -150,6 +156,48 @@ fn command(t: &Tool) -> Option<String> {
     args["command"].as_str().map(text::one_line)
 }
 
+/// A settled test or build run reduced to its verdict, as the turn recap shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::ui) struct Verdict {
+    pub ok: bool,
+    /// `tests` or `build`.
+    pub what: &'static str,
+    /// `18 passed`, `2 failed`, `3 errors`, `clean`.
+    pub summary: String,
+}
+
+/// The verdict of a settled test or build command, or `None` for any other call and for output
+/// that names no result (a job moved to the background).
+pub(in crate::ui) fn verdict(t: &Tool) -> Option<Verdict> {
+    if t.name != "bash" || !matches!(t.state, ToolState::Completed | ToolState::Failed) {
+        return None;
+    }
+    let kind = kind(&command(t)?)?;
+    let report = parse(&t.output);
+    let failed = t.state == ToolState::Failed;
+    let summary = if report.failed > 0 {
+        format!("{} failed", report.failed)
+    } else if !report.errors.is_empty() {
+        plural(report.errors.len(), "error")
+    } else if failed {
+        "failed".to_owned()
+    } else if report.summarized {
+        format!("{} passed", report.passed)
+    } else if kind == Kind::Build && report.finished {
+        "clean".to_owned()
+    } else {
+        return None;
+    };
+    Some(Verdict {
+        ok: !failed && report.failed == 0 && report.errors.is_empty(),
+        what: match kind {
+            Kind::Test => "tests",
+            Kind::Build => "build",
+        },
+        summary,
+    })
+}
+
 /// The check card for a settled test or build command, or `None` for anything else, a running
 /// call, an expanded view, or output this card cannot summarize faithfully.
 pub(super) fn check_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> {
@@ -215,18 +263,57 @@ pub(super) fn check_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows
         Kind::Test => "Test",
         Kind::Build => "Build",
     };
+    let verb_style = theme
+        .fg(if failed { Tok::Error } else { Tok::ToolTitle })
+        .add_modifier(Modifier::BOLD);
+    let facts_style = theme.fg(if failed { Tok::Error } else { Tok::Dim });
     let sep = format!(" {} ", theme.sym(Sym::Dot));
+
+    // Only what needs attention: failing tests, else the first errors with their locations.
+    let cross = theme.sym(Sym::Cross2);
+    let mut attention: Vec<(String, Tok)> = Vec::new();
+    let mut count = 0;
+    if !report.failing.is_empty() {
+        for name in report.failing.iter().take(LISTED) {
+            attention.push((format!("{cross} {name}"), Tok::Error));
+        }
+        count = report.failing.len();
+    } else {
+        for (error, location) in report.errors.iter().take(LISTED) {
+            attention.push((text::one_line(error), Tok::Error));
+            if let Some(location) = location {
+                attention.push((format!("  {location}"), Tok::Dim));
+            }
+        }
+        count = count.max(report.errors.len());
+    }
+    if count > LISTED {
+        attention.push((format!("+{} more", count - LISTED), Tok::Dim));
+    }
+    let log_lines = super::split_trailer(&t.output).lines().count();
+
+    if !attention.is_empty() && w >= CARD_MIN {
+        return Some(attention_card(
+            &AttentionHead {
+                glyph: (glyph, glyph_style),
+                failed,
+                verb: (verb, verb_style),
+                command: &command,
+                facts: (facts, facts_style),
+            },
+            attention,
+            log_lines,
+            w,
+            ctx,
+        ));
+    }
+
     let lead = gutter_span(glyph, glyph_style);
     let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
     let want = text::width(&command).min(super::TARGET_MIN);
     let (facts_text, room) = fit_facts(facts, w, lead_w + VERB_W + 1, want, &sep);
     let mut head = lead;
-    head.push(Span::styled(
-        format!("{verb:<VERB_W$}"),
-        theme
-            .fg(if failed { Tok::Error } else { Tok::ToolTitle })
-            .add_modifier(Modifier::BOLD),
-    ));
+    head.push(Span::styled(format!("{verb:<VERB_W$}"), verb_style));
     head.push(Span::raw(" "));
     head.push(Span::styled(
         text::ellipsize(&command, room.max(1), theme.ascii()),
@@ -238,53 +325,21 @@ pub(super) fn check_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows
         head.push(Span::raw(
             " ".repeat(w.saturating_sub(used + right_w).max(1)),
         ));
-        head.push(Span::styled(
-            facts_text,
-            theme.fg(if failed { Tok::Error } else { Tok::Dim }),
-        ));
+        head.push(Span::styled(facts_text, facts_style));
     }
     let mut rows = vec![fitted(head, w, theme)];
-
-    // Only what needs attention: failing tests, else the first errors with their locations.
     let indent = " ".repeat(GUTTER);
-    let cross = theme.sym(Sym::Cross2);
-    let room = w.saturating_sub(GUTTER + text::width(cross) + 1).max(1);
-    let line = |text: String, tok: Tok| {
-        fitted(
-            vec![Span::raw(indent.clone()), Span::styled(text, theme.fg(tok))],
+    let room = w.saturating_sub(GUTTER).max(1);
+    for (line, tok) in &attention {
+        rows.push(fitted(
+            vec![
+                Span::raw(indent.clone()),
+                Span::styled(text::ellipsize(line, room, theme.ascii()), theme.fg(*tok)),
+            ],
             w,
             theme,
-        )
-    };
-    let mut attention = 0;
-    if !report.failing.is_empty() {
-        for name in report.failing.iter().take(LISTED) {
-            rows.push(line(
-                format!("{cross} {}", text::ellipsize(name, room, theme.ascii())),
-                Tok::Error,
-            ));
-        }
-        attention = report.failing.len();
-    } else {
-        for (error, location) in report.errors.iter().take(LISTED) {
-            rows.push(line(
-                text::ellipsize(
-                    &text::one_line(error),
-                    w.saturating_sub(GUTTER).max(1),
-                    theme.ascii(),
-                ),
-                Tok::Error,
-            ));
-            if let Some(location) = location {
-                rows.push(line(format!("  {location}"), Tok::Dim));
-            }
-        }
-        attention = attention.max(report.errors.len());
+        ));
     }
-    if attention > LISTED {
-        rows.push(line(format!("+{} more", attention - LISTED), Tok::Dim));
-    }
-    let log_lines = super::split_trailer(&t.output).lines().count();
     if rows.len() > 1 && log_lines > 0 {
         rows.push(fitted(
             vec![
@@ -296,6 +351,72 @@ pub(super) fn check_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows
         ));
     }
     Some(rows)
+}
+
+/// What a check's header carries: its mark, verb, command and counts with their styles.
+struct AttentionHead<'a> {
+    glyph: (String, Style),
+    failed: bool,
+    verb: (&'static str, Style),
+    command: &'a str,
+    facts: (Vec<Fact>, Style),
+}
+
+/// A run that needs attention as a framed card: the mark, verb and command on the top edge, the
+/// failing tests or errors inside, and the counts with the hidden log on the bottom edge. The
+/// outline is red for a failure and amber when the run only warns.
+fn attention_card(
+    head: &AttentionHead<'_>,
+    attention: Vec<(String, Tok)>,
+    log_lines: usize,
+    w: usize,
+    ctx: &TranscriptCtx,
+) -> Rows {
+    let theme = ctx.theme;
+    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    let (glyph, glyph_style) = &head.glyph;
+    let (verb, verb_style) = head.verb;
+    let border = if head.failed {
+        Tok::Error
+    } else {
+        Tok::Warning
+    };
+    let mut card = frame::Frame::new(
+        vec![
+            Span::styled(glyph.clone(), *glyph_style),
+            Span::raw(" "),
+            Span::styled(verb, verb_style),
+            Span::styled(dot.clone(), theme.fg(Tok::Dim)),
+            Span::styled(text::one_line(head.command), theme.fg(Tok::Muted)),
+        ],
+        theme.fg(border),
+    );
+    let inner = w.saturating_sub(frame::CHROME_W).max(1);
+    card.sections.push((
+        None,
+        attention
+            .into_iter()
+            .map(|(line, tok)| {
+                Line::from(Span::styled(
+                    text::ellipsize(&line, inner, theme.ascii()),
+                    theme.fg(tok),
+                ))
+            })
+            .collect(),
+    ));
+    let (facts, facts_style) = &head.facts;
+    let text = facts
+        .iter()
+        .map(|f| f.text.as_str())
+        .collect::<Vec<_>>()
+        .join(&dot);
+    card.foot = vec![Span::styled(text, *facts_style)];
+    if log_lines > 0 {
+        card.foot.push(Span::styled(dot, theme.fg(Tok::Dim)));
+        card.foot
+            .push(hidden_hint(log_lines, ctx.expand_key, theme));
+    }
+    card.rows(theme, w)
 }
 
 #[cfg(test)]

@@ -106,11 +106,20 @@ fn sqlite_tables_rows_primary_key_and_injection_boundaries() {
     let (dir, ws) = crate::tools::testkit::workspace();
     let db = rusqlite::Connection::open(dir.path().join("sample.sqlite")).unwrap();
     db.execute_batch("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT, payload BLOB); INSERT INTO notes VALUES(1,'first',X'0001'),(2,'second',NULL);").unwrap();
-    assert!(
-        read_path(&ws, "sample.sqlite")
-            .unwrap()
-            .contains("CREATE TABLE notes")
-    );
+    db.execute_batch("CREATE VIEW recent AS SELECT body FROM notes")
+        .unwrap();
+    let overview = read_path(&ws, "sample.sqlite").unwrap();
+    for expected in [
+        "1 table(s), 1 view(s)",
+        "path:TABLE",
+        "notes: 2 row(s)",
+        "  id INTEGER PRIMARY KEY",
+        "  payload BLOB",
+        "CREATE TABLE notes",
+        "views: recent",
+    ] {
+        assert!(overview.contains(expected), "{expected}\n{overview}");
+    }
     let row = read_path(&ws, "sample.sqlite:notes:key=2").unwrap();
     assert!(row.contains("second") && !row.contains("first"));
     let first = read_path(&ws, "sample.sqlite:notes?offset=0&limit=1").unwrap();
@@ -332,6 +341,107 @@ fn jsonl_query_labels_results_by_source_line() {
     let out = read_path(&ws, "rows.jsonl?q=select(.ok) | .id").unwrap();
     assert!(out.contains("[result 0; source line 3]\n2\n"), "{out}");
     assert!(out.contains("1 of 1 results"), "{out}");
+}
+#[test]
+fn yaml_and_toml_documents_answer_jq_queries() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    fs::write(
+        dir.path().join("config.yaml"),
+        "a: 1\n3: three\nb: !custom [x, y]\n---\nname: second\n",
+    )
+    .unwrap();
+    let yaml = read_path(&ws, "config.yaml?q=.[\"3\"]").unwrap();
+    assert!(yaml.contains("source format YAML"), "{yaml}");
+    assert!(
+        yaml.contains("[result 0]\n\"three\"\n[result 1]\nnull\n"),
+        "{yaml}"
+    );
+    let tagged = read_path(&ws, "config.yaml?q=.b // .name").unwrap();
+    assert!(
+        tagged.contains("[\"x\",\"y\"]") && tagged.contains("\"second\""),
+        "{tagged}"
+    );
+    fs::write(
+        dir.path().join("settings.toml"),
+        "title = \"t\"\n[owner]\ndob = 1979-05-27T07:32:00Z\nids = [1, 2]\n",
+    )
+    .unwrap();
+    let toml = read_path(&ws, "settings.toml?q=.owner.dob&raw=true").unwrap();
+    assert!(toml.contains("source format TOML"), "{toml}");
+    assert!(
+        toml.contains("[result 0]\n1979-05-27T07:32:00Z\n"),
+        "{toml}"
+    );
+    let sum = read_path(&ws, "settings.toml?q=.owner.ids | add").unwrap();
+    assert!(sum.contains("[result 0]\n3\n"), "{sum}");
+    assert!(read_path(&ws, "config.yaml?q=.a").is_ok_and(|out| out.contains("[result 0]\n1\n")));
+    fs::write(dir.path().join("bad.toml"), "a = = 1\n").unwrap();
+    assert!(
+        read_path(&ws, "bad.toml?q=.")
+            .unwrap_err()
+            .contains("malformed TOML")
+    );
+}
+#[test]
+fn compressed_json_lines_are_queried_after_decoding() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(b"{\"id\":1}\n{\"id\":2}\n").unwrap();
+    fs::write(dir.path().join("rows.jsonl.gz"), gz.finish().unwrap()).unwrap();
+    let out = read_path(&ws, "rows.jsonl.gz?q=.id").unwrap();
+    assert!(out.contains("[result 1; source line 2]\n2\n"), "{out}");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(b"{\"n\":[1,2,3]}").unwrap();
+    fs::write(dir.path().join("doc.json.gz"), gz.finish().unwrap()).unwrap();
+    let sum = read_path(&ws, "doc.json.gz?q=.n | add").unwrap();
+    assert!(sum.contains("[result 0]\n6\n"), "{sum}");
+}
+#[test]
+fn csv_tables_need_a_selector_unless_compressed() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    fs::write(
+        dir.path().join("people.csv"),
+        "name,age\nalice,30\nbob,41\n",
+    )
+    .unwrap();
+    let bare = read_streaming(
+        &ws,
+        &json!({"path":"people.csv"}),
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    assert!(bare.is_none(), "bare CSV keeps the editable source view");
+    let page = read_path(&ws, "people.csv:rows=1+1").unwrap();
+    assert!(page.contains("[rows 1..2 of 2]"), "{page}");
+    assert!(
+        page.contains("1 | bob  | 41") && !page.contains("alice"),
+        "{page}"
+    );
+    let table = read_path(&ws, "people.csv:table").unwrap();
+    assert!(table.contains("CSV: 2 rows x 2 columns"), "{table}");
+    assert!(read_path(&ws, "people.csv:rows=x").is_err());
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(b"id\tv\n7\tseven\n").unwrap();
+    fs::write(dir.path().join("pairs.tsv.gz"), gz.finish().unwrap()).unwrap();
+    let compressed = read_path(&ws, "pairs.tsv.gz").unwrap();
+    assert!(
+        compressed.contains("TSV: 1 rows x 2 columns"),
+        "{compressed}"
+    );
+    assert!(compressed.contains("0 | 7  | seven"), "{compressed}");
+}
+#[test]
+fn in_memory_conversion_reuses_local_data_readers() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let db = rusqlite::Connection::open(dir.path().join("mem.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes VALUES(1,'hello');")
+        .unwrap();
+    drop(db);
+    let bytes = fs::read(dir.path().join("mem.sqlite")).unwrap();
+    let overview = convert_format(&ws, &bytes, "sqlite").unwrap();
+    assert!(overview.contains("CREATE TABLE notes"), "{overview}");
+    let csv = convert_bytes(&ws, b"a,b\n1,2\n", "download.csv").unwrap();
+    assert!(csv.contains("0 | 1 | 2"), "{csv}");
+    assert!(convert_format(&ws, b"x", "font-unknown").is_err());
 }
 #[test]
 fn jq_query_stops_an_unbounded_generator_at_its_deadline() {

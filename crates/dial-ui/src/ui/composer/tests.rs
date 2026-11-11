@@ -1708,12 +1708,13 @@ fn history_is_bounded_deduplicated_sanitized_and_only_holds_submissions() {
 }
 
 #[test]
-fn ctrl_r_searches_history_incrementally_below_the_box() {
+fn ctrl_r_searches_history_incrementally_above_the_box() {
     let env = Env::new();
     let mut c = Composer::new(
         vec![
             "git status".into(),
             "cargo test".into(),
+            "ls".into(),
             "git commit".into(),
             "ls".into(),
         ],
@@ -1726,12 +1727,20 @@ fn ctrl_r_searches_history_incrementally_below_the_box() {
     let search_row = rows
         .iter()
         .position(|r| r.starts_with("search"))
-        .expect("prompt row below the box");
+        .expect("prompt row above the box");
     assert!(
-        search_row > 1
-            && rows[search_row + 1].contains("ls")
-            && rows[search_row + 2].contains("git commit"),
-        "newest first: {rows:?}"
+        search_row >= 2
+            && rows[0].contains("ls")
+            && rows[1].contains("git commit")
+            && rows
+                .iter()
+                .filter(|r| r.trim_start_matches(['›', ' ']).starts_with("ls"))
+                .count()
+                == 1
+            && rows[search_row + 1..]
+                .iter()
+                .any(|r| r.contains("do not lose me")),
+        "newest first, each once, list and prompt above the input: {rows:?}"
     );
     assert_eq!(
         view.cursor,
@@ -1753,7 +1762,7 @@ fn ctrl_r_searches_history_incrementally_below_the_box() {
         "git status",
         "Enter loads the selected entry without sending it"
     );
-    assert_eq!(c.history().len(), 4);
+    assert_eq!(c.history().len(), 5);
     assert!(
         !screen(&c, &env, 60).iter().any(|r| r.starts_with("search")),
         "search closes"
@@ -4573,4 +4582,46 @@ fn the_busy_chooser_reopens_on_the_route_picked_last_and_still_waits_for_enter()
         vec![("first".into(), true), ("second".into(), true)],
         "Enter confirms the remembered After this turn"
     );
+}
+
+#[test]
+fn scattered_subsequences_do_not_match_commands() {
+    let entries = vec![
+        cmd(
+            "settings",
+            "appearance, tools and coding preferences",
+            CommandKind::Builtin,
+        ),
+        cmd(
+            "reload",
+            "reload settings, commands and skills",
+            CommandKind::Builtin,
+        ),
+        cmd(
+            "fresh",
+            "reset provider streams and retry state",
+            CommandKind::Builtin,
+        ),
+        cmd(
+            "weights",
+            "inspect local MLX model weights",
+            CommandKind::Builtin,
+        ),
+        cmd(
+            "skill:file-structure-cleanup",
+            "Plan or implement moves",
+            CommandKind::Skill,
+        ),
+        cmd("sessions", "browse all sessions", CommandKind::Builtin),
+    ];
+    let names: Vec<&str> = rank(&entries, "settings")
+        .iter()
+        .map(|m| entries[m.index].name.as_str())
+        .collect();
+    assert_eq!(names, ["settings", "reload"]);
+    let names: Vec<&str> = rank(&entries, "ses")
+        .iter()
+        .map(|m| entries[m.index].name.as_str())
+        .collect();
+    assert!(names.contains(&"sessions"), "{names:?}");
 }

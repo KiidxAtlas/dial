@@ -67,6 +67,42 @@ fn kind_detection_uses_magic_media_type_and_extension() {
 }
 
 #[test]
+fn data_files_are_detected_for_their_local_readers() {
+    assert_eq!(
+        kind_of("https://x.test/a", None, b"PAR1\0\0"),
+        Some("parquet")
+    );
+    assert_eq!(
+        kind_of("https://x.test/db", None, b"SQLite format 3\0"),
+        Some("sqlite")
+    );
+    assert_eq!(
+        kind_of(
+            "https://x.test/a",
+            Some("application/vnd.oasis.opendocument.spreadsheet"),
+            b"PK"
+        ),
+        Some("spreadsheet")
+    );
+    assert_eq!(
+        kind_of(
+            "https://x.test/mail/note.eml",
+            Some("text/plain"),
+            b"From: a"
+        ),
+        Some("mail")
+    );
+    assert_eq!(
+        kind_of("https://x.test/data.csv", Some("text/csv"), b"a,b"),
+        None
+    );
+    assert_eq!(
+        kind_of("https://x.test/archive.zip", None, b"PK\x03\x04"),
+        None
+    );
+}
+
+#[test]
 #[ignore = "requires operator-installed Poppler pdftotext; external smoke enables this test"]
 fn pdf_served_from_loopback_is_converted() {
     let url = serve("/fixture.pdf", "application/pdf", pdf_fixture());

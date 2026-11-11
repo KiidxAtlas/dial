@@ -1,11 +1,12 @@
 //! Apache Parquet and Arrow IPC (Feather v2) files: schema, file metadata and a page of rows.
-//! Rows are selected with `:rows=O+N` (zero-based offset, default `0+100`).
+//! Rows are selected with `:rows=O+N` (zero-based offset, default `0+100`) and rendered as an
+//! aligned table; nulls show as `NULL`.
 
+use super::table_view;
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::Schema;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use serde_json::{Map, Value};
 use std::{
     fmt::Write as _,
     io::{Seek, Write},
@@ -14,24 +15,11 @@ use std::{
 #[cfg(test)]
 mod tests;
 
-const DEFAULT_ROWS: usize = 100;
-const MAX_ROWS: usize = 10_000;
 /// Characters kept from one cell value.
 const MAX_CELL: usize = 2_000;
 
 fn rows(member: Option<&str>) -> Result<(usize, usize), String> {
-    let Some(member) = member else {
-        return Ok((0, DEFAULT_ROWS));
-    };
-    let usage = || format!("columnar selector must be :rows=O or :rows=O+N (N <= {MAX_ROWS})");
-    let spec = member.strip_prefix("rows=").ok_or_else(usage)?;
-    let (offset, count) = spec.split_once('+').unwrap_or((spec, "100"));
-    let offset = offset.parse().map_err(|_| usage())?;
-    let count: usize = count.parse().map_err(|_| usage())?;
-    if count == 0 || count > MAX_ROWS {
-        return Err(usage());
-    }
-    Ok((offset, count))
+    table_view::window(member)
 }
 
 fn spool(bytes: &[u8]) -> Result<std::fs::File, String> {
@@ -67,7 +55,8 @@ pub(super) fn parquet(bytes: &[u8], member: Option<&str>) -> Result<String, Stri
             column.compression()
         );
     }
-    schema(&mut out, builder.schema());
+    let fields = builder.schema().clone();
+    schema(&mut out, &fields);
     if let Some(pairs) = file.key_value_metadata() {
         let keys: Vec<&str> = pairs.iter().map(|kv| kv.key.as_str()).collect();
         let _ = writeln!(out, "Key-value metadata keys: {}", keys.join(", "));
@@ -80,7 +69,7 @@ pub(super) fn parquet(bytes: &[u8], member: Option<&str>) -> Result<String, Stri
     let batches = reader
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("reading Parquet rows: {e}"))?;
-    page(&mut out, &batches, 0, count, offset, total)?;
+    page(&mut out, &fields, &batches, 0, count, offset, total)?;
     Ok(out)
 }
 
@@ -104,7 +93,15 @@ pub(super) fn arrow(bytes: &[u8], member: Option<&str>) -> Result<String, String
     let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
     let mut out = format!("{label}: {total} rows; {} record batches\n", batches.len());
     schema(&mut out, &schema_ref);
-    page(&mut out, &batches, offset, count, offset, total)?;
+    page(
+        &mut out,
+        &schema_ref,
+        &batches,
+        offset,
+        count,
+        offset,
+        total,
+    )?;
     Ok(out)
 }
 
@@ -125,28 +122,30 @@ fn schema(out: &mut String, schema: &Schema) {
     }
 }
 
-/// Renders rows `skip..skip+count` of `batches` as one JSON object per line. `first` is the
-/// absolute index of the first rendered row.
+/// Renders rows `skip..skip+count` of `batches` as a table led by the absolute row index.
+/// `first` is the absolute index of the first rendered row.
 fn page(
     out: &mut String,
+    fields: &Schema,
     batches: &[RecordBatch],
     mut skip: usize,
     count: usize,
     first: usize,
     total: usize,
 ) -> Result<(), String> {
-    let options = FormatOptions::default().with_null("null");
-    let mut shown = 0;
-    let mut lines = String::new();
+    let options = FormatOptions::default().with_null("NULL");
+    let header: Vec<String> = std::iter::once("#".to_owned())
+        .chain(fields.fields().iter().map(|f| table_view::cell(f.name())))
+        .collect();
+    let mut rows = Vec::new();
     for batch in batches {
-        if shown == count {
+        if rows.len() == count {
             break;
         }
         if skip >= batch.num_rows() {
             skip -= batch.num_rows();
             continue;
         }
-        let schema = batch.schema();
         let formatters = batch
             .columns()
             .iter()
@@ -154,39 +153,24 @@ fn page(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("formatting rows: {e}"))?;
         for row in skip..batch.num_rows() {
-            if shown == count {
+            if rows.len() == count {
                 break;
             }
-            let mut object = Map::new();
-            for (index, field) in schema.fields().iter().enumerate() {
-                let column = batch.column(index);
-                let value = if column.is_null(row) {
-                    Value::Null
+            let mut cells = vec![(first + rows.len()).to_string()];
+            for (index, formatter) in formatters.iter().enumerate() {
+                let text = if batch.column(index).is_null(row) {
+                    "NULL".to_owned()
                 } else {
-                    let text = formatters[index].value(row).to_string();
-                    let numeric = field.data_type().is_numeric()
-                        || matches!(field.data_type(), DataType::Boolean);
-                    match numeric
-                        .then(|| serde_json::from_str::<Value>(&text).ok())
-                        .flatten()
-                    {
-                        Some(value @ (Value::Number(_) | Value::Bool(_))) => value,
-                        _ => Value::String(text.chars().take(MAX_CELL).collect()),
-                    }
+                    formatter.value(row).to_string()
                 };
-                object.insert(field.name().clone(), value);
+                cells.push(table_view::cell(
+                    &text.chars().take(MAX_CELL).collect::<String>(),
+                ));
             }
-            lines.push_str(&Value::Object(object).to_string());
-            lines.push('\n');
-            shown += 1;
+            rows.push(cells);
         }
         skip = 0;
     }
-    let end = first + shown;
-    let _ = writeln!(out, "[rows {first}..{end} of {total}]");
-    out.push_str(&lines);
-    if end < total {
-        let _ = writeln!(out, "[more rows: :rows={end}+{count}]");
-    }
+    table_view::page(out, &header, &rows, first, count, total);
     Ok(())
 }

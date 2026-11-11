@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn reset_provider_removes_saved_oauth_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user");
+    let p = path(&user, "kilo");
+    {
+        let _lock = locked(&p).unwrap();
+        crate::config::settings_store::write_private(
+            &p,
+            &serde_json::to_vec(&Credentials {
+                access: "fixture-token".into(),
+                expires_at_ms: util::NEVER_EXPIRES,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    assert!(signed_in(&user, "kilo"));
+    crate::llm::catalog::remove_provider_credentials(&user, "kilo", &[]).unwrap();
+    assert!(!signed_in(&user, "kilo"));
+}
+
+#[test]
 fn flow_ids_are_unique_and_named() {
     let ids: std::collections::HashSet<_> = flows().map(|f| f.id).collect();
     assert_eq!(ids.len(), FLOWS.len());

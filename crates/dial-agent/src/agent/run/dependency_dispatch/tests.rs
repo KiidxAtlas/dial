@@ -315,6 +315,26 @@ fn checks_close_the_wave_after_the_verified_mutation() {
 }
 
 #[test]
+fn an_acceptance_check_sent_with_its_write_runs_after_the_write() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = agent(&config, root.path());
+    let mut check = call("verify", "unused");
+    check.arguments = json!({"acceptance":{"name":"shape","command":"test -s a"}});
+    let calls = [call("write", "a"), check];
+    let wave = agent.dependency_wave(&calls);
+    assert_eq!(
+        wave.calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        ["write"],
+        "barrier: {}",
+        wave.barrier
+    );
+}
+
+#[test]
 fn bookkeeping_and_scoped_reads_join_native_groups_but_deliverable_changes_stay_boundaries() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("src")).unwrap();
@@ -503,6 +523,88 @@ fn effect_free_external_reads_form_a_wave_but_pure_read_groups_do_not() {
         !reads.dispatchable(),
         "pure reads keep the parallel-read path"
     );
+}
+
+#[test]
+fn read_only_shell_commands_and_vcs_reads_join_waves_by_footprint() {
+    let root = tempfile::tempdir().unwrap();
+    for file in ["a", "b"] {
+        std::fs::write(root.path().join(file), "source").unwrap();
+    }
+    let workspace = Workspace::new(root.path()).unwrap();
+    let mut registry = crate::tools::integrations::ext::Registry::new();
+    for tool in crate::tools::vcs::git::tools(&Config::default()) {
+        registry.try_register(tool).unwrap();
+    }
+    let tool = |name: &str, arguments: Value| ToolCall {
+        id: name.into(),
+        name: name.into(),
+        arguments,
+        malformed_arguments: false,
+    };
+    let mut todo = call("todo", "unused");
+    todo.arguments = json!({"op":"view"});
+    let shell = tool("bash", json!({"command":"ls"}));
+    let log = tool("git", json!({"action":"log","vcs":"git"}));
+
+    // Read-only shell commands read every root: they join reads and bookkeeping…
+    let reads = plan(
+        &workspace,
+        &registry,
+        WavePolicy::PARENT,
+        &[
+            todo.clone(),
+            shell.clone(),
+            call("read", "a"),
+            shell.clone(),
+        ],
+    );
+    assert_eq!(reads.calls.len(), 4);
+    assert!(reads.dispatchable() && !reads.writes());
+    // …but never run beside a write, in either order.
+    for calls in [
+        [call("write", "a"), shell.clone()],
+        [shell.clone(), call("write", "b")],
+    ] {
+        let wave = plan(&workspace, &registry, WavePolicy::PARENT, &calls);
+        assert_eq!((wave.calls.len(), wave.barrier), (1, "resource_conflict"));
+    }
+    for args in [
+        json!({"command":"rm a"}),
+        json!({"command":"ls","session":"s"}),
+        json!({"command":"ls","pty":true}),
+        json!({"command":"ls","background":true}),
+    ] {
+        let wave = plan(
+            &workspace,
+            &registry,
+            WavePolicy::PARENT,
+            &[call("write", "a"), tool("bash", args.clone())],
+        );
+        assert_eq!(
+            (wave.calls.len(), wave.barrier),
+            (1, "unknown_resources"),
+            "{args}"
+        );
+    }
+
+    // Object-database reads touch no source file, so they run beside writes.
+    let wave = plan(
+        &workspace,
+        &registry,
+        WavePolicy::PARENT,
+        &[call("write", "a"), log, call("write", "b")],
+    );
+    assert_eq!(wave.calls.len(), 3);
+    assert!(wave.dispatchable() && wave.external());
+    let status = tool("git", json!({"action":"status","vcs":"git"}));
+    let wave = plan(
+        &workspace,
+        &registry,
+        WavePolicy::PARENT,
+        &[call("write", "a"), status],
+    );
+    assert_eq!((wave.calls.len(), wave.barrier), (1, "resource_conflict"));
 }
 
 /// An approval-gated, workspace-inert tool: both calls must be in flight at once to succeed.

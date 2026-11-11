@@ -817,7 +817,7 @@ fn reasoning_is_muted_italic_prose_or_collapses() {
     t.finish_turn();
     let rows = t.all_rows(40, &env.ctx());
     assert!(
-        plain(&rows).contains(&"▎  first thought".to_owned()),
+        plain(&rows).contains(&"┊  first thought".to_owned()),
         "{:?}",
         plain(&rows)
     );
@@ -892,6 +892,24 @@ fn errors_and_notices_wrap_with_hanging_indent() {
     assert!(text[1].starts_with("  "));
     assert_eq!(rows[0].spans[0].style.fg, env.theme.fg(Tok::Error).fg);
     assert!(text.iter().any(|l| l.to_uppercase().contains("HEADS UP")));
+}
+
+#[test]
+fn wide_errors_are_red_cards_with_the_message_inside() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.error("connection refused while talking to the model server");
+    let rows = t.all_rows(50, &env.ctx());
+    assert_fits(&rows, 50);
+    let text = plain(&rows);
+    let top = text.iter().position(|l| l.starts_with('╭')).expect("card");
+    assert!(text[top].contains("Error"), "{text:?}");
+    assert!(
+        text.iter().any(|l| l.contains("connection refused")),
+        "{text:?}"
+    );
+    assert!(text.iter().any(|l| l.starts_with('╰')), "{text:?}");
+    assert_eq!(rows[top].spans[0].style.fg, env.theme.fg(Tok::Error).fg);
 }
 
 // ---- tools ----
@@ -1150,13 +1168,13 @@ fn output_lines_setting_controls_the_cap() {
     env.ui.tool_output_lines = 2;
     let mut t = Transcript::new();
     t.tool_start("1", "bash", "x", "");
-    t.tool_end("1", "a\nb\nc", false, 1.0);
+    t.tool_end("1", "a\nb\nc\nd", false, 1.0);
     let text = text_of(&t.all_rows(40, &env.ctx()));
     assert!(
         text.lines().any(|l| unframed(l) == "a")
             && text.lines().any(|l| unframed(l) == "b")
             && !text.lines().any(|l| unframed(l) == "c")
-            && text.contains("1 more line (Ctrl+O"),
+            && text.contains("2 more lines (Ctrl+O"),
         "{text}"
     );
 }
@@ -1296,8 +1314,17 @@ fn todo_calls_render_the_list_with_their_changes() {
         false,
         0.0,
     );
+    let rows = plain(&t.all_rows(60, &env.ctx()));
+    let top = rows
+        .iter()
+        .position(|r| r.starts_with('╭'))
+        .expect("plan card");
+    assert!(rows[top].contains("Plan ▰▰▰▰▱▱▱▱ 1/2 done"), "{rows:?}");
+    assert_eq!(unframed(&rows[top + 1]).trim(), "✓ read", "{rows:?}");
+    assert_eq!(unframed(&rows[top + 2]).trim(), "● fix", "{rows:?}");
+    // Narrow terminals keep the gutter row and the list under it.
     assert_eq!(
-        plain(&t.all_rows(60, &env.ctx()))[..3],
+        plain(&t.all_rows(39, &env.ctx()))[..3],
         ["·  Plan    1/2 done", "   ✓ read", "   ● fix"]
     );
 }
@@ -1760,13 +1787,13 @@ fn hidden_output_hint_names_the_bound_expand_key() {
     env.ui.tool_output_lines = 2;
     let mut t = Transcript::new();
     t.tool_start("1", "bash", "x", "");
-    t.tool_end("1", "a\nb\nc", false, 1.0);
+    t.tool_end("1", "a\nb\nc\nd", false, 1.0);
     let ctx = TranscriptCtx {
         expand_key: "Alt+E",
         ..env.ctx()
     };
     let text = text_of(&t.all_rows(40, &ctx));
-    assert!(text.contains("1 more line (Alt+E expands)"), "{text}");
+    assert!(text.contains("2 more lines (Alt+E expands)"), "{text}");
     assert!(!text.contains("Ctrl"), "{text}");
 }
 
@@ -1831,6 +1858,19 @@ fn streamed_arguments_show_observationally_then_merge_into_the_started_call() {
     assert_eq!(started.matches("partial.txt").count(), 1, "{started}");
     assert_eq!(started.matches("FINAL-CONTENT").count(), 1, "{started}");
     assert!(!started.contains("DRAFT-CONTENT"), "{started}");
+}
+
+#[test]
+fn completed_streamed_arguments_read_as_the_call_not_raw_json() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.tool_arguments_delta("call-9", "bash", r#"{"command": "cargo test -p demo", "#);
+    t.tool_arguments_delta("call-9", "bash", r#""check": true}"#);
+    let rows = text_of(&t.all_rows(100, &env.ctx()));
+    assert!(rows.contains("$ cargo test -p demo"), "{rows}");
+    assert!(rows.contains("waiting to start"), "{rows}");
+    assert!(!rows.contains("\"check\""), "{rows}");
+    assert!(t.blocks[0].started.is_none());
 }
 
 #[test]
@@ -2588,4 +2628,38 @@ fn a_failure_shows_its_last_lines_under_the_earlier_lines_hint() {
     );
     assert!(text.last().unwrap().contains("error line 10"), "{text:?}");
     assert!(!text.iter().any(|l| l.contains("error line 7")), "{text:?}");
+}
+
+#[test]
+fn block_starts_let_the_committed_tail_be_rendered_alone() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.push_user("first question");
+    t.assistant_delta("An answer with **some** text.\n\n- a list\n- of items");
+    t.finish_turn();
+    for (id, name) in [("r1", "read"), ("b1", "bash")] {
+        t.tool_start(id, name, "src/lib.rs", "");
+        t.tool_end(id, "line one\nline two", false, 0.1);
+    }
+    t.push_user("second question");
+    let (written, _) = t.retire_settled(40, &env.ctx(), Retire::UNLIMITED);
+    let starts = t.take_block_starts();
+    assert!(starts.len() >= 3, "{starts:?}");
+    let (full, full_starts) = t.committed_rows_from(None, 40, &env.ctx());
+    assert_eq!(text_of(&full), text_of(&written));
+    assert_eq!(full_starts, starts);
+    // From every recorded start, the tail rendered alone matches the full render (at a new
+    // width too), so a reflow can reprint from any of them.
+    for width in [40, 70] {
+        let (all, all_starts) = t.committed_rows_from(None, width, &env.ctx());
+        for start in &all_starts {
+            let (tail, tail_starts) = t.committed_rows_from(Some(start), width, &env.ctx());
+            assert_eq!(
+                text_of(&tail),
+                text_of(&all[start.row..].to_vec()),
+                "{start:?}"
+            );
+            assert_eq!(tail_starts[0].row, 0);
+        }
+    }
 }

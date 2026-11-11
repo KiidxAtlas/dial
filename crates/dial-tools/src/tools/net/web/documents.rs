@@ -1,4 +1,6 @@
-//! Binary documents (PDF, Word, PowerPoint, Excel, EPUB) fetched and converted to markdown.
+//! Binary documents and data files fetched and converted to text: PDF, Word, PowerPoint, Excel
+//! and EPUB become markdown; Parquet/Arrow, OpenDocument, legacy spreadsheets, SQLite, mail and
+//! the other formats `read` understands locally reuse those same readers.
 //!
 //! The page fetch keeps the ordinary 2 MiB cap. A document found by media type, extension, or magic
 //! bytes is downloaded again with [`MAX_DOCUMENT_BYTES`]. A document that still does not fit is
@@ -6,6 +8,7 @@
 
 use super::fetch::{Client, Response, parse_url};
 use crate::tools::Workspace;
+use crate::tools::fs::documents;
 
 /// Largest document downloaded for conversion.
 pub const MAX_DOCUMENT_BYTES: usize = 20 * 1024 * 1024;
@@ -29,15 +32,60 @@ const KINDS: &[(&str, &str)] = &[
     ("application/epub+zip", "epub"),
 ];
 
-/// The document kind (`pdf`, `docx`, `pptx`, `xlsx`, `epub`) of a response, if it is one.
+/// Media types of formats read by their local readers (`documents::IN_MEMORY_READERS`).
+const DATA_KINDS: &[(&str, &str)] = &[
+    ("application/vnd.apache.parquet", "parquet"),
+    ("application/x-parquet", "parquet"),
+    ("application/vnd.apache.arrow.file", "arrow"),
+    ("application/vnd.apache.arrow.stream", "arrow"),
+    (
+        "application/vnd.oasis.opendocument.spreadsheet",
+        "spreadsheet",
+    ),
+    ("application/vnd.ms-excel", "spreadsheet"),
+    (
+        "application/vnd.ms-excel.sheet.binary.macroenabled.12",
+        "spreadsheet",
+    ),
+    (
+        "application/vnd.ms-excel.sheet.macroenabled.12",
+        "spreadsheet",
+    ),
+    ("application/vnd.oasis.opendocument.text", "opendocument"),
+    (
+        "application/vnd.oasis.opendocument.presentation",
+        "opendocument",
+    ),
+    ("message/rfc822", "mail"),
+    ("application/mbox", "mbox"),
+    ("application/vnd.sqlite3", "sqlite"),
+    ("application/x-sqlite3", "sqlite"),
+];
+
+/// The document kind of a response, if it is one: a markdown conversion (`pdf`, `docx`, `pptx`,
+/// `xlsx`, `epub`) or a format named by [`documents::kind`] that has an in-memory reader.
 pub fn kind_of(url: &str, media: Option<&str>, body: &[u8]) -> Option<&'static str> {
     if body.starts_with(b"%PDF-") {
         return Some("pdf");
     }
     if let Some(media) = media
-        && let Some((_, kind)) = KINDS.iter().find(|(mime, _)| *mime == media)
+        && let Some((_, kind)) = KINDS
+            .iter()
+            .chain(DATA_KINDS)
+            .find(|(mime, _)| mime.eq_ignore_ascii_case(media))
     {
         return Some(kind);
+    }
+    let readable = |format: &&str| documents::IN_MEMORY_READERS.contains(format);
+    if let Some(format) = crate::tools::fs::binary::identify(body)
+        .and_then(|kind| kind.format)
+        .filter(readable)
+    {
+        return Some(format);
+    }
+    let path = parse_url(url).ok()?.path().to_owned();
+    if let Some(format) = documents::kind(&path).filter(readable) {
+        return Some(format);
     }
     let extension = url_extension(url)?;
     KINDS
@@ -81,8 +129,7 @@ pub fn convert(
     } else {
         first.body
     };
-    let name = format!("document.{kind}");
-    crate::tools::fs::documents::convert_bytes(ws, &body, &name)
+    documents::convert_format(ws, &body, kind)
         .map(|text| text.trim().to_owned())
         .map_err(|error| format!("could not convert the {kind} document: {error:#}"))
 }

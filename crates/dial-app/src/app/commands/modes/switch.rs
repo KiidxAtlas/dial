@@ -11,7 +11,11 @@ pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &st
         let text = if selection.provider.is_empty() || selection.model.is_empty() {
             "No model is currently selected.".to_owned()
         } else {
-            format!("Current model: {}/{}", selection.provider, selection.model)
+            format!(
+                "Current model: {}/{}",
+                selection.display_provider(),
+                selection.model
+            )
         };
         shell.note("Switch", text);
         return Ok(Step::Done);

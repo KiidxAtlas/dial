@@ -277,6 +277,26 @@ fn grep_fixed_string_treats_metacharacters_literally() {
 }
 
 #[test]
+fn grep_without_matches_in_a_partly_scanned_file_reports_unknown_absence() {
+    let (dir, ws) = workspace();
+    let mut big = vec![b'x'; MAX_GREP_FILE as usize];
+    big.extend_from_slice(b"\nneedle\n");
+    fs::write(dir.path().join("big.log"), big).unwrap();
+    for output in ["lines", "count"] {
+        let text = grep(&ws, json!({"pattern": "needle", "output": output}));
+        assert!(
+            text.starts_with(
+                "no matches in the scanned bytes, but 1 file(s) scanned only up to the 4 MiB limit: absence there is unknown."
+            ),
+            "{text}"
+        );
+    }
+    fs::write(dir.path().join("small.txt"), "hay\n").unwrap();
+    let scoped = grep(&ws, json!({"pattern": "needle", "path": "small.txt"}));
+    assert!(scoped.starts_with("no matches\n"), "{scoped}");
+}
+
+#[test]
 fn grep_is_a_case_sensitive_regex_by_default() {
     let (dir, ws) = workspace();
     fs::write(

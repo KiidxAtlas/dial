@@ -376,9 +376,9 @@ impl Shell {
         match &result {
             Ok(_) => self
                 .transcript
-                .completion(crate::app::shell::turn_report::outcome(
-                    &control["turn_summary"],
-                    latency,
+                .completion(crate::app::shell::turn_report::with_cost(
+                    crate::app::shell::turn_report::outcome(&control["turn_summary"], latency),
+                    &agent.usage().1.all,
                 )),
             Err(error) => {
                 // A fatal error may precede durable completion. Never reuse an older turn's summary.

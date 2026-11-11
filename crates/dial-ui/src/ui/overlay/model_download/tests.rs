@@ -803,6 +803,32 @@ fn image_download_stays_image_after_switching_shelves_before_completion() {
 }
 
 #[test]
+fn installed_models_are_classified_when_the_catalog_changes_not_while_drawing() {
+    let mut group = selection_pane(vec![row("chat"), row("vectors")]);
+    let mut catalog = vec![embedder("mlx", "/models/vectors", true)];
+    catalog.extend((0..2000).map(|n| embedder("hosted", &format!("org/chat-{n}"), true)));
+    for entry in catalog.iter_mut().skip(1) {
+        entry.metadata.kind = crate::llm::catalog::ModelKind::Chat;
+    }
+    group.set_embedding_models(&catalog);
+    assert_eq!(
+        group.installed_rows(),
+        [0],
+        "the embedder is not offered as chat"
+    );
+
+    // Drawing and moving read the classification computed above rather than the catalog, which
+    // would canonicalize every entry against every installed path on each frame.
+    group.known_models.clear();
+    assert_eq!(group.installed_rows(), [0]);
+    let shown = text_of(&group.body(140, 20, &Theme::dark()));
+    assert!(!shown.contains("vectors"), "{shown}");
+
+    group.set_embedding_models(&[]);
+    assert_eq!(group.installed_rows(), [0, 1], "a new catalog reclassifies");
+}
+
+#[test]
 fn backspace_after_moving_to_results_edits_the_query_again() {
     let keys = Keymap::defaults();
     let mut group = ModelDownloads::fixed(dashboard(vec![row("a")]));

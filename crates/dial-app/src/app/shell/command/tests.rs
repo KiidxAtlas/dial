@@ -294,8 +294,85 @@ fn context_command_counts_pending_input_without_consuming_it() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("2 queued/draft messages included"), "{text}");
-    assert!(text.contains("Last sent request: unavailable"), "{text}");
+    assert!(text.contains("Last sent request: none yet"), "{text}");
     assert_eq!(shell.composer.queued_messages(), queued);
     assert_eq!(shell.composer.draft(), "unsent input");
     assert!(agent.session().messages().is_empty());
+}
+
+#[test]
+fn cache_line_reports_the_hit_rate_only_from_reported_cache_usage() {
+    let counts = |input, cache_read, cache_reports, reports| usage::Counts {
+        input,
+        cache_read,
+        cache_reported_responses: cache_reports,
+        reported_responses: reports,
+        ..usage::Counts::default()
+    };
+    assert_eq!(
+        cache_line(&counts(1000, 750, 4, 4)),
+        "cache hit rate: 75% of prompt tokens"
+    );
+    assert_eq!(
+        cache_line(&counts(1000, 250, 1, 4)),
+        "cache hit rate: at least 25% of prompt tokens (cache reported on 1 of 4 responses)"
+    );
+    // Absent cache fields are unknown, never a 0% hit rate.
+    assert_eq!(
+        cache_line(&counts(1000, 0, 0, 4)),
+        "cache hit rate: not reported by the provider"
+    );
+    assert_eq!(
+        cache_line(&counts(0, 0, 1, 1)),
+        "cache hit rate: unknown (no prompt tokens reported)"
+    );
+}
+
+#[test]
+fn prefix_reset_line_names_each_cause_and_is_absent_without_resets() {
+    let mut resets = std::collections::BTreeMap::new();
+    assert_eq!(prefix_reset_line(&resets), None);
+    resets.insert("tools_changed", 2);
+    resets.insert("model_changed", 1);
+    let line = prefix_reset_line(&resets).unwrap();
+    assert!(
+        line.starts_with(
+            "Prompt cache restarts (main agent): model switched 1 · tool list changed 2."
+        ),
+        "{line}"
+    );
+}
+
+#[test]
+fn permissions_why_lists_recent_policy_decisions_newest_first() {
+    let (_home, _project, app, mut shell) = shell();
+    let mut agent = permission_agent(&app);
+    let shown = |shell: &mut Shell| {
+        let ctx = TranscriptCtx {
+            theme: shell.themes.current(),
+            ui: &shell.ui,
+            tick: 0,
+            tools_expanded: false,
+            expand_key: "Ctrl+O",
+        };
+        shell
+            .transcript
+            .document(400, &ctx)
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    shell.command(&app, &mut agent, "/permissions why").unwrap();
+    assert!(shown(&mut shell).contains("No tool call has passed the approval policy"));
+    shell.policy_log.push_back("read: first".into());
+    shell.policy_log.push_back("bash: second".into());
+    shell.command(&app, &mut agent, "/permissions why").unwrap();
+    let text = shown(&mut shell);
+    let (second, first) = (
+        text.find("bash: second").unwrap(),
+        text.find("read: first").unwrap(),
+    );
+    assert!(second < first, "{text}");
 }

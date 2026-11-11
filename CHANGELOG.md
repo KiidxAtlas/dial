@@ -19,9 +19,69 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [0.3.5] - 2026-11-11
 
+### Added
+
+- `history source=sessions action=session` lists the session's failures: tool calls that returned an error (with clipped arguments, harness refusals included) and turns that ended failed or interrupted, with recovery notices stripped. Transcripts of any size are streamed rather than read whole ([archive](docs/autoresearch-and-archive.md#archive)).
+- `read {format: "text", offset, limit}` and the eval helpers `dial.readLines(path, offset, limit)` / `dial.lines(path)` page a text file of any size by line, up to 1 MiB per page, under the same admission as other data reads. Before this, data reads refused files over 1 MiB with no way to page them ([execution](docs/execution-and-web.md#persistent-kernels-and-evaluation)).
+- A facade refusal whose `action` belongs to another member names that selector, for example `history action=show` → `source=changes` ([tools](docs/tools.md)).
+- In Python eval cells, an undefined bare helper such as `readText(...)` fails with a hint naming `dial.readText(...)`. The truncated-output marker says the start was kept and how to avoid the loss.
+- `read` decodes NumPy `.npy` arrays (dtype, shape and a sample of values), MessagePack (as JSON), TrueType/OpenType/WOFF fonts (names, metrics and tables) and WAV audio (format, duration and peak/RMS level), by extension or by content. Before this, these files showed as a hex dump ([tools](docs/tools.md)).
+- A SQLite `read` overview lists each table's row count, column types and keys, the views, and how to page rows, instead of only the `CREATE` statements ([tools](docs/tools.md)).
+- `read` shows CSV and TSV files as an aligned table with `path:rows=O+N` or `path:table` (header row, row and column counts, detected delimiter). A bare `.csv` read is still the editable source view; compressed `.csv.gz`/`.tsv.zst` files show the table directly ([tools](docs/tools.md)).
+- `path?q=<jq filter>` queries YAML and TOML files as well as JSON/JSONL, and compressed `.json.gz`/`.jsonl.gz` (also zstd, xz, bzip2) files ([tools](docs/tools.md)).
+- URL reads of Parquet/Arrow, OpenDocument and legacy spreadsheets, `.odt`/`.odp`, `.eml`/`.mbox`, SQLite, NumPy, MessagePack and binary plist downloads use the same readers as local files. Before this, they were refused or shown as text ([tools](docs/tools.md)).
+- Approval prompts state what `/undo` covers directly under the action: checkpointed for `write`, `edit` and `ast_edit`; shell commands only when `shell.undo_snapshot` is on; no checkpoint for other tools. RPC and ACP clients receive the same `Undo:` line in the approval summary ([tools](docs/tools.md)).
+- `/permissions why` lists the 20 most recent approval-policy decisions of the session, newest first, with the rule that decided each call and the control that would change it ([turns](docs/terminal-turns.md)).
+- `/cost` shows a cache hit rate per role and model: the share of prompt tokens read from the provider's prompt cache. It is "not reported" when the provider sent no cache fields and a lower bound when only some responses did ([providers](docs/provider-catalog.md)).
+- `/cost` names the session's prompt cache restarts by cause (model switched, instructions changed, tool list changed, earlier messages rewritten). Each is a main-agent request whose prompt did not extend the previous one, so a provider cache had to start over from the changed part. The comparison is local; it does not measure what the provider billed as uncached.
+- The action palette matches a plain phrase of two or more words ("undo the last changes") by its words when it is not a fuzzy match, ranked below fuzzy matches ([commands](docs/terminal-commands.md)).
+- The end-of-turn footer adds the turn's observed API cost when the turn has a report and the cost is priced.
+- On terminals that report focus, returning to Dial after notices arrived shows one "While you were away" note naming the three newest; `/inbox` has the rest.
+- A turn that called tools ends with a recap card in the tool-card frame: how it ended, files changed and open tasks on the top edge, the verdict of its last test or build and chips for its calls, lookups, edits, commands, web and service calls, workers and failures, the changed files with lines added and removed, any handoff, `/review-file`/`/undo`, and time and tokens on the bottom edge. Its outline follows the outcome. Plain answers keep the one-line footer ([composer and transcript](docs/terminal-composer.md)).
+- Failing test and build runs, workers calls, plan updates, errors and warning or failure notices are drawn as rounded cards whose outline follows their state: red for failures, amber for warnings or blocked steps, green for a finished plan. Passing checks and ordinary command results stay single rows, and every card falls back to rows on narrow terminals ([composer and transcript](docs/terminal-composer.md)).
+
+### Changed
+
+- The launch screen's mark powers up at start-up: the bezel traces in behind a bright comet, the needle follows and the wordmark tunes in under a glow, with the version and tagline typed in beneath. Warnings, recent sessions or starters and the first-run tour now stand in rounded cards aligned with the input, falling back to plain rows in small windows ([composer and transcript](docs/terminal-composer.md)).
+- Clipped `bash` output is cut at line boundaries when one is within 512 bytes of each cut, and the omission notice names the omitted lines of the complete output, for example `[... 51234 bytes of output omitted (lines 181-3820) ...]` ([tools](docs/tools.md)).
+- Parquet/Arrow rows, spreadsheet sheets and SQLite table rows read through `read` are shown as aligned tables, the same layout as CSV, instead of JSON lines, tab-separated text or JSON arrays. Spreadsheet tables are headed by column letters and each row starts with its sheet row number; nulls show as `NULL` ([tools](docs/tools.md)).
+- Dependency waves (`experimental.dependency_dispatch`) admit more read tools. Read-only `bash` commands, `dep_source` and unscoped `git status`/`diff` read every workspace root, so they run with other reads, external reads and `todo` steps, never beside a write. `git status`/`diff`/`blame` with `path` read that path only. `git log`/`reflog`/`show`/`branches`/`pr_view`/`pr_checks`/`issue_view` and the `github`/`glab_mr` read ops touch no source file and run beside writes. Each of these calls was a barrier before ([async execution](docs/async-execution.md#dependency-scheduling-boundary)).
+- Terminal UI polish ([composer and transcript](docs/terminal-composer.md)):
+  - Markdown tables keep whole words in a cell, breaking only after `-` or `/`. Wrapped code lines break at spaces and mark each continuation with `↪`.
+  - The status bar keeps the approval mode at narrow widths. Reasoning shows as `think high` rather than `THINK ON`. `F10 controls` joins the footer hints instead of taking a row of its own.
+  - A `grep` card shows its match count. Output that is one line over the cap is shown in full rather than hidden behind a "1 more line" hint. A pending `bash` call shows `$ command` and "waiting to start" instead of raw JSON with a running timer.
+  - Approval prompts drop the doubled `Undo:` label. They show up to 24 detail rows before paging, and Esc is named "deny".
+  - `/` command list: typing a name such as `/settings` no longer matches unrelated commands through scattered letters. Category tags appear only where they do not cut a description, and long skill names give way to descriptions.
+  - The session browser marks in-use sessions `[in use]`, shows each row's project in all-projects mode, and keeps its status line within the width. Goals in the actions panel list the commands they open.
+  - `/models` labels the list columns (`ctx`, `price`, `speed`, `state`, `caps`) on the search row.
+  - `/settings` pickers show at most 12 choices at once (the window follows the cursor; typing filters), so a 32-theme list no longer fills the panel. The tab strip says how many tabs are hidden.
+  - `/cost` shows one short block per role that made requests and omits zero counters and empty worker sections. Per-model blocks appear only when more than one model served requests.
+  - `/context` labels the model window, prompt budget and auto-compact point separately.
+  - `/approval` names the mode with its status-bar label.
+  - `Ctrl+R` opens above the input like the command menu and lists each prompt once.
+  - Reasoning text hangs off a dotted `┊` rail, distinct from the input's `▎` edge.
+  - After the terminal's width changes and holds for 150 ms, the blocks still on screen (answers, tables, tool cards) are reprinted at the new width. Scrollback is left as printed and never erased; a block cut by the top of the screen keeps its old wrapping. Ctrl+L still reprints everything.
+- The end-of-turn report lists `bash` commands run with `check: true` as checks instead of saying `Checks: none recorded`. Read-only history batches such as `ls -la; git log --oneline` no longer count as shell effects outside `/undo`, and the `Outside /undo` line names only the kinds of effect that occurred. Approval rules are unchanged.
+- Unattended hosted runs (`dial -p`, benchmarks) no longer send the `todo`, `verify`, `bg` and `finish` schemas on every request. The hosted core offer had skipped the unattended deferral that discovery offers already applied, so a benchmark run carried about 7.9 KB of unused schemas per request (tool schemas 20.4 KB → about 14 KB). They remain loadable through `tool_search`, and a command that becomes a background job still loads `bg` ([tools](docs/tools.md)). Unattended runs also leave out the `memory` guidance (about 550 bytes) while that tool is deferred.
+
+### Fixed
+
+- **X/Delete** in `/providers` now resets built-in and custom providers to **not set up**, clears saved connection keys/sign-ins, updates the panel immediately, and persists an auto-discovery suppression record instead of letting Docker Model Runner, MLX-Serve and other built-ins reappear as connected ([providers](docs/provider-catalog.md#reset-a-provider)).
+- A local GGUF model run by Dial's own runtime (on llama.cpp, as on Windows and Linux) is labelled `gguf` in the status bar, the launch screen, the role indicator, `/controls` and `/switch`, as `/models` already showed it, instead of `mlx`. Configs and saved worker records keep the provider id `mlx`, so existing settings and resumed workers are unaffected.
+- File completion now identifies its partial-cache cause (time, entry count, path-name bytes or unreadable paths), reports each cause only once per project root independently of file-list changes, and gives background scans 10 seconds instead of 2 while retaining entry/byte limits and cancellation ([commands](docs/terminal-commands.md#file-completion-cache)).
+- `grep` no longer answers a bare `no matches` when a file was only partly scanned (over the 4 MiB per-file limit) or unreadable. It says absence there is unknown and how to search the rest.
+- Independent workers (the busy-input "Run independently" choice and `task` workers with `isolation = "copy"`) no longer fail to start when a gitignored directory holds a file over the 64 MiB per-file limit or more data than `isolation_source_bytes`, for example local benchmark runs. Gitignored, untracked paths are left out of the worker's copy, its limits and its merge. Under `overlay` and `projfs` the worker still sees them, but its edits there are not merged ([subagents](docs/subagents.md)).
+- `/models` › Get models no longer freezes the terminal. Every frame and key press compared each installed local model with every discovered catalog model through file-system path lookups, which took seconds per frame with a large hosted catalog and made keys lag or seem ignored. Installed models are now classified once when the installed list or the catalog changes.
+
 ### Security
 
 - Before an `npx`/`uvx` MCP server package is first started for an install or import health check (`/extensions` or the `mcp_servers` tool), Dial checks OSV.dev for a malicious-package report (an OpenSSF `MAL-` record or a CWE-506 advisory) and refuses to start or save the server if one exists. Only the package name, ecosystem and pinned version are sent; ordinary vulnerabilities do not block, and an unreachable OSV lets the install continue. Servers already in the config are not rechecked.
+
+### Fixed
+
+- Unattended runs no longer preserve task inputs by default (`efficiency.preserve_task_inputs` is now off), so the model no longer gets a notice that saved copies exist and treats changing the originals as safe. The batching guidance asks for dependent shell commands chained with `&&` instead of one request per step, and the standalone-artifact check is sent with the write that creates it (calls in one response run in order) instead of in a follow-up request.
+- A refused completion now ends the turn with one status line (`Incomplete:`/`Blocked:` plus the reason, blocking check names and the first error with its location) followed by the model's summary, instead of the full controller reason with recovery instructions meant for the model and a repeated copy of the check output.
+- The `read` description now says by category what it decodes (text, documents, data, read-only databases, archives, media, executables, other binaries as hex) and its format selectors (`:bytes=O+N`, `:member`, `:table`, `:sheet=N`), tells the model to use it over shell viewers, once per file, and stays within the hosted core schema budget. The environment's `On PATH` line now also reports installed inspection programs (`xxd`, `od`, `hexdump`, `file`, `strings`).
 
 ### Added
 

@@ -884,6 +884,39 @@ pub fn remove_credential(user_dir: &Path, base_url: &str) -> Result<()> {
     )
 }
 
+/// Forget Dial's URL-scoped keys and sign-ins for a provider, never the host environment.
+pub fn remove_provider_credentials(user_dir: &Path, id: &str, urls: &[String]) -> Result<()> {
+    let mut urls = urls.to_vec();
+    if let Some((_, _, _, base)) = LOCAL_SERVERS.iter().find(|&&(name, ..)| name == id) {
+        urls.push((*base).into());
+    }
+    if let Some((_, _, base, _)) = KNOWN.iter().find(|&&(name, ..)| name == id) {
+        urls.push((*base).into());
+    }
+    if let Some(provider) = bundled::builtin_provider(id) {
+        urls.push(provider.base_url.clone());
+    }
+    {
+        let path = super::credential_store::api_key_path(user_dir);
+        let _lock = locked(&path)?;
+        let mut credentials = credential_map(user_dir)?;
+        credentials.retain(|base, _| {
+            !urls
+                .iter()
+                .any(|url| base.trim_end_matches('/') == url.trim_end_matches('/'))
+        });
+        write_private(&path, &serde_json::to_vec(&credentials)?)?;
+    }
+    if id == super::chatgpt::PROVIDER {
+        super::chatgpt::forget_accounts(user_dir)?;
+    } else if id == "anthropic" {
+        super::anthropic_oauth::sign_out(user_dir)?;
+    } else if super::oauth::flow(id).is_some() {
+        super::oauth::sign_out(user_dir, id)?;
+    }
+    Ok(())
+}
+
 // Never derive Debug: this transient object can contain a bearer credential.
 struct Probe {
     id: String,
@@ -3564,11 +3597,26 @@ pub fn discover(
         |key| std::env::var_os(key).is_some_and(|value| !value.is_empty()),
     );
     endpoints.extend(bundled_probes);
-    endpoints.extend(
-        configured
-            .iter()
-            .map(|(id, spec)| (id.clone(), spec.clone())),
-    );
+    for (id, spec) in configured {
+        // Keep built-in labels and setup URLs, but never probe a reset provider.
+        let endpoint = if spec.is_reset() {
+            let mut endpoint = endpoints.get(id).cloned().unwrap_or_else(|| ProviderSpec {
+                label: bundled::builtin_provider(id)
+                    .map(|p| p.label.clone())
+                    .unwrap_or_else(|| id.clone()),
+                base_url: provider_endpoint(id)
+                    .map(|p| p.0)
+                    .unwrap_or_default()
+                    .to_owned(),
+                ..Default::default()
+            });
+            endpoint.enabled = false;
+            endpoint
+        } else {
+            spec.clone()
+        };
+        endpoints.insert(id.clone(), endpoint);
+    }
     let mut endpoints: Vec<_> = endpoints.into_iter().collect();
     for selection in selections {
         if let Some(base) = &selection.base_url {
@@ -3892,6 +3940,23 @@ pub fn discover(
                 ..capabilities
             },
         });
+    }
+    // Explicitly reset providers stay unconfigured even with running local servers,
+    // environment credentials, downloaded weights or saved model selections.
+    discovery.models.retain(|entry| {
+        !configured
+            .get(&entry.selection.provider)
+            .is_some_and(ProviderSpec::is_reset)
+    });
+    for status in &mut discovery.providers {
+        if configured
+            .get(&status.id)
+            .is_some_and(ProviderSpec::is_reset)
+        {
+            status.state = "not-set-up".into();
+            status.detail = "Removed from Dial; set up this provider to connect again".into();
+            status.models = 0;
+        }
     }
     annotate_embedding_checkpoints(&mut discovery.models);
     discovery

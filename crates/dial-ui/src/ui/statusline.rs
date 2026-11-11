@@ -44,17 +44,11 @@ pub fn controls_row(
     controls_row_with(&custom, data, keys, theme, width)
 }
 
-/// [`controls_row`] beside the status line `cfg` draws at `width`. It names only what differs from
-/// a fresh session (planning on, assistance on, a chosen reasoning level, approval when the line
-/// above hides it, saved-but-pending changes), so an ordinary session shows one short key hint.
-pub fn controls_row_with(
-    cfg: &UiConfig,
-    data: &StatusData,
-    keys: &super::keys::Keymap,
-    theme: &Theme,
-    width: u16,
-) -> Line<'static> {
-    let (left, right) = segments_for(cfg, data, usize::from(width));
+/// What [`controls_row_with`] names beyond its key hint: only what differs from a fresh session.
+/// Empty means the row would say nothing but the key, so the composer folds that key into its
+/// footer hints instead of spending a row on it.
+pub fn controls_facts(cfg: &UiConfig, data: &StatusData, width: usize) -> Vec<String> {
+    let (left, right) = segments_for(cfg, data, width);
     let shown = |segment: &str| {
         left.iter()
             .chain(&right)
@@ -81,6 +75,20 @@ pub fn controls_row_with(
     if data.assistance == Some(true) {
         facts.push("assistance on".to_owned());
     }
+    facts
+}
+
+/// [`controls_row`] beside the status line `cfg` draws at `width`. It names only what differs from
+/// a fresh session (planning on, assistance on, a chosen reasoning level, approval when the line
+/// above hides it, saved-but-pending changes), so an ordinary session shows one short key hint.
+pub fn controls_row_with(
+    cfg: &UiConfig,
+    data: &StatusData,
+    keys: &super::keys::Keymap,
+    theme: &Theme,
+    width: u16,
+) -> Line<'static> {
+    let facts = controls_facts(cfg, data, usize::from(width));
     let key = keys.label(super::keys::Action::StatusFocus);
     let mut label = format!("{key} controls");
     for fact in &facts {
@@ -460,7 +468,8 @@ fn canonical(name: &str) -> Option<(&'static str, u8)> {
         "path" => ("path", 60),
         "role" => ("role", 55),
         "git" => ("git", 50),
-        "approval" => ("approval", 62),
+        // The approval mode decides what runs unasked, so it outlasts everything but the model.
+        "approval" => ("approval", 92),
         "sandbox" => ("sandbox", 44),
         "tokens" => ("tokens", 40),
         "cost" => ("cost", 42),
@@ -638,14 +647,10 @@ impl Env<'_> {
                 if level.trim().is_empty() {
                     return None;
                 }
-                self.seg(
-                    name,
-                    importance,
-                    vec![Some(self.chip(
-                        super::chrome::Section::Learn,
-                        &format!("think {}", level.trim()),
-                    ))],
-                )
+                // Lower case like the other segments; the section colour marks it as a setting.
+                let mut chip = self.chip(super::chrome::Section::Learn, "think");
+                chip.text = format!("think {}", level.trim());
+                self.seg(name, importance, vec![Some(chip)])
             }
             "inference" => {
                 let settings = text::one_line(&data.inference);

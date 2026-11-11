@@ -176,6 +176,47 @@ fn unattended_hosted_runs_offer_a_runnable_eval_up_front() {
     });
 }
 
+/// Hosted print and benchmark runs defer the same long-session helpers as the discovery offer:
+/// they cost schema bytes on every request and stay loadable through `tool_search`.
+#[test]
+fn unattended_hosted_runs_defer_session_helpers_but_keep_them_loadable() {
+    with_agent(HOSTED, |agent| {
+        let attended = agent.offered();
+        agent.modes.launch.unattended = true;
+        let offered = agent.offered();
+        let discoverable = agent.discoverable_tools(&offered);
+        for deferred in ["bg", "todo", "verify", "finish", "task", "message"] {
+            assert!(!offered.iter().any(|name| name == deferred), "{offered:?}");
+        }
+        for loadable in ["bg", "todo", "verify", "finish", "task"] {
+            assert!(
+                discoverable.iter().any(|(name, _)| name == loadable),
+                "{loadable}: {discoverable:?}"
+            );
+        }
+        for core in [
+            "read",
+            "edit",
+            "write",
+            "bash",
+            "grep",
+            "glob",
+            "tool_search",
+        ] {
+            assert!(offered.iter().any(|name| name == core), "{offered:?}");
+        }
+        assert!(agent.bg_loadable());
+        let bytes = |names: &[String]| {
+            serde_json::to_vec(&agent.schemas(names).unwrap())
+                .unwrap()
+                .len()
+        };
+        let (before, after) = (bytes(&attended), bytes(&offered));
+        eprintln!("hosted unattended tool schemas: {before} -> {after} bytes");
+        assert!(after < before);
+    });
+}
+
 #[test]
 fn a_specialist_joins_only_after_an_explicit_load_and_preserves_the_system_band() {
     with_agent("[assistance]\nlean_local=false", |agent| {

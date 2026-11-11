@@ -121,6 +121,31 @@ fn decoder<'a, R: Read + 'a>(compression: &str, source: R) -> Result<Box<dyn Rea
     })
 }
 
+/// The compression [`decoder`] names for a stream starting with `head`: gzip, zstd, xz or
+/// bzip2 magic bytes, otherwise `"none"`.
+pub(super) fn sniff_compression(head: &[u8]) -> &'static str {
+    if head.starts_with(&[0x1f, 0x8b]) {
+        "gzip"
+    } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        "zst"
+    } else if head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        "xz"
+    } else if head.starts_with(b"BZh") {
+        "bz2"
+    } else {
+        "none"
+    }
+}
+
+/// `bytes` decompressed when they start with a known compression magic, bounded to the 8 MiB
+/// content limit; uncompressed bytes are returned unchanged.
+pub(super) fn decompressed(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    match sniff_compression(bytes) {
+        "none" => Ok(std::borrow::Cow::Borrowed(bytes)),
+        format => Ok(std::borrow::Cow::Owned(bounded(decoder(format, bytes)?)?)),
+    }
+}
+
 fn xz(source: impl Read) -> Result<Vec<u8>, String> {
     let mut out = Capped::default();
     let result = lzma_rs::xz_decompress(&mut BufReader::new(source), &mut out);

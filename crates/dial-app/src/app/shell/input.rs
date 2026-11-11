@@ -272,7 +272,8 @@ impl Shell {
             expand_key: &expand_key,
         };
         // Only what already reached scrollback is replayed; the still-streaming tail stays live.
-        let rows = transcript.committed_rows(cols, &ctx);
+        let (rows, starts) = transcript.committed_rows_from(None, cols, &ctx);
+        term.mark_blocks(starts);
         term.commit(rows);
     }
 

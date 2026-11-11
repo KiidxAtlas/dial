@@ -143,7 +143,7 @@ fn reading_a_database_reports_a_damaged_wal_and_never_destroys_it() {
     fs::write(&wal_path, &original).unwrap();
     let out = read(&ws, "main.db:items");
     assert!(out.text.contains("header checksum valid"), "{}", out.text);
-    assert!(out.text.contains("\"e\""), "{}", out.text);
+    assert!(out.text.contains("5  | e\n"), "{}", out.text);
 }
 
 #[test]

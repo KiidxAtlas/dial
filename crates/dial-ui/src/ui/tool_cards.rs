@@ -324,6 +324,12 @@ struct Fact {
 
 /// The `+a −b` totals an edit's change preview reports, when it carries them.
 fn change_totals(t: &Tool, theme: &Theme) -> Option<String> {
+    let (added, removed) = change_counts(t)?;
+    Some(format!("+{added} {}{removed}", theme.sym(Sym::Minus)))
+}
+
+/// Lines a settled edit added and removed, from its change preview's totals.
+pub(in crate::ui) fn change_counts(t: &Tool) -> Option<(u64, u64)> {
     if t.state == ToolState::Failed {
         return None;
     }
@@ -334,13 +340,9 @@ fn change_totals(t: &Tool, theme: &Theme) -> Option<String> {
             .map(str::to_owned)
     })?;
     let (added, removed) = totals.split_once(' ')?;
-    if !added.starts_with('+') || !removed.starts_with('-') {
-        return None;
-    }
-    Some(format!(
-        "{added} {}{}",
-        theme.sym(Sym::Minus),
-        &removed[1..]
+    Some((
+        added.strip_prefix('+')?.parse().ok()?,
+        removed.strip_prefix('-')?.parse().ok()?,
     ))
 }
 
@@ -358,9 +360,8 @@ fn agent_word(a: &AgentRow, live: bool) -> &'static str {
     }
 }
 
-/// Worker counts by displayed state, in one fixed order. A card whose workers all finished cleanly
-/// says nothing: "3 done" under a settled card is just noise.
-fn worker_tally(agents: &[AgentRow], live: bool) -> Vec<String> {
+/// Worker counts by displayed state, in one fixed order, leaving out states no worker is in.
+fn agent_counts(agents: &[AgentRow], live: bool) -> Vec<(&'static str, usize)> {
     const ORDER: &[&str] = &[
         "running",
         BACKGROUND,
@@ -375,20 +376,28 @@ fn worker_tally(agents: &[AgentRow], live: bool) -> Vec<String> {
         "done",
     ];
     let words: Vec<&str> = agents.iter().map(|a| agent_word(a, live)).collect();
-    if words.iter().all(|w| *w == "done") {
-        return Vec::new();
-    }
     ORDER
         .iter()
-        .filter_map(|word| {
-            let n = words.iter().filter(|w| *w == word).count();
-            (n > 0).then(|| {
-                if *word == BACKGROUND {
-                    format!("{n} in background")
-                } else {
-                    format!("{n} {word}")
-                }
-            })
+        .map(|word| (*word, words.iter().filter(|w| *w == word).count()))
+        .filter(|(_, n)| *n > 0)
+        .collect()
+}
+
+/// Worker counts as header facts. A card whose workers all finished cleanly says nothing: "3 done"
+/// under a settled card is just noise.
+fn worker_tally(agents: &[AgentRow], live: bool) -> Vec<String> {
+    let counts = agent_counts(agents, live);
+    if counts.iter().all(|(word, _)| *word == "done") {
+        return Vec::new();
+    }
+    counts
+        .into_iter()
+        .map(|(word, n)| {
+            if word == BACKGROUND {
+                format!("{n} in background")
+            } else {
+                format!("{n} {word}")
+            }
         })
         .collect()
 }
@@ -724,7 +733,16 @@ fn card_with(t: &Tool, w: usize, ctx: &TranscriptCtx, verb_text: String) -> Rows
     if t.presentation.body == crate::runtime::presentation::BodyStyle::Workers
         && !t.agents.is_empty()
     {
-        rows.extend(agent_tree(&t.agents, t.state == ToolState::Running, w, ctx));
+        if w >= WORKERS_CARD_MIN {
+            return workers_card(t, w, ctx);
+        }
+        rows.extend(agent_tree(
+            &t.agents,
+            t.state == ToolState::Running,
+            "   ",
+            w,
+            ctx,
+        ));
         return rows;
     }
     let inner = w.saturating_sub(GUTTER + 2).max(1);
@@ -862,12 +880,85 @@ pub(super) fn lookup_tree(tools: &[&Tool], w: u16, ctx: &TranscriptCtx) -> Rows 
     rows
 }
 
+/// Narrowest width that frames a workers call; below it the tree hangs off the gutter row.
+const WORKERS_CARD_MIN: usize = 40;
+
+/// A workers call as a framed card: the call's mark, verb and target on the top edge, the worker
+/// tree inside, and a chip per state with the call's time on the bottom edge. The outline is red
+/// when a worker failed, the accent while any still runs, and the plain border once all settled.
+fn workers_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
+    let theme = ctx.theme;
+    let live = t.state == ToolState::Running;
+    let (glyph, glyph_style) = tool_glyph(t, ctx);
+    let failed =
+        t.state == ToolState::Failed || t.agents.iter().any(|a| a.state == ToolState::Failed);
+    let busy = t.agents.iter().any(|a| a.state == ToolState::Running);
+    let border = if failed {
+        Tok::Error
+    } else if busy {
+        Tok::BorderAccent
+    } else {
+        Tok::Border
+    };
+    let mut head = vec![
+        Span::styled(glyph, glyph_style),
+        Span::raw(" "),
+        Span::styled(
+            verb(t),
+            theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let target = target(t);
+    if !target.is_empty() {
+        head.push(Span::raw(" "));
+        head.push(Span::styled(target, theme.fg(Tok::Muted)));
+    }
+    let mut card = frame::Frame::new(head, theme.fg(border));
+    let inner = w - frame::CHROME_W;
+    card.sections
+        .push((None, agent_tree(&t.agents, live, "", inner, ctx)));
+
+    // Every state gets a chip here, done included: the edge is the card's tally.
+    let mut foot: Vec<Span<'static>> = Vec::new();
+    for (word, n) in agent_counts(&t.agents, live) {
+        let tok = match word {
+            "done" => Tok::Success,
+            BACKGROUND => Tok::Muted,
+            "running" => Tok::Accent,
+            "failed" => Tok::Error,
+            _ => Tok::Warning,
+        };
+        let label = if word == BACKGROUND {
+            format!("{n} in background")
+        } else {
+            format!("{n} {word}")
+        };
+        if !foot.is_empty() {
+            foot.push(Span::raw(" "));
+        }
+        foot.push(frame::chip(theme, &label, tok));
+    }
+    if let Some(secs) = t.elapsed.filter(|s| *s >= 0.05) {
+        foot.push(Span::styled(
+            format!(" {} ", theme.sym(Sym::Dot)),
+            theme.fg(Tok::Dim),
+        ));
+        foot.push(Span::styled(
+            text::duration_label_precise(secs),
+            theme.fg(Tok::Dim),
+        ));
+    }
+    card.foot = foot;
+    card.rows(theme, w)
+}
+
 /// The agents a `task` call spawned, as a tree: per agent a status row (glyph, name, type, model,
 /// assignment, tool count and time at the right), then one hook row under it with the tool it is
 /// running now, or, once settled, the first line of what it reported. `live` is whether the task
 /// call is still running: once it returned, a worker still running is drawn as a static
-/// "continuing in background" row, because these rows freeze in scrollback.
-fn agent_tree(agents: &[AgentRow], live: bool, w: usize, ctx: &TranscriptCtx) -> Rows {
+/// "continuing in background" row, because these rows freeze in scrollback. `lead` indents the
+/// tree (the gutter when unframed, nothing inside a frame).
+fn agent_tree(agents: &[AgentRow], live: bool, lead: &str, w: usize, ctx: &TranscriptCtx) -> Rows {
     let theme = ctx.theme;
     let mark = ellipsis(theme);
     let ascii = theme.ascii();
@@ -896,7 +987,10 @@ fn agent_tree(agents: &[AgentRow], live: bool, w: usize, ctx: &TranscriptCtx) ->
         }
         let facts = facts.join(&format!(" {} ", theme.sym(Sym::Dot)));
         let mut left = vec![
-            Span::styled(format!("   {} ", if is_last { last } else { branch }), rail),
+            Span::styled(
+                format!("{lead}{} ", if is_last { last } else { branch }),
+                rail,
+            ),
             Span::styled(glyph, glyph_style),
             Span::raw(" "),
             Span::styled(
@@ -962,7 +1056,7 @@ fn agent_tree(agents: &[AgentRow], live: bool, w: usize, ctx: &TranscriptCtx) ->
             _ => None,
         };
         if let Some((detail, style)) = detail {
-            let indent = format!("   {}  ", if is_last { "  " } else { pipe.as_str() });
+            let indent = format!("{lead}{}  ", if is_last { "  " } else { pipe.as_str() });
             let lead = format!("{indent}{hook} ");
             let room = w.saturating_sub(text::width(&lead)).max(1);
             let detail = text::sanitize(&detail);
@@ -986,7 +1080,14 @@ fn agent_tree(agents: &[AgentRow], live: bool, w: usize, ctx: &TranscriptCtx) ->
     rows
 }
 
-/// A todo call: one status line, then the list as it now stands with this call's changes emphasized.
+/// Narrowest width that frames a plan; below it the list hangs off the gutter row.
+const PLAN_CARD_MIN: usize = 40;
+/// Cells of the plan's progress bar.
+const PLAN_BAR: usize = 8;
+
+/// A todo call: the list as it now stands with this call's changes emphasized. Wide enough, it is a
+/// card with a progress bar and the count on the top edge and blocked steps on the bottom edge;
+/// the outline is green once every step closed and amber while one is blocked.
 fn todo_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     let theme = ctx.theme;
     let tasks = t.todo.as_deref().unwrap_or_default();
@@ -997,7 +1098,6 @@ fn todo_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
         .count();
     // Same columns as every other card: status glyph, verb, then what it is about.
     let verb_style = theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD);
-    let mut spans = gutter_span(glyph, glyph_style);
     let summary = if tasks.is_empty() {
         "no tasks".to_owned()
     } else if closed == tasks.len() {
@@ -1005,6 +1105,53 @@ fn todo_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     } else {
         format!("{closed}/{} done", tasks.len())
     };
+    if w >= PLAN_CARD_MIN && !tasks.is_empty() {
+        use crate::agent::workflow::todo::Status;
+        let blocked = tasks
+            .iter()
+            .filter(|(task, _)| task.status == Status::Blocked)
+            .count();
+        let filled = (closed * PLAN_BAR).div_ceil(tasks.len()).min(PLAN_BAR);
+        let (full, empty) = if theme.ascii() {
+            ("#", "-")
+        } else {
+            ("▰", "▱")
+        };
+        let border = if blocked > 0 {
+            Tok::Warning
+        } else if closed == tasks.len() {
+            Tok::Success
+        } else {
+            Tok::BorderAccent
+        };
+        let mut card = frame::Frame::new(
+            vec![
+                Span::styled(glyph, glyph_style),
+                Span::raw(" "),
+                Span::styled("Plan", verb_style),
+                Span::raw(" "),
+                Span::styled(full.repeat(filled), theme.fg(Tok::Success)),
+                Span::styled(empty.repeat(PLAN_BAR - filled), theme.fg(Tok::Dim)),
+                Span::raw(" "),
+                Span::styled(summary, theme.fg(Tok::Muted)),
+            ],
+            theme.fg(border),
+        );
+        let inner = w - frame::CHROME_W;
+        card.sections.push((
+            None,
+            super::tasks::card_rows(tasks, inner, theme, ctx.tools_expanded),
+        ));
+        if blocked > 0 {
+            card.foot = vec![frame::chip(
+                theme,
+                &format!("{blocked} blocked"),
+                Tok::Warning,
+            )];
+        }
+        return card.rows(theme, w);
+    }
+    let mut spans = gutter_span(glyph, glyph_style);
     spans.extend([
         Span::styled(format!("{:<width$}", "Plan", width = VERB_W), verb_style),
         Span::raw(" "),
@@ -1294,6 +1441,13 @@ fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx, tail: bool) -> (Rows
             }
         })
         .collect();
+    // Hiding a single line costs the same row as showing it.
+    let total: usize = lines.iter().map(Vec::len).sum();
+    let limit = if total == limit.saturating_add(1) {
+        total
+    } else {
+        limit
+    };
     let (rows, hidden) = take_lines(lines, limit, tail);
     if tail && hidden > 0 {
         let mut out = vec![Line::from(more_hint(
@@ -1326,7 +1480,8 @@ fn more_hint(hidden: usize, which: &str, expand_key: &str, theme: &Theme) -> Spa
 }
 
 mod check;
-mod frame;
+pub(in crate::ui) use check::{Verdict, verdict};
+pub(in crate::ui) mod frame;
 mod irc;
 pub(super) use irc::incoming_notice;
 

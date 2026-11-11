@@ -1683,3 +1683,56 @@ fn merged_history_stays_inert_while_its_successor_is_not_callable() {
         assert_eq!(history, original);
     }
 }
+
+/// `monitor` is exposed through `bg`, so the optional properties it gained after release are
+/// additions to the `bg` contract too: a session recorded before them must still resume.
+#[test]
+fn a_consolidated_successor_accepts_history_from_before_a_members_additions() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::config::types::Config {
+        project_root: dir.path().to_path_buf(),
+        user_dir: dir.path().join("user"),
+        state_dir: dir.path().join("state"),
+        ..crate::config::types::Config::default()
+    };
+    let mut registry = Registry::new();
+    for tool in crate::tools::exec::background::tools(&config) {
+        registry.register(tool);
+    }
+    let current = registry.get("bg").unwrap().schema();
+    let properties = &current["function"]["parameters"]["properties"];
+    assert!(properties["command"].is_object() && properties["after_secs"].is_object());
+    let recorded = |removed: &[&str]| {
+        let mut schema = current.clone();
+        let properties = schema["function"]["parameters"]["properties"]
+            .as_object_mut()
+            .unwrap();
+        for property in removed {
+            assert!(properties.remove(*property).is_some(), "{property}");
+        }
+        let old = identities(&[schema], &registry)["bg"].clone();
+        vec![
+            json!({"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"bg","arguments":"{\"action\":\"list\"}"}}],"dial_tool_contracts":{"c1":old}}),
+            json!({"role":"tool","tool_call_id":"c1","content":"no jobs"}),
+        ]
+    };
+    let schemas = std::slice::from_ref(&current);
+    // The shape a 0.3.4 session recorded, each later release, and the members' additions alone.
+    for removed in [
+        &["after_secs", "on_exit", "note"][..],
+        &["note"],
+        &["run", "after_secs", "on_exit", "note"],
+        &["call", "after_secs", "on_exit", "note"],
+        &["persist", "lifetime", "call"],
+    ] {
+        let projected = project_history(&recorded(removed), schemas, &registry);
+        assert!(matches!(projected, Ok(None)), "{removed:?}: {projected:?}");
+    }
+    // Anything that is not a listed addition is still a contract change.
+    for removed in [&["pattern"][..], &["command"], &["after_secs", "job"]] {
+        assert!(
+            project_history(&recorded(removed), schemas, &registry).is_err(),
+            "{removed:?}"
+        );
+    }
+}

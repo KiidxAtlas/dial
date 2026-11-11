@@ -95,6 +95,7 @@ impl Shell {
             },
             paste_guard: Default::default(),
             input_recovery: Default::default(),
+            policy_log: Default::default(),
             transcript: Transcript::new(),
             inbox: Default::default(),
             status: StatusData::default(),
@@ -411,7 +412,7 @@ impl Shell {
             };
             let info = WelcomeInfo {
                 version: env!("CARGO_PKG_VERSION").into(),
-                provider: selection.provider.clone(),
+                provider: selection.display_provider().to_owned(),
                 model: selection
                     .display_name()
                     .trim_start_matches(&format!("{}/", selection.provider))

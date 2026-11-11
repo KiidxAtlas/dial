@@ -10,8 +10,10 @@ mod epub;
 mod isolate;
 use isolate::Job;
 pub use isolate::{WORKER_ARG as DOCUMENT_WORKER_ARG, worker_main as document_worker_main};
+mod binary_data;
 mod certificate;
 mod columnar;
+mod delimited;
 mod executable;
 mod json;
 mod mail;
@@ -21,6 +23,7 @@ mod pdf;
 mod property_list;
 mod spreadsheet;
 mod sqlite;
+mod table_view;
 #[cfg(test)]
 mod tests;
 use super::select::{self, MAX_READ_LINES, MAX_READ_OUTPUT, Selector, plan_spans};
@@ -100,6 +103,15 @@ pub(in crate::tools) fn kind(path: &str) -> Option<&'static str> {
         (".odp", "opendocument"),
         (".eml", "mail"),
         (".mbox", "mbox"),
+        (".npy", "npy"),
+        (".msgpack", "msgpack"),
+        (".mpk", "msgpack"),
+        (".ttf", "font"),
+        (".otf", "font"),
+        (".ttc", "font"),
+        (".woff", "font"),
+        (".woff2", "font"),
+        (".wav", "wav"),
     ]
     .iter()
     .find_map(|(suffix, format)| lower.ends_with(suffix).then_some(*format))
@@ -126,6 +138,14 @@ pub(in crate::tools) fn kind(path: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// `name` without a trailing `.gz`, `.zst`, `.xz` or `.bz2` compression suffix.
+pub(in crate::tools) fn without_compression(name: &str) -> &str {
+    [".gz", ".zst", ".xz", ".bz2"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name)
 }
 /// None leaves ordinary files and hashline snapshots completely unchanged.
 pub(in crate::tools) fn read_streaming(
@@ -174,13 +194,13 @@ fn read_streaming_impl(
             .char_indices()
             .filter(|(_, c)| *c == '?')
             .find(|(i, _)| {
-                json::is_json(&input[..*i])
+                json::is_queryable(&input[..*i])
                     && ws.resolve_read(&input[..*i]).is_ok_and(|p| p.is_file())
             })
             .or_else(|| {
                 input
                     .char_indices()
-                    .find(|(i, c)| *c == '?' && json::is_json(&input[..*i]))
+                    .find(|(i, c)| *c == '?' && json::is_queryable(&input[..*i]))
             });
         if let Some((i, _)) = query_at {
             return Some((|| {
@@ -225,8 +245,9 @@ fn read_streaming_impl(
             .filter(|(_, c)| *c == ':')
             .find_map(|(i, _)| {
                 let base = &target[..i];
-                (kind(base).is_some() && ws.resolve_read(base).is_ok_and(|p| p.is_file()))
-                    .then_some((base, Some(&target[i + 1..])))
+                ((kind(base).is_some() || delimited::format_of(base).is_some())
+                    && ws.resolve_read(base).is_ok_and(|p| p.is_file()))
+                .then_some((base, Some(&target[i + 1..])))
             })
             .unwrap_or_else(|| {
                 target
@@ -234,7 +255,17 @@ fn read_streaming_impl(
                     .map_or((target, None), |(a, b)| (a, Some(b)))
             })
     };
-    let format = forced.or_else(|| kind(base))?;
+    // A bare uncompressed CSV/TSV keeps the editable source view; a `:rows=`/`:table` selector
+    // or a compressed file reads it as a table.
+    let delimited = forced
+        .is_none()
+        .then(|| delimited::format_of(base))
+        .flatten()
+        .filter(|_| member.is_some() || without_compression(base) != base);
+    let format = match delimited {
+        Some(format) => format,
+        None => forced.or_else(|| kind(base))?,
+    };
     Some((|| {
         let offset = opt_u64(args, "offset")?.unwrap_or(1);
         let limit = opt_u64(args, "limit")?.unwrap_or(200);
@@ -328,6 +359,11 @@ fn read_payload(
         "arrow" => Some(columnar::arrow(payload, member)),
         "spreadsheet" => Some(spreadsheet::read(payload, member)),
         "opendocument" => without_member(opendocument::read),
+        "npy" => without_member(binary_data::npy),
+        "msgpack" => without_member(binary_data::msgpack),
+        "font" => without_member(binary_data::font),
+        "wav" => without_member(binary_data::wav),
+        "csv" | "tsv" => Some(delimited::read(format, payload, member)),
         _ => None,
     }
 }
@@ -501,10 +537,39 @@ pub(in crate::tools) fn render(
 /// Convert an in-memory document body using the same bounded parsers used by `read`.
 /// The filename supplies only the format; bytes are never extracted to disk or executed.
 pub fn convert_bytes(ws: &Workspace, bytes: &[u8], filename: &str) -> Result<String, String> {
+    let format = kind(filename)
+        .or_else(|| delimited::format_of(filename))
+        .ok_or_else(|| format!("unsupported document type: {filename}"))?;
+    convert_format(ws, bytes, format)
+}
+
+/// Formats [`convert_format`] reads from memory with their local readers, beyond the
+/// markdown conversions (PDF, OOXML, EPUB, notebooks and ZIP).
+pub(in crate::tools) const IN_MEMORY_READERS: &[&str] = &[
+    "parquet",
+    "arrow",
+    "spreadsheet",
+    "opendocument",
+    "mail",
+    "mbox",
+    "sqlite",
+    "npy",
+    "msgpack",
+    "plist",
+    "csv",
+    "tsv",
+];
+
+/// [`convert_bytes`] for a format already known (as [`kind`] names it), such as a URL download
+/// identified by media type or magic bytes.
+pub(in crate::tools) fn convert_format(
+    ws: &Workspace,
+    bytes: &[u8],
+    format: &str,
+) -> Result<String, String> {
     if bytes.len() as u64 > MAX_INPUT {
         return Err("document exceeds the 64 MiB input limit".into());
     }
-    let format = kind(filename).ok_or_else(|| format!("unsupported document type: {filename}"))?;
     match format {
         "pdf" => {
             use std::io::{Seek, Write};
@@ -520,6 +585,17 @@ pub fn convert_bytes(ws: &Workspace, bytes: &[u8], filename: &str) -> Result<Str
             "document",
             &Job::Convert {
                 format: format.to_owned(),
+            },
+            bytes,
+            PARSE_DEADLINE,
+            &AtomicBool::new(false),
+        ),
+        format if IN_MEMORY_READERS.contains(&format) => isolate::run(
+            "document",
+            &Job::Read {
+                format: format.to_owned(),
+                name: format!("document.{format}"),
+                member: None,
             },
             bytes,
             PARSE_DEADLINE,

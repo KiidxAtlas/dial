@@ -1,7 +1,9 @@
 //! Legacy and OpenDocument spreadsheets (`.xls`, `.xlsb`, `.xlsm`, `.ods`) through calamine:
-//! cached cell values per sheet, tab-separated. Formulas are not evaluated; `:sheet=NAME` or
-//! `:sheet=N` selects one sheet.
+//! cached cell values per sheet as an aligned table headed by column letters, each row led by
+//! its sheet row number. Formulas are not evaluated; `:sheet=NAME` or `:sheet=N` selects one
+//! sheet.
 
+use super::table_view;
 use calamine::{Reader, open_workbook_auto_from_rs};
 use std::{fmt::Write as _, io::Cursor};
 
@@ -47,23 +49,41 @@ pub(super) fn read(bytes: &[u8], member: Option<&str>) -> Result<String, String>
             start.0 + 1,
             start.1 + 1
         );
-        for row in range.rows().take(MAX_ROWS) {
-            let cells: Vec<String> = row
-                .iter()
-                .map(|cell| {
-                    cell.to_string()
-                        .replace(['\t', '\n', '\r'], " ")
-                        .chars()
-                        .take(MAX_CELL)
-                        .collect()
-                })
-                .collect();
-            out.push_str(cells.join("\t").trim_end_matches('\t'));
-            out.push('\n');
-        }
+        let mut header = vec!["#".to_owned()];
+        header.extend((0..cols).map(|i| column_name(start.1 as usize + i)));
+        let table: Vec<Vec<String>> = range
+            .rows()
+            .take(MAX_ROWS)
+            .enumerate()
+            .map(|(index, row)| {
+                let mut cells = vec![(start.0 as usize + index + 1).to_string()];
+                cells.extend(row.iter().map(|cell| {
+                    table_view::cell(&cell.to_string().chars().take(MAX_CELL).collect::<String>())
+                }));
+                while cells.last().is_some_and(String::is_empty) {
+                    cells.pop();
+                }
+                cells
+            })
+            .collect();
+        out.push_str(&table_view::render(&header, &table));
         if rows > MAX_ROWS {
             out.push_str("…[more rows omitted]\n");
         }
     }
     Ok(out)
+}
+
+/// Spreadsheet column letters for a zero-based index: 0 → `A`, 25 → `Z`, 26 → `AA`.
+fn column_name(mut index: usize) -> String {
+    let mut name = Vec::new();
+    loop {
+        name.push(b'A' + (index % 26) as u8);
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    name.reverse();
+    String::from_utf8(name).unwrap_or_default()
 }

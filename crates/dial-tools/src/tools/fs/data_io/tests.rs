@@ -78,11 +78,60 @@ fn data_reads_enforce_size_scope_and_representation() {
     for args in [
         json!({"path":"big","format":"base64"}),
         json!({"path":"../outside","format":"text"}),
-        json!({"path":"big","format":"text","offset":1}),
+        json!({"path":"big","format":"base64","offset":1}),
+        json!({"path":"big","format":"text","offset":1,"retain":true}),
+        json!({"path":"big","format":"text","offset":0}),
+        json!({"path":"../outside","format":"text","offset":1}),
         json!({"path":"big","format":"json"}),
     ] {
         assert!(read(&ws, &args).is_err(), "{args}");
     }
+    let whole = read(&ws, &json!({"path":"big","format":"text"})).unwrap_err();
+    assert!(whole.contains("offset/limit"), "{whole}");
+}
+
+#[test]
+fn line_pages_cover_files_beyond_the_exact_read_limit() {
+    let (dir, ws) = testkit::workspace();
+    let line = format!("{}\r\n", "x".repeat(1023));
+    let lines = 1500;
+    std::fs::write(dir.path().join("big.jsonl"), line.repeat(lines)).unwrap();
+    let page = |offset: u64, limit: Option<u64>| {
+        let mut args = json!({"path":"big.jsonl","format":"text","offset":offset});
+        if let Some(limit) = limit {
+            args["limit"] = json!(limit);
+        }
+        read(&ws, &args).unwrap().data.unwrap()
+    };
+    let (mut offset, mut seen, mut joined) = (1, 0, String::new());
+    loop {
+        let data = page(offset, None);
+        let content = data["content"].as_str().unwrap();
+        assert!(content.len() <= MAX_BYTES);
+        seen += data["lines"].as_u64().unwrap();
+        joined.push_str(content);
+        match data["next_offset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(seen, lines as u64);
+    assert_eq!(joined, line.repeat(lines));
+    let two = page(1499, Some(5));
+    assert_eq!(
+        (two["lines"].as_u64(), two["next_offset"].is_null()),
+        (Some(2), true)
+    );
+    let one = page(2, Some(1));
+    assert_eq!(
+        (one["content"].as_str(), one["next_offset"].as_u64()),
+        (Some(line.as_str()), Some(3))
+    );
+    let past = page(5000, None);
+    assert_eq!(
+        (past["lines"].as_u64(), past["content"].as_str()),
+        (Some(0), Some(""))
+    );
 }
 
 #[test]

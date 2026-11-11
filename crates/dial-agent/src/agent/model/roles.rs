@@ -546,7 +546,7 @@ impl<'a> Agent<'a> {
             )?);
         }
         main.release();
-        ui.role(role, &selection.display_name());
+        ui.role(role, &selection.display_label());
         let rewritten = self.provider_request_with(request, ui)?;
         let request = rewritten.as_ref().unwrap_or(request);
         let started = Instant::now();
@@ -596,7 +596,7 @@ impl<'a> Agent<'a> {
         backend.restore_cache_namespace(previous_cache);
         let _ = backend.swap_request_profile(previous_profile);
         self.role_backends.insert(role.to_owned(), backend);
-        ui.role("main", &self.config.selection().display_name());
+        ui.role("main", &self.config.selection().display_label());
         result
     }
 }

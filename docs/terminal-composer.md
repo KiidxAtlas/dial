@@ -6,21 +6,48 @@ Write, paste and edit drafts without losing your place; understand the launch sc
 
 - Inline, scrollback-native transcript with a live composer; finished turns remain in normal terminal
   scrollback. Model, provider and settings panels use a full-screen overlay and restore the terminal
-  when closed. Approval prompts and settings adapt to narrow terminal widths.
+  when closed. Approval prompts and settings adapt to narrow terminal widths. When the terminal's
+  width changes and holds for 150 ms, Dial reprints the blocks still on screen at the new width;
+  scrollback above is left as printed and never erased (Ctrl+L reprints the whole conversation).
 - User and assistant messages have muted local-time timestamp headers. Live timestamps mark submission
   or the start of an answer; resumed messages use their recorded journal time (assistant journal
   times mark persistence). Older imported messages without a recorded time remain unstamped.
 - Finished-turn footers show measured output speed as `tok/s` when available, alongside elapsed
   time and token counts. Unknown or invalid rates are omitted; `ui.show_turn_stats = false` hides
-  the footer. Historical rates are not reconstructed from message timestamps.
-- New conversations open on a centered launch screen: a braille knob and wordmark (the needle turns
-  into place at start-up, then breathes and catches a passing glint, when `ui.motion` allows) above a compact input card near the window
-  midpoint. One line beneath shows the model, current directory and Git branch, then a quiet
-  shortcut hint; setup and unsafe-mode warnings appear only when relevant. Recent sessions appear
-  below the input when space allows; `Down` focuses the list and `Enter` resumes a session. A first
-  launch shows a three-step tour; Esc or sending a message dismisses it for good (the marker lives in
-  Dial's private user state). Small
-  windows shed artwork before warnings and selected actions. Sending a message restores the
+  the timing (the outcome stays). Historical rates are not reconstructed from message timestamps.
+- A turn that called tools closes with a **recap card** in the same rounded frame as the tool
+  cards. The top edge shows how the turn ended, how many files changed and any open tasks. The body
+  holds chips for the verdict of the turn's last test or build (`✓ tests 18 passed`,
+  `✗ build 2 errors`) and what the turn did (calls, lookups, edits, commands, web and service
+  calls, workers, failures), the files its edits changed with the lines each added and removed (six
+  files, then `+N more`), any recorded handoff and, when files changed, `/review-file` and `/undo`.
+  Time and tokens sit on the bottom edge. The outline follows the outcome: accent for done or
+  answered, amber for blocked or incomplete, red for failed. Plain answers and terminals narrower
+  than 40 columns keep the one-line footer.
+- Other blocks that need attention are cards in the same frame, each falling back to plain rows on
+  narrow terminals:
+  - A failing test or build run is a red card (amber when it only warns) with the command on the
+    top edge, the failing tests or the first errors with their locations inside, and the counts,
+    time and hidden log on the bottom edge. A passing run stays one row.
+  - A workers call frames its worker tree. The bottom edge has one chip per state (done, running,
+    in background, failed, …). The outline is red when a worker failed and the accent while one runs.
+  - A plan update shows a progress bar and `n/m done` on its top edge and a blocked chip on its
+    bottom edge. The outline is green once every step closed and amber while one is blocked.
+  - Errors, and notices titled as warnings or failures (for example **Outstanding work** or
+    **Heads up**), are red or amber cards. Other command results stay labelled rows.
+- New conversations open on a centered launch screen: a braille knob and wordmark above a compact
+  input card near the window midpoint. When `ui.motion` allows, the mark powers up at start-up:
+  the bezel traces itself in behind a bright comet, the needle swings up as the trace passes and
+  lights the ticks, and the wordmark tunes in under a travelling glow. At rest the needle breathes
+  and a glint passes now and then. The version and tagline type in under the mark when there is
+  room. One line beneath the input shows the model, current directory and Git branch. Below it, the
+  context stands in rounded cards as wide as the input: setup and unsafe-mode warnings in an amber
+  **heads up** card (only when relevant), recent sessions or starter requests in a list card whose
+  edges carry its heading and key hint, and the first-launch tour in a **first steps** card.
+  `Down` focuses the list and `Enter` resumes a session. Esc or sending a message dismisses the tour
+  for good (the marker lives in Dial's private user state). Small windows shed artwork before
+  warnings and selected actions, and a card turns back into plain rows when its two edge rows do
+  not fit. Sending a message restores the
   normal conversation, and so does a command that prints a result (for example `/add-dir`), so
   its answer is shown rather than left in scrollback behind the launch screen. Commands that
   only open a panel keep it.

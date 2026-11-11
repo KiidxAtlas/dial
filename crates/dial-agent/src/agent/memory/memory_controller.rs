@@ -134,7 +134,7 @@ impl Runner<'_, '_> {
             .frozen
             .unwrap_or(&self.agent.auth_config)
             .memory_role_config(role, model)?;
-        self.ui.role(role, &config.selection().display_name());
+        self.ui.role(role, &config.selection().display_label());
         let key = format!(
             "memory:{role}:{:x}",
             Sha256::digest(serde_json::to_vec(&config.selection())?)

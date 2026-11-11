@@ -832,14 +832,29 @@ fn registry_additive_compatible(
     if old.revision != new.revision || crate::tools::BUILTIN.contains(&old.name.as_str()) {
         return false;
     }
-    let properties = ADDITIVE_PROPERTIES
+    // A consolidated successor's schema is the union of its members' schemas
+    // (`facade::GROUPS`), so a member's additions are additions to the successor too.
+    let owners: Vec<&str> = std::iter::once(old.name.as_str())
+        .chain(
+            crate::tools::surface::facade::GROUPS
+                .iter()
+                .filter(|group| group.successor == old.name)
+                .flat_map(|group| group.members.iter().map(|(member, _)| *member)),
+        )
+        .collect();
+    let additions: Vec<&[&str]> = owners
         .iter()
-        .find(|(name, _)| *name == old.name)
-        .map_or(&[][..], |(_, properties)| *properties);
+        .filter_map(|owner| {
+            ADDITIVE_PROPERTIES
+                .iter()
+                .find(|(name, _)| name == owner)
+                .map(|(_, properties)| *properties)
+        })
+        .collect();
     let has_enum_values = ADDITIVE_ENUM_VALUES
         .iter()
-        .any(|(tool, ..)| *tool == old.name);
-    if properties.is_empty() && !has_enum_values {
+        .any(|(tool, ..)| owners.contains(tool));
+    if additions.is_empty() && !has_enum_values {
         return false;
     }
     let Some(current) = schemas
@@ -848,25 +863,28 @@ fn registry_additive_compatible(
     else {
         return false;
     };
-    // Additions are appended in release order. Walking suffixes preserves every intermediate
-    // release without enumerating a browser-sized powerset. Properties and enum groups can
-    // land independently, so match their bounded cross product. Never change required fields,
-    // existing property types, strictness or semantic revisions.
-    let mut property_variant = current.clone();
-    for remaining in (0..=properties.len()).rev() {
-        if remaining < properties.len()
-            && let Some(map) = property_variant
-                .pointer_mut("/function/parameters/properties")
-                .and_then(Value::as_object_mut)
+    // Additions are appended in release order per owner. Walking suffixes preserves every
+    // intermediate release without enumerating a browser-sized powerset. Owners and enum groups
+    // can land independently, so match their bounded cross product. Never change required
+    // fields, existing property types, strictness or semantic revisions.
+    let mut kept: Vec<usize> = additions.iter().map(|list| list.len()).collect();
+    loop {
+        let mut candidate = current.clone();
+        if let Some(map) = candidate
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
         {
-            map.remove(properties[remaining]);
+            for (list, kept) in additions.iter().zip(&kept) {
+                for property in &list[*kept..] {
+                    map.remove(*property);
+                }
+            }
         }
-        let mut candidate = property_variant.clone();
         if identities(std::slice::from_ref(&candidate), registry).get(&old.name) == Some(old) {
             return true;
         }
         for (tool, property, values) in ADDITIVE_ENUM_VALUES.iter().rev() {
-            if *tool != old.name {
+            if !owners.contains(tool) {
                 continue;
             }
             if let Some(options) = candidate
@@ -882,8 +900,15 @@ fn registry_additive_compatible(
                 return true;
             }
         }
+        // Next combination: shorten the first owner's list that still has an addition.
+        let Some(index) = kept.iter().position(|kept| *kept > 0) else {
+            return false;
+        };
+        kept[index] -= 1;
+        for (earlier, list) in kept[..index].iter_mut().zip(&additions) {
+            *earlier = list.len();
+        }
     }
-    false
 }
 
 /// Recognize exact additive changes to controller-owned schemas. Historical calls remain inert,

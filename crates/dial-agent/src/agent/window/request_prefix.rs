@@ -42,6 +42,14 @@ impl Invalidation {
     fn keeps_message_prefix(self) -> bool {
         matches!(self, Self::None | Self::HistoryChanged)
     }
+
+    /// Count this request in a session-wide tally when its prompt did not extend the previous
+    /// one; a first request and a pure extension are not resets.
+    pub fn count_reset(self, resets: &mut std::collections::BTreeMap<&'static str, u64>) {
+        if !matches!(self, Self::Initial | Self::None) {
+            *resets.entry(self.as_str()).or_default() += 1;
+        }
+    }
 }
 
 impl std::fmt::Display for Invalidation {

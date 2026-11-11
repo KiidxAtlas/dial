@@ -230,6 +230,7 @@ impl Agent<'_> {
         );
         self.record(step, "request_prefix", serde_json::to_value(&prefix)?)?;
         self.efficiency_metrics.prefix(&prefix);
+        prefix.invalidation.count_reset(&mut self.prefix_resets);
         // Wall time before primary inference, including synchronous maintenance and waits.
         self.record(
             step,

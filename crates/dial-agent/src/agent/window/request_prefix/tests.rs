@@ -49,6 +49,41 @@ fn append_reuses_prefix_and_changes_explain_invalidation() {
 }
 
 #[test]
+fn only_requests_that_break_the_prefix_count_as_resets() {
+    let mut tracker = Tracker::default();
+    let mut resets = std::collections::BTreeMap::new();
+    let mut chat = chat();
+    tracker
+        .observe("a", &chat)
+        .invalidation
+        .count_reset(&mut resets);
+    chat.messages
+        .push(json!({"role":"assistant","content":"hello"}));
+    tracker
+        .observe("a", &chat)
+        .invalidation
+        .count_reset(&mut resets);
+    assert!(resets.is_empty(), "{resets:?}");
+    chat.tools.push(json!({"type":"function"}));
+    tracker
+        .observe("a", &chat)
+        .invalidation
+        .count_reset(&mut resets);
+    tracker
+        .observe("b", &chat)
+        .invalidation
+        .count_reset(&mut resets);
+    tracker
+        .observe("c", &chat)
+        .invalidation
+        .count_reset(&mut resets);
+    assert_eq!(
+        resets,
+        std::collections::BTreeMap::from([("model_changed", 2), ("tools_changed", 1)])
+    );
+}
+
+#[test]
 fn an_empty_model_name_is_initial_only_once() {
     let mut tracker = Tracker::default();
     let chat = chat();

@@ -954,6 +954,12 @@ pub fn sign_out(dir: &Path, id: &str, cancel: Arc<AtomicBool>) -> Result<String>
     save(dir, &state)?;
     Ok(if revoked { "Signed out of ChatGPT; account registration retained for later sign-in." } else { "Signed out locally. Remote revocation was not confirmed; disconnect Dial in ChatGPT Settings if needed." }.into())
 }
+
+/// Forget all local account registrations and tokens without a network request.
+pub fn forget_accounts(dir: &Path) -> Result<()> {
+    let _lock = locked_cancellable(&credential_path(dir), &AtomicBool::new(false))?;
+    save(dir, &State::default())
+}
 fn codex_request(
     account_id: &str,
     token: &SecretToken,

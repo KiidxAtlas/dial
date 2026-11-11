@@ -704,7 +704,7 @@ fn an_edit_whose_gate_check_fails_is_reminded_once_then_disclosed() {
     });
     assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
     assert!(
-        report.text.contains("no passing applicable check")
+        report.text.starts_with("Incomplete:")
             && report.text.contains("notes")
             && report.text.contains("note check failed"),
         "the rejected candidate retains the observed check failure: {}",
