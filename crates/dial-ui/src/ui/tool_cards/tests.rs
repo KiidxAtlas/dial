@@ -282,7 +282,7 @@ fn wrapped_diff_lines_hang_under_the_code_column() {
 }
 
 #[test]
-fn a_finished_plan_says_so() {
+fn a_finished_plan_is_not_repeated_in_the_transcript() {
     use crate::agent::workflow::todo::TodoList;
     let theme = Theme::builtin("dial-dark").unwrap();
     let ui = UiConfig::default();
@@ -296,7 +296,7 @@ fn a_finished_plan_says_so() {
     let mut t = settled("todo", r#"{"op":"done"}"#, "2/2 done", false, 0.0);
     t.todo = Some(crate::ui::tasks::changes(&before, &after));
     let rows = plain(&tool_rows(&t, 60, &ctx_for(&theme, &ui, false)));
-    assert!(rows[0].contains("all 2 done"), "{rows:?}");
+    assert!(rows.is_empty(), "{rows:?}");
 }
 
 #[test]

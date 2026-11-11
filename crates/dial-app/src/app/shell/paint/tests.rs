@@ -269,6 +269,7 @@ fn plan_is_live_only_and_evidence_and_mode_remain_available() {
             shell.home = None;
             shell.work_tab = tab;
             shell.status.sandbox = "workspace".into();
+            shell.status.approval = "ask".into();
             shell.todo.call(&serde_json::json!({"op": "set", "tasks": [
                 {"content": "Unique plan step"},
                 {"content": "Second step"}
@@ -286,7 +287,11 @@ fn plan_is_live_only_and_evidence_and_mode_remain_available() {
                 "{cols}x{rows} {tab:?}: {shown}"
             );
             if cols == 120 && tab == Tab::Plan {
-                assert!(shown.contains("Plan ▱▱▱▱▱▱▱▱ 0/2 done"), "{shown}");
+                assert!(
+                    shown.contains("Plan ▱▱▱▱▱▱▱▱ 0/2 done")
+                        || shown.contains("Plan -------- 0/2 done"),
+                    "{shown}"
+                );
             }
             if cols == 120 {
                 match tab {

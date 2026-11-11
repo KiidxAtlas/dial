@@ -123,6 +123,17 @@ fn a_single_pending_step_renders_as_a_four_row_card_without_filler() {
 }
 
 #[test]
+fn a_finished_plan_header_reports_all_steps_done() {
+    let mut todo = plan();
+    todo.call(&json!({"op": "done"}));
+    todo.call(&json!({"op": "done"}));
+    assert_eq!(
+        plan_title(&todo, &Theme::builtin("dial-dark").unwrap()),
+        "Plan ▰▰▰▰▰▰▰▰ 3/3 done"
+    );
+}
+
+#[test]
 fn tabs_show_the_focused_step_evidence_and_approval_mode() {
     let plan = plain(&render(Tab::Plan, 120, 12)).join("\n");
     assert!(plan.contains("Draw the cards"), "{plan}");
