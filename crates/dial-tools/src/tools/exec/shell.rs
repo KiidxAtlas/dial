@@ -190,7 +190,9 @@ fn created_entries_note(before: Option<&DirectoryEntries>, dir: &Path) -> Option
         note.push_str(&format!("[new in the working directory: {shown}{suffix}; remove scratch outputs the task does not want]\n"));
     }
     if !lost.is_empty() {
-        note.push_str(&format!("[working-directory inputs changed: {}. If unintended, inspect retained input artifacts or checkpoints before reconstructing; restore exact bytes in eval with dial.writeBytes(path, dial.readBytes(artifact)) rather than copying them through a reply; do not invent lost data.]\n", lost.iter().take(10).cloned().collect::<Vec<_>>().join("; ")));
+        // A copy exists only when input preservation retained one; that path adds its own
+        // `input_evidence_changed` notice naming the artifacts. Never imply a copy otherwise.
+        note.push_str(&format!("[working-directory inputs changed: {}. Dial kept a copy only if an input_evidence_changed notice names its artifact; then restore exact bytes in eval with dial.writeBytes(path, dial.readBytes(artifact)). Otherwise the original bytes are gone: do not search for copies or invent lost data.]\n", lost.iter().take(10).cloned().collect::<Vec<_>>().join("; ")));
     }
     (!note.is_empty()).then_some(note)
 }

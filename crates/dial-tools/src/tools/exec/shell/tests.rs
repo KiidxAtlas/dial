@@ -11,11 +11,17 @@ fn directory_delta_reports_disappearing_and_shrinking_sources() {
     let note = created_entries_note(before.as_ref(), dir.path()).unwrap();
     assert!(note.contains("main.db-wal disappeared"), "{note}");
     assert!(note.contains("input shrank"), "{note}");
-    // Recovery must name a byte-exact path, not invite copying binary data through a reply.
+    // Recovery must name a byte-exact path, not invite copying binary data through a reply,
+    // and must not promise a retained copy that preservation never made.
     assert!(
         note.contains("dial.writeBytes(path, dial.readBytes(artifact))"),
         "{note}"
     );
+    assert!(
+        note.contains("Otherwise the original bytes are gone"),
+        "{note}"
+    );
+    assert!(!note.contains("inspect retained input artifacts"), "{note}");
 }
 
 #[test]

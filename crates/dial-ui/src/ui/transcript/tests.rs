@@ -1296,7 +1296,7 @@ fn edit_cards_show_the_numbered_diff_not_the_model_facing_preview() {
 }
 
 #[test]
-fn todo_calls_render_the_list_with_their_changes() {
+fn todo_calls_stay_out_of_the_transcript_but_failures_are_visible() {
     use crate::agent::workflow::todo::TodoList;
     let env = Env::new();
     let mut before = TodoList::new();
@@ -1314,19 +1314,18 @@ fn todo_calls_render_the_list_with_their_changes() {
         false,
         0.0,
     );
-    let rows = plain(&t.all_rows(60, &env.ctx()));
-    let top = rows
-        .iter()
-        .position(|r| r.starts_with('╭'))
-        .expect("plan card");
-    assert!(rows[top].contains("Plan ▰▰▰▰▱▱▱▱ 1/2 done"), "{rows:?}");
-    assert_eq!(unframed(&rows[top + 1]).trim(), "✓ read", "{rows:?}");
-    assert_eq!(unframed(&rows[top + 2]).trim(), "● fix", "{rows:?}");
-    // Narrow terminals keep the gutter row and the list under it.
-    assert_eq!(
-        plain(&t.all_rows(39, &env.ctx()))[..3],
-        ["·  Plan    1/2 done", "   ✓ read", "   ● fix"]
-    );
+    for width in [39, 60, 120] {
+        let rows = plain(&t.all_rows(width, &env.ctx()));
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains("Plan") && !row.contains("fix")),
+            "{rows:?}"
+        );
+    }
+    t.tool_start("2", "todo", "done", "");
+    t.tool_end("2", "no step in progress", true, 0.0);
+    let shown = text_of(&t.all_rows(60, &env.ctx()));
+    assert!(shown.contains("no step in progress"), "{shown}");
 }
 
 #[test]

@@ -81,7 +81,7 @@ fn one_compact_card_lists_steps_beside_the_tab_strip_at_capped_width() {
             assert_eq!(text::line_width(row), width.min(MAX_WIDTH), "{row:?}");
         }
         let text = plain(&view);
-        assert!(text[0].starts_with('╭') && text[0].contains("tasks 1/3"));
+        assert!(text[0].starts_with('╭') && text[0].contains("Plan ▰▰▰▱▱▱▱▱ 1/3 done"));
         assert!(text.last().unwrap().starts_with('╰'));
         assert!(text.last().unwrap().contains("Ctrl+F next tab"));
         let joined = text.join("\n");

@@ -477,7 +477,7 @@ pub(super) static EFFICIENCY: &[SettingDef] = &[
         MO,
         "Roles & Sampling",
         "Preserve task inputs",
-        "Capture bounded root-level inputs before an unattended task starts (off by default). Independent bytes are retained outside the workspace; hidden, credential-like, oversized and linked sources are skipped.",
+        "Capture bounded root-level inputs before an unattended task starts. Independent bytes are retained outside the workspace; hidden, credential-like, oversized and linked sources are skipped. The model is told only when an original disappears or shrinks.",
         Kind::Bool,
         true
     ),

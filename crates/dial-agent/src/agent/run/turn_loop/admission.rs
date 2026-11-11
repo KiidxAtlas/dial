@@ -270,13 +270,12 @@ impl Agent<'_> {
                 .is_none()
             && let (Some(checkpoints), Some(turn)) = (&self.checkpoints, checkpoint_turn)
         {
+            // Silent: an up-front "copies exist" note made changing the originals look safe.
+            // `note_preserved_input_changes` names the copy only once an original is lost.
             let preserved = crate::tools::preserve_task_inputs(&self.workspace, checkpoints, turn);
-            let count = preserved["files"].as_array().map_or(0, Vec::len);
             let mut state = self.session.control_state();
             state["preserved_inputs"] = preserved;
             self.session.set_control_state(state)?;
-            self.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Review,
-                format!("Initial task preservation retained {count} bounded root-level source files as independent artifacts for recovery; they do not make changes to the originals safe. Hidden, credential-like, linked and oversized sources are excluded; this is not an atomic live-database snapshot. Look at inputs with read-only tools (read, xxd, sqlite3 -readonly) before running a program that may rewrite them. If an input disappears or shrinks, its retained reference will be reported. Recover actual evidence; never invent missing records or report guessed data as recovered.")))?;
         }
         let names = self.offered();
         let schemas = self.schemas(&names)?;

@@ -20,11 +20,11 @@ Finish the request and its checks; plans and progress reports do not complete im
 pub(crate) const TOOL_POLICY: &str = "
 
 # Tool policy
-- Inspect the requested target, owner and evidence with the most precise tool available, then act on supported, reversible choices.
+- Inspect target, owner and evidence with the most precise tool available; act on supported, reversible choices.
 - Ask one concise question only when investigation leaves an ambiguity that materially changes correctness, scope or authorization.
-- Read a file before editing it.
+- Read a file before editing it. Inspect task inputs with `read` before mutation.
 - Produce data and generated files with code that also checks the result.
-- Keep tool arguments short; omit narration comments in scripts and prefer edit for localized changes.";
+- Keep tool arguments short; no script narration; use edit for local changes.";
 pub(crate) const LEAN_BATCHING: &str = "
 - Send independent reads and searches as parallel tool calls in one response, along with disjoint edits and routine todo updates; `&&`-chain dependent commands, verify after the edits a check covers, and reuse unchanged evidence.";
 pub(crate) const LEAN_ONE_CALL: &str = "

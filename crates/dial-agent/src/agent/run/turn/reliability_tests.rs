@@ -1114,6 +1114,47 @@ fn an_auto_backgrounded_command_loads_bg_for_the_next_request() {
     );
 }
 
+/// Unattended runs copy task inputs silently: the first request carries no preservation note,
+/// and the model hears of a copy only when its original is lost, with the artifact named.
+#[test]
+fn a_lost_task_input_is_reported_with_its_retained_copy_and_no_upfront_note() {
+    struct Quiet;
+    impl Ui for Quiet {}
+    let server = llm::fake::serve(vec![
+        response("", Some(("bash", json!({"command":"rm main.db-wal"})))),
+        slots(),
+        response("The WAL file is gone.", None),
+    ]);
+    with_agent(
+        "approval='auto'\n[compaction]\nenabled=false\n[verification]\nenabled=false",
+        |agent| {
+            std::fs::write(agent.workspace.root().join("main.db-wal"), b"original WAL").unwrap();
+            connect(agent, &server.url);
+            agent.modes.launch.unattended = true;
+            agent.turn("Recover the database.", &mut Quiet).unwrap();
+        },
+    );
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 2);
+    let first = requests[0].to_string();
+    assert!(!first.contains("Initial task preservation"), "{first}");
+    assert!(!first.contains("input_evidence_changed"), "{first}");
+    let result = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        result.contains("<dial-notice kind=\"input_evidence_changed\">")
+            && result.contains("main.db-wal"),
+        "{result}"
+    );
+}
+
 #[test]
 fn an_auto_backgrounded_eval_cell_does_not_stop_the_turn_as_uncertain() {
     if let Err(reason) = crate::tools::exec::eval::prepare_containment() {

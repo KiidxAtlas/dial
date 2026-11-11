@@ -28,6 +28,8 @@ pub const MAX_WIDTH: usize = 100;
 pub const MIN_ROWS: usize = 4;
 /// Recorded reason or finding lines shown under the steps.
 const DETAIL_LINES: usize = 3;
+/// Fixed-width progress indicator in the live card header.
+const PROGRESS_CELLS: usize = 8;
 
 /// The card's view.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -99,11 +101,10 @@ pub fn rows(
                 .map(|task| tasks::task_spans(task, "", theme, spinner, false)),
         );
         let inner = body.len();
-        let (closed, total) = todo.progress();
         return card(
             theme,
             card_w,
-            Some(&format!("tasks {closed}/{total}")),
+            Some(&plan_title(todo, theme)),
             None,
             body,
             inner,
@@ -123,8 +124,7 @@ pub fn rows(
     ));
     // Content-sized: the card is as tall as its rows, within the space the caller allows.
     let inner = body.len().min(max_rows - 2);
-    let (closed, total) = todo.progress();
-    let top = format!("tasks {closed}/{total}");
+    let top = plan_title(todo, theme);
     let hint = format!("{} next tab", facts.tab_key);
     card(
         theme,
@@ -133,6 +133,24 @@ pub fn rows(
         (!facts.tab_key.is_empty()).then_some(hint.as_str()),
         body,
         inner,
+    )
+}
+
+/// The live plan uses the same compact progress language as the transcript cards.
+fn plan_title(todo: &TodoList, theme: &Theme) -> String {
+    let (closed, total) = todo.progress();
+    let filled = (closed * PROGRESS_CELLS)
+        .div_ceil(total.max(1))
+        .min(PROGRESS_CELLS);
+    let (full, empty) = if theme.ascii() {
+        ("#", "-")
+    } else {
+        ("▰", "▱")
+    };
+    format!(
+        "Plan {}{} {closed}/{total} done",
+        full.repeat(filled),
+        empty.repeat(PROGRESS_CELLS - filled)
     )
 }
 

@@ -1238,8 +1238,7 @@ impl SettingsOverlay {
         if def.path == "improve.teach" {
             return true;
         }
-        let learning = Self::learning_setting(def);
-        !self.learning_only || learning
+        !self.learning_only || Self::learning_setting(def)
     }
     fn filter_tabs(&mut self) {
         self.tabs = crate::config::schema::tabs()

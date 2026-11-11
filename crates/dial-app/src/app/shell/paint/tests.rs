@@ -257,6 +257,48 @@ fn bottom_chrome_leaves_the_transcript_most_of_an_80x24_terminal() {
     shell.paint(None).unwrap();
 }
 
+#[test]
+fn plan_is_live_only_and_evidence_and_mode_remain_available() {
+    use crate::ui::work_panel::Tab;
+
+    for (cols, rows) in [(50, 24), (80, 24), (120, 40)] {
+        for tab in Tab::ALL {
+            let (_home, _project, _app, mut shell) = super::super::testkit::shell();
+            let capture = Capture::default();
+            shell.term = crate::ui::term::with_writer(Box::new(capture.clone()), (cols, rows));
+            shell.home = None;
+            shell.work_tab = tab;
+            shell.status.sandbox = "workspace".into();
+            shell.todo.call(&serde_json::json!({"op": "set", "tasks": [
+                {"content": "Unique plan step"},
+                {"content": "Second step"}
+            ]}));
+            for _ in 0..3 {
+                shell.paint(None).unwrap();
+            }
+            let mut parser = vt100::Parser::new(rows, cols, 100);
+            parser.process(&capture.0.lock().unwrap());
+            let shown = parser.screen().contents();
+            let expected = usize::from(tab == Tab::Plan || cols < 90);
+            assert_eq!(
+                shown.matches("Unique plan step").count(),
+                expected,
+                "{cols}x{rows} {tab:?}: {shown}"
+            );
+            if cols == 120 && tab == Tab::Plan {
+                assert!(shown.contains("Plan ▱▱▱▱▱▱▱▱ 0/2 done"), "{shown}");
+            }
+            if cols == 120 {
+                match tab {
+                    Tab::Evidence => assert!(shown.contains("no evidence recorded yet"), "{shown}"),
+                    Tab::Mode => assert!(shown.contains("sandbox"), "{shown}"),
+                    Tab::Plan => {}
+                }
+            }
+        }
+    }
+}
+
 /// Shared capture of everything the inline terminal writes, replayed into a screen emulator.
 #[derive(Clone, Default)]
 struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

@@ -74,9 +74,19 @@ pub struct SettingDef {
 impl SettingDef {
     /// Original metadata remains searchable after presentation-only regrouping.
     pub fn search_location(&self) -> (&'static str, &'static str) {
-        declarations()
-            .chain(management::DECLARATIONS)
-            .find(|def| def.path == self.path)
+        // A settings search asks this for every row, often several times per keypress.
+        // Index immutable declarations once instead of scanning the entire schema per row.
+        static ORIGINAL: std::sync::LazyLock<
+            std::collections::HashMap<&'static str, &'static SettingDef>,
+        > = std::sync::LazyLock::new(|| {
+            let mut locations = std::collections::HashMap::new();
+            for def in declarations().chain(management::DECLARATIONS) {
+                locations.entry(def.path).or_insert(def);
+            }
+            locations
+        });
+        ORIGINAL
+            .get(self.path)
             .map_or((self.tab, self.section), |def| (def.tab, def.section))
     }
     /// Goal-oriented discovery terms shared by every settings surface. These are static

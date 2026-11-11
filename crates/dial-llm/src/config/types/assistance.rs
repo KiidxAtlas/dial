@@ -317,8 +317,8 @@ pub const MAX_BATCH_RESULT_PERCENT: u32 = 80;
 #[serde(default, deny_unknown_fields)]
 pub struct EfficiencyConfig {
     pub enabled: bool,
-    /// Bounded initial source preservation in unattended task sessions. Off by default: its
-    /// notice led the model to treat changing task inputs as safe.
+    /// Bounded initial source preservation in unattended task sessions. The copies are taken
+    /// silently; the model hears of one only when its original disappears or shrinks.
     pub preserve_task_inputs: bool,
     /// Unattended work rounds without new independent evidence before a blocked stop; 0 off.
     pub evidence_stall_rounds: u32,
@@ -346,7 +346,7 @@ impl Default for EfficiencyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            preserve_task_inputs: false,
+            preserve_task_inputs: true,
             evidence_stall_rounds: 32,
             small_case_guard: true,
             ambient_context_bytes: 8192,

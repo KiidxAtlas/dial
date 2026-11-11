@@ -224,6 +224,11 @@ pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
     {
         return Vec::new();
     }
+    // Task state lives in the work panel, not in a second transcript plan. Keep
+    // failures and refusals visible; the calls remain recorded in session history.
+    if t.name == "todo" && matches!(t.state, ToolState::Running | ToolState::Completed) {
+        return Vec::new();
+    }
     if let Some((server, action)) = t
         .name
         .strip_prefix("mcp__")

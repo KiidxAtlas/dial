@@ -70,7 +70,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-15, ubuntu-22.04]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.event_name == 'push' && matrix.os == 'macos-15' && vars.DIAL_MACOS_RUNNER || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux sandbox
@@ -146,7 +146,14 @@ jobs:
         # cargo-nextest runs every test binary at once, one process per test (.config/nextest.toml
         # fails a test still running after 5 minutes); `cargo test` ran the binaries one after
         # another. Doctests still run under `cargo test --doc`.
-        run: make test-nextest TEST_PROFILE=ci
+        run: make test-nextest TEST_PROFILE=ci NEXTEST_PROFILE=ci
+      - name: Preserve per-test timing and failures
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-timings-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
       # The steps below exercise the installed binary, real terminals and runtime overhead. They
       # are not architecture-sensitive, so only Ubuntu runs them; the macOS job ends after its tests
       # instead of adding about ten minutes to the CI critical path. `make preflight` runs the same
@@ -192,7 +199,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, macos-15, windows-2025]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.event_name == 'push' && matrix.os == 'macos-15' && vars.DIAL_MACOS_RUNNER || github.event_name == 'push' && matrix.os == 'windows-2025' && vars.DIAL_WINDOWS_RUNNER || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust and Clippy
@@ -201,8 +208,12 @@ jobs:
           rustup component add clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: lint-${{ matrix.os }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Linux checks and feature coverage use the same dev-profile dependency artifacts.
+          # Reuse the existing feature cache instead of storing another ~400 MB copy.
+          shared-key: ${{ matrix.os == 'ubuntu-22.04' && 'features-ubuntu-22.04' || '' }}
+          key: ${{ matrix.os != 'ubuntu-22.04' && format('lint-{0}', matrix.os) || '' }}
+          # The largest feature selection remains the sole writer of the shared Linux cache.
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.os != 'ubuntu-22.04' }}
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
@@ -276,7 +287,7 @@ jobs:
   windows-rust:
     name: Windows Rust contract
     needs: validate
-    runs-on: windows-2025
+    runs-on: ${{ github.event_name == 'push' && vars.DIAL_WINDOWS_RUNNER || 'windows-2025' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6

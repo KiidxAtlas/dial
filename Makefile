@@ -16,6 +16,8 @@ KEEP_BACKUPS ?= 3
 PYTHON ?= python3
 NODE ?= node
 TEST_PROFILE ?= dev
+# Nextest's reporting profile is independent of Cargo's optimization profile.
+NEXTEST_PROFILE ?= default
 DIAL ?= $(BUILD_DIR)/dial
 
 
@@ -97,7 +99,7 @@ test-module:
 test-nextest:
 	$(PYTHON) scripts/test-prerequisites.py
 	@command -v cargo-nextest >/dev/null 2>&1 || { printf '%s\n' 'cargo-nextest is not installed: https://nexte.st (or use make test-rust)' >&2; exit 2; }
-	$(CARGO) nextest run --locked --workspace --no-fail-fast --cargo-profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(CARGO) nextest run --locked --workspace --no-fail-fast --cargo-profile $(TEST_PROFILE) --profile $(NEXTEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 	$(CARGO) test --locked --workspace --doc --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 
 lint:
@@ -134,6 +136,7 @@ test-packaging:
 test-release-policy:
 	$(PYTHON) scripts/test-prerequisites.py release-policy
 	$(PYTHON) scripts/test-release-policy.py
+	$(PYTHON) scripts/test-benchmark-release.py
 
 # No compilation, dependency installation, network, staging or publication. Aggregate cheap
 # failures so callers see all prerequisites before deciding to run an expensive tier.

@@ -350,20 +350,54 @@ class CandidatePromotionTests(unittest.TestCase):
         self.assertIn("if: needs.gate.outputs.candidates == ''", release)
         self.assertIn("run-id: ${{ needs.gate.outputs.candidates }}", release)
         self.assertIn('identity "$GITHUB_SHA" dist/candidate.json', release)
-        self.assertIn("file: Dockerfile.release", release)
-        self.assertIn("Smoke-test published container", release)
+        publication = (root / '.github/workflows/release-publish.yml').read_text()
+        self.assertIn('uses: ./.github/workflows/release-publish.yml', release)
+        self.assertIn('file: Dockerfile.release', publication)
+        self.assertIn('Smoke-test published container', publication)
 
-    def test_intel_pip_cache_is_lock_keyed_main_only_and_keeps_hash_checks(self):
-        root = SCRIPT.parent.parent
-        for filename, job in (("release-build.yml", "build"),):
-            with self.subTest(workflow=filename):
-                source = (root / ".github/workflows" / filename).read_text()
-                block = source.split(f"\n  {job}:\n", 1)[1].split("\n\n  ", 1)[0]
-                setup = block.split("uses: actions/setup-python@", 1)[1].split("\n      - ", 1)[0]
-                self.assertIn("python-version: '3.12'", setup)
-                self.assertIn("cache: ${{ github.ref == 'refs/heads/main' && runner.os == 'macOS' && runner.arch == 'X64' && 'pip' || '' }}", setup)
-                self.assertIn("cache-dependency-path: scripts/requirements-ci.lock", setup)
-                self.assertIn("--require-hashes -r scripts/requirements-ci.lock", block)
+    def test_preparation_is_parallel_but_all_latest_writers_are_serialized(self):
+        root = SCRIPT.parent.parent / '.github/workflows'
+        release = (root / 'release.yml').read_text()
+        publication = (root / 'release-publish.yml').read_text()
+        self.assertNotIn('\nconcurrency:', release)
+        self.assertIn('group: release-publish', publication)
+        self.assertIn('queue: max', publication)
+        self.assertIn('cancel-in-progress: false', publication)
+        for job in ('publish', 'packaging', 'container'):
+            self.assertIn(f'\n  {job}:\n', publication)
+        self.assertNotIn('needs: sign', publication)
+        self.assertNotIn('needs: [publish, gate]', publication)
+        self.assertNotIn('DIAL_RELEASE_SIGNING_KEY', publication)
+        self.assertIn('release-publish.yml@$GITHUB_REF', publication)
+        self.assertNotIn('release.yml@$GITHUB_REF', publication)
+
+    def test_successful_promotion_does_not_skip_publication(self):
+        release = (SCRIPT.parent.parent / '.github/workflows/release.yml').read_text()
+        publish = release.split('\n  publish:\n', 1)[1]
+        self.assertIn('needs: sign', publish)
+        self.assertIn("if: ${{ !cancelled() && needs.sign.result == 'success' }}", publish)
+        self.assertIn('uses: ./.github/workflows/release-publish.yml', publish)
+
+    def test_candidates_keep_artifact_checks_without_repeating_portable_installer_suite(self):
+        root = SCRIPT.parent.parent / '.github/workflows'
+        candidates = (root / 'release-build.yml').read_text()
+        ci = (root / 'ci.yml').read_text()
+        self.assertNotIn('bash scripts/test-install.sh', candidates)
+        self.assertNotIn('requirements-ci.lock', candidates.split('\n  windows-build:', 1)[0].split('\n  build:', 1)[1])
+        self.assertIn('run: make test-install', ci)
+        self.assertIn('python3 scripts/check-artifact.py', candidates)
+        self.assertIn('Test installer under Windows PowerShell 5.1', candidates)
+        self.assertIn('Test installer under PowerShell 7', candidates)
+
+    def test_linux_lint_reuses_feature_dependencies_without_competing_cache_writers(self):
+        workflows = SCRIPT.parent.parent / '.github/workflows'
+        ci = (workflows / 'ci.yml').read_text().split('\n  lint:\n', 1)[1].split('\n  musl:\n', 1)[0]
+        features = (workflows / 'linux-features.yml').read_text()
+        self.assertIn("shared-key: ${{ matrix.os == 'ubuntu-22.04' && 'features-ubuntu-22.04' || '' }}", ci)
+        self.assertIn("key: ${{ matrix.os != 'ubuntu-22.04' && format('lint-{0}', matrix.os) || '' }}", ci)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' && matrix.os != 'ubuntu-22.04' }}", ci)
+        self.assertIn('shared-key: features-${{ matrix.os }}', features)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' && matrix['save-cache'] }}", features)
 
 
 class ContainerStagingTests(unittest.TestCase):

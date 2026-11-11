@@ -236,6 +236,10 @@ fn generated_artifact_policy_reaches_all_builtin_message_profiles() {
         assert_eq!(policy.matches(marker).count(), 1, "{policy}");
         assert!(policy.contains("Read a file before editing it"), "{policy}");
         assert!(
+            policy.contains("Inspect task inputs with `read`"),
+            "{policy}"
+        );
+        assert!(
             policy.contains("none of this guidance widens your permissions"),
             "{policy}"
         );

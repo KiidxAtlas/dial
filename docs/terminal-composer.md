@@ -69,9 +69,11 @@ Write, paste and edit drafts without losing your place; understand the launch sc
 - The default status line leads with the approval mode as a colored dot and plain label
   (`● Ask first`, `Edit freely`, `Full auto`, `Read-only`): green for ask and read-only, orange for
   full auto. Config, CLI and `/approval` values stay `ask`, `write`, `auto` and `readonly`.
-- **Work panel.** While a plan has open steps on a terminal at least 90 columns wide, one compact
-  rounded card sits above the composer. It is as tall as its content and at most 100 columns wide.
-  Its tab strip shows `plan`, `evidence` and `mode`, switched with `Ctrl+X` (or `Alt+W` or
+- **Work panel.** The plan lives above the composer, not in repeated transcript cards. Successful
+  plan calls are hidden from the transcript; failures remain visible and session history retains the calls.
+  While a plan has open steps on a terminal at least 90 columns wide, one compact rounded card
+  shows a `Plan` header with a progress bar and completed/total count. It is as tall as its content
+  and at most 100 columns wide. Its tab strip shows `plan`, `evidence` and `mode`, switched with `Ctrl+X` (or `Alt+W` or
   `F12`; rebind `app.work.tab`). The plan tab lists the steps with status dots (a green check for
   done, an orange dot for the step in progress, a hollow ring for pending) and the focused step's
   recorded reason or finding; when the card is short it keeps the focused step and drops reason

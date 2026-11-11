@@ -72,6 +72,22 @@ pub fn default_rules() -> Vec<Rule> {
             "read",
             "Use the `read` tool with offset/limit instead of sed -n 'A,Bp'.",
         ),
+        // Read-like sqlite3 opens only (a bare database, or a SELECT/PRAGMA/dot-command). A
+        // writable open can checkpoint and delete a `-wal` file; `-readonly` opens are left alone.
+        Rule {
+            flags: Some("i".to_owned()),
+            ..rule(
+                r#"^\s*sqlite3(?!.*\s-readonly\b)\s+(?:-\S+\s+)*[^\s-]\S*(?:\s*$|\s+["']?\s*(?:select|pragma|\.(?:tables|schema|dump|indexes)))"#,
+                "read",
+                "Use the `read` tool to inspect a database without changing it (`:table` pages rows). A writable sqlite3 open can merge and delete its -wal file; use `sqlite3 -readonly` for queries.",
+            )
+        },
+        // `xxd -r` writes bytes back and keeps the shell.
+        rule(
+            r"^\s*(?:xxd(?!.*\s-r\b)|hexdump|od)\s+",
+            "read",
+            "Use the `read` tool with `:bytes=O+N` for a hex view instead of xxd/hexdump/od.",
+        ),
         rule(
             r"^\s*(grep|rg|ripgrep|ag|ack)\s+",
             "grep",

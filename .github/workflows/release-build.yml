@@ -79,7 +79,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-musl
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.event_name == 'push' && matrix.os == 'macos-15' && vars.DIAL_MACOS_RUNNER || matrix.os }}
     defaults:
       run:
         shell: bash
@@ -88,21 +88,13 @@ jobs:
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap musl-tools
-      - name: Install OpenSSL 3 on macOS
-        if: runner.os == 'macOS'
-        run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-          # Share the Intel wheel cache with main CI; avoid isolated PR/tag caches.
-          cache: ${{ github.ref == 'refs/heads/main' && runner.os == 'macOS' && runner.arch == 'X64' && 'pip' || '' }}
-          cache-dependency-path: scripts/requirements-ci.lock
       - name: Install Rust
         run: |
           rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
-      - name: Install installer test dependencies
-        run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
       - name: Ensure Rosetta for the x86_64 macOS smoke test
         if: matrix.target == 'x86_64-apple-darwin'
         run: /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
@@ -116,8 +108,6 @@ jobs:
           key: release-${{ matrix.target }}${{ matrix.cache-suffix }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Test terminal installer
-        run: bash scripts/test-install.sh
       - name: Build release binary
         env:
           MACOSX_DEPLOYMENT_TARGET: '13.0'
@@ -162,7 +152,7 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.event_name == 'push' && matrix.os == 'windows-2025' && vars.DIAL_WINDOWS_RUNNER || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust
