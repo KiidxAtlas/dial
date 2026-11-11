@@ -158,21 +158,11 @@ impl Shell {
     }
 
     /// One terminal event during a blocking wait. An open panel gets it first, as in a turn:
-    /// Escape or the first stop key closes the panel, and only a stop key with no panel open
-    /// cancels the wait. Otherwise keys, paste and resize use the composer and command routing
+    /// Escape steps back, the stop key closes the panels ((`overlay::run::stop_key_leaves_panels`)), and only a
+    /// stop key with no panel open cancels the wait. Otherwise keys, paste and resize use the composer and command routing
     /// that turns use, so typed and queued work is kept rather than discarded.
     fn wait_event(&mut self, app: &App, event: Event) -> Result<WaitFlow> {
         if self.busy_overlay.is_some() {
-            let close = matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release
-                && self.keys.matches(Action::Interrupt, key)
-                && !self.keys.matches(Action::SelectCancel, key));
-            if close {
-                if let Some(state) = &mut self.busy_overlay {
-                    state.next = None;
-                }
-                self.finish_busy_overlay(app)?;
-                return Ok(WaitFlow::Continue);
-            }
             return Ok(if self.step_busy_overlay(app, Some(event))? {
                 WaitFlow::Stop
             } else {

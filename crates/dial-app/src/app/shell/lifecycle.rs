@@ -43,7 +43,9 @@ impl Shell {
         mut term: InlineTerminal,
     ) -> Result<Shell> {
         term.clear_screen()?;
-        let dark = terminal_dark(std::env::var("COLORFGBG").ok().as_deref());
+        // The terminal's own answer to the background query wins; `COLORFGBG` is the fallback.
+        let dark = crate::ui::termcaps::reported_background_dark()
+            .or_else(|| terminal_dark(std::env::var("COLORFGBG").ok().as_deref()));
         let (keys, warnings) = Keymap::load(&app.layout.user_dir);
         let themes = ThemeManager::new(&app.layout.user_dir, &app.config.ui, dark);
         let history = settings_store::load_history(&app.layout, app.config.ui.history_limit)
@@ -416,7 +418,9 @@ impl Shell {
                     .to_owned(),
                 project: crate::ui::statusline::tilde(
                     &app.layout.project_root.display().to_string(),
-                    std::env::var("HOME").ok().as_deref(),
+                    crate::config::paths::home_dir()
+                        .map(|home| home.to_string_lossy().into_owned())
+                        .as_deref(),
                 ),
                 tips,
                 recent,

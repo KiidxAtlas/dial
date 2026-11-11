@@ -59,7 +59,7 @@ pub fn parse_thinking(value: &str) -> std::result::Result<CliThinking, String> {
     }
     let invalid = || {
         format!(
-            "Invalid --thinking value: {value:?}. Expected one of: {}.",
+            "unknown thinking level; expected one of: {}",
             THINKING_SELECTORS
                 .iter()
                 .map(|(name, _)| *name)

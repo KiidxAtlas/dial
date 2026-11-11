@@ -53,6 +53,13 @@ pub fn is_group_leader(pid: u32) -> bool {
     super::imp::process::is_group_leader(pid)
 }
 
+/// Whether `pid` belongs to the process group led by `leader`: inside the Job Object Dial created
+/// for that group, descendants included. Used to prove a listener's ownership.
+#[cfg(windows)]
+pub fn in_group(leader: u32, pid: u32) -> bool {
+    super::imp::process::in_group(leader, pid)
+}
+
 /// True once `child` has exited, without reaping it, so its PID stays reserved (Unix:
 /// `waitid(WNOWAIT)`; Windows: the process handle, held by `Child`, is signalled).
 pub fn exited(child: &Child) -> io::Result<bool> {

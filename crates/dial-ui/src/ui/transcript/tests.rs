@@ -2190,22 +2190,39 @@ fn message_timestamps_replay_only_recorded_times_and_live_deltas_keep_start_time
     transcript.assistant_delta_at(" reply", "2026-10-01T10:02:00.000Z");
     transcript.finish_turn();
     let rows = plain(&transcript.all_rows(80, &env.ctx()));
+    let (earlier, reply) = (
+        shown_at("2026-10-01T10:00:00"),
+        shown_at("2026-10-01T10:01:00"),
+    );
     assert!(
         rows.iter()
-            .any(|row| row.contains("You · 2026-10-01 10:00:00 UTC")),
+            .any(|row| row.contains(&format!("You · {earlier}"))),
         "{rows:?}"
     );
     assert!(
         rows.iter()
-            .any(|row| row.contains("Assistant · 2026-10-01 10:01:00 UTC")),
+            .any(|row| row.contains(&format!("Assistant · {reply}"))),
         "{rows:?}"
     );
     assert_eq!(
-        rows.iter().filter(|row| row.contains(" UTC")).count(),
+        rows.iter()
+            .filter(|row| row.contains("You · ") || row.contains("Assistant · "))
+            .count(),
         2,
         "unknown history must not acquire a time: {rows:?}"
     );
-    assert!(!rows.iter().any(|row| row.contains("10:02:00")));
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains(&shown_at("2026-10-01T10:02:00")))
+    );
+}
+
+/// How the transcript shows a recorded UTC time: local time, or labelled UTC when unconvertible.
+fn shown_at(utc: &str) -> String {
+    let secs = crate::platform::time::parse_utc(utc).unwrap();
+    crate::platform::time::local_stamp(u64::try_from(secs).unwrap() * 1000)
+        .unwrap_or_else(|| format!("{} UTC", utc.replace('T', " ")))
 }
 
 #[test]
@@ -2240,7 +2257,9 @@ fn timestamped_stream_spills_live_without_repeating_header_or_text() {
     delivered.extend(t.take_settled(40, &ctx));
     let shown = text_of(&delivered);
     assert_eq!(
-        shown.matches("Assistant · 2026-10-01 10:01:00 UTC").count(),
+        shown
+            .matches(&format!("Assistant · {}", shown_at("2026-10-01T10:01:00")))
+            .count(),
         1,
         "the header is delivered once: {shown}"
     );
@@ -2258,7 +2277,7 @@ fn invalid_timestamps_and_nonfinite_token_rates_are_not_displayed() {
     assert!(
         !plain(&transcript.all_rows(40, &env.ctx()))
             .iter()
-            .any(|row| row.contains(" UTC"))
+            .any(|row| row.contains("You · "))
     );
     for rate in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
         let mut transcript = Transcript::new();

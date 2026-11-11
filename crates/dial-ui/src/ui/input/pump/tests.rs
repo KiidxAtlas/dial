@@ -88,6 +88,28 @@ fn reader_events_are_delivered_in_order() {
 }
 
 #[test]
+fn focus_reports_update_focus_state_and_are_not_delivered() {
+    let pump = pump();
+    let probe = Arc::new(Probe::default());
+    let idle_probe = Arc::new(Probe::default());
+    let mut idle = Scripted::boxed(Vec::new(), &idle_probe);
+    pump.start(Scripted::boxed(
+        vec![Event::FocusLost, resize(1), Event::FocusGained, resize(2)],
+        &probe,
+    ))
+    .expect("start");
+    assert_eq!(pump.read_with(idle.as_mut()).expect("read"), resize(1));
+    assert_eq!(pump.read_with(idle.as_mut()).expect("read"), resize(2));
+    assert!(crate::ui::termcaps::terminal_focused());
+    pump.stop();
+    // Stopped: a direct read consumes focus reports too.
+    let mut direct = Scripted::boxed(vec![Event::FocusLost, resize(3)], &idle_probe);
+    assert_eq!(pump.read_with(direct.as_mut()).expect("read"), resize(3));
+    assert!(!crate::ui::termcaps::terminal_focused());
+    crate::ui::termcaps::set_focus(None);
+}
+
+#[test]
 fn stop_joins_the_reader_and_queued_events_survive_a_restart() {
     let pump = pump();
     let first = Arc::new(Probe::default());

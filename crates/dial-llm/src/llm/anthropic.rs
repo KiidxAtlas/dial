@@ -529,10 +529,12 @@ impl Accumulator {
                 }
                 if let Some(raw) = self.arguments.remove(&index) {
                     // No-argument tools stream a single empty `partial_json`; that means `{}`.
+                    // Unparseable text is kept verbatim so the refusal can show the model its input.
                     self.blocks.get_mut(&index).unwrap()["input"] = if raw.trim().is_empty() {
                         json!({})
                     } else {
-                        super::json_repair::parse_arguments(&raw).unwrap_or(Value::Null)
+                        super::json_repair::parse_arguments(&raw)
+                            .unwrap_or_else(|| Value::String(raw.clone()))
                     };
                 }
             }

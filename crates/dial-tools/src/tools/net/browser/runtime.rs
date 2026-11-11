@@ -151,8 +151,13 @@ pub(super) fn install_chromium(
         .args(["install", "chromium"])
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        // Only a set HOME: libuv's os.homedir() prefers HOME, so an empty one hides USERPROFILE.
+        .envs(std::env::var_os("HOME").map(|home| ("HOME", home)))
         .env("TMPDIR", std::env::temp_dir())
+        // Windows Node ignores TMPDIR; without TEMP/TMP it falls back to %SystemRoot%\temp.
+        .env("TEMP", std::env::temp_dir())
+        .env("TMP", std::env::temp_dir())
+        .envs(crate::tools::exec::sandbox::windows_system_env())
         .env("PLAYWRIGHT_BROWSERS_PATH", &runtime.browsers)
         .current_dir(&runtime.root);
     std::fs::create_dir_all(&runtime.browsers)

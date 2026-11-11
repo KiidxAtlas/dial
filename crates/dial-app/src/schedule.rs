@@ -96,9 +96,11 @@ pub fn parse_duration(text: &str) -> Result<u64> {
         text.find(|c: char| !c.is_ascii_digit())
             .unwrap_or(text.len()),
     );
-    let n: u64 = number
-        .parse()
-        .with_context(|| format!("invalid duration {text:?}"))?;
+    let Ok(n) = number.parse::<u64>() else {
+        bail!(
+            "invalid duration {text:?}; use a number with s, m, h or d, such as 30s, 5m, 2h or 1d"
+        );
+    };
     let unit = match unit {
         "" | "s" => 1,
         "m" => 60,

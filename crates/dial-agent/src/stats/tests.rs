@@ -279,11 +279,12 @@ fn rollups_sum_exactly_and_derive_rates() {
     );
     assert_eq!(o.priced_requests, 2);
     assert!((o.cost_usd - 0.75).abs() < 1e-9);
-    assert_eq!(o.duration_ms, 7500);
-    assert!((o.tokens_per_second.unwrap() - 900.0 / 7.5).abs() < 1e-9);
+    // The failed request's 500 ms is not model time, and latency averages the 3 answers.
+    assert_eq!(o.duration_ms, 7000);
+    assert!((o.tokens_per_second.unwrap() - 900.0 / 7.0).abs() < 1e-9);
     assert!((o.cache_rate.unwrap() - 2000.0 * 100.0 / 4500.0).abs() < 1e-9);
     assert!((o.error_rate.unwrap() - 25.0).abs() < 1e-9);
-    assert!((o.avg_latency_ms.unwrap() - 1875.0).abs() < 1e-9);
+    assert!((o.avg_latency_ms.unwrap() - 7000.0 / 3.0).abs() < 1e-9);
 
     let a = report.by_model.iter().find(|g| g.key == "a").unwrap();
     assert_eq!(

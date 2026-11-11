@@ -419,6 +419,20 @@ pub(crate) fn drain_stdout(timeout: Option<Duration>) -> io::Result<()> {
     }
 }
 
+/// Whether a panic message is `print!`'s failure on a closed stdout reader (EPIPE on Unix,
+/// ERROR_BROKEN_PIPE / ERROR_NO_DATA on Windows). Other stdout failures keep their panic.
+pub fn is_closed_stdout_panic(message: &str) -> bool {
+    message.starts_with("failed printing to stdout")
+        && [
+            "Broken pipe",
+            "(os error 32)",
+            "(os error 109)",
+            "(os error 232)",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+}
+
 #[derive(Clone)]
 pub struct StdoutWriter {
     pipe: Arc<Pipe>,

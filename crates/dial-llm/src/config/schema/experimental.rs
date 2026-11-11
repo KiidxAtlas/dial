@@ -55,6 +55,19 @@ pub(super) static EXPERIMENTS: &[SettingDef] = &[
         Kind::Bool,
     ),
     field!(
+        "experimental.background_check_slots",
+        experimental.background_check_slots,
+        EX,
+        "Verification",
+        "Parallel background checks",
+        "How many configured background checks one edit may start together (needs experimental.background_checks). They run in parallel with each other inside one workspace serial-operation boundary, so they must tolerate running side by side (separate outputs, build locks). 1 keeps one at a time.",
+        Kind::Int {
+            min: 1,
+            max: 4,
+            step: 1
+        },
+    ),
+    field!(
         "experimental.video_analysis",
         experimental.video_analysis,
         EX,

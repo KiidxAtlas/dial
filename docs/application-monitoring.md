@@ -13,7 +13,7 @@ that every model will suggest it. You can request it directly:
 > Monitor the existing `site` background job for errors.
 
 The agent calls `monitor` with `action: "start"`, a unique `name`, and exactly one of
-`job`, `run` or `path`. **Every start/rearm asks for explicit approval**, even in automatic mode
+`job`, `run`, `path` or `after_secs`. **Every start/rearm asks for explicit approval**, even in automatic mode
 or with a reusable tool grant. Read-only mode refuses starts; deny rules still apply.
 There is no blanket approval of repairs: edits, commands, extra access and process control
 continue to follow existing permissions. Approving observation does not authorize killing
@@ -32,6 +32,30 @@ For an application already writing a project log file:
 ```json
 {"action":"start","name":"api-errors","path":"logs/api.log","pattern":"(?i)error|exception|traceback|fatal","duration_secs":3600}
 ```
+
+To be told when a job or named run finishes even if it never prints an error, add
+`on_exit`. Closed output without a match then wakes the session instead of disarming silently
+(the exit status itself comes from `bg list`/`bg output`):
+
+```json
+{"action":"start","name":"build-done","job":"build","on_exit":true,"note":"run the integration suite once the build finishes"}
+```
+
+## Timed wake-ups
+
+`after_secs` (1–86,400) arms a one-shot timer instead of watching a source, so the agent can
+come back later to recheck a deploy, a CI run or a slow external job without polling or
+holding the turn open:
+
+```json
+{"action":"start","name":"deploy-check","after_secs":600,"note":"recheck https://staging.example.com/health after the deploy"}
+```
+
+A timer takes no `pattern`. Its `duration_secs` (default one hour) is how long it stays
+deliverable after it is due, because delivery waits for an idle terminal. The optional `note`
+(up to 500 bytes, any watch) is the agent's own reminder of why it armed the watch; it is
+echoed when the watch fires and is not treated as a user instruction. Timers follow every
+wake-up and lifetime rule below, including approval, one-shot disarming and revocation.
 
 ## Foreground apps across sessions
 
@@ -112,11 +136,12 @@ stack-trace parser.
 ## Wake-up and lifetime
 
 While the **main interactive terminal is open and idle**, Dial polls approved sources
-at most once per second, without model calls for ordinary output. Matching output reserves
-bounded diagnostic context and disarms that watch. At a safe boundary, the agent resumes
-the existing user task to investigate, repair where permitted, and verify. Logs are framed
-as untrusted observations, never new user instructions or approval. Monitoring failures
-are reported as monitoring problems, not proof the application is broken.
+at most once per second, without model calls for ordinary output. Matching output, an
+`on_exit` closure or an elapsed timer reserves bounded context and disarms that watch. At a
+safe boundary, the agent resumes the existing user task: to investigate, repair where
+permitted and verify after an error, or to continue the step its note describes after a timer
+or exit. Logs are framed as untrusted observations, never new user instructions or approval.
+Monitoring failures are reported as monitoring problems, not proof the application is broken.
 
 - Human input, open panels and pending reconfiguration take priority. A busy agent does
   not receive a competing repair turn; new output is checked once it becomes idle.

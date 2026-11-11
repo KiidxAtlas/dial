@@ -1070,25 +1070,13 @@ fn app_shortcuts_come_from_the_keymap_and_remapping_is_honored() {
     }
     assert_eq!(c.draft(), "", "shortcuts never type text");
 
-    if cfg!(target_os = "macos") {
-        c.set_draft("keep this draft");
-        assert_eq!(
-            ctrl(&mut c, &env, 'k'),
-            ComposerEvent::Action(Action::ModelSelect)
-        );
-        assert_eq!(
-            c.draft(),
-            "keep this draft",
-            "model selection must not kill draft text"
-        );
-        c.set_draft("");
-        assert!(
-            screen(&c, &env, 110)
-                .last()
-                .unwrap()
-                .contains("Ctrl+K model")
-        );
-    }
+    // Ctrl+K is the editor's kill-line by default on every platform, never model selection.
+    c.set_draft("keep this draft");
+    press(&mut c, &env, KeyCode::Home);
+    press(&mut c, &env, KeyCode::Right);
+    assert_eq!(ctrl(&mut c, &env, 'k'), ComposerEvent::None);
+    assert_eq!(c.draft(), "k", "Ctrl+K cuts to the end of the line");
+    c.set_draft("");
 
     env.keys.rebind(Action::ModelSelect, &["Ctrl+K"]).unwrap();
     assert_eq!(
@@ -1209,6 +1197,30 @@ fn newline_keys_insert_and_enter_submits_without_trimming_or_sending_blanks() {
     assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
     assert_eq!(c.draft(), "   ", "whitespace is not discarded");
     assert_eq!(c.history().last().unwrap(), "one\ntwo\n\nthree");
+}
+
+#[test]
+fn shift_enter_and_mapped_line_feed_work_when_enhancement_detection_fails() {
+    let env = Env::new();
+    let mut c = composer();
+    c.keyboard_enhanced = Some(false);
+    typed(&mut c, &env, "one");
+    assert_eq!(
+        c.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &env.ctx()
+        ),
+        ComposerEvent::None
+    );
+    typed(&mut c, &env, "two");
+    // A terminal-side Shift+Enter -> 0x0A mapping is decoded as Ctrl+J.
+    ctrl(&mut c, &env, 'j');
+    typed(&mut c, &env, "three");
+    assert_eq!(c.draft(), "one\ntwo\nthree");
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit("one\ntwo\nthree".into())
+    );
 }
 
 #[test]
@@ -1566,17 +1578,39 @@ fn ctrl_d_exits_only_on_an_empty_idle_draft_and_esc_is_inert_when_idle() {
     let env = Env::new();
     let mut c = Composer::new(vec![], 10);
     assert_eq!(press(&mut c, &env, KeyCode::Esc), ComposerEvent::None);
+    assert_eq!(
+        ctrl(&mut c, &env, 'd'),
+        ComposerEvent::None,
+        "the first press only arms exit"
+    );
+    assert!(
+        lines(&c.view(80, &env.ctx()).rows)
+            .last()
+            .unwrap()
+            .contains("again to exit")
+    );
     assert_eq!(ctrl(&mut c, &env, 'd'), ComposerEvent::Exit);
+    // Any other key disarms it.
+    let mut c = Composer::new(vec![], 10);
+    ctrl(&mut c, &env, 'd');
+    press(&mut c, &env, KeyCode::Left);
+    assert_eq!(ctrl(&mut c, &env, 'd'), ComposerEvent::None);
     c.set_busy(true);
     assert_eq!(
         ctrl(&mut c, &env, 'd'),
         ComposerEvent::None,
         "never exits in the middle of a turn"
     );
+    assert_eq!(
+        ctrl(&mut c, &env, 'd'),
+        ComposerEvent::None,
+        "not even on a second press"
+    );
     assert_eq!(press(&mut c, &env, KeyCode::Esc), ComposerEvent::None);
     assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::Interrupt);
     c.set_busy(false);
     c.set_draft("keep");
+    assert_ne!(ctrl(&mut c, &env, 'd'), ComposerEvent::Exit);
     assert_ne!(ctrl(&mut c, &env, 'd'), ComposerEvent::Exit);
 }
 
@@ -2577,6 +2611,78 @@ fn file_completion_fuzzy_matches_and_preserves_surrounding_draft() {
         press(&mut c, &env, KeyCode::Enter),
         ComposerEvent::Submit("inspect @src/storage/session.rs ".into())
     );
+}
+
+#[test]
+fn file_completion_quotes_paths_with_spaces_so_the_reference_parses_whole() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_files(vec!["docs/My Notes.md".into(), "say \"hi\" now.txt".into()]);
+    typed(&mut c, &env, "read @mynotes");
+    press(&mut c, &env, KeyCode::Tab);
+    assert_eq!(c.draft(), "read @\"docs/My Notes.md\" ");
+    c.set_draft("");
+    typed(&mut c, &env, "@sayhi");
+    press(&mut c, &env, KeyCode::Tab);
+    assert_eq!(c.draft(), "@'say \"hi\" now.txt' ");
+    assert_eq!(quote_mention("plain/path.rs"), "plain/path.rs");
+}
+
+#[test]
+fn file_completion_works_mid_draft_but_cursor_movement_never_opens_it() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_files(vec!["src/storage/session.rs".into(), "src/app.rs".into()]);
+    c.set_draft("look at  and fix it");
+    for _ in 0.." and fix it".len() {
+        press(&mut c, &env, KeyCode::Left);
+    }
+    assert!(!c.menu_open());
+    typed(&mut c, &env, "@ssess");
+    assert!(
+        c.menu_open(),
+        "typing a mention mid-draft opens the file menu"
+    );
+    press(&mut c, &env, KeyCode::Tab);
+    assert_eq!(c.draft(), "look at @src/storage/session.rs and fix it");
+    assert!(!c.menu_open());
+    assert_eq!(
+        &c.draft()[c.editor.cursor..],
+        "and fix it",
+        "the cursor continues after the completed mention"
+    );
+    // Moving the cursor back to the end of an existing mention does not reopen the menu.
+    for _ in 0.." and fix it".len() {
+        press(&mut c, &env, KeyCode::Left);
+    }
+    press(&mut c, &env, KeyCode::Left);
+    press(&mut c, &env, KeyCode::Right);
+    assert!(!c.menu_open());
+}
+
+#[test]
+fn file_menu_matches_paths_only_and_an_exact_path_sends_on_the_first_enter() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_files(vec!["src/app.rs".into(), "notes.md".into()]);
+    // "project file" is every file's description; matching it would offer every file.
+    typed(&mut c, &env, "thanks @prof");
+    assert!(
+        !c.menu_open(),
+        "a word that only fits the description opens nothing"
+    );
+    c.set_draft("");
+    typed(&mut c, &env, "read @src/app.rs");
+    assert!(c.menu_open());
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit("read @src/app.rs".into()),
+        "the typed path already names the file, so Enter sends"
+    );
+    // A partial path still completes first.
+    typed(&mut c, &env, "read @srcapp");
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    assert_eq!(c.draft(), "read @src/app.rs ");
 }
 
 #[test]
@@ -4423,5 +4529,48 @@ fn deferred_independent_is_enqueued_once_when_the_turn_settles() {
             ("independent request".into(), true),
             ("independent request".into(), true)
         ]
+    );
+}
+
+#[test]
+fn narrow_menu_wraps_the_selected_description_and_keeps_its_height() {
+    let env = Env::new();
+    let mut c = Composer::new(vec![], 10);
+    c.set_commands(vec![
+        cmd(
+            "model",
+            "choose the main and new-session model; assign roles and tune sampling",
+            CommandKind::Builtin,
+        ),
+        cmd("mode", "show modes", CommandKind::Builtin),
+    ]);
+    typed(&mut c, &env, "/mo");
+    let first = screen(&c, &env, 60);
+    let shown = first.join("\n");
+    assert!(shown.contains("assign roles"), "{shown}");
+    assert!(shown.contains("tune sampling"), "{shown}");
+    press(&mut c, &env, KeyCode::Down);
+    let second = screen(&c, &env, 60);
+    assert_eq!(first.len(), second.len(), "{first:?}\n{second:?}");
+    assert!(first.iter().chain(&second).all(|r| text::width(r) <= 60));
+}
+
+#[test]
+fn the_busy_chooser_reopens_on_the_route_picked_last_and_still_waits_for_enter() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "first");
+    press(&mut c, &env, KeyCode::Enter);
+    press(&mut c, &env, KeyCode::Char('3'));
+    typed(&mut c, &env, "second");
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    assert!(c.choice_open(), "remembering never skips the chooser");
+    assert_eq!(c.draft(), "second");
+    press(&mut c, &env, KeyCode::Enter);
+    assert_eq!(
+        c.queued_messages(),
+        vec![("first".into(), true), ("second".into(), true)],
+        "Enter confirms the remembered After this turn"
     );
 }

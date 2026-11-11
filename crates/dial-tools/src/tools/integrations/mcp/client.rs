@@ -355,7 +355,7 @@ impl Client {
 
     /// Starts `program` and its helper threads. No protocol traffic yet; see [`Client::initialize`].
     pub(super) fn spawn(server: &str, config: &McpServerConfig, shared: Shared) -> Result<Client> {
-        let mut command = Command::new(&config.program);
+        let mut command = Command::new(launch_program(config));
         command
             .args(&config.args)
             .env_clear()
@@ -1003,6 +1003,18 @@ impl Drop for Client {
             Transport::Remote(remote) => remote.shutdown(),
         }
     }
+}
+
+/// The executable to start, resolved with `PATHEXT` against the `PATH` the server sees, so `npx`
+/// starts `npx.cmd` on Windows ([`crate::platform::fs::launch_path`]).
+fn launch_program(config: &McpServerConfig) -> PathBuf {
+    let search = config
+        .env
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os("PATH"));
+    crate::platform::fs::launch_path(&config.program, search.as_deref())
 }
 
 /// The server's environment: allowlisted runtime variables ([`child_env_allowed`]), plus the

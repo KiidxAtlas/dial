@@ -424,7 +424,12 @@ An interrupt during a tool round keeps finished parallel results and records
 calls that never started as not run. A panicking read-only tool is a failure with no effects
 (except `bash`, or a tool that committed before panicking). A timed-out or killed check counts as
 failed; a cancelled one settles nothing. Calls repeating in an exact short cycle (period 2 or 3)
-get an advisory note. A file changed by three committed edits (counted once per call) with no
+get an advisory note, as does one call that returns the same result at least 6 times within the
+last 10 tool rounds among otherwise varied calls. Recurrence requires observed, non-null results:
+missing results and synthetic duplicate/refusal answers do not count. A new non-transient user
+request ends that window; transient harness notices do not. Full result values are compared,
+so a rerun whose output changed is not counted toward the same recurrence.
+A file changed by three committed edits (counted once per call) with no
 passing check in between gets a checkpoint asking for a minimal known-answer or round-trip check
 and the first divergent value. Further whole-file `write` calls supplying at least 4 KiB to that
 path are withheld before mutation until a check passes. Focused edits, smaller writes and other
@@ -432,6 +437,10 @@ files remain available, so a failing implementation can still be repaired. A com
 foreground check, asserting eval cell or fresh passing `verify` run clears the counts; merely
 loading a checker, a skipped check or a successful status observation does not. Custom shell
 checks declare `check: true` and must preserve nonzero failure statuses.
+Completion refusals for retained failed checks include a JSON `verify` call with the exact
+check names (bounded by the tool's target limit). Repair the cause before rerunning it;
+additional failures may remain. A differently named passing check does not discharge the
+failure, and recovery guidance does not change approvals or weaken acceptance requirements.
 
 Both the foreground turn and child workers decide how to recover from a reply in
 `agent/run/reply_triage.rs`. A reply cut off at the output limit with no text or tool call uses the

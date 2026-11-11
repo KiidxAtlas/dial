@@ -19,9 +19,8 @@
 //! macOS terminals type symbols for Option chords unless Option is set to send Meta/Esc+, and
 //! Windows Terminal claims `Alt+Enter` (fullscreen), so every default Option/Alt application chord
 //! also has a Ctrl or function-key alternative (`Ctrl+Q`, `Ctrl+L`, `F2`–`F9`).
-//! Model selection uses Ctrl+K on macOS so it works without changing terminal Option settings;
-//! the composer gives that chord to the model selector, so cut-to-line-end is flagged as shadowed
-//! there (see [`Keymap::shadowed`]) and keeps working in dialog fields.
+//! On macOS model selection leads with `F2` so it works without changing terminal Option settings;
+//! `Ctrl+K` stays cut-to-line-end in the composer, as in readline and every macOS text field.
 //! `Ctrl+P`/`Ctrl+N` are list and history navigation everywhere; the command palette uses `Alt+K`
 //! and `F1` so it never competes with them.
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -295,7 +294,7 @@ impl Action {
             Action::Dismiss => "Dismiss suggestions",
             Action::Interrupt => "Stop the running turn",
             Action::ClearDraft => "Clear the draft (press again to exit when empty)",
-            Action::Exit => "Exit when the draft is empty",
+            Action::Exit => "Exit when the draft is empty (press twice)",
             Action::HistorySearch => "Search prompt history",
             Action::EditExternal => "Edit the draft in $VISUAL/$EDITOR",
             Action::DisplayReset => "Clear the screen and repaint",
@@ -310,14 +309,16 @@ impl Action {
             Action::ThinkingToggle => "Show or hide reasoning text",
             Action::StatusExpand => "Expand or collapse status details",
             Action::StatusFocus => "Focus session controls and status editors",
-            Action::ApprovalCycle => "Cycle approval mode (ask, write, auto, read-only)",
+            Action::ApprovalCycle => {
+                "Cycle approval mode (ask, write, read-only); full auto only through /approval"
+            }
             Action::SubagentsHub => {
                 "Open the worker hub: every worker, its activity, steering and cancel (Left twice on an empty composer also opens it)"
             }
             Action::SubagentsRecent => {
                 "Open the most recent running worker's transcript; press again to cycle"
             }
-            Action::WorkTab => "Switch the work panel tab (plan, evidence, approvals)",
+            Action::WorkTab => "Switch the work panel tab (plan, evidence, mode)",
             Action::RateGood => "Mark the last turn good (Teach this model)",
             Action::RateBad => "Mark the last turn bad (Teach this model)",
             Action::SelectUp => "Move up in lists",
@@ -423,7 +424,7 @@ impl Action {
             // Ctrl+P is list/history navigation (with Ctrl+N), so the palette uses chords of its own.
             Action::CommandPalette => &["Alt+K", "F1"],
             // Function keys back up Option chords, which macOS terminals often turn into symbols.
-            Action::ModelSelect if cfg!(target_os = "macos") => &["Ctrl+K", "Alt+M", "F2"],
+            Action::ModelSelect if cfg!(target_os = "macos") => &["F2", "Alt+M"],
             Action::ModelSelect => &["Alt+M", "F2"],
             Action::ModelRoles => &["Alt+R", "F3"],
             Action::ModelFavoriteNext => &["Alt+]", "F8"],

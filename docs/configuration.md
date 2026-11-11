@@ -31,6 +31,16 @@ Both text and JSON redact credential values recursively (also when requesting an
 ordinary token budgets such as `harness.max_tokens` remain visible. Environment-variable names are not
 credential values. The settings panel reports read failures instead of displaying empty fallback layers.
 
+`dial config set` accepts `on`/`off` and `yes`/`no` for true/false settings, and negative numbers
+as values (`dial config set key -1`). A refused value names what the setting accepts, such as
+`expected an integer from 0 to 10000`. An unknown key is reported in one line with the closest
+known setting (`did you mean "ui.motion"?`). `dial config get <table>` prints one `key = value`
+line per setting, and `dial config reset` says when the key was not set in that file.
+`dial config set` and `/config set` also refuse a theme name that does not load (`ui.theme`,
+`ui.theme_dark`, `ui.theme_light`; only `ui.theme` takes `auto`) and unknown status-line segments
+in `ui.status_left`/`ui.status_right`. Values already saved are not re-checked at startup: an
+unknown theme still falls back to the dark theme with a warning, and an unknown segment is skipped.
+
 Every supplied `hooks` layer must be an array; malformed higher-precedence values are rejected,
 not silently discarded during append/deduplication. Global settings saves and previews validate
 the global-only configuration as well as the effective project configuration, so a project override
@@ -101,6 +111,11 @@ Reordering changes only presentation: configuration keys, files and saved overri
 Defaults aim at a safe, low-surprise first run: nothing leaves the machine without approval,
 nothing runs unbounded where a runaway is likely, and nothing important is silent. Defaults changed
 in this revision, with the reason; saved explicit values are never rewritten.
+
+The built-in `approval` default remains `auto`, so non-interactive runs (`-p`, RPC, ACP, benchmarks)
+keep their contract. An interactive first run that never chose a mode instead saves
+`approval = "write"` (Edit freely) to the global config and says so once; from then on it is an
+ordinary user setting that `/approval` or Settings can change.
 
 | Setting | Was | Now | Why |
 | --- | --- | --- | --- |
@@ -367,7 +382,7 @@ effort/budget and reasoning-guard limits. No sampler or thinking policy is chang
 
 ```toml
 model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
-approval = "auto"         # ask | write | auto (default) | readonly
+approval = "auto"         # ask | write | auto (built-in default) | readonly; interactive first run saves "write"
 integrations = ["bg", "web_fetch", "web_search", "lsp", "ast_search", "ast_edit", "dap"]
 context_window = "auto" # defaults to 32768 tokens; serving endpoints may cap to loaded context
 [sandbox]

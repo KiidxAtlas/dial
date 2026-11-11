@@ -341,6 +341,12 @@ you to paste one. Dial checks that key against OpenRouter's protected `/api/v1/a
 before saving. The option appears only for OpenRouter's official endpoint, so a generated key is never
 forwarded to a custom gateway.
 
+`/providers` lists every bundled hosted provider, such as OpenCode Zen and Go, Cerebras, Together or
+Fireworks, not only the ones probed by default. A provider without a credential shows as **not set
+up** and makes no network request; choose **Set API key** or set its environment variable (the row
+names it), and the next scan lists its models. Sign-in providers, templated endpoints (Snowflake,
+Cloudflare AI Gateway) and agent protocols keep their own setup.
+
 When entering OpenAI or Anthropic API keys, Dial checks them against each provider's model-list
 endpoint before saving; this is metadata, not an inference call. OpenAI uses bearer authentication;
 Anthropic API keys use `x-api-key` and `anthropic-version`. Other custom endpoint keys are saved

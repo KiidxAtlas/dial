@@ -28,9 +28,7 @@ impl Linker {
     pub fn new(line_fragments: bool) -> Self {
         Self {
             line_fragments,
-            home: std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .map(PathBuf::from),
+            home: crate::config::paths::home_dir(),
             ..Self::default()
         }
     }

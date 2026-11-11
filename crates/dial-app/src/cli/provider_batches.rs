@@ -17,30 +17,50 @@ pub struct Args {
 #[derive(Debug, Subcommand)]
 pub enum Action {
     /// Prepare a tool-free JSON plan locally. No network or payment.
-    Prepare { file: PathBuf },
+    Prepare {
+        /// JSON plan describing the batch requests to prepare.
+        file: PathBuf,
+    },
     /// Snapshot archive metadata, prompts and existing recaps for independent summaries (not full transcripts).
     ArchiveSummaries {
+        /// Provider that will run the batch (for example `openai` or `anthropic`).
         #[arg(long)]
         provider: String,
+        /// Model the batch requests name.
         #[arg(long)]
         model: String,
+        /// Session ids (or unique prefixes) to summarize.
         #[arg(required = true)]
         sessions: Vec<String>,
     },
     /// Submit a prepared job. This explicitly authorizes paid third-party processing.
     Submit {
+        /// Job id printed by `prepare` or `archive-summaries`.
         id: String,
+        /// Required: confirms that the provider bills this job to your API account.
         #[arg(long, required = true)]
         yes_paid: bool,
     },
     /// Inspect the private local record, without network.
-    Inspect { id: String },
+    Inspect {
+        /// Job id.
+        id: String,
+    },
     /// Fetch remote status using the current paid API credential.
-    Status { id: String },
+    Status {
+        /// Job id.
+        id: String,
+    },
     /// Collect bounded results. Never applies generated text to memory or files.
-    Results { id: String },
+    Results {
+        /// Job id.
+        id: String,
+    },
     /// Request remote cancellation (nonterminal; completed items may still be charged).
-    Cancel { id: String },
+    Cancel {
+        /// Job id.
+        id: String,
+    },
 }
 pub fn run(layout: &Layout, args: &Args) -> Result<()> {
     let ledger = Ledger::open(&layout.user_dir)?;

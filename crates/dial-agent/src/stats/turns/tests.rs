@@ -101,7 +101,11 @@ fn turn_totals_count_outcomes_verdicts_and_latency() {
         text.contains("Turns 4 · settled 50.0%"),
         "turn summary missing:\n{text}"
     );
-    assert!(text.contains("interrupted 1 · undone 3 · rated 1 good / 1 bad"));
+    assert!(
+        text.contains("1 interrupted · 3 undone · rated 1 good / 1 bad"),
+        "{text}"
+    );
+    assert_eq!(text.matches("interrupted").count(), 1, "{text}");
     assert!(text.contains("Failed turns by cause: 1 rate_limited"));
 }
 

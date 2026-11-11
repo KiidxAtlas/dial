@@ -1111,6 +1111,45 @@ fn history_recorded_under_pre_rename_parameter_names_projects_onto_the_simpler_n
             .is_none()
     );
 
+    // grep/glob: `skip` plus a structured cursor became one string cursor.
+    for (tool, recorded, expected) in [
+        (
+            "grep",
+            r#"{"pattern":"x","limit":5,"cursor":{"path":"a.rs","match":3},"skip":2}"#,
+            json!({"pattern":"x","limit":5,"cursor":"3:2:a.rs"}),
+        ),
+        (
+            "glob",
+            r#"{"pattern":"*.rs","skip":7}"#,
+            json!({"pattern":"*.rs","cursor":"7"}),
+        ),
+        (
+            "glob",
+            r#"{"pattern":"*.rs","skip":0}"#,
+            json!({"pattern":"*.rs"}),
+        ),
+    ] {
+        let current = crate::tools::schema(tool, mode).unwrap();
+        let mut before = current.clone();
+        paged_cursor_schema(&mut before);
+        assert_ne!(
+            before, current,
+            "{tool} has a string cursor to restore from"
+        );
+        let history = old_names_history(tool, before, recorded);
+        let projected = project_history(&history, std::slice::from_ref(&current), &registry)
+            .unwrap()
+            .unwrap_or_else(|| panic!("old {tool} paging is projected"));
+        let arguments: Value = serde_json::from_str(
+            projected[0]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(arguments, expected, "{tool}");
+        validate_history(&projected, std::slice::from_ref(&current), &registry).unwrap();
+    }
+
     // bash: the removed async alias becomes background.
     let current = crate::tools::schema("bash", mode).unwrap();
     let mut before = current.clone();

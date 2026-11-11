@@ -542,6 +542,16 @@ mod tests;
 /// command that installs it on this surface: `/setup` in the TUI, `dial doctor --fix` on the
 /// command line). Names are padded so the second column lines up.
 pub fn list_text(env: &Env, install_command: &str) -> String {
+    capability_text(env, install_command, None)
+}
+
+/// Like [`list_text`], but missing capabilities are one summary line pointing at `list_all`
+/// (the full list is long and mostly irrelevant to any one project).
+pub fn summary_text(env: &Env, list_all: &str) -> String {
+    capability_text(env, "", Some(list_all))
+}
+
+fn capability_text(env: &Env, install_command: &str, summarize: Option<&str>) -> String {
     let rows = report(env);
     let width = rows
         .iter()
@@ -568,11 +578,19 @@ pub fn list_text(env: &Env, install_command: &str) -> String {
         if !lines.is_empty() {
             lines.push(String::new());
         }
-        lines.push(format!(
-            "Not installed ({}) — each line ends with the command that previews its setup:",
-            missing.len()
-        ));
-        lines.extend(missing);
+        if let Some(list_all) = summarize {
+            lines.push(format!(
+                "Not installed: {} optional capabilit{}; `{list_all}` lists them with their setup commands.",
+                missing.len(),
+                if missing.len() == 1 { "y" } else { "ies" }
+            ));
+        } else {
+            lines.push(format!(
+                "Not installed ({}) — each line ends with the command that previews its setup:",
+                missing.len()
+            ));
+            lines.extend(missing);
+        }
     }
     if lines.is_empty() {
         lines.push("No optional capabilities are known.".to_owned());

@@ -243,6 +243,66 @@ pub fn is_executable(path: &Path) -> bool {
     super::imp::fs::is_executable(path)
 }
 
+/// The executable `path` names, as the Windows shell would launch it: `path` itself when it is
+/// executable, otherwise (Windows only) `path` with each `PATHEXT` suffix appended, so `npx`
+/// resolves to `npx.cmd` and `rust-analyzer` to `rust-analyzer.exe`. `std::process::Command`
+/// only appends `.exe` to a bare name and never checks `PATHEXT`, so launchers must pass the
+/// resolved path. Suffixes are appended, never substituted: `python3.12` becomes `python3.12.exe`.
+pub fn executable_candidate(path: &Path) -> Option<std::path::PathBuf> {
+    executable_candidate_with(path, cfg!(windows).then(pathext).as_deref(), is_executable)
+}
+
+fn pathext() -> String {
+    std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+}
+
+fn executable_candidate_with(
+    path: &Path,
+    pathext: Option<&str>,
+    executable: impl Fn(&Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    if executable(path) {
+        return Some(path.to_path_buf());
+    }
+    pathext?
+        .split(';')
+        .filter(|suffix| suffix.starts_with('.') && suffix.len() > 1)
+        .map(|suffix| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            std::path::PathBuf::from(name)
+        })
+        .find(|candidate| executable(candidate))
+}
+
+/// [`executable_candidate`] for a program name: a bare name is searched on `search` (a `PATH`
+/// value) in order; a name with a separator is resolved as given.
+pub fn find_program(
+    program: &Path,
+    search: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    if program.as_os_str().is_empty() {
+        return None;
+    }
+    if program.components().count() > 1 {
+        return executable_candidate(program);
+    }
+    std::env::split_paths(search?).find_map(|dir| executable_candidate(&dir.join(program)))
+}
+
+/// The program to hand `std::process::Command::new`. On Windows, `Command` only appends `.exe`,
+/// so `program` is resolved like the shell would: a bare name on `search` with `PATHEXT` (`npm`
+/// starts `npm.cmd`), a path by appending `PATHEXT` suffixes. Elsewhere, or when nothing
+/// matches, `program` is returned unchanged so the spawn error still names it.
+pub fn launch_path(program: &Path, search: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
+    if cfg!(windows)
+        && let Some(found) = find_program(program, search)
+    {
+        return found;
+    }
+    program.to_path_buf()
+}
+
 /// Open `path`, creating it owner-only if it does not exist (Unix: `mode(0o600)`; Windows: the
 /// owner-only DACL is installed on a file this call created).
 pub fn open_owner_only(options: &OpenOptions, path: &Path) -> io::Result<File> {
@@ -254,3 +314,6 @@ pub fn open_owner_only(options: &OpenOptions, path: &Path) -> io::Result<File> {
 pub fn create_dir_owner_only(builder: &DirBuilder, path: &Path) -> io::Result<()> {
     super::imp::fs::create_dir_owner_only(builder, path)
 }
+
+#[cfg(test)]
+mod tests;

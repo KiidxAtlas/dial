@@ -326,3 +326,16 @@ fn the_full_main_screen_at_80x24_keeps_the_transcript_and_whole_rows() {
         }
     }
 }
+
+#[test]
+fn shift_tab_never_cycles_into_full_auto() {
+    let mut mode = Approval::Ask;
+    for _ in 0..6 {
+        mode = next_cycled_approval(mode);
+        assert_ne!(mode, Approval::Auto);
+    }
+    assert_eq!(next_cycled_approval(Approval::Ask), Approval::Write);
+    assert_eq!(next_cycled_approval(Approval::Write), Approval::Readonly);
+    assert_eq!(next_cycled_approval(Approval::Readonly), Approval::Ask);
+    assert_eq!(next_cycled_approval(Approval::Auto), Approval::Ask);
+}

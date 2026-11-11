@@ -329,6 +329,32 @@ pub fn validate_arguments(schema: &Value, arguments: &Value) -> Result<(), Strin
     crate::runtime::arguments::validate(parameters, &arguments)
 }
 
+/// The refusal for unusable arguments. Raw text the provider sent is quoted (head and tail) with
+/// the parse error, so the model can see what it actually produced instead of a bare `{}` replay.
+fn malformed_reason(arguments: &Value) -> String {
+    const BASE: &str = "tool arguments were not a valid JSON object";
+    const EDGE: usize = 160;
+    let Value::String(raw) = arguments else {
+        return BASE.into();
+    };
+    let why = match crate::llm::json_repair::parse(raw) {
+        Err(error) => error,
+        Ok(_) => "the value is not an object".into(),
+    };
+    let chars = raw.chars().count();
+    let excerpt = if chars <= 2 * EDGE {
+        format!("{raw:?}")
+    } else {
+        let head: String = raw.chars().take(EDGE).collect();
+        let tail: String = raw.chars().skip(chars - EDGE).collect();
+        format!("{head:?} … {tail:?}")
+    };
+    format!(
+        "{BASE} ({why}). The {} bytes received were: {excerpt}. Send the arguments again as one complete JSON object.",
+        raw.len()
+    )
+}
+
 /// The request's offered schemas are authoritative, including role restrictions and deferred tools.
 pub fn validate_offered_call(
     call: &crate::llm::ToolCall,
@@ -336,10 +362,7 @@ pub fn validate_offered_call(
     names: &[String],
 ) -> Option<(&'static str, String)> {
     if call.malformed_arguments || call.name.is_empty() {
-        return Some((
-            "malformed_arguments",
-            "tool arguments were not a valid JSON object".into(),
-        ));
+        return Some(("malformed_arguments", malformed_reason(&call.arguments)));
     }
     if !names.contains(&call.name) {
         return Some((

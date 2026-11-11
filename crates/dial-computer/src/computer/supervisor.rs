@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
@@ -51,6 +50,19 @@ const SESSION_CLOSED: &str = "Computer session closed";
 const ABORTED: &str = "Computer run was aborted";
 const CONTROL_TITLE: &str = "Allow foreground computer control?";
 const WORKER_SOURCE: &str = include_str!("js/worker.mjs");
+
+/// The worker source is written to a private `.mjs` file rather than passed with `node -e`: at
+/// ~76 KB it exceeds the 32,767-character Windows command line, where `CreateProcess` refused the
+/// launch and every computer action failed. The path is removed when the worker is dropped.
+pub(super) fn worker_script() -> std::io::Result<tempfile::TempPath> {
+    let mut file = tempfile::Builder::new()
+        .prefix("dial-computer-worker-")
+        .suffix(".mjs")
+        .tempfile()?;
+    file.write_all(WORKER_SOURCE.as_bytes())?;
+    file.flush()?;
+    Ok(file.into_temp_path())
+}
 
 #[derive(Debug, Clone)]
 pub struct RunRequest {
@@ -114,6 +126,8 @@ struct Worker {
     pending: HashMap<u64, flume::Sender<ComputerResult<Value>>>,
     ready: Option<flume::Sender<ComputerResult<Value>>>,
     closed: Option<flume::Sender<ComputerResult<Value>>>,
+    /// Kept until the worker is stopped; dropping it removes the script file.
+    _script: tempfile::TempPath,
 }
 
 impl Worker {
@@ -536,9 +550,11 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> Comput
         }
     }
 
+    let script = worker_script()
+        .map_err(|e| ComputerError::tool(format!("Failed to write computer worker script: {e}")))?;
     let mut command = Command::new("node");
     command
-        .args(["--input-type=module", "-e", WORKER_SOURCE])
+        .arg(&*script)
         .env_clear()
         .envs(
             std::env::vars().filter(|(name, value)| {
@@ -600,6 +616,7 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> Comput
             pending: HashMap::new(),
             ready: Some(ready_tx),
             closed: None,
+            _script: script,
         });
         generation
     };

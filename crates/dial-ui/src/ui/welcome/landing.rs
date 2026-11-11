@@ -161,14 +161,23 @@ pub fn frame(
         ));
     }
     if info.tour && view.selected.is_none() && budget.saturating_sub(context.len()) >= 4 {
-        for hint in [
+        let hints = [
             "1  Type a request in your own words",
             "2  Enter sends · F1 opens actions",
             "3  /models picks a model · Esc dismisses",
-        ] {
+        ]
+        .map(|hint| hint.replace('·', theme.sym(Sym::Dot)));
+        // One left-aligned block centered as a whole, so the step numbers form a column.
+        let block = hints
+            .iter()
+            .map(|hint| text::width(hint))
+            .max()
+            .unwrap_or(0);
+        for hint in hints {
+            let pad = block.saturating_sub(text::width(&hint));
             context.push(centered(
                 vec![Span::styled(
-                    hint.replace('·', theme.sym(Sym::Dot)),
+                    format!("{hint}{}", " ".repeat(pad)),
                     theme.fg(Tok::Muted),
                 )],
                 inner,

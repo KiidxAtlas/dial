@@ -561,7 +561,7 @@ impl Workspace {
         mut self,
         configured: &BTreeMap<String, crate::config::types::SshHostConfig>,
     ) -> Self {
-        self.ssh_hosts = Arc::new(match std::env::var_os("HOME").map(PathBuf::from) {
+        self.ssh_hosts = Arc::new(match crate::config::paths::home_dir() {
             Some(home) => integrations::ssh::host_targets(&home, configured),
             None => BTreeMap::new(),
         });
@@ -1387,8 +1387,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "gitignore": {"type": "boolean", "description": "Honor ignore rules and skip dependency/build directories (default true)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Paths per page (default 500)."},
                 "preview": {"type": "boolean", "description": "Excerpts of up to 3 code files among the first 16 paths (default false). Only returned rows are edit witnesses."},
-                "skip": {"type": "integer", "minimum": 0, "description": "Paths to skip; resume with remaining_skip."},
-                "cursor": {"type": "object", "properties": {"path": {"type": "string"}, "match": {"type": "integer", "minimum": 0, "maximum": 0}}, "required": ["path", "match"], "additionalProperties": false, "description": "next_cursor from the previous page, unchanged."},
+                "cursor": {"type": "string", "description": "next_cursor from the previous page, unchanged; or \"N\" to skip N paths."},
             }),
             &["pattern"],
         ),
@@ -1411,8 +1410,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "multiline": {"type": "boolean", "description": "Match across lines (automatic when the pattern has \\n); use (?s) for dot to match newline."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},
                 "gitignore": {"type": "boolean", "description": "Honor ignore rules and skip dependency/build directories (default true)."},
-                "skip": {"type": "integer", "minimum": 0, "description": "Matches to skip; resume with remaining_skip."},
-                "cursor": {"type": "object", "properties": {"path": {"type": "string"}, "match": {"type": "integer", "minimum": 0}}, "required": ["path", "match"], "additionalProperties": false, "description": "next_cursor from the previous page, unchanged."},
+                "cursor": {"type": "string", "description": "next_cursor from the previous page, unchanged; or \"N\" to skip N results."},
             }),
             &["pattern"],
         ),

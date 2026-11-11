@@ -425,12 +425,10 @@ const FAILURE_CAUSE_CHARS: usize = 600;
 /// The diagnostic chain of a failed turn, without the generic recovery advice every provider
 /// failure carries, bounded so the saved summary stays small.
 fn failure_cause(error: &anyhow::Error) -> String {
-    let chain: Vec<String> = error
-        .chain()
-        .map(ToString::to_string)
-        .filter(|cause| cause != crate::agent::run::failure_guidance::PROVIDER_RECOVERY)
-        .collect();
-    crate::agent::window::prompt::truncate_chars(&chain.join(": "), FAILURE_CAUSE_CHARS)
+    crate::agent::window::prompt::truncate_chars(
+        &crate::agent::run::failure_guidance::user_failure_text(error),
+        FAILURE_CAUSE_CHARS,
+    )
 }
 
 #[cfg(test)]

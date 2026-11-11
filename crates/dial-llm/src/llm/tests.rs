@@ -126,7 +126,7 @@ fn malformed_and_missing_fields_are_tolerated() {
     let reply = parse_reply(body.to_string().as_bytes()).unwrap();
     let calls = &reply.tool_calls;
     assert_eq!(calls[0].id, "call_0");
-    assert!(calls[0].malformed_arguments && calls[0].arguments.is_null());
+    assert!(calls[0].malformed_arguments && calls[0].arguments == json!("{not json"));
     assert!(
         calls[1].malformed_arguments,
         "non-object arguments are malformed"

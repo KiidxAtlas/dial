@@ -237,9 +237,12 @@ impl ArtifactStore {
         Ok(bytes)
     }
 
+    /// Exact bytes from `offset` as base64 JSON, at most `count` and never past the end. The
+    /// store imposes no page cap; callers bound `count` by their own output budget and continue
+    /// from `next_offset`.
     pub fn retrieve_bytes(&self, uri: &str, offset: u64, count: usize) -> Result<String> {
         use std::io::{Seek, SeekFrom};
-        ensure!((1..=16384).contains(&count), "bytes must be 1..16384");
+        ensure!(count >= 1, "bytes must be at least 1");
         let mut file = self.open(uri)?;
         ensure!(
             file.metadata()?.is_file(),
@@ -248,8 +251,9 @@ impl ArtifactStore {
         let total = file.metadata()?.len();
         ensure!(offset <= total, "offset exceeds artifact size");
         file.seek(SeekFrom::Start(offset))?;
-        let mut bytes = Vec::with_capacity(count);
-        file.take(count as u64).read_to_end(&mut bytes)?;
+        let wanted = (count as u64).min(total - offset);
+        let mut bytes = Vec::with_capacity(usize::try_from(wanted)?);
+        file.take(wanted).read_to_end(&mut bytes)?;
         use base64::Engine;
         Ok(json!({"uri":uri,"offset":offset,"next_offset":offset+bytes.len() as u64,"total_bytes":total,"encoding":"base64","data":base64::engine::general_purpose::STANDARD.encode(bytes)}).to_string())
     }

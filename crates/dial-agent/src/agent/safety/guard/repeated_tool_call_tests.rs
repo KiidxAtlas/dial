@@ -305,3 +305,111 @@ fn a_three_step_cycle_is_found_but_progressing_arguments_are_not() {
     }
     assert!(CallCycle::detect(&paging, &["wait"]).is_none());
 }
+
+fn turn_with(id: &str, name: &str, args: &str, result: &str) -> Vec<serde_json::Value> {
+    vec![
+        json!({"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args}}]}),
+        json!({"role":"tool","tool_call_id":id,"content":result}),
+    ]
+}
+
+/// Oldest first: `A` is the same test run, the other letters are distinct reads.
+fn irregular(pattern: &str, result_of_a: impl Fn(usize) -> String) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    for (n, step) in pattern.chars().enumerate() {
+        messages.extend(if step == 'A' {
+            turn_with(
+                &format!("c{n}"),
+                "bash",
+                "{\"command\":\"cargo test\"}",
+                &result_of_a(n),
+            )
+        } else {
+            turn_with(
+                &format!("c{n}"),
+                "read",
+                &format!("{{\"path\":\"{step}\"}}"),
+                "contents",
+            )
+        });
+    }
+    messages
+}
+
+#[test]
+fn an_identical_call_and_result_recurring_irregularly_is_reported() {
+    let failing = |_| "test a ... FAILED".to_owned();
+    let messages = irregular("ABACAADAEA", failing);
+    assert!(RepeatedToolCall::detect(&messages, 5, &["wait"]).is_none());
+    assert!(CallCycle::detect(&messages, &["wait"]).is_none());
+    let found = RecurringCall::detect(&messages, &["wait"]).expect("six of ten");
+    assert_eq!(
+        (found.tool_name.as_str(), found.count, found.turns),
+        ("bash", 6, 10)
+    );
+    assert!(found.guidance().contains("recurring_tool_call"));
+    assert!(found.guidance().contains("cargo"));
+    // Five occurrences, or an older sixth outside the ten-turn window, are not a recurrence.
+    assert!(RecurringCall::detect(&irregular("ABACADAEAF", failing), &["wait"]).is_none());
+    assert!(RecurringCall::detect(&irregular("AABACADAEAF", failing), &["wait"]).is_none());
+}
+
+#[test]
+fn a_rerun_whose_result_changes_or_an_exempt_tool_is_not_a_recurrence() {
+    let progressing = irregular("ABACAADAEA", |n| format!("{n} tests failed"));
+    assert!(RecurringCall::detect(&progressing, &["wait"]).is_none());
+    let mut waits = Vec::new();
+    for n in 0..10 {
+        let (name, args) = if n % 3 == 0 {
+            ("read", format!("{{\"path\":\"{n}\"}}"))
+        } else {
+            ("wait", "{}".to_owned())
+        };
+        waits.extend(turn_with(&format!("w{n}"), name, &args, "same"));
+    }
+    assert!(RecurringCall::detect(&waits, &["wait"]).is_none());
+}
+
+#[test]
+fn recurrence_requires_observed_results_in_the_current_user_turn() {
+    let history = irregular("ABACAADAEA", |_| "same".into());
+    let mut new_turn = history.clone();
+    new_turn.push(json!({"role":"user","content":"Run the check again"}));
+    new_turn.extend(turn_with(
+        "new",
+        "bash",
+        "{\"command\":\"cargo test\"}",
+        "same",
+    ));
+    assert!(RecurringCall::detect(&new_turn, &["wait"]).is_none());
+
+    let missing: Vec<_> = history
+        .iter()
+        .filter(|m| m["role"] != "tool")
+        .cloned()
+        .collect();
+    assert!(RecurringCall::detect(&missing, &["wait"]).is_none());
+
+    let mut transient = history.clone();
+    transient.push(json!({"role":"user","content":"harness notice","dial_transient":true}));
+    assert!(RecurringCall::detect(&transient, &["wait"]).is_some());
+
+    let mut synthetic = history;
+    for message in &mut synthetic {
+        if message["role"] == "tool" {
+            message["content"] = json!(crate::agent::prompts::recovery::DUPLICATE_RESULT_LEAD);
+        }
+    }
+    assert!(RecurringCall::detect(&synthetic, &["wait"]).is_none());
+}
+
+#[test]
+fn recurrence_compares_full_results_and_counts_a_batch_once() {
+    let prefix = "x".repeat(1000);
+    let changed = irregular("ABACAADAEA", |n| format!("{prefix}{n}"));
+    assert!(RecurringCall::detect(&changed, &["wait"]).is_none());
+    let mut batch = turn("first", "read", "{\"path\":\"a\"}");
+    let call = batch[0]["tool_calls"][0].clone();
+    batch[0]["tool_calls"] = json!(vec![call; 6]);
+    assert!(RecurringCall::detect(&batch, &["wait"]).is_none());
+}

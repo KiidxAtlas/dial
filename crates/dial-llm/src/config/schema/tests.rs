@@ -550,6 +550,15 @@ fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
     let mut out_of_range = Config::default();
     out_of_range.experimental.mutation_runs = 17;
     assert!(out_of_range.validate().is_err());
+    let slots = setting("experimental.background_check_slots");
+    assert_eq!(slots.tab, "Experimental");
+    assert_eq!(slots.default_value(), Some(Value::Integer(1)));
+    assert_eq!(unset.experimental.background_check_slots, 1);
+    for invalid in [0, 5] {
+        let mut out_of_range = Config::default();
+        out_of_range.experimental.background_check_slots = invalid;
+        assert!(out_of_range.validate().is_err(), "{invalid}");
+    }
 }
 
 #[test]
@@ -1048,4 +1057,15 @@ fn setting_pairs_are_symmetric_and_both_paths_are_declared() {
     }
     assert_eq!(pair_partner("memory.semantic.embedding_api_key_env"), None);
     assert_eq!(pair_partner("ui.theme"), None);
+}
+
+#[test]
+fn status_lists_written_by_a_command_name_only_known_segments() {
+    let list = |names: &[&str]| Value::Array(names.iter().map(|n| Value::from(*n)).collect());
+    check_status_segments("ui.status_left", &list(&["model", "reasoning", "git"])).unwrap();
+    let error = check_status_segments("ui.status_right", &list(&["model", "nope"])).unwrap_err();
+    assert!(error.contains("unknown status segment nope;"), "{error}");
+    // Other lists and the lenient load-time check are unaffected.
+    check_status_segments("integrations", &list(&["nope"])).unwrap();
+    check_value("ui.status_left", &list(&["nope"])).unwrap();
 }

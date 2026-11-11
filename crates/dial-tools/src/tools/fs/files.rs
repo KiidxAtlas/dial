@@ -414,6 +414,10 @@ fn read_target(
             ArtifactView::Info => serde_json::json!({"uri":uri, "info":true}),
             ArtifactView::Annotations => serde_json::json!({"uri":uri, "annotations":true}),
             ArtifactView::Bytes { offset, count } => {
+                // Base64 is 4 bytes per 3; leave room for the JSON envelope so a page is never
+                // cut mid-encoding. Larger artifacts continue from the reported `next_offset`.
+                let fits = budget.saturating_sub(512) / 4 * 3;
+                let count = count.min(fits.max(1) as u64);
                 serde_json::json!({"uri":uri, "offset":offset, "bytes":count})
             }
         };

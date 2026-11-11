@@ -15,6 +15,24 @@ fn computer_ids_accept_strings_and_numbers() {
     assert_eq!(id_of(&json!(7)), Some(7));
     assert_eq!(id_of(&json!("native-1")), None);
 }
+
+/// Windows refuses a command line over 32,767 UTF-16 units; the worker source alone is larger,
+/// so it must reach Node as a file, never as a `-e` argument.
+#[test]
+fn worker_launches_from_a_file_within_the_windows_command_line_limit() {
+    assert!(
+        WORKER_SOURCE.len() > 32_767,
+        "premise: source exceeds the limit"
+    );
+    let script = worker_script().unwrap();
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), WORKER_SOURCE);
+    assert_eq!(script.extension().and_then(|e| e.to_str()), Some("mjs"));
+    assert!(script.as_os_str().len() < 1024);
+    let path = script.to_path_buf();
+    drop(script);
+    assert!(!path.exists(), "the script is removed with its owner");
+}
+
 // These workers speak only the transport protocol; no DesktopSession is constructed.
 #[cfg(unix)]
 fn fake_worker(source: &str) -> ComputerSupervisor {
@@ -39,6 +57,7 @@ fn fake_worker(source: &str) -> ComputerSupervisor {
         pending: HashMap::new(),
         ready: None,
         closed: None,
+        _script: tempfile::NamedTempFile::new().unwrap().into_temp_path(),
     });
     spawn_reader(Arc::downgrade(&supervisor.inner), 1, stdout, stopped);
     supervisor

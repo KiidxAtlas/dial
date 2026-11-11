@@ -1314,12 +1314,16 @@ fn scope_label(project: Option<&Path>) -> String {
 }
 
 fn shorten_path(path: &str) -> String {
-    match std::env::var("HOME") {
+    let home = crate::config::paths::home_dir().map(|home| home.to_string_lossy().into_owned());
+    match home {
         // Only whole path components: `/Users/al` must not shorten `/Users/alice/x`.
-        Ok(home)
+        Some(home)
             if home.len() > 1
                 && path.starts_with(&home)
-                && matches!(path.as_bytes().get(home.len()), None | Some(b'/')) =>
+                && path[home.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(std::path::is_separator) =>
         {
             format!("~{}", &path[home.len()..])
         }
@@ -1361,11 +1365,12 @@ fn iso(secs: i64) -> String {
 
 /// `~/x` and relative paths resolve like a shell would; the archive matches canonical roots.
 pub fn expand_home(path: &str) -> PathBuf {
-    let expanded = match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-        _ if path == "~" => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default(),
+    let relative = path
+        .strip_prefix("~/")
+        .or_else(|| cfg!(windows).then(|| path.strip_prefix("~\\")).flatten());
+    let expanded = match (relative, crate::config::paths::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ if path == "~" => crate::config::paths::home_dir().unwrap_or_default(),
         _ => PathBuf::from(path),
     };
     fs::canonicalize(&expanded).unwrap_or(expanded)

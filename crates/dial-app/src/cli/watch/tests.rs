@@ -242,3 +242,39 @@ fn feed_failure_keeps_the_inline_screenshot() {
     assert!(thumbnail.is_some());
     assert!(warning.is_some());
 }
+
+/// Fails its first read with `error`, then serves `rest`.
+struct FlakyRead {
+    error: Option<std::io::Error>,
+    rest: std::io::Cursor<Vec<u8>>,
+}
+
+impl std::io::Read for FlakyRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.error.take() {
+            Some(error) => Err(error),
+            None => self.rest.read(buf),
+        }
+    }
+}
+
+#[test]
+fn a_read_blocked_by_an_in_progress_append_is_retried_only_on_windows() {
+    let line = b"{\"kind\":\"text\",\"title\":\"Edit\",\"body\":\"x\"}\n".to_vec();
+    let mut reader = std::io::BufReader::new(FlakyRead {
+        error: Some(std::io::Error::from_raw_os_error(33)),
+        rest: std::io::Cursor::new(line),
+    });
+    let mut pending = Vec::new();
+    let first = next_event(&mut reader, &mut pending);
+    if cfg!(windows) {
+        assert!(first.unwrap().is_none());
+        assert!(matches!(
+            next_event(&mut reader, &mut pending).unwrap(),
+            Some(Event::Text { title, .. }) if title == "Edit"
+        ));
+    } else {
+        assert!(first.is_err());
+    }
+    assert!(!append_in_progress(&std::io::Error::other("x")));
+}

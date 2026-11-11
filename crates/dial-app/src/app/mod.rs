@@ -288,7 +288,8 @@ pub fn run_print(
     match result {
         Ok(report) => ui.finish(Some(&report), None, Some(&session_id), started.elapsed()),
         Err(error) => {
-            let error = format!("{error:#}");
+            // The recovery guidance in the chain is addressed to the model, not to a person.
+            let error = crate::agent::user_failure_text(&error);
             eprintln!("error: {error}");
             ui.finish(None, Some(&error), Some(&session_id), started.elapsed())
         }

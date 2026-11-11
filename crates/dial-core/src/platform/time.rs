@@ -56,5 +56,14 @@ pub fn local_strftime(format: &str) -> String {
     super::imp::time::local_strftime(format)
 }
 
+/// `YYYY-MM-DD HH:MM:SS` in the local time zone for a Unix-ms instant; `None` when the platform
+/// cannot convert it.
+pub fn local_stamp(unix_ms: u64) -> Option<String> {
+    let (year, month, day, hour, minute, second) = super::imp::time::local_fields(unix_ms)?;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
+    ))
+}
+
 #[cfg(test)]
 mod tests;

@@ -273,7 +273,7 @@ fn detail(
             }
             if !facts.cycle_key.is_empty() {
                 out.push(line(
-                    format!("{} cycles the mode", facts.cycle_key),
+                    format!("{} cycles ask, write and read-only", facts.cycle_key),
                     Tok::Muted,
                 ));
             }

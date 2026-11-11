@@ -321,8 +321,8 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "seance",
             "<session id prefix or worker id> <question>",
-            "ask a read-only consultant about a recorded session",
-            Category::Settings,
+            "ask a read-only consultant about a recorded session or worker",
+            Category::Session,
             Surface::Builtin,
         )
     },
@@ -339,7 +339,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "model",
             "[settings|defaults|local|backups]",
-            "choose the main model and assign roles",
+            "choose the main and new-session model; assign roles",
             Category::Model,
             Surface::Builtin,
         )
@@ -743,7 +743,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "laya",
             "[status|check|start|on|off]",
-            "local decision advice",
+            "local Laya advice on how much context to retrieve",
             Category::Learning,
             Surface::Builtin,
         )
@@ -913,7 +913,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "join",
             "<link>",
-            "Join a collab session from a link",
+            "join a collab session from a link",
             Category::Integrations,
             Surface::Group,
         )
@@ -925,7 +925,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "leave",
             "",
-            "Leave the collab session you joined",
+            "leave the collab session you joined",
             Category::Integrations,
             Surface::Group,
         )
@@ -948,7 +948,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "dump",
             "[all|anon]",
-            "Write this session's transcript to a file and print its path",
+            "write this session's transcript to a file and print its path",
             Category::Session,
             Surface::Group,
         )
@@ -957,7 +957,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "trace",
             "",
-            "Open this session in the stats dashboard",
+            "open this session in the stats dashboard",
             Category::Context,
             Surface::Group,
         )
@@ -1335,7 +1335,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "add-dir",
             "<dir>",
-            "Add a directory to the workspace so file tools can read and write under it",
+            "add a directory to the workspace so file tools can read and write under it",
             Category::Context,
             Surface::Group,
         )
@@ -1345,7 +1345,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "remove-dir",
             "<dir>",
-            "Remove an added directory from the workspace",
+            "remove an added directory from the workspace",
             Category::Context,
             Surface::Group,
         )
@@ -1401,7 +1401,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "branch",
             "[n]",
-            "Pick a user message to rewind to, after confirming (keeps the old path as a branch; alias: rewind)",
+            "pick a user message to rewind to, after confirming (keeps the old path as a branch; alias: rewind)",
             Category::Session,
             Surface::Group,
         )
@@ -1410,7 +1410,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "label",
             "[text]",
-            "Label the latest message so it is easy to find in /tree (no text clears the label)",
+            "label the latest message so it is easy to find in /tree (no text clears the label)",
             Category::Settings,
             Surface::Group,
         )
@@ -1419,7 +1419,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "delete",
             "",
-            "Delete the current session after confirming, and start a new one",
+            "delete the current session after confirming, and start a new one",
             Category::Session,
             Surface::Group,
         )
@@ -1428,7 +1428,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "pin",
             "",
-            "Pin or unpin a session at the top of the resume list",
+            "pin or unpin a session at the top of the resume list",
             Category::Session,
             Surface::Group,
         )
@@ -1437,7 +1437,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "move",
             "<dir>",
-            "Move the current session to a different directory",
+            "move the current session to a different directory",
             Category::Session,
             Surface::Group,
         )
@@ -1448,7 +1448,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "pack",
             "[path]",
-            "Write this session as a portable archive with its side history, workers and artifacts",
+            "write this session as a portable archive with its side history, workers and artifacts",
             Category::Settings,
             Surface::Group,
         )
@@ -1457,7 +1457,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "restart",
             "",
-            "Restart dial with the same launch flags, resuming this session",
+            "restart dial with the same launch flags, resuming this session",
             Category::Session,
             Surface::Group,
         )
@@ -1468,7 +1468,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "retry",
             "",
-            "Skip a live provider retry wait; when idle, retry the last failed turn",
+            "skip a live provider retry wait; when idle, retry the last failed turn",
             Category::Session,
             Surface::Group,
         )
@@ -1481,7 +1481,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "stats",
             "[range] [--port <port>]",
-            "Show local usage statistics; --port starts the loopback dashboard",
+            "show local usage statistics; --port starts the loopback dashboard",
             Category::Maintenance,
             Surface::Group,
         )
@@ -1492,7 +1492,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "login",
             "[provider]",
-            "Sign in to an OAuth provider (no argument lists providers)",
+            "sign in to an OAuth provider (no argument lists providers)",
             Category::Integrations,
             Surface::Group,
         )
@@ -1503,7 +1503,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "logout",
             "[provider]",
-            "Sign out of an OAuth provider (no argument lists signed-in providers)",
+            "sign out of an OAuth provider (no argument lists signed-in providers)",
             Category::Integrations,
             Surface::Group,
         )
@@ -1513,7 +1513,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "session",
             "[info|delete|pin]",
-            "Show the current session, or manage it (info, delete, pin)",
+            "show the current session, or manage it (info, delete, pin)",
             Category::Session,
             Surface::Group,
         )
@@ -1525,7 +1525,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "changelog",
             "[full|last [N]]",
-            "Show the Dial changelog: `full`, or `last [N]` (default 1)",
+            "show the Dial changelog: `full`, or `last [N]` (default 1)",
             Category::Review,
             Surface::Group,
         )
@@ -1540,7 +1540,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "drafter",
             "[on|off|status]",
-            "Toggle turn drafting and review before sending to the agent",
+            "toggle turn drafting and review before sending to the agent",
             Category::Settings,
             Surface::Group,
         )
@@ -1561,7 +1561,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "effort",
             "[level|auto] | <role> <level|default>",
-            "Show or set the thinking effort for the current model or a model role",
+            "show or set the thinking effort for the current model or a model role",
             Category::Model,
             Surface::Group,
         )
@@ -1570,7 +1570,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "loop",
             "[count|duration] [--while|--until '<command>'] [prompt]",
-            "Repeat a prompt after each turn, bounded by a count or duration",
+            "repeat a prompt after each turn, bounded by a count or duration",
             Category::Work,
             Surface::Group,
         )
@@ -1581,7 +1581,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "vibe",
             "[on|off|status]",
-            "Toggle read-only vibe mode for this session",
+            "toggle read-only vibe mode for this session",
             Category::Modes,
             Surface::Group,
         )
@@ -1592,7 +1592,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "skillful",
             "[on|off|status]",
-            "Show or set whether the skill catalog is offered this session",
+            "show or set whether the skill catalog is offered this session",
             Category::Modes,
             Surface::Group,
         )
@@ -1601,7 +1601,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "fresh",
             "",
-            "Reset provider stream state without changing the local transcript",
+            "reset provider stream state without changing the local transcript",
             Category::Modes,
             Surface::Group,
         )
@@ -1610,7 +1610,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "handoff",
             "[focus]",
-            "Summarize the session into a handoff document and compact in place",
+            "summarize the session into a handoff document and compact in place",
             Category::Modes,
             Surface::Group,
         )
@@ -1620,7 +1620,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "shake",
             "[elide|images|thinking]",
-            "Drop heavy content from context (tool results, large blocks)",
+            "drop heavy content (tool results, images, reasoning) from context",
             Category::Modes,
             Surface::Group,
         )
@@ -1630,7 +1630,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "btw",
             "[question]",
-            "Browse side threads or ask a side question",
+            "browse side threads or ask a side question",
             Category::Work,
             Surface::Group,
         )
@@ -1639,7 +1639,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "tan",
             "<work>",
-            "Fork the session into a background clone that runs one request",
+            "fork the session into a background clone that runs one request",
             Category::Work,
             Surface::Group,
         )
@@ -1663,7 +1663,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "debug",
             "[item]",
-            "Show debug tools, session/model/usage facts, and run one debug item",
+            "show debug tools, session/model/usage facts, and run one debug item",
             Category::Modes,
             Surface::Group,
         )
@@ -1672,7 +1672,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "rule",
             "<complaint>",
-            "Author a stream rule from a complaint and save it",
+            "author a stream rule from a complaint and save it",
             Category::Modes,
             Surface::Group,
         )
@@ -1682,7 +1682,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "prewalk",
             "[restart|off]",
-            "Arm, restart, or cancel the todo-gated handoff to @small",
+            "hand off to @small once the todo plan is done",
             Category::Modes,
             Surface::Group,
         )
@@ -1691,7 +1691,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "switch",
             "[model]",
-            "Switch the model for this session only",
+            "switch the model for this session only (default unchanged)",
             Category::Model,
             Surface::Group,
         )
@@ -1700,7 +1700,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "plan-review",
             "",
-            "Re-open the submitted plan for approval (plan mode only)",
+            "re-open the submitted plan for approval (plan mode only)",
             Category::Review,
             Surface::Group,
         )
@@ -1710,7 +1710,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "ratchet",
             "<flow> <init|plan|split|approve|status|climb> [flags]",
-            "Eval gate and hill-climb runner: init, plan, split, approve, status, climb",
+            "eval gate and hill-climb runner: init, plan, split, approve, status, climb",
             Category::Modes,
             Surface::Group,
         )
@@ -1720,7 +1720,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "goal",
             "[set <objective>|show|pause|resume|drop|budget <tokens|off>]",
-            "Persistent session objective: set, show, pause, resume, drop, budget",
+            "persistent session objective: set, show, pause, resume, drop, budget",
             Category::Work,
             Surface::Group,
         )
@@ -1729,7 +1729,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "guided-goal",
             "<idea>",
-            "Have the agent interview you in chat, then set up goal mode",
+            "have the agent interview you in chat, then set up goal mode",
             Category::Work,
             Surface::Group,
         )
@@ -1738,7 +1738,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "contract",
             "<task>",
-            "Start a task as a contract: goal, constraints and checkable done-when deliverables",
+            "start a task as a contract: goal, constraints and checkable done-when deliverables",
             Category::Work,
             Surface::Group,
         )
@@ -1747,7 +1747,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "cleanse",
             "[request] [--all] [--tests] [-n N] [-m model]",
-            "Run project checkers and repair their diagnostics with workers",
+            "run project checkers and repair their diagnostics with workers",
             Category::Modes,
             Surface::Group,
         )
@@ -1945,7 +1945,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         visible: false,
         note: Some("Opens now; changes apply after this turn."),
         help_order: Some(2),
-        ..CommandSpec::new("roles", "", "", Category::Settings, Surface::Undiscovered)
+        ..CommandSpec::new(
+            "roles",
+            "",
+            "assign models to roles",
+            Category::Settings,
+            Surface::Undiscovered,
+        )
     },
     CommandSpec {
         during_turn: DuringTurn::Now,
@@ -1955,7 +1961,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "model-settings",
             "",
-            "",
+            "tune settings for the current model",
             Category::Settings,
             Surface::Undiscovered,
         )
@@ -1964,7 +1970,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         during_turn: DuringTurn::Now,
         visible: false,
         help_order: Some(28),
-        ..CommandSpec::new("status", "", "", Category::Settings, Surface::Undiscovered)
+        ..CommandSpec::new(
+            "status",
+            "",
+            "show the full status line",
+            Category::Settings,
+            Surface::Undiscovered,
+        )
     },
     CommandSpec {
         during_turn: DuringTurn::Now,
@@ -1973,7 +1985,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         ..CommandSpec::new(
             "marketplace",
             "",
-            "",
+            "browse installable skills and extensions",
             Category::Settings,
             Surface::Undiscovered,
         )
@@ -2010,6 +2022,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         )
     },
 ];
+
+/// What running `name` does to a turn in progress, when that is more than waiting: shown beside the
+/// command while busy so a typed command never stops work by surprise.
+pub fn busy_effect(name: &str, context: AvailabilityContext) -> Option<&'static str> {
+    (context.busy && command_spec(name)?.during_turn == DuringTurn::Stop)
+        .then_some("stops the current turn first")
+}
 
 pub fn command_spec(name: &str) -> Option<&'static CommandSpec> {
     COMMANDS

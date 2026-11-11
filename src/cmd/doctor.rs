@@ -4,14 +4,22 @@ use crate::overlay::overlay;
 use anyhow::Result;
 use dial::config::{paths::Layout, types::Config};
 
-pub(crate) fn run(cli: &Cli, layout: &Layout, fix: &Option<String>, yes: bool) -> Result<()> {
+pub(crate) fn run(
+    cli: &Cli,
+    layout: &Layout,
+    fix: &Option<String>,
+    yes: bool,
+    all: bool,
+) -> Result<()> {
     let env = dial::setup::deps::Env::current(&layout.user_dir);
     match fix {
         None => {
-            println!(
-                "{}",
+            let capabilities = if all {
                 dial::setup::deps::run::list_text(&env, "dial doctor --fix")
-            );
+            } else {
+                dial::setup::deps::run::summary_text(&env, "dial doctor --all")
+            };
+            println!("{capabilities}");
             println!();
             match Config::load(layout, Some(overlay(cli)?)) {
                 Ok(config) => println!("{}", dial::setup::memory::doctor_text(&config)),
@@ -41,7 +49,7 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, fix: &Option<String>, yes: bool) -
             let preview = dial::setup::deps::run::preview_text(id, &env);
             match dial::setup::deps::recipe(id) {
                 None => println!(
-                    "Unknown capability `{id}`. Run `dial doctor` to list them with their ids."
+                    "Unknown capability `{id}`. Run `dial doctor --all` to list them with their ids."
                 ),
                 Some(recipe) if dial::setup::deps::is_ready(recipe, &env) => println!("{preview}"),
                 Some(_) => println!("{preview}\n\nSet it up with: dial doctor --fix {id} --yes"),

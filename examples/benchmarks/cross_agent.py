@@ -341,13 +341,105 @@ def parse_omp_json(stdout):
     return final_text, usage
 
 
+def parse_claude_json(stdout):
+    """`claude -p --output-format stream-json --verbose`: tokens come from the terminal `result`
+    event's per-model totals (which include side and subagent calls). Requests are unique streamed
+    assistant message IDs; one API message may arrive as several events, one per content block."""
+    usage = empty_usage()
+    result = None
+    message_ids, tool_ids = set(), set()
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        if kind == "assistant":
+            if message.get("id"):
+                message_ids.add(message["id"])
+            for part in message.get("content") or []:
+                if isinstance(part, dict) and part.get("type") == "tool_use" and part.get("id") not in tool_ids:
+                    tool_ids.add(part.get("id"))
+                    count_tool(usage, part.get("name") or "?")
+                    usage["delegations"] += part.get("name") in ("Task", "Agent")
+        elif kind == "user":
+            for part in message.get("content") or []:
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    usage["tool_errors"] += part.get("is_error") is True
+        elif kind == "result":
+            result = event
+    usage["requests"] = len(message_ids)
+    by_model = (result or {}).get("modelUsage") or {}
+    if result is None or not by_model or not message_ids:
+        usage["usage_complete"] = False
+        return (result or {}).get("result"), usage
+    for model, counts in by_model.items():
+        usage["uncached_input"] += counts.get("inputTokens", 0)
+        usage["cache_read"] += counts.get("cacheReadInputTokens", 0)
+        usage["cache_write"] += counts.get("cacheCreationInputTokens", 0)
+        usage["output"] += counts.get("outputTokens", 0)
+    usage["input_total"] = usage["uncached_input"] + usage["cache_read"] + usage["cache_write"]
+    usage["models"] = sorted(by_model)
+    return result.get("result"), usage
+
+
+def parse_hermes_usage(usage_text, session_text=""):
+    """`hermes -z --usage-file`: Hermes's `input_tokens` exclude cache read/write tokens.
+    Tool calls come from `hermes sessions export` JSONL (OpenAI-style `tool_calls`/`tool` roles)."""
+    usage = empty_usage()
+    try:
+        report = json.loads(usage_text)
+    except (json.JSONDecodeError, TypeError):
+        report = None
+    if not isinstance(report, dict) or not isinstance(report.get("api_calls"), int):
+        usage["usage_complete"] = False
+        return None, usage
+    fields = {"uncached_input": "input_tokens", "cache_read": "cache_read_tokens",
+              "cache_write": "cache_write_tokens", "output": "output_tokens"}
+    for key, source in fields.items():
+        value = report.get(source)
+        if isinstance(value, int):
+            usage[key] = value
+        else:
+            usage["usage_complete"] = False
+    usage["requests"] = report["api_calls"]
+    usage["input_total"] = usage["uncached_input"] + usage["cache_read"] + usage["cache_write"]
+    usage["models"] = [f"{report.get('provider')}/{report.get('model')}"] if report.get("model") else []
+    messages = []
+    for line in (session_text or "").splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            messages.extend(value.get("messages") or [] if "messages" in value else [value])
+    if not messages:
+        usage["usage_complete"] = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for call in message.get("tool_calls") or [] if message.get("role") == "assistant" else []:
+            name = ((call or {}).get("function") or {}).get("name") or "?"
+            count_tool(usage, name)
+            usage["delegations"] += name == "delegate_task"
+    # The export has no structured tool-error flag: unknown, never a measured zero.
+    usage["tool_errors"] = None
+    if usage["requests"] == 0 or usage["delegations"]:
+        # Delegated subagents run as separate sessions whose usage this report does not prove.
+        usage["usage_complete"] = False
+    return None, usage
+
+
 def parse_text(stdout):
     usage = empty_usage()
     usage["usage_complete"] = False
     return stdout, usage
 
 
-PARSERS = {"dial-json": parse_dial_json, "omp-json": parse_omp_json, "text": parse_text}
+PARSERS = {"dial-json": parse_dial_json, "omp-json": parse_omp_json, "claude-json": parse_claude_json, "text": parse_text}
 
 
 def add_usage(total, part, agent):

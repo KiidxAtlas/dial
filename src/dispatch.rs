@@ -12,12 +12,16 @@ use std::io::IsTerminal;
 
 pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
     if let Some(Command::Completions { shell }) = &cli.command {
-        clap_complete::generate(
-            *shell,
-            &mut crate::args::command(),
-            "dial",
-            &mut std::io::stdout(),
-        );
+        // Rendered first, then written once, so a closed reader (`| head`) is a quiet exit
+        // rather than a panic inside the generator.
+        let mut script = Vec::new();
+        clap_complete::generate(*shell, &mut crate::args::command(), "dial", &mut script);
+        if let Err(error) = std::io::Write::write_all(&mut std::io::stdout(), &script) {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                std::process::exit(dial::CLOSED_STDOUT_STATUS);
+            }
+            return Err(error.into());
+        }
         return Ok(());
     }
     if let Some(Command::Update { version }) = &cli.command {
@@ -82,7 +86,10 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
             if *json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("{}", dial::storage::experience::render(&report));
+                println!(
+                    "{}",
+                    with_session_note(&dial::storage::experience::render(&report))
+                );
             }
             return Ok(());
         }
@@ -96,7 +103,10 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
             } else {
                 println!(
                     "{}",
-                    dial::tools::codebase::render_understanding(&report, usize::MAX)
+                    with_session_note(&dial::tools::codebase::render_understanding(
+                        &report,
+                        usize::MAX
+                    ))
                 );
             }
             return Ok(());
@@ -117,14 +127,14 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
                 dial::learn::worker::capabilities,
             );
         }
-        Some(Command::Doctor { fix, yes }) => {
-            return cmd::doctor::run(&cli, &layout, fix, *yes);
+        Some(Command::Doctor { fix, yes, all }) => {
+            return cmd::doctor::run(&cli, &layout, fix, *yes, *all);
         }
         Some(Command::Auth { action }) => {
             return cmd::auth::run(&layout, action);
         }
         Some(Command::Sessions { all, action }) => {
-            return cmd::sessions::run(&layout, *all, action);
+            return cmd::sessions::run(&layout, &cwd, *all, action);
         }
         Some(Command::Annotate(args)) => {
             return dial::cli::annotate::run(&layout, args);
@@ -365,3 +375,25 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         mode,
     )
 }
+
+/// Reports shared with the interactive UI name slash commands; from the shell, say where they run.
+fn with_session_note(text: &str) -> String {
+    let mentions_slash = text.split_whitespace().any(|word| {
+        // `/settings` is a command; `/home/me/project` is a path.
+        word.len() > 1
+            && word.starts_with('/')
+            && !word[1..].contains('/')
+            && word[1..].starts_with(|c: char| c.is_ascii_lowercase())
+    });
+    if mentions_slash {
+        format!(
+            "{}\n\n/commands above run inside an interactive `dial` session.",
+            text.trim_end()
+        )
+    } else {
+        text.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests;

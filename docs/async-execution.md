@@ -29,8 +29,12 @@ this feature does not claim every edit previously needed approval.
 With `experimental.background_checks` and `verification.automatic_checks` enabled, a committed
 parent edit can start one configured focused command without waiting for another model request.
 The command must have an existing complete `verification.inputs` contract. Commands without a
-complete, capturable input contract continue through synchronous final verification. Only one
-check process is owned at a time; the normal final gate handles the remaining selected commands.
+complete, capturable input contract continue through synchronous final verification. By default
+one check is started at a time; `experimental.background_check_slots` (1–4) starts up to that many
+eligible configured checks together, each authorized separately. They run in parallel with each
+other but hold one shared workspace serial-operation boundary, so they must tolerate running side
+by side (separate outputs, build-tool locks). The normal final gate handles the remaining selected
+commands.
 
 Configured commands retain ordinary shell authorization, explicit denies and sandbox policy.
 Denied commands start no process. The controller owns the process until its actual outcome is

@@ -36,19 +36,9 @@ pub fn which(program: &Path, root: &Path) -> Option<PathBuf> {
     std::env::split_paths(&path).find_map(|dir| resolve_program(&dir.join(program)))
 }
 
+/// Appends (never substitutes) a `PATHEXT` suffix on Windows, so `node.v2` finds `node.v2.cmd`.
 fn resolve_program(candidate: &Path) -> Option<PathBuf> {
-    if crate::platform::fs::is_executable(candidate) {
-        return Some(candidate.to_path_buf());
-    }
-    #[cfg(windows)]
-    if candidate.extension().is_none() {
-        let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.COM;.BAT;.CMD".into());
-        return extensions
-            .split(';')
-            .map(|extension| candidate.with_extension(extension.trim_start_matches('.')))
-            .find(|path| crate::platform::fs::is_executable(path));
-    }
-    None
+    crate::platform::fs::executable_candidate(candidate)
 }
 
 fn available(config: &DapAdapterConfig, root: &Path) -> bool {

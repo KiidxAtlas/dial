@@ -2409,3 +2409,20 @@ fn download_footer_keeps_its_way_out_last() {
     assert!(last.starts_with("Esc "), "{hints:?}");
     assert!(hints.iter().any(|h| h == "F5 rescan"), "{hints:?}");
 }
+
+#[test]
+fn long_model_rows_shorten_the_provider_before_the_model_name() {
+    let full = "lm-studio/qwen/qwen3.6-35b-a3b";
+    assert_eq!(
+        fit_model_name(full, "lm-studio", 40, false, &[0, 10]),
+        (full.to_owned(), vec![0, 10]),
+        "a row that fits is unchanged"
+    );
+    let (shown, at) = fit_model_name(full, "lm-studio", 22, false, &[0, 10, 15]);
+    assert_eq!(shown, "…/qwen/qwen3.6-35b-a3b");
+    assert_eq!(at, vec![2, 7], "provider hits drop and name hits shift");
+    let (shown, _) = fit_model_name(full, "lm-studio", 22, true, &[]);
+    assert_eq!(shown, "~/qwen/qwen3.6-35b-a3b");
+    let (shown, _) = fit_model_name(full, "lm-studio", 12, false, &[]);
+    assert!(text::width(&shown) <= 12 && shown.ends_with('…'), "{shown}");
+}

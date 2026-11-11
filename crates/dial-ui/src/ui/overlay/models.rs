@@ -364,6 +364,37 @@ fn display_name(entry: &ModelEntry) -> String {
     })
 }
 
+/// Fits `provider/label` into `max` cells. The model name tells rows apart, so a long row first
+/// shortens its provider prefix to `…/`, and only cuts the name itself when even that does not fit.
+/// Search-match `positions` (char indices into the full name) are remapped to the shown text.
+fn fit_model_name(
+    full: &str,
+    provider: &str,
+    max: usize,
+    ascii: bool,
+    positions: &[usize],
+) -> (String, Vec<usize>) {
+    if text::width(full) <= max {
+        return (full.to_owned(), positions.to_vec());
+    }
+    let skip = provider.chars().count() + 1;
+    let marker = if ascii { "~/" } else { "…/" };
+    let rest: String = full.chars().skip(skip).collect();
+    if full.starts_with(provider)
+        && full[provider.len()..].starts_with('/')
+        && text::width(marker) + text::width(&rest) <= max
+    {
+        let lead = marker.chars().count();
+        let shifted = positions
+            .iter()
+            .filter(|&&at| at >= skip)
+            .map(|&at| at - skip + lead)
+            .collect();
+        return (format!("{marker}{rest}"), shifted);
+    }
+    (text::ellipsize(full, max, ascii), positions.to_vec())
+}
+
 fn capabilities(entry: &ModelEntry) -> Vec<(Sym, &'static str, Option<bool>)> {
     if is_embedding(entry) {
         return vec![(Sym::IconEmbedding, "embedding", Some(true))];
@@ -2610,11 +2641,14 @@ impl ModelOverlay {
         let prefix_w = text::width(&pointer) + text::width(&marker) + 2;
         let name_w =
             w.saturating_sub(prefix_w + caps_w + state_w + lora_w + ctx_w + speed_w + price_w);
-        let name = text::ellipsize(
+        let (name, positions) = fit_model_name(
             &display_name(entry),
+            entry.display_provider(),
             name_w.saturating_sub(1),
             theme.ascii(),
+            positions,
         );
+        let positions = positions.as_slice();
         let mut spans = vec![
             Span::styled(format!("{pointer} "), theme.fg(Tok::Accent).patch(fill)),
             Span::styled(format!("{marker} "), theme.fg(Tok::Success).patch(fill)),

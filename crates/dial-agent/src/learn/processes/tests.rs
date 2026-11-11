@@ -194,3 +194,27 @@ fn tracked_server_exposes_model_phase_and_cleans_up_on_stop() {
             .any(|row| row["pid"] == pid)
     );
 }
+
+#[test]
+fn tool_labels_name_the_script_or_package_a_runner_starts() {
+    let label = |command: &str| {
+        let program = command.split_whitespace().next().unwrap();
+        tool_label(program, command).unwrap()
+    };
+    assert_eq!(
+        label("npm exec @upstash/context7-mcp"),
+        "npm @upstash/context7-mcp"
+    );
+    assert_eq!(
+        label("node /h/.dial/mcp/npm/_npx/e/node_modules/.bin/context7-mcp"),
+        "node context7-mcp"
+    );
+    assert_eq!(label("node /srv/weather/dist/index.js"), "node weather");
+    assert_eq!(
+        label("/usr/bin/python3 -m mcp_server_git"),
+        "python3 mcp_server_git"
+    );
+    assert_eq!(label("uvx mcp-server-fetch"), "uvx mcp-server-fetch");
+    assert_eq!(label("/opt/rust-analyzer --stdio"), "rust-analyzer");
+    assert_eq!(label("node"), "node");
+}

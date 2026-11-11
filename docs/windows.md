@@ -67,8 +67,8 @@ to Smart App Control.
 
 ## First run and LM Studio
 
-First run opens Providers. To use a local model without a hosted account, press Esc once to
-open Models. In LM Studio, load a model and start its local API server before selecting it in
+First run asks where the model should run: choose Local model to open Models without a hosted
+account, or Hosted provider to sign in or add an API key. In LM Studio, load a model and start its local API server before selecting it in
 Dial. Dial checks `http://127.0.0.1:1234/v1` by default; set `LM_STUDIO_BASE_URL` if your server
 uses another address.
 
@@ -122,6 +122,13 @@ hosts without a POSIX shell use SFTP; see [SSH](ssh.md) for partial-write semant
 These parity ports have macOS unit-test and Windows cross-compilation coverage; native Windows
 runtime verification is still pending. They do not change the sandbox's security guarantees.
 
+`bg` `ready.port` proves listener ownership from the IP Helper socket table: a listening TCP
+socket on the port must belong to a process inside the job's Job Object. Program names in
+`dial run`, `[[hooks]]` commands and `[mcp.*]` servers are resolved with `PATHEXT`, so `npm`,
+`npx` and other `.cmd` shims start. The external draft editor (`app.editor.external`) falls back
+to Notepad when neither `VISUAL` nor `EDITOR` is set, and copying an answer uses PowerShell's
+`Set-Clipboard`.
+
 ## File edits and checkpoints
 
 An edit refused with `write to "…" blocked by the harness` and Windows error 24
@@ -140,3 +147,4 @@ the original file is not changed without undo coverage.
 - The Windows `dev` sandbox (Low integrity) confines writes but not reads or network; it is weaker than the macOS and Linux sandboxes. Never run untrusted input with `sandbox.mode = "off"`.
 - Atomically published private files flush staged file contents before replacement. Windows does not document an unprivileged parent-directory flush or write-through rename equivalent to POSIX `fsync` on a directory, so a successful replacement is atomic for concurrent readers but its directory entry is not guaranteed to survive sudden power loss.
 - Dial replaces and deletes its own files with POSIX semantics on NTFS/ReFS, so a file another process has open (with delete sharing) can still be replaced, and a deleted name is freed at once. When a program opens a file without delete sharing (some editors, backup and sync tools), Dial retries for about 0.3 s and then reports Windows error 32, "being used by another process". Close that program, or move the project out of a synced folder such as OneDrive.
+- `/autoresearch run` and `dial learn` command verification run in the strict offline sandbox, which Windows cannot provide, so they are refused there.

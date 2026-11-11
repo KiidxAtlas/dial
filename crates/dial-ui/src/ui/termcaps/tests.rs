@@ -1,6 +1,31 @@
 use super::*;
 use std::collections::HashMap;
 
+#[test]
+fn osc11_replies_classify_dark_and_light_backgrounds() {
+    assert_eq!(
+        background_dark_from_reply(b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62c"),
+        Some(true)
+    );
+    assert_eq!(
+        background_dark_from_reply(b"\x1b]11;rgb:ffff/ffff/ffff\x07"),
+        Some(false)
+    );
+    assert_eq!(
+        background_dark_from_reply(b"\x1b]11;rgb:fd/f6/e3\x07"),
+        Some(false)
+    );
+    assert_eq!(
+        background_dark_from_reply(b"\x1b]11;rgb:28/2c/34\x07"),
+        Some(true)
+    );
+    assert_eq!(background_dark_from_reply(b"\x1b[?62c"), None);
+    assert_eq!(
+        background_dark_from_reply(b"\x1b]11;rgb:zz/00/00\x07"),
+        None
+    );
+}
+
 fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     let map: HashMap<String, String> = pairs
         .iter()
@@ -186,8 +211,18 @@ fn turn_notices_follow_the_authoritative_outcome() {
             Some((NotifyKind::Error, "Turn incomplete")),
         ),
         (Phase::Incomplete, true, false, None),
-        (Phase::Answered, true, true, None),
-        (Phase::Answered, true, false, None),
+        (
+            Phase::Answered,
+            true,
+            true,
+            Some((NotifyKind::Completion, "Reply ready")),
+        ),
+        (
+            Phase::Answered,
+            true,
+            false,
+            Some((NotifyKind::Completion, "Reply ready")),
+        ),
         (Phase::Answered, false, true, None),
         (Phase::Interrupted, true, true, None),
         (Phase::Running, true, true, None),

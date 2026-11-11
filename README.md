@@ -78,8 +78,8 @@ Inside Dial:
 | `/review-file`          | Review, keep or undo changes |
 | `/help`                 | Commands and shortcuts       |
 
-The approval mode sets how much Dial does without asking: `ask`, `write`, `auto` (the default) or
-`readonly`. See [configuration](docs/configuration.md).
+The approval mode sets how much Dial does without asking: `ask`, `write`, `auto` or
+`readonly`. An interactive first run starts in `write`; `-p` and protocol runs default to `auto`. See [configuration](docs/configuration.md).
 
 ## Learn more
 

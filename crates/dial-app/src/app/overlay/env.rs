@@ -26,6 +26,8 @@ pub(in crate::app) struct OverlayEnv<'a> {
     pub(in crate::app) model_downloads:
         Option<&'a crate::ui::overlay::models::SharedModelDownloads>,
     pub(in crate::app) compute_monitor: Option<ComputeMonitor>,
+    /// First-run setup (no agent yet): choosing the main model finishes setup and closes the panel.
+    pub(in crate::app) first_run: bool,
     pub(in crate::app) live_tasks: Option<&'a crate::agent::LiveTaskControl>,
     pub(in crate::app) verify_lora: Option<ModelSelection>,
     pub(in crate::app) auth_job: &'a mut Option<AuthJob>,

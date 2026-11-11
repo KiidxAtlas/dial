@@ -151,10 +151,7 @@ fn glob_patterns_sort_and_cap() {
         })
         .unwrap();
     let page: Value = serde_json::from_str(footer).unwrap();
-    assert_eq!(
-        page["next_cursor"],
-        json!({"path": "many_0500.dat", "match": 0})
-    );
+    assert_eq!(page["next_cursor"], json!("0:0:many_0500.dat"));
 }
 
 fn grep(ws: &Workspace, args: serde_json::Value) -> String {
@@ -209,12 +206,12 @@ fn artifact_context_rows_never_repeat_and_separate_distant_groups() {
     );
     let paged = grep(
         &ws,
-        json!({"pattern": "^hit", "path": uri, "context": 1, "skip": 1, "limit": 1}),
+        json!({"pattern": "^hit", "path": uri, "context": 1, "cursor": "1", "limit": 1}),
     );
     assert_eq!(
         paged,
         format!(
-            "{uri}-1-hit a\n{uri}:2:hit b\n{uri}-3-c\n[results capped; increase skip to continue]\n"
+            "{uri}-1-hit a\n{uri}:2:hit b\n{uri}-3-c\n[results capped; continue with cursor=\"2\"]\n"
         )
     );
 }
@@ -417,7 +414,7 @@ fn grep_context_separates_files_and_counts_only_matches() {
     assert!(
         !body(&one).contains("b.txt")
             && one.contains("results=1")
-            && one.contains("\"next_cursor\":{"),
+            && one.contains("\"next_cursor\":\""),
         "{one}"
     );
 }
@@ -686,7 +683,7 @@ fn glob_ignored_hint_is_limited_to_anchored_unpaged_gitignored_no_match() {
         (json!({"pattern": "**/report.md"}), false),
         (json!({"pattern": "**/absent.md"}), false),
         (
-            json!({"pattern": "private work/**/absent.md", "skip": 1}),
+            json!({"pattern": "private work/**/absent.md", "cursor": "1"}),
             false,
         ),
         (
@@ -743,7 +740,7 @@ fn page(text: &str) -> Value {
     text.lines()
         .find_map(|line| line.strip_prefix("[page: ")?.strip_suffix(']'))
         .map_or_else(
-            || json!({"next_cursor": null, "remaining_skip": 0}),
+            || json!({"next_cursor": null}),
             |line| serde_json::from_str(line).unwrap(),
         )
 }
@@ -777,7 +774,7 @@ fn grep_files_and_count_modes_summarize_without_edit_evidence() {
         run(
             &ws,
             "grep",
-            json!({"pattern": "hit", "output": "files", "cursor": {"path": "a.txt", "match": 1}})
+            json!({"pattern": "hit", "output": "files", "cursor": "1:0:a.txt"})
         )
         .is_error
     );
@@ -803,18 +800,21 @@ fn grep_files_mode_pages_over_files_with_cursor_and_skip() {
     );
     assert!(first.contains("page_capped_by=file limit of 2"), "{first}");
     let next = page(&first);
-    assert_eq!(next["next_cursor"], json!({"path": "f2.txt", "match": 0}));
+    assert_eq!(next["next_cursor"], json!("0:0:f2.txt"));
     let second = grep(
         &ws,
         json!({"pattern": "hit", "output": "files", "limit": 2,
-            "cursor": next["next_cursor"], "skip": next["remaining_skip"]}),
+            "cursor": next["next_cursor"]}),
     );
     assert_eq!(
         body(&second),
         "f2.txt (2 matches)\nf3.txt (2 matches)\n",
         "{second}"
     );
-    let skipped = grep(&ws, json!({"pattern": "hit", "output": "files", "skip": 4}));
+    let skipped = grep(
+        &ws,
+        json!({"pattern": "hit", "output": "files", "cursor": "4"}),
+    );
     assert_eq!(body(&skipped), "f4.txt (2 matches)\n", "{skipped}");
     let all = grep(&ws, json!({"pattern": "hit", "output": "count"}));
     assert_eq!(body(&all), "10 matches in 5 files\n", "{all}");
@@ -889,10 +889,10 @@ fn parallel_and_serial_grep_pages_are_byte_identical() {
         json!({"pattern": "needle [0-3]-1", "limit": 7}),
         json!({"pattern": "needle", "output": "files"}),
         json!({"pattern": "needle", "output": "count"}),
-        json!({"pattern": "needle", "output": "files", "limit": 5, "skip": 3}),
+        json!({"pattern": "needle", "output": "files", "limit": 5, "cursor": "3"}),
         json!({"pattern": "needle\\n", "multiline": true, "limit": 40}),
         json!({"pattern": "absent-token"}),
-        json!({"pattern": "needle", "glob": "**/g*.txt", "skip": 11}),
+        json!({"pattern": "needle", "glob": "**/g*.txt", "cursor": "11"}),
         json!({"pattern": "needle", "limit": 1}),
     ];
     for args in cases {
@@ -917,7 +917,6 @@ fn parallel_grep_cursors_resume_exactly_like_serial_ones() {
             break;
         }
         args["cursor"] = footer["next_cursor"].clone();
-        args["skip"] = footer["remaining_skip"].clone();
     }
     let total = grep_with_workers(&ws, &json!({"pattern": "needle", "limit": 1000}), 4).unwrap();
     let paged: usize = collected.iter().map(|page| page.lines().count()).sum();
@@ -1020,10 +1019,7 @@ fn grep_footer_reports_the_continuation_budget_cause_in_every_mode() {
                 text.contains(&format!("page_capped_by={expected};")),
                 "{text}"
             );
-            assert_eq!(
-                page(&text)["next_cursor"],
-                json!({"path": "next.txt", "match": 0})
-            );
+            assert_eq!(page(&text)["next_cursor"], json!("0:0:next.txt"));
         }
     }
 }
@@ -1143,7 +1139,6 @@ fn retrieval_measurement_matrix() {
             let first = grep_with_workers(&ws, &args, 1).unwrap();
             let footer = page(&first);
             args["cursor"] = footer["next_cursor"].clone();
-            args["skip"] = footer["remaining_skip"].clone();
         }
         let expected = grep_with_workers(&ws, &args, 1).unwrap();
         assert_eq!(expected, grep_with_workers(&ws, &args, 4).unwrap());

@@ -418,66 +418,7 @@ fn endpoint_origin(base_url: Option<&str>) -> String {
 
 /// Local-time `YYYY-MM-DD HH:MM:SS` for a Unix-ms instant (the model-usage query format; the space is percent-encoded to `%20`).
 fn local_stamp(unix_ms: u64) -> Option<String> {
-    let (year, month, day, hour, minute, second) = local_fields(unix_ms)?;
-    Some(format!(
-        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
-    ))
-}
-
-/// `(year, month, day, hour, minute, second)` in the local time zone.
-#[cfg(unix)]
-fn local_fields(unix_ms: u64) -> Option<(i32, i32, i32, i32, i32, i32)> {
-    let seconds = libc::time_t::try_from(unix_ms / 1000).ok()?;
-    // SAFETY: `tm` is plain old data and is zero-initialised before `localtime_r` writes into it.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both pointers reference live locals; a null return is checked below.
-    if unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() {
-        return None;
-    }
-    Some((
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec,
-    ))
-}
-
-#[cfg(windows)]
-fn local_fields(unix_ms: u64) -> Option<(i32, i32, i32, i32, i32, i32)> {
-    use windows_sys::Win32::{
-        Foundation::{FILETIME, SYSTEMTIME},
-        System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
-    };
-    /// FILETIME counts 100-ns ticks from 1601-01-01 UTC; this is the offset to the Unix epoch.
-    const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
-    let ticks = unix_ms
-        .checked_mul(10_000)?
-        .checked_add(UNIX_EPOCH_AS_FILETIME)?;
-    let utc_filetime = FILETIME {
-        dwLowDateTime: ticks as u32,
-        dwHighDateTime: (ticks >> 32) as u32,
-    };
-    let mut utc = SYSTEMTIME::default();
-    let mut local = SYSTEMTIME::default();
-    // SAFETY: both pointers reference live locals of the Win32 types the APIs expect; a null
-    // zone selects the current time zone. Zero return means failure and is checked below.
-    unsafe {
-        if FileTimeToSystemTime(&utc_filetime, &mut utc) == 0
-            || SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0
-        {
-            return None;
-        }
-    }
-    Some((
-        local.wYear.into(),
-        local.wMonth.into(),
-        local.wDay.into(),
-        local.wHour.into(),
-        local.wMinute.into(),
-        local.wSecond.into(),
-    ))
+    crate::platform::time::local_stamp(unix_ms)
 }
 
 #[cfg(test)]

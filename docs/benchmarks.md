@@ -152,6 +152,35 @@ all **85 requests, 106 tool completions and 15 errors** match the retained aggre
 The two formerly unexplained calls were automatic focused checks, not lost model-issued calls.
 The historical supplemental result remains **2/3**; the repaired replay is not pooled into it.
 
+## Four-way Harbor comparison
+
+The local Harbor runner's `fourway` agent set runs the current Dial build against OMP 18.13.2,
+Claude Code 2.1.311 and Hermes Agent 0.20.5. Every agent is a frozen, hashed artifact on native
+ARM64 and uses Sonnet 4.6 for main and side models through the same short-lived Claude
+subscription token. Claude Code is Anthropic's linux-arm64 release binary (checksum from its
+release manifest); Hermes is a self-contained `/opt/hermes` bundle built by
+`benchmarks/harbor-current/build_hermes_bundle.sh` from a clean commit and its `uv.lock`.
+Hermes runs with only its wrapper directory first on `PATH`, so its private Python does not reach
+task shells; its own `execute_code` tool still uses it, a harness feature like Dial's eval.
+opencode is not included: its current release cannot use a Claude subscription sign-in.
+
+Usage comes from `parse_claude_json` and `parse_hermes_usage` in
+`examples/benchmarks/cross_agent.py`. Claude Code tokens are the terminal result's per-model totals;
+Hermes tokens come from its usage report and tool calls from its session export. A missing report,
+missing export or delegated subagent leaves usage incomplete, and Hermes tool-error counts are unknown.
+
+```sh
+python3 benchmarks/harbor-current/snapshot_run.py benchmarks/harbor-current/snapshots/fourway-v1 \
+  --manifest benchmarks/harbor-current/fourway-v1-manifest.json --batch fourway-v1-r1
+python3 benchmarks/harbor-current/multiway_sheet.py benchmarks/harbor-current/report-fourway-v1-r1.json \
+  --out benchmarks/harbor-current/sheets/fourway-v1.html --png benchmarks/harbor-current/sheets/fourway-v1.png
+```
+
+These make paid model requests. `multiway_sheet.py` pools several complete rounds of the same frozen
+comparison and refuses incomplete rounds or mismatched agents, tasks, model and artifact hashes.
+Each round is one attempt per agent per task, so a few rounds remain a small sample, not a
+reliability estimate. Token and request totals are shown only when every pooled trial recorded usage.
+
 ## Using an existing subscription sign-in
 
 Add `--share-auth` to explicitly let benchmark inference use the original subscription authentication
@@ -331,6 +360,13 @@ attempts, and observed tokens. Unavailable trials stay in the denominator; unkno
 null. Latency ratios use only tasks passing every trial in both configurations. Exit status 1
 means an observed per-task correctness-frequency regression against the named baseline, not a
 statistical significance claim. Existing summary files are never overwritten.
+
+Lifecycle metric checks read each send's `efficiency.turns[].report.projection_bytes` counters
+and sum them across the case. Recovery snapshots are not additional turns. A missing counter,
+empty observation set, or overflow is unavailable, not zero; legacy flat counter reports remain
+readable. An RPC `answered` outcome can proceed to independent grading without incrementing
+`turns_completed`, which continues to count completed work rather than informational answers.
+Interrupted, blocked, incomplete and failed outcomes are not accepted as successful turns.
 
 Consistency is reported per checked task and as a checked-task mean, for every `k` from 1 to the
 repetition count `n`, under `pass_at_k` and `pass_hat_k` (JSON objects keyed by `"1"`…`"n"`):
@@ -1080,3 +1116,10 @@ usage and agent failures remain retryable. Profile and assistance matrix runs fr
 snapshot and emit contracts but currently reject checkpoint/resume flags. Comparisons refuse
 incompatible recorded source/suite contracts. Scripted regressions establish harness behavior;
 real-model quality and performance require matched provider runs.
+
+The [bounded hosted harness study](plans/hosted-harness-study.md) records 48 measured
+Claude Sonnet 4.6 subscription trials across lifecycle, representative-task and compaction
+profiles. It retains failures and unknown invoice costs, makes no default promotion, and
+separates the measured executable from the subsequent offline-tested recovery-guidance fix.
+Raw reports and executable/source hashes remain under ignored
+`benchmarks/hosted-harness-study/`.

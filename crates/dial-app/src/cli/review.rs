@@ -84,13 +84,40 @@ impl Args {
         })
     }
 
-    /// The run for this project: the target plus the `review` guidance.
+    /// The run for this project: the target plus the `review` guidance. A `--base` or
+    /// `--commit` name must resolve to a commit, so a typo fails before a model is needed.
     pub fn run(&self, layout: &Layout) -> Result<Run> {
         let request = self.request()?;
+        if let Some((flag, name)) = self
+            .base
+            .as_deref()
+            .map(|base| ("--base", base))
+            .or_else(|| self.commit.as_deref().map(|commit| ("--commit", commit)))
+        {
+            ensure_commit(&layout.project_root, flag, name.trim())?;
+        }
         Ok(Run {
             guidance: guidance(layout, &request),
             target: request.target,
         })
+    }
+}
+
+/// `git rev-parse --verify` of `name` as a commit (argument vector, no shell; reads refs only).
+fn ensure_commit(root: &std::path::Path, flag: &str, name: &str) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+        .arg(format!("{name}^{{commit}}"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(_) => bail!("{flag} {name}: no such branch or commit in this repository"),
+        // Without git the review itself reports the problem.
+        Err(_) => Ok(()),
     }
 }
 

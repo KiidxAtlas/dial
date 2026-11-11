@@ -7,7 +7,7 @@ Write, paste and edit drafts without losing your place; understand the launch sc
 - Inline, scrollback-native transcript with a live composer; finished turns remain in normal terminal
   scrollback. Model, provider and settings panels use a full-screen overlay and restore the terminal
   when closed. Approval prompts and settings adapt to narrow terminal widths.
-- User and assistant messages have muted UTC timestamp headers. Live timestamps mark submission
+- User and assistant messages have muted local-time timestamp headers. Live timestamps mark submission
   or the start of an answer; resumed messages use their recorded journal time (assistant journal
   times mark persistence). Older imported messages without a recorded time remain unstamped.
 - Finished-turn footers show measured output speed as `tok/s` when available, alongside elapsed
@@ -179,6 +179,11 @@ preview using the same expansion rules as submission. The composer summarizes in
 and skipped attachments. Text-token counts are estimates; image tokens vary by provider. Pending
 previews keep the draft in place. Missing, unreadable, truncated or otherwise skipped input requires
 a second deliberate submission; holding Enter does not acknowledge the warning.
+
+Mentions inside Markdown code (fenced blocks and inline backticks) are left as written. An
+unresolved `@name` warns only when it looks like a project file: its first directory exists, or it
+ends in a short file extension (`@notes.md`). Scoped packages and decorators such as
+`@angular/core`, `@types/node` and `@pytest.fixture` pass through as text without a warning.
 
 To inspect an existing draft without replacing it, open the command palette and choose
 **attachments**. Select a reference, then **Keep** (default) or **Remove reference**. Removal edits

@@ -285,7 +285,9 @@ impl Shell {
                 std::env::var("EDITOR")
                     .ok()
                     .filter(|v| !v.trim().is_empty())
-            });
+            })
+            // Windows rarely sets either variable; Notepad ships with every install.
+            .or_else(|| cfg!(windows).then(|| "notepad".to_owned()));
         let Some(editor) = editor else {
             self.note(
                 "Editor",
@@ -365,16 +367,29 @@ fn run_editor(editor: &str, path: &std::path::Path) -> std::io::Result<std::proc
 /// PowerShell 7 (`pwsh`) is an optional install; Windows PowerShell ships with every Windows.
 #[cfg(windows)]
 fn run_editor(editor: &str, path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
+    let invocation = editor_invocation(editor, std::path::Path::new(editor.trim()).is_file());
     let run = |shell: &str| {
         Command::new(shell)
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-            .arg(format!("& {editor} $env:DIAL_EDITOR_FILE"))
+            .arg(format!("{invocation} $env:DIAL_EDITOR_FILE"))
             .env("DIAL_EDITOR_FILE", path)
             .status()
     };
     match run("pwsh") {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => run("powershell.exe"),
         other => other,
+    }
+}
+
+/// The PowerShell call operator for `editor`. A setting that names an existing file is one path,
+/// often with spaces (`C:\Program Files\Notepad++\notepad++.exe`), so it is single-quoted;
+/// anything else is a command line with arguments and is used as written.
+#[cfg(any(windows, test))]
+fn editor_invocation(editor: &str, is_file: bool) -> String {
+    if is_file {
+        format!("& '{}'", editor.trim().replace('\'', "''"))
+    } else {
+        format!("& {editor}")
     }
 }
 

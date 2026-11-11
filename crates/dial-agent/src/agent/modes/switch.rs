@@ -95,7 +95,8 @@ pub fn resolve(config: &Config, selector: &str) -> Result<ModelSelection> {
     if let Some((provider, model)) = selector.split_once('/')
         && !model.is_empty()
         && (config.providers.contains_key(provider)
-            || crate::llm::catalog::provider_endpoint(provider).is_some())
+            || crate::llm::catalog::provider_endpoint(provider).is_some()
+            || crate::llm::catalog::is_local_provider(provider))
     {
         return Ok(ModelSelection {
             provider: provider.to_owned(),

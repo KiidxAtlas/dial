@@ -373,6 +373,12 @@ saved. Anonymous GitHub search allows about ten searches a minute; `GITHUB_TOKEN
 raises the limit and is sent only to `api.github.com`.
 These catalogs are not an exhaustive list of every MCP server: a server must be published to one
 of them to appear in remote search. `i` installs; installation always asks for confirmation first.
+Before a server that runs as an `npx` or `uvx` package is started for its install health check
+(from `/extensions`, an import, or the `mcp_servers` tool), Dial asks [OSV.dev](https://osv.dev) whether that package and version are
+reported as malicious: an OpenSSF `MAL-` record, or an advisory tagged CWE-506 (embedded malicious
+code). If so, the server is not started or saved, and the advisory ids are shown. Only the package
+name, ecosystem and pinned version are sent. Ordinary vulnerability advisories do not block a
+server, and when OSV cannot be reached within 5 seconds the install continues unchecked.
 The curated list includes the [official Nuxt MCP server](https://nuxt.com/docs/4.x/guide/ai/mcp),
 available as `nuxt` even without registry access. It uses Nuxt's documented stdio bridge,
 `npx -y mcp-remote https://nuxt.com/mcp` (Node.js/npm required).

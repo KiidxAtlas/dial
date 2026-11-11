@@ -107,9 +107,9 @@ pub fn run(user_dir: &Path, args: PsArgs) -> Result<i32> {
 /// Parses a pid argument. Pids 0 and 1 are never valid targets.
 fn parse_pid(target: Option<&str>, action: &str) -> Result<i32> {
     let raw = target.with_context(|| format!("ps {action} requires a process id"))?;
-    let pid: i32 = raw
-        .parse()
-        .with_context(|| format!("process id must be a number, got {raw:?}"))?;
+    let Ok(pid) = raw.parse::<i32>() else {
+        bail!("process id must be a number, got {raw:?}; `dial ps` lists running processes");
+    };
     if pid <= 1 {
         bail!("process id must be greater than 1, got {pid}");
     }

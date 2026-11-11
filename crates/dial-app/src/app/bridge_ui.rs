@@ -21,7 +21,9 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Ignore result-only policy updates: only changed request controls warrant a transcript notice.
+/// Ignore result-only policy updates and first requests: the transcript names a change only when a
+/// control the user can adjust differs from the previous request to the same model. The status
+/// line always carries the current values, and `/policy` the full detail.
 fn request_settings_change(
     status: &mut crate::ui::status::StatusData,
     previous: &Value,
@@ -31,10 +33,11 @@ fn request_settings_change(
     let settings = &policy["selection"]["effective"];
     status.inference = crate::adaptive::render_request_settings(settings, true).unwrap_or_default();
     let old = &previous["adaptive_policy"];
-    if old["model"] == policy["model"] && old["selection"]["effective"] == *settings {
+    if old["model"].is_null() || old["model"] != policy["model"] {
         return None;
     }
-    crate::adaptive::render_request_settings(settings, false)
+    crate::adaptive::request_settings_diff(&old["selection"]["effective"], settings)
+        .map(|changes| format!("{changes} · /policy for details"))
 }
 
 struct ApprovalPrompt {

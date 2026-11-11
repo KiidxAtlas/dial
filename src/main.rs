@@ -84,6 +84,7 @@ fn main() {
             ));
         }
     }
+    dial::exit_quietly_on_closed_stdout();
     let cli = args::parse();
     if let Some(suggestion) = args::mistyped_subcommand(&cli, std::env::args_os()) {
         args::mistyped_subcommand_error(&cli.prompt[0], &suggestion).exit();
@@ -119,6 +120,14 @@ fn flush_or_exit(code: i32) -> ! {
     dial::telemetry::shutdown();
     dial::llm::ollama::serve::shutdown();
     if let Err(error) = dial::flush_stdout_on_exit() {
+        // The reader went away (`dial … | head`): the output it wanted was delivered.
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(if code == 0 {
+                dial::CLOSED_STDOUT_STATUS
+            } else {
+                code
+            });
+        }
         eprintln!("error: stdout flush failed: {error}");
         std::process::exit(if code == 0 { 1 } else { code });
     }

@@ -214,6 +214,31 @@ pub(in crate::platform) fn is_group_leader(pid: u32) -> bool {
     };
     checked != 0 && in_job != 0
 }
+/// Whether `pid` runs inside the Job Object Dial created for the group led by `leader`. Jobs
+/// are inherited, so this covers every descendant; an unknown leader is never a match.
+pub(in crate::platform) fn in_group(leader: u32, pid: u32) -> bool {
+    let jobs = jobs();
+    let Some(job) = jobs.get(&leader) else {
+        return false;
+    };
+    // SAFETY: OpenProcess takes scalar access/ID arguments and null is handled before use.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return false;
+    }
+    // SAFETY: raw is a fresh non-null OpenProcess handle, adopted exactly once.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+    let mut member = 0;
+    // SAFETY: process and the jobs lock retain both handles; member is writable output storage.
+    let checked = unsafe {
+        IsProcessInJob(
+            process.as_raw_handle() as HANDLE,
+            job.as_raw_handle() as HANDLE,
+            &mut member,
+        )
+    };
+    checked != 0 && member != 0
+}
 pub(in crate::platform) fn exited(child: &Child) -> io::Result<bool> {
     // SAFETY: child owns the live process handle for the entire zero-time query.
     match unsafe { WaitForSingleObject(child.as_raw_handle() as HANDLE, 0) } {

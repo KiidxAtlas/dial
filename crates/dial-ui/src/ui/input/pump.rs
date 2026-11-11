@@ -203,6 +203,9 @@ impl Pump {
                 continue;
             }
             let event = source.read()?;
+            if record_focus(&event) {
+                continue;
+            }
             let mut state = self.state();
             state.events.push_back(event);
             self.changed.notify_all();
@@ -292,7 +295,11 @@ impl Pump {
                         ));
                     }
                     if idle.poll(TICK)? {
-                        return idle.read();
+                        let event = idle.read()?;
+                        if record_focus(&event) {
+                            continue;
+                        }
+                        return Ok(event);
                     }
                 }
             }
@@ -311,6 +318,17 @@ impl Pump {
             }
         }
     }
+}
+
+/// Focus reports update the shared focus state and are consumed here, so no controller loop has
+/// to know about them.
+fn record_focus(event: &Event) -> bool {
+    match event {
+        Event::FocusGained => super::super::termcaps::set_focus(Some(true)),
+        Event::FocusLost => super::super::termcaps::set_focus(Some(false)),
+        _ => return false,
+    }
+    true
 }
 
 /// The real terminal's pump, shared with the panic hook.

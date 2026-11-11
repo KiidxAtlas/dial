@@ -115,7 +115,8 @@ fn local_request_settings_reports_overrides_and_delegation_without_template_data
     assert!(delegated["max_tokens"].is_null());
     assert_eq!(
         render_request_settings(&delegated, true).unwrap(),
-        "temp provider · think on · out provider"
+        "think on",
+        "pure delegation stays off the live label"
     );
     // The server's reported values are shown for the fields Dial omits; sent values stay Dial's.
     let reported = local_request_settings(
@@ -407,4 +408,32 @@ fn phase_pin_and_invalid_configuration_are_bounded() {
     c.adaptive.verification_tokens = 1536;
     c.adaptive.editing_temperature = f64::INFINITY;
     assert!(c.adaptive.validate().is_err());
+}
+
+#[test]
+fn live_label_is_empty_when_everything_is_delegated_and_diffs_name_only_controls() {
+    let delegated = json!({"temperature": null, "max_tokens": null, "thinking": null});
+    assert!(render_request_settings(&delegated, true).is_none());
+    let before = json!({"temperature": 0.6, "thinking": true, "max_tokens": 4096,
+        "max_reasoning_bytes": 13107, "provider_defaults": {"top_k": 20}});
+    let mut after = before.clone();
+    after["max_reasoning_bytes"] = json!(26214);
+    after["provider_defaults"] = json!({"top_k": 40});
+    assert_eq!(
+        request_settings_diff(&before, &after),
+        None,
+        "derived values are not controls"
+    );
+    after["thinking"] = json!(false);
+    after["temperature"] = json!(0.2);
+    assert_eq!(
+        request_settings_diff(&before, &after).as_deref(),
+        Some("temp 0.6 → 0.2 · thinking on → off")
+    );
+    after["max_tokens"] = Value::Null;
+    assert!(
+        request_settings_diff(&before, &after)
+            .unwrap()
+            .ends_with("output limit 4096 → default")
+    );
 }

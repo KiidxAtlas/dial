@@ -78,8 +78,8 @@ queue requests. Passing this small protocol check is not a coding-quality or uni
   `/setup grounding yes` / `/setup image-embeddings yes` download the default MLX checkpoint
   and assign its role (see [model-vision.md](model-vision.md)). `/setup providers` opens
   Providers directly.
-- **Shell**: `dial doctor` reports the same list (✓ installed with its path, · not installed with the
-  `dial doctor --fix <id>` command), followed by a Memory section (the selected backend, what it
+- **Shell**: `dial doctor` lists what is installed (✓ with its path) and counts what is not;
+  `dial doctor --all` lists every missing capability with its `dial doctor --fix <id>` command. Both are followed by a Memory section (the selected backend, what it
   still needs, and each backend's readiness). Select a backend without the TUI with
   `dial config set memory.backend <off|provenance|semantic|local|sharpshooter|hindsight>`.
   `dial doctor --fix <id>` previews and ends with the exact `--yes` command that runs it.

@@ -28,7 +28,12 @@ pub fn run(layout: &Layout, args: &RunArgs) -> Result<i32> {
         "run requires an executable after --"
     );
     let mut capture = Capture::start(layout, &args.name)?;
-    let mut command = Command::new(&args.command[0]);
+    // `npm`, `pnpm` and `npx` are `.cmd` shims on Windows, which `Command` alone cannot find.
+    let program = crate::platform::fs::launch_path(
+        std::path::Path::new(&args.command[0]),
+        std::env::var_os("PATH").as_deref(),
+    );
+    let mut command = Command::new(program);
     command
         .args(&args.command[1..])
         .current_dir(&layout.project_root);

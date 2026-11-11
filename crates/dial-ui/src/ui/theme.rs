@@ -1289,6 +1289,17 @@ impl ThemeManager {
         manager
     }
 
+    /// Whether `name` loads as a theme for the user directory: a built-in, or a valid custom
+    /// file. `auto` is accepted only where `allow_auto` (the `ui.theme` setting) says so.
+    pub fn check_name(user_dir: &Path, name: &str, allow_auto: bool) -> Result<(), String> {
+        if allow_auto && name == "auto" {
+            return Ok(());
+        }
+        Self::new(user_dir, &UiConfig::default(), None)
+            .load_named(name, 0)
+            .map(|_| ())
+    }
+
     pub fn current(&self) -> &Theme {
         &self.theme
     }

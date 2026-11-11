@@ -184,6 +184,7 @@ fn run_external(
     command
         .args(args)
         .env_clear()
+        .envs(crate::tools::exec::sandbox::windows_system_env())
         .envs(reader_env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

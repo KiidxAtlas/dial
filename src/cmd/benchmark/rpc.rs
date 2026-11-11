@@ -113,6 +113,29 @@ fn require_compaction(result: &Value) -> Result<()> {
     Ok(())
 }
 
+fn completed_turns(report: &Value, previous: u64) -> Result<u64> {
+    let completed = report
+        .pointer("/metrics/turns_completed")
+        .and_then(Value::as_u64)
+        .context("benchmark completion counter unavailable")?;
+    let expected = match report["outcome"].as_str() {
+        Some("answered") => Some(previous),
+        Some("completed") | None => previous.checked_add(1),
+        _ => None,
+    };
+    ensure!(
+        expected == Some(completed),
+        "agent stopped without completing the benchmark turn: {}",
+        report["text"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(512)
+            .collect::<String>()
+    );
+    Ok(completed)
+}
+
 /// Recovery state may describe the previous turn, so retain it separately from send reports.
 fn retain_efficiency(metrics: &mut RunMetrics, state: &Value, send: Option<u64>) {
     let Some(report) = state.get("efficiency").filter(|value| !value.is_null()) else {
@@ -413,21 +436,7 @@ pub fn run_configured(
                         .is_some_and(|t| !t.trim().is_empty()),
                 "benchmark turn interrupted or empty"
             );
-            let completed = report
-                .pointer("/metrics/turns_completed")
-                .and_then(Value::as_u64)
-                .context("benchmark completion counter unavailable")?;
-            ensure!(
-                completed == metrics.turns_completed + 1,
-                "agent stopped without completing the benchmark turn: {}",
-                report["text"]
-                    .as_str()
-                    .unwrap_or("")
-                    .chars()
-                    .take(512)
-                    .collect::<String>()
-            );
-            metrics.turns_completed = completed;
+            metrics.turns_completed = completed_turns(&report, metrics.turns_completed)?;
             metrics.response_sha256 = report["text"].as_str().map(response_sha256);
             if let Some(speculation) = report.get("speculation") {
                 for (name, target) in [

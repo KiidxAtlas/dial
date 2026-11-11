@@ -134,10 +134,7 @@ pub(crate) fn binding(config: &AppConfig) -> String {
     let cache = std::env::var_os("HF_HUB_CACHE")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HF_HOME").map(|p| std::path::PathBuf::from(p).join("hub")))
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|p| std::path::PathBuf::from(p).join(".cache/huggingface/hub"))
-        });
+        .or_else(|| crate::config::paths::home_dir().map(|p| p.join(".cache/huggingface/hub")));
     let revision = cache.and_then(|cache| {
         std::fs::read_to_string(
             cache

@@ -1003,103 +1003,156 @@ pub fn is_secret_env(name: &str, value: &str) -> bool {
 /// excluded, not guessed safe from their spelling. Explicit operator-configured environment
 /// entries (for example MCP `env`) are separate grants applied by the caller afterwards.
 pub fn child_env_allowed(name: &str, value: &str) -> bool {
-    const RUNTIME: &[&str] = &[
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "PWD",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "LANG",
-        "LANGUAGE",
-        "LC_ALL",
-        "LC_CTYPE",
-        "LC_COLLATE",
-        "LC_MESSAGES",
-        "LC_MONETARY",
-        "LC_NUMERIC",
-        "LC_TIME",
-        "TZ",
-        "TERM",
-        "COLORTERM",
-        "NO_COLOR",
-        "CARGO_HOME",
-        "RUSTUP_HOME",
-        "CARGO_TARGET_DIR",
-        "RUSTUP_TOOLCHAIN",
-        "GOPATH",
-        "GOROOT",
-        "GOCACHE",
-        "GOMODCACHE",
-        "GOTOOLCHAIN",
-        "GOPROXY",
-        "VIRTUAL_ENV",
-        "CONDA_PREFIX",
-        "PYENV_ROOT",
-        "PYENV_VERSION",
-        "PYENV_DIR",
-        "NVM_DIR",
-        "NODE_PATH",
-        "npm_config_cache",
-        "PNPM_HOME",
-        "BUN_INSTALL",
-        "UV_CACHE_DIR",
-        "PIP_CACHE_DIR",
-        "XDG_CACHE_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "XDG_RUNTIME_DIR",
-        "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "XAUTHORITY",
-        "XDG_CURRENT_DESKTOP",
-        "XDG_SESSION_TYPE",
-        "DESKTOP_SESSION",
-        "DEVELOPER_DIR",
-        "SDKROOT",
-        "HOMEBREW_PREFIX",
-        "HOMEBREW_CELLAR",
-        "SystemRoot",
-        "SYSTEMROOT",
-        "WINDIR",
-        "COMSPEC",
-        "ComSpec",
-        "PATHEXT",
-        "USERPROFILE",
-        "APPDATA",
-        "LOCALAPPDATA",
-        "PROGRAMFILES",
-        "ProgramFiles",
-        "PROGRAMFILES(X86)",
-        "ProgramFiles(x86)",
-        "PROGRAMDATA",
-        "ProgramData",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "HTTPS_PROXY",
-        "HTTP_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "https_proxy",
-        "http_proxy",
-        "all_proxy",
-        "no_proxy",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "CURL_CA_BUNDLE",
-    ];
-    RUNTIME.contains(&name)
-        && !is_secret_env(name, value)
+    !is_secret_env(name, value)
+        && runtime_variable(name, cfg!(windows))
         && !value.split_once("://").is_some_and(|(_, rest)| {
             rest.split(['/', '?', '#'])
                 .next()
                 .is_some_and(|authority| authority.contains('@'))
         })
+}
+
+const RUNTIME_VARIABLES: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "PWD",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TZ",
+    "TERM",
+    "COLORTERM",
+    "NO_COLOR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "CARGO_TARGET_DIR",
+    "RUSTUP_TOOLCHAIN",
+    "GOPATH",
+    "GOROOT",
+    "GOCACHE",
+    "GOMODCACHE",
+    "GOTOOLCHAIN",
+    "GOPROXY",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "PYENV_ROOT",
+    "PYENV_VERSION",
+    "PYENV_DIR",
+    "NVM_DIR",
+    "NODE_PATH",
+    "npm_config_cache",
+    "PNPM_HOME",
+    "BUN_INSTALL",
+    "UV_CACHE_DIR",
+    "PIP_CACHE_DIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XAUTHORITY",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "DESKTOP_SESSION",
+    "DEVELOPER_DIR",
+    "SDKROOT",
+    "HOMEBREW_PREFIX",
+    "HOMEBREW_CELLAR",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "ComSpec",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMFILES",
+    "ProgramFiles",
+    "PROGRAMFILES(X86)",
+    "ProgramFiles(x86)",
+    "PROGRAMDATA",
+    "ProgramData",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+];
+
+/// Windows system variables a process with a cleared environment still needs: without
+/// `SystemRoot` Winsock cannot load its providers (WSAEPROVIDERFAILUREINIT), so Node, Chromium
+/// and other networked children fail, and `ComSpec`/`PATHEXT` are needed to start `.cmd` shims.
+/// It holds no profile, credential or cache location. Empty on other platforms.
+pub fn windows_system_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    windows_system_env_from(std::env::vars_os())
+}
+
+const WINDOWS_SYSTEM_VARIABLES: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "ComSpec",
+    "PATHEXT",
+    "OS",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "CommonProgramFiles",
+];
+
+fn windows_system_env_from(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            WINDOWS_SYSTEM_VARIABLES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&name))
+        })
+        .collect()
+}
+
+/// Windows variable names are case-insensitive and a default profile stores `Path` and `windir`,
+/// so an exact-case match there silently dropped `PATH` from every tool child.
+fn runtime_variable(name: &str, case_insensitive: bool) -> bool {
+    RUNTIME_VARIABLES.iter().any(|known| {
+        if case_insensitive {
+            known.eq_ignore_ascii_case(name)
+        } else {
+            *known == name
+        }
+    })
 }
 
 /// Cache variables a Dev command gets pointed at [`toolchain_cache_root`] (the empty

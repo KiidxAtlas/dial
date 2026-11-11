@@ -25,7 +25,7 @@ Find actions through the goal-first palette, slash completion and command help.
   that filters as you type. `Up`/`Down` move (wrapping, with a position counter for long lists), `Tab`/`Right`
   complete, `Esc` dismisses without losing the draft. Without navigating, `Enter` sends exactly what you
   typed, so a full command runs at once; after you move the highlight with `Up`/`Down`, `Enter` accepts and
-  runs the highlighted command. File mentions (`@path`) complete the highlighted file on `Enter`. Built-ins
+  runs the highlighted command. File mentions (`@path`) complete the highlighted file on `Enter`, also mid-draft while you type the mention; paths with spaces are inserted quoted (`@"My Notes.md"`). Built-ins
   win over a custom command with the same name. `/clear`, `/resume`, `/palette`, `/commands`, `/tree`,
   `/branch`, `/rollback` and `/review-file` still work but are hidden from menus in favor of `/new`,
   `/sessions`, `/help`, `/help commands`, `/sessions this|branch`, `/undo files` and `/review files`.

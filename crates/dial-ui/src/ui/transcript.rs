@@ -404,11 +404,7 @@ impl Block {
             Kind::Assistant(_) => "Assistant",
             _ => return,
         };
-        let header = format!(
-            "{label} {} {} UTC",
-            ctx.theme.sym(Sym::Dot),
-            timestamp.replace('T', " ")
-        );
+        let header = format!("{label} {} {timestamp}", ctx.theme.sym(Sym::Dot));
         rows.insert(
             0,
             Line::from(Span::styled(
@@ -1267,7 +1263,7 @@ impl Transcript {
         self.push(Kind::User(text.to_owned()), false);
     }
 
-    /// Append live user text with its observed UTC submission time.
+    /// Append live user text with its observed UTC submission time (shown in local time).
     pub fn push_user_at(&mut self, text: &str, timestamp: &str) {
         let first = self.blocks.len();
         self.push_user(text);
@@ -1288,19 +1284,26 @@ impl Transcript {
         self.stamp_blocks(first, timestamp);
     }
 
+    /// Stamps new message blocks with a recorded `YYYY-MM-DDTHH:MM:SS…Z` time, shown in the local
+    /// time zone; a time the platform cannot convert is shown as UTC and labelled so.
     fn stamp_blocks(&mut self, first: usize, timestamp: &str) {
-        let Some(time) = timestamp
+        let Some((time, secs)) = timestamp
             .get(..19)
-            .filter(|time| crate::platform::time::parse_utc(time).is_some())
+            .and_then(|time| Some((time, crate::platform::time::parse_utc(time)?)))
         else {
             return;
         };
         if !timestamp.ends_with('Z') {
             return;
         }
+        let shown = u64::try_from(secs)
+            .ok()
+            .and_then(|secs| secs.checked_mul(1000))
+            .and_then(crate::platform::time::local_stamp)
+            .unwrap_or_else(|| format!("{} UTC", time.replace('T', " ")));
         for block in &mut self.blocks[first..] {
             if matches!(block.kind, Kind::User(_) | Kind::Assistant(_)) {
-                block.timestamp = Some(time.to_owned());
+                block.timestamp = Some(shown.clone());
                 block.revision.set(block.revision.get().saturating_add(1));
             }
         }

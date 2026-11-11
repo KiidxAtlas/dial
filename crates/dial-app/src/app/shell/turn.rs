@@ -309,13 +309,11 @@ impl Shell {
                 }
             }
             Err(error) => {
-                self.transcript.error(&format!("{error:#}"));
+                let text = crate::agent::user_failure_text(error);
+                self.transcript.error(&text);
                 self.live_pane.chat(
                     ChatRole::Event,
-                    &format!(
-                        "Turn failed: {}",
-                        crate::ui::text::one_line(&format!("{error:#}"))
-                    ),
+                    &format!("Turn failed: {}", crate::ui::text::one_line(&text)),
                 );
             }
         }
@@ -348,7 +346,10 @@ impl Shell {
         }
         // Inbox availability is independent of terminal notification preferences. Use the
         // authoritative typed outcome, not message text, to attach its settings destination.
-        if let Some(notice) = crate::ui::termcaps::turn_end_notice(outcome, true, true) {
+        // A delivered reply is already on screen, so only work outcomes reach the inbox.
+        if outcome != crate::agent::TurnOutcome::Answered
+            && let Some(notice) = crate::ui::termcaps::turn_end_notice(outcome, true, true)
+        {
             use crate::ui::overlay::inbox::Category;
             use crate::ui::termcaps::NotifyKind;
             let category = match notice.kind {

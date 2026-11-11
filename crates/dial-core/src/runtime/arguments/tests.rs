@@ -110,3 +110,19 @@ fn bare_schemas_keep_every_parameter_and_help_restores_explanations() {
     assert!(help.contains("- ready (object): readiness"), "{help}");
     assert!(parameter_help(&json!({})).is_empty());
 }
+
+#[test]
+fn prose_words_keep_apostrophes_and_plain_backslashes() {
+    assert_eq!(
+        split_prose_words("don't panic now"),
+        ["don't", "panic", "now"]
+    );
+    assert_eq!(split_prose_words(r"C:\dir a\b"), [r"C:\dir", r"a\b"]);
+    assert_eq!(
+        split_prose_words(r#"one 'two words' "three \" four" five\ six"#),
+        ["one", "two words", "three \" four", "five six"]
+    );
+    assert_eq!(split_prose_words("it's 'open"), ["it's", "'open"]);
+    // The shell-style splitter keeps its existing semantics.
+    assert_eq!(split_words(r"a\b"), ["ab"]);
+}

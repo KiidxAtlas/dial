@@ -635,3 +635,20 @@ fn a_variable_shadows_a_named_color_but_a_self_reference_means_the_terminal_colo
     );
     assert!(resolve("loop").unwrap_err().contains("cycle"));
 }
+
+#[test]
+fn check_name_accepts_built_in_valid_custom_and_auto_only_where_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    write_theme(dir.path(), "mine", "{}");
+    write_theme(dir.path(), "broken", "{not json");
+    assert_eq!(ThemeManager::check_name(dir.path(), "light", false), Ok(()));
+    assert_eq!(ThemeManager::check_name(dir.path(), "mine", false), Ok(()));
+    assert_eq!(ThemeManager::check_name(dir.path(), "auto", true), Ok(()));
+    assert!(ThemeManager::check_name(dir.path(), "auto", false).is_err());
+    assert!(ThemeManager::check_name(dir.path(), "broken", true).is_err());
+    let unknown = ThemeManager::check_name(dir.path(), "nosuchtheme", true).unwrap_err();
+    assert!(
+        unknown.contains("unknown theme \"nosuchtheme\""),
+        "{unknown}"
+    );
+}

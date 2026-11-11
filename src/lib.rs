@@ -19,6 +19,9 @@ pub use dial_agent::{
     weights,
 };
 pub use dial_app::{acp, app, benchmark, changelog, cli, collab, release, repl, rpc, schedule};
-pub use dial_core::{flush_stdout_on_exit, install_tls_provider, platform, runtime};
+pub use dial_core::{
+    CLOSED_STDOUT_STATUS, exit_quietly_on_closed_stdout, flush_stdout_on_exit,
+    install_tls_provider, platform, runtime,
+};
 pub use dial_tools::{browser_relay, embedded_shell, security, setup, tools, voice};
 pub use dial_ui::ui;

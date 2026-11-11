@@ -469,10 +469,11 @@ pub fn config_name(name: &str) -> String {
     }
 }
 
-/// Finds an executable on PATH without running it.
+/// Finds an executable on PATH without running it. On Windows a bare name also matches its
+/// `PATHEXT` form, so `npx` is found as `npx.cmd`.
 pub fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+    crate::platform::fs::find_program(Path::new(program), std::env::var_os("PATH").as_deref())
+        .is_some()
 }
 
 /// Why a health check found no tools.
@@ -494,12 +495,16 @@ impl std::fmt::Display for CheckFailure {
 }
 
 /// Starts `server` once and counts its tools. `Err` when it lists none or fails to start;
-/// [`CheckFailure::SignIn`] when it only lacks an OAuth sign-in.
+/// [`CheckFailure::SignIn`] when it only lacks an OAuth sign-in. A package OSV.dev reports as
+/// malicious is refused before it is started (see [`super::osv`]).
 pub fn check(
     config: &Config,
     name: &str,
     server: &McpServerConfig,
 ) -> std::result::Result<usize, CheckFailure> {
+    if let Some(why) = super::osv::refusal(super::osv::URL, name, server) {
+        return Err(CheckFailure::Failed(why));
+    }
     // An explicit health check tests disabled entries without enabling them in saved config.
     let mut server = server.clone();
     server.enabled = true;
@@ -596,17 +601,67 @@ pub fn dedupe_key(name: &str) -> String {
 /// `uvx [--from <pkg>[extras]==v] <cmd>`), so listings that run the same package fold together.
 /// Installs with further arguments (a bridge to a URL, a project root) are not a package identity.
 fn package_key(server: &McpServerConfig) -> Option<String> {
+    let package = launched_package(server).filter(|package| package.whole)?;
+    Some(format!(
+        "package:{}:{}",
+        package.ecosystem.to_ascii_lowercase(),
+        package.name.to_ascii_lowercase()
+    ))
+}
+
+/// The registry package a stdio server is launched from.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct LaunchedPackage<'a> {
+    /// OSV ecosystem name: `npm` or `PyPI`.
+    pub ecosystem: &'static str,
+    pub name: &'a str,
+    /// A pinned release (`1.2.3`); tags such as `latest` are not versions.
+    pub version: Option<&'a str>,
+    /// The arguments are exactly the launch, with nothing after the package or its command.
+    pub whole: bool,
+}
+
+/// The package behind `npx -y <pkg>[@v] …`, `npx -y --package=<pkg>[@v] <cmd> …`,
+/// `uvx --from <pkg>[extras][==v] <cmd> …` or `uvx <pkg> …`. `None` for anything else.
+pub(super) fn launched_package(server: &McpServerConfig) -> Option<LaunchedPackage<'_>> {
     let args: Vec<&str> = server.args.iter().map(String::as_str).collect();
     let program = server.program.to_str()?;
-    let (kind, package) = match (program, args.as_slice()) {
-        ("npx", ["-y", spec]) => ("npm", unversioned(spec)),
-        ("npx", ["-y", spec, _]) => ("npm", unversioned(spec.strip_prefix("--package=")?)),
-        // Extras (`graphifyy[mcp]`) select optional dependencies of the same package.
-        ("uvx", ["--from", spec, _]) => ("pypi", spec.split(['=', '[']).next()?),
-        ("uvx", [package]) if !package.starts_with('-') => ("pypi", *package),
-        _ => return None,
+    let pinned = |version: &'_ str| {
+        version.starts_with(|c: char| c.is_ascii_digit()) && super::fetch::plain_version(version)
     };
-    Some(format!("package:{kind}:{}", package.to_ascii_lowercase()))
+    match (program, args.as_slice()) {
+        ("npx", ["-y", spec, rest @ ..]) => {
+            let (spec, whole) = match spec.strip_prefix("--package=") {
+                Some(spec) => (spec, rest.len() == 1),
+                None => (*spec, rest.is_empty()),
+            };
+            let name = unversioned(spec);
+            let version = spec[name.len()..].strip_prefix('@').filter(|v| pinned(v));
+            Some(LaunchedPackage {
+                ecosystem: "npm",
+                name,
+                version,
+                whole,
+            })
+        }
+        // Extras (`graphifyy[mcp]`) select optional dependencies of the same package.
+        ("uvx", ["--from", spec, _, rest @ ..]) => Some(LaunchedPackage {
+            ecosystem: "PyPI",
+            name: spec.split(['=', '[']).next()?,
+            version: spec
+                .split_once("==")
+                .map(|(_, version)| version)
+                .filter(|v| pinned(v)),
+            whole: rest.is_empty(),
+        }),
+        ("uvx", [package, rest @ ..]) if !package.starts_with('-') => Some(LaunchedPackage {
+            ecosystem: "PyPI",
+            name: package,
+            version: None,
+            whole: rest.is_empty(),
+        }),
+        _ => None,
+    }
 }
 
 /// `name@version` or `@scope/name@version` without the version.

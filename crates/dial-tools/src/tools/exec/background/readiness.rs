@@ -84,15 +84,63 @@ impl Ready {
     }
 }
 
+/// Windows proves ownership without external tools: the IP Helper table names each listener's
+/// PID, and the PID must sit inside the Job Object Dial created for this background group.
 #[cfg(windows)]
 pub(super) fn port_ready(
-    _: u32,
-    _: SocketAddr,
-    _: Option<Instant>,
-    _: &AtomicBool,
-    _: &AtomicBool,
+    group_pid: u32,
+    address: SocketAddr,
+    deadline: Option<Instant>,
+    cancel: &AtomicBool,
+    interrupt: &AtomicBool,
 ) -> Result<bool, String> {
-    Err("Windows port readiness cannot prove listener ownership; use ready.log instead".into())
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    if cancel.load(Ordering::Acquire) || interrupt.load(Ordering::Acquire) {
+        return Err("cancelled readiness probe; background process remains managed by bg".into());
+    }
+    let listeners = crate::platform::processes::listeners()
+        .map_err(|e| format!("reading the socket tables for listener ownership: {e}"))?;
+    let owned = owned_listener(
+        listeners
+            .iter()
+            .map(|l| (l.protocol, l.address, l.port, l.pid)),
+        address,
+        |pid| crate::platform::process::in_group(group_pid, pid),
+    );
+    if !owned {
+        return Ok(false);
+    }
+    // Bounded TCP probe follows positive socket ownership evidence, as on Unix.
+    let local_end = Instant::now() + Duration::from_millis(100);
+    let end = deadline.map_or(local_end, |end| end.min(local_end));
+    let remaining = end.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+    Ok(std::net::TcpStream::connect_timeout(&address, remaining).is_ok())
+}
+
+/// Whether a listening TCP socket on `address`'s port belongs to the group. A wildcard socket
+/// (`0.0.0.0` or `::`, often dual-stack) counts for either family, as lsof's `*:port` does; the
+/// TCP probe then decides reachability.
+#[cfg(any(windows, test))]
+fn owned_listener(
+    listeners: impl IntoIterator<Item = (&'static str, IpAddr, u16, u32)>,
+    address: SocketAddr,
+    owned: impl Fn(u32) -> bool,
+) -> bool {
+    listeners.into_iter().any(|(protocol, ip, port, pid)| {
+        let family = matches!(
+            (protocol, address.ip()),
+            ("tcp", IpAddr::V4(_)) | ("tcp6", IpAddr::V6(_))
+        );
+        let tcp = matches!(protocol, "tcp" | "tcp6");
+        port == address.port()
+            && tcp
+            && (ip.is_unspecified() || (family && ip == address.ip()))
+            && owned(pid)
+    })
 }
 #[cfg(unix)]
 pub(super) fn port_ready(
@@ -222,3 +270,6 @@ pub(super) fn port_ready(
     }
     Ok(TcpStream::connect_timeout(&address, remaining).is_ok())
 }
+
+#[cfg(test)]
+mod tests;

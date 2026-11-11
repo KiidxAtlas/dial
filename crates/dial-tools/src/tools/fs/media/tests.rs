@@ -193,7 +193,13 @@ fn external_reads_reject_before_open_or_converter_lookup_without_both_grants() {
     let (_dir, ws) = crate::tools::testkit::workspace();
     let config = crate::config::types::Config::default();
     let cancel = AtomicBool::new(false);
-    for path in ["missing.mp4", "missing.heic", "missing.pdf:page=1:img"] {
+    for path in [
+        "missing.mp4",
+        "missing.heic",
+        "missing.pdf:page=1:img",
+        "missing.html:img",
+        "missing.md:img",
+    ] {
         let args = json!({"path": path});
         let output = crate::tools::read_tool_streaming(&ws, &args, &cancel, 4096);
         assert!(
@@ -247,6 +253,68 @@ fn handles_route_before_media_detection_and_plain_reads_stay_available() {
     );
     let output = crate::tools::read_tool_streaming(&ws, &json!({"paths":[handle]}), &cancel, 4096);
     assert!(output.text.contains("single path"), "{}", output.text);
+}
+
+#[test]
+fn page_targets_render_only_with_the_img_selector() {
+    assert!(needs_approval("site/index.html:img"));
+    assert!(needs_approval("README.md:img"));
+    assert!(!needs_approval("README.md"));
+    assert!(!needs_approval("index.html:3"));
+    let (dir, ws) = crate::tools::testkit::workspace();
+    fs::write(dir.path().join("notes.md"), b"# plain text read\n").unwrap();
+    let cancel = AtomicBool::new(false);
+    let output = crate::tools::read_tool_streaming(&ws, &json!({"path":"notes.md"}), &cancel, 4096);
+    assert!(
+        !output.is_error && output.text.contains("# plain text read"),
+        "{}",
+        output.text
+    );
+}
+
+/// Runs only where a Chromium is installed; elsewhere it reports the skip and returns.
+#[test]
+fn rendered_pages_show_inline_content_and_block_local_files() {
+    let browser = crate::config::tools::browser::BrowserConfig::default();
+    if crate::tools::net::browser::installed_chromium(&browser).is_none() {
+        eprintln!("skipped: no installed Chromium");
+        return;
+    }
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let red = image::RgbImage::from_pixel(4, 4, image::Rgb([255, 0, 0]));
+    red.save(dir.path().join("red.png")).unwrap();
+    let local = url::Url::from_file_path(dir.path().join("red.png")).unwrap();
+    fs::write(
+        dir.path().join("page.html"),
+        format!(
+            "<body style=\"margin:0;background:#00ff00\"><img src=\"{local}\" style=\"position:fixed;inset:0;width:100%;height:100%\"></body>"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("note.md"),
+        b"<div style=\"position:fixed;inset:0;background:#0000ff\"></div>\n\n# Title\n",
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    for (file, ext, expected) in [
+        ("page.html", "html", [0u8, 255, 0]),
+        ("note.md", "md", [0, 0, 255]),
+    ] {
+        let output = render_page(&ws, file, ext, &browser, &cancel).unwrap();
+        assert!(output.text.contains("rendered from"), "{}", output.text);
+        let encoded = output.data.as_ref().unwrap()["artifact"]["data"]
+            .as_str()
+            .unwrap();
+        let png = image::load_from_memory(&STANDARD.decode(encoded).unwrap())
+            .unwrap()
+            .to_rgb8();
+        let centre = png.get_pixel(png.width() / 2, png.height() / 2).0;
+        assert_eq!(
+            centre, expected,
+            "{file}: local file loads must stay blocked"
+        );
+    }
 }
 
 #[test]

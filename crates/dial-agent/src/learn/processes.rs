@@ -233,17 +233,66 @@ fn classify(user: &Path, process: &Process, all: &[Process]) -> Option<(&'static
     for _ in 0..16 {
         let ancestor = all.iter().find(|p| p.pid == parent)?;
         if ancestor.is_dial() {
-            return Some((
-                "tools",
-                Path::new(program)
-                    .file_name()?
-                    .to_string_lossy()
-                    .into_owned(),
-            ));
+            return Some(("tools", tool_label(program, command)?));
         }
         parent = ancestor.parent;
     }
     None
+}
+
+/// A descendant tool's name: the executable, plus the script or package an interpreter or
+/// package runner runs, so `npm exec @upstash/context7-mcp` and
+/// `node …/node_modules/.bin/context7-mcp` read as `npm @upstash/context7-mcp` and
+/// `node context7-mcp` rather than a column of `npm` and `node`.
+pub(crate) fn tool_label(program: &str, command: &str) -> Option<String> {
+    const RUNNERS: &[&str] = &[
+        "node", "npm", "npx", "pnpm", "yarn", "bun", "bunx", "deno", "python", "python3", "uv",
+        "uvx", "pipx", "ruby", "java", "sh", "bash", "zsh",
+    ];
+    const VERBS: &[&str] = &["exec", "run", "x", "dlx", "tool"];
+    const GENERIC: &[&str] = &["index", "main", "cli", "server", "__main__", "run"];
+    let name = Path::new(program)
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    let base = name.trim_end_matches(".exe");
+    let runner = RUNNERS.contains(&base)
+        || base.starts_with("python3.")
+        || base
+            .strip_prefix("python")
+            .is_some_and(|v| v.parse::<f32>().is_ok());
+    if !runner {
+        return Some(name);
+    }
+    let target = command
+        .split_whitespace()
+        .skip(1)
+        .find(|word| !word.starts_with('-') && !VERBS.contains(word));
+    let Some(target) = target else {
+        return Some(name);
+    };
+    let path = Path::new(target);
+    let mut subject = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| target.to_owned());
+    if target.starts_with('@') {
+        subject = target.to_owned();
+    } else if GENERIC.contains(&subject.as_str())
+        && let Some(parent) = path.parent().and_then(Path::file_name)
+    {
+        // `…/context7/dist/index.js` → `context7`: skip build directories.
+        let parent = parent.to_string_lossy();
+        subject = if matches!(parent.as_ref(), "dist" | "build" | "lib" | "src" | "bin") {
+            path.parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .map_or(parent.to_string(), |dir| dir.to_string_lossy().into_owned())
+        } else {
+            parent.into_owned()
+        };
+    }
+    Some(format!("{base} {subject}"))
 }
 fn inventory(user: &Path, all: &[Process]) -> Vec<Value> {
     let mut rows = Vec::new();

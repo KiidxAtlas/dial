@@ -233,11 +233,26 @@ pub(in crate::app) fn draw_overlay_frame(
                 frame.buffer_mut(),
                 area,
                 themes.current(),
-                &format!("Dial is still working · {stop} closes this panel"),
+                &format!("Dial is still working · {stop} closes panels"),
             );
         }
     }
     overlay.native_placements()
+}
+
+/// The one panel rule, idle or busy: Esc steps back a level, the stop key (Ctrl+C) leaves the panels
+/// entirely and never stops the turn from inside a panel. The worker viewer keeps the stop key
+/// because it arms a cancel of the worker it shows.
+pub(in crate::app) fn stop_key_leaves_panels(
+    keys: &crate::ui::keys::Keymap,
+    overlay: &mut ActiveOverlay,
+    event: &Event,
+) -> bool {
+    use crate::ui::keys::Action;
+    matches!(event, Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release
+        && keys.matches(Action::Interrupt, key)
+        && !keys.matches(Action::SelectCancel, key))
+        && !matches!(overlay.content_mut(), ActiveOverlay::SubagentViewer(_))
 }
 
 pub(in crate::app) fn overlay_input(
@@ -271,6 +286,11 @@ pub(in crate::app) fn overlay_input(
     }
     if matches!(event, Event::Resize(..)) {
         return false;
+    }
+    if stop_key_leaves_panels(env.keys, overlay, &event) {
+        env.next = None;
+        env.history.clear();
+        return true;
     }
     let outcome = overlay.handle(&event, env.keys);
     env.apply(outcome, overlay)

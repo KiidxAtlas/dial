@@ -50,6 +50,23 @@ pub(crate) fn directory(layout: &Layout, session: &str) -> Result<PathBuf> {
     Ok(layout.state_dir.join("live").join(session))
 }
 
+/// Why a live feed could not be opened, in the user's terms: an unknown session, a session that
+/// never ran `/watch`, or (for anything else) the underlying error.
+fn missing_feed(layout: &Layout, session: &str, error: std::io::Error) -> anyhow::Error {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return anyhow::Error::new(error).context("cannot open the live feed");
+    }
+    let known = crate::storage::session::Session::find_prefix(layout, session)
+        .is_ok_and(|matches| !matches.is_empty());
+    if known {
+        anyhow::anyhow!("session {session} has no live feed yet; run /watch in that session first")
+    } else {
+        anyhow::anyhow!(
+            "no session {session:?} in this project; `dial sessions` lists ids (the full id is shown by /watch)"
+        )
+    }
+}
+
 fn image_name(file: &str) -> bool {
     file.strip_suffix(".image")
         .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -239,7 +256,7 @@ pub fn run(layout: &Layout, args: WatchArgs) -> Result<i32> {
         OpenOptions::new().read(true),
         &dir.join("events.jsonl"),
     )
-    .context("no live feed; run /watch in the session first")?;
+    .map_err(|error| missing_feed(layout, &args.session, error))?;
     atomic::check_file(&file)?;
     let terminal = std::io::stdout().is_terminal();
     if !args.once && terminal {
@@ -316,7 +333,12 @@ pub fn run(layout: &Layout, args: WatchArgs) -> Result<i32> {
 
 fn next_event(reader: &mut impl BufRead, pending: &mut Vec<u8>) -> Result<Option<Event>> {
     loop {
-        let available = reader.fill_buf()?;
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            // A failed read consumes nothing, so the next poll retries at the same offset.
+            Err(error) if append_in_progress(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         if available.is_empty() {
             return Ok(None);
         }
@@ -337,6 +359,14 @@ fn next_event(reader: &mut impl BufRead, pending: &mut Vec<u8>) -> Result<Option
             return Ok(Some(event));
         }
     }
+}
+
+/// [`append`] holds `File::lock` while writing. On Windows that lock is a mandatory byte-range
+/// lock, so a concurrent read fails with `ERROR_LOCK_VIOLATION` instead of waiting; the watcher
+/// must treat it as "nothing new yet" rather than closing the pane.
+fn append_in_progress(error: &std::io::Error) -> bool {
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    cfg!(windows) && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION)
 }
 
 #[cfg(test)]

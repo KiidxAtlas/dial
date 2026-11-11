@@ -140,18 +140,17 @@ fn model_shortcut_is_platform_specific_and_keeps_alt_compatibility() {
     assert_eq!(
         map.label(Action::ModelSelect),
         if cfg!(target_os = "macos") {
-            "Ctrl+K"
+            "F2"
         } else {
             "Alt+M"
         }
     );
-    assert_eq!(
-        map.matches(
-            Action::ModelSelect,
-            &key(KeyCode::Char('k'), KeyModifiers::CONTROL)
-        ),
-        cfg!(target_os = "macos")
-    );
+    // Ctrl+K stays cut-to-line-end in the composer on every platform.
+    assert!(!map.matches(
+        Action::ModelSelect,
+        &key(KeyCode::Char('k'), KeyModifiers::CONTROL)
+    ));
+    assert!(map.shadowed(Action::EditorDeleteToLineEnd).is_empty());
     assert!(map.matches(
         Action::ModelSelect,
         &key(KeyCode::Char('m'), KeyModifiers::ALT)

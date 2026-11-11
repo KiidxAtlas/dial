@@ -13,7 +13,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command as Process;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -1446,16 +1445,16 @@ pub trait Evaluator {
     fn run(&mut self, root: &Path, check: &Check) -> Result<()>;
 }
 
-/// Runs the resolved command through `sh -c` in the workspace root. A non-zero exit is an error
+/// Runs the resolved command through the host shell (`sh -c`; Git Bash or PowerShell on Windows)
+/// in the workspace root. A non-zero exit is an error
 /// with stderr attached; the gate separately checks that every slot has a row.
 pub struct ShellEvaluator;
 
 impl Evaluator for ShellEvaluator {
     fn run(&mut self, root: &Path, check: &Check) -> Result<()> {
         fs::create_dir_all(root.join(&check.out_dir))?;
-        let output = Process::new("sh")
-            .arg("-c")
-            .arg(&check.command)
+        let output = crate::tools::exec::shell::host_script_command(&check.command)
+            .map_err(anyhow::Error::msg)?
             .current_dir(root)
             .output()
             .with_context(|| format!("starting the ratchet command for {}", check.variant))?;

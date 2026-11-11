@@ -163,6 +163,7 @@ pub(crate) enum LayaCommand {
 pub(crate) enum AuthCommand {
     /// Manage the stored accounts of an OAuth provider (the id shown in /providers).
     Accounts {
+        /// Provider id, for example `anthropic` or `openai`.
         provider: String,
         #[command(subcommand)]
         action: Option<AccountCommand>,
@@ -709,6 +710,9 @@ pub(crate) enum Command {
         /// Run the install after previewing it.
         #[arg(long, requires = "fix")]
         yes: bool,
+        /// List every optional capability that is not installed, with its setup command.
+        #[arg(long, conflicts_with = "fix")]
+        all: bool,
     },
     /// Manage the stored sign-ins of an OAuth provider: list accounts, select one, or remove one.
     Auth {
@@ -724,9 +728,12 @@ pub(crate) enum Command {
     },
     /// Share the latest session (or a selected session) through an encrypted upload endpoint.
     Share {
+        /// Session id or unique prefix (default: the latest session).
         id: Option<String>,
+        /// Upload server URL (default: `share.server_url`, else `DIAL_SHARE_SERVER`).
         #[arg(long)]
         endpoint: Option<String>,
+        /// Create a secret GitHub gist through `gh` instead of using an upload server.
         #[arg(long, conflicts_with = "endpoint")]
         gist: bool,
         /// Diagnostic: share the whole journal, including abandoned branches and internal records,
@@ -759,6 +766,7 @@ pub(crate) enum Command {
     },
     /// Generate shell completions from the live command and argument definitions.
     Completions {
+        /// Shell to generate completions for.
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
@@ -770,17 +778,22 @@ pub(crate) enum Command {
     BrowserRelay(dial::cli::browser_relay::BrowserRelayArgs),
     /// Run a local WebSocket collaboration relay.
     Relay {
+        /// Address and port to listen on.
         #[arg(long, default_value = "127.0.0.1:7331")]
         bind: std::net::SocketAddr,
     },
     /// Inspect aggregate model/tool usage, or serve a loopback dashboard.
     Stats {
+        /// Print the report as JSON.
         #[arg(long)]
         json: bool,
+        /// Serve the dashboard on a loopback port instead of printing.
         #[arg(long)]
         serve: bool,
+        /// Dashboard port for --serve (default: `stats.port`).
         #[arg(long)]
         port: Option<u16>,
+        /// Look-back window: 24h, 7d, 2w, … or all.
         #[arg(long, default_value = "all")]
         range: String,
     },
@@ -799,6 +812,7 @@ pub(crate) enum Command {
     },
     /// Inspect project experience, reusable recipes and observed utility without loading a model.
     Experience {
+        /// Print the report as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -831,14 +845,72 @@ impl Command {
 
 /// The root command for parsing, help and completions: the top-level copies of the `dev`
 /// subcommands are hidden, so `dial --help` lists everyday commands and the `dev` group.
+/// Global options that belong to a help section (model, permissions, …) still parse after a
+/// subcommand but are hidden from its `--help`, which then shows only what that command takes.
 pub(crate) fn command() -> clap::Command {
     use clap::{CommandFactory, Subcommand};
     let names: Vec<String> = DevCommand::augment_subcommands(clap::Command::new("dev"))
         .get_subcommands()
         .map(|sub| sub.get_name().to_owned())
         .collect();
-    names.iter().fold(Cli::command(), |root, name| {
+    let root = names.iter().fold(Cli::command(), |root, name| {
         root.mut_subcommand(name, |sub| sub.hide(true))
+    });
+    let sectioned: Vec<clap::Arg> = root
+        .get_arguments()
+        .filter(|arg| arg.is_global_set() && arg.get_help_heading().is_some())
+        .map(|arg| arg.clone().hide(true))
+        .collect();
+    let subcommands: Vec<String> = root
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    subcommands.iter().fold(root, |root, name| {
+        root.mut_subcommand(name, |sub| {
+            let mut sub = with_sectioned_globals(sub, &sectioned);
+            if sub.get_after_help().is_none() {
+                sub = sub.after_help(
+                    "Model, permission and session options from `dial --help` also apply.",
+                );
+            }
+            sub
+        })
+    })
+}
+
+/// Adds hidden copies of the sectioned global options to `sub` and, recursively, its
+/// subcommands. A command whose own description names one (`--yes`) keeps it visible.
+/// A subcommand's own argument with the same id wins, as clap's propagation does.
+fn with_sectioned_globals(mut sub: clap::Command, sectioned: &[clap::Arg]) -> clap::Command {
+    let about = [sub.get_about(), sub.get_long_about()]
+        .into_iter()
+        .flatten()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for arg in sectioned {
+        if sub.get_arguments().any(|own| own.get_id() == arg.get_id()) {
+            continue;
+        }
+        let named = arg
+            .get_long()
+            .is_some_and(|long| mentions_flag(&about, long));
+        sub = sub.arg(arg.clone().hide(!named));
+    }
+    let nested: Vec<String> = sub
+        .get_subcommands()
+        .map(|nested| nested.get_name().to_owned())
+        .collect();
+    nested.iter().fold(sub, |sub, name| {
+        sub.mut_subcommand(name, |nested| with_sectioned_globals(nested, sectioned))
+    })
+}
+
+/// `text` names `--long` as a whole flag (not as a prefix of a longer one).
+fn mentions_flag(text: &str, long: &str) -> bool {
+    let flag = format!("--{long}");
+    text.match_indices(&flag).any(|(at, _)| {
+        !text[at + flag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
     })
 }
 
@@ -922,6 +994,7 @@ pub(crate) enum DevCommand {
 pub(crate) enum ScheduleCommand {
     /// Add a schedule. Runs are read-only unless --yes (everything) or --allow (named tools) is given.
     Add {
+        /// Prompt each run sends (quote it).
         prompt: String,
         /// Repeat at this interval: 30s, 15m, 2h, 1d (minimum 30s).
         #[arg(long)]
@@ -939,11 +1012,18 @@ pub(crate) enum ScheduleCommand {
     /// List schedules and when they last ran.
     List,
     /// Delete a schedule.
-    Remove { id: String },
+    Remove {
+        /// Schedule id (see `dial schedule list`).
+        id: String,
+    },
     /// Print a schedule's run log.
-    Log { id: String },
+    Log {
+        /// Schedule id (see `dial schedule list`).
+        id: String,
+    },
     /// Run the scheduler in the foreground until interrupted (--once runs due entries and exits).
     Run {
+        /// Run the entries that are due now, then exit.
         #[arg(long)]
         once: bool,
     },
@@ -957,21 +1037,28 @@ pub(crate) enum SkillCommand {
     Sources,
     /// Enable an installed skill (project override by default).
     Enable {
+        /// Skill name, as shown by `dial skills list`.
         name: String,
+        /// Apply to every project (the user settings) instead of this project.
         #[arg(long)]
         user: bool,
     },
     /// Disable a skill without deleting it (project override by default).
     Disable {
+        /// Skill name, as shown by `dial skills list`.
         name: String,
+        /// Apply to every project (the user settings) instead of this project.
         #[arg(long)]
         user: bool,
     },
     /// Copy one skill directory or a directory containing skills. Never executes bundled scripts.
     Import {
+        /// A skill directory (with SKILL.md) or a directory of skills.
         source: PathBuf,
+        /// Import into the user skills, available in every project.
         #[arg(long)]
         user: bool,
+        /// Show what would be imported without copying anything.
         #[arg(long)]
         dry_run: bool,
         /// Update previously imported, locally unchanged skills from the same source.
@@ -980,43 +1067,66 @@ pub(crate) enum SkillCommand {
     },
     /// Install a skill package from a Git URL (`url[@ref][#path]`) or a configured registry (`<registry>/<skill>[@ref]`).
     Install {
+        /// `url[@ref][#path]` or `<registry>/<skill>[@ref]`.
         spec: String,
+        /// Install for every project (the user skills) instead of this project.
         #[arg(long)]
         user: bool,
     },
     /// Update one installed package, or all of them, to the latest commit of its locked source.
-    Update { name: Option<String> },
+    Update {
+        /// Package to update (default: every installed package).
+        name: Option<String>,
+    },
     /// Remove an installed skill package and its stored files.
-    Remove { name: String },
+    Remove {
+        /// Package name, as shown by `dial skills installed`.
+        name: String,
+    },
     /// List installed skill packages and where they came from.
     Installed,
     /// Search the configured skill registries (no query lists everything).
-    Search { query: Vec<String> },
+    Search {
+        /// Words to search for.
+        query: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
 pub(crate) enum SessionCommand {
     /// Export a conversation as Markdown (or HTML with --html).
     Export {
+        /// Session id or unique prefix (see `dial sessions`).
         id: String,
+        /// File to write (default: session-<id>.md or .html in the current directory).
         path: Option<PathBuf>,
+        /// Write HTML instead of Markdown.
         #[arg(long)]
         html: bool,
     },
     /// Give a session a title.
-    Rename { id: String, title: String },
+    Rename {
+        /// Session id or unique prefix.
+        id: String,
+        /// New title.
+        title: String,
+    },
     /// Pack a session and its side history, stream journal, subagent transcripts and referenced
     /// artifacts into one verified, portable zip archive.
     Pack {
+        /// Session id or unique prefix.
         id: String,
-        /// Archive to write (default: session-<id>.dialpack in the project root). Never replaces an
+        /// Archive to write (default: session-<id>.dialpack in the current directory). Never replaces an
         /// existing file.
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
     /// Unpack a session archive into this project. Refuses anything that would overwrite an
     /// existing file, and records the transfer so the original path forks if reopened.
-    Unpack { file: PathBuf },
+    Unpack {
+        /// Archive written by `dial sessions pack`.
+        file: PathBuf,
+    },
 }
 
 #[cfg(test)]

@@ -24,6 +24,22 @@ Links are off there because tmux does not keep them by default. Zellij and GNU s
 these. Dial restores progress and variables when it exits, suspends or crashes. The older
 `ui.hyperlinks` key is still accepted but ignored.
 
+### Notifications and focus
+
+Turn-end notifications go out for finished, answered ("Reply ready"), failed, blocked and
+incomplete turns, and for turns that need your input. Dial asks the terminal for focus reports
+(`CSI ? 1004 h`); while the terminal reports that Dial's window has focus, no notification is sent,
+because you are already looking at it. Terminals without focus reporting are treated as unfocused, so
+notifications are never lost there.
+
+### Automatic light or dark theme
+
+With `ui.theme = "auto"`, Dial asks the terminal for its background colour (OSC 11) at startup and
+picks `ui.theme_light` or `ui.theme_dark` from the answer. The query waits at most 200 ms and ends as
+soon as the terminal answers a device-attributes query sent with it. A terminal that does not answer
+falls back to `COLORFGBG`, then to the dark theme. Keys typed during that instant at startup are
+discarded.
+
 ### Live side pane
 
 `/watch` enables a private live feed for the current session and runs immediately, even during a
@@ -37,6 +53,7 @@ The innermost layer wins, because a multiplexer inherits the outer terminal's va
 | macOS, `TERM_PROGRAM=iTerm.app` | iTerm2 vertical split of that exact session (Automation permission) |
 | `$WEZTERM_PANE` | `wezterm cli split-pane --right --pane-id PANE -- dial …` |
 | `$KITTY_WINDOW_ID` and `$KITTY_LISTEN_ON` | `kitty @ --to SOCKET launch --location=vsplit --keep-focus -- dial …` |
+| native Windows, `$WT_SESSION` | `wt -w 0 split-pane -V -- dial …` (Windows Terminal; needs the `wt.exe` app execution alias) |
 
 The watcher's executable and arguments are passed as separate arguments, never through a shell.
 GNU screen is refused because its split commands act on whichever region is focused and cannot be
@@ -49,6 +66,10 @@ executable's path, to run in another terminal:
 ```sh
 /path/to/dial -C /path/to/project watch SESSION_ID
 ```
+
+On Windows the printed command is quoted for PowerShell, the default Windows Terminal shell:
+`& 'C:\path\to\dial.exe' -C 'C:\path\to\project' watch SESSION_ID`. Windows Terminal moves focus
+to the new pane; click Dial's pane or press `Alt+←` to return to the composer.
 
 In a terminal the pane is a tabbed dashboard of everything running for the session. Switch tabs with
 `←`/`→`, `Tab`/`Shift-Tab` or `1`–`6`; `↑`/`↓` select, `PgUp`/`PgDn` scroll the details, `Home`/`End`

@@ -380,12 +380,53 @@ fn one_table_preserves_the_legacy_command_contract() {
     const UX_MENU_CHANGES: &[&str] = &["model", "search", "context"];
     // The worker vocabulary rewords these descriptions; asserted exactly below.
     const WORKER_WORDING_CHANGES: &[&str] = &["message", "cancel", "cleanse"];
+    // Descriptions that hid what the command does are reworded; asserted exactly below.
+    const CLARITY_REWORDINGS: &[(&str, &str)] = &[
+        (
+            "seance",
+            "ask a read-only consultant about a recorded session or worker",
+        ),
+        ("laya", "local Laya advice on how much context to retrieve"),
+        (
+            "tan",
+            "fork the session into a background clone that runs one request",
+        ),
+        (
+            "shake",
+            "drop heavy content (tool results, images, reasoning) from context",
+        ),
+        ("prewalk", "hand off to @small once the todo plan is done"),
+        (
+            "switch",
+            "switch the model for this session only (default unchanged)",
+        ),
+    ];
     let excluded = |name: &str| {
         HUB_MENU_CHANGES.contains(&name)
             || EXTENSIONS_STATS_MENU_CHANGES.contains(&name)
             || GIT_ACTIVITY_MENU_CHANGES.contains(&name)
             || UX_MENU_CHANGES.contains(&name)
             || WORKER_WORDING_CHANGES.contains(&name)
+            || CLARITY_REWORDINGS
+                .iter()
+                .any(|(changed, _)| *changed == name)
+    };
+    // Descriptions now start in lowercase like the rest of the menu; wording is otherwise frozen.
+    let sentence_case = |row: Value| {
+        let mut row = row;
+        let description = row[2].as_str().unwrap_or_default();
+        let mut chars = description.chars();
+        let lowered = chars.next().map_or_else(String::new, |first| {
+            let acronym = chars.clone().next().is_some_and(char::is_uppercase);
+            let first = if acronym {
+                first
+            } else {
+                first.to_ascii_lowercase()
+            };
+            std::iter::once(first).chain(chars).collect()
+        });
+        row[2] = Value::String(lowered);
+        row
     };
     let unchanged_hub_row = |row: &&Value| !excluded(row[0].as_str().unwrap());
     let entries: Vec<_> = command_entries(&[], &[])
@@ -406,15 +447,23 @@ fn one_table_preserves_the_legacy_command_contract() {
         .iter()
         .filter(unchanged_hub_row)
         .cloned()
+        .map(sentence_case)
         .collect();
     assert_eq!(json!(entries), json!(expected_entries));
+    for (name, description) in CLARITY_REWORDINGS {
+        assert_eq!(
+            command_spec(name).unwrap().description,
+            *description,
+            "{name}"
+        );
+    }
     // Worker vocabulary: only the descriptions change ("worker" noun, "stop" verb).
     for (name, description) in [
         ("message", "message a running worker"),
         ("cancel", "stop a running worker"),
         (
             "cleanse",
-            "Run project checkers and repair their diagnostics with workers",
+            "run project checkers and repair their diagnostics with workers",
         ),
     ] {
         let entry = command_entries(&[], &[])
@@ -429,11 +478,16 @@ fn one_table_preserves_the_legacy_command_contract() {
             .unwrap()
             .iter()
             .filter(|row| {
-                !UX_MENU_CHANGES.contains(&row[0].as_str().unwrap())
-                    && !WORKER_WORDING_CHANGES.contains(&row[0].as_str().unwrap())
-                    && !matches!(row[0].as_str(), Some("attachments" | "draft"))
+                let name = row[0].as_str().unwrap();
+                !UX_MENU_CHANGES.contains(&name)
+                    && !WORKER_WORDING_CHANGES.contains(&name)
+                    && !CLARITY_REWORDINGS
+                        .iter()
+                        .any(|(changed, _)| *changed == name)
+                    && !matches!(name, "attachments" | "draft")
             })
             .cloned()
+            .map(sentence_case)
             .collect::<Vec<_>>()
     };
     assert_eq!(unchanged_rpc(&rpc), unchanged_rpc(&baseline["rpc"]));
@@ -458,9 +512,14 @@ fn one_table_preserves_the_legacy_command_contract() {
             continue;
         }
         assert_eq!(canonical_command(name), row[1].as_str().unwrap(), "{name}");
+        // /seance consults a recorded session, so it moved from Settings to Session.
+        let category = match (name, row[2].as_str().unwrap()) {
+            ("seance", "Settings") => "Session",
+            (_, other) => other,
+        };
         assert_eq!(
             format!("{:?}", crate::ui::command_surface::category(name)),
-            row[2].as_str().unwrap(),
+            category,
             "{name}"
         );
         // The worker vocabulary rewords the worker panel's note; its policy is unchanged.
@@ -602,7 +661,7 @@ fn next_ux_commands_have_explicit_replacement_contracts_and_safe_busy_routes() {
         (
             "model",
             "[settings|defaults|local|backups]",
-            "choose the main model and assign roles",
+            "choose the main and new-session model; assign roles",
         ),
         (
             "search",

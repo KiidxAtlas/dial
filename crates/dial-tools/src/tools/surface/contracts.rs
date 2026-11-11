@@ -25,7 +25,7 @@ pub struct HistoricalCall {
 const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("bash", &["session", "pty", "check", "check_paths", "trace"]),
     ("bg", &["persist", "lifetime", "call"]),
-    ("monitor", &["run"]),
+    ("monitor", &["run", "after_secs", "on_exit", "note"]),
     ("grep", &["output", "preview", "ast", "lang"]),
     ("glob", &["preview"]),
     ("edit", &["allow_syntax_errors", "verify"]),
@@ -495,10 +495,13 @@ const REMOVED_ALIASES: &[(&str, &str, &str)] = &[("bash", "async", "background")
 fn has_legacy_names(tool: &str) -> bool {
     RENAMED_PROPERTIES.iter().any(|(t, ..)| *t == tool)
         || REMOVED_ALIASES.iter().any(|(t, ..)| *t == tool)
+        || matches!(tool, "grep" | "glob")
 }
 
-/// The schema as recorded before the renames: current names moved back, removed aliases restored.
+/// The schema as recorded before the renames: current names moved back, removed aliases restored,
+/// and `grep`/`glob` paging as `skip` plus a structured cursor ([`paged_cursor_schema`]).
 fn legacy_schema(schema: &mut Value) {
+    paged_cursor_schema(schema);
     let Some(name) = schema
         .pointer("/function/name")
         .and_then(Value::as_str)
@@ -556,6 +559,87 @@ pub fn legacy_arguments(tool: &str, parameters: &Value, arguments: &mut Value) {
         {
             object.insert((*canonical).into(), value);
         }
+    }
+    legacy_paging_arguments(tool, properties, object);
+}
+
+/// `grep`/`glob` paging before the single string `cursor`: an integer `skip` plus a structured
+/// `{path, match}` cursor (`match` was always 0 for glob). Other schemas are left unchanged.
+fn paged_cursor_schema(schema: &mut Value) {
+    let name = schema["function"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    if !matches!(name.as_str(), "grep" | "glob") {
+        return;
+    }
+    let Some(properties) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if properties
+        .get("cursor")
+        .and_then(|cursor| cursor.get("type"))
+        != Some(&json!("string"))
+    {
+        return;
+    }
+    let mut matched = json!({"type": "integer", "minimum": 0});
+    if name == "glob" {
+        matched["maximum"] = json!(0);
+    }
+    properties.insert(
+        "cursor".into(),
+        json!({"type": "object", "properties": {"path": {"type": "string"}, "match": matched},
+            "required": ["path", "match"], "additionalProperties": false}),
+    );
+    properties.insert("skip".into(), json!({"type": "integer", "minimum": 0}));
+}
+
+/// A habitual pre-single-cursor `grep`/`glob` call: a structured `{path, match}` cursor and/or
+/// integer `skip` become the one string cursor (`"consumed:skip:path"` or `"skip"`). Anything
+/// else is left for ordinary validation to refuse.
+fn legacy_paging_arguments(
+    tool: &str,
+    properties: &serde_json::Map<String, Value>,
+    object: &mut serde_json::Map<String, Value>,
+) {
+    if !matches!(tool, "grep" | "glob")
+        || properties.contains_key("skip")
+        || properties
+            .get("cursor")
+            .and_then(|cursor| cursor.get("type"))
+            != Some(&json!("string"))
+    {
+        return;
+    }
+    let skip = match object.get("skip") {
+        None | Some(Value::Null) => 0,
+        Some(value) => match value.as_u64() {
+            Some(skip) => skip,
+            None => return,
+        },
+    };
+    let cursor = match object.get("cursor") {
+        None | Some(Value::Null) => skip.to_string(),
+        Some(Value::Object(cursor)) => {
+            let (Some(path), Some(consumed)) = (
+                cursor.get("path").and_then(Value::as_str),
+                cursor.get("match").and_then(Value::as_u64),
+            ) else {
+                return;
+            };
+            format!("{consumed}:{skip}:{path}")
+        }
+        Some(_) => return,
+    };
+    object.remove("skip");
+    if cursor == "0" {
+        object.remove("cursor");
+    } else {
+        object.insert("cursor".into(), json!(cursor));
     }
 }
 
@@ -673,10 +757,18 @@ fn native_identities(name: &str, legacy: bool) -> Vec<Identity> {
     ]
     .into_iter()
     .filter_map(|mode| crate::tools::schema(name, mode))
-    .flat_map(|mut schema| {
-        if legacy {
-            legacy_schema(&mut schema);
+    .flat_map(|schema| {
+        if !legacy {
+            return vec![schema];
         }
+        // History before the single string cursor, with and without the older renames.
+        let mut paged = schema.clone();
+        paged_cursor_schema(&mut paged);
+        let mut renamed = schema;
+        legacy_schema(&mut renamed);
+        vec![renamed, paged]
+    })
+    .flat_map(|schema| {
         let mut before = schema.clone();
         if let Some(properties) = before
             .pointer_mut("/function/parameters/properties")

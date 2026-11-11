@@ -310,6 +310,7 @@ experimental.reasoning_strategy
 experimental.batch_approvals
 experimental.dependency_dispatch
 experimental.background_checks
+experimental.background_check_slots
 experimental.video_analysis
 experimental.work_packet_contracts
 experimental.verification_receipts

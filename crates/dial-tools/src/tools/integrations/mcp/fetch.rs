@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-const USER_AGENT: &str = concat!("dial/", env!("CARGO_PKG_VERSION"));
+pub(super) const USER_AGENT: &str = concat!("dial/", env!("CARGO_PKG_VERSION"));
 
 pub(super) struct Reply {
     pub status: u16,

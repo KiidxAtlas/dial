@@ -209,6 +209,8 @@ fn ring_watch(ring: Arc<Mutex<Ring>>) -> Watch {
         pending: Vec::new(),
         context: String::new(),
         artifacts: None,
+        note: None,
+        on_exit: false,
     }
 }
 
@@ -339,6 +341,98 @@ fn normal_bg_eof_silently_disarms_without_waking_for_repairs() {
 }
 
 #[test]
+fn on_exit_watch_reports_closed_output_with_its_note() {
+    let monitor = Monitor::new(None);
+    let ring = Arc::new(Mutex::new(Ring::new(64)));
+    let mut watch = ring_watch(ring.clone());
+    watch.on_exit = true;
+    watch.note = Some("rerun the integration suite".into());
+    lock(&monitor.watches).push(watch);
+    lock(&ring).push(b"compiling\n");
+    assert!(monitor.poll_monitors().is_empty());
+    lock(&ring).closed = true;
+    let events = monitor.poll_monitors();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].contains("output closed without a pattern match"));
+    assert!(events[0].contains("rerun the integration suite"));
+    assert!(!monitor.has_monitors());
+}
+
+#[test]
+fn timer_fires_once_when_due_and_echoes_its_note() {
+    let (_dir, ws) = workspace();
+    let monitor = Monitor::new(None);
+    let out = call(
+        &monitor,
+        &ws,
+        json!({"action":"start", "name":"deploy", "after_secs":60, "note":"check \u{1b}[31mdeploy"}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("wakes this session in 60s"));
+    assert!(monitor.poll_monitors().is_empty(), "not yet due");
+    let listed = call(&monitor, &ws, json!({"action":"list"}));
+    assert!(listed.text.contains("deploy: timer 60s"), "{}", listed.text);
+    assert!(listed.text.contains("due in"), "{}", listed.text);
+    {
+        let mut watches = lock(&monitor.watches);
+        let Source::Timer { due, .. } = &mut watches[0].source else {
+            panic!("timer source expected");
+        };
+        *due = Instant::now();
+    }
+    let events = monitor.poll_monitors();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].contains("deploy / timer 60s"));
+    assert!(events[0].contains("timer elapsed"));
+    assert!(events[0].contains("check deploy"), "{}", events[0]);
+    assert!(!events[0].contains('\u{1b}'));
+    assert!(monitor.poll_monitors().is_empty(), "one-shot");
+    assert!(!monitor.has_monitors());
+}
+
+#[test]
+fn timer_and_on_exit_arguments_are_validated_before_arming() {
+    let (dir, ws) = workspace();
+    stdfs::write(dir.path().join("server.log"), "").unwrap();
+    let monitor = Monitor::new(None);
+    for (args, expected) in [
+        (
+            json!({"action":"start","name":"t","after_secs":0}),
+            "after_secs must be",
+        ),
+        (
+            json!({"action":"start","name":"t","after_secs":86401}),
+            "after_secs must be",
+        ),
+        (
+            json!({"action":"start","name":"t","after_secs":5,"path":"server.log"}),
+            "exactly one of",
+        ),
+        (
+            json!({"action":"start","name":"t","after_secs":5,"pattern":"x"}),
+            "pattern does not apply",
+        ),
+        (
+            json!({"action":"start","name":"t","path":"server.log","on_exit":true}),
+            "on_exit applies only",
+        ),
+        (
+            json!({"action":"start","name":"t","after_secs":5,"note":" "}),
+            "note must be",
+        ),
+        (
+            json!({"action":"start","name":"t","after_secs":5,"note":"x".repeat(501)}),
+            "note must be",
+        ),
+    ] {
+        let out = call(&monitor, &ws, args);
+        assert!(out.is_error && out.text.contains(expected), "{}", out.text);
+    }
+    assert!(!monitor.has_monitors());
+    assert!(monitor.needs_approval(&json!({"action":"start","after_secs":5})));
+}
+
+#[test]
 fn matched_window_retains_reopenable_sanitized_evidence_with_partial_coverage() {
     use crate::runtime::evidence::{CoverageExtent, Representation};
     use crate::storage::artifact::ArtifactStore;
@@ -429,6 +523,8 @@ fn named_run_watchers_have_independent_cursors_and_stop_never_controls_app() {
             pending: Vec::new(),
             context: String::new(),
             artifacts: None,
+            note: None,
+            on_exit: false,
         });
         assert!(monitor.poll_monitors().is_empty());
     }
@@ -454,19 +550,18 @@ fn named_run_watchers_have_independent_cursors_and_stop_never_controls_app() {
 }
 
 #[test]
-fn named_run_is_additive_for_settled_monitor_history() {
+fn named_run_and_wake_options_are_additive_for_settled_monitor_history() {
     use crate::tools::integrations::ext::Registry;
     use crate::tools::surface::contracts::{identities, validate_history};
     let registry = Registry::new();
     let current = Monitor::new(None).schema();
     let mut old = current.clone();
-    assert!(
-        old["function"]["parameters"]["properties"]
-            .as_object_mut()
-            .unwrap()
-            .remove("run")
-            .is_some()
-    );
+    let properties = old["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap();
+    for property in ["run", "after_secs", "on_exit", "note"] {
+        assert!(properties.remove(property).is_some(), "{property}");
+    }
     let identity = identities(&[old], &registry)["monitor"].clone();
     let history = vec![json!({"role":"assistant", "dial_tool_contracts":{"call":identity}})];
     validate_history(&history, &[current], &registry).unwrap();

@@ -33,13 +33,21 @@ fn resolve_prefix(layout: &Layout, all: bool, id: &str) -> Result<SessionInfo> {
     Ok(info)
 }
 
-pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -> Result<()> {
+/// `cwd` is the directory Dial works in (`-C`, else the current one): relative paths and default
+/// file names for `export`, `pack` and `unpack` are resolved there, like other command-line tools,
+/// rather than at the project root.
+pub(crate) fn run(
+    layout: &Layout,
+    cwd: &Path,
+    all: bool,
+    action: &Option<SessionCommand>,
+) -> Result<()> {
     if let Some(action) = action {
         match action {
-            SessionCommand::Unpack { file } => unpack(layout, file)?,
+            SessionCommand::Unpack { file } => unpack(layout, &resolve_in(cwd, file))?,
             SessionCommand::Pack { id, output } => {
                 let info = resolve_prefix(layout, all, id)?;
-                pack(layout, &info, output.as_deref())?;
+                pack(layout, cwd, &info, output.as_deref())?;
             }
             SessionCommand::Rename { id, title } => {
                 let info = resolve_prefix(layout, all, id)?;
@@ -57,11 +65,7 @@ pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -
                         if *html { "html" } else { "md" }
                     ))
                 });
-                let path = if path.is_absolute() {
-                    path
-                } else {
-                    layout.project_root.join(path)
-                };
+                let path = resolve_in(cwd, &path);
                 session.export(layout, &path, *html)?;
                 println!("{}", path.display());
             }
@@ -74,6 +78,24 @@ pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -
         };
         // Activity order in both views: the most recently written session first.
         sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
+        // Launches that never sent a message leave empty sessions; like the session picker,
+        // the listing leaves them out and says how many it hid. Ids still resolve.
+        let listed = sessions.len();
+        sessions.retain(|s| s.messages > 0);
+        let empty = listed - sessions.len();
+        if sessions.is_empty() && !std::io::stdout().is_terminal() {
+            // The terminal table explains an empty list itself; piped output says so on stderr,
+            // so stdout stays empty for scripts.
+            eprintln!(
+                "{}",
+                if all {
+                    "No saved sessions yet. Run `dial` to start one."
+                } else {
+                    "No saved sessions in this project yet. Run `dial` to start one, or `dial sessions --all` for every project."
+                }
+            );
+            return Ok(());
+        }
         let shown = if all {
             sessions.len()
         } else {
@@ -112,20 +134,20 @@ pub(crate) fn run(layout: &Layout, all: bool, action: &Option<SessionCommand>) -
         if let Some(notice) = Session::listing_notice(shown, sessions.len()) {
             eprintln!("{notice}");
         }
+        if empty > 0 {
+            eprintln!(
+                "{empty} empty session{} (no messages) not shown.",
+                if empty == 1 { "" } else { "s" }
+            );
+        }
     }
     Ok(())
 }
 
 /// Packs one session into a portable archive; a relative output lands in the project root.
-fn pack(layout: &Layout, info: &SessionInfo, output: Option<&Path>) -> Result<()> {
-    let path = output.map_or_else(
-        || {
-            layout
-                .project_root
-                .join(format!("session-{}.dialpack", info.id))
-        },
-        |path| resolve_in_project(layout, path),
-    );
+fn pack(layout: &Layout, cwd: &Path, info: &SessionInfo, output: Option<&Path>) -> Result<()> {
+    let default = PathBuf::from(format!("session-{}.dialpack", info.id));
+    let path = resolve_in(cwd, output.unwrap_or(&default));
     let report = pack::pack_session(layout, &info.path, &path)?;
     println!(
         "Packed {} ({} member(s), {} artifact(s), {} subagent transcript(s), {} bytes) to {}",
@@ -141,7 +163,7 @@ fn pack(layout: &Layout, info: &SessionInfo, output: Option<&Path>) -> Result<()
 
 /// Installs an archive as a session of this project. Nothing existing is overwritten.
 fn unpack(layout: &Layout, file: &Path) -> Result<()> {
-    let report = pack::unpack_session(layout, &resolve_in_project(layout, file))?;
+    let report = pack::unpack_session(layout, file)?;
     println!(
         "Unpacked {} to {} ({} artifact(s), {} subagent transcript(s))",
         report.session_id,
@@ -152,11 +174,11 @@ fn unpack(layout: &Layout, file: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_in_project(layout: &Layout, path: &Path) -> PathBuf {
+fn resolve_in(cwd: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        layout.project_root.join(path)
+        cwd.join(path)
     }
 }
 

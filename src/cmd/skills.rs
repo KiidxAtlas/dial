@@ -22,7 +22,7 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &SkillCommand) -> Result<(
     };
     match action {
         SkillCommand::List => {
-            println!("{}", skills::management::list(layout)?);
+            println!("{}", skills::management::list_for_cli(layout)?);
         }
         SkillCommand::Sources => println!("{}", skills::management::sources(layout)),
         SkillCommand::Enable { name, user } | SkillCommand::Disable { name, user } => {
@@ -33,7 +33,7 @@ pub(crate) fn run(cli: &Cli, layout: &Layout, action: &SkillCommand) -> Result<(
                 enabled,
                 if *user { Scope::User } else { Scope::Project },
             )?;
-            println!("{}", skills::management::list(layout)?);
+            println!("{}", skills::management::list_for_cli(layout)?);
         }
         SkillCommand::Import {
             source,

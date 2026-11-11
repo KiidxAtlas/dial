@@ -34,6 +34,7 @@ jaq-std.workspace = true
 libc.workspace = true
 resvg.workspace = true
 parking_lot.workspace = true
+pulldown-cmark.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
 regex.workspace = true

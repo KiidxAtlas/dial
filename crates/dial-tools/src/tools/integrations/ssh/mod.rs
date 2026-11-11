@@ -26,12 +26,8 @@ pub(super) struct Settings {
 }
 
 pub(crate) fn user_dir() -> Result<std::path::PathBuf, String> {
-    std::env::var_os("DIAL_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".dial"))
-        })
-        .ok_or_else(|| "HOME is unset; cannot access the SSH connection state".to_owned())
+    crate::config::paths::user_dir()
+        .map_err(|error| format!("cannot access the SSH connection state: {error:#}"))
 }
 
 /// Every addressable host as a connection target: `[ssh_hosts]` entries carry their HostName,

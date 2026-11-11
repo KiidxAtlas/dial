@@ -3,7 +3,11 @@ use super::*;
 const ID: &str = "01234567-89AB-CDEF-0123-456789abcdef";
 
 fn detect_with(macos: bool, vars: &[(&str, &str)]) -> Result<Option<Launcher>> {
-    detect(macos, |key| {
+    detect_on(macos, false, vars)
+}
+
+fn detect_on(macos: bool, windows: bool, vars: &[(&str, &str)]) -> Result<Option<Launcher>> {
+    detect(macos, windows, |key| {
         vars.iter()
             .find(|(name, _)| *name == key)
             .map(|(_, value)| (*value).to_owned())
@@ -293,6 +297,75 @@ fn every_fallback_names_the_exact_watch_command() {
     );
     assert_eq!(first_line("\n  usage: x  \nmore"), "usage: x");
     assert_eq!(first_line(&"e".repeat(500)).len(), 200);
+}
+
+#[test]
+fn windows_terminal_splits_only_on_native_windows() {
+    let wt = [("WT_SESSION", "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b")];
+    assert_eq!(
+        detect_on(false, true, &wt).unwrap(),
+        Some(Launcher::WindowsTerminal)
+    );
+    // WSL inherits WT_SESSION through WSLENV but cannot hand wt.exe a Linux path.
+    assert_eq!(detect_on(false, false, &wt).unwrap(), None);
+    assert_eq!(detect_on(false, true, &[("WT_SESSION", "")]).unwrap(), None);
+    // A multiplexer running inside Windows Terminal still owns the split.
+    assert_eq!(
+        detect_on(false, true, &[("WT_SESSION", "x"), ("TMUX", "/tmp/t")]).unwrap(),
+        Some(Launcher::Tmux { pane: None })
+    );
+    let argv: Vec<String> = [
+        r"C:\Program Files\dial\dial.exe",
+        "-C",
+        r"C:\a;b",
+        "watch",
+        "s",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let (program, args) = invocation(&Launcher::WindowsTerminal, &argv).unwrap();
+    assert_eq!(program, "wt");
+    assert_eq!(
+        args,
+        [
+            "-w",
+            "0",
+            "split-pane",
+            "-V",
+            "--",
+            r"C:\Program Files\dial\dial.exe",
+            "-C",
+            r"C:\a\;b",
+            "watch",
+            "s"
+        ]
+    );
+}
+
+#[test]
+fn windows_manual_command_is_pasteable_into_powershell() {
+    let words: Vec<String> = [
+        r"C:\Users\O'Neil\dial.exe",
+        "-C",
+        r"C:\work\my project",
+        "watch",
+        "01ABC-def",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    assert_eq!(
+        display_command(&words, true).unwrap(),
+        r"& 'C:\Users\O''Neil\dial.exe' -C 'C:\work\my project' watch 01ABC-def"
+    );
+    assert_eq!(
+        display_command(&[r"C:\d.exe".to_owned(), "x\u{2019}y".to_owned()], true).unwrap(),
+        "& 'C:\\d.exe' 'x\u{2019}\u{2019}y'"
+    );
+    let unix = argv();
+    assert_eq!(
+        display_command(&unix, false).unwrap(),
+        shlex::try_join(unix.iter().map(String::as_str)).unwrap()
+    );
 }
 
 #[test]

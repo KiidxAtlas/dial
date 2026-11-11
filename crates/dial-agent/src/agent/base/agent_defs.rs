@@ -343,12 +343,9 @@ fn directories(config: &Config) -> Vec<(PathBuf, Source)> {
             Source::User,
         ));
         if config.task.claude_agents
-            && let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty())
+            && let Some(home) = crate::config::paths::home_dir()
         {
-            out.push((
-                PathBuf::from(home).join(".claude").join("agents"),
-                Source::ClaudeUser,
-            ));
+            out.push((home.join(".claude").join("agents"), Source::ClaudeUser));
         }
     }
     let mut seen = BTreeSet::new();

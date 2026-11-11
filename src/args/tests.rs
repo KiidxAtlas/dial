@@ -349,3 +349,67 @@ fn dev_commands_parse_under_dev_and_at_the_hidden_top_level() {
         assert!(dev_help.contains(listed), "{listed} missing:\n{dev_help}");
     }
 }
+
+#[test]
+fn subcommand_help_omits_sectioned_globals_that_still_parse() {
+    use clap::FromArgMatches;
+    let mut root = command();
+    let help = root
+        .find_subcommand_mut("ps")
+        .unwrap()
+        .render_help()
+        .to_string();
+    assert!(!help.contains("--thinking"), "{help}");
+    assert!(help.contains("--json"), "{help}");
+    assert!(help.contains("also apply"), "{help}");
+    let matches = command()
+        .try_get_matches_from(["dial", "review", "--uncommitted", "-m", "some-model"])
+        .unwrap();
+    let cli = Cli::from_arg_matches(&matches).unwrap();
+    assert_eq!(cli.model.as_deref(), Some("some-model"));
+    let matches = command()
+        .try_get_matches_from(["dial", "-m", "root-model", "ps"])
+        .unwrap();
+    let cli = Cli::from_arg_matches(&matches).unwrap();
+    assert_eq!(cli.model.as_deref(), Some("root-model"));
+}
+
+#[test]
+fn a_global_option_named_by_a_subcommand_stays_in_its_help() {
+    let mut root = command();
+    let add = root
+        .find_subcommand_mut("schedule")
+        .unwrap()
+        .find_subcommand_mut("add")
+        .unwrap();
+    let help = add.render_help().to_string();
+    assert!(help.contains("-y, --yes"), "{help}");
+    assert!(!help.contains("--thinking"), "{help}");
+    assert!(mentions_flag("unless --yes or", "yes"));
+    assert!(!mentions_flag("--yes-paid", "yes"));
+}
+
+#[test]
+fn user_facing_arguments_all_have_help_text() {
+    fn walk(command: &clap::Command, path: &str, missing: &mut Vec<String>) {
+        for arg in command.get_arguments() {
+            let id = arg.get_id().as_str();
+            if arg.is_hide_set() || matches!(id, "help" | "version") {
+                continue;
+            }
+            if arg.get_help().is_none() && arg.get_long_help().is_none() {
+                missing.push(format!("{path} {id}"));
+            }
+        }
+        for sub in command.get_subcommands() {
+            // `dev` is developer and research tooling, documented in its own pages.
+            if sub.is_hide_set() || matches!(sub.get_name(), "dev" | "help") {
+                continue;
+            }
+            walk(sub, &format!("{path} {}", sub.get_name()), missing);
+        }
+    }
+    let mut missing = Vec::new();
+    walk(&command(), "dial", &mut missing);
+    assert!(missing.is_empty(), "arguments without help: {missing:#?}");
+}

@@ -532,16 +532,21 @@ impl Shell {
         }
     }
 
-    /// Shift+Tab: cycles write → auto → readonly → ask → write and reports the new mode.
+    /// Shift+Tab: cycles ask → write → readonly → ask and reports the new mode. Full auto is never
+    /// one stray keypress away: it is chosen explicitly (`/approval`), and the cycle leaves it for ask.
     pub(super) fn cycle_approval(&mut self, agent: &mut Agent<'_>) {
-        let next = match agent.approval() {
-            Approval::Write => Approval::Auto,
-            Approval::Auto => Approval::Readonly,
-            Approval::Readonly => Approval::Ask,
-            Approval::Ask => Approval::Write,
-        };
+        let next = next_cycled_approval(agent.approval());
         agent.set_approval(next);
         self.note("Approval", format!("{next:?}").to_lowercase());
+    }
+}
+
+/// The approval mode Shift+Tab moves to; never `Auto`.
+pub(super) fn next_cycled_approval(current: Approval) -> Approval {
+    match current {
+        Approval::Ask => Approval::Write,
+        Approval::Write => Approval::Readonly,
+        Approval::Readonly | Approval::Auto => Approval::Ask,
     }
 }
 

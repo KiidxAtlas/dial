@@ -163,3 +163,21 @@ fn set_model_accepts_only_known_models() {
     assert!(is_known_model(&config, dir.path(), &known));
     assert!(!is_known_model(&config, dir.path(), &unknown));
 }
+
+#[test]
+fn picker_ids_for_discovered_local_providers_resolve_without_configuration() {
+    let config = Config::default();
+    for selector in [
+        "lm-studio/google/gemma-4-e4b",
+        "ollama/qwen3:8b",
+        "mlx/mlx-community/Qwen2.5-7B-Instruct-4bit",
+    ] {
+        let resolved = resolve(&config, selector).unwrap();
+        let (provider, model) = selector.split_once('/').unwrap();
+        assert_eq!(
+            (resolved.provider.as_str(), resolved.model.as_str()),
+            (provider, model)
+        );
+    }
+    assert!(resolve(&config, "nowhere/model").is_err());
+}

@@ -545,7 +545,7 @@ fn reply_from_output(response: &Value, partial: bool) -> Result<Reply> {
                 reply.tool_calls.push(ToolCall {
                     id: id.into(),
                     name: tool_name(item)?,
-                    arguments: arguments.unwrap_or(Value::Null),
+                    arguments: arguments.unwrap_or_else(|| Value::String(raw.into())),
                     malformed_arguments: malformed,
                 });
                 reply.finish_reason = "tool_calls".into();

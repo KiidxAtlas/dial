@@ -27,8 +27,8 @@ use anyhow::{Context, Result, bail};
 use crossterm::{
     Command,
     event::{
-        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     terminal::{disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement},
 };
@@ -55,6 +55,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Facts the panic hook needs (it has no access to the `InlineTerminal`).
 static UP_ROWS: AtomicU16 = AtomicU16::new(0);
 static KEYBOARD_FLAGS: AtomicBool = AtomicBool::new(false);
+static KEY_RELEASES: AtomicBool = AtomicBool::new(false);
 static IN_ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 static HOOK: Once = Once::new();
 static UI_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
@@ -222,29 +223,28 @@ impl InlineTerminal {
             );
         }
         enable_raw_mode().context("enabling raw mode")?;
+        // Ask the terminal for its background before anything else reads input, so `theme =
+        // "auto"` follows the real colours rather than only `COLORFGBG`.
+        #[cfg(unix)]
+        super::termcaps::set_reported_background(query_background_dark());
         // Clear only the visible screen. The user's scrollback belongs to their terminal.
         let _ = io::stdout().write_all(b"\x1b[2J\x1b[H");
         let _ = io::stdout().flush();
-        let keyboard_flags = supports_keyboard_enhancement().unwrap_or(false);
+        let key_releases = supports_keyboard_enhancement().unwrap_or(false);
         let mut out = Sink::queued(Box::new(io::stdout())).context("starting terminal output")?;
-        let mut setup = String::new();
-        if keyboard_flags {
-            push_command(
-                &mut setup,
-                &PushKeyboardEnhancementFlags(KEYBOARD_FLAGS_WANTED),
-            );
-        }
-        push_command(&mut setup, &EnableBracketedPaste);
+        let setup = terminal_input_setup();
         out.write_all(setup.as_bytes())?;
         out.flush()?;
-        KEYBOARD_FLAGS.store(keyboard_flags, Ordering::SeqCst);
+        KEYBOARD_FLAGS.store(true, Ordering::SeqCst);
+        KEY_RELEASES.store(key_releases, Ordering::SeqCst);
         UP_ROWS.store(0, Ordering::SeqCst);
         IN_ALT_SCREEN.store(false, Ordering::SeqCst);
         *UI_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
         install_panic_hook();
         let size = crossterm::terminal::size().unwrap_or((80, 24));
         input::start().context("starting terminal input")?;
-        let terminal = Self::build(out, size, true, keyboard_flags);
+        // We requested the protocol even if detection failed; always balance the push on exit.
+        let terminal = Self::build(out, size, true, true);
         #[cfg(unix)]
         let terminal = {
             let mut terminal = terminal;
@@ -871,6 +871,8 @@ impl InlineTerminal {
                 push_command(&mut resets, &PopKeyboardEnhancementFlags);
             }
             push_command(&mut resets, &DisableBracketedPaste);
+            push_command(&mut resets, &DisableFocusChange);
+            super::termcaps::set_focus(None);
         }
         resets.push_str(&self.signal_update(None));
         let resets = resets.into_bytes();
@@ -916,6 +918,8 @@ impl InlineTerminal {
             push_command(&mut s, &PopKeyboardEnhancementFlags);
         }
         push_command(&mut s, &DisableBracketedPaste);
+        push_command(&mut s, &DisableFocusChange);
+        super::termcaps::set_focus(None);
         // The shell (or the program) owns the tab while Dial is away; the next paint restores it.
         s.push_str(&self.signal_update(None));
         self.out.write_all(s.as_bytes())?;
@@ -960,6 +964,9 @@ impl InlineTerminal {
                 push_command(&mut s, &PushKeyboardEnhancementFlags(KEYBOARD_FLAGS_WANTED));
             }
             push_command(&mut s, &EnableBracketedPaste);
+            if self.real {
+                push_command(&mut s, &EnableFocusChange);
+            }
             self.out.write_all(s.as_bytes())?;
             self.out.flush()?;
             Ok(())
@@ -1010,12 +1017,69 @@ const KEYBOARD_FLAGS_WANTED: KeyboardEnhancementFlags =
 
 /// True when the terminal accepted the keyboard enhancement flags and so reports key releases.
 pub fn reports_key_releases() -> bool {
-    KEYBOARD_FLAGS.load(Ordering::SeqCst)
+    KEY_RELEASES.load(Ordering::SeqCst)
+}
+
+/// Request disambiguated keys even when the capability query timed out or was filtered by a
+/// multiplexer. Terminals without this protocol ignore the request. Detection remains separate:
+/// hold-to-talk must not assume key releases are available merely because we requested them.
+fn terminal_input_setup() -> String {
+    let mut setup = String::new();
+    push_command(
+        &mut setup,
+        &PushKeyboardEnhancementFlags(KEYBOARD_FLAGS_WANTED),
+    );
+    push_command(&mut setup, &EnableBracketedPaste);
+    push_command(&mut setup, &EnableFocusChange);
+    setup
 }
 
 fn push_command(into: &mut String, command: &impl Command) {
     // Writing into a String cannot fail.
     let _ = command.write_ansi(into);
+}
+
+/// Asks the terminal for its background colour (OSC 11), followed by a device-attributes query
+/// every terminal answers, so a terminal without OSC 11 support costs one round trip instead of
+/// the whole timeout. Runs in raw mode before the input reader starts; input typed in this
+/// instant is discarded. `None` when the terminal does not say.
+///
+/// Reads through a duplicate of stdin, never `/dev/tty`: macOS `poll(2)` rejects the `/dev/tty`
+/// alias (`POLLNVAL`), which ended the wait at once and left the reply to the input reader, where
+/// it arrived as typed text (`11;rgb:…`).
+#[cfg(unix)]
+fn query_background_dark() -> Option<bool> {
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    const LIMIT: std::time::Duration = std::time::Duration::from_millis(200);
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return None;
+    }
+    let mut tty = std::fs::File::from(io::stdin().as_fd().try_clone_to_owned().ok()?);
+    let mut out = io::stdout();
+    out.write_all(b"\x1b]11;?\x1b\\\x1b[c").ok()?;
+    out.flush().ok()?;
+    let deadline = std::time::Instant::now() + LIMIT;
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let answered = reply
+            .windows(3)
+            .position(|w| w == b"\x1b[?")
+            .is_some_and(|at| reply[at..].contains(&b'c'));
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if answered || left.is_zero() || reply.len() > 4096 {
+            break;
+        }
+        match crate::platform::terminal::input_ready(&tty, left) {
+            Ok(Some(true)) => match tty.read(&mut chunk) {
+                Ok(read) if read > 0 => reply.extend_from_slice(&chunk[..read]),
+                _ => break,
+            },
+            _ => break,
+        }
+    }
+    super::termcaps::background_dark_from_reply(&reply)
 }
 
 /// Best-effort restore from a panic: the `InlineTerminal` is not reachable, so statics carry the facts.
@@ -1048,6 +1112,7 @@ fn emergency_restore() {
         push_command(&mut s, &PopKeyboardEnhancementFlags);
     }
     push_command(&mut s, &DisableBracketedPaste);
+    push_command(&mut s, &DisableFocusChange);
     if let Ok(reset) = SIGNALS_RESET.try_lock() {
         s.push_str(&reset);
     }

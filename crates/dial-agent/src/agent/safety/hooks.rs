@@ -245,7 +245,11 @@ fn run_one(
     let Some(program) = hook.command.first() else {
         return Err("hook has an empty command".into());
     };
-    let mut command = Command::new(program);
+    // `npx`-style hooks are `.cmd` shims on Windows, which `Command` alone cannot find.
+    let mut command = Command::new(crate::platform::fs::launch_path(
+        Path::new(program),
+        std::env::var_os("PATH").as_deref(),
+    ));
     command
         .args(&hook.command[1..])
         .current_dir(root)

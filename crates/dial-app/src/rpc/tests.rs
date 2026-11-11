@@ -426,3 +426,12 @@ fn revisioned_snapshot_retains_partial_output_and_interrupted_outcome() {
     assert_eq!(restored["tree"][0]["result"]["phase"], "interrupted");
     assert_eq!(restored["tree"][0]["call_id"], "call-1");
 }
+
+#[test]
+fn only_listed_methods_are_known_before_dispatch() {
+    assert!(known_method("state"));
+    assert!(known_method("send"));
+    assert!(!known_method("nope"));
+    assert!(!known_method(""));
+    assert!(!known_method("fork_session"));
+}

@@ -188,7 +188,7 @@ fn created_entries_note(before: Option<&DirectoryEntries>, dir: &Path) -> Option
         note.push_str(&format!("[new in the working directory: {shown}{suffix}; remove scratch outputs the task does not want]\n"));
     }
     if !lost.is_empty() {
-        note.push_str(&format!("[working-directory inputs changed: {}. If unintended, inspect retained input artifacts or checkpoints before reconstructing; do not invent lost data.]\n", lost.iter().take(10).cloned().collect::<Vec<_>>().join("; ")));
+        note.push_str(&format!("[working-directory inputs changed: {}. If unintended, inspect retained input artifacts or checkpoints before reconstructing; restore exact bytes in eval with dial.writeBytes(path, dial.readBytes(artifact)) rather than copying them through a reply; do not invent lost data.]\n", lost.iter().take(10).cloned().collect::<Vec<_>>().join("; ")));
     }
     (!note.is_empty()).then_some(note)
 }
@@ -1461,6 +1461,44 @@ fn git_for_windows_bash(bin_dirs: impl IntoIterator<Item = PathBuf>) -> Option<P
     })
 }
 
+/// Windows PowerShell running `script`, exiting with the last native command's failure status.
+fn powershell_command(script: &str) -> Result<std::process::Command, String> {
+    let system_root = std::env::var_os("SystemRoot").ok_or("SystemRoot is unavailable")?;
+    let powershell = Path::new(&system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let command = format!(
+        "$global:LASTEXITCODE = 0; {script}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}"
+    );
+    let mut spawn = std::process::Command::new(powershell);
+    spawn
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(command);
+    Ok(spawn)
+}
+
+/// A command that runs a user-written script outside the `bash` tool, such as `/loop --while`
+/// conditions and ratchet flow commands: `sh -c` on Unix. Windows has no `sh`, so it uses Git for
+/// Windows' bash when installed and otherwise Windows PowerShell, the `bash` tool's `auto` order
+/// without the built-in shell. Environment, stdio and process ownership belong to the caller.
+pub fn host_script_command(script: &str) -> Result<std::process::Command, String> {
+    if !cfg!(windows) {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", script]);
+        return Ok(command);
+    }
+    match find_system_bash() {
+        Some(bash) => {
+            let mut command = std::process::Command::new(bash);
+            command.args(["-c", script]);
+            Ok(command)
+        }
+        None => powershell_command(script),
+    }
+}
+
 /// Writes `script` for the built-in shell and returns the host program and its arguments.
 fn embedded_invocation(
     scratch: &Path,
@@ -1569,23 +1607,7 @@ fn shell_command_with_state(
                 spawn.args(args);
                 spawn
             }
-            Runner::PowerShell => {
-                let system_root =
-                    std::env::var_os("SystemRoot").ok_or("SystemRoot is unavailable")?;
-                let powershell = Path::new(&system_root)
-                    .join("System32")
-                    .join("WindowsPowerShell")
-                    .join("v1.0")
-                    .join("powershell.exe");
-                let command = format!(
-                    "$global:LASTEXITCODE = 0; {script}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}"
-                );
-                let mut spawn = std::process::Command::new(powershell);
-                spawn
-                    .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-                    .arg(command);
-                spawn
-            }
+            Runner::PowerShell => powershell_command(script)?,
         };
         let mut spawn = if ws.unsandboxed {
             spawn.env_clear();

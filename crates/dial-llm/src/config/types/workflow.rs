@@ -116,6 +116,9 @@ pub struct ExperimentalConfig {
     pub dependency_dispatch: bool,
     /// Start configured focused verification after committed edits, overlapping safe reads only.
     pub background_checks: bool,
+    /// Configured background checks one edit may start together (1..=4); 1 keeps one at a time.
+    /// Together they hold one workspace serial-operation boundary.
+    pub background_check_slots: u8,
     /// Offer `check.expect` (pass/fail prediction); a mismatch is reported as a fact and the next
     /// request asks the model to account for it before editing again.
     pub check_predictions: bool,
@@ -144,6 +147,7 @@ impl Default for ExperimentalConfig {
             batch_approvals: false,
             dependency_dispatch: true,
             background_checks: false,
+            background_check_slots: 1,
             check_predictions: false,
         }
     }

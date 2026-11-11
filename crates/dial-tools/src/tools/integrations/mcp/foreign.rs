@@ -93,11 +93,9 @@ const SOURCES: &[Source] = &[
     },
 ];
 
-/// The user's home directory, if `HOME` names one.
+/// The user's home directory: `HOME`, or `USERPROFILE` on Windows.
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
+    crate::config::paths::home_dir()
 }
 
 /// Servers defined by other tools for this workspace and user. Unreadable, oversized or

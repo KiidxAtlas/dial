@@ -656,14 +656,9 @@ fn session(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> R
             let path = session.path().map_or_else(
                 || "not saved (in-memory session)".to_owned(),
                 |path| {
-                    let path = path.display().to_string();
-                    match std::env::var("HOME").ok().filter(|home| !home.is_empty()) {
-                        Some(home) => match path.strip_prefix(home.trim_end_matches('/')) {
-                            Some(rest) if rest.starts_with('/') => format!("~{rest}"),
-                            _ => path,
-                        },
-                        None => path,
-                    }
+                    let home = crate::config::paths::home_dir()
+                        .map(|home| home.to_string_lossy().into_owned());
+                    crate::ui::statusline::tilde(&path.display().to_string(), home.as_deref())
                 },
             );
             let title = session.title();

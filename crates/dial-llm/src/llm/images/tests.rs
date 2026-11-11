@@ -298,3 +298,14 @@ fn a_resized_image_is_reused_on_later_requests_instead_of_resized_again() {
     // A cache hit only hashes the source; a fresh Lanczos resize of this image takes far longer.
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
+
+#[test]
+fn home_relative_paths_accept_the_platform_separator() {
+    assert_eq!(home_relative(Path::new("~/shot.png")), Some("shot.png"));
+    assert_eq!(home_relative(Path::new("/abs/shot.png")), None);
+    assert_eq!(home_relative(Path::new("~user/shot.png")), None);
+    assert_eq!(
+        home_relative(Path::new("~\\Pictures\\shot.png")),
+        cfg!(windows).then_some("Pictures\\shot.png")
+    );
+}

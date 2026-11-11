@@ -11,6 +11,28 @@ pub fn flush_stdout_on_exit() -> std::io::Result<()> {
     output::drain_stdout(Some(std::time::Duration::from_secs(5)))
 }
 
+/// Exit status for output cut short by a closed reader, as a shell reports a SIGPIPE death.
+pub const CLOSED_STDOUT_STATUS: i32 = 141;
+
+/// `dial config | head` closes stdout early; Rust ignores SIGPIPE, so `println!` then panics with
+/// "failed printing to stdout: Broken pipe". Turn that panic into a quiet exit, as other command
+/// line tools behave. SIGPIPE itself stays ignored: Dial writes to child pipes that may close.
+pub fn exit_quietly_on_closed_stdout() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if output::is_closed_stdout_panic(message) {
+            std::process::exit(CLOSED_STDOUT_STATUS);
+        }
+        previous(info);
+    }));
+}
+
 /// Selects rustls's process-wide crypto provider. If a dependency enables a second provider
 /// (`aws-lc-rs`), rustls refuses to choose and panics on the first TLS handshake. The AWS SDK's
 /// HTTP client is built on `ring` as well, so the default graph has one provider. Idempotent;

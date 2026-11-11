@@ -1008,3 +1008,38 @@ fn a_transcript_replay_larger_than_one_frame_is_painted_in_slices() {
     }
     assert!(paints > 1, "the replay was split across frames");
 }
+
+#[test]
+fn input_setup_requests_shift_enter_without_a_successful_capability_probe() {
+    let setup = terminal_input_setup();
+    assert!(
+        setup.contains("\x1b[>7u"),
+        "request disambiguated keys and releases"
+    );
+    assert!(setup.contains("\x1b[?2004h"), "enable bracketed paste");
+    assert!(setup.contains("\x1b[?1004h"), "enable focus reports");
+}
+
+#[test]
+fn requested_keyboard_protocol_is_balanced_across_suspend() {
+    let mut rig = Rig::new(20, 8);
+    // A request was sent, independently of whether detection reported key-release support.
+    rig.term.keyboard_flags = true;
+    let bytes = rig.bytes.clone();
+    rig.term
+        .suspend(|| {
+            let before = String::from_utf8(bytes.0.lock().clone()).unwrap();
+            assert!(
+                before.contains("\x1b[<1u"),
+                "restore keyboard before external editor"
+            );
+            assert!(
+                !before.contains("\x1b[>7u"),
+                "do not rearm before editor exits"
+            );
+        })
+        .unwrap();
+    rig.sync();
+    let all = String::from_utf8(rig.raw.clone()).unwrap();
+    assert!(all.rfind("\x1b[<1u").unwrap() < all.rfind("\x1b[>7u").unwrap());
+}

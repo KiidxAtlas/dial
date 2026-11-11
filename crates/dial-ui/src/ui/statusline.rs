@@ -44,8 +44,9 @@ pub fn controls_row(
     controls_row_with(&custom, data, keys, theme, width)
 }
 
-/// [`controls_row`] beside the status line `cfg` draws at `width`: approval and reasoning appear
-/// only when that line does not already show them, so one fact is never stated twice.
+/// [`controls_row`] beside the status line `cfg` draws at `width`. It names only what differs from
+/// a fresh session (planning on, assistance on, a chosen reasoning level, approval when the line
+/// above hides it, saved-but-pending changes), so an ordinary session shows one short key hint.
 pub fn controls_row_with(
     cfg: &UiConfig,
     data: &StatusData,
@@ -53,46 +54,39 @@ pub fn controls_row_with(
     theme: &Theme,
     width: u16,
 ) -> Line<'static> {
-    let on = |value| match value {
-        Some(true) => "on",
-        Some(false) => "off",
-        None => "unknown",
-    };
     let (left, right) = segments_for(cfg, data, usize::from(width));
     let shown = |segment: &str| {
         left.iter()
             .chain(&right)
             .any(|name| canonical(name).is_some_and(|(name, _)| name == segment))
     };
-    let mut label = format!(
-        "{} Controls · Planning {}",
-        keys.label(super::keys::Action::StatusFocus),
-        on(data.planning),
-    );
-    if !shown("approval") {
-        label.push_str(&format!(
-            " · Approval {}",
+    let mut facts = Vec::new();
+    if data.controls_pending {
+        facts.push("saved changes apply after this turn".to_owned());
+    }
+    if data.planning == Some(true) {
+        facts.push("planning on".to_owned());
+    }
+    if !shown("approval") && !data.approval.is_empty() {
+        facts.push(format!(
+            "approval {}",
             super::status::approval_label(&data.approval)
         ));
     }
     // Reasoning is on the line as the thinking chip, or inside the request settings that replace it.
-    let reasoning_shown = !data.thinking.is_empty()
-        && shown("thinking")
-        && (data.inference.is_empty() || shown("inference"));
-    if !reasoning_shown {
-        let reasoning = if data.thinking.is_empty() {
-            "provider default"
-        } else {
-            &data.thinking
-        };
-        label.push_str(&format!(" · Reasoning(main) {reasoning}"));
+    let reasoning_shown = shown("thinking") && (data.inference.is_empty() || shown("inference"));
+    if !data.thinking.is_empty() && !reasoning_shown {
+        facts.push(format!("reasoning {}", data.thinking));
     }
-    label.push_str(&format!(" · Assistance {}", on(data.assistance)));
-    let label = if data.controls_pending {
-        format!("Saved changes after turn (not active) · {label}")
-    } else {
-        label
-    };
+    if data.assistance == Some(true) {
+        facts.push("assistance on".to_owned());
+    }
+    let key = keys.label(super::keys::Action::StatusFocus);
+    let mut label = format!("{key} controls");
+    for fact in &facts {
+        label.push_str(" · ");
+        label.push_str(fact);
+    }
     let label = if theme.ascii() {
         label.replace('·', "-")
     } else {
@@ -1020,14 +1014,14 @@ fn short_model(model: &str) -> String {
 /// Show `path` relative to `home` as `~/…`; a trailing `/` on `home` is ignored.
 pub fn tilde(path: &str, home: Option<&str>) -> String {
     let Some(home) = home
-        .map(|h| h.trim_end_matches('/'))
+        .map(|h| h.trim_end_matches(std::path::is_separator))
         .filter(|h| !h.is_empty())
     else {
         return path.to_owned();
     };
     match path.strip_prefix(home) {
         Some("") => "~".to_owned(),
-        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        Some(rest) if rest.starts_with(std::path::is_separator) => format!("~{rest}"),
         _ => path.to_owned(),
     }
 }
@@ -1241,7 +1235,7 @@ fn compose(
         cfg,
         data,
         theme,
-        home: std::env::var("HOME").ok(),
+        home: crate::config::paths::home_dir().map(|home| home.to_string_lossy().into_owned()),
     };
     let (left_names, right_names) = segments_for(cfg, data, width);
     let build = |names: &[String]| {

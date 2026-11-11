@@ -171,7 +171,7 @@ impl Preflight {
         }
         self.result.as_ref().map(|result| {
             if self.armed {
-                "Attachments need attention · submit again to send as shown · /attachments inspect"
+                "Attachments need attention · submit again to send anyway · /attachments inspect"
                     .into()
             } else {
                 format!("{} · /attachments inspect", result.summary)
@@ -228,7 +228,7 @@ impl Composer {
             && !self.attachments.armed
         {
             self.attachments.armed = true;
-            self.queue_notice = Some("Attachment content is missing or truncated. /attachments inspect, or submit again to send as shown.".into());
+            self.queue_notice = Some("Attachment content is missing or truncated. Submit again to send anyway, or /attachments inspect.".into());
             return false;
         }
         true

@@ -563,9 +563,40 @@ pub fn local_model_metadata(model: &Path) -> ModelMetadata {
             if let Some(template) = template {
                 classify_template(&mut info, &template);
             }
+            // The model card's `pipeline_tag` is an explicit declaration; it fills only a
+            // purpose the configuration left unknown.
+            if info.kind == ModelKind::Unknown {
+                info.kind = model_card_kind(model);
+            }
             info
         })
         .unwrap_or_default()
+}
+
+/// The purpose a downloaded model card declares in its front matter (`pipeline_tag:
+/// feature-extraction`), matched exactly like other declarations. Reads at most 16 KiB.
+fn model_card_kind(model: &Path) -> ModelKind {
+    let Ok(file) = fs::File::open(model.join("README.md")) else {
+        return ModelKind::Unknown;
+    };
+    let mut text = String::new();
+    if file.take(16 * 1024).read_to_string(&mut text).is_err() {
+        return ModelKind::Unknown;
+    }
+    model_card_kind_in(&text)
+}
+
+fn model_card_kind_in(card: &str) -> ModelKind {
+    let mut lines = card.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return ModelKind::Unknown;
+    }
+    lines
+        .take_while(|line| line.trim() != "---")
+        .find_map(|line| line.strip_prefix("pipeline_tag:"))
+        .map_or(ModelKind::Unknown, |value| {
+            kind_from_declared(value.trim().trim_matches(['"', '\'']))
+        })
 }
 
 /// The chat template a model directory declares: `tokenizer_config.json`'s `chat_template` (a string,
@@ -749,6 +780,73 @@ pub fn credential_token(user_dir: &Path, base_url: &str) -> Result<Option<String
         valid_token(token)?;
     }
     Ok(token)
+}
+/// Base URLs (without a trailing `/`) that have a saved credential, read once per discovery pass.
+/// An unreadable store yields none; a probed provider still reports that error from [`prepare`].
+fn saved_credential_urls(user_dir: &Path) -> BTreeSet<String> {
+    if user_dir.as_os_str().is_empty() {
+        return BTreeSet::new();
+    }
+    let Ok(_lock) = locked(&super::credential_store::api_key_path(user_dir)) else {
+        return BTreeSet::new();
+    };
+    credential_map(user_dir)
+        .map(|saved| {
+            saved
+                .into_keys()
+                .map(|url| url.trim_end_matches('/').to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Bundled API-key providers that `taken` does not already cover (the always-probed [`KNOWN`]
+/// set, local servers and configured providers). One with a credential (an `is_set` variable or a
+/// key saved for its base URL) is returned as an endpoint to probe; the rest are listed as not set
+/// up, without a network request, so `/providers` can offer them. Sign-in providers stay with
+/// [`oauth_catalog`]; templated URLs and non-HTTP agent wires need explicit configuration first.
+fn bundled_endpoints(
+    taken: impl Fn(&str) -> bool,
+    saved: &BTreeSet<String>,
+    is_set: impl Fn(&str) -> bool,
+) -> (Vec<(String, ProviderSpec)>, Vec<ProviderStatus>) {
+    let mut probes = Vec::new();
+    let mut not_set_up = Vec::new();
+    for provider in bundled::builtin_providers() {
+        if taken(&provider.id)
+            || super::oauth::flow(&provider.id).is_some()
+            || provider.base_url.contains('<')
+            || !(bundled::routable(provider.protocol) || provider.protocol == ApiProtocol::Ollama)
+        {
+            continue;
+        }
+        let env = provider.key_env(&is_set);
+        if env.is_some_and(&is_set) || saved.contains(provider.base_url.trim_end_matches('/')) {
+            probes.push((
+                provider.id.clone(),
+                ProviderSpec {
+                    label: provider.label.clone(),
+                    base_url: provider.base_url.clone(),
+                    api_key_env: env.map(str::to_owned),
+                    protocol: Some(provider.protocol),
+                    ..ProviderSpec::default()
+                },
+            ));
+        } else {
+            not_set_up.push(ProviderStatus {
+                id: provider.id.clone(),
+                label: provider.label.clone(),
+                base_url: Some(provider.base_url.clone()),
+                state: "auth-required".into(),
+                detail: match env {
+                    Some(variable) => format!("Not set up: set {variable} or add an API key"),
+                    None => "Not set up: add an API key".into(),
+                },
+                models: 0,
+            });
+        }
+    }
+    (probes, not_set_up)
 }
 
 /// The environment variable Dial reads for a built-in provider's base URL, if the URL is one of its known endpoints.
@@ -3293,6 +3391,12 @@ fn oauth_catalog(
         .collect()
 }
 
+/// Whether `id` names a local provider Dial discovers itself (a local server, downloaded MLX/GGUF
+/// weights or Apple's on-device model), so `provider/model` selectors work without configuration.
+pub fn is_local_provider(id: &str) -> bool {
+    matches!(id, "mlx" | "apple") || LOCAL_SERVERS.iter().any(|&(server, ..)| server == id)
+}
+
 /// Local inference servers Dial looks for: id, label, base-URL override variable, default URL.
 const LOCAL_SERVERS: &[(&str, &str, &str, &str)] = &[
     (
@@ -3454,6 +3558,12 @@ pub fn discover(
             },
         );
     }
+    let (bundled_probes, not_set_up) = bundled_endpoints(
+        |id| endpoints.contains_key(id) || configured.contains_key(id),
+        &saved_credential_urls(&layout.user_dir),
+        |key| std::env::var_os(key).is_some_and(|value| !value.is_empty()),
+    );
+    endpoints.extend(bundled_probes);
     endpoints.extend(
         configured
             .iter()
@@ -3695,6 +3805,11 @@ pub fn discover(
                 detail: "Live metadata could not be saved privately".into(),
                 models: 0,
             });
+        }
+    }
+    for status in not_set_up {
+        if !discovery.providers.iter().any(|p| p.id == status.id) {
+            discovery.providers.push(status);
         }
     }
     if storage_safe {

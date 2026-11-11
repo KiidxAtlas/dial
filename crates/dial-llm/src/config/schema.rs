@@ -904,6 +904,25 @@ pub fn check_value(path: &str, value: &Value) -> Result<(), String> {
     check_value_for(&Table::new(), path, value)
 }
 
+/// A typed CLI value in the form its setting stores: `on`/`off`, `yes`/`no` and `true`/`false`
+/// become booleans for boolean settings. Every other value is returned unchanged.
+pub fn coerce_value(values: &Table, path: &str, value: Value) -> Value {
+    let Some(def) = registry().iter().find(|def| def.path == path) else {
+        return value;
+    };
+    if !matches!(def.kind_for(values), Kind::Bool | Kind::AutoBool) {
+        return value;
+    }
+    let flag = value
+        .as_str()
+        .and_then(|text| match text.to_ascii_lowercase().as_str() {
+            "on" | "yes" | "true" => Some(true),
+            "off" | "no" | "false" => Some(false),
+            _ => None,
+        });
+    flag.map_or(value, Value::Boolean)
+}
+
 pub fn check_value_for(values: &Table, path: &str, value: &Value) -> Result<(), String> {
     let Some(def) = registry().iter().find(|def| def.path == path) else {
         return Ok(());
@@ -911,7 +930,8 @@ pub fn check_value_for(values: &Table, path: &str, value: &Value) -> Result<(), 
     let number = value
         .as_float()
         .or_else(|| value.as_integer().map(|n| n as f64));
-    let fits = match def.kind_for(values) {
+    let kind = def.kind_for(values);
+    let fits = match kind {
         Kind::Bool => value.is_bool(),
         Kind::AutoBool => value.is_bool() || value.as_str() == Some("auto"),
         Kind::Enum(options) => value
@@ -937,8 +957,70 @@ pub fn check_value_for(values: &Table, path: &str, value: &Value) -> Result<(), 
         Ok(())
     } else {
         Err(format!(
-            "{path} does not accept that value; /settings shows its allowed values and range"
+            "{path} does not accept that value; expected {}",
+            expected(&kind)
         ))
+    }
+}
+
+/// Status-line lists name renderer segments; an unknown name would be dropped silently at
+/// render time, so a command that writes the setting refuses it. Loading stays lenient, so a
+/// saved typo never stops Dial from starting. `reasoning` is a legacy alias.
+pub fn check_status_segments(path: &str, value: &Value) -> Result<(), String> {
+    if !matches!(path, "ui.status_left" | "ui.status_right") {
+        return Ok(());
+    }
+    let unknown: Vec<&str> = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|name| *name != "reasoning" && !sources::STATUS_SEGMENTS.contains(name))
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{path}: unknown status segment{} {}; known segments: {}",
+            if unknown.len() == 1 { "" } else { "s" },
+            unknown.join(", "),
+            sources::STATUS_SEGMENTS.join(", ")
+        ))
+    }
+}
+
+/// What a setting of `kind` accepts, for a rejected CLI value.
+fn expected(kind: &Kind) -> String {
+    let int_range = |min: i64, max: i64| match (min, max) {
+        (min, i64::MAX) => format!("an integer of at least {min}"),
+        (min, max) => format!("an integer from {min} to {max}"),
+    };
+    let float_range = |min: f64, max: f64| {
+        if max.is_finite() && max < f64::MAX {
+            format!("a number from {min} to {max}")
+        } else {
+            format!("a number of at least {min}")
+        }
+    };
+    match kind {
+        Kind::Bool => "true or false (on/off, yes/no)".into(),
+        Kind::AutoBool => "true, false or \"auto\"".into(),
+        Kind::Enum(options) => format!(
+            "one of {}",
+            options
+                .iter()
+                .map(|(stored, _)| *stored)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Kind::Int { min, max, .. } => int_range(*min, *max),
+        Kind::AutoInt { min, max, .. } => format!("\"auto\" or {}", int_range(*min, *max)),
+        Kind::Float { min, max, .. } => float_range(*min, *max),
+        Kind::AutoFloat { min, max, .. } => format!("\"auto\" or {}", float_range(*min, *max)),
+        Kind::Text | Kind::Theme | Kind::Choice(_) => "a string".into(),
+        Kind::StringList => "an array of strings, such as [\"a\", \"b\"]".into(),
+        Kind::Table => "an inline table, such as { key = \"value\" }".into(),
+        Kind::Toml => "a TOML value".into(),
     }
 }
 

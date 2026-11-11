@@ -1274,3 +1274,30 @@ fn the_default_layout_shows_the_thinking_level_at_every_width() {
         assert!(line.contains("THINK HIGH"), "{width}: {line}");
     }
 }
+
+#[test]
+fn controls_row_names_only_what_differs_from_a_fresh_session() {
+    let keys = crate::ui::keys::Keymap::defaults();
+    let theme = Theme::dark();
+    let mut status = StatusData {
+        planning: Some(false),
+        assistance: Some(false),
+        ..data()
+    };
+    let quiet = plain(&controls_row(&status, &keys, &theme, 200));
+    assert!(quiet.ends_with("controls"), "{quiet}");
+    for noise in ["Planning off", "Assistance off", "provider default"] {
+        assert!(!quiet.contains(noise), "{quiet}");
+    }
+    status.planning = Some(true);
+    status.assistance = Some(true);
+    status.controls_pending = true;
+    let busy = plain(&controls_row(&status, &keys, &theme, 200));
+    for fact in [
+        "planning on",
+        "assistance on",
+        "saved changes apply after this turn",
+    ] {
+        assert!(busy.contains(fact), "{busy}");
+    }
+}

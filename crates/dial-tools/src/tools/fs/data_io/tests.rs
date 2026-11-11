@@ -157,3 +157,37 @@ fn retained_sources_survive_removal_of_the_original() {
     assert!(!result.is_error, "{}", result.text);
     assert!(result.text.contains("AP8q"), "{}", result.text);
 }
+
+#[test]
+fn artifact_byte_reads_return_whole_inputs_and_page_losslessly_within_the_budget() {
+    let (dir, ws) = testkit::workspace();
+    let ws = ws.with_artifacts(
+        crate::storage::artifact::ArtifactStore::new(&dir.path().join("artifacts")).unwrap(),
+    );
+    // The size of a real retained WAL that a fixed 16 KiB page could not return in one read.
+    let bytes: Vec<u8> = (0..16_512u32).map(|n| (n * 7 % 256) as u8).collect();
+    let uri = ws.artifacts().unwrap().retain_exact_bytes(&bytes).unwrap();
+    let page = |selector: String, budget| {
+        let result = crate::tools::read_tool_streaming(
+            &ws,
+            &json!({ "path": selector }),
+            &AtomicBool::new(false),
+            budget,
+        );
+        assert!(!result.is_error, "{}", result.text);
+        assert!(result.text.len() <= budget, "{}", result.text.len());
+        let value: Value = serde_json::from_str(&result.text).unwrap();
+        let data = STANDARD.decode(value["data"].as_str().unwrap()).unwrap();
+        (data, value["next_offset"].as_u64().unwrap())
+    };
+    let (whole, next) = page(format!("{uri}:bytes=0"), 48 * 1024);
+    assert_eq!((whole.as_slice(), next), (bytes.as_slice(), 16_512));
+    let mut rebuilt = Vec::new();
+    while (rebuilt.len() as u64) < 16_512 {
+        let (data, next) = page(format!("{uri}:bytes={}+20000", rebuilt.len()), 4096);
+        assert!(!data.is_empty() && data.len() < 4096);
+        rebuilt.extend(data);
+        assert_eq!(next, rebuilt.len() as u64);
+    }
+    assert_eq!(rebuilt, bytes);
+}

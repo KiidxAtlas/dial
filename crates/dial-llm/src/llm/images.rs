@@ -122,12 +122,10 @@ pub fn inline_attachment(bytes: &[u8]) -> Result<Value> {
 /// An explicit user image reference may name a file outside the tool workspace.
 /// Tool reads continue to use `attachment` and remain project-confined.
 pub fn user_attachment(root: &Path, path: &Path) -> Result<Value> {
-    let expanded = path
-        .to_str()
-        .and_then(|p| p.strip_prefix("~/"))
-        .map(|p| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(p))
+    let expanded = home_relative(path)
+        .map(|rest| {
+            crate::config::paths::home_dir()
+                .map(|home| home.join(rest))
                 .context("home directory is unavailable")
         })
         .transpose()?;
@@ -140,6 +138,14 @@ pub fn user_attachment(root: &Path, path: &Path) -> Result<Value> {
     attachment(parent, Path::new(name))
 }
 
+/// The rest of a `~/`-prefixed path (also `~\` on Windows). Native Windows rarely sets `HOME`,
+/// so expansion uses [`crate::config::paths::home_dir`], which falls back to `USERPROFILE`.
+fn home_relative(path: &Path) -> Option<&str> {
+    let text = path.to_str()?;
+    text.strip_prefix("~/")
+        .or_else(|| cfg!(windows).then(|| text.strip_prefix("~\\")).flatten())
+}
+
 /// Re-reading exactly an image explicitly attached by the human does not grant arbitrary external
 /// file access. The caller still verifies the recorded hash before using the reference.
 /// Whether `path` could name a user-supplied image at all (absolute after `~/` expansion, with an
@@ -150,10 +156,8 @@ pub fn may_reference_user_image(path: &Path) -> bool {
 }
 
 fn requested_image(path: &Path) -> Option<std::path::PathBuf> {
-    let expanded = path
-        .to_str()
-        .and_then(|p| p.strip_prefix("~/"))
-        .and_then(|p| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(p)));
+    let expanded = home_relative(path)
+        .and_then(|rest| crate::config::paths::home_dir().map(|home| home.join(rest)));
     let requested = expanded.unwrap_or_else(|| path.to_path_buf());
     (requested.is_absolute() && is_image(&requested)).then_some(requested)
 }

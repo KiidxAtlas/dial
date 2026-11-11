@@ -243,3 +243,37 @@ fn documented_context_windows_cover_current_haiku_and_fable() {
     assert_eq!(documented_context_window("claude-fable-5"), Some(1_000_000));
     assert_eq!(documented_context_window("claude-haiku-4-5"), Some(200_000));
 }
+
+#[test]
+fn streamed_tool_input_keeps_unparseable_text_and_empty_input_means_no_arguments() {
+    let call = |partial: &str| {
+        let delta = json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":partial}}).to_string();
+        let reply = stream(&[
+            START,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c0","name":"verify","input":{}}}"#,
+            &delta,
+            r#"{"type":"content_block_stop","index":0}"#,
+            DELTA,
+            STOP,
+        ]);
+        reply.tool_calls[0].clone()
+    };
+    let empty = call("");
+    assert!(!empty.malformed_arguments);
+    assert_eq!(empty.arguments, json!({}));
+    let cut = call(r#"{"acceptance":{"command":"python3 -c "#);
+    assert!(cut.malformed_arguments);
+    assert_eq!(
+        cut.arguments,
+        json!(r#"{"acceptance":{"command":"python3 -c "#)
+    );
+    let replay = crate::llm::assistant_message(&Reply {
+        tool_calls: vec![cut.clone()],
+        provider_content: vec![
+            json!({"type":"tool_use","id":"c0","name":"verify","input":cut.arguments}),
+        ],
+        ..Default::default()
+    });
+    assert_eq!(replay["dial_provider_content"][0]["input"], json!({}));
+    assert_eq!(replay["tool_calls"][0]["function"]["arguments"], "{}");
+}

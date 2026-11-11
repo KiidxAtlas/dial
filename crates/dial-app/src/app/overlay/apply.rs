@@ -117,6 +117,7 @@ impl OverlayEnv<'_> {
                     .clone()
                     .unwrap_or_else(|| self.app.config.clone());
                 let embedding_role = role == "embedding";
+                let main_role = role == "main";
                 let mut saved = false;
                 let outcome = (|| -> Result<String> {
                     // Selecting a model applies it directly; there is no confirmation screen.
@@ -199,6 +200,10 @@ impl OverlayEnv<'_> {
                 {
                     settings.replace_values(values, project, global);
                     settings.roles_changed();
+                }
+                // First-run setup is done once a main model is chosen; the landing page follows.
+                if assigned && self.first_run && main_role && self.next.is_none() {
+                    return true;
                 }
                 if assigned
                     && self.next.is_none()

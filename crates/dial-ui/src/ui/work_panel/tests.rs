@@ -137,7 +137,7 @@ fn tabs_show_the_focused_step_evidence_and_approval_mode() {
     assert!(
         mode.contains("● Ask first")
             && mode.contains("sandbox workspace")
-            && mode.contains("Shift+Tab cycles the mode"),
+            && mode.contains("Shift+Tab cycles ask, write and read-only"),
         "{mode}"
     );
     assert_eq!(Tab::Plan.next(), Tab::Evidence);

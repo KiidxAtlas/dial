@@ -163,5 +163,56 @@ pub fn split_words(s: &str) -> Vec<String> {
     words
 }
 
+/// Words of typed prose arguments (slash commands): like [`split_words`], but forgiving of ordinary
+/// text. A quote groups words only when it starts a word and is closed later, so `don't` keeps
+/// its apostrophe; a backslash escapes only a quote, a backslash or whitespace, so `C:\dir` and
+/// `a\b` are kept as typed.
+pub fn split_prose_words(s: &str) -> Vec<String> {
+    let (mut words, mut cur, mut quote, mut in_word) =
+        (Vec::new(), String::new(), None::<char>, false);
+    let mut chars = s.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(q), '\\') if chars.peek().is_some_and(|&(_, n)| n == q || n == '\\') => {
+                if let Some((_, next)) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            (Some(_), c) => cur.push(c),
+            (None, '"' | '\'') if !in_word && s[at + 1..].contains(c) => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '\\') => {
+                match chars.peek() {
+                    Some(&(_, next))
+                        if next == '"' || next == '\'' || next == '\\' || next.is_whitespace() =>
+                    {
+                        cur.push(next);
+                        chars.next();
+                    }
+                    _ => cur.push('\\'),
+                }
+                in_word = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    words
+}
+
 #[cfg(test)]
 mod tests;

@@ -378,8 +378,9 @@ impl GitOverlay {
         let mut cursor = 0;
         for (label, _, x, col_w) in &sides {
             caption.push(Span::raw(" ".repeat(*x - cursor)));
-            let text = format!(" {label}");
-            let fill = col_w.saturating_sub(text.chars().count());
+            let text = text::clip(&format!(" {label}"), *col_w);
+            // Display columns, not chars: a wide (CJK, emoji) file name would push the row out.
+            let fill = col_w.saturating_sub(text::width(&text));
             caption.push(Span::styled(text, muted));
             caption.push(Span::raw(" ".repeat(fill)));
             cursor = x + col_w;

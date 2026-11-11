@@ -181,3 +181,40 @@ fn shared_repetition_guidance_redirects_then_escalates() {
     let (_, escalation) = repetition_guidance(&messages).expect("six identical calls");
     assert_ne!(escalation, redirect);
 }
+
+#[test]
+fn parent_and_worker_recovery_selection_agree_for_every_pattern() {
+    use crate::agent::safety::guard::RepeatedToolCall;
+    for pattern in [
+        "",
+        "AAAA",
+        "AAAAA",
+        "AAAAAA",
+        "ABABAB",
+        "ABCABCABC",
+        "ABACAADAEA",
+    ] {
+        let mut messages = Vec::new();
+        for (index, path) in pattern.chars().enumerate() {
+            let id = format!("call{index}");
+            messages.push(serde_json::json!({"role":"assistant","tool_calls":[{
+                "id":id,"type":"function","function":{"name":"read","arguments":{"path":path.to_string()}}
+            }]}));
+            messages
+                .push(serde_json::json!({"role":"tool","tool_call_id":id,"content":"same result"}));
+        }
+        let streak = RepeatedToolCall::detect(
+            &messages,
+            TOOL_CALL_LOOP_THRESHOLD,
+            TOOL_CALL_LOOP_EXEMPT_TOOLS,
+        );
+        assert_eq!(
+            repetition_guidance(&messages),
+            repetition_guidance_with_streak(&messages, streak.as_ref()),
+            "{pattern}"
+        );
+        if pattern.len() >= 5 {
+            assert!(repetition_guidance(&messages).is_some(), "{pattern}");
+        }
+    }
+}
