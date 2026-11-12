@@ -16,11 +16,20 @@ jobs:
   validate:
     name: No-build readiness
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      # Find an already-tested pull request whose candidates main can reuse.
+      actions: read
+      pull-requests: read
     outputs:
       candidate-tag: ${{ steps.candidate.outputs.tag }}
+      candidate-ref: ${{ steps.candidate.outputs.ref }}
       epoch: ${{ steps.candidate.outputs.epoch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Release-candidate reuse checks that a merged pull request head is in main's history.
+          fetch-depth: 0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
@@ -43,24 +52,47 @@ jobs:
           echo "48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9  $archive" | sha256sum -c -
           tar -xzf "$archive" -C "$tool_dir" --strip-components=1 cargo-machete-v0.9.2-x86_64-unknown-linux-musl/cargo-machete
           PATH="$tool_dir:$PATH" make lint-deps
-      - name: Select untagged main release candidate
+      - name: Select untagged release candidate
         id: candidate
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # Version-bump pull requests from this repository build candidates too, so a release
+        # tagged right after the merge reuses them instead of waiting for main to rebuild.
+        if: >-
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           tag="$(python3 -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
-          if ! git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
-            echo "tag=$tag" >> "$GITHUB_OUTPUT"
-            echo "epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
+            exit 0
           fi
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # Tests run on the merge with main; candidates are built from the head. Record them
+            # only when both are the same tree, so a release can match them by tree.
+            if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse "$HEAD_SHA^{tree}")" ]; then
+              echo "Pull request is behind main; no release candidates for this run." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          elif RELEASE_TAG="$tag" scripts/release-candidate-run.sh "$GITHUB_SHA" > "$RUNNER_TEMP/reused"; then
+            echo "Reusing candidates from pull request CI run $(cat "$RUNNER_TEMP/reused")." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "tag=$tag"
+            echo "ref=$HEAD_SHA"
+            echo "epoch=$(git show -s --format=%ct "$HEAD_SHA")"
+          } >> "$GITHUB_OUTPUT"
 
   release-candidates:
     name: Unsigned release candidates
     needs: validate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.validate.outputs.candidate-tag != ''
+    if: needs.validate.outputs.candidate-tag != ''
     uses: ./.github/workflows/release-build.yml
     with:
       tag: ${{ needs.validate.outputs.candidate-tag }}
+      ref: ${{ needs.validate.outputs.candidate-ref }}
       epoch: ${{ needs.validate.outputs.epoch }}
 
   test:

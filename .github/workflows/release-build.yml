@@ -7,6 +7,10 @@ on:
         description: Validated stable release tag matching the checkout
         required: true
         type: string
+      ref:
+        description: Commit to build; candidates record its tree, which a release must match
+        required: true
+        type: string
       epoch:
         description: Source commit timestamp
         required: true
@@ -22,6 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -42,7 +47,9 @@ jobs:
           spec = importlib.util.spec_from_file_location('policy', 'scripts/release-policy.py')
           policy = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(policy)
-          identity = policy.candidate_identity(os.environ['GITHUB_SHA'])
+          import subprocess
+          git = lambda *args: subprocess.check_output(['git', *args], text=True).strip()
+          identity = policy.candidate_identity(git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD^{tree}'))
           path = Path('candidate.json')
           path.write_text(json.dumps(identity) + '\n', encoding='utf-8')
           assert json.loads(path.read_text()) == identity
@@ -85,6 +92,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap musl-tools
@@ -155,6 +164,8 @@ jobs:
     runs-on: ${{ github.event_name == 'push' && matrix.os == 'windows-2025' && vars.DIAL_WINDOWS_RUNNER || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - name: Install pinned Rust
         run: |
           rustup show active-toolchain

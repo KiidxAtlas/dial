@@ -13,6 +13,11 @@ jobs:
   gate:
     name: Require tested main commit
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
+      # Find the merged pull request whose CI already tested this exact tree.
+      pull-requests: read
     outputs:
       epoch: ${{ steps.identity.outputs.epoch }}
       candidates: ${{ steps.candidates.outputs.run }}
@@ -44,8 +49,20 @@ jobs:
           git fetch origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           echo "epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+      - name: Reuse same-tree pull request CI
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if run="$(scripts/release-candidate-run.sh "$GITHUB_SHA")"; then
+            echo "run=$run" >> "$GITHUB_OUTPUT"
+            echo "Pull request CI run $run tested and built this exact source tree; not waiting for main CI." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Require successful push CI on main
         id: ci
+        if: steps.pr.outputs.run == ''
         env:
           GH_TOKEN: ${{ github.token }}
         timeout-minutes: 90
@@ -75,7 +92,7 @@ jobs:
         id: candidates
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_RUN: ${{ steps.ci.outputs.run }}
+          CI_RUN: ${{ steps.pr.outputs.run || steps.ci.outputs.run }}
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
@@ -83,7 +100,7 @@ jobs:
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN/artifacts?per_page=100" > "$RUNNER_TEMP/artifacts.json"
           if python3 scripts/release-policy.py artifacts "$GITHUB_SHA" "$RUNNER_TEMP/artifacts.json"; then
             gh run download "$CI_RUN" -R "$GITHUB_REPOSITORY" -n release-assets-identity -D "$RUNNER_TEMP/candidate-identity"
-            if python3 scripts/release-policy.py identity "$GITHUB_SHA" "$RUNNER_TEMP/candidate-identity/candidate.json"; then
+            if python3 scripts/release-policy.py identity "$(git rev-parse 'HEAD^{tree}')" "$RUNNER_TEMP/candidate-identity/candidate.json"; then
               echo "run=$CI_RUN" >> "$GITHUB_OUTPUT"
               echo "Reusing all eight tested platform archives from CI run $CI_RUN." >> "$GITHUB_STEP_SUMMARY"
               exit 0
@@ -121,6 +138,7 @@ jobs:
     uses: ./.github/workflows/release-build.yml
     with:
       tag: ${{ github.ref_name }}
+      ref: ${{ github.sha }}
       epoch: ${{ needs.gate.outputs.epoch }}
 
   sign:
@@ -154,13 +172,13 @@ jobs:
           pattern: release-assets-*
           merge-multiple: true
           path: dist
-      - name: Recheck candidate commit, version and embedded public key
+      - name: Recheck candidate source tree, version and embedded public key
         env:
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          python3 scripts/release-policy.py identity "$GITHUB_SHA" dist/candidate.json
+          python3 scripts/release-policy.py identity "$(git rev-parse 'HEAD^{tree}')" dist/candidate.json
           rm dist/candidate.json
       - name: Prepare installers and manifest (no private key)
         env:

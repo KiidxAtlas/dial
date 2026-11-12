@@ -477,28 +477,43 @@ Use Python 3.12 with the pinned check dependencies, for example:
 uv run --no-project --python 3.12 --with-requirements scripts/requirements-ci.lock make release-check
 ```
 
-`--tag` requires clean `main`, matching `origin/main`, passing no-build checks and a completed
-successful **push-to-main CI run for that exact commit**, checked with `gh`. It does not bump,
-commit, compile or push main. `--tag --push` additionally pushes the tag; bare `--push` and the
-old `--no-check` bypass are refused. The workflow independently repeats exact-commit admission.
+`--tag` requires clean `main`, matching `origin/main`, passing no-build checks and completed
+successful CI for that exact source: either the **push-to-main CI run for the commit** or the CI
+run of the **merged pull request whose tested and built tree is identical** (see below), checked
+with `gh`. It does not bump, commit, compile or push main. `--tag --push` additionally pushes the
+tag; bare `--push` and the old `--no-check` bypass are refused. The workflow independently repeats
+admission.
 
 CI's shared no-build readiness/format job gates every compiling matrix and the container build.
-On main, while the workspace version has no tag, CI also calls `release-build.yml` to compile
-unsigned candidates for all eight release targets **in parallel with the test/lint jobs**. This
-does not run for PRs or after that version is tagged. Candidate jobs validate public keys, package
-and smoke-test every archive, and record the exact commit, version and embedded public key.
-They receive no private signing key or protected environment access. All candidate jobs must
-succeed for that main CI run to pass; this uses more concurrent runner capacity on release-bound
-main pushes, so queue time still depends on the account's concurrency allowance.
+While the workspace version has no tag, CI also calls `release-build.yml` to compile unsigned
+candidates for all eight release targets **in parallel with the test/lint jobs**, on main pushes
+and on pull requests from this repository (version-bump PRs in practice). A pull request records
+candidates only when the merge with main that CI tests has the same tree as the PR head that is
+built; a PR that is behind main gets none. Main skips the rebuild when a merged PR's CI already
+recorded candidates for the same tree. Candidate jobs validate public keys, package and smoke-test
+every archive, and record the built commit, its source tree, the version and the embedded public
+key. They receive no private signing key or protected environment access. All candidate jobs must
+succeed for that CI run to pass; this uses more concurrent runner capacity on release-bound
+pushes, so queue time still depends on the account's concurrency allowance.
 
-The tag workflow still requires successful push-to-main CI for the exact SHA. It promotes that
-CI run's complete, unexpired candidate artifact set rather than compiling again. PR artifacts,
-other commits, incomplete sets and identities with a changed public key cannot be promoted.
-Older CI runs, expired artifacts or a rotated public key use the same shared build workflow as a
-fallback. Authentication/API errors fail visibly rather than silently bypassing admission.
-The protected `release-signing` input check and final signing approval remain mandatory when
-configured. The final job rechecks candidate identity before signing; build jobs never receive
-the private key. Workflow source alone cannot establish hosted repository protections.
+The tag workflow first looks for a pull request from this repository, merged into main with a
+merge commit (its head is an ancestor of the tag), whose head has the tagged commit's tree and whose
+newest successful CI run recorded candidates for that tree and tag. When found, it reuses that run's
+tests and archives and does not wait for main CI;
+this is what makes "merge the release PR, then tag" fast. Otherwise it requires successful
+push-to-main CI for the exact SHA, as before, and promotes that run's candidates. Fork pull
+requests, other trees, incomplete or expired sets and identities with a changed public key cannot
+be promoted; those cases rebuild every platform with the same shared workflow. Released binaries
+built on a pull request report its head commit in `dial --version`; that commit is in main's
+history and has the tagged tree. Authentication/API errors fail visibly rather than silently
+bypassing admission. The protected `release-signing` input check and final signing approval
+remain mandatory when configured. The final job rechecks the candidate tree, tag and public key
+before signing; build jobs never receive the private key. Workflow source alone cannot establish
+hosted repository protections.
+
+Release in one path: either push the prepared commit to main and tag it after main CI passes, or
+open a release PR, merge it once its checks pass, and tag the merge commit right away. Doing both
+repeats CI on the same tree.
 
 Candidate Rust caches are saved from main, including after failure, so later main commits can
 restore them; tag-scoped fallback builds restore main caches without creating isolated tag caches.

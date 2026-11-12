@@ -146,7 +146,7 @@ release-check:
 	$(PYTHON) scripts/release-policy.py check $(if $(RELEASE_TAG),"$(RELEASE_TAG)") || status=1; \
 	$(PYTHON) scripts/check-packaging.py || status=1; \
 	$(PYTHON) scripts/release-policy.py tools || status=1; \
-	for script in scripts/release.sh scripts/preflight.sh; do bash -n "$$script" || status=1; done; \
+	for script in scripts/release.sh scripts/release-candidate-run.sh scripts/preflight.sh; do bash -n "$$script" || status=1; done; \
 	exit $$status
 
 # Deliberately no build prerequisite: test exactly the artifact selected by DIAL.

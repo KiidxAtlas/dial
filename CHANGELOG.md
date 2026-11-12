@@ -17,6 +17,15 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Changed
+
+- **Faster releases from a release pull request:** CI builds unsigned release candidates for
+  version-bump pull requests from this repository when the tested merge tree equals the built
+  head tree. Tagging the merge commit of such a pull request (merged with a merge commit) reuses
+  its tests and archives instead of waiting for main CI to repeat them, and main skips rebuilding
+  them. Candidates now record their source tree, and promotion matches by tree; other cases still
+  require main push CI or rebuild every platform ([releases](docs/release-and-install.md)).
+
 ## [0.3.5] - 2026-11-11
 
 ### Added

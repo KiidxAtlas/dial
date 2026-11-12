@@ -49,6 +49,30 @@ def successful_ci_run_id(runs, revision):
     raise ValueError("no successful exact-commit main push CI run with a valid ID")
 
 
+def merged_pull_request_heads(pulls, repository):
+    """Head commits of pull requests from this repository that were merged into main."""
+    heads = []
+    for pull in pulls:
+        head = pull.get("head") or {}
+        sha = head.get("sha")
+        if (pull.get("merged_at") and (pull.get("base") or {}).get("ref") == "main"
+                and (head.get("repo") or {}).get("full_name") == repository
+                and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)):
+            heads.append(sha)
+    return heads
+
+
+def successful_pull_request_ci_run_id(runs, head):
+    """Newest completed, successful pull-request CI run for exactly this head commit."""
+    for run in runs:
+        run_id = run.get("databaseId")
+        if (run.get("event") == "pull_request" and run.get("headSha") == head
+                and run.get("status") == "completed" and run.get("conclusion") == "success"
+                and type(run_id) is int and run_id > 0):
+            return run_id
+    raise ValueError("no successful pull-request CI run with a valid ID for this head")
+
+
 RELEASE_TARGETS = (
     "aarch64-apple-darwin", "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl",
@@ -66,10 +90,32 @@ def complete_candidate_artifacts(pages):
             and all(artifact.get("expired") is False for artifact in artifacts))
 
 
-def candidate_identity(revision):
+def candidate_identity(revision, tree):
     tag = os.environ["RELEASE_TAG"]
     stable_version(tag)
-    return dict(revision=revision, tag=tag, public_key=os.environ["DIAL_RELEASE_PUBLIC_KEY"])
+    return dict(revision=revision, tree=tree, tag=tag, public_key=os.environ["DIAL_RELEASE_PUBLIC_KEY"])
+
+
+def candidate_matches(identity, tree, check_key=True):
+    """Candidates are accepted by source tree: the tested and built tree must be the tagged tree.
+
+    The recorded revision names the commit that was built (on a pull request, its head), which is
+    reported by `dial --version`; it must be a full commit hash but need not be the tag commit.
+    """
+    if not isinstance(identity, dict) or not isinstance(tree, str) or not re.fullmatch(r"[0-9a-f]{40}", tree):
+        return False
+    revision = identity.get("revision")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        return False
+    expected = candidate_identity(revision, tree) if check_key else dict(
+        revision=revision, tree=tree, tag=stable_tag(os.environ["RELEASE_TAG"]),
+        public_key=identity.get("public_key"))
+    return identity == expected
+
+
+def stable_tag(tag):
+    stable_version(tag)
+    return tag
 
 
 def release_notes(tag, changelog):
@@ -192,7 +238,8 @@ def tool_problems():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("latest", "ci", "ci-run", "artifacts", "identity", "notes", "check", "keys", "tools"))
+    parser.add_argument("action", choices=("latest", "ci", "ci-run", "pr-heads", "pr-run", "artifacts",
+                                           "identity", "candidate-tree", "notes", "check", "keys", "tools"))
     parser.add_argument("identity", nargs="?")
     parser.add_argument("input", type=Path, nargs="?")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -220,9 +267,20 @@ def main():
         return 0
     if args.action == "artifacts":
         return 0 if complete_candidate_artifacts(json.loads(text)) else 1
-    if args.action == "identity":
-        if json.loads(text) != candidate_identity(args.identity):
-            print("release: candidate commit, tag or public key changed; rebuild candidates", file=sys.stderr)
+    if args.action == "pr-heads":
+        for head in merged_pull_request_heads(json.loads(text), args.identity):
+            print(head)
+        return 0
+    if args.action == "pr-run":
+        try:
+            print(successful_pull_request_ci_run_id(json.loads(text), args.identity))
+        except ValueError as error:
+            print(f"release: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if args.action in ("identity", "candidate-tree"):
+        if not candidate_matches(json.loads(text), args.identity, check_key=args.action == "identity"):
+            print("release: candidate source tree, tag or public key changed; rebuild candidates", file=sys.stderr)
             return 1
         return 0
     if args.action == "latest":
