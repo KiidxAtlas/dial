@@ -221,7 +221,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def goal(transcript, required=True):
         # Scan each line once instead of retrying a wildcard suffix at every
         # untrusted "acceptance goal" prefix. Preserve the first matching anchor.
-        token = re.compile(r"\s+([A-Z]+-\d+)", re.IGNORECASE)
+        # Whitespace after a marker is skipped by hand so no unbounded regex
+        # repetition is ever retried against untrusted text.
+        token = re.compile(r"([A-Z]+-\d+)", re.IGNORECASE)
         offset = 0
         for line in transcript.split("\n"):
             anchor = re.search("acceptance goal", line, re.IGNORECASE)
@@ -231,7 +233,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 is_actual = marker.group().lower() != "exactly"
                 if not is_actual and (acceptance < 0 or marker.start() < acceptance):
                     continue
-                match = token.match(transcript, offset + marker.end())
+                start = position = offset + marker.end()
+                while position < len(transcript) and transcript[position].isspace():
+                    position += 1
+                match = token.match(transcript, position) if position > start else None
                 if match is None:
                     continue
                 if not is_actual or acceptance < 0 or marker.start() < acceptance:

@@ -23,7 +23,7 @@ pub fn is_endpoint(url: &str) -> bool {
 /// One identifier per process for requests that belong to no conversation (one-shot calls), so
 /// they still route instead of failing; a bound conversation always sends its own id.
 static PROCESS_SESSION: LazyLock<String> = LazyLock::new(|| {
-    use rand::Rng;
+    use rand::RngExt;
     format!("dial-{:032x}", rand::rng().random::<u128>())
 });
 

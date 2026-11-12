@@ -1383,6 +1383,7 @@ fn bridge(
                         NextTimeout {
                             after: ureq::unversioned::transport::time::Duration::from(phase),
                             reason: ureq::Timeout::Resolve,
+                            ..NextTimeout::default()
                         },
                     )
                     .map(|_| ())

@@ -28,7 +28,7 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: Validate public keys and record identity
@@ -97,7 +97,7 @@ jobs:
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap musl-tools
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: Install Rust
@@ -199,7 +199,7 @@ jobs:
           if ($code -ne 0 -or $version -notmatch ("^dial " + [regex]::Escape($expected) + "( |$)")) { throw "Packaged version check failed (exit $code): $version" }
           & "dist/$package/dial.exe" --help
           if ($LASTEXITCODE -ne 0) { throw "Packaged help check failed" }
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: Verify packaged binary format

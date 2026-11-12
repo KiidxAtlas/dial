@@ -4,7 +4,7 @@ use super::profiles::ModelProfile;
 use super::transports::{OnText, Route};
 use super::{Chat, Endpoint, Reply, StreamEvent};
 use anyhow::{Context, Result, ensure};
-use rand::RngCore;
+use rand::Rng;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::{
