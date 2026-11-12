@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run the focused Windows Rust contract listed in scripts/windows-contract.txt.
+"""Run a focused native Rust contract: scripts/windows-contract.txt by default, or --contract.
 
-Each `test-lib` selects a package library; `test-bin` selects a package binary.
-Every `skip` line is passed to libtest as `--skip` and printed with its reason.
-Successful Cargo exits with no executed tests are rejected, including ignored-only selections.
-`--print` shows the commands without running them (it does not verify selection).
+Each `test-lib` selects a package library; `test-bin` selects a package binary; `test-integration`
+selects a package integration-test target. Every `skip` line is passed to libtest as `--skip` and
+printed with its reason. Successful Cargo exits with no executed tests are rejected, including
+ignored-only selections. `--print` shows the commands without running them (it does not verify
+selection).
 """
 import argparse
 import re
@@ -43,6 +44,12 @@ def parse(path):
                 raise SystemExit(f"{path}:{number}: test-bin needs <package> <binary> <filter>")
             package, binary, filter_name = parts
             tests.append((["--package", package, "--bin", binary], filter_name))
+        elif kind == "test-integration":
+            parts = name.split()
+            if len(parts) != 3 or any(part.startswith("-") for part in parts):
+                raise SystemExit(f"{path}:{number}: test-integration needs <package> <target> <filter>")
+            package, target, filter_name = parts
+            tests.append((["--package", package, "--test", target], filter_name))
         elif kind == "skip":
             if not reason:
                 raise SystemExit(f"{path}:{number}: skip `{name}` needs a reason after ` # `")
@@ -50,11 +57,11 @@ def parse(path):
         else:
             raise SystemExit(f"{path}:{number}: unknown directive `{kind}`")
     if not tests:
-        raise SystemExit(f"{path}: no test filters; the Windows contract would run nothing")
+        raise SystemExit(f"{path}: no test filters; the contract would run nothing")
     return tests, skips
 
 
-def run_contract(tests, skips, profile, dry_run=False):
+def run_contract(tests, skips, profile, dry_run=False, label="Windows"):
     for name, reason in skips:
         print(f"SKIPPED {name}: {reason}", flush=True)
 
@@ -73,7 +80,7 @@ def run_contract(tests, skips, profile, dry_run=False):
                                 stderr=subprocess.STDOUT, text=True)
         print(result.stdout, end="", flush=True)
         if result.returncode != 0:
-            print(f"Windows contract failed in filter `{filter_name}`", file=sys.stderr)
+            print(f"{label} contract failed in filter `{filter_name}`", file=sys.stderr)
             status = status or result.returncode
             failed.append(filter_name)
             continue
@@ -82,14 +89,14 @@ def run_contract(tests, skips, profile, dry_run=False):
         passed = sum(int(count) for count in re.findall(
             r"^test result: ok\. (\d+) passed;", result.stdout, re.MULTILINE))
         if passed == 0:
-            print(f"Windows contract filter `{filter_name}` executed no tests "
+            print(f"{label} contract filter `{filter_name}` executed no tests "
                   "(after platform gates, skips and ignored tests)", file=sys.stderr)
             status = status or 1
             failed.append(filter_name)
             continue
         print(f"VERIFIED {filter_name}: {passed} tests passed", flush=True)
     if failed:
-        print("Windows contract failures: " + ", ".join(f"`{name}`" for name in failed),
+        print(f"{label} contract failures: " + ", ".join(f"`{name}`" for name in failed),
               file=sys.stderr)
     return status
 
@@ -97,12 +104,15 @@ def run_contract(tests, skips, profile, dry_run=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--profile", default="ci", help="cargo profile (default: ci)")
+    parser.add_argument("--contract", type=Path, default=CONTRACT,
+                        help="contract file (default: scripts/windows-contract.txt)")
+    parser.add_argument("--label", default="Windows", help="platform name used in messages")
     parser.add_argument("--print", action="store_true", dest="dry_run",
                         help="print the commands without running them")
     args = parser.parse_args()
 
-    tests, skips = parse(CONTRACT)
-    return run_contract(tests, skips, args.profile, args.dry_run)
+    tests, skips = parse(args.contract)
+    return run_contract(tests, skips, args.profile, args.dry_run, args.label)
 
 
 if __name__ == "__main__":

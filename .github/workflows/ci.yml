@@ -148,26 +148,30 @@ jobs:
         timeout-minutes: 10
         run: cargo test --locked --profile ci --workspace linux_sandbox_enforces_filesystem_and_both_network_modes
       - name: Build
-        # The `dial` library and its unit-test build each peak near 5 GB in rustc. Built together
-        # they exceed the 7 GB macOS arm64 runner and swap (11-16 min); one at a time they fit.
-        # Workspace crates (crates/dial-*) are built one lib target at a time for the same reason.
-        # The `ci` profile drops debug info, which cuts rustc memory, link time and cache size.
+        # The full workspace build and test suite run on Linux. macOS runs the focused contract below,
+        # which builds only the test targets it selects. On Linux the `dial` library and its
+        # unit-test build each peak near 5 GB in rustc and are still built one at a time, and
+        # workspace crates one lib target at a time. The `ci` profile drops debug info, which cuts
+        # rustc memory, link time and cache size.
+        if: runner.os == 'Linux'
         run: |
           cargo build --locked --profile ci --workspace --lib
           cargo test --locked --profile ci --workspace --lib --no-run
           cargo build --locked --profile ci --workspace --all-targets
+      - name: Run focused macOS contract suite
+        # Modules with macOS-specific code: scripts/macos-contract.txt. Portable tests already ran
+        # in full on Linux; repeating them here took ~11 minutes of the macOS critical path.
+        if: runner.os == 'macOS'
+        run: python3 scripts/windows-contract.py --contract scripts/macos-contract.txt --label macOS --profile ci
       - name: Install cargo-nextest (verified archive)
-        # SHA-256 pins are from the upstream 0.9.150 release checksum assets.
+        # SHA-256 pin is from the upstream 0.9.150 release checksum asset.
+        if: runner.os == 'Linux'
         env:
           NEXTEST_VERSION: 0.9.150
         run: |
           set -euo pipefail
           platform=x86_64-unknown-linux-gnu
           checksum=b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f
-          if [[ "$RUNNER_OS" == macOS ]]; then
-            platform=universal-apple-darwin
-            checksum=82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a
-          fi
           archive="$RUNNER_TEMP/nextest.tar.gz"
           curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-$platform.tar.gz" -o "$archive"
           printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 -c -
@@ -178,9 +182,10 @@ jobs:
         # cargo-nextest runs every test binary at once, one process per test (.config/nextest.toml
         # fails a test still running after 5 minutes); `cargo test` ran the binaries one after
         # another. Doctests still run under `cargo test --doc`.
+        if: runner.os == 'Linux'
         run: make test-nextest TEST_PROFILE=ci NEXTEST_PROFILE=ci
       - name: Preserve per-test timing and failures
-        if: always()
+        if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-timings-${{ matrix.os }}

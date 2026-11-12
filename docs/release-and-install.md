@@ -595,10 +595,15 @@ does it create a GitHub release with the archives, bundled MIT license and READM
 combined `SHA256SUMS` with its `SHA256SUMS.sig` and `SHA256SUMS.sshsig` signatures, and curated notes
 from the tag's exact version section in `CHANGELOG.md` (missing, duplicate or empty sections refuse publication).
 The container job pins Cosign installer v4.1.2 and Cosign v3.0.6; its OIDC signing and verification still
-require a successful hosted run. CI runs on both
-macOS and Ubuntu without weakening host security. CI builds the `dial` library and its unit-test
-build one after the other: each peaks near 5 GB in rustc, and together they would swap on the
-7 GB macOS arm64 runner. The native Windows Rust contract (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) runs in CI's `windows-rust` job, so the CI requirement above covers it; the release does not repeat it. The Windows release jobs (x86-64 and ARM64) build `dial.exe`, smoke-test the packaged archive (`--version`, `--help`), verify the binary format for the target, and run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.sshsig`.
+require a successful hosted run. CI runs the full portable test suite once, on Ubuntu, and a
+focused macOS contract (`scripts/macos-contract.txt`) on macOS: the modules with macOS-specific
+code (Seatbelt sandbox, APFS clones, power assertions, launchd schedules, pasteboard, keychain,
+desktop capture, browser discovery, self-update) plus sandboxed isolation, shell-session and
+terminal-lifecycle integration tests. Repeating the portable suite on macOS took about 11 of the
+job's 20 minutes in CI run `42935891367`. Locally, its 28 filters ran 3,196 tests in about 7
+minutes, including compilation, on Apple Silicon. Add a filter with any new macOS-specific code;
+`make preflight` on a macOS host still runs the full suite before pushing. Ubuntu builds the
+`dial` library and its unit-test build one after the other: each peaks near 5 GB in rustc. The native Windows Rust contract (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) runs in CI's `windows-rust` job, so the CI requirement above covers it; the release does not repeat it. The Windows release jobs (x86-64 and ARM64) build `dial.exe`, smoke-test the packaged archive (`--version`, `--help`), verify the binary format for the target, and run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.sshsig`.
 
 The Windows contract selects each library's owning package rather than compiling every
 workspace test harness for each filter. Its migrated-record privacy assertion checks native

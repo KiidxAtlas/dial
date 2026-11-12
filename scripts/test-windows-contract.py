@@ -114,9 +114,45 @@ class WindowsContractTests(unittest.TestCase):
     def test_invalid_or_empty_contracts_are_rejected(self):
         for text in ("", "skip x # reason", "test-bin dial dial", "test-bin dial dial x extra",
                      "test-bin --workspace dial x", "test x extra", "skip x", "unknown x",
-                     "test-lib dial-llm", "test-lib dial-llm x extra", "test-lib --workspace x"):
+                     "test-lib dial-llm", "test-lib dial-llm x extra", "test-lib --workspace x",
+                     "test-integration dial integration", "test-integration dial --all x",
+                     "test-integration dial integration x extra"):
             with self.subTest(text=text), self.assertRaises(SystemExit):
                 self.parse(text)
+
+    def test_integration_target_selects_only_that_test_target(self):
+        tests, _ = self.parse("test-integration dial integration isolation::\n")
+        self.assertEqual(tests, [(["--package", "dial", "--test", "integration"], "isolation::")])
+        result, run, _, _ = self.run_fixture(summary(4), tests=tests)
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_args.args[0][:10], ["cargo", "test", "--locked", "--profile", "ci",
+                                                     "--package", "dial", "--test", "integration",
+                                                     "isolation::"])
+
+    def test_label_names_the_platform_in_failures(self):
+        stderr = io.StringIO()
+        with patch.object(contract.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, stdout=summary(0))):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                result = contract.run_contract([(["--workspace", "--lib"], "x::")], [], "ci",
+                                               label="macOS")
+        self.assertEqual(result, 1)
+        self.assertIn("macOS contract filter `x::` executed no tests", stderr.getvalue())
+
+    def test_macos_contract_never_builds_every_workspace_harness_and_ci_uses_it(self):
+        root = Path(contract.__file__).resolve().parent.parent
+        tests, skips = contract.parse(root / "scripts" / "macos-contract.txt")
+        self.assertEqual(skips, [])
+        self.assertTrue(any(target[:2] == ["--package", "dial-core"] for target, _ in tests))
+        self.assertTrue(any("--test" in target for target, _ in tests))
+        for target, _ in tests:
+            self.assertNotIn("--workspace", target)
+        ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        job = ci.split("\n  test:\n", 1)[1].split("\n  lint:\n", 1)[0]
+        self.assertIn("--contract scripts/macos-contract.txt --label macOS", job)
+        for step in ("Build", "Install cargo-nextest (verified archive)", "Test"):
+            body = job.split(f"- name: {step}\n", 1)[1].split("\n      - ", 1)[0]
+            self.assertIn("if: runner.os == 'Linux'", body, step)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,11 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
   its tests and archives instead of waiting for main CI to repeat them, and main skips rebuilding
   them. Candidates now record their source tree, and promotion matches by tree; other cases still
   require main push CI or rebuild every platform ([releases](docs/release-and-install.md)).
+- **Shorter macOS CI:** the portable test suite runs once, on Ubuntu. macOS runs a focused contract
+  (`scripts/macos-contract.txt`) of the modules with macOS-specific code and the sandboxed
+  isolation, shell-session and terminal-lifecycle integration tests, instead of repeating the full
+  suite. The required `fmt, build, test (macos-15)` check keeps its name
+  ([releases](docs/release-and-install.md)).
 
 ## [0.3.5] - 2026-11-11
 
