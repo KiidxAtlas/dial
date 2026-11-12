@@ -24,6 +24,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 - `/benchmark` opens a local agent/suite selection workspace with sequential live results, cancellation, private JSON evidence and an automatic SVG comparison image plus browser PNG export. The shared launch owner is available through native RPC. Dial trials use fresh settings homes and discard ambient Dial overrides; personal tuning is unchanged and model-quality effects are unmeasured. Python 3.11+ and a checkout are required; Harbor/SWE-bench remain separate runners ([benchmarks](docs/benchmarks.md#interactive-comparisons-benchmark)).
 - Tool audit inventory, evidence receipts, behavior-report evaluation and coverage/closure gates, with offline contract tests and a CI ratchet against silently dropping coverage or findings. Missing native, operation-specific and live evidence remains explicit, not a passing audit ([tool audit](docs/tool-audit.md)).
 
+### Changed
+
+- Release binaries no longer use cross-crate thin LTO (`[profile.release] lto = false`). On a warm dependency cache, which is what release candidate jobs restore, a local Apple Silicon rebuild of the workspace crates dropped from 150 to 105 seconds and the binary shrank by about 1.7 MB, with no measurable `--version`/`--help` startup difference. Optimization level, codegen units, stripping and features are unchanged ([releases](docs/release-and-install.md#release-speed-and-measurement)).
+
 ### Fixed
 
 - Steering vector jobs explicitly release their mutation leases before closing file descriptors, so concurrent subprocess launches cannot prolong a finished job's lock. Portable Python test prerequisites now check FastAPI before collection and point to the pinned isolated CI environment.

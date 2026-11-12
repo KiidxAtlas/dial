@@ -1,5 +1,5 @@
 CARGO ?= cargo
-# Use PROFILE=release for shipping-equivalent optimization (thin LTO).
+# Use PROFILE=release for shipping-equivalent optimization (opt-level 3, no cross-crate LTO).
 PROFILE ?= local
 # Keep builds and installation on the same persistent cache, including custom locations.
 CARGO_TARGET_DIR ?= target
