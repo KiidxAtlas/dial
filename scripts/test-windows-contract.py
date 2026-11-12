@@ -125,6 +125,7 @@ class WindowsContractTests(unittest.TestCase):
     def test_each_filter_must_execute_tests(self):
         tests = [(["--workspace", "--lib"], name) for name in ("platform::", "missing::")]
         with patch.object(contract.subprocess, "run", side_effect=[
+                subprocess.CompletedProcess([], 0, stdout=""),
                 subprocess.CompletedProcess([], 0, stdout=summary(1)),
                 subprocess.CompletedProcess([], 0, stdout=summary())]):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -134,7 +135,8 @@ class WindowsContractTests(unittest.TestCase):
         tests = [(["--workspace", "--lib"], name) for name in ("broken::", "platform::")]
         result, run, output, error = self.run_fixture("compile failed\n", code=101, tests=tests)
         self.assertEqual(result, 101)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 3)
+        self.assertIn("contract prebuild failed", error)
         self.assertIn("compile failed", output)
         self.assertIn("Windows contract failed in filter `broken::`", error)
         self.assertIn("Windows contract failures: `broken::`, `platform::`", error)
@@ -183,11 +185,44 @@ class WindowsContractTests(unittest.TestCase):
         for target, _ in tests:
             self.assertNotIn("--workspace", target)
         ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        job = ci.split("\n  test:\n", 1)[1].split("\n  lint:\n", 1)[0]
-        self.assertIn("--contract scripts/macos-contract.txt --label macOS", job)
-        for step in ("Build", "Install cargo-nextest (verified archive)", "Test"):
-            body = job.split(f"- name: {step}\n", 1)[1].split("\n      - ", 1)[0]
-            self.assertIn("if: runner.os == 'Linux'", body, step)
+        macos = ci.split("\n  test:\n", 1)[1].split("\n  linux-tests:\n", 1)[0]
+        self.assertIn("os: [macos-15]", macos)
+        self.assertIn("--contract scripts/macos-contract.txt --label macOS", macos)
+        for step in ("- name: Build\n", "cargo-nextest", "make test-nextest"):
+            self.assertNotIn(step, macos)
+
+    def test_linux_gate_keeps_the_required_check_and_needs_every_linux_job(self):
+        root = Path(contract.__file__).resolve().parent.parent
+        ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        tests = ci.split("\n  linux-tests:\n", 1)[1].split("\n  linux-runtime:\n", 1)[0]
+        self.assertIn("partition: [1, 2]", tests)
+        self.assertIn("NEXTEST_PARTITION=hash:${{ matrix.partition }}/2", tests)
+        self.assertIn("NEXTEST_DOCTESTS=${{ matrix.partition == 2 && '1' || '0' }}", tests)
+        gate = ci.split("\n  linux-gate:\n", 1)[1].split("\n  lint:\n", 1)[0]
+        self.assertIn("name: fmt, build, test (ubuntu-22.04)\n", gate)
+        self.assertIn("needs: [linux-tests, linux-runtime]", gate)
+        self.assertIn("if: always()", gate)
+        self.assertIn('test "$TESTS" = success && test "$RUNTIME" = success', gate)
+
+    def test_prebuild_compiles_exactly_the_filter_targets_together(self):
+        tests, _ = self.parse("test-lib dial-core platform::\n"
+                              "test-lib dial-tools tools::\n"
+                              "test-lib dial-core more::\n"
+                              "test-bin dial dial cmd::\n"
+                              "test-integration dial integration isolation::\n")
+        self.assertEqual(contract.prebuild_commands(tests, "ci"), [
+            ["cargo", "test", "--locked", "--profile", "ci", "--no-run",
+             "--package", "dial-core", "--package", "dial-tools", "--lib"],
+            ["cargo", "test", "--locked", "--profile", "ci", "--no-run",
+             "--package", "dial", "--bin", "dial"],
+            ["cargo", "test", "--locked", "--profile", "ci", "--no-run",
+             "--package", "dial", "--test", "integration"],
+        ])
+        result, run, _, _ = self.run_fixture(summary(2), tests=tests)
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_count, 3 + len(tests))
+        self.assertIn("--no-run", run.call_args_list[0].args[0])
+        self.assertNotIn("--no-run", run.call_args_list[3].args[0])
 
 
 if __name__ == "__main__":

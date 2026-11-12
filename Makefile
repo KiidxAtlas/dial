@@ -21,6 +21,10 @@ NODE ?= node
 TEST_PROFILE ?= dev
 # Nextest's reporting profile is independent of Cargo's optimization profile.
 NEXTEST_PROFILE ?= default
+# CI splits the nextest suite across runners: e.g. NEXTEST_PARTITION=hash:1/2. Doctests run in the
+# job that keeps NEXTEST_DOCTESTS=1, so a split never runs them twice or skips them.
+NEXTEST_PARTITION ?=
+NEXTEST_DOCTESTS ?= 1
 DIAL ?= $(BUILD_DIR)/dial
 
 # Tests that run the embedded shell need a freshly built `dial` host (the test binary cannot act as
@@ -123,8 +127,8 @@ test-module:
 test-nextest:
 	$(PYTHON) scripts/test-prerequisites.py
 	@command -v cargo-nextest >/dev/null 2>&1 || { printf '%s\n' 'cargo-nextest is not installed: https://nexte.st (or use make test-rust)' >&2; exit 2; }
-	$(HOST_RUN) --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS) -- $(CARGO) nextest run --locked --workspace --no-fail-fast --cargo-profile $(TEST_PROFILE) --profile $(NEXTEST_PROFILE) $(CARGO_FEATURE_FLAGS)
-	$(HOST_RUN) --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked --workspace --doc --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS) -- $(CARGO) nextest run --locked --workspace --no-fail-fast --cargo-profile $(TEST_PROFILE) --profile $(NEXTEST_PROFILE) $(if $(NEXTEST_PARTITION),--partition $(NEXTEST_PARTITION)) $(CARGO_FEATURE_FLAGS)
+	$(if $(filter 1,$(NEXTEST_DOCTESTS)),$(HOST_RUN) --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked --workspace --doc --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS),@echo 'doctests: run by another partition (NEXTEST_DOCTESTS=0)')
 
 lint:
 	$(CARGO) clippy --locked --workspace --all-targets $(CARGO_FEATURE_FLAGS) -- -D warnings

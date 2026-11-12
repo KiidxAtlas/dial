@@ -27,6 +27,11 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 ### Changed
 
 - Release binaries no longer use cross-crate thin LTO (`[profile.release] lto = false`). On a warm dependency cache, which is what release candidate jobs restore, a local Apple Silicon rebuild of the workspace crates dropped from 150 to 105 seconds and the binary shrank by about 1.7 MB, with no measurable `--version`/`--help` startup difference. Optimization level, codegen units, stripping and features are unchanged ([releases](docs/release-and-install.md#release-speed-and-measurement)).
+- **Shorter CI critical path:** the portable Linux suite runs on two runners by Nextest hash
+  partition, and the installed-binary, real-terminal and runtime checks run in their own job beside
+  them instead of after them; the required `fmt, build, test (ubuntu-22.04)` check now gates on all
+  three. The focused Windows and macOS contracts compile their selected test targets in one parallel
+  Cargo build before running filters ([releases](docs/release-and-install.md)).
 
 ### Fixed
 

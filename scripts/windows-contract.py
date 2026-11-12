@@ -3,9 +3,11 @@
 
 Each `test-lib` selects a package library; `test-bin` selects a package binary; `test-integration`
 selects a package integration-test target. Every `skip` line is passed to libtest as `--skip` and
-printed with its reason. Successful Cargo exits with no executed tests are rejected, including
-ignored-only selections. `--print` shows the commands without running them (it does not verify
-selection).
+printed with its reason. Before any filter runs, the selected test targets are compiled together
+(one `cargo test --no-run` per distinct target selection), so Cargo builds independent packages in
+parallel instead of one filter at a time. Successful Cargo exits with no executed tests are
+rejected, including ignored-only selections. `--print` shows the commands without running them
+(it does not verify selection).
 
 The embedded shell is the default backend, so the contract first builds the matching `dial` host
 binary and exports its path as DIAL_EMBEDDED_SHELL_HOST to every filter (scripts/embedded-host.py).
@@ -70,14 +72,42 @@ def parse(path):
     return tests, skips
 
 
+def prebuild_commands(tests, profile):
+    """One `--no-run` build per distinct target selection: the same targets the filters compile."""
+    groups = {}
+    for target, _ in tests:
+        if target[0] == "--package":
+            groups.setdefault(tuple(target[2:]), []).append(target[1])
+        else:
+            groups.setdefault(tuple(target), [])
+    commands = []
+    for selection, packages in groups.items():
+        package_args = [arg for package in dict.fromkeys(packages) for arg in ("--package", package)]
+        commands.append(["cargo", "test", "--locked", "--profile", profile, "--no-run",
+                         *package_args, *selection])
+    return commands
+
+
 def run_contract(tests, skips, profile, dry_run=False, label="Windows", host=None):
     """Run each filter. `host` is the verified embedded host path, or None for no host variable."""
     for name, reason in skips:
         print(f"SKIPPED {name}: {reason}", flush=True)
 
     env = embedded_host.environment(host)
+    # A prebuild failure is reported, then every filter still runs and names its own failure.
+    for command in prebuild_commands(tests, profile):
+        print("+ " + " ".join(command), flush=True)
+        if dry_run:
+            continue
+        result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, env=env)
+        print(result.stdout, end="", flush=True)
+        if result.returncode != 0:
+            print(f"{label} contract prebuild failed; running each filter to report failures",
+                  file=sys.stderr)
+
     skip_args = [arg for name, _ in skips for arg in ("--skip", name)]
-    # Every filter runs even after one fails, so a single CI run reports all Windows failures;
+    # Every filter runs even after one fails, so a single CI run reports all failures;
     # the first failure's exit status is preserved.
     status = 0
     failed = []

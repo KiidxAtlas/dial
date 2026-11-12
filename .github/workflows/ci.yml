@@ -110,20 +110,18 @@ jobs:
       epoch: ${{ needs.validate.outputs.epoch }}
 
   test:
+    # macOS: driver/installer/release-tooling checks plus the focused macOS contract. The portable
+    # Rust suite runs once, on Linux (linux-tests below).
     name: fmt, build, test (${{ matrix.os }})
     needs: validate
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-22.04]
-    runs-on: ${{ github.event_name == 'push' && matrix.os == 'macos-15' && vars.DIAL_MACOS_RUNNER || matrix.os }}
+        os: [macos-15]
+    runs-on: ${{ github.event_name == 'push' && vars.DIAL_MACOS_RUNNER || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Linux sandbox
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap tmux
       - name: Install terminal fixture and OpenSSL 3 on macOS
-        if: runner.os == 'macOS'
         run: |
           command -v tmux || brew install tmux
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
@@ -141,8 +139,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: test-${{ matrix.os }}
-          # A failing test or smoke step still leaves a valid build; without this a red run
-          # discards ~10 minutes of compilation and the next run on that OS starts cold.
+          # A failing test still leaves a valid build; without this a red run discards the
+          # compilation and the next run on that OS starts cold.
           cache-on-failure: true
           # The repository's 10 GB cache quota evicts least-recently-used entries; pull requests
           # restore main's caches but do not add their own.
@@ -161,29 +159,75 @@ jobs:
         run: make test-embedded-host
       - name: Check packaging and release policy
         run: make test-packaging test-release-policy
+      - name: Run focused macOS contract suite
+        # Modules with macOS-specific code: scripts/macos-contract.txt. Portable tests run in full
+        # on Linux; repeating them here took ~11 minutes of the macOS critical path. The contract
+        # builds only the test targets it selects.
+        run: python3 scripts/windows-contract.py --contract scripts/macos-contract.txt --label macOS --profile ci
+
+  linux-tests:
+    # The portable Rust suite, split across two runners by nextest's stable hash partition. The
+    # required `fmt, build, test (ubuntu-22.04)` check is linux-gate below, which passes only when
+    # both partitions and linux-runtime pass.
+    name: Linux tests (${{ matrix.partition }}/2)
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Linux sandbox
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap tmux
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install Rust
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: test-ubuntu-22.04
+          cache-on-failure: true
+          # Both partitions and linux-runtime restore this cache; one writer keeps a single entry.
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
+      # Python, driver, installer and release-tooling checks run once, in partition 1; partition 2
+      # takes the doctests instead.
+      - name: Test embedded driver contracts
+        if: matrix.partition == 1
+        run: make test-drivers
+      - name: Install installer test dependencies
+        if: matrix.partition == 1
+        run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
+      - name: Test terminal installer
+        if: matrix.partition == 1
+        run: make test-install
+      - name: Test local build and update commands
+        if: matrix.partition == 1
+        run: make test-build
+      - name: Test focused Windows contract runner
+        if: matrix.partition == 1
+        run: make test-windows-contract
+      - name: Check packaging and release policy
+        if: matrix.partition == 1
+        run: make test-packaging test-release-policy
       - name: Verify Linux sandbox enforcement
-        if: runner.os == 'Linux'
+        if: matrix.partition == 1
         timeout-minutes: 10
         run: cargo test --locked --profile ci --workspace linux_sandbox_enforces_filesystem_and_both_network_modes
       - name: Build
-        # The full workspace build and test suite run on Linux. macOS runs a focused contract,
-        # plus the real dial binary needed to host its embedded shell. On Linux the `dial`
-        # library and its unit-test build each peak near 5 GB in rustc and are built one at a
-        # time, and workspace crates one lib target at a time. The `ci` profile drops debug
-        # info, which cuts rustc memory, link time and cache size.
-        if: runner.os == 'Linux'
+        # The `dial` library and its unit-test build each peak near 5 GB in rustc and are still
+        # built one at a time, and workspace crates one lib target at a time. The `ci` profile
+        # drops debug info, which cuts rustc memory, link time and cache size.
         run: |
           cargo build --locked --profile ci --workspace --lib
           cargo test --locked --profile ci --workspace --lib --no-run
           cargo build --locked --profile ci --workspace --all-targets
-      - name: Run focused macOS contract suite
-        # Modules with macOS-specific code: scripts/macos-contract.txt. Portable tests already ran
-        # in full on Linux; repeating them here took ~11 minutes of the macOS critical path.
-        if: runner.os == 'macOS'
-        run: python3 scripts/windows-contract.py --contract scripts/macos-contract.txt --label macOS --profile ci
       - name: Install cargo-nextest (verified archive)
         # SHA-256 pin is from the upstream 0.9.150 release checksum asset.
-        if: runner.os == 'Linux'
         env:
           NEXTEST_VERSION: 0.9.150
         run: |
@@ -198,33 +242,56 @@ jobs:
           cargo nextest --version
       - name: Test
         # cargo-nextest runs every test binary at once, one process per test (.config/nextest.toml
-        # fails a test still running after 5 minutes); `cargo test` ran the binaries one after
-        # another. Doctests still run under `cargo test --doc`.
-        if: runner.os == 'Linux'
-        run: make test-nextest TEST_PROFILE=ci NEXTEST_PROFILE=ci
+        # fails a test still running after 5 minutes). Each partition runs half the tests by a
+        # stable hash of their names; doctests run in partition 2.
+        run: >-
+          make test-nextest TEST_PROFILE=ci NEXTEST_PROFILE=ci
+          NEXTEST_PARTITION=hash:${{ matrix.partition }}/2
+          NEXTEST_DOCTESTS=${{ matrix.partition == 2 && '1' || '0' }}
       - name: Preserve per-test timing and failures
-        if: always() && runner.os == 'Linux'
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: test-timings-${{ matrix.os }}
+          name: test-timings-ubuntu-22.04-${{ matrix.partition }}
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
-      # The steps below exercise the installed binary, real terminals and runtime overhead. They
-      # are not architecture-sensitive, so only Ubuntu runs them; the macOS job ends after its tests
-      # instead of adding about ten minutes to the CI critical path. `make preflight` runs the same
-      # smoke and real-terminal suites on a developer's macOS host.
+
+  linux-runtime:
+    # The installed binary, real terminals and runtime overhead. They are not architecture-sensitive,
+    # so only Ubuntu runs them, beside the test partitions rather than after them. `make preflight`
+    # runs the same smoke and real-terminal suites on a developer's macOS host.
+    name: Linux runtime checks
+    needs: validate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Linux sandbox
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap tmux
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install Rust
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: test-ubuntu-22.04
+          save-if: false
+      - name: Install installer test dependencies
+        run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
+      - name: Build
+        run: cargo build --locked --profile ci -p dial --bin dial
       - name: Check slim build
-        if: runner.os == 'Linux'
         run: cargo check --locked --profile ci --no-default-features -p dial --bin dial
       - name: Install executable and verify artifact contracts
-        if: runner.os == 'Linux'
         timeout-minutes: 10
         run: |
           mkdir -p target/installed/bin
           install -m755 "${CARGO_TARGET_DIR:-target}/ci/dial" target/installed/bin/dial
           make test-smoke DIAL=target/installed/bin/dial
       - name: Real terminal and crash lifecycle
-        if: runner.os == 'Linux'
         timeout-minutes: 10
         run: |
           python3 examples/benchmarks/interactive_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/main
@@ -232,21 +299,37 @@ jobs:
           python3 examples/benchmarks/session_contention_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/contention
           python3 examples/benchmarks/side_lifecycle_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/side-lifecycle
       - name: Record runtime overhead
-        if: runner.os == 'Linux'
         continue-on-error: true
         run: cargo run --locked --profile ci --example runtime_baseline -- target/runtime-baseline.json
       - name: Preserve runtime baseline
-        if: always() && runner.os == 'Linux'
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: runtime-baseline-${{ matrix.os }}
+          name: runtime-baseline-ubuntu-22.04
           path: target/runtime-baseline.json
       - name: Preserve terminal failure evidence
-        if: failure() && runner.os == 'Linux'
+        if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: terminal-${{ matrix.os }}
+          name: terminal-ubuntu-22.04
           path: target/pty-captures
+
+  linux-gate:
+    # Keeps the required check name: passes only when both test partitions and the runtime checks
+    # passed (skipped or cancelled counts as failure).
+    name: fmt, build, test (ubuntu-22.04)
+    needs: [linux-tests, linux-runtime]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require every Linux test partition and the runtime checks
+        env:
+          TESTS: ${{ needs.linux-tests.result }}
+          RUNTIME: ${{ needs.linux-runtime.result }}
+        run: |
+          echo "Linux tests: $TESTS; Linux runtime checks: $RUNTIME"
+          test "$TESTS" = success && test "$RUNTIME" = success
+
   lint:
     name: Clippy (${{ matrix.os }}) and dependency policy
     needs: validate

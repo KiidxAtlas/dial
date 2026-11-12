@@ -227,12 +227,18 @@ main CI rather than once for each of the six Unix candidate targets; each archiv
 own format/runtime smoke checks, and Windows retains its archive-backed installer checks.
 
 CI explicitly selects Nextest's `ci` reporting profile, independently of Cargo's `ci` build profile,
-and uploads `test-timings-<os>` artifacts containing `junit.xml` even when tests fail. Use the
-per-test durations to investigate the critical path before removing coverage. The inspected
-macOS CI run `42935891367` spent 646 seconds in Nextest; its settings tiny-terminal grid test
-took 86 seconds. Those historical measurements are not a promised speedup or current acceptance.
-Locally, `make test-nextest TEST_PROFILE=ci NEXTEST_PROFILE=ci` produces the same JUnit report
-under `target/nextest/ci/` (or the selected `CARGO_TARGET_DIR`).
+and uploads `test-timings-ubuntu-22.04-<partition>` artifacts containing `junit.xml` even when
+tests fail. The portable suite is split across two Linux runners (`Linux tests (1/2)` and
+`(2/2)`) by Nextest's stable hash partition; partition 1 also runs the Python, installer and
+release-tooling checks, and partition 2 the doctests. `Linux runtime checks` builds only the `dial`
+binary and runs the slim build, smoke, real-terminal and runtime-baseline steps beside them. The
+required `fmt, build, test (ubuntu-22.04)` check is a gate job that passes only when all three
+succeed. Use the per-test durations to investigate the critical path before removing coverage. The
+inspected macOS CI run `42935891367` spent 646 seconds in Nextest; its settings tiny-terminal grid
+test took 86 seconds. Those historical measurements are not a promised speedup or current
+acceptance. Locally, `make test-nextest TEST_PROFILE=ci NEXTEST_PROFILE=ci` produces the same JUnit
+report under `target/nextest/ci/` (or the selected `CARGO_TARGET_DIR`); add
+`NEXTEST_PARTITION=hash:1/2 NEXTEST_DOCTESTS=0` to reproduce one partition.
 
 Profiling the unchanged 961-size settings grid found repeated linear scans of the original
 settings declarations. Original locations are now indexed once, and the normal settings view
@@ -683,7 +689,10 @@ minutes, including compilation, on Apple Silicon. Add a filter with any new macO
 `dial` library and its unit-test build one after the other: each peaks near 5 GB in rustc. The native Windows Rust contract (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) runs in CI's `windows-rust` job, so the CI requirement above covers it; the release does not repeat it. The Windows release jobs (x86-64 and ARM64) build `dial.exe`, smoke-test the packaged archive (`--version`, `--help`), verify the binary format for the target, and run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.sshsig`.
 
 The Windows contract selects each library's owning package rather than compiling every
-workspace test harness for each filter. Its migrated-record privacy assertion checks native
+workspace test harness for each filter. Before running filters, the runner compiles all selected
+test targets with one `cargo test --no-run` per distinct target selection, so independent
+packages build in parallel instead of one filter after another (compiling took about 14.5 of the
+job's 15 minutes in CI run `43124043407`). Its migrated-record privacy assertion checks native
 owner-only permissions (Unix mode bits or Windows ACLs), not synthetic Windows POSIX bits.
 The Unix CI smoke tier stages the executable already produced by the workspace build into
 `target/installed/bin`, then runs the same artifact and recovery checks; it does not invoke
