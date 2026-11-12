@@ -8,7 +8,7 @@ use crate::app::shell::Shell;
 use crate::ui::composer::{ComposerCtx, ComposerEvent};
 use crate::ui::input::{poll, read};
 use crate::ui::keys::Action;
-use crate::ui::transcript::TranscriptCtx;
+use crate::ui::transcript::{RecapRun, TranscriptCtx};
 use crate::ui::welcome;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -146,6 +146,21 @@ impl Shell {
         if let Some(text) = guarded {
             self.composer.handle_paste(text);
             return ComposerEvent::None;
+        }
+        // Alt+1…: the latest recap card's follow-ups (rerun check, retry, plan, review, undo),
+        // offered only while idle with nothing typed, so the chord never competes with editing or
+        // a busy turn. A rerun only fills the draft; Enter runs it.
+        if !self.composer.is_busy()
+            && self.composer.is_resting()
+            && let Some(action) = self.transcript.recap_action_for(&key)
+        {
+            return match action.run {
+                RecapRun::Command(command) => ComposerEvent::Submit(command.to_owned()),
+                RecapRun::Draft(text) => {
+                    self.composer.set_draft(&text);
+                    ComposerEvent::None
+                }
+            };
         }
         let ctx = ComposerCtx {
             theme: self.themes.current(),

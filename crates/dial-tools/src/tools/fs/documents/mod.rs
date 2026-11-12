@@ -12,8 +12,10 @@ use isolate::Job;
 pub use isolate::{WORKER_ARG as DOCUMENT_WORKER_ARG, worker_main as document_worker_main};
 mod binary_data;
 mod certificate;
+#[cfg(feature = "data-formats")]
 mod columnar;
 mod delimited;
+#[cfg(feature = "data-formats")]
 mod executable;
 mod json;
 mod mail;
@@ -38,6 +40,14 @@ use std::{
     },
 };
 pub(in crate::tools) const MAX_INPUT: u64 = 64 * 1024 * 1024;
+
+/// The error for a recognised format whose decoder this build omits.
+#[cfg(not(feature = "data-formats"))]
+fn not_built(what: &str) -> String {
+    format!(
+        "{what} decoding is not built into this dial; rebuild with the `data-formats` feature (on by default)"
+    )
+}
 const PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 pub(in crate::tools) const MAX_CONTENT: u64 = 8 * 1024 * 1024;
 
@@ -275,6 +285,11 @@ fn read_streaming_impl(
         if args.get("offset").is_some_and(|v| !v.is_null()) && selector.selects_lines() {
             return Err("use offset or a line selector, not both".into());
         }
+        if !selector.symbols.is_empty() {
+            return Err(
+                "`:sym=` selects a declaration in source code; documents take line ranges".into(),
+            );
+        }
         let path = ws.resolve_read(base)?;
         if cancel.load(Ordering::Acquire) {
             return Err("document read cancelled".into());
@@ -351,12 +366,19 @@ fn read_payload(
     };
     match format {
         "x509" => without_member(certificate::read),
+        #[cfg(feature = "data-formats")]
         "object" => without_member(executable::read),
+        #[cfg(not(feature = "data-formats"))]
+        "object" => Some(Err(not_built("Executable and object file"))),
         "plist" => without_member(property_list::read),
         "mail" => without_member(mail::message),
         "mbox" => Some(mail::mbox(payload, member)),
+        #[cfg(feature = "data-formats")]
         "parquet" => Some(columnar::parquet(payload, member)),
+        #[cfg(feature = "data-formats")]
         "arrow" => Some(columnar::arrow(payload, member)),
+        #[cfg(not(feature = "data-formats"))]
+        "parquet" | "arrow" => Some(Err(not_built("Parquet/Arrow"))),
         "spreadsheet" => Some(spreadsheet::read(payload, member)),
         "opendocument" => without_member(opendocument::read),
         "npy" => without_member(binary_data::npy),

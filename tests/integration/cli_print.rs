@@ -1140,3 +1140,5 @@ fn provider_batch_preparation_is_local_and_submission_requires_consent() {
 }
 
 mod rpc_lifecycle;
+
+mod rpc_client;

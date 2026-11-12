@@ -33,13 +33,13 @@ class FeatureMatrixTests(unittest.TestCase):
         self.assertIn(frozenset(declared["default"]), selections(features.matrix()))
         self.assertIn("desktop", declared["wayland-pipewire"])
 
-    def test_exhaustive_matrix_checks_each_of_the_64_combinations_once(self):
+    def test_exhaustive_matrix_checks_each_of_the_128_combinations_once(self):
         selected = selections(features.matrix(True))
         expected = {
             frozenset(name for name, enabled in zip(features.FEATURES, switches) if enabled)
-            for switches in itertools.product([False, True], repeat=6)
+            for switches in itertools.product([False, True], repeat=7)
         }
-        self.assertEqual(len(selected), 64)
+        self.assertEqual(len(selected), 128)
         self.assertEqual(set(selected), expected)
 
     def test_pipewire_uses_newer_runner_and_only_largest_selections_write_caches(self):

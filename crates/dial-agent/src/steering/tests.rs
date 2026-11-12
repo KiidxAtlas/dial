@@ -429,3 +429,60 @@ fn admission_is_model_scoped_and_content_change_restarts_profile() {
     write_private(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
     assert_ne!(first, specification(&config, "test").unwrap().unwrap());
 }
+#[test]
+fn only_completed_attempts_start_the_cooldown() {
+    let (_dir, mut config, store) = auto_fixture();
+    seed_pairs(&mut config, &store);
+    let path = vector_path(&config);
+    // An operator stop is observed before any worker starts: the attempt is unsettled, not cooled down.
+    let stop = config.state_dir.join("improvement.stop");
+    fs::write(&stop, b"").unwrap();
+    let result = automatic_with(&config, &store, None, &mut |_| {
+        panic!("stopped before compute")
+    })
+    .unwrap();
+    assert_eq!(result["finished"], json!(false));
+    assert!(
+        result["phase"]
+            .as_str()
+            .unwrap()
+            .contains("stopped by operator")
+    );
+    fs::remove_file(&stop).unwrap();
+    // A transient worker failure is unsettled too: the same fingerprint resumes on the next run.
+    let mut calls = 0;
+    let result = automatic_with(&config, &store, None, &mut |_| {
+        calls += 1;
+        anyhow::bail!("worker exited early")
+    })
+    .unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(result["finished"], json!(false));
+    assert!(result["phase"].as_str().unwrap().contains("interrupted"));
+    assert!(
+        !path.exists(),
+        "no admission without a completed evaluation"
+    );
+    // A completed rejection settles the fingerprint, so the identical retry is cooled down.
+    calls = 0;
+    let result = automatic_with(&config, &store, None, &mut |request| {
+        calls += 1;
+        let output = Path::new(request["output"].as_str().unwrap());
+        let mut bad = candidate();
+        bad["evaluation"]["passed"] = json!(false);
+        write_private(output, &serde_json::to_vec(&bad)?)?;
+        if request["op"] == "steering_extract" {
+            return Ok(swept(0.5));
+        }
+        Ok(bad["evaluation"].clone())
+    })
+    .unwrap();
+    assert_eq!(calls, 2, "extraction and evaluation both completed");
+    assert_eq!(result["finished"], json!(true));
+    assert!(result["phase"].as_str().unwrap().contains("not activated"));
+    automatic_with(&config, &store, None, &mut |_| {
+        panic!("a settled rejection cools down")
+    })
+    .unwrap();
+    assert!(!path.exists());
+}

@@ -311,3 +311,75 @@ pub(super) fn palette_sessions(
 pub(crate) fn builtin_commands() -> &'static [(&'static str, &'static str, &'static str)] {
     &BUILTIN_COMMANDS
 }
+
+/// The prompt a `/skill:<name> [task]` line sends: the same text the terminal sends.
+pub(crate) fn skill_prompt(skill: &str, task: &str) -> String {
+    let task = task.trim();
+    let task = if task.is_empty() {
+        String::new()
+    } else {
+        format!(" Task: {task}")
+    };
+    format!("Use the \"{skill}\" skill (load it with the skill tool first).{task}")
+}
+
+/// Expands a prompt that starts with a custom command (`/name args`) or a skill
+/// (`/skill:name task`) into the text the terminal would send, for RPC `send` and ACP prompts.
+/// `None` leaves the text as is: no leading slash, or text that only happens to start with a
+/// slash (a pasted path). A built-in command name is an error rather than text for the model,
+/// because it would otherwise look as if the command had run; so is an unknown skill.
+pub(crate) fn expand_prompt_command(
+    layout: &crate::config::paths::Layout,
+    text: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(line) = text.trim_start().strip_prefix('/') else {
+        return Ok(None);
+    };
+    let (name, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    if let Some(skill) = name.strip_prefix("skill:") {
+        anyhow::ensure!(
+            skills::discover(layout)
+                .iter()
+                .any(|found| found.name == skill),
+            "unknown skill {skill:?}; get_available_commands lists them"
+        );
+        return Ok(Some(skill_prompt(skill, args)));
+    }
+    if name.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        command_spec(name).is_none(),
+        "/{name} is a Dial command and does not run from a prompt; use the client's matching control or RPC method (get_available_commands lists them), or reword the message"
+    );
+    Ok(context::discover_commands(layout)
+        .iter()
+        .find(|def| def.name == name)
+        .map(|def| context::expand_command(def, args)))
+}
+
+/// Custom and skill commands as RPC rows (`name`, `usage`, `description`, `kind`), in the order
+/// the terminal's command menu lists them. `send` expands them (see [`expand_prompt_command`]).
+pub(crate) fn prompt_commands(
+    layout: &crate::config::paths::Layout,
+) -> Vec<(String, String, String, &'static str)> {
+    command_entries(
+        &context::discover_commands(layout),
+        &skills::discover(layout),
+    )
+    .into_iter()
+    .filter_map(|entry| {
+        let kind = match entry.kind {
+            CommandKind::Custom => "custom",
+            CommandKind::Skill => "skill",
+            _ => return None,
+        };
+        Some((
+            entry.name,
+            entry.args_hint.unwrap_or_default(),
+            entry.description,
+            kind,
+        ))
+    })
+    .collect()
+}

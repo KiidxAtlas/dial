@@ -3,7 +3,7 @@ use crate::config::settings_store::Scope;
 use crate::ui::overlay::settings::testkit::*;
 use crate::ui::overlay::{DrawCtx, OverlayEvent};
 use crate::ui::theme::{Glyphs, Theme};
-use crossterm::event::KeyCode;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use toml::Table;
 
 fn overlay(path: &str, scope: Scope) -> SettingsOverlay {
@@ -99,7 +99,10 @@ fn appearance_outcomes_render_together_at_wide_narrow_and_ascii_sizes() {
             let mut o = overlay("ui.show_tools", Scope::Global);
             o.handle(&key(KeyCode::Enter), &rig.keys);
             o.handle(&key(KeyCode::Down), &rig.keys);
-            o.handle(&key(KeyCode::F(4)), &rig.keys);
+            o.handle(
+                &Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+                &rig.keys,
+            );
             let preview = |_: &crate::llm::model_config::UiConfig, _: u16| {
                 ratatui::text::Line::from("STATUS SAMPLE")
             };
@@ -154,15 +157,20 @@ fn small_terminal_toggle_preserves_draft_and_exposes_all_preview_rows() {
                 preview_status: &preview,
             };
             let controls = screen(&render(40, 12, |f| o.draw(f, &ctx)));
-            assert!(controls.contains("F4 preview"), "{controls}");
+            // The footer keeps saving over previewing when both do not fit; the key still works.
+            let wider = screen(&render(48, 12, |f| o.draw(f, &ctx)));
+            assert!(wider.contains("Shift+F4 preview"), "{wider}");
             assert!(
                 !controls.contains("Preview tools:"),
                 "small controls retain room for editing"
             );
-            o.handle(&key(KeyCode::F(4)), &rig.keys);
+            o.handle(
+                &Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+                &rig.keys,
+            );
             let first = screen(&render(40, 12, |f| o.draw(f, &ctx)));
             assert!(
-                first.contains("F4 controls") && first.contains("Preview status line:"),
+                first.contains("Shift+F4 controls") && first.contains("Preview status line:"),
                 "{first}"
             );
             o.handle(&key(KeyCode::End), &rig.keys);
@@ -171,14 +179,20 @@ fn small_terminal_toggle_preserves_draft_and_exposes_all_preview_rows() {
                 last.contains("Preview session rail:") && last.contains("Side pane:"),
                 "{last}"
             );
-            o.handle(&key(KeyCode::F(4)), &rig.keys);
+            o.handle(
+                &Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+                &rig.keys,
+            );
             assert_eq!(o.appearance_draft().unwrap().1, draft);
             assert!(o.pending.is_empty());
             assert_eq!(
                 (&o.effective, &o.global, &o.project),
                 (&original.0, &original.1, &original.2)
             );
-            o.handle(&key(KeyCode::F(4)), &rig.keys);
+            o.handle(
+                &Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+                &rig.keys,
+            );
             o.handle(&key(KeyCode::Esc), &rig.keys);
             assert!(o.appearance_draft().is_none());
             assert!(o.pending.is_empty());
@@ -188,4 +202,24 @@ fn small_terminal_toggle_preserves_draft_and_exposes_all_preview_rows() {
             );
         }
     }
+}
+
+/// F4 is the global Providers fallback, so the preview answers Shift+F4; plain F4 only once
+/// the user has moved Providers off it. Hints name whichever key works.
+#[test]
+fn preview_key_never_gives_the_global_providers_key_a_second_meaning() {
+    let plain = Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+    let mut rig = Rig::new();
+    let mut o = overlay("ui.show_tools", Scope::Project);
+    o.handle(&plain, &rig.keys);
+    assert!(!o.appearance_preview, "plain F4 belongs to Providers");
+    rig.keys
+        .rebind(crate::ui::keys::Action::ProviderSetup, &["Alt+P"])
+        .unwrap();
+    assert_eq!(
+        super::super::local_function_label(&rig.keys, 4, crate::ui::keys::Action::ProviderSetup),
+        "F4"
+    );
+    o.handle(&plain, &rig.keys);
+    assert!(o.appearance_preview, "a free F4 previews");
 }

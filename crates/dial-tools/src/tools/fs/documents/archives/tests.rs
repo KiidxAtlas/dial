@@ -65,6 +65,7 @@ fn iso_image(name: &str, data: &[u8]) -> Vec<u8> {
     img
 }
 
+#[cfg(feature = "data-formats")]
 fn rar_stored(name: &str, data: &[u8]) -> Vec<u8> {
     use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions};
     use rars::{ArchiveVersion, EntrySource, FeatureSet};
@@ -263,6 +264,7 @@ fn iso_reads_member_content() {
     );
 }
 
+#[cfg(feature = "data-formats")]
 #[test]
 fn rar_reads_stored_member_content() {
     let bytes = rar_stored("notes.txt", HELLO.as_bytes());
@@ -272,8 +274,16 @@ fn rar_reads_stored_member_content() {
     );
 }
 
+#[cfg(feature = "data-formats")]
 #[test]
 fn rar_missing_member_is_an_error() {
     let bytes = rar_stored("notes.txt", HELLO.as_bytes());
     assert!(read_bytes("rar", "pack.rar", &bytes, Some("absent.txt")).is_err());
+}
+
+#[cfg(not(feature = "data-formats"))]
+#[test]
+fn rar_without_data_formats_names_the_feature() {
+    let error = read_bytes("rar", "pack.rar", b"Rar!\x1a\x07\x01\x00", None).unwrap_err();
+    assert!(error.contains("`data-formats` feature"), "{error}");
 }

@@ -410,6 +410,7 @@ requests are refused. Stale versions/files, invalid UTF-16 ranges, overlaps and 
 fail before writing. `status` lists existing sessions without starting servers; `capabilities` \
 shows a selected live session's real initialize/dynamic capabilities; approved `reload` stops and \
 restarts the selected session. `request` sends one raw LSP method named by `query` to a session that advertises it; `payload` is a JSON object of params, with `textDocument` and `position` defaulted from `path` and `line`; a WorkspaceEdit result is validated and previewed, never applied. First startup and reload run project code outside the sandbox. \
+`format` applies the server's whole-document formatting as one approved, checkpointed transaction (`apply:false` previews it). `completion` and `signature_help` report what the server offers at the position, read-only. `call_hierarchy` lists the callers (`direction` incoming, the default) or callees (`outgoing`) of the symbol at the position. Each needs the server to advertise the matching capability; none is sent otherwise. \
 Examples: {\"action\":\"references\",\"path\":\"src/lib.rs\",\"line\":12,\"symbol\":\"parse\"}; {\"action\":\"rename_preview\",\"path\":\"src/lib.rs\",\"line\":12,\"symbol\":\"parse\",\"new_name\":\"parse_all\"}.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,9 +434,13 @@ enum Action {
     Reload,
     Capabilities,
     Request,
+    Format,
+    Completion,
+    SignatureHelp,
+    CallHierarchy,
 }
 
-const ACTIONS: [(&str, Action); 19] = [
+const ACTIONS: [(&str, Action); 23] = [
     ("definition", Action::Definition),
     ("references", Action::References),
     ("hover", Action::Hover),
@@ -455,6 +460,10 @@ const ACTIONS: [(&str, Action); 19] = [
     ("reload", Action::Reload),
     ("capabilities", Action::Capabilities),
     ("request", Action::Request),
+    ("format", Action::Format),
+    ("completion", Action::Completion),
+    ("signature_help", Action::SignatureHelp),
+    ("call_hierarchy", Action::CallHierarchy),
 ];
 
 impl Action {
@@ -480,6 +489,9 @@ impl Action {
                 | Self::RenamePreview
                 | Self::Rename
                 | Self::CodeActions
+                | Self::Completion
+                | Self::SignatureHelp
+                | Self::CallHierarchy
         )
     }
 }
@@ -897,6 +909,56 @@ impl LspTool {
         ))
     }
 
+    /// Whole-document formatting as one checkpointed text transaction: the explicit form of
+    /// format-on-write. The server's edits are validated against the snapshot, approved, then
+    /// committed. `apply: false` validates and previews without writing.
+    fn format_document(
+        &self,
+        ctx: &ToolContext,
+        client: &Arc<Client>,
+        abs: &Path,
+        source: &str,
+        apply: bool,
+        cancel: &AtomicBool,
+    ) -> Result<String, String> {
+        let ws = ctx.workspace;
+        let file = ws.rel(abs);
+        let snapshot = Snapshot::capture(ws)?;
+        snapshot.validate_source(ws, abs, source)?;
+        check_cancel(cancel)?;
+        let edits = client
+            .format(abs, source)
+            .map_err(|error| format!("{error:#}"))?
+            .ok_or_else(|| {
+                format!(
+                    "the {} language server does not advertise textDocument/formatting",
+                    client.name()
+                )
+            })?;
+        if edits.is_empty() {
+            return Ok(format!(
+                "{file} is already formatted; the server returned no edits"
+            ));
+        }
+        snapshot.validate(ws, abs)?;
+        let value = json!({"changes": {uri_from_path(abs): edits}});
+        let plan = Plan::prepare(ws, client, &snapshot, &value)?;
+        if !apply {
+            return Ok(format!(
+                "Format preview (nothing written) for {file}:\nValidated text transaction:\n{}",
+                plan.summary(ws)
+            ));
+        }
+        check_cancel(cancel)?;
+        ctx.authorize_mutation("lsp", plan.targets(), false)?;
+        let transaction_warnings = plan.commit(ws, &snapshot)?;
+        let mut warnings = synchronize_applied(self, client, &plan, client.name());
+        if !transaction_warnings.is_empty() {
+            warnings.push_str(&format!("\n{}", transaction_warnings.join("\n")));
+        }
+        Ok(format!("Formatted {file}:\n{}{warnings}", plan.summary(ws)))
+    }
+
     fn run(
         &self,
         ctx: &ToolContext,
@@ -955,6 +1017,26 @@ impl LspTool {
                     .ok_or("workspace_symbols needs a non-empty `query`")?,
             ),
             _ => None,
+        };
+        // Validated before any server starts: `direction` for call hierarchy, `apply` for format.
+        let apply = match action {
+            Action::Format => match args.get("apply") {
+                None | Some(Value::Null) => true,
+                Some(_) => opt_bool(args, "apply")?,
+            },
+            _ => true,
+        };
+        let incoming = match action {
+            Action::CallHierarchy => match opt_str(args, "direction")? {
+                None | Some("incoming") => true,
+                Some("outgoing") => false,
+                Some(other) => {
+                    return Err(format!(
+                        "direction must be \"incoming\" or \"outgoing\", not {other:?}"
+                    ));
+                }
+            },
+            _ => true,
         };
         let new_name = match action {
             Action::RenamePreview | Action::Rename => Some(
@@ -1210,6 +1292,39 @@ impl LspTool {
                     "diagnostics_context_available": diagnostics.is_some(),
                     "limitation": "IDs expire on the next listing or reload; only the first 128 actions are retained. Use query to narrow by kind. Commands require a separate approved execute_command call."}).to_string()
             }
+            Action::Format => self.format_document(ctx, &client, &abs, &source, apply, cancel)?,
+            Action::Completion => {
+                require_capability(&client, "/completionProvider", "textDocument/completion")?;
+                let result = client
+                    .request("textDocument/completion", at.unwrap_or_default())
+                    .map_err(io)?;
+                format::completions(&result)
+            }
+            Action::SignatureHelp => {
+                require_capability(
+                    &client,
+                    "/signatureHelpProvider",
+                    "textDocument/signatureHelp",
+                )?;
+                let result = client
+                    .request("textDocument/signatureHelp", at.unwrap_or_default())
+                    .map_err(io)?;
+                format::signature_help(&result)
+            }
+            Action::CallHierarchy => {
+                require_capability(
+                    &client,
+                    "/callHierarchyProvider",
+                    "textDocument/prepareCallHierarchy",
+                )?;
+                call_hierarchy(
+                    &client,
+                    &mut lines,
+                    at.unwrap_or_default(),
+                    incoming,
+                    cancel,
+                )?
+            }
             Action::CodeActionResolve
             | Action::CodeActionApply
             | Action::ExecuteCommand
@@ -1393,6 +1508,45 @@ fn command_of(action: &Value) -> Option<&Value> {
         command if command.is_object() => Some(command),
         _ => None,
     }
+}
+
+/// Refuses a first-class request the live server does not advertise, before anything is sent.
+fn require_capability(client: &Client, pointer: &str, method: &str) -> Result<(), String> {
+    if client.supports(pointer, method) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the {} language server does not advertise {method}",
+            client.name()
+        ))
+    }
+}
+
+/// The call hierarchy at the cursor: prepares the item there, then asks for its callers
+/// (`incoming`) or callees. The first prepared item is used.
+fn call_hierarchy(
+    client: &Client,
+    lines: &mut Lines<'_>,
+    at: Value,
+    incoming: bool,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let prepared = client
+        .request("textDocument/prepareCallHierarchy", at)
+        .map_err(|error| format!("{error:#}"))?;
+    let Some(item) = prepared.as_array().and_then(|items| items.first()) else {
+        return Ok("no call hierarchy item at this position".to_owned());
+    };
+    check_cancel(cancel)?;
+    let method = if incoming {
+        "callHierarchy/incomingCalls"
+    } else {
+        "callHierarchy/outgoingCalls"
+    };
+    let calls = client
+        .request(method, json!({"item": item}))
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(format::call_hierarchy(lines, item, &calls, incoming))
 }
 
 /// Successful disk commits stay successful if a dead server cannot receive didChange. Report
@@ -1630,11 +1784,12 @@ impl Tool for LspTool {
                 "symbol": {"type": "string", "description": "Text on `line` to put the cursor on instead of `column`."},
                 "query": {"type": "string", "description": "workspace_symbols: name; code_actions: exact LSP action kind to filter."},
                 "new_name": {"type": "string", "description": "rename/rename_preview: the new name. rename_file: workspace-relative destination path."},
-                "apply": {"type": "boolean", "description": "rename_file only: false previews the willRenameFiles edits and move without writing. Defaults to true."},
+                "apply": {"type": "boolean", "description": "rename_file and format only: false previews the edits and the move without writing. Defaults to true."},
                 "action_id": {"type": "string", "description": "Session-local ID from code_actions; required for code_action_resolve/code_action_apply/execute_command."},
                 "end_line": {"type": "integer", "minimum": 1, "description": "code_actions: optional 1-based end line; needs end_column."},
                 "end_column": {"type": "integer", "minimum": 1, "description": "code_actions: 1-based end character column."},
                 "payload": {"type": "object", "description": "request only: JSON object of LSP params for `query`. Absent textDocument/position fields are filled from `path` and `line`."},
+                "direction": {"type": "string", "enum": ["incoming", "outgoing"], "description": "call_hierarchy only: callers (incoming, the default) or callees (outgoing) of the symbol at the position."},
             }),
             &["action"],
         )
@@ -1655,6 +1810,7 @@ impl Tool for LspTool {
                 | Action::Reload
                 | Action::Request,
             ) => return true,
+            Some(Action::Format) if args.get("apply") != Some(&json!(false)) => return true,
             Some(Action::Status | Action::Capabilities | Action::CodeActionResolve) => {
                 return false;
             }
@@ -1674,7 +1830,9 @@ impl Tool for LspTool {
             .and_then(Value::as_str)
             .and_then(|name| Action::parse(name).ok())
         {
-            Some(Action::Rename | Action::CodeActionApply | Action::RenameFile) => false, // every write is observed
+            Some(
+                Action::Rename | Action::CodeActionApply | Action::RenameFile | Action::Format,
+            ) => false, // every write is observed
             Some(Action::ExecuteCommand | Action::Reload | Action::Request) => true, // project code outside sandbox; raw requests reach any advertised method
             _ => self.needs_approval(args),
         }

@@ -6,11 +6,15 @@ Search configuration, choose storage scope and review setup presets before savin
 
 ### Settings
 
-`/settings` is the configuration hub, including persistent learning preferences. Categories are
-horizontal tabs at the top; narrow terminals scroll the strip to keep the active tab visible.
-`Left`/`Right` change categories, `Up`/`Down` move through settings, and `Tab`/`Shift-Tab` jump
-sections within a category. Type to search labels, descriptions, paths and goal-oriented synonyms
-across categories. Exact paths rank first. Tab counts show saved overrides, not running tasks.
+`/settings` is the configuration hub, including persistent learning preferences. The categories
+are a one-row tab strip at the top that scrolls to keep the active one visible. `Left`/`Right` change categories,
+`Up`/`Down` move through settings, and `Tab`/`Shift-Tab` jump sections within a category. The
+first category, **Common**, also shows the model, approval mode, sandbox mode, Enter-while-working
+and notification rows under one heading; they stay in their own categories too, and editing either
+copy edits the same setting. Type to search labels, descriptions, paths and goal-oriented synonyms
+across categories. An exact path or label ranks first, whole-word matches rank above scattered
+letters, weak scattered matches are dropped, and each result names its category at the right edge.
+Tab counts show saved overrides, not running tasks.
 [Settings layout](configuration.md#settings-layout) describes
 the categories; Safety groups approval, sandbox, isolation, folders and rules, while Connections
 groups provider and tool-server configuration. Approval and sandboxing remain independent controls.
@@ -29,6 +33,20 @@ never silently added. A failed review stays open with an error. Very short termi
 an unreadable review.
 
 While you search, the category tabs are not offered and `Tab` does nothing; `Esc` clears the search first.
+
+The footer shows at most four keys: the main action, search or filter, `F1 keys` and the way out.
+`F1` opens the panel's full key sheet, which lists every key the footer left out; `/models` works
+the same way. While a panel is open, the terminal title leads with its name.
+
+**Context & history** opens with a summary card: a gauge of the context used against the active
+limit (marked *estimated* when it is), the point where compaction starts, and the read-only server
+capacity and compaction reserve. A fact that is missing says why (`nothing sent yet`, `not reported
+by the server`) or which setting supplies it. The saved defaults follow; compaction tuning is folded
+under **Advanced**.
+
+A zero or empty value says what it does, in the words of the setting's description: `0 (unlimited)`,
+`0 (off)`, `not set (python3 from PATH)`. An empty value whose description states no meaning reads
+`not set`.
 
 Choice lists also accept typing to filter their labels and stored values. `Esc` clears that filter
 before returning to settings; `Enter` confirms only a visible match. Clearing an override restores
@@ -133,7 +151,8 @@ original prompt. Timed typed questions pause their deadline during inspection an
 the exact remaining time. Missing or last-observed snapshots are not an all-clear.
 
 The tabs, scope and search stay in fixed header rows while browsing. Appearance samples never
-expand above the options automatically: `F4` explicitly opens a wrapped, scrollable preview and
+expand above the options automatically: `Shift+F4` explicitly opens a wrapped, scrollable preview
+(plain `F4` too once the provider-setup shortcut no longer uses it) and
 returns to controls with the draft retained, at every terminal size. `Enter` confirms through the
 normal settings owner; `Esc` discards. Samples cover status,
 tool output, motion, transcript detail, worker cards and the session rail; they are not live animation

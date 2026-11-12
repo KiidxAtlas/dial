@@ -253,11 +253,13 @@ fn scan<T, P>(
                 );
                 ensure!(
                     meta.len() <= *remaining as u64,
-                    "{} is {} bytes, but the copied source is limited to {} bytes in total (task.isolation_source_bytes; {} bytes already counted)",
-                    relative.display(),
-                    meta.len(),
-                    limits.isolation_source_bytes,
-                    limits.isolation_source_bytes - *remaining
+                    "{}",
+                    source_budget_error(
+                        &relative,
+                        meta.len(),
+                        limits.isolation_source_bytes as u64,
+                        (limits.isolation_source_bytes - *remaining) as u64,
+                    )
                 );
                 let identity = Identity::of(&meta, platform_fs::path_identity(&path)?);
                 let size = identity.size as usize;
@@ -398,6 +400,36 @@ fn changed(before: &Snapshot, after: &Snapshot) -> Vec<PathBuf> {
         .into_iter()
         .cloned()
         .collect()
+}
+
+/// The aggregate `isolation_source_bytes` message. `counted` bytes are already charged and `size`
+/// more would exceed `limit`. Copy walks and resulting overlay/ProjFS snapshots share this wording.
+fn source_budget_error(relative: &Path, size: u64, limit: u64, counted: u64) -> String {
+    format!(
+        "{} is {size} bytes, but the copied source is limited to {limit} bytes in total (task.isolation_source_bytes; {counted} bytes already counted)",
+        relative.display()
+    )
+}
+
+/// Applies the aggregate source budget to a resulting snapshot in path order, the same rule `scan`
+/// applies while copying. Overlay and ProjFS views are not walked by `scan`, so `current` calls
+/// this before any merge can read the change set.
+fn ensure_source_budget(
+    snapshot: &Snapshot,
+    limits: &crate::config::task::TaskConfig,
+) -> Result<()> {
+    let limit = limits.isolation_source_bytes as u64;
+    let mut counted = 0u64;
+    for (relative, stamp) in snapshot {
+        let size = stamp.identity.size;
+        ensure!(
+            size <= limit - counted,
+            "{}",
+            source_budget_error(relative, size, limit, counted)
+        );
+        counted += size;
+    }
+    Ok(())
 }
 
 /// `whiteouts`: the worker tree is an overlay upper layer, where a deleted name is recorded as a
@@ -623,6 +655,8 @@ impl Isolated {
             (None, None) => snapshot(&self.root, Some(&self.before), &self.ignored, &self.limits)?,
         };
         after.retain(|path, _| !self.ignored.covers(path));
+        // Overlay and ProjFS snapshots are not walked by `scan`; every backend meets the same budget.
+        ensure_source_budget(&after, &self.limits)?;
         Ok(after)
     }
 

@@ -1098,3 +1098,23 @@ fn an_oversized_first_line_is_clipped_instead_of_reported_as_an_empty_range() {
         "{tiny}"
     );
 }
+
+#[test]
+fn a_budget_cut_inside_a_span_reports_the_rows_already_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let text: String = (0..10).map(|_| format!("{}\n", "x".repeat(40))).collect();
+    std::fs::write(dir.path().join("f.rs"), &text).unwrap();
+    // Room for three 43-byte rows ("N:" + 40 chars + newline), not a fourth.
+    let budget = crate::tools::fs::select::READ_FOOTER_RESERVE + 150;
+    let out = read(&ws, "f.rs", &Selector::default(), 1, 10, budget).unwrap();
+    assert!(out.contains("\n3:"), "{out}");
+    assert!(!out.contains("\n4:"), "{out}");
+    assert!(
+        out.contains(
+            "[output truncated at the byte budget after line 3 of 10; continue with `f.rs:4-`]"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("does not fit"), "{out}");
+}

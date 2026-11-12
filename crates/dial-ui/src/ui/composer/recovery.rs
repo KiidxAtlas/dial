@@ -292,15 +292,15 @@ impl Composer {
         self.explicit = snapshot
             .explicit
             .into_iter()
-            .map(|(text, independent)| super::Explicit {
-                text,
-                kind: if independent {
-                    SteerKind::Independent
-                } else {
-                    SteerKind::Steer
-                },
-                stage: SteerStage::Pending,
-                untaken: true,
+            .map(|(text, independent)| {
+                super::Explicit::new(
+                    text,
+                    if independent {
+                        SteerKind::Independent
+                    } else {
+                        SteerKind::Steer
+                    },
+                )
             })
             .collect();
         self.editing_queue = snapshot.editing.map(|(index, text, follow_up)| QueuedEdit {

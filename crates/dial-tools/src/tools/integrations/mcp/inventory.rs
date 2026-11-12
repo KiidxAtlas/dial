@@ -119,7 +119,9 @@ impl Inventory {
             })
             .collect();
         json!({"servers": servers,
-            "note": "Only connected servers have completed initialization and discovery. Listed tool names are registered capabilities, not permission grants; model/profile eligibility and approvals still apply. Use tool_search or tool_load for next-round schemas. Failed/disabled servers have no callable tools. Use /mcp for operator diagnostics and configuration; disconnected sessions reconnect on demand."})
+            "client_capabilities": super::client::client_capabilities(),
+            "unsupported_client_requests": ["sampling/createMessage", "elicitation/create"],
+            "note": "Only connected servers have completed initialization and discovery. Listed tool names are registered capabilities, not permission grants; model/profile eligibility and approvals still apply. Use tool_search or tool_load for next-round schemas. Failed/disabled servers have no callable tools. Use /mcp for operator diagnostics and configuration; disconnected sessions reconnect on demand. Client callbacks support ping and roots/list only; servers requiring sampling or elicitation are not compatible with those workflows."})
     }
 }
 

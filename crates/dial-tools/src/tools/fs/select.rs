@@ -33,11 +33,13 @@ pub struct Selector {
     pub ranges: Vec<(usize, Option<usize>)>,
     /// Last N lines.
     pub tail: Option<usize>,
+    /// Declarations named by `:sym=NAME`; [`resolve_symbols`] turns them into `ranges`.
+    pub symbols: Vec<String>,
 }
 
 impl Selector {
     pub(in crate::tools) fn selects_lines(&self) -> bool {
-        !self.ranges.is_empty() || self.tail.is_some()
+        !self.ranges.is_empty() || self.tail.is_some() || !self.symbols.is_empty()
     }
 }
 
@@ -76,6 +78,15 @@ fn parse_ranges(seg: &str) -> Result<Option<Parsed>, String> {
                 (Some(a), Some(b)) => (a, b),
                 _ => return Ok(None),
             }
+        } else if let Some((a, c)) = part.split_once('~') {
+            // `N~C`: line N with C lines of context on each side.
+            match (number(a), c.parse::<usize>().ok()) {
+                (Some(0), Some(_)) => {
+                    return Err("line selector 0 is invalid; lines are 1-based. Use :1".to_owned());
+                }
+                (Some(a), Some(c)) => (a.saturating_sub(c).max(1), Some(a.saturating_add(c))),
+                _ => return Ok(None),
+            }
         } else {
             match number(part) {
                 Some(a) => (a, None),
@@ -106,8 +117,8 @@ fn parse_ranges(seg: &str) -> Result<Option<Parsed>, String> {
     Ok(Some((merged, None)))
 }
 
-/// Split `file.rs:50-100`, `file.rs:raw`, `file.rs:raw:5-9`, `file.rs:-30`
-/// into path and selector. Unrecognized trailing text stays in the path.
+/// Split `file.rs:50-100`, `file.rs:raw`, `file.rs:raw:5-9`, `file.rs:-30`, `file.rs:812~15`
+/// and `file.rs:sym=NAME` into path and selector. Unrecognized trailing text stays in the path.
 pub fn split_selector(input: &str) -> Result<(&str, Selector), String> {
     let mut rest = input;
     let mut sel = Selector::default();
@@ -116,6 +127,13 @@ pub fn split_selector(input: &str) -> Result<(&str, Selector), String> {
         let seg = &rest[i + 1..];
         if seg == "raw" && !sel.raw {
             sel.raw = true;
+            rest = &rest[..i];
+            continue;
+        }
+        if !sel.selects_lines()
+            && let Some(names) = parse_symbols(seg)?
+        {
+            sel.symbols = names;
             rest = &rest[..i];
             continue;
         }
@@ -132,14 +150,52 @@ pub fn split_selector(input: &str) -> Result<(&str, Selector), String> {
         // in split_target before we get here.
         let start = seg.strip_prefix('L').unwrap_or(seg);
         let digits = start.bytes().take_while(u8::is_ascii_digit).count();
-        if !sel.selects_lines() && digits > 0 && start[digits..].starts_with(['-', '+', '.', ',']) {
+        if !sel.selects_lines()
+            && digits > 0
+            && start[digits..].starts_with(['-', '+', '.', ',', '~'])
+        {
             return Err(format!(
-                "Invalid line selector {seg:?}: use numeric 1-based lines, e.g. :25-50 or :25+20. Correct the selector or use separate offset/limit arguments; do not retry this path unchanged."
+                "Invalid line selector {seg:?}: use numeric 1-based lines, e.g. :25-50, :25+20 or :25~10. Correct the selector or use separate offset/limit arguments; do not retry this path unchanged."
             ));
         }
         break;
     }
     Ok((rest, sel))
+}
+
+/// Prefix of a symbol selector: `path:sym=NAME` reads the declaration named NAME.
+pub(in crate::tools) const SYMBOL_PREFIX: &str = "sym=";
+
+/// `sym=NAME[,NAME…]` names (each may be qualified as `Parent.name`). `None`: not a symbol selector.
+fn parse_symbols(seg: &str) -> Result<Option<Vec<String>>, String> {
+    let Some(list) = seg
+        .strip_prefix(SYMBOL_PREFIX)
+        .or_else(|| seg.strip_prefix("symbol="))
+    else {
+        return Ok(None);
+    };
+    let names: Vec<String> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if names.is_empty() {
+        return Err("`:sym=` needs a declaration name, e.g. `:sym=parse_config`".to_owned());
+    }
+    if names.len() > 8 {
+        return Err("`:sym=` accepts at most 8 names; split the read".to_owned());
+    }
+    if let Some(bad) = names.iter().find(|name| {
+        !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || "_.$".contains(c))
+    }) {
+        return Err(format!(
+            "`:sym=` name {bad:?} is not an identifier; use the declaration's name (or `Parent.name`)"
+        ));
+    }
+    Ok(Some(names))
 }
 
 /// The path and selector of a `read` argument. A literal file name wins over

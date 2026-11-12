@@ -285,24 +285,15 @@ pub fn run_config_with_overlay(
     let layout = Layout::discover(cwd)?;
     match args.action.clone().unwrap_or(ConfigAction::List) {
         ConfigAction::List => {
-            let entries = flatten(&merged(&layout, &overlay)?);
             if args.json {
-                let settings = entries
-                    .iter()
-                    .map(|(key, value)| {
-                        Ok(serde_json::json!({
-                            "key": key,
-                            "value": serde_json::to_value(redacted_value(key, value))?,
-                            "redacted": redacted_value(key, value) != *value,
-                        }))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({ "settings": settings }))?
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({ "settings": setting_entries(&layout, &overlay)? })
+                    )?
                 );
             } else {
-                for (key, value) in &entries {
+                for (key, value) in &flatten(&merged(&layout, &overlay)?) {
                     println!("{key} = {}", display_value(key, value));
                 }
             }
@@ -335,32 +326,18 @@ pub fn run_config_with_overlay(
             project,
         } => {
             let scope = scope(project);
-            let current = merged(&layout, &overlay)?;
-            let value = crate::config::schema::coerce_value(&current, &key, parse_value(&value));
-            crate::config::schema::check_value_for(&current, &key, &value)
-                .map_err(anyhow::Error::msg)?;
-            check_written_value(&layout.user_dir, &key, &value)?;
-            settings_store::save_config(
-                &layout,
-                scope,
-                &[Change::Set {
-                    path: key.clone(),
-                    value,
-                }],
-            )
-            .map_err(|error| unknown_key_error(error, &key, &current))?;
+            set_setting(&layout, &overlay, &key, parse_value(&value), scope)?;
             println!("set {key} in {}", scope_name(scope));
         }
         ConfigAction::Reset { key, project } => {
             let scope = scope(project);
-            if lookup(&settings_store::load_layer(&layout, scope)?, &key).is_none() {
+            if !reset_setting(&layout, &key, scope)? {
                 println!(
                     "{key} is not set in {}; nothing to reset",
                     scope_name(scope)
                 );
                 return Ok(0);
             }
-            settings_store::save_config(&layout, scope, &[Change::Remove { path: key.clone() }])?;
             println!("reset {key} in {}", scope_name(scope));
         }
         ConfigAction::Path => {
@@ -373,6 +350,77 @@ pub fn run_config_with_overlay(
         ConfigAction::Reference => unreachable!("reference does not load operator configuration"),
     }
     Ok(0)
+}
+
+/// Every effective setting as `{key, value, redacted}` with credentials redacted. Shared by
+/// `dial config list --json` and the RPC `get_settings` method.
+pub(crate) fn setting_entries(
+    layout: &Layout,
+    overlay: &toml::Table,
+) -> Result<Vec<serde_json::Value>> {
+    flatten(&merged(layout, overlay)?)
+        .iter()
+        .map(|(key, value)| {
+            let shown = redacted_value(key, value);
+            Ok(serde_json::json!({
+                "key": key,
+                "value": serde_json::to_value(&shown)?,
+                "redacted": shown != *value,
+            }))
+        })
+        .collect()
+}
+
+/// One effective setting (a scalar or a whole table), redacted like `dial config get --json`.
+pub(crate) fn setting_value(
+    layout: &Layout,
+    overlay: &toml::Table,
+    key: &str,
+) -> Result<serde_json::Value> {
+    let table = merged(layout, overlay)?;
+    let value = lookup(&table, key).ok_or_else(|| anyhow::anyhow!("no setting at {key:?}"))?;
+    Ok(serde_json::to_value(redacted_value(key, value))?)
+}
+
+/// Validates and saves one setting exactly as `dial config set` does: schema coercion and range
+/// checks, write-only checks (themes, status segments), then a validated layer publication.
+pub(crate) fn set_setting(
+    layout: &Layout,
+    overlay: &toml::Table,
+    key: &str,
+    value: toml::Value,
+    scope: Scope,
+) -> Result<()> {
+    let current = merged(layout, overlay)?;
+    let value = crate::config::schema::coerce_value(&current, key, value);
+    crate::config::schema::check_value_for(&current, key, &value).map_err(anyhow::Error::msg)?;
+    check_written_value(&layout.user_dir, key, &value)?;
+    settings_store::save_config(
+        layout,
+        scope,
+        &[Change::Set {
+            path: key.to_owned(),
+            value,
+        }],
+    )
+    .map_err(|error| unknown_key_error(error, key, &current))?;
+    Ok(())
+}
+
+/// Removes one setting from a layer as `dial config reset` does. Returns `false` (and writes
+/// nothing) when the layer does not set it.
+pub(crate) fn reset_setting(layout: &Layout, key: &str, scope: Scope) -> Result<bool> {
+    if lookup(&settings_store::load_layer(layout, scope)?, key).is_none() {
+        return Ok(false);
+    }
+    settings_store::save_config(
+        layout,
+        scope,
+        &[Change::Remove {
+            path: key.to_owned(),
+        }],
+    )?;
+    Ok(true)
 }
 
 /// Replaces the configuration loader's "unknown field" error (which lists every field of the

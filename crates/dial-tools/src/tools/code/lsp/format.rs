@@ -17,6 +17,9 @@ const MAX_DIAGNOSTICS: usize = 50;
 const MAX_EDITS: usize = 100;
 const MAX_LINE_TEXT: usize = 160;
 const MAX_MESSAGE: usize = 300;
+const MAX_COMPLETIONS: usize = 50;
+const MAX_SIGNATURES: usize = 10;
+const MAX_CALLS: usize = 50;
 const MAX_NEW_TEXT: usize = 200;
 const MAX_HOVER: usize = 4000;
 
@@ -152,6 +155,174 @@ pub fn locations(lines: &mut Lines, result: &Value, noun: &str) -> String {
     );
     if found.len() > MAX_LOCATIONS {
         out.push(format!("… {} more not shown", found.len() - MAX_LOCATIONS));
+    }
+    out.join("\n")
+}
+
+/// The `CompletionItemKind` name, or `None` for an unknown or absent kind.
+fn completion_kind(kind: u64) -> Option<&'static str> {
+    Some(match kind {
+        1 => "text",
+        2 => "method",
+        3 => "function",
+        4 => "constructor",
+        5 => "field",
+        6 => "variable",
+        7 => "class",
+        8 => "interface",
+        9 => "module",
+        10 => "property",
+        11 => "unit",
+        12 => "value",
+        13 => "enum",
+        14 => "keyword",
+        15 => "snippet",
+        16 => "color",
+        17 => "file",
+        18 => "reference",
+        19 => "folder",
+        20 => "enum member",
+        21 => "constant",
+        22 => "struct",
+        23 => "event",
+        24 => "operator",
+        25 => "type parameter",
+        _ => return None,
+    })
+}
+
+/// A `CompletionList` or an array of `CompletionItem`s: one line per item, label first.
+/// Insert text is not echoed; the model sees what the server offers, never a rewritten edit.
+pub fn completions(result: &Value) -> String {
+    let (items, incomplete) = match result {
+        Value::Array(items) => (items.as_slice(), false),
+        Value::Object(_) => (
+            result["items"].as_array().map_or(&[][..], Vec::as_slice),
+            result["isIncomplete"].as_bool() == Some(true),
+        ),
+        _ => (&[][..], false),
+    };
+    if items.is_empty() {
+        return "no completions at this position".to_owned();
+    }
+    let mut out = vec![format!(
+        "{} completion{}{}",
+        items.len(),
+        if items.len() == 1 { "" } else { "s" },
+        if incomplete {
+            " (incomplete: the server may offer more as you type)"
+        } else {
+            ""
+        }
+    )];
+    for item in items.iter().take(MAX_COMPLETIONS) {
+        let label = clip(item["label"].as_str().unwrap_or("?"), MAX_LINE_TEXT);
+        let kind = item["kind"]
+            .as_u64()
+            .and_then(completion_kind)
+            .map(str::to_owned);
+        let detail = item["detail"]
+            .as_str()
+            .and_then(|detail| detail.lines().next())
+            .map(|detail| clip(detail.trim(), MAX_MESSAGE))
+            .filter(|detail| !detail.is_empty());
+        let parts: Vec<String> = std::iter::once(label).chain(kind).chain(detail).collect();
+        out.push(parts.join("  "));
+    }
+    if items.len() > MAX_COMPLETIONS {
+        out.push(format!(
+            "… {} more not shown",
+            items.len() - MAX_COMPLETIONS
+        ));
+    }
+    out.join("\n")
+}
+
+/// `SignatureHelp`: each signature's label (the active one starred), its first documentation
+/// line, and the active parameter index when the server reports one.
+pub fn signature_help(result: &Value) -> String {
+    let signatures = result["signatures"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    if signatures.is_empty() {
+        return "no signature help at this position".to_owned();
+    }
+    let active = result["activeSignature"]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .unwrap_or(0);
+    let mut out = vec![format!(
+        "{} signature{}",
+        signatures.len(),
+        if signatures.len() == 1 { "" } else { "s" }
+    )];
+    for (index, signature) in signatures.iter().enumerate().take(MAX_SIGNATURES) {
+        let marker = if index == active { "*" } else { " " };
+        let label = clip(signature["label"].as_str().unwrap_or("?"), MAX_MESSAGE);
+        out.push(format!("{marker} {label}"));
+        if let Some(docs) = signature.get("documentation") {
+            let first = hover_text(docs);
+            if let Some(line) = first.lines().find(|line| !line.trim().is_empty()) {
+                out.push(format!("    {}", clip(line.trim(), MAX_MESSAGE)));
+            }
+        }
+        if index == active
+            && let Some(parameter) = result["activeParameter"]
+                .as_u64()
+                .or_else(|| signature["activeParameter"].as_u64())
+        {
+            out.push(format!("    active parameter: {parameter}"));
+        }
+    }
+    if signatures.len() > MAX_SIGNATURES {
+        out.push(format!(
+            "… {} more not shown",
+            signatures.len() - MAX_SIGNATURES
+        ));
+    }
+    out.join("\n")
+}
+
+/// Callers (`incoming`, each `from`) or callees (`outgoing`, each `to`) of the prepared `item`,
+/// with the first call site of each. Call-site ranges are in the calling document for incoming
+/// calls and in the prepared item's document for outgoing ones; both are resolved by `Lines`.
+pub fn call_hierarchy(lines: &mut Lines, item: &Value, result: &Value, incoming: bool) -> String {
+    let name = clip(item["name"].as_str().unwrap_or("?"), MAX_LINE_TEXT);
+    let (noun, key) = if incoming {
+        ("caller", "from")
+    } else {
+        ("callee", "to")
+    };
+    let calls = result.as_array().map_or(&[][..], Vec::as_slice);
+    if calls.is_empty() {
+        return format!("no {noun}s of {name}");
+    }
+    let mut out = vec![format!(
+        "{} {noun}{} of {name}",
+        calls.len(),
+        if calls.len() == 1 { "" } else { "s" }
+    )];
+    for call in calls.iter().take(MAX_CALLS) {
+        let target = &call[key];
+        let other = clip(target["name"].as_str().unwrap_or("?"), MAX_LINE_TEXT);
+        // Incoming call sites sit in the caller's document; outgoing ones in the prepared item's.
+        let document = if incoming {
+            &target["uri"]
+        } else {
+            &item["uri"]
+        };
+        let at = call["fromRanges"]
+            .as_array()
+            .and_then(|ranges| ranges.first())
+            .and_then(|range| spot(document, Some(range)))
+            .map(|s| lines.describe(&s.path, s.line, s.character));
+        match at {
+            Some(at) => out.push(format!("{other}  call at {at}")),
+            None => out.push(other),
+        }
+    }
+    if calls.len() > MAX_CALLS {
+        out.push(format!("… {} more not shown", calls.len() - MAX_CALLS));
     }
     out.join("\n")
 }

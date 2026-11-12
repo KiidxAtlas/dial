@@ -536,3 +536,22 @@ fn user_requested_calls_ignore_the_background_improvement_stop() {
     let answer = call_user_requested(&config, &json!({"op": "weights_map"}), None).unwrap();
     assert_eq!(answer["ok"], true);
 }
+
+#[test]
+fn configured_tool_failures_name_the_exit_code_and_keep_the_stderr_tail() {
+    assert_eq!(
+        failure_message(Some(1), b"  parts is empty\n"),
+        "configured subprocess failed (exit 1): parts is empty"
+    );
+    assert_eq!(
+        failure_message(None, b""),
+        "configured subprocess failed or returned incomplete output"
+    );
+    // Long stderr keeps its end, cut on a character boundary.
+    let mut stderr = "é".repeat(FAILURE_STDERR);
+    stderr.push_str("final reason");
+    let message = failure_message(Some(3), stderr.as_bytes());
+    assert!(message.starts_with("configured subprocess failed (exit 3): …"));
+    assert!(message.ends_with("final reason"));
+    assert!(message.len() <= FAILURE_STDERR + 64);
+}

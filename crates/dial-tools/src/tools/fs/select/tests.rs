@@ -5,6 +5,7 @@ fn sel(ranges: &[(usize, Option<usize>)]) -> Selector {
         raw: false,
         ranges: ranges.to_vec(),
         tail: None,
+        ..Selector::default()
     }
 }
 
@@ -98,6 +99,7 @@ fn tail_selects_the_last_lines_even_when_longer_than_the_file() {
         raw: false,
         ranges: vec![],
         tail: Some(n),
+        ..Selector::default()
     };
     assert_eq!(plan_spans(&tail(3), 1, 10, 10), vec![span(8, 10, false)]);
     assert_eq!(plan_spans(&tail(50), 1, 10, 10), vec![span(1, 10, false)]);
@@ -155,4 +157,19 @@ fn resume_keeps_the_bounds_and_later_ranges_of_a_capped_read() {
         resume(&[span(1, 2000, true)], 30, 5000).as_deref(),
         Some("30-")
     );
+}
+
+#[test]
+fn context_and_symbol_selectors_parse() {
+    let (path, s) = split_selector("a.rs:812~15").unwrap();
+    assert_eq!((path, s.ranges), ("a.rs", vec![(797, Some(827))]));
+    let (_, s) = split_selector("a.rs:3~10").unwrap();
+    assert_eq!(s.ranges, vec![(1, Some(13))]);
+    assert!(split_selector("a.rs:0~3").is_err());
+    let (path, s) = split_selector("a.rs:sym=Foo.new,helper").unwrap();
+    assert_eq!(path, "a.rs");
+    assert_eq!(s.symbols, ["Foo.new", "helper"]);
+    assert!(s.selects_lines());
+    assert!(split_selector("a.rs:sym=").is_err());
+    assert!(split_selector("a.rs:sym=a b").is_err());
 }

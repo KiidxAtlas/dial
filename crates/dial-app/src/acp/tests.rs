@@ -213,6 +213,34 @@ fn plan_entries_map_every_todo_status_without_silent_pending() {
         entry("blocked")["_meta"]["dial"],
         json!({"status":"blocked","note":"why"})
     );
+    assert_eq!(entry("blocked")["content"], "[blocked] task (why)");
+    assert_eq!(entry("abandoned")["content"], "[abandoned] task (why)");
+    assert_eq!(entry("pending")["content"], "task");
+}
+
+#[test]
+fn unfinished_prompts_say_so_in_the_transcript() {
+    let mut adapter = initialized(json!({}));
+    adapter.sessions.insert("s1".into());
+    adapter.active = Some("s1".into());
+    adapter.modes.insert("s1".into(), false);
+    adapter.receive(json!({"jsonrpc":"2.0","id":1,"method":"session/prompt",
+        "params":{"sessionId":"s1","prompt":[{"type":"text","text":"hi"}]}}));
+    let replies = adapter.emit(json!({"id":1,"result":{"outcome":"needs_input","text":"which?"}}));
+    let chunk = &replies[0]["params"]["update"];
+    assert_eq!(chunk["sessionUpdate"], "agent_message_chunk");
+    assert!(
+        chunk["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("needs input")
+    );
+    assert_eq!(replies.last().unwrap()["result"]["stopReason"], "end_turn");
+
+    adapter.receive(json!({"jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":"s1","prompt":[{"type":"text","text":"hi"}]}}));
+    let done = adapter.emit(json!({"id":2,"result":{"outcome":"completed"}}));
+    assert_eq!(done.len(), 1);
 }
 
 #[test]
@@ -416,4 +444,116 @@ fn unknown_methods_are_method_not_found_with_or_without_params() {
     }
     let (_, replies) = adapter.receive(json!({"jsonrpc":"2.0","id":4,"method":"session/new"}));
     assert_eq!(replies[0]["error"]["code"], -32602, "{replies:?}");
+}
+
+#[test]
+fn model_and_thought_level_config_options_follow_actor_results() {
+    let mut adapter = initialized(json!({}));
+    // A session/new answer carrying the actor's `_acp_models`.
+    adapter.pending.insert(
+        key(&json!(1)),
+        Pending {
+            method: "session/new".into(),
+            session: None,
+        },
+    );
+    let opened = adapter.emit(json!({"id":1,"result":{"session_id":"s1","plan_mode":false,
+        "_acp_models":{"model":"p/a","models":[{"value":"p/a","name":"A"},{"value":"p/b","name":"B"}],
+        "thought_level":null,"levels":["low","high"],"settable":true}}}));
+    let opened = opened.last().unwrap()["result"].clone();
+    assert!(opened.get("_acp_models").is_none());
+    let options = &opened["configOptions"];
+    let ids: Vec<&str> = options
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|option| option["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["mode", "model", "thought_level"]);
+    assert_eq!(options[1]["currentValue"], "p/a");
+    assert_eq!(options[1]["options"].as_array().unwrap().len(), 2);
+    // An unset level shows as the model default, the first choice.
+    assert_eq!(options[2]["currentValue"], "default");
+    assert_eq!(options[2]["options"][0]["value"], "default");
+
+    // Selecting a model maps to set_model with the provider split at the first slash.
+    let (request, replies) = adapter.receive(json!({"jsonrpc":"2.0","id":2,
+        "method":"session/set_config_option","params":{"sessionId":"s1","configId":"model","value":"p/org/b"}}));
+    assert!(replies.is_empty(), "{replies:?}");
+    let request = request.unwrap();
+    assert_eq!(request["method"], "set_model");
+    assert_eq!(request["params"]["provider"], "p");
+    assert_eq!(request["params"]["model_id"], "org/b");
+    // The answer keeps the mode, keeps the list and reports the new choice.
+    let answered = adapter.emit(json!({"id":2,"result":{"model":"org/b",
+        "_acp_models":{"model":"p/b","thought_level":"high","levels":["low","high"],"settable":true}}}));
+    assert!(
+        !answered
+            .iter()
+            .any(|message| message["params"]["update"]["sessionUpdate"] == "current_mode_update")
+    );
+    let result = &answered.last().unwrap()["result"]["configOptions"];
+    assert_eq!(result[0]["currentValue"], "default");
+    assert_eq!(result[1]["currentValue"], "p/b");
+    assert_eq!(result[1]["options"].as_array().unwrap().len(), 2);
+    assert_eq!(result[2]["currentValue"], "high");
+    assert_eq!(result[2]["options"].as_array().unwrap().len(), 3);
+
+    for level in ["low", "default"] {
+        let (request, _) = adapter.receive(json!({"jsonrpc":"2.0","id":3,
+            "method":"session/set_config_option","params":{"sessionId":"s1","configId":"thought_level","value":level}}));
+        let request = request.unwrap();
+        assert_eq!(request["method"], "set_thinking");
+        assert_eq!(request["params"]["level"], level);
+        adapter.emit(json!({"id":3,"result":{"level":null}}));
+    }
+    for (id, config, value) in [(5, "model", "no-provider"), (6, "temperature", "1")] {
+        let (request, replies) = adapter.receive(json!({"jsonrpc":"2.0","id":id,
+            "method":"session/set_config_option","params":{"sessionId":"s1","configId":config,"value":value}}));
+        assert!(request.is_none());
+        assert!(replies[0].get("error").is_some(), "{config}: {replies:?}");
+    }
+}
+
+#[test]
+fn prompt_results_refresh_changed_model_options_only() {
+    let mut adapter = initialized(json!({}));
+    adapter.sessions.insert("s1".into());
+    adapter.modes.insert("s1".into(), false);
+    adapter.store_models(
+        "s1",
+        &json!({"model":"p/a","models":[{"value":"p/a","name":"A"}],"thought_level":null,"levels":[],"settable":false}),
+    );
+    let prompt = |adapter: &mut Adapter, id: u64, model: &str| {
+        adapter.receive(json!({"jsonrpc":"2.0","id":id,"method":"session/prompt",
+            "params":{"sessionId":"s1","prompt":[{"type":"text","text":"hi"}]}}));
+        adapter.emit(
+            json!({"id":id,"result":{"outcome":"completed","plan_mode":false,
+            "_acp_models":{"model":model,"thought_level":null,"levels":[],"settable":false}}}),
+        )
+    };
+    assert_eq!(prompt(&mut adapter, 1, "p/a").len(), 1);
+    let changed = prompt(&mut adapter, 2, "p/b");
+    assert_eq!(changed.len(), 2);
+    let update = &changed[0]["params"]["update"];
+    assert_eq!(update["sessionUpdate"], "config_option_update");
+    assert_eq!(update["configOptions"][1]["currentValue"], "p/b");
+}
+
+#[test]
+fn permission_requests_offer_and_map_the_project_scope() {
+    let mut adapter = initialized(json!({}));
+    let request = adapter.emit(json!({"event":"approval","approval_id":"p1","tool":"bash"}));
+    let options: Vec<&str> = request[0]["params"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|option| option["optionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(options, ["allow", "always", "project", "deny"]);
+    let (decision, _) = adapter.receive(json!({"jsonrpc":"2.0","id":request[0]["id"],
+        "result":{"outcome":{"outcome":"selected","optionId":"project"}}}));
+    let decision = decision.unwrap();
+    assert_eq!(decision["method"], "approve");
+    assert_eq!(decision["params"]["decision"], "project");
 }

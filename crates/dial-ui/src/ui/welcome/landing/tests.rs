@@ -73,7 +73,7 @@ fn input_is_centered_and_cursor_tracks_the_real_draft() {
 }
 
 #[test]
-fn resting_home_has_no_metadata_stack_or_action_list() {
+fn resting_home_has_no_metadata_stack_and_offers_starters_where_room_allows() {
     let theme = Theme::dark();
     let input = ComposerView {
         rows: vec![Line::from("draft")],
@@ -85,11 +85,47 @@ fn resting_home_has_no_metadata_stack_or_action_list() {
         text.contains("local-model") && text.contains("~/projects/dial"),
         "the model and current directory stay visible: {text}"
     );
-    assert!(!text.contains(STARTERS[0]) && !text.contains("sandbox"));
+    // A tall first visit fills its spare room with the starters, in a card under the key hint.
+    assert!(
+        text.contains(STARTERS[0]) && !text.contains("sandbox"),
+        "{text}"
+    );
+    let hint = text.find("Enter send").expect("key hint");
+    assert!(hint < text.find(STARTERS[0]).unwrap(), "{text}");
+    assert!(
+        !text.contains("browse"),
+        "the list is already shown: {text}"
+    );
     assert!(content_width(120) <= 56);
     assert!(
         text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
         "the braille knob lockup fills a tall window: {text}"
+    );
+}
+
+#[test]
+fn starters_yield_to_first_run_steps_and_short_windows() {
+    let theme = Theme::dark();
+    let render = |info: &WelcomeInfo, height| {
+        let input = ComposerView {
+            rows: vec![Line::from("draft")],
+            cursor: (0, 0),
+        };
+        plain(&frame(info, 100, height, &theme, View::default(), input, vec![]).rows).join("\n")
+    };
+    let mut tour = info();
+    tour.tour = true;
+    let text = render(&tour, 40);
+    assert!(
+        text.contains("first steps") && !text.contains(STARTERS[0]),
+        "{text}"
+    );
+    // Short: the hint row alone, still offering to browse the list.
+    let short = render(&info(), 16);
+    assert!(!short.contains(STARTERS[0]), "{short}");
+    assert!(
+        short.contains("Enter send") && short.contains("browse"),
+        "{short}"
     );
 }
 
@@ -400,4 +436,23 @@ fn first_run_guidance_fits_and_respects_ascii_glyphs() {
             && text.contains("F1 opens actions")
             && text.contains("/models")
     );
+}
+
+#[test]
+fn the_home_names_the_approval_mode_and_the_key_that_changes_it() {
+    let theme = Theme::dark();
+    let draw = |info: &WelcomeInfo| {
+        let input = ComposerView {
+            rows: vec![Line::from("draft")],
+            cursor: (0, 0),
+        };
+        plain(&frame(info, 120, 40, &theme, View::default(), input, vec![]).rows).join("\n")
+    };
+    let mut with_key = info();
+    with_key.approval_key = "Shift+Tab".into();
+    let text = draw(&with_key);
+    assert!(text.contains("Shift+Tab mode: Ask first"), "{text}");
+    // Without a bound key the hint row stays as it was.
+    let text = draw(&info());
+    assert!(!text.contains("mode:"), "{text}");
 }

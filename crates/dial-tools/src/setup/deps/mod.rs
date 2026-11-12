@@ -344,6 +344,19 @@ pub const RECIPES: &[Recipe] = &[
     brew_lsp!("gleam", "Gleam", "gleam"),
     brew_lsp!("helm_ls", "helm-ls", "helm-ls"),
     brew_lsp!("nixd", "nixd", "nixd"),
+    // Delve, the Go debug adapter (`dlv dap`), offered when the `dap` tool needs it.
+    Recipe {
+        id: "dlv",
+        title: "Delve (dlv)",
+        requires: &[],
+        program: "dlv",
+        base: Base::Install,
+        artifact: "",
+        methods: &[
+            Method::Go("github.com/go-delve/delve/cmd/dlv@latest"),
+            Method::Brew("delve"),
+        ],
+    },
     Recipe {
         id: "node",
         title: "Node.js",

@@ -134,7 +134,7 @@ fn consistent_ux_worker_card_settles_with_its_workers() {
     // worker still running is drawn statically, since these rows freeze in scrollback.
     let settled = text_of(&transcript.take_settled(80, &env.ctx()));
     assert!(
-        settled.contains("continuing in background") && !settled.contains(env.theme.spinner(0)),
+        settled.contains("background") && !settled.contains(env.theme.spinner(0)),
         "{settled}"
     );
     worker.settle(
@@ -1089,18 +1089,21 @@ fn tool_calls_share_the_gutter_light_bodies_hang_off_a_hook_and_heavy_ones_are_f
 }
 
 #[test]
-fn user_messages_are_tinted_across_the_width() {
+fn user_messages_carry_an_accent_bar_without_background_shading() {
     let mut env = Env::new();
     env.theme = Theme::builtin("dial-dark").unwrap();
     let mut t = Transcript::new();
     t.push_user("a question that wraps onto a second line here");
     let tint = env.theme.bg(Tok::UserBg).bg;
-    assert!(tint.is_some_and(|c| c != ratatui::style::Color::Reset));
+    assert!(
+        tint.is_none_or(|c| c == ratatui::style::Color::Reset),
+        "dial-dark leaves the terminal background alone"
+    );
     let rows = t.all_rows(30, &env.ctx());
     let user: Vec<_> = rows.iter().filter(|r| text::line_width(r) > 0).collect();
     assert!(user.len() >= 2, "{:?}", plain(&rows));
     for row in user {
-        assert_eq!(text::line_width(row), 30, "the tint spans the width");
+        assert!(plain(&vec![row.clone()])[0].starts_with(" ▎"), "{row:?}");
         assert!(row.spans.iter().all(|s| s.style.bg == tint), "{row:?}");
     }
 }
@@ -1363,8 +1366,9 @@ fn long_commands_are_compact_and_expand_to_the_full_target() {
     t.tool_start("1", "bash", &"word ".repeat(80), "");
     let rows = t.all_rows(30, &env.ctx());
     assert_fits(&rows, 30);
-    // A running command is framed from the start: its top and bottom edges.
-    assert_eq!(rows.len(), 2, "{:?}", plain(&rows));
+    // A running command is framed from the start: its edges around one waiting row.
+    assert_eq!(rows.len(), 3, "{:?}", plain(&rows));
+    assert!(plain(&rows)[1].contains("waiting for output"), "{rows:?}");
     let expanded = t.all_rows(
         30,
         &TranscriptCtx {
@@ -1891,31 +1895,89 @@ fn partial_arguments_stay_bounded_and_empty_ids_are_ignored() {
 }
 
 #[test]
-fn reveal_cuts_land_on_grapheme_boundaries_and_hold_back_the_newest() {
+fn reveal_steps_land_on_grapheme_boundaries_and_hold_back_the_newest() {
     let text = "e\u{301}xyzabcdefghijkl\u{1F468}\u{200D}\u{1F469}z";
-    let mut at = 0;
+    let start = Instant::now();
+    let mut reveal = Transcript::reveal_step(text, None, start);
+    assert_eq!(reveal.cut, 0, "a new reveal starts empty");
     let mut cuts = Vec::new();
-    loop {
-        let next = Transcript::reveal_cut(text, at);
-        if next == at {
-            break;
-        }
-        assert!(
-            text.grapheme_indices(true).any(|(i, _)| i == next),
-            "cut {next} splits a grapheme"
+    for frame in 1..200 {
+        reveal = Transcript::reveal_step(
+            text,
+            Some(reveal),
+            start + Duration::from_millis(frame * 40),
         );
-        at = next;
-        cuts.push(at);
+        assert!(
+            text.grapheme_indices(true).any(|(i, _)| i == reveal.cut),
+            "cut {} splits a grapheme",
+            reveal.cut
+        );
+        cuts.push(reveal.cut);
     }
     assert_eq!(
-        at,
+        reveal.cut,
         text.len() - 1,
         "the newest grapheme waits for its successor: {cuts:?}"
     );
     // A combining mark arriving after a cut joins its base: the cut must not separate them.
-    let joined = "ab\u{301}c";
-    assert_eq!(Transcript::reveal_cut("ab", 0), 1);
-    assert_eq!(Transcript::reveal_cut(joined, 1), 4);
+    let at = start + Duration::from_secs(1);
+    let held = Transcript::reveal_step("ab", Some(reveal_at(0, start)), at);
+    assert_eq!(held.cut, 1);
+    let joined = Transcript::reveal_step("ab\u{301}c", Some(held), at + Duration::from_secs(1));
+    assert_eq!(joined.cut, 4);
+}
+
+fn reveal_at(cut: usize, at: Instant) -> Reveal {
+    Reveal {
+        cut,
+        at,
+        speed: super::REVEAL_MIN_SPEED,
+        carry: 0.0,
+    }
+}
+
+#[test]
+fn reveal_pace_follows_time_not_call_count_and_smooths_bursts() {
+    let start = Instant::now();
+    let mut text = "word ".repeat(10);
+    let mut reveal = Transcript::reveal_step(&text, None, start);
+    // Repeated calls at one instant (a burst of deltas) reveal nothing more.
+    for _ in 0..50 {
+        reveal = Transcript::reveal_step(&text, Some(reveal), start);
+    }
+    assert_eq!(reveal.cut, 0);
+    // The network delivers 40 characters every fourth 40 ms frame (250 per second on average).
+    // Once the pace settles, every frame reveals a similar amount instead of jumping on arrival.
+    let mut steps = Vec::new();
+    let mut previous = 0;
+    for frame in 1..=100u64 {
+        if frame % 4 == 0 {
+            text.push_str(&"word ".repeat(8));
+        }
+        reveal = Transcript::reveal_step(
+            &text,
+            Some(reveal),
+            start + Duration::from_millis(frame * 40),
+        );
+        steps.push(reveal.cut - previous);
+        previous = reveal.cut;
+    }
+    let settled = &steps[60..];
+    let (low, high) = (
+        *settled.iter().min().unwrap(),
+        *settled.iter().max().unwrap(),
+    );
+    assert!(
+        low >= 6,
+        "the reveal keeps moving between bursts: {steps:?}"
+    );
+    assert!(high <= 14, "a burst shows as a jump: {steps:?}");
+    assert!(
+        reveal.cut + 160 >= text.len(),
+        "the reveal keeps up with the stream: {} of {}",
+        reveal.cut,
+        text.len()
+    );
 }
 
 #[test]
@@ -1934,9 +1996,17 @@ fn smooth_reveal_shows_a_growing_prefix_and_flushes_at_turn_end() {
         } else {
             t.assistant_delta(answer);
         }
-        t.advance_reveal(&env.ui);
+        let start = Instant::now();
+        let mut frame = 0u64;
+        let mut tick = |t: &mut Transcript, frames: u64| {
+            for _ in 0..frames {
+                frame += 1;
+                t.advance_reveal_at(&env.ui, start + Duration::from_millis(frame * 40));
+            }
+        };
+        tick(&mut t, 4);
         let partial = text_of(&t.live(80, &ctx, 100).1);
-        assert!(partial.contains("quick"), "{partial}");
+        assert!(partial.contains("The"), "{partial}");
         assert!(
             !partial.contains("again"),
             "the tail is held back: {partial}"
@@ -1949,15 +2019,13 @@ fn smooth_reveal_shows_a_growing_prefix_and_flushes_at_turn_end() {
                 "Background",
                 "An observational notice while the answer is active.",
             );
-            t.advance_reveal(&env.ui);
+            tick(&mut t, 10);
             assert!(
                 text_of(&t.live(80, &ctx, 100).1).contains("jumps"),
                 "a notice must not freeze the active shared answer"
             );
         }
-        for _ in 0..200 {
-            t.advance_reveal(&env.ui);
-        }
+        tick(&mut t, 200);
         assert!(!t.has_pending_reveal());
         assert!(text_of(&t.live(80, &ctx, 100).1).contains("again"));
         if let Some(body) = &body {
@@ -2661,4 +2729,110 @@ fn block_starts_let_the_committed_tail_be_rendered_alone() {
             assert_eq!(tail_starts[0].row, 0);
         }
     }
+}
+
+#[test]
+fn framed_cards_stand_apart_while_plain_work_rows_stay_together() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.tool_start("r1", "read", "src/a.rs", r#"{"path":"src/a.rs"}"#);
+    t.tool_end("r1", "1: fn a() {}", false, 0.1);
+    t.tool_start("b1", "bash", "cargo test", r#"{"command":"cargo test"}"#);
+    t.tool_end("b1", "running 1 test\nok", false, 0.4);
+    t.tool_start("b2", "bash", "cargo fmt", r#"{"command":"cargo fmt"}"#);
+    t.tool_end("b2", "formatted", false, 0.2);
+    t.tool_start("r2", "read", "src/b.rs", r#"{"path":"src/b.rs"}"#);
+    t.tool_end("r2", "1: fn b() {}", false, 0.1);
+    let rows = plain(&t.all_rows(80, &env.ctx()));
+    let tops: Vec<usize> = (0..rows.len())
+        .filter(|&i| rows[i].starts_with('╭'))
+        .collect();
+    let bottoms: Vec<usize> = (0..rows.len())
+        .filter(|&i| rows[i].starts_with('╰'))
+        .collect();
+    assert_eq!(tops.len(), 2, "{rows:#?}");
+    for &top in &tops {
+        assert!(top > 0 && rows[top - 1].trim().is_empty(), "{rows:#?}");
+    }
+    for &bottom in &bottoms {
+        assert!(rows[bottom + 1].trim().is_empty(), "{rows:#?}");
+    }
+    // Two adjacent cards are separated by exactly one blank row.
+    assert_eq!(tops[1], bottoms[0] + 2, "{rows:#?}");
+
+    // Plain work rows keep stacking without a gap.
+    let mut lookups = Transcript::new();
+    lookups.tool_start("r1", "read", "src/a.rs", r#"{"path":"src/a.rs"}"#);
+    lookups.tool_end("r1", "1: fn a() {}", false, 0.1);
+    lookups.tool_start("s1", "grep", "needle", r#"{"pattern":"needle"}"#);
+    lookups.tool_end("s1", "src/a.rs:1: needle", false, 0.1);
+    let rows = plain(&lookups.all_rows(80, &env.ctx()));
+    assert!(rows.iter().all(|r| !r.trim().is_empty()), "{rows:#?}");
+}
+
+#[test]
+fn work_rows_and_cards_are_capped_at_the_work_width_on_wide_terminals() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.push_user("Run the tests");
+    t.tool_start("b1", "bash", "cargo test", r#"{"command":"cargo test"}"#);
+    t.tool_end("b1", "ok", false, 0.4);
+    let rows = t.all_rows(200, &env.ctx());
+    let card: Vec<_> = rows
+        .iter()
+        .filter(|r| r.spans.first().is_some_and(|s| s.content.starts_with('╭')))
+        .collect();
+    assert_eq!(card.len(), 1);
+    assert_eq!(
+        text::line_width(card[0]),
+        usize::from(super::super::tool_cards::frame::WORK_MAX_W)
+    );
+    // Narrower terminals still use their full width.
+    let narrow = t.all_rows(70, &env.ctx());
+    assert!(narrow.iter().any(
+        |r| r.spans.first().is_some_and(|s| s.content.starts_with('╭'))
+            && text::line_width(r) == 70
+    ));
+}
+
+#[test]
+fn consecutive_skill_loads_fold_into_one_row_per_skill() {
+    let env = Env::new();
+    let mut t = Transcript::new();
+    t.tool_start("k1", "skill", "rust", r#"{"name":"rust"}"#);
+    t.tool_end("k1", "Skill instructions loaded", false, 0.01);
+    for (id, file) in [("k2", "references/a.md"), ("k3", "references/b.md")] {
+        t.tool_start(
+            id,
+            "skill",
+            "rust",
+            &format!(r#"{{"name":"rust","file":"{file}"}}"#),
+        );
+        t.tool_end(id, "Skill reference loaded", false, 0.01);
+    }
+    let rows = plain(&t.all_rows(80, &env.ctx()));
+    let skill_rows: Vec<_> = rows.iter().filter(|r| r.contains("Skill")).collect();
+    assert_eq!(skill_rows.len(), 1, "{rows:#?}");
+    assert!(skill_rows[0].contains("rust · 2 references"), "{rows:#?}");
+
+    // Different skills hang off one head, each with its own count.
+    t.tool_start("k4", "skill", "docs", r#"{"name":"docs"}"#);
+    t.tool_end("k4", "Skill instructions loaded", false, 0.01);
+    let rows = plain(&t.all_rows(80, &env.ctx()));
+    let text = rows.join("\n");
+    assert!(text.contains("Skill (2)"), "{text}");
+    assert!(
+        text.contains("rust · 2 references") && text.contains("docs"),
+        "{text}"
+    );
+
+    // Expanded tool views keep every call.
+    let expanded = text_of(&t.all_rows(
+        80,
+        &TranscriptCtx {
+            tools_expanded: true,
+            ..env.ctx()
+        },
+    ));
+    assert!(expanded.contains("references/a.md") && expanded.contains("references/b.md"));
 }

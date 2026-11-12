@@ -594,6 +594,41 @@ fn build_embedder(
     })))
 }
 
+/// An embedder on the route semantic memory uses (the `embedding` model role, or the explicit
+/// `memory.semantic.embedding_*` overrides), for other features such as embedding code search.
+pub struct SharedEmbedder {
+    pub embedder: Box<dyn Embedder>,
+    /// The endpoint is on this machine (loopback), so inputs never leave it.
+    pub local: bool,
+    pub base_url: String,
+}
+
+/// [`SharedEmbedder`] from the full config, independent of the memory backend and its
+/// `embedding` mode. `Ok(None)` when no embedding role or override is configured.
+pub fn shared_embedder(config: &crate::config::types::Config) -> Result<Option<SharedEmbedder>> {
+    let mut semantic = config.memory.semantic.clone();
+    semantic.embedding = EmbeddingMode::Auto;
+    let role = role_from_config(config);
+    let Some(route) = resolve_route(&semantic, role.clone())? else {
+        return Ok(None);
+    };
+    let Some(embedder) = build_embedder(&semantic, role, &config.user_dir)? else {
+        return Ok(None);
+    };
+    let url = embedding_url(
+        route.wire,
+        &route.base_url,
+        route.allow_insecure,
+        &route.model,
+    )
+    .unwrap_or_default();
+    Ok(Some(SharedEmbedder {
+        embedder,
+        local: is_local_url(&url),
+        base_url: route.base_url,
+    }))
+}
+
 struct Semantic {
     /// This project's facts.
     store: Store,
@@ -833,22 +868,32 @@ struct Request<'a> {
     token_budget: usize,
 }
 
-/// Whether the query names a time.
+/// Whether the query names a time. Keywords match whole words and phrases, so "blast" or
+/// "diagonal" do not count as "last" or "ago".
 fn looks_temporal(query: &str) -> bool {
-    let lower = query.to_lowercase();
-    [
+    const WORDS: &[&str] = &[
         "yesterday",
         "today",
         "recent",
+        "recently",
         "last",
         "latest",
-        "this week",
-        "this month",
         "ago",
         "before",
-    ]
-    .iter()
-    .any(|keyword| lower.contains(keyword))
+    ];
+    const PHRASES: &[&str] = &["this week", "this month"];
+    let words: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // Padding with spaces makes every keyword a whole-word match when searched as a substring.
+    let normalized = format!(" {} ", words.join(" "));
+    WORDS
+        .iter()
+        .chain(PHRASES)
+        .any(|keyword| normalized.contains(&format!(" {keyword} ")))
 }
 
 /// How a bank's recall was served: from the cache, ranked and then cached, ranked without the

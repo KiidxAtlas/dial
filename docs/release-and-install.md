@@ -395,7 +395,7 @@ dial -c                               # continue the latest session   (-r <id-pr
 ```
 
 To rebuild after changing this checkout, run `make update` here (or `make -C /path/to/dial update`).
-This runs `cargo build -p dial --bin dial --profile local --locked --timings`: an incremental build without the shipping profile's thin LTO. Dependencies stay optimized at level 2; Dial itself uses level 1 and more parallel codegen to reduce rebuild time. Published releases and `cargo install` still use the unchanged release profile. It copies the binary to `bin/dial` in this checkout (git-ignored), and installs it over the `dial` your PATH resolves to (or `~/.local/bin/dial` if none), also refreshing `~/.cargo/bin/dial` when present. Previous copies are kept as `dial.bak-<stamp>` (three most recent). Use `make update PROFILE=release` for shipping-equivalent optimization.
+This runs `cargo build -p dial --bin dial --profile local --locked`: an incremental build without the shipping profile's thin LTO. Dependencies stay optimized at level 2; Dial itself uses level 1 and more parallel codegen to reduce rebuild time. Published releases and `cargo install` still use the unchanged release profile. It copies the binary to `bin/dial` in this checkout (git-ignored), and installs it over the `dial` your PATH resolves to (or `~/.local/bin/dial` if none), also refreshing `~/.cargo/bin/dial` when present. Previous copies are kept as `dial.bak-<stamp>` (three most recent). Use `make update PROFILE=release` for shipping-equivalent optimization.
 `cargo install --path . --locked` remains available when you specifically want a release build
 installed into Cargo's bin directory instead. `command -v dial` shows which copy your terminal
 will run, and `make help` lists the other build and check targets. Restart any running dial
@@ -403,7 +403,8 @@ session afterward. See `ARCHITECTURE.md` for the module layout.
 
 For a faster development loop, use `make check` for compilation checks,
 `make test-lib` for library unit tests, or `make test-module MOD=llm::provider`
-for a single module (a module path is required). `make test-integration` runs the
+for a single module (a module path is required; add `CRATE=dial-llm` to build only that
+crate's test binary instead of every crate's). `make test-integration` runs the
 process/API fixtures; `make test` still runs the full Rust suite. Tests use the
 usual dev profile, so these commands share its build cache. `make build` uses the
 optimized `local` profile; its first build creates a separate cache in
@@ -419,23 +420,49 @@ make build SLIM=1 FEATURES=desktop   # slim, but keep native desktop control
 make check SLIM=1                   # typecheck the same feature selection
 ```
 
-Default builds retain voice, embedded shell, native desktop control and AWS support.
-Slim builds omit these optional integrations, retaining the external shell, browser,
-coding tools and non-AWS model providers. Bedrock bearer-token authentication remains
+Default builds retain voice, embedded shell, embedded JavaScript, the heavy `read` decoders
+(`data-formats`: Parquet/Arrow, RAR, executables and object files), native desktop control and
+AWS support. Slim builds omit these optional integrations, retaining the external shell, browser,
+coding tools, the other document readers and non-AWS model providers. Without `data-formats`
+(parquet and arrow alone are roughly 120 MB of build output) a slim build compiles noticeably
+less and keeps a smaller cache. Bedrock bearer-token authentication remains
 available; AWS credential-chain/SigV4 authentication requires `FEATURES=aws`. Native
-desktop operations require `FEATURES=desktop`; the `voice` and `embedded-shell` features
-can also be restored individually. Use a quoted, comma-separated list for several,
+desktop operations require `FEATURES=desktop`; the `voice`, `embedded-shell`, `embedded-js` and
+`data-formats` features can also be restored individually. Use a quoted, comma-separated list for several,
 for example `FEATURES='aws,desktop'`. Missing optional capabilities report an explicit
 error rather than silently succeeding. Select the same flags on subsequent updates.
 Native-only desktop helpers are compiled only with a supported desktop backend (or
 their unit tests), so slim builds do not produce unused-native-code warnings.
 
-Builds automatically write Cargo's timing report to
-`target/cargo-timings/cargo-timing.html`. Keep `target` between builds: the first build
+`make build TIMINGS=1` (or `make update TIMINGS=1`) also writes Cargo's timing report to
+`target/cargo-timings/cargo-timing.html`; it is off by default so routine builds do not
+accumulate reports. Keep `target` between builds: the first build
 of a profile or feature selection compiles its dependencies, and switching toolchains
 or features can invalidate cached work. `CARGO_TARGET_DIR=/path/to/cache make update`
 uses that persistent cache for both compilation and installation; its timing report
 is under that directory instead. No clean step or toolchain update is part of `make update`.
+
+Reducing build storage and rebuild time:
+
+- `make clean` removes build output from this checkout: `target/` (or `CARGO_TARGET_DIR`), the
+  per-session `.tmp/cargo-target/<session>` directories and preflight's `.tmp/preflight/target`.
+  A directory a running Cargo build or a live Dial session still uses is skipped and reported, so
+  it is safe to run while other sessions are open; run it again once they finish. It never touches
+  sources, git worktrees, installed binaries or `~/.cargo/registry`. `make clean DRY_RUN=1` lists
+  what would be removed and its size. The next build after a clean recompiles every dependency.
+- Each build profile keeps its own full dependency cache. `make test` uses `dev` and `make build`
+  uses `local`, so a typical checkout holds two. `make test-rust TEST_PROFILE=ci` reuses CI's
+  smaller profile (no debug info, no incremental cache) at the cost of panic line numbers and
+  incremental test rebuilds.
+- Commands Dial runs build into a per-session `.tmp/cargo-target/<session>` directory (see
+  [shell](shell.md#per-session-cargo-build-output)), so concurrent sessions each hold a copy of
+  compiled dependencies. If you rarely run sessions in parallel, start Dial with an explicit
+  `CARGO_TARGET_DIR` to share one cache; alternatively install a compiler cache such as
+  [sccache](https://github.com/mozilla/sccache) and set `RUSTC_WRAPPER=sccache` so separate
+  target directories and worktrees reuse compiled dependencies.
+- Cargo's download cache (`~/.cargo/registry`) grows with every dependency version ever
+  fetched; a tool such as `cargo cache --autoclean` (from the `cargo-cache` crate) trims it.
+
 For a compile-only, unoptimized development binary, use `make build PROFILE=dev`.
 
 For local MLX you can also prepare the runtime and model explicitly:

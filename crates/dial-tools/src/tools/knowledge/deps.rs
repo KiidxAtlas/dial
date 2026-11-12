@@ -1,12 +1,14 @@
 //! The `dep_source` tool: read-only source of a dependency at the version this workspace locked or
 //! installed (Cargo.lock + the cargo registry, node_modules, the project's virtualenv, go.mod + the
-//! module cache or `vendor/`). It never fetches, builds or runs package code.
+//! module cache or `vendor/`, Gradle/Maven `-sources.jar` files, installed Ruby gems, Composer's
+//! `vendor/` and the NuGet global packages folder). It never fetches, builds or runs package code.
 //!
 //! Read authority. A package inside a workspace root follows the workspace's protected paths. A
-//! package in a shared cache outside every root (cargo registry, Go module cache) is read where
-//! the shell sandbox would let `bash` read it as well (the Dev policy), and under the strict
-//! policy too when it lies in one of the resolved dependency caches (`CARGO_HOME/registry/src`,
-//! `CARGO_HOME/git/checkouts`, the Go module cache): a read-only grant for this tool alone. Every
+//! package in a shared cache outside every root (cargo registry, Go module cache, local Maven
+//! repository, Gradle module cache, gem directories, NuGet packages) is read where the shell
+//! sandbox would let `bash` read it as well (the Dev policy), and under the strict policy too
+//! when it lies in one of the resolved dependency caches (see [`Caches::contain`]): a read-only
+//! grant for this tool alone. Every
 //! denied (credential or Dial state) path still wins. Other paths stay unreadable under the
 //! strict policy unless the user attaches them with `/add-dir`. Every read stays inside the
 //! resolved package root, which in turn must lie inside the cache or install directory it was
@@ -24,12 +26,17 @@ use std::sync::Arc;
 
 const DESCRIPTION: &str = "Read-only source of a dependency at the version this workspace locked or installed: \
 cargo (Cargo.lock + cargo registry), npm (node_modules), python (project .venv site-packages), go (go.mod + \
-module cache or vendor/). Never fetches or runs package code. `name`: crate/package/module (`name@version` picks \
-one of several locked versions); `ecosystem` is inferred from workspace manifests when omitted. Without `query` \
-or `path` it reports version, root and top-level files. `query`: literal text searched in the package (path:line \
-results). `path`: package-relative file (optional `:N-M` line range) or directory to list; may combine with `query`.";
+module cache or vendor/), jvm (gradle.lockfile/pom.xml + -sources.jar in ~/.m2 or the Gradle cache; name is \
+group:artifact), ruby (Gemfile.lock + installed gems), composer (composer.lock + vendor/), nuget \
+(packages.lock.json or obj/project.assets.json + NuGet packages folder). Never fetches or runs package code. \
+`name`: crate/package/module (`name@version` picks one of several locked versions); `ecosystem` is inferred \
+from workspace manifests when omitted. Without `query` or `path` it reports version, root and top-level files. \
+`query`: literal text searched in the package (path:line results). `path`: package-relative file (optional \
+`:N-M` line range) or directory to list; may combine with `query`.";
 
-const ECOSYSTEMS: &[&str] = &["cargo", "npm", "python", "go"];
+const ECOSYSTEMS: &[&str] = &[
+    "cargo", "npm", "python", "go", "jvm", "ruby", "composer", "nuget",
+];
 /// Lines of a file excerpt when no range is given, and the most one call returns.
 const EXCERPT_LINES: usize = 200;
 const MAX_EXCERPT_LINES: usize = 400;
@@ -60,7 +67,7 @@ impl Tool for DepSource {
             "dep_source",
             DESCRIPTION,
             json!({
-                "name": {"type": "string", "description": "crate, package or module name; optional @version"},
+                "name": {"type": "string", "description": "crate, package or module name (jvm: group:artifact); optional @version"},
                 "ecosystem": {"type": "string", "enum": ECOSYSTEMS},
                 "query": {"type": "string", "description": "literal text to find in the package source"},
                 "path": {"type": "string", "description": "package-relative file or directory; files accept :N-M"},
@@ -106,6 +113,10 @@ enum Ecosystem {
     Npm,
     Python,
     Go,
+    Jvm,
+    Ruby,
+    Composer,
+    NuGet,
 }
 
 impl Ecosystem {
@@ -115,6 +126,10 @@ impl Ecosystem {
             "npm" | "node" => Ok(Self::Npm),
             "python" | "pip" | "uv" => Ok(Self::Python),
             "go" => Ok(Self::Go),
+            "jvm" | "maven" | "gradle" | "java" | "kotlin" => Ok(Self::Jvm),
+            "ruby" | "gem" | "rubygems" | "bundler" => Ok(Self::Ruby),
+            "composer" | "php" => Ok(Self::Composer),
+            "nuget" | "dotnet" => Ok(Self::NuGet),
             _ => Err(format!(
                 "unknown ecosystem {name:?}; use one of: {}",
                 ECOSYSTEMS.join(", ")
@@ -128,6 +143,10 @@ impl Ecosystem {
             Self::Npm => "npm",
             Self::Python => "python",
             Self::Go => "go",
+            Self::Jvm => "jvm",
+            Self::Ruby => "ruby",
+            Self::Composer => "composer",
+            Self::NuGet => "nuget",
         }
     }
 
@@ -154,6 +173,27 @@ impl Ecosystem {
         if any(&["go.mod"]) {
             found.push(Self::Go);
         }
+        if any(&[
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "gradle.lockfile",
+        ]) {
+            found.push(Self::Jvm);
+        }
+        if any(&["Gemfile", "Gemfile.lock", "gems.rb", "gems.locked"]) {
+            found.push(Self::Ruby);
+        }
+        if any(&["composer.json", "composer.lock"]) {
+            found.push(Self::Composer);
+        }
+        if any(&["packages.lock.json", "Directory.Packages.props", "obj"])
+            || nuget::has_project(root)
+        {
+            found.push(Self::NuGet);
+        }
         found
     }
 }
@@ -163,6 +203,15 @@ impl Ecosystem {
 pub(crate) struct Caches {
     pub cargo_home: Option<PathBuf>,
     pub go_mod_cache: Option<PathBuf>,
+    /// The local Maven repository (`~/.m2/repository`).
+    pub maven_repo: Option<PathBuf>,
+    /// The Gradle user home (`GRADLE_USER_HOME`, else `~/.gradle`).
+    pub gradle_home: Option<PathBuf>,
+    /// Gem installation directories, each holding a `gems/` directory (`GEM_HOME`, `GEM_PATH`,
+    /// user and version-manager installs).
+    pub gem_paths: Vec<PathBuf>,
+    /// The NuGet global packages folder (`NUGET_PACKAGES`, else `~/.nuget/packages`).
+    pub nuget_packages: Option<PathBuf>,
 }
 
 impl Caches {
@@ -172,13 +221,32 @@ impl Caches {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         };
-        let home = env("HOME");
+        let home = env("HOME").or_else(|| env("USERPROFILE"));
         let gopath = env("GOPATH")
             .and_then(|paths| std::env::split_paths(&paths).next())
             .or_else(|| home.as_ref().map(|home| home.join("go")));
+        let mut gem_paths: Vec<PathBuf> = env("GEM_HOME").into_iter().collect();
+        if let Some(paths) = std::env::var_os("GEM_PATH") {
+            gem_paths
+                .extend(std::env::split_paths(&paths).filter(|path| !path.as_os_str().is_empty()));
+        }
+        if let Some(home) = &home {
+            gem_paths.extend(subdirs(&home.join(".gem/ruby")));
+            gem_paths.extend(subdirs(&home.join(".local/share/gem/ruby")));
+            for version in subdirs(&home.join(".rbenv/versions")) {
+                gem_paths.extend(subdirs(&version.join("lib/ruby/gems")));
+            }
+        }
+        gem_paths.dedup();
         Self {
             cargo_home: env("CARGO_HOME").or_else(|| home.as_ref().map(|home| home.join(".cargo"))),
             go_mod_cache: env("GOMODCACHE").or_else(|| gopath.map(|path| path.join("pkg/mod"))),
+            maven_repo: home.as_ref().map(|home| home.join(".m2/repository")),
+            gradle_home: env("GRADLE_USER_HOME")
+                .or_else(|| home.as_ref().map(|home| home.join(".gradle"))),
+            gem_paths,
+            nuget_packages: env("NUGET_PACKAGES")
+                .or_else(|| home.as_ref().map(|home| home.join(".nuget/packages"))),
         }
     }
 
@@ -188,8 +256,20 @@ impl Caches {
             .cargo_home
             .iter()
             .flat_map(|home| [home.join("registry/src"), home.join("git/checkouts")]);
+        let gradle = self
+            .gradle_home
+            .iter()
+            .map(|home| home.join(jvm::GRADLE_FILES));
+        let gems = self
+            .gem_paths
+            .iter()
+            .flat_map(|path| [path.join("gems"), path.join("bundler/gems")]);
         cargo
             .chain(self.go_mod_cache.iter().cloned())
+            .chain(self.maven_repo.iter().cloned())
+            .chain(gradle)
+            .chain(gems)
+            .chain(self.nuget_packages.iter().cloned())
             .filter_map(|cache| cache.canonicalize().ok())
             .any(|cache| base.starts_with(cache))
     }
@@ -238,6 +318,18 @@ pub(crate) fn run(ws: &Workspace, args: &Value, caches: &Caches) -> Result<Strin
     if !package.others.is_empty() {
         let _ = writeln!(out, "other locked versions: {}", package.others.join(", "));
     }
+    if package.ecosystem == Ecosystem::Jvm {
+        // A JVM package is its `-sources.jar`, read in place.
+        let (inner, range) = match path {
+            Some(path) => {
+                let (path, range) = split_range(path)?;
+                (Some(path), range)
+            }
+            None => (None, None),
+        };
+        jvm::browse(&root, inner, range, query, &mut out)?;
+        return Ok(out);
+    }
     let (target, range) = match path {
         Some(path) => {
             let (path, range) = split_range(path)?;
@@ -262,7 +354,8 @@ fn split_version(name: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Package names become path components, so only plain names (and one npm scope) are accepted.
+/// Package names become path components, so only plain names (one npm scope, slash-separated
+/// Go/Composer paths, or one JVM `group:artifact`) are accepted.
 fn validate_name(name: &str) -> Result<(), String> {
     let plain = |part: &str| {
         !part.is_empty()
@@ -272,12 +365,16 @@ fn validate_name(name: &str) -> Result<(), String> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+'))
     };
-    let ok = match name.strip_prefix('@') {
-        Some(scoped) => scoped
+    let ok = if let Some(scoped) = name.strip_prefix('@') {
+        scoped
             .split_once('/')
-            .is_some_and(|(scope, rest)| plain(scope) && plain(rest)),
+            .is_some_and(|(scope, rest)| plain(scope) && plain(rest))
+    } else if let Some((group, artifact)) = name.split_once(':') {
+        // JVM coordinates: the group's dot segments become directories.
+        plain(artifact) && plain(group) && group.split('.').all(plain)
+    } else {
         // Go module paths have several segments; none may be empty or a dot segment.
-        None => name.split('/').all(plain),
+        name.split('/').all(plain)
     };
     if ok {
         Ok(())
@@ -292,10 +389,14 @@ fn infer(
     wanted: Option<&str>,
     caches: &Caches,
 ) -> Result<Package, String> {
+    // `group:artifact` names only exist on the JVM.
+    if name.contains(':') {
+        return resolve(root, Ecosystem::Jvm, name, wanted, caches);
+    }
     let present = Ecosystem::present(root);
     if present.is_empty() {
         return Err(
-            "no Cargo.lock, package.json, Python project or go.mod in the workspace root; pass `ecosystem`"
+            "no Cargo, npm, Python, Go, Gradle/Maven, Ruby, Composer or .NET project in the workspace root; pass `ecosystem`"
                 .into(),
         );
     }
@@ -316,11 +417,21 @@ fn resolve(
     wanted: Option<&str>,
     caches: &Caches,
 ) -> Result<Package, String> {
+    if name.contains(':') && ecosystem != Ecosystem::Jvm {
+        return Err(format!(
+            "{name:?} is a JVM group:artifact name; {} packages have no `:`",
+            ecosystem.label()
+        ));
+    }
     match ecosystem {
         Ecosystem::Cargo => cargo(root, name, wanted, caches),
         Ecosystem::Npm => npm(root, name, wanted),
         Ecosystem::Python => python(root, name, wanted),
         Ecosystem::Go => go(root, name, wanted, caches),
+        Ecosystem::Jvm => jvm::resolve(root, name, wanted, caches),
+        Ecosystem::Ruby => ruby::resolve(root, name, wanted, caches),
+        Ecosystem::Composer => composer::resolve(root, name, wanted),
+        Ecosystem::NuGet => nuget::resolve(root, name, wanted, caches),
     }
 }
 
@@ -960,6 +1071,16 @@ fn excerpt(
     let rel = relative(root, file);
     let text = text_of(file, MAX_READ_FILE)
         .ok_or_else(|| format!("{rel} is binary, not a regular file, or larger than 8 MiB"))?;
+    excerpt_text(&rel, &text, range, out)
+}
+
+/// Numbered lines of `text` (shown as `rel`) within `range`, with a footer naming the next range.
+fn excerpt_text(
+    rel: &str,
+    text: &str,
+    range: Option<LineRange>,
+    out: &mut String,
+) -> Result<(), String> {
     let lines: Vec<&str> = text.lines().collect();
     let (start, end) = range.unwrap_or((1, EXCERPT_LINES));
     let end = end.min(start + MAX_EXCERPT_LINES - 1).min(lines.len());
@@ -1000,52 +1121,82 @@ fn search(root: &Path, start: &Path, query: &str, out: &mut String) {
                     .to_str()
                     .is_some_and(|name| SKIPPED_DIRS.contains(&name))
         });
-    let (mut scanned, mut matches, mut capped) = (0usize, 0usize, false);
+    let mut tally = SearchTally::default();
     for entry in walker.build().flatten() {
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
-        scanned += 1;
-        if scanned > MAX_SCANNED_FILES {
-            capped = true;
+        if !tally.admit_file() {
             break;
         }
         let Some(text) = text_of(entry.path(), MAX_SEARCH_FILE) else {
             continue;
         };
-        let rel = relative(root, entry.path());
+        if tally.lines(&relative(root, entry.path()), &text, query, out) {
+            break;
+        }
+    }
+    tally.finish(query, out);
+}
+
+/// Running counts of one package search, shared by directory and jar searches.
+#[derive(Default)]
+struct SearchTally {
+    scanned: usize,
+    matches: usize,
+    capped: bool,
+}
+
+impl SearchTally {
+    /// Counts one more file; false once the scan limit is reached.
+    fn admit_file(&mut self) -> bool {
+        self.scanned += 1;
+        if self.scanned > MAX_SCANNED_FILES {
+            self.capped = true;
+        }
+        !self.capped
+    }
+
+    /// Writes the lines of `text` containing `query`; true once the match or output cap is hit.
+    fn lines(&mut self, rel: &str, text: &str, query: &str, out: &mut String) -> bool {
         for (number, line) in text.lines().enumerate() {
             if !line.contains(query) {
                 continue;
             }
-            matches += 1;
-            if matches > MAX_MATCHES || out.len() > MAX_OUTPUT {
-                capped = true;
-                break;
+            self.matches += 1;
+            if self.matches > MAX_MATCHES || out.len() > MAX_OUTPUT {
+                self.capped = true;
+                return true;
             }
             let _ = writeln!(out, "{rel}:{}: {}", number + 1, clip(line.trim()));
         }
-        if capped {
-            break;
-        }
+        false
     }
-    match (matches, capped) {
-        (0, _) => {
-            let _ = writeln!(
-                out,
-                "no matches for {query:?} in {} files",
-                scanned.min(MAX_SCANNED_FILES)
-            );
+
+    fn finish(&self, query: &str, out: &mut String) {
+        match (self.matches, self.capped) {
+            (0, _) => {
+                let _ = writeln!(
+                    out,
+                    "no matches for {query:?} in {} files",
+                    self.scanned.min(MAX_SCANNED_FILES)
+                );
+            }
+            (_, true) => {
+                let _ = writeln!(
+                    out,
+                    "[first {MAX_MATCHES} matches or output limit; narrow `query` or `path`]"
+                );
+            }
+            _ => {}
         }
-        (_, true) => {
-            let _ = writeln!(
-                out,
-                "[first {MAX_MATCHES} matches or output limit; narrow `query` or `path`]"
-            );
-        }
-        _ => {}
     }
 }
+
+mod composer;
+mod jvm;
+mod nuget;
+mod ruby;
 
 #[cfg(all(test, unix))]
 mod tests;

@@ -46,7 +46,12 @@ model selector and Option+M remains available; bind `Ctrl+K` yourself if you pre
 `Fn` unless "Use F1, F2, etc. keys as standard function keys" is on. On Windows, Windows Terminal
 keeps `Alt+Enter` (fullscreen), `Ctrl+V` (its text paste) and `Ctrl+,` (its settings), so use `Ctrl+Q`,
 `Alt+V` and `Ctrl+4` there; `Ctrl+G` opens the draft through `pwsh`, falling back to Windows PowerShell.
-Panel keys (`F2`–`F8` in `/models`) are panel-local; in the HTTP header editor `Ctrl+O` adds a row
+Panel keys (such as `Shift+F2` and `Shift+F3` in `/models`) are panel-local. A panel never gives a global
+function key a second meaning: the settings Appearance preview answers `Shift+F4` and the model
+tuner `Shift+F7`, and the plain key works there only after you rebind provider setup or the latest
+worker shortcut away from it; hints always show the key that works. Panel footers show at most four
+keys (the main action, search, `F1 keys` and the way out); `F1` (or `?` where typing does not
+search) opens the full key sheet. In the HTTP header editor `Ctrl+O` adds a row
 (`Ctrl+P`/`Ctrl+N` move between rows) and `Ctrl+S` saves, since
 GNOME Terminal takes `F10`. A key you bind to an editing action is not shadowed by an application
 default on the same key. `/model` works on every platform, and the footer and `/hotkeys` show your

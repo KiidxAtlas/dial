@@ -198,6 +198,8 @@ struct State {
     runs: HashMap<u64, Run>,
     next_id: u64,
     next_gen: u64,
+    /// Exit status of the last worker that exited on its own, for start-failure messages.
+    last_exit: Option<i32>,
 }
 
 struct Inner {
@@ -277,6 +279,7 @@ impl ComputerSupervisor {
                     runs: HashMap::new(),
                     next_id: 0,
                     next_gen: 0,
+                    last_exit: None,
                 }),
                 gate: Mutex::new(false),
                 gate_wake: Condvar::new(),
@@ -552,6 +555,9 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> Comput
 
     let script = worker_script()
         .map_err(|e| ComputerError::tool(format!("Failed to write computer worker script: {e}")))?;
+    // A Node install that cannot load (a broken or wrong-architecture node.exe or DLL) would
+    // otherwise stop at a Windows popup; this turns it into an exit status reported below.
+    crate::platform::process::quiet_error_dialogs();
     let mut command = Command::new("node");
     command
         .arg(&*script)
@@ -561,12 +567,14 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> Comput
                 crate::tools::exec::sandbox::child_env_allowed(name, value)
             }),
         )
+        // The same Windows system variables the browser launch keeps; empty elsewhere.
+        .envs(crate::tools::exec::sandbox::windows_system_env())
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = crate::platform::process::spawn_group(&mut command)
-        .map_err(|e| ComputerError::tool(format!("Failed to start computer worker: {e}")))?;
+        .map_err(|e| ComputerError::tool(launch_failure(&e)))?;
     let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
@@ -608,6 +616,7 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> Comput
         }
         st.next_gen += 1;
         let generation = st.next_gen;
+        st.last_exit = None;
         st.worker = Some(Worker {
             generation,
             child,
@@ -637,12 +646,66 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> Comput
             }
             Ok(())
         }
-        Err(error) if error.message == WORKER_EXITED => Err(ComputerError::tool(format!(
-            "{WORKER_EXITED} before ready: {}",
-            tail.lock().trim()
-        ))),
+        Err(error) if error.message == WORKER_EXITED => {
+            let code = inner.state.lock().last_exit.take();
+            Err(ComputerError::tool(start_failure(code, tail.lock().trim())))
+        }
         Err(error) => Err(error),
     }
+}
+
+const NODE_HINT: &str = "Computer use runs on Node.js: check that `node --version` works in a new terminal, and if it does not, install the current Node.js LTS for this computer's CPU from https://nodejs.org, then restart Dial.";
+
+/// Why `node` could not be launched at all.
+fn launch_failure(error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!("Failed to start computer worker: `node` was not found on PATH. {NODE_HINT}")
+    } else {
+        format!("Failed to start computer worker: {error}. {NODE_HINT}")
+    }
+}
+
+/// Why the worker exited before it was ready. `code` is its exit status when known; Windows
+/// loader failures (NTSTATUS values) are named, since they otherwise show only as a number.
+fn start_failure(code: Option<i32>, stderr: &str) -> String {
+    let status = code.map(|code| {
+        let reason = match code as u32 {
+            0xC000_0142 => Some("a DLL failed to initialize while Node started"),
+            0xC000_007B => Some(
+                "node.exe or a DLL it loads is damaged or built for a different CPU architecture",
+            ),
+            0xC000_0135 => Some("a DLL that node.exe needs is missing"),
+            0xC000_0139 => Some("node.exe and one of its DLLs do not match"),
+            _ => None,
+        };
+        match reason {
+            Some(reason) => format!(" (exit {:#010X}: {reason})", code as u32),
+            None if code as u32 >= 0xC000_0000 => format!(" (exit {:#010X})", code as u32),
+            None => format!(" (exit {code})"),
+        }
+    });
+    let mut message = format!(
+        "{WORKER_EXITED} before ready{}. {NODE_HINT}",
+        status.unwrap_or_default()
+    );
+    if !stderr.is_empty() {
+        message.push_str(" Worker output: ");
+        message.push_str(stderr);
+    }
+    message
+}
+
+/// The exit code of a worker whose output already closed. It is exiting, so wait briefly for
+/// the status rather than report none.
+fn exited_code(child: &mut Child) -> Option<i32> {
+    for _ in 0..25 {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 fn spawn_stderr(mut stderr: ChildStderr, tail: Arc<Mutex<String>>, stopped: AbortSignal) {
@@ -1249,7 +1312,12 @@ fn terminate_inner(inner: &Arc<Inner>, error: ComputerError, only_gen: Option<u6
     if let Some(session) = session {
         session.cancel_for(CancelReason::WorkerTerminated);
     }
-    if let Some(worker) = worker {
+    if let Some(mut worker) = worker {
+        if error.message == WORKER_EXITED
+            && let Some(code) = exited_code(&mut worker.child)
+        {
+            inner.state.lock().last_exit = Some(code);
+        }
         worker.stop();
     }
 }

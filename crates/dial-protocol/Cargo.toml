@@ -1,0 +1,17 @@
+[package]
+name = "dial-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire vocabulary of Dial's `dial rpc` control protocol, shared by the engine and clients"
+publish = false
+
+# No dependencies: this crate is plain data (method table, versions, error codes, event names) so
+# both the engine and any frontend can link it without pulling in engine internals.
+[dependencies]
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

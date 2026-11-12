@@ -59,6 +59,9 @@ integrations! {
     ("security_scan", false, false),
     ("computer", false, false),
     ("glab_mr", false, false),
+    ("gitea_pr", false, false),
+    // Live read-only database queries; every call needs approval.
+    ("db_query", false, false),
     // Read-only local MLX weight and activation inspection; approval-gated.
     ("model_weights", false, false),
     ("ida", false, false),

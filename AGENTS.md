@@ -8,7 +8,8 @@ is the authority for crate layers, module ownership and invariants; read it befo
 One Cargo workspace. The root package `dial` holds the binary, a facade library re-exporting every
 crate, and the integration tests (`tests/integration`). Crates under `crates/` are layered
 `dial-build-info` → `dial-core` → `dial-llm` → `dial-storage` → `dial-tools` → `dial-computer` →
-`dial-agent` → `dial-ui` → `dial-app`; a crate may depend only on lower layers.
+`dial-agent` → `dial-ui` → `dial-app`; a crate may depend only on lower layers. `dial-client`
+is the separate Rust client for `dial rpc` and depends on no other workspace crate.
 `tests/integration/architecture.rs` enforces the layering and module rules.
 
 ## Repository rules and checks
@@ -37,7 +38,7 @@ review convention backed by owning deserialization/validation tests, not a unive
 cargo fmt --check
 cargo build --locked --workspace --all-targets
 make lint                      # clippy with the CI gate
-make test-module MOD=llm::retry  # fast loop for one module (searches every crate)
+make test-module MOD=llm::retry  # fast loop for one module (searches every crate; CRATE=dial-llm builds only that crate)
 make test-integration          # integration test binary
 make test-rust                 # whole workspace
 make test-nextest              # same suite under cargo-nextest, if installed (.config/nextest.toml)
@@ -56,6 +57,11 @@ optional tiers (`make test-mlx`, `make test-smoke`); never present a skipped tie
 
 - Reuse existing owners and helpers; do not add a parallel pipeline for an existing concern.
 - Keep changes focused. Preserve unrelated uncommitted work in the checkout.
+- Keep the engine frontend-neutral. A feature's behaviour and validation live in its engine owner,
+  not in a terminal handler; the TUI calls that owner. When other clients need it, expose it through
+  `dial rpc` (with a `docs/rpc-schema.json` entry and a coded refusal) rather than through terminal
+  output. Event payloads keep structured fields (ids, phases, outcomes, paths) next to readable
+  text. See "Frontend boundary" in `ARCHITECTURE.md`.
 - Update the matching `docs/*.md` page for user-visible behaviour, and add an entry under
   `## [Unreleased]` in `CHANGELOG.md`.
 - Never weaken a valid check, suppress a warning, or leave stubs to get a green run.

@@ -128,6 +128,29 @@ pub fn ellipsize(text: &str, max: usize, ascii: bool) -> String {
     format!("{}{mark}", clip(text, room))
 }
 
+/// [`ellipsize`] that prefers to cut between words: the mark follows the last whole word that
+/// fits, unless that would leave less than half the row, where a grapheme cut reads better.
+/// `force` marks text that continues elsewhere even though this row fits (a hidden second row).
+pub fn ellipsize_words(text: &str, max: usize, ascii: bool, force: bool) -> String {
+    if !force && width(text) <= max {
+        return text.to_owned();
+    }
+    let mark = if ascii { "..." } else { "…" };
+    if max < width(mark) {
+        return clip(mark, max);
+    }
+    let room = max - width(mark);
+    let clipped = clip(text, room);
+    // Whole when the clip ended at a word end: the text continues with a space or not at all.
+    let whole = text[clipped.len()..].starts_with(' ') || clipped.len() == text.len();
+    let kept = match clipped.rfind(' ') {
+        _ if whole => clipped.as_str(),
+        Some(at) if width(&clipped[..at]) * 2 >= room => &clipped[..at],
+        _ => clipped.as_str(),
+    };
+    format!("{}{mark}", kept.trim_end())
+}
+
 /// Keep the end of `text` within `max` cells, starting with `…` (or `...` when `ascii`) if anything
 /// was cut. For paths, where the tail is what identifies the thing.
 pub fn ellipsize_start(text: &str, max: usize, ascii: bool) -> String {

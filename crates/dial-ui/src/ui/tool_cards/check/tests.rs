@@ -206,3 +206,28 @@ fn rows_never_exceed_the_width() {
         }
     });
 }
+
+#[test]
+fn failing_tests_show_why_and_where_under_their_names() {
+    let output = "running 2 tests\ntest ui::a ... FAILED\ntest ui::b ... FAILED\n\nfailures:\n---- ui::a stdout ----\n\nthread 'ui::a' (77) panicked at src/a.rs:12:5:\nassertion `left == right` failed\n  left: 1\n right: 2\nnote: run with `RUST_BACKTRACE=1`\n\ntest result: FAILED. 0 passed; 2 failed; 0 ignored\n[exit code: 101]";
+    ctx_with(false, |ctx| {
+        let rows = rendered(&check_card(&run("cargo test", output, true), 100, ctx).unwrap());
+        let at = rows
+            .iter()
+            .position(|r| r.contains("x ui::a"))
+            .expect("test row");
+        assert!(
+            rows[at + 1].contains("assertion `left == right` failed - src/a.rs:12:5"),
+            "{rows:?}"
+        );
+        // A test whose output names no reason keeps only its name.
+        assert!(rows[at + 2].contains("ui::b"), "{rows:?}");
+    });
+    assert_eq!(
+        failure_reason(
+            "FAILED tests/t.py::test_x - AssertionError: 1 != 2",
+            "test_x"
+        ),
+        Some(("AssertionError: 1 != 2".to_owned(), None))
+    );
+}

@@ -24,7 +24,7 @@ const MAX_SESSION_LEN: usize = 128;
 /// Records when Dial last exported the directory for a command.
 const USED_MARKER: &str = ".dial-last-used";
 /// Session target directories unused for this long are removed.
-pub const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const STALE_AFTER: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// Another session's directory unused for this long, with no Cargo build holding it, may be
 /// taken over by a new session.
 pub const ADOPT_AFTER: Duration = Duration::from_secs(30 * 60);

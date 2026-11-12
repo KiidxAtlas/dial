@@ -24,8 +24,9 @@ impl<'a> Agent<'a> {
     /// Initial built-in schemas stay below this bound on lean and local model routes.
     const CORE_SCHEMA_BYTES: usize = 12 * 1024;
     /// Hosted routes ([`Self::hosted_route`]) have room for delegation and job control up front.
-    /// Raised from 24 KiB when `bash.trace` left the core offer without headroom for `task`.
-    const HOSTED_CORE_SCHEMA_BYTES: usize = 25 * 1024;
+    /// Raised from 24 KiB when `bash.trace` left the core offer without headroom for `task`, and
+    /// from 25 KiB when write batches/artifact sources, `bg` watches and read selectors grew.
+    const HOSTED_CORE_SCHEMA_BYTES: usize = 27 * 1024;
     /// The stable first-request offer, in priority order: each tool joins while it fits the route's
     /// budget. `bg` is the only way to wait for or stop a command that became a background job.
     /// Basic workspace operations precede questions, which precede optional execution helpers.
@@ -1199,12 +1200,12 @@ impl<'a> Agent<'a> {
             if self.tool_discovery() && !self.hosted_route() {
                 let description = match name.as_str() {
                     "write" => Some(
-                        "Write complete UTF-8 source to a workspace path; guarded syntax and normal approvals apply.".to_owned(),
+                        "Write complete files using path + content/source, or files for a local UTF-8 batch (1 MiB/file, 8 MiB total). Existing files must be read first; use edit for small changes. Artifact sources require SHA-256. Optional destination preconditions, idempotent retries and compact receipts; normal approvals apply.".to_owned(),
                     ),
                     "bash" => Some(format!(
                         "Run a shell command in the project root; set relative `cwd` instead of prefixing `cd`. {} Normal approvals apply; inspect exit status. A foreground command returns when it finishes or reaches `timeout` (seconds); `background: true` starts a server, watcher or long job as a `bg` job.",
                         if cfg!(windows) {
-                            "Windows `dev` sandbox runs commands at Low integrity: writes confined to the project; `strict` is unavailable."
+                            "Windows `dev` sandbox runs commands at Low integrity (writes confined to the project); `strict` or no-network policies use an AppContainer (reads confined, no network, no loopback)."
                         } else {
                             "May be sandboxed: writes confined to the project, network possibly blocked, temp files in `$TMPDIR`."
                         }

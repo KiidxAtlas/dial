@@ -4,7 +4,7 @@ import argparse
 import itertools
 import json
 
-FEATURES = ("aws", "voice", "embedded-shell", "embedded-js", "desktop", "wayland-pipewire")
+FEATURES = ("aws", "voice", "embedded-shell", "embedded-js", "data-formats", "desktop", "wayland-pipewire")
 
 
 def matrix(exhaustive=False):

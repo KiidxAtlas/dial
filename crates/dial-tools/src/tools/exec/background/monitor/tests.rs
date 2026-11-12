@@ -391,6 +391,40 @@ fn timer_fires_once_when_due_and_echoes_its_note() {
 }
 
 #[test]
+fn start_without_a_name_derives_a_unique_one_from_the_source() {
+    let (dir, ws) = workspace();
+    stdfs::write(dir.path().join("server.log"), "").unwrap();
+    let monitor = Monitor::new(None);
+    for (args, expected) in [
+        (json!({"action":"start","after_secs":60}), "\"timer\""),
+        (json!({"action":"start","after_secs":30}), "\"timer-2\""),
+        (
+            json!({"action":"start","path":"server.log"}),
+            "\"server.log\"",
+        ),
+    ] {
+        let out = call(&monitor, &ws, args);
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains(expected), "{}", out.text);
+        assert!(
+            out.text.contains("Name assigned automatically"),
+            "{}",
+            out.text
+        );
+    }
+    let out = call(&monitor, &ws, json!({"action":"stop","name":"timer-2"}));
+    assert!(!out.is_error, "{}", out.text);
+    assert!(
+        call(
+            &monitor,
+            &ws,
+            json!({"action":"start","name":"bad name","after_secs":5})
+        )
+        .is_error
+    );
+}
+
+#[test]
 fn timer_and_on_exit_arguments_are_validated_before_arming() {
     let (dir, ws) = workspace();
     stdfs::write(dir.path().join("server.log"), "").unwrap();
@@ -559,10 +593,134 @@ fn named_run_and_wake_options_are_additive_for_settled_monitor_history() {
     let properties = old["function"]["parameters"]["properties"]
         .as_object_mut()
         .unwrap();
-    for property in ["run", "after_secs", "on_exit", "note"] {
+    for property in ["run", "after_secs", "on_exit", "note", "pid", "save"] {
         assert!(properties.remove(property).is_some(), "{property}");
     }
     let identity = identities(&[old], &registry)["monitor"].clone();
     let history = vec![json!({"role":"assistant", "dial_tool_contracts":{"call":identity}})];
     validate_history(&history, &[current], &registry).unwrap();
+}
+
+#[test]
+fn pid_and_saved_watch_options_are_additive_for_settled_monitor_history() {
+    use crate::tools::integrations::ext::Registry;
+    use crate::tools::surface::contracts::{identities, validate_history};
+    let registry = Registry::new();
+    let current = Monitor::new(None).schema();
+    let mut old = current.clone();
+    let parameters = &mut old["function"]["parameters"]["properties"];
+    for property in ["pid", "save"] {
+        assert!(
+            parameters
+                .as_object_mut()
+                .unwrap()
+                .remove(property)
+                .is_some(),
+            "{property}"
+        );
+    }
+    parameters["action"]["enum"] = json!(["start", "list", "stop"]);
+    let identity = identities(&[old], &registry)["monitor"].clone();
+    let history = vec![json!({"role":"assistant", "dial_tool_contracts":{"call":identity}})];
+    validate_history(&history, &[current], &registry).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn pid_watch_reports_exit_once_and_refuses_patterns_and_saving() {
+    let (_dir, ws) = workspace();
+    let monitor = Monitor::new(None);
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    for bad in [
+        json!({"action":"start", "pid": pid, "pattern":"x"}),
+        json!({"action":"start", "pid": pid, "save": true}),
+        json!({"action":"start", "pid": 1}),
+        json!({"action":"start", "pid": std::process::id()}),
+        json!({"action":"start", "pid": pid, "path":"x.log"}),
+    ] {
+        let out = call(&monitor, &ws, bad.clone());
+        assert!(out.is_error, "{bad}: {}", out.text);
+    }
+    let out = call(&monitor, &ws, json!({"action":"start", "pid": pid}));
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains(&format!("pid-{pid}")), "{}", out.text);
+    assert!(out.text.contains("sleep"), "{}", out.text);
+    assert!(monitor.poll_monitors().is_empty());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let events = monitor.poll_monitors();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].contains("process exited"), "{}", events[0]);
+    assert!(!monitor.has_monitors());
+    let missing = call(&monitor, &ws, json!({"action":"start", "pid": pid}));
+    assert!(missing.is_error, "{}", missing.text);
+}
+
+#[test]
+fn saved_watches_round_trip_and_restore_rearms_from_current_end() {
+    let (dir, ws) = workspace();
+    let state = tempfile::tempdir().unwrap();
+    saved::FILE_OVERRIDE
+        .with(|slot| *slot.borrow_mut() = Some(state.path().join("private/monitor-watches.json")));
+    let log = dir.path().join("server.log");
+    stdfs::write(&log, "").unwrap();
+    let monitor = Monitor::new(None);
+    for action in ["saved", "forget"] {
+        assert!(!monitor.needs_approval(&json!({"action": action})));
+    }
+    assert!(monitor.needs_approval(&json!({"action":"restore", "name":"server.log"})));
+    let out = call(
+        &monitor,
+        &ws,
+        json!({"action":"start", "path":"server.log", "pattern":"boom", "save": true}),
+    );
+    assert!(out.text.contains("Saved as \"server.log\""), "{}", out.text);
+    let listed = call(&monitor, &ws, json!({"action":"saved"}));
+    assert!(
+        listed
+            .text
+            .contains("server.log: path=\"server.log\" pattern=\"boom\""),
+        "{}",
+        listed.text
+    );
+
+    // A new session (fresh monitor) restores it; output written before the restore is not read.
+    let later = Monitor::new(None);
+    append(&log, b"boom before restore\n");
+    let restored = call(
+        &later,
+        &ws,
+        json!({"action":"restore", "name":"server.log"}),
+    );
+    assert!(!restored.is_error, "{}", restored.text);
+    assert!(later.poll_monitors().is_empty());
+    append(&log, b"boom after\n");
+    let events = later.poll_monitors();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].contains("boom after"), "{}", events[0]);
+
+    let forgot = call(
+        &monitor,
+        &ws,
+        json!({"action":"forget", "name":"server.log"}),
+    );
+    assert!(!forgot.is_error, "{}", forgot.text);
+    assert!(
+        call(&monitor, &ws, json!({"action":"saved"}))
+            .text
+            .contains("No saved watches")
+    );
+    assert!(
+        call(
+            &monitor,
+            &ws,
+            json!({"action":"restore", "name":"server.log"})
+        )
+        .is_error
+    );
+    saved::FILE_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
 }

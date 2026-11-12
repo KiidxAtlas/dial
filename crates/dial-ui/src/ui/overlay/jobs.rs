@@ -416,7 +416,7 @@ impl JobsOverlay {
         }
         if self.jobs.is_empty() {
             for line in text::wrap_words(
-                "No background processes yet. Servers, watchers and other long-running commands the agent starts appear here.",
+                "No background processes yet. Servers, watchers and other long-running commands the agent starts appear here. To start one, Esc and ask, e.g. \"run the dev server in the background\".",
                 w.saturating_sub(2).max(1),
             ) {
                 out.push(filled(

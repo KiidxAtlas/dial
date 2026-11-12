@@ -200,3 +200,37 @@ fn replacing_the_controller_revokes_retained_promotion_authority() {
         "{error:#}"
     );
 }
+
+/// A refused launch is durable as retryable and survives restart as such, while an unsettled
+/// intent (a crash before attach) restores as interrupted. Neither restore poisons the journal.
+#[test]
+fn refused_launch_restores_retryable_and_unsettled_intent_restores_interrupted() {
+    for (refused, expected) in [(true, "retryable"), (false, "interrupted")] {
+        let mut ledger = Ledger::default();
+        ledger.begin(&contract("n1", &[]), request()).unwrap();
+        if refused {
+            ledger
+                .settle(
+                    "n1",
+                    "never_started",
+                    Acceptance::unverified("refused"),
+                    None,
+                )
+                .unwrap();
+        }
+        let mut restored = Ledger::restore(&ledger.snapshot());
+        assert_eq!(
+            state_of(&restored, "n1"),
+            json!(expected),
+            "refused={refused}"
+        );
+        assert!(restored.snapshot()["fault"].is_null(), "refused={refused}");
+        assert!(restored.running().is_empty());
+        if refused {
+            restored.begin(&contract("n1", &[]), request()).unwrap();
+            assert_eq!(restored.node("n1").unwrap()["attempts"], 2);
+        } else {
+            assert!(restored.begin(&contract("n1", &[]), request()).is_err());
+        }
+    }
+}

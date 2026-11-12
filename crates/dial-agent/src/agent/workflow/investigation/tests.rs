@@ -719,3 +719,42 @@ fn native_coverage_rejects_notebook_aliases_after_resolution() {
         "notebook projection must not use raw-file line counts"
     );
 }
+
+#[test]
+fn a_changed_file_reads_only_its_changed_lines_unless_fresh() {
+    let (root, workspace, mut returned) = native_fixture();
+    let before: String = (1..=30)
+        .map(|n| format!("code {n} {}\n", "x".repeat(40)))
+        .collect();
+    std::fs::write(root.path().join("src/lib.rs"), &before).unwrap();
+    remember_native(&mut returned, &workspace, "first", "src/lib.rs:1-30");
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        before.replace("code 12 ", "changed 12 "),
+    )
+    .unwrap();
+    let reuse = returned.reusable(|_| true);
+    let mut invoked = Vec::new();
+    let output = reuse.execute(&workspace, &json!({"path":"src/lib.rs:1-30"}), |args| {
+        invoked.push(args.clone());
+        crate::tools::execute(&workspace, "read", args, 10)
+    });
+    assert!(!output.is_error, "{}", output.text);
+    assert_eq!(invoked, [json!({"path":"src/lib.rs:12-12"})]);
+    assert!(output.text.contains("12:changed 12"), "{}", output.text);
+    assert!(!output.text.contains("11:code 11"), "{}", output.text);
+    assert!(output.text.contains("[Read delta]"), "{}", output.text);
+    let data = &output.data.as_ref().unwrap()["read_reuse"];
+    assert_eq!(data["delta"], true);
+    assert_eq!(data["executed_ranges"], json!([[12, 12]]));
+    // `fresh: true` resends every row.
+    let fresh = json!({"path":"src/lib.rs:1-30","fresh":true});
+    let mut calls = 0;
+    let full = reuse.execute(&workspace, &fresh, |args| {
+        calls += 1;
+        crate::tools::execute(&workspace, "read", args, 10)
+    });
+    assert_eq!(calls, 1);
+    assert!(full.text.contains("11:code 11"), "{}", full.text);
+    assert!(full.data.is_none());
+}

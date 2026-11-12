@@ -9,6 +9,7 @@ pub mod deps;
 pub mod evidence;
 pub mod history;
 pub mod investigate;
+pub mod live_db;
 pub mod network_inspect;
 pub mod notebook;
 pub mod perception;

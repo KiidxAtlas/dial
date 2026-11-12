@@ -12,7 +12,7 @@ Supported lifecycle points include user prompt submission, session start/end, be
 
 ## Custom tools
 
-`[tools.<name>]` declares `program`, optional `args` and `timeout_secs`, plus `description` and a JSON Schema `parameters` object. When parameters are supplied, the tool receives the full JSON arguments object on stdin; otherwise it receives a single `input` string. Custom programs are operator-trusted and run outside the workspace sandbox. Do not configure workspace-controlled executables.
+`[tools.<name>]` declares `program`, optional `args` and `timeout_secs`, plus `description` and a JSON Schema `parameters` object. When parameters are supplied, the tool receives the full JSON arguments object on stdin; otherwise it receives a single `input` string. Custom programs are operator-trusted and run outside the workspace sandbox. Do not configure workspace-controlled executables. To write tools and hooks in Python, see the [Python plugin SDK](#python-plugin-sdk).
 
 ## Context and skills
 
@@ -186,6 +186,32 @@ dependencies may need adaptation. Importing does not grant extra permissions.
 For the recommended authoring pattern, versioned examples, loader budgets and utility evaluation,
 see [Writing and evaluating skills](skills.md). Skills are procedures, not executable tools;
 `/skill:<name>` requests guidance rather than running a script.
+
+## Python plugin SDK
+
+[`sdk/python`](../sdk/python/README.md) (`dial_sdk`, standard library only, Python 3.9+) lets you
+write custom tools and lifecycle hooks as decorated Python functions in one file. It adds no new
+runtime: a plugin compiles to ordinary `[tools.<name>]` and `[[hooks]]` entries, so everything in
+[Custom tools](#custom-tools) and the hooks section below applies unchanged, including trust (plugins run
+unsandboxed with your privileges), timeouts, approval and `pre_tool_use` gating.
+
+- `@plugin.tool` turns a function into a tool. Its parameters become the JSON Schema `parameters`
+  (`str`, `int`, `float`, `bool`, `List[T]`, `Dict`, `Optional[T]`, `Literal[...]`;
+  `Annotated[T, "description"]` or `Annotated[T, {"minimum": 1}]` adds schema keywords). A parameter
+  without a default is required and unknown arguments are refused. The docstring is the description.
+  The return value is the result: strings as is, anything else as JSON. `raise ToolError("why")`
+  fails the call; Dial reports the exit code and the tail of stderr to the model.
+- `@plugin.hook(event, matcher=...)` runs a function on any lifecycle event (aliases accepted). It
+  receives the event object (`event.tool`, `event.input`, `event.output`, `event.cwd`) and returns
+  `None` to continue, `Block("reason")` to refuse (exit 2), a string as a notice, or
+  `Reply(input=..., content=..., additional_context=..., prompt=..., payload=..., messages=...)`.
+- `python3 plugin.py config` prints the TOML to add to `~/.dial/config.toml` or the project's state
+  `config.toml`. Tools are named `<plugin>_<tool>` and run with the same interpreter and the script's
+  absolute path. `manifest` prints the same as JSON; `tool NAME` and `hook NAME` are what Dial runs.
+
+A configured tool that fails now reports `configured subprocess failed (exit N): <stderr tail>`
+(up to 4 KiB), for SDK and hand-written tools alike. See
+[`sdk/python/examples/word_tools.py`](../sdk/python/examples/word_tools.py).
 
 ## Rust embedding SDK
 
@@ -421,6 +447,14 @@ server that asks for an OAuth sign-in; the user then runs `/mcp login <name>`. A
 next session; `/mcp` shows its status. Smithery servers still install through their settings form
 (`/extensions` → `i`, or `/mcp smithery-install`). Archived upstream packages (Brave, Slack,
 GitLab, Puppeteer) are listed with that note because they still install.
+
+`list` distinguishes the server's negotiated capabilities from Dial's own `client_capabilities`.
+Dial advertises roots with `listChanged=false` and answers server `ping` and `roots/list`
+requests. It does not advertise sampling or elicitation; `sampling/createMessage` and
+`elicitation/create` appear in `unsupported_client_requests` and receive `-32601` with an
+explanation if attempted. A connected server can still require an unsupported callback for a
+particular tool workflow. Connection success is not full protocol compatibility, and neither a
+server request nor its capability declaration authorizes model calls or human-input prompts.
 
 MCP lists refresh while the session runs. A server that sends `notifications/tools/list_changed`, `resources/list_changed`, or `prompts/list_changed` is re-listed once: tool announcements are debounced for 100 ms and a refresh that is already running is not repeated, so a burst of announcements costs one `tools/list`. Tools change only at the next model request, never mid-request. A tool the server removed refuses calls with "removed by its server", and a tool whose definition changed gets a new identity and is offered from the next request. A failed re-list keeps the previous list and shows a notice. Each session keeps at most 16 notices, dropping the oldest first. Resource and prompt listings are cached until the server announces a change.
 

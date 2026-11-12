@@ -241,7 +241,11 @@ impl ReturnedReads {
             .join("\0");
         let key = observation_key(call, text);
         let sections = shown_runs(text);
-        let ids = if let Some((previous, id)) = self.seen.get(&target)
+        // `fresh: true` asks for every row again, for example after the earlier result was summarized.
+        let fresh = call.arguments["fresh"].as_bool() == Some(true);
+        let ids = if fresh {
+            None
+        } else if let Some((previous, id)) = self.seen.get(&target)
             && *previous == key
             && still_full(id)
         {
@@ -373,17 +377,21 @@ impl ReadReuse {
     ) -> crate::runtime::tool_output::ToolOutput {
         use crate::runtime::tool_output::ToolOutput;
         use serde_json::json;
-        if self.is_empty() {
+        if self.is_empty() || args["fresh"].as_bool() == Some(true) {
             return read(args);
         }
         let Some(selection) = workspace.native_read_selection(args) else {
-            return read(args);
+            return self
+                .delta(workspace, args, &mut read)
+                .unwrap_or_else(|| read(args));
         };
         let Some(known) = self
             .files
             .get(&(selection.path.clone(), selection.revision.clone()))
         else {
-            return read(args);
+            return self
+                .delta(workspace, args, &mut read)
+                .unwrap_or_else(|| read(args));
         };
         let mut missing = Vec::new();
         let mut covered = Vec::new();
@@ -500,6 +508,80 @@ impl ReadReuse {
             "covered":covered,"executed_ranges":missing,"fully_reused":fully_reused
         }}));
         output
+    }
+
+    /// A read of a file that changed after a still-visible earlier read: send only the changed
+    /// lines, with a note mapping the unchanged ones onto that earlier call. `None` falls back to
+    /// an ordinary read (no visible earlier revision, unmappable change, or a racing edit).
+    fn delta(
+        &self,
+        workspace: &crate::tools::Workspace,
+        args: &serde_json::Value,
+        read: &mut impl FnMut(&serde_json::Value) -> crate::runtime::tool_output::ToolOutput,
+    ) -> Option<crate::runtime::tool_output::ToolOutput> {
+        use crate::runtime::tool_output::ToolOutput;
+        use serde_json::json;
+        // The selection's canonical path; an unqualified whole-file read is probed as its first page.
+        let mut probe = args.clone();
+        if args.get("offset").is_none_or(serde_json::Value::is_null)
+            && args.get("limit").is_none_or(serde_json::Value::is_null)
+        {
+            probe["limit"] = json!(2000);
+        }
+        let target = workspace.native_read_selection(&probe)?.path;
+        let (revision, plan) = self
+            .files
+            .range((target.clone(), String::new())..)
+            .take_while(|((path, _), _)| *path == target)
+            .find_map(|((_, revision), runs)| {
+                workspace
+                    .read_delta_plan(args, revision, runs)
+                    .map(|plan| (revision.clone(), plan))
+            })?;
+        let note = plan.note(&revision);
+        let covered: Vec<_> = plan
+            .covered
+            .iter()
+            .map(|run| {
+                json!({"range":[run.current.0,run.current.1],
+                    "earlier_range":[run.earlier.0,run.earlier.1],"call_id":run.call_id})
+            })
+            .collect();
+        let mut output = if plan.missing.is_empty() {
+            ToolOutput::ok(note)
+        } else {
+            let ranges = plan
+                .missing
+                .iter()
+                .map(|(first, last)| format!("{first}-{last}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut narrowed = args.clone();
+            let object = narrowed.as_object_mut()?;
+            object.remove("offset");
+            object.remove("limit");
+            let narrowed_path = format!("{target}:{ranges}");
+            if workspace.resolve_read_target(&narrowed_path).ok()
+                != workspace.resolve_read_target(&target).ok()
+            {
+                return None;
+            }
+            object.insert("path".into(), json!(narrowed_path));
+            let mut output = read(&narrowed);
+            let expected = format!("[Source raw SHA256:{}]", plan.revision);
+            if output.is_error || output.text.lines().nth(1) != Some(expected.as_str()) {
+                // The file changed again between planning and reading.
+                return None;
+            }
+            output.text.push_str(&format!("\n{note}"));
+            output
+        };
+        output.data = Some(json!({"read_reuse":{
+            "path":plan.path,"source_sha256":plan.revision,"earlier_sha256":revision,
+            "covered":covered,"executed_ranges":plan.missing,
+            "fully_reused":plan.missing.is_empty(),"delta":true
+        }}));
+        Some(output)
     }
 }
 

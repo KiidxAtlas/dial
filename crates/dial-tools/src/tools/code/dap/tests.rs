@@ -49,6 +49,7 @@ fn fake_adapter(dir: &Path, mode: &str) -> DapAdapterConfig {
     let script = dir.join("adapter.py");
     fs::write(&script, r#"#!/usr/bin/env python3
 import json,os,sys,time
+restarted=False
 while True:
  h={}
  while True:
@@ -63,10 +64,24 @@ while True:
  if mode == 'oversized':
   sys.stdout.buffer.write(b'Content-Length: 999999999\r\n\r\n');sys.stdout.buffer.flush();sys.exit(0)
  if mode == 'timeout': time.sleep(5)
- body={'seq':1,'type':'response','request_seq':req['seq'],'command':req['command'],'success':True,'body':{'received':req['command'],'args':req.get('arguments',{})}}
- out=json.dumps(body,separators=(',',':')).encode()
- sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n'%len(out)).encode()+out);sys.stdout.buffer.flush()
- if req['command'] in ('disconnect','terminate'): sys.exit(0)
+ def emit(b):
+  out=json.dumps(b,separators=(',',':')).encode()
+  sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n'%len(out)).encode()+out);sys.stdout.buffer.flush()
+ cmd=req['command']
+ rmode=os.environ.get('DAP_FAKE_RESTART','') if cmd=='restart' else ''
+ if cmd=='launch' and os.environ.get('DAP_FAKE_LAUNCH_INIT')=='1': emit({'seq':9,'type':'event','event':'initialized','body':{}})
+ if rmode=='stall': time.sleep(30)
+ if rmode in ('initialized','delayed'): emit({'seq':9,'type':'event','event':'initialized','body':{}})
+ if rmode=='delayed': time.sleep(0.3)
+ body={'seq':1,'type':'response','request_seq':req['seq'],'command':cmd,'success':True,'body':{'received':cmd,'args':req.get('arguments',{})}}
+ if cmd=='initialize': body['body'].update(json.loads(os.environ.get('DAP_FAKE_CAPS','{}')))
+ if rmode=='reject':
+  body['success']=False; body['message']='restart refused'
+ if cmd=='restart': restarted=True
+ if cmd=='configurationDone' and restarted and os.environ.get('DAP_FAKE_REJECT_LATE_CONFIG')=='1':
+  body['success']=False; body['message']='configurationDone refused after restart'
+ emit(body)
+ if cmd in ('disconnect','terminate'): sys.exit(0)
 "#).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
     DapAdapterConfig {
@@ -81,6 +96,16 @@ while True:
         launch_defaults: serde_json::Map::new(),
         attach_defaults: serde_json::Map::new(),
     }
+}
+
+/// The fake adapter, advertising `caps` in its `initialize` response.
+#[cfg(unix)]
+fn fake_adapter_with_caps(dir: &Path, caps: &Value) -> DapAdapterConfig {
+    let mut config = fake_adapter(dir, "valid");
+    config
+        .env
+        .insert("DAP_FAKE_CAPS".to_owned(), caps.to_string());
+    config
 }
 
 #[cfg(unix)]
@@ -265,4 +290,377 @@ fn unsupported_probe_options_are_refused_without_poisoning_session() {
     assert!(!ordinary.is_error, "{}", ordinary.text);
     let response: Value = serde_json::from_str(&ordinary.text).unwrap();
     assert_eq!(response["args"]["breakpoints"], json!([{"line":5}]));
+}
+
+#[test]
+fn exception_and_restart_arguments_are_validated_before_any_session_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+    let tool = pick(tools(&BTreeMap::new()), "dap");
+    for (args, expected) in [
+        (
+            json!({"action":"setExceptionBreakpoints"}),
+            "requires an array of string filters",
+        ),
+        (
+            json!({"action":"setExceptionBreakpoints","filters":[1]}),
+            "requires an array of string filters",
+        ),
+        (
+            json!({"action":"setExceptionBreakpoints","filters":[],"arguments":{}}),
+            "not arguments",
+        ),
+        (
+            json!({"action":"setExceptionBreakpoints","filters":["raised"],"filterOptions":[{"condition":"x"}]}),
+            "filterId",
+        ),
+        (
+            json!({"action":"setExceptionBreakpoints","filters":["raised"],"exceptionOptions":[{"breakMode":"sometimes"}]}),
+            "breakMode",
+        ),
+        (
+            json!({"action":"restart","arguments":{"program":"/bin/true"}}),
+            "restart takes no arguments",
+        ),
+    ] {
+        let output = tool.call(&ctx, &args);
+        assert!(
+            output.is_error,
+            "{args} unexpectedly passed: {}",
+            output.text
+        );
+        assert!(output.text.contains(expected), "{args}: {}", output.text);
+    }
+}
+
+#[test]
+fn exception_and_restart_actions_are_schema_visible() {
+    let schema = tools(&BTreeMap::new())
+        .into_iter()
+        .find(|tool| tool.name() == "dap")
+        .unwrap()
+        .schema();
+    let properties = &schema["function"]["parameters"]["properties"];
+    let actions: Vec<&str> = properties["action"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for action in ["setExceptionBreakpoints", "exceptionInfo", "restart"] {
+        assert!(actions.contains(&action), "schema omits {action}");
+    }
+    for property in ["filters", "filterOptions", "exceptionOptions"] {
+        assert!(
+            properties.get(property).is_some(),
+            "schema omits {property}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exception_breakpoints_and_exception_info_reach_the_wire_with_validated_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let caps = json!({
+        "exceptionBreakpointFilters": [{"filter": "raised", "supportsCondition": true}],
+        "supportsExceptionFilterOptions": true,
+        "supportsExceptionOptions": true,
+        "supportsExceptionInfoRequest": true,
+    });
+    let configs = BTreeMap::from([("fake".to_owned(), fake_adapter_with_caps(dir.path(), &caps))]);
+    let tool = pick(tools(&configs), "dap_fake");
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+
+    let set = tool.call(
+        &ctx,
+        &json!({"action":"setExceptionBreakpoints","filters":["raised"],
+            "filterOptions":[{"filterId":"raised","condition":"x > 1","hitCondition":null}],
+            "exceptionOptions":[{"breakMode":"unhandled","path":[{"names":["Error"]}]}]}),
+    );
+    assert!(!set.is_error, "{}", set.text);
+    let sent: Value = serde_json::from_str(&set.text).unwrap();
+    assert_eq!(sent["args"]["filters"], json!(["raised"]));
+    assert_eq!(
+        sent["args"]["filterOptions"],
+        json!([{"filterId":"raised","condition":"x > 1"}]),
+        "null option fields must not reach the adapter"
+    );
+    assert_eq!(
+        sent["args"]["exceptionOptions"][0]["breakMode"],
+        "unhandled"
+    );
+
+    let status: Value =
+        serde_json::from_str(&tool.call(&ctx, &json!({"action":"status"})).text).unwrap();
+    assert_eq!(status["exceptionBreakpoints"], sent["args"]);
+
+    let info = tool.call(&ctx, &json!({"action":"exceptionInfo","threadId":4}));
+    assert!(!info.is_error, "{}", info.text);
+    let info: Value = serde_json::from_str(&info.text).unwrap();
+    assert_eq!(info["received"], "exceptionInfo");
+    assert_eq!(info["args"], json!({"threadId": 4}));
+}
+
+#[cfg(unix)]
+#[test]
+fn exception_requests_refuse_what_the_adapter_did_not_advertise() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("program"), "").unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    // Filter options are advertised, conditions are not per filter; no exception options,
+    // exception info, or restart support.
+    let caps = json!({
+        "exceptionBreakpointFilters": [{"filter": "raised", "supportsCondition": false}],
+        "supportsExceptionFilterOptions": true,
+    });
+    let configs = BTreeMap::from([("fake".to_owned(), fake_adapter_with_caps(dir.path(), &caps))]);
+    let tool = pick(tools(&configs), "dap_fake");
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+    let launched = tool.call(&ctx, &json!({"action":"launch","program":"program"}));
+    assert!(!launched.is_error, "{}", launched.text);
+
+    for (args, expected) in [
+        (
+            json!({"action":"setExceptionBreakpoints","filters":["uncaught"]}),
+            "does not advertise exception filter \"uncaught\"",
+        ),
+        (
+            json!({"action":"setExceptionBreakpoints","filters":[],"filterOptions":[{"filterId":"raised","condition":"x"}]}),
+            "does not support conditions on exception filter \"raised\"",
+        ),
+        (
+            json!({"action":"setExceptionBreakpoints","filters":["raised"],"exceptionOptions":[{"breakMode":"always"}]}),
+            "does not support exception options",
+        ),
+        (
+            json!({"action":"exceptionInfo","threadId":1}),
+            "does not support exceptionInfo",
+        ),
+        (json!({"action":"restart"}), "does not support restart"),
+    ] {
+        let output = tool.call(&ctx, &args);
+        assert!(
+            output.is_error,
+            "{args} unexpectedly succeeded: {}",
+            output.text
+        );
+        assert!(output.text.contains(expected), "{args}: {}", output.text);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn restart_without_initialized_completes_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("program"), "").unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let configs = BTreeMap::from([(
+        "fake".to_owned(),
+        fake_adapter_with_caps(dir.path(), &json!({"supportsRestartRequest": true})),
+    )]);
+    let tool = pick(tools(&configs), "dap_fake");
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+    let launched = tool.call(&ctx, &json!({"action":"launch","program":"program"}));
+    assert!(!launched.is_error, "{}", launched.text);
+
+    let restarted = tool.call(&ctx, &json!({"action":"restart"}));
+    assert!(!restarted.is_error, "{}", restarted.text);
+    let body: Value = serde_json::from_str(&restarted.text).unwrap();
+    assert_eq!(body["response"]["received"], "restart");
+    // A successful answer without `initialized` completes configuration; nothing is due.
+    assert_eq!(body["session"]["needsConfigurationDone"], false);
+    assert_eq!(body["session"]["configurationDone"], true);
+    // Restart keeps the session alive and never reports the old debuggee as stopped.
+    let status: Value =
+        serde_json::from_str(&tool.call(&ctx, &json!({"action":"status"})).text).unwrap();
+    assert_eq!(status["active"], true);
+    assert_eq!(status["stopped"], Value::Null);
+}
+
+/// The launchable fake adapter for restart tests. It advertises restart and configurationDone and
+/// reports `initialized` before its launch answer. `restart_mode` shapes its answer to `restart`:
+/// "" answers success only, "initialized" reports `initialized` then answers, "delayed" pauses
+/// before answering, "reject" fails, and "stall" never answers.
+#[cfg(unix)]
+fn restart_adapter(dir: &Path, restart_mode: &str, timeout_secs: u64) -> DapAdapterConfig {
+    let mut config = fake_adapter_with_caps(
+        dir,
+        &json!({"supportsRestartRequest": true, "supportsConfigurationDoneRequest": true}),
+    );
+    config
+        .env
+        .insert("DAP_FAKE_LAUNCH_INIT".to_owned(), "1".to_owned());
+    config
+        .env
+        .insert("DAP_FAKE_RESTART".to_owned(), restart_mode.to_owned());
+    config.timeout_secs = timeout_secs;
+    config
+}
+
+/// The restart test adapter as a dap tool.
+#[cfg(unix)]
+fn restart_tool(dir: &Path, restart_mode: &str, timeout_secs: u64) -> Arc<dyn Tool> {
+    pick(
+        tools(&BTreeMap::from([(
+            "fake".to_owned(),
+            restart_adapter(dir, restart_mode, timeout_secs),
+        )])),
+        "dap_fake",
+    )
+}
+
+/// Launches and completes the initial configuration, so restart starts from a configured session.
+#[cfg(unix)]
+fn configured_restart_session(tool: &Arc<dyn Tool>, ctx: &ToolContext) {
+    let launched = tool.call(ctx, &json!({"action":"launch","program":"program"}));
+    assert!(!launched.is_error, "{}", launched.text);
+    let done = tool.call(ctx, &json!({"action":"configurationDone"}));
+    assert!(!done.is_error, "{}", done.text);
+}
+
+#[cfg(unix)]
+#[test]
+fn restart_configuration_gate_accepts_initialized_or_a_successful_answer() {
+    // The answer to restart is the only proof of readiness for "" (it is never delayed), so it
+    // must surface there; the other modes may surface it at restart or at configurationDone.
+    for (mode, answered_at_restart) in [("", true), ("initialized", false), ("delayed", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("program"), "").unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let config = crate::config::types::Config::default();
+        let ctx = context(&workspace, &config);
+        let tool = restart_tool(dir.path(), mode, 2);
+        configured_restart_session(&tool, &ctx);
+
+        let restarted = tool.call(&ctx, &json!({"action":"restart"}));
+        assert!(!restarted.is_error, "{mode}: {}", restarted.text);
+        let restart_body: Value = serde_json::from_str(&restarted.text).unwrap();
+        let restart_answered = restart_body["response"]["received"] == "restart";
+        assert_eq!(
+            restart_body["session"]["needsConfigurationDone"], !answered_at_restart,
+            "{mode}"
+        );
+        if answered_at_restart {
+            assert!(restart_answered, "{mode}: {}", restarted.text);
+        }
+
+        // Breakpoints must not wait for a second `initialized` once the restart is answered.
+        let source = json!({"path": "/src/main.rs"});
+        let breakpoints = tool.call(
+            &ctx,
+            &json!({"action":"setBreakpoints","source":source,"breakpoints":[{"line":3}]}),
+        );
+        assert!(!breakpoints.is_error, "{mode}: {}", breakpoints.text);
+
+        let done = tool.call(&ctx, &json!({"action":"configurationDone"}));
+        assert!(!done.is_error, "{mode}: {}", done.text);
+        let done_body: Value = serde_json::from_str(&done.text).unwrap();
+        assert!(
+            restart_answered || done_body["response"]["received"] == "restart",
+            "{mode}: restart answer lost: {} / {}",
+            restarted.text,
+            done.text
+        );
+        let status: Value =
+            serde_json::from_str(&tool.call(&ctx, &json!({"action":"status"})).text).unwrap();
+        assert_eq!(status["configurationDone"], true, "{mode}");
+        assert_eq!(status["needsConfigurationDone"], false, "{mode}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn silent_restart_skips_configuration_done_so_a_refusing_adapter_still_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("program"), "").unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+    let mut adapter = restart_adapter(dir.path(), "", 2);
+    adapter
+        .env
+        .insert("DAP_FAKE_REJECT_LATE_CONFIG".to_owned(), "1".to_owned());
+    let tool = pick(
+        tools(&BTreeMap::from([("fake".to_owned(), adapter)])),
+        "dap_fake",
+    );
+    configured_restart_session(&tool, &ctx);
+
+    let restarted = tool.call(&ctx, &json!({"action":"restart"}));
+    assert!(!restarted.is_error, "{}", restarted.text);
+    let status: Value =
+        serde_json::from_str(&tool.call(&ctx, &json!({"action":"status"})).text).unwrap();
+    assert_eq!(status["configurationDone"], true);
+    assert_eq!(status["needsConfigurationDone"], false);
+
+    // The adapter refuses configurationDone after restart. A silent restart never sends one, so
+    // the next execution action still reaches the adapter.
+    let resumed = tool.call(&ctx, &json!({"action":"continue","threadId":1}));
+    assert!(!resumed.is_error, "{}", resumed.text);
+    let body: Value = serde_json::from_str(&resumed.text).unwrap();
+    assert_eq!(body["received"], "continue");
+}
+
+#[cfg(unix)]
+#[test]
+fn rejected_restart_restores_the_configured_session() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("program"), "").unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+    let tool = restart_tool(dir.path(), "reject", 2);
+    configured_restart_session(&tool, &ctx);
+
+    let restarted = tool.call(&ctx, &json!({"action":"restart"}));
+    assert!(restarted.is_error, "{}", restarted.text);
+    assert!(
+        restarted.text.contains("restart refused"),
+        "{}",
+        restarted.text
+    );
+    let status: Value =
+        serde_json::from_str(&tool.call(&ctx, &json!({"action":"status"})).text).unwrap();
+    assert_eq!(status["active"], true);
+    assert_eq!(status["configurationDone"], true);
+    assert_eq!(status["needsConfigurationDone"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn unanswered_restart_times_out_and_cancellation_interrupts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("program"), "").unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let config = crate::config::types::Config::default();
+    let ctx = context(&workspace, &config);
+
+    // This deadline also covers Python adapter startup under a parallel workspace test run.
+    let timed_out = restart_tool(dir.path(), "stall", 5);
+    configured_restart_session(&timed_out, &ctx);
+    let restarted = timed_out.call(&ctx, &json!({"action":"restart"}));
+    assert!(restarted.is_error, "{}", restarted.text);
+    assert!(restarted.text.contains("timed out"), "{}", restarted.text);
+
+    let cancelled = restart_tool(dir.path(), "stall", 5);
+    configured_restart_session(&cancelled, &ctx);
+    let flag = Arc::new(AtomicBool::new(false));
+    let setter = {
+        let flag = Arc::clone(&flag);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::Release);
+        })
+    };
+    let restarted = cancelled.call_streaming(&ctx, &json!({"action":"restart"}), &|_| {}, &flag);
+    setter.join().unwrap();
+    assert!(restarted.is_error, "{}", restarted.text);
+    assert!(restarted.text.contains("cancelled"), "{}", restarted.text);
 }

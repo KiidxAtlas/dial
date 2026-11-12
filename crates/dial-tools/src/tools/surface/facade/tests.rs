@@ -237,6 +237,7 @@ fn recorded_member_calls_project_onto_the_successor() {
     );
     assert_eq!(successor_call("bash", &json!({})), None);
     assert_eq!(successor_of("glab_mr"), Some("git"));
+    assert_eq!(successor_of("gitea_pr"), Some("git"));
 }
 
 #[test]
@@ -285,6 +286,82 @@ fn shared_action_owners_are_forked_and_polled_once() {
     let forked = facade.fork_session().unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert_eq!(forked.poll_monitors(), ["event"]);
+}
+
+/// A member property documented for its own `start` must read as the merged `watch` route, and a
+/// member argument sent with the successor's own action names the route that accepts it.
+#[test]
+fn action_members_document_and_suggest_their_merged_routes() {
+    struct Native;
+    impl Tool for Native {
+        fn name(&self) -> &str {
+            "bg"
+        }
+        fn schema(&self) -> Value {
+            tool_schema(
+                "bg",
+                "jobs",
+                json!({"action":{"type":"string","enum":["start"]},"command":{"type":"string"}}),
+                &["action"],
+            )
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            ToolOutput::ok("native".into())
+        }
+    }
+    struct Watcher;
+    impl Tool for Watcher {
+        fn name(&self) -> &str {
+            "monitor"
+        }
+        fn schema(&self) -> Value {
+            tool_schema(
+                "monitor",
+                "watches",
+                json!({
+                    "action":{"type":"string","enum":["start","stop"]},
+                    "after_secs":{"type":"integer","description":"start: wake later"},
+                    "on_exit":{"type":"boolean","description":"start (job/run): report exit"}
+                }),
+                &["action"],
+            )
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+            ToolOutput::ok("watched".into())
+        }
+    }
+    let owner: Arc<dyn Tool> = Arc::new(Watcher);
+    let facade = Facade::new(
+        "bg",
+        "fixture",
+        "",
+        Some(Arc::new(Native)),
+        vec![
+            Member::action("watch", Some("start"), Arc::clone(&owner)),
+            Member::action("unwatch", Some("stop"), owner),
+        ],
+    );
+    let schema = facade.schema();
+    let properties = &schema["function"]["parameters"]["properties"];
+    assert_eq!(properties["after_secs"]["description"], "watch: wake later");
+    assert_eq!(
+        properties["on_exit"]["description"],
+        "watch (job/run): report exit"
+    );
+    let (owner, own) = facade
+        .resolve(&json!({"action":"start","after_secs":5}))
+        .unwrap();
+    let error = facade.validated(owner, &own).unwrap_err();
+    assert!(
+        error.contains("after_secs belongs to action=watch; resend with that route"),
+        "{error}"
+    );
 }
 
 #[test]

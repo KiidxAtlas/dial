@@ -53,6 +53,9 @@ fn read_with(
     if args.get("offset").is_some_and(|v| !v.is_null()) && target.selector.selects_lines() {
         return Err("use offset or a line selector, not both".into());
     }
+    if !target.selector.symbols.is_empty() {
+        return Err("`:sym=` applies to local source files; URLs take line ranges".into());
+    }
     if cancel.load(std::sync::atomic::Ordering::Acquire) {
         return Err("read of a URL was cancelled".into());
     }

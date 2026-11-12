@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+fn unsupported_callbacks_are_correlated_and_explain_client_limits() {
+    let shared = Shared::new(Vec::new(), None);
+    for method in [
+        "sampling/createMessage",
+        "elicitation/create",
+        "unknown/method",
+    ] {
+        let reply = shared
+            .handle(
+                &json!({"jsonrpc": "2.0", "id": "server-request", "method": method, "params": {}}),
+            )
+            .expect("server requests receive a refusal");
+        assert_eq!(reply["id"], "server-request");
+        assert_eq!(reply["error"]["code"], -32601);
+        let message = reply["error"]["message"].as_str().unwrap();
+        assert!(message.contains("ping and roots/list"), "{message}");
+        assert!(
+            message.contains("sampling and elicitation are not enabled"),
+            "{message}"
+        );
+    }
+    assert!(lock(&shared.state).pending.is_empty());
+    let ping = shared.handle(&json!({"id": 2, "method": "ping"})).unwrap();
+    assert_eq!(ping["result"], json!({}));
+    let roots = shared
+        .handle(&json!({"id": 3, "method": "roots/list"}))
+        .unwrap();
+    assert_eq!(roots["result"]["roots"], json!([]));
+}
+
+#[test]
 fn server_error_text_and_stderr_lose_terminal_escapes() {
     let shared = Shared::new(Vec::new(), None);
     let (tx, rx) = mpsc::channel();

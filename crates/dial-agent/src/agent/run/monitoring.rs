@@ -139,5 +139,33 @@ impl Agent<'_> {
     }
 }
 
+/// Background jobs, watches and watch-wake state carried from an agent to the agent rebuilt for
+/// the same session after a settings change ([`Agent::take_live_processes`]).
+pub struct LiveProcesses {
+    tools: Vec<std::sync::Arc<dyn crate::tools::integrations::ext::Tool>>,
+    watch: State,
+}
+
+impl Agent<'_> {
+    /// Running `bg` jobs and armed watches, with their wake state, for the agent rebuilt after a
+    /// settings change. `None` when nothing runs; dropping the value stops the jobs as before.
+    pub fn take_live_processes(&mut self) -> Option<LiveProcesses> {
+        let tools = self.ext.live_processes();
+        (!tools.is_empty()).then(|| LiveProcesses {
+            tools,
+            watch: std::mem::take(&mut self.monitor_state),
+        })
+    }
+
+    /// Adopt [`Self::take_live_processes`] from the previous agent of this same session. Watch
+    /// wake state for another session is not adopted.
+    pub fn adopt_live_processes(&mut self, carried: LiveProcesses) {
+        self.ext.adopt_live_processes(carried.tools);
+        if carried.watch.session == self.session.id() {
+            self.monitor_state = carried.watch;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

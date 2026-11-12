@@ -11,7 +11,7 @@ members = [".", "crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 license = "MIT"
 
@@ -29,6 +29,8 @@ dial-computer = { path = "crates/dial-computer", default-features = false }
 dial-agent = { path = "crates/dial-agent" }
 dial-ui = { path = "crates/dial-ui", default-features = false }
 dial-app = { path = "crates/dial-app" }
+dial-client = { path = "crates/dial-client" }
+dial-protocol = { path = "crates/dial-protocol" }
 anyhow = "1"
 csv = "1"
 bigdecimal = "0.4"
@@ -72,7 +74,7 @@ unicode-segmentation = "1"
 pulldown-cmark = { version = "0.12", default-features = false }
 quick-xml = "0.42"
 regex = "1.13.1"
-fancy-regex = "0.16"
+fancy-regex = "0.19"
 tiktoken-rs = "0.12"
 ast-grep-core = "0.51.0"
 ast-grep-language = "0.51.0"
@@ -138,7 +140,7 @@ objc2-application-services = "=0.3.2"
 objc2-core-foundation = "=0.3.2"
 objc2-core-graphics = "=0.3.2"
 objc2-foundation = "=0.3.2"
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_Storage_ProjectedFileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_Storage_ProjectedFileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Storage_EnhancedStorage", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem"] }
 enigo = { version = "=0.6.1", default-features = false }
 uiautomation = "=0.25.1"
@@ -157,7 +159,7 @@ undocumented_unsafe_blocks = "deny"
 workspace = true
 
 [features]
-default = ["aws", "voice", "embedded-shell", "embedded-js", "desktop"]
+default = ["aws", "voice", "embedded-shell", "embedded-js", "data-formats", "desktop"]
 # AWS credential chain (env, profiles, SSO, process, web identity, ECS/IMDS) and SigV4 for Bedrock.
 # Bearer-key Bedrock works without it; SigV4 without it fails with a clear error.
 aws = ["dial-llm/aws"]
@@ -166,6 +168,9 @@ voice = ["dial-tools/voice"]
 embedded-shell = ["dial-tools/embedded-shell"]
 # Embedded JavaScript engine for `eval` when no Node runtime is installed (QuickJS-ng via rquickjs).
 embedded-js = ["dial-tools/embedded-js"]
+# `read` decoders for Parquet/Arrow IPC, RAR archives and ELF/Mach-O/PE/ar binaries (the heaviest
+# decoder dependencies: parquet and arrow alone are ~120 MB of build output).
+data-formats = ["dial-tools/data-formats"]
 # Native desktop capture, accessibility and input (crates/dial-computer). Browser automation is independent.
 desktop = ["dial-computer/desktop"]
 # Linux Wayland screencast (PipeWire); off by default.
@@ -182,6 +187,7 @@ dial-ui = { workspace = true, features = ["test-support"] }
 libc.workspace = true
 rusqlite.workspace = true
 parking_lot.workspace = true
+dial-client.workspace = true
 
 [dependencies]
 dial-build-info.workspace = true

@@ -38,6 +38,11 @@ pub(super) fn rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows
     {
         return rows;
     }
+    if title == "Notice"
+        && let Some((title, body)) = open_work(body)
+    {
+        return rows(title, &body, w, ctx);
+    }
     if title == "Turn report" {
         let next = body.lines().find(|line| line.starts_with("Next: "));
         let summary = body.lines().find_map(|line| line.strip_prefix("Summary: "));
@@ -111,6 +116,54 @@ enum Severity {
     Error,
 }
 
+/// The agent's end-of-turn open-work notice in plain words. Required steps and deliverables keep
+/// a warning card; when only optional follow-ups remain, a quiet row says nothing required is left.
+fn open_work(body: &str) -> Option<(&'static str, String)> {
+    let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
+    let counts = first.strip_prefix("Outstanding work retained: ")?;
+    let mut numbers = counts.split(", ").map(|part| {
+        part.split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<usize>().ok())
+    });
+    let (steps, deliverables, follow_ups) = (numbers.next()??, numbers.next()??, numbers.next()??);
+    let count = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+    let (title, mut text) = if steps + deliverables > 0 {
+        let mut open = Vec::new();
+        if steps > 0 {
+            open.push(count(steps, "step"));
+        }
+        if deliverables > 0 {
+            open.push(count(deliverables, "deliverable"));
+        }
+        let mut text = format!("{} still open.", open.join(" and "));
+        if follow_ups > 0 {
+            text.push_str(&format!(
+                " Also {} for later.",
+                count(follow_ups, "optional follow-up")
+            ));
+        }
+        if counts.contains("does not mark that work complete") {
+            text.push_str(" This answer does not finish them.");
+        }
+        ("Unfinished work", text)
+    } else {
+        (
+            "Follow-up",
+            format!(
+                "{} for later; nothing required is left.",
+                count(follow_ups, "optional follow-up")
+            ),
+        )
+    };
+    if !rest.trim().is_empty() {
+        text.push('\n');
+        text.push_str(rest.trim_end());
+    }
+    Some((title, text))
+}
+
+/// The severity a notice title asks for.
 fn severity_of(title: &str) -> Option<Severity> {
     let t = title.to_ascii_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| t.contains(w));
@@ -121,6 +174,7 @@ fn severity_of(title: &str) -> Option<Severity> {
         "heads up",
         "outstanding",
         "attention",
+        "unfinished",
         "unavailable",
     ]) {
         Some(Severity::Warning)

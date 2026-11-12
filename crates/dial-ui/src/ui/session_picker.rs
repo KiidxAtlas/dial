@@ -68,6 +68,8 @@ pub struct Picker {
     all_projects: bool,
     /// Journals in scope; `sessions.len()` is how many are loaded ("showing N of M").
     total: usize,
+    /// Sessions in every project, when this project has none (the empty state offers them).
+    elsewhere: Option<usize>,
     open_elsewhere: HashSet<String>,
     query: String,
     /// Session id and draft title while renaming.
@@ -111,6 +113,7 @@ impl Picker {
         let searchable = sessions.iter().map(search_text).collect();
         let mut picker = Self {
             total: sessions.len(),
+            elsewhere: None,
             sessions,
             depth,
             pinned: pinned.into_iter().collect(),
@@ -140,6 +143,13 @@ impl Picker {
     pub fn scope(mut self, all_projects: bool, total: usize) -> Self {
         self.all_projects = all_projects;
         self.total = total.max(self.sessions.len());
+        self
+    }
+
+    /// How many sessions every project holds, for this project's empty state: it then names
+    /// the way to them with the count, or says how to start one when there are none anywhere.
+    pub fn with_elsewhere(mut self, count: usize) -> Self {
+        self.elsewhere = Some(count);
         self
     }
 
@@ -669,9 +679,20 @@ impl Picker {
                     if empty == 1 { "" } else { "s" }
                 )
             } else if !self.all_projects {
-                "No sessions in this project yet. Ctrl+G lists sessions from every project.".into()
+                match self.elsewhere {
+                    Some(0) => {
+                        "No sessions in any project yet. Esc, then type below to start one.".into()
+                    }
+                    Some(n) => format!(
+                        "No sessions in this project yet. Ctrl+G sessions from all projects ({n})."
+                    ),
+                    None => {
+                        "No sessions in this project yet. Ctrl+G lists sessions from every project."
+                            .into()
+                    }
+                }
             } else {
-                "No sessions in any project yet. Conversations appear here once they start.".into()
+                "No sessions in any project yet. Esc, then type below to start one.".into()
             };
             // The message wraps rather than losing its way forward at narrow widths; it yields
             // rows only to the frame, the notice and the key hints.

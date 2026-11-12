@@ -96,7 +96,7 @@ fn run_boundary(
                 reply(
                     &id,
                     Err(anyhow::Error::new(RequestError {
-                        code: "internal_error",
+                        code: ErrorCode::InternalError,
                         message: "RPC actor panicked; session terminated".into(),
                     })),
                 );
@@ -201,6 +201,7 @@ impl Actor {
                     image_input,
                     acp,
                 ));
+                worker_out.attribute(agent.session().id(), Value::Null);
                 let _ = control_tx.send((
                     agent.live_task_control(),
                     agent.background_compaction_control(),
@@ -295,9 +296,13 @@ impl ActorRuntime<'_> {
             }
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             *in_flight = Some(id.clone());
+            self.worker_out
+                .attribute(self.agent.session().id(), id.clone());
             let result = self.handle_request(&request);
             self.settle_request(&request, &id, result);
             *in_flight = None;
+            self.worker_out
+                .attribute(self.agent.session().id(), Value::Null);
             if self.worker_out.failed.load(Ordering::SeqCst) {
                 break;
             }
@@ -394,13 +399,16 @@ impl ActorRuntime<'_> {
 
     /// Implicit ACP selection is a real session switch, including for query requests.
     fn activate_parked(&mut self, wanted: &str) -> Result<()> {
-        let next = self.parked.get(wanted).context("session is not open")?;
+        let next = self
+            .parked
+            .get(wanted)
+            .ok_or_else(|| coded(ErrorCode::NotFound, "session is not open"))?;
         self.agent
             .gate_session_change(
                 "session_before_switch",
                 json!({"reason":"activate","target_session_id":wanted}),
             )
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|error| coded(ErrorCode::Refused, error))?;
         let workspace = self.agent.prepare_session_workspace(&next.session)?;
         stop_owned_tasks(&mut self.agent, &mut self.ui);
         drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
@@ -432,11 +440,10 @@ impl ActorRuntime<'_> {
         {
             let wanted = params["session_id"]
                 .as_str()
-                .context("session_id required")?;
-            anyhow::ensure!(
-                self.current || self.parked.contains_key(wanted),
-                "session is not open"
-            );
+                .ok_or_else(|| coded(ErrorCode::InvalidParams, "session_id required"))?;
+            if !(self.current || self.parked.contains_key(wanted)) {
+                return Err(coded(ErrorCode::NotFound, "session is not open"));
+            }
             if !self.current || self.agent.session().id() != wanted {
                 self.activate_parked(wanted)?;
             }
@@ -474,7 +481,7 @@ impl ActorRuntime<'_> {
                 &self.config.model,
             )?;
         }
-        match request["method"].as_str().unwrap_or("") {
+        let mut result = match method {
             "send" | "live_listen" => self.send(request, params),
             "state" => Ok(state_projection(&self.agent)),
             "plan" => {
@@ -486,24 +493,34 @@ impl ActorRuntime<'_> {
                 Ok(json!({"enabled":self.agent.plan_mode()}))
             }
             "set_model" => {
-                let provider = params["provider"]
-                    .as_str()
-                    .context("set_model requires params.provider")?;
-                let model_id = params["model_id"]
-                    .as_str()
-                    .context("set_model requires params.model_id")?;
+                let provider = params["provider"].as_str().ok_or_else(|| {
+                    coded(
+                        ErrorCode::InvalidParams,
+                        "set_model requires params.provider",
+                    )
+                })?;
+                let model_id = params["model_id"].as_str().ok_or_else(|| {
+                    coded(
+                        ErrorCode::InvalidParams,
+                        "set_model requires params.model_id",
+                    )
+                })?;
                 let selection = crate::agent::modes::switch::resolve(
                     self.agent.effective_config(),
                     &format!("{provider}/{model_id}"),
                 )?;
-                anyhow::ensure!(
-                    crate::agent::modes::switch::is_known_model(
-                        self.agent.effective_config(),
-                        &self.layout.user_dir,
-                        &selection,
-                    ),
-                    "unknown model {provider}/{model_id}: not in the catalog, configured models or downloaded local models"
-                );
+                if !crate::agent::modes::switch::is_known_model(
+                    self.agent.effective_config(),
+                    &self.layout.user_dir,
+                    &selection,
+                ) {
+                    return Err(coded(
+                        ErrorCode::NotFound,
+                        format!(
+                            "unknown model {provider}/{model_id}: not in the catalog, configured models or downloaded local models"
+                        ),
+                    ));
+                }
                 self.agent.switch_model(&selection, None)?;
                 Ok(json!({"model":self.agent.effective_config().model}))
             }
@@ -511,11 +528,18 @@ impl ActorRuntime<'_> {
                 let level = params["level"]
                     .as_str()
                     .context("set_thinking requires params.level")?;
-                let effort = crate::agent::modes::switch::parse_effort(level)
-                    .with_context(|| format!("unknown reasoning level: {level}"))?;
-                let selection = self.agent.effective_config().selection();
-                self.agent.switch_model(&selection, Some(effort))?;
-                Ok(json!({"level":effort.as_str()}))
+                if level == "default" {
+                    // Drop the session's level: the model runs at its configured or catalog default.
+                    self.agent.reset_thinking()?;
+                    Ok(json!({"level":Value::Null}))
+                } else {
+                    let effort = crate::agent::modes::switch::parse_effort(level).with_context(|| {
+                        format!("unknown reasoning level: {level}; use default to restore the model default")
+                    })?;
+                    let selection = self.agent.effective_config().selection();
+                    self.agent.switch_model(&selection, Some(effort))?;
+                    Ok(json!({"level":effort.as_str()}))
+                }
             }
             "get_session_stats" => {
                 let state = state_projection(&self.agent);
@@ -529,32 +553,50 @@ impl ActorRuntime<'_> {
                 }))
             }
             "get_available_commands" => {
-                let commands: Vec<Value> = crate::app::builtin_commands()
-                .iter()
-                .map(|(name, usage, description)| {
-                    json!({"name":name,"usage":usage,"description":description})
-                })
-                .collect();
+                let mut commands: Vec<Value> = crate::app::builtin_commands()
+                    .iter()
+                    .map(|(name, usage, description)| {
+                        json!({"name":name,"usage":usage,"description":description,"kind":"builtin"})
+                    })
+                    .collect();
+                // Custom and skill commands are prompt templates that `send` expands.
+                commands.extend(crate::app::prompt_commands(self.layout).into_iter().map(
+                    |(name, usage, description, kind)| {
+                        json!({"name":name,"usage":usage,"description":description,"kind":kind})
+                    },
+                ));
                 Ok(json!({"commands":commands}))
             }
             "export" => self.export(params),
             "set_host_tools" => self.set_host_tools(params),
             "set_host_uri_schemes" => self.set_host_uri_schemes(params),
             "new_session" => self.new_session(),
+            "list_checkpoints" => Ok(checkpoints::list(self.agent.checkpoints())),
+            "checkpoint_files" => checkpoints::files(self.agent.checkpoints(), params),
+            "checkpoint_diff" => checkpoints::diff(self.agent.checkpoints(), params),
+            "restore_checkpoint_files" => checkpoints::restore(self.agent.checkpoints(), params),
+            "undo" => {
+                let turns = checkpoints::undo_turns(params)?;
+                let result =
+                    crate::rewind::undo(self.config, &self.flag, &mut self.agent, turns, || {});
+                checkpoints::undo_result(turns, result)
+            }
             "compact" => self.compact(params),
             "memory" => {
-                let command = params["command"]
-                    .as_str()
-                    .context("memory requires params.command")?;
-                anyhow::ensure!(
-                    command.len() <= MAX_MEMORY_COMMAND_BYTES,
-                    "memory command exceeds {MAX_MEMORY_COMMAND_BYTES} bytes"
-                );
+                let command = params["command"].as_str().ok_or_else(|| {
+                    coded(ErrorCode::InvalidParams, "memory requires params.command")
+                })?;
+                if command.len() > MAX_MEMORY_COMMAND_BYTES {
+                    return Err(coded(
+                        ErrorCode::InvalidParams,
+                        format!("memory command exceeds {MAX_MEMORY_COMMAND_BYTES} bytes"),
+                    ));
+                }
                 self.agent.selected_memory_command(command, &mut self.ui)
             }
             "seed_context" => self.seed_context(params),
             "resume" => self.resume(params),
-            "fork_session" if self.acp => self.fork_session(params),
+            "fork_session" => self.fork_session(params),
             "close_session" if self.acp => self.close_session(params),
             "list_sessions" if self.acp => self.list_sessions(params),
             "messages" => Ok(json!({"messages":self.agent.session().messages()})),
@@ -572,7 +614,29 @@ impl ActorRuntime<'_> {
                 .agent
                 .subagent_status(params["id"].as_str(), &mut self.ui),
             _ => Err(super::unknown_method()),
+        }?;
+        // ACP renders model and thought-level config options from these results without querying
+        // the actor. Prompts only refresh the current choice; the model list is kept from earlier.
+        if self.acp
+            && result.is_object()
+            && matches!(
+                method,
+                "new_session"
+                    | "resume"
+                    | "fork_session"
+                    | "plan"
+                    | "set_model"
+                    | "set_thinking"
+                    | "send"
+            )
+        {
+            result["_acp_models"] = models::acp_options(
+                self.agent.effective_config(),
+                &self.layout.user_dir,
+                method != "send",
+            );
         }
+        Ok(result)
     }
 
     fn send(&mut self, request: &Value, params: &Value) -> Result<Value> {
@@ -586,8 +650,12 @@ impl ActorRuntime<'_> {
         } else {
             let text = params["text"]
                 .as_str()
-                .context("send requires params.text")?;
-            (text.to_owned(), None)
+                .ok_or_else(|| coded(ErrorCode::InvalidParams, "send requires params.text"))?;
+            // `/custom args` and `/skill:name task` expand as they do in the terminal.
+            let text = crate::app::expand_prompt_command(self.layout, text)
+                .map_err(|error| coded(ErrorCode::InvalidParams, error))?
+                .unwrap_or_else(|| text.to_owned());
+            (text, None)
         };
         let started = Instant::now();
         let prompt = {
@@ -637,7 +705,10 @@ impl ActorRuntime<'_> {
         } else if format == "markdown" {
             false
         } else {
-            anyhow::bail!("unsupported export format: {format}");
+            return Err(coded(
+                ErrorCode::InvalidParams,
+                format!("unsupported export format: {format}"),
+            ));
         };
         let name = match params["path"].as_str() {
             Some(path) => path.to_owned(),
@@ -648,12 +719,15 @@ impl ActorRuntime<'_> {
             ),
         };
         let relative = std::path::Path::new(&name);
-        anyhow::ensure!(
-            relative
-                .components()
-                .all(|part| matches!(part, std::path::Component::Normal(_))),
-            "export path must be relative to the project root without '..'"
-        );
+        if !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(coded(
+                ErrorCode::InvalidParams,
+                "export path must be relative to the project root without '..'",
+            ));
+        }
         self.agent
             .session()
             .export(self.layout, &self.layout.project_root.join(relative), html)?;
@@ -727,12 +801,19 @@ impl ActorRuntime<'_> {
         let mut options: crate::config::compaction::CompactionOptions = if params.is_null() {
             Default::default()
         } else {
-            serde_json::from_value(params.clone()).context("invalid compact options")?
+            serde_json::from_value(params.clone()).map_err(|error| {
+                coded(
+                    ErrorCode::InvalidParams,
+                    format!("invalid compact options: {error}"),
+                )
+            })?
         };
-        anyhow::ensure!(
-            options.reason == crate::config::compaction::CompactionReason::Manual,
-            "RPC compact accepts only manual maintenance; automatic reasons are owned by the actor"
-        );
+        if options.reason != crate::config::compaction::CompactionReason::Manual {
+            return Err(coded(
+                ErrorCode::InvalidParams,
+                "RPC compact accepts only manual maintenance; automatic reasons are owned by the actor",
+            ));
+        }
         options.suppress_continuation = true;
         let outcome = self.agent.compact_with_options(&mut self.ui, options)?;
         Ok(json!({
@@ -743,19 +824,28 @@ impl ActorRuntime<'_> {
     }
 
     fn seed_context(&mut self, params: &Value) -> Result<Value> {
-        let messages = params["messages"]
-            .as_array()
-            .context("seed_context requires params.messages")?;
-        anyhow::ensure!(
-            messages.len() <= MAX_SEED_MESSAGES,
-            "at most {MAX_SEED_MESSAGES} seed messages"
-        );
+        let messages = params["messages"].as_array().ok_or_else(|| {
+            coded(
+                ErrorCode::InvalidParams,
+                "seed_context requires params.messages",
+            )
+        })?;
+        if messages.len() > MAX_SEED_MESSAGES {
+            return Err(coded(
+                ErrorCode::InvalidParams,
+                format!("at most {MAX_SEED_MESSAGES} seed messages"),
+            ));
+        }
         for text in messages {
-            let text = text.as_str().context("context entries must be strings")?;
-            anyhow::ensure!(
-                text.len() <= MAX_SEED_ENTRY_BYTES,
-                "context entry exceeds 1 MiB"
-            );
+            let text = text.as_str().ok_or_else(|| {
+                coded(ErrorCode::InvalidParams, "context entries must be strings")
+            })?;
+            if text.len() > MAX_SEED_ENTRY_BYTES {
+                return Err(coded(
+                    ErrorCode::InvalidParams,
+                    "context entry exceeds 1 MiB",
+                ));
+            }
             self.agent
                 .session_mut()
                 .append(json!({"role":"user","content":text}))?;
@@ -764,9 +854,12 @@ impl ActorRuntime<'_> {
     }
 
     fn resume(&mut self, params: &Value) -> Result<Value> {
-        let wanted = params["session_id"]
-            .as_str()
-            .context("resume requires params.session_id")?;
+        let wanted = params["session_id"].as_str().ok_or_else(|| {
+            coded(
+                ErrorCode::InvalidParams,
+                "resume requires params.session_id",
+            )
+        })?;
         if !self.current
             || (if self.acp {
                 self.agent.session().id() != wanted
@@ -779,7 +872,7 @@ impl ActorRuntime<'_> {
                     "session_before_switch",
                     json!({"reason":"resume","target_session_id":wanted}),
                 )
-                .map_err(anyhow::Error::msg)?;
+                .map_err(|error| coded(ErrorCode::Refused, error))?;
         }
         let mut forked_from: Option<String> = None;
         if self.acp {
@@ -791,14 +884,21 @@ impl ActorRuntime<'_> {
                     .transpose()?;
                 let (session, workspace) = if let Some(workspace) = workspace {
                     (
-                        self.parked.remove(wanted).context("session is not open")?,
+                        self.parked
+                            .remove(wanted)
+                            .ok_or_else(|| coded(ErrorCode::NotFound, "session is not open"))?,
                         workspace,
                     )
                 } else {
                     let info = Session::find_prefix(self.layout, wanted)?
                         .into_iter()
                         .find(|s| s.id == wanted)
-                        .context("session id not found in launched project")?;
+                        .ok_or_else(|| {
+                            coded(
+                                ErrorCode::NotFound,
+                                "session id not found in launched project",
+                            )
+                        })?;
                     let (session, source) = match Session::open_or_fork(self.layout, &info.path)? {
                         crate::storage::session::Resumed::Owned(session) => (session, None),
                         crate::storage::session::Resumed::Forked { source_id, session } => {
@@ -838,7 +938,21 @@ impl ActorRuntime<'_> {
             )
         } else {
             let matching = Session::find_prefix(self.layout, wanted)?;
-            anyhow::ensure!(matching.len() == 1, "session id missing or ambiguous");
+            match matching.len() {
+                0 => {
+                    return Err(coded(
+                        ErrorCode::NotFound,
+                        "session id not found in launched project",
+                    ));
+                }
+                1 => {}
+                _ => {
+                    return Err(coded(
+                        ErrorCode::InvalidParams,
+                        "session id prefix is ambiguous",
+                    ));
+                }
+            }
             if self.agent.session().id() != matching[0].id {
                 let (session, source) = match Session::open_or_fork(self.layout, &matching[0].path)?
                 {
@@ -859,21 +973,24 @@ impl ActorRuntime<'_> {
     }
 
     fn fork_session(&mut self, params: &Value) -> Result<Value> {
+        if !self.acp {
+            return self.fork_native(params);
+        }
         let wanted = params["session_id"]
             .as_str()
-            .context("session_id required")?;
+            .ok_or_else(|| coded(ErrorCode::InvalidParams, "session_id required"))?;
         self.agent
             .gate_session_change(
                 "session_before_branch",
                 json!({"reason":"fork","source_session_id":wanted}),
             )
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|error| coded(ErrorCode::Refused, error))?;
         self.agent
             .gate_session_change(
                 "session_before_switch",
                 json!({"reason":"fork","source_session_id":wanted}),
             )
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|error| coded(ErrorCode::Refused, error))?;
         let session = if self.current && self.agent.session().id() == wanted {
             self.agent.session().fork(self.layout)?
         } else if let Some(session) = self.parked.get(wanted) {
@@ -882,7 +999,12 @@ impl ActorRuntime<'_> {
             let info = Session::find_prefix(self.layout, wanted)?
                 .into_iter()
                 .find(|s| s.id == wanted)
-                .context("session id not found in launched project")?;
+                .ok_or_else(|| {
+                    coded(
+                        ErrorCode::NotFound,
+                        "session id not found in launched project",
+                    )
+                })?;
             Session::read(&info.path)?.fork(self.layout)?
         };
         let workspace = self.agent.prepare_session_workspace(&session)?;
@@ -899,6 +1021,53 @@ impl ActorRuntime<'_> {
         self.agent.set_plan_mode(false);
         self.current = true;
         Ok(json!({"session_id":self.agent.session().id(),"plan_mode":self.agent.plan_mode()}))
+    }
+
+    /// Native `fork_session`: forks the active session (or another session of this project named by
+    /// `session_id`) into a new session and switches to it, as `resume` switches.
+    fn fork_native(&mut self, params: &Value) -> Result<Value> {
+        let current = self.agent.session().id().to_owned();
+        let wanted = match params.get("session_id").filter(|value| !value.is_null()) {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| coded(ErrorCode::InvalidParams, "session_id must be a string"))?
+                .to_owned(),
+            None => current.clone(),
+        };
+        self.agent
+            .gate_session_change(
+                "session_before_branch",
+                json!({"reason":"fork","source_session_id":wanted}),
+            )
+            .map_err(|error| coded(ErrorCode::Refused, error))?;
+        self.agent
+            .gate_session_change(
+                "session_before_switch",
+                json!({"reason":"fork","source_session_id":wanted}),
+            )
+            .map_err(|error| coded(ErrorCode::Refused, error))?;
+        let session = if wanted == current {
+            self.agent.session().fork(self.layout)?
+        } else {
+            let info = Session::find_prefix(self.layout, &wanted)?
+                .into_iter()
+                .find(|s| s.id == wanted)
+                .ok_or_else(|| {
+                    coded(
+                        ErrorCode::NotFound,
+                        "session id not found in launched project",
+                    )
+                })?;
+            Session::read(&info.path)?.fork(self.layout)?
+        };
+        let workspace = self.agent.prepare_session_workspace(&session)?;
+        stop_owned_tasks(&mut self.agent, &mut self.ui);
+        drop_host_tools(&mut self.agent, &self.worker_host, &self.worker_uris);
+        self.agent.swap_session_prepared(session, workspace);
+        self.agent.set_plan_mode(false);
+        Ok(
+            json!({"session_id":self.agent.session().id(),"forked_from":wanted,"plan_mode":self.agent.plan_mode()}),
+        )
     }
 
     fn close_session(&mut self, params: &Value) -> Result<Value> {

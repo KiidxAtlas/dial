@@ -121,3 +121,88 @@ fn failed_staging_leaves_destination_untouched_and_cleans_private_directory() {
         );
     }
 }
+
+#[test]
+fn discovered_aliases_stay_opaque_so_openssh_applies_the_full_config() {
+    let home = tempfile::tempdir().expect("home fixture");
+    let ssh = home.path().join(".ssh");
+    std::fs::create_dir(&ssh).expect("ssh directory");
+    std::fs::write(
+        ssh.join("config"),
+        "Host bastion\n\
+         \tHostName 10.0.0.9\n\
+         \tUser jump\n\
+         Host prod\n\
+         \tHostName prod.internal\n\
+         \tUser deploy\n\
+         \tPort 2222\n\
+         \tIdentityFile ~/.ssh/id_prod\n\
+         \tProxyJump bastion\n",
+    )
+    .expect("config fixture");
+    let mut configured = BTreeMap::new();
+    configured.insert(
+        "bastion".to_owned(),
+        SshHostConfig {
+            host: "10.1.1.1".into(),
+            user: Some("ops".into()),
+            port: Some(2200),
+            key: None,
+        },
+    );
+    configured.insert(
+        "staging".to_owned(),
+        SshHostConfig {
+            host: "staging.example".into(),
+            user: None,
+            port: None,
+            key: None,
+        },
+    );
+    let targets = host_targets(home.path(), &configured);
+    let settings = Settings {
+        user_dir: home.path().join("dial"),
+        config: crate::config::tools::ssh::SshConfig::default(),
+    };
+    // Connection arguments without a ControlMaster, so the test touches no control directory.
+    let args = |name: &str| -> Vec<String> {
+        let target = &targets[name];
+        let mut args = connection::common_args(target, &settings, None, false);
+        args.push(target.destination().expect("destination"));
+        args
+    };
+    let has_pair = |args: &[String], flag: &str, value: &str| {
+        args.windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == value)
+    };
+
+    // Discovered aliases stay opaque: no HostName, port, key or user is copied into the arguments,
+    // so the ProxyJump and other settings in OpenSSH's configuration keep applying.
+    let prod = &targets["prod"];
+    assert_eq!(prod.host, "prod");
+    assert_eq!(
+        (prod.user.as_deref(), prod.port, prod.key.as_ref()),
+        (None, None, None)
+    );
+    let prod_args = args("prod");
+    assert_eq!(prod_args.last().map(String::as_str), Some("prod"));
+    assert!(!prod_args.iter().any(|arg| arg == "-p" || arg == "-i"));
+    assert!(!prod_args.iter().any(|arg| arg.contains("prod.internal")));
+
+    // A configured [ssh_hosts] entry wins over the same discovered alias.
+    let bastion_args = args("bastion");
+    assert_eq!(
+        bastion_args.last().map(String::as_str),
+        Some("ops@10.1.1.1")
+    );
+    assert!(has_pair(&bastion_args, "-p", "2200"));
+    assert!(!bastion_args.iter().any(|arg| arg.contains("10.0.0.9")));
+
+    // A configured entry with no discovered alias keeps its explicit HostName.
+    let staging_args = args("staging");
+    assert_eq!(
+        staging_args.last().map(String::as_str),
+        Some("staging.example")
+    );
+    assert!(!staging_args.iter().any(|arg| arg == "-p" || arg == "-i"));
+}

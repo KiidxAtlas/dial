@@ -25,12 +25,39 @@ pub struct HistoricalCall {
 const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("bash", &["session", "pty", "check", "check_paths", "trace"]),
     ("bg", &["persist", "lifetime", "call"]),
-    ("monitor", &["run", "after_secs", "on_exit", "note"]),
+    (
+        "monitor",
+        &["run", "after_secs", "on_exit", "note", "pid", "save"],
+    ),
     ("grep", &["output", "preview", "ast", "lang"]),
     ("glob", &["preview"]),
     ("edit", &["allow_syntax_errors", "verify"]),
-    ("write", &["allow_syntax_errors", "verify", "encoding"]),
-    ("read", &["format", "retain", "fetch", "raw", "max_chars"]),
+    (
+        "write",
+        &[
+            "allow_syntax_errors",
+            "verify",
+            "encoding",
+            "source",
+            "files",
+            "if_absent",
+            "expected_sha256",
+            "idempotent",
+            "receipt",
+        ],
+    ),
+    (
+        "read",
+        &[
+            "format",
+            "retain",
+            "fetch",
+            "raw",
+            "max_chars",
+            "budget",
+            "fresh",
+        ],
+    ),
     ("ast_edit", &["allow_syntax_errors"]),
     ("skill", &["action", "description", "body", "scope"]),
     ("checkpoint", &["action", "report"]),
@@ -46,7 +73,8 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
         ],
     ),
     ("find", &["related"]),
-    ("lsp", &["payload"]),
+    ("lsp", &["payload", "direction"]),
+    ("dap", &["filters", "filterOptions", "exceptionOptions"]),
     ("tool_search", &["load", "names", "unload"]),
     ("eval", &["background", "title"]),
     ("verify", &["acceptance"]),
@@ -57,6 +85,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ),
     ("image_gen", &["image", "frame_count", "frame_duration_ms"]),
     ("model_weights", &["span"]),
+    ("gitea_pr", &["style"]),
     (
         "data",
         &[
@@ -177,9 +206,28 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
 /// schema is the current one with exactly these values removed.
 const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
     ("git", "action", &["reflog"]),
+    ("git", "forge", &["gitea"]),
+    (
+        "git",
+        "op",
+        &["pr_list", "pr_view", "pr_comment", "pr_approve", "pr_merge"],
+    ),
     ("eval", "language", &["py"]),
+    ("find", "ranking", &["embedding"]),
+    ("monitor", "action", &["saved", "restore", "forget"]),
+    ("bg", "action", &["saved", "restore", "forget"]),
     ("task", "action", &["verify"]),
     ("lsp", "action", &["request"]),
+    (
+        "lsp",
+        "action",
+        &["format", "completion", "signature_help", "call_hierarchy"],
+    ),
+    (
+        "dap",
+        "action",
+        &["setExceptionBreakpoints", "exceptionInfo", "restart"],
+    ),
     ("model_weights", "method", &["add"]),
     (
         "data",
@@ -189,6 +237,11 @@ const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
     ("data", "format", &["jsonl"]),
     ("audio", "action", &["analyze"]),
     ("document", "action", &["inspect"]),
+    (
+        "dep_source",
+        "ecosystem",
+        &["jvm", "ruby", "composer", "nuget"],
+    ),
     (
         "evidence",
         "action",
@@ -813,6 +866,25 @@ fn native_identities(name: &str, legacy: bool) -> Vec<Identity> {
             }
         }
         variants.push(narrowed);
+        if name == "write" {
+            // Before artifact/batch inputs, path and content were required. Only recognize
+            // that exact historical requirement when both alternative inputs are absent.
+            let historical: Vec<_> = variants
+                .iter()
+                .filter_map(|variant| {
+                    let properties = variant
+                        .pointer("/function/parameters/properties")?
+                        .as_object()?;
+                    if properties.contains_key("source") || properties.contains_key("files") {
+                        return None;
+                    }
+                    let mut old = variant.clone();
+                    old["function"]["parameters"]["required"] = json!(["path", "content"]);
+                    Some(old)
+                })
+                .collect();
+            variants.extend(historical);
+        }
         variants
     })
     .filter_map(|schema| identities(&[schema], &Registry::new()).remove(name))
@@ -835,6 +907,8 @@ fn registry_additive_compatible(
     // A consolidated successor's schema is the union of its members' schemas
     // (`facade::GROUPS`), so a member's additions are additions to the successor too.
     let owners: Vec<&str> = std::iter::once(old.name.as_str())
+        // Pinned adapter tools expose the same protocol schema as the selecting DAP owner.
+        .chain(old.name.starts_with("dap_").then_some("dap"))
         .chain(
             crate::tools::surface::facade::GROUPS
                 .iter()

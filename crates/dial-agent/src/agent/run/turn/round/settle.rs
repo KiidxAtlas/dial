@@ -443,6 +443,49 @@ impl Agent<'_> {
             // An unchanged re-read is not an intervention, but it is still a repeated call.
             self.record(step, "repeated_call", json!({"name":call.name}))?;
         }
+        // Read reuse metrics: pointers for unchanged re-reads and narrowed or changed-lines
+        // reads. `saved_bytes` is known exactly only for a pointer that replaced a full result.
+        if call.name == "read" && !output.is_error {
+            let reuse = output.data.as_ref().and_then(|data| data.get("read_reuse"));
+            let covered_lines =
+                reuse
+                    .and_then(|reuse| reuse["covered"].as_array())
+                    .map_or(0, |covered| {
+                        covered
+                            .iter()
+                            .filter_map(|part| {
+                                Some(part["range"][1].as_u64()? + 1 - part["range"][0].as_u64()?)
+                            })
+                            .sum::<u64>()
+                    });
+            if is_pointer || reuse.is_some() {
+                let saved_bytes = duplicate
+                    .as_deref()
+                    .filter(|_| is_pointer)
+                    .map_or(0, |pointer| output.text.len().saturating_sub(pointer.len()));
+                let kind = if is_pointer
+                    || reuse.is_some_and(|reuse| reuse["fully_reused"] == true)
+                        && reuse.is_some_and(|reuse| reuse["delta"] != true)
+                {
+                    "pointer"
+                } else if reuse.is_some_and(|reuse| reuse["delta"] == true) {
+                    "delta"
+                } else {
+                    "narrowed"
+                };
+                self.efficiency_metrics
+                    .read_reuse(kind, covered_lines, saved_bytes as u64);
+                self.record(
+                    step,
+                    "read_reuse",
+                    json!({
+                        "kind": kind,
+                        "covered_lines": covered_lines,
+                        "saved_bytes": saved_bytes,
+                    }),
+                )?;
+            }
+        }
         if is_duplicate && !is_pointer {
             self.record(step, "investigation_gate", json!({"name":call.name}))?;
             ui.diagnostic(&format!("Recovery checkpoint: unchanged observation in this `{}` call; it is withheld while corrected arguments and narrower evidence remain available.", call.name));

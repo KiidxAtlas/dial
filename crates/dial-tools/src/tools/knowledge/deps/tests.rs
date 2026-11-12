@@ -51,6 +51,7 @@ fn cargo_fixture() -> (tempfile::TempDir, tempfile::TempDir, Caches) {
     let caches = Caches {
         cargo_home: Some(home.path().to_path_buf()),
         go_mod_cache: None,
+        ..Default::default()
     };
     (project, home, caches)
 }
@@ -163,6 +164,7 @@ fn caches_outside_the_workspace_follow_the_sandbox_read_policy() {
     let other = Caches {
         cargo_home: Some(project.path().join("no-cargo-home")),
         go_mod_cache: None,
+        ..Default::default()
     };
     assert!(!other.contain(&fs::canonicalize(home.path()).unwrap()));
     assert!(caches.contain(&fs::canonicalize(home.path().join("registry/src")).unwrap()));
@@ -298,6 +300,7 @@ fn go_resolves_required_modules_from_the_module_cache() {
     let caches = Caches {
         cargo_home: None,
         go_mod_cache: Some(cache.path().to_path_buf()),
+        ..Default::default()
     };
     let ws = dev(Workspace::new(project.path()).unwrap(), Vec::new());
     let out = run(&ws, &json!({"name": "bar"}), &caches).unwrap();
@@ -315,4 +318,338 @@ fn schema_is_read_only_and_needs_no_approval() {
     assert!(tool.read_only_hint());
     assert_eq!(tool.concurrency(&json!({})), Concurrency::Shared);
     assert_eq!(tool.schema()["function"]["name"], "dep_source");
+}
+
+#[test]
+fn composer_reads_the_locked_package_from_vendor() {
+    let project = tempfile::tempdir().unwrap();
+    write(
+        &project.path().join("composer.lock"),
+        r#"{"packages":[{"name":"monolog/monolog","version":"3.5.0"}],"packages-dev":[{"name":"phpunit/phpunit","version":"v10.5.2"}]}"#,
+    );
+    write(
+        &project.path().join("vendor/monolog/monolog/src/Logger.php"),
+        "<?php\nclass Logger { public function needle() {} }\n",
+    );
+    let ws = dev(Workspace::new(project.path()).unwrap(), Vec::new());
+    let caches = Caches::default();
+    let out = run(
+        &ws,
+        &json!({"name": "Monolog/Monolog", "query": "needle"}),
+        &caches,
+    )
+    .unwrap();
+    assert!(
+        out.starts_with("composer monolog/monolog 3.5.0 (resolved from composer.lock, vendor/)"),
+        "{out}"
+    );
+    assert!(out.contains("src/Logger.php:2: class Logger"), "{out}");
+    let error = run(&ws, &json!({"name": "monolog/monolog@2.0.0"}), &caches).unwrap_err();
+    assert!(error.contains("composer.lock has 3.5.0"), "{error}");
+    // Locked dev dependency that is not installed: an honest error, nothing fetched.
+    let error = run(&ws, &json!({"name": "phpunit/phpunit@10.5.2"}), &caches).unwrap_err();
+    assert!(error.contains("not installed in vendor/"), "{error}");
+}
+
+const GEMFILE_LOCK: &str = "GEM
+  remote: https://rubygems.org/
+  specs:
+    rack (3.0.8)
+    nokogiri (1.16.0-arm64-darwin)
+      racc (~> 1.4)
+    racc (1.7.3)
+
+GIT
+  remote: https://github.com/example/tool.git
+  revision: 0123456789abcdef
+  specs:
+    tool (0.4.0)
+
+PATH
+  remote: engines/local
+  specs:
+    local (0.1.0)
+
+PLATFORMS
+  arm64-darwin
+
+DEPENDENCIES
+  rack
+";
+
+#[test]
+fn ruby_reads_locked_gems_from_the_bundle_path_and_gem_directories() {
+    let project = tempfile::tempdir().unwrap();
+    write(&project.path().join("Gemfile.lock"), GEMFILE_LOCK);
+    write(&project.path().join("Gemfile"), "gem 'rack'\n");
+    let bundle = project.path().join("vendor/bundle/ruby/3.3.0");
+    write(
+        &bundle.join("gems/rack-3.0.8/lib/rack.rb"),
+        "module Rack\n  def self.needle; end\nend\n",
+    );
+    write(
+        &bundle.join("bundler/gems/tool-0123456789ab/tool.gemspec"),
+        "Gem::Specification.new\n",
+    );
+    // nokogiri is installed only in a gem directory outside the project.
+    let gem_home = tempfile::tempdir().unwrap();
+    write(
+        &gem_home
+            .path()
+            .join("gems/nokogiri-1.16.0-arm64-darwin/lib/nokogiri.rb"),
+        "module Nokogiri; end\n",
+    );
+    let caches = Caches {
+        gem_paths: vec![gem_home.path().to_path_buf()],
+        ..Default::default()
+    };
+    let ws = dev(Workspace::new(project.path()).unwrap(), Vec::new());
+    let out = run(&ws, &json!({"name": "rack", "query": "needle"}), &caches).unwrap();
+    assert!(
+        out.starts_with("ruby rack 3.0.8 (resolved from Gemfile.lock GEM)"),
+        "{out}"
+    );
+    assert!(out.contains("lib/rack.rb:2: def self.needle; end"), "{out}");
+    let out = run(&ws, &json!({"name": "nokogiri@1.16.0"}), &caches).unwrap();
+    assert!(
+        out.starts_with("ruby nokogiri 1.16.0-arm64-darwin"),
+        "{out}"
+    );
+    let out = run(&ws, &json!({"name": "tool"}), &caches).unwrap();
+    assert!(
+        out.starts_with("ruby tool 0.4.0 (resolved from Gemfile.lock GIT)"),
+        "{out}"
+    );
+    // A dependency-of-a-dependency line is not a top-level spec of its own version.
+    let error = run(&ws, &json!({"name": "racc"}), &caches).unwrap_err();
+    assert!(
+        error.contains("racc 1.7.3 is locked but not installed"),
+        "{error}"
+    );
+    let error = run(&ws, &json!({"name": "local"}), &caches).unwrap_err();
+    assert!(error.contains("path gem"), "{error}");
+}
+
+#[test]
+fn nuget_reads_the_restored_version_from_the_global_packages_folder() {
+    let project = tempfile::tempdir().unwrap();
+    write(&project.path().join("App/App.csproj"), "<Project />\n");
+    write(&project.path().join("App.sln"), "\n");
+    write(
+        &project.path().join("App/packages.lock.json"),
+        r#"{"version":1,"dependencies":{"net8.0":{"Newtonsoft.Json":{"type":"Direct","resolved":"13.0.3"}}}}"#,
+    );
+    write(
+        &project.path().join("App/obj/project.assets.json"),
+        r#"{"libraries":{"Serilog/3.1.1":{"type":"package"},"App.Core/1.0.0":{"type":"project"}}}"#,
+    );
+    let packages = tempfile::tempdir().unwrap();
+    write(
+        &packages.path().join("newtonsoft.json/13.0.3/README.md"),
+        "Json.NET needle\n",
+    );
+    write(
+        &packages.path().join("serilog/3.1.1/serilog.nuspec"),
+        "<package />\n",
+    );
+    let caches = Caches {
+        nuget_packages: Some(packages.path().to_path_buf()),
+        ..Default::default()
+    };
+    let ws = dev(Workspace::new(project.path()).unwrap(), Vec::new());
+    let out = run(
+        &ws,
+        &json!({"name": "Newtonsoft.Json", "query": "needle"}),
+        &caches,
+    )
+    .unwrap();
+    assert!(
+        out.starts_with("nuget Newtonsoft.Json 13.0.3 (resolved from App/packages.lock.json)"),
+        "{out}"
+    );
+    assert!(out.contains("README.md:1: Json.NET needle"), "{out}");
+    let out = run(&ws, &json!({"name": "serilog"}), &caches).unwrap();
+    assert!(out.contains("App/obj/project.assets.json"), "{out}");
+    assert!(out.contains("  serilog.nuspec\n"), "{out}");
+    let error = run(&ws, &json!({"name": "App.Core"}), &caches).unwrap_err();
+    assert!(error.contains("not in packages.lock.json"), "{error}");
+}
+
+fn sources_jar(path: &Path, files: &[(&str, &str)]) {
+    use std::io::Write as _;
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+    for (name, body) in files {
+        zip.start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(body.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+const POM: &str = r#"<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <version>1.0.0</version>
+  <properties><guava.version>33.0.0-jre</guava.version></properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>${guava.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${undefined.version}</version>
+    </dependency>
+  </dependencies>
+</project>
+"#;
+
+#[test]
+fn jvm_reads_the_declared_version_inside_its_sources_jar() {
+    let project = tempfile::tempdir().unwrap();
+    write(&project.path().join("pom.xml"), POM);
+    let m2 = tempfile::tempdir().unwrap();
+    let guava = m2.path().join("com/google/guava/guava");
+    sources_jar(
+        &guava.join("33.0.0-jre/guava-33.0.0-jre-sources.jar"),
+        &[
+            ("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n"),
+            (
+                "com/google/common/base/Strings.java",
+                "package com.google.common.base;\npublic final class Strings { static void needle() {} }\n",
+            ),
+            ("com/google/common/collect/Lists.java", "class Lists {}\n"),
+        ],
+    );
+    // An older cached version without sources; only binary jars for slf4j.
+    write(&guava.join("31.1-jre/guava-31.1-jre.jar"), "binary");
+    let slf4j = m2.path().join("org/slf4j/slf4j-api");
+    write(&slf4j.join("2.0.9/slf4j-api-2.0.9.jar"), "binary");
+    let caches = Caches {
+        maven_repo: Some(m2.path().to_path_buf()),
+        ..Default::default()
+    };
+    let ws = dev(Workspace::new(project.path()).unwrap(), Vec::new());
+
+    let out = run(&ws, &json!({"name": "com.google.guava:guava"}), &caches).unwrap();
+    assert!(
+        out.starts_with(
+            "jvm com.google.guava:guava 33.0.0-jre (resolved from pom.xml, local Maven repository)"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("other locked versions: 31.1-jre"), "{out}");
+    assert!(out.contains(".: 2 entries\n  META-INF/\n  com/\n"), "{out}");
+
+    let out = run(
+        &ws,
+        &json!({"name": "com.google.guava:guava", "path": "com/google/common", "query": "needle"}),
+        &caches,
+    )
+    .unwrap();
+    assert!(
+        out.contains("com/google/common/base/Strings.java:2: public final class Strings"),
+        "{out}"
+    );
+    assert!(!out.contains("Lists"), "{out}");
+
+    let out = run(
+        &ws,
+        &json!({"name": "com.google.guava:guava", "path": "com/google/common/base/Strings.java:2-2"}),
+        &caches,
+    )
+    .unwrap();
+    assert!(out.contains("\n2:public final class Strings"), "{out}");
+    assert!(
+        out.contains("[com/google/common/base/Strings.java lines 2-2 of 2]"),
+        "{out}"
+    );
+
+    let error = run(
+        &ws,
+        &json!({"name": "com.google.guava:guava", "path": "../escape"}),
+        &caches,
+    )
+    .unwrap_err();
+    assert!(error.contains("without `..`"), "{error}");
+    let error = run(
+        &ws,
+        &json!({"name": "com.google.guava:guava@31.1-jre"}),
+        &caches,
+    )
+    .unwrap_err();
+    assert!(error.contains("without a -sources.jar"), "{error}");
+    // An unresolvable property version is skipped; the binary-only cache has no sources.
+    let error = run(&ws, &json!({"name": "org.slf4j:slf4j-api"}), &caches).unwrap_err();
+    assert!(error.contains("no -sources.jar"), "{error}");
+    // A `:` name never falls through to another ecosystem.
+    let error = run(
+        &ws,
+        &json!({"name": "com.google.guava:guava", "ecosystem": "npm"}),
+        &caches,
+    )
+    .unwrap_err();
+    assert!(error.contains("JVM group:artifact"), "{error}");
+}
+
+#[test]
+fn jvm_uses_gradle_lockfiles_and_the_gradle_module_cache() {
+    let project = tempfile::tempdir().unwrap();
+    write(
+        &project.path().join("gradle.lockfile"),
+        "# comment\norg.jetbrains.kotlin:kotlin-stdlib:1.9.22=compileClasspath,runtimeClasspath\nempty=\n",
+    );
+    let gradle = tempfile::tempdir().unwrap();
+    sources_jar(
+        &gradle.path().join(
+            "caches/modules-2/files-2.1/org.jetbrains.kotlin/kotlin-stdlib/1.9.22/0a1b2c/kotlin-stdlib-1.9.22-sources.jar",
+        ),
+        &[("kotlin/Standard.kt", "package kotlin\n")],
+    );
+    let caches = Caches {
+        gradle_home: Some(gradle.path().to_path_buf()),
+        ..Default::default()
+    };
+    let ws = dev(Workspace::new(project.path()).unwrap(), Vec::new());
+    let out = run(
+        &ws,
+        &json!({"name": "org.jetbrains.kotlin:kotlin-stdlib"}),
+        &caches,
+    )
+    .unwrap();
+    assert!(
+        out.starts_with("jvm org.jetbrains.kotlin:kotlin-stdlib 1.9.22 (resolved from gradle.lockfile, Gradle module cache)"),
+        "{out}"
+    );
+    assert!(out.contains("  kotlin/\n"), "{out}");
+}
+
+#[test]
+fn new_ecosystems_are_detected_and_named_in_the_schema() {
+    let project = tempfile::tempdir().unwrap();
+    for file in ["pom.xml", "Gemfile", "composer.json", "App.csproj"] {
+        write(&project.path().join(file), "\n");
+    }
+    assert_eq!(
+        Ecosystem::present(project.path()),
+        [
+            Ecosystem::Jvm,
+            Ecosystem::Ruby,
+            Ecosystem::Composer,
+            Ecosystem::NuGet
+        ]
+    );
+    let schema = DepSource.schema();
+    assert_eq!(
+        schema["function"]["parameters"]["properties"]["ecosystem"]["enum"],
+        json!([
+            "cargo", "npm", "python", "go", "jvm", "ruby", "composer", "nuget"
+        ])
+    );
+    assert!(validate_name("com.google.guava:guava").is_ok());
+    for bad in ["a:b:c", ":guava", "com..google:guava", "com.google:../x"] {
+        assert!(validate_name(bad).is_err(), "{bad}");
+    }
 }

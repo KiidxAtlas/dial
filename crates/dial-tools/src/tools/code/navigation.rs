@@ -2,6 +2,7 @@
 mod cache;
 mod related;
 mod semantic;
+mod vector;
 use crate::config::types::Config;
 use crate::tools::fs::walk::Walk;
 use crate::tools::integrations::ext::{Tool, ToolContext};
@@ -16,7 +17,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 const MAX_FILE: u64 = 2 * 1024 * 1024;
@@ -24,17 +25,55 @@ const MAX_TOTAL: u64 = 64 * 1024 * 1024;
 const MAX_OUTPUT: usize = 20 * 1024;
 
 pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
+    let embedding = match crate::storage::memory_backend::shared_embedder(config) {
+        Ok(Some(shared)) => EmbeddingSlot {
+            local: shared.local,
+            endpoint: shared.base_url.clone(),
+            embedder: Mutex::new(Some(shared.embedder)),
+            error: None,
+        },
+        Ok(None) => EmbeddingSlot::unavailable(
+            "ranking=embedding needs an embedding model: assign the embedding model role (Alt+M, or `/setup embeddings` for a local Ollama model) or set memory.semantic.embedding_base_url and embedding_model".into(),
+        ),
+        Err(error) => EmbeddingSlot::unavailable(format!(
+            "ranking=embedding is unavailable: {error:#}"
+        )),
+    };
     vec![Arc::new(Find {
         lsp: Arc::new(super::lsp::LspTool::new(&config.lsp)),
+        embedding: Arc::new(embedding),
     })]
+}
+/// The embedding route `ranking=embedding` uses, shared by forked sessions.
+struct EmbeddingSlot {
+    embedder: Mutex<Option<Box<dyn crate::storage::memory_backend::Embedder>>>,
+    /// The endpoint is loopback, so source never leaves the machine.
+    local: bool,
+    endpoint: String,
+    error: Option<String>,
+}
+impl EmbeddingSlot {
+    fn unavailable(error: String) -> Self {
+        Self {
+            embedder: Mutex::new(None),
+            local: false,
+            endpoint: String::new(),
+            error: Some(error),
+        }
+    }
+}
+fn embedding_ranking(args: &Value) -> bool {
+    args.get("ranking").and_then(Value::as_str) == Some("embedding")
 }
 struct Find {
     lsp: Arc<dyn Tool>,
+    embedding: Arc<EmbeddingSlot>,
 }
 impl Tool for Find {
     fn fork_session(&self) -> Option<Arc<dyn Tool>> {
         Some(Arc::new(Self {
             lsp: self.lsp.fork_session()?,
+            embedding: Arc::clone(&self.embedding),
         }))
     }
     fn name(&self) -> &str {
@@ -43,12 +82,12 @@ impl Tool for Find {
     fn schema(&self) -> Value {
         tool_schema(
             "find",
-            "Locate code by behavior (default) or exact text. Related evidence automatically maps literal name methods and string-array constants across source groups; bounded lexical references, not confirmed owners. Complete numbered excerpts are editable. ranking=semantic adds one model rerank; lsp_path adds language-server symbols.",
+            "Locate code by behavior (default) or exact text. Related evidence automatically maps literal name methods and string-array constants across source groups; bounded lexical references, not confirmed owners. Complete numbered excerpts are editable. ranking=semantic adds one model rerank; ranking=embedding uses the embedding model; lsp_path adds language-server symbols.",
             json!({
                 "query": {"type":"string", "description":"Behavior description, quoted mandatory phrases, or exact text"},
                 "path": {"type":"string", "description":"File/directory scope, default workspace"},
                 "mode": {"type":"string", "enum":["behavior", "exact"]},
-                "ranking": {"type":"string", "enum":["lexical", "semantic"], "description":"Behavior mode only (default lexical)."},
+                "ranking": {"type":"string", "enum":["lexical", "semantic", "embedding"], "description":"Behavior mode only (default lexical)."},
                 "keywords": {"type":"array", "items":{"type":"string"}, "description":"Optional known literal terms to boost in behavior mode"},
                 "lsp_path": {"type":"string", "description":"Source file selecting a language server for symbol metadata; startup needs approval"},
                 "lsp_query": {"type":"string", "description":"Exact symbol for language-server metadata (default query)"},
@@ -59,12 +98,36 @@ impl Tool for Find {
         )
     }
     fn needs_approval(&self, args: &Value) -> bool {
-        lsp_args(args)
-            .ok()
-            .flatten()
-            .is_some_and(|args| self.lsp.needs_approval(&args))
+        // Embedding search sends file contents to the embedding endpoint: off-machine needs approval.
+        (embedding_ranking(args) && !self.embedding.local)
+            || lsp_args(args)
+                .ok()
+                .flatten()
+                .is_some_and(|args| self.lsp.needs_approval(&args))
     }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
+        if embedding_ranking(args) {
+            if let Some(error) = &self.embedding.error {
+                return ToolOutput::err(error.clone());
+            }
+            let mut slot = self
+                .embedding
+                .embedder
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(embedder) = slot.as_mut() else {
+                return ToolOutput::err("ranking=embedding has no embedding model configured");
+            };
+            let endpoint = if self.embedding.local {
+                format!("local endpoint {}", self.embedding.endpoint)
+            } else {
+                format!("remote endpoint {}", self.embedding.endpoint)
+            };
+            return match vector::search(ctx.workspace, args, embedder.as_mut(), &endpoint) {
+                Ok(text) => ToolOutput::ok(text),
+                Err(error) => ToolOutput::err(error),
+            };
+        }
         match semantic::enabled(args) {
             Ok(true) => {
                 return ToolOutput::err(

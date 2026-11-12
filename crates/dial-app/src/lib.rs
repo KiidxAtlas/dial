@@ -6,6 +6,7 @@ pub mod cli;
 pub mod collab;
 pub mod release;
 pub mod repl;
+pub(crate) mod rewind;
 pub mod rpc;
 pub mod schedule;
 

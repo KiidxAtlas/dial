@@ -127,6 +127,8 @@ pub(super) struct Shell {
     /// Latest-request background `/search` state; see `search.rs`.
     search: search::Search,
     pub(super) busy_overlay: Option<BusyOverlay>,
+    /// Palette actions run this session, most recent first; they lead the next palette.
+    pub(super) palette_recent: Vec<String>,
     pub(super) worker_editors: crate::ui::overlay::subagent_viewer::WorkerEditors,
     pub(super) term: InlineTerminal,
     pub(super) themes: ThemeManager,

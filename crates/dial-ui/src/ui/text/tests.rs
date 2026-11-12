@@ -147,3 +147,46 @@ fn tiny_widths_never_exceed_their_cell_limit() {
     assert_eq!(wrap_words("界界", 1), vec!["?", "?"]);
     assert!(wrap_words("ab界cd", 2).iter().all(|row| width(row) <= 2));
 }
+
+#[test]
+fn ellipsize_words_cuts_between_words() {
+    // Fits: unchanged unless forced.
+    assert_eq!(
+        ellipsize_words("short text", 20, false, false),
+        "short text"
+    );
+    assert_eq!(
+        ellipsize_words("short text", 20, false, true),
+        "short text…"
+    );
+    // Cut lands inside "overflow": back up to the previous word.
+    assert_eq!(
+        ellipsize_words("Long help text overflows here", 20, false, false),
+        "Long help text…"
+    );
+    // Cut lands exactly at a word end: keep the word.
+    assert_eq!(
+        ellipsize_words("abcd efgh ijkl", 10, true, false),
+        "abcd..."
+    );
+    assert_eq!(
+        ellipsize_words("abcd efgh ijkl", 12, true, false),
+        "abcd efgh..."
+    );
+    // One long word: a grapheme cut rather than an almost empty row.
+    assert_eq!(
+        ellipsize_words("a supercalifragilistic", 12, false, false),
+        "a supercali…"
+    );
+    // Every result fits.
+    for max in 0..30 {
+        assert!(
+            width(&ellipsize_words(
+                "Long help text overflows here",
+                max,
+                false,
+                true
+            )) <= max
+        );
+    }
+}

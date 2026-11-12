@@ -322,12 +322,17 @@ pub(in crate::tools) fn list_dir(ws: &Workspace, dir: &Path) -> Result<String, S
 }
 
 pub(in crate::tools) fn read_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
-    read_tool_streaming(
-        ws,
-        args,
-        &std::sync::atomic::AtomicBool::new(false),
-        MAX_READ_OUTPUT,
-    )
+    let budget = read_budget(args, MAX_READ_OUTPUT)?;
+    read_tool_streaming(ws, args, &std::sync::atomic::AtomicBool::new(false), budget)
+}
+
+/// The byte budget of one read: the caller's model-facing limit, lowered by an explicit `budget`.
+pub(in crate::tools) fn read_budget(args: &Value, limit: usize) -> Result<usize, String> {
+    match opt_u64(args, "budget")? {
+        None => Ok(limit),
+        Some(requested) if requested < 1024 => Err("budget must be at least 1024 bytes".into()),
+        Some(requested) => Ok(limit.min(usize::try_from(requested).unwrap_or(usize::MAX))),
+    }
 }
 pub(in crate::tools) fn read_tool_streaming(
     ws: &Workspace,
@@ -342,9 +347,7 @@ pub(in crate::tools) fn read_tool_streaming(
         let Ok(input) = req_str(args, "path") else {
             return error;
         };
-        let input = input
-            .strip_suffix(super::outline::SELECTOR)
-            .unwrap_or(input);
+        let input = super::outline::plain_path(input);
         let plain = select::split_selector(input).map_or(input, |(plain, _)| plain);
         super::suggest::annotate(ws, error, &[plain])
     })
@@ -469,11 +472,11 @@ fn read_target(
     if scheme == crate::tools::integrations::resources::Scheme::System {
         return super::system::read(input, cancel);
     }
-    if let Some(path_text) = super::outline::target(ws, input) {
+    if let Some(request) = super::outline::target(ws, input) {
         if present(args, "offset") || present(args, "limit") {
             return Err("`:outline` does not accept offset/limit".into());
         }
-        return super::outline::read(ws, path_text, budget);
+        return super::outline::read(ws, &request, budget);
     }
     let local = ws.expand_file_handle(input)?;
     if let Some((base, spec)) = super::binary::split_bytes_selector(ws, &local) {
@@ -497,7 +500,8 @@ fn read_target(
         return Err("limit must be at least 1".to_string());
     }
     let limit = limit.min(MAX_READ_LINES);
-    let (path_text, sel) = select::split_target(ws, input)?;
+    let (path_text, mut sel) = select::split_target(ws, input)?;
+    super::outline::resolve_symbols(ws, path_text, &mut sel)?;
     if offset.is_some() && sel.selects_lines() {
         return Err(
             "use either offset or a line selector on the path (`path:50-100`), not both"
@@ -557,6 +561,12 @@ fn read_target(
         EditMode::Hashline => {
             if whole && let Some(summary) = super::summary::try_read(ws, path_text, limit, budget) {
                 return Ok(summary);
+            }
+            if whole && let Some(folded) = super::fold::plan(ws, path_text) {
+                let mut sel = sel;
+                sel.ranges = folded.shown;
+                let body = hashline::read(ws, path_text, &sel, offset, limit, budget)?;
+                return Ok(format!("{body}\n{}", folded.note));
             }
             hashline::read(ws, path_text, &sel, offset, limit, budget)
         }
@@ -876,12 +886,13 @@ pub(crate) fn write_plan(
     if path == ws.root() || path.is_dir() {
         return Err(format!("{input:?} is a directory"));
     }
-    let cleaned = if ws.edit_mode == crate::tools::EditMode::Hashline {
+    let cleaned = if ws.edit_mode == crate::tools::EditMode::Hashline && !present(args, "source") {
         crate::tools::edit::edit_native::write_prefixes::strip(content)
     } else {
         None
     };
     if ws.edit_mode == crate::tools::EditMode::Hashline
+        && !present(args, "source")
         && crate::tools::edit::edit_native::write_prefixes::incomplete_projection(content)
     {
         return Err("write content is an incomplete read projection; reread the whole source or use targeted edit instead".into());
@@ -891,6 +902,7 @@ pub(crate) fn write_plan(
         path,
         Some(cleaned.as_deref().unwrap_or(content).to_owned()),
     )?;
+    super::write::preconditions(args, &change)?;
     if let Some(before) = &change.before {
         let count = hashline::split_lines(&hashline::normalize(&before.text)).len();
         if count > 0
@@ -1001,20 +1013,18 @@ fn unseen_overwrite_projection(ws: &Workspace, path: &Path, before: &str) -> Opt
     }
     Some(text)
 }
-pub(in crate::tools) fn write_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
-    write_with(ws, args, &crate::tools::edit::editing::Execution::default())
+pub(in crate::tools) fn write_tool(
+    ws: &Workspace,
+    args: &Value,
+) -> Result<crate::tools::ToolOutput, String> {
+    super::write::output(ws, args, &crate::tools::edit::editing::Execution::default())
 }
 pub(crate) fn write_with(
     ws: &Workspace,
     args: &Value,
     execution: &crate::tools::edit::editing::Execution<'_>,
-) -> Result<String, String> {
-    crate::tools::edit::editing::verify_targets(args)?;
-    let execution = crate::tools::edit::editing::Execution {
-        refuse_syntax_errors: crate::tools::edit::editing::syntax_gate(ws, args)?,
-        ..*execution
-    };
-    crate::tools::edit::editing::finish_with(ws, write_plan(ws, args)?, true, &execution)
+) -> Result<crate::tools::ToolOutput, String> {
+    super::write::output(ws, args, execution)
 }
 
 #[cfg(test)]

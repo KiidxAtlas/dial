@@ -40,6 +40,12 @@ pub struct Metrics {
     pub chatter_bytes: u64,
     /// Provider-reported output tokens; zero when the provider does not report usage.
     pub completion_tokens: u64,
+    /// Reads answered from rows the model already held: pointers, narrowed and changed-lines reads.
+    #[serde(default)]
+    pub read_reuses: u64,
+    /// Source lines those reads did not resend.
+    #[serde(default)]
+    pub read_lines_reused: u64,
 }
 
 impl Metrics {
@@ -89,6 +95,12 @@ impl Metrics {
             "repeated_call" => self.repeated_calls += 1,
             "reasoning_gate" => self.interventions += 1,
             "tool_form_failure" => self.protocol_errors += 1,
+            "read_reuse" => {
+                self.read_reuses += 1;
+                self.read_lines_reused = self
+                    .read_lines_reused
+                    .saturating_add(data["covered_lines"].as_u64().unwrap_or(0));
+            }
             _ => {}
         }
     }
@@ -119,6 +131,10 @@ impl Metrics {
         self.completion_tokens = self
             .completion_tokens
             .saturating_add(other.completion_tokens);
+        self.read_reuses = self.read_reuses.saturating_add(other.read_reuses);
+        self.read_lines_reused = self
+            .read_lines_reused
+            .saturating_add(other.read_lines_reused);
     }
 }
 

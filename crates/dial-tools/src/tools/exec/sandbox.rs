@@ -77,10 +77,15 @@
 //! * Hard links: creating one to a denied file is refused (needs read access),
 //!   but a hard link made before the sandbox started is a distinct path.
 
+#[cfg(any(windows, test))]
+mod appcontainer;
 #[cfg(target_os = "linux")]
 pub mod fork_fence;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod linux;
+/// Hidden first argument of the Windows AppContainer launcher (see `low_integrity::launcher_main`).
+#[cfg(windows)]
+pub use appcontainer::LAUNCH_ARG as APPCONTAINER_LAUNCH_ARG;
 #[cfg(any(windows, test))]
 pub mod low_integrity;
 pub mod netproxy;
@@ -436,9 +441,7 @@ impl Sandbox {
             {
                 low_integrity::probe()
             } else {
-                Sandbox::Unavailable(
-                    "Windows supports only sandbox.mode = \"dev\" with network allowed".to_string(),
-                )
+                appcontainer::probe()
             }
         }
         #[cfg(target_os = "linux")]

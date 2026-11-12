@@ -24,8 +24,8 @@ use super::{
     text,
     theme::{Sym, Theme, Tok},
     tool_cards::{
-        AgentRow, Tool, ToolOutcome, ToolState, lookup_group, lookup_tree, may_join, spinner_style,
-        state_mark, tool_rows,
+        AgentRow, Tool, ToolOutcome, ToolState, frame::WORK_MAX_W, lookup_group, lookup_tree,
+        may_join, spinner_style, state_mark, tool_rows,
     },
 };
 use crate::llm::model_config::UiConfig;
@@ -165,6 +165,29 @@ struct Rendered {
     animated: Vec<(usize, usize)>,
 }
 
+/// Progress of a smooth reveal: the visible byte prefix and the pace it moves at.
+#[derive(Clone, Copy, Debug)]
+struct Reveal {
+    cut: usize,
+    at: Instant,
+    /// Graphemes per second, eased toward the pace that keeps the backlog near [`REVEAL_LAG`].
+    speed: f64,
+    /// Fraction of a grapheme earned but not yet shown, so slow paces still advance evenly.
+    carry: f64,
+}
+
+/// Backlog, in seconds of reveal, a smooth reveal trails the stream by; its pace follows the
+/// incoming rate instead of jumping when a chunk arrives.
+const REVEAL_LAG: f64 = 0.25;
+/// Slowest and fastest reveal pace, in graphemes per second.
+const REVEAL_MIN_SPEED: f64 = 30.0;
+const REVEAL_MAX_SPEED: f64 = 4000.0;
+/// Time constant of pace changes, so a burst of text speeds the reveal up without a visible jump.
+const REVEAL_EASE: f64 = 0.12;
+/// Longest frame gap one step accounts for (the slowest paint interval), so a stalled UI resumes
+/// at pace instead of leaping.
+const REVEAL_MAX_STEP: f64 = 0.25;
+
 struct Block {
     kind: Kind,
     timestamp: Option<String>,
@@ -174,9 +197,9 @@ struct Block {
     shared: Option<crate::runtime::Body>,
     revision: std::cell::Cell<u64>,
     rendered: std::cell::RefCell<Option<Rendered>>,
-    /// Visible byte prefix of a streaming answer under `ui.smooth_reveal`. `None` shows all
-    /// text. Inactive blocks ignore it, so every structural boundary flushes the full text.
-    revealed: Option<usize>,
+    /// Visible prefix of a streaming answer under `ui.smooth_reveal`. `None` shows all text.
+    /// Inactive blocks ignore it, so every structural boundary flushes the full text.
+    reveal: Option<Reveal>,
     /// A lookup run may not reach back across this block's start: it opens a new turn, or the
     /// block that stood between it and its predecessor was removed.
     breaks_run: bool,
@@ -213,7 +236,7 @@ impl Block {
             shared: None,
             revision: std::cell::Cell::new(0),
             rendered: std::cell::RefCell::new(None),
-            revealed: None,
+            reveal: None,
             breaks_run: false,
             started: None,
             thinking_key: None,
@@ -232,8 +255,10 @@ impl Block {
 
     /// The visible streaming prefix, or the complete text at a structural boundary.
     fn visible<'a>(&self, text: &'a str) -> &'a str {
-        match self.revealed {
-            Some(cut) if self.active => &text[..text.floor_char_boundary(cut.min(text.len()))],
+        match self.reveal {
+            Some(Reveal { cut, .. }) if self.active => {
+                &text[..text.floor_char_boundary(cut.min(text.len()))]
+            }
             _ => text,
         }
     }
@@ -365,6 +390,7 @@ impl Block {
             }),
             // Work rows put their own status glyph in the shared icon gutter.
             Kind::Tool(_) => Arc::new(self.tool_view().map_or_else(Vec::new, |view| {
+                let w = w.min(WORK_MAX_W);
                 if live_secs >= 1 {
                     let mut view = view.into_owned();
                     view.elapsed = Some(live_secs as f64);
@@ -374,10 +400,11 @@ impl Block {
                 }
             })),
             Kind::Notice { title, text } => Arc::new(super::notice::rows(title, text, w, ctx)),
-            Kind::Event(event) => Arc::new(super::lanes::rows(event, w, ctx)),
+            Kind::Event(event) => Arc::new(super::lanes::rows(event, w.min(WORK_MAX_W), ctx)),
             Kind::Error(t) => Arc::new(error_rows(t, w, ctx)),
             Kind::Image(image) => Arc::new(image.rows(w, ctx.theme)),
             Kind::Stats(s, recap) => {
+                let w = w.min(WORK_MAX_W);
                 Arc::new(recap::card(s, recap, w, ctx).unwrap_or_else(|| stats_rows(s, w, ctx)))
             }
         };
@@ -726,9 +753,9 @@ fn answer_rows(source: &str, width: u16, theme: &Theme, lead: bool) -> Rows {
         .collect()
 }
 
-/// A user message is a shaded band across the full width: a row of padding, the text after the
-/// `›` prompt in the icon gutter, and another row of padding, so turns are easy to find when
-/// scrolling back.
+/// A user message is easy to find when scrolling back. On a theme that tints `userBg` it is a
+/// shaded band across the full width with padding rows and the `›` prompt in the icon gutter; on a
+/// theme without that shading, an accent bar runs down the gutter beside every line instead.
 fn user_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     let w = w as usize;
     let clean = text::sanitize(raw);
@@ -768,7 +795,11 @@ fn user_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     }
     let inner = w - gutter - 1;
     for (i, line) in text::wrap_words(body, inner).into_iter().enumerate() {
-        let marker = format!(" {}", if i == 0 { theme.sym(Sym::Prompt) } else { "" });
+        let marker = if padded {
+            format!(" {}", if i == 0 { theme.sym(Sym::Prompt) } else { "" })
+        } else {
+            format!(" {}", theme.sym(Sym::Quote))
+        };
         let pad = gutter.saturating_sub(text::width(&marker));
         rows.push(tinted(vec![
             Span::styled(format!("{marker}{}", " ".repeat(pad)), prompt_style),
@@ -895,6 +926,16 @@ fn error_rows(body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
         .collect()
 }
 
+/// Open tasks are a problem only when the turn stopped short; after a delivered answer they are
+/// later work, so they stay quiet rather than amber.
+fn open_tasks_tok(status: &str) -> Tok {
+    if matches!(status, "blocked" | "needs_input" | "incomplete" | "failed") {
+        Tok::Warning
+    } else {
+        Tok::Muted
+    }
+}
+
 /// How a turn's reported `status` reads: its color, mark and word. An outcome the agent did not
 /// name is reported as unknown, never as a failure or success; a delivered answer is neutral.
 fn outcome_mark(status: &str, theme: &Theme) -> (Tok, String, &'static str) {
@@ -977,7 +1018,7 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
                     o.open_tasks,
                     if o.open_tasks == 1 { "" } else { "s" }
                 ),
-                theme.fg(Tok::Warning),
+                theme.fg(open_tasks_tok(&o.status)),
             );
         }
     }
@@ -1045,9 +1086,9 @@ pub struct Transcript {
     blocks: Vec<Block>,
     /// First block whose rows have not been handed out through `take_settled`.
     cursor: usize,
-    /// Whether the last block handed to scrollback was a tool call; `None` before any. The blank
-    /// separator after it is owed until the next block shows whether it belongs to the same group.
-    owed_gap: Option<bool>,
+    /// The group of the last block handed to scrollback; `None` before any. The blank separator
+    /// after it is owed until the next block shows whether it belongs to the same group.
+    owed_gap: Option<Group>,
     /// The settled block split at a row cursor, if one is in progress. See `retire_settled`.
     retiring: Option<Retiring>,
     /// How the running turn ended, waiting for the closing stats row that shows it.
@@ -1069,10 +1110,22 @@ pub struct BlockStart {
     pub gap: bool,
 }
 
-/// Blocks are separated by one blank row, except consecutive members of the work group (tool
-/// calls and the one-line context facts beside them), which read as one group.
-fn gap_between(prev_is_tool: bool, next_is_tool: bool) -> bool {
-    !(prev_is_tool && next_is_tool)
+/// Where a block sits in the transcript's rhythm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Group {
+    /// Conversation and everything outside the work group: messages, answers, notices, recaps.
+    Prose,
+    /// A one-line-shaped work row: an unframed tool call, a lookup tree or a context/alert line.
+    Work,
+    /// A tool call drawn as a whole frame (command, edit, service call, workers).
+    Card,
+}
+
+/// Blocks are separated by one blank row, except consecutive work rows, which read as one group.
+/// A framed card always stands apart, so two cards never touch and a card never butts against the
+/// rows above or below it.
+fn gap_between(prev: Group, next: Group) -> bool {
+    !(prev == Group::Work && next == Group::Work)
 }
 
 impl Block {
@@ -1083,6 +1136,21 @@ impl Block {
             Kind::Tool(_) => true,
             Kind::Event(event) => event.kind.lane() != crate::agent::ui::ui_event::Lane::Divider,
             _ => false,
+        }
+    }
+
+    /// The block's group given `rows`, its rendering at the width being laid out. A tool call is
+    /// a card exactly when it rendered as one whole frame, so narrow widths that fall back to plain
+    /// rows keep the tight work spacing.
+    fn group(&self, rows: &[Line<'static>], theme: &Theme) -> Group {
+        if !self.is_tool() {
+            Group::Prose
+        } else if matches!(self.kind, Kind::Tool(_))
+            && super::tool_cards::frame::is_card(rows, theme)
+        {
+            Group::Card
+        } else {
+            Group::Work
         }
     }
 }
@@ -1173,7 +1241,7 @@ impl Transcript {
                 .filter_map(Block::tool_view)
                 .collect();
             let tools: Vec<&Tool> = views.iter().map(|v| v.as_ref()).collect();
-            return Arc::new(lookup_tree(&tools, w, ctx));
+            return Arc::new(lookup_tree(&tools, w.min(WORK_MAX_W), ctx));
         }
         self.blocks[index].render(w, ctx)
     }
@@ -1378,6 +1446,12 @@ impl Transcript {
     /// Called from input and heartbeat ticks rather than from `live`, so the reveal keeps moving
     /// while the provider is quiet.
     pub fn advance_reveal(&mut self, ui: &UiConfig) {
+        self.advance_reveal_at(ui, Instant::now());
+    }
+
+    /// [`Self::advance_reveal`] at an explicit time. Progress depends on elapsed time, not on how
+    /// often this is called, so bursts of deltas and throttled paints keep an even pace.
+    pub fn advance_reveal_at(&mut self, ui: &UiConfig, now: Instant) {
         let Some(block) = self.blocks[self.cursor..]
             .iter_mut()
             .rev()
@@ -1388,38 +1462,61 @@ impl Transcript {
         let Kind::Assistant(text) = &block.kind else {
             return;
         };
-        if !block.active {
-            return;
-        }
-        let from = block.revealed.unwrap_or(0);
+        let current = block.reveal;
         let next = ui.smooth_reveal.then(|| match &block.shared {
-            Some(body) => body.read(|node| Self::reveal_cut(&node.result.text, from)),
-            None => Self::reveal_cut(text, from),
+            Some(body) => body.read(|node| Self::reveal_step(&node.result.text, current, now)),
+            None => Self::reveal_step(text, current, now),
         });
-        if block.revealed == next {
-            return;
+        let changed = next.map(|r| r.cut) != current.map(|r| r.cut);
+        block.reveal = next;
+        if changed {
+            block.revision.set(block.revision.get().saturating_add(1));
         }
-        block.revealed = next;
-        block.revision.set(block.revision.get().saturating_add(1));
     }
 
-    /// Next visible byte cut: a quarter of the pending text (at least a few bytes), moved forward to a
-    /// grapheme boundary and never past the newest grapheme, which a following combining mark may join.
-    fn reveal_cut(text: &str, from: usize) -> usize {
-        const REVEAL_MIN_BYTES: usize = 8;
-        let from = text.floor_char_boundary(from.min(text.len()));
-        let want = from + ((text.len() - from) / 4).max(REVEAL_MIN_BYTES);
-        let limit = text
+    /// One reveal step at `now`: the pace eases toward the backlog divided by [`REVEAL_LAG`], and
+    /// the cut moves forward by the whole graphemes that pace earned since the previous step,
+    /// never past the newest grapheme. A new reveal starts empty at the slowest pace.
+    fn reveal_step(text: &str, reveal: Option<Reveal>, now: Instant) -> Reveal {
+        let Some(mut reveal) = reveal else {
+            return Reveal {
+                cut: 0,
+                at: now,
+                speed: REVEAL_MIN_SPEED,
+                carry: 0.0,
+            };
+        };
+        let dt = now
+            .saturating_duration_since(reveal.at)
+            .as_secs_f64()
+            .min(REVEAL_MAX_STEP);
+        reveal.at = now;
+        let from = text.floor_char_boundary(reveal.cut.min(text.len()));
+        let limit = Self::reveal_limit(text).max(from);
+        let pending = text[from..limit].graphemes(true).count();
+        let target = (pending as f64 / REVEAL_LAG).clamp(REVEAL_MIN_SPEED, REVEAL_MAX_SPEED);
+        reveal.speed += (target - reveal.speed) * (1.0 - (-dt / REVEAL_EASE).exp());
+        let budget = reveal.carry + reveal.speed * dt;
+        let steps = (budget.floor() as usize).min(pending);
+        reveal.carry = if steps == pending {
+            0.0
+        } else {
+            budget - steps as f64
+        };
+        reveal.cut = text[from..]
             .grapheme_indices(true)
+            .nth(steps)
+            .map_or(limit, |(at, _)| from + at)
+            .min(limit);
+        reveal
+    }
+
+    /// Where a reveal stops: the start of the newest grapheme, which a following combining mark
+    /// may still join.
+    fn reveal_limit(text: &str) -> usize {
+        text.grapheme_indices(true)
             .next_back()
-            .map_or(0, |(at, _)| at);
-        text[from..]
-            .grapheme_indices(true)
-            .map(|(at, _)| from + at)
-            .find(|&at| at >= want)
-            .unwrap_or(limit)
-            .min(limit)
-            .max(from)
+            .map_or(0, |(at, _)| at)
     }
 
     pub fn thinking_delta(&mut self, text: &str) {
@@ -2013,7 +2110,44 @@ impl Transcript {
                 }
             }
         }
+        // The turn's last answer, for the "plan steps" follow-up when it lists numbered steps.
+        if let Some(answer) = self.blocks[start..]
+            .iter()
+            .rev()
+            .find_map(|b| match &b.kind {
+                Kind::Assistant(t) => Some(match &b.shared {
+                    Some(body) => body.read(|n| n.result.text.clone()),
+                    None => t.clone(),
+                }),
+                _ => None,
+            })
+        {
+            recap.answer_steps = recap::numbered_steps(&answer);
+        }
         self.push(Kind::Stats(stats, recap), false);
+    }
+
+    /// The follow-ups the latest turn's recap card offers (see [`RecapAction`]), in Alt+digit
+    /// order. Empty once a newer message starts the next turn, so a key never acts on a recap
+    /// that has scrolled out of the conversation's present.
+    pub fn recap_actions(&self) -> Vec<RecapAction> {
+        for block in self.blocks.iter().rev() {
+            match &block.kind {
+                Kind::Stats(stats, recap) => return recap::actions(stats, recap),
+                Kind::User(_) | Kind::Assistant(_) | Kind::Tool(_) => return Vec::new(),
+                _ => {}
+            }
+        }
+        Vec::new()
+    }
+
+    /// The follow-up for a pressed Alt+digit, when the latest recap offers that many actions.
+    pub fn recap_action_for(&self, key: &crossterm::event::KeyEvent) -> Option<RecapAction> {
+        self.recap_actions()
+            .into_iter()
+            .enumerate()
+            .find(|(i, _)| recap_action_chord(*i).is_some_and(|chord| chord.matches(key)))
+            .map(|(_, action)| action)
     }
 
     /// Finalize every streaming block; a tool that never reported back is shown as interrupted.
@@ -2041,7 +2175,7 @@ impl Transcript {
             kind: Kind::Assistant(text),
             active: true,
             shared,
-            revealed: Some(cut),
+            reveal: Some(Reveal { cut, .. }),
             ..
         }) = self.blocks[self.cursor..]
             .iter()
@@ -2051,8 +2185,8 @@ impl Transcript {
             return false;
         };
         match shared {
-            Some(body) => body.read(|node| Self::reveal_cut(&node.result.text, *cut) > *cut),
-            None => Self::reveal_cut(text, *cut) > *cut,
+            Some(body) => body.read(|node| *cut < Self::reveal_limit(&node.result.text)),
+            None => *cut < Self::reveal_limit(text),
         }
     }
 
@@ -2115,7 +2249,6 @@ impl Transcript {
             if self.retiring.is_none() && self.lookup_waits(index, ctx) {
                 break;
             }
-            let tool = self.blocks[index].is_tool();
             let (frozen, next, block_end) = match &self.retiring {
                 Some(state) => (std::sync::Arc::clone(&state.rows), state.next, state.end),
                 None => {
@@ -2133,9 +2266,10 @@ impl Transcript {
                 Kind::Image(image) if next == 0 && !frozen.is_empty() => image.native(width),
                 _ => None,
             };
+            let group = self.blocks[index].group(&frozen, ctx.theme);
             let gap = next == 0
                 && !frozen.is_empty()
-                && self.owed_gap.is_some_and(|prev| gap_between(prev, tool));
+                && self.owed_gap.is_some_and(|prev| gap_between(prev, group));
             let needed = if frozen.is_empty() {
                 0
             } else if native.is_some() {
@@ -2178,7 +2312,7 @@ impl Transcript {
                     });
                     break;
                 }
-                self.owed_gap = Some(tool);
+                self.owed_gap = Some(group);
             }
             self.retiring = None;
             for block in &self.blocks[index..block_end] {
@@ -2197,12 +2331,12 @@ impl Transcript {
         /// One block's rows in the tail, newest first. `skip` rows were already retired.
         struct Piece {
             head: bool,
-            tool: bool,
+            group: Group,
             rows: std::sync::Arc<Rows>,
             skip: usize,
         }
         /// Joins the tail oldest first, with the same separators `document` uses.
-        fn assemble(pieces: &[Piece], owed: Option<bool>, max_rows: usize) -> (Rows, usize) {
+        fn assemble(pieces: &[Piece], owed: Option<Group>, max_rows: usize) -> (Rows, usize) {
             let mut total = 0usize;
             let mut previous = None;
             for piece in pieces.iter().rev() {
@@ -2211,9 +2345,9 @@ impl Transcript {
                 } else {
                     previous
                 };
-                total += usize::from(before.is_some_and(|kind| gap_between(kind, piece.tool)));
+                total += usize::from(before.is_some_and(|kind| gap_between(kind, piece.group)));
                 total += piece.rows.len().saturating_sub(piece.skip);
-                previous = Some(piece.tool);
+                previous = Some(piece.group);
             }
             let trailing = previous.or(owed).is_some();
             total += usize::from(trailing);
@@ -2231,11 +2365,11 @@ impl Transcript {
                 } else {
                     previous
                 };
-                if before.is_some_and(|kind| gap_between(kind, piece.tool)) {
+                if before.is_some_and(|kind| gap_between(kind, piece.group)) {
                     append(std::slice::from_ref(&blank_row()));
                 }
                 append(&piece.rows[piece.skip.min(piece.rows.len())..]);
-                previous = Some(piece.tool);
+                previous = Some(piece.group);
             }
             if trailing {
                 append(std::slice::from_ref(&blank_row()));
@@ -2253,7 +2387,6 @@ impl Transcript {
             return (Vec::new(), gap);
         };
         let cursor = self.cursor;
-        let head_tool = first.is_tool();
         let active = first.active;
         let owed = self.owed_gap;
         // A streaming head may spill and a partly retired head keeps frozen rows, so both are fixed up
@@ -2297,9 +2430,10 @@ impl Transcript {
                 continue;
             }
             visible += rows.len().saturating_sub(skip);
+            let group = self.blocks[index].group(&rows, ctx.theme);
             pieces.push(Piece {
                 head,
-                tool: self.blocks[index].is_tool(),
+                group,
                 rows,
                 skip,
             });
@@ -2313,7 +2447,8 @@ impl Transcript {
             && let Some((src, rows)) =
                 self.blocks[cursor].spill_point(width, ctx, head_rows, *head_skip)
         {
-            if *head_skip == 0 && owed.is_some_and(|prev| gap_between(prev, head_tool)) {
+            let head_group = self.blocks[cursor].group(head_rows, ctx.theme);
+            if *head_skip == 0 && owed.is_some_and(|prev| gap_between(prev, head_group)) {
                 spilled.push(blank_row());
             }
             spilled.extend(head_rows[*head_skip..rows].iter().cloned());
@@ -2336,19 +2471,20 @@ impl Transcript {
     pub fn document(&self, width: u16, ctx: &TranscriptCtx) -> (Rows, Vec<usize>) {
         let mut out = Vec::new();
         let mut anchors = Vec::with_capacity(self.blocks.len());
-        let mut prev: Option<bool> = None;
+        let mut prev: Option<Group> = None;
         for (index, block) in self.blocks.iter().enumerate() {
             let rows = self.rows_at(index, width, ctx);
             if rows.is_empty() {
                 anchors.push(out.len());
                 continue;
             }
-            if prev.is_some_and(|p| gap_between(p, block.is_tool())) {
+            let group = block.group(&rows, ctx.theme);
+            if prev.is_some_and(|p| gap_between(p, group)) {
                 out.push(blank_row());
             }
             anchors.push(out.len());
             out.extend(rows.iter().cloned());
-            prev = Some(block.is_tool());
+            prev = Some(group);
         }
         (out, anchors)
     }
@@ -2377,7 +2513,7 @@ impl Transcript {
         let (first, lead_gap) = from.map_or((0, false), |start| (start.block, start.gap));
         let mut out = Vec::new();
         let mut starts = Vec::new();
-        let mut prev: Option<bool> = None;
+        let mut prev: Option<Group> = None;
         for (i, block) in self.blocks.iter().enumerate().skip(first) {
             if i > self.cursor {
                 break;
@@ -2387,10 +2523,11 @@ impl Transcript {
             } else {
                 self.rows_in_range(i, width, ctx, self.cursor..self.blocks.len())
             };
+            let group = block.group(&rows, ctx.theme);
             let gap = if i == first {
                 lead_gap
             } else {
-                prev.is_some_and(|p| gap_between(p, block.is_tool()))
+                prev.is_some_and(|p| gap_between(p, group))
             };
             if i < self.cursor {
                 if !rows.is_empty() {
@@ -2403,7 +2540,7 @@ impl Transcript {
                         out.push(blank_row());
                     }
                     out.extend(rows.iter().cloned());
-                    prev = Some(block.is_tool());
+                    prev = Some(group);
                 }
             } else if let Some(state) = self.retiring.as_ref() {
                 if gap {
@@ -2622,6 +2759,7 @@ impl Replay {
 }
 
 mod recap;
+pub use recap::{RecapAction, RecapRun, action_chord as recap_action_chord};
 
 #[cfg(test)]
 mod tests;

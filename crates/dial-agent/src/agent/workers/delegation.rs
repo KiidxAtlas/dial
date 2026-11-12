@@ -8,6 +8,22 @@ mod contracts;
 /// Idle terminal sleep cap while live workers may message the parent.
 const WORKER_MESSAGE_POLL: Duration = Duration::from_millis(250);
 
+/// Why a launch failed. Only `NotStarted` proves that no worker, runtime node, transcript or lease
+/// was created, so only it may leave a contracted node retryable.
+enum LaunchFailure {
+    NotStarted(anyhow::Error),
+    /// Failed after a worker may have been created, so its effects are unknown.
+    Uncertain(anyhow::Error),
+}
+
+impl LaunchFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::NotStarted(error) | Self::Uncertain(error) => error,
+        }
+    }
+}
+
 impl<'a> Agent<'a> {
     pub fn pump_subagents(&mut self, ui: &mut dyn Ui) {
         self.memory_maintenance_tick(ui, true);
@@ -153,6 +169,7 @@ impl<'a> Agent<'a> {
             return self.contract_task(args, ui);
         }
         self.start_live_subagents(args, ui, None)
+            .map_err(LaunchFailure::into_error)
     }
 
     fn start_live_subagents(
@@ -160,11 +177,15 @@ impl<'a> Agent<'a> {
         args: &Value,
         ui: &mut dyn Ui,
         promotion: Option<crate::agent::workers::contracts::Promotion>,
-    ) -> Result<Value> {
+    ) -> Result<Value, LaunchFailure> {
+        // Everything up to `start_with_promotion` refuses before a worker, runtime node, transcript
+        // or lease exists. Only the post-start runtime flush can follow a created worker.
         self.gate_subagent_spawn(args, ui)
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|reason| LaunchFailure::NotStarted(anyhow::Error::msg(reason)))?;
         if let Some(backend) = &self.backend {
-            backend.require_session_identity()?;
+            backend
+                .require_session_identity()
+                .map_err(LaunchFailure::NotStarted)?;
         }
         self.live_tasks.bind(self.session.runtime());
         ui.runtime(&self.session.runtime());
@@ -175,7 +196,7 @@ impl<'a> Agent<'a> {
             malformed_arguments: false,
         };
         self.authorize_call(&call, ui)
-            .map_err(|e| anyhow::anyhow!(e.message()))?;
+            .map_err(|e| LaunchFailure::NotStarted(anyhow::anyhow!(e.message())))?;
         let mut harness = self.child_harness();
         if promotion.is_some() {
             // A bounded workflow node cannot hide unlimited descendants inside one request.
@@ -183,7 +204,7 @@ impl<'a> Agent<'a> {
                 .tools
                 .retain(|name| name != "task" && name != "side_request");
         }
-        let result = self
+        let started = self
             .live_tasks
             .start_with_promotion(
                 crate::agent::workers::live_tasks::StartContext {
@@ -207,8 +228,15 @@ impl<'a> Agent<'a> {
                 promotion,
             )
             .map_err(anyhow::Error::msg);
-        self.session.flush_runtime()?;
-        result
+        let flushed = self.session.flush_runtime();
+        match (started, flushed) {
+            (Ok(reply), Ok(())) => Ok(reply),
+            (Ok(_), Err(error)) => Err(LaunchFailure::Uncertain(error)),
+            (Err(error), Ok(())) => Err(LaunchFailure::NotStarted(error)),
+            (Err(error), Err(flush)) => Err(LaunchFailure::NotStarted(
+                error.context(format!("runtime flush also failed: {flush:#}")),
+            )),
+        }
     }
 
     /// Run `before_subagent_spawn` hooks; `Err(reason)` refuses the spawn.

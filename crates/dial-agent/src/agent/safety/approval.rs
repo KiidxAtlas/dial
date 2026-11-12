@@ -612,8 +612,13 @@ fn call_paths(call: &ToolCall, root: &Path) -> Option<Vec<String>> {
         return None;
     }
     let args = &call.arguments;
-    if call.name == "edit" {
-        let Ok(paths) = crate::tools::declared_edit_targets(args) else {
+    if matches!(call.name.as_str(), "edit" | "write") {
+        let paths = if call.name == "write" {
+            crate::tools::declared_write_targets(args)
+        } else {
+            crate::tools::declared_edit_targets(args)
+        };
+        let Ok(paths) = paths else {
             return Some(Vec::new());
         };
         let mut found = Vec::new();
@@ -1173,6 +1178,13 @@ pub fn batch_call_line(call: &ToolCall) -> String {
         }
     };
     let line = match call.name.as_str() {
+        "write" if args["files"].is_array() => {
+            let paths = crate::tools::declared_write_targets(args).unwrap_or_default();
+            format!("write {} files · {}", paths.len(), paths.join(", "))
+        }
+        "write" if args["source"].is_object() => {
+            format!("write {} · exact artifact source", text("path"))
+        }
         "write" => {
             let content = text("content");
             format!(

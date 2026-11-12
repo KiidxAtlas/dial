@@ -1,6 +1,6 @@
 {
   "name": "dial",
-  "description": "Dial light: ink on the terminal background, a deep sage accent, shaded bands behind your messages and the composer, inset tinted panels and no frames",
+  "description": "Dial light: ink on the terminal background, a deep sage accent, an accent bar beside your messages, a rounded composer and no background shading",
   "dark": false,
   "vars": {
     "ink": "#202020",
@@ -21,7 +21,8 @@
     "comment": "#6b7f72",
     "band": "#eeeeee",
     "panel": "#e5eee8",
-    "code": "#f3f3f3"
+    "code": "#f3f3f3",
+    "chip": "#e8ece9"
   },
   "colors": {
     "text": "ink",
@@ -36,9 +37,9 @@
     "warning": "gold",
     "selectedBg": "selectedTint",
     "canvasBg": "",
-    "userBg": "band",
+    "userBg": "",
     "userText": "black",
-    "panelBg": "panel",
+    "panelBg": "",
     "toolPendingBg": "",
     "toolSuccessBg": "",
     "toolErrorBg": "",
@@ -62,7 +63,7 @@
     "mdLinkUrl": "faint",
     "mdCode": "teal",
     "mdCodeBlock": "ink",
-    "mdCodeBlockBg": "code",
+    "mdCodeBlockBg": "",
     "mdCodeBorder": "sky",
     "mdQuote": {
       "fg": "muted",
@@ -81,7 +82,7 @@
     "thinkHigh": "plum",
     "thinkXhigh": "orchid",
     "shellMode": "gold",
-    "statusBg": "band",
+    "statusBg": "",
     "statusSep": "faint",
     "statusModel": {
       "fg": "sageDeep",

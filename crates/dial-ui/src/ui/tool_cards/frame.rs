@@ -16,6 +16,11 @@ use ratatui::{
 /// Narrowest frame worth drawing. Below it callers keep their unframed rows.
 pub(in crate::ui) const MIN_W: usize = 12;
 
+/// Widest the work group (tool rows, cards, context lines and the turn recap) is laid out. On a
+/// wide terminal a four-line edit should not span 200 columns, and facts at the right edge stay
+/// within one glance of the target they describe. Matches the work panel's cap.
+pub(in crate::ui) const WORK_MAX_W: u16 = crate::ui::work_panel::MAX_WIDTH as u16;
+
 /// Cells a frame takes from each body row: `│ ` on the left and ` │` on the right.
 pub(in crate::ui) const CHROME_W: usize = 4;
 
@@ -146,17 +151,37 @@ fn clip(spans: Vec<Span<'static>>, w: usize, mark: &str) -> Line<'static> {
     }
 }
 
-/// A status or metadata chip, `⟦done⟧` (`[done]` in ASCII), in one foreground color.
+/// A status or metadata chip in one foreground color. Themes that give `chipBg` a background (or
+/// a modifier such as `reverse`) draw it as a tinted pill, ` done `; otherwise, and always with
+/// ASCII glyphs, brackets delimit it, `⟦done⟧` (`[done]`). Both forms are the same width, so a
+/// theme change never reflows a row.
 pub(in crate::ui) fn chip(theme: &Theme, label: &str, tok: Tok) -> Span<'static> {
+    let label = text::one_line(label);
+    let pill = theme.bg(Tok::ChipBg);
+    if !theme.ascii() && pill != Style::default() {
+        return Span::styled(format!(" {label} "), pill.patch(theme.fg(tok)));
+    }
     Span::styled(
         format!(
-            "{}{}{}",
+            "{}{label}{}",
             theme.sym(Sym::ChipOpen),
-            text::one_line(label),
             theme.sym(Sym::ChipClose)
         ),
         theme.fg(tok),
     )
+}
+
+/// Whether `rows` are one whole frame: the top edge opens with the frame's corner and the bottom
+/// edge closes it. The transcript uses this to give framed cards room from the rows around them.
+pub(in crate::ui) fn is_card(rows: &[Line<'static>], theme: &Theme) -> bool {
+    let opens = |row: Option<&Line<'static>>, corner: Sym| {
+        let corner = theme.sym(corner);
+        !corner.is_empty()
+            && row
+                .and_then(|row| row.spans.first())
+                .is_some_and(|span| span.content.starts_with(corner))
+    };
+    rows.len() >= 2 && opens(rows.first(), Sym::BoxTl) && opens(rows.last(), Sym::BoxBl)
 }
 
 #[cfg(test)]

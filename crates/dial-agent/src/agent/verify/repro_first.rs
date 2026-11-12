@@ -47,7 +47,8 @@ impl Agent<'_> {
         match call.name.as_str() {
             "edit" => crate::tools::edit::editing::targets(self.edit_mode(), &call.arguments)
                 .unwrap_or_default(),
-            "write" | "ast_edit" => call.arguments["path"]
+            "write" => crate::tools::declared_write_targets(&call.arguments).unwrap_or_default(),
+            "ast_edit" => call.arguments["path"]
                 .as_str()
                 .map(str::to_owned)
                 .into_iter()

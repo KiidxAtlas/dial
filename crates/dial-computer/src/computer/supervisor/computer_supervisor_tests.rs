@@ -462,3 +462,54 @@ fn late_and_overlapping_native_captures_cannot_cross_mutation_epochs() {
         assert_eq!(state.receipts, vec![capture.clone()]);
     }
 }
+
+#[test]
+fn worker_start_failures_name_windows_loader_errors_and_how_to_fix_node() {
+    // 0xC0000142 as Windows reports it through ExitStatus::code.
+    let message = start_failure(Some(0xC000_0142_u32 as i32), "");
+    assert!(
+        message.starts_with(
+            "Computer worker exited before ready (exit 0xC0000142: a DLL failed to initialize"
+        ),
+        "{message}"
+    );
+    assert!(message.contains("`node --version`"), "{message}");
+    assert!(!message.contains("Worker output"), "{message}");
+    let wrong_arch = start_failure(Some(0xC000_007B_u32 as i32), "");
+    assert!(
+        wrong_arch.contains("different CPU architecture"),
+        "{wrong_arch}"
+    );
+    assert!(start_failure(Some(0xC000_0409_u32 as i32), "").contains("(exit 0xC0000409)."));
+    let ordinary = start_failure(Some(1), "SyntaxError: Unexpected token");
+    assert!(ordinary.contains("(exit 1)."), "{ordinary}");
+    assert!(ordinary.ends_with("Worker output: SyntaxError: Unexpected token"));
+    assert!(start_failure(None, "").starts_with("Computer worker exited before ready. "));
+}
+
+#[test]
+fn a_missing_node_says_so_instead_of_an_os_error() {
+    let missing = launch_failure(&std::io::Error::from(std::io::ErrorKind::NotFound));
+    assert!(
+        missing.contains("`node` was not found on PATH"),
+        "{missing}"
+    );
+    assert!(missing.contains("https://nodejs.org"), "{missing}");
+    let denied = launch_failure(&std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    assert!(
+        denied.starts_with("Failed to start computer worker: permission denied"),
+        "{denied}"
+    );
+}
+
+/// A worker that dies at startup reports its exit code, read before it is cleaned up.
+#[cfg(unix)]
+#[test]
+fn a_worker_that_exits_at_startup_reports_its_exit_code() {
+    let supervisor = fake_worker("import sys; sys.exit(7)");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while supervisor.inner.state.lock().worker.is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(supervisor.inner.state.lock().last_exit, Some(7));
+}

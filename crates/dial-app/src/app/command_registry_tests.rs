@@ -698,3 +698,47 @@ fn next_ux_commands_have_explicit_replacement_contracts_and_safe_busy_routes() {
     assert_eq!(during_turn("search", "results"), DuringTurn::Now);
     assert_eq!(during_turn("attachments", ""), DuringTurn::Now);
 }
+
+#[test]
+fn protocol_prompts_expand_custom_and_skill_commands_like_the_terminal() {
+    use crate::app::command_registry::{expand_prompt_command, prompt_commands, skill_prompt};
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout =
+        crate::config::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
+            .unwrap();
+    let commands = layout.project_dir.join("commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(commands.join("triage.md"), "Triage issue $1 carefully.").unwrap();
+
+    assert_eq!(
+        expand_prompt_command(&layout, "/triage 42")
+            .unwrap()
+            .as_deref(),
+        Some("Triage issue 42 carefully.")
+    );
+    // Plain text and pasted paths are sent unchanged.
+    for text in ["hello", "/Users/me/notes.md please read"] {
+        assert_eq!(
+            expand_prompt_command(&layout, text).unwrap(),
+            None,
+            "{text}"
+        );
+    }
+    // A built-in is refused rather than sent to the model as if it had run.
+    let builtin = expand_prompt_command(&layout, "/compact").unwrap_err();
+    assert!(
+        format!("{builtin:#}").contains("/compact is a Dial command"),
+        "{builtin:#}"
+    );
+    assert!(expand_prompt_command(&layout, "/skill:zz-not-installed go").is_err());
+    assert_eq!(
+        skill_prompt("web", " check links "),
+        "Use the \"web\" skill (load it with the skill tool first). Task: check links"
+    );
+    assert!(
+        prompt_commands(&layout)
+            .iter()
+            .any(|(name, _, _, kind)| name == "triage" && *kind == "custom")
+    );
+}

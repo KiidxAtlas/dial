@@ -54,10 +54,9 @@ fn received_and_applied_requests_never_reappear_but_pending_intent_remains_held(
         SteerStage::Applied,
     ] {
         composer.explicit.push(super::super::Explicit {
-            text: format!("{stage:?}"),
-            kind: SteerKind::Independent,
             stage,
             untaken: stage == SteerStage::Pending,
+            ..super::super::Explicit::new(format!("{stage:?}"), SteerKind::Independent)
         });
     }
     let snapshot = composer.recovery_snapshot().unwrap();

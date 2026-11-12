@@ -105,17 +105,25 @@ fn full_guidance(presentation: Presentation, has: &dyn Fn(&str) -> bool) -> Stri
     } else {
         policy.push_str(LEAN_BATCHING);
     }
+    // Each optional rule names its tools; it appears only when all of them are offered.
     let mut optional: Vec<&str> = [
-        ("skill", SKILL_RULE),
-        ("checkpoint", CHECKPOINT_RULE),
-        ("ask", ASK_RULE),
-        ("codebase_memory", PROJECT_MAP_RULE),
-        ("lsp", LSP_RULE),
-        ("glob", SOURCE_PREVIEW_RULE),
-        ("verify", ARTIFACT_CHECK_RULE),
+        (&["skill"][..], SKILL_RULE),
+        (&["checkpoint"], CHECKPOINT_RULE),
+        (&["codebase_memory"], PROJECT_MAP_RULE),
+        (&["lsp"], LSP_RULE),
+        (&["glob"], SOURCE_PREVIEW_RULE),
+        (&["read"], READ_BATCH_RULE),
+        (&["grep"], SEARCH_SCOPE_RULE),
+        (&["eval", "bash"], EVAL_SHELL_RULE),
+        (&["verify"], VERIFY_REPRO_RULE),
+        (&["verify"], ARTIFACT_CHECK_RULE),
     ]
     .into_iter()
-    .filter(|(tool, _)| has(tool) || (*tool == "codebase_memory" && has("memory")))
+    .filter(|(tools, _)| {
+        tools
+            .iter()
+            .all(|tool| has(tool) || (*tool == "codebase_memory" && has("memory")))
+    })
     .map(|(_, rule)| rule)
     .collect();
     if EVIDENCE_DATA_TOOLS.iter().any(|tool| has(tool)) {

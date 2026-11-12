@@ -295,3 +295,158 @@ fn acp_forks_parked_history_and_reopens_closed_sessions_with_fresh_mode() {
     assert_replayed_history(&replay_fork, &fork, "fork-only prompt", "fork-only answer");
     assert_eq!(server.requests.lock().len(), 2);
 }
+
+/// The response to `id`, which must be an error. Other responses are kept for `result`.
+fn error_response(rpc: &RpcChild, id: u64) -> Value {
+    if let Some(event) = rpc.pending.borrow_mut().remove(&id) {
+        assert!(event.get("error").is_some(), "{event}");
+        return event;
+    }
+    loop {
+        let event = rpc.next();
+        if event["id"] == id {
+            assert!(event.get("error").is_some(), "{event}");
+            return event;
+        }
+        if let Some(other) = event["id"].as_u64() {
+            rpc.pending.borrow_mut().insert(other, event);
+        }
+    }
+}
+
+fn listed(page: &Value) -> Vec<String> {
+    page["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|session| session["session_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn native_session_model_and_settings_methods_answer_during_a_turn() {
+    let env = Env::new();
+    let server = Server::new(vec![
+        text("first answer"),
+        json!({"wait_for_interrupt":true}),
+    ]);
+    let mut rpc = RpcChild::start(&env, &server);
+    rpc.send(1, "send", json!({"text":"first prompt"}));
+    rpc.result(1);
+    rpc.send(2, "state", json!({}));
+    let state = rpc.result(2);
+    let a = state["session_id"].as_str().unwrap().to_owned();
+    assert_eq!(state["current_model"]["model_id"], "scripted");
+    rpc.send(3, "new_session", json!({}));
+    let b = rpc.result(3)["session_id"].as_str().unwrap().to_owned();
+
+    rpc.send(4, "send", json!({"text":"wait"}));
+    server.wait_for_request(SETTLE).unwrap();
+    server.wait_for_request(SETTLE).unwrap();
+    // These are controller methods: they answer while the turn holds the actor.
+    rpc.send(5, "list_sessions", json!({}));
+    let page = rpc.result(5);
+    let ids = listed(&page);
+    assert!(ids.contains(&a) && ids.contains(&b), "{page}");
+    rpc.send(6, "pin_session", json!({"session_id":a,"pinned":true}));
+    assert_eq!(rpc.result(6)["changed"], true);
+    rpc.send(7, "list_sessions", json!({}));
+    assert_eq!(listed(&rpc.result(7))[0], a);
+    rpc.send(8, "list_models", json!({}));
+    let models = rpc.result(8)["models"].as_array().unwrap().clone();
+    assert!(
+        models
+            .iter()
+            .any(|model| model["model_id"] == "scripted" && model["current"] == true),
+        "{models:?}"
+    );
+    rpc.send(9, "delete_session", json!({"session_id":b}));
+    let refused = error_response(&rpc, 9);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("active session"),
+        "{refused}"
+    );
+    rpc.send(
+        10,
+        "set_setting",
+        json!({"key":"harness.max_steps","value":5}),
+    );
+    assert_eq!(rpc.result(10)["saved"], true);
+    rpc.send(11, "get_settings", json!({"key":"harness.max_steps"}));
+    assert_eq!(rpc.result(11)["value"], 5);
+    rpc.send(
+        12,
+        "set_setting",
+        json!({"key":"harness.max_steps","value":"many"}),
+    );
+    error_response(&rpc, 12);
+
+    rpc.send(13, "abort", json!({}));
+    rpc.result(13);
+    assert_eq!(rpc.result(4)["interrupted"], true);
+
+    rpc.send(14, "delete_session", json!({"session_id":a}));
+    assert_eq!(rpc.result(14)["deleted"], true);
+    rpc.send(15, "fork_session", json!({}));
+    let forked = rpc.result(15);
+    assert_eq!(forked["forked_from"], b.as_str());
+    assert_ne!(forked["session_id"], b.as_str());
+    rpc.send(16, "list_sessions", json!({}));
+    let ids = listed(&rpc.result(16));
+    assert!(!ids.contains(&a));
+    rpc.send(17, "reset_setting", json!({"key":"harness.max_steps"}));
+    assert_eq!(rpc.result(17)["removed"], true);
+    rpc.send(1000, "shutdown", json!({}));
+    rpc.result(1000);
+}
+
+#[test]
+fn acp_sessions_expose_and_switch_the_model_config_option() {
+    let env = Env::new();
+    let server = Server::new(vec![]);
+    let mut rpc = RpcChild::start_acp(&env, &server);
+    initialize_acp(&mut rpc);
+    rpc.send(2, "session/new", session_params(&env, None));
+    let opened = rpc.result(2);
+    let session = opened["sessionId"].as_str().unwrap().to_owned();
+    let model = opened["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["id"] == "model")
+        .unwrap_or_else(|| panic!("no model option: {opened}"))
+        .clone();
+    let current = model["currentValue"].as_str().unwrap().to_owned();
+    assert!(current.ends_with("/scripted"), "{model}");
+    assert!(
+        model["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|option| option["value"] == current.as_str())
+    );
+    rpc.send(
+        3,
+        "session/set_config_option",
+        json!({"sessionId":session,"configId":"model","value":current}),
+    );
+    let (switched, updates) = rpc.result_with_events(3);
+    assert_eq!(
+        switched["configOptions"][1]["currentValue"],
+        current.as_str()
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|update| update["params"]["update"]["sessionUpdate"] == "config_option_update")
+    );
+    rpc.send(
+        4,
+        "session/set_config_option",
+        json!({"sessionId":session,"configId":"model","value":"nope/unknown-model"}),
+    );
+    error_response(&rpc, 4);
+}

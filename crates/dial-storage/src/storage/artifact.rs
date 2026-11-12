@@ -607,7 +607,8 @@ impl Drop for ArtifactSpool {
         let _ = fs::remove_file(&self.path);
     }
 }
-/// Convert a tool's encoded screenshot to compact immutable evidence before context clipping.
+/// Convert a tool's encoded image (PNG, JPEG, GIF or WebP) to compact immutable evidence before
+/// context clipping. The declared media type must match the decoded bytes.
 pub fn capture_image(
     store: Option<&ArtifactStore>,
     output: &mut ToolOutput,
@@ -621,23 +622,28 @@ pub fn capture_image(
         return Ok(None);
     };
     ensure!(
-        value["artifact"]["encoding"] == "base64" && value["artifact"]["media_type"] == "image/png",
-        "unsupported screenshot encoding"
+        value["artifact"]["encoding"] == "base64",
+        "unsupported image encoding"
     );
+    let declared = value["artifact"]["media_type"].as_str().unwrap_or_default();
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data)
-        .context("decoding screenshot")?;
+        .context("decoding image")?;
+    let media_type = crate::llm::images::sniff_mime(&bytes);
     ensure!(
-        bytes.len() as u64 <= crate::llm::images::MAX_IMAGE_BYTES
-            && bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "screenshot must be PNG no larger than the image input limit"
+        media_type == Some(declared),
+        "image must be PNG, JPEG, GIF or WebP data matching its declared media type ({declared})"
     );
-    let store = store.context("screenshot artifact storage is unavailable")?;
+    ensure!(
+        bytes.len() as u64 <= crate::llm::images::MAX_IMAGE_BYTES,
+        "image is larger than the image input limit"
+    );
+    let store = store.context("image artifact storage is unavailable")?;
     let mut spool = store.spool()?;
     spool.write_all(&bytes)?;
     let uri = spool.finish()?;
-    value["artifact"] = json!({"uri":uri,"media_type":"image/png","bytes":bytes.len()});
+    value["artifact"] = json!({"uri":uri,"media_type":declared,"bytes":bytes.len()});
     output.text = value.to_string();
     output.data = Some(value);
     Ok(Some(store.image_reference(&uri)?))

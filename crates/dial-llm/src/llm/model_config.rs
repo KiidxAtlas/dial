@@ -567,9 +567,9 @@ pub enum StatusSeparator {
 pub enum ComposerShape {
     /// A full-width tinted card with an accent edge that follows the input state; the status line
     /// and key hints sit beneath it. No frame.
-    #[default]
     Band,
     /// Rounded box; the status line is embedded in its top border and key hints in its bottom border.
+    #[default]
     Box,
     /// Rules above and below with no side borders (cleaner when copying text).
     Line,
@@ -683,7 +683,7 @@ impl Default for UiConfig {
             status_git_counts: true,
             status_transparent: false,
             session_accent: true,
-            composer_shape: ComposerShape::Band,
+            composer_shape: ComposerShape::Box,
             welcome: true,
             tips: true,
             motion: true,

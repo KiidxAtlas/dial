@@ -220,7 +220,11 @@ pub fn resolve(
         },
         "write" => Access {
             reads: Vec::new(),
-            writes: vec![PathBuf::from(args["path"].as_str()?)],
+            writes: crate::tools::declared_write_targets(args)
+                .ok()?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
         },
         "edit" => Access {
             reads: Vec::new(),

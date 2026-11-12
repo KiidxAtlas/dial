@@ -240,20 +240,24 @@ impl crate::agent::Agent<'_> {
             && crate::agent::workflow::working_state::open_deliverables(&control["working_state"])
                 .is_empty();
         if delivery && blocker.is_none() {
-            let (unverified, failures) = self.gate_unverified_edits(!nudged, ui);
-            if let Some(checks) = unverified {
-                blocker = Some(format!(
-                    "Current edits have no passing applicable check: {}. {}",
-                    checks.join(", "),
-                    if failures.is_empty() && nudged {
-                        control["completion_gate"]["reason"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned()
-                    } else {
-                        failures.join("\n")
-                    }
-                ));
+            let gate = self.gate_unverified_edits(!nudged, ui);
+            if gate.unverified.is_some() || gate.blocking {
+                let lead = match &gate.unverified {
+                    Some(checks) => format!(
+                        "Current edits have no passing applicable check: {}. ",
+                        checks.join(", ")
+                    ),
+                    None => "Current edits have a failing applicable check. ".to_owned(),
+                };
+                let detail = if gate.failures.is_empty() && nudged {
+                    control["completion_gate"]["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                } else {
+                    gate.failures.join("\n")
+                };
+                blocker = Some(format!("{lead}{detail}").trim_end().to_owned());
             }
         }
         // The lexical investigation nudge is a guard rail for small local models only.

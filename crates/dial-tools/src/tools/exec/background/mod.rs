@@ -1247,7 +1247,7 @@ impl Tool for Background {
                 "call": {"type": "object", "additionalProperties": false, "required": ["name", "arguments"], "properties": {
                     "name": {"type": "string"}, "arguments": {"type": "object"}
                 }, "description": "start: authorized tool call instead of command; only name may accompany it"},
-                "name": {"type": "string", "description": "start: optional unique name (letters, digits, - _ .); other actions: which job"},
+                "name": {"type": "string", "description": "start: optional unique name (letters, digits, - _ .); other actions: which job; watch: optional (defaults from the source); unwatch: which watch"},
                 "cwd": {"type": "string", "description": "start: working directory (default workspace root)"},
                 "persist": {"type": "boolean", "description": "Durable pipe job until `lifetime`; pass true on every call; no pty/stdin/ready. Unix and Windows; it survives Dial restarts."},
                 "lifetime": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "persist start: seconds until stopped (default 3600)"},

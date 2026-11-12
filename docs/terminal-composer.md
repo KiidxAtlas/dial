@@ -20,7 +20,14 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   holds chips for the verdict of the turn's last test or build (`✓ tests 18 passed`,
   `✗ build 2 errors`) and what the turn did (calls, lookups, edits, commands, web and service
   calls, workers, failures), the files its edits changed with the lines each added and removed (six
-  files, then `+N more`), any recorded handoff and, when files changed, `/review-file` and `/undo`.
+  files, then `+N more`) and any recorded handoff. Follow-up actions carry their keys: **rerun
+  check** first when the turn's last test or build failed (puts `!<command>` in the draft; Enter
+  runs it), **retry** (`/retry`) after a failed turn, **plan** (`/todo`) when a blocked,
+  needs-input or incomplete turn left open tasks, **review** (`/review-file`) and **undo**
+  (`/undo`) when files changed, and **plan steps** when the answer lists three or more numbered
+  steps (drafts a request to turn them into a plan; nothing runs until Enter).
+  `Option+1`…`Option+9` on macOS (`Alt+1`…`Alt+9` elsewhere) run them while no turn runs and the
+  composer is empty; otherwise those chords reach the draft as usual.
   Time and tokens sit on the bottom edge. The outline follows the outcome: accent for done or
   answered, amber for blocked or incomplete, red for failed. Plain answers and terminals narrower
   than 40 columns keep the one-line footer.
@@ -33,8 +40,9 @@ Write, paste and edit drafts without losing your place; understand the launch sc
     in background, failed, …). The outline is red when a worker failed and the accent while one runs.
   - A plan update shows a progress bar and `n/m done` on its top edge and a blocked chip on its
     bottom edge. The outline is green once every step closed and amber while one is blocked.
-  - Errors, and notices titled as warnings or failures (for example **Outstanding work** or
-    **Heads up**), are red or amber cards. Other command results stay labelled rows.
+  - Errors and warning or failure notices are red or amber cards. Required work an answer left
+    open is an amber **Unfinished work** card; optional follow-ups alone stay a quiet
+    **Follow-up** row. Other command results stay labelled rows.
 - New conversations open on a centered launch screen: a braille knob and wordmark above a compact
   input card near the window midpoint. When `ui.motion` allows, the mark powers up at start-up:
   the bezel traces itself in behind a bright comet, the needle swings up as the trace passes and

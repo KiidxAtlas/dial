@@ -250,7 +250,7 @@ fn emitted_events() -> std::collections::BTreeSet<String> {
 fn schema_requests_match_the_method_table_and_the_dispatchers() {
     let schema = schema();
     let in_schema = schema_consts(&schema["$defs"]["request"]["oneOf"], "method");
-    let table = names(METHODS.iter().map(|(method, _)| (*method).to_owned()));
+    let table = names(METHODS.iter().map(|method| method.name.to_owned()));
     assert_eq!(in_schema, table, "docs/rpc-schema.json and METHODS differ");
     let dispatched = dispatched_methods()
         .into_iter()
@@ -354,7 +354,7 @@ fn hello_picks_the_highest_version_both_sides_speak() {
 fn hello_below_every_served_version_is_refused_with_a_code() {
     let err = negotiated_version(0).unwrap_err();
     let error = err.downcast_ref::<RequestError>().unwrap();
-    assert_eq!(error.code, "unsupported_protocol_version");
+    assert_eq!(error.code, ErrorCode::UnsupportedProtocolVersion);
 }
 
 #[test]
@@ -385,7 +385,7 @@ fn client_request_examples_validate_against_the_published_schema() {
     for line in include_str!("../../../../examples/clients/rpc-v1.jsonl").lines() {
         let frame: Value = serde_json::from_str(line).unwrap();
         crate::runtime::schema::validate(&schema, &frame).unwrap();
-        assert!(METHODS.iter().any(|(method, _)| frame["method"] == *method));
+        assert!(METHODS.iter().any(|method| frame["method"] == method.name));
         let mut input = std::io::Cursor::new(format!("{line}\n").into_bytes());
         let read = read_request(&mut input).unwrap().unwrap().unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&read).unwrap(), frame);
@@ -433,5 +433,71 @@ fn only_listed_methods_are_known_before_dispatch() {
     assert!(known_method("send"));
     assert!(!known_method("nope"));
     assert!(!known_method(""));
-    assert!(!known_method("fork_session"));
+    // ACP-internal actor methods are not native RPC methods.
+    assert!(!known_method("close_session"));
+    assert!(known_method("fork_session") && known_method("list_sessions"));
+}
+
+#[test]
+fn envelope_numbers_events_and_attributes_them_without_touching_replies() {
+    let mut envelope = Envelope::default();
+    let mut ready = ready_frame("s1", "m", json!([]), false, false);
+    assert!(
+        ready["engine_version"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty())
+    );
+    envelope.stamp(&mut ready);
+    assert_eq!(ready["seq"], 1);
+    assert_eq!(ready["session_id"], "s1");
+    assert_eq!(ready["request_id"], Value::Null);
+
+    envelope.session_id = Some("s2".into());
+    envelope.request_id = json!("turn-7");
+    let mut text = json!({"event":"text","delta":"hi"});
+    envelope.stamp(&mut text);
+    assert_eq!(
+        text,
+        json!({"event":"text","delta":"hi","seq":2,"session_id":"s2","request_id":"turn-7"})
+    );
+    // An event that names its own session keeps it.
+    let mut closed = json!({"event":"question_closed","session_id":"other"});
+    envelope.stamp(&mut closed);
+    assert_eq!(
+        (closed["seq"].clone(), closed["session_id"].clone()),
+        (json!(3), json!("other"))
+    );
+    // Replies are correlated by id and are never numbered.
+    let mut reply = json!({"id":1,"result":{}});
+    envelope.stamp(&mut reply);
+    assert_eq!(reply, json!({"id":1,"result":{}}));
+    assert_eq!(envelope.seq, 3);
+}
+
+#[test]
+fn list_extensions_reports_configured_and_curated_rows() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    let mut config = Config {
+        user_dir: layout.user_dir.clone(),
+        project_root: layout.project_root.clone(),
+        ..Config::default()
+    };
+    config.mcp.insert(
+        "mine".into(),
+        crate::config::types::McpServerConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+    let listed = extensions(&layout, &config);
+    let mcp = listed["mcp"].as_array().unwrap();
+    let mine = mcp.iter().find(|row| row["id"] == "mine").unwrap();
+    assert_eq!(
+        (mine["origin"].as_str(), mine["state"].as_str()),
+        (Some("installed"), Some("disabled"))
+    );
+    assert!(mcp.iter().any(|row| row["origin"] == "curated"));
+    assert!(listed["skills"].is_array());
 }

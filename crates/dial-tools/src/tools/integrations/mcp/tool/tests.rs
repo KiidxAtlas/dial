@@ -201,11 +201,11 @@ fn catalog_publication_at_admission_refuses_the_previously_approved_definition()
 
 #[test]
 fn png_images_travel_in_the_shared_attachment_envelope() {
-    let png = format!("{PNG_BASE64_PREFIX}AAAA");
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
     let result = json!({"content":[
         {"type":"text","text":"chart"},
         {"type":"image","data":png,"mimeType":"image/png"},
-        {"type":"image","data":"/9j/AAAA","mimeType":"image/jpeg"},
+        {"type":"image","data":"/9j/4AAQSkZJRgABAQ","mimeType":"image/jpeg"},
     ]});
     let output = render_result(&result);
     assert_eq!(
@@ -226,6 +226,51 @@ fn png_images_travel_in_the_shared_attachment_envelope() {
         &json!({"isError":true,"content":[{"type":"image","data":png,"mimeType":"image/png"}]}),
     );
     assert!(failed.data.unwrap().get("artifact").is_none());
+}
+
+#[test]
+fn jpeg_gif_and_webp_images_attach_when_their_bytes_match_the_declared_type() {
+    use base64::Engine;
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let cases = [
+        (
+            "image/jpeg",
+            encode(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00"),
+        ),
+        ("image/gif", encode(b"GIF89a\x01\x00\x01\x00\x80\x00\x00")),
+        ("image/webp", encode(b"RIFF\x24\x00\x00\x00WEBPVP8 ")),
+    ];
+    for (kind, data) in &cases {
+        let output = render_result(&json!({"content":[
+            {"type":"image","data":data,"mimeType":kind},
+        ]}));
+        assert_eq!(
+            output.text,
+            format!("[image content, {kind}, attached for models that accept images]")
+        );
+        assert_eq!(
+            output.data.unwrap()["artifact"],
+            json!({"data": data, "encoding": "base64", "media_type": kind})
+        );
+    }
+    // A JPEG labelled as WebP is noted, and the first genuine image attaches instead.
+    let (_, jpeg) = &cases[0];
+    let (_, gif) = &cases[1];
+    let output = render_result(&json!({"content":[
+        {"type":"image","data":jpeg,"mimeType":"image/webp"},
+        {"type":"image","data":gif,"mimeType":"image/gif"},
+    ]}));
+    assert_eq!(
+        output.text,
+        "[image content, image/webp, not shown]\n[image content, image/gif, attached for models that accept images]"
+    );
+    assert_eq!(output.data.unwrap()["artifact"]["media_type"], "image/gif");
+    // Other image types and audio stay noted only.
+    let other = render_result(&json!({"content":[
+        {"type":"image","data":encode(b"<svg xmlns='x'/>"),"mimeType":"image/svg+xml"},
+        {"type":"audio","data":"AAAA","mimeType":"audio/wav"},
+    ]}));
+    assert!(other.data.unwrap().get("artifact").is_none());
 }
 
 #[test]

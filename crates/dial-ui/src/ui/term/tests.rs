@@ -916,6 +916,42 @@ fn title_is_set_once_per_change_and_sanitized() {
     assert!(!text.contains("\x1b[2Jevil"));
 }
 
+#[test]
+fn an_open_panel_leads_the_title_and_closing_it_restores_the_session_title() {
+    let mut rig = Rig::new(20, 4);
+    let rows = lines(&["x"]);
+    let paint = |rig: &mut Rig| {
+        rig.term
+            .paint(&Viewport {
+                rows: &rows,
+                cursor: None,
+                title: Some("dial · proj"),
+                signals: None,
+            })
+            .unwrap();
+    };
+    paint(&mut rig);
+    rig.term.open_overlay().unwrap();
+    rig.term.set_panel_name("Settings\x1b[2J");
+    for _ in 0..2 {
+        rig.term.draw_overlay(|_| {}).unwrap();
+    }
+    rig.term.close_overlay().unwrap();
+    paint(&mut rig);
+    rig.sync();
+    let text = String::from_utf8(rig.raw.clone()).unwrap();
+    let titles: Vec<&str> = text
+        .split("\x1b]0;")
+        .skip(1)
+        .map(|rest| rest.split('\x07').next().unwrap())
+        .collect();
+    // Once per change: the session, the panel (not again on its second frame), the session.
+    assert_eq!(
+        titles,
+        ["dial · proj", "Settings · dial · proj", "dial · proj"]
+    );
+}
+
 // ---- rows_to_ansi -------------------------------------------------------------------
 
 #[test]

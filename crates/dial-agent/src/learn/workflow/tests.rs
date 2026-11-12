@@ -16,6 +16,8 @@ fn metrics_count_actual_calls_and_chatter_not_answers_or_results() {
         &json!({"tool_calls":0,"output":"the requested final answer","completion_tokens":9}),
     );
     metrics.observe("tool_form_failure", &json!({"kind":"schema"}));
+    metrics.observe("read_reuse", &json!({"kind":"delta","covered_lines":40}));
+    metrics.observe("read_reuse", &json!({"kind":"pointer","covered_lines":0}));
     assert_eq!(
         metrics,
         Metrics {
@@ -25,6 +27,8 @@ fn metrics_count_actual_calls_and_chatter_not_answers_or_results() {
             protocol_errors: 1,
             chatter_bytes: 4,
             completion_tokens: 16,
+            read_reuses: 2,
+            read_lines_reused: 40,
             ..Metrics::default()
         }
     );

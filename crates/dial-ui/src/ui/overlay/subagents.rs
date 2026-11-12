@@ -33,7 +33,8 @@ const SPLIT_AT: usize = 96;
 pub(super) const CANCEL_CONFIRM: Duration = Duration::from_secs(2);
 /// Inspector recent-activity lines.
 const RECENT_ACTIVITY: usize = 8;
-/// Lines per roster card: header, task, detail.
+/// Lines per roster card: header, task, detail. A card repeating the task above it drops the
+/// task line.
 const CARD_LINES: usize = 3;
 /// Two clicks on the same row inside this window open it.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(500);
@@ -613,10 +614,7 @@ impl SubagentsOverlay {
             }
             Tab::Agents if x < self.roster_w.get() => {
                 let rows = self.rows();
-                let Some(row) = rows
-                    .get(self.roster_start.get() + line / CARD_LINES)
-                    .copied()
-                else {
+                let Some(row) = self.roster_row_at(&rows, line) else {
                     return OverlayEvent::None;
                 };
                 let id = self.agents[row.index].id.clone();
@@ -996,21 +994,80 @@ impl SubagentsOverlay {
                 })
                 .collect();
         }
-        let page = (h / CARD_LINES).max(1);
         let sel = rows
             .iter()
             .position(|row| self.is_selected(row.index))
             .unwrap_or(0);
-        let start = if sel >= page { sel + 1 - page } else { 0 };
+        // The earliest first card that still shows the selection whole: cards are three rows,
+        // two when they repeat the task of the card above.
+        let mut start = sel;
+        while start > 0 && self.cards_height(&rows, start - 1, sel) <= h {
+            start -= 1;
+        }
         self.roster_start.set(start);
         let mut out = Vec::new();
-        for row in rows.iter().skip(start).take(page) {
-            out.extend(self.roster_card(*row, w, theme));
+        for i in start..rows.len() {
+            let height = self.card_height(&rows, i, start);
+            if out.len() + height > h.max(CARD_LINES) {
+                break;
+            }
+            let task = (height == CARD_LINES).then(|| self.task_run(&rows, i));
+            out.extend(self.roster_card(rows[i], task, w, theme));
         }
         out
     }
 
-    fn roster_card(&self, row: Row, w: usize, theme: &Theme) -> Vec<Line<'static>> {
+    /// Whether roster row `i` repeats the task of the row above it in a window that starts at
+    /// `first`; such a card leaves its task to the first card of the run.
+    fn repeats_task(&self, rows: &[Row], i: usize, first: usize) -> bool {
+        let task = |row: Row| self.agents[row.index].task.trim();
+        i > first && !task(rows[i]).is_empty() && task(rows[i]) == task(rows[i - 1])
+    }
+
+    fn card_height(&self, rows: &[Row], i: usize, first: usize) -> usize {
+        if self.repeats_task(rows, i, first) {
+            CARD_LINES - 1
+        } else {
+            CARD_LINES
+        }
+    }
+
+    /// Rows the cards `first..=last` take when `first` leads the window.
+    fn cards_height(&self, rows: &[Row], first: usize, last: usize) -> usize {
+        (first..=last)
+            .map(|i| self.card_height(rows, i, first))
+            .sum()
+    }
+
+    /// How many cards from `i` on share its task (1 when the next one differs).
+    fn task_run(&self, rows: &[Row], i: usize) -> usize {
+        1 + (i + 1..rows.len())
+            .take_while(|&j| self.repeats_task(rows, j, i))
+            .count()
+    }
+
+    /// The roster row under body line `line`, walking the drawn card heights.
+    fn roster_row_at(&self, rows: &[Row], line: usize) -> Option<Row> {
+        let start = self.roster_start.get();
+        let mut top = 0;
+        for i in start..rows.len() {
+            top += self.card_height(rows, i, start);
+            if line < top {
+                return Some(rows[i]);
+            }
+        }
+        None
+    }
+
+    /// One roster card: name and state, the task when `task` names how many cards share it
+    /// (`None` leaves it to the card above), then the current step or outcome.
+    fn roster_card(
+        &self,
+        row: Row,
+        task: Option<usize>,
+        w: usize,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
         let agent = &self.agents[row.index];
         let selected = self.is_selected(row.index);
         let (glyph, glyph_tok) = status_glyph(agent.status, theme);
@@ -1034,7 +1091,15 @@ impl SubagentsOverlay {
         } else {
             String::new()
         };
-        let name_tok = if selected { Tok::Accent } else { Tok::Text };
+        // A worker waiting on the user stands out even when it is not the selected one.
+        let waiting = matches!(agent.status, AgentStatus::Waiting | AgentStatus::NeedsInput);
+        let name_tok = if selected {
+            Tok::Accent
+        } else if waiting {
+            Tok::Warning
+        } else {
+            Tok::Text
+        };
         let mut left = vec![
             Span::styled(format!("{pointer} "), theme.fg(Tok::Accent)),
             Span::styled(format!("{glyph} "), theme.fg(glyph_tok)),
@@ -1081,19 +1146,30 @@ impl SubagentsOverlay {
         left.push(Span::styled(badge, theme.fg(Tok::Dim)));
         let header = filled(left, w, Style::default());
 
-        let task = if agent.task.trim().is_empty() {
-            agent.agent.clone()
-        } else {
-            text::one_line(&agent.task)
-        };
-        let task = filled(
-            vec![Span::styled(
-                format!("   {}", text::ellipsize(&task, w.saturating_sub(4), ascii)),
-                theme.fg(Tok::Muted),
-            )],
-            w,
-            Style::default(),
-        );
+        let task_line = task.map(|shared| {
+            let text = if agent.task.trim().is_empty() {
+                agent.agent.clone()
+            } else {
+                text::one_line(&agent.task)
+            };
+            let suffix = if shared > 1 {
+                format!("{}{shared} workers", sep(theme))
+            } else {
+                String::new()
+            };
+            let room = w.saturating_sub(4 + text::width(&suffix));
+            filled(
+                vec![
+                    Span::styled(
+                        format!("   {}", text::ellipsize(&text, room, ascii)),
+                        theme.fg(Tok::Muted),
+                    ),
+                    Span::styled(suffix, theme.fg(Tok::Dim)),
+                ],
+                w,
+                Style::default(),
+            )
+        });
 
         // What the worker is doing now, or why it stopped; usage numbers otherwise.
         let result = agent.result.as_deref().map(text::one_line);
@@ -1139,7 +1215,10 @@ impl SubagentsOverlay {
             w,
             Style::default(),
         );
-        let mut card = vec![header, task, detail];
+        let mut card: Vec<Line<'static>> = std::iter::once(header)
+            .chain(task_line)
+            .chain(std::iter::once(detail))
+            .collect();
         if selected {
             for line in &mut card {
                 chrome::select_spans(theme, &mut line.spans);

@@ -103,3 +103,30 @@ fn controls_never_infer_a_main_route_receipt_from_saved_selection() {
             .contains("Why this main model (recorded): unavailable (not recorded)")
     );
 }
+
+#[test]
+fn controls_name_the_direct_key_of_each_status_fact() {
+    let (_home, _project, app, shell) = shell();
+    let spec = shell.controls_picker(&app.config);
+    let detail = |value: &str| {
+        spec.items
+            .iter()
+            .find(|item| item.value == value)
+            .unwrap()
+            .detail
+            .clone()
+    };
+    let keys = &shell.keys;
+    for (value, action) in [
+        ("approval", Action::ApprovalCycle),
+        ("model", Action::ModelSelect),
+        ("providers", Action::ProviderSetup),
+    ] {
+        let key = keys.label(action);
+        assert!(
+            detail(value).ends_with(&format!("key {key}")),
+            "{value}: {}",
+            detail(value)
+        );
+    }
+}

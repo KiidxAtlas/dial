@@ -129,6 +129,14 @@ impl<'a> Agent<'a> {
             backend.adopt_resident_server(server);
         }
     }
+
+    /// The configured MCP servers this agent connected, for the agent rebuilt after a settings
+    /// change to adopt through [`crate::tools::integrations::mcp::retain`] instead of reconnecting.
+    pub fn mcp_handoff(
+        &self,
+    ) -> Option<std::sync::Arc<crate::tools::integrations::mcp::Connecting>> {
+        self.ext.mcp_handoff()
+    }
     pub fn todo(&self) -> &TodoList {
         &self.todo
     }

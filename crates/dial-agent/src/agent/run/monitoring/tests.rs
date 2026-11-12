@@ -163,3 +163,44 @@ fn monitor_resume_uses_logs_as_data_without_drafting_or_replacing_instruction() 
         "observations reach the request as data"
     );
 }
+
+#[test]
+fn a_settings_rebuild_keeps_running_jobs_and_armed_watch_state() {
+    with_agent("", |agent| {
+        assert!(agent.take_live_processes().is_none(), "nothing runs yet");
+        arm(agent);
+        let ws = agent.workspace().clone().without_sandbox();
+        let config = Config::default();
+        let allow = |_: &str, _: &[std::path::PathBuf], _: bool| Ok(());
+        let ctx = ToolContext {
+            workspace: &ws,
+            config: &config,
+            mutation_authorizer: Some(&allow),
+            confirm: None,
+        };
+        let bg = Arc::clone(agent.ext.owner("bg").unwrap());
+        let started = bg.call(
+            &ctx,
+            &json!({"action":"start","name":"server","command":"sleep 30"}),
+        );
+        assert!(!started.is_error, "{}", started.text);
+        drop(bg);
+
+        let carried = agent.take_live_processes().expect("a job is running");
+        // The rebuilt agent's freshly built tools, as `make_agent` creates them.
+        agent.ext = crate::tools::integrations::ext::Registry::standard(&config, Vec::new());
+        agent.adopt_live_processes(carried);
+
+        let bg = Arc::clone(agent.ext.owner("bg").unwrap());
+        assert!(bg.has_live_work(), "the job survived the rebuild");
+        assert!(
+            agent.monitor_state.eligible,
+            "the watch can still wake the task"
+        );
+        assert_eq!(agent.monitor_state.remaining, MAX_WAKES);
+        assert!(
+            !bg.call(&ctx, &json!({"action":"kill","name":"server"}))
+                .is_error
+        );
+    });
+}

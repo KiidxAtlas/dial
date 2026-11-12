@@ -164,16 +164,86 @@ impl Facade {
         let schema = owner.schema();
         crate::tools::surface::catalog::validate_arguments(&schema, own).map_err(|error| {
             format!(
-                "{} ({}): {error}{}\nContract: {}\nParameters: {}",
+                "{} ({}): {error}{}{}\nContract: {}\nParameters: {}",
                 self.name,
                 owner.name(),
                 self.action_elsewhere(owner, own),
+                self.property_elsewhere(owner, own),
                 schema["function"]["description"]
                     .as_str()
                     .unwrap_or_default(),
                 schema["function"]["parameters"]
             )
         })
+    }
+
+    /// `(recorded, merged)` action names of every action route to `tool`.
+    fn action_names(&self, tool: &Arc<dyn Tool>) -> Vec<(&'static str, &'static str)> {
+        self.members
+            .iter()
+            .filter(|member| Arc::ptr_eq(&member.tool, tool))
+            .filter_map(|member| match &member.route {
+                Route::Action {
+                    merged,
+                    recorded: Some(recorded),
+                } => Some((*recorded, *merged)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `"\nafter_secs belongs to action=watch"` when `own` carries arguments its owner does not
+    /// declare but another member does, e.g. a monitor argument sent with `bg`'s own `start`.
+    /// Among a member's action routes, the one recording the call's action is named first.
+    fn property_elsewhere(&self, owner: &Arc<dyn Tool>, own: &Value) -> String {
+        let declared = |tool: &Arc<dyn Tool>, key: &str| {
+            tool.schema()
+                .pointer("/function/parameters/properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| properties.contains_key(key))
+        };
+        let Some(arguments) = own.as_object() else {
+            return String::new();
+        };
+        let stray: Vec<&str> = arguments
+            .iter()
+            .filter(|(key, value)| !value.is_null() && !declared(owner, key))
+            .map(|(key, _)| key.as_str())
+            .collect();
+        if stray.is_empty() {
+            return String::new();
+        }
+        let action = own.get("action").and_then(Value::as_str);
+        let mut routes: Vec<String> = Vec::new();
+        for member in &self.members {
+            if Arc::ptr_eq(&member.tool, owner)
+                || !stray.iter().all(|key| declared(&member.tool, key))
+            {
+                continue;
+            }
+            let route = match &member.route {
+                Route::Select { field, value } => format!("{field}={value}"),
+                Route::Action { merged, recorded } => {
+                    let names = self.action_names(&member.tool);
+                    let same = |name: &&str| Some(*name) == action;
+                    if names.iter().any(|(r, _)| same(r)) && !recorded.as_ref().is_some_and(same) {
+                        continue;
+                    }
+                    format!("action={merged}")
+                }
+            };
+            if !routes.contains(&route) {
+                routes.push(route);
+            }
+        }
+        if routes.is_empty() {
+            return String::new();
+        }
+        format!(
+            "\n{} belongs to {}; resend with that route",
+            stray.join(", "),
+            routes.join(" or ")
+        )
     }
 
     /// `"\naction=show belongs to source=changes"` when the selected member lacks `own`'s action
@@ -331,6 +401,48 @@ fn merge_properties(properties: &mut Map<String, Value>, added: &Value, skip: &[
     }
 }
 
+/// Rewrite an action-routed member's description scopes, the text before the first `:` such as
+/// `start:` or `start (job/run):`, to the facade's merged action names. Without this, a member
+/// property documented as `start: ...` reads as belonging to the successor's own `start` action.
+fn rename_scopes(schema: &mut Value, names: &[(&str, &str)]) {
+    let Some(properties) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for property in properties.values_mut() {
+        let Some(description) = property.get("description").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(colon) = description.find(':').filter(|colon| *colon <= 40) else {
+            continue;
+        };
+        let (scope, rest) = description.split_at(colon);
+        let mut renamed = String::with_capacity(description.len() + 8);
+        let mut word = String::new();
+        let flush = |word: &mut String, out: &mut String| {
+            let name = names
+                .iter()
+                .find(|(recorded, _)| recorded == word)
+                .map_or(word.as_str(), |(_, merged)| merged);
+            out.push_str(name);
+            word.clear();
+        };
+        for c in scope.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                word.push(c);
+            } else {
+                flush(&mut word, &mut renamed);
+                renamed.push(c);
+            }
+        }
+        flush(&mut word, &mut renamed);
+        renamed.push_str(rest);
+        property["description"] = json!(renamed);
+    }
+}
+
 impl Tool for Facade {
     fn name(&self) -> &str {
         &self.name
@@ -371,10 +483,12 @@ impl Tool for Facade {
         let selector_fields: Vec<&str> = selectors.iter().map(|(field, _)| *field).collect();
         for member in &self.members {
             let mut skip = selector_fields.clone();
+            let mut owned = member.tool.schema();
             if matches!(member.route, Route::Action { .. }) {
                 skip.push("action");
+                rename_scopes(&mut owned, &self.action_names(&member.tool));
             }
-            merge_properties(&mut properties, &member.tool.schema(), &skip);
+            merge_properties(&mut properties, &owned, &skip);
         }
         if !actions.is_empty() {
             let action = properties
@@ -674,7 +788,14 @@ pub const GROUPS: &[Group] = &[
         native_required: false,
         members: &[(
             "monitor",
-            Spec::Actions(&[("watch", "start"), ("watches", "list"), ("unwatch", "stop")]),
+            Spec::Actions(&[
+                ("watch", "start"),
+                ("watches", "list"),
+                ("unwatch", "stop"),
+                ("saved", "saved"),
+                ("restore", "restore"),
+                ("forget", "forget"),
+            ]),
         )],
     },
     Group {
@@ -718,6 +839,7 @@ pub const GROUPS: &[Group] = &[
         members: &[
             ("github", Spec::Select("forge", "github")),
             ("glab_mr", Spec::Select("forge", "gitlab")),
+            ("gitea_pr", Spec::Select("forge", "gitea")),
         ],
     },
 ];

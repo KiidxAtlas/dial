@@ -1,7 +1,7 @@
-//! The IRC lane: messages one agent sends another (`message`, `peers` with `action: send`).
+//! The message lane: messages one agent sends another (`message`, `peers` with `action: send`).
 //!
 //! ```text
-//! ✉  IRC     ➤ all                         2 queued · 1 refused
+//! ✉  Message ➤ all                         2 queued · 1 refused
 //!    ▏ rebase onto main before you push
 //!    ├─ reviewer ⟦queued⟧
 //!    ├─ scout#1 ⟦queued⟧
@@ -133,7 +133,7 @@ pub(super) fn irc_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows> 
     let (facts_text, room) = fit_facts(facts, w, lead_w + VERB_W + 1, text::width(&target), &sep);
     let mut head = lead;
     head.push(Span::styled(
-        format!("{:<VERB_W$}", "IRC"),
+        format!("{:<VERB_W$}", "Message"),
         theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD),
     ));
     head.push(Span::raw(" "));
@@ -244,7 +244,7 @@ pub(in crate::ui) fn incoming_notice(body: &str, w: u16, ctx: &TranscriptCtx) ->
     );
     let mut head = gutter_span(envelope.into(), theme.fg(Tok::SectionConnect));
     head.push(Span::styled(
-        format!("{:<VERB_W$} ", "IRC"),
+        format!("{:<VERB_W$} ", "Message"),
         theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD),
     ));
     head.push(Span::styled(

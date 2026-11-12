@@ -517,3 +517,66 @@ fn installation_failure_rolls_back_the_whole_patch_and_preserves_concurrent_edit
         }
     }
 }
+
+/// One aggregate `isolation_source_bytes` rule covers the copy walk and every resulting snapshot
+/// that overlay and ProjFS merge from: a total at the limit merges, a total one byte over is refused
+/// before any project file is written.
+#[test]
+fn aggregate_source_budget_is_enforced_on_the_resulting_copy() {
+    // The project already counts 5 bytes (a.txt, b.txt and gone.txt).
+    for (limit, added, accepted) in [(7, 2, true), (6, 2, false), (8, 3, true), (7, 3, false)] {
+        let (dir, ws) = project();
+        let config = crate::config::task::TaskConfig {
+            isolation_source_bytes: limit,
+            ..Default::default()
+        };
+        let iso = Isolated::with_config(&ws, &config, Preference::Copy).unwrap();
+        fs::write(iso.root().join("new.txt"), "x".repeat(added)).unwrap();
+        let merge = iso.merge(&ws, &AtomicBool::new(false));
+        if accepted {
+            assert!(merge.integrated, "limit {limit}: {merge:?}");
+            assert_eq!(
+                fs::read_to_string(dir.path().join("new.txt"))
+                    .unwrap()
+                    .len(),
+                added
+            );
+        } else {
+            assert!(!merge.integrated, "limit {limit}: {merge:?}");
+            assert!(merge.applied.is_empty(), "limit {limit}: {merge:?}");
+            assert!(!dir.path().join("new.txt").exists(), "limit {limit}");
+            let [error] = merge.errors.as_slice() else {
+                panic!("limit {limit}: {merge:?}");
+            };
+            assert_eq!(error.stage, "snapshot");
+            assert!(
+                error
+                    .message
+                    .contains(&format!("limited to {limit} bytes in total")),
+                "{}",
+                error.message
+            );
+        }
+    }
+}
+
+#[test]
+fn source_budget_admits_exactly_the_limit_for_any_resulting_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut snapshot = Snapshot::new();
+    for (name, len) in [("a", 3usize), ("b", 2)] {
+        fs::write(dir.path().join(name), vec![b'x'; len]).unwrap();
+        snapshot.insert(
+            PathBuf::from(name),
+            stamp(&dir.path().join(name)).unwrap().unwrap(),
+        );
+    }
+    for (limit, ok) in [(5, true), (6, true), (4, false), (0, false)] {
+        let config = crate::config::task::TaskConfig {
+            isolation_source_bytes: limit,
+            ..Default::default()
+        };
+        let result = ensure_source_budget(&snapshot, &config);
+        assert_eq!(result.is_ok(), ok, "limit {limit}: {result:?}");
+    }
+}

@@ -198,6 +198,66 @@ struct Explicit {
     stage: SteerStage,
     /// Not yet handed to the agent through `take_explicit_*`.
     untaken: bool,
+    /// When it reached [`SteerStage::Applied`]; its row fades [`STEER_FADE`] later.
+    applied_at: Option<std::time::Instant>,
+}
+
+/// How long a recorded steer or started worker stays in the strip: long enough to read that it
+/// landed, short enough that the strip only ever shows what is still in flight.
+const STEER_FADE: std::time::Duration = std::time::Duration::from_secs(4);
+
+impl Explicit {
+    fn new(text: String, kind: SteerKind) -> Self {
+        Explicit {
+            text,
+            kind,
+            stage: SteerStage::Pending,
+            untaken: true,
+            applied_at: None,
+        }
+    }
+
+    /// Still shown: not yet applied, or applied within the fade window.
+    fn visible(&self, now: std::time::Instant) -> bool {
+        self.applied_at
+            .is_none_or(|at| now.saturating_duration_since(at) < STEER_FADE)
+    }
+}
+
+/// The stage trail that leads a steer or worker row, one mark per stage (pending, received,
+/// recorded): reached stages in the row's color, the rest dim, a check once it is recorded. The
+/// one row changes in place as the agent reports each stage: ` ●─●─○ Steer`.
+fn steer_trail(theme: &Theme, stage: SteerStage, tok: Tok) -> Vec<Span<'static>> {
+    let (reached, open, link) = if theme.ascii() {
+        ("*", ".", "-")
+    } else {
+        ("●", "○", "─")
+    };
+    let mut spans = vec![Span::raw(" ")];
+    for (i, step) in [
+        SteerStage::Pending,
+        SteerStage::Received,
+        SteerStage::Applied,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i > 0 {
+            spans.push(Span::styled(link, theme.fg(Tok::Dim)));
+        }
+        let (glyph, style) = if step == SteerStage::Applied && stage == SteerStage::Applied {
+            (
+                theme.sym(Sym::Check),
+                theme.fg(tok).add_modifier(Modifier::BOLD),
+            )
+        } else if step <= stage {
+            (reached, theme.fg(tok).add_modifier(Modifier::BOLD))
+        } else {
+            (open, theme.fg(Tok::Dim))
+        };
+        spans.push(Span::styled(glyph.to_owned(), style));
+    }
+    spans
 }
 
 impl BusyChoice {
@@ -212,10 +272,24 @@ impl BusyChoice {
         }
     }
 
+    /// A few words for the busy hint: `redirect`, `after turn`.
+    fn short(self) -> &'static str {
+        match self {
+            BusyChoice::Auto => "auto",
+            BusyChoice::Redirect => "redirect",
+            BusyChoice::AfterTurn => "after turn",
+            BusyChoice::Independent => "independent",
+            BusyChoice::KeepWorking => "keep working",
+            BusyChoice::StopAndSend => "stop and send",
+        }
+    }
+
     fn detail(self) -> &'static str {
         match self {
             BusyChoice::Auto => "uses configured routing; may redirect or request a worker",
-            BusyChoice::Redirect => "changes this task at a safe point; running tools finish",
+            BusyChoice::Redirect => {
+                "changes this task after the current step; running tools finish"
+            }
             BusyChoice::AfterTurn => "queues this message; leaves the current task unchanged",
             BusyChoice::Independent => {
                 "requests a separate worker; otherwise queues after this turn"
@@ -236,17 +310,27 @@ fn queued_route(follow_up: bool) -> &'static str {
 }
 
 /// One row of the steer/queue strip above the composer, indented like the status row:
-/// ` ○ Steer  pending · acts at the next safe point  “message”`. The glyph and bold label carry
+/// ` ○ Steer  pending · applies after the current step  “message”`. The glyph and bold label carry
 /// the state; the message is muted and dropped first when the row is narrow.
 fn strip_row(
     theme: &Theme,
     width: usize,
-    (sym, label, tok): (Sym, &str, Tok),
+    lead: Vec<Span<'static>>,
+    (label, tok): (&str, Tok),
     detail: &str,
     message: &str,
 ) -> Line<'static> {
-    let head = format!(" {} {label}  ", theme.sym(sym));
-    let room = width.saturating_sub(text::width(&head));
+    let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
+    if lead_w >= width {
+        return Line::from(Span::styled(
+            text::ellipsize(&format!(" {label}"), width, theme.ascii()),
+            theme.fg(tok).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let head = format!(" {label}  ");
+    let room = width - lead_w;
+    let head = text::ellipsize(&head, room, theme.ascii());
+    let room = room.saturating_sub(text::width(&head));
     let detail = text::ellipsize(detail, room, theme.ascii());
     let room = room.saturating_sub(text::width(&detail));
     let quoted = if room > 6 {
@@ -263,14 +347,13 @@ fn strip_row(
     } else {
         String::new()
     };
-    Line::from(vec![
-        Span::styled(
-            text::ellipsize(&head, width, theme.ascii()),
-            theme.fg(tok).add_modifier(Modifier::BOLD),
-        ),
+    let mut spans = lead;
+    spans.extend([
+        Span::styled(head, theme.fg(tok).add_modifier(Modifier::BOLD)),
         Span::styled(detail, theme.fg(tok)),
         Span::styled(quoted, theme.fg(Tok::Muted)),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 /// The launch/compose placeholder, longest first; the first that fits is shown whole.
@@ -282,6 +365,9 @@ const PLACEHOLDERS: [&str; 3] = [
 
 /// The launch input asks the home screen's question itself, so the hero carries no second copy.
 const LANDING_PLACEHOLDERS: [&str; 2] = ["What are we building?", "Ask anything"];
+
+/// Text rows the launch input shows even when empty (see `view_with`).
+const LANDING_INPUT_ROWS: usize = 2;
 
 /// Offered for a non-empty draft while busy. Automatic routing is the default.
 const DRAFT_CHOICES: &[BusyChoice] = &[
@@ -542,6 +628,20 @@ impl Composer {
         self.editor.text.clone()
     }
 
+    /// Whether a turn is running (see [`Composer::set_busy`]).
+    pub fn is_busy(&self) -> bool {
+        self.busy
+    }
+
+    /// Whether the draft is empty and nothing (chooser, menu, search) is open over it, so a
+    /// shortcut that acts on the conversation cannot be mistaken for editing.
+    pub fn is_resting(&self) -> bool {
+        self.editor.text.is_empty()
+            && self.choice.is_none()
+            && self.menu.is_none()
+            && self.search.is_none()
+    }
+
     /// The draft with collapsed paste placeholders replaced by their text, for handing to an editor.
     pub fn expanded_draft(&self) -> String {
         expand_pastes(&self.editor.text, &self.pastes)
@@ -670,13 +770,19 @@ impl Composer {
             self.choice = None;
         }
     }
-    fn busy_send_hint(&self) -> &'static str {
+
+    /// What Enter does with a draft while busy. With the chooser, a route picked earlier this
+    /// session is named, since the chooser opens on it and Enter twice repeats it.
+    fn busy_send_hint(&self) -> String {
         match self.busy_send {
-            BusySend::Choose => "choose send action",
-            BusySend::Redirect => "redirect task",
-            BusySend::AfterTurn => "send after turn",
-            BusySend::Independent => "run independently",
-            BusySend::Auto => "route automatically",
+            BusySend::Choose => match self.last_draft_choice {
+                Some(last) => format!("choose route (last: {})", last.short()),
+                None => "choose send action".to_owned(),
+            },
+            BusySend::Redirect => "redirect task".to_owned(),
+            BusySend::AfterTurn => "send after turn".to_owned(),
+            BusySend::Independent => "run independently".to_owned(),
+            BusySend::Auto => "route automatically".to_owned(),
         }
     }
 
@@ -814,6 +920,9 @@ impl Composer {
         {
             item.stage = stage;
             item.untaken = false;
+            if stage == SteerStage::Applied {
+                item.applied_at = Some(std::time::Instant::now());
+            }
             true
         } else {
             false
@@ -860,12 +969,8 @@ impl Composer {
         if text.trim().is_empty() || text.len() > 256 * 1024 || self.explicit.len() >= 16 {
             return false;
         }
-        self.explicit.push(Explicit {
-            text: text.to_owned(),
-            kind: SteerKind::Independent,
-            stage: SteerStage::Pending,
-            untaken: true,
-        });
+        self.explicit
+            .push(Explicit::new(text.to_owned(), SteerKind::Independent));
         true
     }
     fn send_explicit(&mut self, kind: SteerKind) -> ComposerEvent {
@@ -885,12 +990,7 @@ impl Composer {
         self.push_history(sent.clone());
         // An edited queue item sent explicitly leaves the queue: the explicit route replaces it.
         self.editing_queue = None;
-        self.explicit.push(Explicit {
-            text: sent,
-            kind,
-            stage: SteerStage::Pending,
-            untaken: true,
-        });
+        self.explicit.push(Explicit::new(sent, kind));
         self.finish_draft();
         self.queue_notice = None;
         ComposerEvent::None
@@ -2283,6 +2383,17 @@ impl Composer {
                 Line::from(spans)
             });
         }
+        // The launch input keeps a second row, so it reads as a place to write rather than a
+        // one-line search field. The cursor stays on the first row; typed text fills the second.
+        if landing && boxed && laid.rows.len().saturating_sub(start) < LANDING_INPUT_ROWS {
+            for _ in laid.rows.len().saturating_sub(start)..LANDING_INPUT_ROWS {
+                rows.push(Line::from(vec![
+                    Span::styled(format!("{side} "), border),
+                    Span::raw(" ".repeat(inner + 1)),
+                    Span::styled(side.to_owned(), border),
+                ]));
+            }
+        }
         let cursor = (
             (activity_rows + 1 + laid.cursor.0 - start) as u16,
             (laid.cursor.1
@@ -2302,7 +2413,14 @@ impl Composer {
             } else {
                 format!("recording, {key} to stop")
             };
-            hints.insert(0, Hint { key: None, what });
+            hints.insert(
+                0,
+                Hint {
+                    key: None,
+                    what,
+                    warn: false,
+                },
+            );
         }
         if !landing
             && ctx.ui.hints
@@ -2312,6 +2430,7 @@ impl Composer {
             hints.push(Hint {
                 key: Some(ctx.keys.label(Action::StatusFocus)),
                 what: "controls".to_owned(),
+                warn: false,
             });
         }
         if banded {
@@ -2364,6 +2483,9 @@ impl Composer {
             ));
         }
         let mut cursor = cursor;
+        // Rows stacked above the activity row (menus, the chooser, a notice), so the steer strip
+        // can sit right under the activity it changes instead of above everything.
+        let mut lead = 0usize;
         if let Some(search) = &self.search {
             // Like the command menu, history search opens upward, above the input, with its
             // query row next to the box, so it never lands below the footer.
@@ -2373,6 +2495,7 @@ impl Composer {
             let mut above: Rows = list.collect();
             above.extend(head);
             cursor = ((above.len() - 1) as u16, col as u16);
+            lead += above.len();
             above.append(&mut rows);
             rows = above;
         } else if let Some(menu) = &self.menu {
@@ -2380,12 +2503,14 @@ impl Composer {
             // down and the closest rows to the cursor are the selected command's details.
             let mut menu_rows = self.menu_rows(menu, w, ctx);
             cursor.0 += menu_rows.len() as u16;
+            lead += menu_rows.len();
             menu_rows.append(&mut rows);
             rows = menu_rows;
         }
         if let Some(choice) = &self.choice {
             let mut choice_rows = self.choice_rows(choice, w, ctx);
             cursor.0 += choice_rows.len() as u16;
+            lead += choice_rows.len();
             choice_rows.append(&mut rows);
             rows = choice_rows;
         }
@@ -2398,52 +2523,58 @@ impl Composer {
                 )),
             );
             cursor.0 += 1;
+            lead += 1;
         }
-        if !self.explicit.is_empty() {
+        // Fading is by time, so a recorded row leaves on a later paint without another event.
+        let now = std::time::Instant::now();
+        let showing: Vec<&Explicit> = self.explicit.iter().filter(|i| i.visible(now)).collect();
+        if !showing.is_empty() {
             let mut strip = Vec::new();
-            for item in &self.explicit {
+            for item in showing {
                 // Indented like the status row, with a stage glyph and a bold label so the stage
                 // reads at a glance; the message itself stays muted and quoted.
-                let (what, stage, tok, sym) = match (item.kind, item.stage) {
+                let (what, stage, tok) = match (item.kind, item.stage) {
                     (SteerKind::Steer, SteerStage::Pending) => (
                         "Steer",
-                        "pending · acts at the next safe point",
+                        "pending · applies after the current step",
                         Tok::Warning,
-                        Sym::RadioOff,
                     ),
-                    (SteerKind::Steer, SteerStage::Received) => (
-                        "Steer",
-                        "received · awaiting a safe-point decision",
-                        Tok::Accent,
-                        Sym::Working,
-                    ),
+                    (SteerKind::Steer, SteerStage::Received) => {
+                        ("Steer", "received · applying it next", Tok::Accent)
+                    }
                     (SteerKind::Steer, SteerStage::Applied) => (
                         "Steer",
                         "recorded · now the current instruction",
                         Tok::Success,
-                        Sym::Check,
                     ),
                     (SteerKind::Independent, SteerStage::Pending) => (
                         "Worker",
-                        "pending · starts at the next safe point",
+                        "pending · starts after the current step",
                         Tok::Warning,
-                        Sym::RadioOff,
                     ),
                     (SteerKind::Independent, SteerStage::Received) => {
-                        ("Worker", "received · starting", Tok::Accent, Sym::Working)
+                        ("Worker", "received · starting", Tok::Accent)
                     }
-                    (SteerKind::Independent, SteerStage::Applied) => (
-                        "Worker",
-                        "started · this task continues",
-                        Tok::Success,
-                        Sym::Check,
-                    ),
+                    (SteerKind::Independent, SteerStage::Applied) => {
+                        ("Worker", "started · this task continues", Tok::Success)
+                    }
                 };
-                strip.push(strip_row(theme, w, (sym, what, tok), stage, &item.text));
+                strip.push(strip_row(
+                    theme,
+                    w,
+                    steer_trail(theme, item.stage, tok),
+                    (what, tok),
+                    stage,
+                    &item.text,
+                ));
             }
-            cursor.0 += strip.len() as u16;
-            strip.extend(rows);
-            rows = strip;
+            // Under the activity row, directly above the draft: your message reads after what
+            // Dial is doing now, next to where you typed it.
+            let at = (lead + activity_rows).min(rows.len());
+            if usize::from(cursor.0) >= at {
+                cursor.0 += strip.len() as u16;
+            }
+            rows.splice(at..at, strip);
         }
         if !self.queued.is_empty() {
             let mut queued = Vec::new();
@@ -2451,7 +2582,11 @@ impl Composer {
                 queued.push(strip_row(
                     theme,
                     w,
-                    (Sym::ArrowUp, "Queued", Tok::Accent),
+                    vec![Span::styled(
+                        format!(" {}", theme.sym(Sym::ArrowUp)),
+                        theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+                    )],
+                    ("Queued", Tok::Accent),
                     queued_route(*follow_up),
                     message,
                 ));
@@ -2553,10 +2688,20 @@ impl Composer {
         let blank_pointer = " ".repeat(text::width(pointer));
         // Pointer, space, option number, space.
         let prefix = text::width(pointer) + 3;
+        // The remembered route carries a ` ·` mark after its label (see below).
+        let mark = format!(" {}", theme.sym(Sym::Dot));
+        let remembered = |option: BusyChoice| !queue && self.last_draft_choice == Some(option);
         let label_col = choice
             .options
             .iter()
-            .map(|option| text::width(option.label()))
+            .map(|option| {
+                text::width(option.label())
+                    + if remembered(*option) {
+                        text::width(&mark)
+                    } else {
+                        0
+                    }
+            })
             .max()
             .unwrap_or(0);
         let inline = choice
@@ -2566,6 +2711,7 @@ impl Composer {
         let accent = theme.fg(Tok::Accent);
         let total = choice.options.len();
         let mut rows = Vec::new();
+        let dot = theme.sym(Sym::Dot);
         if !panel {
             rows.push(finish_row(
                 vec![Span::styled(title.clone(), theme.fg(Tok::Muted))],
@@ -2581,8 +2727,16 @@ impl Composer {
             choice.selected,
             |i, budget, selected| {
                 let option = choice.options[i];
-                let label =
-                    text::ellipsize(option.label(), budget.saturating_sub(prefix), theme.ascii());
+                let mark_w = if remembered(option) {
+                    text::width(&mark)
+                } else {
+                    0
+                };
+                let label = text::ellipsize(
+                    option.label(),
+                    budget.saturating_sub(prefix + mark_w),
+                    theme.ascii(),
+                );
                 let mut spans = vec![
                     Span::styled(
                         if selected {
@@ -2597,16 +2751,20 @@ impl Composer {
                     Span::styled(format!("{} ", i + 1), theme.fg(Tok::Muted)),
                     Span::styled(label.clone(), theme.fg(Tok::Text)),
                 ];
+                // The route picked last time this session, which the chooser opened on.
+                if mark_w > 0 {
+                    spans.push(Span::styled(mark.clone(), theme.fg(Tok::Accent)));
+                }
+                let label_w = text::width(&label) + mark_w;
                 if inline {
-                    spans.push(Span::raw(
-                        " ".repeat(label_col.saturating_sub(text::width(&label)) + 2),
-                    ));
+                    spans.push(Span::raw(" ".repeat(label_col.saturating_sub(label_w) + 2)));
                     spans.push(Span::styled(option.detail(), theme.fg(Tok::Muted)));
                 }
                 spans
             },
         ));
-        if !inline && let Some(option) = choice.options.get(choice.selected) {
+        let selected_option = choice.options.get(choice.selected).copied();
+        if !inline && let Some(option) = selected_option {
             rows.push(finish_row(
                 vec![Span::styled(
                     format!(
@@ -2618,14 +2776,43 @@ impl Composer {
                 w,
             ));
         }
+        // A worker starts from this message alone, so show exactly what it will be given.
+        if !queue && selected_option == Some(BusyChoice::Independent) {
+            let (open, close) = if theme.ascii() {
+                ('"', '"')
+            } else {
+                ('“', '”')
+            };
+            rows.push(finish_row(
+                vec![Span::styled(
+                    format!(
+                        "{blank_pointer}   {}",
+                        text::ellipsize(
+                            &format!(
+                                "worker gets {open}{}{close}",
+                                text::one_line(&self.editor.text)
+                            ),
+                            w.saturating_sub(prefix),
+                            theme.ascii()
+                        )
+                    ),
+                    theme.fg(Tok::Dim),
+                )],
+                w,
+            ));
+        }
         if !queue {
             let dash = if theme.ascii() { "-" } else { "–" };
-            let dot = theme.sym(Sym::Dot);
             let mut shortcut = format!("1{dash}{total} pick directly");
             if self.keyboard_enhanced() {
                 shortcut.push_str(&format!(" {dot} Ctrl+Enter redirect"));
             }
             shortcut.push_str(&format!(" {dot} /worker <message> starts a worker"));
+            // A route chosen every time can be the default: the setting skips the chooser.
+            let into = if theme.ascii() { ">" } else { "›" };
+            shortcut.push_str(&format!(
+                " {dot} default: /settings {into} Enter while working"
+            ));
             rows.push(finish_row(
                 vec![Span::styled(
                     text::ellipsize(&shortcut, w, theme.ascii()),
@@ -2697,6 +2884,7 @@ impl Composer {
             (!key.is_empty()).then(|| Hint {
                 key: Some(key),
                 what: what.to_owned(),
+                warn: false,
             })
         };
         let select = || {
@@ -2708,15 +2896,23 @@ impl Composer {
             (!labels.is_empty()).then(|| Hint {
                 key: Some(labels.join("/")),
                 what: "select".to_owned(),
+                warn: false,
             })
         };
         let keyed = |key: &str, what: &str| {
             Some(Hint {
                 key: Some(key.to_owned()),
                 what: what.to_owned(),
+                warn: false,
             })
         };
-        let plain = |what: String| Some(Hint { key: None, what });
+        let plain = |what: String| {
+            Some(Hint {
+                key: None,
+                what,
+                warn: false,
+            })
+        };
         let mut pieces = Vec::new();
         if self.busy {
             // Esc is advertised only when it closes something no other hint names: an inline
@@ -2735,7 +2931,8 @@ impl Composer {
                 && keys.chords(Action::Interrupt).first().is_some_and(|chord| {
                     keys.matches(Action::ClearDraft, &KeyEvent::new(chord.code, chord.mods))
                 });
-            pieces.push(hint(
+            // An armed stop leads in the warning color: the next press ends the turn.
+            let stop = hint(
                 Action::Interrupt,
                 if clears {
                     "clear draft"
@@ -2744,7 +2941,12 @@ impl Composer {
                 } else {
                     "stop"
                 },
-            ));
+            )
+            .map(|stop| Hint {
+                warn: self.stop_armed && !clears,
+                ..stop
+            });
+            pieces.push(stop);
             // The draft a busy Ctrl+C just cleared is one undo away.
             if self.stop_armed && !clears {
                 pieces.push(hint(Action::EditorUndo, "restore draft"));
@@ -2820,7 +3022,7 @@ impl Composer {
                         }
                     }
                 } else if !blank {
-                    pieces.push(hint(Action::Submit, self.busy_send_hint()));
+                    pieces.push(hint(Action::Submit, &self.busy_send_hint()));
                 }
                 // Alt-Enter only queues a non-blank draft.
                 if !command && !blank {
@@ -3270,10 +3472,12 @@ fn layout(text: &str, ghost: &str, cursor: usize, width: usize, shell: bool) -> 
     Layout { rows, cursor }
 }
 
-/// One bottom-border hint: an optional key (drawn amber bold) and its label (muted).
+/// One bottom-border hint: an optional key (drawn amber bold) and its label (muted). A `warn`
+/// hint is drawn whole in the warning color: the next press of its key has a lasting effect.
 struct Hint {
     key: Option<String>,
     what: String,
+    warn: bool,
 }
 
 impl Hint {
@@ -3317,18 +3521,22 @@ fn bottom_border(
         if i > 0 {
             spans.push(Span::styled(sep.clone(), theme.fg(Tok::Muted)));
         }
+        let label = if hint.warn {
+            theme.fg(Tok::Warning).add_modifier(Modifier::BOLD)
+        } else {
+            theme.fg(Tok::Muted)
+        };
+        let key_style = if hint.warn {
+            theme.fg(Tok::Warning).add_modifier(Modifier::BOLD)
+        } else {
+            theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)
+        };
         match &hint.key {
             Some(key) => {
-                spans.push(Span::styled(
-                    key.clone(),
-                    theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
-                ));
-                spans.push(Span::styled(
-                    format!(" {}", hint.what),
-                    theme.fg(Tok::Muted),
-                ));
+                spans.push(Span::styled(key.clone(), key_style));
+                spans.push(Span::styled(format!(" {}", hint.what), label));
             }
-            None => spans.push(Span::styled(hint.what.clone(), theme.fg(Tok::Muted))),
+            None => spans.push(Span::styled(hint.what.clone(), label)),
         }
     }
     spans.push(Span::styled(

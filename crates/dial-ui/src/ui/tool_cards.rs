@@ -654,6 +654,14 @@ fn framed_card(
         ));
     }
     let mut body = body;
+    // A command framed from its start holds one quiet row until output arrives, so the card reads
+    // as running rather than as an empty box, and the first output line takes that row's place.
+    if body.is_empty() && t.state == ToolState::Running {
+        body.push(Line::from(Span::styled(
+            format!("waiting for output{}", theme.sym(Sym::Ellipsis)),
+            theme.fg(Tok::Dim),
+        )));
+    }
     if hidden > 0 {
         body.push(Line::from(hidden_hint(hidden, ctx.expand_key, theme)));
     }
@@ -661,11 +669,16 @@ fn framed_card(
     let label = (!frame.sections.is_empty()).then_some(if failed { "Error" } else { "Output" });
     frame.sections.push((label.map(str::to_owned), body));
     let sep = format!(" {} ", theme.sym(Sym::Dot));
-    let facts = facts(t, theme)
+    let mut facts = facts(t, theme)
         .into_iter()
         .map(|f| f.text)
-        .collect::<Vec<_>>()
-        .join(&sep);
+        .collect::<Vec<_>>();
+    // A running card says so on its edge, with its clock once it has one, so it never reads as
+    // an empty box.
+    if t.state == ToolState::Running {
+        facts.insert(0, "running".to_owned());
+    }
+    let facts = facts.join(&sep);
     if !facts.is_empty() {
         frame.foot = vec![Span::styled(
             facts,
@@ -815,8 +828,8 @@ fn fit_facts(
     }
 }
 
-/// The group label (`Read`, `Search`, `Find`) a settled lookup folds into, so consecutive
-/// lookups read as one tree instead of a column of near-identical rows.
+/// The group label (`Read`, `Search`, `Find`, `Skill`) a settled lookup folds into, so
+/// consecutive lookups read as one tree instead of a column of near-identical rows.
 pub(super) fn lookup_group(
     state: ToolState,
     presentation: &crate::runtime::presentation::Presentation,
@@ -824,7 +837,7 @@ pub(super) fn lookup_group(
     let label = text::one_line(&presentation.label);
     (state == ToolState::Completed
         && presentation.body == crate::runtime::presentation::BodyStyle::Quiet
-        && matches!(label.as_str(), "Read" | "Search" | "Find"))
+        && matches!(label.as_str(), "Read" | "Search" | "Find" | "Skill"))
     .then_some(label)
 }
 
@@ -840,11 +853,15 @@ pub(super) fn may_join(
 }
 
 /// `·  Read (3)` and one branch per call: its target, and its own facts at the right edge.
+/// A run of skill loads folds by skill instead, see [`skill_rows`].
 pub(super) fn lookup_tree(tools: &[&Tool], w: u16, ctx: &TranscriptCtx) -> Rows {
     let w = w as usize;
     let Some(first) = tools.first().filter(|_| w > 0) else {
         return Vec::new();
     };
+    if tools.iter().all(|t| t.name == "skill") {
+        return skill_rows(tools, w, ctx);
+    }
     let theme = ctx.theme;
     let (glyph, glyph_style) = phase_glyph(ToolState::Completed, ctx);
     let mut head = gutter_span(glyph, glyph_style);
@@ -885,6 +902,69 @@ pub(super) fn lookup_tree(tools: &[&Tool], w: u16, ctx: &TranscriptCtx) -> Rows 
     rows
 }
 
+/// The skill a `skill` call loaded and the reference file it read, if any, from its arguments.
+fn skill_load(t: &Tool) -> (String, bool) {
+    let input = serde_json::from_str::<Value>(&t.input).ok();
+    let field = |key: &str| {
+        input
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(Value::as_str)
+            .map(text::one_line)
+            .filter(|s| !s.is_empty())
+    };
+    let name = field("name").unwrap_or_else(|| target(t));
+    (name, field("file").is_some())
+}
+
+/// A run of skill loads, one row per skill with the count of its reference files:
+/// `◆  Skill   rust-best-practices · 2 references`. Several skills hang off a `Skill (N)` head.
+/// Each row keeps the single call's layout, so a folded run reads like the context line it replaces.
+fn skill_rows(tools: &[&Tool], w: usize, ctx: &TranscriptCtx) -> Rows {
+    let dot = ctx.theme.sym(Sym::Dot);
+    let mut skills: Vec<(String, usize)> = Vec::new();
+    for t in tools {
+        let (name, reference) = skill_load(t);
+        let at = match skills.iter().position(|(n, _)| *n == name) {
+            Some(at) => at,
+            None => {
+                skills.push((name, 0));
+                skills.len() - 1
+            }
+        };
+        skills[at].1 += usize::from(reference);
+    }
+    let label = |(name, refs): &(String, usize)| match refs {
+        0 => name.clone(),
+        1 => format!("{name} {dot} 1 reference"),
+        n => format!("{name} {dot} {n} references"),
+    };
+    let mut row = tools[0].clone();
+    row.elapsed = None;
+    if let [only] = skills.as_slice() {
+        row.presentation.target = label(only);
+        return card_with(&row, w, ctx, verb(&row));
+    }
+    row.presentation.target = String::new();
+    let mut rows = card_with(&row, w, ctx, format!("{} ({})", verb(&row), skills.len()));
+    let (branch, last) = (ctx.theme.sym(Sym::TreeBranch), ctx.theme.sym(Sym::TreeLast));
+    for (i, skill) in skills.iter().enumerate() {
+        let rail = format!(
+            "{}{} ",
+            " ".repeat(GUTTER),
+            if i + 1 == skills.len() { last } else { branch }
+        );
+        rows.push(fitted(
+            vec![
+                Span::styled(rail, ctx.theme.fg(Tok::Border)),
+                Span::styled(label(skill), ctx.theme.fg(Tok::Muted)),
+            ],
+            w,
+            ctx.theme,
+        ));
+    }
+    rows
+}
 /// Narrowest width that frames a workers call; below it the tree hangs off the gutter row.
 const WORKERS_CARD_MIN: usize = 40;
 
@@ -927,7 +1007,8 @@ fn workers_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     let mut foot: Vec<Span<'static>> = Vec::new();
     for (word, n) in agent_counts(&t.agents, live) {
         let tok = match word {
-            "done" => Tok::Success,
+            // Same colors as each worker's own chip: settled work is quiet, live work is accent.
+            "done" => Tok::Dim,
             BACKGROUND => Tok::Muted,
             "running" => Tok::Accent,
             "failed" => Tok::Error,
@@ -1048,7 +1129,9 @@ fn agent_tree(agents: &[AgentRow], live: bool, lead: &str, w: usize, ctx: &Trans
         rows.push(fitted(row, w, theme));
 
         let detail = match (&a.current_tool, a.state) {
-            _ if background => Some(("continuing in background".to_owned(), theme.fg(Tok::Dim))),
+            // The `background` chip already says it; a preview, when there is one, is news.
+            _ if background && a.preview.is_empty() => None,
+            _ if background => Some((a.preview.clone(), theme.fg(Tok::Dim))),
             (Some(tool), ToolState::Running) => Some((text::one_line(tool), theme.fg(Tok::Muted))),
             // Between tool calls a running worker is waiting on its model.
             (None, ToolState::Running) if a.preview.is_empty() => {
@@ -1485,7 +1568,7 @@ fn more_hint(hidden: usize, which: &str, expand_key: &str, theme: &Theme) -> Spa
 }
 
 mod check;
-pub(in crate::ui) use check::{Verdict, verdict};
+pub(in crate::ui) use check::{Verdict, command as check_command, verdict};
 pub(in crate::ui) mod frame;
 mod irc;
 pub(super) use irc::incoming_notice;

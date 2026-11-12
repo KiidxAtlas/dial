@@ -1176,6 +1176,60 @@ fn an_explicit_need_waits_for_servers_still_connecting() {
 }
 
 #[test]
+fn a_rebuilt_registry_adopts_handed_over_servers_without_reconnecting() {
+    use crate::tools::integrations::ext::Registry;
+    let config = config_with(vec![("fake", fake_config("", 30))]);
+    let loaded = load_with(&config, CONNECT_TIMEOUT);
+    assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
+    let session = loaded.sessions[0].clone();
+    let mut old = Registry::new();
+    old.attach_mcp(&config, Startup::Ready(loaded));
+    assert!(old.contains("mcp__fake__echo"));
+
+    let slot = std::sync::Mutex::new(None);
+    retain_in(
+        &slot,
+        old.mcp_handoff()
+            .expect("connected servers are handed over"),
+    );
+    drop(old);
+    // A settings change that leaves MCP alone keeps the handed-over servers: nothing reconnects.
+    prefetch_in(&slot, &config);
+    assert!(!pending_in(&slot), "no reconnect is pending");
+    let adopted = take_from(&slot, &config).expect("kept for the same servers");
+    let loaded = adopted.wait().clone();
+    assert!(
+        Arc::ptr_eq(&loaded.sessions[0], &session),
+        "the rebuilt agent adopts the same server session"
+    );
+    assert!(
+        loaded.notices.is_empty(),
+        "startup notices are not repeated"
+    );
+    let mut rebuilt = Registry::new();
+    rebuilt.attach_mcp(&config, Startup::Ready(loaded));
+    assert!(rebuilt.contains("mcp__fake__echo"));
+}
+
+#[test]
+fn a_changed_mcp_configuration_stops_handed_over_servers() {
+    let config = config_with(vec![("fake", fake_config("", 30))]);
+    let loaded = load_with(&config, CONNECT_TIMEOUT);
+    assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
+    let session = Arc::downgrade(&loaded.sessions[0]);
+    let slot = std::sync::Mutex::new(None);
+    retain_in(&slot, Connecting::ready(&config, loaded));
+
+    let without = Config {
+        mcp: BTreeMap::new(),
+        ..config.clone()
+    };
+    prefetch_in(&slot, &without);
+    assert!(slot.lock().unwrap().is_none());
+    assert!(session.upgrade().is_none(), "the old servers are stopped");
+}
+
+#[test]
 fn dropping_a_pass_still_connecting_cancels_it_without_waiting_for_its_budget() {
     let dir = tempfile::tempdir().unwrap();
     let (config, _never_opened) = gated(&dir);

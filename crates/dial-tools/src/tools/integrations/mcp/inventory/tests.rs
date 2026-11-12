@@ -5,6 +5,30 @@ fn inventory() -> Inventory {
 }
 
 #[test]
+fn inventory_distinguishes_client_limits_from_connected_server_capabilities() {
+    let snapshot = inventory().snapshot();
+    assert_eq!(snapshot["servers"], json!([]));
+    assert_eq!(
+        snapshot["client_capabilities"],
+        super::super::client::client_capabilities()
+    );
+    assert_eq!(
+        snapshot["client_capabilities"],
+        json!({"roots": {"listChanged": false}})
+    );
+    assert_eq!(
+        snapshot["unsupported_client_requests"],
+        json!(["sampling/createMessage", "elicitation/create"])
+    );
+    assert!(
+        snapshot["note"]
+            .as_str()
+            .unwrap()
+            .contains("not compatible")
+    );
+}
+
+#[test]
 fn only_install_needs_approval() {
     let tool = inventory();
     assert!(!tool.needs_approval(&json!({"action": "list"})));

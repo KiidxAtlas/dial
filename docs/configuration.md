@@ -85,8 +85,11 @@ Brief concurrent saves still serialize; longer contention reports a retryable er
 freezing command dispatch. A failed settings save leaves the effective setting unchanged; a failed
 history save is reported without preventing the command from running.
 
-Agent-bound settings such as `/drafter` can rebuild the agent and reconnect configured MCP servers.
-The composer stays active during that connection pass, both at startup and after settings changes.
+Agent-bound settings such as `/drafter` rebuild the agent. Configured MCP servers stay connected
+across that rebuild when the change leaves their configuration (the `mcp` table, project root and
+user directory) alone, so external settings edits and saves from other sessions no longer restart
+them or post a reconnect notice. A change to the MCP configuration reconnects the servers; the
+composer stays active during that connection pass, both at startup and after settings changes.
 Once Enter or another action is queued, subsequent input is held in order until tools are ready;
 it does not bypass initialization. Slow or unavailable servers still have their configured connection
 deadline and report connection failures normally.
@@ -336,7 +339,7 @@ status = "default"                 # default | minimal | compact | full | nerd |
 status_left = ["spinner", "model", "path", "git"]
 status_right = ["context"]
 status_separator = "powerline-thin"
-composer_shape = "band"            # band | box | line
+composer_shape = "box"             # box | band | line
 symbols = "auto"                   # auto | unicode | nerd | ascii (auto: ascii on TERM=dumb/linux or a non-UTF-8 locale)
 show_tools = true
 history_limit = 0

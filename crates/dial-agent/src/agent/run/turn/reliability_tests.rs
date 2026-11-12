@@ -27,10 +27,9 @@ fn fallback_to(url: &str) -> String {
 
 #[test]
 fn a_new_turn_recovers_a_failed_stream_writer_without_replaying_the_failed_turn() {
-    let server = llm::fake::serve(vec![
-        response("This reply cannot be published.", None),
-        response("Recovered.", None),
-    ]);
+    // Only the new turn may reach the provider: the failed turn's first journal write happens
+    // when its request starts, so that request (whose reply could not be published) is never sent.
+    let server = llm::fake::serve(vec![response("Recovered.", None)]);
     with_agent("[compaction]\nenabled=false\n", |agent| {
         connect(agent, &server.url);
         let journal = agent.session.runtime().stream_writer().unwrap();
@@ -54,10 +53,10 @@ fn a_new_turn_recovers_a_failed_stream_writer_without_replaying_the_failed_turn(
     let requests = completion_requests(&server);
     assert_eq!(
         requests.len(),
-        2,
-        "one failed request and one explicitly started new turn"
+        1,
+        "the failed turn sends nothing; only the explicitly started new turn reaches the model"
     );
-    assert!(mentions(&requests[1], "Answer the new request"));
+    assert!(mentions(&requests[0], "Answer the new request"));
 }
 
 #[test]
@@ -776,6 +775,67 @@ fn the_completion_gate_runs_a_passing_check_instead_of_spending_a_reminder_round
     );
 }
 
+// `exact` fails on the first note while `notes` passes: a partial pass that must stay a blocker.
+const PARTIAL_NOTE_CHECKS: &str = "approval=\"auto\"\n[compaction]\nenabled=false\n[[verification.commands]]\nname=\"notes\"\ncommand=\"test -f note.txt\"\nfile_extensions=[\"txt\"]\ntimeout_secs=5\n[[verification.commands]]\nname=\"exact\"\ncommand=\"grep -qx fixed note.txt\"\nfile_extensions=[\"txt\"]\ntimeout_secs=5\n";
+
+#[test]
+fn a_partial_pass_stays_a_blocker_and_repair_clears_it() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some(("write", json!({"path":"note.txt","content":"x\n"}))),
+        ),
+        slots(),
+        response("The note is written.", None),
+        response(
+            "",
+            Some(("write", json!({"path":"note.txt","content":"fixed\n"}))),
+        ),
+        response("", Some(("verify", json!({"targets":["notes","exact"]})))),
+        response("The note is fixed and both checks pass.", None),
+    ]);
+    let report = with_agent(PARTIAL_NOTE_CHECKS, |agent| {
+        connect(agent, &server.url);
+        agent.turn("Write the note", &mut NullUi).unwrap()
+    });
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    let requests = completion_requests(&server);
+    assert!(
+        requests
+            .iter()
+            .any(|request| mentions(request, "Current edits have a failing applicable check")),
+        "the failing exact check blocks the first answer"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !mentions(request, "no passing applicable check")),
+        "the check that passed is not reported as still unverified"
+    );
+}
+
+#[test]
+fn a_partial_pass_still_blocks_the_answer_after_the_reminder_without_repair() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some(("write", json!({"path":"note.txt","content":"x\n"}))),
+        ),
+        slots(),
+        response("The note is written.", None),
+        response("The note is written.", None),
+    ]);
+    let report = with_agent(PARTIAL_NOTE_CHECKS, |agent| {
+        connect(agent, &server.url);
+        agent.turn("Write the note", &mut NullUi).unwrap()
+    });
+    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+    assert!(
+        report.text.contains("exact"),
+        "the reminded failure keeps blocking: {}",
+        report.text
+    );
+}
 #[test]
 fn a_passing_check_after_the_edit_satisfies_the_evidence_gate() {
     let server = llm::fake::serve(vec![

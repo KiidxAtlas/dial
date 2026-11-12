@@ -192,11 +192,13 @@ impl Agent<'_> {
             "turn draft did not preserve explicit verbatim material; your message was not sent to the main model"
         );
         ui.extension_panel("Turn drafter · proposed instruction", drafted);
-        ensure!(
-            ui.review_turn_draft(drafted, &self.interrupt)
-                && !self.interrupt.load(Ordering::Acquire),
-            "turn draft cancelled; your message was not sent to the main model"
-        );
+        if !ui.review_turn_draft(drafted, &self.interrupt) {
+            let interrupted = self.interrupt.load(Ordering::Acquire);
+            return Err(DraftCancelled { interrupted }.into());
+        }
+        if self.interrupt.load(Ordering::Acquire) {
+            return Err(DraftCancelled { interrupted: true }.into());
+        }
         self.record(
             step,
             "turn_drafted",
@@ -206,32 +208,53 @@ impl Agent<'_> {
     }
 
     /// Draft and journal steering that was deferred while the main stream held the backend, in
-    /// submission order. Returns whether anything was journaled. On failure the remaining queue
-    /// is dropped, so no undrafted text can reach the main model later.
+    /// submission order. Returns whether anything was journaled. When a draft fails, that message
+    /// is not sent (the error says so); the messages queued after it stay queued and are drafted
+    /// before the next turn's message, so no undrafted text reaches the main model and none is lost.
     pub(in crate::agent) fn draft_deferred_steering(
         &mut self,
         main: &mut Backend,
         ui: &mut dyn Ui,
     ) -> Result<bool> {
-        let queued = std::mem::take(&mut self.undrafted_steering);
-        let total = queued.len();
-        for (index, (mut message, text)) in queued.into_iter().enumerate() {
-            let drafted = self
-                .draft_message(main, &text, self.cur_step, ui)
-                .with_context(|| {
-                    format!(
-                        "{} steering message(s) were not sent to the main model",
-                        total - index
-                    )
-                })?;
+        let mut queued = std::mem::take(&mut self.undrafted_steering).into_iter();
+        let mut journaled = false;
+        while let Some((mut message, text)) = queued.next() {
+            let drafted = match self.draft_message(main, &text, self.cur_step, ui) {
+                Ok(drafted) => drafted,
+                Err(error) => {
+                    // An interrupt stops the steering queued behind this message too; a rejected
+                    // review or a drafter failure loses only this message, and later messages
+                    // stay queued for their own drafts.
+                    let interrupted = error
+                        .downcast_ref::<DraftCancelled>()
+                        .is_some_and(|cancelled| cancelled.interrupted);
+                    let kept: Vec<_> = if interrupted {
+                        Vec::new()
+                    } else {
+                        queued.collect()
+                    };
+                    let later = kept.len();
+                    // Anything queued while drafting stays behind the kept messages.
+                    let newer = std::mem::replace(&mut self.undrafted_steering, kept);
+                    self.undrafted_steering.extend(newer);
+                    return Err(error.context(if later == 0 {
+                        "1 steering message was not sent to the main model".to_owned()
+                    } else {
+                        format!(
+                            "1 steering message was not sent to the main model; {later} later message(s) stay queued and are drafted before your next message"
+                        )
+                    }));
+                }
+            };
             if let Some(drafted) = drafted {
                 apply_draft(&mut message, &text, &drafted);
             }
             // The typed text stays the current instruction; the draft only travels with it.
             self.journal_steering(message, &text)?;
             ui.steering_applied(&text);
+            journaled = true;
         }
-        Ok(total > 0)
+        Ok(journaled)
     }
 
     /// Steering left over from an earlier turn (one that was interrupted, for example) is
@@ -258,6 +281,19 @@ impl Agent<'_> {
         result
     }
 }
+
+/// The user rejected a draft in review, or interrupted: nothing is sent. Only an interrupt also
+/// drops the steering queued behind it.
+#[derive(Debug)]
+struct DraftCancelled {
+    interrupted: bool,
+}
+impl std::fmt::Display for DraftCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("turn draft cancelled; your message was not sent to the main model")
+    }
+}
+impl std::error::Error for DraftCancelled {}
 
 #[cfg(test)]
 mod tests;

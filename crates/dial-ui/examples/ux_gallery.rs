@@ -1135,11 +1135,19 @@ fn main() -> anyhow::Result<()> {
             ),
             light,
         );
+        // Realistic endpoints, so the locality the panels derive from them is the real one.
+        let endpoint = |provider: &str| match provider {
+            "openai" => "https://api.openai.com/v1".to_owned(),
+            "ollama" => "http://127.0.0.1:11434/v1".to_owned(),
+            "lm-studio" => "http://127.0.0.1:1234/v1".to_owned(),
+            "llama.cpp" => "http://127.0.0.1:8081/v1".to_owned(),
+            _ => "http://127.0.0.1:8080/v1".to_owned(),
+        };
         let entry = |provider: &str, model: &str, source: &str, available: bool| ModelEntry {
             selection: ModelSelection {
                 provider: provider.into(),
                 model: model.into(),
-                base_url: Some(format!("http://{provider}/v1")),
+                base_url: Some(endpoint(provider)),
                 context_window: Some(32768),
                 ..ModelSelection::default()
             },
@@ -1152,7 +1160,7 @@ fn main() -> anyhow::Result<()> {
             |id: &str, label: &str, state: &str, models: usize, detail: &str| ProviderStatus {
                 id: id.into(),
                 label: label.into(),
-                base_url: Some(format!("http://{id}/v1")),
+                base_url: Some(endpoint(id)),
                 state: state.into(),
                 detail: detail.into(),
                 models,
@@ -1331,7 +1339,7 @@ fn main() -> anyhow::Result<()> {
         answered.push_user("Why is the optional live diagnostic still pending?");
         answered.assistant_delta("The local implementation is delivered. The live diagnostic is an optional follow-up awaiting separate approval; it does not block this answer.");
         answered.finish_turn();
-        answered.notice("Outstanding work", "Retained: 0 execution steps, 0 required deliverables, 1 optional follow-up. No live request was made.");
+        answered.notice("Notice", "Outstanding work retained: 0 execution step(s), 0 required deliverable(s), 1 optional follow-up(s). This answer does not mark that work complete.\n1. Run the live diagnostic once approved");
         answered.turn_stats(dial_ui::ui::transcript::TurnStats {
             clock: String::new(),
             elapsed_secs: 1.0,

@@ -9,6 +9,9 @@ BUILD_DIR = $(CARGO_TARGET_DIR)/$(if $(filter dev,$(PROFILE)),debug,$(PROFILE))
 SLIM ?= 0
 FEATURES ?=
 CARGO_FEATURE_FLAGS = $(if $(filter 1,$(SLIM)),--no-default-features) $(if $(strip $(FEATURES)),--features "$(FEATURES)")
+# TIMINGS=1 writes Cargo's HTML timing report (cargo-timings/) for `make build` and `make update`.
+TIMINGS ?= 0
+TIMINGS_FLAG = $(if $(filter 1,$(TIMINGS)),--timings)
 INSTALL_DIR ?= $(shell path="$$(command -v dial 2>/dev/null)"; if [ -n "$$path" ]; then dirname "$$path"; else printf '%s' "$(HOME)/.local/bin"; fi)
 # Timestamped `dial.bak-*` copies kept per installed location by `make update` (newest first).
 KEEP_BACKUPS ?= 3
@@ -24,18 +27,19 @@ DIAL ?= $(BUILD_DIR)/dial
 .DEFAULT_GOAL := help
 .PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline test-smoke test-mlx preflight preflight-quick hooks
 .PHONY: test-install test-build test-windows-contract test-packaging test-release-policy preflight-worktree
-.PHONY: release-check lint-deps
+.PHONY: release-check lint-deps clean test-clean
 
 help:
 	@printf '%s\n' \
 		'make update   Rebuild and replace the installed dial from this checkout (keeps KEEP_BACKUPS=3 backups)' \
 		'make install  Same as update' \
-		'make build    Build locally with timings (SLIM=1 omits optional integrations; PROFILE=release for shipping)' \
+		'make build    Build locally (SLIM=1 omits optional integrations; PROFILE=release for shipping; TIMINGS=1 writes a Cargo timing report)' \
+		'make clean    Remove build output (target/, idle session build dirs); skips dirs in use (DRY_RUN=1 lists only)' \
 		'make check    Check Rust compilation' \
 		'make test     Run the Rust tests' \
 		'make test-lib Run every workspace crate'"'"'s library unit tests (no CLI/integration targets)' \
 		'make test-integration  Run the single integration test binary (tests/integration)' \
-		'make test-module MOD=llm::provider  Run lib tests under one module path' \
+		'make test-module MOD=llm::provider  Run lib tests under one module path (CRATE=dial-llm builds only that crate)' \
 		'make lint     Run clippy with the CI lint gate' \
 		'make lint-deps  Detect unused workspace dependencies (requires cargo-machete; never fixes manifests)' \
 		'make test-rust TEST_PROFILE=dev  Run portable Rust tests (CI uses ci)' \
@@ -58,7 +62,7 @@ help:
 
 update:
 	$(PYTHON) scripts/install-dev.py check --keep "$(KEEP_BACKUPS)"
-	$(CARGO) build -p dial --bin dial --profile $(PROFILE) --locked --timings $(CARGO_FEATURE_FLAGS)
+	$(CARGO) build -p dial --bin dial --profile $(PROFILE) --locked $(TIMINGS_FLAG) $(CARGO_FEATURE_FLAGS)
 	mkdir -p bin "$(INSTALL_DIR)"
 	$(PYTHON) scripts/install-dev.py install --keep "$(KEEP_BACKUPS)" --build "$(BUILD_DIR)/dial" --bin-target bin/dial --install-dir "$(INSTALL_DIR)" --cargo-bin "$(HOME)/.cargo/bin/dial"
 	@active="$$(command -v dial 2>/dev/null)"; \
@@ -74,7 +78,15 @@ update:
 install: update
 
 build:
-	$(CARGO) build -p dial --bin dial --profile $(PROFILE) --locked --timings $(CARGO_FEATURE_FLAGS)
+	$(CARGO) build -p dial --bin dial --profile $(PROFILE) --locked $(TIMINGS_FLAG) $(CARGO_FEATURE_FLAGS)
+
+# Remove build output (target/, idle per-session .tmp/cargo-target dirs, preflight's cache).
+# Directories used by a running Cargo build or live Dial session are skipped. DRY_RUN=1 lists only.
+clean:
+	$(PYTHON) scripts/clean.py --target-dir "$(CARGO_TARGET_DIR)" $(if $(filter 1,$(DRY_RUN)),--dry-run)
+
+test-clean:
+	$(PYTHON) scripts/test-clean.py
 
 check:
 	$(CARGO) check --locked --workspace $(CARGO_FEATURE_FLAGS)
@@ -91,10 +103,11 @@ test-lib:
 test-integration:
 	$(CARGO) test --locked -p dial --test integration $(CARGO_FEATURE_FLAGS)
 
-# Fast loop for one lib module: make test-module MOD=llm::provider (searches every workspace crate)
+# Fast loop for one lib module: make test-module MOD=llm::provider (searches every workspace crate).
+# CRATE=dial-llm builds only that crate's test binary instead of every crate's.
 test-module:
-	@test -n "$(MOD)" || { printf '%s\n' 'Usage: make test-module MOD=llm::provider' >&2; exit 2; }
-	$(CARGO) test --locked --workspace --lib $(CARGO_FEATURE_FLAGS) $(MOD)
+	@test -n "$(MOD)" || { printf '%s\n' 'Usage: make test-module MOD=llm::provider [CRATE=dial-llm]' >&2; exit 2; }
+	$(CARGO) test --locked $(if $(strip $(CRATE)),-p $(CRATE),--workspace) --lib $(CARGO_FEATURE_FLAGS) $(MOD)
 
 test-nextest:
 	$(PYTHON) scripts/test-prerequisites.py
@@ -116,6 +129,7 @@ test-drivers:
 test-python:
 	$(PYTHON) scripts/test-prerequisites.py python
 	HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m pytest -rs python/test_*.py
+	$(PYTHON) -m unittest discover -s sdk/python/tests
 
 test-bench-offline:
 	$(PYTHON) -m unittest discover -s examples/benchmarks -p 'test_*.py'

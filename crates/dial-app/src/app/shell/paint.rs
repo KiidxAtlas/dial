@@ -564,7 +564,12 @@ impl Shell {
     pub(super) fn cycle_approval(&mut self, agent: &mut Agent<'_>) {
         let next = next_cycled_approval(agent.approval());
         agent.set_approval(next);
-        self.note("Approval", format!("{next:?}").to_lowercase());
+        let mode = format!("{next:?}").to_lowercase();
+        // The home names the mode the first request will run in, so it follows the cycle.
+        if let Some(home) = &mut self.home {
+            home.info.approval.clone_from(&mode);
+        }
+        self.note("Approval", mode);
     }
 }
 

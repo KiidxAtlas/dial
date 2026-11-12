@@ -84,18 +84,25 @@ fn bytes(root: &Path, path: &Path) -> Result<(Vec<u8>, &'static str)> {
     Ok((bytes, mime))
 }
 
-fn mime(bytes: &[u8]) -> Result<&'static str> {
-    Ok(if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        "image/png"
+/// The image format named by the leading magic bytes: PNG, JPEG, GIF or WebP, the formats every
+/// image-input route accepts. `None` for anything else.
+pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
     } else if bytes.starts_with(b"\xff\xd8\xff") {
-        "image/jpeg"
+        Some("image/jpeg")
     } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        "image/gif"
+        Some("image/gif")
     } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        "image/webp"
+        Some("image/webp")
     } else {
-        anyhow::bail!("file is not a supported PNG, JPEG, GIF or WebP image")
-    })
+        None
+    }
+}
+
+fn mime(bytes: &[u8]) -> Result<&'static str> {
+    sniff_mime(bytes)
+        .ok_or_else(|| anyhow::anyhow!("file is not a supported PNG, JPEG, GIF or WebP image"))
 }
 
 /// Caller must apply ordinary tool permissions before attaching a read result.

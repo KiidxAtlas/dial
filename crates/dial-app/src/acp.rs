@@ -54,6 +54,9 @@ pub(crate) struct Adapter {
     tools: Vec<ActiveTool>,
     next_tool: u64,
     modes: HashMap<String, bool>,
+    /// Per-session model options from the actor (`_acp_models`): current model, model list and
+    /// thought levels. Prompt results refresh the current choice and keep the list.
+    models: HashMap<String, Value>,
     /// Client `fs` capabilities from `initialize`: (readTextFile, writeTextFile).
     client_fs: (bool, bool),
     /// Agent-to-client fs requests awaiting the client's answer: wire id key -> (call id, is read).
@@ -128,7 +131,8 @@ fn prompt_stop(value: &Value) -> Value {
     json!({"stopReason":stop,"_meta":{"dial":dial}})
 }
 /// ACP plan entry for one todo task. The `Status` match is exhaustive, so a new status cannot
-/// silently render as pending. Abandoned and blocked tasks keep their state and note in `_meta.dial`.
+/// silently render as pending. ACP has no blocked or abandoned status, so those tasks carry a
+/// visible `[blocked]`/`[abandoned]` label (and the note) in their text, plus `_meta.dial`.
 fn plan_entry(task: &Value) -> Value {
     use crate::agent::workflow::todo::Status;
     let raw = match task["status"].as_str() {
@@ -150,10 +154,14 @@ fn plan_entry(task: &Value) -> Value {
     };
     let mut entry = json!({"content":task["content"],"priority":"medium","status":acp});
     if let Some(dial_status) = dial_status {
+        let content = task["content"].as_str().unwrap_or_default();
+        let mut label = format!("[{dial_status}] {content}");
         let mut dial = json!({"status":dial_status});
-        if let Some(note) = task["note"].as_str() {
+        if let Some(note) = task["note"].as_str().filter(|note| !note.is_empty()) {
+            label.push_str(&format!(" ({note})"));
             dial["note"] = json!(note);
         }
+        entry["content"] = json!(label);
         entry["_meta"] = json!({"dial":dial});
     }
     entry
@@ -176,9 +184,46 @@ fn mode_state(plan: bool) -> Value {
         {"id":"plan","name":"Plan","description":"Read-only exploration; implementation still requires operator permission"}
     ]})
 }
-fn config_options(plan: bool) -> Value {
-    json!([{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":if plan {"plan"} else {"default"},
-        "options":[{"value":"default","name":"Agent"},{"value":"plan","name":"Plan"}]}])
+/// Session config options: the plan/agent mode, and when the actor supplied them, the model and
+/// thought-level selectors. The thought level is offered when `set_thinking` can set one; its
+/// first choice, "default", drops the session's level so the model's own default applies again.
+fn config_options(plan: bool, models: Option<&Value>) -> Value {
+    let mut options = vec![
+        json!({"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":if plan {"plan"} else {"default"},
+        "options":[{"value":"default","name":"Agent"},{"value":"plan","name":"Plan"}]}),
+    ];
+    if let Some(models) = models {
+        if let Some(list) = models["models"].as_array().filter(|list| !list.is_empty()) {
+            options.push(
+                json!({"id":"model","name":"Model","category":"model","type":"select",
+                "currentValue":models["model"],"options":list}),
+            );
+        }
+        let levels: Vec<&str> = models["levels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if models["settable"] == true && !levels.is_empty() {
+            let default_name = match models["default_level"].as_str() {
+                Some(level) => format!("Model default ({level})"),
+                None => "Model default".to_owned(),
+            };
+            let mut choices: Vec<Value> = vec![json!({"value":"default","name":default_name})];
+            choices.extend(
+                levels
+                    .iter()
+                    .map(|level| json!({"value":level,"name":level})),
+            );
+            let current = models["thought_level"].as_str().unwrap_or("default");
+            options.push(
+                json!({"id":"thought_level","name":"Thinking","category":"thought_level",
+                "type":"select","currentValue":current,"options":choices}),
+            );
+        }
+    }
+    Value::Array(options)
 }
 
 impl Adapter {
@@ -194,6 +239,7 @@ impl Adapter {
             tools: Vec::new(),
             next_tool: 0,
             modes: HashMap::new(),
+            models: HashMap::new(),
             client_fs: (false, false),
             fs_requests: HashMap::new(),
         }
@@ -246,6 +292,7 @@ impl Adapter {
                 match outcome["optionId"].as_str() {
                     Some("allow") => "allow",
                     Some("always") => "always",
+                    Some("project") => "project",
                     _ => "deny",
                 }
             } else {
@@ -428,24 +475,47 @@ impl Adapter {
                 actor_params["_active"] = json!(session.as_deref() == self.active.as_deref());
                 "close_session"
             }
-            "session/set_mode" | "session/set_config_option" => {
-                if method == "session/set_config_option" {
-                    ensure!(
-                        params["configId"] == "mode",
-                        "only the mode config option is supported"
-                    );
-                }
-                let mode = if method == "session/set_mode" {
-                    &params["modeId"]
-                } else {
-                    &params["value"]
-                };
+            "session/set_mode" => {
+                let mode = &params["modeId"];
                 ensure!(
                     mode == "plan" || mode == "default",
                     "mode must be plan or default"
                 );
                 actor_params["enabled"] = json!(mode == "plan");
                 "plan"
+            }
+            "session/set_config_option" => {
+                let value = &params["value"];
+                match params["configId"].as_str() {
+                    Some("mode") => {
+                        ensure!(
+                            value == "plan" || value == "default",
+                            "mode must be plan or default"
+                        );
+                        actor_params["enabled"] = json!(value == "plan");
+                        "plan"
+                    }
+                    Some("model") => {
+                        let (provider, model) = value
+                            .as_str()
+                            .and_then(|value| value.split_once('/'))
+                            .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+                            .context("model value must be provider/model")?;
+                        actor_params["provider"] = json!(provider);
+                        actor_params["model_id"] = json!(model);
+                        "set_model"
+                    }
+                    Some("thought_level") => {
+                        let level = value
+                            .as_str()
+                            .context("thought_level value must be a string")?;
+                        actor_params["level"] = json!(level);
+                        "set_thinking"
+                    }
+                    _ => {
+                        anyhow::bail!("supported config options are mode, model and thought_level")
+                    }
+                }
             }
             _ => return Ok((None, vec![unsupported_method(id, method)])),
         };
@@ -560,6 +630,10 @@ impl Adapter {
             ensure!(text.len() <= 262_144, "expanded prompt exceeds 256 KiB");
         }
         ensure!(!text.trim().is_empty(), "prompt is empty");
+        // `/custom args` and `/skill:name task` expand as they do in the terminal.
+        if let Some(expanded) = crate::app::expand_prompt_command(&self.layout, &text)? {
+            text = expanded;
+        }
         let mut message = json!({"role":"user","content":text});
         if !images.is_empty() {
             message["dial_images"] = json!(images);
@@ -636,6 +710,22 @@ impl Adapter {
             "stored attachment content differs"
         );
         Ok(reference)
+    }
+    /// Records the actor's model options for `session`. An answer without a model list keeps the
+    /// stored list and updates the current choice. Returns whether the stored options changed.
+    fn store_models(&mut self, session: &str, options: &Value) -> bool {
+        let Some(fields) = options.as_object() else {
+            return false;
+        };
+        let stored = self
+            .models
+            .entry(session.to_owned())
+            .or_insert_with(|| json!({}));
+        let before = stored.clone();
+        for (name, value) in fields {
+            stored[name] = value.clone();
+        }
+        *stored != before
     }
     fn update(&self, update: Value) -> Option<Value> {
         self.active.as_ref().map(|session|json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":update}}))
@@ -725,8 +815,9 @@ impl Adapter {
                     self.tools.clear();
                     let plan = value["plan_mode"].as_bool().unwrap_or(false);
                     self.modes.insert(session.clone(), plan);
-                    let mut result =
-                        json!({"modes":mode_state(plan),"configOptions":config_options(plan)});
+                    self.store_models(&session, &value["_acp_models"]);
+                    let mut result = json!({"modes":mode_state(plan),
+                        "configOptions":config_options(plan, self.models.get(&session))});
                     if matches!(pending.method.as_str(), "session/new" | "session/fork") {
                         result["sessionId"] = json!(session);
                     }
@@ -737,11 +828,33 @@ impl Adapter {
                     self.permissions.clear();
                     self.fs_requests.retain(|_, (_, read)| !*read);
                     let plan = value["plan_mode"].as_bool().unwrap_or(false);
-                    if let Some(session) = self.active.clone()
-                        && self.modes.insert(session, plan) != Some(plan)
+                    if let Some(session) = self.active.clone() {
+                        let mode_changed = self.modes.insert(session.clone(), plan) != Some(plan);
+                        let models_changed = self.store_models(&session, &value["_acp_models"]);
+                        if mode_changed
+                            && let Some(update) = self.update(json!({"sessionUpdate":"current_mode_update","currentModeId":if plan {"plan"} else {"default"}}))
+                        {
+                            updates.push(update);
+                        }
+                        if mode_changed || models_changed {
+                            let options = config_options(plan, self.models.get(&session));
+                            if let Some(update)=self.update(json!({"sessionUpdate":"config_option_update","configOptions":options})){updates.push(update);}
+                        }
+                    }
+                    // ACP stop reasons cannot say failed, blocked or needs input; say it in the
+                    // transcript so editors that ignore `_meta` still show the turn did not finish.
+                    let outcome = value["outcome"].as_str().unwrap_or_default();
+                    if value["interrupted"] != true && !outcome.is_empty() && outcome != "completed"
                     {
-                        if let Some(update)=self.update(json!({"sessionUpdate":"current_mode_update","currentModeId":if plan {"plan"} else {"default"}})){updates.push(update);}
-                        if let Some(update)=self.update(json!({"sessionUpdate":"config_option_update","configOptions":config_options(plan)})){updates.push(update);}
+                        let notice =
+                            format!("\n\nDial: the turn ended as {}.", outcome.replace('_', " "));
+                        if let Some(update) =
+                            self.update(json!({"sessionUpdate":"agent_message_chunk",
+                            "content":text_content(&json!(notice)),
+                            "_meta":{"dial":{"event":"outcome","outcome":outcome}}}))
+                        {
+                            updates.push(update);
+                        }
                     }
                     prompt_stop(value)
                 }
@@ -749,6 +862,7 @@ impl Adapter {
                     if let Some(session) = pending.session {
                         self.sessions.remove(&session);
                         self.modes.remove(&session);
+                        self.models.remove(&session);
                         if self.active.as_ref() == Some(&session) {
                             self.active = None;
                             self.tools.clear();
@@ -758,15 +872,37 @@ impl Adapter {
                     json!({})
                 }
                 "session/set_mode" | "session/set_config_option" => {
-                    let plan = value["enabled"].as_bool().unwrap_or(false);
-                    if let Some(session) = pending.session {
+                    // `plan` answers carry `enabled`; model and thinking answers keep the mode.
+                    let previous = pending
+                        .session
+                        .as_ref()
+                        .and_then(|session| self.modes.get(session).copied())
+                        .unwrap_or(false);
+                    let plan = value["enabled"].as_bool().unwrap_or(previous);
+                    if let Some(session) = &pending.session {
                         self.modes.insert(session.clone(), plan);
-                        self.active = Some(session);
+                        self.store_models(session, &value["_acp_models"]);
+                        self.active = Some(session.clone());
                     }
-                    if let Some(update)=self.update(json!({"sessionUpdate":"current_mode_update","currentModeId":if plan {"plan"} else {"default"}})){updates.push(update);}
-                    if let Some(update)=self.update(json!({"sessionUpdate":"config_option_update","configOptions":config_options(plan)})){updates.push(update);}
+                    let options = config_options(
+                        plan,
+                        pending
+                            .session
+                            .as_ref()
+                            .and_then(|session| self.models.get(session)),
+                    );
+                    if value.get("enabled").is_some()
+                        && let Some(update) = self.update(json!({"sessionUpdate":"current_mode_update","currentModeId":if plan {"plan"} else {"default"}}))
+                    {
+                        updates.push(update);
+                    }
+                    if let Some(update) = self.update(
+                        json!({"sessionUpdate":"config_option_update","configOptions":options}),
+                    ) {
+                        updates.push(update);
+                    }
                     if pending.method == "session/set_config_option" {
-                        json!({"configOptions":config_options(plan)})
+                        json!({"configOptions":options})
                     } else {
                         json!({})
                     }
@@ -852,7 +988,7 @@ impl Adapter {
                 return vec![
                     json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{"sessionId":session,
                     "toolCall":{"toolCallId":tool,"title":event["summary"],"kind":tool_kind(name),"status":"pending"},
-                    "options":[{"optionId":"allow","name":"Allow once","kind":"allow_once"},{"optionId":"always","name":"Allow always","kind":"allow_always"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}),
+                    "options":[{"optionId":"allow","name":"Allow once","kind":"allow_once"},{"optionId":"always","name":"Allow always","kind":"allow_always"},{"optionId":"project","name":"Allow always in this project","kind":"allow_always"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}),
                 ];
             }
             "approval_resolved" => {

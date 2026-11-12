@@ -63,6 +63,9 @@ pub fn describe_call(name: &str, a: &Value) -> String {
     };
     match name {
         "bash" => s("command").to_owned(),
+        "write" if a["files"].is_array() => crate::tools::declared_write_targets(a)
+            .unwrap_or_default()
+            .join(", "),
         "write" | "read" => s("path").to_owned(),
         "edit" => a["input"]
             .as_str()

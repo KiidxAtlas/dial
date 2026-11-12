@@ -873,7 +873,7 @@ and tests eight separate exact tool-call contracts covering read, write, grep an
 must improve over the unsteered model, pass the existing repetition and latency gates, and avoid
 reducing the incumbent vector's held-out score. Failed candidates preserve the active vector.
 These are response-contract checks, not proof of overall coding improvement. Manual vectors are
-preserved. Unchanged completed attempts have a 24-hour cooldown; new evidence can trigger a new attempt.
+preserved. Unchanged completed attempts have a 24-hour cooldown; new evidence can trigger a new attempt. Only a completed admission or a candidate the evaluation gate rejected starts that cooldown. An operator stop, cancellation or transient worker failure leaves the attempt unsettled, so the next run resumes the same fingerprint immediately and the incumbent vector stays active.
 
 `/improve settings` → Activation steering → **Automatic vector creation** controls automatic creation
 and, while **Enable manual vector** is off, automatic use. **Enable manual vector** uses the selected

@@ -1,0 +1,17 @@
+[package]
+name = "dial-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed Rust client for Dial's `dial rpc` control protocol"
+publish = false
+
+# Independent of every engine crate: a frontend links only this crate (and the plain-data
+# `dial-protocol` vocabulary) and talks to the engine through the versioned wire protocol.
+[dependencies]
+dial-protocol.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

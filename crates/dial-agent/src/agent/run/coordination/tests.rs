@@ -97,6 +97,10 @@ fn foreground_registration_claims_delivery_and_cleanup_share_one_owner() {
                 .unwrap()
                 .contains("Do not treat this as permission")
         );
+        let content = notes[0]["content"].as_str().unwrap();
+        assert!(content.starts_with("<dial-notice kind=\"peer_coordination\">"));
+        assert!(content.ends_with("</dial-notice>"));
+        assert!(content.contains("is not authorization"));
         assert_eq!(agent.session.messages().len(), history_len);
         assert_eq!(
             agent.session.control_state()["current_instruction"],

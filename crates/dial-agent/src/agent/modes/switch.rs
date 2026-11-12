@@ -129,38 +129,63 @@ pub fn resolve(config: &Config, selector: &str) -> Result<ModelSelection> {
 }
 
 /// The config a session override runs under: `config` with `selection` active and, when given, the
-/// `:level` effort set on that model's profile (in memory only; the profile must validate).
+/// `:level` effort set on that model's profile (in memory only; the profile must validate). A model
+/// without a configured profile gets a session-only one from the reasoning controls the bundled
+/// catalog or the saved provider listing declares, as `--thinking` and role thinking do.
 pub(crate) fn switched_config(
     config: &Config,
     selection: &ModelSelection,
     effort: Option<ReasoningEffort>,
 ) -> Result<Config> {
-    let mut next = config.with_selection(selection);
-    if let Some(effort) = effort {
-        let matching: Vec<String> = next
-            .model_profiles
-            .iter()
-            .filter(|(_, p)| p.provider == selection.provider && p.model == selection.model)
-            .map(|(name, _)| name.clone())
-            .collect();
-        let key = match next.model_profile.as_ref() {
-            Some(name) if matching.contains(name) => name.clone(),
-            _ => match matching.as_slice() {
-                [only] => only.clone(),
-                _ => bail!(
-                    "reasoning metadata is unavailable for {}/{}; open /models and rescan, or select an explicit profile",
-                    selection.provider,
-                    selection.model
-                ),
-            },
-        };
-        let profile = next
-            .model_profiles
-            .get_mut(&key)
-            .context("model profile disappeared while switching")?;
+    let next = config.with_selection(selection);
+    let Some(effort) = effort else {
+        return Ok(next);
+    };
+    // As `/thinking` does: an explicit thinking switch follows the chosen level.
+    let apply = |profile: &mut crate::llm::profiles::ModelProfile| {
         profile.reasoning_effort = Some(effort);
-        profile.validate()?;
-    }
+        if profile.thinking.is_some() {
+            profile.thinking = Some(effort != ReasoningEffort::None);
+        }
+    };
+    let matching: Vec<String> = next
+        .model_profiles
+        .iter()
+        .filter(|(_, p)| p.provider == selection.provider && p.model == selection.model)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let key = match next.model_profile.as_ref() {
+        Some(name) if matching.contains(name) => name.clone(),
+        _ => match matching.as_slice() {
+            [only] => only.clone(),
+            [] => {
+                let mut cleared = next;
+                cleared.model_profile = None;
+                let mut profile = crate::config::thinking::reasoning_profile(&cleared)?
+                    .with_context(|| {
+                        format!(
+                            "reasoning metadata is unavailable for {}/{}; open /models and rescan, or add a model profile",
+                            selection.provider, selection.model
+                        )
+                    })?;
+                apply(&mut profile);
+                // Validates the profile and installs it as a session-only entry.
+                return crate::config::thinking::install_thinking_profile(cleared, profile);
+            }
+            _ => bail!(
+                "several model profiles match {}/{}; select one with model_profile",
+                selection.provider,
+                selection.model
+            ),
+        },
+    };
+    let mut next = next;
+    let profile = next
+        .model_profiles
+        .get_mut(&key)
+        .context("model profile disappeared while switching")?;
+    apply(profile);
+    profile.validate()?;
     Ok(next)
 }
 
@@ -204,6 +229,18 @@ impl Agent<'_> {
         });
         self.save_modes()?;
         Ok(())
+    }
+
+    /// Drops the session's reasoning-level choice: the current model keeps running, at the level
+    /// its configuration gives it. Refused while a turn holds the backend.
+    pub fn reset_thinking(&mut self) -> Result<()> {
+        let selection = self.effective_config().selection();
+        let prior = self.model_override.take();
+        let result = self.switch_model(&selection, None);
+        if result.is_err() {
+            self.model_override = prior;
+        }
+        result
     }
 
     /// Reapplies this session's saved `/switch` selection when no override is in memory (a rebuilt agent).
@@ -267,9 +304,10 @@ impl Agent<'_> {
     }
 }
 
-/// Whether `selection` names a model Dial can offer without a network round trip: a bundled catalog
-/// entry, a configured selection (current model, role, favorite or profile), or a downloaded local
-/// model. Discovered remote listings are not consulted here.
+/// Whether `selection` names a chat model Dial can offer without a network round trip: a bundled
+/// catalog entry, a configured selection (current model, role, favorite or profile), a downloaded
+/// local model, or a model in a provider listing saved by an earlier `/models` refresh. Local and
+/// listed models that declare a non-chat kind (embedding, rerank, image, audio) are excluded.
 pub fn is_known_model(
     config: &Config,
     user_dir: &std::path::Path,
@@ -293,7 +331,8 @@ pub fn is_known_model(
         || crate::llm::catalog::bundled_model(&selection.provider, &selection.model).is_some()
         || crate::llm::catalog::downloaded_local_models(user_dir)
             .iter()
-            .any(|entry| same(&entry.selection))
+            .chain(crate::llm::catalog::saved_listing_models(user_dir).iter())
+            .any(|entry| entry.supports_chat() && same(&entry.selection))
 }
 
 #[cfg(test)]

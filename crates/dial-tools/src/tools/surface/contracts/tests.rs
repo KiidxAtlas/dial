@@ -1004,9 +1004,16 @@ fn registry_contracts_accept_each_intermediate_additive_release_shape() {
         .chain(crate::tools::exec::eval::tools(&config))
         .chain(crate::tools::knowledge::data::tools(&config))
         .chain(crate::tools::exec::background::tools(&config))
+        .chain(crate::tools::code::lsp::tools(&config))
+        .chain(crate::tools::code::dap::tools(&BTreeMap::new()))
     {
         let name = tool.name().to_owned();
-        let Some((_, properties)) = ADDITIVE_PROPERTIES.iter().find(|(tool, _)| *tool == name)
+        let owner = if name.starts_with("dap_") {
+            "dap"
+        } else {
+            &name
+        };
+        let Some((_, properties)) = ADDITIVE_PROPERTIES.iter().find(|(tool, _)| *tool == owner)
         else {
             continue;
         };
@@ -1024,7 +1031,7 @@ fn registry_contracts_accept_each_intermediate_additive_release_shape() {
             let mut narrowed = before.clone();
             let groups: Vec<_> = ADDITIVE_ENUM_VALUES
                 .iter()
-                .filter(|(tool, ..)| *tool == name)
+                .filter(|(tool, ..)| *tool == owner)
                 .collect();
             for index in (0..=groups.len()).rev() {
                 if index < groups.len() {
@@ -1719,11 +1726,12 @@ fn a_consolidated_successor_accepts_history_from_before_a_members_additions() {
     let schemas = std::slice::from_ref(&current);
     // The shape a 0.3.4 session recorded, each later release, and the members' additions alone.
     for removed in [
-        &["after_secs", "on_exit", "note"][..],
-        &["note"],
-        &["run", "after_secs", "on_exit", "note"],
-        &["call", "after_secs", "on_exit", "note"],
-        &["persist", "lifetime", "call"],
+        &["after_secs", "on_exit", "note", "pid", "save"][..],
+        &["note", "pid", "save"],
+        &["run", "after_secs", "on_exit", "note", "pid", "save"],
+        &["call", "after_secs", "on_exit", "note", "pid", "save"],
+        &["persist", "lifetime", "call", "pid", "save"],
+        &["pid", "save"],
     ] {
         let projected = project_history(&recorded(removed), schemas, &registry);
         assert!(matches!(projected, Ok(None)), "{removed:?}: {projected:?}");
@@ -1735,4 +1743,32 @@ fn a_consolidated_successor_accepts_history_from_before_a_members_additions() {
             "{removed:?}"
         );
     }
+}
+
+#[test]
+fn write_artifact_batch_contract_accepts_the_exact_legacy_required_shape() {
+    let registry = Registry::new();
+    let current = crate::tools::schema("write", crate::config::types::EditMode::default()).unwrap();
+    let mut old = current.clone();
+    for property in [
+        "source",
+        "files",
+        "if_absent",
+        "expected_sha256",
+        "idempotent",
+        "receipt",
+    ] {
+        old["function"]["parameters"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove(property);
+    }
+    old["function"]["parameters"]["required"] = json!(["path", "content"]);
+    let identity = identities(&[old.clone()], &registry)["write"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"call":identity}})];
+    validate_history(&history, std::slice::from_ref(&current), &registry).unwrap();
+    old["function"]["parameters"]["properties"]["content"]["type"] = json!("number");
+    let identity = identities(&[old], &registry)["write"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"call":identity}})];
+    assert!(validate_history(&history, &[current], &registry).is_err());
 }

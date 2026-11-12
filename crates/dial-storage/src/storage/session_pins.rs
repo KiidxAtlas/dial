@@ -45,6 +45,24 @@ pub fn toggle(user_dir: &Path, session_id: &str) -> Result<bool> {
     Ok(now_pinned)
 }
 
+/// Pin or unpin a session explicitly. Idempotent: a matching stored state writes nothing.
+/// Returns whether the stored state changed.
+pub fn set(user_dir: &Path, session_id: &str, pinned: bool) -> Result<bool> {
+    let _guard = LOCK.lock();
+    let _lock = crate::config::settings_store::locked(&file(user_dir))?;
+    let mut ids = read(user_dir)?;
+    if ids.iter().any(|id| id == session_id) == pinned {
+        return Ok(false);
+    }
+    if pinned {
+        ids.push(session_id.to_string());
+    } else {
+        ids.retain(|id| id != session_id);
+    }
+    write(user_dir, &ids)?;
+    Ok(true)
+}
+
 /// Remove a pin if present (used when the session is deleted).
 pub fn unpin(user_dir: &Path, session_id: &str) -> Result<()> {
     let _guard = LOCK.lock();

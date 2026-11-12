@@ -14,7 +14,7 @@ fn panics_reply_to_pending_request_then_fatal_and_stop() {
                 let error = result.unwrap_err();
                 assert_eq!(
                     error.downcast_ref::<RequestError>().unwrap().code,
-                    "internal_error"
+                    ErrorCode::InternalError
                 );
                 events
                     .borrow_mut()
@@ -99,6 +99,7 @@ fn with_runtime(configure: impl FnOnce(&mut Config), f: impl FnOnce(&mut ActorRu
         output: Arc::new(Mutex::new(Output {
             acp: None,
             protocol: DEFAULT_PROTOCOL_VERSION,
+            envelope: Envelope::default(),
         })),
         writer: crate::output::StdoutWriter::new().unwrap(),
         failed: Arc::new(AtomicBool::new(false)),

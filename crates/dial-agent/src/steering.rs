@@ -253,11 +253,10 @@ fn automatic_with(
             &json!({"op":"steering_evaluate","model":config.model,"adapter":adapter,"output":candidate,"progress":progress,"strength":strength,"cases":automatic_cases(),"max_tokens":128}),
         )?;
         let mut bundle = read(&candidate)?;
-        check(&bundle, strength)?;
-        ensure!(
-            bundle["model_name"] == config.model && bundle["layer"] == extracted["layer"],
-            "candidate model or layer changed"
-        );
+        check(&bundle, strength).map_err(|e| rejected(format!("{e:#}")))?;
+        if bundle["model_name"] != config.model || bundle["layer"] != extracted["layer"] {
+            return Err(rejected("candidate model or layer changed"));
+        }
         if let Ok(incumbent) = read(&path)
             && incumbent["automatic_adapter"] == json!(adapter)
             && let Some(incumbent_strength) = incumbent["evaluation"]["strength"].as_f64()
@@ -268,13 +267,12 @@ fn automatic_with(
             let evaluation = call(
                 &json!({"op":"steering_evaluate","model":config.model,"adapter":adapter,"output":incumbent_path,"progress":path.with_extension("incumbent.progress.json"),"strength":incumbent_strength,"cases":automatic_cases(),"max_tokens":128}),
             )?;
-            ensure!(
-                bundle["evaluation"]["steered_passes"].as_u64().unwrap_or(0)
-                    >= evaluation["steered_passes"]
-                        .as_u64()
-                        .context("incumbent evaluation missing score")?,
-                "candidate regressed from the active vector"
-            );
+            let incumbent_score = evaluation["steered_passes"]
+                .as_u64()
+                .context("incumbent evaluation missing score")?;
+            if bundle["evaluation"]["steered_passes"].as_u64().unwrap_or(0) < incumbent_score {
+                return Err(rejected("candidate regressed from the active vector"));
+            }
         }
         bundle["automatic_adapter"] = json!(adapter);
         bundle["origin"] = json!("automatic verified repairs");
@@ -283,14 +281,36 @@ fn automatic_with(
         write_private(&path, &serde_json::to_vec(&bundle)?)?;
         Ok(())
     })();
-    // Final state is published below even when the job was cancelled after admission.
-    state["finished"] = json!(true);
-    state["phase"] = json!(match result {
+    // Only a completed admission or rejection settles this fingerprint. A stop, cancellation or
+    // transient failure leaves it open, so the next run resumes without waiting out the cooldown.
+    let settled = match &result {
+        Ok(()) => true,
+        Err(error) => error.downcast_ref::<Rejected>().is_some(),
+    };
+    state["finished"] = json!(settled);
+    state["phase"] = json!(match &result {
         Ok(()) => "admitted; runtime confirmation pending".to_owned(),
-        Err(error) => format!("candidate not activated: {error:#}"),
+        Err(error) if settled => format!("candidate not activated: {error:#}"),
+        Err(error) => format!(
+            "interrupted before admission; the active vector is unchanged and the next run resumes: {error:#}"
+        ),
     });
     publish(&state)?;
     Ok(state)
+}
+
+/// A candidate the admission gate refused after a completed local evaluation. Unlike a stop or a
+/// transient failure, this attempt is settled for its fingerprint and enters the cooldown.
+#[derive(Debug)]
+struct Rejected(String);
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Rejected {}
+fn rejected(reason: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Rejected(reason.into()))
 }
 fn contrast_pair(pair: &Value) -> Option<Value> {
     let context = pair["context"].as_array()?;

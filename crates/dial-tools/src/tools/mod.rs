@@ -46,6 +46,7 @@ pub mod vision;
 // External `dial::tools::*` paths used by src/main.rs, src/cmd and tests/integration.
 pub use edit::hashline;
 pub use exec::sandbox;
+pub use fs::delta::{CoveredRun, DeltaPlan};
 pub use fs::documents;
 pub use fs::files::NativeReadSelection;
 pub use integrations::ext;
@@ -1299,14 +1300,14 @@ impl Workspace {
 
 const HASHLINE_READ_DESC: &str = "read: view any file or directory without changing it; use it over shell viewers, once per file. Decodes text, \
 documents, data, databases (read-only), archives, media, executables; other binaries as hex. Suffixes: `:50-100`, \
-`:50+20`, `:50-`, `:-30`, `:bytes=O+N`, `:outline`, `:raw` (non-editable); format parts `:member`, `:table`, \
-`:sheet=N`. `paths` reads up to 16 targets. Also `ssh://host/path`, `http(s)://`, `pr://N`, `issue://N`, \
-`conflict://`, `artifact://H`. Output is a `[PATH#TAG]` header then `LINE:TEXT` rows; edit needs that TAG and may \
-touch only shown lines. Stops at 48 KiB; the footer names the next range. Large or unfamiliar files: `grep` or \
-`:outline` first, then read only the needed ranges, never page through. Excerpts already shown by glob/grep \
-previews or earlier reads stay current: reuse them instead of rereading.";
+`:50+20`, `:-30`, `:80~10` (context), `:sym=NAME`, `:outline` (file or dir), `:bytes=O+N`, `:raw` (non-editable); \
+format parts `:member`, `:table`, `:sheet=N`. `paths` reads up to 16 targets. Also `ssh://host/path`, `http(s)://`, \
+`pr://N`, `issue://N`, `conflict://`, `artifact://H`. Output is a `[PATH#TAG]` header then `LINE:TEXT` rows; edit needs \
+that TAG and may touch only shown lines. Stops at 48 KiB; the footer names the next range. Large or unfamiliar files: \
+`grep`, `:outline` or `:sym=` first, never page through. Rows still visible are not resent; a changed file returns \
+its changed lines.";
 
-const HASHLINE_WRITE_DESC: &str = "write: create a new file or replace one whose content changes almost entirely. Max 1 MiB; parent directories are created. Replacing an existing file requires reading all of it first; for changes to an existing file use edit (one call carries every operation) instead of regenerating it. Content must be complete, never a placeholder; do not also paste it into chat. Notebooks take literal JSON. Copied read prefixes are stripped; truncated projections are refused. Returns the fresh `[PATH#TAG]`.";
+const HASHLINE_WRITE_DESC: &str = "write: create files or near-total replacements; use edit for local changes. Read existing files in full first. Supply path plus content OR source (artifact://SHA256 and matching sha256), or files. Max 1 MiB/file, 8 MiB/batch; creates parents. Notebooks need literal JSON. Inline read prefixes stripped; incomplete projections refused. Artifact bytes stay exact. Returns fresh [PATH#TAG] headers and receipts. SSH accepts only path/content.";
 
 const HASHLINE_EDIT_DESC: &str = r#"edit: change existing files with a line-anchored patch in `input`; whole files use write.
 `input` holds sections: a header `[PATH#TAG]` (TAG from that file's latest read, edit or write), then operations. Line numbers refer to THAT snapshot, never to earlier operations in the call; touch only lines a read has shown.
@@ -1324,9 +1325,10 @@ One section per file; put every planned change to every file in one call. Succes
 
 const REPLACE_READ_DESC: &str = "read: view any file or directory without changing it; use it over shell viewers, once per file. Decodes text, \
 documents, data, databases (read-only), archives, media, executables; other binaries as hex. Suffixes: `:50-100`, \
-`:50+150`, `:bytes=O+N`, `:outline`; format parts `:member`, `:table`, `:sheet=N`. `paths` reads up to 16 targets. \
-Also `artifact://H`. Lines are numbered. Stops at 48 KiB; the footer names the next range. Large or unfamiliar \
-files: `grep` or `:outline` first, then read only the needed ranges, never page through.";
+`:50+150`, `:80~10` (context), `:sym=NAME`, `:bytes=O+N`, `:outline` (file or dir); format parts `:member`, `:table`, \
+`:sheet=N`. `paths` reads up to 16 targets. Also `artifact://H`. Lines are numbered. Stops at 48 KiB; the footer \
+names the next range. Large or unfamiliar files: `grep`, `:outline` or `:sym=` first, then read only the needed \
+ranges, never page through.";
 
 fn schema(name: &str, mode: EditMode) -> Option<Value> {
     let hashline = mode == EditMode::Hashline;
@@ -1349,6 +1351,8 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                     "fetch": {"type":"boolean","description":"For a single http(s) path: use configured page/markdown discovery and reader fallback (former web_fetch); no selectors/formats."},
                     "raw": {"type":"boolean","description":"With fetch: return decoded body without HTML/JSON conversion."},
                     "max_chars": {"type":"integer","minimum":1,"maximum":100000,"description":"With fetch: character cap (default 20000)."},
+                    "budget": {"type":"integer","minimum":1024,"maximum":49152,"description":"Smaller output byte cap."},
+                    "fresh": {"type":"boolean","description":"Resend rows already visible."},
                 }),
                 &[],
             );
@@ -1356,25 +1360,11 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
             schema["function"]["parameters"]["properties"]["paths"]["minItems"] = json!(1);
             schema
         }
-        "write" => tool_schema(
-            "write",
-            if hashline {
-                HASHLINE_WRITE_DESC
-            } else {
-                "write: create a new file or replace one whose content changes almost entirely. Max 1 MiB; \
-                 parent directories are created. For changes to an existing file use edit instead of \
-                 regenerating it. Content must be complete, never a placeholder; do not also \
-                 paste it into chat."
-            },
-            json!({
-                "path": {"type": "string", "description": "Workspace-relative file path or an `ssh://host/path` remote file (requires approval)."},
-                "content": {"type": "string", "description": "Full file content."},
-                "encoding": {"type":"string","enum":["base64"],"description":"Create a new binary file from base64, at most 1 MiB; parent must exist; never overwrite."},
-                "allow_syntax_errors": {"type": "boolean", "description": "Set true only when valid code is refused for new syntax errors (parser dialect gap)."},
-                "verify": edit::editing::verify_property(),
-            }),
-            &["path", "content"],
-        ),
+        "write" => fs::write::schema(if hashline {
+            HASHLINE_WRITE_DESC
+        } else {
+            "write: create files or replace almost-entirely changed files; use edit for local changes. Max 1 MiB/file, 8 MiB/batch. Full content or immutable artifact source; existing files must be read first."
+        }),
         "edit" => edit::editing::schema(mode),
         "glob" => tool_schema(
             "glob",
@@ -1418,7 +1408,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         "bash" => tool_schema(
             "bash",
             if cfg!(windows) {
-                "bash: run a shell command. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. Uses Git for Windows bash when installed, otherwise Dial's built-in bash-compatible shell (PowerShell only with `shell.backend = \"powershell\"`). On Windows `sandbox.mode = \"dev\"` runs commands at Low integrity (writes confined to the project; `strict` is unavailable) and `off` runs them with the user's privileges. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
+                "bash: run a shell command. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. Uses Git for Windows bash when installed, otherwise Dial's built-in bash-compatible shell (PowerShell only with `shell.backend = \"powershell\"`). On Windows `sandbox.mode = \"dev\"` runs commands at Low integrity (writes confined to the project); `strict` or `allow_network = false` runs them in an AppContainer (reads also confined; no network) and `off` runs them with the user's privileges. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
             } else {
                 "bash: run a shell command with `/bin/bash -c`. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. May be sandboxed: writes confined to the project, network possibly blocked, temp files in `$TMPDIR`. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
             },
@@ -1526,6 +1516,10 @@ fn read_streaming(
         if let Some(result) = fs::media::read(ws, args, cancel, context) {
             return result.unwrap_or_else(ToolOutput::err);
         }
+        let budget = match fs::files::read_budget(args, budget) {
+            Ok(budget) => budget,
+            Err(error) => return ToolOutput::err(error),
+        };
         if present(args, "paths") {
             return fs::files::read_paths_output(ws, args, cancel, budget)
                 .unwrap_or_else(ToolOutput::err);
@@ -1608,6 +1602,11 @@ pub fn preview_edit_should_abort(output: &ToolOutput) -> bool {
             .and_then(|data| data["edit_preview"]["no_change"].as_bool())
             .unwrap_or(false)
 }
+/// Validated literal destinations of a single-file or batched whole-file write.
+pub fn declared_write_targets(args: &Value) -> Result<Vec<String>, String> {
+    fs::write::targets(args)
+}
+
 /// Preserve the resolver's permission classification before any mutation is attempted. Other
 /// binding errors remain ordinary call errors, never guessed from diagnostic text or path shape.
 fn path_refusal(error: io::Error) -> ToolOutput {
@@ -1780,7 +1779,10 @@ pub fn write_with_context(
     repair: Option<edit::syntax::RepairCallback<'_>>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
-    if let Some(encoding) = args.get("encoding") {
+    if let Err(error) = fs::write::entries(args) {
+        return ToolOutput::err(error);
+    }
+    if let Some(encoding) = args.get("encoding").filter(|value| !value.is_null()) {
         if encoding != "base64" {
             return ToolOutput::err("write encoding must be base64 when supplied");
         }
@@ -1793,6 +1795,22 @@ pub fn write_with_context(
         .and_then(Value::as_str)
         .filter(|path| integrations::ssh::url::is_ssh_url(path))
     {
+        if [
+            "source",
+            "if_absent",
+            "expected_sha256",
+            "idempotent",
+            "receipt",
+            "verify",
+            "allow_syntax_errors",
+        ]
+        .iter()
+        .any(|key| present(args, key))
+        {
+            return ToolOutput::err(
+                "remote writes accept only path and content; local write options are unsupported",
+            );
+        }
         let content = match args.get("content").and_then(Value::as_str) {
             Some(content) => content,
             None => return ToolOutput::err("missing string argument \"content\""),
@@ -1816,9 +1834,9 @@ pub fn write_with_context(
             Err(error) => ToolOutput::err(error),
         };
     }
-    let bound = match req_str(args, "path")
+    let bound = match fs::write::targets(args)
         .map_err(io::Error::other)
-        .and_then(|path| bind_edit_targets(ctx.workspace, vec![path.to_owned()]))
+        .and_then(|paths| bind_edit_targets(ctx.workspace, paths))
     {
         Ok(bound) => bound,
         Err(error) => return path_refusal(error),
@@ -1847,7 +1865,7 @@ pub fn write_with_context(
         refuse_syntax_errors: false,
     };
     match fs::files::write_with(ctx.workspace, args, &execution) {
-        Ok(text) => ToolOutput::ok(text),
+        Ok(output) => output,
         Err(error) => ToolOutput::err(error),
     }
 }
@@ -1870,21 +1888,26 @@ fn dispatch(
                 ws,
                 args,
                 &std::sync::atomic::AtomicBool::new(false),
-                fs::select::MAX_READ_OUTPUT,
+                fs::files::read_budget(args, fs::select::MAX_READ_OUTPUT)?,
             ),
             None => fs::files::read_tool(ws, args).map(ToolOutput::ok),
         },
         "write" => {
-            if args.get("encoding").is_some() {
+            if present(args, "encoding") {
                 return Err("binary writes require controller mutation admission".into());
             }
-            if let Err(error) = req_str(args, "path")
-                .map_err(io::Error::other)
-                .and_then(|path| ws.resolve_checked(path))
+            if let Err(error) =
+                fs::write::targets(args)
+                    .map_err(io::Error::other)
+                    .and_then(|paths| {
+                        paths
+                            .iter()
+                            .try_for_each(|path| ws.resolve_checked(path).map(|_| ()))
+                    })
             {
                 return Ok(path_refusal(error));
             }
-            fs::files::write_tool(ws, args).map(ToolOutput::ok)
+            fs::files::write_tool(ws, args)
         }
         "edit" => edit::editing::edit_output(ws, args)
             .map_err(|error| fs::suggest::annotate_edit(ws, args, error)),

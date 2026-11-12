@@ -194,7 +194,8 @@ fn a_turn_with_work_closes_with_a_framed_recap_card() {
     let all = lines.join("\n");
     assert!(lines[0].starts_with(theme.sym(Sym::BoxTl)), "{all}");
     assert!(lines[0].contains("1 file changed"), "{all}");
-    assert!(all.contains("2 calls") && all.contains("1 edit") && all.contains("1 failed"));
+    // A breakdown is shown, so the bare total is not repeated.
+    assert!(!all.contains("2 calls") && all.contains("1 edit") && all.contains("1 failed"));
     assert!(
         all.contains("Changed") && all.contains("src/lib.rs"),
         "{all}"
@@ -203,8 +204,10 @@ fn a_turn_with_work_closes_with_a_framed_recap_card() {
         all.contains("Handoff") && all.contains("cargo test failed"),
         "{all}"
     );
+    // Follow-ups are named by word under their Alt+digit chords, not as slash commands.
     assert!(
-        all.contains("/review-file") && all.contains("/undo"),
+        all.contains(&format!("{} review", action_chord(0).unwrap().display()))
+            && all.contains(&format!("{} undo", action_chord(1).unwrap().display())),
         "{all}"
     );
     let last = lines.last().unwrap();
@@ -251,7 +254,7 @@ fn the_transcript_gathers_the_turns_calls_into_its_closing_card() {
     t.finish_turn();
     let text = plain(&t.all_rows(80, &ctx(&theme, &ui))).join("\n");
     assert!(
-        text.contains("2 calls"),
+        text.contains("1 command") && text.contains("1 lookup") && !text.contains("2 command"),
         "only this turn's calls count: {text}"
     );
     for w in 1..=100u16 {
@@ -280,4 +283,167 @@ fn many_changed_files_are_bounded() {
     let text = plain(&card(&stats(None), &recap, 60, &ctx(&theme, &ui)).unwrap()).join("\n");
     assert!(text.contains("src/file_5.rs") && !text.contains("src/file_6.rs"));
     assert!(text.contains("+4 more"), "{text}");
+}
+
+fn outcome(status: &str, changed: usize, open: usize) -> Option<TurnOutcome> {
+    Some(TurnOutcome {
+        status: status.into(),
+        changed_files: changed,
+        open_tasks: open,
+        ..TurnOutcome::default()
+    })
+}
+
+fn did_work() -> Recap {
+    Recap {
+        calls: 2,
+        ..Recap::default()
+    }
+}
+
+#[test]
+fn follow_ups_lead_with_recovery_for_how_the_turn_ended() {
+    let labels = |o| -> Vec<&str> {
+        actions(&stats(o), &did_work())
+            .iter()
+            .map(|a| a.label)
+            .collect()
+    };
+    assert_eq!(labels(outcome("failed", 2, 0)), ["retry", "review", "undo"]);
+    assert_eq!(labels(outcome("blocked", 0, 1)), ["plan"]);
+    assert_eq!(
+        labels(outcome("needs_input", 1, 2)),
+        ["plan", "review", "undo"]
+    );
+    assert_eq!(labels(outcome("completed", 1, 0)), ["review", "undo"]);
+    assert!(labels(outcome("completed", 0, 0)).is_empty());
+    // A plain answer has no recap card, so nothing to offer.
+    assert!(actions(&stats(outcome("failed", 1, 0)), &Recap::default()).is_empty());
+    // Every follow-up except a check rerun runs a slash command.
+    for a in actions(&stats(outcome("failed", 1, 1)), &did_work()) {
+        assert!(
+            matches!(a.run, RecapRun::Command(c) if c.starts_with('/')),
+            "{a:?}"
+        );
+    }
+}
+
+#[test]
+fn the_card_numbers_its_follow_ups_with_their_alt_digit_chords() {
+    let theme = Theme::builtin("dial-dark").unwrap();
+    let ui = UiConfig::default();
+    let rows = plain(
+        &card(
+            &stats(outcome("failed", 1, 0)),
+            &did_work(),
+            80,
+            &ctx(&theme, &ui),
+        )
+        .unwrap(),
+    );
+    let next = rows.iter().find(|r| r.contains("next")).expect("next row");
+    let first = action_chord(0).unwrap().display();
+    let second = action_chord(1).unwrap().display();
+    assert!(next.contains(&format!("{first} retry")), "{rows:#?}");
+    assert!(next.contains(&format!("{second} review")), "{rows:#?}");
+    assert!(action_chord(8).is_some() && action_chord(9).is_none());
+}
+
+#[test]
+fn alt_digit_resolves_only_against_the_latest_turn() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+    let mut t = Transcript::new();
+    t.push_user("fix it");
+    t.tool_start("1", "write", "src/a.rs", r#"{"path":"src/a.rs"}"#);
+    t.tool_end("1", "ok", false, 0.1);
+    t.completion(TurnOutcome {
+        status: "failed".into(),
+        changed_files: 1,
+        ..TurnOutcome::default()
+    });
+    t.turn_stats(stats(None));
+    let run = |c| t.recap_action_for(&alt(c)).map(|a| a.run);
+    assert_eq!(run('1'), Some(RecapRun::Command("/retry")));
+    assert_eq!(run('3'), Some(RecapRun::Command("/undo")));
+    assert_eq!(run('4'), None);
+    // A plain digit is text, never an action.
+    assert_eq!(
+        t.recap_action_for(&KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+        None
+    );
+    // The next message starts a new turn: the old recap no longer answers.
+    t.push_user("thanks");
+    assert!(t.recap_actions().is_empty());
+}
+
+#[test]
+fn a_failed_check_is_offered_first_as_a_reviewable_shell_line() {
+    let mut t = Transcript::new();
+    t.push_user("fix it");
+    t.tool_start(
+        "1",
+        "bash",
+        "cargo test",
+        r#"{"command":"cargo test -p dial-ui"}"#,
+    );
+    t.tool_end(
+        "1",
+        "test a ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n[exit code: 101]",
+        true,
+        0.4,
+    );
+    t.turn_stats(stats(outcome("failed", 0, 0)));
+    let actions = t.recap_actions();
+    assert_eq!(actions[0].label, "rerun check");
+    assert_eq!(
+        actions[0].run,
+        RecapRun::Draft("!cargo test -p dial-ui".into())
+    );
+    assert_eq!(actions[1].run, RecapRun::Command("/retry"));
+    // A passing check offers no rerun.
+    let mut ok = Transcript::new();
+    ok.push_user("check");
+    ok.tool_start("1", "bash", "cargo test", r#"{"command":"cargo test"}"#);
+    ok.tool_end(
+        "1",
+        "test result: ok. 3 passed; 0 failed; 0 ignored",
+        false,
+        0.4,
+    );
+    ok.turn_stats(stats(None));
+    assert!(ok.recap_actions().iter().all(|a| a.label != "rerun check"));
+}
+
+#[test]
+fn an_answer_with_numbered_steps_offers_to_plan_them() {
+    assert_eq!(
+        numbered_steps("Do this:\n1. read\n2) edit\n  3. test\n```\n4. not a step\n```\n2026. no"),
+        3
+    );
+    let mut t = Transcript::new();
+    t.push_user("how do I fix it?");
+    t.tool_start("1", "read", "src/a.rs", r#"{"path":"src/a.rs"}"#);
+    t.tool_end("1", "fn a() {}", false, 0.1);
+    t.assistant_delta("1. Update the parser\n2. Add a test\n3. Run the suite\n");
+    t.turn_stats(stats(outcome("answered", 0, 0)));
+    let actions = t.recap_actions();
+    let plan = actions
+        .iter()
+        .find(|a| a.label == "plan steps")
+        .expect("offered");
+    assert!(matches!(&plan.run, RecapRun::Draft(text) if text.contains("numbered steps")));
+    // Two steps are not a plan.
+    let mut short = Transcript::new();
+    short.push_user("quick?");
+    short.tool_start("1", "read", "a", r#"{"path":"a"}"#);
+    short.tool_end("1", "x", false, 0.1);
+    short.assistant_delta("1. one\n2. two\n");
+    short.turn_stats(stats(None));
+    assert!(
+        short
+            .recap_actions()
+            .iter()
+            .all(|a| a.label != "plan steps")
+    );
 }

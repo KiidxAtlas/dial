@@ -550,6 +550,7 @@ fn a_failing_language_server_leaves_the_lexical_find_successful() {
     let config = Config::default();
     let tool = Find {
         lsp: Arc::new(FailingMetadata),
+        embedding: Arc::new(EmbeddingSlot::unavailable("not configured".into())),
     };
     let out = tool.call(
         &ToolContext {

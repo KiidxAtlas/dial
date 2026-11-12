@@ -36,7 +36,7 @@ const MAX_EVENTS: usize = 256;
 const EVENT_BYTES: usize = 256 * 1024;
 const POLL: Duration = Duration::from_millis(25);
 const REVERSE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
-const DESCRIPTION: &str = "Approved event-aware DAP control for an operator-installed adapter. Runtime probes use setBreakpoints with logMessage (interpolate {expression}) for non-stopping logpoints; optional condition/hitCondition are adapter-dependent, not automatic capture limits. Check status capabilities and breakpoint verification, read output, then removeBreakpoint to disarm. Expressions may have side effects. launch/attach return when initialized, possibly before their response: setBreakpoints then configurationDone completes configuration. setBreakpoints and removeBreakpoint (source + line) merge into the per-source list; setFunctionBreakpoints and removeFunctionBreakpoint (name) merge into the function list; an empty list clears its scope. Each sends the full merged list and records adapter verification in status.breakpoints. Execution actions also complete configuration. status exposes capabilities/state; output drains bounded events, debuggee output and adapter stderr with loss counters. Positive timeout_secs covers writes and waits; zero is unlimited until cancellation/adapter exit. Reverse runInTerminal/startDebugging requests are refused, never host-launched. Each call requires approval; launch program/cwd remain inside the workspace. Disconnect/terminate/cancellation destroy the owned adapter process group.";
+const DESCRIPTION: &str = "Approved event-aware DAP control for an operator-installed adapter. Runtime probes use setBreakpoints with logMessage (interpolate {expression}) for non-stopping logpoints; optional condition/hitCondition are adapter-dependent, not automatic capture limits. Check status capabilities and breakpoint verification, read output, then removeBreakpoint to disarm. Expressions may have side effects. launch/attach return when initialized, possibly before their response: setBreakpoints then configurationDone completes configuration. setBreakpoints and removeBreakpoint (source + line) merge into the per-source list; setFunctionBreakpoints and removeFunctionBreakpoint (name) merge into the function list; an empty list clears its scope. Each sends the full merged list and records adapter verification in status.breakpoints. setExceptionBreakpoints replaces the exception set: filters must be advertised by the adapter's exceptionBreakpointFilters (an empty array clears), with optional filterOptions [{filterId, condition?}] (supportsExceptionFilterOptions) and exceptionOptions [{breakMode, path?}] (supportsExceptionOptions); it is a configuration action like breakpoints. exceptionInfo explains the stopped exception when supportsExceptionInfoRequest is advertised; threadId defaults to the stopped thread. restart re-runs the original launch when supportsRestartRequest is advertised and takes no arguments; it returns once the adapter reports initialized or answers the request successfully. A successful answer without initialized completes configuration, so no configurationDone is sent. initialized reopens configuration: breakpoints, exception filters and configurationDone must be sent again (status shows them as unconfigured), and a delayed answer is collected at configurationDone. Execution actions also complete configuration. status exposes capabilities/state; output drains bounded events, debuggee output and adapter stderr with loss counters. Positive timeout_secs covers writes and waits; zero is unlimited until cancellation/adapter exit. Reverse runInTerminal/startDebugging requests are refused, never host-launched. Each call requires approval; launch program/cwd remain inside the workspace. Disconnect/terminate/cancellation destroy the owned adapter process group.";
 
 /// Creates one lazy, single-session tool per catalogued adapter, plus a `dap` tool that selects an
 /// adapter from its `adapter` argument, the launch program's extension, or project root markers.
@@ -65,6 +65,8 @@ struct DapTool {
     active: Mutex<Option<Arc<AdapterProcess>>>,
     cancellation: AtomicU64,
     interrupted: AtomicBool,
+    /// Adapter programs this tool installed, by adapter name; they may land outside `PATH`.
+    installed: Mutex<BTreeMap<String, PathBuf>>,
 }
 
 impl Tool for DapTool {
@@ -74,7 +76,7 @@ impl Tool for DapTool {
 
     fn schema(&self) -> Value {
         let mut properties = json!({
-            "action": {"type":"string","enum":["initialize","launch","attach","setBreakpoints","removeBreakpoint","setFunctionBreakpoints","removeFunctionBreakpoint","configurationDone","threads","pause","status","output","continue","next","stepIn","stepOut","stackTrace","scopes","variables","evaluate","disconnect","terminate"]},
+            "action": {"type":"string","enum":["initialize","launch","attach","setBreakpoints","removeBreakpoint","setFunctionBreakpoints","removeFunctionBreakpoint","setExceptionBreakpoints","exceptionInfo","restart","configurationDone","threads","pause","status","output","continue","next","stepIn","stepOut","stackTrace","scopes","variables","evaluate","disconnect","terminate"]},
             "program": {"type":"string","description":"launch: program path inside the workspace"},
             "cwd": {"type":"string","description":"launch: working directory inside the workspace (defaults to workspace root)"},
             "args": {"type":"array","items":{"type":"string"},"description":"launch: program arguments"},
@@ -85,7 +87,10 @@ impl Tool for DapTool {
             "breakpoints": {"type":"array","items":{"type":"object"},"description":"setBreakpoints: [{line, logMessage?, condition?, hitCondition?}] merged per line. logMessage interpolates {expression} without stopping when supportsLogPoints is advertised; hitCondition syntax is adapter-specific, not an automatic capture limit. setFunctionBreakpoints: [{name}] merged by name"},
             "threadId": {"type":"integer"}, "frameId": {"type":"integer"},
             "variablesReference": {"type":"integer"}, "expression": {"type":"string"},
-            "terminateDebuggee": {"type":"boolean"}
+            "terminateDebuggee": {"type":"boolean"},
+            "filters": {"type":"array","items":{"type":"string"},"description":"setExceptionBreakpoints: exception filter ids from the adapter's exceptionBreakpointFilters; an empty array clears them"},
+            "filterOptions": {"type":"array","items":{"type":"object"},"description":"setExceptionBreakpoints: [{filterId, condition?}]; needs supportsExceptionFilterOptions, and condition needs the filter's supportsCondition"},
+            "exceptionOptions": {"type":"array","items":{"type":"object"},"description":"setExceptionBreakpoints: [{breakMode: never|always|unhandled|userUnhandled, path?: [{names, negate?}]}]; needs supportsExceptionOptions"}
         });
         if self.requested.is_none() {
             properties["adapter"] = json!({"type":"string","description":"Adapter id from the catalogue (gdb, lldb-dap, debugpy, dlv, ...); omitted selects by launch program extension and project root markers"});
@@ -147,7 +152,82 @@ impl DapTool {
             active: Mutex::new(None),
             cancellation: AtomicU64::new(0),
             interrupted: AtomicBool::new(false),
+            installed: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The catalogue with programs this tool installed substituted for their bare names.
+    fn effective_catalogue(&self) -> Arc<BTreeMap<String, DapAdapterConfig>> {
+        let installed = self.installed.lock().unwrap_or_else(|e| e.into_inner());
+        if installed.is_empty() {
+            return Arc::clone(&self.catalogue);
+        }
+        let mut catalogue = (*self.catalogue).clone();
+        for (adapter, program) in installed.iter() {
+            if let Some(config) = catalogue.get_mut(adapter) {
+                config.program = program.clone();
+            }
+        }
+        Arc::new(catalogue)
+    }
+
+    /// Before a session starts: when the adapter `launch`/`attach` would select is missing but has
+    /// a Dial install recipe (for example `dlv` for Go), install it with the package manager's
+    /// normal location (never sudo), gated like LSP server installs. Returns a note on success.
+    fn install_missing_adapter(
+        &self,
+        ctx: &ToolContext,
+        args: &Value,
+        cancel: &AtomicBool,
+    ) -> Result<Option<String>, String> {
+        if !matches!(
+            args.get("action").and_then(Value::as_str),
+            Some("launch" | "attach")
+        ) || !self.session.try_lock().is_ok_and(|slot| slot.is_none())
+        {
+            return Ok(None);
+        }
+        let requested = self
+            .requested
+            .as_deref()
+            .or_else(|| args.get("adapter").and_then(Value::as_str));
+        let program = args
+            .get("program")
+            .and_then(Value::as_str)
+            .and_then(|path| ctx.workspace.resolve(path).ok());
+        let catalogue = self.effective_catalogue();
+        let root = ctx.workspace.root();
+        let Some((adapter, recipe_id)) =
+            select::installable(&catalogue, requested, program.as_deref(), root)
+        else {
+            return Ok(None);
+        };
+        ctx.authorize_mutation(&self.name, &[], true)?;
+        let env = crate::setup::deps::Env::current(&crate::config::types::default_user_dir());
+        let recipe = crate::setup::deps::recipe(&recipe_id)
+            .ok_or_else(|| format!("no install recipe for {recipe_id}"))?;
+        let location = crate::setup::deps::run::standard_location(recipe, &env)
+            .and_then(|existing| match existing {
+                Some(path) => Ok(path),
+                None => crate::setup::deps::run::install_with_requirements(
+                    &recipe_id,
+                    &env,
+                    cancel,
+                    &mut |_| {},
+                ),
+            })
+            .map_err(|error| {
+                format!("DAP adapter {adapter} is not installed; automatic install of {recipe_id} failed: {error:#}")
+            })?;
+        let note = format!(
+            "[Installed DAP adapter {adapter} ({recipe_id}) at {}]",
+            location.display()
+        );
+        self.installed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(adapter, location);
+        Ok(Some(note))
     }
 
     /// A pinned `dap_<id>` tool keeps its adapter; the `dap` tool honors `adapter`, else selects
@@ -172,8 +252,13 @@ impl DapTool {
             .get("program")
             .and_then(Value::as_str)
             .map(Path::new);
-        select::select(&self.catalogue, requested, program, workspace.root())
-            .map_err(DapError::user)
+        select::select(
+            &self.effective_catalogue(),
+            requested,
+            program,
+            workspace.root(),
+        )
+        .map_err(DapError::user)
     }
 
     /// The `dap` tool's deadline follows the selected adapter; pinned tools set theirs at entry.
@@ -204,12 +289,19 @@ impl DapTool {
             interrupted: &self.interrupted,
             cancel,
         };
+        let installed = match self.install_missing_adapter(ctx, args, cancel) {
+            Ok(note) => note,
+            Err(error) => return ToolOutput::err(error),
+        };
         let result = self.call_inner(ctx.workspace, args, &operation);
         let (full, failed) = match result {
             Ok(value) => (value.to_string(), false),
             Err(error) => (error.message, true),
         };
         let mut text = bounded(&full);
+        if let Some(note) = installed {
+            text = format!("{note}\n{text}");
+        }
         if full.len() > MAX_OUTPUT
             && let Some(store) = ctx.workspace.artifacts()
         {
@@ -248,9 +340,13 @@ impl DapTool {
             "removeFunctionBreakpoint" => {
                 remove_function_breakpoint_arguments(args).map_err(DapError::user)?
             }
+            "setExceptionBreakpoints" => {
+                exception_breakpoint_arguments(args).map_err(DapError::user)?
+            }
+            "restart" => restart_arguments(args).map_err(DapError::user)?,
             "initialize" | "configurationDone" | "status" | "output" | "terminate" => json!({}),
             "attach" | "threads" | "pause" | "continue" | "next" | "stepIn" | "stepOut"
-            | "stackTrace" | "scopes" | "variables" | "evaluate" => {
+            | "stackTrace" | "scopes" | "variables" | "evaluate" | "exceptionInfo" => {
                 action_arguments(args).map_err(DapError::user)?
             }
             "disconnect" => {
@@ -479,6 +575,80 @@ fn remove_function_breakpoint_arguments(args: &Value) -> Result<Value, String> {
     Ok(value)
 }
 
+fn exception_breakpoint_arguments(args: &Value) -> Result<Value, String> {
+    if args.get("arguments").is_some_and(|value| !value.is_null()) {
+        return Err(
+            "setExceptionBreakpoints takes top-level filters, filterOptions and exceptionOptions, not arguments"
+                .into(),
+        );
+    }
+    let filters = args
+        .get("filters")
+        .and_then(Value::as_array)
+        .filter(|items| items.iter().all(Value::is_string))
+        .ok_or("setExceptionBreakpoints requires an array of string filters; an empty array clears them")?;
+    let mut object = serde_json::Map::new();
+    object.insert("filters".into(), Value::Array(filters.clone()));
+    if let Some(options) = args.get("filterOptions").filter(|value| !value.is_null()) {
+        let valid = options.as_array().is_some_and(|items| {
+            items.iter().all(|entry| {
+                entry.get("filterId").is_some_and(Value::is_string)
+                    && entry
+                        .get("condition")
+                        .is_none_or(|value| value.is_null() || value.is_string())
+            })
+        });
+        if !valid {
+            return Err(
+                "filterOptions must be objects with a string filterId and an optional string condition"
+                    .into(),
+            );
+        }
+        object.insert("filterOptions".into(), without_null_fields(options));
+    }
+    if let Some(options) = args
+        .get("exceptionOptions")
+        .filter(|value| !value.is_null())
+    {
+        let valid = options.as_array().is_some_and(|items| {
+            items.iter().all(|entry| {
+                entry
+                    .get("breakMode")
+                    .and_then(Value::as_str)
+                    .is_some_and(|mode| BREAK_MODES.contains(&mode))
+                    && entry.get("path").is_none_or(|path| {
+                        path.is_null()
+                            || path.as_array().is_some_and(|segments| {
+                                segments.iter().all(|segment| {
+                                    segment
+                                        .get("names")
+                                        .and_then(Value::as_array)
+                                        .is_some_and(|names| names.iter().all(Value::is_string))
+                                })
+                            })
+                    })
+            })
+        });
+        if !valid {
+            return Err(
+                "exceptionOptions must be objects with a breakMode (never, always, unhandled, userUnhandled) and optional path segments with string names"
+                    .into(),
+            );
+        }
+        object.insert("exceptionOptions".into(), without_null_fields(options));
+    }
+    Ok(Value::Object(object))
+}
+
+fn restart_arguments(args: &Value) -> Result<Value, String> {
+    if args.get("arguments").is_some_and(|value| !value.is_null()) {
+        return Err(
+            "restart takes no arguments; it reuses the original launch configuration".into(),
+        );
+    }
+    Ok(json!({}))
+}
+
 fn is_breakpoint_action(action: &str) -> bool {
     matches!(
         action,
@@ -488,6 +658,14 @@ fn is_breakpoint_action(action: &str) -> bool {
             | "removeFunctionBreakpoint"
     )
 }
+
+/// Actions that configure the debuggee before `configurationDone`: they wait for `initialized`.
+fn is_configuration_action(action: &str) -> bool {
+    is_breakpoint_action(action) || action == "setExceptionBreakpoints"
+}
+
+/// DAP `exceptionBreakpoints` modes accepted by `exceptionOptions`.
+const BREAK_MODES: [&str; 4] = ["never", "always", "unhandled", "userUnhandled"];
 
 #[derive(Debug)]
 struct DapError {
@@ -898,6 +1076,7 @@ struct Session {
     launched: bool,
     timeout_secs: u64,
     book: breakpoints::Book,
+    exceptions: Value,
     _socket_dir: Option<tempfile::TempDir>,
 }
 impl Drop for Session {
@@ -1198,6 +1377,7 @@ impl Session {
             launched: false,
             timeout_secs: config.timeout_secs,
             book: breakpoints::Book::default(),
+            exceptions: Value::Null,
             // The path is only needed while connecting; `_socket_dir` owns its cleanup.
             _socket_dir: cleanup.0.take(),
         })
@@ -1386,6 +1566,156 @@ impl Session {
             ))),
         }
     }
+
+    /// Refuses exception filters, filter options and exception options the adapter did not advertise.
+    fn check_exception_request(&self, arguments: &Value) -> DapResult<()> {
+        let advertised = self.capability("exceptionBreakpointFilters");
+        let advertised = advertised.as_array().cloned().unwrap_or_default();
+        let entry_for = |id: &str| {
+            advertised
+                .iter()
+                .find(|entry| entry.get("filter").and_then(Value::as_str) == Some(id))
+        };
+        for id in arguments["filters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if entry_for(id).is_none() {
+                return Err(DapError::user(format!(
+                    "adapter does not advertise exception filter {id:?}"
+                )));
+            }
+        }
+        if let Some(options) = arguments.get("filterOptions").and_then(Value::as_array)
+            && !options.is_empty()
+        {
+            if !self.supports("supportsExceptionFilterOptions") {
+                return Err(DapError::user(
+                    "adapter does not support exception filter options",
+                ));
+            }
+            for option in options {
+                let id = option["filterId"].as_str().unwrap_or_default();
+                let entry = entry_for(id).ok_or_else(|| {
+                    DapError::user(format!(
+                        "adapter does not advertise exception filter {id:?}"
+                    ))
+                })?;
+                if option.get("condition").is_some()
+                    && entry.get("supportsCondition") != Some(&Value::Bool(true))
+                {
+                    return Err(DapError::user(format!(
+                        "adapter does not support conditions on exception filter {id:?}"
+                    )));
+                }
+            }
+        }
+        if arguments.get("exceptionOptions").is_some() && !self.supports("supportsExceptionOptions")
+        {
+            return Err(DapError::user("adapter does not support exception options"));
+        }
+        Ok(())
+    }
+
+    /// The adapter's advertised capability value, `Null` when absent.
+    fn capability(&self, name: &str) -> Value {
+        self.wire
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .capabilities
+            .get(name)
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// Restarts the debuggee through the adapter's `restart` request on the launch gate: the call
+    /// returns once `initialized` arrives or the request is answered. A successful answer without
+    /// `initialized` completes configuration; `initialized` reopens it. Failure restores the
+    /// bookkeeping that `status` shows.
+    fn restart(&mut self, op: &Operation<'_>) -> DapResult<Value> {
+        if !self.launched {
+            return Err(DapError::user("restart requires a launched debuggee"));
+        }
+        if !self.supports("supportsRestartRequest") {
+            return Err(DapError::user("adapter does not support restart"));
+        }
+        let saved = {
+            let mut state = self.wire.state.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = (
+                state.initialized_seen,
+                std::mem::replace(&mut state.status, "restarting".into()),
+                state.stopped.take(),
+                self.configured,
+                self.start_request.take(),
+            );
+            state.initialized_seen = false;
+            saved
+        };
+        self.configured = false;
+        let result = self.begin_restart(op);
+        if result.is_err() {
+            let (initialized, status, stopped, configured, start_request) = saved;
+            {
+                let mut state = self.wire.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.initialized_seen = initialized;
+                state.status = status;
+                state.stopped = stopped;
+            }
+            self.configured = configured;
+            self.start_request = start_request;
+        }
+        result
+    }
+    /// Sends `restart` and waits on the launch gate. An `initialized` before the answer keeps
+    /// configuration open, and a delayed successful answer stays pending as `start_request`, which
+    /// `configurationDone` collects just as it does for a delayed launch. A successful answer
+    /// without `initialized` completes configuration with no `configurationDone` due.
+    fn begin_restart(&mut self, op: &Operation<'_>) -> DapResult<Value> {
+        let seq = self.send("restart", json!({}), op)?;
+        self.start_request = Some(seq);
+        self.wait(op, |state| {
+            state.initialized_seen
+                || state
+                    .pending
+                    .get(&seq)
+                    .is_some_and(|pending| pending.response.is_some())
+        })?;
+        let (initialized, answered) = {
+            let state = self.wire.state.lock().unwrap_or_else(|e| e.into_inner());
+            let answered = state
+                .pending
+                .get(&seq)
+                .is_some_and(|pending| pending.response.is_some());
+            (state.initialized_seen, answered)
+        };
+        let body = if !initialized && answered {
+            self.start_request = None;
+            let body = self.response(seq, op)?;
+            self.configured = true;
+            let mut state = self.wire.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.status == "restarting" {
+                state.status = "running".into();
+            }
+            body
+        } else {
+            json!({})
+        };
+        self.wire
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .threads
+            .clear();
+        let next = if self.configured {
+            "configuration is complete; execution actions may continue"
+        } else {
+            "setBreakpoints and exception filters, then configurationDone"
+        };
+        Ok(json!({"response": body, "session": self.summary(), "next": next}))
+    }
     fn summary(&self) -> Value {
         let mut summary = self
             .wire
@@ -1395,6 +1725,7 @@ impl Session {
             .summary(self.configured, self.start_request, self.launched);
         if let Some(object) = summary.as_object_mut() {
             object.insert("breakpoints".into(), self.book.snapshot());
+            object.insert("exceptionBreakpoints".into(), self.exceptions.clone());
         }
         summary
     }
@@ -1453,7 +1784,10 @@ impl Session {
             }
             self.configured = true;
             let mut state = self.wire.state.lock().unwrap_or_else(|e| e.into_inner());
-            if matches!(state.status.as_str(), "launching" | "configuring") {
+            if matches!(
+                state.status.as_str(),
+                "launching" | "configuring" | "restarting"
+            ) {
                 state.status = "running".into();
             }
         }
@@ -1490,6 +1824,9 @@ impl Session {
         if action == "initialize" {
             return Ok(self.initialized.clone());
         }
+        if action == "restart" {
+            return self.restart(op);
+        }
         if action == "terminate" && !self.supports("supportsTerminateRequest") {
             return Err(DapError::user(
                 "adapter does not support terminate; use disconnect",
@@ -1515,6 +1852,12 @@ impl Session {
             && !self.supports("supportsEvaluateForHovers")
         {
             return Err(DapError::user("adapter does not support hover evaluation"));
+        }
+        if action == "exceptionInfo" && !self.supports("supportsExceptionInfoRequest") {
+            return Err(DapError::user("adapter does not support exceptionInfo"));
+        }
+        if action == "setExceptionBreakpoints" {
+            self.check_exception_request(&arguments)?;
         }
         if action == "setBreakpoints" {
             for (field, capability) in [
@@ -1589,7 +1932,7 @@ impl Session {
         if action == "configurationDone" {
             return self.finish_configuration(op);
         }
-        if is_breakpoint_action(action) && self.launched && !self.configured {
+        if is_configuration_action(action) && self.launched && !self.configured {
             self.wait(op, |state| {
                 state.initialized_seen
                     || self.start_request.is_some_and(|seq| {
@@ -1609,15 +1952,15 @@ impl Session {
             if !initialized {
                 return self.finish_configuration(op);
             }
-        } else if !is_breakpoint_action(action)
-            && !matches!(action, "disconnect" | "terminate")
+        } else if !is_configuration_action(action)
+            && !matches!(action, "disconnect" | "terminate" | "restart")
             && self.launched
         {
             self.finish_configuration(op)?;
         }
         if matches!(
             action,
-            "pause" | "continue" | "next" | "stepIn" | "stepOut" | "stackTrace"
+            "pause" | "continue" | "next" | "stepIn" | "stepOut" | "stackTrace" | "exceptionInfo"
         ) && arguments.get("threadId").is_none()
         {
             let stopped = self
@@ -1646,6 +1989,11 @@ impl Session {
                 .as_object_mut()
                 .unwrap()
                 .insert("threadId".into(), json!(thread));
+        }
+        if action == "setExceptionBreakpoints" {
+            let body = self.request("setExceptionBreakpoints", arguments.clone(), op)?;
+            self.exceptions = arguments;
+            return Ok(body);
         }
         if is_breakpoint_action(action) {
             return self.breakpoint_action(action, arguments, op);
@@ -1727,7 +2075,10 @@ fn route_message(wire: &Wire, value: Value) -> DapResult<()> {
             match event {
                 "initialized" => {
                     state.initialized_seen = true;
-                    if matches!(state.status.as_str(), "launching" | "initializing") {
+                    if matches!(
+                        state.status.as_str(),
+                        "launching" | "initializing" | "restarting"
+                    ) {
                         state.status = "configuring".into();
                     }
                 }
