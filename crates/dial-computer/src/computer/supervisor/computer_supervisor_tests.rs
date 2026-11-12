@@ -503,12 +503,14 @@ fn a_missing_node_says_so_instead_of_an_os_error() {
 }
 
 /// A worker that dies at startup reports its exit code, read before it is cleaned up.
+/// `worker` is taken from the state before the exit status is recorded, so wait for the
+/// status itself rather than for the worker to disappear.
 #[cfg(unix)]
 #[test]
 fn a_worker_that_exits_at_startup_reports_its_exit_code() {
     let supervisor = fake_worker("import sys; sys.exit(7)");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while supervisor.inner.state.lock().worker.is_some() && Instant::now() < deadline {
+    while supervisor.inner.state.lock().last_exit.is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(supervisor.inner.state.lock().last_exit, Some(7));
