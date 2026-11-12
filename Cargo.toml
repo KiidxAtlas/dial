@@ -120,7 +120,7 @@ brush-builtins = "0.2"
 # Embedded ECMAScript engine (QuickJS-ng) for `eval` JavaScript when no Node runtime is installed.
 rquickjs = "0.14"
 # Desktop control (computer tool): platform crates pinned to known-good versions.
-ashpd = { version = "=0.11.1", default-features = false, features = ["tokio"] }
+ashpd = { version = "=0.13.13", default-features = false, features = ["tokio"] }
 atspi = { version = "=0.30.0", features = ["tokio", "zbus"] }
 pipewire = "=0.9.2"
 reis = { version = "=0.5.0", features = ["tokio"] }
