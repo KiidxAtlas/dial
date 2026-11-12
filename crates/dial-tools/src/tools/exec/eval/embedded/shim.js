@@ -288,6 +288,7 @@
     process: 'tool callbacks for host operations', require: 'tool callbacks for host operations',
     module: 'top-level declarations', exports: 'top-level declarations',
     __filename: 'a workspace-relative path', __dirname: 'a workspace-relative path',
+    Buffer: 'Uint8Array and DataView (dial.hex(bytes) for hex text)',
   };
   // QuickJS stacks omit the `Name: message` header that Node prints first; restore it.
   function errorText(error) {

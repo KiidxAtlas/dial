@@ -59,6 +59,85 @@ fn working_directory(
     }
     Ok((cwd, command.to_owned()))
 }
+
+/// Refuses a `sqlite3` CLI command that would open a database read-write while its `-wal`
+/// holds data SQLite would discard (an invalid header or checksum chain, or an uncommitted
+/// tail). Such an open checkpoints, truncates or deletes the WAL, destroying the only copy of
+/// those bytes, so the refusal comes before the command runs. `-readonly`, `mode=ro` and
+/// `immutable=1` opens, databases whose WAL SQLite would apply in full, and opens after an
+/// earlier step of the same command names the WAL (replacing or backing it up first) are left
+/// alone.
+fn sqlite_wal_guard(ws: &Workspace, args: &Value, command: &str) -> Option<String> {
+    use std::io::Read as _;
+    if !command.contains("sqlite3") {
+        return None;
+    }
+    let (cwd, script) = working_directory(ws, args, command).ok()?;
+    let heads = crate::tools::exec::bash_interceptor::pipeline_heads(&script);
+    for (index, (head, _)) in heads.iter().enumerate() {
+        let words: Vec<&str> = head
+            .split_whitespace()
+            .map(|word| word.trim_matches(['\'', '"']))
+            .collect();
+        let Some(at) = words.iter().position(|word| !word.contains('=')) else {
+            continue;
+        };
+        if words[at] != "sqlite3" && !words[at].ends_with("/sqlite3") {
+            continue;
+        }
+        let operands = &words[at + 1..];
+        let read_only = |word: &&str| {
+            matches!(*word, "-readonly" | "--readonly")
+                || word.contains("mode=ro")
+                || word.contains("immutable=1")
+        };
+        if operands.iter().any(read_only) {
+            continue;
+        }
+        for operand in operands.iter().filter(|word| !word.starts_with('-')) {
+            let operand = operand.strip_prefix("file:").unwrap_or(operand);
+            let database = operand.split('?').next().unwrap_or(operand);
+            if database.is_empty() {
+                continue;
+            }
+            let wal_name = format!("{database}-wal");
+            let handled_earlier = heads[..index].iter().any(|(earlier, _)| {
+                earlier.split_whitespace().any(|word| {
+                    word.trim_matches(['\'', '"'])
+                        .trim_end_matches('/')
+                        .ends_with(&wal_name)
+                })
+            });
+            if handled_earlier {
+                continue;
+            }
+            let Some(wal_path) = cwd
+                .join(&wal_name)
+                .to_str()
+                .and_then(|path| ws.resolve_read(path).ok())
+            else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            let Ok(file) = std::fs::File::open(&wal_path) else {
+                continue;
+            };
+            if file.take(64 * 1024 * 1024).read_to_end(&mut bytes).is_err()
+                || !crate::tools::fs::binary::wal_discards_data(&bytes)
+            {
+                continue;
+            }
+            let report = crate::tools::fs::binary::wal(&bytes);
+            let summary = report.lines().next().unwrap_or_default();
+            let summary = summary.split(". ").next().unwrap_or(summary);
+            return Some(format!(
+                "Blocked before running: `{wal_name}` ({} bytes) holds data SQLite would discard ({summary}). This read-write `sqlite3` open would checkpoint, truncate or delete it, and the bytes could not be recovered afterwards. Inspect without changing anything: `read {database}` (schema, rows and WAL status) or `read {wal_name}:bytes=0+64`; query with `sqlite3 -readonly` or a `file:{database}?mode=ro` URI. Repair the WAL before a writable open, or move it aside first if it should really be discarded.",
+                bytes.len()
+            ));
+        }
+    }
+    None
+}
 const MAX_COMMAND: usize = 64 * 1024;
 // Keep the model-facing preview small; complete output is spooled independently below.
 const BASH_HEAD: usize = 4 * 1024;
@@ -814,6 +893,9 @@ fn with_bash_interceptor(
     }
     if command.len() > MAX_COMMAND {
         return Err(format!("command is longer than {MAX_COMMAND} bytes"));
+    }
+    if let Some(message) = sqlite_wal_guard(ws, args, command) {
+        return Ok(ToolOutput::err(message).with_effects(crate::runtime::execution::Effects::None));
     }
     use crate::tools::exec::bash_interceptor::{self, Verdict};
     let interceptor = ws.bash_interceptor().map(|(config, offered)| {

@@ -520,10 +520,25 @@ fn wal_checksum(data: &[u8], big_endian: bool, seed: (u32, u32)) -> (u32, u32) {
 /// recovery does. Frames after the first invalid one, and valid frames after the last commit, are
 /// ignored by SQLite.
 pub(in crate::tools) fn wal(bytes: &[u8]) -> String {
+    wal_analysis(bytes).0
+}
+
+/// Whether a read-write SQLite open would discard data this WAL holds: an invalid header or
+/// header checksum (every frame ignored), or frames past the first invalid frame or after the
+/// last commit. An empty WAL holds nothing.
+pub(in crate::tools) fn wal_discards_data(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && wal_analysis(bytes).1
+}
+
+/// [`wal`]'s report and whether SQLite would discard any of the file's data.
+fn wal_analysis(bytes: &[u8]) -> (String, bool) {
     const NOTE: &str = "SQLite ignores an invalid WAL, and a read-write open (such as the plain `sqlite3` CLI) then truncates or deletes it with the data it holds. Copy it first, or open the database with `sqlite3 -readonly` or a `file:...?mode=ro` URI.";
     let len = bytes.len();
     if len < 32 {
-        return format!("SQLite WAL: {len} bytes, shorter than the 32-byte header. {NOTE}\n");
+        return (
+            format!("SQLite WAL: {len} bytes, shorter than the 32-byte header. {NOTE}\n"),
+            true,
+        );
     }
     let magic = be32(bytes, 0);
     let page_size = be32(bytes, 8) as usize;
@@ -540,7 +555,7 @@ pub(in crate::tools) fn wal(bytes: &[u8]) -> String {
                 break;
             }
         }
-        return out;
+        return (out, true);
     }
     let big_endian = magic == WAL_MAGIC_BE;
     let stored = (be32(bytes, 24), be32(bytes, 28));
@@ -568,7 +583,7 @@ pub(in crate::tools) fn wal(bytes: &[u8]) -> String {
         out.push_str(&format!(
             "The header does not validate, so SQLite treats every frame as absent. {NOTE}\n"
         ));
-        return out;
+        return (out, true);
     }
     let frame = page_size + 24;
     let total = (len - 32) / frame;
@@ -610,10 +625,11 @@ pub(in crate::tools) fn wal(bytes: &[u8]) -> String {
         ));
     }
     out.push('\n');
-    if valid < total || committed < valid {
+    let discards = valid < total || committed < valid;
+    if discards {
         out.push_str("SQLite discards frames after the first invalid frame and any uncommitted tail; a read-write open may delete them.\n");
     }
-    out
+    (out, discards)
 }
 
 /// Structure of a rollback journal. A hot journal is replayed (the database is rolled back) by

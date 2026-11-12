@@ -17,20 +17,6 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
-### Changed
-
-- **Faster releases from a release pull request:** CI builds unsigned release candidates for
-  version-bump pull requests from this repository when the tested merge tree equals the built
-  head tree. Tagging the merge commit of such a pull request (merged with a merge commit) reuses
-  its tests and archives instead of waiting for main CI to repeat them, and main skips rebuilding
-  them. Candidates now record their source tree, and promotion matches by tree; other cases still
-  require main push CI or rebuild every platform ([releases](docs/release-and-install.md)).
-- **Shorter macOS CI:** the portable test suite runs once, on Ubuntu. macOS runs a focused contract
-  (`scripts/macos-contract.txt`) of the modules with macOS-specific code and the sandboxed
-  isolation, shell-session and terminal-lifecycle integration tests, instead of repeating the full
-  suite. The required `fmt, build, test (macos-15)` check keeps its name
-  ([releases](docs/release-and-install.md)).
-
 ## [0.3.5] - 2026-11-11
 
 ### Added
@@ -56,6 +42,23 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Changed
 
+- **A damaged SQLite WAL is no longer destroyed by a shell `sqlite3` call:** `bash` refuses,
+  before running anything, a `sqlite3` CLI command that would open a database read-write while
+  its `-wal` holds data SQLite would discard, and names the read-only alternatives. Previously the
+  first plain `sqlite3 main.db` merged or deleted the WAL, and recovery depended on a retained
+  copy. In embedded JavaScript `eval`, `Buffer` now gets the same guidance as other Node-only
+  globals (use `Uint8Array`/`DataView`).
+- **Faster releases from a release pull request:** CI builds unsigned release candidates for
+  version-bump pull requests from this repository when the tested merge tree equals the built
+  head tree. Tagging the merge commit of such a pull request (merged with a merge commit) reuses
+  its tests and archives instead of waiting for main CI to repeat them, and main skips rebuilding
+  them. Candidates now record their source tree, and promotion matches by tree; other cases still
+  require main push CI or rebuild every platform ([releases](docs/release-and-install.md)).
+- **Shorter macOS CI:** the portable test suite runs once, on Ubuntu. macOS runs a focused contract
+  (`scripts/macos-contract.txt`) of the modules with macOS-specific code and the sandboxed
+  isolation, shell-session and terminal-lifecycle integration tests, instead of repeating the full
+  suite. The required `fmt, build, test (macos-15)` check keeps its name
+  ([releases](docs/release-and-install.md)).
 - The live work panel leads with a Plan progress bar and completed/total count. Successful plan updates no longer repeat the plan in the transcript; failed updates remain visible ([composer](docs/terminal-composer.md)).
 - Release preparation no longer waits on the publication queue; signed publication, package metadata and container updates remain serialized. Successful candidate promotion explicitly reaches publication even when its optional rebuild is skipped. Unix candidate jobs reuse main CI's portable installer coverage while retaining archive checks. CI preserves per-test JUnit timings, supports opt-in larger macOS/Windows push runners, and adds a manual thin-LTO/no-LTO build benchmark without changing shipping features or optimization ([releases](docs/release-and-install.md#release-speed-and-measurement)).
 - Settings search indexes immutable declaration locations instead of rescanning the schema for each row; the full tiny-terminal grid remains covered. Linux Clippy reuses the existing feature-check dependency cache without adding a competing writer. Native thin-LTO/no-LTO measurements did not justify changing the shipping profile ([releases](docs/release-and-install.md#release-speed-and-measurement)).
