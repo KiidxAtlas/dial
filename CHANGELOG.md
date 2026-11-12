@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Changed
+
+- Updated dependencies: `rand` 0.10, `sevenz-rust2` 0.25, `parking_lot` 0.13, the compatible Cargo group (including `ureq` 3.5), `fastapi` 0.162.2 for CI scripts, and the `setup-python`, `setup-node`, `docker/setup-buildx-action` and `docker/login-action` workflow actions.
+
 ## [0.3.5] - 2026-11-11
 
 ### Added

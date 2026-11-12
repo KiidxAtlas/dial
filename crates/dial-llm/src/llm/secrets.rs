@@ -19,7 +19,7 @@ use crate::config::settings_store;
 use crate::platform::atomic::{read_private, write_private};
 use anyhow::{Context, Result, bail};
 use dial_core::credentials::{self, patterns};
-use rand::RngCore;
+use rand::Rng;
 use ring::hmac;
 use serde_json::Value;
 use std::{

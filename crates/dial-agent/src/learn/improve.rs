@@ -20,7 +20,7 @@ use crate::{
     storage::store::{Store, TrainingState},
 };
 use anyhow::{Context, Result, bail, ensure};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{

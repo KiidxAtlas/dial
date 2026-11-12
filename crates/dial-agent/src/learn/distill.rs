@@ -21,7 +21,7 @@ use crate::{
     storage::store::Store,
 };
 use anyhow::Result;
-use rand::Rng;
+use rand::RngExt;
 use serde_json::{Value, json};
 use std::{collections::HashSet, path::PathBuf};
 

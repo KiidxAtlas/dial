@@ -38,7 +38,7 @@ thiserror = "2"
 unicode-normalization = "0.1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-rand = "0.9"
+rand = "0.10"
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
 rusqlite = { version = "0.41", features = ["bundled", "hooks", "limits"] }
@@ -85,7 +85,7 @@ flate2 = "1"
 lzma-rs = "0.3"
 bzip2-rs = "0.1"
 ruzstd = "0.9"
-sevenz-rust2 = { version = "0.24.1", default-features = false }
+sevenz-rust2 = { version = "0.25.0", default-features = false }
 cab = "0.6"
 rars = { version = "0.12", default-features = false }
 # Rich `read` projections: certificates, executables, columnar data, legacy office, plists and mail.
@@ -99,7 +99,7 @@ arrow-cast = { version = "60", default-features = false }
 calamine = "0.38"
 plist = { version = "1.10", default-features = false }
 mail-parser = { version = "1", features = ["full_encoding"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 similar = { version = "2.7", default-features = false, features = ["text"] }
 shlex = "2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
@@ -132,7 +132,7 @@ cpal = "0.16"
 block2 = "=0.6.2"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 foreign-types = "=0.5.0"
-objc2 = "=0.6.4"
+objc2 = "=0.6.5"
 objc2-app-kit = "=0.3.2"
 objc2-application-services = "=0.3.2"
 objc2-core-foundation = "=0.3.2"

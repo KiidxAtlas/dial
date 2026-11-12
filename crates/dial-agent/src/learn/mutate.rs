@@ -6,7 +6,7 @@
 //! operator, in an order shuffled by the caller's RNG.
 
 use crate::config::types::{EditMode, Harness};
-use rand::{Rng, RngCore, seq::SliceRandom};
+use rand::{Rng, seq::SliceRandom};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
@@ -151,9 +151,9 @@ fn mutation(name: &'static str, rationale: String, harness: Harness) -> Mutation
     }
 }
 
-type Operator = fn(&Harness, &Context, &mut dyn RngCore) -> Vec<Mutation>;
+type Operator = fn(&Harness, &Context, &mut dyn Rng) -> Vec<Mutation>;
 
-fn toggle_edit_mode(active: &Harness, ctx: &Context, _: &mut dyn RngCore) -> Vec<Mutation> {
+fn toggle_edit_mode(active: &Harness, ctx: &Context, _: &mut dyn Rng) -> Vec<Mutation> {
     let current = active.edit_mode.unwrap_or(ctx.default_edit_mode);
     let next = match current {
         EditMode::Hashline => EditMode::Replace,
@@ -170,7 +170,7 @@ fn toggle_edit_mode(active: &Harness, ctx: &Context, _: &mut dyn RngCore) -> Vec
     )]
 }
 
-fn step_temperature(active: &Harness, _: &Context, _: &mut dyn RngCore) -> Vec<Mutation> {
+fn step_temperature(active: &Harness, _: &Context, _: &mut dyn Rng) -> Vec<Mutation> {
     let t = active.temperature;
     let below = TEMPERATURES.iter().rev().find(|g| **g < t - 1e-9);
     let above = TEMPERATURES.iter().find(|g| **g > t + 1e-9);
@@ -196,7 +196,7 @@ fn step_temperature(active: &Harness, _: &Context, _: &mut dyn RngCore) -> Vec<M
         .collect()
 }
 
-fn scale_max_steps(active: &Harness, _: &Context, _: &mut dyn RngCore) -> Vec<Mutation> {
+fn scale_max_steps(active: &Harness, _: &Context, _: &mut dyn Rng) -> Vec<Mutation> {
     let from = active.max_steps;
     if from == 0 {
         return Vec::new();
@@ -218,7 +218,7 @@ fn scale_max_steps(active: &Harness, _: &Context, _: &mut dyn RngCore) -> Vec<Mu
     .collect()
 }
 
-fn ablate_tool(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Mutation> {
+fn ablate_tool(active: &Harness, _: &Context, rng: &mut dyn Rng) -> Vec<Mutation> {
     let mut options: Vec<Mutation> = ABLATABLE.iter().filter(|t| active.tools.iter().any(|x| x == *t)).map(|tool| {
         let mut h = active.clone();
         h.tools.retain(|x| x != tool);
@@ -228,7 +228,7 @@ fn ablate_tool(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Muta
     options
 }
 
-fn restore_tool(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Mutation> {
+fn restore_tool(active: &Harness, _: &Context, rng: &mut dyn Rng) -> Vec<Mutation> {
     let mut options: Vec<Mutation> = crate::config::tools::default_tools().into_iter().filter(|t| !active.tools.contains(t)).map(|tool| {
         let mut h = active.clone();
         h.tools.push(tool.clone());
@@ -238,7 +238,7 @@ fn restore_tool(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Mut
     options
 }
 
-fn guidance(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Mutation> {
+fn guidance(active: &Harness, _: &Context, rng: &mut dyn Rng) -> Vec<Mutation> {
     let mut options: Vec<Mutation> = guidance_variants()
         .into_iter()
         .filter(|(_, p)| *p != active.system_prompt)
@@ -256,7 +256,7 @@ fn guidance(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Mutatio
     options
 }
 
-fn failure_note(active: &Harness, ctx: &Context, _: &mut dyn RngCore) -> Vec<Mutation> {
+fn failure_note(active: &Harness, ctx: &Context, _: &mut dyn Rng) -> Vec<Mutation> {
     // Merge kinds that share advice, most frequent first (ties by advice text, so deterministic).
     let mut by_advice: BTreeMap<&str, (usize, Vec<&str>)> = BTreeMap::new();
     for (kind, count) in ctx.failure_kinds.iter().filter(|(_, c)| **c > 0) {
@@ -286,7 +286,7 @@ fn failure_note(active: &Harness, ctx: &Context, _: &mut dyn RngCore) -> Vec<Mut
         .collect()
 }
 
-fn family_note(active: &Harness, ctx: &Context, _: &mut dyn RngCore) -> Vec<Mutation> {
+fn family_note(active: &Harness, ctx: &Context, _: &mut dyn Rng) -> Vec<Mutation> {
     let mut weak: Vec<(&str, usize, usize)> = ctx
         .selfplay_rates
         .iter()
