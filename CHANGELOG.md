@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Changed
+
+- Release binaries no longer use cross-crate thin LTO (`[profile.release] lto = false`). On a warm dependency cache, which is what release candidate jobs restore, a local Apple Silicon rebuild of the workspace crates dropped from 150 to 105 seconds and the binary shrank by about 1.7 MB, with no measurable `--version`/`--help` startup difference. Optimization level, codegen units, stripping and features are unchanged ([releases](docs/release-and-install.md#release-speed-and-measurement)).
+
 ## [0.3.5] - 2026-11-11
 
 ### Added

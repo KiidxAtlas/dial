@@ -48,11 +48,13 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertEqual(report['sha256'], 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
                 self.assertFalse(report['dirty'])
 
-    def test_shipping_profile_is_unchanged_and_benchmark_never_publishes(self):
+    def test_shipping_profile_avoids_cross_crate_lto_and_benchmark_never_publishes(self):
         root = Path(__file__).resolve().parent.parent
         cargo = (root / 'Cargo.toml').read_text().split('[profile.release]', 1)[1].split('\n[', 1)[0]
         workflow = (root / '.github/workflows/release-benchmark.yml').read_text()
-        self.assertIn('lto = "thin"', cargo)
+        self.assertIn('lto = false', cargo)
+        self.assertIn('codegen-units = 16', cargo)
+        self.assertIn('strip = true', cargo)
         self.assertIn('workflow_dispatch:', workflow)
         self.assertNotIn('secrets.', workflow)
         self.assertNotIn('contents: write', workflow)

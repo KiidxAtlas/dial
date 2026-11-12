@@ -224,15 +224,23 @@ and no-LTO builds on native macOS ARM and Linux x86-64 runners. It never signs o
 It records build seconds, binary bytes, binary SHA-256, compiler/source identity, seven warmed
 `--help` startup samples and their median, plus Cargo HTML timings, then runs artifact/recovery
 smoke tests. It deliberately restores no build cache. Repeat the workflow before drawing timing
-conclusions; startup measurements are not representative of all agent workloads. Shipping stays
-on thin LTO until representative parsing/image/runtime benchmarks and size results justify a change.
+conclusions; startup measurements are not representative of all agent workloads.
 
 A single native Apple Silicon/macOS cold-build comparison with Rust 1.99.0 and a dirty snapshot
 of `99ad369` measured 132.4 seconds with thin LTO and 136.4 seconds without it. Both binaries
 passed artifact and recovery smoke checks; their sizes were 147.7 MB and 145.3 MB respectively.
 Another session reported overlapping benchmark processes during both builds, so these are
 shared-host observations, not an isolated LTO comparison. The approximately 3% difference
-does not establish an improvement from disabling LTO. The shipping profile is unchanged.
+does not establish an improvement from disabling LTO on a cold build.
+
+Cold builds are not what release candidate jobs pay: they restore a full-match dependency cache
+and rebuild only the workspace crates, which took 11 to 17 minutes per target in CI with thin LTO.
+Measured that way (dependencies warm, every workspace crate invalidated, Rust 1.99.0, `44047903`,
+Apple Silicon shared with other sessions), the rebuild took 150 seconds with thin LTO and 105
+seconds without it; binaries were 176.6 MB and 174.9 MB, and warmed `--version`/`--help` timings
+did not differ beyond run-to-run noise. Raising codegen units to 64 was slower (175 seconds) and
+larger (182.0 MB). The shipping profile therefore uses `lto = false` (crate-local thin LTO only),
+keeping opt-level 3, 16 codegen units and stripping.
 
 For a local measurement on a native host (set the matching target triple):
 
@@ -248,7 +256,7 @@ the exact-commit hosted main-CI publication gate.
 
 ## Build from source
 
-Install the pinned Rust toolchain from `rust-toolchain.toml` and run `cargo build --release --locked -p dial` for shipping optimization. `make build` and `make update` default to the optimized `local` profile (incremental compilation, no LTO); pass `PROFILE=release` for shipping-equivalent builds (thin LTO). `make update` rebuilds from the checkout, backs up existing binaries, and retains only the three newest backups at each managed location. `make check`, `make test-lib`, and `make test-module MOD=module::path` provide narrower development checks; `make test` retains the full Rust suite. CI builds and tests with the `ci` profile (unoptimized, no debug info) and caches Rust dependencies separately for test, lint, and release jobs. Main CI builds unsigned candidates alongside tests; the tag workflow requires a completed successful push-to-main CI run for the exact tagged commit before fallback builds, signing or publication. Python tests run under pytest in CI; optional model/runtime dependencies are separate from the Rust executable.
+Install the pinned Rust toolchain from `rust-toolchain.toml` and run `cargo build --release --locked -p dial` for shipping optimization. `make build` and `make update` default to the optimized `local` profile (incremental compilation, no LTO); pass `PROFILE=release` for shipping-equivalent builds (opt-level 3, no cross-crate LTO). `make update` rebuilds from the checkout, backs up existing binaries, and retains only the three newest backups at each managed location. `make check`, `make test-lib`, and `make test-module MOD=module::path` provide narrower development checks; `make test` retains the full Rust suite. CI builds and tests with the `ci` profile (unoptimized, no debug info) and caches Rust dependencies separately for test, lint, and release jobs. Main CI builds unsigned candidates alongside tests; the tag workflow requires a completed successful push-to-main CI run for the exact tagged commit before fallback builds, signing or publication. Python tests run under pytest in CI; optional model/runtime dependencies are separate from the Rust executable.
 
 `make test-python` and `make test-release-policy` check the selected `PYTHON` interpreter before
 starting their suites. Missing or broken `pytest`/`cryptography` imports fail with the interpreter
@@ -395,7 +403,7 @@ dial -c                               # continue the latest session   (-r <id-pr
 ```
 
 To rebuild after changing this checkout, run `make update` here (or `make -C /path/to/dial update`).
-This runs `cargo build -p dial --bin dial --profile local --locked --timings`: an incremental build without the shipping profile's thin LTO. Dependencies stay optimized at level 2; Dial itself uses level 1 and more parallel codegen to reduce rebuild time. Published releases and `cargo install` still use the unchanged release profile. It copies the binary to `bin/dial` in this checkout (git-ignored), and installs it over the `dial` your PATH resolves to (or `~/.local/bin/dial` if none), also refreshing `~/.cargo/bin/dial` when present. Previous copies are kept as `dial.bak-<stamp>` (three most recent). Use `make update PROFILE=release` for shipping-equivalent optimization.
+This runs `cargo build -p dial --bin dial --profile local --locked --timings`: an incremental build at lower optimization than the shipping profile. Dependencies stay optimized at level 2; Dial itself uses level 1 and more parallel codegen to reduce rebuild time. Published releases and `cargo install` use the release profile. It copies the binary to `bin/dial` in this checkout (git-ignored), and installs it over the `dial` your PATH resolves to (or `~/.local/bin/dial` if none), also refreshing `~/.cargo/bin/dial` when present. Previous copies are kept as `dial.bak-<stamp>` (three most recent). Use `make update PROFILE=release` for shipping-equivalent optimization.
 `cargo install --path . --locked` remains available when you specifically want a release build
 installed into Cargo's bin directory instead. `command -v dial` shows which copy your terminal
 will run, and `make help` lists the other build and check targets. Restart any running dial
