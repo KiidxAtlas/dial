@@ -321,12 +321,16 @@ impl Shell {
             .map(|s| s.id.clone())
             .collect();
         let pinned = crate::storage::session_pins::load(&layout.user_dir)?;
-        Ok(
+        let mut picker =
             crate::ui::session_picker::Picker::new(sessions, pinned, current, query, tree)
                 .scope(all, total)
                 .with_open_elsewhere(open_elsewhere)
-                .with_show_empty(show_empty),
-        )
+                .with_show_empty(show_empty);
+        if !all && total == 0 {
+            // Only an empty project pays for the count its empty state offers.
+            picker = picker.with_elsewhere(Session::count_for_picker(layout, true)?);
+        }
+        Ok(picker)
     }
 
     /// Rebuilds the picker for `scope`, keeping the highlighted session when it is still listed.

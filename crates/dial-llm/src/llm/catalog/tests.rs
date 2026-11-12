@@ -1385,8 +1385,11 @@ fn hosted_catalog_capabilities_match_what_requests_assume() {
         (entries[1].metadata.vision, entries[1].metadata.reasoning),
         (runtime.vision, runtime.reasoning)
     );
-    // Discovery does not attach a list price as if the provider had reported one.
+    // Discovery does not attach a list price as if the provider had reported one; the bundled
+    // card's list price stays available separately, labelled as an estimate by the picker.
     assert!(entries[1].metadata.pricing.is_none());
+    assert!(list_pricing(selection).is_some_and(|p| p.prompt > 0.0 && p.completion > 0.0));
+    assert!(list_pricing(&entries[2].selection).is_none());
     // A model no source describes stays unknown rather than guessed from its name.
     assert_eq!(
         (

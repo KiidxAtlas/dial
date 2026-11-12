@@ -30,29 +30,34 @@ pub(crate) fn user_dir() -> Result<std::path::PathBuf, String> {
         .map_err(|error| format!("cannot access the SSH connection state: {error:#}"))
 }
 
-/// Every addressable host as a connection target: `[ssh_hosts]` entries carry their HostName,
-/// user, port, and key and win over `~/.ssh/config` aliases; any other name is left to OpenSSH.
+/// Every addressable host as a connection target. `[ssh_hosts]` entries carry their own HostName,
+/// user, port, and key and win over `~/.ssh/config` aliases with the same name. A discovered alias
+/// stays opaque: OpenSSH applies its full configuration (ProxyJump, Match, IdentityAgent, ...) to
+/// the alias itself, so the partial fields Dial parsed are never copied into connection arguments.
 pub fn host_targets(
     home: &std::path::Path,
     configured: &BTreeMap<String, SshHostConfig>,
 ) -> BTreeMap<String, Target> {
-    resolve_hosts(home, configured)
+    let mut targets: BTreeMap<String, Target> = config::discover(home)
         .into_iter()
-        .map(|host| {
-            let target = match host.hostname {
-                Some(hostname) => Target {
-                    name: host.alias.clone(),
-                    host: hostname,
-                    user: host.user,
-                    port: host.port,
-                    key: host.identity_file.map(std::path::PathBuf::from),
-                    compat: None,
-                },
-                None => Target::opaque(&host.alias),
-            };
-            (host.alias, target)
-        })
-        .collect()
+        .map(|host| (host.alias.clone(), Target::opaque(&host.alias)))
+        .collect();
+    for (alias, entry) in configured {
+        targets.insert(alias.clone(), configured_target(alias, entry));
+    }
+    targets
+}
+
+/// The explicit connection target for a `[ssh_hosts]` entry.
+fn configured_target(name: &str, entry: &SshHostConfig) -> Target {
+    Target {
+        name: name.to_owned(),
+        host: entry.host.clone(),
+        user: entry.user.clone(),
+        port: entry.port,
+        key: entry.key.as_ref().map(std::path::PathBuf::from),
+        compat: None,
+    }
 }
 
 fn target_for(hosts: &BTreeMap<String, Target>, name: &str) -> Target {
@@ -202,14 +207,7 @@ impl SshTool {
     /// port, and key; any other name is an alias that OpenSSH resolves itself.
     fn target(&self, name: &str) -> Target {
         match self.hosts.get(name) {
-            Some(entry) => Target {
-                name: name.to_owned(),
-                host: entry.host.clone(),
-                user: entry.user.clone(),
-                port: entry.port,
-                key: entry.key.as_ref().map(std::path::PathBuf::from),
-                compat: None,
-            },
+            Some(entry) => configured_target(name, entry),
             None => Target::opaque(name),
         }
     }

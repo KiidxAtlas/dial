@@ -976,6 +976,8 @@ fn test_files_declared_inside_inline_modules_resolve_below_that_module() {
 /// crates before it in this list and on nothing else; an unlisted crate is a violation, so a new
 /// crate is placed in the order deliberately.
 const CRATE_LAYERS: &[&str] = &[
+    // Plain-data wire vocabulary shared by the engine and clients; depends on nothing.
+    "dial-protocol",
     "dial-build-info",
     "dial-core",
     "dial-llm",
@@ -985,6 +987,8 @@ const CRATE_LAYERS: &[&str] = &[
     "dial-agent",
     "dial-ui",
     "dial-app",
+    // Frontend client: speaks the wire protocol; depends only on dial-protocol.
+    "dial-client",
 ];
 
 /// Workspace-crate dependencies of one crate's manifest that are not in the layers below it.

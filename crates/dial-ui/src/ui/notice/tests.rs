@@ -179,7 +179,7 @@ fn received_messages_use_the_irc_lane_without_inventing_a_peer_body() {
         }
         let worker = plain(&rows("Notice", worker, 100, &ctx));
         assert!(
-            worker[0].contains("IRC") && worker[0].contains("reviewer"),
+            worker[0].contains("Message") && worker[0].contains("reviewer"),
             "{worker:?}"
         );
         assert!(
@@ -256,4 +256,40 @@ fn warnings_and_failures_are_cards_in_their_severity_color() {
     // Ordinary command results stay quiet.
     let help = plain(&rows("Help", "/review  review changes", 60, &env.ctx()));
     assert!(!help[0].starts_with(theme.sym(Sym::BoxTl)), "{help:?}");
+}
+
+#[test]
+fn open_work_notices_read_plainly_and_only_required_work_is_a_warning() {
+    let env = Env::new();
+    let theme = &env.theme;
+    let optional = plain(&rows(
+        "Notice",
+        "Outstanding work retained: 0 execution step(s), 0 required deliverable(s), 1 optional follow-up(s). This answer does not mark that work complete.\n1. Run the live check",
+        80,
+        &env.ctx(),
+    ))
+    .join("\n");
+    assert!(!optional.starts_with(theme.sym(Sym::BoxTl)), "{optional}");
+    assert!(
+        optional.contains("1 optional follow-up for later; nothing required is left."),
+        "{optional}"
+    );
+    assert!(optional.contains("Run the live check"), "{optional}");
+    assert!(!optional.contains("execution step"), "{optional}");
+    let required = plain(&rows(
+        "Notice",
+        "Outstanding work retained: 2 execution step(s), 1 required deliverable(s), 0 optional follow-up(s). This answer does not mark that work complete.",
+        80,
+        &env.ctx(),
+    ));
+    assert!(
+        required[0].starts_with(theme.sym(Sym::BoxTl)) && required[0].contains("Unfinished work"),
+        "{required:?}"
+    );
+    assert!(
+        required
+            .join("\n")
+            .contains("2 steps and 1 deliverable still open. This answer does not finish them."),
+        "{required:?}"
+    );
 }

@@ -2228,7 +2228,7 @@ dependencies = [
 
 [[package]]
 name = "dial"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2238,6 +2238,7 @@ dependencies = [
  "dial-agent",
  "dial-app",
  "dial-build-info",
+ "dial-client",
  "dial-computer",
  "dial-core",
  "dial-llm",
@@ -2261,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "dial-agent"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "ast-grep-language",
@@ -2271,7 +2272,7 @@ dependencies = [
  "dial-llm",
  "dial-storage",
  "dial-tools",
- "fancy-regex 0.16.2",
+ "fancy-regex 0.19.2",
  "flate2",
  "fontdue",
  "globset",
@@ -2301,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "dial-app"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2312,6 +2313,7 @@ dependencies = [
  "dial-computer",
  "dial-core",
  "dial-llm",
+ "dial-protocol",
  "dial-storage",
  "dial-tools",
  "dial-ui",
@@ -2341,14 +2343,23 @@ dependencies = [
 
 [[package]]
 name = "dial-build-info"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
+name = "dial-client"
+version = "0.3.6"
+dependencies = [
+ "dial-protocol",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "dial-computer"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2392,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "dial-core"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -2413,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "dial-llm"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -2448,8 +2459,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dial-protocol"
+version = "0.3.6"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "dial-storage"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2476,7 +2494,7 @@ dependencies = [
 
 [[package]]
 name = "dial-tools"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2498,7 +2516,7 @@ dependencies = [
  "dial-llm",
  "dial-storage",
  "encoding_rs",
- "fancy-regex 0.16.2",
+ "fancy-regex 0.19.2",
  "flate2",
  "futures",
  "globset",
@@ -2551,7 +2569,7 @@ dependencies = [
 
 [[package]]
 name = "dial-ui"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2858,17 +2876,6 @@ checksum = "b95f7c0680e4142284cf8b22c14a476e87d61b004a3a0861872b32ef7ead40a2"
 dependencies = [
  "bit-set 0.5.3",
  "regex",
-]
-
-[[package]]
-name = "fancy-regex"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "998b056554fbe42e03ae0e152895cd1a7e1002aec800fdc6635d20270260c46f"
-dependencies = [
- "bit-set 0.8.0",
- "regex-automata",
- "regex-syntax",
 ]
 
 [[package]]
@@ -3943,9 +3950,9 @@ dependencies = [
 
 [[package]]
 name = "itoa"
-version = "1.0.18"
+version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
 name = "jaq-core"

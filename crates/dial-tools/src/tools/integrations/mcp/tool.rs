@@ -24,8 +24,9 @@ const MAX_DESCRIPTION: usize = 2048;
 /// Server-supplied input schemas are sent with every request that offers the tool; bound them
 /// like descriptions ([`bounded_input_schema`]).
 const MAX_INPUT_SCHEMA: usize = 16 * 1024;
-/// Base64 of the PNG signature: only PNG image blocks reach the shared image-attachment path.
-const PNG_BASE64_PREFIX: &str = "iVBORw0KGgo";
+/// Image types that reach the shared image-attachment path; each block is checked against its
+/// decoded magic bytes, so a mislabelled block is noted only.
+const ATTACHABLE_IMAGES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 /// What `tools/list` says about one tool.
 #[derive(Clone, Debug, PartialEq)]
@@ -693,48 +694,56 @@ fn strip_schema_annotations(node: &mut Value) {
     }
 }
 
-/// The first PNG image block, as the shared tool-image envelope (`data.artifact`) that the agent
-/// attaches for a model route that accepts images. Other image types and audio stay noted only.
-fn png_attachment(result: &Value) -> Option<Value> {
-    result
+/// The first attachable image block (PNG, JPEG, GIF or WebP whose bytes match its declared type),
+/// as the shared tool-image envelope (`data.artifact`) that the agent attaches for a model route
+/// that accepts images. Other image types and audio stay noted only.
+fn image_attachment(result: &Value) -> Option<Value> {
+    let block = result
         .get("content")?
         .as_array()?
         .iter()
-        .find(|block| png_block(block))
-        .map(
-            |block| json!({"data": block["data"], "encoding": "base64", "media_type": "image/png"}),
-        )
+        .find(|block| attachable_image(block).is_some())?;
+    let media_type = attachable_image(block)?;
+    Some(json!({"data": block["data"], "encoding": "base64", "media_type": media_type}))
 }
 
-fn png_block(block: &Value) -> bool {
-    block.get("type").and_then(Value::as_str) == Some("image")
-        && block.get("mimeType").and_then(Value::as_str) == Some("image/png")
-        && block
-            .get("data")
-            .and_then(Value::as_str)
-            .is_some_and(|data| data.starts_with(PNG_BASE64_PREFIX))
+/// The declared media type of an image block whose leading bytes confirm it.
+fn attachable_image(block: &Value) -> Option<&'static str> {
+    use base64::Engine;
+    if block.get("type").and_then(Value::as_str) != Some("image") {
+        return None;
+    }
+    let declared = block.get("mimeType").and_then(Value::as_str)?;
+    let declared = ATTACHABLE_IMAGES
+        .into_iter()
+        .find(|kind| *kind == declared)?;
+    // 16 base64 characters decode to the first 12 bytes, enough for every signature (WebP's
+    // `WEBP` tag ends at byte 12).
+    let head = block.get("data").and_then(Value::as_str)?.get(..16)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(head)
+        .ok()?;
+    (crate::llm::images::sniff_mime(&bytes) == Some(declared)).then_some(declared)
 }
 
 /// Flattens a `tools/call` result: text blocks verbatim, other block kinds noted by type. The text
-/// is the server's, so control characters are stripped and the length bounded. The first PNG image
-/// travels in `data.artifact` for vision routes. `structuredContent` is appended only when no text
-/// block already carries the same JSON (servers are asked to send both).
+/// is the server's, so control characters are stripped and the length bounded. The first PNG,
+/// JPEG, GIF or WebP image travels in `data.artifact` for vision routes. `structuredContent` is
+/// appended only when no text block already carries the same JSON (servers are asked to send both).
 pub fn render_result(result: &Value) -> ToolOutput {
     let blocks = result.get("content").and_then(Value::as_array);
-    let attachment = png_attachment(result);
+    let attachment = image_attachment(result);
     let mut attached = attachment.is_some();
     let mut parts: Vec<String> = blocks
         .map(|blocks| {
             blocks
                 .iter()
-                .map(|block| {
-                    if attached && png_block(block) {
+                .map(|block| match attachable_image(block) {
+                    Some(kind) if attached => {
                         attached = false;
-                        "[image content, image/png, attached for models that accept images]"
-                            .to_owned()
-                    } else {
-                        render_block(block)
+                        format!("[image content, {kind}, attached for models that accept images]")
                     }
+                    _ => render_block(block),
                 })
                 .collect()
         })

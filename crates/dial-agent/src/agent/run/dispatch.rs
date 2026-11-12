@@ -7,6 +7,8 @@ use crate::agent::*;
 mod controller_tests;
 #[cfg(test)]
 mod image_question_tests;
+#[cfg(test)]
+mod plugin_sdk_tests;
 pub(in crate::agent) mod result_budget;
 pub(in crate::agent::run) mod search_index;
 #[cfg(test)]

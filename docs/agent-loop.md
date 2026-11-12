@@ -2136,7 +2136,9 @@ false). File paths, `@references`, code and quoted text are kept verbatim. An un
   It must not manufacture permission gates or open questions for already actionable tasks.
 - It fails closed: if the drafter errors, is cancelled, hits its output limit, returns an empty
   prompt, fails the verbatim-material check, or the user cancels review, nothing is sent to the
-  main model. For a steering message, any steering still queued behind it is dropped too.
+  main model. For deferred steering, only the message whose draft failed or was rejected in
+  review is lost (the error says so); later steering stays queued and is drafted before the next
+  message. An interrupt also drops the steering queued behind it.
 - Before review, a deterministic check requires explicit code/quoted spans, path-like tokens,
   `@references` and numeric tokens from the typed message to remain in the draft. The check
   does not echo missing text in errors, make another model request, or send raw text as a fallback.

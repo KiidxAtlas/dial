@@ -383,6 +383,23 @@ fn grep_filters_by_glob_and_skips_binary_files() {
 }
 
 #[test]
+fn oversized_limit_and_context_are_lowered_visibly() {
+    let (dir, ws) = workspace();
+    numbered_file(&dir, "f.txt", 10);
+    let out = grep(
+        &ws,
+        json!({"pattern": "l5$", "context": 50, "limit": 100_000}),
+    );
+    assert!(
+        out.contains("[context=50 is above the maximum 10; used 10]"),
+        "{out}"
+    );
+    assert!(out.contains("[limit=100000 is above the maximum"), "{out}");
+    let within = grep(&ws, json!({"pattern": "l5$", "context": 2}));
+    assert!(!within.contains("above the maximum"), "{within}");
+}
+
+#[test]
 fn grep_context_lines_merge_and_separate_groups() {
     let (dir, ws) = workspace();
     numbered_file(&dir, "f.txt", 10);

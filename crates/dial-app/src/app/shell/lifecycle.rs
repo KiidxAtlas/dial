@@ -155,6 +155,7 @@ impl Shell {
             skills_listing: String::new(),
             pending_config: None,
             busy_overlay: None,
+            palette_recent: Vec::new(),
             pending_verification: None,
             pending_resume: None,
             pending_favorite: None,
@@ -447,6 +448,7 @@ impl Shell {
                 branch,
                 approval: format!("{:?}", app.config.approval).to_lowercase(),
                 sandbox: format!("{:?}", app.config.sandbox.mode).to_lowercase(),
+                approval_key: self.keys.label(Action::ApprovalCycle),
                 doctor_issues: usize::from(app.store_error.is_some())
                     + usize::from(self.themes.last_error().is_some())
                     + usize::from(selection.provider.is_empty()),

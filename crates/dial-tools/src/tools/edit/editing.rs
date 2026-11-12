@@ -1245,10 +1245,30 @@ pub(crate) fn finish(ws: &Workspace, changes: Vec<Change>, commit: bool) -> Resu
 }
 pub(crate) fn finish_with(
     ws: &Workspace,
-    mut changes: Vec<Change>,
+    changes: Vec<Change>,
     commit: bool,
     execution: &Execution<'_>,
 ) -> Result<String, String> {
+    finish_impl(ws, changes, commit, execution, None).map(|output| output.text)
+}
+
+pub(crate) fn finish_write_with(
+    ws: &Workspace,
+    changes: Vec<Change>,
+    execution: &Execution<'_>,
+    policies: &[crate::tools::fs::write::Policy],
+    args: &Value,
+) -> Result<crate::tools::ToolOutput, String> {
+    finish_impl(ws, changes, true, execution, Some((policies, args)))
+}
+
+fn finish_impl(
+    ws: &Workspace,
+    mut changes: Vec<Change>,
+    commit: bool,
+    execution: &Execution<'_>,
+    write: Option<(&[crate::tools::fs::write::Policy], &Value)>,
+) -> Result<crate::tools::ToolOutput, String> {
     let _lease = if commit {
         Some(super::document_transaction::Lease::acquire(
             changes.iter().map(|change| change.path.clone()),
@@ -1263,6 +1283,49 @@ pub(crate) fn finish_with(
     };
     let mut report = Vec::new();
     let mut records = Vec::new();
+    let mut receipts = Vec::new();
+    if let Some((policies, _)) = write {
+        execution.check_cancel()?;
+        // Even an unchanged retry must pass admission for every requested destination.
+        execution.authorize(
+            &changes
+                .iter()
+                .map(|change| change.path.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let mut pending = Vec::new();
+        for change in changes {
+            generated_guard(
+                ws,
+                &change.path,
+                change.before.as_ref().map(|before| before.text.as_str()),
+            )?;
+            let policy = policies
+                .iter()
+                .find(|policy| policy.path == change.path)
+                .ok_or("missing write policy")?;
+            if policy.idempotent
+                && change.before.as_ref().map(|before| before.text.as_str())
+                    == change.after.as_deref()
+            {
+                // Recheck the observed no-op under the document lease; it will not enter commit.
+                let current = edit_transaction::read(ws, &change.path)?;
+                if current.as_ref().map(|before| before.text.as_str()) != change.after.as_deref() {
+                    return Err(format!(
+                        "{} changed during idempotent write; nothing was written",
+                        ws.rel(&change.path)
+                    ));
+                }
+                receipts.push(crate::tools::fs::write::receipt(ws, &change, "unchanged"));
+            } else {
+                pending.push(change);
+            }
+        }
+        changes = pending;
+        if changes.is_empty() {
+            execution.mark_no_change();
+        }
+    }
     for change in &mut changes {
         execution.check_cancel()?;
         let before = change.before.as_ref().map(|x| x.text.as_str());
@@ -1327,6 +1390,31 @@ pub(crate) fn finish_with(
                 }
             }
         }
+        if let Some((policies, _)) = write {
+            let policy = policies
+                .iter()
+                .find(|policy| policy.path == change.path)
+                .ok_or("missing write policy")?;
+            if let Some(expected) = &policy.exact_sha256
+                && !change
+                    .after
+                    .as_ref()
+                    .is_some_and(|after| super::edit_source::revision_hex(after) == *expected)
+            {
+                return Err(
+                    "syntax preparation changed artifact bytes; nothing was written".into(),
+                );
+            }
+            receipts.push(crate::tools::fs::write::receipt(
+                ws,
+                change,
+                if change.before.is_some() {
+                    "overwrote"
+                } else {
+                    "created"
+                },
+            ));
+        }
         let summary = change.report.clone().unwrap_or_else(|| {
             format!(
                 "{} {}",
@@ -1373,13 +1461,19 @@ pub(crate) fn finish_with(
             });
         report.push(format!("{header}{summary}{}",if change.authored_whole{String::new()}else if kind_changed{"\nCarrier extension changed; raw bytes were retained. Read the destination before further edits.".into()}else{super::diff::preview(logical_before,logical_after)}));
     }
-    if commit {
-        execution.authorize(
-            &changes
+    if commit && !changes.is_empty() {
+        let paths = if let Some((policies, _)) = write {
+            policies
+                .iter()
+                .map(|policy| policy.path.clone())
+                .collect::<Vec<_>>()
+        } else {
+            changes
                 .iter()
                 .map(|change| change.path.clone())
-                .collect::<Vec<_>>(),
-        )?;
+                .collect::<Vec<_>>()
+        };
+        execution.authorize(&paths)?;
         warnings.extend(edit_transaction::commit(ws, &changes)?);
         let mut store = ws.store();
         for change in &changes {
@@ -1437,11 +1531,53 @@ pub(crate) fn finish_with(
     if !commit {
         output.insert_str(0, "Preview only; no files modified.\n");
     }
-    for note in warnings {
+    for note in &warnings {
         output.push('\n');
-        output.push_str(&note);
+        output.push_str(note);
     }
-    Ok(output)
+    if let Some((policies, args)) = write {
+        receipts.sort_by_key(|receipt| {
+            policies.iter().position(|policy| {
+                ws.rel(&policy.path) == receipt["path"].as_str().unwrap_or_default()
+            })
+        });
+        let verification = if crate::tools::edit::editing::verify_targets(args)?.is_empty() {
+            "not_requested"
+        } else {
+            "requested"
+        };
+        let data = json!({"files":receipts,"changed":!changes.is_empty(),"verification":{"status":verification},"warnings":warnings});
+        if args["receipt"] == true || present(args, "files") || changes.is_empty() {
+            let headers = receipts
+                .iter()
+                .map(|receipt| {
+                    format!(
+                        "[{}#{}]\n[Source raw SHA256:{}]",
+                        super::edit_source::display_path(
+                            receipt["path"].as_str().unwrap_or_default().to_owned()
+                        ),
+                        receipt["tag"].as_str().unwrap_or_default(),
+                        receipt["sha256"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            output = format!("{headers}\n{data}");
+        }
+        let output = crate::tools::ToolOutput {
+            text: output,
+            data: Some(data),
+            is_error: false,
+            execution: Default::default(),
+        };
+        Ok(if changes.is_empty() {
+            with_outcome(output, EditOutcome::AlreadyApplied)
+        } else {
+            output
+        })
+    } else {
+        Ok(crate::tools::ToolOutput::ok(output))
+    }
 }
 
 /// Keep the built-in hashline model projection separate from the raw transcript result. A failed

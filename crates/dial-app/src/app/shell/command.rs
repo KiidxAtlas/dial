@@ -565,17 +565,10 @@ impl Shell {
                     );
                     return Ok(Step::Done);
                 }
-                let task = if args.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Task: {args}")
-                };
                 return self.run_turn(
                     app,
                     agent,
-                    &format!(
-                        "Use the \"{skill}\" skill (load it with the skill tool first).{task}"
-                    ),
+                    &crate::app::command_registry::skill_prompt(skill, args),
                 );
             }
             _ => match self.commands.iter().find(|def| def.name == name) {
@@ -1079,79 +1072,64 @@ impl Shell {
             );
             return Ok(Step::Done);
         };
-        // Resolve and validate the exact conversation range before any filesystem mutation.
-        let checkpoint_turns = match agent.session().rewind_checkpoint_turns(turns) {
-            Ok(turns) => turns,
-            Err(error) => {
+        // The engine owner validates the range, runs the gate, restores files, then rewinds.
+        let mut lines = Vec::new();
+        let trajectory = self.last_trajectory;
+        let mut monitor = false;
+        let result = crate::rewind::undo(&app.config, &app.interrupt, agent, turns, || {
+            if let (Some(trajectory), Some(store)) = (trajectory, app.store.as_ref()) {
+                let outcome = Outcome {
+                    trajectory,
+                    score: 0.0,
+                    source: "user:undo".into(),
+                    reference: None,
+                };
+                match store.outcome(&outcome) {
+                    Ok(()) => monitor = true,
+                    Err(error) => lines.push(format!("could not record undo feedback: {error:#}")),
+                }
+            }
+        });
+        if monitor {
+            self.start_live_monitor("Undo", app.config.clone());
+        }
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(crate::rewind::UndoRefusal::Range(error)) => {
                 self.note("Undo", format!("{error:#}"));
                 return Ok(Step::Done);
             }
-        };
-        let approval = match crate::app::commands::branch::preflight_rewind(agent, turns) {
-            Ok(approval) => approval,
-            Err(error) => {
+            Err(crate::rewind::UndoRefusal::Gate(error)) => {
                 self.note("Undo", format!("{error:#}; files and conversation kept"));
                 return Ok(Step::Done);
             }
         };
-        let checkpoint_session = agent.session().id().to_owned();
-        let mut lines = Vec::new();
-        if let (Some(trajectory), Some(store)) = (self.last_trajectory, app.store.as_ref()) {
-            let outcome = Outcome {
-                trajectory,
-                score: 0.0,
-                source: "user:undo".into(),
-                reference: None,
-            };
-            match store.outcome(&outcome) {
-                Ok(()) => self.start_live_monitor("Undo", app.config.clone()),
-                Err(error) => lines.push(format!("could not record undo feedback: {error:#}")),
+        if let Some(report) = &outcome.files {
+            lines.push(format!(
+                "restored {} file(s), removed {}",
+                report.restored.len(),
+                report.removed.len()
+            ));
+            if !report.warnings.is_empty() {
+                lines.extend(report.warnings.iter().cloned());
+                lines.push(
+                    "Restoration incomplete; conversation kept. Inspect files before retrying."
+                        .into(),
+                );
             }
         }
-        if !checkpoint_turns.is_empty() {
-            let result = agent
-                .checkpoints()
-                .context("checkpoints unavailable; conversation kept")
-                .and_then(|checkpoints| {
-                    checkpoints.rollback_conversation(agent.session().id(), &checkpoint_turns)
-                });
-            match result {
-                Ok(report) => {
-                    lines.push(format!(
-                        "restored {} file(s), removed {}",
-                        report.restored.len(),
-                        report.removed.len()
-                    ));
-                    if !report.warnings.is_empty() {
-                        lines.extend(report.warnings);
-                        lines.push("Restoration incomplete; conversation kept. Inspect files before retrying.".into());
-                        self.note("Undo", lines.join("\n"));
-                        return Ok(Step::Done);
-                    }
-                }
-                Err(error) => {
-                    lines.push(format!("rollback: {error:#}; conversation kept"));
-                    self.note("Undo", lines.join("\n"));
-                    return Ok(Step::Done);
-                }
-            }
+        if let Some(error) = &outcome.rollback_error {
+            lines.push(format!("rollback: {error}; conversation kept"));
         }
-        agent.cancel_background_compaction();
-        match crate::app::commands::branch::rewind_approved(app, agent, approval) {
-            Ok(rewound) => {
-                lines.push(format!("dropped {} message(s)", rewound.dropped));
-                agent.record_feedback(crate::telemetry::FeedbackKind::Undo, turns as u64);
-                lines.extend(rewound.note);
-                if let Some(checkpoints) = agent.checkpoints()
-                    && let Err(error) = checkpoints
-                        .finalize_conversation_rollback(&checkpoint_session, &checkpoint_turns)
-                {
-                    lines.push(format!(
-                        "conversation rewound, checkpoint cleanup: {error:#}"
-                    ));
-                }
-            }
-            Err(error) => lines.push(format!("rewind: {error:#}")),
+        if let Some(dropped) = outcome.dropped {
+            lines.push(format!("dropped {dropped} message(s)"));
+            lines.extend(outcome.note);
+        }
+        if let Some(error) = outcome.cleanup_error {
+            lines.push(format!("conversation rewound, checkpoint cleanup: {error}"));
+        }
+        if let Some(error) = outcome.rewind_error {
+            lines.push(format!("rewind: {error}"));
         }
         self.note("Undo", lines.join("\n"));
         Ok(Step::Done)

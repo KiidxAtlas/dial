@@ -12,8 +12,12 @@ that every model will suggest it. You can request it directly:
 
 > Monitor the existing `site` background job for errors.
 
-The agent calls `monitor` with `action: "start"`, a unique `name`, and exactly one of
-`job`, `run`, `path` or `after_secs`. **Every start/rearm asks for explicit approval**, even in automatic mode
+The agent calls `monitor` with `action: "start"` and exactly one of `job`, `run`, `path` or
+`after_secs`; in the consolidated tool list these are `bg` with `action: "watch"`, `"watches"` and
+`"unwatch"`. `name` is optional: without it the watch is named after its job, run, log file name
+or `timer`, with a `-2`, `-3`, ... suffix when that name is taken, and the receipt reports the
+name to use with `stop`. Sending a watch argument such as `after_secs` with `bg`'s own `start`
+is refused with a hint naming the `watch` route. **Every start/rearm asks for explicit approval**, even in automatic mode
 or with a reusable tool grant. Read-only mode refuses starts; deny rules still apply.
 There is no blanket approval of repairs: edits, commands, extra access and process control
 continue to follow existing permissions. Approving observation does not authorize killing
@@ -152,8 +156,17 @@ Monitoring failures are reported as monitoring problems, not proof the applicati
   waiting for user input revokes watches. Stopping observation never stops the app.
 - Workspace-root changes and mutable workspace reconfiguration revoke watches; removing an
   attached root cannot leave its approved logs readable through a stale watch.
-- Watches are process-local, not persisted across restart/session rebuild. There is no
+- Armed watches are process-local and end with a restart. A settings change in the terminal
+  keeps running `bg` jobs and armed watches (and their wake state) when the project root is
+  unchanged; moving to another project or worktree ends them. There is no
   unattended daemon or automatic wake in print, RPC, ACP or child-worker execution.
+- **Saved watches.** `save: true` on a log-file (`path`), named-run (`run`) or timer watch also
+  stores its arguments (never captured output) in this project's private Dial state, outside the
+  workspace. `bg` `action: "saved"` lists them, `restore`
+  (with `name`) re-arms one through the normal start path, and `forget`
+  deletes one. Restoring needs approval like any start, reads only output written
+  after it, and is never automatic on resume. Job and PID watches cannot be saved. At most 32
+  watches are saved per project.
 - Forked tool sessions never observe the parent's background jobs; file and named-run
   watches remain available to integrations that explicitly poll them.
 
@@ -164,6 +177,12 @@ does **not** capture another terminal, attach a debugger, discover containers, o
 app to redirect its output. An external application must write an accessible log file or be
 explicitly launched with `dial run`. Dial-owned jobs reuse their existing output capture
 without consuming the normal `bg output` cursor or changing process ownership.
+
+**PID watches** (`pid: N`, macOS and Linux) observe an existing process of the same user for
+**exit only**: Dial checks that it still exists (signal 0, nothing delivered) and rechecks its start
+time every five seconds, so a reused PID counts as an exit. Another user's process is refused,
+its output is never read, it is never signalled, and its exit status is not available. A
+`pattern` does not apply. Starting one needs approval like any watch.
 
 Only existing regular files under approved workspace roots are accepted; private-state
 restrictions still apply. File paths are revalidated on polling. Rotation/replacement or

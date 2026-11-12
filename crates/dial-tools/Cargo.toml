@@ -61,14 +61,14 @@ cab.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true
 sevenz-rust2.workspace = true
-rars.workspace = true
+rars = { workspace = true, optional = true }
 x509-parser.workspace = true
-object.workspace = true
-parquet.workspace = true
-arrow-ipc.workspace = true
-arrow-array.workspace = true
-arrow-schema.workspace = true
-arrow-cast.workspace = true
+object = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+arrow-cast = { workspace = true, optional = true }
 calamine.workspace = true
 plist.workspace = true
 mail-parser.workspace = true
@@ -87,12 +87,23 @@ rars = { workspace = true, features = ["write"] }
 sevenz-rust2 = { workspace = true, features = ["compress"] }
 
 [features]
-default = ["voice", "embedded-shell", "embedded-js"]
+default = ["voice", "embedded-shell", "embedded-js", "data-formats"]
 voice = ["dep:cpal"]
 # Built-in POSIX shell for the `bash` tool (`shell.backend = "embedded"`); brush shell language plus coreutils builtins.
 embedded-shell = ["dep:brush-core", "dep:brush-builtins"]
 # Embedded JavaScript engine for `eval` JavaScript when no Node runtime is installed (QuickJS-ng).
 embedded-js = ["dep:rquickjs"]
+# `read` decoders for Parquet/Arrow IPC, RAR archives and ELF/Mach-O/PE/ar binaries. These are the
+# heaviest decoder dependencies; without them those formats report that the build omits them.
+data-formats = [
+    "dep:rars",
+    "dep:object",
+    "dep:parquet",
+    "dep:arrow-ipc",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:arrow-cast",
+]
 # Test helpers used by other crates' tests (`#[cfg(test)]` items compiled only for this crate otherwise).
 test-support = []
 

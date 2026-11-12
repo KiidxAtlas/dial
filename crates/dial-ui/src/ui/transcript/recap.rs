@@ -5,7 +5,7 @@
 //! counts and any recorded handoff, and the bottom edge carries time and tokens. A plain answer
 //! keeps the one-line closing row, and so does a terminal too narrow for a card.
 use super::{
-    super::tool_cards::{Tool, ToolState, Verdict, change_counts, frame, verdict},
+    super::tool_cards::{Tool, ToolState, Verdict, change_counts, check_command, frame, verdict},
     Line, Modifier, Rows, Span, Sym, TranscriptCtx, TurnStats, text,
 };
 use crate::runtime::presentation::{Presentation, Tone};
@@ -37,6 +37,10 @@ pub(super) struct Recap {
     pub lines: BTreeMap<String, (u64, u64)>,
     /// The verdict of the turn's last settled test or build command.
     pub check: Option<Verdict>,
+    /// That command's text when its verdict failed, so the recap can offer to run it again.
+    pub failed_check: Option<String>,
+    /// Numbered steps (`1.`, `2)`, …) in the turn's last answer.
+    pub answer_steps: usize,
 }
 
 impl Recap {
@@ -70,6 +74,7 @@ impl Recap {
     /// Add what a settled call reported: an edit's line counts, a check's verdict.
     pub fn note_result(&mut self, tool: &Tool) {
         if let Some(v) = verdict(tool) {
+            self.failed_check = if v.ok { None } else { check_command(tool) };
             self.check = Some(v);
         }
         if tool.presentation.tone == Tone::Edit
@@ -84,6 +89,111 @@ impl Recap {
             }
         }
     }
+}
+
+/// A follow-up the last turn's recap offers under Alt+1, Alt+2, … in this order: its word on the
+/// card and what the key does. Recovery comes first, so Alt+1 is always the most useful next step
+/// for how the turn ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecapAction {
+    pub label: &'static str,
+    pub run: RecapRun,
+}
+
+/// What a recap follow-up does when its key is pressed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecapRun {
+    /// Run this slash command.
+    Command(&'static str),
+    /// Put this text in the empty composer for review; nothing runs until Enter.
+    Draft(String),
+}
+
+impl RecapAction {
+    fn command(label: &'static str, command: &'static str) -> Self {
+        Self {
+            label,
+            run: RecapRun::Command(command),
+        }
+    }
+}
+
+/// The follow-ups for a turn that ended with `stats` after doing `recap`. Empty for a plain
+/// answer: only a turn that made calls draws a recap card to carry them.
+pub(super) fn actions(stats: &TurnStats, recap: &Recap) -> Vec<RecapAction> {
+    let mut out = Vec::new();
+    if recap.calls == 0 {
+        return out;
+    }
+    // A failed check is the most specific thing to redo: its own command, as a shell line in
+    // the draft, so the user sees exactly what will run.
+    if let Some(command) = &recap.failed_check {
+        out.push(RecapAction {
+            label: "rerun check",
+            run: RecapRun::Draft(format!("!{command}")),
+        });
+    }
+    let outcome = stats.outcome.as_ref();
+    let status = outcome.map_or("", |o| o.status.as_str());
+    if status == "failed" {
+        out.push(RecapAction::command("retry", "/retry"));
+    }
+    if matches!(status, "blocked" | "needs_input" | "incomplete")
+        && outcome.is_some_and(|o| o.open_tasks > 0)
+    {
+        out.push(RecapAction::command("plan", "/todo"));
+    }
+    if outcome
+        .map_or(0, |o| o.changed_files)
+        .max(recap.files.len())
+        > 0
+    {
+        out.push(RecapAction::command("review", "/review-file"));
+        out.push(RecapAction::command("undo", "/undo"));
+    }
+    // An answer that lists steps can become tracked work; the request is drafted for review.
+    if recap.answer_steps >= MIN_STEPS && !out.iter().any(|a| a.label == "plan") {
+        out.push(RecapAction {
+            label: "plan steps",
+            run: RecapRun::Draft(PLAN_STEPS.to_owned()),
+        });
+    }
+    out
+}
+
+/// Numbered steps an answer needs before the recap offers to plan them.
+const MIN_STEPS: usize = 3;
+/// The request the "plan steps" follow-up drafts.
+const PLAN_STEPS: &str =
+    "Turn the numbered steps in your last answer into a plan, then start the first step.";
+
+/// How many numbered list items (`1.`, `2)`) start a line of `answer`, outside code fences.
+pub(super) fn numbered_steps(answer: &str) -> usize {
+    let mut fenced = false;
+    answer
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| {
+            if line.starts_with("```") || line.starts_with("~~~") {
+                fenced = !fenced;
+                return false;
+            }
+            let digits = line.chars().take_while(char::is_ascii_digit).count();
+            !fenced
+                && (1..=3).contains(&digits)
+                && matches!(line[digits..].chars().next(), Some('.' | ')'))
+                && line[digits + 1..].starts_with(' ')
+        })
+        .count()
+}
+
+/// The chord that runs the `index`-th (0-based) recap action: Alt+1 … Alt+9.
+pub fn action_chord(index: usize) -> Option<crate::ui::keys::Chord> {
+    let digit = char::from_digit(u32::try_from(index + 1).ok()?, 10).filter(|d| *d != '0')?;
+    Some(crate::ui::keys::Chord {
+        code: crossterm::event::KeyCode::Char(digit),
+        mods: crossterm::event::KeyModifiers::ALT,
+    })
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -131,7 +241,7 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
         head.push(Span::styled(dot.clone(), theme.fg(Tok::Dim)));
         head.push(Span::styled(
             plural(open, "open task", "open tasks"),
-            theme.fg(Tok::Warning),
+            theme.fg(outcome.map_or(Tok::Warning, |o| super::open_tasks_tok(&o.status))),
         ));
     }
 
@@ -152,9 +262,18 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
             tok,
         ));
     }
+    // The total is only news when no breakdown chip below names where the calls went.
+    let broken_down =
+        recap.lookups + recap.edits + recap.commands + recap.web + recap.services + recap.workers
+            > 0;
     chips.extend(
         [
-            (recap.calls, "call", "calls", Tok::Text),
+            (
+                if broken_down { 0 } else { recap.calls },
+                "call",
+                "calls",
+                Tok::Text,
+            ),
             (recap.lookups, "lookup", "lookups", Tok::Muted),
             (recap.edits, "edit", "edits", Tok::Accent),
             (recap.commands, "command", "commands", Tok::Muted),
@@ -246,17 +365,23 @@ pub(super) fn card(stats: &TurnStats, recap: &Recap, w: u16, ctx: &TranscriptCtx
         card.sections.push((Some("Handoff".into()), rows));
     }
 
-    // Follow-ups for changed files, right where the change is reported.
-    if changed > 0 {
-        card.sections.push((
-            None,
-            vec![Line::from(vec![
-                Span::styled("next  ", theme.fg(Tok::Dim)),
-                Span::styled("/review-file", theme.fg(Tok::Accent)),
-                Span::styled(dot.clone(), theme.fg(Tok::Dim)),
-                Span::styled("/undo", theme.fg(Tok::Accent)),
-            ])],
-        ));
+    // Follow-ups right where the outcome is reported, each under its own Alt+digit.
+    let follow_ups = actions(stats, recap);
+    if !follow_ups.is_empty() {
+        let mut spans = vec![Span::styled("next  ", theme.fg(Tok::Dim))];
+        for (i, action) in follow_ups.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(dot.clone(), theme.fg(Tok::Dim)));
+            }
+            if let Some(chord) = action_chord(i) {
+                spans.push(Span::styled(
+                    format!("{} ", chord.display()),
+                    theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::styled(action.label, theme.fg(Tok::Accent)));
+        }
+        card.sections.push((None, vec![Line::from(spans)]));
     }
 
     // Bottom edge: time and tokens.

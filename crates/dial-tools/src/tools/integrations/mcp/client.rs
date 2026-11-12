@@ -77,6 +77,11 @@ const POLL: Duration = Duration::from_millis(50);
 /// Bound for notifications and answers to server requests.
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Client offers shared by initialization and runtime compatibility diagnostics.
+pub(super) fn client_capabilities() -> Value {
+    json!({"roots": {"listChanged": false}})
+}
+
 enum Failure {
     /// The server answered with a JSON-RPC error.
     Rpc(String),
@@ -195,7 +200,7 @@ impl Shared {
                     json!({"jsonrpc": "2.0", "id": id, "result": {"roots": self.roots_json()}})
                 }
                 _ => {
-                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not supported by dial"}})
+                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "MCP client method unavailable: Dial supports ping and roots/list only; sampling and elicitation are not enabled"}})
                 }
             }),
             (Some(method), None) => {
@@ -461,7 +466,7 @@ impl Client {
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSIONS[0],
-                "capabilities": {"roots": {"listChanged": false}},
+                "capabilities": client_capabilities(),
                 "clientInfo": {"name": "dial", "version": env!("CARGO_PKG_VERSION")},
             }),
             timeout,

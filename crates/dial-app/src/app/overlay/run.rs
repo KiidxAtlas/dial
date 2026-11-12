@@ -315,6 +315,7 @@ pub(in crate::app) fn run_overlay(
         } else {
             1.0
         };
+        ot.set_panel_name(overlay.title());
         ot.draw(|frame| {
             let placements = draw_overlay_frame(frame, env, overlay);
             if progress < 1.0 {

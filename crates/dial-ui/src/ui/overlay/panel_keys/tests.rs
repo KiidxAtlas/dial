@@ -68,3 +68,39 @@ fn sheet_aligns_keys_wraps_notes_and_ends_with_the_way_back() {
     assert!(lines.iter().all(|l| crate::ui::text::width(l) <= 20));
     assert_eq!(lines.last().unwrap(), " Esc back to panel");
 }
+
+#[test]
+fn a_long_footer_keeps_the_action_the_finder_the_sheet_and_the_way_out() {
+    let s = |v: &[&str]| v.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+    let short = s(&["Enter save", "Esc cancel"]);
+    assert_eq!(capped_footer(short.clone(), "F1 keys"), short);
+    let long = s(&[
+        "Enter set main",
+        "",
+        "F7 tune",
+        "Shift+F2 filter",
+        "type to search",
+        "Ctrl+S scope",
+        "Esc close",
+    ]);
+    assert_eq!(
+        capped_footer(long, "F1 keys"),
+        s(&["Enter set main", "type to search", "F1 keys", "Esc close"])
+    );
+    let picker = s(&[
+        "Enter save",
+        "↑↓ preview",
+        "Type filter",
+        "Tab x",
+        "Esc cancel",
+    ]);
+    assert_eq!(
+        capped_footer(picker, "F1 keys")[1],
+        "Type filter",
+        "filtering outranks previewing"
+    );
+    let plain = s(&["Enter open", "↑↓ move", "a add", "x remove", "Esc close"]);
+    let capped = capped_footer(plain, "F1 keys");
+    assert_eq!(capped[1], "↑↓ move");
+    assert_eq!(capped.len(), FOOTER_HINTS);
+}

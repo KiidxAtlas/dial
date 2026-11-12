@@ -959,6 +959,162 @@
             "method"
           ],
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "list_sessions"},
+            "params": {"type": "object", "properties": {"offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50}, "include_empty": {"type": "boolean", "default": false}}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "fork_session"},
+            "params": {"type": "object", "properties": {"session_id": {"type": "string", "minLength": 1}}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "delete_session"},
+            "params": {"type": "object", "properties": {"session_id": {"type": "string", "minLength": 1}}, "additionalProperties": false, "required": ["session_id"]}
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "pin_session"},
+            "params": {"type": "object", "properties": {"session_id": {"type": "string", "minLength": 1}, "pinned": {"type": "boolean"}}, "additionalProperties": false, "required": ["session_id", "pinned"]}
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "list_models"},
+            "params": {"type": "object", "properties": {"provider": {"type": "string", "minLength": 1}}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "settings_schema"},
+            "params": {"type": "object", "properties": {}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "get_settings"},
+            "params": {"type": "object", "properties": {"key": {"type": "string", "minLength": 1}}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "set_setting"},
+            "params": {"type": "object", "properties": {"key": {"type": "string", "minLength": 1}, "value": {"not": {"type": "null"}}, "scope": {"enum": ["global", "project"], "default": "global"}}, "additionalProperties": false, "required": ["key", "value"]}
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "reset_setting"},
+            "params": {"type": "object", "properties": {"key": {"type": "string", "minLength": 1}, "scope": {"enum": ["global", "project"], "default": "global"}}, "additionalProperties": false, "required": ["key"]}
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Checkpointed turns of the active session that changed files, newest first. Result: {checkpoints:[{turn,label,files}]}.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "list_checkpoints"},
+            "params": {"type": "object", "properties": {}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Files one checkpointed turn changed, with writers and overlap signals. Result: {turn,label,files:[{path,writers,later_turns,overlap}],skipped}.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "checkpoint_files"},
+            "params": {"type": "object", "properties": {"turn": {"type": "integer", "minimum": 1}}, "additionalProperties": false, "required": ["turn"]}
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Diff that restoring one file would apply, and the review token binding it to the current bytes. Result: {turn,path,diff,token}.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "checkpoint_diff"},
+            "params": {"type": "object", "properties": {"turn": {"type": "integer", "minimum": 1}, "path": {"type": "string", "minLength": 1}}, "additionalProperties": false, "required": ["turn", "path"]}
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Restores reviewed files of one turn. Every token must still match (else code conflict, nothing written); overlapping files need overlap_confirmed. The restore gets its own checkpoint. Result: {turn,restored}.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "restore_checkpoint_files"},
+            "params": {"type": "object", "properties": {"turn": {"type": "integer", "minimum": 1}, "files": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {"path": {"type": "string"}, "token": {"type": "string"}}, "required": ["path", "token"], "additionalProperties": false}}, "overlap_confirmed": {"type": "boolean", "default": false}}, "additionalProperties": false, "required": ["turn", "files"]}
+          },
+          "required": ["method", "params"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Undoes the last user turns like /undo: restores their checkpointed files, then rewinds the conversation keeping the abandoned branch as a summary. Result: {turns,files,rollback_error,dropped,note,rewind_error,cleanup_error,conversation_kept}.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "undo"},
+            "params": {"type": "object", "properties": {"turns": {"type": "integer", "minimum": 1, "default": 1}}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Extension rows shown by /extensions: configured and curated MCP servers and skill packages. Result: {mcp:[row],skills:[row]} where row is {id,title,summary,tags,origin,state,details}. Read-only; installs and sign-in remain terminal flows.",
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "method": {"const": "list_extensions"},
+            "params": {"type": "object", "properties": {}, "additionalProperties": false}
+          },
+          "required": ["method"],
+          "additionalProperties": false
         }
       ]
     },
@@ -989,6 +1145,10 @@
               "properties": {
                 "message": {
                   "type": "string"
+                },
+                "code": {
+                  "type": "string",
+                  "description": "Protocol 2 only. Clients must treat values they do not know as failed.", "x-known-values": ["busy", "invalid_params", "not_pending", "not_found", "refused", "conflict", "unknown_method", "unsupported_protocol_version", "internal_error", "failed"]
                 }
               },
               "required": [
@@ -1011,6 +1171,9 @@
           "description": "Asks the host to run a host-declared tool; answer with host_tool_result using the same call_id.",
           "properties": {
             "event": {"const": "host_tool_call"},
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "call_id": {"type": "string"},
             "tool": {"type": "string"},
             "arguments": {"type": "object"}
@@ -1023,6 +1186,9 @@
           "description": "Asks the host to read a host-served URI scheme; answer with host_uri_result using the same call_id.",
           "properties": {
             "event": {"const": "host_uri_request"},
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "call_id": {"type": "string"},
             "scheme": {"type": "string"},
             "operation": {"const": "read"},
@@ -1036,6 +1202,9 @@
           "description": "Sign-in URL (and device code, when given) to open in a browser. Carries no tokens.",
           "properties": {
             "event": {"const": "auth_url"},
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "provider": {"type": "string"},
             "url": {"type": "string"},
             "instructions": {"type": ["string", "null"]}
@@ -1048,6 +1217,9 @@
           "description": "Sign-in progress text for a provider. Carries no tokens.",
           "properties": {
             "event": {"const": "auth_progress"},
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "provider": {"type": "string"},
             "message": {"type": "string"}
           },
@@ -1059,6 +1231,9 @@
           "description": "Asks the host for a typed sign-in value; answer with auth_code using the same prompt_id. The answer is never echoed.",
           "properties": {
             "event": {"const": "auth_prompt"},
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "provider": {"type": "string"},
             "prompt_id": {"type": "string"},
             "message": {"type": "string"},
@@ -1073,6 +1248,9 @@
           "description": "Observational policy provenance; never a permission grant or approval response.",
           "properties": {
             "event": {"const": "policy_explanation"},
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "call_id": {"type": "string"},
             "tool": {"type": "string"},
             "message": {"type": "string"},
@@ -1093,6 +1271,9 @@
             "event": {
               "const": "ready"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
+            "engine_version": {"type": "string", "description": "Engine build version, for display and mismatch diagnostics; not a capability signal."},
             "protocol_version": {
               "type": "integer"
             },
@@ -1157,6 +1338,9 @@
             "event": {
               "const": "fatal"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "message": {
               "type": "string"
             }
@@ -1173,6 +1357,8 @@
             "event": {
               "const": "active_session"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "session_id": {
               "type": "string"
             }
@@ -1189,6 +1375,9 @@
             "event": {
               "const": "replay_message"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "message": {}
           },
           "required": [
@@ -1203,6 +1392,9 @@
             "event": {
               "const": "text"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "delta": {
               "type": "string"
             }
@@ -1219,6 +1411,9 @@
             "event": {
               "const": "reasoning"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "delta": {
               "type": "string"
             }
@@ -1235,6 +1430,9 @@
             "event": {
               "const": "tool_arguments"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "index": {
               "type": "integer"
             },
@@ -1259,6 +1457,9 @@
             "event": {
               "const": "tool_call"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "call_id": {
               "type": "string"
             },
@@ -1280,6 +1481,9 @@
             "event": {
               "const": "tool_output"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "name": {
               "type": "string"
             },
@@ -1294,10 +1498,32 @@
         },
         {
           "type": "object",
+          "description": "Engine-built card for a tool call, emitted after tool_call and updated as the call runs: the same label, target, tone, body style, facts and compact preview the terminal renders. A GUI renders these fields instead of parsing summaries.",
+          "properties": {
+            "event": {"const": "tool_card"},
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
+            "call_id": {"type": "string"},
+            "label": {"type": "string"},
+            "target": {"type": "string"},
+            "tone": {"enum": ["tools", "shell", "edit", "connect", "workers"]},
+            "body": {"enum": ["text", "quiet", "diff", "write", "plan", "workers"]},
+            "facts": {"type": "array", "items": {"type": "string"}},
+            "preview": {"type": "string"}
+          },
+          "required": ["event", "call_id", "label", "target"],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
           "properties": {
             "event": {
               "const": "tool_result"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "call_id": {
               "type": "string"
             },
@@ -1310,6 +1536,9 @@
             "is_error": {
               "type": "boolean"
             },
+            "status": {"enum": ["ok", "error", "blocked", "skipped", "timeout", "aborted"], "description": "Controller-owned execution status (falls back to ok/error from is_error); never derived from output text."},
+            "effects": {"enum": ["none", "known", "unknown"], "description": "Whether the call's side effects are known; a timeout or abort can leave unknown effects."},
+            "changed_paths": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths of files the call changed, for review and diff cards."},
             "data": {}
           },
           "required": [
@@ -1323,6 +1552,9 @@
             "event": {
               "const": "tool_timing"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "call_id": {
               "type": "string"
             },
@@ -1344,6 +1576,9 @@
             "event": {
               "const": "notice"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "message": {
               "type": "string"
             },
@@ -1369,6 +1604,9 @@
             "event": {
               "const": "background"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "message": {
               "type": "string"
             },
@@ -1391,6 +1629,9 @@
             "event": {
               "const": "panel"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "title": {
               "type": "string"
             },
@@ -1409,6 +1650,9 @@
             "event": {
               "const": "todo"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "tasks": {
               "type": "array"
             }
@@ -1424,6 +1668,9 @@
             "event": {
               "const": "model_progress"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "progress": {}
           },
           "required": [
@@ -1437,6 +1684,9 @@
             "event": {
               "const": "context_usage"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "tokens": {
               "type": "integer"
             },
@@ -1455,6 +1705,9 @@
             "event": {
               "const": "cached_usage"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "read_tokens": {
               "type": [
                 "integer",
@@ -1479,6 +1732,9 @@
             "event": {
               "const": "usage"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "prompt_tokens": {
               "type": [
                 "integer",
@@ -1506,6 +1762,9 @@
             "event": {
               "const": "efficiency"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "report": {}
           },
           "required": [
@@ -1519,6 +1778,9 @@
             "event": {
               "const": "approval"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "approval_id": {
               "type": "string"
             },
@@ -1546,6 +1808,9 @@
             "event": {
               "const": "approval_resolved"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "approval_id": {
               "type": "string"
             }
@@ -1562,6 +1827,9 @@
             "event": {
               "const": "question"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "request": {
               "type": "object"
             },
@@ -1584,6 +1852,8 @@
             "event": {
               "const": "question_closed"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "question_id": {
               "type": "string"
             },
@@ -1615,7 +1885,10 @@
           "properties": {
             "event": {
               "const": "state_reset"
-            }
+            },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]}
           },
           "required": [
             "event"
@@ -1628,6 +1901,9 @@
             "event": {
               "const": "state_node"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "node": {
               "type": "object"
             }
@@ -1644,6 +1920,9 @@
             "event": {
               "const": "state_delta"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "id": {
               "type": "string"
             },
@@ -1668,6 +1947,9 @@
             "event": {
               "const": "live_error"
             },
+            "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
+            "session_id": {"type": "string", "description": "Session the engine was serving when the event was produced."},
+            "request_id": {"description": "Id of the request whose processing produced the event; null for background work between requests.", "type": ["string", "integer", "null"]},
             "message": {
               "type": "string"
             }

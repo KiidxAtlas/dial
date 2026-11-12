@@ -93,7 +93,7 @@ Model capabilities and supported reasoning levels come from the bundled catalog 
 ## Model roles in the picker
 
 The model picker (`/roles`) assigns the shared chat/helper roles; `/improve models` also exposes learning controls. Each row shows its assigned model or fallback identity, not proof that a consumer is enabled or has run. Unassigned roles use main except `decision` (small, then main), `memory` (required for model-backed memory), and `embedding` (lexical recall when unset). Laya checkpoints and vision tool models are feature settings, not role rows. Clearing a role removes its explicit assignment.
-Missing memory model assignments do not prevent Dial from opening: the selected memory backend stays inactive with a setup error. Assign its required roles in /roles, then restart Dial to activate memory. No backend or chat-model fallback is silently selected.
+Missing memory model assignments do not prevent Dial from opening: the selected memory backend stays inactive with a setup error. Assign its required roles in /roles; the terminal reopens memory when the saved roles take effect, without a restart (a running `dial rpc` keeps its launch configuration until it is restarted). No backend or chat-model fallback is silently selected.
 
 In the picker, `Tab` switches between the sidebar and list; `Enter` or `Right` enters the selected list. In **Roles**, highlight a role and press `Enter` to choose its model, or `x` / `Delete` to clear its assignment (main cannot be cleared). Role selection starts with a fresh search and kind filter; `Esc` returns to the same role. `Ctrl+A` on a model opens the role-assignment chooser.
 

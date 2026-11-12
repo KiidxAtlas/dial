@@ -33,7 +33,7 @@ pub(super) const MAX_PROCESSES: usize = 8;
 const MAX_FINISHED: usize = 8;
 /// Output retained per process; older bytes are discarded.
 pub(super) const MAX_BUFFER: usize = 256 * 1024;
-const MAX_NAME: usize = 32;
+pub(super) const MAX_NAME: usize = 32;
 /// How long after exit the reader may still be draining the pipe.
 const SETTLE: Duration = Duration::from_millis(300);
 /// How long a reader keeps draining after its owner asks it to stop. A group that has just died

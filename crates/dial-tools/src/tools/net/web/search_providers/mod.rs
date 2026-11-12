@@ -418,26 +418,61 @@ pub fn search(
     env: Env,
     user_dir: &Path,
 ) -> Result<Found, String> {
+    run_chain(chain, query, |provider| {
+        attempt(client, provider, query, env, user_dir)
+    })
+}
+
+/// Keyless HTML scrapers. A page that parses to no results usually means a changed layout or a soft
+/// block rather than a query nothing matches.
+fn is_scraper(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::DuckDuckGo | Provider::Startpage | Provider::Mojeek | Provider::Ecosia
+    )
+}
+
+/// [`search`] with the network attempt supplied. An empty scraper reply moves on to the next provider
+/// and is returned only when no later provider finds anything either.
+fn run_chain(
+    chain: &[Provider],
+    query: &Query,
+    mut attempt: impl FnMut(Provider) -> Result<Parsed, String>,
+) -> Result<Found, String> {
     let mut failures = Vec::new();
-    for &provider in chain {
-        match attempt(client, provider, query, env, user_dir) {
+    let mut empty: Option<Found> = None;
+    for (position, &provider) in chain.iter().enumerate() {
+        match attempt(provider) {
             Ok(parsed) => {
                 let present: Vec<SearchResult> = parsed
                     .results
                     .into_iter()
                     .filter(|result| !result.url.is_empty())
                     .collect();
+                let nothing = present.is_empty() && parsed.answer.is_none();
                 let (mut results, domain_note) = query.filter.apply(present);
                 results.truncate(query.limit);
-                return Ok(Found {
+                let found = Found {
                     provider,
                     answer: parsed.answer,
                     results,
                     domain_note,
-                });
+                };
+                if nothing && is_scraper(provider) && position + 1 < chain.len() {
+                    failures.push(format!(
+                        "{}: no results (the page may have changed or blocked the request)",
+                        provider.name()
+                    ));
+                    empty.get_or_insert(found);
+                    continue;
+                }
+                return Ok(found);
             }
             Err(message) => failures.push(format!("{}: {message}", provider.name())),
         }
+    }
+    if let Some(found) = empty {
+        return Ok(found);
     }
     if failures.is_empty() {
         return Err("no search provider is available".into());

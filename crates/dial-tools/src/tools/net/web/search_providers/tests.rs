@@ -319,3 +319,50 @@ fn codex_is_named_only_and_needs_no_key_variable() {
     assert!(names().contains(&"codex"));
     assert!(build(Provider::Codex, &query(), &env_from(&[])).is_err());
 }
+
+#[test]
+fn an_empty_scraper_page_falls_through_to_the_next_provider() {
+    let hit = |url: &str| SearchResult {
+        title: "t".into(),
+        url: url.into(),
+        snippet: String::new(),
+    };
+    let chain = [Provider::DuckDuckGo, Provider::Startpage, Provider::Mojeek];
+    let mut tried = Vec::new();
+    let found = run_chain(&chain, &query(), |provider| {
+        tried.push(provider);
+        Ok(Parsed {
+            answer: None,
+            results: match provider {
+                Provider::Startpage => vec![hit("https://a.example/")],
+                _ => Vec::new(),
+            },
+        })
+    })
+    .unwrap();
+    assert_eq!(found.provider, Provider::Startpage);
+    assert_eq!(tried, [Provider::DuckDuckGo, Provider::Startpage]);
+
+    // Every engine empty: the last engine's empty reply is returned rather than an error.
+    let found = run_chain(&chain, &query(), |_| {
+        Ok(Parsed {
+            answer: None,
+            results: Vec::new(),
+        })
+    })
+    .unwrap();
+    assert_eq!(found.provider, Provider::Mojeek);
+    assert!(found.results.is_empty());
+
+    // A keyed provider's empty answer is trusted and ends the chain.
+    let mut calls = 0;
+    let found = run_chain(&[Provider::Brave, Provider::DuckDuckGo], &query(), |_| {
+        calls += 1;
+        Ok(Parsed {
+            answer: None,
+            results: Vec::new(),
+        })
+    })
+    .unwrap();
+    assert_eq!((found.provider, calls), (Provider::Brave, 1));
+}

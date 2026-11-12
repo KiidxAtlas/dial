@@ -595,13 +595,13 @@ fn bool_toggles_and_enum_choices_require_confirmation() {
     ));
     assert!(matches!(o.mode, Mode::Browse));
     let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
-    assert_eq!(value, Value::String("box".into()));
-    o.settled("ui.composer_shape", Ok(value));
-    let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
     assert_eq!(value, Value::String("line".into()));
     o.settled("ui.composer_shape", Ok(value));
     let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
     assert_eq!(value, Value::String("band".into()), "wraps around");
+    o.settled("ui.composer_shape", Ok(value));
+    let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
+    assert_eq!(value, Value::String("box".into()));
 }
 
 #[test]
@@ -835,8 +835,12 @@ fn search_filters_across_tabs_shows_location_and_escape_clears_before_closing() 
         "{shown}"
     );
     assert!(
-        shown.contains("Safety/Sandbox"),
-        "each hit names its tab and section\n{shown}"
+        shown.contains("Safety"),
+        "each hit names its category\n{shown}"
+    );
+    assert!(
+        !shown.contains("Safety/Sandbox"),
+        "the category is a tag, not a tab/section column\n{shown}"
     );
     assert!(
         !shown.contains("Welcome banner"),
@@ -852,7 +856,9 @@ fn search_filters_across_tabs_shows_location_and_escape_clears_before_closing() 
     let restored = draw(&mut o, &rig, 120, 40);
     assert_eq!(o.tabs[o.tab].0, "Common");
     assert!(restored.contains("Theme"), "{restored}");
-    assert!(!shows(&o, "approval"));
+    // Common mirrors high-traffic settings such as approval; they still live in their own tab.
+    assert!(shows(&o, "approval"));
+    assert!(!shows(&o, "sandbox.allow_network"));
     goto(&mut o, &rig.keys, "approval");
     assert_eq!(o.tabs[o.tab].0, "Safety");
     assert!(draw(&mut o, &rig, 120, 40).contains("Approval mode"));
@@ -924,6 +930,60 @@ fn search_matches_description_words_in_any_order_and_preserves_metadata_search()
         search_match("retain", "Memory", "Retain facts").unwrap().1,
         Vec::<usize>::new()
     );
+}
+
+#[test]
+fn path_search_ranks_the_setting_first_and_drops_scattered_letter_matches() {
+    let mut o = overlay();
+    o.search = "ui.theme".into();
+    let hits = o.visible();
+    assert!(
+        matches!(hits.first(), Some(Row::Setting(i)) if crate::config::schema::registry()[*i].path == "ui.theme"),
+        "exact path first"
+    );
+    let paths: Vec<&str> = hits
+        .iter()
+        .filter_map(|row| match row {
+            Row::Setting(i) => Some(crate::config::schema::registry()[*i].path),
+            _ => None,
+        })
+        .collect();
+    // Rows that merely contain the letters u, i, t, h, e, m, e somewhere are gone.
+    assert!(
+        paths.iter().all(|p| !p.starts_with("memory.hindsight")),
+        "{paths:?}"
+    );
+    assert!(paths.len() <= 6, "{paths:?}");
+    // A contiguous word still matches anywhere in the metadata, and an abbreviation still works.
+    assert!(search_match("network", "Allow network Safety", "").is_some());
+    assert!(search_match("sndbx", "Sandbox mode", "").is_some());
+    assert!(search_match("uithm", "Hindsight timeout memory.hindsight.timeout", "").is_none());
+}
+
+#[test]
+fn common_mirrors_frequent_settings_under_one_heading_without_moving_them() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    assert_eq!(o.tabs[o.tab].0, "Common");
+    for path in COMMON_MIRRORS {
+        let def = crate::config::schema::registry()
+            .iter()
+            .find(|d| d.path == *path)
+            .unwrap_or_else(|| panic!("{path} is not a declared setting"));
+        assert_ne!(def.tab, COMMON_TAB, "{path} already lives in Common");
+        assert!(shows(&o, path), "{path}");
+    }
+    let shown = draw(&mut o, &rig, 120, 40);
+    for heading in ["Safety", "Sandbox", "Approval"] {
+        assert!(
+            !shown.lines().any(|l| l.trim() == heading),
+            "a borrowed row brings no heading of its own\n{shown}"
+        );
+    }
+    // Its home tab still lists it, and search still names that home.
+    goto(&mut o, &rig.keys, "approval");
+    assert_eq!(o.tabs[o.tab].0, "Safety");
+    assert!(shows(&o, "approval"));
 }
 
 #[test]
@@ -1063,9 +1123,17 @@ fn preview_row_receives_the_pending_config() {
             status: &rig.status,
             preview_status: &preview,
         };
-        send(o, &rig.keys, key(KeyCode::F(4)));
+        send(
+            o,
+            &rig.keys,
+            Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+        );
         let shown = screen(&render(120, 30, |f| o.draw(f, &ctx)));
-        send(o, &rig.keys, key(KeyCode::F(4)));
+        send(
+            o,
+            &rig.keys,
+            Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+        );
         shown
     };
     assert!(paint(&mut o).contains("sep=PowerlineThin"));
@@ -1110,7 +1178,11 @@ fn invalid_ui_table_falls_back_to_default_preview() {
         status: &rig.status,
         preview_status: &preview,
     };
-    send(&mut o, &rig.keys, key(KeyCode::F(4)));
+    send(
+        &mut o,
+        &rig.keys,
+        Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+    );
     let _ = render(100, 24, |f| o.draw(f, &ctx));
     assert_eq!(
         seen.borrow().as_ref().unwrap().status_separator,
@@ -1196,7 +1268,7 @@ fn tabs_and_sections_follow_the_keymap_including_remapped_keys() {
 
     goto(&mut o, &rig.keys, "ui.theme_dark");
     // Tab / Shift+Tab jump between sections of the tab.
-    let section = |o: &SettingsOverlay| SettingsOverlay::section_of(o.current_row().unwrap());
+    let section = |o: &SettingsOverlay| o.section_of(o.current_row().unwrap());
     assert_eq!(section(&o), "Theme");
     send(&mut o, &rig.keys, key(KeyCode::Tab));
     assert_eq!(section(&o), "Symbols");
@@ -1239,18 +1311,11 @@ fn tabs_and_sections_follow_the_keymap_including_remapped_keys() {
     assert_eq!(path_at_cursor(&o), "ui.theme_dark");
     send(&mut o, &remapped, ctrl('n'));
     assert_eq!(section(&o), "Symbols");
-    let hints = draw(
-        &mut o,
-        &Rig {
-            keys: remapped.clone(),
-            ..Rig::new()
-        },
-        140,
-        30,
-    );
+    let footer = o.footer(&remapped);
     assert!(
-        hints.contains("Ctrl+K/Ctrl+J move") && hints.contains("Ctrl+N sections"),
-        "footer reflects the remap\n{hints}"
+        footer.contains(&"Ctrl+K/Ctrl+J move".to_owned())
+            && footer.contains(&"Ctrl+N sections".to_owned()),
+        "footer reflects the remap\n{footer:?}"
     );
     assert!(matches!(
         send(&mut o, &remapped, ctrl('o')),
@@ -1646,13 +1711,21 @@ fn appearance_preview_is_explicit_and_return_restores_the_controls() {
         0,
         "browsing settings must not render a preview"
     );
-    send(&mut o, &rig.keys, key(KeyCode::F(4)));
+    send(
+        &mut o,
+        &rig.keys,
+        Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+    );
     assert!(
         draw_with(&mut o, &rig, 100, 24, &preview)
             .contains("Preview status line: EXPLICIT PREVIEW")
     );
     assert_eq!(calls.get(), 1);
-    send(&mut o, &rig.keys, key(KeyCode::F(4)));
+    send(
+        &mut o,
+        &rig.keys,
+        Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)),
+    );
     assert_eq!(draw_with(&mut o, &rig, 100, 24, &preview), controls);
 }
 
@@ -1688,12 +1761,10 @@ fn horizontal_categories_keep_the_header_and_list_position_stable() {
             .lines()
             .position(|line| line.contains("Theme") && line.contains(rig.theme.sym(Sym::Pointer)))
             .unwrap();
+        // Categories are one strip under the title at every width; Left/Right move through it.
+        let strip = before.lines().nth(1).unwrap();
         assert!(
-            before.lines().nth(1).unwrap().contains("Common"),
-            "{before}"
-        );
-        assert!(
-            before.lines().nth(1).unwrap().contains("Appearance"),
+            strip.contains("Common") && strip.contains("Appearance"),
             "{before}"
         );
         assert!(
@@ -2326,3 +2397,68 @@ fn settings_runtime_sources_win_over_saved_layers() {
 mod application;
 mod bulk;
 mod redesign;
+
+#[test]
+fn blank_values_say_what_they_do_in_the_settings_own_words() {
+    let int = Value::Integer(0);
+    let empty = Value::String(String::new());
+    assert_eq!(
+        blank_meaning("Steps allowed; 0 means unlimited, including repair.", &int).as_deref(),
+        Some("0 (unlimited)")
+    );
+    assert_eq!(
+        blank_meaning(
+            "Output limit; 0 means no operator cap (local hosts choose).",
+            &int
+        )
+        .as_deref(),
+        Some("0 (no operator cap)")
+    );
+    assert_eq!(
+        blank_meaning("Escalate after failures. 0 disables.", &int).as_deref(),
+        Some("0 (off)")
+    );
+    assert_eq!(
+        blank_meaning(
+            "Python that imports idapro. Empty uses python3 from PATH.",
+            &empty
+        )
+        .as_deref(),
+        Some("not set (python3 from PATH)")
+    );
+    assert_eq!(
+        blank_meaning("Draft model (id or path); empty disables.", &empty).as_deref(),
+        Some("not set (off)")
+    );
+    assert_eq!(
+        blank_meaning("Teachers. Empty uses none.", &Value::Array(vec![])).as_deref(),
+        Some("none")
+    );
+    // No stated meaning, or a value that is not blank: nothing is invented.
+    assert_eq!(blank_meaning("Raw model name.", &empty), None);
+    assert_eq!(
+        blank_meaning("0 means unlimited.", &Value::Integer(3)),
+        None
+    );
+    // "10 means" is not "0 means".
+    assert_eq!(blank_meaning("Use 10 means fast.", &int), None);
+}
+
+#[test]
+fn every_declared_blank_meaning_is_a_short_phrase() {
+    let mut found = 0;
+    for def in crate::config::schema::registry() {
+        for blank in [
+            Value::Integer(0),
+            Value::String(String::new()),
+            Value::Array(vec![]),
+        ] {
+            if let Some(meaning) = blank_meaning(def.description, &blank) {
+                found += 1;
+                assert!(meaning.len() <= 56, "{}: {meaning}", def.path);
+                assert!(!meaning.contains("(that "), "{}: {meaning}", def.path);
+            }
+        }
+    }
+    assert!(found >= 10, "{found}");
+}

@@ -416,3 +416,28 @@ fn pointer_projection_does_not_reintroduce_file_labels() {
     assert_eq!(model_result(&ws, &read, pointer), pointer);
     assert!(ws.existing_file_handle("note.rs").is_none());
 }
+
+#[test]
+fn batched_write_paths_expand_atomically_without_touching_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(root.path()).unwrap();
+    let handle = ws.file_handle("a.txt").unwrap();
+    let mut write = call(
+        "write",
+        json!({"files":[{"path":handle,"content":"@f999"},{"path":"b.txt","source":{"artifact":"artifact://literal","sha256":"literal"}}]}),
+    );
+    expand(&ws, &mut write).unwrap();
+    assert_eq!(write.arguments["files"][0]["path"], "a.txt");
+    assert_eq!(write.arguments["files"][0]["content"], "@f999");
+    assert_eq!(
+        write.arguments["files"][1]["source"]["artifact"],
+        "artifact://literal"
+    );
+    let mut invalid = call(
+        "write",
+        json!({"files":[{"path":handle,"content":"x"},{"path":"@f999","content":"y"}]}),
+    );
+    let before = invalid.arguments.clone();
+    assert!(expand(&ws, &mut invalid).is_err());
+    assert_eq!(invalid.arguments, before);
+}

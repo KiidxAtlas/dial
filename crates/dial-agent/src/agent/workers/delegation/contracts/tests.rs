@@ -224,3 +224,99 @@ paths = ["source.txt"]
         },
     );
 }
+
+/// A launch refused by a `before_subagent_spawn` hook is a definite non-start: the node stays
+/// retryable, the workflow is not poisoned, an unrelated contract still runs, and the explicit
+/// retry of the same assignment is accepted.
+#[test]
+fn hook_refused_contract_launch_is_retryable_without_poisoning_other_contracts() {
+    const REPLY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Inspected the candidate.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let server = crate::llm::fake::serve(vec![
+        crate::llm::fake::Script::Sse(REPLY.into()),
+        crate::llm::fake::Script::Sse(REPLY.into()),
+    ]);
+    let overlay = format!(
+        r#"
+endpoint = {{base_url = "{}/v1"}}
+[task]
+persist = true
+[compaction]
+enabled = false
+[codebase]
+enabled = false
+[verification]
+automatic_checks = false
+[[verification.commands]]
+name = "behavior"
+command = "test -f source.txt && printf '1 test passed\\n'"
+timeout_secs = 5
+[verification.inputs.behavior]
+paths = ["source.txt"]
+[[hooks]]
+event = "before_subagent_spawn"
+command = ["sh", "-c", "cat >/dev/null; if [ -f refuse-next-spawn ]; then rm -f refuse-next-spawn; echo 'refused by the test gate' >&2; exit 2; fi"]
+timeout_secs = 5
+"#,
+        server.url
+    );
+    with_agent(&overlay, |agent| {
+        agent.approval = crate::config::types::Approval::Auto;
+        let root = agent.workspace.root().to_path_buf();
+        std::fs::write(root.join("source.txt"), "candidate").unwrap();
+        let launch = |id: &str| {
+            json!({
+                "action":"start", "agent":"worker", "task":"Inspect the candidate; do not edit it",
+                "solution_space":"Return findings only", "max_steps":4,
+                "acceptance_checks":["behavior"], "contract":{"id":id}
+            })
+        };
+        std::fs::write(root.join("refuse-next-spawn"), "").unwrap();
+        let refused = agent
+            .start_subagents(&launch("first"), &mut NullUi)
+            .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("refused by the test gate"),
+            "{refused:#}"
+        );
+        assert!(
+            agent.workflow_contracts.snapshot()["fault"].is_null(),
+            "a pre-start refusal must not poison the workflow"
+        );
+        assert_eq!(
+            agent.workflow_contracts.node("first").unwrap()["state"],
+            "retryable"
+        );
+
+        let unrelated = agent
+            .start_subagents(&launch("unrelated"), &mut NullUi)
+            .unwrap();
+        assert_eq!(unrelated["workflow"]["state"], "running");
+        let retried = agent
+            .start_subagents(&launch("first"), &mut NullUi)
+            .unwrap();
+        assert_eq!(retried["workflow"]["attempts"], 2);
+        assert_eq!(retried["workflow"]["state"], "running");
+
+        let mut backend = agent.backend.take().unwrap();
+        for worker in [&unrelated, &retried] {
+            let id = worker["workers"][0]["id"].as_str().unwrap();
+            let waited = agent.run_task(
+                &mut backend,
+                &json!({"action":"wait","id":id,"timeout":30}),
+                &mut NullUi,
+            );
+            assert!(!waited.is_error, "{}", waited.text);
+        }
+        agent.backend = Some(backend);
+        agent.sync_contracts().unwrap();
+        assert_eq!(
+            agent.workflow_contracts.node("unrelated").unwrap()["state"],
+            "accepted"
+        );
+        assert_eq!(
+            agent.workflow_contracts.node("first").unwrap()["state"],
+            "accepted"
+        );
+        assert!(agent.workflow_contracts.blocker().is_none());
+    });
+}

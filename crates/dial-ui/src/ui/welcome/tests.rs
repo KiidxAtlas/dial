@@ -39,6 +39,7 @@ fn info() -> WelcomeInfo {
         branch: String::new(),
         approval: "ask".into(),
         sandbox: "dev".into(),
+        approval_key: String::new(),
         doctor_issues: 0,
         tour: false,
     }
@@ -279,6 +280,7 @@ fn long_and_hostile_fields_are_sanitized_and_ellipsized() {
         branch: String::new(),
         approval: String::new(),
         sandbox: String::new(),
+        approval_key: String::new(),
         doctor_issues: 0,
         tour: false,
     };

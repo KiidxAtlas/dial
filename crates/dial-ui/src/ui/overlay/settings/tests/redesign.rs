@@ -108,9 +108,11 @@ fn browsing_appearance_and_other_categories_keeps_the_header_height_stable() {
         ] {
             assert!(o.focus_path(path));
             let shown = draw(&mut o, &rig, width, 30);
+            // Title, category strip, scope line, then search, at every width.
+            let search_row = 3;
             assert_eq!(
                 shown.lines().position(|line| line.contains("Search:")),
-                Some(3),
+                Some(search_row),
                 "header moved for {path}:\n{shown}"
             );
             assert!(
@@ -143,22 +145,33 @@ fn context_page_keeps_active_limits_separate_from_saved_defaults() {
     let shown = draw(&mut o, &rig, 160, 30);
     for expected in [
         "Context & history",
-        "active limit 32768",
-        "12000 estimated",
-        "capacity: 65536 (read-only)",
-        "reserve: 4096",
+        "12k of 32k used (37%, estimated)",
+        "compacts near 28k (~88%)",
+        "capacity 65k (read-only)",
+        "reserve 4k",
     ] {
         assert!(shown.contains(expected), "{expected}: {shown}");
     }
+    // The gauge is 16 cells; 12000 of 32768 fills six.
+    assert!(shown.contains("██████░░░░░░░░░░ 12k"), "{shown}");
+    // Saved defaults never move the gauge, which follows the active request.
     o.effective
         .insert("context_window".into(), Value::Integer(8192));
-    assert!(draw(&mut o, &rig, 160, 30).contains("active limit 32768"));
+    assert!(draw(&mut o, &rig, 160, 30).contains("12k of 32k used"));
     assert!(o.pending.is_empty());
-    let unknown = draw(&mut o, &Rig::new(), 160, 30);
-    assert!(
-        unknown.contains("capacity: unknown (read-only)"),
-        "{unknown}"
-    );
+    // Missing facts say why, or which setting supplies them, instead of "unknown".
+    let unknown = draw(&mut o, &Rig::new(), 200, 30);
+    for expected in [
+        "nothing sent yet",
+        "set Current model context below",
+        "capacity not reported by the server",
+    ] {
+        assert!(unknown.contains(expected), "{expected}: {unknown}");
+    }
+    assert!(!unknown.contains("unknown"), "{unknown}");
+    // Compaction tuning folds behind "Show advanced"; whether it runs stays in view.
+    assert!(shows(&o, "compaction.enabled"));
+    assert!(!shows(&o, "compaction.method_order"));
     for (w, h) in [(40, 10), (20, 4), (1, 1)] {
         let _ = draw(&mut o, &rig, w, h);
     }
@@ -210,4 +223,23 @@ fn memory_model_links_open_the_exact_existing_role_without_mutating_settings() {
         );
         assert!(o.pending.is_empty());
     }
+}
+
+#[test]
+fn the_context_defaults_view_lists_its_categories_in_the_top_strip() {
+    let rig = Rig::new();
+    let mut o = SettingsOverlay::new(
+        Table::new(),
+        Table::new(),
+        Table::new(),
+        Scope::Global,
+        vec![],
+    )
+    .context_defaults();
+    let shown = draw(&mut o, &rig, 120, 40);
+    let strip = shown.lines().nth(1).unwrap();
+    assert!(
+        strip.contains("Model") && strip.contains("Setup") && !shown.contains('│'),
+        "{shown}"
+    );
 }

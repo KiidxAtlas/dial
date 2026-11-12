@@ -6,7 +6,9 @@ Find actions through the goal-first palette, slash completion and command help.
 
 - **Action palette:** `Alt-K`, `F1` or `/palette` starts with a short list of goals: start or
   continue work, review changes, manage ongoing work, configure Dial, or browse all actions.
-  Choose a goal to drill into relevant commands; return to the goal list before closing.
+  Choose a goal to drill into relevant commands; return to the goal list before closing. Up to
+  three actions you ran from the palette this session (idle or during a turn) lead the goal list, marked *recent*. While
+  nothing is typed, digits `1`–`9` run the matching visible row (pickers keep digits for filtering).
   Search is fuzzy; a phrase of two or more words that matches nothing that way ("undo the last
   changes") is matched by its words against command names and descriptions instead.
   Type at any point to search every registered action, including advanced commands and enabled

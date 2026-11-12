@@ -1,6 +1,6 @@
 {
   "name": "dial-dark",
-  "description": "Dial dark: quiet gray text on the terminal background, a sage accent, shaded bands behind your messages and the composer, inset tinted panels and no frames",
+  "description": "Dial dark: quiet gray text on the terminal background, a sage accent, an accent bar beside your messages, a rounded composer and no background shading",
   "dark": true,
   "vars": {
     "text": "#e4e4e4",
@@ -23,7 +23,8 @@
     "comment": "#7c8f83",
     "band": "#282828",
     "panel": "#171d1a",
-    "code": "#262626"
+    "code": "#262626",
+    "chip": "#232a26"
   },
   "colors": {
     "text": "text",
@@ -38,9 +39,9 @@
     "warning": "gold",
     "selectedBg": "selection",
     "canvasBg": "",
-    "userBg": "band",
+    "userBg": "",
     "userText": "bright",
-    "panelBg": "panel",
+    "panelBg": "",
     "toolPendingBg": "",
     "toolSuccessBg": "",
     "toolErrorBg": "",
@@ -64,7 +65,7 @@
     "mdLinkUrl": "faint",
     "mdCode": "teal",
     "mdCodeBlock": "text",
-    "mdCodeBlockBg": "code",
+    "mdCodeBlockBg": "",
     "mdCodeBorder": "steel",
     "mdQuote": {
       "fg": "muted",
@@ -83,7 +84,7 @@
     "thinkHigh": "lavender",
     "thinkXhigh": "orchid",
     "shellMode": "gold",
-    "statusBg": "band",
+    "statusBg": "",
     "statusSep": "faint",
     "statusModel": {
       "fg": "mint",

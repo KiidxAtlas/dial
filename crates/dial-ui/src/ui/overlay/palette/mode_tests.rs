@@ -369,3 +369,85 @@ fn narrow_panels_wrap_the_empty_message_and_drop_the_busy_note_before_overlap() 
         assert!(!top.contains("Actionsturn"), "{width}: {top}");
     }
 }
+
+fn command(name: &str) -> PaletteEntry {
+    PaletteEntry {
+        command: CommandEntry {
+            name: name.into(),
+            description: format!("{name} description"),
+            kind: CommandKind::Builtin,
+            args_hint: None,
+        },
+        during_turn: "Runs after the current turn finishes.",
+    }
+}
+
+#[test]
+fn recent_actions_lead_the_goal_list_and_back_returns_to_the_goal_left() {
+    let keys = Keymap::defaults();
+    let list = ["model", "changes", "settings ui.theme", "settings", "undo"].map(command);
+    let mut palette = PaletteOverlay::new(list.into(), false).with_recent(&[
+        "/settings ui.theme".into(),
+        "/undo".into(),
+        "/rename later".into(),
+        "/undo".into(),
+        "/model".into(),
+        "/changes".into(),
+    ]);
+    let rows = palette.rows();
+    // The deep link keeps its exact entry; unknown and repeated names are skipped; three at most.
+    assert_eq!(&rows[..3], &[Row::Entry(2), Row::Entry(4), Row::Entry(0)]);
+    assert_eq!(rows[3], Row::Goal(0));
+    let shown = rendered(&mut palette, 100).join("\n");
+    assert!(shown.contains("recent"), "{shown}");
+    palette.handle(&plain(KeyCode::Down), &keys);
+    palette.handle(&plain(KeyCode::Down), &keys);
+    palette.handle(&plain(KeyCode::Down), &keys);
+    palette.handle(&plain(KeyCode::Down), &keys);
+    palette.handle(&plain(KeyCode::Enter), &keys);
+    assert_eq!(palette.view, View::Goal(1));
+    palette.handle(&plain(KeyCode::Esc), &keys);
+    assert_eq!(palette.rows()[palette.cursor], Row::Goal(1));
+}
+
+#[test]
+fn digits_pick_visible_rows_until_a_search_or_picker_needs_them() {
+    let keys = Keymap::defaults();
+    let list = ["model", "undo"].map(command);
+    let mut palette = PaletteOverlay::new(list.into(), false).with_recent(&["/undo".into()]);
+    let shown = rendered(&mut palette, 100);
+    assert!(shown.iter().any(|row| row.starts_with(" 2 ")), "{shown:?}");
+    assert!(shown.last().unwrap().contains("1-9 pick"), "{shown:?}");
+    let OverlayEvent::Action(action) = palette.handle(&plain(KeyCode::Char('1')), &keys) else {
+        panic!("1 runs the first row")
+    };
+    assert_eq!(action, "command:/undo");
+    palette.handle(&plain(KeyCode::Char('3')), &keys);
+    assert!(
+        matches!(palette.view, View::Goal(1)),
+        "3 opens the second goal"
+    );
+    palette.handle(&plain(KeyCode::Char('9')), &keys);
+    assert!(
+        palette.search.text.is_empty(),
+        "a digit past the list does nothing"
+    );
+    palette.handle(&plain(KeyCode::Char('u')), &keys);
+    palette.handle(&plain(KeyCode::Char('2')), &keys);
+    assert_eq!(
+        palette.search.text, "u2",
+        "digits search once typing starts"
+    );
+    let mut picker = PaletteOverlay::choice(ChoiceSpec {
+        title: "Pick".into(),
+        command: "effort".into(),
+        items: vec![item("1", false), item("2", false)],
+        ..Default::default()
+    });
+    assert!(matches!(
+        picker.handle(&plain(KeyCode::Char('2')), &keys),
+        OverlayEvent::None
+    ));
+    assert_eq!(picker.search.text, "2", "pickers filter on digits");
+    assert!(palette.is_action_search() && !picker.is_action_search());
+}

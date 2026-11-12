@@ -905,6 +905,73 @@ fn temporal_and_degraded_recall_bypass_the_cache() {
 }
 
 #[test]
+fn only_whole_word_temporal_phrases_count_as_temporal() {
+    for query in [
+        "deploy plan yesterday",
+        "recent deploys",
+        "what changed in the last week",
+        "latest revision",
+        "updated recently",
+        "this week's plan",
+        "two days ago",
+        "before the migration",
+        "this month",
+    ] {
+        assert!(looks_temporal(query), "{query} names a time");
+    }
+    for query in [
+        "negative blast radius",
+        "diagonal matrix",
+        "cargo test",
+        "Chicago office",
+        "lastname",
+        "",
+    ] {
+        assert!(!looks_temporal(query), "{query} names no time");
+    }
+}
+
+#[test]
+fn substring_matches_do_not_bypass_the_recall_cache() {
+    let mut store = store();
+    store
+        .retain(
+            "the negative blast radius of the diagonal matrix",
+            "test",
+            1,
+        )
+        .unwrap();
+    for (query, temporal) in [
+        ("negative blast radius", false),
+        ("diagonal matrix", false),
+        ("cargo test", false),
+        ("deploy vault yesterday", true),
+        ("this week's blast radius", true),
+    ] {
+        let mut cache = RecallCache::default();
+        let first = cached_ranked(&mut cache, &store, request(query), 10)
+            .unwrap()
+            .1;
+        let second = cached_ranked(&mut cache, &store, request(query), 10)
+            .unwrap()
+            .1;
+        if temporal {
+            assert_eq!(
+                (first, second),
+                (CacheOutcome::Bypass, CacheOutcome::Bypass),
+                "{query}"
+            );
+        } else {
+            assert_eq!(
+                (first, second),
+                (CacheOutcome::Miss, CacheOutcome::Hit),
+                "{query}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_temporal_query_ranks_the_newest_facts_first() {
     let mut store = store();
     let now = 1_000_000;

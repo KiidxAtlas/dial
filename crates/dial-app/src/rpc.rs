@@ -20,16 +20,16 @@ use std::{
 
 mod actor;
 mod auth;
+mod checkpoints;
 mod client_fs;
 mod host_tools;
 mod host_uris;
-/// Latest control protocol version this build speaks. A connection starts at
-/// `DEFAULT_PROTOCOL_VERSION` and moves up only when the client sends `hello`.
-pub const PROTOCOL_VERSION: u32 = 2;
-/// Version of connections that never send `hello`; keeps existing clients unchanged.
-const DEFAULT_PROTOCOL_VERSION: u32 = 1;
-/// Protocol versions this build serves, announced in `ready` so clients can negotiate.
-const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[DEFAULT_PROTOCOL_VERSION, PROTOCOL_VERSION];
+mod models;
+mod sessions;
+mod settings;
+/// Wire vocabulary shared with clients: versions, the method table and error codes.
+pub use dial_protocol::PROTOCOL_VERSION;
+use dial_protocol::{DEFAULT_PROTOCOL_VERSION, ErrorCode, METHODS, SUPPORTED_PROTOCOL_VERSIONS};
 const MAX_REQUEST: usize = 1024 * 1024;
 /// ACP clients may send larger frames (embedded resources and images).
 const MAX_ACP_REQUEST: usize = 8 * MAX_REQUEST;
@@ -43,64 +43,27 @@ const MESSAGES_PAGE_MAX: u64 = 500;
 /// `tool_result` events clip their text to this many bytes (the model-visible result is unchanged).
 const TOOL_RESULT_EVENT_BYTES: usize = 24 * 1024;
 
-/// Every request method of the plain RPC endpoint with the capability it belongs to. The `ready`
-/// frame derives its method and capability lists from this table, `docs/rpc-schema.json` is
-/// tested against it, and a source scan test keeps it equal to the methods the dispatchers match.
-const METHODS: &[(&str, &str)] = &[
-    ("hello", "query"),
-    ("send", "prompt"),
-    ("state", "query"),
-    ("messages", "query"),
-    ("messages_page", "query"),
-    ("plan", "plan_mode"),
-    ("set_model", "model"),
-    ("set_thinking", "model"),
-    ("get_session_stats", "query"),
-    ("get_available_commands", "query"),
-    ("export", "export"),
-    ("set_host_tools", "host_tools"),
-    ("host_tool_result", "host_tools"),
-    ("set_host_uri_schemes", "host_uris"),
-    ("host_uri_result", "host_uris"),
-    ("auth_providers", "auth"),
-    ("login", "auth"),
-    ("auth_code", "auth"),
-    ("auth_cancel", "auth"),
-    ("logout", "auth"),
-    ("new_session", "sessions"),
-    ("resume", "sessions"),
-    ("rename", "sessions"),
-    ("compact", "maintenance"),
-    ("memory", "maintenance"),
-    ("seed_context", "context_seed"),
-    ("task_start", "tasks"),
-    ("task_status", "tasks"),
-    ("task_cancel", "tasks"),
-    ("task_message", "tasks"),
-    ("steer", "steering"),
-    ("abort", "abort"),
-    ("approve", "approvals"),
-    ("question_presented", "questions"),
-    ("question_answer", "questions"),
-    ("live_start", "live_voice"),
-    ("live_mute", "live_voice"),
-    ("live_stop", "live_voice"),
-    ("live_listen", "live_voice"),
-    ("shutdown", "shutdown"),
-];
-
 /// Largest request line the reader accepts on this transport.
 fn request_limit(acp: bool) -> usize {
     if acp { MAX_ACP_REQUEST } else { MAX_REQUEST }
 }
 
 /// Capabilities a transport lacks: ACP has no custom question input, no live voice, no host tool or
-/// host URI bridge, and no provider sign-in (these are native `dial rpc` capabilities).
+/// host URI bridge, no provider sign-in, and no session administration, settings or checkpoint methods
+/// (these are native `dial rpc` capabilities).
 fn capability_available(capability: &str, acp: bool) -> bool {
     !(acp
         && matches!(
             capability,
-            "questions" | "live_voice" | "host_tools" | "host_uris" | "auth"
+            "questions"
+                | "live_voice"
+                | "host_tools"
+                | "host_uris"
+                | "auth"
+                | "session_admin"
+                | "settings"
+                | "checkpoints"
+                | "extensions"
         ))
 }
 
@@ -113,15 +76,20 @@ pub(crate) fn ready_frame(
     image_input: bool,
     acp: bool,
 ) -> Value {
+    // `dial_protocol::METHODS` is the one method table: `ready` derives its method and
+    // capability lists from it, `docs/rpc-schema.json` is tested against it, and a source scan
+    // test keeps it equal to the methods the dispatchers match.
     let methods: Vec<&str> = METHODS
         .iter()
-        .filter(|(_, capability)| capability_available(capability, acp))
-        .map(|(method, _)| *method)
+        .filter(|method| capability_available(method.capability, acp))
+        .map(|method| method.name)
         .collect();
     let mut capabilities: Vec<&str> = Vec::new();
-    for (_, capability) in METHODS {
-        if capability_available(capability, acp) && !capabilities.contains(capability) {
-            capabilities.push(capability);
+    for method in METHODS {
+        if capability_available(method.capability, acp)
+            && !capabilities.contains(&method.capability)
+        {
+            capabilities.push(method.capability);
         }
     }
     let question_input = if acp {
@@ -131,6 +99,7 @@ pub(crate) fn ready_frame(
     };
     json!({
         "event":"ready",
+        "engine_version":crate::build_info::VERSION,
         "protocol_version":DEFAULT_PROTOCOL_VERSION,
         "supported_protocol_versions":SUPPORTED_PROTOCOL_VERSIONS,
         "session_id":session_id,
@@ -156,12 +125,39 @@ struct Output {
     acp: Option<crate::acp::Adapter>,
     /// Negotiated protocol version; `DEFAULT_PROTOCOL_VERSION` until the client sends `hello`.
     protocol: u32,
+    /// Envelope fields stamped on every plain-RPC event (ACP frames are mapped, not stamped).
+    envelope: Envelope,
+}
+/// Attribution for plain-RPC events. `seq` is assigned under the same lock that reserves the
+/// output position, so it increases in stdout order with no gaps; a gap means a lost frame.
+#[derive(Default)]
+struct Envelope {
+    seq: u64,
+    /// Session the actor was serving when the event was produced.
+    session_id: Option<String>,
+    /// Id of the actor request in flight, or null for background work between requests.
+    request_id: Value,
+}
+impl Envelope {
+    fn stamp(&mut self, value: &mut Value) {
+        let Some(event) = value.as_object_mut().filter(|v| v.contains_key("event")) else {
+            return;
+        };
+        self.seq += 1;
+        event.insert("seq".into(), json!(self.seq));
+        if !event.contains_key("session_id")
+            && let Some(session) = &self.session_id
+        {
+            event.insert("session_id".into(), json!(session));
+        }
+        event.insert("request_id".into(), self.request_id.clone());
+    }
 }
 /// A request failure with a stable machine code. Protocol 2 clients receive the code next to the
 /// message; protocol 1 clients receive the message alone.
 #[derive(Debug)]
 pub(super) struct RequestError {
-    pub(super) code: &'static str,
+    pub(super) code: ErrorCode,
     pub(super) message: String,
 }
 impl std::fmt::Display for RequestError {
@@ -170,14 +166,22 @@ impl std::fmt::Display for RequestError {
     }
 }
 impl std::error::Error for RequestError {}
+/// A request failure carrying a stable protocol-2 code; [`ErrorCode`] documents each one.
+/// Uncoded failures are reported as `failed`.
+pub(super) fn coded(code: ErrorCode, error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(RequestError {
+        code,
+        message: format!("{error:#}"),
+    })
+}
 /// A plain RPC method listed in [`METHODS`].
 fn known_method(method: &str) -> bool {
-    METHODS.iter().any(|(name, _)| *name == method)
+    dial_protocol::method(method).is_some()
 }
 /// The error for a method this endpoint does not serve; the actor returns the same one.
 pub(super) fn unknown_method() -> anyhow::Error {
     anyhow::Error::new(RequestError {
-        code: "unknown_method",
+        code: ErrorCode::UnknownMethod,
         message: "unknown RPC method".to_owned(),
     })
 }
@@ -191,7 +195,7 @@ fn negotiated_version(requested: u64) -> Result<u32> {
         .max()
         .ok_or_else(|| {
             anyhow::Error::new(RequestError {
-                code: "unsupported_protocol_version",
+                code: ErrorCode::UnsupportedProtocolVersion,
                 message: format!(
                     "protocol_version {requested} is not supported; supported: {SUPPORTED_PROTOCOL_VERSIONS:?}"
                 ),
@@ -245,10 +249,11 @@ impl Sender {
         Ok(())
     }
     /// Returns false when the event was not published (ACP dropped it or the transport failed).
-    fn emit(&self, value: Value) -> bool {
+    fn emit(&self, mut value: Value) -> bool {
         let result = (|| -> Result<bool> {
             let (ticket, batch) = {
-                let mut output = self.mapping()?;
+                let mut guard = self.mapping()?;
+                let output = &mut *guard;
                 let batch = match &mut output.acp {
                     Some(acp) => {
                         let values = acp.emit(value);
@@ -257,7 +262,10 @@ impl Sender {
                         }
                         Batch::Mapped(values)
                     }
-                    None => Batch::Single(value),
+                    None => {
+                        output.envelope.stamp(&mut value);
+                        Batch::Single(value)
+                    }
                 };
                 (self.writer.reserve(), batch)
             };
@@ -306,6 +314,13 @@ impl Sender {
         self.mapping()?.protocol = version;
         Ok(())
     }
+    /// Attribute later events to `session_id` and to the request in flight (null when idle).
+    fn attribute(&self, session_id: &str, request_id: Value) {
+        if let Ok(mut output) = self.mapping() {
+            output.envelope.session_id = Some(session_id.to_owned());
+            output.envelope.request_id = request_id;
+        }
+    }
     fn result(&self, id: &Value, result: Result<Value>) {
         let v2 = self.protocol() >= 2;
         self.emit(match result {
@@ -313,7 +328,8 @@ impl Sender {
             Err(e) if v2 => {
                 let code = e
                     .downcast_ref::<RequestError>()
-                    .map_or("failed", |error| error.code);
+                    .map_or(ErrorCode::Failed, |error| error.code)
+                    .as_str();
                 json!({"id":id,"error":{"code":code,"message":format!("{e:#}")}})
             }
             Err(e) => json!({"id":id,"error":{"message":format!("{e:#}")}}),
@@ -481,7 +497,21 @@ impl Ui for RpcUi {
             .emit(json!({"event":"tool_call","call_id":call_id,"name":name,"summary":summary}));
     }
     fn tool_result_with_id(&mut self, call_id: &str, name: &str, output: &ToolOutput) {
-        self.out.emit(json!({"event":"tool_result","call_id":call_id,"name":name,"text":crate::agent::safety::guard::clip_middle(&output.text,TOOL_RESULT_EVENT_BYTES),"is_error":output.is_error,"data":output.data}));
+        self.out.emit(json!({"event":"tool_result","call_id":call_id,"name":name,"text":crate::agent::safety::guard::clip_middle(&output.text,TOOL_RESULT_EVENT_BYTES),"is_error":output.is_error,"data":output.data,"status":crate::tools::ToolStatus::from_output(output),"effects":output.execution.effects,"changed_paths":output.execution.changed_paths}));
+    }
+    /// The terminal's card for this call, as fields a GUI renders without parsing summaries.
+    fn tool_presentation(
+        &mut self,
+        call_id: &str,
+        view: &crate::tools::surface::presentation::Presentation,
+    ) {
+        let mut card = json!({"event":"tool_card","call_id":call_id});
+        if let (Some(card), Ok(Value::Object(fields))) =
+            (card.as_object_mut(), serde_json::to_value(view))
+        {
+            card.extend(fields);
+        }
+        self.out.emit(card);
     }
     fn notice(&mut self, message: &str) {
         self.out.emit(json!({"event":"notice","message":message}));
@@ -799,7 +829,109 @@ fn state_projection(agent: &Agent<'_>) -> Value {
         "plan_mode":agent.plan_mode(),"cost":agent.session_cost(),
         "cost_note":"observed priced session spend, not an invoice total; usage has explicit unknown-cost coverage",
         "observed_cost":usage_total.all.observed_cost_usd,"usage":{"total":usage_total,"turn":usage_turn},
-        "metrics":agent.metrics(),"efficiency":agent.efficiency_report(),"speculation":agent.speculation_stats(),"tree":agent.session().execution_tree()})
+        "metrics":agent.metrics(),"efficiency":agent.efficiency_report(),"speculation":agent.speculation_stats(),"tree":agent.session().execution_tree(),
+        "current_model":models::current(agent.effective_config())})
+}
+
+/// Native controller methods that never touch the agent: session administration, the offline
+/// model listing and settings. Reads run off the controller thread; writes run on it, so a later
+/// request observes an earlier write. `current` is the active session and model from the
+/// worker's cached projection.
+struct Admin {
+    layout: Layout,
+    config: Config,
+}
+
+impl Admin {
+    fn current(
+        projection: &QueryProjection,
+    ) -> (Option<String>, crate::llm::model_config::ModelSelection) {
+        let state = &projection.state;
+        let model = &state["current_model"];
+        (
+            state["session_id"].as_str().map(str::to_owned),
+            crate::llm::model_config::ModelSelection {
+                provider: model["provider"].as_str().unwrap_or_default().to_owned(),
+                model: model["model_id"].as_str().unwrap_or_default().to_owned(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Whether `method` only reads, so it may run on its own thread.
+    fn reads(method: &str) -> bool {
+        matches!(
+            method,
+            "list_sessions"
+                | "list_models"
+                | "settings_schema"
+                | "get_settings"
+                | "list_extensions"
+        )
+    }
+
+    fn handle(
+        &self,
+        method: &str,
+        params: &Value,
+        current: (Option<String>, crate::llm::model_config::ModelSelection),
+    ) -> Result<Value> {
+        let (session, model) = current;
+        match method {
+            "list_sessions" => sessions::list(&self.layout, session.as_deref(), params),
+            "delete_session" => sessions::delete(&self.layout, session.as_deref(), params),
+            "pin_session" => sessions::pin(&self.layout, params),
+            "list_models" => {
+                let provider = match params.get("provider").filter(|value| !value.is_null()) {
+                    Some(value) => Some(
+                        value
+                            .as_str()
+                            .filter(|provider| !provider.is_empty())
+                            .context("provider must be a non-empty string")?,
+                    ),
+                    None => None,
+                };
+                let models = if model.provider.is_empty() {
+                    models::list(
+                        &self.config,
+                        &self.config.selection(),
+                        &self.layout.user_dir,
+                        provider,
+                    )
+                } else {
+                    models::list(&self.config, &model, &self.layout.user_dir, provider)
+                };
+                Ok(json!({"models":models}))
+            }
+            "settings_schema" => Ok(settings::schema()),
+            "get_settings" => settings::get(&self.layout, params),
+            "set_setting" => settings::set(&self.layout, params),
+            "reset_setting" => settings::reset(&self.layout, params),
+            "list_extensions" => Ok(extensions(&self.layout, &self.config)),
+            _ => Err(unknown_method()),
+        }
+    }
+}
+
+/// `list_extensions`: the rows `/extensions` shows, from disk and the launch configuration.
+/// Installing, enabling and signing in remain terminal flows.
+fn extensions(layout: &Layout, config: &Config) -> Value {
+    let row = |row: &crate::ui::overlay::extensions::model::Row| {
+        json!({
+            "id": row.id,
+            "title": row.title,
+            "summary": row.summary,
+            "tags": row.tags,
+            "origin": row.origin,
+            "state": row.state,
+            "details": row.details,
+        })
+    };
+    let snapshot = crate::app::extensions_snapshot(layout, config);
+    json!({
+        "mcp": snapshot.mcp.iter().map(row).collect::<Vec<_>>(),
+        "skills": snapshot.skills.iter().map(row).collect::<Vec<_>>(),
+    })
 }
 
 fn query_snapshot(agent: &Agent<'_>, projection: &mut QueryProjection) {
@@ -953,6 +1085,7 @@ fn run_control(
         output: Arc::new(Mutex::new(Output {
             acp: acp.then(|| crate::acp::Adapter::new(layout.clone())),
             protocol: DEFAULT_PROTOCOL_VERSION,
+            envelope: Envelope::default(),
         })),
         writer,
         failed: Arc::new(AtomicBool::new(false)),
@@ -991,6 +1124,10 @@ fn run_control(
     let active = busy.clone();
     let worker_closing = closing.clone();
     let worker_prompt_queued = prompt_queued.clone();
+    let admin = Arc::new(Admin {
+        layout: layout.clone(),
+        config: config.clone(),
+    });
     let queue = steering.clone();
     let actor = actor::Actor {
         layout,
@@ -1121,7 +1258,8 @@ fn run_control(
                                     .as_array()
                                     .context("RPC message snapshot is unavailable")?,
                                 &request["params"],
-                            ),
+                            )
+                            .map_err(|error| coded(ErrorCode::InvalidParams, error)),
                         }
                     })();
                     out.result(&id, result);
@@ -1155,14 +1293,18 @@ fn run_control(
                 }
                 "steer" => {
                     let result = (|| -> Result<Value> {
-                        anyhow::ensure!(busy.load(Ordering::SeqCst), "no active turn");
-                        let text = request["params"]["text"]
-                            .as_str()
-                            .context("steer requires params.text")?;
+                        if !busy.load(Ordering::SeqCst) {
+                            return Err(coded(ErrorCode::NotPending, "no active turn"));
+                        }
+                        let text = request["params"]["text"].as_str().ok_or_else(|| {
+                            coded(ErrorCode::InvalidParams, "steer requires params.text")
+                        })?;
                         let mut q = steering
                             .lock()
                             .map_err(|_| anyhow::anyhow!("steering unavailable"))?;
-                        anyhow::ensure!(q.len() < MAX_STEERING, "steering queue full");
+                        if q.len() >= MAX_STEERING {
+                            return Err(coded(ErrorCode::Busy, "steering queue full"));
+                        }
                         q.push(text.to_owned());
                         maintenance_control.note_input();
                         Ok(json!({"queued":true}))
@@ -1173,21 +1315,26 @@ fn run_control(
                     let result = (|| -> Result<Value> {
                         anyhow::ensure!(!acp, "ACP custom question input is not negotiated");
                         let correlation: crate::agent::workflow::questions::Correlation =
-                            serde_json::from_value(request["params"].clone())?;
+                            serde_json::from_value(request["params"].clone())
+                                .map_err(|error| coded(ErrorCode::InvalidParams, error))?;
                         let mut pending = pending_question
                             .lock()
                             .map_err(|_| anyhow::anyhow!("question owner unavailable"))?;
-                        let question = pending
-                            .as_mut()
-                            .context("no question is currently pending")?;
-                        anyhow::ensure!(
-                            correlation.matches(&question.request),
-                            "question id, generation or session does not match the pending question"
-                        );
-                        anyhow::ensure!(
-                            !question.presented,
-                            "question presentation was already acknowledged"
-                        );
+                        let question = pending.as_mut().ok_or_else(|| {
+                            coded(ErrorCode::NotPending, "no question is currently pending")
+                        })?;
+                        if !correlation.matches(&question.request) {
+                            return Err(coded(
+                                ErrorCode::NotPending,
+                                "question id, generation or session does not match the pending question",
+                            ));
+                        }
+                        if question.presented {
+                            return Err(coded(
+                                ErrorCode::NotPending,
+                                "question presentation was already acknowledged",
+                            ));
+                        }
                         question.deadline = if question.request.timeout_seconds == 0 {
                             None
                         } else {
@@ -1202,48 +1349,63 @@ fn run_control(
                     let result = (|| -> Result<Value> {
                         anyhow::ensure!(!acp, "ACP custom question input is not negotiated");
                         let submission: crate::agent::workflow::questions::Submission =
-                            serde_json::from_value(request["params"].clone())?;
+                            serde_json::from_value(request["params"].clone())
+                                .map_err(|error| coded(ErrorCode::InvalidParams, error))?;
                         let correlation = submission.correlation();
                         let question = {
                             let pending = pending_question
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("question owner unavailable"))?;
-                            let question = pending
-                                .as_ref()
-                                .context("no question is currently pending")?;
-                            anyhow::ensure!(
-                                correlation.matches(&question.request),
-                                "question id, generation or session does not match the pending question"
-                            );
-                            anyhow::ensure!(
-                                question.presented,
-                                "acknowledge actual question presentation before answering"
-                            );
-                            anyhow::ensure!(
-                                !question
-                                    .deadline
-                                    .is_some_and(|deadline| Instant::now() >= deadline),
-                                "question presentation deadline expired"
-                            );
+                            let question = pending.as_ref().ok_or_else(|| {
+                                coded(ErrorCode::NotPending, "no question is currently pending")
+                            })?;
+                            if !correlation.matches(&question.request) {
+                                return Err(coded(
+                                    ErrorCode::NotPending,
+                                    "question id, generation or session does not match the pending question",
+                                ));
+                            }
+                            if !question.presented {
+                                return Err(coded(
+                                    ErrorCode::NotPending,
+                                    "acknowledge actual question presentation before answering",
+                                ));
+                            }
+                            if question
+                                .deadline
+                                .is_some_and(|deadline| Instant::now() >= deadline)
+                            {
+                                return Err(coded(
+                                    ErrorCode::NotPending,
+                                    "question presentation deadline expired",
+                                ));
+                            }
                             question.request.clone()
                         };
                         let outcome = submission
                             .outcome(&question, &question_root)
-                            .map_err(anyhow::Error::msg)?;
+                            .map_err(|error| coded(ErrorCode::InvalidParams, error))?;
                         let mut pending = pending_question
                             .lock()
                             .map_err(|_| anyhow::anyhow!("question owner unavailable"))?;
-                        let current = pending.as_ref().context("question is no longer pending")?;
-                        anyhow::ensure!(
-                            correlation.matches(&current.request),
-                            "stale or replayed question answer"
-                        );
-                        anyhow::ensure!(
-                            !current
-                                .deadline
-                                .is_some_and(|deadline| Instant::now() >= deadline),
-                            "question presentation deadline expired"
-                        );
+                        let current = pending.as_ref().ok_or_else(|| {
+                            coded(ErrorCode::NotPending, "question is no longer pending")
+                        })?;
+                        if !correlation.matches(&current.request) {
+                            return Err(coded(
+                                ErrorCode::NotPending,
+                                "stale or replayed question answer",
+                            ));
+                        }
+                        if current
+                            .deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline)
+                        {
+                            return Err(coded(
+                                ErrorCode::NotPending,
+                                "question presentation deadline expired",
+                            ));
+                        }
                         question_tx.send((question.question_id, outcome))?;
                         *pending = None;
                         maintenance_control.note_input();
@@ -1253,23 +1415,31 @@ fn run_control(
                 }
                 "approve" => {
                     let result = (|| -> Result<Value> {
-                        let approval_id = request["params"]["approval_id"]
-                            .as_str()
-                            .context("approval_id required")?;
+                        let approval_id =
+                            request["params"]["approval_id"].as_str().ok_or_else(|| {
+                                coded(ErrorCode::InvalidParams, "approval_id required")
+                            })?;
                         let decision = match request["params"]["decision"].as_str() {
                             Some("allow") => Decision::Allow,
                             Some("always") => Decision::AllowAlways,
                             Some("project") => Decision::AllowProject,
                             Some("deny") => Decision::Deny,
-                            _ => anyhow::bail!("decision must be allow, always or deny"),
+                            _ => {
+                                return Err(coded(
+                                    ErrorCode::InvalidParams,
+                                    "decision must be allow, always, project or deny",
+                                ));
+                            }
                         };
                         let mut pending = pending_approval
                             .lock()
                             .map_err(|_| anyhow::anyhow!("approval unavailable"))?;
-                        anyhow::ensure!(
-                            pending.as_deref() == Some(approval_id),
-                            "approval id is not currently pending"
-                        );
+                        if pending.as_deref() != Some(approval_id) {
+                            return Err(coded(
+                                ErrorCode::NotPending,
+                                "approval id is not currently pending",
+                            ));
+                        }
                         *pending = None;
                         approval_tx.send((approval_id.to_owned(), decision))?;
                         Ok(json!({"received":true}))
@@ -1353,9 +1523,12 @@ fn run_control(
                 }
                 "hello" => {
                     let result = (|| -> Result<Value> {
-                        let requested = request["params"]["protocol_version"]
-                            .as_u64()
-                            .context("protocol_version required")?;
+                        let requested =
+                            request["params"]["protocol_version"]
+                                .as_u64()
+                                .ok_or_else(|| {
+                                    coded(ErrorCode::InvalidParams, "protocol_version required")
+                                })?;
                         let version = negotiated_version(requested)?;
                         out.negotiate(version)?;
                         Ok(
@@ -1445,6 +1618,24 @@ fn run_control(
                     drop(state);
                     out.result(&id, Ok(json!({"live":false,"stopped":stopped})));
                 }
+                "list_sessions" | "delete_session" | "pin_session" | "list_models"
+                | "settings_schema" | "get_settings" | "set_setting" | "reset_setting"
+                | "list_extensions"
+                    if !acp =>
+                {
+                    let method = request["method"].as_str().unwrap_or_default().to_owned();
+                    let current =
+                        Admin::current(&query_cache.lock().unwrap_or_else(|p| p.into_inner()));
+                    if Admin::reads(&method) {
+                        let (admin, out, params) =
+                            (admin.clone(), out.clone(), request["params"].clone());
+                        thread::spawn(move || {
+                            out.result(&id, admin.handle(&method, &params, current));
+                        });
+                    } else {
+                        out.result(&id, admin.handle(&method, &request["params"], current));
+                    }
+                }
                 _ => {
                     // An unknown method is refused here, before it takes the busy slot: queued
                     // behind the agent it would make `state` report busy and refuse the next
@@ -1459,7 +1650,10 @@ fn run_control(
                         && busy.load(Ordering::SeqCst)
                     {
                         if closing.swap(true, Ordering::SeqCst) {
-                            out.result(&id, Err(anyhow::anyhow!("session is already closing")));
+                            out.result(
+                                &id,
+                                Err(coded(ErrorCode::Busy, "session is already closing")),
+                            );
                             continue;
                         }
                         interrupt.store(true, Ordering::SeqCst);
@@ -1487,7 +1681,10 @@ fn run_control(
                     {
                         out.result(
                             &id,
-                            Err(anyhow::anyhow!("agent busy; use steer, abort or approve")),
+                            Err(coded(
+                                ErrorCode::Busy,
+                                "agent busy; use steer, abort or approve",
+                            )),
                         );
                         continue;
                     }

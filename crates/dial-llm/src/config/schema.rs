@@ -500,7 +500,7 @@ pub(super) static APPEARANCE: &[SettingDef] = &[
         AP,
         "Composer",
         "Composer shape",
-        "Band: a shaded band with the status line inside it. Box: rounded frame with the status line in its border. Line: plain rules, easier to copy from.",
+        "Box (default): rounded frame with the status line in its border. Band: a shaded band with the status line inside it. Line: plain rules, easier to copy from.",
         Kind::Enum(SHAPE),
     ),
     field!(

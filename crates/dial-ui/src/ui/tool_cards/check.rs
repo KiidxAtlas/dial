@@ -151,9 +151,46 @@ pub(super) fn parse(output: &str) -> Report {
     report
 }
 
-fn command(t: &Tool) -> Option<String> {
+/// The command text of a `bash` call, one line.
+pub(in crate::ui) fn command(t: &Tool) -> Option<String> {
     let args: serde_json::Value = serde_json::from_str(&t.input).ok()?;
     args["command"].as_str().map(text::one_line)
+}
+
+/// Failing tests that also show their failure line under the name.
+const REASONS: usize = 3;
+
+/// Why `test` failed, and where when the runner said so: the panic message and location of a Rust
+/// test, or the reason pytest prints after its `FAILED <test> - ` summary.
+fn failure_reason(output: &str, test: &str) -> Option<(String, Option<String>)> {
+    let lines: Vec<&str> = output.lines().map(str::trim).collect();
+    let quoted = format!("'{test}'");
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("thread ")
+            && line.contains(&quoted)
+            && let Some((_, at)) = line.split_once(" panicked at ")
+        {
+            let location = Some(at.trim_end_matches(':').trim().to_owned())
+                .filter(|location| !location.is_empty());
+            let message = lines[i + 1..]
+                .iter()
+                .take(3)
+                .find(|next| !next.is_empty() && !next.starts_with("note:"))
+                .map(|next| text::one_line(next));
+            return match (message, location) {
+                (Some(message), location) => Some((message, location)),
+                (None, Some(location)) => Some((location, None)),
+                (None, None) => None,
+            };
+        }
+        if let Some(rest) = line.strip_prefix("FAILED ")
+            && let Some((name, reason)) = rest.split_once(" - ")
+            && (name == test || name.ends_with(&format!("::{test}")))
+        {
+            return Some((text::one_line(reason), None));
+        }
+    }
+    None
 }
 
 /// A settled test or build run reduced to its verdict, as the turn recap shows it.
@@ -274,8 +311,18 @@ pub(super) fn check_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Option<Rows
     let mut attention: Vec<(String, Tok)> = Vec::new();
     let mut count = 0;
     if !report.failing.is_empty() {
-        for name in report.failing.iter().take(LISTED) {
+        for (i, name) in report.failing.iter().take(LISTED).enumerate() {
             attention.push((format!("{cross} {name}"), Tok::Error));
+            // Why it failed and where, for the first few: what you need before the full log.
+            if i < REASONS
+                && let Some((reason, location)) = failure_reason(&t.output, name)
+            {
+                let reason = match location {
+                    Some(location) => format!("{reason}{sep}{location}"),
+                    None => reason,
+                };
+                attention.push((format!("  {reason}"), Tok::Muted));
+            }
         }
         count = report.failing.len();
     } else {

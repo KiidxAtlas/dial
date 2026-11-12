@@ -16,7 +16,9 @@ mod sharpshooter;
 pub use managed::discover as managed_skills;
 pub use managed::{directory_path as managed_directory, read_skill as read_managed_skill};
 /// OpenAI-compatible embedding wire helpers, shared with the `image_embedding` role.
-pub use semantic::{EmbeddingWire, embedding_url, parse_embeddings};
+pub use semantic::{
+    Embedder, EmbeddingWire, SharedEmbedder, embedding_url, parse_embeddings, shared_embedder,
+};
 pub fn managed_root(layout: &Layout) -> std::path::PathBuf {
     crate::config::paths::memory_backends_dir(&layout.user_dir).join("managed-skills")
 }

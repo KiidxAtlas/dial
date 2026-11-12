@@ -99,6 +99,33 @@ pub fn select(
         }
         return Ok((name.to_owned(), config.clone()));
     }
+    let candidates = ranked(catalogue, program, root);
+    let installed = candidates
+        .iter()
+        .find(|(_, config)| available(config, root))
+        .map(|(name, config)| ((*name).clone(), (*config).clone()));
+    installed.ok_or_else(|| {
+        if candidates.is_empty() {
+            "no DAP adapter matches this program or project; pass `adapter` (e.g. gdb, lldb-dap, debugpy, dlv) or configure [dap.<id>]".to_owned()
+        } else {
+            format!(
+                "matching DAP adapters are not installed: {}; install one or pass `adapter`",
+                candidates
+                    .iter()
+                    .map(|(name, config)| format!("{name} (`{}`)", config.program.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    })
+}
+
+/// Adapters matching `program` (by extension) or the project (by root markers), best first.
+fn ranked<'a>(
+    catalogue: &'a BTreeMap<String, DapAdapterConfig>,
+    program: Option<&Path>,
+    root: &Path,
+) -> Vec<(&'a String, &'a DapAdapterConfig)> {
     let extension = program
         .and_then(|p| p.extension())
         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()));
@@ -121,23 +148,34 @@ pub fn select(
         .collect();
     // Extension match first, then root marker, then preference order.
     candidates.sort_by_key(|(ext, marker, rank, ..)| (!*ext, !*marker, *rank));
-    let installed = candidates
-        .iter()
-        .find(|(.., config)| available(config, root))
-        .map(|(.., name, config)| ((*name).clone(), (*config).clone()));
-    installed.ok_or_else(|| {
-        if candidates.is_empty() {
-            "no DAP adapter matches this program or project; pass `adapter` (e.g. gdb, lldb-dap, debugpy, dlv) or configure [dap.<id>]".to_owned()
-        } else {
-            format!(
-                "matching DAP adapters are not installed: {}; install one or pass `adapter`",
-                candidates
-                    .iter()
-                    .map(|(.., name, config)| format!("{name} (`{}`)", config.program.display()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
+    candidates
+        .into_iter()
+        .map(|(.., name, config)| (name, config))
+        .collect()
+}
+
+/// The best adapter `select` would want that is missing but has a Dial install recipe for its
+/// bare program name, as `(adapter, recipe id)`. `None` when one is installed already, nothing
+/// matches, or no matching adapter can be installed.
+pub fn installable(
+    catalogue: &BTreeMap<String, DapAdapterConfig>,
+    requested: Option<&str>,
+    program: Option<&Path>,
+    root: &Path,
+) -> Option<(String, String)> {
+    let candidates: Vec<(&String, &DapAdapterConfig)> = match requested {
+        Some(name) => catalogue.get_key_value(name).into_iter().collect(),
+        None => ranked(catalogue, program, root),
+    };
+    if candidates.iter().any(|(_, config)| available(config, root)) {
+        return None;
+    }
+    candidates.into_iter().find_map(|(name, config)| {
+        let bare = config.program.to_str()?;
+        (config.address.is_empty()
+            && config.program.components().count() == 1
+            && crate::setup::deps::recipe(bare).is_some())
+        .then(|| (name.clone(), bare.to_owned()))
     })
 }
 

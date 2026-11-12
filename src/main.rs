@@ -47,6 +47,7 @@ fn main() {
     if std::env::args_os().nth(1).is_some_and(|arg| {
         arg == dial::tools::exec::sandbox::low_integrity::LAUNCH_ARG
             || arg == dial::tools::exec::sandbox::low_integrity::CHILD_FENCE_ARG
+            || arg == dial::tools::exec::sandbox::APPCONTAINER_LAUNCH_ARG
     }) {
         std::process::exit(dial::tools::exec::sandbox::low_integrity::launcher_main());
     }

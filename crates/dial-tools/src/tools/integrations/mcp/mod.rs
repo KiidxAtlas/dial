@@ -636,11 +636,19 @@ pub fn start(config: &Config) -> Startup {
 /// The prefetch for exactly these servers. A prefetch for other servers is dropped, which cancels
 /// it and stops its servers.
 fn take_prefetch(config: &Config) -> Option<Arc<Connecting>> {
-    let (key, connecting) = PREFETCH.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    take_from(&PREFETCH, config)
+}
+
+fn take_from(
+    slot: &std::sync::Mutex<Option<Prefetch>>,
+    config: &Config,
+) -> Option<Arc<Connecting>> {
+    let (key, connecting) = slot.lock().unwrap_or_else(|e| e.into_inner()).take()?;
     (Some(key) == prefetch_key(config)).then_some(connecting)
 }
 
-/// A connection pass started before the first agent exists, keyed by the servers it connects.
+/// A connection pass started before the first agent exists, or servers a rebuilt agent handed
+/// over ([`retain`]), keyed by the servers it connects.
 type Prefetch = (String, Arc<Connecting>);
 static PREFETCH: std::sync::Mutex<Option<Prefetch>> = std::sync::Mutex::new(None);
 
@@ -651,20 +659,51 @@ fn prefetch_key(config: &Config) -> Option<String> {
 
 /// Start connecting the configured servers in the background, so the interface can draw and the
 /// first request can start while slow servers start; the next [`load`] or [`start`] for the same
-/// servers adopts the result. A config that changes first discards the prefetch (dropping it
-/// cancels the connect and stops those servers).
+/// servers adopts the result. A pass (or [`retain`]ed servers) for the same servers is kept, so a
+/// settings change that leaves MCP alone does not reconnect. A config that changes first discards
+/// the held pass (dropping it cancels the connect and stops those servers).
 pub fn prefetch(config: &Config) {
-    if !config.mcp.values().any(|server| server.enabled) {
-        return;
-    }
+    prefetch_in(&PREFETCH, config);
+}
+
+fn prefetch_in(slot: &std::sync::Mutex<Option<Prefetch>>, config: &Config) {
     let Some(key) = prefetch_key(config) else {
         return;
     };
+    let held = {
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|(held, _)| *held == key) {
+            return;
+        }
+        slot.take()
+    };
+    // Dropped outside the lock: its drop waits for the cancel and stops those servers.
+    drop(held);
+    if !config.mcp.values().any(|server| server.enabled) {
+        return;
+    }
     let Some(connecting) = Connecting::spawn(config) else {
         return;
     };
-    // The replaced pass is dropped after the lock is released: its drop waits for the cancel.
-    let replaced = PREFETCH
+    let replaced = slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace((key, connecting));
+    drop(replaced);
+}
+
+/// Hand servers a registry connected ([`crate::tools::integrations::ext::Registry::mcp_handoff`])
+/// to the next [`prefetch`]/[`start`], so an agent rebuilt for the same servers adopts them
+/// instead of reconnecting. Servers for a different configuration are stopped by that call.
+pub fn retain(connecting: Arc<Connecting>) {
+    retain_in(&PREFETCH, connecting);
+}
+
+fn retain_in(slot: &std::sync::Mutex<Option<Prefetch>>, connecting: Arc<Connecting>) {
+    let Some(key) = prefetch_key(&connecting.config) else {
+        return;
+    };
+    let replaced = slot
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .replace((key, connecting));
@@ -674,8 +713,11 @@ pub fn prefetch(config: &Config) {
 /// Whether a [`prefetch`] is still connecting, so the interface can keep accepting input
 /// instead of blocking in [`load`].
 pub fn prefetch_pending() -> bool {
-    PREFETCH
-        .lock()
+    pending_in(&PREFETCH)
+}
+
+fn pending_in(slot: &std::sync::Mutex<Option<Prefetch>>) -> bool {
+    slot.lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|(_, connecting)| !connecting.is_finished())
@@ -704,6 +746,21 @@ impl Connecting {
             handle: Mutex::new(Some(handle)),
             loaded: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Servers already connected, as a finished pass: a rebuilt registry adopts them unchanged.
+    /// `loaded` must be the load as connecting returned it (its `live` mirror not yet synced);
+    /// its notices were already shown, so they are not repeated.
+    pub(crate) fn ready(config: &Config, mut loaded: McpLoad) -> Arc<Self> {
+        loaded.notices.clear();
+        let finished = std::sync::OnceLock::new();
+        let _ = finished.set(loaded);
+        Arc::new(Self {
+            config: config.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            handle: Mutex::new(None),
+            loaded: finished,
+        })
     }
 
     /// Whether [`Connecting::wait`] would return without waiting.

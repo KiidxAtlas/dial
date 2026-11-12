@@ -30,7 +30,7 @@ use crate::{
         theme::{Sym, Theme, Tok},
     },
 };
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     style::{Modifier, Style},
@@ -490,10 +490,13 @@ struct Columns {
 }
 
 impl Columns {
-    fn new(w: usize, learning: bool) -> Self {
+    /// `lora` asks for the LoRA column; [`ModelOverlay::shows_lora`] decides whether it says anything.
+    fn new(w: usize, learning: bool, lora: bool) -> Self {
         Self {
             state_w: if w >= 60 { 20 } else { 0 },
-            lora_w: if learning && w >= 90 {
+            lora_w: if !lora {
+                0
+            } else if learning && w >= 90 {
                 19
             } else if w >= 72 {
                 10
@@ -587,18 +590,29 @@ fn is_local(entry: &ModelEntry) -> bool {
     }
 }
 
-/// The provider-reported price when it is usable (finite, not negative); never estimated.
-fn pricing(entry: &ModelEntry) -> Option<crate::llm::catalog::TokenPricing> {
-    entry.metadata.pricing.filter(|p| {
+/// A usable price (finite, not negative) and whether it is an estimate. The provider-reported price
+/// wins; otherwise a cloud model with a bundled card shows its published list price, marked as an
+/// estimate wherever it appears.
+fn pricing(entry: &ModelEntry) -> Option<(crate::llm::catalog::TokenPricing, bool)> {
+    let usable = |p: &crate::llm::catalog::TokenPricing| {
         [p.prompt, p.completion]
             .iter()
             .all(|v| v.is_finite() && *v >= 0.0)
-    })
+    };
+    if let Some(reported) = entry.metadata.pricing {
+        return usable(&reported).then_some((reported, false));
+    }
+    if is_local(entry) {
+        return None;
+    }
+    crate::llm::catalog::list_pricing(&entry.selection)
+        .filter(usable)
+        .map(|listed| (listed, true))
 }
 
 /// Input plus output price per token: the price sort key.
 fn blended_price(entry: &ModelEntry) -> Option<f64> {
-    pricing(entry).map(|p| p.prompt + p.completion)
+    pricing(entry).map(|(p, _)| p.prompt + p.completion)
 }
 
 /// USD per 1M tokens from a per-token price, compact: `3`, `0.15`, `0.075`, `15`.
@@ -624,21 +638,35 @@ fn per_million(per_token: f64) -> String {
     }
 }
 
-/// The price column: `$input/$output` per 1M tokens, `free`, or `-` when unknown.
+/// The price column: `$input/$output` per 1M tokens, `free`, or `-` when unknown. A bundled list
+/// price (an estimate) is prefixed with `~`.
 fn price_cell(entry: &ModelEntry) -> String {
-    match pricing(entry) {
-        Some(p) if p.prompt == 0.0 && p.completion == 0.0 => "free".into(),
-        Some(p) => format!("${}/${}", per_million(p.prompt), per_million(p.completion)),
-        None => "-".into(),
+    let Some((p, estimated)) = pricing(entry) else {
+        return "-".into();
+    };
+    let mark = if estimated { "~" } else { "" };
+    if p.prompt == 0.0 && p.completion == 0.0 {
+        format!("{mark}free")
+    } else {
+        format!(
+            "{mark}${}/${}",
+            per_million(p.prompt),
+            per_million(p.completion)
+        )
     }
 }
 
 fn price_detail(entry: &ModelEntry) -> String {
-    let Some(p) = pricing(entry) else {
+    let Some((p, estimated)) = pricing(entry) else {
         return "no price listed".into();
     };
+    let what = if estimated {
+        "list price (estimate, not reported by the provider)"
+    } else {
+        "price"
+    };
     if p.prompt == 0.0 && p.completion == 0.0 {
-        return "price free".into();
+        return format!("{what} free");
     }
     let valid = |v: &f64| v.is_finite() && *v >= 0.0;
     let mut parts = vec![
@@ -651,7 +679,7 @@ fn price_detail(entry: &ModelEntry) -> String {
     if let Some(write) = p.cache_write.filter(valid) {
         parts.push(format!("cache write ${}", per_million(write)));
     }
-    format!("price per 1M tokens: {}", parts.join(" "))
+    format!("{what} per 1M tokens: {}", parts.join(" "))
 }
 
 fn fmt_rate(tok_per_s: f64) -> String {
@@ -1106,6 +1134,16 @@ impl ModelOverlay {
             .map(|_| self.main_lora)
     }
 
+    /// Whether the LoRA column earns its width: always in the learning view, otherwise only when
+    /// a listed model has something to say there (a trainable local model, an adapter state or a
+    /// running check). A list of hosted models would show a column of dashes.
+    fn shows_lora(&self, rows: &[(&ModelEntry, Vec<usize>)]) -> bool {
+        self.learning
+            || rows
+                .iter()
+                .any(|(entry, _)| lora_cell(entry, self.main_lora_for(entry)).0 != "-")
+    }
+
     /// Open on the Roles view (used by the "assign models to roles" shortcut).
     pub fn show_roles(&mut self) {
         self.group = Group::Roles;
@@ -1364,7 +1402,14 @@ impl ModelOverlay {
         }
         // With a query the best match leads within a rank; without one the discovery order stands.
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
-        if self.sort != SortOrder::Default {
+        if self.sort == SortOrder::Price {
+            // Stable, unknown last; the key is computed once per row because a price may come from
+            // a bundled-card lookup. Usable prices are not negative, so their bits order like values.
+            rows.sort_by_cached_key(|row| {
+                let price = blended_price(row.3);
+                (price.is_none(), price.map_or(0, f64::to_bits))
+            });
+        } else if self.sort != SortOrder::Default {
             // Stable: ties keep the ranked order above.
             rows.sort_by(|a, b| self.sort_cmp(a.3, b.3));
         }
@@ -1656,7 +1701,7 @@ impl ModelOverlay {
             }
             return OverlayEvent::None;
         }
-        if key.code == KeyCode::F(7) {
+        if local_function_key(key, keys, 7, Action::SubagentsRecent) {
             let selection = if self.focus != Focus::List {
                 None
             } else if self.group == Group::Roles {
@@ -2055,7 +2100,15 @@ impl ModelOverlay {
     // ---- drawing --------------------------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        if self.panel_keys.draw(frame, ctx, "Models", "Typing searches the models; Shift+F2 filters, Shift+F3 sorts and F5 rescans providers.\nF7 tunes the selected model; Ctrl+F marks a favorite; Ctrl+S switches save scope.", true, false) {
+        self.panel_keys.set_footer(self.footer(ctx.keys));
+        let tune = local_function_label(ctx.keys, 7, Action::SubagentsRecent);
+        let help = format!(
+            "Typing searches the models; Shift+F2 filters, Shift+F3 sorts and F5 rescans providers.\n{tune} tunes the selected model; Ctrl+F marks a favorite; Ctrl+S switches save scope."
+        );
+        if self
+            .panel_keys
+            .draw(frame, ctx, "Models", &help, true, false)
+        {
             return;
         }
         let extra = super::settings::scope_caption(
@@ -2179,6 +2232,7 @@ impl ModelOverlay {
         }
         self.scroll = self.scroll.min(len.saturating_sub(body_rows));
         let rows = self.rows();
+        let lora = self.shows_lora(&rows);
         let download_lines = if download_view {
             self.downloads.borrow().body(right_w, body_rows, theme)
         } else {
@@ -2229,7 +2283,7 @@ impl ModelOverlay {
                     right_w,
                 ))
             } else {
-                self.search_line(theme, right_w, list_w)
+                self.search_line(theme, right_w, list_w, lora)
             });
         }
         let top_rows = right_top.len();
@@ -2278,7 +2332,7 @@ impl ModelOverlay {
                         filled(vec![], list_w, Style::default())
                     }
                 } else if let Some((entry, positions)) = rows.get(index) {
-                    self.model_line(theme, entry, positions, index == self.cursor, list_w)
+                    self.model_line(theme, entry, positions, index == self.cursor, list_w, lora)
                 } else if rows.is_empty() {
                     let empty_rows =
                         text::wrap_words(self.empty_text().trim(), list_w.saturating_sub(2).max(1));
@@ -2315,7 +2369,8 @@ impl ModelOverlay {
             out.push(Line::from(fit(numbers, w)));
         }
         if show_footer {
-            out.push(hint_line(theme, &self.footer(ctx.keys), w));
+            let hints = super::panel_keys::capped_footer(self.footer(ctx.keys), "F1 keys");
+            out.push(hint_line(theme, &hints, w));
         }
         out
     }
@@ -2455,7 +2510,7 @@ impl ModelOverlay {
     }
 
     /// The search prompt; the rest of the row labels the list's columns, aligned with them.
-    fn search_line(&self, theme: &Theme, w: usize, list_w: usize) -> Line<'static> {
+    fn search_line(&self, theme: &Theme, w: usize, list_w: usize, lora: bool) -> Line<'static> {
         let prompt = Span::styled(
             format!(" {} ", theme.sym(Sym::Prompt)),
             theme.fg(Tok::Accent),
@@ -2475,7 +2530,7 @@ impl ModelOverlay {
                 ),
             ]
         };
-        let labels = Columns::new(list_w, self.learning).labels();
+        let labels = Columns::new(list_w, self.learning, lora).labels();
         let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
         let labels_w = text::width(&labels);
         if !labels.trim().is_empty() && used + 2 + labels_w <= list_w {
@@ -2644,6 +2699,7 @@ impl ModelOverlay {
         positions: &[usize],
         selected: bool,
         w: usize,
+        lora: bool,
     ) -> Line<'static> {
         let fill = if selected {
             theme.bg(Tok::SelectedBg)
@@ -2690,7 +2746,7 @@ impl ModelOverlay {
             speed_w,
             price_w,
             caps_w,
-        } = Columns::new(w, self.learning);
+        } = Columns::new(w, self.learning, lora);
         let prefix_w = text::width(&pointer) + text::width(&marker) + 2;
         let name_w =
             w.saturating_sub(prefix_w + caps_w + state_w + lora_w + ctx_w + speed_w + price_w);
@@ -3205,7 +3261,10 @@ impl ModelOverlay {
                 } else {
                     String::new()
                 },
-                "F7 tune selected".to_owned(),
+                format!(
+                    "{} tune selected",
+                    local_function_label(keys, 7, Action::SubagentsRecent)
+                ),
                 "Shift+F8 Connection overrides (HTTP headers)".to_owned(),
                 self.groups_hint(keys),
                 hint(keys, Action::SelectCancel, "close"),
@@ -3270,7 +3329,10 @@ impl ModelOverlay {
             } else {
                 String::new()
             },
-            "F7 tune selected".to_owned(),
+            format!(
+                "{} tune selected",
+                local_function_label(keys, 7, Action::SubagentsRecent)
+            ),
             "Ctrl+F favorite".to_owned(),
             self.groups_hint(keys),
             "Shift+F8 Connection overrides".to_owned(),
@@ -3324,12 +3386,7 @@ impl ModelOverlay {
     }
 }
 
-/// Keep the old panel key when it is not claimed by the effective global shortcut.
-fn local_function_key(key: &KeyEvent, keys: &Keymap, number: u8, global: Action) -> bool {
-    key.code == KeyCode::F(number)
-        && (key.modifiers == KeyModifiers::SHIFT
-            || (key.modifiers.is_empty() && !keys.triggers(global, key)))
-}
+use super::settings::{local_function_key, local_function_label};
 
 #[cfg(test)]
 mod tests;

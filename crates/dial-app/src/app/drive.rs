@@ -63,11 +63,20 @@ pub(super) fn drive(
     // changed settings still match what it loaded.
     let mut resident = None;
     let mut coordination = None;
+    // Connected MCP servers survive a same-session rebuild; the next agent adopts them when the
+    // changed settings leave the servers' configuration alone.
+    let mut mcp_handoff = None;
+    // Running background jobs and armed watches survive a same-project rebuild instead of being
+    // killed with the old agent's tools.
+    let mut live_processes = None;
     loop {
         let (step, layout) = {
             let mut agent = app.make_agent(session)?;
             if let Some(carry) = coordination.take() {
                 agent.restore_coordination(carry);
+            }
+            if let Some(processes) = live_processes.take() {
+                agent.adopt_live_processes(processes);
             }
             if let Some(server) = resident.take() {
                 agent.adopt_resident_server(server);
@@ -117,6 +126,8 @@ pub(super) fn drive(
                 lifecycle_open = true;
                 resident = agent.take_resident_server();
                 coordination = agent.take_coordination();
+                mcp_handoff = agent.mcp_handoff();
+                live_processes = agent.take_live_processes();
             } else {
                 agent.end_session_lifecycle();
             }
@@ -139,6 +150,8 @@ pub(super) fn drive(
                 let project_changed =
                     app.adopt_project(layout.unwrap_or_else(|| app.layout.clone()), *config);
                 if project_changed {
+                    // A new project root revokes watches and its jobs end with the old agent.
+                    live_processes = None;
                     shell.after_project_change(app);
                 }
                 shell.after_adopt(app);
@@ -147,8 +160,12 @@ pub(super) fn drive(
                 if !onboard(app, shell, Some(&session))? {
                     break;
                 }
-                // Rebuilds reconnect MCP too. Do not freeze the composer for their startup
-                // budget just because the initial startup prefetch has already been consumed.
+                // Rebuilds reconnect MCP only when its configuration changed: `prefetch` keeps the
+                // handed-over servers for an equal configuration and replaces them otherwise. Do
+                // not freeze the composer for a reconnect's startup budget.
+                if let Some(connecting) = mcp_handoff.take() {
+                    crate::tools::integrations::mcp::retain(connecting);
+                }
                 crate::tools::integrations::mcp::prefetch(&app.config);
                 if crate::tools::integrations::mcp::prefetch_pending() {
                     shell.note("Tools", "Reconnecting configured MCP servers. You can keep typing; commands wait until tools are ready.");

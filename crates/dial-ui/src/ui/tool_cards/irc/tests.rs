@@ -54,7 +54,7 @@ fn a_delivered_note_reads_as_a_quoted_message_not_work() {
         let rows = rendered(&irc_card(&t, 60, ctx).unwrap());
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].starts_with('✉'), "{rows:?}");
-        assert!(rows[0].contains("IRC") && rows[0].contains("➤ reviewer"));
+        assert!(rows[0].contains("Message") && rows[0].contains("➤ reviewer"));
         assert!(rows[0].trim_end().ends_with("queued"), "{rows:?}");
         assert_eq!(rows[1].trim_end(), "   ▏ please look at the diff");
     });
@@ -114,8 +114,11 @@ fn nothing_delivered_is_flagged_and_peers_send_shares_the_lane() {
         let rows = rendered(&irc_card(&t, 60, ctx).unwrap());
         assert!(rows[0].starts_with(ctx.theme.sym(Sym::Cross2)), "{rows:?}");
         assert!(rows[0].trim_end().ends_with("refused"), "{rows:?}");
+        let refused = crate::ui::tool_cards::frame::chip(ctx.theme, "refused", Tok::Error);
         assert!(
-            rows.last().unwrap().contains("490adb ⟦refused⟧ — gone"),
+            rows.last()
+                .unwrap()
+                .contains(&format!("490adb {} — gone", refused.content)),
             "{rows:?}"
         );
     });

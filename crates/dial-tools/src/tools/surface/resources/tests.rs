@@ -373,3 +373,28 @@ fn vcs_and_dependency_reads_declare_footprints_and_mutations_stay_unknown() {
     let forced = get("git", json!({"action":"log","vcs":"git"})).unwrap();
     assert!(forced.is_empty());
 }
+
+#[test]
+fn batched_writes_conflict_with_each_destination_but_not_disjoint_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(root.path()).unwrap();
+    for path in ["a", "b", "c"] {
+        std::fs::write(root.path().join(path), "source").unwrap();
+    }
+    let registry = Registry::new();
+    let mode = EditMode::default();
+    let batch = resolve(
+        &ws,
+        mode,
+        &registry,
+        "write",
+        &json!({"files":[{"path":"a","content":"x"},{"path":"b","content":"y"}]}),
+    )
+    .unwrap();
+    for path in ["a", "b"] {
+        let read = resolve(&ws, mode, &registry, "read", &json!({"path":path})).unwrap();
+        assert!(batch.conflicts(&read));
+    }
+    let read = resolve(&ws, mode, &registry, "read", &json!({"path":"c"})).unwrap();
+    assert!(!batch.conflicts(&read));
+}

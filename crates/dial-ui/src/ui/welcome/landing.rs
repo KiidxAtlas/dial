@@ -242,13 +242,54 @@ pub fn frame(
         }
     }
 
-    // The recent sessions or starters: a bordered list card whose edges carry its heading and hint.
+    // The key hint stays whenever there is a row for it, so the way to send never disappears
+    // behind a list. `↓ browse` is offered only while the list is not already on screen.
     let mut limit = budget.saturating_sub(context.len());
-    let wants_list = view.selected.is_some() || (!info.recent.is_empty() && limit >= 4);
-    if wants_list && warned && limit >= 6 {
+    // At rest, a first visit to the project shows its starters, as long as the first-run steps
+    // do not need the room and the card (two edges, a heading edge and its rows) fits whole.
+    let starters = info.recent.is_empty()
+        && !info.tour
+        && view.selected.is_none()
+        && limit >= STARTERS.len() + 2 + 2 + usize::from(warned);
+    let wants_list = view.selected.is_some() || (!info.recent.is_empty() && limit >= 4) || starters;
+    if view.selected.is_none() && limit > 0 {
+        let browse = if items(info) > 0 && !wants_list {
+            if theme.ascii() {
+                "  Down browse"
+            } else {
+                "  ↓ browse"
+            }
+        } else {
+            ""
+        };
+        // How Dial will act on the first request, and the key that changes it, before it is sent.
+        let mode = if info.approval.is_empty() || info.approval_key.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  {} mode: {}",
+                text::one_line(&info.approval_key),
+                crate::ui::status::approval_label(&info.approval)
+            )
+        };
+        let full = format!("Enter send  / commands{browse}{mode}");
+        let hint = if text::width(&full) <= inner {
+            full
+        } else {
+            format!("Enter send  / commands{browse}")
+        };
+        context.push(centered(
+            vec![Span::styled(hint, theme.fg(Tok::Dim))],
+            inner,
+            theme,
+        ));
+        limit -= 1;
+    }
+    if wants_list && limit >= 6 && (warned || view.selected.is_none()) {
         context.push(Line::default());
         limit -= 1;
     }
+    // The recent sessions or starters: a bordered list card whose edges carry its heading and hint.
     if wants_list {
         let framed = (limit >= 3)
             .then(|| {
@@ -277,24 +318,6 @@ pub fn frame(
                     .map(|spans| centered(spans, inner, theme)),
             ),
         }
-    } else if limit > 0 {
-        let browse = if items(info) > 0 {
-            if theme.ascii() {
-                "  Down browse"
-            } else {
-                "  ↓ browse"
-            }
-        } else {
-            ""
-        };
-        context.push(centered(
-            vec![Span::styled(
-                format!("Enter send  / commands{browse}"),
-                theme.fg(Tok::Dim),
-            )],
-            inner,
-            theme,
-        ));
     }
     let left = budget.saturating_sub(context.len());
     if info.tour && view.selected.is_none() && left >= 4 {

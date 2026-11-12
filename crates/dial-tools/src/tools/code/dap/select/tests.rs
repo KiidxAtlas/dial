@@ -67,3 +67,34 @@ fn glob_root_markers_match_suffixes() {
         &["*.csproj".to_owned()]
     ));
 }
+
+#[test]
+fn installable_offers_a_missing_adapter_with_a_recipe_only() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.go"), "package main\n").unwrap();
+    let main = dir.path().join("main.go");
+    let mut catalogue = BTreeMap::new();
+    let mut dlv = defaults().remove("dlv").unwrap();
+    dlv.program = PathBuf::from("dial-test-absent-dlv");
+    catalogue.insert("dlv".to_owned(), dlv.clone());
+    // No recipe for this program name: nothing to install.
+    assert_eq!(installable(&catalogue, None, Some(&main), dir.path()), None);
+    // The bundled `dlv` command has a recipe; it is offered only when absent from PATH.
+    dlv.program = PathBuf::from("dlv");
+    catalogue.insert("dlv".to_owned(), dlv.clone());
+    let offered = installable(&catalogue, None, Some(&main), dir.path());
+    if which(Path::new("dlv"), dir.path()).is_none() {
+        assert_eq!(offered, Some(("dlv".to_owned(), "dlv".to_owned())));
+    } else {
+        assert_eq!(offered, None);
+    }
+    // A program path (not a bare name) and a TCP address are never installed.
+    dlv.program = PathBuf::from("bin/dlv");
+    catalogue.insert("dlv".to_owned(), dlv.clone());
+    assert_eq!(installable(&catalogue, Some("dlv"), None, dir.path()), None);
+    // Nothing matches a Python file here.
+    assert_eq!(
+        installable(&catalogue, None, Some(&dir.path().join("x.py")), dir.path()),
+        None
+    );
+}

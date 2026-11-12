@@ -139,8 +139,9 @@ pub(super) fn enabled(args: &Value) -> Result<bool, String> {
     // model opts into it only when lexical candidates are not enough.
     let semantic = match opt_str(args, "ranking")?.unwrap_or("lexical") {
         "semantic" => true,
-        "lexical" => false,
-        _ => return Err("ranking must be semantic or lexical".into()),
+        // Embedding ranking is served by the find tool itself, never by a model rerank.
+        "lexical" | "embedding" => false,
+        _ => return Err("ranking must be lexical, semantic or embedding".into()),
     };
     Ok(!exact && semantic)
 }

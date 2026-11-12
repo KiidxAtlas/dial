@@ -1856,6 +1856,7 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         if preview {
             out.push_str(preview::UNAVAILABLE);
         }
+        out.push_str(&clamped_note(args)?);
         return Ok(out);
     }
     let mode = OutputMode::parse(args)?;
@@ -1994,7 +1995,25 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         page
     };
     page.push_str(&resolved.note());
+    page.push_str(&clamped_note(args)?);
     Ok(page)
+}
+
+/// Names a `limit` or `context` above its maximum, which grep lowers rather than refuses, so the
+/// smaller result is not mistaken for everything that was asked for.
+fn clamped_note(args: &Value) -> Result<String, String> {
+    let mut note = String::new();
+    for (name, max) in [
+        ("limit", MAX_GREP_MATCHES as u64),
+        ("context", MAX_GREP_CONTEXT as u64),
+    ] {
+        if let Some(requested) = opt_u64(args, name)?.filter(|requested| *requested > max) {
+            note.push_str(&format!(
+                "\n[{name}={requested} is above the maximum {max}; used {max}]"
+            ));
+        }
+    }
+    Ok(note)
 }
 
 /// Line matches in one retained or remote text, in the row format of a file search: matches are

@@ -479,6 +479,22 @@ fn empty_project_points_to_all_projects_and_search_shows_a_hint() {
         rendered.contains("Ctrl+G lists sessions from every project"),
         "{rendered}"
     );
+    // With the count of sessions elsewhere, the way forward carries it; with none anywhere,
+    // it says how to start one instead of pointing at an empty list.
+    let elsewhere = Picker::new(vec![], vec![], "", "", false)
+        .scope(false, 0)
+        .with_elsewhere(3);
+    let rendered = text_of(&elsewhere.rows(80, 24, &theme));
+    assert!(
+        rendered.contains("Ctrl+G sessions from all projects (3)"),
+        "{rendered}"
+    );
+    let nowhere = Picker::new(vec![], vec![], "", "", false)
+        .scope(false, 0)
+        .with_elsewhere(0);
+    let rendered = text_of(&nowhere.rows(80, 24, &theme));
+    assert!(rendered.contains("type below to start one"), "{rendered}");
+    assert!(!rendered.contains("Ctrl+G sessions"), "{rendered}");
     let narrow = text_of(&empty.rows(38, 16, &theme));
     assert!(narrow.contains("Ctrl+G all projects"), "{narrow}");
     assert!(!narrow.contains("Enter resume"), "{narrow}");

@@ -1,6 +1,17 @@
 //! Context/history presentation uses the same settings rows and recorded session facts.
 use super::*;
 
+/// Cells in the context gauge.
+const GAUGE_CELLS: usize = 16;
+
+/// Compaction settings the context page keeps in view; see `context_advanced`.
+const CONTEXT_BASIC: &[&str] = &[
+    "compaction.enabled",
+    "compaction.auto_continue",
+    "compaction.reserve_tokens",
+    "compaction.keep_recent_tokens",
+];
+
 impl SettingsOverlay {
     pub(super) fn context_setting(def: &SettingDef) -> bool {
         def.path.starts_with("compaction.")
@@ -14,40 +25,80 @@ impl SettingsOverlay {
             )
     }
 
+    /// The context page's summary card: a gauge of the active request's use of its window and
+    /// where compaction starts, then the read-only server facts. Unknown facts say so.
     pub(super) fn context_summary(&self, ctx: &DrawCtx) -> Vec<String> {
         if !self.context_only {
             return self.memory_landing();
         }
         let status = ctx.status;
-        let active = if status.context_window == 0 {
-            "unknown".to_owned()
+        let ascii = ctx.theme.ascii();
+        let count = |n: u64| text::compact_count(n);
+        let window = (status.context_window > 0).then_some(status.context_window as u64);
+        let used = status.prompt_tokens;
+        let estimated = if status.context_estimated {
+            ", estimated"
         } else {
-            status.context_window.to_string()
+            ""
         };
-        let loaded = status
-            .loaded_context_window
-            .map_or_else(|| "unknown".to_owned(), |n| n.to_string());
-        let used = status.prompt_tokens.map_or_else(
-            || "unknown".to_owned(),
-            |n| {
-                format!(
-                    "{n}{}",
-                    if status.context_estimated {
-                        " estimated"
-                    } else {
-                        ""
-                    }
-                )
-            },
+        let mut gauge = String::from("Context & history · ");
+        match (used, window) {
+            (Some(used), Some(window)) => {
+                let share = (used as f64 / window as f64).clamp(0.0, 1.0);
+                let filled = (share * GAUGE_CELLS as f64).round() as usize;
+                let (full, empty) = if ascii { ("#", ".") } else { ("█", "░") };
+                gauge.push_str(&format!(
+                    "{}{} {} of {} used ({:.0}%{estimated})",
+                    full.repeat(filled),
+                    empty.repeat(GAUGE_CELLS - filled),
+                    count(used),
+                    count(window),
+                    share * 100.0
+                ));
+            }
+            // Each missing fact says why it is missing or how to supply it.
+            (None, Some(window)) => {
+                gauge.push_str(&format!("{} window · nothing sent yet", count(window)));
+            }
+            (Some(used), None) => {
+                gauge.push_str(&format!(
+                    "{} used{estimated} · window not known: set Current model context below",
+                    count(used)
+                ));
+            }
+            (None, None) => {
+                gauge.push_str(
+                    "nothing sent yet · window not known: set Current model context below",
+                );
+            }
+        }
+        if let (Some(window), Some(reserve)) = (window, status.compaction_reserve) {
+            let at = window.saturating_sub(reserve as u64);
+            gauge.push_str(&format!(
+                " · compacts near {} (~{:.0}%)",
+                count(at),
+                at as f64 * 100.0 / window as f64
+            ));
+        }
+        let loaded = status.loaded_context_window.map_or_else(
+            || "not reported by the server".to_owned(),
+            |n| format!("{} (read-only)", count(n as u64)),
         );
         let reserve = status
             .compaction_reserve
-            .map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+            .map_or_else(|| "not set".to_owned(), |n| count(n as u64));
         vec![
-            format!("Context & history · active limit {active} · used {used}"),
-            format!("Loaded server capacity: {loaded} (read-only) · compaction reserve: {reserve}"),
-            "Saved caps/output/compaction below are defaults, not a claim about the active request. Auto follows reported capacity; loaded server limits still apply.".to_owned(),
+            gauge,
+            format!("Server capacity {loaded} · compaction reserve {reserve}"),
+            "Values below are saved defaults; the active request follows reported capacity."
+                .to_owned(),
         ]
+    }
+
+    /// Context settings shown without opening "Show advanced": the window sizes, output cap and
+    /// whether and how compaction runs. The other compaction tuning folds away.
+    pub(super) fn context_advanced(&self, path: &str) -> bool {
+        self.context_only && path.starts_with("compaction.") && !CONTEXT_BASIC.contains(&path)
     }
 
     fn memory_landing(&self) -> Vec<String> {

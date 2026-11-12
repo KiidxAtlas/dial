@@ -35,6 +35,15 @@ use anyhow::Result;
 use crossterm::event::Event;
 
 impl Shell {
+    /// Remember a command run from the palette so the next palette offers it first.
+    fn remember_palette_command(&mut self, command: &str) {
+        const KEEP: usize = 8;
+        let command = command.trim().to_owned();
+        self.palette_recent.retain(|earlier| *earlier != command);
+        self.palette_recent.insert(0, command);
+        self.palette_recent.truncate(KEEP);
+    }
+
     pub(in crate::app) fn open(
         &mut self,
         app: &App,
@@ -46,6 +55,7 @@ impl Shell {
         // navigating, so the requested panel still opens and the rebuild still happens.
         let mut carried = Step::Done;
         loop {
+            let from_palette = matches!(which, Which::Palette);
             let outcome = self.run_overlay(app, Some(&mut *agent), which)?;
             if let Some(config) = outcome.latest {
                 carried = self.config_changed(app, agent, config);
@@ -59,6 +69,9 @@ impl Shell {
                 .as_deref()
                 .and_then(|next| next.strip_prefix("command:"))
             {
+                if from_palette {
+                    self.remember_palette_command(command);
+                }
                 return Ok(match self.command(app, agent, command)? {
                     Step::Done => carried,
                     step => step,
@@ -272,6 +285,7 @@ impl Shell {
                     self.status.phase != Phase::Idle,
                 )
                 .with_command_context(self.command_context())
+                .with_recent(&self.palette_recent)
                 .with_unified_search(super::help::palette_topics(), {
                     let layout = app.layout.clone();
                     let current = self.session_id.clone();
@@ -799,6 +813,7 @@ impl Shell {
             });
         let draw_result = if redraw && !closed {
             // An inline prompt may have temporarily yielded the screen while retaining this menu.
+            term.set_panel_name(state.overlay.title());
             term.open_overlay().and_then(|()| {
                 term.draw_overlay_placed(|frame| {
                     draw_overlay_frame(frame, &env, &mut state.overlay)
@@ -831,6 +846,8 @@ impl Shell {
         let returning = state.next.as_deref() == Some("navigate:back")
             || (state.next.is_none() && !state.history.is_empty());
         let previous = returning.then(|| state.history.pop()).flatten();
+        let from_palette =
+            matches!(&state.overlay, ActiveOverlay::Palette(p) if p.is_action_search());
         if next_panel.is_some() && state.overlay.retains_navigation() {
             if state.history.len() == 16 {
                 state.history.remove(0);
@@ -879,6 +896,9 @@ impl Shell {
             .as_deref()
             .and_then(|next| next.strip_prefix("command:"))
         {
+            if from_palette {
+                self.remember_palette_command(command);
+            }
             return Ok(self.route_busy_command(app, command.to_owned()));
         } else if let Some(id) = state
             .next

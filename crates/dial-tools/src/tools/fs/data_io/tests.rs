@@ -240,3 +240,32 @@ fn artifact_byte_reads_return_whole_inputs_and_page_losslessly_within_the_budget
     }
     assert_eq!(rebuilt, bytes);
 }
+
+#[test]
+fn binary_artifact_sources_use_raw_bytes_and_stay_create_only() {
+    let (dir, ws) = testkit::workspace();
+    let ws = ws.with_artifacts(
+        crate::storage::artifact::ArtifactStore::new(&dir.path().join("artifacts")).unwrap(),
+    );
+    let bytes = [0, 255, 13, 10];
+    let uri = ws.artifacts().unwrap().retain_exact_bytes(&bytes).unwrap();
+    let hash = uri.strip_prefix("artifact://").unwrap();
+    let config = crate::config::types::Config::default();
+    let authorize = testkit::authorize_in_workspace(&ws, "write");
+    let ctx = ToolContext {
+        workspace: &ws,
+        config: &config,
+        mutation_authorizer: Some(&authorize),
+        confirm: None,
+    };
+    let args = json!({"path":"binary","encoding":"base64","source":{"artifact":uri,"sha256":hash}});
+    let result = write(&ctx, &args, &AtomicBool::new(false)).unwrap();
+    assert_eq!(std::fs::read(dir.path().join("binary")).unwrap(), bytes);
+    assert_eq!(result.data.unwrap()["files"][0]["outcome"], "created");
+    assert!(write(&ctx, &args, &AtomicBool::new(false)).is_err());
+    let mut args = args;
+    args["path"] = json!("no-retry");
+    args["idempotent"] = json!(true);
+    assert!(write(&ctx, &args, &AtomicBool::new(false)).is_err());
+    assert!(!dir.path().join("no-retry").exists());
+}

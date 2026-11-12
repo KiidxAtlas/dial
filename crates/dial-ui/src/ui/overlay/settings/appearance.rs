@@ -1,6 +1,9 @@
 //! Appearance previews are projections of the open editor, never another settings store.
 use super::super::DrawCtx;
-use super::{Mode, Row, SettingsOverlay, choice_value, fit, hint_line, parse_input, pressed};
+use super::{
+    Mode, Row, SettingsOverlay, choice_value, fit, hint_line, local_function_key,
+    local_function_label, parse_input, pressed,
+};
 use crate::config::schema::SettingDef;
 use crate::llm::model_config::PinnedWorkers;
 use crate::ui::{
@@ -33,7 +36,7 @@ impl SettingsOverlay {
         if !pressed(key) {
             return false;
         }
-        if key.code == KeyCode::F(4) && key.modifiers.is_empty() {
+        if local_function_key(key, keys, 4, Action::ProviderSetup) {
             self.appearance_preview = !self.appearance_preview;
             self.appearance_scroll = 0;
             return true;
@@ -94,7 +97,10 @@ impl SettingsOverlay {
             .min(content.len().saturating_sub(room.max(1)));
         let mut lines = vec![Line::from(fit(
             vec![Span::styled(
-                " Preview / F4 controls",
+                format!(
+                    " Preview / {} controls",
+                    local_function_label(ctx.keys, 4, Action::ProviderSetup)
+                ),
                 ctx.theme.fg(Tok::Accent),
             )],
             w,

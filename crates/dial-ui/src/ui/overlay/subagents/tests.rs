@@ -919,7 +919,8 @@ fn clipped_roster_text_ends_in_an_ellipsis_and_ascii_has_no_unicode() {
         .iter()
         .filter_map(|line| line.split('│').next())
         .filter(|left| left.contains("Preserve public"))
-        .all(|left| left.trim_end().ends_with('…'));
+        // The task clips at a word with an ellipsis; a shared task's count follows it.
+        .all(|left| left.contains("improving…"));
     assert!(clipped, "{}", shown.join("\n"));
     let ascii = Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
     for (w, h) in [(120, 40), (60, 20), (38, 16)] {
@@ -1007,4 +1008,43 @@ fn terminal_input_request_without_transcript_does_not_promise_a_reply() {
     hub.set_snapshot(snapshot(vec![ask]));
     let text = screen(&mut hub, &theme, 140, 40).join("\n");
     assert!(text.contains("Press Enter to open it and reply"), "{text}");
+}
+
+/// Workers sharing a task show it once, on the first card of the run with how many share it;
+/// the rest show only their own state and step, and clicks still land on the card drawn there.
+#[test]
+fn workers_sharing_a_task_show_it_once_and_clicks_follow_the_shorter_cards() {
+    let theme = Theme::dark();
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(review_roster());
+    let shown = screen(&mut hub, &theme, 120, 40);
+    let roster: Vec<&str> = shown
+        .iter()
+        .filter_map(|line| line.split('│').next())
+        .collect();
+    let tasks = roster
+        .iter()
+        .filter(|left| left.contains("Preserve public"))
+        .count();
+    assert_eq!(tasks, 1, "{}", shown.join("\n"));
+    assert!(
+        roster.iter().any(|left| left.contains("5 workers")),
+        "{}",
+        shown.join("\n")
+    );
+    for n in 1..=4 {
+        assert!(
+            roster
+                .iter()
+                .any(|left| left.contains(&format!("Worker {n}"))),
+            "Worker {n} lost its card\n{}",
+            shown.join("\n")
+        );
+    }
+    // Cards: the waiting worker's three rows, then two rows per worker repeating its task.
+    let order = ids_in_roster_order(&hub);
+    let (col, row) = (3, 1 + 1 + 3 + 2);
+    let now = std::time::Instant::now();
+    assert!(matches!(hub.click(col, row, now), OverlayEvent::None));
+    assert_eq!(hub.selected.as_deref(), Some(order[2].as_str()));
 }

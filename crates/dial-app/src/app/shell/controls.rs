@@ -122,6 +122,20 @@ impl Shell {
                     .into(),
             ),
         ];
+        // The status line's facts become keyboard targets here: each row names its direct key, so
+        // the next time the key alone does it.
+        for (value, action) in [
+            ("approval", crate::ui::keys::Action::ApprovalCycle),
+            ("model", crate::ui::keys::Action::ModelSelect),
+            ("providers", crate::ui::keys::Action::ProviderSetup),
+        ] {
+            let key = self.keys.label(action);
+            if !key.is_empty()
+                && let Some(row) = items.iter_mut().find(|row| row.value == value)
+            {
+                row.detail.push_str(&format!(" · key {key}"));
+            }
+        }
         // Saved values are never projected into the active snapshot while the agent is lent out.
         if status.phase != Phase::Idle {
             let timing = "Saved defaults; agent changes apply after this turn (not active now)";

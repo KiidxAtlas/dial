@@ -269,7 +269,7 @@ fn steering_is_journaled_only_after_it_is_drafted() {
 }
 
 #[test]
-fn failed_steering_draft_drops_the_queue_instead_of_sending_raw_text() {
+fn failed_steering_draft_drops_only_that_message_and_keeps_later_steering_queued() {
     let server = llm::fake::serve(vec![reply("")]);
     with_agent(ON_NO_RETRY, |agent| {
         let mut ui = Applied::default();
@@ -280,12 +280,14 @@ fn failed_steering_draft_drops_the_queue_instead_of_sending_raw_text() {
             .draft_deferred_steering(&mut backend(&server.url), &mut ui)
             .unwrap_err();
         assert!(
-            format!("{error:#}").contains("2 steering message(s)"),
+            format!("{error:#}").contains("1 later message(s) stay queued"),
             "{error:#}"
         );
+        // Nothing undrafted reached the session; the second message waits for its own draft.
         assert!(user_messages(agent).is_empty());
         assert!(ui.0.is_empty());
-        assert!(agent.undrafted_steering.is_empty());
+        assert_eq!(agent.undrafted_steering.len(), 1);
+        assert_eq!(agent.undrafted_steering[0].1, long("second"));
     });
 }
 
@@ -385,7 +387,7 @@ fn rejected_or_interrupted_review_never_sends_or_journals_the_instruction() {
 }
 
 #[test]
-fn rejected_steering_draft_drops_later_steering_without_journaling() {
+fn rejected_steering_draft_keeps_later_steering_queued_without_journaling() {
     let server = llm::fake::serve(vec![reply("Use version 2.")]);
     with_agent(ON, |agent| {
         let mut ui = DraftReview::default();
@@ -399,9 +401,33 @@ fn rejected_steering_draft_drops_later_steering_without_journaling() {
         );
         assert_eq!(ui.reviewed, ["Use version 2."]);
         assert!(user_messages(agent).is_empty());
-        assert!(agent.undrafted_steering.is_empty());
+        // Rejecting one draft is not a rejection of the next message.
+        assert_eq!(agent.undrafted_steering.len(), 1);
+        assert_eq!(agent.undrafted_steering[0].1, long("then fix tests"));
     });
     assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn interrupted_steering_draft_drops_later_steering() {
+    let server = llm::fake::serve(vec![reply("Use version 2.")]);
+    with_agent(ON, |agent| {
+        let mut ui = DraftReview {
+            accept: true,
+            interrupt_on_accept: true,
+            ..DraftReview::default()
+        };
+        agent
+            .accept_steering(vec![long("use v2"), long("then fix tests")], &mut ui)
+            .unwrap();
+        assert!(
+            agent
+                .draft_deferred_steering(&mut backend(&server.url), &mut ui)
+                .is_err()
+        );
+        assert!(user_messages(agent).is_empty());
+        assert!(agent.undrafted_steering.is_empty());
+    });
 }
 
 #[test]
@@ -580,7 +606,7 @@ fn draft_fidelity_protects_explicit_material_without_claiming_semantic_equivalen
 }
 
 #[test]
-fn fidelity_failure_drops_steering_queue_without_delivery() {
+fn fidelity_failure_drops_that_steering_message_and_keeps_later_ones_undelivered() {
     let server = llm::fake::serve(vec![reply("Use the other file.")]);
     with_agent(ON_NO_RETRY, |agent| {
         let mut ui = Applied::default();
@@ -592,7 +618,8 @@ fn fidelity_failure_drops_steering_queue_without_delivery() {
                 .draft_deferred_steering(&mut backend(&server.url), &mut ui)
                 .is_err()
         );
-        assert!(agent.undrafted_steering.is_empty());
+        assert_eq!(agent.undrafted_steering.len(), 1);
+        assert_eq!(agent.undrafted_steering[0].1, long("then test"));
         assert!(ui.0.is_empty());
         assert!(user_messages(agent).is_empty());
     });

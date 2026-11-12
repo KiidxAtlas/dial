@@ -199,6 +199,31 @@ impl ActiveOverlay {
                 | Self::Shortcuts(_)
         )
     }
+
+    /// The panel's name for the terminal title, matching the name its border shows.
+    pub(super) fn title(&self) -> &'static str {
+        match self {
+            Self::Activity(_) => "Activity",
+            Self::Palette(_) => "Commands",
+            Self::Compute(_) => "Compute & background work",
+            Self::Improve(_) => "Improve",
+            Self::Extensions(_) => "Extensions",
+            Self::Stats(_) => "Stats",
+            Self::Settings(_) => "Settings",
+            Self::ModelSettings(_) => "Model settings",
+            Self::BackupModels(_) => "Backup models",
+            Self::HistorySearch(_) => "Search history",
+            Self::ImageSettings(_) => "Image settings",
+            Self::Models(_) => "Models",
+            Self::Providers(_) => "Providers",
+            Self::Shortcuts(_) => "Keyboard shortcuts",
+            Self::Git(_) => "Git",
+            Self::Subagents(_) => "Workers",
+            Self::SubagentViewer(_) => "Worker",
+            Self::Jobs(_) => "Background processes",
+            Self::Peers(_) => "Project peers",
+        }
+    }
     pub(super) fn content_mut(&mut self) -> &mut Self {
         match self {
             Self::Activity(activity) => activity.panel.content_mut(),

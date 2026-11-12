@@ -72,10 +72,14 @@ fn serve_with_rename(stream: UnixStream, log: Log, mut rename: impl FnMut() -> V
         };
         match (method, id) {
             ("workspace/willRenameFiles", Some(id)) => reply(&mut out, &id, rename()),
+            ("initialize", Some(id)) if params["initializationOptions"]["bare"] == true => {
+                reply(&mut out, &id, json!({"capabilities": {}}))
+            }
             ("initialize", Some(id)) => reply(
                 &mut out,
                 &id,
                 json!({"capabilities": {"documentFormattingProvider": true,
+                    "completionProvider": {}, "signatureHelpProvider": {}, "callHierarchyProvider": true,
                     "workspace": {"fileOperations": {"willRename": {"filters": [{"pattern": {"glob": "**/*"}}]}}}}}),
             ),
             ("initialized", None) => {
@@ -145,11 +149,50 @@ fn serve_with_rename(stream: UnixStream, log: Log, mut rename: impl FnMut() -> V
                 )
             }
             ("textDocument/formatting", Some(id)) => {
-                // Every pass inserts a line, so a formatter re-run on its own commit never converges.
+                // Formatting inserts a header once: a document that already carries it has no edits left.
+                let current = uri
+                    .as_str()
+                    .and_then(path_from_uri)
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .unwrap_or_default();
+                let edits = if current.starts_with("// formatted") {
+                    json!([])
+                } else {
+                    json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "// formatted\n"}])
+                };
+                reply(&mut out, &id, edits)
+            }
+            ("textDocument/completion", Some(id)) => reply(
+                &mut out,
+                &id,
+                json!({"isIncomplete": false, "items": [
+                    {"label": "alpha", "kind": 3, "detail": "fn alpha()"},
+                    {"label": "beta"}]}),
+            ),
+            ("textDocument/signatureHelp", Some(id)) => reply(
+                &mut out,
+                &id,
+                json!({"signatures": [{"label": "f(a, b)", "documentation": "adds"}, {"label": "f(a)"}],
+                    "activeSignature": 0, "activeParameter": 1}),
+            ),
+            ("textDocument/prepareCallHierarchy", Some(id)) => {
+                let item = json!({"name": "target", "kind": 12, "uri": uri, "range": here["range"], "selectionRange": here["range"]});
+                reply(&mut out, &id, json!([item]))
+            }
+            ("callHierarchy/incomingCalls", Some(id)) => {
+                let from = json!({"name": "caller", "kind": 12, "uri": params["item"]["uri"], "range": call_site(), "selectionRange": call_site()});
                 reply(
                     &mut out,
                     &id,
-                    json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "// formatted\n"}]),
+                    json!([{"from": from, "fromRanges": [call_site()]}]),
+                )
+            }
+            ("callHierarchy/outgoingCalls", Some(id)) => {
+                let to = json!({"name": "helper", "kind": 12, "uri": params["item"]["uri"], "range": call_site(), "selectionRange": call_site()});
+                reply(
+                    &mut out,
+                    &id,
+                    json!([{"to": to, "fromRanges": [{"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}]}]),
                 )
             }
             ("test/fail", Some(id)) => {
@@ -174,6 +217,10 @@ fn serve_with_rename(stream: UnixStream, log: Log, mut rename: impl FnMut() -> V
 }
 
 fn fake_client(root: &Path, timeouts: Timeouts) -> (Client, Log) {
+    fake_client_with(root, timeouts, ServerOptions::default())
+}
+
+fn fake_client_with(root: &Path, timeouts: Timeouts, options: ServerOptions) -> (Client, Log) {
     let (ours, theirs) = UnixStream::pair().unwrap();
     let log = Log::default();
     let server_log = Arc::clone(&log);
@@ -186,7 +233,7 @@ fn fake_client(root: &Path, timeouts: Timeouts) -> (Client, Log) {
         Box::new(ours),
         None,
         timeouts,
-        ServerOptions::default(),
+        options,
     )
     .unwrap();
     (client, log)
@@ -1400,4 +1447,219 @@ fn rename_move_rollback_does_not_replace_a_recreated_source() {
     assert!(error.contains("could not restore"), "{error}");
     assert!(source.is_dir());
     assert_eq!(std::fs::read_to_string(target).unwrap(), "original");
+}
+
+/// The range the fake server reports for call sites: the second line, first four characters.
+fn call_site() -> Value {
+    json!({"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}})
+}
+
+/// A server that advertises no optional capability, so first-class requests must refuse.
+fn bare_launcher(logs: &Arc<Mutex<Vec<Log>>>) -> Launcher {
+    let collected = Arc::clone(logs);
+    Box::new(move |_server, root, _cancel| {
+        let options = ServerOptions {
+            init_options: json!({"bare": true}),
+            ..ServerOptions::default()
+        };
+        let (client, log) = fake_client_with(root, fast(), options);
+        collected.lock().push(log);
+        Ok(client)
+    })
+}
+
+#[test]
+fn first_class_requests_refuse_servers_that_do_not_advertise_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    std::fs::write(ws.root().join("a.fk"), "alpha beta\n").unwrap();
+    let logs: Arc<Mutex<Vec<Log>>> = Arc::default();
+    let tool = LspTool::with_launcher(&fake_config(false), bare_launcher(&logs));
+    let cases = [
+        (
+            json!({"action": "format", "path": "a.fk"}),
+            "textDocument/formatting",
+        ),
+        (
+            json!({"action": "completion", "path": "a.fk", "line": 1, "column": 1}),
+            "textDocument/completion",
+        ),
+        (
+            json!({"action": "signature_help", "path": "a.fk", "line": 1, "column": 1}),
+            "textDocument/signatureHelp",
+        ),
+        (
+            json!({"action": "call_hierarchy", "path": "a.fk", "line": 1, "column": 1}),
+            "textDocument/prepareCallHierarchy",
+        ),
+    ];
+    for (args, method) in cases.clone() {
+        let out = run_as(&tool, &ws, args.clone());
+        assert!(out.is_error, "{args} unexpectedly succeeded: {}", out.text);
+        assert!(
+            out.text.contains(&format!("does not advertise {method}")),
+            "{}",
+            out.text
+        );
+    }
+    // The refusal happens before anything is sent: no first-class method reached the server.
+    let sent = methods(&logs.lock()[0]);
+    for (_, method) in cases {
+        assert!(!sent.iter().any(|sent| sent == method), "{method} was sent");
+    }
+}
+
+#[test]
+fn completion_and_signature_help_send_the_cursor_and_render_the_answer() {
+    let h = Harness::new();
+    h.write("a.fk", "alpha beta\n");
+    let completions = h.ok(json!({"action": "completion", "path": "a.fk", "line": 1, "column": 7}));
+    assert_eq!(
+        completions,
+        "2 completions\nalpha  function  fn alpha()\nbeta"
+    );
+    let signature =
+        h.ok(json!({"action": "signature_help", "path": "a.fk", "line": 1, "symbol": "beta"}));
+    assert_eq!(
+        signature,
+        "2 signatures\n* f(a, b)\n    adds\n    active parameter: 1\n  f(a)"
+    );
+    // Columns reach the server as zero-based UTF-16 positions, for both forms of the cursor.
+    let log = h.log();
+    let sent = |method: &str| {
+        log.lock()
+            .iter()
+            .rev()
+            .find(|message| message["method"] == method)
+            .map(|message| message["params"].clone())
+            .unwrap_or_else(|| panic!("{method} was not sent"))
+    };
+    assert_eq!(
+        sent("textDocument/completion")["position"],
+        json!({"line": 0, "character": 6})
+    );
+    assert_eq!(
+        sent("textDocument/signatureHelp")["position"],
+        json!({"line": 0, "character": 6})
+    );
+}
+
+#[test]
+fn call_hierarchy_lists_callers_or_callees_of_the_prepared_item() {
+    let h = Harness::new();
+    h.write("a.fk", "alpha beta\ncall it\n");
+    let incoming =
+        h.ok(json!({"action": "call_hierarchy", "path": "a.fk", "line": 1, "column": 1}));
+    assert_eq!(
+        incoming,
+        "1 caller of target\ncaller  call at a.fk:2:1  call it"
+    );
+    let outgoing = h.ok(json!({"action": "call_hierarchy", "path": "a.fk", "line": 1, "column": 1, "direction": "outgoing"}));
+    assert_eq!(
+        outgoing,
+        "1 callee of target\nhelper  call at a.fk:1:1  alpha beta"
+    );
+    let log = h.log();
+    let item_sent = |method: &str| {
+        log.lock()
+            .iter()
+            .rev()
+            .find(|message| message["method"] == method)
+            .map(|message| message["params"]["item"]["name"].clone())
+            .unwrap_or_else(|| panic!("{method} was not sent"))
+    };
+    assert_eq!(item_sent("callHierarchy/incomingCalls"), "target");
+    assert_eq!(item_sent("callHierarchy/outgoingCalls"), "target");
+}
+
+#[test]
+fn format_applies_the_server_edit_as_one_transaction_and_previews_without_writing() {
+    let h = Harness::new();
+    h.write("a.fk", "one\n");
+    let file = h.ws.root().join("a.fk");
+    let preview = h.ok(json!({"action": "format", "path": "a.fk", "apply": false}));
+    assert!(
+        preview.starts_with("Format preview (nothing written) for a.fk:"),
+        "{preview}"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+    let applied = h.ok(json!({"action": "format", "path": "a.fk"}));
+    assert!(applied.starts_with("Formatted a.fk:"), "{applied}");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "// formatted\none\n"
+    );
+    let again = h.ok(json!({"action": "format", "path": "a.fk"}));
+    assert!(again.contains("already formatted"), "{again}");
+}
+
+#[test]
+fn format_needs_approval_unless_it_only_previews() {
+    let h = Harness::new();
+    h.write("a.fk", "one\n");
+    assert!(
+        h.tool
+            .needs_approval(&json!({"action": "format", "path": "a.fk"}))
+    );
+    assert!(
+        h.tool
+            .needs_approval(&json!({"action": "format", "path": "a.fk", "apply": true}))
+    );
+    // The preview needs only the start approval, which the running server has already received.
+    h.ok(json!({"action": "document_symbols", "path": "a.fk"}));
+    assert!(
+        !h.tool
+            .needs_approval(&json!({"action": "format", "path": "a.fk", "apply": false}))
+    );
+}
+
+#[test]
+fn first_class_arguments_are_checked_before_any_server_starts() {
+    let h = Harness::new();
+    h.write("a.fk", "one\n");
+    for (args, expected) in [
+        (
+            json!({"action": "completion", "path": "a.fk"}),
+            "needs `line`",
+        ),
+        (
+            json!({"action": "format", "path": "a.fk", "apply": "yes"}),
+            "must be a boolean",
+        ),
+        (
+            json!({"action": "call_hierarchy", "path": "a.fk", "line": 1, "column": 1, "direction": 3}),
+            "must be a string",
+        ),
+        (
+            json!({"action": "call_hierarchy", "path": "a.fk", "line": 1, "column": 1, "direction": "up"}),
+            "direction must be",
+        ),
+    ] {
+        let text = h.err(args.clone());
+        assert!(text.contains(expected), "{args}: {text}");
+    }
+    assert_eq!(
+        h.starts.load(Ordering::SeqCst),
+        0,
+        "validation started a server"
+    );
+}
+
+#[test]
+fn first_class_actions_and_direction_are_schema_visible() {
+    let schema = LspTool::new(&LspConfig::default()).schema();
+    let properties = &schema["function"]["parameters"]["properties"];
+    let actions: Vec<&str> = properties["action"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for action in ["format", "completion", "signature_help", "call_hierarchy"] {
+        assert!(actions.contains(&action), "schema omits {action}");
+    }
+    assert_eq!(
+        properties["direction"]["enum"],
+        json!(["incoming", "outgoing"])
+    );
 }

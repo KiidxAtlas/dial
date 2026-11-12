@@ -51,10 +51,10 @@ pub(in crate::agent) fn declared_targets(
             .iter()
             .map(|path| ws.resolve(path))
             .collect::<Result<Vec<_>, _>>(),
-        "write" => call.arguments["path"]
-            .as_str()
+        "write" => crate::tools::declared_write_targets(&call.arguments)
+            .unwrap_or_default()
+            .iter()
             .map(|path| ws.resolve(path))
-            .into_iter()
             .collect::<Result<Vec<_>, _>>(),
         "bash" => call.arguments["check_paths"]
             .as_array()

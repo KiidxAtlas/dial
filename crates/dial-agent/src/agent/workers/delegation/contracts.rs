@@ -1,5 +1,6 @@
 //! Strict named workflows reuse live tasks, controller acceptance and the session journal.
 //! Persist intent before launch; recovery never replays a saved worker or trusts a saved verdict.
+use super::LaunchFailure;
 use crate::agent::{
     Agent, Ui,
     verify::worker_acceptance,
@@ -204,7 +205,23 @@ impl Agent<'_> {
                 self.persist_contracts()?;
                 Ok(json!({"workflow":self.workflow_contracts.node(&contract.id), "workers":reply}))
             }
-            Err(error) => {
+            Err(LaunchFailure::NotStarted(error)) => {
+                // Refused before any worker, runtime node or lease existed: the node stays retryable,
+                // so denied or hook-refused launches neither poison the workflow nor replay anything.
+                self.workflow_contracts
+                    .settle(
+                        &contract.id,
+                        "never_started",
+                        worker_acceptance::Acceptance::unverified(
+                            "launch refused before a worker started",
+                        ),
+                        None,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                self.persist_contracts()?;
+                Err(error)
+            }
+            Err(LaunchFailure::Uncertain(error)) => {
                 // A launch can fail after creating a worker (for example a journal flush). Do not
                 // guess that no effects happened or make the durable intent retryable.
                 self.workflow_contracts.fail(format!("contract launch did not settle: {error:#}; inspect retained execution before new work"));

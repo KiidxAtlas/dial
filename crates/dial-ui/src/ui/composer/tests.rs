@@ -844,10 +844,15 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
         .rebind(Action::Submit, &["Alt+Enter", "F2"])
         .unwrap();
     c.set_draft("draft");
+    // A route picked earlier this session is named, since the chooser opens on it.
     assert!(
+        c.hint(&env.ctx()).iter().any(|h| h
+            == &format!(
+                "{} choose route (last: auto)",
+                env.keys.label(Action::Submit)
+            )),
+        "{:?}",
         c.hint(&env.ctx())
-            .iter()
-            .any(|h| h == &format!("{} choose send action", env.keys.label(Action::Submit)))
     );
     key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
     assert!(
@@ -3412,11 +3417,13 @@ fn busy_enter_offers_automatic_routing_or_queue_and_waits_for_a_choice() {
     assert_eq!(c.draft(), "change the plan");
     assert!(c.queued_messages().is_empty());
     let rows = screen(&c, &env, 100).join("\n");
+    // One option per row, each with its effect.
     assert!(
         rows.contains("Let Dial choose (auto)")
             && rows.contains("Redirect current task now")
             && rows.contains("After this turn")
-            && rows.contains("Run independently"),
+            && rows.contains("Run independently")
+            && rows.contains("uses configured routing"),
         "{rows}"
     );
     assert_eq!(press(&mut c, &env, KeyCode::Up), ComposerEvent::None);
@@ -3512,6 +3519,16 @@ fn escape_closes_the_chooser_and_keeps_the_draft_pastes_and_history_exactly() {
     assert!(
         hints.contains(&"Ctrl+- restore draft".to_owned()),
         "the cleared draft is one undo away: {hints:?}"
+    );
+    // The armed stop is drawn in the warning color, so the second press is not a surprise.
+    let view = c.view(100, &env.ctx());
+    let warning = env.ctx().theme.fg(crate::ui::theme::Tok::Warning).fg;
+    assert!(
+        view.rows
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .any(|s| s.content.contains("again stops") && s.style.fg == warning),
+        "armed stop hint is not in the warning color"
     );
     assert_eq!(ctrl(&mut c, &env, 'c'), ComposerEvent::Interrupt);
 }
@@ -3766,11 +3783,10 @@ fn the_band_send_choice_is_its_own_panel_with_whole_labels_at_every_width() {
                     .all(|row| text::line_width(row) <= width as usize),
                 "{width}: {rows:?}"
             );
-            // Labels are never cut; details yield first.
+            // Options are never cut: each whole label has its own row.
             for option in DRAFT_CHOICES {
-                let label = option.label();
                 assert!(
-                    rows.iter().any(|row| row.contains(label)),
+                    rows.iter().any(|row| row.contains(option.label())),
                     "{width}: {rows:?}"
                 );
             }
@@ -3862,7 +3878,7 @@ fn explicit_steer_is_separate_from_the_queue_and_reports_stages() {
     );
     let pending = screen(&c, &env, 100).join("\n");
     assert!(
-        pending.contains("Steer  pending · acts at the next safe point  “use the v2 API”"),
+        pending.contains("Steer  pending · applies after the current step  “use the v2 API”"),
         "{pending}"
     );
     assert_eq!(c.take_explicit_steering(), ["use the v2 API"]);
@@ -3871,7 +3887,7 @@ fn explicit_steer_is_separate_from_the_queue_and_reports_stages() {
     assert!(
         screen(&c, &env, 100)
             .join("\n")
-            .contains("received · awaiting a safe-point decision")
+            .contains("received · applying it next")
     );
     assert!(c.mark_explicit("use the v2 API", SteerStage::Applied));
     let applied = screen(&c, &env, 100).join("\n");
@@ -4624,4 +4640,101 @@ fn scattered_subsequences_do_not_match_commands() {
         .map(|m| entries[m.index].name.as_str())
         .collect();
     assert!(names.contains(&"sessions"), "{names:?}");
+}
+
+#[test]
+fn busy_chooser_names_and_marks_the_route_remembered_this_session() {
+    let env = Env::new();
+    let mut c = Composer::new(vec![], 100);
+    c.set_busy(true);
+    c.set_draft("first");
+    assert!(
+        c.hint(&env.ctx())
+            .iter()
+            .any(|h| h.ends_with("choose send action"))
+    );
+    press(&mut c, &env, KeyCode::Enter);
+    assert!(c.choice_open());
+    // Pick "After this turn" directly by its number.
+    press(&mut c, &env, KeyCode::Char('3'));
+    assert!(!c.choice_open());
+    c.set_draft("second");
+    let hints = c.hint(&env.ctx());
+    assert!(
+        hints
+            .iter()
+            .any(|h| h.ends_with("choose route (last: after turn)")),
+        "{hints:?}"
+    );
+    press(&mut c, &env, KeyCode::Enter);
+    let rows: Vec<String> = c
+        .view(100, &env.ctx())
+        .rows
+        .iter()
+        .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    // The remembered route carries a ` ·` mark after its label; the others do not.
+    let row = |label: &str| rows.iter().find(|r| r.contains(label)).expect("option row");
+    assert!(
+        row("3 After this turn").contains("After this turn ·"),
+        "{rows:#?}"
+    );
+    assert!(!row("2 Redirect").contains("now ·"), "{rows:#?}");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("default: /settings › Enter while working")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("queues this message")),
+        "{rows:#?}"
+    );
+}
+
+#[test]
+fn one_steer_row_advances_its_trail_in_place_and_fades_once_recorded() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "use the v2 API");
+    press(&mut c, &env, KeyCode::Enter);
+    press(&mut c, &env, KeyCode::Char('2'));
+    let steer_rows = |c: &Composer| -> Vec<String> {
+        screen(c, &env, 100)
+            .into_iter()
+            .filter(|r| r.contains("Steer"))
+            .collect()
+    };
+    assert_eq!(steer_rows(&c).len(), 1);
+    assert!(
+        steer_rows(&c)[0].starts_with(" ●─○─○ Steer  pending"),
+        "{:?}",
+        steer_rows(&c)
+    );
+    c.take_explicit_steering();
+    c.mark_explicit("use the v2 API", SteerStage::Received);
+    assert_eq!(steer_rows(&c).len(), 1, "the same row, not a second one");
+    assert!(steer_rows(&c)[0].starts_with(" ●─●─○ Steer  received"));
+    c.mark_explicit("use the v2 API", SteerStage::Applied);
+    let applied = steer_rows(&c);
+    assert_eq!(applied.len(), 1);
+    assert!(applied[0].contains("●─●─✓ Steer  recorded"), "{applied:?}");
+    // A few seconds later the recorded row has said its piece and leaves.
+    c.explicit[0].applied_at = Some(std::time::Instant::now() - STEER_FADE);
+    assert!(steer_rows(&c).is_empty(), "{:?}", steer_rows(&c));
+}
+
+#[test]
+fn choosing_a_worker_previews_the_message_it_will_get() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "audit the parser");
+    press(&mut c, &env, KeyCode::Enter);
+    assert!(!screen(&c, &env, 100).join("\n").contains("worker gets"));
+    for _ in 0..3 {
+        press(&mut c, &env, KeyCode::Down);
+    }
+    let rows = screen(&c, &env, 100).join("\n");
+    assert!(rows.contains("worker gets “audit the parser”"), "{rows}");
 }

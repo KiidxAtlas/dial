@@ -11,6 +11,14 @@ pub(in crate::agent) struct CheckRun {
     pub(in crate::agent) diagnoses: Vec<String>,
 }
 
+/// The completion gate's evidence answer: the still-unverified checks after the gate's run, and
+/// whether an undisclosed failure keeps the answer blocked (with the failure output when it ran).
+pub(in crate::agent) struct GateOutcome {
+    pub(in crate::agent) unverified: Option<Vec<String>>,
+    pub(in crate::agent) blocking: bool,
+    pub(in crate::agent) failures: Vec<String>,
+}
+
 /// Why a declared input witness could not be observed. Never a code-failure diagnosis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckInputError {
@@ -1637,35 +1645,50 @@ impl<'a> Agent<'a> {
             .then(|| checks.into_iter().map(|check| check.name).collect())
     }
 
-    /// The completion gate's evidence question, answered by running the applicable checks once
-    /// (same approval and freshness path as the `check` tool) before a model round is spent on a
-    /// reminder. Returns the still-unverified check names and the observed failures, which keep
-    /// the reminder even when another applicable check passed.
+    /// The completion gate's evidence question. `unverified` is the still-unverified set after any
+    /// run this call made; `blocking` is an undisclosed failure on the current revision, which keeps
+    /// the answer blocked even when another applicable check passed.
     pub(in crate::agent) fn gate_unverified_edits(
         &mut self,
         run: bool,
         ui: &mut dyn Ui,
-    ) -> (Option<Vec<String>>, Vec<String>) {
+    ) -> GateOutcome {
         let unverified = self.unverified_edits();
         if !run || unverified.is_none() || self.interrupt.load(Ordering::SeqCst) {
-            return (unverified, Vec::new());
+            return GateOutcome {
+                unverified,
+                blocking: self.blocking_failure(),
+                failures: Vec::new(),
+            };
         }
         let checks = self.current_focused_checks();
         let failures = self.run_checks(&checks, ui).failures;
+        let blocking = self.blocking_failure();
+        GateOutcome {
+            // Derived after the run: a check that just passed no longer counts as unverified.
+            unverified: self.unverified_edits(),
+            blocking,
+            failures: if blocking { failures } else { Vec::new() },
+        }
+    }
+
+    /// Whether an applicable check that failed on the current revision is still undisclosed. Stale
+    /// failures do not block (`disclosed_failure` treats them as not observed), and a shell test
+    /// that passed on this revision already answers the question.
+    fn blocking_failure(&self) -> bool {
+        if !self.unverified_edits_apply()
+            || self.step_checks.shell_check_passed == Some(self.step_checks.revision())
+        {
+            return false;
+        }
         let diagnosis = self.diagnosis_requested();
-        let blocking = checks.iter().any(|check| {
+        self.current_focused_checks().iter().any(|check| {
             self.step_checks
                 .failed_checks
                 .iter()
                 .any(|failed| failed.command == check.command)
                 && self.disclosed_failure(check, diagnosis).is_none()
-        });
-        if failures.is_empty() || !blocking {
-            // Only disclosed failures remain; `disclosed_gaps` reports them with the answer.
-            (self.unverified_edits(), Vec::new())
-        } else {
-            (unverified, failures)
-        }
+        })
     }
 
     /// One completion boundary for plain reports and explicit finish calls. Pumps worker results

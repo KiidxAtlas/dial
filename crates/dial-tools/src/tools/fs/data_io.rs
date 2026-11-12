@@ -221,16 +221,26 @@ pub(in crate::tools) fn write(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<ToolOutput, String> {
-    if args.get("verify").is_some() || args.get("allow_syntax_errors").is_some() {
+    if crate::tools::present(args, "verify") || crate::tools::present(args, "allow_syntax_errors") {
         return Err("binary writes do not accept text-edit verification or syntax options".into());
     }
-    let encoded = crate::tools::req_str(args, "content")?;
-    if encoded.len() > MAX_BYTES.div_ceil(3) * 4 {
-        return Err("binary write exceeds 1 MiB".into());
+    super::write::entries(args)?;
+    if crate::tools::present(args, "expected_sha256") || args["idempotent"] == true {
+        return Err(
+            "binary writes are create-only and do not accept expected_sha256 or idempotent".into(),
+        );
     }
-    let bytes = STANDARD
-        .decode(encoded)
-        .map_err(|error| format!("invalid base64: {error}"))?;
+    let bytes = if crate::tools::present(args, "source") {
+        super::write::artifact_bytes(ctx.workspace, args, MAX_BYTES)?
+    } else {
+        let encoded = crate::tools::req_str(args, "content")?;
+        if encoded.len() > MAX_BYTES.div_ceil(3) * 4 {
+            return Err("binary write exceeds 1 MiB".into());
+        }
+        STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("invalid base64: {error}"))?
+    };
     if bytes.len() > MAX_BYTES {
         return Err("binary write exceeds 1 MiB".into());
     }
@@ -246,11 +256,10 @@ pub(in crate::tools) fn write(
         .write_all(&bytes)
         .map_err(|error| error.to_string())?;
     staged.publish(ctx.workspace, cancel)?;
-    Ok(
-        ToolOutput::structured(json!({"path":input,"bytes":bytes.len(),
-        "sha256":format!("{:x}",Sha256::digest(&bytes)),"created":true}))
-        .with_changes([path]),
-    )
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    Ok(ToolOutput::structured(json!({"path":input,"bytes":bytes.len(),"sha256":hash,"created":true,
+        "files":[{"path":input,"bytes":bytes.len(),"sha256":hash,"outcome":"created","changed":true}],
+        "changed":true,"verification":{"status":"not_requested"}})).with_changes([path]))
 }
 
 #[cfg(test)]

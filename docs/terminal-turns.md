@@ -51,11 +51,14 @@ failures (including checkpoint failures) are not reset by this recovery.
   **Let Dial choose (auto)** (uses configured routing; may redirect or request a worker),
   **Redirect current task now** (explicit steering at the next safe point), **After this turn**
   (queued follow-up that leaves the current task unchanged), or **Run independently** (requests a
-  separate worker and falls back to an after-turn follow-up if it cannot start). The footer states
+  separate worker and falls back to an after-turn follow-up if it cannot start). The chooser lists
+  one option per row with its effect, marks the route picked last with ` ·`, and choosing
+  **Run independently** shows the exact message the worker will get. The footer states
   what Enter will do. In `/settings` → Input, **Enter while working** explicitly saves `ui.busy_send`:
   `choose` (default), `redirect`, `after_turn`, `independent`, or `auto`. Choices other than `choose`
   send directly on Enter; selecting a chooser action never changes this preference, but the next
-  chooser in the same session opens on the action picked last (Enter still confirms). Empty Enter
+  chooser in the same session opens on the action picked last (Enter still confirms) and marks it,
+  and the status hint names that route. Empty Enter
   with queued work still asks before stopping, regardless of preference. Automatic routing defaults
   to steering without an extra model call; `[message_routing] route = "classify"` opts into a routing
   judge, and a failed decision steers. `Ctrl+Enter` redirects directly when the terminal supports the
@@ -64,9 +67,10 @@ failures (including checkpoint failures) are not reset by this recovery.
   Redirect cancels the pending model request or discards its stale response before its tool calls
   run; an already running tool may finish. Completed results are retained and unstarted actions
   skipped. `/worker <message>` uses the same independent route; while idle it submits a normal task.
-  Explicit messages are shown above the composer, one row each, with the controller stage:
-  *pending* (awaiting a safe point), *received* (dequeued by the controller, awaiting a safe-point
-  decision), and *recorded* (now the current instruction, or the requested worker started).
+  Explicit messages are shown above the composer, one row each, with the controller stage as a
+  short trail: *pending* (awaiting a safe point), *received* (dequeued by the controller, awaiting a
+  safe-point decision), and *recorded* (now the current instruction, or the requested worker
+  started). A recorded row leaves on the first repaint about four seconds later.
   Receipt alone does not prove cancellation, provider receipt, or model compliance. Runtime
   cancellation/discard events report their own observed effects. Batched redirects retain submission
   order. If the turn ends before a message was recorded it is queued to send next rather than lost.
@@ -80,7 +84,7 @@ failures (including checkpoint failures) are not reset by this recovery.
   edits any item). Saving an edit preserves its queue
   position and route; Esc restores the original. Interrupting preserves the draft and queue.
   While a turn runs with a draft in the composer, the first `Ctrl+C` clears the draft (the hint
-  reads "Ctrl+C again stops") and the next stops the turn. In a panel opened during a turn, the first
+  reads "Ctrl+C again stops", in the warning color) and the next stops the turn. In a panel opened during a turn, the first
   `Ctrl+C` only closes the panel.
   The status line reports stopping immediately; interrupted turns do not send a finished notification.
   Slash commands never become model steering: `/hotkeys`, `/todo`, `/skills`, `/commands`, `/context`, `/search`, `/workers`, `/message`,

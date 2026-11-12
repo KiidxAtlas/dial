@@ -49,3 +49,14 @@ fn toggle_round_trips_and_sorts_pinned_first() {
     let sorted = sort_pinned_first(vec!["a", "c", "b"], &pinned, |s| s);
     assert_eq!(sorted, vec!["c", "a", "b"]);
 }
+
+#[test]
+fn explicit_set_is_idempotent_in_both_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(set(dir.path(), "a", true).unwrap());
+    assert!(!set(dir.path(), "a", true).unwrap());
+    assert_eq!(load(dir.path()).unwrap(), vec!["a"]);
+    assert!(set(dir.path(), "a", false).unwrap());
+    assert!(!set(dir.path(), "a", false).unwrap());
+    assert!(load(dir.path()).unwrap().is_empty());
+}

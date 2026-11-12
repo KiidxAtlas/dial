@@ -10,6 +10,9 @@ use crate::tools::{ToolOutput, Workspace};
 use serde_json::Value;
 use std::{collections::BTreeMap, sync::Arc};
 
+/// Tools owning processes and watches that must outlive an agent rebuilt for the same session.
+const LIVE_PROCESS_TOOLS: [&str; 2] = ["bg", "monitor"];
+
 /// Authorizes `(tool, paths, unbounded_effects)` before a native tool mutates or starts a process.
 pub type MutationAuthorizer<'a> =
     &'a dyn Fn(&str, &[std::path::PathBuf], bool) -> Result<(), String>;
@@ -358,6 +361,9 @@ pub struct Registry {
     mcp: super::mcp::Live,
     /// Configured servers still connecting at startup; [`Registry::adopt_mcp`] mounts them.
     pending_mcp: Option<Arc<super::mcp::Connecting>>,
+    /// The configured servers as connected, before this registry mirrored them, so an agent
+    /// rebuilt for the same servers can adopt them ([`Registry::mcp_handoff`]).
+    mcp_source: Option<Arc<super::mcp::Connecting>>,
     /// Set when servers were adopted, so the next [`Registry::sync_mcp`] reports a change.
     mcp_adopted: bool,
     /// Raw owners of consolidated tools (`surface::facade::GROUPS`): every member and its native
@@ -468,6 +474,7 @@ impl Registry {
             origins: self.origins.clone(),
             mcp: self.mcp.clone(),
             pending_mcp: self.pending_mcp.clone(),
+            mcp_source: self.mcp_source.clone(),
             mcp_adopted: self.mcp_adopted,
             folded: fork(&self.folded),
         };
@@ -611,6 +618,8 @@ impl Registry {
             crate::tools::fs::notebook::tools(config),
             crate::tools::vcs::gh::tools(config),
             crate::tools::vcs::glab::tools(config),
+            crate::tools::vcs::tea::tools(config),
+            crate::tools::knowledge::live_db::tools(config),
             native,
             crate::security::tools(config),
             crate::tools::net::browser::tools(config),
@@ -686,6 +695,7 @@ impl Registry {
     }
 
     fn mount_mcp(&mut self, config: &Config, mut loaded: super::mcp::McpLoad) {
+        self.mcp_source = Some(super::mcp::Connecting::ready(config, loaded.clone()));
         self.register_native(loaded.inventory_tool(config));
         self.mcp = std::mem::take(&mut loaded.live);
         self.sync_mcp();
@@ -693,9 +703,47 @@ impl Registry {
         self.mcp_instructions = loaded.instructions;
     }
 
+    /// The configured servers this registry connected, or the pass still connecting them, for
+    /// [`super::mcp::retain`]: an agent rebuilt for the same servers adopts them instead of
+    /// reconnecting. Servers added later in the session (temporary connections) are not included.
+    pub fn mcp_handoff(&self) -> Option<Arc<super::mcp::Connecting>> {
+        self.pending_mcp.clone().or_else(|| self.mcp_source.clone())
+    }
+
     /// Names of the enabled MCP servers still connecting, so the prompt can say they are coming.
     pub fn mcp_connecting(&self) -> Option<Vec<String>> {
         self.pending_mcp.as_ref().map(|pending| pending.servers())
+    }
+
+    /// The `bg` and `monitor` tools while they own running jobs or armed watches, for an agent
+    /// rebuilt for the same session and project (after a settings change) to adopt through
+    /// [`Registry::adopt_live_processes`]. Dropping them instead kills every background job.
+    /// Both travel together because a watch observes the jobs of its own `bg` table. Empty when
+    /// nothing is running, so the rebuilt tools then take the new configuration.
+    pub fn live_processes(&self) -> Vec<Arc<dyn Tool>> {
+        let owners: Vec<Arc<dyn Tool>> = LIVE_PROCESS_TOOLS
+            .iter()
+            .filter_map(|name| self.owner(name).cloned())
+            .collect();
+        if owners
+            .iter()
+            .any(|tool| tool.has_live_work() || tool.has_monitors())
+        {
+            owners
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Replace this registry's freshly built process tools with the previous agent's
+    /// ([`Registry::live_processes`]), keeping their jobs and watches. A tool the new
+    /// configuration no longer registers is dropped, which stops what it owned.
+    pub fn adopt_live_processes(&mut self, tools: Vec<Arc<dyn Tool>>) {
+        for tool in tools {
+            if self.owner(tool.name()).is_some() {
+                self.register_native(tool);
+            }
+        }
     }
 
     /// Mounts servers that were still connecting at startup once they finished, or waiting for

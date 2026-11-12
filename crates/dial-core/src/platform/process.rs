@@ -14,6 +14,16 @@ pub fn spawn(command: &mut Command) -> io::Result<Child> {
     }
 }
 
+/// Stop Windows from showing modal error dialogs, such as "The application was unable to start
+/// correctly" when a DLL fails to load or the crash dialog, for this process and the children it
+/// starts afterwards; children inherit the error mode. The failure becomes the child's exit
+/// status, which the caller can report, instead of a popup that blocks the program. This is
+/// process-wide, only adds flags and is idempotent. Does nothing on other platforms.
+pub fn quiet_error_dialogs() {
+    #[cfg(windows)]
+    super::imp::process::quiet_error_dialogs();
+}
+
 /// Spawn `command` as the leader of a new process group (Unix: `process_group(0)`; Windows: a
 /// new console process group inside a Job Object assigned before the child runs any code).
 /// On Windows this sets the command's creation flags; do not set them separately.

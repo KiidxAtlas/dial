@@ -314,7 +314,8 @@ fn card(
     let h = theme.sym(Sym::BoxH).to_owned();
     let v = theme.sym(Sym::BoxV).to_owned();
     let ellipsis = theme.sym(Sym::Ellipsis).to_owned();
-    let edge = |left: &str, right: &str, label: Option<&str>| -> Line<'static> {
+    // The top label is a title; the bottom one is a key hint and stays as quiet as the frame.
+    let edge = |left: &str, right: &str, label: Option<&str>, tok: Tok| -> Line<'static> {
         let label = label
             .map(|label| {
                 format!(
@@ -328,7 +329,7 @@ fn card(
                 let fill = width - 3 - text::width(&label);
                 Line::from(vec![
                     Span::styled(format!("{left}{h}"), border),
-                    Span::styled(label, theme.fg(Tok::Text)),
+                    Span::styled(label, theme.fg(tok)),
                     Span::styled(format!("{}{right}", h.repeat(fill)), border),
                 ])
             }
@@ -340,7 +341,12 @@ fn card(
     };
     let content_w = width.saturating_sub(4);
     let mut body = body.into_iter();
-    let mut rows = vec![edge(theme.sym(Sym::BoxTl), theme.sym(Sym::BoxTr), top)];
+    let mut rows = vec![edge(
+        theme.sym(Sym::BoxTl),
+        theme.sym(Sym::BoxTr),
+        top,
+        Tok::Text,
+    )];
     for _ in 0..inner {
         let spans = truncate_spans(body.next().unwrap_or_default(), content_w, &ellipsis);
         let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
@@ -350,7 +356,12 @@ fn card(
         line.push(Span::styled(format!(" {v}"), border));
         rows.push(Line::from(line));
     }
-    rows.push(edge(theme.sym(Sym::BoxBl), theme.sym(Sym::BoxBr), bottom));
+    rows.push(edge(
+        theme.sym(Sym::BoxBl),
+        theme.sym(Sym::BoxBr),
+        bottom,
+        Tok::Dim,
+    ));
     rows
 }
 

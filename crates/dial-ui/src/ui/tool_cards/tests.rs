@@ -390,11 +390,7 @@ fn worker_cards_show_phase_chips_totals_time_and_reports() {
                 ("tester", "failed"),
                 ("fixer", "interrupted"),
             ] {
-                let chip = if ascii {
-                    format!("[{phase}]")
-                } else {
-                    format!("⟦{phase}⟧")
-                };
+                let chip = frame::chip(&theme, phase, Tok::Muted).content.into_owned();
                 assert!(
                     rows.iter()
                         .any(|r| r.contains(name) && r.contains(&chip) && r.contains("2s")),
@@ -405,11 +401,13 @@ fn worker_cards_show_phase_chips_totals_time_and_reports() {
                 let spinning = rows.iter().any(|r| r.contains(theme.spinner(0)));
                 assert_eq!(spinning, call == ToolState::Running, "{rows:?}");
             }
+            // The background chip says it once; no separate "continuing in background" row.
             assert_eq!(
-                rows.iter().any(|r| r.contains("continuing in background")),
+                rows.iter().any(|r| r.contains("background")),
                 call != ToolState::Running,
                 "{rows:?}"
             );
+            assert!(!rows.iter().any(|r| r.contains("continuing in background")));
             assert!(rows.iter().any(|r| r.contains("Found the parser branch.")));
             assert!(rows.iter().any(|r| r.contains("Fixture unavailable.")));
             for width in [0, 1, 8, 24, 60] {

@@ -88,8 +88,41 @@ fn ascii_frames_and_chips_use_ascii_glyphs() {
     assert!(lines[1].starts_with("| ") && lines[1].ends_with(" |"));
     assert!(lines.iter().all(|l| l.is_ascii()), "{lines:?}");
     assert_eq!(chip(&theme, "done", Tok::Success).content, "[done]");
-    let unicode = Theme::builtin("dial-dark").unwrap();
-    assert_eq!(chip(&unicode, "done", Tok::Success).content, "⟦done⟧");
+}
+
+#[test]
+fn chips_are_tinted_pills_where_the_theme_has_a_chip_background() {
+    let theme = Theme::builtin("dial-dark").unwrap();
+    let pill = chip(&theme, "done", Tok::Success);
+    assert_eq!(pill.content, " done ");
+    assert_eq!(pill.style.bg, theme.bg(Tok::ChipBg).bg);
+    assert!(pill.style.bg.is_some());
+    assert_eq!(pill.style.fg, theme.fg(Tok::Success).fg);
+    // Same width as the bracketed form, so switching glyph sets never reflows a row.
+    let ascii = Theme::builtin("dial-dark")
+        .unwrap()
+        .with_glyphs(Glyphs::Ascii);
+    assert_eq!(
+        text::width(&pill.content),
+        text::width(&chip(&ascii, "done", Tok::Success).content)
+    );
+}
+
+#[test]
+fn whole_frames_are_recognised_as_cards() {
+    let theme = Theme::builtin("dial-dark").unwrap();
+    let rows = sample(&theme, "Run").rows(&theme, 40);
+    assert!(is_card(&rows, &theme));
+    assert!(!is_card(&rows[..rows.len() - 1], &theme));
+    assert!(!is_card(
+        &[Line::from("·  Read (3)"), Line::from("x")],
+        &theme
+    ));
+    assert!(!is_card(&[], &theme));
+    let ascii = Theme::builtin("dial-dark")
+        .unwrap()
+        .with_glyphs(Glyphs::Ascii);
+    assert!(is_card(&sample(&ascii, "Run").rows(&ascii, 40), &ascii));
 }
 
 #[test]

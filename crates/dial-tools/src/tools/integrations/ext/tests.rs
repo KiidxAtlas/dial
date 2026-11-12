@@ -326,3 +326,43 @@ fn dap_adapters_share_one_catalog_entry_and_preserve_pinned_owners() {
     );
     assert_eq!(registry.fork_session().names().collect::<Vec<_>>(), ["dap"]);
 }
+
+#[test]
+fn running_jobs_and_their_watches_move_to_a_rebuilt_registry() {
+    let (_dir, ws) = crate::tools::testkit::workspace();
+    let ws = ws.without_sandbox();
+    let config = Config::default();
+    let allow = |_: &str, _: &[std::path::PathBuf], _: bool| Ok(());
+    let ctx = ToolContext {
+        workspace: &ws,
+        config: &config,
+        mutation_authorizer: Some(&allow),
+        confirm: None,
+    };
+    let old = Registry::standard(&config, Vec::new());
+    assert!(old.live_processes().is_empty(), "nothing runs yet");
+    let bg = Arc::clone(old.owner("bg").unwrap());
+    let started = bg.call(
+        &ctx,
+        &serde_json::json!({"action":"start","name":"server","command":"sleep 30"}),
+    );
+    assert!(!started.is_error, "{}", started.text);
+
+    let carried = old.live_processes();
+    let mut names: Vec<_> = carried.iter().map(|tool| tool.name().to_owned()).collect();
+    names.sort();
+    assert_eq!(names, ["bg", "monitor"]);
+    let mut rebuilt = Registry::standard(&config, Vec::new());
+    rebuilt.adopt_live_processes(carried);
+    drop(old);
+    drop(bg);
+
+    let bg = rebuilt.owner("bg").unwrap();
+    assert!(bg.has_live_work(), "the job survived the old registry");
+    let listed = bg.call(&ctx, &serde_json::json!({"action":"list"}));
+    assert!(listed.text.contains("server"), "{}", listed.text);
+    assert!(
+        !bg.call(&ctx, &serde_json::json!({"action":"kill","name":"server"}))
+            .is_error
+    );
+}

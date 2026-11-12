@@ -58,6 +58,34 @@ fn screenshots_become_compact_image_evidence_not_clipped_base64() {
     assert!(output.text.contains("artifact://") && !output.text.contains("\"data\""));
 }
 #[test]
+fn jpeg_images_are_captured_and_mislabelled_images_refused() {
+    use base64::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::new(dir.path()).unwrap();
+    let envelope = |kind: &str, bytes: &[u8]| {
+        let value = json!({"artifact":{"media_type":kind,"encoding":"base64","data":base64::engine::general_purpose::STANDARD.encode(bytes)}});
+        ToolOutput {
+            execution: Default::default(),
+            data: Some(value.clone()),
+            text: value.to_string(),
+            is_error: false,
+        }
+    };
+    let jpeg = b"\xff\xd8\xff\xe0jpeg-bytes";
+    let mut output = envelope("image/jpeg", jpeg);
+    let image = capture_image(Some(&store), &mut output).unwrap().unwrap();
+    assert_eq!(
+        fs::read(store.root.join(image["path"].as_str().unwrap())).unwrap(),
+        jpeg
+    );
+    assert_eq!(output.data.unwrap()["artifact"]["media_type"], "image/jpeg");
+    // The declared type must match the bytes; unknown formats are refused too.
+    let mut mislabelled = envelope("image/png", jpeg);
+    assert!(capture_image(Some(&store), &mut mislabelled).is_err());
+    let mut svg = envelope("image/svg+xml", b"<svg/>");
+    assert!(capture_image(Some(&store), &mut svg).is_err());
+}
+#[test]
 fn text_body_is_never_parsed_as_an_image_envelope() {
     use base64::Engine;
     let dir = tempfile::tempdir().unwrap();

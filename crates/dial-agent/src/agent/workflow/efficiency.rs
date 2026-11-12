@@ -166,6 +166,11 @@ pub(in crate::agent) struct Metrics {
     pub worker_inspection_coverage_truncated: bool,
     pub first_tool_result_ms: Option<u64>,
     pub first_workspace_change_result_ms: Option<u64>,
+    /// Reads answered from rows the model already held, by kind (`pointer`, `delta`, `narrowed`).
+    pub read_reuse: BTreeMap<String, u64>,
+    /// Source lines those reads did not resend, and bytes a pointer replaced.
+    pub read_lines_reused: u64,
+    pub read_bytes_saved: u64,
     #[serde(skip)]
     worker_inspections: Inspections,
     #[serde(skip)]
@@ -295,6 +300,12 @@ impl Metrics {
         self.full_result_bytes += full.len() as u64;
         self.visible_result_bytes += visible.len() as u64;
         self.reduced_results += u64::from(visible.len() < full.len());
+    }
+    /// One read answered (wholly or partly) from rows the model already held.
+    pub fn read_reuse(&mut self, kind: &str, covered_lines: u64, saved_bytes: u64) {
+        *self.read_reuse.entry(kind.to_owned()).or_default() += 1;
+        self.read_lines_reused = self.read_lines_reused.saturating_add(covered_lines);
+        self.read_bytes_saved = self.read_bytes_saved.saturating_add(saved_bytes);
     }
 }
 

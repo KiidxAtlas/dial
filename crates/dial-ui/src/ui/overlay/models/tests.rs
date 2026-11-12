@@ -1,6 +1,7 @@
 use super::super::settings::testkit::*;
 use super::*;
 use crate::llm::model_config::UiConfig;
+use crossterm::event::KeyModifiers;
 
 fn shifted_function(number: u8) -> Event {
     Event::Key(KeyEvent::new(KeyCode::F(number), KeyModifiers::SHIFT))
@@ -635,8 +636,25 @@ fn narrow_panes_do_not_focus_the_hidden_groups_and_the_legend_names_favorites() 
     assert_eq!(o.focus, Focus::List, "hidden groups cannot take focus");
     let wide = draw(&mut o, &rig, 100, 30);
     assert!(wide.contains("* favorite"), "{wide}");
-    assert!(wide.contains("Ctrl+F favorite"), "{wide}");
-    assert!(wide.contains("Shift+Tab groups"), "{wide}");
+    let footer = o.footer(&rig.keys);
+    assert!(footer.contains(&"Ctrl+F favorite".to_owned()), "{footer:?}");
+    assert!(
+        footer.contains(&"Shift+Tab groups".to_owned()),
+        "{footer:?}"
+    );
+    assert!(
+        wide.contains("F1 keys"),
+        "the rest of the keys are one key away\n{wide}"
+    );
+    send(&mut o, &rig, key(KeyCode::F(1)));
+    let sheet = draw(&mut o, &rig, 100, 40);
+    for hidden in ["Ctrl+F", "favorite", "Shift+F3", "sort"] {
+        assert!(
+            sheet.contains(hidden),
+            "the key sheet lists {hidden}\n{sheet}"
+        );
+    }
+    send(&mut o, &rig, key(KeyCode::F(1)));
     send(&mut o, &rig, key(KeyCode::BackTab));
     assert_eq!(o.focus, Focus::Groups);
 }
@@ -757,7 +775,7 @@ fn capability_icons_labels_and_search_use_metadata_in_every_glyph_preset() {
         );
         o.set_roles(roles);
         for selected in [false, true] {
-            let line = o.model_line(&rig.theme, &model, &[], selected, 100);
+            let line = o.model_line(&rig.theme, &model, &[], selected, 100, true);
             let icons = line.spans.last().unwrap();
             assert_eq!(icons.content, capability_cell(&rig.theme, &model, 8));
             // On the selection fill every detail takes the body color.
@@ -802,7 +820,7 @@ fn capability_icons_labels_and_search_use_metadata_in_every_glyph_preset() {
             rig.theme.sym(Sym::IconEmbedding)
         );
         for w in [28, 40, 60, 80, 100] {
-            assert!(o.model_line(&rig.theme, &model, &[], true, w).width() <= w);
+            assert!(o.model_line(&rig.theme, &model, &[], true, w, true).width() <= w);
         }
     }
 }
@@ -1941,6 +1959,36 @@ fn f2_cycles_the_show_filter_and_escape_resets_it_before_closing() {
 }
 
 #[test]
+fn cloud_models_without_a_reported_price_show_their_list_price_as_an_estimate() {
+    let listed = |model: &str| ModelEntry {
+        selection: ModelSelection {
+            provider: "anthropic".into(),
+            model: model.into(),
+            base_url: Some(crate::llm::anthropic::BASE_URL.into()),
+            ..ModelSelection::default()
+        },
+        ..entry("anthropic", model, "Anthropic", true, None)
+    };
+    let estimate = listed("claude-opus-5-5");
+    let cell = price_cell(&estimate);
+    assert!(cell.starts_with("~$"), "{cell}");
+    assert!(price_detail(&estimate).starts_with("list price (estimate"));
+    assert!(blended_price(&estimate).is_some());
+
+    // A provider-reported price wins and is shown without the estimate mark.
+    let reported = priced(listed("claude-opus-5-5"), 3e-6, 15e-6);
+    assert_eq!(price_cell(&reported), "$3/$15");
+    assert!(price_detail(&reported).starts_with("price per 1M tokens"));
+
+    // No card, or a local endpoint serving a same-named model: still unknown.
+    assert_eq!(price_cell(&listed("claude-unlisted")), "-");
+    let mut local = listed("claude-opus-5-5");
+    local.selection.base_url = Some("http://127.0.0.1:8080/v1".into());
+    assert_eq!(price_cell(&local), "-");
+    assert_eq!(price_detail(&local), "no price listed");
+}
+
+#[test]
 fn f3_sorts_by_price_speed_and_use_with_unknown_values_last() {
     let rig = Rig::new();
     let mut d = discovery();
@@ -2046,7 +2094,10 @@ fn memory_group_lists_local_chat_models_and_enter_assigns_the_memory_role() {
     assert!(screen.contains("backend local"), "{screen}");
     assert!(screen.contains("memory role: unassigned"), "{screen}");
     assert!(screen.contains("set memory"), "{screen}");
-    assert!(screen.contains("Ctrl+G get memory models"), "{screen}");
+    assert!(
+        o.footer(&rig.keys)
+            .contains(&"Ctrl+G get memory models".to_owned())
+    );
 
     o.cursor = names(&o).iter().position(|n| n == "qwen-mlx").unwrap();
     assert!(matches!(
@@ -2241,8 +2292,8 @@ fn selected_tuning_carries_identity_without_reassigning_conversation() {
     let main = o.role_selection("main").cloned();
     send(&mut o, &rig, key(KeyCode::Down));
     let selected = o.highlighted().unwrap().selection.clone();
-    let OverlayEvent::Action(action) = send(&mut o, &rig, key(KeyCode::F(7))) else {
-        panic!("F7 must open selected tuning, not assign a model");
+    let OverlayEvent::Action(action) = send(&mut o, &rig, shifted_function(7)) else {
+        panic!("Shift+F7 must open selected tuning, not assign a model");
     };
     let carried: ModelSelection =
         serde_json::from_str(action.strip_prefix("open:model-settings:").unwrap()).unwrap();
@@ -2251,7 +2302,11 @@ fn selected_tuning_carries_identity_without_reassigning_conversation() {
     let shown = draw(&mut o, &rig, 180, 30);
     assert!(shown.contains("ACTIVE SESSION: OLLAMA/LLAMA3"), "{shown}");
     assert!(shown.contains("Selected: lm-studio/qwen-warm"), "{shown}");
-    assert!(shown.contains("Connection overrides"), "{shown}");
+    assert!(
+        o.footer(&rig.keys)
+            .iter()
+            .any(|h| h.contains("Connection overrides"))
+    );
     assert!(
         o.assignment_effect()
             .contains("user default; clears this project's overrides")
@@ -2261,7 +2316,7 @@ fn selected_tuning_carries_identity_without_reassigning_conversation() {
     o.show_roles();
     o.cursor = ROLES.iter().position(|(role, _)| *role == "small").unwrap();
     assert!(matches!(
-        send(&mut o, &rig, key(KeyCode::F(7))),
+        send(&mut o, &rig, shifted_function(7)),
         OverlayEvent::None
     ));
     assert_eq!(o.role_selection("main"), main.as_ref());
@@ -2448,4 +2503,35 @@ fn model_list_columns_are_labelled_above_their_values() {
         line[..at].chars().count()
     };
     assert_eq!(column(header, "price"), column(row, "$3/$15"), "{screen}");
+}
+
+#[test]
+fn the_lora_column_appears_only_when_a_listed_model_has_something_to_show() {
+    let rig = Rig::new();
+    let header = |models: Vec<ModelEntry>| {
+        let mut o = ModelOverlay::new(
+            Some(Discovery {
+                models,
+                providers: vec![],
+            }),
+            vec![],
+            Scope::Global,
+        );
+        draw(&mut o, &rig, 140, 24)
+    };
+    // Hosted models cannot carry an adapter: a column of dashes is dropped.
+    let hosted = header(vec![
+        entry("openai", "gpt-5-mini", "OpenAI", true, Some(32768)),
+        entry("ollama", "llama3.2", "Ollama", true, Some(32768)),
+    ]);
+    assert!(!hosted.contains("LoRA"), "{hosted}");
+    assert!(hosted.contains("state"), "{hosted}");
+    // A local MLX checkpoint reports its LoRA compatibility, so the column returns.
+    let mut local = entry("mlx", "qwen-local", "Downloaded", true, Some(32768));
+    local.selection.base_url = None;
+    let mixed = header(vec![
+        local,
+        entry("openai", "gpt-5-mini", "OpenAI", true, Some(32768)),
+    ]);
+    assert!(mixed.contains("LoRA"), "{mixed}");
 }

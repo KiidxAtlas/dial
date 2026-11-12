@@ -6891,6 +6891,86 @@ fn steering_after_final_text_extends_the_turn() {
 }
 
 #[test]
+fn steering_correction_stays_current_across_compaction() {
+    struct Correct {
+        ready: bool,
+        sent: bool,
+    }
+    impl Ui for Correct {
+        fn text_delta(&mut self, _: &str) {
+            self.ready = true;
+        }
+        fn take_steering(&mut self) -> Vec<String> {
+            if self.ready && !self.sent {
+                self.sent = true;
+                vec!["Correction: explain only the rollback plan, not the risks.".into()]
+            } else {
+                vec![]
+            }
+        }
+    }
+    // Summarizer windows are answered by content, as in the compaction tests above.
+    let chat = Mutex::new(std::collections::VecDeque::from([
+        Reply::Say(format!(
+            "first answer about the risks {}",
+            (0..1500).map(|i| format!("detail{i} ")).collect::<String>()
+        )),
+        Reply::Text("tradeoffs"),
+        Reply::Text("rollback plan"),
+    ]));
+    let server = serve_fn(
+        Arc::new(move |request: &Value| {
+            let summarizing = request["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .and_then(|message| message["content"].as_str())
+                .is_some_and(|text| text.starts_with("<conversation>"));
+            if summarizing {
+                return Reply::Text("SUMMARY: the user asked about the risks");
+            }
+            chat.lock()
+                .pop_front()
+                .unwrap_or(Reply::Text("(script exhausted)"))
+        }),
+        None,
+        None,
+    );
+    let mut e = env(&server.url, "auto");
+    e.config.compaction.keep_recent_tokens = 100;
+    // This fixture exercises the explicit manual boundary, independent of automatic trigger timing.
+    e.config.compaction.enabled = false;
+    e.config.compaction.mid_turn_enabled = false;
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    a.turn("explain the risks", &mut Recorder::default())
+        .unwrap();
+    let report = a
+        .turn(
+            "list tradeoffs",
+            &mut Correct {
+                ready: false,
+                sent: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.text, "rollback plan");
+    // The correction arrived after the second turn's text, so it is the latest admitted request
+    // that compaction must carry while the older turn is cut.
+    a.compact(&mut Recorder::default()).unwrap();
+    let carried = a
+        .session()
+        .messages()
+        .iter()
+        .find(|m| m["dial_compaction_critical"] == true)
+        .expect("compaction must carry the critical request state")
+        .clone();
+    assert_eq!(
+        carried["dial_critical_state"]["runtime_user_request"]["current_instruction"],
+        "Correction: explain only the rollback plan, not the risks.",
+        "{carried}"
+    );
+}
+
+#[test]
 fn plan_mode_refuses_mutations_and_approved_exit_continues() {
     let server = serve(vec![
         Reply::Call("write", json!({"path":"never.txt","content":"no"})),
@@ -10343,7 +10423,9 @@ fn reliability_capability_check_executes_only_disposable_expected_calls() {
 fn reliability_stops_different_contract_failures_without_executing_them() {
     let server = serve(vec![
         Reply::Call("read", json!({"path":5})),
-        Reply::Call("write", json!({"path":"must-not-exist.txt"})),
+        // `write` accepts a batch form, so its schema no longer requires `content`; a
+        // wrongly typed `content` is still a schema (contract) failure.
+        Reply::Call("write", json!({"path":"must-not-exist.txt","content":5})),
         Reply::Calls(vec![
             (
                 "write",

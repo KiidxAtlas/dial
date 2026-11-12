@@ -47,6 +47,8 @@ pub struct WelcomeInfo {
     pub approval: String,
     /// Sandbox mode (`dev`, `strict`, `off`).
     pub sandbox: String,
+    /// The key that cycles the approval mode (`Shift+Tab`); empty hides the home's mode hint.
+    pub approval_key: String,
     /// Cheap, already-known startup diagnostics; never runs a probe while drawing.
     pub doctor_issues: usize,
     /// First-run guidance, dismissed persistently by the application.

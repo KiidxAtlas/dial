@@ -98,9 +98,23 @@ takeown /F "$env:USERPROFILE\.dial" /R /D Y
 
 Windows does not provide macOS Seatbelt or the Linux namespace sandbox. Instead, `sandbox.mode = "dev"` runs shell commands (PowerShell, Git Bash and the built-in shell, foreground and background) at **Low integrity**: Dial re-executes itself as a launcher that lowers its own token, and the command inherits it. Dial labels the workspace and each `sandbox.extra_write` directory Low so commands can create, edit and delete there; it labels existing protected paths (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.gnupg`, the gcloud and GitHub CLI AppData folders, and Dial's own state) Medium with no-read-up, so commands can neither read nor write them; and it labels each project's existing `.git` Medium, so hooks and config cannot be changed in place. These labels are stored in the folders' security settings and stay after Dial exits; ordinary programs are unaffected, but any other Low-integrity process can also write the labeled project. On first use a fixed PowerShell self-test checks every rule through the real launcher; if any check fails, sandboxed commands are refused, never run unconfined.
 
-Limits of the Windows `dev` sandbox: reads elsewhere on the disk and network access are not confined, so `strict`, `sandbox.allow_network = false` and `sandbox.network_allow`/`network_deny` are refused rather than weakened. A command can rename a protected `.git` away and create a new one (only in-place changes are blocked). Files moved, not copied, into the project keep their old label. The uv, pip, npm and Go caches are redirected to `%LOCALAPPDATA%\dial\sandbox`, which is labelled writable, so those installs work without extra configuration. Other folders outside the project, such as `~/.cargo` for cargo's registry, need `sandbox.extra_write`.
+Limits of the Windows `dev` sandbox with network allowed: reads elsewhere on the disk and network access are not confined. A command can rename a protected `.git` away and create a new one (only in-place changes are blocked). Files moved, not copied, into the project keep their old label. The uv, pip, npm and Go caches are redirected to `%LOCALAPPDATA%\dial\sandbox`, which is labelled writable, so those installs work without extra configuration. Other folders outside the project, such as `~/.cargo` for cargo's registry, need `sandbox.extra_write`.
+
+### AppContainer: `strict` and `allow_network = false`
+
+`sandbox.mode = "strict"`, and `dev` with `sandbox.allow_network = false`, run shell commands in a Windows **AppContainer** instead. These policies were previously refused on Windows. Each project gets its own AppContainer profile (`dial.sandbox.<hash>`). Dial grants that profile full access to the workspace and each `sandbox.extra_write` folder (including the redirected toolchain caches), read and execute access to the Dial executable, and nothing else. It adds deny entries for existing protected paths and a deny-write entry for each existing `.git`. An AppContainer can read only folders Windows opens to all packages (the Windows and Program Files folders) and folders granted to it, so the rest of your user profile and your other projects are unreadable. With `allow_network = false` the token carries no network capability. `strict` with `allow_network = true` adds the `internetClient` and `privateNetworkClientServer` capabilities. Windows never lets an AppContainer reach loopback, so local servers (`localhost`) are unreachable in either case.
+
+Dial's launcher starts the command suspended. It then checks that the new token is an AppContainer token with exactly the expected capabilities before letting the command run. On first use a fixed PowerShell self-test, run through the real launcher, checks that the container can write the workspace and that it cannot write or read outside it, read a protected path or change `.git`. If any check fails, these commands are refused, never run unconfined. The access entries name only this project's AppContainer and stay in the folders' security settings after Dial exits. Programs installed under your user profile (a per-user Node, Python or Rust toolchain) are not readable from the container: add their folder to `sandbox.extra_write`, or install them system-wide. `sandbox.network_allow`/`network_deny` domain filtering is still refused on Windows. The browser keeps refusing `strict`, because its driver talks to Chromium over loopback.
 
 The browser, PDF parsing (`pdftotext`) and both `eval` kernels also run under `dev`. The browser's Node driver is written to its state folder, and that folder is made writable. The Python and JavaScript kernels (Node or the embedded QuickJS engine) start through Dial's launcher, which installs the native `ProcessChildProcessPolicy` no-child-process mitigation before user code runs. They also run at Low integrity when the sandbox is on. With `sandbox.mode = "off"`, the default, everything runs with your normal Windows privileges; the kernels keep the no-child-process mitigation.
+
+Native AppContainer confinement is not equivalent to the Linux namespace sandbox. For namespace
+isolation on Windows, run the Linux build inside
+[WSL2](release-and-install.md#windows-through-wsl2--linux-x86-64), with bubblewrap and working
+unprivileged user namespaces, and select the required sandbox policy there. Dial refuses unsafe
+WSL Windows interop and failed enforcement probes; WSL2 alone is not proof of confinement.
+Do not work around a native Windows policy refusal by switching to `off` or enabling network
+access when the task requires it blocked.
 
 Windows shell commands are PowerShell source executed by Windows PowerShell; POSIX shell scripts are not translated. Process groups use Windows Job Objects, and background PTY jobs use ConPTY, sandboxed like other commands. Durable background jobs are supported; see [background services](background-services.md).
 
@@ -129,6 +143,14 @@ socket on the port must belong to a process inside the job's Job Object. Program
 to Notepad when neither `VISUAL` nor `EDITOR` is set, and copying an answer uses PowerShell's
 `Set-Clipboard`.
 
+**Computer use** (`/computer on`) runs its worker with Node.js (`node` on `PATH`). The worker gets
+the same Windows system variables (`SystemRoot`, `SystemDrive`, `ProgramFiles`, ...) as the browser.
+Dial turns off Windows' modal error dialogs for the processes it starts, so a `node.exe` that cannot
+load no longer stops at "The application was unable to start correctly". Instead `/computer on`
+fails with the reason, for example `exit 0xC0000142: a DLL failed to initialize while Node
+started` or `0xC000007B` for a damaged or wrong-architecture install. If `node --version` also
+fails in a new terminal, reinstall the Node.js LTS for your CPU from nodejs.org.
+
 ## File edits and checkpoints
 
 An edit refused with `write to "…" blocked by the harness` and Windows error 24
@@ -144,7 +166,7 @@ the original file is not changed without undo coverage.
 
 - MLX/Apple Silicon inference is unavailable. Use a local server such as LM Studio or Ollama, or a hosted provider instead.
 - PTY terminal behavior differs from Unix. ConPTY resize is supported. ConPTY has no half-close, so `close_stdin` on a terminal job sends Ctrl+Z, Enter, which ends input only for programs reading the console in line mode.
-- The Windows `dev` sandbox (Low integrity) confines writes but not reads or network; it is weaker than the macOS and Linux sandboxes. Never run untrusted input with `sandbox.mode = "off"`.
+- The Windows `dev` sandbox with network allowed (Low integrity) confines writes but not reads or network. `strict` and `allow_network = false` use an AppContainer, which also confines reads and network but blocks loopback and programs installed under your user profile. Neither is identical to the macOS and Linux sandboxes. Never run untrusted input with `sandbox.mode = "off"`.
 - Atomically published private files flush staged file contents before replacement. Windows does not document an unprivileged parent-directory flush or write-through rename equivalent to POSIX `fsync` on a directory, so a successful replacement is atomic for concurrent readers but its directory entry is not guaranteed to survive sudden power loss.
 - Dial replaces and deletes its own files with POSIX semantics on NTFS/ReFS, so a file another process has open (with delete sharing) can still be replaced, and a deleted name is freed at once. When a program opens a file without delete sharing (some editors, backup and sync tools), Dial retries for about 0.3 s and then reports Windows error 32, "being used by another process". Close that program, or move the project out of a synced folder such as OneDrive.
-- `/autoresearch run` and `dial learn` command verification run in the strict offline sandbox, which Windows cannot provide, so they are refused there.
+- `/autoresearch run` and `dial learn` command verification run `/bin/bash` in the strict offline sandbox. That path is not supported on native Windows.

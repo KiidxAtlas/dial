@@ -375,7 +375,12 @@ impl FileOps {
                     }
                     None => self.add(false, arguments["path"].as_str()),
                 },
-                "write" => self.add(true, arguments["path"].as_str()),
+                "write" => {
+                    for path in crate::tools::declared_write_targets(&arguments).unwrap_or_default()
+                    {
+                        self.add(true, Some(&path));
+                    }
+                }
                 "edit" => match crate::tools::declared_edit_targets(&arguments) {
                     Ok(paths) if !paths.is_empty() => {
                         for path in &paths {

@@ -27,6 +27,7 @@ in this table (see Dependency boundaries).
 | 7 | `dial-agent` | `agent` (agent loop, grouped below), `learn`, `judgment`, `adaptive`, `steering`, `weights`, `reliability`, `telemetry`, `stats`, `extensions`, `commit`, `pack` |
 | 8 | `dial-ui` | `ui` (terminal interface: composer, transcript, overlays, themes), `git_panel`; bundled palettes live in `crates/dial-ui/themes/` |
 | 9 | `dial-app` | `app` (application wiring, with private slash-command handlers in `app/commands/`), `cli` (subcommands, flags, plain-text tables), `benchmark`, `repl`, `rpc`, `acp`, `schedule`, `changelog`, `collab` |
+| 10 | `dial-client` | Rust client for the `dial rpc` wire protocol (launch, negotiation, correlation, disconnect accounting); depends on no other workspace crate, so frontends couple only to the protocol |
 
 The root `build.rs` only declares rerun inputs; per-crate build scripts own their own outputs.
 
@@ -105,9 +106,10 @@ Enforced by `tests/integration/architecture.rs`.
 
 - **Crate layers.** `CRATE_LAYERS` lists the workspace crates lowest first (`dial-build-info`,
   `dial-core`, `dial-llm`, `dial-storage`, `dial-tools`, `dial-computer`, `dial-agent`, `dial-ui`,
-  `dial-app`). `crates_depend_only_on_lower_layers` requires every workspace-crate dependency of a
+  `dial-app`, `dial-client`). `crates_depend_only_on_lower_layers` requires every workspace-crate dependency of a
   crate, including dev-dependencies, to appear earlier in that list. An unlisted crate is a
-  violation, so a new crate is placed in the order deliberately.
+  violation, so a new crate is placed in the order deliberately. `dial-client` sits last so no
+  engine crate can depend on it; it declares no workspace dependencies of its own.
   `crate_manifests_are_checked_against_the_layer_order` tests that check against fixture manifests.
   `workspace_crates_and_layer_registry_agree` additionally rejects missing, duplicate or unregistered
   crates and crates not selected by `workspace.members`.
@@ -136,6 +138,26 @@ definitions across the root and all member source trees. Fixture tests cover bot
 layouts and violations in nested crate directories.
 
 Changing a rule means editing that test and stating why here.
+
+## Frontend boundary
+
+The terminal UI is one frontend; `dial rpc`, `dial acp` and print mode are others, and future
+frontends (a separate TUI or a desktop GUI) should need no engine changes to reach existing
+behaviour. Rules for new and changed features:
+
+- Behaviour, validation and policy live in the engine owner (`agent`, `tools`, `storage`, `config`).
+  `ui` and `app` handlers only collect input, call that owner and render its result.
+- Operations useful to other clients are exposed through `dial rpc` with a schema entry in
+  `docs/rpc-schema.json`, an entry in `METHODS`, and coded protocol-2 refusals (`busy`,
+  `invalid_params`, `not_pending`) instead of message-only errors.
+- Events carry structured fields (call ids, phases, outcomes, paths, artifact references) next to
+  readable text; clients never need to parse terminal prose.
+- Out-of-process Rust frontends use `crates/dial-client`, which knows only the wire protocol.
+  Embedding engine crates directly is possible but unversioned (see
+  [client contracts](docs/client-contracts.md)).
+
+Recovery semantics (no replay cursor, no exactly-once retry, outcome unknown after a lost
+connection) are part of the protocol contract; `dial-client` reports them rather than hiding them.
 
 ## Invariants
 

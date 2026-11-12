@@ -138,9 +138,10 @@ pub fn run_tool_command(
             "configured subprocess output exceeded its limit"
         ))
     } else {
-        Err(anyhow::anyhow!(
-            "configured subprocess failed or returned incomplete output"
-        ))
+        Err(anyhow::anyhow!(failure_message(
+            output.status.and_then(|status| status.code()),
+            &output.stderr
+        )))
     };
     result.map_err(|error| {
         if output.started {
@@ -149,6 +150,32 @@ pub fn run_tool_command(
             error
         }
     })
+}
+
+/// Most stderr bytes a configured tool's failure message repeats; the tail is kept.
+const FAILURE_STDERR: usize = 4 * 1024;
+
+/// Why a configured tool failed: its exit code and the tail of its stderr, which is where tool
+/// programs (and the Python plugin SDK's `ToolError`) report the reason.
+fn failure_message(code: Option<i32>, stderr: &[u8]) -> String {
+    let mut message = match code {
+        Some(code) => format!("configured subprocess failed (exit {code})"),
+        None => "configured subprocess failed or returned incomplete output".to_owned(),
+    };
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if !text.is_empty() {
+        let mut start = text.len().saturating_sub(FAILURE_STDERR);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        message.push_str(": ");
+        if start > 0 {
+            message.push('…');
+        }
+        message.push_str(&text[start..]);
+    }
+    message
 }
 
 fn run_command_controlled(

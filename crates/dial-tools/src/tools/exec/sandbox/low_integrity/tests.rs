@@ -9,22 +9,28 @@ fn dev(allow_network: bool) -> Policy {
 }
 
 #[test]
-fn only_dev_with_network_is_enforceable() {
+fn dev_with_network_keeps_low_integrity_and_other_policies_use_an_appcontainer() {
     let policy = dev(true);
-    let (deny, extra) = enforceable(&policy).unwrap();
-    assert_eq!(deny, [PathBuf::from("/home/u/.ssh")]);
-    assert_eq!(extra, [PathBuf::from("/home/u/.cargo")]);
-    assert!(
-        enforceable(&dev(false))
-            .unwrap_err()
-            .contains("allow_network")
-    );
+    let Backend::LowIntegrity {
+        deny_read,
+        extra_write,
+    } = backend(&policy)
+    else {
+        panic!("dev with network must stay on Low integrity");
+    };
+    assert_eq!(deny_read, [PathBuf::from("/home/u/.ssh")]);
+    assert_eq!(extra_write, [PathBuf::from("/home/u/.cargo")]);
+    let offline = dev(false);
+    let Backend::AppContainer(plan) = backend(&offline) else {
+        panic!("dev without network needs an AppContainer");
+    };
+    assert!(!plan.network);
     let strict = Policy::Strict {
         deny_read: Vec::new(),
-        allow_network: false,
+        allow_network: true,
         extra_write: Vec::new(),
     };
-    assert!(enforceable(&strict).unwrap_err().contains("strict"));
+    assert!(matches!(backend(&strict), Backend::AppContainer(plan) if plan.network));
 }
 
 #[test]

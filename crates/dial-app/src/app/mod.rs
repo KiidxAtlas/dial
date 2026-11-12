@@ -33,7 +33,9 @@ mod bridge;
 mod bridge_ui;
 mod clipboard;
 mod command_registry;
-pub(crate) use command_registry::builtin_commands;
+pub(crate) use command_registry::{builtin_commands, expand_prompt_command, prompt_commands};
+/// Extension rows (configured and curated MCP servers, skill packages) for `dial rpc`.
+pub(crate) use commands::extensions_browser::snapshot as extensions_snapshot;
 mod completions;
 mod core;
 mod discovery;

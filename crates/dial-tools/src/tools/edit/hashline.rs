@@ -491,6 +491,16 @@ impl EditStore {
                 |s| s.seen.flags(split_lines(lf).len()),
             )
     }
+    /// Retained LF text of `path` whose SHA-256 is `digest`, so an earlier read can be mapped onto
+    /// the current version. Notebook projections are never returned.
+    pub(crate) fn text_with_digest(&self, path: &Path, digest: &[u8; 32]) -> Option<Arc<str>> {
+        self.files
+            .get(path)?
+            .iter()
+            .rev()
+            .find(|s| s.raw_revision.is_none() && &s.digest == digest)
+            .map(|s| s.text.clone())
+    }
     pub(crate) fn record_flags(&mut self, path: &Path, text: &str, flags: &[bool]) {
         self.record(path, &normalize(text), &ranges_from_flags(flags));
     }
@@ -1371,6 +1381,14 @@ fn backtrack(trace: &[Vec<isize>], n: isize, m: isize, last_d: isize) -> Vec<(us
 fn intern_line<'a>(ids: &mut HashMap<&'a str, u32>, text: &'a str) -> u32 {
     let next = ids.len() as u32;
     *ids.entry(text).or_insert(next)
+}
+
+/// For every line of `before`, the 0-based index of the identical line of `after` it maps to.
+/// `None` overall when the change is too large to map safely.
+pub(crate) fn unchanged_line_map(before: &str, after: &str) -> Option<Vec<Option<usize>>> {
+    let old: Vec<String> = split_lines(before).into_iter().map(str::to_owned).collect();
+    let new: Vec<String> = split_lines(after).into_iter().map(str::to_owned).collect();
+    line_map(&old, &new)
 }
 
 /// For every base line, the index of the identical current line it maps to.
@@ -2969,6 +2987,10 @@ fn read_impl(
                     stopped_at = (n < len).then_some(n + 1);
                 } else {
                     stopped_at = Some(n);
+                    // Rows of this span already emitted still count as shown.
+                    if let Some(end) = last {
+                        shown.push((span.start, end));
+                    }
                 }
                 break 'spans;
             }
@@ -3094,10 +3116,10 @@ pub fn rehydrate<'a>(
             "glob" => crate::tools::fs::search::glob_source_targets(ws, args, text),
             "grep" => crate::tools::fs::search::grep_source_targets(ws, args, text),
             "write" => {
-                let Some(path) = args["path"].as_str() else {
+                let Ok(paths) = crate::tools::fs::write::targets(args) else {
                     continue;
                 };
-                vec![path.to_owned()]
+                paths
             }
             "edit" => {
                 let Ok(targets) = crate::tools::declared_edit_targets(args) else {

@@ -26,6 +26,15 @@ unsafe extern "system" {
 fn jobs() -> std::sync::MutexGuard<'static, HashMap<u32, OwnedHandle>> {
     JOBS.lock().unwrap_or_else(|poison| poison.into_inner())
 }
+pub(in crate::platform) fn quiet_error_dialogs() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        GetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+    };
+    // SAFETY: both calls take and return plain flag words for this process only.
+    unsafe {
+        SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    }
+}
 pub(in crate::platform) fn spawn_group(command: &mut Command) -> io::Result<Child> {
     // SAFETY: null security attributes and name request an unnamed job with default security.
     let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };

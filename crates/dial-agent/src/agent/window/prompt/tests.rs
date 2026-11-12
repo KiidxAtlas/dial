@@ -262,7 +262,7 @@ fn advisory_research_economy_is_carried_by_every_focused_profile() {
         for phrase in [
             "For an advisory question",
             "For implementation, continue",
-            "concrete missing question or contradictory evidence",
+            "a concrete question remains open or evidence conflicts",
             "most precise tool available",
         ] {
             assert!(guidance.contains(phrase), "{profile} lost {phrase}");
@@ -285,9 +285,9 @@ fn supported_target_guidance_is_carried_by_every_focused_profile() {
     for lean in [false, true] {
         let guidance = guidance_for(&tools, lean, false);
         for phrase in [
-            "act on supported, reversible choices",
+            "instead of asking",
             "narrowest useful check first",
-            "reopen discovery only for a concrete missing question or contradictory evidence",
+            "search again only when a concrete question remains open or evidence conflicts",
             "materially changes correctness, scope or authorization",
             "read-only investigation delivers findings",
         ] {
@@ -316,7 +316,7 @@ fn planning_and_delivery_keep_optional_work_separate_in_every_profile() {
         );
         for contract in [
             "execution steps with `todo`",
-            "settle each step you finish",
+            "finish or block each step",
             "optional follow-ups separate",
             "keeps the unfinished work",
         ] {
@@ -417,6 +417,28 @@ fn tool_specific_rules_follow_the_offered_tools() {
         guidance(true).contains(LSP_RULE),
         "unscoped guidance keeps every rule"
     );
+}
+
+/// Cross-tool habits name only offered tools; `eval`/`bash` routing needs both.
+#[test]
+fn cross_tool_rules_require_every_named_tool() {
+    for (tools, rule) in [
+        (&["read"][..], READ_BATCH_RULE),
+        (&["grep"], SEARCH_SCOPE_RULE),
+        (&["verify"], VERIFY_REPRO_RULE),
+        (&["eval", "bash"], EVAL_SHELL_RULE),
+    ] {
+        for lean in [false, true] {
+            assert!(guidance_for(&names(tools), lean, false).contains(rule));
+            for missing in tools {
+                let rest: Vec<&str> = tools.iter().copied().filter(|t| t != missing).collect();
+                assert!(
+                    !guidance_for(&names(&rest), lean, false).contains(rule),
+                    "{rule} without {missing}"
+                );
+            }
+        }
+    }
 }
 
 /// Preview guidance must not require a capability absent from the configured catalog.

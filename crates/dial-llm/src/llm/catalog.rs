@@ -683,6 +683,13 @@ pub fn model_metadata(layout: &Layout, selection: &ModelSelection) -> ModelMetad
     bundled::complete_metadata(selection, metadata)
 }
 
+/// The published list price of `selection`'s exact bundled card, matched by endpoint origin so a
+/// custom proxy never inherits a first-party card. An estimate, not a provider-reported price:
+/// callers label it as such. Local endpoints and models without a card have none.
+pub fn list_pricing(selection: &ModelSelection) -> Option<TokenPricing> {
+    bundled::selection_model(selection)?.pricing
+}
+
 /// Reasoning controls the saved live listing declares for `selection`'s exact model at its
 /// endpoint, for models the bundled catalog does not describe yet. No network access.
 pub fn declared_reasoning(
@@ -3322,6 +3329,12 @@ fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
 /// this listing.
 pub fn downloaded_local_models(user_dir: &Path) -> Vec<ModelEntry> {
     local_model_entries(mlx_architectures(user_dir).as_deref())
+}
+
+/// Every model in the provider listings a `/models` refresh saved, across providers. No network
+/// access; a model that was never listed (or a listing that was never refreshed) is absent.
+pub fn saved_listing_models(user_dir: &Path) -> Vec<ModelEntry> {
+    cached(user_dir).values().flatten().cloned().collect()
 }
 
 /// The listing behind [`downloaded_local_models`]; `trainable` is the mlx-lm model directory that

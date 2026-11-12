@@ -238,6 +238,31 @@ pub(super) enum Axis {
     Vertical,
 }
 
+/// A panel's own function key `F<number>`: plain while that chord does not trigger the global
+/// `global` action (the user rebound it), Shift+F<number> always. Function keys are global
+/// fallbacks for chords some terminals cannot send, so a panel never gives one a second meaning.
+pub(super) fn local_function_key(
+    key: &KeyEvent,
+    keys: &Keymap,
+    number: u8,
+    global: Action,
+) -> bool {
+    key.kind != KeyEventKind::Release
+        && key.code == KeyCode::F(number)
+        && (key.modifiers == KeyModifiers::SHIFT
+            || (key.modifiers.is_empty() && !keys.triggers(global, key)))
+}
+
+/// The label of [`local_function_key`] for hints: `F<number>` when it is free, else `Shift+F<number>`.
+pub(super) fn local_function_label(keys: &Keymap, number: u8, global: Action) -> String {
+    let plain = KeyEvent::new(KeyCode::F(number), KeyModifiers::NONE);
+    if keys.triggers(global, &plain) {
+        format!("Shift+F{number}")
+    } else {
+        format!("F{number}")
+    }
+}
+
 /// The arrow pair for a hint, following the theme's ASCII mode.
 pub(super) fn arrows(theme: &Theme, axis: Axis) -> String {
     match axis {
@@ -826,6 +851,19 @@ fn label_for_choice(backend: &str) -> &'static str {
         .unwrap_or("That backend")
 }
 
+/// The tab of frequently changed settings (see `crate::config::schema::COMMON_SETTINGS`).
+const COMMON_TAB: &str = "Common";
+
+/// Settings people change often that belong to another tab, also listed under Common: the model,
+/// how much Dial may do on its own, what Enter does mid-turn and when it asks for attention.
+const COMMON_MIRRORS: &[&str] = &[
+    "model",
+    "approval",
+    "sandbox.mode",
+    "ui.busy_send",
+    "ask.notify",
+];
+
 fn label_of(path: &str) -> &'static str {
     crate::config::schema::registry()
         .iter()
@@ -847,14 +885,35 @@ fn haystack(def: &SettingDef) -> String {
     )
 }
 
+/// Fuzzy points a query character must average for a scattered (non-contiguous) match to count.
+/// A run of consecutive characters earns 30 and more each; letters picked one by one from unrelated
+/// words earn about 10 minus their gaps. The cut keeps abbreviations such as `sndbx` while dropping
+/// rows that only contain the letters somewhere (`ui.theme` matching a Hindsight timeout).
+const FUZZY_FLOOR: i32 = 15;
+
 /// Match words independently, keeping fuzzy matching on concise metadata rather than long prose.
-/// Description-only hits still match, but do not invent highlights in the setting's label.
+/// A word found whole in the metadata ranks above a fuzzy hit; a weak scattered hit falls back to
+/// the description, and description-only hits do not invent highlights in the setting's label.
 fn search_match(query: &str, metadata: &str, description: &str) -> Option<(i32, Vec<usize>)> {
     let description = description.to_lowercase();
+    let lower: Vec<char> = metadata.to_lowercase().chars().collect();
     let mut score = 0;
     let mut positions = Vec::new();
     for word in query.split_whitespace() {
-        if let Some((rank, matched)) = text::fuzzy(word, metadata) {
+        let needle: Vec<char> = word.to_lowercase().chars().collect();
+        let whole = (lower.len() == metadata.chars().count())
+            .then(|| {
+                lower
+                    .windows(needle.len())
+                    .position(|w| w == needle.as_slice())
+            })
+            .flatten();
+        if let Some(start) = whole {
+            score += 40 * needle.len() as i32 + if start == 0 { 30 } else { 0 };
+            positions.extend(start..start + needle.len());
+        } else if let Some((rank, matched)) = text::fuzzy(word, metadata)
+            .filter(|(rank, _)| *rank >= FUZZY_FLOOR * needle.len() as i32)
+        {
             score += rank;
             positions.extend(matched);
         } else if !description.contains(&word.to_lowercase()) {
@@ -894,8 +953,8 @@ fn value_text(def: &SettingDef, value: &Value) -> String {
             _ => "TOML value".into(),
         };
     }
-    if def.path == "harness.max_steps" && value.as_integer() == Some(0) {
-        return "0 (unlimited)".into();
+    if let Some(meaning) = blank_meaning(def.description, value) {
+        return text::one_line(&meaning);
     }
     let raw = match (&def.kind, value) {
         (Kind::AutoInt { .. } | Kind::AutoFloat { .. }, Value::String(s)) if s == "auto" => {
@@ -909,7 +968,7 @@ fn value_text(def: &SettingDef, value: &Value) -> String {
             .iter()
             .find(|(v, _)| v == s)
             .map_or_else(|| s.clone(), |(_, label)| (*label).to_owned()),
-        (_, Value::String(s)) if s.is_empty() => "(empty)".to_owned(),
+        (_, Value::String(s)) if s.is_empty() => "not set".to_owned(),
         (_, Value::String(s)) => s.clone(),
         (_, Value::Integer(n)) => n.to_string(),
         (_, Value::Float(f)) => fmt_float(*f),
@@ -923,6 +982,52 @@ fn value_text(def: &SettingDef, value: &Value) -> String {
         (_, other) => other.to_string(),
     };
     text::one_line(&raw)
+}
+
+/// What a zero or empty value does, in the setting's own words: its description's
+/// "0 means unlimited", "0 disables", "Empty uses python3 from PATH" or "empty disables".
+/// `None` when the value is not blank or the description does not say.
+fn blank_meaning(description: &str, value: &Value) -> Option<String> {
+    let (shown, subjects) = match value {
+        Value::Integer(0) => ("0", &["0"][..]),
+        Value::String(s) if s.is_empty() => ("not set", &["empty", "blank"][..]),
+        Value::Array(items) if items.is_empty() => ("none", &["empty"][..]),
+        _ => return None,
+    };
+    let lower = description.to_ascii_lowercase();
+    subjects.iter().find_map(|subject| {
+        // A clause starts the description or follows a sentence or clause break.
+        let at = [". ", "; ", ", ", "("]
+            .iter()
+            .filter_map(|lead| {
+                lower
+                    .find(&format!("{lead}{subject} "))
+                    .map(|i| i + lead.len())
+            })
+            .chain(lower.starts_with(&format!("{subject} ")).then_some(0))
+            .min()?;
+        let rest = &description[at + subject.len() + 1..];
+        let end = rest.find(['.', ';', ',', '(']).unwrap_or(rest.len());
+        let clause = rest[..end].trim();
+        let meaning = if let Some(what) = clause.strip_prefix("means ") {
+            what.trim()
+        } else if clause.starts_with("disables") {
+            "off"
+        } else {
+            clause.strip_prefix("uses ")?.trim()
+        };
+        // A pronoun leans on the sentence it came from ("Empty uses that default").
+        let meaning = if meaning.starts_with("that ") || meaning.starts_with("this ") {
+            "default"
+        } else {
+            meaning
+        };
+        Some(if meaning.is_empty() || meaning == shown {
+            shown.to_owned()
+        } else {
+            format!("{shown} ({meaning})")
+        })
+    })
 }
 
 fn setting_edit_text(def: &SettingDef, value: &Value) -> String {
@@ -1487,6 +1592,7 @@ impl SettingsOverlay {
     /// rows do while no override URL is set.
     fn advanced(&self, path: &str) -> bool {
         crate::config::schema::is_advanced(path)
+            || self.context_advanced(path)
             || (EMBEDDING_OVERRIDE_ROWS.contains(&path)
                 && self
                     .current_path(EMBEDDING_URL_PATH)
@@ -1886,8 +1992,15 @@ impl SettingsOverlay {
                         .then_some((0, Vec::new()))
                     })
                 {
-                    let score = if self.search.trim().eq_ignore_ascii_case(def.path) {
+                    // The whole query in the path or the label outranks any word-by-word hit;
+                    // the exact path outranks everything.
+                    let query = self.search.trim().to_lowercase();
+                    let score = if query.eq_ignore_ascii_case(def.path) {
                         i32::MAX
+                    } else if def.path.to_lowercase().contains(&query)
+                        || def.label.to_lowercase().contains(&query)
+                    {
+                        score.saturating_add(100_000)
                     } else {
                         score
                     };
@@ -1948,14 +2061,37 @@ impl SettingsOverlay {
                         rows.extend(advanced.into_iter().map(Row::Setting));
                     }
                 }
+                // Common also lists the high-traffic settings that live elsewhere, in place: they
+                // keep their home tab, search location and jump target, and edit the same value.
+                if *tab == COMMON_TAB {
+                    rows.extend(COMMON_MIRRORS.iter().filter_map(|path| {
+                        defs.iter()
+                            .position(|d| {
+                                d.path == *path && d.tab != COMMON_TAB && self.scope_shown(d)
+                            })
+                            .map(Row::Setting)
+                    }));
+                }
                 rows
             }
             None => (0..LINKS.len()).map(Row::Link).collect(),
         }
     }
 
-    fn section_of(row: Row) -> &'static str {
+    /// The heading a row sits under. In the Common tab every row is grouped as Common, mirrors
+    /// included, so the tab reads as one short list rather than a heading per borrowed row.
+    fn section_of(&self, row: Row) -> &'static str {
         match row {
+            Row::Setting(_)
+                if self.search.is_empty()
+                    && !self.changed_only
+                    && self
+                        .tabs
+                        .get(self.tab)
+                        .is_some_and(|(t, _)| *t == COMMON_TAB) =>
+            {
+                COMMON_TAB
+            }
             Row::Setting(i) => crate::config::schema::registry()[i].section,
             Row::Link(_) => LINK_SECTION,
             Row::Advanced(_, section, _) => section,
@@ -2132,7 +2268,7 @@ impl SettingsOverlay {
             return;
         }
         let at = self.cursor.min(rows.len() - 1);
-        let section = |i: usize| Self::section_of(rows[i]);
+        let section = |i: usize| self.section_of(rows[i]);
         let group_start = |mut i: usize| {
             while i > 0 && section(i - 1) == section(i) {
                 i -= 1;
@@ -2928,6 +3064,7 @@ impl SettingsOverlay {
         if let Some(review) = &mut self.bulk_review {
             review.display_ready = false;
         }
+        self.panel_keys.set_footer(self.full_footer(ctx.keys));
         if self.panel_keys.draw(
             frame,
             ctx,
@@ -3041,7 +3178,7 @@ impl SettingsOverlay {
         let mut cursor_item = 0;
         let mut last_section = "";
         for (i, row) in rows.iter().enumerate() {
-            let section = Self::section_of(*row);
+            let section = self.section_of(*row);
             if !searching && section != last_section {
                 items.push(Item::Header(section));
                 last_section = section;
@@ -3414,21 +3551,13 @@ impl SettingsOverlay {
                         }
                         meta = Some((self.source_detail(def), Tok::Dim));
                     }
-                    head.extend(
-                        text::wrap_words(def.description, w.saturating_sub(2).max(1))
-                            .into_iter()
-                            .map(|l| (l, Tok::Muted)),
-                    );
+                    head.push((def.description.to_owned(), Tok::Muted));
                 }
                 Some(Row::Advanced(_, _, count)) => head.push((
                     format!("{count} tuning settings: timeouts, limits and budgets. Search also finds them."),
                     Tok::Muted,
                 )),
-                Some(Row::Link(i)) => head.extend(
-                    text::wrap_words(LINKS[i].1, w.saturating_sub(2).max(1))
-                        .into_iter()
-                        .map(|l| (l, Tok::Muted)),
-                ),
+                Some(Row::Link(i)) => head.push((LINKS[i].1.to_owned(), Tok::Muted)),
                 None => {}
             }
             // With two rows, the meta line takes the second so the path and source stay visible.
@@ -3437,7 +3566,22 @@ impl SettingsOverlay {
             } else {
                 wanted
             };
-            let mut desc: Vec<(String, Tok)> = head.into_iter().take(lead).collect();
+            // Every entry wraps between words; when rows are left over, the last shown row ends
+            // with an ellipsis at a word boundary rather than a clipped half word.
+            let room = w.saturating_sub(2).max(1);
+            let wrapped: Vec<(String, Tok)> = head
+                .into_iter()
+                .flat_map(|(line, tok)| {
+                    text::wrap_words(&text::one_line(&line), room)
+                        .into_iter()
+                        .map(move |row| (row, tok))
+                })
+                .collect();
+            let hidden = wrapped.len() > lead;
+            let mut desc: Vec<(String, Tok)> = wrapped.into_iter().take(lead).collect();
+            if hidden && let Some((last, _)) = desc.last_mut() {
+                *last = text::ellipsize_words(last, room, theme.ascii(), true);
+            }
             if let Some(meta) = meta
                 && (wanted > 1 || desc.is_empty())
             {
@@ -3457,18 +3601,25 @@ impl SettingsOverlay {
             }
         }
         if show_footer {
-            let mut hints = self.footer(ctx.keys);
-            if self.appearance_selected() {
-                hints.insert(1.min(hints.len()), "F4 preview".into());
-            }
+            let hints = super::panel_keys::capped_footer(self.full_footer(ctx.keys), "F1 keys");
             lines.push(hint_line(theme, &hints, w));
         }
         lines
     }
 
-    fn tab_bar(&self, theme: &Theme, w: usize) -> Line<'static> {
-        let names: Vec<String> = self
-            .tabs
+    /// Every hint for the current mode, the Appearance preview key included; the footer shows a
+    /// capped selection and the F1 key sheet lists them all.
+    fn full_footer(&self, keys: &Keymap) -> Vec<String> {
+        let mut hints = self.footer(keys);
+        if self.appearance_selected() {
+            let preview = local_function_label(keys, 4, Action::ProviderSetup);
+            hints.insert(1.min(hints.len()), format!("{preview} preview"));
+        }
+        hints
+    }
+    /// Every category with the number of settings saved in the edited scope, Providers last.
+    fn tab_counts(&self) -> Vec<(&'static str, usize)> {
+        self.tabs
             .iter()
             .map(|(name, _)| *name)
             .chain(std::iter::once(PROVIDERS_TAB))
@@ -3482,6 +3633,16 @@ impl SettingsOverlay {
                                 .is_some()
                     })
                     .count();
+                (name, count)
+            })
+            .collect()
+    }
+
+    fn tab_bar(&self, theme: &Theme, w: usize) -> Line<'static> {
+        let names: Vec<String> = self
+            .tab_counts()
+            .into_iter()
+            .map(|(name, count)| {
                 if count == 0 {
                     name.to_owned()
                 } else {
@@ -3546,7 +3707,7 @@ impl SettingsOverlay {
                 LINKS[i].0.to_owned(),
                 vec![Span::styled("open", base(Tok::Muted))],
                 Vec::new(),
-                format!("{PROVIDERS_TAB}{}{LINK_SECTION}", theme.sym(Sym::SepSlash)),
+                PROVIDERS_TAB.to_owned(),
             ),
             Row::Advanced(tab, section, count) => {
                 let verb = if self.advanced_open.contains(&(tab, section)) {
@@ -3558,7 +3719,7 @@ impl SettingsOverlay {
                     format!("{verb} advanced ({count})"),
                     Vec::new(),
                     Vec::new(),
-                    format!("{tab}{}{section}", theme.sym(Sym::SepSlash)),
+                    tab.to_owned(),
                 )
             }
             Row::Setting(i) => {
@@ -3618,12 +3779,7 @@ impl SettingsOverlay {
                         tags.push(("restart".to_owned(), Tok::Warning));
                     }
                 }
-                (
-                    def.label.to_owned(),
-                    value_spans,
-                    tags,
-                    format!("{}{}{}", def.tab, theme.sym(Sym::SepSlash), def.section),
-                )
+                (def.label.to_owned(), value_spans, tags, def.tab.to_owned())
             }
         };
         let label = text::one_line(&label);
@@ -3647,10 +3803,17 @@ impl SettingsOverlay {
 
         let room = w.saturating_sub(2 + label_w);
         let value_w = spans_width(&value_spans);
-        // In search mode the tab/section replaces the tags: it tells where a hit lives.
+        // In search mode the category replaces the tags: a muted tag at the right edge tells
+        // where a hit lives without competing with its value.
         let mut tag_spans: Vec<Span<'static>> = Vec::new();
         if !self.search.is_empty() {
-            tag_spans.push(Span::styled(format!("  {search_tag}"), base(Tok::Muted)));
+            let tag = text::ellipsize(&search_tag, room / 3, theme.ascii());
+            let tag_w = text::width(&tag);
+            let gap = room.saturating_sub(value_w.min(room) + tag_w + 1);
+            if !tag.is_empty() && gap >= 2 {
+                tag_spans.push(Span::styled(" ".repeat(gap), base(Tok::Text)));
+                tag_spans.push(Span::styled(format!("{tag} "), base(Tok::Dim)));
+            }
         } else {
             let mut tags = tags;
             loop {
@@ -3820,6 +3983,11 @@ impl SettingsOverlay {
                 };
                 let mut hints = vec![
                     hint(keys, Action::SelectConfirm, verb),
+                    if self.search.is_empty() {
+                        "Type search".to_owned()
+                    } else {
+                        String::new()
+                    },
                     pair(Action::SelectUp, Action::SelectDown, "move"),
                     if self.search.is_empty() && !self.changed_only {
                         pair(Action::TabPrev, Action::TabNext, "categories")

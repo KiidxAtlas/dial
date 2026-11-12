@@ -181,3 +181,103 @@ fn picker_ids_for_discovered_local_providers_resolve_without_configuration() {
     }
     assert!(resolve(&config, "nowhere/model").is_err());
 }
+
+#[test]
+fn a_reasoning_level_needs_no_hand_written_profile_when_the_catalog_declares_levels() {
+    let config = Config::default();
+    let (provider, bundled) = ["openai", "anthropic", "gemini", "xai", "deepseek"]
+        .into_iter()
+        .find_map(|provider| {
+            crate::llm::catalog::bundled_models(provider)
+                .into_iter()
+                .find(|model| model.thinking_efforts.len() > 1)
+                .map(|model| (provider, model))
+        })
+        .expect("a bundled model with several reasoning levels");
+    let selection = ModelSelection {
+        provider: provider.into(),
+        model: bundled.id.clone(),
+        ..Default::default()
+    };
+    let effort = *bundled
+        .thinking_efforts
+        .iter()
+        .rfind(|effort| **effort != ReasoningEffort::None)
+        .unwrap();
+    let next = switched_config(&config, &selection, Some(effort)).unwrap();
+    assert_eq!(
+        next.active_model_profile().unwrap().reasoning_effort,
+        Some(effort)
+    );
+    // Session-only: the operator's configuration gains no profile.
+    assert!(config.model_profiles.is_empty());
+
+    let unknown = ModelSelection {
+        provider: "nowhere".into(),
+        model: "x".into(),
+        ..Default::default()
+    };
+    let refused = switched_config(&config, &unknown, Some(effort)).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("reasoning metadata is unavailable")
+    );
+}
+
+#[test]
+fn reset_thinking_restores_the_configured_level_and_keeps_the_model() {
+    let mut config = Config::default();
+    let server = crate::llm::fake::serve(vec![]);
+    let base_url = format!("{}/v1", server.url);
+    let selection = ModelSelection {
+        provider: "switch-test".into(),
+        model: "beta".into(),
+        base_url: Some(base_url.clone()),
+        protocol: Some(ApiProtocol::ChatCompletions),
+        ..Default::default()
+    };
+    let profile: crate::llm::profiles::ModelProfile = serde_json::from_value(json!({
+        "provider":"switch-test","model":"beta","reasoning_effort":"low",
+        "capabilities":{"reasoning":"openai-effort","reasoning_efforts":["low","high"]}
+    }))
+    .unwrap();
+    config.model_profiles.insert("beta".into(), profile);
+    let backend = Backend::new(
+        ProviderKind::Endpoint {
+            base_url,
+            model: "alpha".into(),
+            api_key: None,
+        },
+        PathBuf::new(),
+        5,
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let version = Version {
+        id: 0,
+        parent: None,
+        kind: "config".into(),
+        harness: config.harness.clone(),
+        adapter: None,
+        status: "active".into(),
+    };
+    let mut agent =
+        Agent::hermetic(&config, backend, &version, workspace.path(), None, None).unwrap();
+    agent.switch_model(&selection, None).unwrap();
+    agent
+        .switch_model(&selection, Some(ReasoningEffort::High))
+        .unwrap();
+    let effort = |agent: &Agent| {
+        agent
+            .effective_config()
+            .active_model_profile()
+            .unwrap()
+            .reasoning_effort
+    };
+    assert_eq!(effort(&agent), Some(ReasoningEffort::High));
+
+    agent.reset_thinking().unwrap();
+    assert_eq!(agent.effective_config().selection().model, "beta");
+    assert_eq!(effort(&agent), Some(ReasoningEffort::Low));
+    assert_eq!(agent.modes.switch.as_ref().unwrap().effort, None);
+}

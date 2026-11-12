@@ -176,6 +176,10 @@ pub struct InlineTerminal {
     foreign_until: usize,
     deferred_paint: bool,
     title: Option<String>,
+    /// The title the last inline paint asked for; a panel's title is built on it.
+    inline_title: Option<String>,
+    /// The open panel's name, shown first in the terminal title while it owns the screen.
+    panel_name: Option<String>,
     last_frame: Option<Frame>,
     last_rendered: Vec<(String, usize)>,
     /// The open alternate-screen panel, drawn frame by frame (see [`InlineTerminal::open_overlay`]).
@@ -205,6 +209,11 @@ impl OverlayTerminal<'_> {
         frame: impl FnOnce(&mut ratatui::Frame) -> Vec<super::images::Placement>,
     ) -> Result<()> {
         self.terminal.draw_overlay_placed(frame)
+    }
+
+    /// Name the open panel in the terminal title (see [`InlineTerminal::set_panel_name`]).
+    pub fn set_panel_name(&mut self, name: &str) {
+        self.terminal.set_panel_name(name);
     }
 }
 
@@ -304,6 +313,8 @@ impl InlineTerminal {
             foreign_until: 0,
             deferred_paint: false,
             title: None,
+            inline_title: None,
+            panel_name: None,
             last_frame: None,
             last_rendered: Vec::new(),
             overlay: None,
@@ -740,6 +751,7 @@ impl InlineTerminal {
         }
         self.deferred_paint = false;
         if let Some(title) = next_title {
+            self.inline_title = Some(title.clone());
             self.title = Some(title);
         }
         self.signals.accept(next_signals);
@@ -891,6 +903,9 @@ impl InlineTerminal {
         f: impl FnOnce(&mut ratatui::Frame) -> Vec<super::images::Placement>,
     ) -> Result<()> {
         let protocol = self.image_protocol();
+        let title = self
+            .panel_title()
+            .filter(|t| self.title.as_ref() != Some(t));
         let Some(session) = &mut self.overlay else {
             bail!("no panel is open");
         };
@@ -900,11 +915,14 @@ impl InlineTerminal {
         let mut placements = Vec::new();
         session.terminal.draw(|frame| placements = f(frame))?;
         let bytes = std::mem::take(&mut *session.buffer.0.borrow_mut());
-        if bytes.is_empty() {
+        if bytes.is_empty() && title.is_none() {
             return Ok(());
         }
         let mut frame = Vec::with_capacity(bytes.len() + SYNC_BEGIN.len() + SYNC_END.len());
         frame.extend_from_slice(SYNC_BEGIN.as_bytes());
+        if let Some(title) = &title {
+            frame.extend_from_slice(format!("\x1b]0;{title}\x07").as_bytes());
+        }
         frame.extend_from_slice(&bytes);
         if let Some(protocol) = protocol {
             let mut images = String::new();
@@ -917,6 +935,9 @@ impl InlineTerminal {
             return Ok(());
         }
         session.redraw = false;
+        if title.is_some() {
+            self.title = title;
+        }
         self.out.flush()?;
         Ok(())
     }
@@ -958,6 +979,8 @@ impl InlineTerminal {
         }
         self.flush_output()?;
         self.overlay.take();
+        // The next inline paint sees a different title and puts the session's back.
+        self.panel_name = None;
         if self.image_protocol() == Some(super::images::ImageProtocol::Kitty) {
             self.out.write_all(b"\x1b_Ga=d,d=A,q=2\x1b\\")?;
             self.out.flush()?;
@@ -969,6 +992,21 @@ impl InlineTerminal {
     /// Ask for mouse reports (wheel and buttons) while a panel is open. Takes effect at the next open.
     pub fn set_overlay_mouse(&mut self, enabled: bool) {
         self.overlay_mouse = enabled;
+    }
+
+    /// Name the open panel in the terminal title: `<name> · <inline title>`, the name first so a
+    /// narrow tab still says where you are. Written with the next panel frame; cleared on close.
+    pub fn set_panel_name(&mut self, name: &str) {
+        let name = text::one_line(name.trim());
+        self.panel_name = (!name.is_empty()).then_some(name);
+    }
+
+    fn panel_title(&self) -> Option<String> {
+        let name = self.panel_name.as_deref()?;
+        Some(match self.inline_title.as_deref() {
+            Some(base) if !base.is_empty() => format!("{name} · {base}"),
+            _ => name.to_owned(),
+        })
     }
 
     fn restore_inline_screen(&mut self) -> io::Result<()> {

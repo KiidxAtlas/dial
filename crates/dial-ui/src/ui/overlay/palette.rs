@@ -121,6 +121,9 @@ const ALL_BLURB: &str = "every command by category; type to search all of them";
 /// starter lists.
 const STARTERS: &[&str] = crate::ui::command_surface::STARTERS;
 
+/// Recently run actions shown above the goals.
+const RECENT_MAX: usize = 3;
+
 impl Goal {
     fn holds(&self, command: &CommandEntry) -> bool {
         self.commands.contains(&command.name.as_str())
@@ -348,6 +351,8 @@ pub struct PaletteOverlay {
     progress_tab: bool,
     progress_scroll: usize,
     unified: Option<UnifiedSearch>,
+    /// Entries run recently (most recent first, at most [`RECENT_MAX`]); they lead the goal list.
+    recent: Vec<usize>,
 }
 
 impl PaletteOverlay {
@@ -398,6 +403,7 @@ impl PaletteOverlay {
             progress_tab: false,
             progress_scroll: 0,
             unified: None,
+            recent: Vec::new(),
         }
     }
 
@@ -407,6 +413,42 @@ impl PaletteOverlay {
     ) -> Self {
         self.command_context = context;
         self
+    }
+
+    /// Lead the goal list with the actions run most recently (`recent` most recent first, as
+    /// `/name args` or `name`). A command line maps to its exact entry (settings deep links) or
+    /// else to the entry named by its first word; unknown names are skipped.
+    pub fn with_recent(mut self, recent: &[String]) -> Self {
+        for line in recent {
+            let line = line.trim().trim_start_matches('/');
+            let first = line.split_whitespace().next().unwrap_or_default();
+            let found = self
+                .entries
+                .iter()
+                .position(|entry| entry.command.name == line)
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .position(|entry| entry.command.name == first)
+                });
+            if let Some(index) = found
+                && !self.recent.contains(&index)
+                && self.recent.len() < RECENT_MAX
+            {
+                self.recent.push(index);
+            }
+        }
+        self
+    }
+
+    /// Digits 1–9 run the visible row while nothing is typed (pickers keep digits for filtering).
+    fn quick_picks(&self) -> bool {
+        self.choice.is_none() && self.arguments.is_none() && self.search.text.is_empty()
+    }
+
+    /// Whether this is the action search rather than a picker over one command's values.
+    pub fn is_action_search(&self) -> bool {
+        self.choice.is_none()
     }
 
     /// `all:` explicitly expands this palette to cached local sessions and topic help.
@@ -504,8 +546,11 @@ impl PaletteOverlay {
         if !picker && unified.is_none() && query.is_empty() {
             match self.view {
                 View::Goals => {
-                    return (0..GOALS.len())
-                        .map(Row::Goal)
+                    return self
+                        .recent
+                        .iter()
+                        .map(|&index| Row::Entry(index))
+                        .chain((0..GOALS.len()).map(Row::Goal))
                         .chain(std::iter::once(Row::AllActions))
                         .collect();
                 }
@@ -638,8 +683,8 @@ impl PaletteOverlay {
             return false;
         }
         let cursor = match self.view {
-            View::Goal(goal) => goal,
-            View::Tabs => GOALS.len(),
+            View::Goal(goal) => self.recent.len() + goal,
+            View::Tabs => self.recent.len() + GOALS.len(),
             View::Goals => return false,
         };
         self.view = View::Goals;
@@ -812,6 +857,15 @@ impl PaletteOverlay {
             self.cursor = 0;
         } else if self.search.text.is_empty() && key.code == KeyCode::End {
             self.cursor = rows.len().saturating_sub(1);
+        } else if let Some(digit) = typed_char(key)
+            .filter(|c| self.quick_picks() && ('1'..='9').contains(c))
+            .and_then(|c| c.to_digit(10))
+        {
+            let position = self.scroll + digit as usize - 1;
+            if let Some(&row) = rows.get(position) {
+                self.cursor = position;
+                return self.activate(row);
+            }
         } else if let Some(c) = typed_char(key) {
             self.search.insert(&c.to_string());
             self.reset_selection();
@@ -990,6 +1044,9 @@ impl PaletteOverlay {
             items.push(keys_hint(keys, Action::SelectConfirm, "run"));
         } else if !empty {
             items.push(keys_hint(keys, Action::SelectConfirm, "choose"));
+            if self.quick_picks() {
+                items.push("1-9 pick".to_owned());
+            }
             items.push(keys_hint(keys, Action::SelectDown, "navigate"));
             if self.unified_query().is_none() {
                 items.push(keys_hint(keys, Action::SectionNext, "category"));
@@ -1261,6 +1318,10 @@ impl PaletteOverlay {
                                             "Actions"
                                         }
                                         .into()
+                                    } else if self.view == View::Goals
+                                        && self.search.text.is_empty()
+                                    {
+                                        "recent".into()
                                     } else {
                                         shortcut(&entry.command.name)
                                             .map(|a| ctx.keys.label(a))
@@ -1298,6 +1359,7 @@ impl PaletteOverlay {
                     } else {
                         text::ellipsize(&description, description_w, ascii)
                     };
+                    let quick = (self.quick_picks() && row < 9).then(|| (row + 1).to_string());
                     let mut spans = vec![
                         Span::styled(
                             format!(
@@ -1307,10 +1369,14 @@ impl PaletteOverlay {
                                 } else if current {
                                     "*"
                                 } else {
-                                    " "
+                                    quick.as_deref().unwrap_or(" ")
                                 }
                             ),
-                            theme.fg(Tok::Accent),
+                            theme.fg(if quick.is_some() && !selected {
+                                Tok::Dim
+                            } else {
+                                Tok::Accent
+                            }),
                         ),
                         Span::styled(
                             text::pad(&text::ellipsize(&name, name_w, ascii), name_w),

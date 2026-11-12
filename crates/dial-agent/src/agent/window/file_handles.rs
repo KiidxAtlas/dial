@@ -69,6 +69,15 @@ fn map_paths(
             }
         }
     }
+    if name == "write"
+        && let Some(files) = args.get_mut("files").and_then(Value::as_array_mut)
+    {
+        for entry in files {
+            if let Some(Value::String(path)) = entry.get_mut("path") {
+                *path = map(path)?;
+            }
+        }
+    }
     if name == "edit"
         && let Some(input) = args.get("input").and_then(Value::as_str)
     {

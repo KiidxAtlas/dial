@@ -775,6 +775,67 @@ fn the_completion_gate_runs_a_passing_check_instead_of_spending_a_reminder_round
     );
 }
 
+// `exact` fails on the first note while `notes` passes: a partial pass that must stay a blocker.
+const PARTIAL_NOTE_CHECKS: &str = "approval=\"auto\"\n[compaction]\nenabled=false\n[[verification.commands]]\nname=\"notes\"\ncommand=\"test -f note.txt\"\nfile_extensions=[\"txt\"]\ntimeout_secs=5\n[[verification.commands]]\nname=\"exact\"\ncommand=\"grep -qx fixed note.txt\"\nfile_extensions=[\"txt\"]\ntimeout_secs=5\n";
+
+#[test]
+fn a_partial_pass_stays_a_blocker_and_repair_clears_it() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some(("write", json!({"path":"note.txt","content":"x\n"}))),
+        ),
+        slots(),
+        response("The note is written.", None),
+        response(
+            "",
+            Some(("write", json!({"path":"note.txt","content":"fixed\n"}))),
+        ),
+        response("", Some(("verify", json!({"targets":["notes","exact"]})))),
+        response("The note is fixed and both checks pass.", None),
+    ]);
+    let report = with_agent(PARTIAL_NOTE_CHECKS, |agent| {
+        connect(agent, &server.url);
+        agent.turn("Write the note", &mut NullUi).unwrap()
+    });
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    let requests = completion_requests(&server);
+    assert!(
+        requests
+            .iter()
+            .any(|request| mentions(request, "Current edits have a failing applicable check")),
+        "the failing exact check blocks the first answer"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !mentions(request, "no passing applicable check")),
+        "the check that passed is not reported as still unverified"
+    );
+}
+
+#[test]
+fn a_partial_pass_still_blocks_the_answer_after_the_reminder_without_repair() {
+    let server = llm::fake::serve(vec![
+        response(
+            "",
+            Some(("write", json!({"path":"note.txt","content":"x\n"}))),
+        ),
+        slots(),
+        response("The note is written.", None),
+        response("The note is written.", None),
+    ]);
+    let report = with_agent(PARTIAL_NOTE_CHECKS, |agent| {
+        connect(agent, &server.url);
+        agent.turn("Write the note", &mut NullUi).unwrap()
+    });
+    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+    assert!(
+        report.text.contains("exact"),
+        "the reminded failure keeps blocking: {}",
+        report.text
+    );
+}
 #[test]
 fn a_passing_check_after_the_edit_satisfies_the_evidence_gate() {
     let server = llm::fake::serve(vec![
@@ -1738,11 +1799,11 @@ fn covered_native_reads_reuse_only_visible_rows_in_serial_and_parallel_turns() {
                 // Native output budgeting can omit whole rows without clipping any displayed row.
                 let first_missing = if clipped { 17 } else { 21 };
                 if clipped {
+                    let seed = seed["content"].as_str().unwrap();
                     assert!(
-                        seed["content"]
-                            .as_str()
-                            .unwrap()
-                            .contains("line 17 does not fit")
+                        seed.contains("truncated at the byte budget after line 16 of 30")
+                            && !seed.contains("17:source 17"),
+                        "{seed}"
                     );
                 }
                 assert!(

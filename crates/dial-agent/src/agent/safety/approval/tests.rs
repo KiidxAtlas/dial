@@ -973,3 +973,22 @@ fn shell_consumers_share_lexical_boundaries_without_sharing_authority() {
         );
     }
 }
+
+#[test]
+fn write_batches_check_every_destination_against_path_permissions() {
+    let root = Path::new("/p");
+    let denied = [rule(Effect::Deny, "write", &["secret/**"])];
+    let batch = file_call(
+        "write",
+        json!({"files":[{"path":"src/a","content":"x"},{"path":"secret/key","content":"y"}]}),
+    );
+    assert!(denied_by_rule(&denied, &batch, root));
+    let allowed = rule(Effect::Allow, "write", &["src/**"]);
+    assert!(!allowed.matches(&batch, root));
+    let safe = file_call(
+        "write",
+        json!({"files":[{"path":"src/a","content":"x"},{"path":"src/b","content":"y"}]}),
+    );
+    assert!(allowed.matches(&safe, root));
+    assert!(batch_call_line(&batch).contains("secret/key"));
+}

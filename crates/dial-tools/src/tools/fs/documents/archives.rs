@@ -11,6 +11,7 @@ use std::{
 
 mod cab;
 mod iso;
+#[cfg(feature = "data-formats")]
 mod rar;
 mod sevenz;
 #[cfg(test)]
@@ -84,7 +85,10 @@ fn read_source<R: Read + Seek>(
         "7z" => sevenz::read(source, member),
         "cab" => cab::read(source, member),
         "iso" => iso::read(source, member),
+        #[cfg(feature = "data-formats")]
         "rar" => rar::read(source, member),
+        #[cfg(not(feature = "data-formats"))]
+        "rar" => Err(super::not_built("RAR")),
         other => Err(format!("unsupported archive format {other:?}")),
     }
 }
