@@ -691,8 +691,11 @@ minutes, including compilation, on Apple Silicon. Add a filter with any new macO
 The Windows contract selects each library's owning package rather than compiling every
 workspace test harness for each filter. Before running filters, the runner compiles all selected
 test targets with one `cargo test --no-run` per distinct target selection, so independent
-packages build in parallel instead of one filter after another (compiling took about 14.5 of the
-job's 15 minutes in CI run `43124043407`). Its migrated-record privacy assertion checks native
+packages build in parallel, then runs each filter's prebuilt test binary directly (with its
+`--skip` list, from the package directory). A per-filter `cargo test` would resolve features for
+a different package set and recompile shared crates; compiling took about 14.5 of the Windows
+job's 15 minutes in CI run `43124043407`. Workspace-wide filters, or a failed prebuild, fall back
+to `cargo test`. Its migrated-record privacy assertion checks native
 owner-only permissions (Unix mode bits or Windows ACLs), not synthetic Windows POSIX bits.
 The Unix CI smoke tier stages the executable already produced by the workspace build into
 `target/installed/bin`, then runs the same artifact and recovery checks; it does not invoke

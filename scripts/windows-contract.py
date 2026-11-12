@@ -14,6 +14,7 @@ binary and exports its path as DIAL_EMBEDDED_SHELL_HOST to every filter (scripts
 """
 import argparse
 import importlib.util
+import json
 import re
 import subprocess
 import sys
@@ -73,7 +74,11 @@ def parse(path):
 
 
 def prebuild_commands(tests, profile):
-    """One `--no-run` build per distinct target selection: the same targets the filters compile."""
+    """One `--no-run` build per distinct target selection: the same targets the filters compile.
+
+    JSON messages on stdout name each test executable, so the filters run those binaries instead
+    of a per-package `cargo test`, which resolves features for a different package set and would
+    recompile shared crates."""
     groups = {}
     for target, _ in tests:
         if target[0] == "--package":
@@ -84,8 +89,46 @@ def prebuild_commands(tests, profile):
     for selection, packages in groups.items():
         package_args = [arg for package in dict.fromkeys(packages) for arg in ("--package", package)]
         commands.append(["cargo", "test", "--locked", "--profile", profile, "--no-run",
-                         *package_args, *selection])
+                         "--message-format=json-render-diagnostics", *package_args, *selection])
     return commands
+
+
+def test_executables(stdout):
+    """Map (target kind, target name) to the built test executables and their package directories."""
+    found = {}
+    for line in stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if message.get("reason") != "compiler-artifact" or not message.get("executable"):
+            continue
+        if not message.get("profile", {}).get("test"):
+            continue
+        target = message.get("target", {})
+        for kind in target.get("kind", []):
+            key = (kind, target.get("name"))
+            entry = (message["executable"], str(Path(message["manifest_path"]).parent))
+            found.setdefault(key, [])
+            if entry not in found[key]:
+                found[key].append(entry)
+    return found
+
+
+def target_key(target):
+    """The (kind, name) of the single test target a filter selects, or None for workspace filters."""
+    if target[0] != "--package":
+        return None
+    package, selection = target[1], target[2:]
+    if selection == ["--lib"]:
+        return ("lib", package.replace("-", "_"))
+    if len(selection) == 2 and selection[0] == "--bin":
+        return ("bin", selection[1])
+    if len(selection) == 2 and selection[0] == "--test":
+        return ("test", selection[1])
+    return None
 
 
 def run_contract(tests, skips, profile, dry_run=False, label="Windows", host=None):
@@ -95,16 +138,22 @@ def run_contract(tests, skips, profile, dry_run=False, label="Windows", host=Non
 
     env = embedded_host.environment(host)
     # A prebuild failure is reported, then every filter still runs and names its own failure.
+    executables = {}
     for command in prebuild_commands(tests, profile):
         print("+ " + " ".join(command), flush=True)
         if dry_run:
             continue
         result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, env=env)
-        print(result.stdout, end="", flush=True)
+                                stderr=subprocess.PIPE, text=True, env=env)
+        print(result.stderr or "", end="", file=sys.stderr, flush=True)
         if result.returncode != 0:
+            print(result.stdout or "", end="", flush=True)
             print(f"{label} contract prebuild failed; running each filter to report failures",
                   file=sys.stderr)
+            continue
+        for key, entries in test_executables(result.stdout or "").items():
+            known = executables.setdefault(key, [])
+            known.extend(entry for entry in entries if entry not in known)
 
     skip_args = [arg for name, _ in skips for arg in ("--skip", name)]
     # Every filter runs even after one fails, so a single CI run reports all failures;
@@ -112,12 +161,19 @@ def run_contract(tests, skips, profile, dry_run=False, label="Windows", host=Non
     status = 0
     failed = []
     for target, filter_name in tests:
-        command = ["cargo", "test", "--locked", "--profile", profile, *target,
-                   filter_name, "--", *skip_args]
+        built = executables.get(target_key(target), [])
+        if len(built) == 1:
+            # The prebuilt binary, run from its package directory as `cargo test` does.
+            executable, cwd = built[0]
+            command = [executable, filter_name, *skip_args]
+        else:
+            # Workspace filters, an ambiguous match or a failed prebuild: Cargo builds and runs.
+            command, cwd = ["cargo", "test", "--locked", "--profile", profile, *target,
+                            filter_name, "--", *skip_args], ROOT
         print("+ " + " ".join(command), flush=True)
         if dry_run:
             continue
-        result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE,
+        result = subprocess.run(command, cwd=cwd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, env=env)
         print(result.stdout, end="", flush=True)
         if result.returncode != 0:
