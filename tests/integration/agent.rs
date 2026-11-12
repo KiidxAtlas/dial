@@ -10423,7 +10423,9 @@ fn reliability_capability_check_executes_only_disposable_expected_calls() {
 fn reliability_stops_different_contract_failures_without_executing_them() {
     let server = serve(vec![
         Reply::Call("read", json!({"path":5})),
-        Reply::Call("write", json!({"path":"must-not-exist.txt"})),
+        // `write` accepts a batch form, so its schema no longer requires `content`; a
+        // wrongly typed `content` is still a schema (contract) failure.
+        Reply::Call("write", json!({"path":"must-not-exist.txt","content":5})),
         Reply::Calls(vec![
             (
                 "write",

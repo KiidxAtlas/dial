@@ -1799,11 +1799,11 @@ fn covered_native_reads_reuse_only_visible_rows_in_serial_and_parallel_turns() {
                 // Native output budgeting can omit whole rows without clipping any displayed row.
                 let first_missing = if clipped { 17 } else { 21 };
                 if clipped {
+                    let seed = seed["content"].as_str().unwrap();
                     assert!(
-                        seed["content"]
-                            .as_str()
-                            .unwrap()
-                            .contains("line 17 does not fit")
+                        seed.contains("truncated at the byte budget after line 16 of 30")
+                            && !seed.contains("17:source 17"),
+                        "{seed}"
                     );
                 }
                 assert!(
