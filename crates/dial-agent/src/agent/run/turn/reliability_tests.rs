@@ -27,10 +27,9 @@ fn fallback_to(url: &str) -> String {
 
 #[test]
 fn a_new_turn_recovers_a_failed_stream_writer_without_replaying_the_failed_turn() {
-    let server = llm::fake::serve(vec![
-        response("This reply cannot be published.", None),
-        response("Recovered.", None),
-    ]);
+    // Only the new turn may reach the provider: the failed turn's first journal write happens
+    // when its request starts, so that request (whose reply could not be published) is never sent.
+    let server = llm::fake::serve(vec![response("Recovered.", None)]);
     with_agent("[compaction]\nenabled=false\n", |agent| {
         connect(agent, &server.url);
         let journal = agent.session.runtime().stream_writer().unwrap();
@@ -54,10 +53,10 @@ fn a_new_turn_recovers_a_failed_stream_writer_without_replaying_the_failed_turn(
     let requests = completion_requests(&server);
     assert_eq!(
         requests.len(),
-        2,
-        "one failed request and one explicitly started new turn"
+        1,
+        "the failed turn sends nothing; only the explicitly started new turn reaches the model"
     );
-    assert!(mentions(&requests[1], "Answer the new request"));
+    assert!(mentions(&requests[0], "Answer the new request"));
 }
 
 #[test]
