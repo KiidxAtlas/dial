@@ -108,7 +108,6 @@ fn fake_adapter_with_caps(dir: &Path, caps: &Value) -> DapAdapterConfig {
     config
 }
 
-#[cfg(unix)]
 fn context<'a>(
     workspace: &'a Workspace,
     config: &'a crate::config::types::Config,
@@ -121,7 +120,6 @@ fn context<'a>(
     }
 }
 
-#[cfg(unix)]
 fn pick(tools: Vec<Arc<dyn Tool>>, name: &str) -> Arc<dyn Tool> {
     tools
         .into_iter()
