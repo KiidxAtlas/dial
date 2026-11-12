@@ -83,7 +83,15 @@ fn launch_path_keeps_the_name_when_nothing_matches_or_off_windows() {
     let search = Some(dir.path().as_os_str());
     let launched = launch_path(Path::new("tool"), search);
     if cfg!(windows) {
-        assert_eq!(launched, file);
+        // The suffix comes from `PATHEXT` (`.CMD`), and Windows names are case-insensitive, so the
+        // resolved path names the same file with the extension's casing.
+        assert_eq!(launched.parent(), file.parent());
+        assert!(
+            launched
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&file.to_string_lossy()),
+            "{launched:?} is not {file:?}"
+        );
     } else {
         // Unix `Command` searches PATH itself; the name is passed through.
         assert_eq!(launched, PathBuf::from("tool"));
