@@ -318,7 +318,7 @@ impl Action {
             Action::SubagentsRecent => {
                 "Open the most recent running worker's transcript; press again to cycle"
             }
-            Action::WorkTab => "Switch the work panel tab (plan, evidence, mode)",
+            Action::WorkTab => "Switch the work panel tab (plan, mode)",
             Action::RateGood => "Mark the last turn good (Teach this model)",
             Action::RateBad => "Mark the last turn bad (Teach this model)",
             Action::SelectUp => "Move up in lists",

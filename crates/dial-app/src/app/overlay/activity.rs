@@ -1,10 +1,17 @@
 //! Activity navigation reuses the existing panels and their refresh/action owners.
 use super::{ActiveOverlay, Which};
+use crate::ui::chrome::{self, Section};
 use crate::ui::keys::{Action, Keymap};
 use crate::ui::overlay::palette::{ChoiceItem, ChoiceSpec, PaletteOverlay};
 use crate::ui::overlay::{DrawCtx, OverlayEvent, panel_keys};
+use crate::ui::{text, theme::Theme};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::{Frame, layout::Rect, widgets::Paragraph};
+use ratatui::{
+    Frame,
+    layout::Rect,
+    text::{Line, Span},
+    widgets::Paragraph,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum ActivityTab {
@@ -18,11 +25,14 @@ pub(in crate::app) enum ActivityTab {
 }
 
 impl ActivityTab {
-    pub(super) const ALL: [Self; 7] = [
+    /// The tabs that Tab/Shift+Tab (and the arrow keys) cycle through. Downloads is not one of
+    /// them: it is the Models panel's Get models view, a different panel with its own keys, so it
+    /// opens only when asked for (`/activity downloads` or an attention item), never by stepping
+    /// sideways from Workers.
+    pub(super) const ALL: [Self; 6] = [
         Self::Attention,
         Self::Workers,
         Self::Processes,
-        Self::Downloads,
         Self::Compute,
         Self::Schedule,
         Self::Queue,
@@ -37,6 +47,19 @@ impl ActivityTab {
             Self::Compute => "compute",
             Self::Schedule => "schedule",
             Self::Queue => "queue",
+        }
+    }
+
+    /// The tab's label in the title row.
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Attention => "Attention",
+            Self::Workers => "Workers",
+            Self::Processes => "Processes",
+            Self::Downloads => "Downloads",
+            Self::Compute => "Compute",
+            Self::Schedule => "Schedule",
+            Self::Queue => "Queue",
         }
     }
 
@@ -174,23 +197,19 @@ impl ActivityOverlay {
             return;
         }
         self.panel.draw(frame, ctx);
-        let labels = ActivityTab::ALL
-            .map(|tab| {
-                if tab == self.tab {
-                    format!("[{}]", tab.name())
-                } else {
-                    tab.name().to_owned()
-                }
-            })
-            .join("  ");
+        // The Activity title row replaces the reused panel's own title row, on the same surface.
         let area = frame.area();
-        frame.render_widget(
-            Paragraph::new(format!(" Activity · {labels} · Tab / Shift+Tab · F1 keys ")),
-            Rect {
-                height: 1.min(area.height),
-                ..area
-            },
-        );
+        if area.height > 0 {
+            frame.render_widget(
+                Paragraph::new(title_row(
+                    ctx.theme,
+                    ctx.keys,
+                    self.tab,
+                    usize::from(area.width),
+                )),
+                Rect { height: 1, ..area },
+            );
+        }
     }
 
     pub(super) fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
@@ -221,6 +240,74 @@ impl ActivityOverlay {
         }
         self.panel.handle(event, keys)
     }
+}
+
+/// The Activity title row, `width` cells on the panel surface: ` Activity   Attention  Workers …`
+/// with the active tab in the shared tab style, and the key that switches tabs at the right edge
+/// when it fits. A row too narrow for every tab names only the active one and its position, and
+/// the narrowest rows drop the panel name before the active tab.
+pub(super) fn title_row(
+    theme: &Theme,
+    keys: &Keymap,
+    active: ActivityTab,
+    width: usize,
+) -> Line<'static> {
+    let spans_width = |spans: &[Span<'static>]| -> usize {
+        spans.iter().map(|span| text::width(&span.content)).sum()
+    };
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(chrome::fig_label(theme, Section::Dial, "Activity"));
+    spans.push(Span::raw("   "));
+    let lead = spans.clone();
+    for (index, tab) in ActivityTab::ALL.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            tab.title(),
+            chrome::tab_style(theme, tab == active),
+        ));
+    }
+    if spans_width(&spans) + 1 > width {
+        let position = ActivityTab::ALL
+            .iter()
+            .position(|tab| *tab == active)
+            .map(|index| format!(" {}/{}", index + 1, ActivityTab::ALL.len()))
+            .unwrap_or_default();
+        spans = lead;
+        spans.push(Span::styled(active.title(), chrome::tab_style(theme, true)));
+        spans.push(Span::styled(
+            position,
+            theme.fg(crate::ui::theme::Tok::Muted),
+        ));
+        // Where even that is too wide, the active tab outranks the panel name and its gap.
+        let name_end = 1 + chrome::fig_label(theme, Section::Dial, "Activity").len() + 1;
+        if spans_width(&spans) > width {
+            spans.drain(1..name_end);
+        }
+    }
+    let switch = format!(
+        "{}/{}",
+        keys.label(Action::TabPrev),
+        keys.label(Action::TabNext)
+    );
+    let mut hint = chrome::key_hint_spans(theme, &[(switch.as_str(), "tabs")]);
+    hint.push(Span::raw(" "));
+    let used = spans_width(&spans);
+    let hint_w = spans_width(&hint);
+    if used + hint_w + 2 <= width {
+        spans.push(Span::raw(" ".repeat(width - used - hint_w)));
+        spans.extend(hint);
+    } else {
+        spans = crate::ui::markdown::truncate_spans(
+            spans,
+            width,
+            theme.sym(crate::ui::theme::Sym::Ellipsis),
+        );
+        let used = spans_width(&spans);
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    }
+    Line::from(chrome::on_surface(theme, spans))
 }
 
 pub(in crate::app) fn schedule_choices() -> ChoiceSpec {

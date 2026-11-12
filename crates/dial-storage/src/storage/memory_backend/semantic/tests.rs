@@ -83,6 +83,7 @@ fn semantic_with(embedder: Option<Box<dyn Embedder>>) -> Semantic {
         token_budget: 1500,
         auto_retain: true,
         retain_paused: false,
+        retain_role: MEMORY_ROLE,
         consolidate_interval_secs: 0,
         turn_failures: HashMap::new(),
         retain_note: None,
@@ -571,8 +572,8 @@ fn a_second_session_opens_the_store_while_the_first_is_still_using_it() {
     std::fs::create_dir_all(&project).unwrap();
     let layout = Layout::with_user_dir(&project, dir.path().join("home")).unwrap();
     let config = SemanticConfig::default();
-    let mut first = open(&layout, &config, Ok(None), false).unwrap();
-    let mut second = open(&layout, &config, Ok(None), false)
+    let mut first = open(&layout, &config, Ok(None), None).unwrap();
+    let mut second = open(&layout, &config, Ok(None), None)
         .expect("reopening must not switch the journal mode under the live connection");
     let op = Operation::for_test(authority("session"), scope(), None);
     assert_eq!(first.status(&op).unwrap()["backend"], "semantic");

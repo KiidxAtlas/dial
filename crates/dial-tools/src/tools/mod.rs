@@ -1298,14 +1298,13 @@ impl Workspace {
     }
 }
 
-const HASHLINE_READ_DESC: &str = "read: view any file or directory without changing it; use it over shell viewers, once per file. Decodes text, \
+const HASHLINE_READ_DESC: &str = "read: view any file or directory without changing it; prefer it to shell viewers. Decodes text, \
 documents, data, databases (read-only), archives, media, executables; other binaries as hex. Suffixes: `:50-100`, \
-`:50+20`, `:-30`, `:80~10` (context), `:sym=NAME`, `:outline` (file or dir), `:bytes=O+N`, `:raw` (non-editable); \
+`:50+20`, `:-30`, `:80~10` (context), `:sym=NAME`, `:outline`, `:bytes=O+N`, `:raw` (non-editable); \
 format parts `:member`, `:table`, `:sheet=N`. `paths` reads up to 16 targets. Also `ssh://host/path`, `http(s)://`, \
-`pr://N`, `issue://N`, `conflict://`, `artifact://H`. Output is a `[PATH#TAG]` header then `LINE:TEXT` rows; edit needs \
-that TAG and may touch only shown lines. Stops at 48 KiB; the footer names the next range. Large or unfamiliar files: \
-`grep`, `:outline` or `:sym=` first, never page through. Rows still visible are not resent; a changed file returns \
-its changed lines.";
+`pr://N`, `issue://N`, `conflict://`, `artifact://H`. Output: a `[PATH#TAG]` header, then `LINE:TEXT` rows; edit needs \
+that TAG and may touch only shown lines. Stops at 48 KiB; the footer names the next range. Large files: `grep`, \
+`:outline` or `:sym=` first, never page through. Rows still visible are not resent; a changed file returns its changed lines.";
 
 const HASHLINE_WRITE_DESC: &str = "write: create files or near-total replacements; use edit for local changes. Read existing files in full first. Supply path plus content OR source (artifact://SHA256 and matching sha256), or files. Max 1 MiB/file, 8 MiB/batch; creates parents. Notebooks need literal JSON. Inline read prefixes stripped; incomplete projections refused. Artifact bytes stay exact. Returns fresh [PATH#TAG] headers and receipts. SSH accepts only path/content.";
 

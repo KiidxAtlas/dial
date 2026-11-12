@@ -149,6 +149,37 @@ fn pinned_sessions_open_first_under_one_header() {
 }
 
 #[test]
+fn wide_rows_mark_pinned_and_current_sessions_with_colored_chips() {
+    let theme = Theme::dark();
+    let mut now = session("now", "Now", 1);
+    now.updated = "2025-01-01T00:00:00Z".into();
+    let mut other = session("other", "Other", 1);
+    other.updated = "2026-02-01T00:00:00Z".into();
+    let mut p = Picker::new(
+        vec![session("saved", "Saved", 1), other, now],
+        vec!["saved".into()],
+        "now",
+        "",
+        false,
+    );
+    // Selected rows read in one body color, so move the selection off both marked sessions.
+    p.handle(&key(KeyCode::Down, KeyModifiers::NONE), 24);
+    let rows = p.rows(80, 24, &theme);
+    assert!(text_of(&rows).contains("› Other"), "{}", text_of(&rows));
+    let chip = |word: &str| {
+        rows.iter()
+            .flat_map(|row| row.spans.iter())
+            .find(|span| span.content.contains(&format!("⟦{word}⟧")))
+            .unwrap_or_else(|| panic!("no {word} chip in {}", text_of(&rows)))
+            .style
+            .fg
+    };
+    assert_eq!(chip("pinned"), theme.fg(Tok::Accent).fg);
+    assert_eq!(chip("current"), theme.fg(Tok::Success).fg);
+    assert!(!text_of(&rows).contains("[pin]"));
+}
+
+#[test]
 fn tree_includes_empty_sessions_and_never_reorders_ancestry_for_search() {
     let p = Picker::new(
         vec![

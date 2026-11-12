@@ -13,7 +13,7 @@ use crate::app::drive::sign_in_still_pending;
 use crate::app::git::{StatusCache, parse_file_diffs, parse_status};
 use crate::app::improve_view::improve_summary;
 use crate::app::learning::{Learning, lora_state};
-use crate::app::notices::{memory_age, memory_status_text};
+use crate::app::notices::{memory_age, memory_status_text, memory_view_text};
 #[cfg(unix)]
 use crate::app::overlay::compute::{compute_starts, overlay_compute_release};
 use crate::app::overlay::{Which, overlay_destination, work_panel};
@@ -345,6 +345,87 @@ fn memory_age_uses_short_relative_units() {
     assert_eq!(memory_age(now - 300), "5m ago");
     assert_eq!(memory_age(now - 7200), "2h ago");
     assert_eq!(memory_age(now - 3 * 86400), "3d ago");
+}
+
+#[test]
+fn memory_view_lists_each_bank_with_refs_revisions_and_auto_retain_state() {
+    let value = json!({
+        "backend": "semantic",
+        "view": {
+            "banks": [
+                {"scope": "project", "total": 3, "truncated": true, "facts": [
+                    {"ref": "12", "id": 12, "revision": 2, "content": "staging  database\nis orchid", "source": "auto-retain", "updated": 0},
+                    {"ref": "3", "id": 3, "revision": 1, "content": "tests use nextest", "source": "", "updated": 0}
+                ]},
+                {"scope": "global", "total": 0, "truncated": false, "facts": []}
+            ],
+            "autoRetain": {"state": "on", "role": "small", "pendingTurns": 1}
+        }
+    });
+    let text = memory_view_text(&value);
+    assert!(text.contains("Project facts: 3 (newest 2 shown)"), "{text}");
+    let row = text
+        .lines()
+        .find(|line| line.contains("staging database is orchid"))
+        .unwrap();
+    assert!(row.trim_start().starts_with("12  r2"), "{text}");
+    let source = text
+        .lines()
+        .find(|line| line.contains("source: auto-retain"))
+        .unwrap();
+    assert_eq!(
+        source.find("source:"),
+        row.find("staging"),
+        "the source sits under the fact text: {text}"
+    );
+    assert!(
+        text.contains("User-wide facts (all projects): none yet"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Auto-retain: on (extracts with the small role) · 1 turn waiting"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Next: /memory forget <ref> <revision>"),
+        "{text}"
+    );
+}
+
+#[test]
+fn empty_memory_view_says_how_facts_arrive() {
+    let value = json!({
+        "backend": "semantic",
+        "view": {
+            "banks": [{"scope": "project", "total": 0, "truncated": false, "facts": []}],
+            "autoRetain": {"state": "paused", "role": null, "pendingTurns": 0}
+        }
+    });
+    let text = memory_view_text(&value);
+    assert!(text.contains("Project facts: none yet"), "{text}");
+    assert!(
+        text.contains("Auto-retain: paused: assign the memory or small role"),
+        "{text}"
+    );
+    assert!(text.contains("/memory save <text>"), "{text}");
+}
+
+#[test]
+fn provenance_memory_view_has_no_auto_retain_line_and_marks_a_full_page() {
+    let facts: Vec<Value> = (1..=3)
+        .map(|id| json!({"ref": id.to_string(), "id": id, "revision": 1, "content": format!("fact {id}"), "source": "agent", "updated": 0}))
+        .collect();
+    let value = json!({
+        "backend": "provenance",
+        "view": {"banks": [{"scope": "project", "total": 3, "truncated": true, "facts": facts}]}
+    });
+    let text = memory_view_text(&value);
+    assert!(
+        text.contains("Project facts: 3+ (newest 3 shown)"),
+        "{text}"
+    );
+    assert!(!text.contains("Auto-retain"), "{text}");
+    assert!(text.contains("Next: /memory search <words>"), "{text}");
 }
 
 #[test]

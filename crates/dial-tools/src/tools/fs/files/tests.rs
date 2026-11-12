@@ -226,6 +226,273 @@ fn multi_path_reads_report_each_target_and_fail_only_when_nothing_was_read() {
     assert_eq!(omitted.data.unwrap()["targets"][0]["status"], "omitted");
 }
 
+#[test]
+fn multi_path_budget_is_shared_so_a_large_first_file_does_not_starve_later_targets() {
+    let (dir, ws) = workspace();
+    numbered_file(&dir, "big.txt", 2000);
+    fs::write(dir.path().join("small.txt"), "alpha\nbeta\n").unwrap();
+    let mid: String = (1..=20).map(|n| format!("mid {n}\n")).collect();
+    fs::write(dir.path().join("mid.txt"), mid).unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let budget = 16 * 1024;
+    let out = read_paths_output(
+        &ws,
+        &json!({"paths": ["big.txt", "small.txt", "mid.txt"]}),
+        &cancel,
+        budget,
+    )
+    .unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(out.data.as_ref().unwrap()["read"], 3, "{}", out.text);
+    assert!(out.text.contains("     1\tline 1\n"), "{}", out.text);
+    assert!(
+        out.text.contains("alpha") && out.text.contains("mid 20"),
+        "{}",
+        out.text
+    );
+    assert!(out.text.len() <= budget, "{}", out.text.len());
+
+    // The clipped first file names the exact selector that continues it from its first unshown row.
+    let next = out
+        .text
+        .split("continue with `big.txt:")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .expect("big.txt continuation");
+    let from: usize = next.trim_end_matches('-').parse().unwrap();
+    assert!(from > 1 && from < 2000, "{next}");
+    // Only the rows the output showed witness edits: the first row yes, the continuation row no.
+    let big = dir.path().join("big.txt");
+    let big_text = fs::read_to_string(&big).unwrap();
+    assert!(crate::tools::edit::editing::seen_guard(&ws, &big, &big_text, &[(1, 1)]).is_ok());
+    assert!(
+        crate::tools::edit::editing::seen_guard(&ws, &big, &big_text, &[(from, from)]).is_err()
+    );
+
+    // The continuation selector then reads on from exactly that row.
+    let rest = run(&ws, "read", json!({"path": format!("big.txt:{next}")}));
+    assert!(
+        rest.text.contains(&format!("{from:>6}\tline {from}\n")),
+        "{}",
+        rest.text
+    );
+    let mid_path = dir.path().join("mid.txt");
+    let mid_text = fs::read_to_string(&mid_path).unwrap();
+    assert!(
+        crate::tools::edit::editing::seen_guard(&ws, &mid_path, &mid_text, &[(20, 20)]).is_ok()
+    );
+}
+
+#[test]
+fn multi_path_total_stays_bounded_and_clipped_or_omitted_targets_name_their_continuation() {
+    let (dir, ws) = workspace();
+    let names: Vec<String> = (0..16).map(|n| format!("t{n:02}.txt")).collect();
+    for name in &names {
+        numbered_file(&dir, name, 400);
+    }
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+
+    // Sixteen large files share the default output budget: each is clipped, none starves.
+    let budget = MAX_READ_OUTPUT;
+    let out = read_paths_output(&ws, &json!({"paths": names}), &cancel, budget).unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(out.data.as_ref().unwrap()["read"], 16, "{}", out.text);
+    assert!(out.text.len() <= budget, "{}", out.text.len());
+    for name in &names {
+        assert!(
+            out.text.contains(&format!("continue with `{name}:")),
+            "{name}: {}",
+            out.text
+        );
+    }
+
+    // A budget that cannot show every target reads the first, omits the rest by name, and
+    // leaves the omitted rows without edit witnesses. A fresh workspace keeps the earlier
+    // full-budget reads from witnessing these rows.
+    let tight_budget = 2048;
+    let fresh = Workspace::new(dir.path())
+        .unwrap()
+        .with_edit_mode(crate::tools::EditMode::Replace);
+    let tight = read_paths_output(&fresh, &json!({"paths": names}), &cancel, tight_budget).unwrap();
+    let data = tight.data.as_ref().unwrap();
+    assert_eq!(
+        (data["read"].clone(), data["omitted"].clone()),
+        (json!(1), json!(15)),
+        "{}",
+        tight.text
+    );
+    assert!(
+        tight.text.contains(&format!("paths={}", json!(names[1..]))),
+        "{}",
+        tight.text
+    );
+    assert!(tight.text.len() <= tight_budget, "{}", tight.text.len());
+    let shown = dir.path().join(&names[0]);
+    let shown_text = fs::read_to_string(&shown).unwrap();
+    assert!(
+        crate::tools::edit::editing::seen_guard(&fresh, &shown, &shown_text, &[(1, 1)]).is_ok()
+    );
+    assert!(
+        crate::tools::edit::editing::seen_guard(&fresh, &shown, &shown_text, &[(400, 400)])
+            .is_err()
+    );
+    let omitted = dir.path().join(&names[1]);
+    let omitted_text = fs::read_to_string(&omitted).unwrap();
+    assert!(
+        crate::tools::edit::editing::seen_guard(&fresh, &omitted, &omitted_text, &[(1, 1)])
+            .is_err()
+    );
+    // The smallest budget a read accepts shows no row, and a failing target stays one bounded line.
+    let mut failing = names[..15].to_vec();
+    failing.push("gone.txt".into());
+    let minimal = read_paths_output(&fresh, &json!({"paths": failing}), &cancel, 1024).unwrap();
+    assert!(minimal.is_error, "{}", minimal.text);
+    assert_eq!(
+        minimal.data.as_ref().unwrap()["omitted"],
+        16,
+        "{}",
+        minimal.text
+    );
+    assert!(minimal.text.len() <= 1024, "{}", minimal.text.len());
+    let error = read_paths_output(
+        &fresh,
+        &json!({"paths": ["gone.txt", &"x".repeat(900)]}),
+        &cancel,
+        48 * 1024,
+    )
+    .unwrap();
+    assert!(
+        error
+            .text
+            .lines()
+            .all(|line| line.len() <= ERROR_LINE_CAP + 3),
+        "{}",
+        error.text
+    );
+}
+
+#[test]
+fn multi_path_demand_follows_selectors_offset_and_limit_without_reading_rows() {
+    let (dir, ws) = workspace();
+    numbered_file(&dir, "big.txt", 2000);
+    let none = json!({});
+    let whole = target_demand(&ws, &none, "big.txt");
+    let ranged = target_demand(&ws, &none, "big.txt:1-3");
+    assert_eq!(ranged, 3 * PATH_ROW_BOUND + PATH_ROOM_FLOOR);
+    assert!(ranged < whole, "a 3-line range must not reserve the file");
+    // An open-ended range and a whole file both reach `limit` lines (default 2000) and the end.
+    assert_eq!(target_demand(&ws, &none, "big.txt:5-"), whole);
+    assert_eq!(
+        target_demand(&ws, &json!({"offset": 5, "limit": 2}), "big.txt"),
+        2 * PATH_ROW_BOUND + PATH_ROOM_FLOOR
+    );
+    assert_eq!(
+        target_demand(&ws, &json!({"limit": 2}), "big.txt:5-"),
+        2 * PATH_ROW_BOUND + PATH_ROOM_FLOOR
+    );
+    // A closed selector is not stretched by `limit`: its 11 lines, capped at the file size.
+    assert_eq!(
+        target_demand(&ws, &json!({"limit": 2}), "big.txt:10-20"),
+        (11 * PATH_ROW_BOUND).min(whole - PATH_ROOM_FLOOR) + PATH_ROOM_FLOOR
+    );
+    assert_eq!(target_demand(&ws, &none, "missing.txt"), PATH_ROOM_FLOOR);
+}
+
+#[test]
+fn multi_path_handle_targets_plan_and_read_like_their_paths() {
+    let (dir, ws) = workspace();
+    numbered_file(&dir, "big.txt", 2000);
+    fs::write(dir.path().join("small.txt"), "alpha\n").unwrap();
+    let none = json!({});
+    let handle = ws.file_handle("big.txt").unwrap();
+    assert_eq!(
+        target_demand(&ws, &none, &handle),
+        target_demand(&ws, &none, "big.txt")
+    );
+    assert_eq!(
+        target_demand(&ws, &none, &format!("{handle}:1-3")),
+        target_demand(&ws, &none, "big.txt:1-3")
+    );
+    // The handle target shares the budget like its path: the small target after it is whole and
+    // the handle's own continuation names the file by its path.
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let out = read_paths_output(
+        &ws,
+        &json!({"paths": [handle, "small.txt"]}),
+        &cancel,
+        16 * 1024,
+    )
+    .unwrap();
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("alpha"), "{}", out.text);
+    assert!(out.text.contains("continue with `big.txt:"), "{}", out.text);
+    assert_eq!(out.data.as_ref().unwrap()["read"], 2, "{}", out.text);
+}
+
+#[test]
+fn multi_path_notice_stays_within_budget_when_full_target_list_would_not() {
+    let (_dir, ws) = workspace();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    // Sixteen long names, none of which exist: their full JSON list is far larger than 1 KiB.
+    let names: Vec<String> = (0..16)
+        .map(|n| format!("{n:02}-{}.txt", "x".repeat(300)))
+        .collect();
+    let out = read_paths_output(&ws, &json!({"paths": names}), &cancel, 1024).unwrap();
+    assert!(out.is_error, "{}", out.text);
+    assert!(out.text.len() <= 1024, "{}", out.text.len());
+    assert!(
+        out.text.contains("[paths 1-16 of 16 omitted"),
+        "{}",
+        out.text
+    );
+    assert!(!out.text.contains("paths=["), "{}", out.text);
+    // The structured list still carries every target by name, in order.
+    let data = out.data.as_ref().unwrap();
+    assert_eq!(data["omitted"], 16);
+    assert_eq!(data["targets"][15]["path"], names[15]);
+    assert!(compact_notice(15, 16).len() <= COMPACT_NOTICE_BOUND);
+}
+
+#[test]
+fn multi_path_cuts_only_non_witnessing_sections_that_overrun_their_share() {
+    let (dir, ws) = workspace();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    fs::write(dir.path().join("small.txt"), "alpha\n").unwrap();
+    // A listing ignores the reader's room, so long names overrun a share on their own.
+    fs::create_dir(dir.path().join("long")).unwrap();
+    for n in 0..60 {
+        let name = format!("{n:03}-{}.txt", "y".repeat(110));
+        fs::write(dir.path().join("long").join(name), "").unwrap();
+    }
+    let outline: String = (0..800).map(|n| format!("fn decl_{n}() {{}}\n")).collect();
+    fs::write(dir.path().join("outline.rs"), outline).unwrap();
+    let json: String = (0..4000).map(|n| format!("{{\"n\":{n}}},")).collect();
+    fs::write(dir.path().join("data.json"), format!("[{json}{{}}]")).unwrap();
+    let blob: Vec<u8> = (0..40_000).map(|n| (n % 251) as u8).collect();
+    fs::write(dir.path().join("blob.bin"), blob).unwrap();
+    let budget = 4096;
+    // Directories are the reader that overran; the others already stay within a share, and the
+    // guard leaves their text whole. Every case keeps the total bound and the later target.
+    for target in ["long", "outline.rs:outline", "data.json", "blob.bin"] {
+        let out = read_paths_output(
+            &ws,
+            &json!({"paths": [target, "small.txt"]}),
+            &cancel,
+            budget,
+        )
+        .unwrap();
+        assert!(out.text.len() <= budget, "{target}: {}", out.text.len());
+        assert!(out.text.contains("alpha"), "{target}: {}", out.text);
+        if target == "long" {
+            assert!(
+                out.text.contains("cut to its share of the budget"),
+                "{}",
+                out.text
+            );
+        }
+    }
+}
+
 fn numbered_file(dir: &tempfile::TempDir, name: &str, lines: usize) {
     let body: String = (1..=lines).map(|i| format!("line {i}\n")).collect();
     fs::write(dir.path().join(name), body).unwrap();

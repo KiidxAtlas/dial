@@ -11,7 +11,7 @@ use crate::agent::window::context::expand_message;
 use crate::llm::images::user_attachment;
 
 /// The user text and message for a print turn that carries explicit image files.
-pub(super) struct PreparedTurn {
+pub(crate) struct PreparedTurn {
     pub text: String,
     pub message: Value,
     pub warnings: Vec<String>,
@@ -33,6 +33,18 @@ pub(super) fn prepare_turn(
     stdin_image: Option<&[u8]>,
     interrupt: &AtomicBool,
 ) -> Result<PreparedTurn> {
+    prepare_attached_turn(root, prompt, images, stdin_image.as_slice(), interrupt)
+}
+
+/// One user turn with explicit image files and inline image bytes, shared by `--image` print runs
+/// and the RPC `send` method. Typed `@file` references expand exactly as in the terminal.
+pub(crate) fn prepare_attached_turn(
+    root: &Path,
+    prompt: &str,
+    images: &[PathBuf],
+    inline: &[&[u8]],
+    interrupt: &AtomicBool,
+) -> Result<PreparedTurn> {
     let (mut message, warnings) = expand_message(root, prompt, interrupt);
     let mut attached = message
         .get("dial_images")
@@ -41,14 +53,14 @@ pub(super) fn prepare_turn(
         .unwrap_or_default();
     for path in images {
         let image = user_attachment(root, path)
-            .with_context(|| format!("attaching --image {}", path.display()))?;
+            .with_context(|| format!("attaching image {}", path.display()))?;
         if !attached.contains(&image) {
             attached.push(image);
         }
     }
-    if let Some(bytes) = stdin_image {
+    for (index, bytes) in inline.iter().enumerate() {
         let image = crate::llm::images::inline_attachment(bytes)
-            .context("attaching --image - from stdin")?;
+            .with_context(|| format!("attaching inline image {}", index + 1))?;
         if !attached.contains(&image) {
             attached.push(image);
         }

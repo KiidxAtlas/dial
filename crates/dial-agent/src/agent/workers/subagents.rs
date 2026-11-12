@@ -233,7 +233,7 @@ pub fn schema(config: &Config) -> Value {
         format!("{presets}\nCustom agents:{custom}")
     };
     let description = format!(
-        "Delegate independent work: tasks[] shares context; start returns live ids, wait collects results. Default: read-only on main model. scout: routine lookup; reviewer: audit; planner: analysis; worker: implementation. source_session attaches a record to a read-only audit, never directory permission. Types:{types}{presets}"
+        "Delegate independent work: tasks[] shares context; start returns ids, wait collects results. Default: read-only on main model. source_session attaches a record to a read-only audit, never permission. Types:{types}{presets}"
     );
     let mut entry_properties = json!({
         "acceptance_checks":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1},"description":"Names of configured checks, not shell commands. A mutating worker's changes merge only when these pass."},
@@ -827,7 +827,7 @@ impl Job<'_> {
             }
             out.push_str("Keep changes within the scope unless a necessary dependency forces a deviation; explain any deviation. In your final handoff, report each acceptance condition as met, unmet, or not verified, with concrete evidence. Never claim a check or interface contract passed unless you actually verified it.\n");
             if self.schema.is_none() {
-                out.push_str("Prefer a JSON report with summary, blockers, acceptance keyed by acceptance_N (each with status met|unmet|not_verified), evidence_refs, changed_paths, and integration_risks. Report statuses as claims with evidence, not execution lifecycle. Missing statuses are not_verified.\n");
+                out.push_str("Prefer a JSON report with summary, blockers, acceptance keyed by acceptance_N (each with status met|unmet|not_verified), evidence_refs, changed_paths, integration_risks, checks_run, and gaps. checks_run and gaps are arrays of plain strings (not objects; the parent drops non-string items): checks_run lists each exact command you ran with its result, e.g. \"cargo test -p dial-storage --lib skills => exit 0\", as evidence only, never acceptance; gaps lists acceptance items or checks you did not run or could not verify, each with its reason. Report statuses as claims with evidence, not execution lifecycle. Missing statuses are not_verified.\n");
             } else {
                 out.push_str("The output_schema remains authoritative for the final answer; do not add fields it forbids. Acceptance coverage absent from that payload remains not_verified in the parent projection.\n");
             }

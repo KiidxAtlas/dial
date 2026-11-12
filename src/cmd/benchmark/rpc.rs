@@ -1,7 +1,8 @@
 //! Benchmark child protocol: every turn stays in one process/session, with bounded event capture.
 use anyhow::{Context, Result, ensure};
 use dial::benchmark::{
-    AgentFailure, BenchmarkCase, RunMetrics, ToolTrace, failure_detail, response_sha256,
+    AgentFailure, BenchmarkCase, RunMetrics, ToolTrace, WorkerExecution, failure_detail,
+    response_sha256,
 };
 use serde_json::{Value, json};
 use std::{
@@ -111,6 +112,44 @@ fn require_compaction(result: &Value) -> Result<()> {
         result["outcome"]
     );
     Ok(())
+}
+
+/// Completed RPC phases of one case, so a whole-case deadline names where its time went.
+#[derive(Default)]
+struct Phases {
+    completed: Vec<(String, Duration)>,
+    mark: Option<Instant>,
+}
+
+impl Phases {
+    fn start(&mut self, now: Instant) {
+        self.mark = Some(now);
+    }
+
+    fn done(&mut self, name: impl Into<String>, now: Instant) {
+        let since = self.mark.map_or(Duration::ZERO, |mark| now - mark);
+        self.completed.push((name.into(), since));
+        self.mark = Some(now);
+    }
+
+    /// `case elapsed 95.2 s; completed: ready 3.1 s, send#1 40.0 s; pending for 52.1 s`.
+    fn summary(&self, started: Instant, now: Instant) -> String {
+        let completed = if self.completed.is_empty() {
+            "none".to_owned()
+        } else {
+            self.completed
+                .iter()
+                .map(|(name, took)| format!("{name} {:.1} s", took.as_secs_f64()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let pending = self.mark.unwrap_or(started);
+        format!(
+            "case elapsed {:.1} s; completed: {completed}; pending for {:.1} s",
+            (now - started).as_secs_f64(),
+            (now - pending).as_secs_f64()
+        )
+    }
 }
 
 fn completed_turns(report: &Value, previous: u64) -> Result<u64> {
@@ -263,6 +302,55 @@ fn apply_ledger(metrics: &mut RunMetrics, ledger: Option<Ledger>) {
     metrics.token_usage_incomplete = !ledger.complete;
 }
 
+/// The canonical terminal phases serialized by the runtime. Any other value, including a missing or
+/// corrupt phase, is not terminal, so it can never certify a worker as complete.
+fn terminal_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        "completed"
+            | "answered"
+            | "blocked"
+            | "needs_input"
+            | "incomplete"
+            | "failed"
+            | "interrupted"
+    )
+}
+
+/// Sums worker counters from the child's `state.tree` (`kind == "worker"`). A node without a
+/// counter, or a terminal node without elapsed time, makes that total unknown instead of zero. A
+/// node without a terminal phase counts as running, so partial counters never look complete.
+fn read_worker_execution(state: &Value) -> Option<WorkerExecution> {
+    fn add(total: &mut Option<u64>, value: Option<u64>) {
+        *total = total
+            .zip(value)
+            .map(|(sum, value)| sum.saturating_add(value));
+    }
+    let nodes = state.get("tree")?.as_array()?;
+    let mut execution = WorkerExecution {
+        workers: 0,
+        running: 0,
+        tool_starts: Some(0),
+        model_steps: Some(0),
+        elapsed_ms: Some(0),
+    };
+    for node in nodes.iter().filter(|node| node["kind"] == "worker") {
+        execution.workers += 1;
+        let data = &node["result"]["data"];
+        let terminal = node["result"]["phase"].as_str().is_some_and(terminal_phase);
+        if !terminal {
+            execution.running += 1;
+        }
+        add(&mut execution.tool_starts, data["tools"].as_u64());
+        add(&mut execution.model_steps, data["steps"].as_u64());
+        add(
+            &mut execution.elapsed_ms,
+            terminal.then(|| data["elapsed_ms"].as_u64()).flatten(),
+        );
+    }
+    Some(execution)
+}
+
 fn configure_subscription_auth(command: &mut Command, auth_home: Option<&Path>) -> Result<()> {
     // An ambient override must never opt a benchmark into shared credentials implicitly.
     let key = dial::config::paths::SUBSCRIPTION_AUTH_HOME;
@@ -374,6 +462,8 @@ pub fn run_configured(
     let mut ledger_read = false;
     let mut trace_snapshot: Option<Value> = None;
     let (mut trace_sends, mut trace_snapshots) = (0u64, 0u64);
+    let mut phases = Phases::default();
+    phases.start(started);
     let result = (|| -> Result<()> {
         loop {
             let event = receive(&rx, deadline)?;
@@ -383,6 +473,7 @@ pub fn run_configured(
                 event["message"]
             );
             if event["event"] == "ready" {
+                phases.done("ready", Instant::now());
                 break;
             }
         }
@@ -397,6 +488,7 @@ pub fn run_configured(
                 deadline,
                 &mut metrics,
             )?;
+            phases.done(format!("seed_context#{id}"), Instant::now());
             id += 1;
         }
         for (prompt, compact) in std::iter::once((case.prompt.as_str(), false)).chain(
@@ -415,6 +507,7 @@ pub fn run_configured(
                     &mut metrics,
                 )?;
                 require_compaction(&compacted)?;
+                phases.done(format!("compact#{id}"), Instant::now());
                 id += 1;
             }
             trace_sends += 1;
@@ -427,6 +520,7 @@ pub fn run_configured(
                 deadline,
                 &mut metrics,
             )?;
+            phases.done(format!("send#{id}"), Instant::now());
             retain_efficiency(&mut metrics, &report, Some(trace_sends));
             id += 1;
             ensure!(
@@ -490,6 +584,7 @@ pub fn run_configured(
         .context("benchmark runtime usage snapshot unavailable")?;
         ledger_read = true;
         apply_ledger(&mut metrics, read_ledger(&state));
+        metrics.worker_execution = read_worker_execution(&state);
         id += 1;
         request(
             &mut input,
@@ -502,6 +597,8 @@ pub fn run_configured(
         )?;
         Ok(())
     })();
+    // Attribute a whole-case failure (notably the deadline) to the phase that consumed the time.
+    let result = result.map_err(|error| error.context(phases.summary(started, Instant::now())));
     // A turn can fail after paying for inference. When the child still speaks RPC, retain its
     // settled ledger rather than throwing away worker/auxiliary usage on the error path.
     // A dead or busy child gets only one bounded recovery read, never another model request.
@@ -525,6 +622,7 @@ pub fn run_configured(
     {
         ledger_read = true;
         apply_ledger(&mut metrics, read_ledger(&state));
+        metrics.worker_execution = read_worker_execution(&state);
         retain_efficiency(&mut metrics, &state, None);
     }
     metrics.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -545,6 +643,7 @@ pub fn run_configured(
     if result.is_err() && !ledger_read && active {
         metrics.token_usage_incomplete = true;
     }
+    metrics.whole_execution = Some(metrics.derive_whole_execution());
     drop(input);
     drop(child);
     drop(rx);

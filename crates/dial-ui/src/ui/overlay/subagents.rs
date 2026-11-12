@@ -14,7 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{Axis, arrows, filled, hint, hint_line, pair_label, panel},
+    settings::{Axis, arrows, filled, hint, hint_line, panel},
 };
 use crate::ui::{
     chrome::{self, Section},
@@ -715,7 +715,7 @@ impl SubagentsOverlay {
             frame,
             ctx,
             "Workers",
-            "x x  stop a running worker\nm  message or continue a worker\nt  tree view\nr  role settings\n1 / 2  workers or activity tab",
+            "x x  stop a running worker\nm  message or continue a worker\nt  tree view\nr  role settings\n1 / 2  workers or events view",
             true,
             true,
         ) {
@@ -763,6 +763,8 @@ impl SubagentsOverlay {
         self.roster_w.set(0);
         let body = match self.tab {
             Tab::Activity => self.activity_lines(w, body_h, theme),
+            // No workers at all: one guide across the panel instead of an empty split.
+            Tab::Agents if self.agents.is_empty() => self.empty_lines(w, body_h, theme),
             Tab::Agents if wide => self.split_lines(w, body_h, theme),
             Tab::Agents if self.inspector => self.inspector_lines(w, body_h, theme),
             Tab::Agents => {
@@ -804,7 +806,7 @@ impl SubagentsOverlay {
         }
         let mut spans = vec![
             tab("1 Workers", self.tab == Tab::Agents),
-            tab("2 Activity", self.tab == Tab::Activity),
+            tab("2 Events", self.tab == Tab::Activity),
         ];
         let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
         let room = w.saturating_sub(used + 2);
@@ -931,10 +933,9 @@ impl SubagentsOverlay {
                 s
             }
         };
-        segments.push(format!(
-            "1/2 {} tabs",
-            pair_label(ctx.keys, Action::TabPrev, Action::TabNext)
-        ));
+        // The digits switch views in every layout; Tab and the arrows may belong to an
+        // enclosing panel's tabs, so the hint names only the keys this panel owns.
+        segments.push("1/2 workers/events".to_owned());
         let searching = match self.tab {
             Tab::Agents => !self.agent_query.is_empty(),
             Tab::Activity => !self.activity_query.is_empty(),
@@ -973,6 +974,69 @@ impl SubagentsOverlay {
                 Line::from(spans)
             })
             .collect()
+    }
+
+    /// The roster before any worker exists: what workers are, where they come from and how to
+    /// start one, full width and left-aligned under the tabs. Short panels drop the explanation
+    /// before the ways to start a worker.
+    fn empty_lines(&self, w: usize, h: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let room = w.saturating_sub(4).max(1);
+        let row = |spans: Vec<Span<'static>>| filled(spans, w, Style::default());
+        let mut out = vec![
+            Line::default(),
+            row(vec![Span::styled(
+                "  No workers yet",
+                theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
+            )]),
+            Line::default(),
+        ];
+        let about = "Workers take on separate tasks in the background while you keep working \
+                     with Dial. Their progress, questions and results show up here.";
+        let about = text::wrap_words(about, room);
+        // Title block, the explanation and its gap, the label and three ways.
+        if out.len() + about.len() + 1 + 1 + 3 <= h {
+            out.extend(about.into_iter().map(|line| {
+                row(vec![Span::styled(
+                    format!("  {line}"),
+                    theme.fg(Tok::Muted),
+                )])
+            }));
+            out.push(Line::default());
+        }
+        out.push(row(vec![
+            Span::raw("  "),
+            chrome::label(theme, "Start one"),
+        ]));
+        let ways = [
+            (
+                "/worker <task>",
+                "start a worker on a task, even while Dial is busy",
+            ),
+            ("ask Dial", "to hand part of the work to a worker"),
+            ("r", "choose the models workers use"),
+        ];
+        let key_w = ways
+            .iter()
+            .map(|(key, _)| text::width(key))
+            .max()
+            .unwrap_or(0);
+        for (key, what) in ways {
+            let what_room = w.saturating_sub(key_w + 8);
+            out.push(row(vec![
+                Span::raw("    "),
+                Span::styled(
+                    text::pad(key, key_w),
+                    theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    text::ellipsize(what, what_room, theme.ascii()),
+                    theme.fg(Tok::Muted),
+                ),
+            ]));
+        }
+        out.truncate(h);
+        out
     }
 
     fn roster_lines(&self, w: usize, h: usize, theme: &Theme) -> Vec<Line<'static>> {

@@ -106,6 +106,19 @@ pub const METHODS: &[Method] = &[
     write("restore_checkpoint_files", "checkpoints"),
     write("undo", "checkpoints"),
     read("list_extensions", "extensions"),
+    write("extension_action", "extensions"),
+    write("mcp_login", "auth"),
+    write("mcp_logout", "auth"),
+    read("get_schema", "schema"),
+    write("set_approval", "session_control"),
+    read("list_dirs", "workspace"),
+    write("add_dir", "workspace"),
+    write("remove_dir", "workspace"),
+    write("retry", "session_control"),
+    write("restart_model", "session_control"),
+    read("list_jobs", "jobs"),
+    write("stop_job", "jobs"),
+    write("apply_settings", "settings"),
 ];
 
 /// The method named `name`, if the protocol defines it.
@@ -233,5 +246,6 @@ pub const EVENTS: &[&str] = &[
     "auth_url",
     "auth_progress",
     "auth_prompt",
+    "extension_progress",
     "fatal",
 ];

@@ -216,6 +216,100 @@ fn remembered_lines(value: &Value, noun: &str) -> Vec<String> {
     lines
 }
 
+/// `/memory view`: every saved fact per bank (most recently updated first) with the reference and
+/// revision that `/memory forget`/`update`/`history` take, then the auto-retain state.
+pub(super) fn memory_view_text(value: &Value) -> String {
+    let view = &value["view"];
+    let mut lines = Vec::new();
+    let mut any = false;
+    for bank in view["banks"].as_array().into_iter().flatten() {
+        let global = bank["scope"] == "global";
+        let title = if global {
+            "User-wide facts (all projects)"
+        } else {
+            "Project facts"
+        };
+        let total = bank["total"].as_u64().unwrap_or(0);
+        let facts = bank["facts"].as_array().map_or(&[][..], Vec::as_slice);
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        if total == 0 {
+            lines.push(format!("{title}: none yet"));
+            continue;
+        }
+        any = true;
+        let shown = facts.len();
+        lines.push(if bank["truncated"] == true {
+            // A backend that cannot count beyond the page reports total == shown.
+            let total = if total as usize > shown {
+                total.to_string()
+            } else {
+                format!("{shown}+")
+            };
+            format!("{title}: {total} (newest {shown} shown)")
+        } else {
+            format!("{title}: {total}")
+        });
+        // Each row's label columns: ref, `r` + revision, age.
+        let rows: Vec<([String; 3], &Value)> = facts
+            .iter()
+            .map(|fact| {
+                let cells = [
+                    fact["ref"].as_str().unwrap_or("?").to_owned(),
+                    format!("r{}", fact["revision"].as_i64().unwrap_or(0)),
+                    fact["updated"].as_i64().map(memory_age).unwrap_or_default(),
+                ];
+                (cells, fact)
+            })
+            .collect();
+        let mut widths = [0usize; 3];
+        for (cells, _) in &rows {
+            for (width, cell) in widths.iter_mut().zip(cells) {
+                *width = (*width).max(cell.chars().count());
+            }
+        }
+        let [refs, revisions, ages] = widths;
+        for ([reference, revision, age], fact) in &rows {
+            let content = fact["content"].as_str().unwrap_or("");
+            let content = content.split_whitespace().collect::<Vec<_>>().join(" ");
+            let prefix = format!("  {reference:>refs$}  {revision:<revisions$}  {age:>ages$}  ");
+            lines.push(format!("{prefix}{content}"));
+            if let Some(source) = fact["source"].as_str().filter(|s| !s.is_empty()) {
+                // Under the fact text.
+                let indent = prefix.chars().count();
+                lines.push(format!("{:indent$}source: {source}", ""));
+            }
+        }
+    }
+    if let Some(retain) = view.get("autoRetain").filter(|retain| retain.is_object()) {
+        let pending = retain["pendingTurns"].as_u64().unwrap_or(0);
+        let state = match (retain["state"].as_str(), retain["role"].as_str()) {
+            (Some("on"), Some(role)) => format!("on (extracts with the {role} role)"),
+            (Some("paused"), _) => {
+                "paused: assign the memory or small role in Alt+M to save facts automatically"
+                    .to_owned()
+            }
+            (Some(state), _) => state.to_owned(),
+            (None, _) => "unknown".to_owned(),
+        };
+        lines.push(String::new());
+        lines.push(format!(
+            "Auto-retain: {state} · {pending} turn{} waiting",
+            if pending == 1 { "" } else { "s" }
+        ));
+    } else {
+        lines.push(String::new());
+    }
+    let semantic = value["backend"] == "semantic";
+    lines.push(match (semantic, any) {
+        (true, true) => "Next: /memory forget <ref> <revision> · /memory update <ref> <revision> <text> · /memory history <ref>".to_owned(),
+        (true, false) => "Next: /memory save <text> saves a fact now; auto-retain adds facts between turns.".to_owned(),
+        (false, _) => "Next: /memory search <words> · /memory clear [project|global] · the agent corrects facts with its memory tools".to_owned(),
+    });
+    lines.join("\n")
+}
+
 /// Relative age of a unix timestamp in seconds: `just now`, `5m ago`, `2h ago`, `3d ago`.
 pub(super) fn memory_age(then: i64) -> String {
     let now = std::time::SystemTime::now()

@@ -62,8 +62,14 @@ optional tiers (`make test-mlx`, `make test-smoke`); never present a skipped tie
   `dial rpc` (with a `docs/rpc-schema.json` entry and a coded refusal) rather than through terminal
   output. Event payloads keep structured fields (ids, phases, outcomes, paths) next to readable
   text. See "Frontend boundary" in `ARCHITECTURE.md`.
+- Every new terminal feature also gets an RPC method in the same change. Classify each new slash
+  command in `crates/dial-app/src/rpc/parity.rs`; do not add commands to `TERMINAL_BASELINE` in
+  `rpc/parity/tests.rs` to get a green run (that list may only shrink).
 - Update the matching `docs/*.md` page for user-visible behaviour, and add an entry under
   `## [Unreleased]` in `CHANGELOG.md`.
 - Never weaken a valid check, suppress a warning, or leave stubs to get a green run.
+- New opt-in integrations and new built-in tools are paused until the headline benchmark score has
+  a baseline; see "New integrations and tools are paused" in `CONTRIBUTING.md`. Fix, harden or
+  remove existing ones instead. Do not raise the hosted core schema budget to fit new text.
 - Secrets and per-project private state live outside the workspace (`crates/dial-llm/src/config/paths.rs`);
   never commit them or print them in logs or test output.

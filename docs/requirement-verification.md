@@ -2,6 +2,24 @@
 
 Dial can map **declared requirements to observed verification**, without interpreting an English completion claim as proof. This is opt-in operator configuration; ordinary answers still need no checklist.
 
+## Inspect the mapping before running checks
+
+The agent can call `verify` with `{"plan": true}` to inspect the existing contract without
+starting commands or changing settings. The result connects configured check names and commands,
+the current focused selection, requirement IDs, working-state deliverable IDs, and visual targets.
+It includes recorded evidence statuses at the current effect revision; it does **not** revalidate
+external input freshness, record a pass, or establish that the declared checks cover the task.
+
+The text preview shows up to 16 checks and requirements; structured check rows are capped at 64
+with an explicit omitted count. Structured requirement coverage retains the configured mapping.
+No declared requirements means `not_independently_assessed`, not successful coverage. Establish a
+mapping with named `verification.commands` and `verification.requirements.<id>.checks` as below;
+the plan never invents commands or writes operator configuration. Run a discovered check by name
+with `verify {"targets": ["input-boundaries"]}`, or use ordinary focused verification after edits.
+`plan: true` cannot be combined with execution arguments; omitted or false preserves normal runs.
+
+## Declare checks and requirements
+
 ```toml
 [verification]
 automatic_checks = true

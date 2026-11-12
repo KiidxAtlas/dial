@@ -489,6 +489,23 @@ fn wait_reports_timeout_and_early_exit_as_not_ready() {
         "{}",
         timed.text
     );
+    // A short bounded wait gives no hint; only a wait that used the whole cap points at timeout 0.
+    assert!(!timed.text.contains("timeout: 0"), "{}", timed.text);
+    assert_eq!(
+        capped_wait_hint("ci", MAX_WAIT_SECS - 1, false, false),
+        None
+    );
+    assert_eq!(capped_wait_hint("ci", MAX_WAIT_SECS, true, false), None);
+    let exits = capped_wait_hint("ci", MAX_WAIT_SECS, false, false).expect("capped wait hint");
+    assert!(
+        exits.contains("`timeout: 0`") && exits.contains("returns when ci exits"),
+        "{exits}"
+    );
+    let ready = capped_wait_hint("web", MAX_WAIT_SECS, false, true).expect("capped wait hint");
+    assert!(
+        ready.contains("returns when web is ready or exits"),
+        "{ready}"
+    );
 
     start(&tool, &ws, "dies", "echo nothing useful; exit 3");
     let early = bg(
@@ -1858,10 +1875,7 @@ fn a_session_start_naming_lifetime_starts_the_job_and_says_the_lifetime_is_ignor
     // Only a start is lenient: the argument still means nothing on other session actions.
     let listed = bg(&tool, &ws, json!({"action":"list", "lifetime": 60}));
     assert!(
-        listed.is_error
-            && listed
-                .text
-                .contains("lifetime requires explicit persist=true"),
+        listed.is_error && listed.text.contains("lifetime is accepted only by start"),
         "{}",
         listed.text
     );

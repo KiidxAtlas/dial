@@ -75,9 +75,10 @@ swallowed. Lists in Settings and Providers stop at their first and last rows rat
 - **`/git`** opens Status, Diff, Commit and Log tabs; `Tab`/`Shift-Tab` switch tabs and keep the
   commit draft. `/git tab status|diff|commit|log` opens a tab directly, `/git <revision>` still
   shows that revision (even one named `status`), and `/git commit run [flags]` runs `/commit`.
-- **`/activity`** opens Workers, Processes, Compute, Schedule and Queue tabs. `/workers`,
-  `/processes`, `/compute`, `/schedule` and `/queue` open their tab. `Ctrl-Tab` reaches a
-  panel's inner tabs; attached terminals keep normal `Tab` input.
+- **`/activity`** opens Attention, Workers, Processes, Compute, Schedule and Queue tabs; Left/Right
+  or `Tab`/`Shift-Tab` switch them. `/workers`, `/processes`, `/compute`, `/schedule` and `/queue`
+  open their tab, and `/activity downloads` opens model downloads in the Models panel (it is not
+  one of the tabs). `Ctrl-Tab` reaches a panel's inner tabs; attached terminals keep normal `Tab` input.
 - **`/extensions`** browses MCP servers, skills, tool groups and hooks; `/extensions
   mcp|skills|tools|hooks` opens a tab and `/hooks` opens the Hooks tab.
 - **`/stats`** opens searchable Usage / cost, Tokens, Sessions and Tools tabs across sessions.

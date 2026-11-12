@@ -147,6 +147,28 @@ fn goals_are_the_first_screen_and_open_their_commands() {
 }
 
 #[test]
+fn the_selected_rows_detail_follows_the_list_instead_of_the_panel_bottom() {
+    let mut palette = PaletteOverlay::new(entries(), false);
+    let lines = text_lines(&mut palette);
+    let last_goal = lines
+        .iter()
+        .position(|line| line.contains("All actions"))
+        .expect("goal list");
+    let detail = lines
+        .iter()
+        .position(|line| line.contains("Enter opens this goal"))
+        .expect("detail note");
+    // One spacer row, the detail header and its description sit between the list and the note.
+    assert!(
+        detail <= last_goal + 4,
+        "detail at {detail}, list ends at {last_goal}: {lines:#?}"
+    );
+    // The footer keeps the bottom row of the tall panel.
+    assert!(lines.last().unwrap().contains("Esc"), "{lines:#?}");
+    assert_eq!(lines.len(), 24);
+}
+
+#[test]
 fn back_from_a_goal_returns_to_goals_without_running_anything() {
     let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(entries(), false);

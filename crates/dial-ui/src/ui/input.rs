@@ -7,6 +7,23 @@ mod pump;
 pub use pump::{halt_for_panic, poll, read, start, stop};
 
 const PASTE_SETTLE: Duration = Duration::from_millis(150);
+/// How long a plain Enter with nothing queued waits for more input before it counts as a submit.
+/// The input pump hands keys over one at a time, so the key after a pasted line break can still
+/// be in flight when the Enter is handled; a typed Enter is followed by a pause far longer.
+const ENTER_GRACE: Duration = Duration::from_millis(25);
+
+/// Whether more input is waiting after `key`: the pump already holds the next event, or `key`
+/// is a plain Enter and another event arrives within [`ENTER_GRACE`]. Feeds the `buffered`
+/// argument of [`PasteGuard::text_for_key`] for the real terminal.
+pub fn input_follows(key: &KeyEvent) -> bool {
+    if poll(Duration::ZERO).unwrap_or(false) {
+        return true;
+    }
+    key.kind != KeyEventKind::Release
+        && key.code == KeyCode::Enter
+        && key.modifiers.is_empty()
+        && poll(ENTER_GRACE).unwrap_or(false)
+}
 
 #[derive(Default)]
 pub struct PasteGuard {

@@ -28,7 +28,7 @@ Find the active keys, edit bindings and handle terminal-specific keyboard differ
 | Expand the status line | `Alt-S` (`F11`) |
 | Cycle approval mode | `Shift-Tab` cycles ask → write → read-only; full auto is chosen only with `/approval auto` (from auto, `Shift-Tab` returns to ask) |
 | Show or hide reasoning | `Ctrl-T` |
-| Switch the work panel tab (plan, evidence, mode) | `Ctrl-X`, `Alt-W` or `F12` |
+| Switch the work panel tab (plan, mode) | `Ctrl-X`, `Alt-W` or `F12` |
 | Focus session controls | `F10` |
 | Edit the draft in `$VISUAL`/`$EDITOR` | `Ctrl-G` |
 | Rate the last turn good / bad | `Alt-Up` / `Alt-Down` |

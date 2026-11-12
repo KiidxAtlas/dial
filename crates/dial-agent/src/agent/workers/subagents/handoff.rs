@@ -136,6 +136,7 @@ pub(super) fn project(
     }
     let mut envelope = json!({"summary":"Worker report available below; execution status is not acceptance verification.",
         "blockers":[],"acceptance":coverage,"evidence_refs":[],"changed_paths":[],"integration_risks":[],
+        "checks_run":null,"checks_run_reported":false,"gaps":null,"gaps_reported":false,
         "provenance":"untrusted_worker_report"});
     if let Some(source) = source {
         if let Some(summary) = source["summary"].as_str() {
@@ -148,18 +149,22 @@ pub(super) fn project(
             "integration_risks",
         ] {
             if let Some(items) = source[key].as_array() {
+                // Only string rows count toward the cap, so a non-string row cannot push a valid
+                // string out of the bounded list.
+                let rows: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
                 envelope[key] = json!(
-                    items
-                        .iter()
+                    rows.iter()
                         .take(8)
-                        .filter_map(Value::as_str)
                         .map(|s| super::clip(s, 192))
                         .collect::<Vec<_>>()
                 );
-                if items.len() > 8 {
+                if rows.len() > 8 {
                     envelope[format!("{key}_overflow")] = json!(true);
                 }
             }
+        }
+        for key in ["checks_run", "gaps"] {
+            reported_rows(&mut envelope, source, key);
         }
     }
     // Scan the complete report, not its prefix. These are quoted candidate warnings, not parsed
@@ -192,6 +197,37 @@ pub(super) fn project(
         audit_evidence(&mut envelope, source, workspace);
     }
     envelope
+}
+
+/// `checks_run` and `gaps` keep "not reported" apart from "reported empty". An absent or non-array
+/// value stays `null` with `<key>_reported: false`. An array reports `true`; its string rows are
+/// kept (bounded like the other lists), and non-string rows are counted in `<key>_dropped` rather
+/// than silently disappearing. An array with only non-string rows is `null`, never an empty claim.
+fn reported_rows(envelope: &mut Value, source: &Value, key: &str) {
+    let Some(items) = source[key].as_array() else {
+        envelope[key] = Value::Null;
+        envelope[format!("{key}_reported")] = json!(false);
+        return;
+    };
+    let rows: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+    let dropped = items.len() - rows.len();
+    envelope[format!("{key}_reported")] = json!(true);
+    envelope[key] = if rows.is_empty() && dropped > 0 {
+        Value::Null
+    } else {
+        json!(
+            rows.iter()
+                .take(8)
+                .map(|s| super::clip(s, 192))
+                .collect::<Vec<_>>()
+        )
+    };
+    if dropped > 0 {
+        envelope[format!("{key}_dropped")] = json!(dropped);
+    }
+    if rows.len() > 8 {
+        envelope[format!("{key}_overflow")] = json!(true);
+    }
 }
 
 /// References a worker cites for one claim: the item's own `evidence` (string or list) when

@@ -524,6 +524,36 @@ pub(crate) fn poll(shell: &mut Shell, app: &App, agent: &mut Agent<'_>) -> bool 
     true
 }
 
+/// Runs `intent` to completion for a client other than the overlay (`dial rpc`) and saves its
+/// config changes in the owning scope, exactly as [`start`] and [`finish`] do for the overlay.
+/// Returns the outcome (`ok` false when saving failed) and the scope written, if any. The running
+/// agent adopts saved changes when the caller applies settings.
+pub(crate) fn run_and_save(
+    layout: &Layout,
+    config: &Config,
+    intent: &Intent,
+    selected: Scope,
+    progress: &SharedProgress,
+) -> Result<(Outcome, Option<Scope>)> {
+    let scope = intent_scope(layout, intent, selected)?;
+    let mut outcome = run(layout, config, intent, progress).unwrap_or_else(|error| Outcome {
+        ok: false,
+        message: format!("{error:#}"),
+        changes: Vec::new(),
+    });
+    if !outcome.ok || outcome.changes.is_empty() {
+        return Ok((outcome, None));
+    }
+    match crate::config::settings_store::save_config(layout, scope, &outcome.changes) {
+        Ok(_) => Ok((outcome, Some(scope))),
+        Err(error) => {
+            outcome.ok = false;
+            outcome.message = format!("Done, but saving the config failed: {error:#}");
+            Ok((outcome, None))
+        }
+    }
+}
+
 fn run(
     layout: &Layout,
     config: &Config,

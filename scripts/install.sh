@@ -1,14 +1,15 @@
-#!/bin/bash
+#!/bin/sh
 # Install a verified release into the current user's terminal PATH directory.
-set -euo pipefail
+# POSIX sh (dash, busybox ash, bash, zsh): `curl -fsSL https://dial.rootatlas.dev/install | sh`.
+set -eu
 
 if [ "$#" -gt 1 ] || [ "${1:-}" = '--help' ]; then
-    echo "Usage: bash install.sh [vX.Y.Z|latest]" >&2
+    echo "Usage: sh install.sh [vX.Y.Z|latest]" >&2
     # shellcheck disable=SC2016 # Print the variable literally in usage help.
     echo 'Optional destination: DIAL_INSTALL_DIR (default: $HOME/.local/bin)' >&2
     echo 'DIAL_NO_MODIFY_PATH=1 leaves shell profiles unchanged.' >&2
-    echo 'Signature verifiers, tried in order: DIAL_OPENSSL (OpenSSL 3+), python3 with the' >&2
-    echo '`cryptography` package (DIAL_PYTHON selects it), and ssh-keygen (DIAL_SSH_KEYGEN selects it).' >&2
+    echo 'Signature verifiers, tried in order: OpenSSH ssh-keygen (DIAL_SSH_KEYGEN selects it), OpenSSL 3+' >&2
+    echo '(DIAL_OPENSSL), and python3 with the cryptography package (DIAL_PYTHON selects it).' >&2
     echo 'With none available the install is refused. DIAL_ALLOW_UNSIGNED_INSTALL=1 (insecure) installs' >&2
     echo 'with only the SHA-256 checksum from the same release.' >&2
     [ "${1:-}" = '--help' ] && exit 0
@@ -24,72 +25,81 @@ case "$(uname -s):$(uname -m)" in
             *) linux_arch=aarch64 ;;
         esac
         # Prefer the active libc reported by ldd: glibc development hosts can also have
-        # musl loaders installed. Only use loader presence when ldd is unavailable.
-        if { command -v ldd >/dev/null && { ldd --version 2>&1 || true; } | grep -qi musl; } \
-            || { ! command -v ldd >/dev/null && compgen -G '/lib/ld-musl-*.so.1' >/dev/null; }; then
-            target=$linux_arch-unknown-linux-musl
+        # musl loaders installed. Only use loader presence when ldd is unavailable; `ls`
+        # fails when the glob matches nothing (the pattern is then passed literally).
+        if command -v ldd >/dev/null 2>&1; then
+            if { ldd --version 2>&1 || true; } | grep -qi musl; then libc=musl; else libc=gnu; fi
+        elif ls /lib/ld-musl-*.so.1 >/dev/null 2>&1; then
+            libc=musl
         else
-            target=$linux_arch-unknown-linux-gnu
+            libc=gnu
         fi
+        target=$linux_arch-unknown-linux-$libc
         ;;
-    *) echo 'Supported: macOS (Apple Silicon or Intel) or Linux (x86-64 or arm64). Native Windows: irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 | iex' >&2; exit 1 ;;
+    *) echo 'Supported: macOS (Apple Silicon or Intel) or Linux (x86-64 or arm64). Native Windows: irm https://dial.rootatlas.dev/install | iex' >&2; exit 1 ;;
 esac
 
 # Authenticated GitHub CLI also supports private releases without exposing tokens
 # in command arguments, logs, or URLs. Public releases retain the curl path.
 use_gh=false
-if command -v gh >/dev/null && gh auth status --hostname github.com >/dev/null 2>&1; then
+if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
     use_gh=true
 fi
 required_tools='tar install mktemp'
 if [ "$use_gh" = false ]; then required_tools="$required_tools curl"; fi
 for tool in $required_tools; do
-    command -v "$tool" >/dev/null || { echo "Missing required tool: $tool" >&2; exit 1; }
+    command -v "$tool" >/dev/null 2>&1 || { echo "Missing required tool: $tool" >&2; exit 1; }
 done
 
-# SHA256SUMS is signed with the release Ed25519 key. The first available verifier is used:
-#   1. OpenSSL 3+ (`pkeyutl -rawin`). macOS ships LibreSSL as `openssl`, which cannot verify
+# SHA256SUMS is signed with the release Ed25519 key. Verifiers, in order of preference:
+#   1. OpenSSH `ssh-keygen -Y verify` (OpenSSH 8.1+) over SHA256SUMS.sshsig. It ships with
+#      macOS and nearly every Linux, so most installs need nothing extra.
+#   2. OpenSSL 3+ (`pkeyutl -rawin`). macOS ships LibreSSL as `openssl`, which cannot verify
 #      Ed25519, so Homebrew's OpenSSL 3 is also tried.
-#   2. python3 with the `cryptography` package.
-#   3. OpenSSH `ssh-keygen -Y verify` over SHA256SUMS.sshsig (present on macOS and modern Linux).
-# If none is available the install is refused, unless DIAL_ALLOW_UNSIGNED_INSTALL=1 is set.
-openssl_bin=
-if [ -n "${DIAL_OPENSSL:-}" ]; then
-    openssl_candidates=("$DIAL_OPENSSL")
-else
-    openssl_candidates=("$(command -v openssl || true)" /opt/homebrew/opt/openssl@3/bin/openssl
-        /usr/local/opt/openssl@3/bin/openssl /opt/homebrew/opt/openssl/bin/openssl /usr/local/opt/openssl/bin/openssl)
-fi
-for candidate in "${openssl_candidates[@]}"; do
-    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
-    # `-help` exits non-zero on some OpenSSL builds; only its text matters.
-    case "$("$candidate" pkeyutl -help 2>&1 || true)" in
-        *-rawin*) openssl_bin=$candidate; break ;;
-    esac
-done
-python_bin=${DIAL_PYTHON:-python3}
-ssh_keygen_bin=${DIAL_SSH_KEYGEN:-ssh-keygen}
+#   3. python3 with the `cryptography` package.
+# OpenSSL and Python verify SHA256SUMS.sig, which every release has; they also cover older
+# releases published without SHA256SUMS.sshsig. If no verifier can run the install is refused,
+# unless DIAL_ALLOW_UNSIGNED_INSTALL=1 is set.
 if [ -z "${DIAL_RELEASE_PUBLIC_KEY:-}" ]; then
     echo 'DIAL_RELEASE_PUBLIC_KEY must contain the trusted Ed25519 public key PEM; refusing unsigned installation.' >&2
     exit 1
 fi
-signature_verifier=
-if [ -n "$openssl_bin" ]; then
-    signature_verifier=openssl
-elif command -v "$python_bin" >/dev/null && "$python_bin" -c 'import cryptography.hazmat.primitives.asymmetric.ed25519' >/dev/null 2>&1; then
-    signature_verifier=python
-elif command -v "$ssh_keygen_bin" >/dev/null; then
-    signature_verifier=ssh-keygen
-elif [ "${DIAL_ALLOW_UNSIGNED_INSTALL:-0}" = 1 ]; then
-    signature_verifier=none
-    echo 'WARNING: DIAL_ALLOW_UNSIGNED_INSTALL=1 and no signature verifier is available. The SHA-256 checksum from the GitHub release is checked, but the release signature is NOT. Install OpenSSL 3 (macOS: brew install openssl@3) to verify signatures.' >&2
-else
-    echo 'No release signature verifier found: install OpenSSL 3 (macOS: brew install openssl@3), or Python 3 with the cryptography package, or OpenSSH ssh-keygen. Refusing to install an unverified release. DIAL_ALLOW_UNSIGNED_INSTALL=1 installs with checksum verification only (insecure).' >&2
-    exit 1
+ssh_keygen_bin=
+candidate=${DIAL_SSH_KEYGEN:-ssh-keygen}
+# OpenSSH before 8.1 has no -Y and reports an unknown/illegal option instead.
+if command -v "$candidate" >/dev/null 2>&1 \
+    && { "$candidate" -Y 2>&1 || true; } | grep -q 'requires an argument'; then
+    ssh_keygen_bin=$candidate
 fi
-if command -v sha256sum >/dev/null; then
+openssl_bin=
+openssl_supports_ed25519() {
+    # `-help` exits non-zero on some OpenSSL builds; only its text matters.
+    [ -n "$1" ] && [ -x "$1" ] && { "$1" pkeyutl -help 2>&1 || true; } | grep -q -- '-rawin'
+}
+if [ -n "${DIAL_OPENSSL:-}" ]; then
+    if openssl_supports_ed25519 "$DIAL_OPENSSL"; then openssl_bin=$DIAL_OPENSSL; fi
+else
+    for candidate in "$(command -v openssl || true)" /opt/homebrew/opt/openssl@3/bin/openssl \
+        /usr/local/opt/openssl@3/bin/openssl /opt/homebrew/opt/openssl/bin/openssl /usr/local/opt/openssl/bin/openssl; do
+        if openssl_supports_ed25519 "$candidate"; then openssl_bin=$candidate; break; fi
+    done
+fi
+python_bin=${DIAL_PYTHON:-python3}
+if ! command -v "$python_bin" >/dev/null 2>&1 \
+    || ! "$python_bin" -c 'import cryptography.hazmat.primitives.asymmetric.ed25519' >/dev/null 2>&1; then
+    python_bin=
+fi
+if [ -z "$ssh_keygen_bin$openssl_bin$python_bin" ]; then
+    if [ "${DIAL_ALLOW_UNSIGNED_INSTALL:-0}" = 1 ]; then
+        echo 'WARNING: DIAL_ALLOW_UNSIGNED_INSTALL=1 and no signature verifier is available. The SHA-256 checksum from the GitHub release is checked, but the release signature is NOT. Install OpenSSH 8.1+ or OpenSSL 3 (macOS: brew install openssl@3) to verify signatures.' >&2
+    else
+        echo 'No release signature verifier found: install OpenSSH 8.1+ (ssh-keygen), OpenSSL 3 (macOS: brew install openssl@3), or Python 3 with the cryptography package. Refusing to install an unverified release. DIAL_ALLOW_UNSIGNED_INSTALL=1 installs with checksum verification only (insecure).' >&2
+        exit 1
+    fi
+fi
+if command -v sha256sum >/dev/null 2>&1; then
     hash_tool=sha256sum
-elif command -v shasum >/dev/null; then
+elif command -v shasum >/dev/null 2>&1; then
     hash_tool=shasum
 else
     echo 'Install sha256sum or shasum before installing Dial.' >&2
@@ -107,7 +117,17 @@ if [ "$version" = latest ]; then
         version=${release_url##*/}
     fi
 fi
-if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+newline='
+'
+case "$version" in
+    *"$newline"*) valid_version=false ;;
+    *) if printf '%s\n' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+           valid_version=true
+       else
+           valid_version=false
+       fi ;;
+esac
+if [ "$valid_version" != true ]; then
     echo "Invalid release version (or no published release): $version" >&2
     exit 1
 fi
@@ -116,22 +136,33 @@ package="dial-$version-$target"
 archive="$package.tar.gz"
 base="$repository/releases/download/$version"
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/dial-install.XXXXXX")
-trap 'rm -rf "$scratch"; [ -z "${staged:-}" ] || rm -f "$staged"' EXIT
-# SHA256SUMS.sshsig exists only for releases that publish the OpenSSH signature; fetch it only
-# when ssh-keygen is the verifier, so older releases still install through OpenSSL or Python.
-assets=("$archive" SHA256SUMS SHA256SUMS.sig)
-if [ "$signature_verifier" = ssh-keygen ]; then assets+=(SHA256SUMS.sshsig); fi
-if [ "$use_gh" = true ]; then
-    patterns=()
-    for asset in "${assets[@]}"; do patterns+=(--pattern "$asset"); done
-    gh release download "$version" --repo KiidxAtlas/dial --dir "$scratch" "${patterns[@]}"
-else
-    for asset in "${assets[@]}"; do
-        curl --fail --silent --show-error --location --retry 2 "$base/$asset" --output "$scratch/$asset" || {
-            echo "Could not download release asset $asset" >&2
-            exit 1
-        }
-    done
+staged=
+trap 'rm -rf "$scratch"; [ -z "$staged" ] || rm -f "$staged"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# fetch ASSET: download one release asset into the scratch directory; non-zero when unavailable.
+fetch() {
+    if [ "$use_gh" = true ]; then
+        gh release download "$version" --repo KiidxAtlas/dial --dir "$scratch" --pattern "$1" >/dev/null 2>&1
+    else
+        curl --fail --silent --show-error --location --retry 2 "$base/$1" --output "$scratch/$1" 2>/dev/null
+    fi
+}
+for asset in "$archive" SHA256SUMS; do
+    fetch "$asset" || { echo "Could not download release asset $asset" >&2; exit 1; }
+done
+# SHA256SUMS.sshsig exists only for releases that publish the OpenSSH signature; without it,
+# fall back to SHA256SUMS.sig with OpenSSL or Python.
+signature_verifier=none
+if [ -n "$ssh_keygen_bin" ] && fetch SHA256SUMS.sshsig; then
+    signature_verifier=ssh-keygen
+elif [ -n "$openssl_bin$python_bin" ]; then
+    fetch SHA256SUMS.sig || { echo 'Could not download release asset SHA256SUMS.sig' >&2; exit 1; }
+    if [ -n "$openssl_bin" ]; then signature_verifier=openssl; else signature_verifier=python; fi
+elif [ -n "$ssh_keygen_bin" ]; then
+    echo 'This release has no SHA256SUMS.sshsig for ssh-keygen; install OpenSSL 3 (macOS: brew install openssl@3) or Python 3 with the cryptography package to verify it. Nothing was installed.' >&2
+    exit 1
 fi
 
 reject_signature() {
@@ -167,17 +198,19 @@ PY
             MCowBQYDK2VwAyEA*) ;;
             *) echo 'DIAL_RELEASE_PUBLIC_KEY is not an Ed25519 public key; nothing was installed.' >&2; exit 1 ;;
         esac
-        key_blob=$({ printf '\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20'; printf '%s' "$pem_body" | base64 -d | tail -c 32; } | base64 | tr -d '\n') || reject_signature
+        printf '%s' "$pem_body" | base64 -d > "$scratch/release-public.der" || reject_signature
+        { printf '\000\000\000\013ssh-ed25519\000\000\000\040'; tail -c 32 "$scratch/release-public.der"; } \
+            > "$scratch/release-public.blob"
+        key_blob=$(base64 < "$scratch/release-public.blob" | tr -d '\n')
+        [ -n "$key_blob" ] || reject_signature
         printf 'dial-release ssh-ed25519 %s\n' "$key_blob" > "$scratch/allowed_signers"
         "$ssh_keygen_bin" -Y verify -f "$scratch/allowed_signers" -I dial-release -n dial-release \
             -s "$scratch/SHA256SUMS.sshsig" < "$scratch/SHA256SUMS" >/dev/null 2>&1 || reject_signature
         ;;
     none) ;;
 esac
-line=$(awk -v name="$archive" '$2 == name || $2 == "*" name { print; exit }' "$scratch/SHA256SUMS")
-read -r expected filename <<< "$line"
-filename=${filename#\*}
-if ! [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || [ "$filename" != "$archive" ]; then
+expected=$(awk -v name="$archive" '$2 == name || $2 == "*" name { print $1; exit }' "$scratch/SHA256SUMS")
+if ! printf '%s\n' "$expected" | grep -Eqx '[0-9a-fA-F]{64}'; then
     echo 'Invalid release checksum manifest; nothing was installed.' >&2
     exit 1
 fi
@@ -202,7 +235,10 @@ mkdir -p "$destination"
 staged=$(mktemp "$destination/.dial.new.XXXXXX")
 backup="$destination/dial.bak"
 install -m 755 "$scratch/$package/dial" "$staged"
-if ! "$staged" --version | awk -v want="${version#v}" '$1 == "dial" && $2 == want { found = 1 } END { exit !found }'; then
+reports_version() {
+    "$1" --version | awk -v want="${version#v}" '$1 == "dial" && $2 == want { found = 1 } END { exit !found }'
+}
+if ! reports_version "$staged"; then
     rm -f "$staged"
     echo 'Downloaded binary failed its version check; nothing was installed.' >&2
     exit 1
@@ -216,20 +252,21 @@ if ! mv "$staged" "$destination/dial"; then
     echo 'Could not activate downloaded binary; previous version restored.' >&2
     exit 1
 fi
-if ! "$destination/dial" --version | awk -v want="${version#v}" '$1 == "dial" && $2 == want { found = 1 } END { exit !found }'; then
+staged=
+if ! reports_version "$destination/dial"; then
     rm -f "$destination/dial"
     [ ! -e "$backup" ] || mv "$backup" "$destination/dial"
     echo 'Installed binary failed its version check; previous version restored.' >&2
     exit 1
 fi
 
-# `curl | bash` cannot change the calling shell, so persist the PATH entry in the login shell's
+# `curl | sh` cannot change the calling shell, so persist the PATH entry in the login shell's
 # profile once; a later install finds the line and leaves the profile alone.
 path_hint=
 case ":$PATH:" in
     *":$destination:"*) ;;
     *)
-        case "$(basename "${SHELL:-}")" in
+        case "$(basename "${SHELL:-sh}")" in
             zsh) profile="${ZDOTDIR:-$HOME}/.zshrc" ;;
             bash) if [ "$(uname -s)" = Darwin ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi ;;
             fish) profile="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" ;;

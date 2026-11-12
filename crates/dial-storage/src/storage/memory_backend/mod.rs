@@ -372,8 +372,8 @@ pub struct MemoryRuntime {
     config: MemoryConfig,
     /// The assigned `embedding` role, resolved once and reused by child runtimes.
     embedding: semantic::EmbeddingRole,
-    /// Whether the `memory` model role is assigned; semantic auto-retain pauses without it.
-    memory_role: bool,
+    /// Role semantic auto-retain extracts with (`memory`, else `small`); `None` pauses it.
+    retain_role: Option<&'static str>,
     scope: BankScope,
     active: Mutex<Active>,
     epoch: Arc<AtomicU64>,
@@ -549,7 +549,7 @@ fn open_driver(
     layout: &Layout,
     config: &MemoryConfig,
     embedding: semantic::EmbeddingRole,
-    memory_role: bool,
+    retain_role: Option<&'static str>,
 ) -> Result<Box<dyn Driver>> {
     match config.backend {
         MemoryBackendId::Off => Ok(Box::new(Inactive {
@@ -568,7 +568,7 @@ fn open_driver(
         MemoryBackendId::Hindsight => hindsight::open(layout, &config.hindsight),
         MemoryBackendId::Sharpshooter => sharpshooter::open(layout, &config.sharpshooter),
         MemoryBackendId::Semantic => {
-            semantic::open(layout, &config.semantic, embedding, memory_role)
+            semantic::open(layout, &config.semantic, embedding, retain_role)
         }
     }
 }
@@ -594,7 +594,7 @@ impl MemoryRuntime {
             scope,
             config.memory_setup_error(),
             embedding,
-            config.role_selection("memory").is_some(),
+            config.auto_retain_role(),
         )
     }
     fn with_scope(
@@ -604,7 +604,7 @@ impl MemoryRuntime {
         scope: BankScope,
         setup_error: Option<String>,
         embedding: semantic::EmbeddingRole,
-        memory_role: bool,
+        retain_role: Option<&'static str>,
     ) -> Result<Arc<Self>> {
         ensure!(
             !authority.session_id.is_empty()
@@ -614,7 +614,7 @@ impl MemoryRuntime {
         );
         let opened = match setup_error {
             Some(error) => Err(anyhow::anyhow!(error)),
-            None => open_driver(layout, config, embedding.clone(), memory_role),
+            None => open_driver(layout, config, embedding.clone(), retain_role),
         };
         let (driver, open_error) = match opened {
             Ok(driver) => (driver, None),
@@ -635,7 +635,7 @@ impl MemoryRuntime {
             layout: layout.clone(),
             config: config.clone(),
             embedding,
-            memory_role,
+            retain_role,
             scope,
             active: Mutex::new(Active {
                 authority,
@@ -711,7 +711,7 @@ impl MemoryRuntime {
             self.scope.clone(),
             self.open_error.clone(),
             self.embedding.clone(),
-            self.memory_role,
+            self.retain_role,
         )
     }
     pub fn bind(&self, authority: MemoryAuthority) {
@@ -1318,6 +1318,13 @@ impl MemoryRuntime {
             "stats" => driver.stats(&op, model),
             "diagnose" => driver.diagnose(&op, model),
             "queue" => driver.queue(&op),
+            "view" => match driver.special_command(&op, input, model) {
+                Some(result) => result,
+                None => anyhow::bail!(
+                    "{} memory has no fact list to view; /memory view needs the semantic backend. Use /memory status or /memory <query>",
+                    self.id().as_str()
+                ),
+            },
             "clear" => {
                 // A scope word is the backend's own (semantic `clear user`); others take none.
                 let value = if args.trim().is_empty() {
@@ -1372,6 +1379,7 @@ impl MemoryRuntime {
         ];
         lines.extend_from_slice(match self.id() {
             MemoryBackendId::Semantic => &[
+                "/memory view [project|user]: every saved fact with its ref, revision and age",
                 "/memory search <query>: keyword (and, with embeddings, vector) search over project and user-wide facts",
                 "/memory save <text>: save a project fact",
                 "/memory forget <ref> <revision>: forget a fact; <ref> is <n> for a project fact or user:<n> for a user-wide fact",

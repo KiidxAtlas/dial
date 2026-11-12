@@ -605,6 +605,7 @@ fn experimental_work_packets_are_off_by_default_and_enforce_handoff_contracts() 
     assert!(prompt.contains("WORK PACKET CONTRACT"));
     assert!(prompt.contains("Keep existing task argument compatibility."));
     assert!(prompt.contains("Never claim a check or interface contract passed"));
+    assert!(prompt.contains("checks_run") && prompt.contains("gaps"));
     assert_eq!(
         request.jobs[0]
             .work_packet
@@ -1549,4 +1550,110 @@ fn recovered_safe_reads_prompt_through_direct_and_remote_approval_owners() {
             );
         }
     }
+}
+
+#[test]
+fn worker_report_returns_string_checks_and_gaps_to_the_parent() {
+    let long = "x".repeat(400);
+    let mut checks: Vec<Value> = (0..9)
+        .map(|n| json!(format!("check {n} => exit 0")))
+        .collect();
+    checks.insert(0, json!({"command":"not a string row"}));
+    checks.push(json!(long));
+    let payload = json!({
+        "checks_run": checks,
+        "gaps": ["acceptance_2: integration binary not run"]
+    });
+    let projection = result_projection("", Some(&payload), &["one".into(), "two".into()], None);
+    let kept = projection["checks_run"].as_array().unwrap();
+    // Object rows are dropped and disclosed, the list keeps eight string rows and flags the overflow.
+    assert_eq!(kept.len(), 8);
+    assert_eq!(kept[0], "check 0 => exit 0");
+    assert!(kept.iter().all(|row| row.as_str().unwrap().len() <= 192));
+    assert_eq!(projection["checks_run_dropped"], 1);
+    assert_eq!(projection["checks_run_overflow"], true);
+    assert_eq!(projection["checks_run_reported"], true);
+    assert_eq!(projection["gaps"], payload["gaps"]);
+    assert_eq!(projection["gaps_reported"], true);
+    assert!(projection.get("gaps_dropped").is_none());
+    let bare = result_projection("done", None, &["one".into()], None);
+    assert_eq!(bare["checks_run"], Value::Null);
+    assert_eq!(bare["checks_run_reported"], false);
+}
+
+#[test]
+fn unreported_empty_and_malformed_handoff_rows_are_never_confused() {
+    // (label, raw field value; None = the field is absent, as in a custom output_schema answer).
+    // Expected: projected value, `<key>_reported`, and `<key>_dropped` when rows were discarded.
+    type Case = (&'static str, Option<Value>, Value, bool, Option<u64>);
+    let cases: &[Case] = &[
+        ("absent", None, Value::Null, false, None),
+        ("explicit empty", Some(json!([])), json!([]), true, None),
+        (
+            "object only",
+            Some(json!([{"command":"cargo test"}])),
+            Value::Null,
+            true,
+            Some(1),
+        ),
+        (
+            "malformed string",
+            Some(json!("cargo test => exit 0")),
+            Value::Null,
+            false,
+            None,
+        ),
+        (
+            "mixed rows",
+            Some(json!([{"command":"x"}, "cargo test => exit 0"])),
+            json!(["cargo test => exit 0"]),
+            true,
+            Some(1),
+        ),
+    ];
+    for key in ["checks_run", "gaps"] {
+        for (label, raw, expected, reported, dropped) in cases {
+            let payload = match raw {
+                Some(raw) => json!({ key: raw }),
+                None => json!({"answer": "done"}),
+            };
+            let projection = result_projection("", Some(&payload), &[], None);
+            assert_eq!(projection[key], *expected, "{key}: {label}");
+            assert_eq!(
+                projection[format!("{key}_reported")],
+                *reported,
+                "{key}: {label}"
+            );
+            assert_eq!(
+                projection.get(format!("{key}_dropped")).cloned(),
+                dropped.map(|n| json!(n)),
+                "{key}: {label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn custom_output_schema_absent_fields_stay_unknown_in_the_parent_projection() {
+    let payload = json!({"answer": "done", "checks_run": "not part of my schema"});
+    let projection = result_projection("done", Some(&payload), &["one".into()], None);
+    assert_eq!(projection["checks_run"], Value::Null);
+    assert_eq!(projection["checks_run_reported"], false);
+    assert_eq!(projection["gaps_reported"], false);
+    assert_eq!(projection["blockers"], json!([]));
+}
+
+#[test]
+fn custom_output_schema_prompt_does_not_request_report_keys() {
+    let mut config = config(&[]);
+    config.experimental.work_packet_contracts = true;
+    let args = json!({
+        "task":"inspect this change","solution_space":"s",
+        "work_packet":{"scope":"s","interface":"i","acceptance":["one"]},
+        "output_schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}
+    });
+    let request = parse(&args, &config).unwrap();
+    let prompt = request.jobs[0].system(Path::new("/repo"), &[]);
+    assert!(prompt.contains("output_schema remains authoritative"));
+    assert!(!prompt.contains("checks_run"));
 }

@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 const GROUP_PID: u32 = 40;
@@ -70,4 +71,19 @@ fn foreign_wrong_port_udp_and_other_addresses_are_not_ready() {
         SocketAddr::from((Ipv6Addr::LOCALHOST, 3000)),
         owned
     ));
+}
+
+#[test]
+fn ready_without_a_log_or_port_names_both_probes_and_an_example() {
+    // A timeout bounds a probe; on its own it has nothing to wait for.
+    for ready in [json!({"timeout": 30}), json!({})] {
+        let error = Ready::parse(&json!({"ready": ready})).err().unwrap();
+        assert!(
+            error.contains("ready.log")
+                && error.contains("ready.port")
+                && error.contains("\"log\""),
+            "{error}"
+        );
+    }
+    assert!(Ready::parse(&json!({"ready": {"log": "listening", "timeout": 30}})).is_ok());
 }

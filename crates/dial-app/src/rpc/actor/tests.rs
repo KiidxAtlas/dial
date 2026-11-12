@@ -99,6 +99,7 @@ fn with_runtime(configure: impl FnOnce(&mut Config), f: impl FnOnce(&mut ActorRu
         output: Arc::new(Mutex::new(Output {
             acp: None,
             protocol: DEFAULT_PROTOCOL_VERSION,
+            interactive: false,
             envelope: Envelope::default(),
         })),
         writer: crate::output::StdoutWriter::new().unwrap(),
@@ -132,6 +133,7 @@ fn with_runtime(configure: impl FnOnce(&mut Config), f: impl FnOnce(&mut ActorRu
         compute: None,
         layout: &layout,
         config: &config,
+        overlay: &toml::Table::new(),
         acp: true,
         rx,
         worker_out: &out,
@@ -350,6 +352,153 @@ fn returning_to_parked_session_does_not_restore_sensitive_grants() {
                     .workspace()
                     .resolve(file.to_str().unwrap())
                     .is_err()
+            );
+        },
+    );
+}
+
+fn code(error: &anyhow::Error) -> ErrorCode {
+    error
+        .downcast_ref::<RequestError>()
+        .unwrap_or_else(|| panic!("uncoded error: {error:#}"))
+        .code
+}
+
+#[test]
+fn set_approval_changes_the_mode_and_refuses_unknown_modes() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            let result = runtime
+                .handle_request(&json!({"method":"set_approval","params":{"mode":"readonly"}}))
+                .unwrap();
+            assert_eq!(result["approval"], json!(runtime.agent.approval()));
+            assert_eq!(
+                runtime.agent.approval(),
+                crate::config::types::Approval::Readonly
+            );
+            let error = runtime
+                .handle_request(&json!({"method":"set_approval","params":{"mode":"yolo"}}))
+                .unwrap_err();
+            assert_eq!(code(&error), ErrorCode::InvalidParams);
+            assert_eq!(
+                runtime.agent.approval(),
+                crate::config::types::Approval::Readonly
+            );
+        },
+    );
+}
+
+#[test]
+fn add_and_remove_dir_use_the_workspace_owner() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            let extra = tempfile::tempdir().unwrap();
+            let path = extra.path().canonicalize().unwrap();
+            let added = runtime
+                .handle_request(&json!({"method":"add_dir","params":{"path":path}}))
+                .unwrap();
+            assert_eq!(added["changed"], true);
+            assert_eq!(added["dirs"], json!([path]));
+            assert_eq!(
+                runtime.agent.workspace().additional_roots(),
+                std::slice::from_ref(&path)
+            );
+            let again = runtime
+                .handle_request(&json!({"method":"add_dir","params":{"path":path}}))
+                .unwrap();
+            assert_eq!(again["changed"], false);
+            let removed = runtime
+                .handle_request(&json!({"method":"remove_dir","params":{"path":path}}))
+                .unwrap();
+            assert_eq!(removed["changed"], true);
+            assert_eq!(removed["dirs"], json!([]));
+            let error = runtime
+                .handle_request(&json!({"method":"add_dir","params":{}}))
+                .unwrap_err();
+            assert_eq!(code(&error), ErrorCode::InvalidParams);
+        },
+    );
+}
+
+#[test]
+fn retry_refuses_when_there_is_no_unanswered_prompt() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            let error = runtime
+                .handle_request(&json!({"method":"retry","params":{}}))
+                .unwrap_err();
+            assert_eq!(code(&error), ErrorCode::InvalidParams);
+            assert!(error.to_string().contains("session is empty"), "{error:#}");
+        },
+    );
+}
+
+#[test]
+fn restart_model_refuses_external_endpoints() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            let error = runtime
+                .handle_request(&json!({"method":"restart_model","params":{}}))
+                .unwrap_err();
+            assert_eq!(code(&error), ErrorCode::InvalidParams);
+            assert!(
+                error.to_string().contains("external endpoints"),
+                "{error:#}"
+            );
+        },
+    );
+}
+
+#[test]
+fn send_validates_attachments_before_starting_a_turn() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            for params in [
+                json!({"text":"look","images":"one.png"}),
+                json!({"text":"look","images":[1]}),
+                json!({"text":"look","inline_images":["%%%"]}),
+                // The test endpoint does not accept images, so a valid attachment is refused too.
+                json!({"text":"look","inline_images":["aGVsbG8="]}),
+            ] {
+                let error = runtime
+                    .handle_request(&json!({"method":"send","params":params}))
+                    .unwrap_err();
+                assert_eq!(code(&error), ErrorCode::InvalidParams, "{params}");
+            }
+            assert_eq!(runtime.agent.session().message_count(), 0);
+        },
+    );
+}
+
+#[test]
+fn available_commands_carry_their_rpc_surface() {
+    with_runtime(
+        |_| {},
+        |runtime| {
+            runtime.acp = false;
+            let result = runtime
+                .handle_request(&json!({"method":"get_available_commands","params":{}}))
+                .unwrap();
+            let commands = result["commands"].as_array().unwrap();
+            let find = |name: &str| commands.iter().find(|row| row["name"] == name).unwrap();
+            assert_eq!(
+                find("add-dir")["rpc"],
+                json!({"surface":"method","method":"add_dir"})
+            );
+            assert_eq!(find("commit")["rpc"]["surface"], "terminal");
+            assert!(
+                commands.iter().all(|row| row["rpc"].is_object()),
+                "{commands:?}"
             );
         },
     );

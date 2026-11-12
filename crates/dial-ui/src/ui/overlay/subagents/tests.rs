@@ -390,10 +390,35 @@ fn wide_layout_shows_roster_inspector_and_tabs() {
     let buffer = render(120, 28, |frame| hub.draw(frame, &ctx));
     let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
     assert!(text.contains("1 Workers"), "{text}");
-    assert!(text.contains("2 Activity"), "{text}");
+    assert!(text.contains("2 Events"), "{text}");
     assert!(text.contains("task-1-name"), "{text}");
     assert!(text.contains("Recent activity"), "{text}");
     assert!(text.contains("x stop worker"), "{text}");
+}
+
+#[test]
+fn an_empty_hub_explains_workers_full_width_and_hints_only_its_own_keys() {
+    let rig = Rig::new();
+    let mut hub = SubagentsOverlay::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &preview,
+    };
+    for (width, height) in [(120, 28), (60, 20), (36, 12)] {
+        let buffer = render(width, height, |frame| hub.draw(frame, &ctx));
+        let rows: Vec<String> = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let text = rows.join("\n");
+        assert!(text.contains("No workers yet"), "{text}");
+        assert!(text.contains("/worker <task>"), "{text}");
+        // One guide across the panel: no roster/inspector divider on an empty hub.
+        assert!(!text.contains(rig.theme.sym(Sym::BoxV)), "{text}");
+        // The tab hint names the digits this panel owns, not keys an enclosing panel takes.
+        assert!(!text.contains("Left/Right tabs"), "{text}");
+    }
 }
 
 #[test]

@@ -617,20 +617,25 @@ fn dropped_on_rewind(agent: &Agent<'_>, n: usize) -> usize {
         .map_or(0, |(index, _)| messages.len() - index)
 }
 
-fn retry(shell: &mut Shell, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
-    let messages = agent.session().messages();
+/// The unanswered prompt `/retry` (and RPC `retry`) sends again, or why nothing can be retried.
+pub(crate) fn failed_prompt(messages: &[Value]) -> Result<String, &'static str> {
     let Some(last) = messages.last() else {
-        shell.note("Retry", "Nothing to retry: the session is empty.");
-        return Ok(Step::Done);
+        return Err("Nothing to retry: the session is empty.");
     };
     if last["role"].as_str() != Some("user") {
-        shell.note(
-            "Retry",
-            "No failed turn: the last message is not an unanswered prompt.",
-        );
-        return Ok(Step::Done);
+        return Err("No failed turn: the last message is not an unanswered prompt.");
     }
-    let text = message_text(last);
+    Ok(message_text(last))
+}
+
+fn retry(shell: &mut Shell, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
+    let text = match failed_prompt(&agent.session().messages()) {
+        Ok(text) => text,
+        Err(reason) => {
+            shell.note("Retry", reason);
+            return Ok(Step::Done);
+        }
+    };
     agent.cancel_background_compaction();
     let rewound = match super::branch::rewind(app, agent, 1) {
         Ok(rewound) => rewound,

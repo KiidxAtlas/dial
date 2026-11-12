@@ -102,11 +102,9 @@ pub fn backend_missing(config: &Config, backend: MemoryBackendId) -> (Vec<String
             {
                 optional.push("Recall is keyword-only until you assign the embedding role (Alt+M) or run /setup embeddings.".to_owned());
             }
-            if auto_retain_uses_memory_role(&probe.memory)
-                && probe.role_selection("memory").is_none()
-            {
+            if auto_retain_uses_memory_role(&probe.memory) && probe.auto_retain_role().is_none() {
                 optional.push(
-                    "Assign the memory role (Alt+M) to save facts automatically; until then only the retain tool saves them."
+                    "Assign the memory role (or the small role) in Alt+M to save facts automatically; until then only the retain tool saves them."
                         .to_owned(),
                 );
             }

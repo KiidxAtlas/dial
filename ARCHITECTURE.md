@@ -152,6 +152,14 @@ behaviour. Rules for new and changed features:
   `invalid_params`, `not_pending`) instead of message-only errors.
 - Events carry structured fields (call ids, phases, outcomes, paths, artifact references) next to
   readable text; clients never need to parse terminal prose.
+- Every new slash command is classified in `crates/dial-app/src/rpc/parity.rs` as an RPC method,
+  client-owned presentation, or terminal-only. A new feature gets an RPC method in the same change
+  (calling the same owner the terminal handler calls); terminal-only is a reviewed exception, and
+  the parity tests fail when a command is unclassified, names a method plain RPC does not serve,
+  or is added to the terminal-only set (`TERMINAL_BASELINE`), which may only shrink.
+- Interactive flows (sign-in prompts, forms, confirmations) go through a frontend-neutral
+  interface such as `oauth::Interaction`, so the RPC server can answer them with events and a
+  reply method instead of a terminal.
 - Out-of-process Rust frontends use `crates/dial-client`, which knows only the wire protocol.
   Embedding engine crates directly is possible but unversioned (see
   [client contracts](docs/client-contracts.md)).

@@ -100,6 +100,19 @@ report unavailable services and remaining uncertainty.
 Prioritize concrete findings with severity, location and consequence. A clean review is valid.
 ```
 
+### Repository-specific workflow examples
+
+Three versioned examples encode recurring Dial boundaries rather than general coding advice:
+
+- `tool-schema-change`: change a built-in tool schema and its resume-compatibility contract.
+- `frontend-rpc-feature`: keep feature ownership frontend-neutral and update RPC parity.
+- `focused-rust-verification`: select the owning Rust module/package checks before broad gates.
+
+Each procedure names positive triggers, non-goals, relevant owners, verification and unavailable
+prerequisite handling. They are portable examples, not automatically enabled policies: import them
+through the existing skill importer below. Loader/evaluation fixtures check their contracts;
+their effect on live-model correctness, latency and token use remains unmeasured.
+
 ## Import and maintain the examples
 
 From the repository root:

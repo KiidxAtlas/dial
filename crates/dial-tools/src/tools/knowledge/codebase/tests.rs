@@ -451,10 +451,11 @@ fn architecture_priority_is_capped_and_old_outline_caches_are_upgraded() {
     assert!(context.contains("src/router.rs"));
     {
         let conn = cache.conn.lock();
-        conn.execute("DELETE FROM codebase_meta WHERE key='outline_version'", [])
-            .unwrap();
-        conn.execute("UPDATE codebase_files SET outline='old outline'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE codebase_files SET outline='old outline', outline_version=1",
+            [],
+        )
+        .unwrap();
     }
     let refresh = cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
     assert_eq!(refresh.indexed, 10);
@@ -1439,4 +1440,304 @@ fn observed_digest_shares_one_byte_budget_across_candidates() {
         );
         assert!(SOURCE_READS.with(|reads| reads.borrow().is_empty()));
     }
+}
+
+#[test]
+fn navigation_packet_names_fresh_owner_symbols_and_verified_consumers() {
+    let (_home, project, layout, ws) = fixture();
+    fs::write(
+        project.path().join("src/consumer.rs"),
+        "use crate::router;\npub fn call() {}\n",
+    )
+    .unwrap();
+    fs::create_dir(project.path().join("ignored")).unwrap();
+    fs::write(
+        project.path().join("ignored/hidden.rs"),
+        "pub fn route_request() {}\n",
+    )
+    .unwrap();
+    fs::write(project.path().join(".gitignore"), "ignored/\n").unwrap();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    let packet = cache.navigation_packet("route_request", 4000).unwrap();
+    assert!(
+        packet.contains(r#""path":"src/router.rs""#) && packet.contains(r#""freshness":"fresh""#)
+    );
+    assert!(packet.contains("pub fn route_request"));
+    assert!(packet.lines().any(|line| line.starts_with("Related ")
+        && line.contains(r#""path":"src/consumer.rs""#)
+        && line.contains("Import/module match")));
+    assert!(
+        !packet.contains("ignored/hidden.rs"),
+        "ignored sources stay out of the packet"
+    );
+    assert!(
+        packet.contains(r#""status":"missing""#) && packet.contains("unknown: no check command")
+    );
+    assert!(packet.len() <= 4000);
+}
+
+#[test]
+fn navigation_packet_withholds_symbols_of_changed_or_missing_owners() {
+    let (_home, project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    fs::write(
+        project.path().join("src/router.rs"),
+        "pub fn replacement() {}\n",
+    )
+    .unwrap();
+    let changed = cache.navigation_packet("route_request", 4000).unwrap();
+    assert!(changed.contains(r#""freshness":"changed""#) && changed.contains(r#""symbols":""#));
+    assert!(
+        !changed.contains("pub fn route_request"),
+        "stale outline must not be shown"
+    );
+    assert!(
+        !changed.contains("Related {"),
+        "no fresh owner means no related rows"
+    );
+    fs::remove_file(project.path().join("src/router.rs")).unwrap();
+    let missing = cache.navigation_packet("route_request", 4000).unwrap();
+    assert!(
+        missing.contains(r#""freshness":"missing""#) && !missing.contains("pub fn route_request")
+    );
+}
+
+#[test]
+fn navigation_packet_is_bounded_and_abstains_without_a_task_match() {
+    let (_home, _project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    assert!(
+        cache.navigation_packet("", 4000).is_err(),
+        "navigation needs a task query"
+    );
+    assert!(
+        cache
+            .navigation_packet("route_request", 100)
+            .unwrap()
+            .is_empty()
+    );
+    let budget = cache.navigation_packet("route_request", 1024).unwrap();
+    assert!(!budget.is_empty() && budget.len() <= 1024);
+    // The no-match note is optional under the same budget, while the rule and check row are kept.
+    let none = cache.navigation_packet("unrelatedxyz", 4000).unwrap();
+    assert!(
+        none.contains("No indexed owner matched") && none.contains("unknown: no check command")
+    );
+    let floor = cache.navigation_packet("unrelatedxyz", none.len()).unwrap();
+    assert_eq!(floor, none);
+    let tight = cache
+        .navigation_packet("route_request", none.len())
+        .unwrap();
+    assert!(tight.contains("Checks {") && !tight.contains("Owner {"));
+    assert!(tight.len() <= none.len());
+    assert!(
+        cache
+            .navigation_packet("route_request", tight.len() - 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        cache
+            .navigation_packet("unrelatedxyz", none.len() - 1)
+            .unwrap()
+            .len()
+            < none.len()
+    );
+}
+
+#[test]
+fn navigate_is_offered_as_an_explicit_action_and_ambient_retrieval_stays_unchanged() {
+    let (_home, _project, layout, ws) = fixture();
+    let cache = Arc::new(Codebase::open(&layout).unwrap());
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    let schema = tool(cache.clone(), "session".into()).schema();
+    let actions = schema["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(actions.contains(&json!("navigate")));
+    // The packet is explicit only: per-message ambient retrieval never carries it.
+    let ambient = cache.task_context("route_request", 8000).unwrap();
+    assert!(!ambient.contains("Navigation packet"));
+}
+
+#[test]
+fn navigation_packet_reports_recorded_check_status_without_its_command() {
+    let (_home, _project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    for (passed, status) in [
+        (true, "passed_for_recorded_sources"),
+        (false, "failed_requires_review"),
+    ] {
+        cache
+            .record_behavior_check("cargo test navigation", passed)
+            .unwrap();
+        let packet = cache.navigation_packet("route_request", 4000).unwrap();
+        assert!(packet.contains(status), "{status}: {packet}");
+        assert!(
+            !packet.contains("cargo test"),
+            "recorded commands are digests only"
+        );
+    }
+}
+
+fn limits(files: usize, rows: usize, bytes: usize) -> ScanLimits {
+    ScanLimits {
+        files,
+        rows,
+        bytes,
+        time: Duration::from_secs(60),
+    }
+}
+
+fn add_modules(project: &Path, count: usize) {
+    fs::create_dir_all(project.join("pkg")).unwrap();
+    for n in 0..count {
+        fs::write(
+            project.join(format!("pkg/m{n:02}.rs")),
+            format!("pub fn m{n:02}() {{}}\n"),
+        )
+        .unwrap();
+    }
+}
+
+fn indexed_paths(cache: &Codebase) -> BTreeSet<String> {
+    cache
+        .conn
+        .lock()
+        .prepare("SELECT path FROM codebase_files")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// Refreshes under `budget` until each of `expected` files has an indexed row; returns how many
+/// refreshes that took. A budgeted refresh always stops early, so completion is row coverage.
+fn cover(cache: &Codebase, ws: &Workspace, budget: ScanLimits, expected: usize) -> usize {
+    for refreshes in 1..=50 {
+        cache
+            .refresh_with(ws, &AtomicBool::new(false), budget)
+            .unwrap();
+        if indexed_paths(cache).len() == expected {
+            return refreshes;
+        }
+    }
+    panic!("coverage did not reach {expected} files within 50 refreshes");
+}
+
+#[test]
+fn partial_refreshes_resume_after_the_cursor_until_every_file_is_indexed() {
+    let (_home, project, layout, ws) = fixture();
+    add_modules(project.path(), 12);
+    let cache = Codebase::open(&layout).unwrap();
+    // A 64-byte read budget covers only a few files per refresh; the fixture holds 14 files.
+    let refreshes = cover(&cache, &ws, limits(usize::MAX, usize::MAX, 64), 14);
+    assert!(refreshes >= 3, "the budget must span several refreshes");
+    assert_eq!(indexed_paths(&cache).len(), 14);
+}
+
+#[test]
+fn unchanged_partial_refresh_reuses_rows_instead_of_reoutlining_them() {
+    let (_home, project, layout, ws) = fixture();
+    add_modules(project.path(), 12);
+    let cache = Codebase::open(&layout).unwrap();
+    cover(&cache, &ws, limits(usize::MAX, usize::MAX, 64), 14);
+    // Once every row carries the current outline version, budgeted refreshes reuse them.
+    for _ in 0..2 {
+        let refresh = cache
+            .refresh_with(
+                &ws,
+                &AtomicBool::new(false),
+                limits(usize::MAX, usize::MAX, 64),
+            )
+            .unwrap();
+        assert!(refresh.partial, "{refresh:?}");
+        assert_eq!(refresh.indexed, 0, "{refresh:?}");
+        assert!(refresh.reused > 0, "{refresh:?}");
+    }
+}
+
+#[test]
+fn legacy_rows_are_rebuilt_once_unless_a_completed_marker_proves_them_current() {
+    // (marker present, rows indexed by the first refresh, rows reused by the first refresh)
+    for (marker, indexed, reused) in [(false, 2, 0), (true, 0, 2)] {
+        let (_home, _project, layout, ws) = fixture();
+        {
+            let cache = Codebase::open(&layout).unwrap();
+            cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+            let conn = cache.conn.lock();
+            conn.execute("ALTER TABLE codebase_files DROP COLUMN outline_version", [])
+                .unwrap();
+            if marker {
+                conn.execute(
+                    "INSERT INTO codebase_meta(key,value) VALUES('outline_version','2')",
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        let cache = Codebase::open(&layout).unwrap();
+        let refresh = cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            (refresh.indexed, refresh.reused),
+            (indexed, reused),
+            "marker={marker}"
+        );
+        assert_eq!(
+            cache.refresh(&ws, &AtomicBool::new(false)).unwrap().reused,
+            2,
+            "marker={marker}"
+        );
+    }
+}
+
+#[test]
+fn navigation_packet_states_when_index_coverage_is_partial() {
+    let (_home, project, layout, ws) = fixture();
+    add_modules(project.path(), 12);
+    let cache = Codebase::open(&layout).unwrap();
+    let first = cache
+        .refresh_with(
+            &ws,
+            &AtomicBool::new(false),
+            limits(usize::MAX, usize::MAX, 64),
+        )
+        .unwrap();
+    assert!(first.partial, "{first:?}");
+    let partial = cache.navigation_packet("unrelatedxyz", 4000).unwrap();
+    assert!(
+        partial.contains("Index coverage: partial") && partial.contains("coverage is partial"),
+        "{partial}"
+    );
+    cover(&cache, &ws, limits(usize::MAX, usize::MAX, 64), 14);
+    // An unbudgeted refresh completes the scan, so the packet no longer reports partial coverage.
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    let complete = cache.navigation_packet("unrelatedxyz", 4000).unwrap();
+    assert!(
+        !complete.contains("Index coverage")
+            && complete.contains("No indexed owner matched this task;")
+    );
+}
+
+#[test]
+fn partial_scans_keep_the_row_cap_while_coverage_progresses() {
+    let (_home, project, layout, ws) = fixture();
+    add_modules(project.path(), 12);
+    let cache = Codebase::open(&layout).unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut covered = BTreeSet::new();
+    for _ in 0..8 {
+        cache
+            .refresh_with(&ws, &cancel, limits(4, 4, usize::MAX))
+            .unwrap();
+        let rows = indexed_paths(&cache);
+        assert!(rows.len() <= 4, "{rows:?}");
+        covered.extend(rows);
+    }
+    assert_eq!(covered.len(), 14, "{covered:?}");
 }

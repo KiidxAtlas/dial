@@ -146,7 +146,7 @@ const call = (name, args = {}) => {
 };
 // Reserved controller name (BATCH_CALLBACK in eval.rs); no provider tool can carry it.
 const BATCH = 'dial.batch';
-const batch = (entries) => {
+const batchCalls = (entries) => {
   if (!Array.isArray(entries) || entries.length > MAX_CALLBACKS) throw new ToolError(`tool.batch expects an array of at most ${MAX_CALLBACKS} {name, args} entries`);
   const calls = entries.map((entry, index) => {
     const { name, args = {} } = entry ?? {};
@@ -154,6 +154,9 @@ const batch = (entries) => {
     if (!args || typeof args !== 'object' || Array.isArray(args)) throw new ToolError(`tool.batch entry ${index}: tool arguments must be an object`);
     return { name, arguments: args };
   });
+  return calls;
+};
+const runBatch = (calls) => {
   if (!calls.length) return [];
   const operation = operationStorage.getStore();
   // Each entry is one callback against the cell's limit, whether or not it runs concurrently.
@@ -176,6 +179,18 @@ const batch = (entries) => {
   }
   if (!Array.isArray(result.data) || result.data.length !== calls.length || result.data.some(item => !item || typeof item !== 'object' || typeof item.is_error !== 'boolean')) throw new ToolError('controller returned a malformed tool.batch result', result);
   return result.data;
+};
+// Results stay a plain array for synchronous use and also await/then/catch/finally like a Promise.
+const batch = (entries) => {
+  const calls = batchCalls(entries);
+  let results;
+  try { results = runBatch(calls); } catch (error) { return Promise.reject(error); }
+  const settle = () => Promise.resolve([...results]);
+  return Object.defineProperties(results, {
+    then: { value: (onFulfilled, onRejected) => settle().then(onFulfilled, onRejected) },
+    catch: { value: onRejected => settle().catch(onRejected) },
+    finally: { value: onFinally => settle().finally(onFinally) },
+  });
 };
 const tool = new Proxy(Object.create(null), {
   get(_target, name) {
@@ -290,7 +305,7 @@ function evaluationHint(error) {
     return `\n[dial] \`${missing[1]}\` is not a global in eval cells; use ${WITHHELD_GLOBALS[missing[1]]} instead.`;
   }
   if (error?.name === 'SyntaxError' && /^Identifier '[^']+' has already been declared$/.test(message)) {
-    return '\n[dial] Top-level declarations persist across cells in this namespace; reuse the existing binding, assign to it, or pick a new name.';
+    return '\n[dial] Top-level declarations persist across cells in this namespace: `const`/`let` cannot be redeclared. Use `var` or a new name, or assign to the existing binding.';
   }
   return '';
 }

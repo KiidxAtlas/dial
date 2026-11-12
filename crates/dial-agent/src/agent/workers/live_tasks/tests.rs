@@ -1057,3 +1057,95 @@ fn recovered_safe_reads_prompt_through_the_live_approval_owner() {
         );
     }
 }
+
+#[test]
+fn finished_worker_reports_tool_dispatches_and_elapsed_time() {
+    for expected_tools in [0, 1] {
+        let project = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(project.path()).unwrap();
+        std::fs::write(project.path().join("fixture.txt"), "fixture\n").unwrap();
+        let mut scripts = Vec::new();
+        if expected_tools == 1 {
+            scripts.push(crate::llm::fake::Script::Sse(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"read-fixture","type":"function","function":{"name":"read","arguments":"{\"path\":\"fixture.txt\"}"}}]},"finish_reason":"tool_calls"}]})
+        )));
+        }
+        scripts.push(crate::llm::fake::Script::Sse(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"finished\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+    ));
+        let server = crate::llm::fake::serve(scripts);
+        let mut config = Config::default();
+        config.task.persist = false;
+        config.model = "test".into();
+        config.endpoint =
+            Some(serde_json::from_value(json!({"base_url":format!("{}/v1", server.url)})).unwrap());
+        config.compaction.enabled = false;
+        config.codebase.enabled = false;
+        let ext = Registry::new();
+        let harness = Harness::default();
+        let mut tasks = LiveTasks::default();
+        let reply = tasks
+            .start(
+                StartContext {
+                    config: &config,
+                    workspace: &workspace,
+                    ext: &ext,
+                    layout: None,
+                    session_id: "parent",
+                    harness: &harness,
+                    usage: None,
+                    context_cap: None,
+                    memory: None,
+                    plan_mode: false,
+                    agents_messages: &[],
+                    handoff: subagents::Handoff::capture(&json!({}), &[]),
+                },
+                &json!({"tasks":[{"agent":"worker","task":"inspect","solution_space":"fixture"}]}),
+            )
+            .expect("the worker starts without persistence");
+        assert_eq!(reply[0]["status"], "running");
+        // Pump the parent approval owner while waiting for the worker's settled runtime node.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        struct View;
+        impl Ui for View {}
+        let mut view = View;
+        let mut rules = vec![];
+        let data = loop {
+            tasks.pump(
+                Approval::Auto,
+                PumpPolicy {
+                    read_only: true,
+                    rules: &mut rules,
+                    root: project.path(),
+                    extra_roots: &[],
+                },
+                None,
+                &mut None,
+                &mut view,
+            );
+            let node = tasks
+                .tree
+                .snapshots()
+                .into_iter()
+                .find(|node| node.kind == "worker")
+                .expect("the started worker has a runtime node");
+            if node.result.phase != crate::runtime::Phase::Running {
+                break node.result.data.expect("a settled worker keeps its data");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake worker did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            data["tools"], expected_tools,
+            "count dispatched worker tools"
+        );
+        assert!(data["steps"].is_u64(), "model steps are recorded");
+        let started = data["started_ms"].as_u64().expect("start time recorded");
+        let finished = data["finished_ms"].as_u64().expect("finish time recorded");
+        assert_eq!(data["elapsed_ms"].as_u64(), Some(finished - started));
+    }
+}

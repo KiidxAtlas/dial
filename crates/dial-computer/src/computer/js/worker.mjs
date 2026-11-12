@@ -260,7 +260,7 @@ function describeWindowSnapshot(snapshot) {
 }
 
 /** Points scripts that use the Eval-only `computer` global at the run-scope `desktop` facade. */
-function hintWrongGlobal(error) {
+function hintWrongGlobal(error, desktopHandle) {
 	if (error?.name === "ReferenceError" && error.message === "computer is not defined") {
 		error.message +=
 			"; direct computer run code uses the `desktop` global (for example `await desktop.windows()`). `computer.*` exists only in Eval code.";
@@ -268,8 +268,23 @@ function hintWrongGlobal(error) {
 	if (error?.name === "TypeError" && /\.bounds is not a function$/.test(error.message ?? "")) {
 		error.message +=
 			"; a window's `bounds` is a property (`win.bounds` → {x, y, width, height}); only elements have the method `await el.bounds()`.";
+	} else if (error?.name === "TypeError") {
+		hintHandleMethods(error, desktopHandle);
 	}
 	return error;
+}
+
+/** After `X.m is not a function`, lists the callable methods of each Dial handle type so a guessed name gets the real ones. */
+function hintHandleMethods(error, desktopHandle) {
+	const match = /^([\w$.]+)\.([\w$]+) is not a function$/.exec(error.message ?? "");
+	if (!match) return;
+	const groups = [
+		["desktop", Object.keys(desktopHandle ?? {})],
+		["window", WINDOW_METHODS],
+		["element", ELEMENT_METHODS],
+		["display", DISPLAY_METHODS],
+	];
+	error.message += `; if \`${match[1]}\` is a Dial handle, its methods are: ${groups.map(([kind, names]) => `${kind}: ${names.join(", ")}`).join("; ")}`;
 }
 
 function guardRun(context, method) {
@@ -1257,8 +1272,16 @@ Object.assign(globalThis, {
 });
 
 class ComputerRuntime {
+	#scope = {};
+
 	setRunScope(scope) {
+		this.#scope = scope;
 		Object.assign(globalThis, scope);
+	}
+
+	/** The `{ desktop, wait, assert }` object that `fn` receives as its first argument. */
+	runScope() {
+		return this.#scope;
 	}
 
 	/** Sync code runs as indirect eval (completion value); code with top-level await/return runs as an async body. */
@@ -1635,6 +1658,26 @@ class Win {
 	}
 }
 
+/** Callable names on window handles (`desktop.windows()` items); used by the TypeError hint. */
+const WINDOW_METHODS = Object.getOwnPropertyNames(Win.prototype).filter(
+	name => name !== "constructor" && typeof Object.getOwnPropertyDescriptor(Win.prototype, name)?.value === "function",
+);
+/** Callable names on display handles from `desktop.display(id)`; they forward to the same window-level input and capture. */
+const DISPLAY_METHODS = [
+	"screenshot",
+	"zoom",
+	"locate",
+	"click",
+	"doubleClick",
+	"move",
+	"drag",
+	"scroll",
+	"type",
+	"press",
+	"holdKeys",
+	"holdMouse",
+];
+
 // ---------------------------------------------------------------------------
 // Worker core
 // ---------------------------------------------------------------------------
@@ -1646,6 +1689,7 @@ class ComputerWorkerCore {
 	#active = null;
 	#runContexts = new AsyncLocalStorage();
 	#closed = false;
+	#desktop = null;
 
 	constructor(transport) {
 		this.#transport = transport;
@@ -1745,6 +1789,7 @@ class ComputerWorkerCore {
 			const session = await this.#ensureSession(message.session);
 			throwIfAborted(signal);
 			const desktop = this.#createDesktopScope(session);
+			this.#desktop = desktop;
 			this.#runtime.setRunScope({
 				desktop: bindRunFacade(desktop, signal),
 				assert: (condition, text) => {
@@ -1782,23 +1827,21 @@ class ComputerWorkerCore {
 			else signal.addEventListener("abort", onCancel, { once: true });
 			try {
 				returnValue = await Promise.race([
-					this.#runContexts.run(runContext, () =>
-						this.#runtime.run(message.code, `computer-run-${message.id}.js`, this.#runtimeHooks(active, output)),
-					),
+					this.#runContexts.run(runContext, () => this.#runCode(message, active, output)),
 					cancelRejection,
 				]);
 				completed = true;
 				if (typeof returnValue === "function") {
 					completed = false;
 					throw new ToolError(
-						"`code` evaluated to a function that was never called, so nothing ran. Direct `code` is a function body, e.g. `return await desktop.windows();`. To send function source such as `async ({ desktop }) => …`, pass it as `fn` instead of `code`.",
+						"`code` returned a function even after it was called, so there is no value to report. Return a plain value, or send function source with `fn` (its arguments go in `args`).",
 					);
 				}
 			} finally {
 				signal.removeEventListener("abort", onCancel);
 			}
 		} catch (error) {
-			failure = { error: hintWrongGlobal(error) };
+			failure = { error: hintWrongGlobal(error, this.#desktop) };
 		} finally {
 			// Successful completion retires outstanding native work but keeps an explicitly acquired grant; errors revoke it.
 			signal.removeEventListener("abort", onNativeCancel);
@@ -1832,6 +1875,17 @@ class ComputerWorkerCore {
 				payload: { displays: output.finish(), returnValue: cloneSafe(returnValue), screenshots, capabilities },
 			});
 		}
+	}
+
+	/** Runs `code`. A function value is called with the same scope object `fn` receives, so `code` holding `async ({ desktop }) => …` still runs. */
+	async #runCode(message, active, output) {
+		const value = await this.#runtime.run(message.code, `computer-run-${message.id}.js`, this.#runtimeHooks(active, output));
+		if (typeof value !== "function") return value;
+		output.push({
+			type: "text",
+			text: "`code` evaluated to a function, so it was called with { desktop, wait, assert } exactly as `fn` would be. Send function source with `fn` instead of `code`.",
+		});
+		return await value(this.#runtime.runScope());
 	}
 
 	/** Answers a capabilities request without running a script; never touches `#active`. */

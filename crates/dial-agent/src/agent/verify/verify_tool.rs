@@ -17,6 +17,8 @@ use crate::agent::verify::verification::{CheckStatus, FocusedCheck};
 use crate::agent::*;
 use crate::tools::edit::editing::MAX_VERIFY_TARGETS;
 
+mod plan;
+
 pub(in crate::agent) const NAME: &str = "verify";
 /// The target that reruns every check whose latest result is a code failure.
 const FAILED: &str = "failed";
@@ -39,6 +41,8 @@ pub(in crate::agent) fn schema(predictions: bool) -> Value {
     schema["function"]["parameters"]["properties"]["acceptance"] = json!({"type":"object",
         "description":"Register and run one focused model-authored acceptance helper for a standalone artifact without an existing test suite: check required format and task constraints with a command that exits non-zero on failure. Reuse its passing result until inputs or criteria change; rerun after settled edits when enabled. Separate from task/operator checks. Cannot combine with targets, repro, command or expect.",
         "properties":{"name":{"type":"string"},"command":{"type":"string"}},"required":["name","command"],"additionalProperties":false});
+    schema["function"]["parameters"]["properties"]["plan"] = json!({"type":"boolean",
+        "description":"Inspect configured requirement-to-check mappings, deliverables and focused check selection without running commands or changing configuration. Reports recorded evidence only, not a fresh verification. Cannot combine true with other arguments."});
     schema
 }
 
@@ -288,6 +292,20 @@ pub(in crate::agent) fn post_mutation_verify(output: &ToolOutput) -> Option<&Val
 
 impl Agent<'_> {
     pub(in crate::agent) fn verify_tool(&mut self, args: &Value, ui: &mut dyn Ui) -> ToolOutput {
+        if let Some(plan) = args.get("plan") {
+            match plan.as_bool() {
+                Some(true) => {
+                    if args.as_object().is_some_and(|args| args.len() != 1) {
+                        return ToolOutput::err(
+                            "plan: true cannot be combined with other verify arguments",
+                        );
+                    }
+                    return self.verification_plan();
+                }
+                Some(false) => {}
+                None => return ToolOutput::err("plan must be a boolean"),
+            }
+        }
         if args.get("acceptance").is_some() {
             return self.register_acceptance(args, ui);
         }
@@ -358,16 +376,23 @@ impl Agent<'_> {
         // changes, so one call reports every applicable check instead of prompting a second plain
         // `verify` for the ones still lacking a pass. Before any change it runs alone as a baseline.
         let explicit_names = names.is_some();
+        let changed =
+            self.step_checks.mutations > 0 || self.step_checks.has_uncheckpointed_operations();
         let mut registered = None;
+        // A reproduction registered for the first time before any change is expected to fail: that
+        // first failure is what makes it a reproduction, so it does not make the call an error.
+        let mut expected_failure: Option<String> = None;
         if let Some(check) = repro {
+            let fresh = !self.step_checks.evidence.is_repro(&check.command);
             if let Err(error) = self.register_repro(&check, &mut candidates) {
                 return ToolOutput::err(error);
             }
             names.get_or_insert_with(Vec::new).push(check.name.clone());
+            if fresh && !changed {
+                expected_failure = Some(check.name.clone());
+            }
             registered = Some(check.name);
         }
-        let changed =
-            self.step_checks.mutations > 0 || self.step_checks.has_uncheckpointed_operations();
         if registered.is_some() && changed && !explicit_names {
             names = None;
         }
@@ -408,6 +433,7 @@ impl Agent<'_> {
         let mut all_passed = true;
         let mut cancelled = false;
         let mut refused = None;
+        let mut unexpected_failure = false;
         for check in &selected {
             // The reproduction just registered always executes; other checks may reuse passes.
             let reused = names.is_none()
@@ -453,6 +479,12 @@ impl Agent<'_> {
             if status != CheckStatus::Passed {
                 self.step_checks.reproduced |= status == CheckStatus::CodeFailed;
                 all_passed = false;
+                // The newly registered reproduction's first code failure is its expected outcome.
+                if expected_failure.as_ref() != Some(&check.name)
+                    || status != CheckStatus::CodeFailed
+                {
+                    unexpected_failure = true;
+                }
                 self.step_checks.failed_checks.push(check.clone());
                 if let Some(output) = &output {
                     if let Some(problem) =
@@ -498,6 +530,9 @@ impl Agent<'_> {
                     }
                 }
             }
+            if expected_failure.as_ref() == Some(&check.name) && status == CheckStatus::CodeFailed {
+                result["registration"] = json!("failed_as_expected");
+            }
             results.push(result);
         }
         self.step_checks.failed = !self.step_checks.failed_checks.is_empty();
@@ -537,6 +572,10 @@ impl Agent<'_> {
             refused.clone()
         } else if all_passed {
             "Passes count toward final verification. Later changes stale evidence unless complete declared inputs are revalidated unchanged.".into()
+        } else if let Some(name) = expected_failure.as_deref().filter(|_| !unexpected_failure) {
+            format!(
+                "Reproduction {name} failed as expected before any change: it reproduces the bug and is now registered. Fix the code, then rerun it by name or with targets [\"failed\"]; the final gate reruns it."
+            )
         } else if registered.is_some() && selected.len() == 1 {
             "Reproduction registered. Fix the code, then rerun it by name or with targets [\"failed\"]; the final gate reruns it.".into()
         } else {
@@ -564,7 +603,7 @@ impl Agent<'_> {
                 execution: Default::default(),
                 data: Some(data),
                 text: text.join("\n"),
-                is_error: !all_passed || refused.is_some(),
+                is_error: unexpected_failure || refused.is_some(),
             },
             &candidates,
         )

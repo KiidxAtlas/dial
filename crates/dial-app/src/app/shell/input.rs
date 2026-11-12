@@ -136,7 +136,9 @@ impl Shell {
         if let Some(control) = &self.maintenance_control {
             control.note_input();
         }
-        let buffered = poll(Duration::ZERO).unwrap_or(false);
+        // Keys held back while tools connected are replayed one at a time from `held`, so the
+        // rest of a paste may wait there rather than in the input pump.
+        let buffered = !self.held.is_empty() || crate::ui::input::input_follows(&key);
         let guarded = self.paste_guard.text_for_draft_key(
             key,
             buffered,

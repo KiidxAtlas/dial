@@ -1175,6 +1175,7 @@ fn lightweight_contract_escalates_after_a_tool_error_and_resets_next_turn() {
 #[test]
 fn shared_economy_reduces_projected_schema_and_guidance_without_changing_the_answer() {
     let mut measured = Vec::new();
+    let mut offered = Vec::new();
     for enabled in [false, true] {
         let server = serve(vec![Reply::Text("ok")]);
         let mut e = env(&server.url, "auto");
@@ -1192,9 +1193,34 @@ fn shared_economy_reduces_projected_schema_and_guidance_without_changing_the_ans
             bytes["request_tail_bytes"].as_u64().unwrap(),
         ));
         assert_eq!(metrics["usage"]["main"]["requests"], 1);
-        assert_eq!(server.requests.lock().len(), 1);
+        let requests = server.requests.lock();
+        assert_eq!(requests.len(), 1);
+        // Per-tool schema bytes as sent, so the comparison is like for like even when the
+        // smaller efficient schemas let one more tool join the same core budget.
+        let tools: std::collections::BTreeMap<String, usize> = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                let name = tool["function"]["name"].as_str().unwrap().to_owned();
+                (name, serde_json::to_vec(tool).unwrap().len())
+            })
+            .collect();
+        offered.push(tools);
     }
-    assert!(measured[1].0 < measured[0].0 && measured[1].1 <= measured[0].1);
+    let (legacy, efficient) = (&offered[0], &offered[1]);
+    assert!(
+        legacy.keys().all(|name| efficient.contains_key(name)),
+        "efficient offer dropped a legacy tool: {legacy:?} vs {efficient:?}"
+    );
+    let shared = |tools: &std::collections::BTreeMap<String, usize>| -> usize {
+        legacy.keys().map(|name| tools[name]).sum()
+    };
+    assert!(
+        shared(efficient) < shared(legacy),
+        "{legacy:?} vs {efficient:?}"
+    );
+    assert!(measured[1].1 <= measured[0].1);
     eprintln!(
         "fixture projected schema/tail bytes: legacy {:?}, efficient {:?}; not billed tokens",
         measured[0], measured[1]

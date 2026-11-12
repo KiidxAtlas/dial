@@ -290,6 +290,28 @@ def helper_hint(error):
     return "\n[dial] Portable helpers are methods of `dial`, not globals: use dial.%s(...)." % match.group(1)
 
 
+_HARNESS_FILE = (lambda: None).__code__.co_filename
+
+
+def user_traceback(error):
+    """Formats a cell traceback without the driver's own frames or the asyncio frames that precede user code."""
+    pending = [traceback.TracebackException(type(error), error, error.__traceback__)]
+    seen = set()
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        frames = list(item.stack)
+        first_user = next((i for i, frame in enumerate(frames) if frame.filename == "<dial-kernel>"), 0)
+        item.stack = traceback.StackSummary.from_list(
+            [frame for i, frame in enumerate(frames) if frame.filename != _HARNESS_FILE and i >= first_user]
+        )
+        pending.extend(link for link in (item.__cause__, item.__context__) if link is not None)
+        pending.extend(getattr(item, "exceptions", None) or [])
+    return "".join(item.format())
+
+
 def execute(tree, mode):
     compiled = compile(tree, "<dial-kernel>", mode, flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
     value = eval(compiled, namespace)
@@ -327,7 +349,7 @@ while True:
                     namespace["_"] = value
                     result["value"] = repr(value)[:LIMIT]
     except BaseException as error:
-        result["error"] = traceback.format_exc()[-LIMIT:]
+        result["error"] = user_traceback(error)[-LIMIT:]
         hint = helper_hint(error)
         if hint:
             result["error"] += hint

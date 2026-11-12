@@ -209,7 +209,11 @@ fn schema_consts(branches: &Value, key: &str) -> std::collections::BTreeSet<Stri
 /// excluding ACP-only arms.
 fn dispatched_methods() -> std::collections::BTreeSet<String> {
     let mut found = std::collections::BTreeSet::new();
-    for source in [include_str!("../rpc.rs"), include_str!("actor.rs")] {
+    for source in [
+        include_str!("../rpc.rs"),
+        include_str!("actor.rs"),
+        include_str!("jobs.rs"),
+    ] {
         for line in source.lines() {
             let Some((pattern, _)) = line.trim().split_once(" => ") else {
                 continue;
@@ -217,6 +221,8 @@ fn dispatched_methods() -> std::collections::BTreeSet<String> {
             if pattern.ends_with(" if acp") {
                 continue;
             }
+            // Native-only arms are still dispatched methods.
+            let pattern = pattern.strip_suffix(" if !acp").unwrap_or(pattern);
             let quoted: Option<Vec<&str>> = pattern
                 .split(" | ")
                 .map(|part| {
@@ -238,6 +244,7 @@ fn emitted_events() -> std::collections::BTreeSet<String> {
         include_str!("host_tools.rs"),
         include_str!("host_uris.rs"),
         include_str!("auth.rs"),
+        include_str!("extensions.rs"),
     ] {
         for piece in source.split("\"event\":\"").skip(1) {
             found.insert(piece.split('"').next().unwrap().to_owned());
@@ -491,7 +498,7 @@ fn list_extensions_reports_configured_and_curated_rows() {
             ..Default::default()
         },
     );
-    let listed = extensions(&layout, &config);
+    let listed = extensions::list(&layout, &config);
     let mcp = listed["mcp"].as_array().unwrap();
     let mine = mcp.iter().find(|row| row["id"] == "mine").unwrap();
     assert_eq!(

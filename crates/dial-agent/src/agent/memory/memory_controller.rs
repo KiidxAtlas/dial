@@ -41,6 +41,7 @@ fn memory_call(action: &str, mut arguments: Value) -> ToolCall {
 const PROVENANCE_HELP: &str =
     "Provenance memory: facts with history and expiry, found again by keyword.
 /memory                    status and the newest remembered facts
+/memory view [project|global]   every remembered fact with its id, revision and age
 /memory search <words>     find remembered facts (any other words also search)
 /memory clear [project|global]   forget this project's facts, or the facts shared by every project
 /memory help               this help
@@ -648,6 +649,34 @@ impl Agent<'_> {
         if let Some(memory) = self.memory.clone() {
             if input.trim() == "help" {
                 return Ok(json!({"backend":"provenance","help":PROVENANCE_HELP}));
+            }
+            if input.trim() == "view" || input.trim().starts_with("view ") {
+                use crate::tools::knowledge::provenance::Scope;
+                let scopes: &[Scope] = match input.trim() {
+                    "view" => &[Scope::Project, Scope::Global],
+                    "view project" => &[Scope::Project],
+                    "view global" => &[Scope::Global],
+                    _ => anyhow::bail!("usage: /memory view [project|global]"),
+                };
+                let mut banks = Vec::new();
+                for scope in scopes {
+                    // Most recently updated first; 0 bytes means no byte budget.
+                    let listed = memory.recall("", Some(*scope), 500, 0)?;
+                    let facts: Vec<Value> = listed
+                        .entries
+                        .iter()
+                        .map(|entry| {
+                            json!({"ref": entry.id.to_string(), "id": entry.id, "revision": entry.revision, "content": entry.content, "source": entry.source, "created": entry.created_at, "updated": entry.updated_at})
+                        })
+                        .collect();
+                    banks.push(json!({
+                        "scope": if *scope == Scope::Global { "global" } else { "project" },
+                        "total": facts.len(),
+                        "truncated": listed.truncated,
+                        "facts": facts,
+                    }));
+                }
+                return Ok(json!({"backend": "provenance", "view": {"banks": banks}}));
             }
             if matches!(input.trim(), "" | "status") {
                 let recent = memory.recall("", None, 20, 24000)?;

@@ -1118,3 +1118,84 @@ fn a_budget_cut_inside_a_span_reports_the_rows_already_shown() {
     );
     assert!(!out.contains("does not fit"), "{out}");
 }
+
+#[test]
+fn insertion_gap_is_witnessed_by_either_side_of_it() {
+    // (operation, seen ranges, expected result). The gap is witnessed by its anchor line or by
+    // the line across it; replacements keep the strict rule (see the refusal test below).
+    let original = "one\ntwo\nthree\nfour\n";
+    let cases = [
+        ("PUT >2:\n+X\n", vec![(3, 3)], "one\ntwo\nX\nthree\nfour\n"),
+        ("PUT <3:\n+X\n", vec![(2, 2)], "one\ntwo\nX\nthree\nfour\n"),
+        ("PUT >2:\n+X\n", vec![(2, 2)], "one\ntwo\nX\nthree\nfour\n"),
+        ("PUT <1:\n+X\n", vec![(1, 1)], "X\none\ntwo\nthree\nfour\n"),
+        ("PUT >4:\n+X\n", vec![(4, 4)], "one\ntwo\nthree\nfour\nX\n"),
+    ];
+    for (operation, seen, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, original).unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let path = ws.resolve("a.txt").unwrap();
+        let tag = ws.store().record(&path, original, &seen);
+        edit(&ws, &format!("[a.txt#{tag}]\n{operation}")).unwrap_or_else(|e| {
+            panic!("{operation:?} with seen {seen:?} should be witnessed: {e}")
+        });
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            expected,
+            "{operation:?}"
+        );
+    }
+}
+
+#[test]
+fn insertion_gap_with_no_shown_side_is_still_refused() {
+    let original = "one\ntwo\nthree\nfour\n";
+    // Gap between 2 and 3 with lines 2 and 3 both unshown. The refusal names the anchor line.
+    let cases = [("PUT >2:\n+X\n", "2:two"), ("PUT <3:\n+X\n", "3:three")];
+    for (operation, shown) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, original).unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let path = ws.resolve("a.txt").unwrap();
+        let tag = ws.store().record(&path, original, &[(1, 1), (4, 4)]);
+        let error = edit(&ws, &format!("[a.txt#{tag}]\n{operation}")).expect_err(operation);
+        assert!(
+            error.contains("have not been shown"),
+            "{operation:?}: {error}"
+        );
+        assert!(error.contains(shown), "{operation:?}: {error}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "{operation:?}"
+        );
+    }
+}
+
+#[test]
+fn replacement_of_a_partly_shown_range_is_still_refused() {
+    let original = "one\ntwo\nthree\nfour\n";
+    // Line 2 is shown, line 3 is not: each replacement touches an unshown line. A refusal reveals
+    // the unshown rows and counts them as read, so every operation gets a fresh snapshot.
+    for operation in ["PUT 2.=3:\n+X\n", "CUT 2.=3\n"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, original).unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let path = ws.resolve("a.txt").unwrap();
+        let tag = ws.store().record(&path, original, &[(2, 2)]);
+        let error = edit(&ws, &format!("[a.txt#{tag}]\n{operation}")).expect_err(operation);
+        assert!(
+            error.contains("have not been shown"),
+            "{operation:?}: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "{operation:?}"
+        );
+    }
+}

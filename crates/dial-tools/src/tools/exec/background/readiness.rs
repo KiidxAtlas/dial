@@ -74,7 +74,7 @@ impl Ready {
             return Err("ready.host requires ready.port".into());
         }
         if log.is_none() && port.is_none() {
-            return Err("ready needs a log regex or port (or both)".into());
+            return Err("ready needs ready.log (a regex the job prints) or ready.port (a TCP port the job listens on); ready.timeout alone waits for nothing. Example: \"ready\": {\"log\": \"listening on\", \"timeout\": 30}".into());
         }
         let timeout = super::opt_u64(value, "timeout")?;
         if timeout.is_some_and(|secs| secs > super::MAX_WAIT_SECS) {

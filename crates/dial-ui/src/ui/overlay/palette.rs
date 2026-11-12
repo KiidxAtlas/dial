@@ -1252,10 +1252,18 @@ impl PaletteOverlay {
             };
             out.push(line(header, Tok::Muted));
             let headers = out.len();
-            let list_h = h
+            let room = h
                 .saturating_sub(headers + 5)
                 .max(1)
                 .min(h.saturating_sub(headers + 1));
+            // The list takes only the rows it has, so the detail of the selected row sits right
+            // under it instead of being stranded at the bottom of a tall panel. An empty list
+            // keeps the room for its wrapped message.
+            let list_h = if rows.is_empty() {
+                room
+            } else {
+                rows.len().min(room)
+            };
             self.page = list_h;
             if self.cursor < self.scroll {
                 self.scroll = self.cursor;
@@ -1417,6 +1425,10 @@ impl PaletteOverlay {
                 }
             }
             if let Some(&picked) = rows.get(self.cursor) {
+                // One blank row sets the detail apart from the list when the panel has room.
+                if out.len() + 6 < h {
+                    out.push(Line::default());
+                }
                 let (header, description, note) = match picked {
                     Row::Unified(index) => {
                         let result = &self.unified.as_ref().unwrap().entries[index];

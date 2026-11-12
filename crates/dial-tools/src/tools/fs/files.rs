@@ -575,7 +575,9 @@ fn read_target(
 }
 
 /// Several targets in one call. Each keeps its own selector; a failing target is reported inline.
-/// The targets share one byte budget: each read gets what the earlier ones left of it.
+/// The shared byte budget is split max-min fairly up front (see `fair_shares`): each target reads
+/// what the budget holds beyond the planned shares of the targets after it, so no target starves
+/// the others and any surplus flows forward.
 fn read_paths(
     ws: &Workspace,
     args: &Value,
@@ -629,25 +631,46 @@ fn read_paths_outcomes(
         .map(|target| target.as_str().ok_or("paths must contain only strings"))
         .collect::<Result<Vec<_>, _>>()?;
     let total = budget.min(MAX_READ_PATHS_BYTES);
+    // Room for the omitted-target notice and the outcome footer is held back from the rows, so the
+    // combined text stays within `total` whichever targets end up omitted.
+    let rows = total.saturating_sub(COMPACT_NOTICE_BOUND + PATHS_FOOTER_BOUND);
+    let shares = fair_shares(
+        &targets
+            .iter()
+            .map(|target| target_demand(ws, args, target))
+            .collect::<Vec<_>>(),
+        rows,
+    );
+    let mut reserved_after: usize = shares.iter().sum();
     let mut out = String::new();
     let mut outcomes = Vec::with_capacity(targets.len());
     for (index, path) in targets.iter().enumerate() {
-        // Room left for this target; too little to show a row is left for a separate call.
-        let Some(room) = total
-            .checked_sub(out.len())
-            .filter(|room| *room > READ_FOOTER_RESERVE)
-        else {
-            out.push_str(&format!(
-                "[{} remaining paths omitted: output limit reached; read them in a separate call]",
-                targets.len() - index
-            ));
+        reserved_after -= shares[index];
+        let remaining = rows.saturating_sub(out.len());
+        if remaining <= READ_FOOTER_RESERVE {
+            // No room left for a row: name the rest so the next call can read them.
+            let rest = &targets[index..];
+            // The full list when it fits beside the footer; otherwise the bounded form, whose names
+            // are in the structured `targets` list.
+            let full = omitted_notice(rest);
+            let notice = if out.len() + full.len() + PATHS_FOOTER_BOUND <= total {
+                full
+            } else {
+                compact_notice(index, targets.len())
+            };
+            out.push_str(&notice);
             outcomes.extend(
-                targets[index..]
-                    .iter()
+                rest.iter()
                     .map(|path| (path.to_string(), TargetStatus::Omitted)),
             );
             break;
-        };
+        }
+        // What the budget holds beyond the later plans, never below the floor, and always leaving
+        // room for the section gap that follows this target.
+        let room = remaining
+            .saturating_sub(reserved_after)
+            .max(PATH_ROOM_FLOOR)
+            .min(remaining - SECTION_GAP.len());
         let mut single = args.clone();
         if let Some(object) = single.as_object_mut() {
             object.remove("paths");
@@ -655,18 +678,147 @@ fn read_paths_outcomes(
         }
         let status = match read_tool_streaming(ws, &single, cancel, room) {
             Ok(text) => {
-                out.push_str(&text);
+                out.push_str(&bounded_section(ws, path, &text, room));
                 TargetStatus::Read
             }
             Err(error) => {
-                out.push_str(&format!("[{path}] error: {error}"));
+                out.push_str(&error_line(path, &error));
                 TargetStatus::Failed
             }
         };
         outcomes.push((path.to_string(), status));
-        out.push_str("\n\n");
+        out.push_str(SECTION_GAP);
     }
     Ok((out.trim_end().to_string(), outcomes))
+}
+
+/// Bytes a target is planned to read, as a size hint: the lines its selector and `offset`/`limit`
+/// reach, costed at the longest row the reader can show and capped at the file size, plus the
+/// floor for its header and footer. Only metadata is read here. A target that cannot be resolved
+/// is planned at the floor alone and then reports its own error.
+fn target_demand(ws: &Workspace, args: &Value, input: &str) -> usize {
+    let Ok((path, selector)) = select::split_target(ws, input) else {
+        return PATH_ROOM_FLOOR;
+    };
+    let size = ws
+        .resolve_read(path)
+        .ok()
+        .and_then(|path| fs::metadata(path).ok())
+        .filter(|meta| meta.is_file())
+        .map_or(0, |meta| usize::try_from(meta.len()).unwrap_or(usize::MAX));
+    let offset = opt_u64(args, "offset")
+        .ok()
+        .flatten()
+        .map_or(1, |value| value.min(usize::MAX as u64) as usize);
+    let limit = opt_u64(args, "limit")
+        .ok()
+        .flatten()
+        .map_or(DEFAULT_READ_LINES, |value| value as usize)
+        .clamp(1, MAX_READ_LINES);
+    // The spans the read itself plans, with the file length unknown: an open end is `limit` long.
+    let lines = plan_spans(&selector, offset, limit, usize::MAX)
+        .iter()
+        .fold(0usize, |sum, span| {
+            sum.saturating_add(span.end.saturating_sub(span.start).saturating_add(1))
+        });
+    lines
+        .saturating_mul(PATH_ROW_BOUND)
+        .min(size)
+        .saturating_add(PATH_ROOM_FLOOR)
+}
+
+/// Whether a target's rows can become edit witnesses. Only plain, anchored or notebook text does:
+/// a directory, document, image, outline or raw read never witnesses, so cutting it hides nothing
+/// that an edit could rely on. When unsure this answers yes, which keeps the text whole.
+fn can_witness(ws: &Workspace, input: &str) -> bool {
+    if super::outline::target(ws, input).is_some() {
+        return false;
+    }
+    let Ok((path, selector)) = select::split_target(ws, input) else {
+        return true;
+    };
+    let Ok(physical) = ws.resolve_read(path) else {
+        return true;
+    };
+    let notebook = crate::tools::edit::edit_source::notebook_path(Path::new(path));
+    physical.is_file()
+        && (!selector.raw || notebook)
+        && (notebook
+            || super::documents::kind(path).is_none() && !crate::llm::images::is_image(&physical))
+}
+
+/// One target's text within its room. Text that overran its room is cut at a line boundary only
+/// when its rows cannot witness an edit; witnessing text is kept whole, since cutting it would
+/// leave witnesses for rows the output no longer shows.
+fn bounded_section(ws: &Workspace, input: &str, text: &str, room: usize) -> String {
+    const CUT: &str = "\n[output for this target was cut to its share of the budget; read it again with a narrower selector]";
+    if text.len() <= room || can_witness(ws, input) {
+        return text.to_owned();
+    }
+    let mut end = room.saturating_sub(CUT.len()).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let kept = &text[..end];
+    let kept = kept.rfind('\n').map_or("", |newline| &kept[..newline]);
+    format!("{kept}{CUT}")
+}
+
+/// Max-min fair split of `total` bytes over `demands`: a target asking for less than an even
+/// share gets exactly its demand, and the rest is divided evenly among the larger targets.
+fn fair_shares(demands: &[usize], total: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..demands.len()).collect();
+    order.sort_by_key(|&index| demands[index]);
+    let mut shares = vec![0; demands.len()];
+    let mut left = total;
+    for (done, &index) in order.iter().enumerate() {
+        let share = demands[index].min(left / (demands.len() - done));
+        shares[index] = share;
+        left -= share;
+    }
+    shares
+}
+
+/// Text between two targets' sections in the combined read.
+const SECTION_GAP: &str = "\n\n";
+/// Upper bound on the `[paths: …]` outcome footer that follows the combined text.
+const PATHS_FOOTER_BOUND: usize = 96;
+/// Upper bound on one planned row: a line truncated to `MAX_READ_LINE` plus its number prefix.
+const PATH_ROW_BOUND: usize = MAX_READ_LINE + 32;
+/// Upper bound on the bounded notice that names omitted targets by their original positions.
+const COMPACT_NOTICE_BOUND: usize = 160;
+/// Longest failure line kept in full; a failing target is only attempted with more than this left.
+const ERROR_LINE_CAP: usize = 512;
+
+/// The notice that names targets not read in this call, with a `paths` list that continues them.
+fn omitted_notice(rest: &[&str]) -> String {
+    format!(
+        "[{} remaining paths omitted: output limit reached; read them in a separate call with paths={}]",
+        rest.len(),
+        serde_json::json!(rest)
+    )
+}
+
+/// The bounded notice for omitted targets when their full list would not fit: their 1-based
+/// positions out of `count`. Their names are in the structured `targets` list.
+fn compact_notice(first: usize, count: usize) -> String {
+    format!(
+        "[paths {}-{count} of {count} omitted: output limit reached; their names are in the structured targets list; read them in separate calls]",
+        first + 1
+    )
+}
+
+/// One target's failure line, shortened so it never exceeds `ERROR_LINE_CAP` bytes.
+fn error_line(path: &str, error: &str) -> String {
+    let line = format!("[{path}] error: {error}");
+    if line.len() <= ERROR_LINE_CAP {
+        return line;
+    }
+    let mut end = ERROR_LINE_CAP - "…".len();
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &line[..end])
 }
 
 /// `read` with `paths`: the combined text plus one structured status per target. Partial results
@@ -709,7 +861,9 @@ pub(in crate::tools) fn read_paths_output(
 
 const MAX_READ_PATHS: usize = 16;
 const MAX_READ_PATHS_BYTES: usize = 96 * 1024;
-
+/// Room every target is given at least, and the overhead its planned size keeps beyond its file's
+/// bytes: enough for a header, a footer and a few rows.
+const PATH_ROOM_FLOOR: usize = 2 * READ_FOOTER_RESERVE;
 /// Lines in the rest of `reader`, which sits on a line boundary.
 fn count_remaining_lines(reader: &mut impl BufRead) -> io::Result<usize> {
     let mut lines = 0;

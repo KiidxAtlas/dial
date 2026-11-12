@@ -113,6 +113,13 @@ impl<'a> Agent<'a> {
         Ok(())
     }
 
+    /// Whether the active model accepts image input, so a client can refuse attachments early.
+    pub fn accepts_image_input(&self) -> bool {
+        self.backend
+            .as_ref()
+            .is_some_and(Backend::accepts_image_input)
+    }
+
     /// Move the main backend's resident local server out so the agent rebuilt after a settings
     /// change in this session can adopt it instead of reloading the weights.
     pub fn take_resident_server(&mut self) -> Option<crate::llm::server::ModelServer> {

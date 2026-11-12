@@ -456,6 +456,33 @@ impl Store {
         fact_by_id(&self.conn, id)
     }
 
+    /// Live facts, most recently updated first, bounded by `limit`.
+    pub fn list(&self, limit: usize) -> Result<Vec<Fact>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,content,source,revision,created,updated FROM facts
+             WHERE forgotten=0 ORDER BY updated DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| {
+            Ok(Fact {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                source: row.get(2)?,
+                revision: row.get(3)?,
+                created: row.get(4)?,
+                updated: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Completed turns queued for auto-retain extraction.
+    pub fn pending_turn_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM pending_turns", [], |row| row.get(0))?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     /// Ids of live facts matching any query token, best BM25 first.
     pub fn lexical(&self, query: &str, limit: usize) -> Result<Vec<i64>> {
         let Some(expression) = fts_expression(query) else {

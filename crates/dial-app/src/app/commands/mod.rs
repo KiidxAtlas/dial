@@ -34,7 +34,7 @@ mod security;
 pub(in crate::app) mod session;
 mod setup;
 pub(super) mod smithery;
-mod workspace;
+pub(in crate::app) mod workspace;
 
 /// Group metadata and static completions are projections of the one command table.
 pub(super) fn specs() -> impl Iterator<Item = &'static super::command_registry::CommandSpec> {

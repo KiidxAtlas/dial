@@ -1479,8 +1479,8 @@ impl Config {
                         None => (Some(main.clone()), RoleSource::FollowsMain),
                     },
                     ("embedding", None) => (None, RoleSource::NotSet),
-                    // The memory role never falls back to main: local and sharpshooter stay inactive
-                    // and semantic pauses automatic fact saving until it is assigned.
+                    // The memory role never falls back to main: local and sharpshooter stay inactive,
+                    // and semantic auto-retain uses the small role or pauses (`auto_retain_role`).
                     ("memory", None) => (None, RoleSource::NotSet),
                     (_, None) => (Some(main.clone()), RoleSource::FollowsMain),
                 };
@@ -1584,6 +1584,14 @@ impl Config {
         })
     }
 
+    /// Role that performs semantic auto-retain: the `memory` role when assigned, otherwise the
+    /// `small` (Fast helpers) role. Never the main conversation model; `None` pauses auto-retain.
+    pub fn auto_retain_role(&self) -> Option<&'static str> {
+        ["memory", "small"]
+            .into_iter()
+            .find(|role| self.role_selection(role).is_some())
+    }
+
     /// Selected memory work participates in the same local-compute lease as foreground turns.
     /// This route inspection borrows selectors; it never constructs a backend or clones Config.
     pub fn memory_uses_local_compute(&self) -> bool {
@@ -1597,11 +1605,12 @@ impl Config {
                 &self.memory.sharpshooter.model_role,
                 Some(&self.memory.sharpshooter.model),
             ),
-            // Automatic fact saving runs on the memory role and pauses while it is unassigned.
+            // Automatic fact saving runs on the memory role, else the small role, else pauses.
             MemoryBackendId::Semantic => {
                 self.memory.semantic.auto_retain
-                    && self.role_selection("memory").is_some()
-                    && self.memory_role_is_local("memory", None)
+                    && self
+                        .auto_retain_role()
+                        .is_some_and(|role| self.memory_role_is_local(role, None))
             }
             _ => false,
         }

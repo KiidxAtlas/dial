@@ -717,8 +717,11 @@ fn versioned_skill_examples_import_discover_and_load() {
         "code-cleanup",
         "debugging",
         "file-structure-cleanup",
+        "focused-rust-verification",
+        "frontend-rpc-feature",
         "implementation-quality",
         "test-runner",
+        "tool-schema-change",
     ];
     for name in names {
         // Import authored fixtures explicitly; Finder metadata is not a skill fixture.
@@ -744,6 +747,63 @@ fn versioned_skill_examples_import_discover_and_load() {
         assert!(catalog.contains(&format!("- {name}:")));
     }
     assert!(!catalog.contains("more skills"));
+}
+
+#[test]
+fn example_skills_are_matched_for_their_triggers_not_neighbouring_requests() {
+    let e = env();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/skills");
+    for name in [
+        "focused-rust-verification",
+        "frontend-rpc-feature",
+        "tool-schema-change",
+    ] {
+        import::run(&e.layout, &root.join(name), Scope::Project, false, false).unwrap();
+    }
+    let skills = discover(&e.layout);
+    // (request, the example expected to be named, or None when no example should be suggested).
+    // The unavailable-dependency row is a trigger: the skill still applies, and its own text says
+    // to report a missing prerequisite instead of substituting another check.
+    let cases: &[(&str, Option<&str>)] = &[
+        (
+            "Add an optional parameter to the bash tool schema without breaking recorded sessions",
+            Some("tool-schema-change"),
+        ),
+        (
+            "Run the narrowest Rust checks for this crate: module tests, the integration binary and the clippy gate",
+            Some("focused-rust-verification"),
+        ),
+        (
+            "Run make lint here, but cargo clippy is not installed: report the clippy gate as skipped",
+            Some("focused-rust-verification"),
+        ),
+        (
+            "Add an RPC method and schema entry so the client can call this terminal command",
+            Some("frontend-rpc-feature"),
+        ),
+        (
+            "Rename the heading in the README introduction paragraph",
+            None,
+        ),
+        ("Explain how the session log is stored on disk", None),
+        (
+            "Fix the invoice total when quantities differ, keep the public API and verify the behavior",
+            None,
+        ),
+    ];
+    for (request, expected) in cases {
+        let hint = match_hint(&skills, request, true);
+        let named: Vec<&str> = hint
+            .as_deref()
+            .and_then(|hint| hint.strip_prefix("Skill hint: "))
+            .and_then(|hint| hint.split(" may match").next())
+            .map(|names| names.split(", ").collect())
+            .unwrap_or_default();
+        match expected {
+            Some(name) => assert!(named.contains(name), "{request}: {hint:?}"),
+            None => assert!(named.is_empty(), "{request}: {hint:?}"),
+        }
+    }
 }
 
 #[test]

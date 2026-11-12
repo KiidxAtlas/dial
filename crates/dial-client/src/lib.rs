@@ -30,6 +30,12 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod conversation;
+pub use conversation::{
+    AssistantEntry, Conversation, Entry, NoticeEntry, PendingApproval, ToolCard, ToolEntry,
+    ToolOutcome, UserEntry,
+};
+
 #[cfg(test)]
 mod tests;
 
@@ -78,6 +84,7 @@ pub struct Launch {
     current_dir: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
     diagnostics: Diagnostics,
+    interactive: bool,
 }
 
 impl Launch {
@@ -90,6 +97,7 @@ impl Launch {
             current_dir: None,
             env: Vec::new(),
             diagnostics: Diagnostics::default(),
+            interactive: false,
         }
     }
 
@@ -129,6 +137,15 @@ impl Launch {
     #[must_use]
     pub fn diagnostics(mut self, diagnostics: Diagnostics) -> Self {
         self.diagnostics = diagnostics;
+        self
+    }
+
+    /// Declare that a person answers this client (a GUI rather than a script), so the engine may
+    /// ask interactive questions such as directory-access grants. Sent with `hello`, so it takes
+    /// effect on protocol 2 and later.
+    #[must_use]
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
         self
     }
 
@@ -556,11 +573,11 @@ impl Client {
         })?;
         if version > 1 {
             let left = deadline.saturating_duration_since(Instant::now());
-            let reply = client.call(
-                "hello",
-                json!({"protocol_version": version}),
-                left.max(Duration::from_millis(1)),
-            )?;
+            let mut hello = json!({"protocol_version": version});
+            if launch.interactive {
+                hello["interactive"] = json!(true);
+            }
+            let reply = client.call("hello", hello, left.max(Duration::from_millis(1)))?;
             client.protocol = reply["protocol_version"]
                 .as_u64()
                 .and_then(|v| u32::try_from(v).ok())
@@ -810,7 +827,8 @@ impl Client {
     }
 
     /// Save one setting. The running engine keeps its launch configuration; when the reply says
-    /// `restart_required`, apply it with [`Client::restart_and_resume`].
+    /// `restart_required`, apply it with [`Client::apply_settings`] (or
+    /// [`Client::restart_and_resume`] on engines that do not serve it).
     ///
     /// # Errors
     /// As [`Client::call`]; a bad key, value or scope fails with code `invalid_params`.
@@ -860,6 +878,118 @@ impl Client {
     /// As [`Client::call`]; a hook veto fails with code `refused`.
     pub fn undo(&mut self, turns: usize, timeout: Duration) -> Result<Value, ClientError> {
         self.call("undo", json!({"turns": turns}), timeout)
+    }
+
+    /// Start a turn with `text` and image attachments: `images` are file paths (absolute, `~`, or
+    /// relative to the workspace root) and `inline_images` are base64 image bytes.
+    ///
+    /// # Errors
+    /// As [`Client::request`]; the turn's reply fails with code `invalid_params` when an image
+    /// cannot be read or the active model does not accept image input.
+    pub fn send_with_images(
+        &mut self,
+        text: &str,
+        images: &[&str],
+        inline_images: &[&str],
+    ) -> Result<RequestId, ClientError> {
+        self.request(
+            "send",
+            json!({"text": text, "images": images, "inline_images": inline_images}),
+        )
+    }
+
+    /// Apply the saved settings to the running engine in place, keeping the session. The reply's
+    /// `applied` is `live` (nothing to rebuild) or `rebuild` (the agent was rebuilt).
+    ///
+    /// # Errors
+    /// As [`Client::call`]; fails with code `busy` while workers run and `invalid_params` when the
+    /// saved settings are invalid.
+    pub fn apply_settings(&mut self, timeout: Duration) -> Result<Value, ClientError> {
+        self.call("apply_settings", json!({}), timeout)
+    }
+
+    /// Set the session's approval mode: `ask`, `write`, `auto` or `readonly`.
+    ///
+    /// # Errors
+    /// As [`Client::call`]; another mode fails with code `invalid_params`.
+    pub fn set_approval(&mut self, mode: &str, timeout: Duration) -> Result<Value, ClientError> {
+        self.call("set_approval", json!({"mode": mode}), timeout)
+    }
+
+    /// Run one `/extensions` action (`intent` is tagged by `op`, for example
+    /// `{"op":"toggle_mcp","id":"github","enable":true}`). Actions that change files, run a
+    /// downloaded command, or remove or disable something need `confirm`. Saved changes apply on
+    /// [`Client::apply_settings`]. Progress arrives as `extension_progress` events.
+    ///
+    /// # Errors
+    /// As [`Client::call`]; an unconfirmed risky action fails with code `invalid_params`, a second
+    /// concurrent action with `busy`.
+    pub fn extension_action(
+        &mut self,
+        intent: Value,
+        confirm: bool,
+        timeout: Duration,
+    ) -> Result<Value, ClientError> {
+        self.call(
+            "extension_action",
+            json!({"intent": intent, "confirm": confirm}),
+            timeout,
+        )
+    }
+
+    /// Sign in to the configured MCP server `server`, answering `auth_prompt` events (provider
+    /// `mcp:<server>`) with `auth_code`. Apply the grant with `apply_settings {reconnect: true}`.
+    ///
+    /// # Errors
+    /// As [`Client::call`]; an unconfigured server fails with code `not_found`.
+    pub fn mcp_login(&mut self, server: &str, timeout: Duration) -> Result<Value, ClientError> {
+        self.call("mcp_login", json!({"server": server}), timeout)
+    }
+
+    /// The workspace roots: `{root, dirs}`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn list_dirs(&mut self, timeout: Duration) -> Result<Value, ClientError> {
+        self.call("list_dirs", json!({}), timeout)
+    }
+
+    /// Add (`add` true) or remove a workspace directory; the change is persisted.
+    ///
+    /// # Errors
+    /// As [`Client::call`]; a missing directory fails with code `invalid_params`.
+    pub fn workspace_dir(
+        &mut self,
+        path: &str,
+        add: bool,
+        timeout: Duration,
+    ) -> Result<Value, ClientError> {
+        let method = if add { "add_dir" } else { "remove_dir" };
+        self.call(method, json!({"path": path}), timeout)
+    }
+
+    /// The session's background jobs, also while a turn runs.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn list_jobs(&mut self, timeout: Duration) -> Result<Value, ClientError> {
+        self.call("list_jobs", json!({}), timeout)
+    }
+
+    /// Stop one background job by name.
+    ///
+    /// # Errors
+    /// As [`Client::call`]; an unknown job fails with code `not_found`.
+    pub fn stop_job(&mut self, name: &str, timeout: Duration) -> Result<Value, ClientError> {
+        self.call("stop_job", json!({"name": name}), timeout)
+    }
+
+    /// The protocol's JSON Schema, for generating client types in other languages.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn schema(&mut self, timeout: Duration) -> Result<Value, ClientError> {
+        self.call("get_schema", json!({}), timeout)
     }
 
     /// Apply saved settings by replacing this engine process: read the active session, shut

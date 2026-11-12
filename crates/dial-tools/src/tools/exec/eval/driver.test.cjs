@@ -205,9 +205,29 @@ test('withheld globals and redeclarations explain the persistent namespace', () 
   assert.equal(output.length, 4);
   assert.match(output[0].result.error, /ReferenceError: process is not defined[\s\S]*await import\('node:process'\)/);
   assert.equal(output[1].result.value, "'string'");
-  assert.match(output[2].result.error, /already been declared[\s\S]*Top-level declarations persist across cells/);
+  assert.match(output[2].result.error, /already been declared[\s\S]*Top-level declarations persist across cells[\s\S]*Use `var`/);
   assert.match(output[3].result.error, /undefinedThing is not defined/);
   assert.doesNotMatch(output[3].result.error, /\[dial\]/);
+});
+
+test('tool.batch is a promise-compatible array: sync indexing, await, then and catch', () => {
+  const output = run([
+    cell(1, "const pending = tool.batch([{name:'read',args:{path:'a'}}]); [pending.length, typeof pending.catch, await pending.then(rows => rows[0].text)]"),
+    reply(1, 1, [{ is_error: false, text: 'ok', data: 1, status: 'ok' }]),
+    cell(2, "tool.batch([{name:'read',args:{path:'b'}}]).catch(error => error.message)"),
+    reply(2, 2, null, 'batch denied', true),
+  ]);
+  const results = Object.fromEntries(output.filter(frame => frame.result).map(frame => [frame.id, frame.result]));
+  assert.match(results[1].value, /\[ 1, 'function', 'ok' \]/);
+  assert.match(results[2].value, /'batch denied'/);
+});
+
+test('Python tracebacks keep user frames and drop the kernel harness frames', () => {
+  const output = run([cell(1, "def boom():\n    raise ValueError('boom')\nboom()")], true);
+  const error = output[0].result.error;
+  assert.match(error, /File "<dial-kernel>", line 2, in boom[\s\S]*ValueError: boom/);
+  assert.doesNotMatch(error, /File "<string>"/);
+  assert.doesNotMatch(error, /in execute/);
 });
 
 test('all wire boundaries repair lone surrogates without damaging emoji or literal escapes', () => {

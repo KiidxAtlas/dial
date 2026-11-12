@@ -25,7 +25,7 @@ DIAL ?= $(BUILD_DIR)/dial
 
 
 .DEFAULT_GOAL := help
-.PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline test-smoke test-mlx preflight preflight-quick hooks
+.PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline bench-headline test-smoke test-mlx preflight preflight-quick hooks
 .PHONY: test-install test-build test-windows-contract test-packaging test-release-policy preflight-worktree
 .PHONY: release-check lint-deps clean test-clean
 
@@ -47,6 +47,7 @@ help:
 		'make test-drivers  Run browser, JavaScript eval and Python kernel transport contracts (Node 22+, Python 3)' \
 		'make test-python  Run Python contracts; report unavailable optional MLX checks' \
 		'make test-bench-offline  Run benchmark grader/reporting tests, no model or binary needed' \
+		'make bench-headline DIAL=target/local/dial [BASELINE=old.json]  Run the headline local-tasks score (needs a loaded model in HEADLINE_PROFILES)' \
 		'make test-packaging  Check distribution metadata and packaging contracts' \
 		'make test-release-policy  Check publication authorization and version ordering' \
 		'make release-check  No-build source, packaging, shell and tooling checks (RELEASE_TAG=v0.3.0 optional)' \
@@ -133,6 +134,20 @@ test-python:
 
 test-bench-offline:
 	$(PYTHON) -m unittest discover -s examples/benchmarks -p 'test_*.py'
+
+# Headline task score: the fixed local-tasks suite, run against an already-loaded model. Reports
+# go to a durable path under the target dir, never $TMPDIR, so an interrupted run keeps its
+# progress journal. BASELINE compares against an earlier headline report (correctness first).
+HEADLINE_PROFILES ?= examples/benchmarks/local-tasks-profiles.toml
+HEADLINE_REPORT := $(CARGO_TARGET_DIR)/benchmarks/headline-$(shell date +%Y%m%d-%H%M%S).json
+BASELINE ?=
+bench-headline:
+	@status=0; \
+	"$(DIAL)" benchmark examples/benchmarks/local-tasks.toml --profiles "$(HEADLINE_PROFILES)" --report "$(HEADLINE_REPORT)" || status=$$?; \
+	if [ -n "$(BASELINE)" ] && [ -f "$(HEADLINE_REPORT)" ]; then \
+		$(PYTHON) examples/benchmarks/compare.py "$(BASELINE)" "$(HEADLINE_REPORT)" || status=1; \
+	fi; \
+	exit $$status
 
 test-install:
 	bash scripts/test-install.sh

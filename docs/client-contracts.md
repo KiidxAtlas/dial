@@ -34,13 +34,19 @@ server supports them. Runtime offers and normal approvals remain authoritative.
 | Human questions | Native dialogs | Correlated question events, presentation acknowledgment and answers | Not negotiated; `questionInput.supported=false` |
 | Tool permissions | Native approval UI | Pending `approval_id` only (`allow`, `always`, `project`, `deny`) | `session/request_permission` with once, always, project and deny options; permission choices are not question answers |
 | Editor-buffer filesystem | Local workspace files | Local workspace files and separately declared host integrations | Negotiated `fs.writeTextFile`; reads use client buffers when `fs.readTextFile` is also offered |
-| Image prompts | Supported for image-capable models | Check `ready.image_input` | Check `promptCapabilities.image` |
+| Image prompts | Supported for image-capable models | `send` `images`/`inline_images`; check `ready.image_input` | Check `promptCapabilities.image` |
 | Live voice | Device/provider-dependent | `live_*` methods when advertised | Not exposed; audio prompt blocks also unsupported |
 | Host tools and URI schemes | Configured extensions | Explicit session-scoped declarations | No host-tool, URI or client MCP bridge |
-| Provider sign-in | Native setup | `auth` methods after protocol 2 negotiation | Existing external configuration only; no terminal/OAuth bridge |
+| Provider sign-in | Native setup | `auth` methods after protocol 2 negotiation, for every provider (typed values arrive as `auth_prompt`, masked when `secret`) | Existing external configuration only; no terminal/OAuth bridge |
+| Extensions and MCP sign-in | `/extensions`, `/mcp login` | `list_extensions`, `extension_action` (with `confirm` for risky actions), `mcp_login`/`mcp_logout`, then `apply_settings` (`reconnect: true` after a sign-in) | Not exposed |
 | Session administration | Session picker | `list_sessions`, `pin_session`, `delete_session`, `fork_session` | `session/list`, `session/fork`, `session/close`; no pin or delete |
 | Models and thinking | `/model`, `/thinking` | `list_models`, `set_model`, `set_thinking`, `state.current_model` | `model` and `thought_level` config options |
-| Settings | `/settings` | `settings_schema`, `get_settings`, `set_setting`, `reset_setting` (saved files; applied on restart) | Not exposed |
+| Settings | `/settings` | `settings_schema`, `get_settings`, `set_setting`, `reset_setting`, then `apply_settings` to apply in the running session | Not exposed |
+| Approval mode, retry, managed model | `/approval`, `/retry`, `/model restart` | `set_approval`, `retry`, `restart_model`; `state.approval` | Not exposed |
+| Workspace directories | `/add-dir`, `/remove-dir`, `/dirs`, directory-access prompts | `add_dir`, `remove_dir`, `list_dirs`; directory-access prompts after `hello {interactive: true}` | Not exposed |
+| Background jobs | `/processes` | `list_jobs`, `stop_job` (no terminal attach) | Not exposed |
+| Slash-command parity | Every command | `get_available_commands` rows carry `rpc`: the method, client presentation, or terminal-only with a reason | ACP `available_commands_update` |
+| Client code generation | Not applicable | `get_schema` (same document as `docs/rpc-schema.json`) | ACP's own schema |
 
 ACP's filesystem bridge does not grant new directory access or turn permission responses into
 free-form user input. Clients needing questions or live voice should use plain RPC; there is no
@@ -136,8 +142,13 @@ It provides:
 `cargo run -p dial-client --example headless -- "prompt"` drives one turn without a terminal UI
 (set `DIAL_BIN` and `DIAL_RPC_ARGS` to choose the engine); it denies every approval request.
 
-The client renders nothing and keeps no conversation model: execution-tree reduction and display
-remain the frontend's job, following the state rules above.
+The `Client` renders nothing. `dial_client::Conversation` is the shared view model: feed it
+`messages` history (`load_history`), the prompts you send (`push_user`) and every received
+message (`apply`), then draw `entries()` (user, assistant with reasoning, tool cards with their
+results, notices) next to `pending_approvals()`, `question()` and `todo()`. When
+`needs_reload()` reports an event-sequence gap, reload `messages` and call `load_history` again.
+Execution-tree reduction (`state_*` events) remains the frontend's job, following the state rules
+above.
 
 ## Executable conformance map
 

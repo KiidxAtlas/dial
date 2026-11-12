@@ -944,31 +944,32 @@ impl Picker {
         } else {
             " "
         };
-        // Wide rows spell the markers out; narrow rows keep one-character glyphs visible. The
-        // detail strip below the list explains an in-use session in full.
-        let flags = if width >= 44 {
-            let mut flags = String::new();
-            for (on, word) in [
-                (pinned, "[pin] "),
-                (current, "[current] "),
-                (open, "[in use] "),
-            ] {
-                if on {
-                    flags.push_str(word);
-                }
-            }
-            flags
+        // Wide rows spell the markers out as chips colored by meaning; narrow rows keep
+        // one-character glyphs visible. The detail strip below the list explains an in-use
+        // session in full.
+        let flags: Vec<(String, Tok)> = if width >= 44 {
+            let (open_chip, close_chip) = (theme.sym(Sym::ChipOpen), theme.sym(Sym::ChipClose));
+            [
+                (pinned, "pinned", Tok::Accent),
+                (current, "current", Tok::Success),
+                (open, "in use", Tok::Warning),
+            ]
+            .into_iter()
+            .filter(|(on, ..)| *on)
+            .map(|(_, word, tok)| (format!("{open_chip}{word}{close_chip} "), tok))
+            .collect()
         } else {
             let glyphs: String = [(pinned, '*'), (current, '@'), (open, '~')]
                 .into_iter()
                 .filter_map(|(on, glyph)| on.then_some(glyph))
                 .collect();
             if glyphs.is_empty() {
-                glyphs
+                Vec::new()
             } else {
-                format!("{glyphs} ")
+                vec![(format!("{glyphs} "), Tok::Accent)]
             }
         };
+        let flags_w: usize = flags.iter().map(|(flag, _)| text::width(flag)).sum();
         let age = if width >= 28 {
             age(&s.updated)
         } else {
@@ -980,16 +981,20 @@ impl Picker {
             String::new()
         };
         let title = format!("{indent}{}", label(s));
-        let room = width.saturating_sub(text::width(&flags) + text::width(&age) + 4);
+        let room = width.saturating_sub(flags_w + text::width(&age) + 4);
         let title = text::ellipsize(&title, room, theme.ascii());
-        let gap =
-            width.saturating_sub(text::width(&title) + text::width(&flags) + text::width(&age) + 2);
-        let spans = vec![
-            Span::styled(format!("{marker} {flags}"), theme.fg(Tok::Accent)),
+        let gap = width.saturating_sub(text::width(&title) + flags_w + text::width(&age) + 2);
+        let mut spans = vec![Span::styled(format!("{marker} "), theme.fg(Tok::Accent))];
+        spans.extend(
+            flags
+                .into_iter()
+                .map(|(flag, tok)| Span::styled(flag, theme.fg(tok))),
+        );
+        spans.extend([
             Span::styled(title, theme.fg(Tok::Text)),
             Span::raw(" ".repeat(gap)),
             Span::styled(age, theme.fg(Tok::Muted)),
-        ];
+        ]);
         body.push(if selected {
             chrome::selected_row(theme, spans, width)
         } else {

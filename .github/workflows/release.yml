@@ -185,8 +185,13 @@ jobs:
           DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
         run: |
           set -euo pipefail
-          printf 'export DIAL_RELEASE_PUBLIC_KEY=%q\n' "$DIAL_RELEASE_PUBLIC_KEY_PEM" > dist/install.sh
-          cat scripts/install.sh >> dist/install.sh
+          # install.sh is POSIX sh, so embed the key with single quotes (`printf %q` is bash-only).
+          pem=$(printf '%s' "$DIAL_RELEASE_PUBLIC_KEY_PEM" | tr -d '\r')
+          case "$pem" in *"'"*) echo 'DIAL_RELEASE_PUBLIC_KEY_PEM must not contain single quotes' >&2; exit 1 ;; esac
+          { head -n 1 scripts/install.sh
+            printf "DIAL_RELEASE_PUBLIC_KEY='%s'\nexport DIAL_RELEASE_PUBLIC_KEY\n" "$pem"
+            tail -n +2 scripts/install.sh; } > dist/install.sh
+          sh -n dist/install.sh
           python3 - <<'PY'
           import os
           import re

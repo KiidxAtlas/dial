@@ -24,9 +24,9 @@ impl<'a> Agent<'a> {
     /// Initial built-in schemas stay below this bound on lean and local model routes.
     const CORE_SCHEMA_BYTES: usize = 12 * 1024;
     /// Hosted routes ([`Self::hosted_route`]) have room for delegation and job control up front.
-    /// Raised from 24 KiB when `bash.trace` left the core offer without headroom for `task`, and
-    /// from 25 KiB when write batches/artifact sources, `bg` watches and read selectors grew.
-    const HOSTED_CORE_SCHEMA_BYTES: usize = 27 * 1024;
+    /// Raised from 24 KiB when `bash.trace` left the core offer without headroom for `task`, then
+    /// briefly to 27 KiB; shorter `eval`, `finish`, `message` and `task` descriptions restored 25 KiB.
+    const HOSTED_CORE_SCHEMA_BYTES: usize = 25 * 1024;
     /// The stable first-request offer, in priority order: each tool joins while it fits the route's
     /// budget. `bg` is the only way to wait for or stop a command that became a background job.
     /// Basic workspace operations precede questions, which precede optional execution helpers.

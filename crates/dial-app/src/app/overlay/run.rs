@@ -16,7 +16,7 @@ use crate::ui::statusline;
 use crate::ui::term::OverlayTerminal;
 use anyhow::Result;
 use crossterm::event::Event;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// What a blocking wait (compute lock, local preparation) does after one terminal event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,7 +272,7 @@ pub(in crate::app) fn overlay_input(
             Event::Key(key) => {
                 if let Some(value) = paste_guard.text_for_key(
                     *key,
-                    poll(Duration::ZERO).unwrap_or(false),
+                    crate::ui::input::input_follows(key),
                     Instant::now(),
                 ) {
                     if value.is_empty() {

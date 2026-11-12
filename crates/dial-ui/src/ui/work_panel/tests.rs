@@ -1,23 +1,6 @@
 use super::*;
 use serde_json::json;
 
-#[test]
-fn recorded_references_never_look_like_passing_checks() {
-    let view = render(Tab::Evidence, 120, 12);
-    let shown = plain(&view).join("\n");
-    assert!(
-        !shown.contains('✓'),
-        "references are observations, not check verdicts: {shown}"
-    );
-    let theme = Theme::builtin("dial-dark").unwrap();
-    assert!(
-        view.iter()
-            .flat_map(|row| &row.spans)
-            .all(|span| span.style.fg != theme.fg(Tok::Success).fg)
-    );
-    assert!(shown.contains("not verified"), "{shown}");
-}
-
 fn plain(rows: &Rows) -> Vec<String> {
     rows.iter()
         .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -90,7 +73,6 @@ fn one_compact_card_lists_steps_beside_the_tab_strip_at_capped_width() {
             "Draw the cards",
             "○ Write the docs",
             " plan ",
-            " evidence ",
             " mode ",
         ] {
             assert!(joined.contains(needle), "{needle:?} in {joined}");
@@ -134,15 +116,9 @@ fn a_finished_plan_header_reports_all_steps_done() {
 }
 
 #[test]
-fn tabs_show_the_focused_step_evidence_and_approval_mode() {
+fn tabs_show_the_focused_step_and_approval_mode() {
     let plan = plain(&render(Tab::Plan, 120, 12)).join("\n");
     assert!(plan.contains("Draw the cards"), "{plan}");
-
-    let evidence = plain(&render(Tab::Evidence, 120, 12)).join("\n");
-    assert!(
-        evidence.contains("src/paint.rs:195") && evidence.contains("not verified"),
-        "{evidence}"
-    );
 
     let mode = plain(&render(Tab::Mode, 120, 12)).join("\n");
     assert!(
@@ -151,39 +127,8 @@ fn tabs_show_the_focused_step_evidence_and_approval_mode() {
             && mode.contains("Shift+Tab cycles ask, write and read-only"),
         "{mode}"
     );
-    assert_eq!(Tab::Plan.next(), Tab::Evidence);
+    assert_eq!(Tab::Plan.next(), Tab::Mode);
     assert_eq!(Tab::Mode.next(), Tab::Plan);
-}
-
-#[test]
-fn evidence_lists_newest_steps_first_and_counts_what_the_card_cuts() {
-    let mut todo = TodoList::new();
-    let tasks: Vec<_> = (0..4)
-        .map(|i| json!({"content": format!("step {i}")}))
-        .collect();
-    todo.call(&json!({"op": "set", "tasks": tasks}));
-    for i in 0..3 {
-        todo.call(&json!({"op": "done", "evidence": [format!("ref {i}a"), format!("ref {i}b")]}));
-    }
-    // Plenty of room: every reference, newest step first.
-    let all = plain(&render_todo(&todo, Tab::Evidence, 120, 40)).join("\n");
-    assert!(!all.contains("more reference"), "{all}");
-    assert!(
-        all.find("step 2").unwrap() < all.find("step 0").unwrap(),
-        "{all}"
-    );
-    // Eight rows: borders, tabs, the caveat, three rows and the overflow count.
-    let view = render_todo(&todo, Tab::Evidence, 120, 8);
-    let text = plain(&view);
-    assert_eq!(view.len(), 8, "{text:?}");
-    let joined = text.join("\n");
-    assert!(
-        joined.contains("step 2") && joined.contains("ref 2b"),
-        "{joined}"
-    );
-    assert!(!joined.contains("step 0"), "{joined}");
-    // Shown: step 2, ref 2a, ref 2b; the other four references are counted.
-    assert!(joined.contains("+4 more references"), "{joined}");
 }
 
 #[test]
