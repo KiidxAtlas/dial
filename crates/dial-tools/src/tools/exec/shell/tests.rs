@@ -1545,7 +1545,7 @@ fn a_writable_sqlite3_open_is_refused_before_it_can_destroy_a_damaged_wal() {
         assert_eq!(guard(command), None, "{command}");
     }
     // Through the bash tool the command never runs, so the WAL keeps its bytes.
-    let out = execute(
+    let out = crate::tools::execute(
         &ws,
         "bash",
         &json!({"command": "sqlite3 main.db 'SELECT 1'; rm main.db-wal"}),
