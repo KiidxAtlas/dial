@@ -27,8 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client = Client::connect(&launch, STARTUP)?;
     eprintln!(
-        "connected: session {} model {} protocol {}",
-        client.ready().session_id,
+        "connected: model {} protocol {}",
         client.ready().model,
         client.protocol_version()
     );
