@@ -357,6 +357,9 @@ fn execute(job: &Job, payload: &[u8]) -> Result<String, String> {
             if super::is_archive(format) {
                 return super::archives::read_bytes(format, name, payload, member.as_deref());
             }
+            if let Some(text) = super::read_payload(format, payload, member.as_deref()) {
+                return text;
+            }
             let mut file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
             file.write_all(payload).map_err(|e| e.to_string())?;
             file.rewind().map_err(|e| e.to_string())?;
@@ -377,6 +380,8 @@ fn execute(job: &Job, payload: &[u8]) -> Result<String, String> {
                     name,
                     member.as_deref().ok_or("JSON query missing")?,
                 ),
+                // A downloaded database snapshot; live files use `Job::Sqlite` on their path.
+                "sqlite" => super::sqlite::read(file.path(), member.as_deref()),
                 _ => Err(format!("unsupported snapshot document format {format:?}")),
             }
         }

@@ -275,3 +275,31 @@ fn capability_search_reminds_once_and_never_after_a_search() {
     searched.searched();
     assert!(!searched.remind(denial, true));
 }
+
+#[test]
+fn a_rejected_report_states_the_status_first_and_drops_model_directed_recovery_text() {
+    let reason = "Cannot complete: focused checks failed and have not passed since. After repairing the cause, start with the retained checks below; additional failures may remain.\nRecovery call: verify {\"targets\":[\"cargo check: crates/dial-tools\"]}\nBlocking checks: cargo check: crates/dial-tools. A check registered under another name does not discharge them. Do not replace a valid check with a weaker one; report a blocker if it cannot be rerun.\nEarlier completion reminder: Current edits have no passing applicable check: cargo check: crates/dial-tools.\ncargo check: crates/dial-tools failed:\nCommand: cargo check --offline --all-targets\nerror[E0433]: cannot find type `DataType` in this scope\n --> crates/dial-tools/src/tools/fs/documents/columnar/tests.rs:8:26\n  |\n8 |         Field::new(\"id\", DataType::Int64, false),\n  |                          ^^^^^^^^ use of undeclared type `DataType`\nerror: could not compile `dial-tools` (lib test) due to 2 previous errors\n[exit code: 101]\n";
+    let report = rejected_report(
+        "Rewrote the read description.",
+        reason,
+        TurnOutcome::Incomplete,
+    );
+    assert_eq!(
+        report,
+        "Incomplete: focused checks failed and have not passed since. \
+Blocking checks: cargo check: crates/dial-tools. First error: error[E0433]: cannot find type \
+`DataType` in this scope (crates/dial-tools/src/tools/fs/documents/columnar/tests.rs:8:26)\n\n\
+Rewrote the read description."
+    );
+    let blocked = rejected_report(
+        " Need the key. ",
+        "Completion cannot follow a failed or refused call in the same batch.",
+        TurnOutcome::Blocked,
+    );
+    assert_eq!(
+        blocked,
+        "Blocked: Completion cannot follow a failed or refused call in the same batch.\n\nNeed the key."
+    );
+    let long = rejected_report("x", &"word ".repeat(400), TurnOutcome::Incomplete);
+    assert!(long.chars().count() < 700 && long.contains('…'), "{long}");
+}

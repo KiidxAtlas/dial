@@ -27,10 +27,9 @@ fn fallback_to(url: &str) -> String {
 
 #[test]
 fn a_new_turn_recovers_a_failed_stream_writer_without_replaying_the_failed_turn() {
-    let server = llm::fake::serve(vec![
-        response("This reply cannot be published.", None),
-        response("Recovered.", None),
-    ]);
+    // Only the new turn may reach the provider: the failed turn's first journal write happens
+    // when its request starts, so that request (whose reply could not be published) is never sent.
+    let server = llm::fake::serve(vec![response("Recovered.", None)]);
     with_agent("[compaction]\nenabled=false\n", |agent| {
         connect(agent, &server.url);
         let journal = agent.session.runtime().stream_writer().unwrap();
@@ -54,10 +53,10 @@ fn a_new_turn_recovers_a_failed_stream_writer_without_replaying_the_failed_turn(
     let requests = completion_requests(&server);
     assert_eq!(
         requests.len(),
-        2,
-        "one failed request and one explicitly started new turn"
+        1,
+        "the failed turn sends nothing; only the explicitly started new turn reaches the model"
     );
-    assert!(mentions(&requests[1], "Answer the new request"));
+    assert!(mentions(&requests[0], "Answer the new request"));
 }
 
 #[test]
@@ -704,7 +703,7 @@ fn an_edit_whose_gate_check_fails_is_reminded_once_then_disclosed() {
     });
     assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
     assert!(
-        report.text.contains("no passing applicable check")
+        report.text.starts_with("Incomplete:")
             && report.text.contains("notes")
             && report.text.contains("note check failed"),
         "the rejected candidate retains the observed check failure: {}",
@@ -1110,6 +1109,47 @@ fn an_auto_backgrounded_command_loads_bg_for_the_next_request() {
         result.contains("background job")
             && result.contains("`bg wait` returns its output")
             && !result.contains("tool_load"),
+        "{result}"
+    );
+}
+
+/// Unattended runs copy task inputs silently: the first request carries no preservation note,
+/// and the model hears of a copy only when its original is lost, with the artifact named.
+#[test]
+fn a_lost_task_input_is_reported_with_its_retained_copy_and_no_upfront_note() {
+    struct Quiet;
+    impl Ui for Quiet {}
+    let server = llm::fake::serve(vec![
+        response("", Some(("bash", json!({"command":"rm main.db-wal"})))),
+        slots(),
+        response("The WAL file is gone.", None),
+    ]);
+    with_agent(
+        "approval='auto'\n[compaction]\nenabled=false\n[verification]\nenabled=false",
+        |agent| {
+            std::fs::write(agent.workspace.root().join("main.db-wal"), b"original WAL").unwrap();
+            connect(agent, &server.url);
+            agent.modes.launch.unattended = true;
+            agent.turn("Recover the database.", &mut Quiet).unwrap();
+        },
+    );
+    let requests = completion_requests(&server);
+    assert_eq!(requests.len(), 2);
+    let first = requests[0].to_string();
+    assert!(!first.contains("Initial task preservation"), "{first}");
+    assert!(!first.contains("input_evidence_changed"), "{first}");
+    let result = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        result.contains("<dial-notice kind=\"input_evidence_changed\">")
+            && result.contains("main.db-wal"),
         "{result}"
     );
 }

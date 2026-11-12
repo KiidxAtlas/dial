@@ -1,8 +1,8 @@
 //! Bounded workspace search. Pages use sorted component/depth-first file order.
-//! `skip` counts results (matching lines, or non-overlapping multiline matches); in the
-//! `output="files"`/`"count"` summary modes it counts matching files instead.
-//! Copy `next_cursor` and `remaining_skip` from the footer to continue an unchanged
-//! query/workspace; cursors are inclusive file positions plus consumed match counts.
+//! A bare numeric `cursor` skips that many results (matching lines, or non-overlapping
+//! multiline matches; matching files in the `output="files"`/`"count"` summary modes).
+//! Copy `next_cursor` from the footer to continue an unchanged query/workspace; it encodes an
+//! inclusive file position, the matches already consumed there and any skip still pending.
 //! Coverage is per call; ignored subtrees are explicitly not enumerated.
 //! Grep edit evidence uses immutable UTF-8 source snapshots and only complete
 //! verbatim rows surviving the final 48 KiB page budget, including its footer.
@@ -351,14 +351,30 @@ pub(crate) fn scheduling_scopes(ws: &Workspace, args: &Value) -> Result<Vec<Path
     scopes(ws, args)
 }
 
-fn cursor(args: &Value, ws: &Workspace) -> Result<Option<(PathBuf, usize)>, String> {
+/// Where a page starts: a walk position with the matches already consumed in that file, plus
+/// results still to skip. `cursor` is one string: `"N"` skips N results from the start;
+/// `"consumed:skip:path"` is a `next_cursor` from an earlier page.
+fn continuation(args: &Value, ws: &Workspace) -> Result<(Option<(PathBuf, usize)>, u64), String> {
     let Some(value) = args.get("cursor").filter(|v| !v.is_null()) else {
-        return Ok(None);
+        return Ok((None, 0));
     };
-    let path = ws.resolve_read(req_str(value, "path")?)?;
-    let consumed = opt_u64(value, "match")?.unwrap_or(0);
-    let consumed = usize::try_from(consumed).map_err(|_| "cursor.match is too large")?;
-    Ok(Some((path, consumed)))
+    let token = value
+        .as_str()
+        .ok_or("cursor must be the next_cursor string from the previous page, or a number of results to skip as a string")?;
+    let number = |text: &str| {
+        text.parse::<u64>()
+            .map_err(|_| format!("cursor {token:?} is not a next_cursor value"))
+    };
+    let mut parts = token.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(skip), None, None) => Ok((None, number(skip)?)),
+        (Some(consumed), Some(skip), Some(path)) if !path.is_empty() => {
+            let consumed = usize::try_from(number(consumed)?)
+                .map_err(|_| "cursor match count is too large")?;
+            Ok((Some((ws.resolve_read(path)?, consumed)), number(skip)?))
+        }
+        _ => Err(format!("cursor {token:?} is not a next_cursor value")),
+    }
 }
 
 fn page_footer(
@@ -373,17 +389,42 @@ fn page_footer(
             let path = relative
                 .to_str()
                 .ok_or("cannot encode continuation for a non-UTF-8 filename; narrow the scope")?;
-            Ok::<_, String>(serde_json::json!({"path": path, "match": consumed}))
+            Ok::<_, String>(format!("{consumed}:{remaining_skip}:{path}"))
         })
         .transpose()?;
     // The traversal order is part of the tool description; repeat it only when there is a
     // continuation to copy, which is when it matters. Without one the page line says nothing.
-    if next.is_none() && remaining_skip == 0 {
-        return Ok(format!("[coverage: {coverage}]\n"));
-    }
-    let page = serde_json::json!({"next_cursor": next, "remaining_skip": remaining_skip,
-        "order": "sorted component/depth-first; unchanged query and workspace required"});
+    let page = match next {
+        Some(next) => serde_json::json!({"next_cursor": next,
+            "order": "sorted component/depth-first; unchanged query and workspace required"}),
+        // The requested skip passed every result; say so rather than imply an empty search.
+        None if remaining_skip > 0 => {
+            serde_json::json!({"next_cursor": null, "unused_skip": remaining_skip})
+        }
+        None => return Ok(format!("[coverage: {coverage}]\n")),
+    };
     Ok(format!("[coverage: {coverage}]\n[page: {page}]\n"))
+}
+
+/// The body of a page with no matches. When files were only partly scanned or unreadable, absence
+/// is unknown beyond the scanned bytes, which a bare "no matches" would hide.
+fn empty_body(partial: usize, unreadable: usize) -> String {
+    if partial == 0 && unreadable == 0 {
+        return "no matches\n".to_string();
+    }
+    let mut gaps = Vec::new();
+    if partial > 0 {
+        gaps.push(format!(
+            "{partial} file(s) scanned only up to the 4 MiB limit"
+        ));
+    }
+    if unreadable > 0 {
+        gaps.push(format!("{unreadable} file(s) unreadable"));
+    }
+    format!(
+        "no matches in the scanned bytes, but {}: absence there is unknown. Page a large text file with read format=text offset/limit, or search it with bash\n",
+        gaps.join(" and ")
+    )
 }
 
 fn finish_page(
@@ -657,15 +698,14 @@ pub(in crate::tools) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String
         missing,
     }
     .note();
-    let resume = cursor(args, ws)?;
+    let (resume, mut skip) = continuation(args, ws)?;
     if resume.as_ref().is_some_and(|(_, consumed)| *consumed != 0) {
-        return Err("glob cursor.match must be 0".into());
+        return Err("a glob cursor never has consumed matches; copy next_cursor unchanged".into());
     }
     let limit = opt_u64(args, "limit")?.unwrap_or(MAX_LIST as u64);
     if limit == 0 || limit > MAX_LIST as u64 {
         return Err(format!("limit must be 1..={MAX_LIST}"));
     }
-    let mut skip = opt_u64(args, "skip")?.unwrap_or(0);
     let preview = opt_bool(args, "preview")?;
     let mut preview_paths = Vec::new();
     let unpaged = skip == 0 && resume.is_none();
@@ -1255,7 +1295,7 @@ impl GrepState {
             let omitted = if next.is_some() {
                 let cap = self.continuation_cap();
                 format!(
-                    "; page_capped_by={cap}; files and matches past the cap are omitted from this page and not counted; continue by repeating this grep with cursor=next_cursor and skip=remaining_skip from [page]"
+                    "; page_capped_by={cap}; files and matches past the cap are omitted from this page and not counted; continue by repeating this grep with cursor=next_cursor from [page]"
                 )
             } else {
                 String::new()
@@ -1281,7 +1321,7 @@ impl GrepState {
             };
             let footer = page_footer(ws, next.as_ref(), self.skip, &coverage)?;
             let body = if self.summary_files == 0 {
-                "no matches\n".to_string()
+                empty_body(self.oversized, self.unreadable)
             } else if self.mode == OutputMode::Count {
                 format!(
                     "{} {} in {} {}\n",
@@ -1575,7 +1615,7 @@ impl GrepState {
             // without scanning on, so the footer says so instead of guessing.
             let mut omitted = if next.is_some() {
                 format!(
-                    "; page_capped_by={}; page_files_with_matches={}; matches and files past the cap are omitted from this page and not counted; continue by repeating this grep with cursor=next_cursor and skip=remaining_skip from [page]",
+                    "; page_capped_by={}; page_files_with_matches={}; matches and files past the cap are omitted from this page and not counted; continue by repeating this grep with cursor=next_cursor from [page]",
                     self.continuation_cap(),
                     self.matched_files.len(),
                 )
@@ -1638,7 +1678,7 @@ impl GrepState {
                 )
                 .ok_or_else(too_large)?;
             let body_len = if self.out.is_empty() {
-                "no matches\n".len()
+                empty_body(self.oversized, self.unreadable).len()
             } else {
                 self.out.len()
             };
@@ -1679,7 +1719,8 @@ impl GrepState {
         };
         let returned_body = self.out.len();
         if self.out.is_empty() {
-            self.out.push_str("no matches\n");
+            self.out
+                .push_str(&empty_body(self.oversized, self.unreadable));
         }
         // Footer validation and all row removals precede any witness publication.
         // The fixed warning reserve cannot evict a row after it has been recorded.
@@ -1795,7 +1836,13 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
         } else {
             artifact_text(ws, path)?
         };
-        let skip = opt_u64(args, "skip")?.unwrap_or(0) as usize;
+        let (resume, skip) = continuation(args, ws)?;
+        if resume.is_some() {
+            return Err(format!(
+                "{path} pages with a numeric cursor from its own capped result, not a workspace next_cursor"
+            ));
+        }
+        let skip = usize::try_from(skip).map_err(|_| "cursor is too large")?;
         let max = opt_u64(args, "limit")?
             .unwrap_or(DEFAULT_GREP_MATCHES as u64)
             .min(MAX_GREP_MATCHES as u64) as usize;
@@ -1814,9 +1861,11 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     let mode = OutputMode::parse(args)?;
     let resolved = resolve_scopes(ws, args)?;
     let roots = &resolved.roots;
-    let resume = cursor(args, ws)?;
+    let (resume, skip) = continuation(args, ws)?;
     if mode != OutputMode::Lines && resume.as_ref().is_some_and(|(_, consumed)| *consumed != 0) {
-        return Err("cursor.match must be 0 for output=\"files\" or \"count\"".into());
+        return Err(
+            "this cursor resumes inside a file, so it applies only to output=\"lines\"".into(),
+        );
     }
     let context = opt_u64(args, "context")?
         .unwrap_or(0)
@@ -1833,7 +1882,6 @@ fn grep_with_workers(ws: &Workspace, args: &Value, workers: usize) -> Result<Str
     } else {
         GREP_PER_FILE
     };
-    let skip = opt_u64(args, "skip")?.unwrap_or(0);
     let hidden = bool_default(args, "hidden", true)?;
     let gitignore = bool_default(args, "gitignore", true)?;
     // Batched discovery can walk beyond the page. Reconstruct only its coverage
@@ -1968,6 +2016,7 @@ fn grep_text(
         .skip(skip);
     let page: Vec<usize> = hits.by_ref().take(max).collect();
     let mut capped = hits.next().is_some();
+    let mut shown = page.len();
     let mut out = String::new();
     // The last line already written, so overlapping context is never repeated.
     let mut written: Option<usize> = None;
@@ -1999,13 +2048,17 @@ fn grep_text(
             out.truncate(end);
             out.push_str("\n[output capped]\n");
             capped = true;
+            shown = position + 1;
             break;
         }
     }
     if page.is_empty() {
         out.push_str("No matches.\n");
     } else if capped {
-        out.push_str("[results capped; increase skip to continue]\n");
+        out.push_str(&format!(
+            "[results capped; continue with cursor=\"{}\"]\n",
+            skip + shown
+        ));
     }
     out
 }

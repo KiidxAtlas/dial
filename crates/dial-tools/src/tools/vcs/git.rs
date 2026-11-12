@@ -1182,6 +1182,32 @@ impl Tool for Git {
         }
     }
 
+    /// Object-database and GitHub reads touch no working-tree file; working-tree reads declare
+    /// their `path`, or every root without one. jj snapshots the whole working copy first.
+    fn resources(
+        &self,
+        workspace: &Workspace,
+        args: &Value,
+    ) -> Option<crate::tools::surface::resources::Access> {
+        use crate::tools::surface::resources::{Access, workspace_reads};
+        let action = args["action"].as_str().filter(|a| READS.contains(a))?;
+        if use_jj(workspace, args, action).ok()? {
+            return Some(workspace_reads(workspace));
+        }
+        match (action, args["path"].as_str()) {
+            (
+                "log" | "reflog" | "show" | "branches" | "pr_view" | "pr_checks" | "issue_view",
+                _,
+            ) => Some(Access::default()),
+            ("status" | "diff" | "blame", Some(path)) => Some(Access {
+                reads: vec![path.into()],
+                writes: Vec::new(),
+            }),
+            ("status" | "diff", None) => Some(workspace_reads(workspace)),
+            _ => None,
+        }
+    }
+
     fn name(&self) -> &str {
         "git"
     }

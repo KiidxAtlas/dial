@@ -69,8 +69,29 @@ pub fn set_enabled(layout: &Layout, name: &str, enabled: bool, scope: Scope) -> 
 
 pub const HELP: &str = "Skills: /skills list | sources | enable <name> [--user] | disable <name> [--user] | import <path> [--user] [--dry-run] [--update] | install <git-url>[@ref][#path] | install <registry>/<skill>[@ref] [--user] | update [name] | remove <name> | installed | search <query>";
 
+/// The `/skills` listing: installed skills, then the slash-command syntax.
 pub fn list(layout: &Layout) -> Result<String> {
-    let mut lines: Vec<String> = installed(layout)?
+    let mut lines = listed_skills(layout)?;
+    if lines.is_empty() {
+        lines.push("No installed skills. Browse /skills sources, then import a directory.".into());
+    }
+    lines.push(HELP.into());
+    Ok(lines.join("\n"))
+}
+
+/// The `dial skills list` listing: installed skills only. Slash syntax does not apply in a shell,
+/// and `dial skills --help` documents the subcommands.
+pub fn list_for_cli(layout: &Layout) -> Result<String> {
+    let lines = listed_skills(layout)?;
+    Ok(if lines.is_empty() {
+        "No installed skills. `dial skills sources` shows skills you can import.".into()
+    } else {
+        lines.join("\n")
+    })
+}
+
+fn listed_skills(layout: &Layout) -> Result<Vec<String>> {
+    Ok(installed(layout)?
         .into_iter()
         .map(|(skill, enabled)| {
             format!(
@@ -83,12 +104,7 @@ pub fn list(layout: &Layout) -> Result<String> {
                 skill.description
             )
         })
-        .collect();
-    if lines.is_empty() {
-        lines.push("No installed skills. Browse /skills sources, then import a directory.".into());
-    }
-    lines.push(HELP.into());
-    Ok(lines.join("\n"))
+        .collect())
 }
 
 fn source_roots(layout: &Layout, home: Option<&Path>) -> Vec<(String, PathBuf)> {

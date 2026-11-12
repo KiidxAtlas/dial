@@ -7,7 +7,7 @@
 use crate::tools::exec::shell::ProcessGroup;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -293,7 +293,9 @@ pub(crate) enum Verdict {
     Aborted,
 }
 
-/// Runs one `--while` / `--until` condition through `sh -c` in `cwd` and maps its exit status.
+/// Runs one `--while` / `--until` condition through the host shell
+/// ([`crate::tools::exec::shell::host_script_command`]: `sh -c`, or Git Bash/PowerShell on
+/// Windows) in `cwd` and maps its exit status.
 /// Exit 0 and exit 1 answer the question; anything else, a timeout, or a spawn failure breaks the loop.
 pub(crate) fn evaluate(
     condition: &Condition,
@@ -302,10 +304,15 @@ pub(crate) fn evaluate(
     timeout: Duration,
 ) -> Verdict {
     let quoted = format!("`{}`", condition.command);
-    let mut command = Command::new("sh");
+    let mut command = match crate::tools::exec::shell::host_script_command(&condition.command) {
+        Ok(command) => command,
+        Err(error) => {
+            return Verdict::Stop(format!(
+                "Loop condition {quoted} could not run: {error}. Loop mode disabled."
+            ));
+        }
+    };
     command
-        .arg("-c")
-        .arg(&condition.command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

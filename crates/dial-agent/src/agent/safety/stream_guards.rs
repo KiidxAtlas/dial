@@ -284,11 +284,21 @@ pub(crate) fn render_tool_call_loop_escalation(
 /// the guidance text to send. A streak past [`TOOL_CALL_LOOP_THRESHOLD`] gets the stronger
 /// escalation. Shared by the main loop and child workers so both see the same redirect.
 pub(crate) fn repetition_guidance(messages: &[serde_json::Value]) -> Option<(String, String)> {
-    if let Some(repeat) = crate::agent::safety::guard::RepeatedToolCall::detect(
+    let repeat = crate::agent::safety::guard::RepeatedToolCall::detect(
         messages,
         TOOL_CALL_LOOP_THRESHOLD,
         TOOL_CALL_LOOP_EXEMPT_TOOLS,
-    ) {
+    );
+    repetition_guidance_with_streak(messages, repeat.as_ref())
+}
+
+/// The parent retains the detected streak for duplicate-call suppression; workers only need
+/// advice. Both use the same priority and rendering without detecting the streak twice.
+pub(crate) fn repetition_guidance_with_streak(
+    messages: &[serde_json::Value],
+    repeat: Option<&crate::agent::safety::guard::RepeatedToolCall>,
+) -> Option<(String, String)> {
+    if let Some(repeat) = repeat {
         let render = if repeat.count > TOOL_CALL_LOOP_THRESHOLD {
             render_tool_call_loop_escalation
         } else {
@@ -307,17 +317,19 @@ pub(crate) fn repetition_guidance(messages: &[serde_json::Value]) -> Option<(Str
             ),
         ));
     }
-    crate::agent::safety::guard::CallCycle::detect(messages, TOOL_CALL_LOOP_EXEMPT_TOOLS).map(
-        |cycle| {
-            (
-                format!(
-                    "Tool calls cycling with period {}; redirecting the model",
-                    cycle.period
-                ),
-                cycle.guidance(),
-            )
-        },
-    )
+    if let Some(cycle) =
+        crate::agent::safety::guard::CallCycle::detect(messages, TOOL_CALL_LOOP_EXEMPT_TOOLS)
+    {
+        return Some((
+            format!(
+                "Tool calls cycling with period {}; redirecting the model",
+                cycle.period
+            ),
+            cycle.guidance(),
+        ));
+    }
+    crate::agent::safety::guard::RecurringCall::detect(messages, TOOL_CALL_LOOP_EXEMPT_TOOLS)
+        .map(|recurring| (recurring.event(), recurring.guidance()))
 }
 
 pub(crate) fn render_duplicate_call_result(

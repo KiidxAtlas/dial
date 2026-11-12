@@ -11,3 +11,12 @@ fn parses_exact_utc_timestamps_and_rejects_malformed_ones() {
     assert_eq!(parse_utc("2024-01-01T00:00:0"), None);
     assert_eq!(parse_utc("2024-01-01T0+:00:00"), None);
 }
+
+#[test]
+fn local_stamp_has_the_fixed_query_shape() {
+    let stamp = local_stamp(1_700_000_000_000).unwrap();
+    assert_eq!(stamp.len(), 19, "{stamp}");
+    assert_eq!(&stamp[4..5], "-");
+    assert_eq!(&stamp[10..11], " ");
+    assert_eq!(&stamp[13..14], ":");
+}

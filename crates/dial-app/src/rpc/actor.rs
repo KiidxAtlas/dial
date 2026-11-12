@@ -571,10 +571,7 @@ impl ActorRuntime<'_> {
             "task_status" => self
                 .agent
                 .subagent_status(params["id"].as_str(), &mut self.ui),
-            _ => Err(anyhow::Error::new(RequestError {
-                code: "unknown_method",
-                message: "unknown RPC method".to_owned(),
-            })),
+            _ => Err(super::unknown_method()),
         }
     }
 

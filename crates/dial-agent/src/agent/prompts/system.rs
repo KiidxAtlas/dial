@@ -20,13 +20,13 @@ Finish the request and its checks; plans and progress reports do not complete im
 pub(crate) const TOOL_POLICY: &str = "
 
 # Tool policy
-- Inspect the requested target, owner and evidence with the most precise tool available, then act on supported, reversible choices.
+- Inspect target, owner and evidence with the most precise tool available; act on supported, reversible choices.
 - Ask one concise question only when investigation leaves an ambiguity that materially changes correctness, scope or authorization.
-- Read a file before editing it.
+- Read a file before editing it. Inspect task inputs with `read` before mutation.
 - Produce data and generated files with code that also checks the result.
-- Keep tool arguments short; omit narration comments in scripts and prefer edit for localized changes.";
+- Keep tool arguments short; no script narration; use edit for local changes.";
 pub(crate) const LEAN_BATCHING: &str = "
-- Send independent reads and searches as parallel tool calls in one response, along with disjoint edits and routine todo updates; sequence dependent steps, verify after the edits a check covers, and reuse unchanged evidence.";
+- Send independent reads and searches as parallel tool calls in one response, along with disjoint edits and routine todo updates; `&&`-chain dependent commands, verify after the edits a check covers, and reuse unchanged evidence.";
 pub(crate) const LEAN_ONE_CALL: &str = "
 - This route allows one tool call per response: read its result before choosing the next action.";
 /// Present only when the presentation itself limits calls per response.
@@ -53,7 +53,7 @@ pub(crate) const TESTING_DECISIONS: &str = "
 - Prove new algorithms/formats on tiny known-answer/round-trip cases; keep tests meaningful and temporary outputs out of deliverables.
 - Reuse passing checks while inputs and acceptance criteria are unchanged. If a new helper disagrees, minimize the helper and artifact before rewriting previously passing code.
 - Test doubles and unavailable runtimes do not establish live behavior.";
-pub(crate) const ARTIFACT_CHECK_RULE: &str = "For standalone artifacts without a test suite, use verify acceptance: {name, command} for one focused format/constraint check that fails on violations. Avoid empty verification and unrelated test searches. Helpers do not replace task/operator checks; disclose remaining gaps.";
+pub(crate) const ARTIFACT_CHECK_RULE: &str = "For standalone artifacts without a test suite, send verify acceptance with the write: {name, command} for one focused format/constraint check that fails on violations. Avoid empty verification and unrelated test searches. Helpers don't replace task/operator checks; disclose gaps.";
 pub(crate) const DELIVERY: &str = "
 
 # Delivery
@@ -88,7 +88,7 @@ pub(crate) const PREVIEW_SERVER_RULES: &str = " Temporary servers: `bg`, readine
 pub(crate) const MONITOR_RULES: &str = "\n\n# Application monitoring\nWatches (`bg` watch/watches/unwatch): Dial `bg` jobs/project-evidenced logs only; no process scans. One-shot approval; no chat substitute/denial retry. New output only; expiry/match disarms. Rearm/restart/kill/takeover: fresh approval. Disclose unsupported terminals.";
 pub(crate) const DELEGATION_RULES: &str = "\n\n# Delegation coordination\n- Workers lack this conversation: hand off observable outcomes, owned files, interfaces, evidence and check ownership, not transcripts or whole unrelated documents. For substantial implementation, use available `work_packet`/`acceptance_checks`; name uncovered criteria.\n- Keep one integration/shared-check owner. Start independent tasks together, do non-overlapping work, collect with `wait`. Message only for new requirements, not status.\n- Reuse delivered findings. Report incomplete/failed workers honestly. Finished workers supply candidates, not verified acceptance; check combined results after edits settle.\n- Respect scout/reviewer/planner read-only roles; workers implement, test-runners author/run/diagnose tests. Don't invent work to keep workers busy.";
 
-pub(crate) const SELECTIVE_DELEGATION_RULES: &str = "\n\n# Selective delegation\n- Keep coupled planning, implementation, tests and diagnosis in this loop. Specialist labels don't justify spawning models; long commands need background jobs, not subagents.\n- Delegate substantial independent parallel work, fresh-context review, or work that would crowd context. Use scouts for stalled scoping and test-runners for independent test work.";
+pub(crate) const SELECTIVE_DELEGATION_RULES: &str = "\n\n# Selective delegation\n- Keep coupled planning, implementation, tests and diagnosis in this loop. Specialist labels don't justify spawning models; long commands need background jobs, not subagents.\n- Delegate substantial independent parallel work, fresh-context review, or work that would crowd context. Use scouts for stalled scoping and test-runners for independent test work.\n- Start delegated work with `task` action=start, keep doing independent work, then collect with `wait`.";
 pub(crate) const LEAN_SELECTIVE_DELEGATION_RULES: &str = "\n\n# Selective delegation\nDelegate only substantial independent/context-heavy work or fresh review, not labels or long commands (`bg`).";
 // Shared across full/lean profiles; present only when the parent can delegate.
 pub(crate) const TESTER_DELEGATION_RULES: &str = "\n\n# Prefer subagents\n- Delegate separable implementation, investigation, planning and review; keep user communication and integration here. Skip trivial/tightly coupled handoffs.\n- Start test-runner after covered code settles, supplying criteria, files, interfaces and focused commands; collect with `wait`. Avoid same-file races and duplicate runs. Check inline for small coupled work, unavailable/refused delegation or a user request.\n- Collect exact commands, source state, failures and gaps. Production repairs need explicit non-overlapping scope.";

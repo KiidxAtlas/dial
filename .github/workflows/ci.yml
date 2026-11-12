@@ -16,11 +16,20 @@ jobs:
   validate:
     name: No-build readiness
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      # Find an already-tested pull request whose candidates main can reuse.
+      actions: read
+      pull-requests: read
     outputs:
       candidate-tag: ${{ steps.candidate.outputs.tag }}
+      candidate-ref: ${{ steps.candidate.outputs.ref }}
       epoch: ${{ steps.candidate.outputs.epoch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Release-candidate reuse checks that a merged pull request head is in main's history.
+          fetch-depth: 0
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
@@ -43,24 +52,47 @@ jobs:
           echo "48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9  $archive" | sha256sum -c -
           tar -xzf "$archive" -C "$tool_dir" --strip-components=1 cargo-machete-v0.9.2-x86_64-unknown-linux-musl/cargo-machete
           PATH="$tool_dir:$PATH" make lint-deps
-      - name: Select untagged main release candidate
+      - name: Select untagged release candidate
         id: candidate
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # Version-bump pull requests from this repository build candidates too, so a release
+        # tagged right after the merge reuses them instead of waiting for main to rebuild.
+        if: >-
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           tag="$(python3 -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
-          if ! git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
-            echo "tag=$tag" >> "$GITHUB_OUTPUT"
-            echo "epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
+            exit 0
           fi
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # Tests run on the merge with main; candidates are built from the head. Record them
+            # only when both are the same tree, so a release can match them by tree.
+            if [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse "$HEAD_SHA^{tree}")" ]; then
+              echo "Pull request is behind main; no release candidates for this run." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          elif RELEASE_TAG="$tag" scripts/release-candidate-run.sh "$GITHUB_SHA" > "$RUNNER_TEMP/reused"; then
+            echo "Reusing candidates from pull request CI run $(cat "$RUNNER_TEMP/reused")." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "tag=$tag"
+            echo "ref=$HEAD_SHA"
+            echo "epoch=$(git show -s --format=%ct "$HEAD_SHA")"
+          } >> "$GITHUB_OUTPUT"
 
   release-candidates:
     name: Unsigned release candidates
     needs: validate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.validate.outputs.candidate-tag != ''
+    if: needs.validate.outputs.candidate-tag != ''
     uses: ./.github/workflows/release-build.yml
     with:
       tag: ${{ needs.validate.outputs.candidate-tag }}
+      ref: ${{ needs.validate.outputs.candidate-ref }}
       epoch: ${{ needs.validate.outputs.epoch }}
 
   test:
@@ -69,8 +101,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, "${{ vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel' }}", ubuntu-22.04]
-    runs-on: ${{ matrix.os }}
+        os: [macos-15, ubuntu-22.04]
+    runs-on: ${{ github.event_name == 'push' && matrix.os == 'macos-15' && vars.DIAL_MACOS_RUNNER || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux sandbox
@@ -84,9 +116,6 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-          # Retain Intel's source-built cryptography wheel without PR/tag cache copies.
-          cache: ${{ github.ref == 'refs/heads/main' && runner.os == 'macOS' && runner.arch == 'X64' && 'pip' || '' }}
-          cache-dependency-path: scripts/requirements-ci.lock
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
@@ -119,26 +148,30 @@ jobs:
         timeout-minutes: 10
         run: cargo test --locked --profile ci --workspace linux_sandbox_enforces_filesystem_and_both_network_modes
       - name: Build
-        # The `dial` library and its unit-test build each peak near 5 GB in rustc. Built together
-        # they exceed the 7 GB macOS arm64 runner and swap (11-16 min); one at a time they fit.
-        # Workspace crates (crates/dial-*) are built one lib target at a time for the same reason.
-        # The `ci` profile drops debug info, which cuts rustc memory, link time and cache size.
+        # The full workspace build and test suite run on Linux. macOS runs the focused contract below,
+        # which builds only the test targets it selects. On Linux the `dial` library and its
+        # unit-test build each peak near 5 GB in rustc and are still built one at a time, and
+        # workspace crates one lib target at a time. The `ci` profile drops debug info, which cuts
+        # rustc memory, link time and cache size.
+        if: runner.os == 'Linux'
         run: |
           cargo build --locked --profile ci --workspace --lib
           cargo test --locked --profile ci --workspace --lib --no-run
           cargo build --locked --profile ci --workspace --all-targets
+      - name: Run focused macOS contract suite
+        # Modules with macOS-specific code: scripts/macos-contract.txt. Portable tests already ran
+        # in full on Linux; repeating them here took ~11 minutes of the macOS critical path.
+        if: runner.os == 'macOS'
+        run: python3 scripts/windows-contract.py --contract scripts/macos-contract.txt --label macOS --profile ci
       - name: Install cargo-nextest (verified archive)
-        # SHA-256 pins are from the upstream 0.9.150 release checksum assets.
+        # SHA-256 pin is from the upstream 0.9.150 release checksum asset.
+        if: runner.os == 'Linux'
         env:
           NEXTEST_VERSION: 0.9.150
         run: |
           set -euo pipefail
           platform=x86_64-unknown-linux-gnu
           checksum=b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f
-          if [[ "$RUNNER_OS" == macOS ]]; then
-            platform=universal-apple-darwin
-            checksum=82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a
-          fi
           archive="$RUNNER_TEMP/nextest.tar.gz"
           curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-$platform.tar.gz" -o "$archive"
           printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 -c -
@@ -149,23 +182,31 @@ jobs:
         # cargo-nextest runs every test binary at once, one process per test (.config/nextest.toml
         # fails a test still running after 5 minutes); `cargo test` ran the binaries one after
         # another. Doctests still run under `cargo test --doc`.
-        run: make test-nextest TEST_PROFILE=ci
+        if: runner.os == 'Linux'
+        run: make test-nextest TEST_PROFILE=ci NEXTEST_PROFILE=ci
+      - name: Preserve per-test timing and failures
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-timings-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
       # The steps below exercise the installed binary, real terminals and runtime overhead. They
-      # are not architecture-sensitive and macos-15 runs them; skipping them on the slower Intel
-      # runner keeps it from being the CI long pole. Intel still builds and runs every test above,
-      # and the release workflow builds and smoke-tests the packaged x86_64-apple-darwin archive.
+      # are not architecture-sensitive, so only Ubuntu runs them; the macOS job ends after its tests
+      # instead of adding about ten minutes to the CI critical path. `make preflight` runs the same
+      # smoke and real-terminal suites on a developer's macOS host.
       - name: Check slim build
-        if: matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
+        if: runner.os == 'Linux'
         run: cargo check --locked --profile ci --no-default-features -p dial --bin dial
       - name: Install executable and verify artifact contracts
-        if: matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
+        if: runner.os == 'Linux'
         timeout-minutes: 10
         run: |
           mkdir -p target/installed/bin
           install -m755 "${CARGO_TARGET_DIR:-target}/ci/dial" target/installed/bin/dial
           make test-smoke DIAL=target/installed/bin/dial
       - name: Real terminal and crash lifecycle
-        if: matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
+        if: runner.os == 'Linux'
         timeout-minutes: 10
         run: |
           python3 examples/benchmarks/interactive_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/main
@@ -173,17 +214,17 @@ jobs:
           python3 examples/benchmarks/session_contention_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/contention
           python3 examples/benchmarks/side_lifecycle_smoke.py --dial target/installed/bin/dial --captures target/pty-captures/side-lifecycle
       - name: Record runtime overhead
-        if: matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
+        if: runner.os == 'Linux'
         continue-on-error: true
         run: cargo run --locked --profile ci --example runtime_baseline -- target/runtime-baseline.json
       - name: Preserve runtime baseline
-        if: always() && matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
+        if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runtime-baseline-${{ matrix.os }}
           path: target/runtime-baseline.json
       - name: Preserve terminal failure evidence
-        if: failure() && matrix.os != (vars.DIAL_MACOS_INTEL_RUNNER || 'macos-15-intel')
+        if: failure() && runner.os == 'Linux'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terminal-${{ matrix.os }}
@@ -195,7 +236,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, macos-15, windows-2025]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.event_name == 'push' && matrix.os == 'macos-15' && vars.DIAL_MACOS_RUNNER || github.event_name == 'push' && matrix.os == 'windows-2025' && vars.DIAL_WINDOWS_RUNNER || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust and Clippy
@@ -204,8 +245,12 @@ jobs:
           rustup component add clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: lint-${{ matrix.os }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Linux checks and feature coverage use the same dev-profile dependency artifacts.
+          # Reuse the existing feature cache instead of storing another ~400 MB copy.
+          shared-key: ${{ matrix.os == 'ubuntu-22.04' && 'features-ubuntu-22.04' || '' }}
+          key: ${{ matrix.os != 'ubuntu-22.04' && format('lint-{0}', matrix.os) || '' }}
+          # The largest feature selection remains the sole writer of the shared Linux cache.
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.os != 'ubuntu-22.04' }}
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
@@ -216,9 +261,11 @@ jobs:
 
   musl:
     # Release builds ship musl binaries; check them on every push so target-specific type
-    # differences (for example libc's ioctl request type) fail here, not at publish time.
+    # differences (for example libc's ioctl request type) fail here, not at publish time. A main
+    # push that builds release candidates already compiles both musl targets, so it skips this.
     name: musl check (${{ matrix.target }})
     needs: validate
+    if: github.event_name != 'push' || needs.validate.outputs.candidate-tag == ''
     strategy:
       fail-fast: false
       matrix:
@@ -257,28 +304,6 @@ jobs:
       - run: make test-python PYTHON=python
       - name: Benchmark graders and repeated-trial reporting
         run: make test-bench-offline PYTHON=python
-  docker:
-    name: Container image
-    needs: validate
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Build image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          build-args: DIAL_BUILD_REVISION=${{ github.sha }}
-          load: true
-          tags: dial:ci
-          cache-from: type=gha,scope=docker
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=docker,mode=max' || '' }}
-      - name: Smoke test
-        run: |
-          docker run --rm dial:ci --version
-          docker run --rm dial:ci --help >/dev/null
-      - name: Validate compose file
-        run: docker compose config --quiet
   installer-windows:
     name: Windows installer (${{ matrix.shell }})
     strategy:
@@ -299,7 +324,7 @@ jobs:
   windows-rust:
     name: Windows Rust contract
     needs: validate
-    runs-on: windows-2025
+    runs-on: ${{ github.event_name == 'push' && vars.DIAL_WINDOWS_RUNNER || 'windows-2025' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0

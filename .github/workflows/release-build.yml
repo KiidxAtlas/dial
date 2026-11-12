@@ -7,6 +7,10 @@ on:
         description: Validated stable release tag matching the checkout
         required: true
         type: string
+      ref:
+        description: Commit to build; candidates record its tree, which a release must match
+        required: true
+        type: string
       epoch:
         description: Source commit timestamp
         required: true
@@ -22,6 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -42,7 +47,9 @@ jobs:
           spec = importlib.util.spec_from_file_location('policy', 'scripts/release-policy.py')
           policy = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(policy)
-          identity = policy.candidate_identity(os.environ['GITHUB_SHA'])
+          import subprocess
+          git = lambda *args: subprocess.check_output(['git', *args], text=True).strip()
+          identity = policy.candidate_identity(git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD^{tree}'))
           path = Path('candidate.json')
           path.write_text(json.dumps(identity) + '\n', encoding='utf-8')
           assert json.loads(path.read_text()) == identity
@@ -66,8 +73,8 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
           # Cross-compiled on Apple Silicon: the Intel runner's build took ~24 min and set the
-          # candidate critical path. The smoke test runs the binary under Rosetta; native Intel
-          # testing stays in ci.yml (DIAL_MACOS_INTEL_RUNNER).
+          # candidate critical path. The smoke test runs the binary under Rosetta; CI does not
+          # run the test suite on Intel hardware.
           - os: macos-15
             target: x86_64-apple-darwin
             cache-suffix: -arm64-host
@@ -79,30 +86,24 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-musl
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.event_name == 'push' && matrix.os == 'macos-15' && vars.DIAL_MACOS_RUNNER || matrix.os }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap musl-tools
-      - name: Install OpenSSL 3 on macOS
-        if: runner.os == 'macOS'
-        run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-          # Share the Intel wheel cache with main CI; avoid isolated PR/tag caches.
-          cache: ${{ github.ref == 'refs/heads/main' && runner.os == 'macOS' && runner.arch == 'X64' && 'pip' || '' }}
-          cache-dependency-path: scripts/requirements-ci.lock
       - name: Install Rust
         run: |
           rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
-      - name: Install installer test dependencies
-        run: python3 -m pip install --disable-pip-version-check --require-hashes -r scripts/requirements-ci.lock
       - name: Ensure Rosetta for the x86_64 macOS smoke test
         if: matrix.target == 'x86_64-apple-darwin'
         run: /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
@@ -116,8 +117,6 @@ jobs:
           key: release-${{ matrix.target }}${{ matrix.cache-suffix }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Test terminal installer
-        run: bash scripts/test-install.sh
       - name: Build release binary
         env:
           MACOSX_DEPLOYMENT_TARGET: '13.0'
@@ -162,9 +161,11 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.event_name == 'push' && matrix.os == 'windows-2025' && vars.DIAL_WINDOWS_RUNNER || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - name: Install pinned Rust
         run: |
           rustup show active-toolchain

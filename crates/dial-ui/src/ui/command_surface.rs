@@ -148,7 +148,7 @@ impl Category {
 mod commands;
 pub use commands::{
     ArgumentPolicy, Availability, AvailabilityContext, COMMANDS, CommandAlias, CommandSpec,
-    DuringTurn, LiveForm, Surface, command_spec, unavailable_reason,
+    DuringTurn, LiveForm, Surface, busy_effect, command_spec, unavailable_reason,
 };
 
 /// Category lookup is a thin projection of the shared command table.

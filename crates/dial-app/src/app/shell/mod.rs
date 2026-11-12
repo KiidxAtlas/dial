@@ -133,6 +133,8 @@ pub(super) struct Shell {
     pub(super) keys: Keymap,
     pub(super) composer: Composer,
     input_recovery: input_recovery::InputRecovery,
+    /// Recent approval-policy decisions, oldest first, for `/permissions why`.
+    pub(super) policy_log: std::collections::VecDeque<String>,
     pub(super) paste_guard: crate::ui::input::PasteGuard,
     pub(super) transcript: Transcript,
     pub(super) status: StatusData,

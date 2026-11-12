@@ -81,7 +81,7 @@ fn one_compact_card_lists_steps_beside_the_tab_strip_at_capped_width() {
             assert_eq!(text::line_width(row), width.min(MAX_WIDTH), "{row:?}");
         }
         let text = plain(&view);
-        assert!(text[0].starts_with('╭') && text[0].contains("tasks 1/3"));
+        assert!(text[0].starts_with('╭') && text[0].contains("Plan ▰▰▰▱▱▱▱▱ 1/3 done"));
         assert!(text.last().unwrap().starts_with('╰'));
         assert!(text.last().unwrap().contains("Ctrl+F next tab"));
         let joined = text.join("\n");
@@ -123,6 +123,17 @@ fn a_single_pending_step_renders_as_a_four_row_card_without_filler() {
 }
 
 #[test]
+fn a_finished_plan_header_reports_all_steps_done() {
+    let mut todo = plan();
+    todo.call(&json!({"op": "done"}));
+    todo.call(&json!({"op": "done"}));
+    assert_eq!(
+        plan_title(&todo, &Theme::builtin("dial-dark").unwrap()),
+        "Plan ▰▰▰▰▰▰▰▰ 3/3 done"
+    );
+}
+
+#[test]
 fn tabs_show_the_focused_step_evidence_and_approval_mode() {
     let plan = plain(&render(Tab::Plan, 120, 12)).join("\n");
     assert!(plan.contains("Draw the cards"), "{plan}");
@@ -137,7 +148,7 @@ fn tabs_show_the_focused_step_evidence_and_approval_mode() {
     assert!(
         mode.contains("● Ask first")
             && mode.contains("sandbox workspace")
-            && mode.contains("Shift+Tab cycles the mode"),
+            && mode.contains("Shift+Tab cycles ask, write and read-only"),
         "{mode}"
     );
     assert_eq!(Tab::Plan.next(), Tab::Evidence);

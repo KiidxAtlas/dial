@@ -62,6 +62,11 @@ const PRESENT: &[&str] = &[
     "g++",
     "javac",
     "pytest",
+    "xxd",
+    "od",
+    "hexdump",
+    "file",
+    "strings",
 ];
 
 /// Commonly assumed tools; their absence is reported explicitly.

@@ -59,6 +59,85 @@ fn working_directory(
     }
     Ok((cwd, command.to_owned()))
 }
+
+/// Refuses a `sqlite3` CLI command that would open a database read-write while its `-wal`
+/// holds data SQLite would discard (an invalid header or checksum chain, or an uncommitted
+/// tail). Such an open checkpoints, truncates or deletes the WAL, destroying the only copy of
+/// those bytes, so the refusal comes before the command runs. `-readonly`, `mode=ro` and
+/// `immutable=1` opens, databases whose WAL SQLite would apply in full, and opens after an
+/// earlier step of the same command names the WAL (replacing or backing it up first) are left
+/// alone.
+fn sqlite_wal_guard(ws: &Workspace, args: &Value, command: &str) -> Option<String> {
+    use std::io::Read as _;
+    if !command.contains("sqlite3") {
+        return None;
+    }
+    let (cwd, script) = working_directory(ws, args, command).ok()?;
+    let heads = crate::tools::exec::bash_interceptor::pipeline_heads(&script);
+    for (index, (head, _)) in heads.iter().enumerate() {
+        let words: Vec<&str> = head
+            .split_whitespace()
+            .map(|word| word.trim_matches(['\'', '"']))
+            .collect();
+        let Some(at) = words.iter().position(|word| !word.contains('=')) else {
+            continue;
+        };
+        if words[at] != "sqlite3" && !words[at].ends_with("/sqlite3") {
+            continue;
+        }
+        let operands = &words[at + 1..];
+        let read_only = |word: &&str| {
+            matches!(*word, "-readonly" | "--readonly")
+                || word.contains("mode=ro")
+                || word.contains("immutable=1")
+        };
+        if operands.iter().any(read_only) {
+            continue;
+        }
+        for operand in operands.iter().filter(|word| !word.starts_with('-')) {
+            let operand = operand.strip_prefix("file:").unwrap_or(operand);
+            let database = operand.split('?').next().unwrap_or(operand);
+            if database.is_empty() {
+                continue;
+            }
+            let wal_name = format!("{database}-wal");
+            let handled_earlier = heads[..index].iter().any(|(earlier, _)| {
+                earlier.split_whitespace().any(|word| {
+                    word.trim_matches(['\'', '"'])
+                        .trim_end_matches('/')
+                        .ends_with(&wal_name)
+                })
+            });
+            if handled_earlier {
+                continue;
+            }
+            let Some(wal_path) = cwd
+                .join(&wal_name)
+                .to_str()
+                .and_then(|path| ws.resolve_read(path).ok())
+            else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            let Ok(file) = std::fs::File::open(&wal_path) else {
+                continue;
+            };
+            if file.take(64 * 1024 * 1024).read_to_end(&mut bytes).is_err()
+                || !crate::tools::fs::binary::wal_discards_data(&bytes)
+            {
+                continue;
+            }
+            let report = crate::tools::fs::binary::wal(&bytes);
+            let summary = report.lines().next().unwrap_or_default();
+            let summary = summary.split(". ").next().unwrap_or(summary);
+            return Some(format!(
+                "Blocked before running: `{wal_name}` ({} bytes) holds data SQLite would discard ({summary}). This read-write `sqlite3` open would checkpoint, truncate or delete it, and the bytes could not be recovered afterwards. Inspect without changing anything: `read {database}` (schema, rows and WAL status) or `read {wal_name}:bytes=0+64`; query with `sqlite3 -readonly` or a `file:{database}?mode=ro` URI. Repair the WAL before a writable open, or move it aside first if it should really be discarded.",
+                bytes.len()
+            ));
+        }
+    }
+    None
+}
 const MAX_COMMAND: usize = 64 * 1024;
 // Keep the model-facing preview small; complete output is spooled independently below.
 const BASH_HEAD: usize = 4 * 1024;
@@ -68,6 +147,8 @@ const BASH_TAIL: usize = 4 * 1024;
 const FULL_FILTER_MAX: u64 = 4 * 1024 * 1024;
 /// Diagnostic lines kept from the omitted middle (a compiler's first error is often there).
 const BASH_DIAGNOSTICS: usize = 3 * 1024;
+/// Farthest a cut moves to reach a line boundary; a longer line is cut by bytes instead.
+const BASH_LINE_SLACK: usize = 512;
 #[cfg(not(windows))]
 const CLT_DIR: &str = "/Library/Developer/CommandLineTools";
 
@@ -188,7 +269,9 @@ fn created_entries_note(before: Option<&DirectoryEntries>, dir: &Path) -> Option
         note.push_str(&format!("[new in the working directory: {shown}{suffix}; remove scratch outputs the task does not want]\n"));
     }
     if !lost.is_empty() {
-        note.push_str(&format!("[working-directory inputs changed: {}. If unintended, inspect retained input artifacts or checkpoints before reconstructing; do not invent lost data.]\n", lost.iter().take(10).cloned().collect::<Vec<_>>().join("; ")));
+        // A copy exists only when input preservation retained one; that path adds its own
+        // `input_evidence_changed` notice naming the artifacts. Never imply a copy otherwise.
+        note.push_str(&format!("[working-directory inputs changed: {}. Dial kept a copy only if an input_evidence_changed notice names its artifact; then restore exact bytes in eval with dial.writeBytes(path, dial.readBytes(artifact)). Otherwise the original bytes are gone: do not search for copies or invent lost data.]\n", lost.iter().take(10).cloned().collect::<Vec<_>>().join("; ")));
     }
     (!note.is_empty()).then_some(note)
 }
@@ -324,6 +407,7 @@ struct Capture {
     head: Vec<u8>,
     tail: Vec<u8>,
     total: usize,
+    newlines: usize,
     diagnostics: crate::tools::code::diagnostics::Collector,
 }
 
@@ -333,6 +417,7 @@ impl Capture {
             head: Vec::new(),
             tail: Vec::new(),
             total: 0,
+            newlines: 0,
             diagnostics: crate::tools::code::diagnostics::Collector::new(BASH_DIAGNOSTICS),
         }
     }
@@ -346,6 +431,7 @@ impl Capture {
 
     fn push(&mut self, mut chunk: &[u8]) {
         self.total += chunk.len();
+        self.newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
         if self.head.len() < BASH_HEAD {
             let take = (BASH_HEAD - self.head.len()).min(chunk.len());
             self.head.extend_from_slice(&chunk[..take]);
@@ -366,7 +452,6 @@ impl Capture {
         if self.tail.len() > BASH_TAIL {
             self.drop_front(self.tail.len() - BASH_TAIL);
         }
-        self.diagnostics.finish();
         let mut dropped = self.total - self.head.len() - self.tail.len();
         if dropped == 0 {
             // Head and tail are contiguous: decode them together so a character that straddles
@@ -375,6 +460,37 @@ impl Capture {
             all.extend_from_slice(&self.tail);
             return String::from_utf8_lossy(&all).into_owned();
         }
+        // Move both cuts to nearby line boundaries, so the view shows whole lines and the
+        // omission can be named as a line range of the complete output.
+        let slack = self.tail.len().min(BASH_LINE_SLACK);
+        let tail_at_line = match self.tail[..slack].iter().position(|byte| *byte == b'\n') {
+            Some(newline) => {
+                self.drop_front(newline + 1);
+                dropped += newline + 1;
+                true
+            }
+            None => false,
+        };
+        self.diagnostics.finish();
+        let floor = self.head.len().saturating_sub(BASH_LINE_SLACK);
+        if let Some(newline) = self.head[floor..].iter().rposition(|byte| *byte == b'\n') {
+            let keep = floor + newline + 1;
+            // The collector never saw the head, so a diagnostic line that starts there stays.
+            let fragment = String::from_utf8_lossy(&self.head[keep..]);
+            if !crate::tools::code::diagnostics::is_diagnostic(&fragment) {
+                dropped += self.head.len() - keep;
+                self.head.truncate(keep);
+            }
+        }
+        let count = |bytes: &[u8]| bytes.iter().filter(|byte| **byte == b'\n').count();
+        let first_line = count(&self.head) + 1;
+        // A tail that starts inside a line leaves that line partly omitted.
+        let last_line = self.newlines - count(&self.tail) + usize::from(!tail_at_line);
+        let range = if last_line > first_line {
+            format!(" (lines {first_line}-{last_line})")
+        } else {
+            format!(" (line {first_line})")
+        };
         // Around an omission, trim each side back to whole characters and count the rest as omitted.
         let head_end = complete_utf8_prefix(&self.head);
         let tail_start = self
@@ -387,6 +503,9 @@ impl Capture {
         self.head.truncate(head_end);
         self.tail.drain(..tail_start);
         let mut text = String::from_utf8_lossy(&self.head).into_owned();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
         let (kept, lines, overflow) = self.diagnostics.kept();
         if dropped > 0 && lines > 0 {
             let more = if overflow > 0 {
@@ -394,9 +513,11 @@ impl Capture {
             } else {
                 String::new()
             };
-            text.push_str(&format!("\n[... {dropped} bytes of output omitted; {lines} diagnostic line(s) from that part follow{more} ...]\n{kept}[... end of omitted-part diagnostics ...]\n"));
+            text.push_str(&format!("[... {dropped} bytes of output omitted{range}; {lines} diagnostic line(s) from that part follow{more} ...]\n{kept}[... end of omitted-part diagnostics ...]\n"));
         } else if dropped > 0 {
-            text.push_str(&format!("\n[... {dropped} bytes of output omitted ...]\n"));
+            text.push_str(&format!(
+                "[... {dropped} bytes of output omitted{range} ...]\n"
+            ));
         }
         text.push_str(&String::from_utf8_lossy(&self.tail));
         text
@@ -772,6 +893,9 @@ fn with_bash_interceptor(
     }
     if command.len() > MAX_COMMAND {
         return Err(format!("command is longer than {MAX_COMMAND} bytes"));
+    }
+    if let Some(message) = sqlite_wal_guard(ws, args, command) {
+        return Ok(ToolOutput::err(message).with_effects(crate::runtime::execution::Effects::None));
     }
     use crate::tools::exec::bash_interceptor::{self, Verdict};
     let interceptor = ws.bash_interceptor().map(|(config, offered)| {
@@ -1461,6 +1585,44 @@ fn git_for_windows_bash(bin_dirs: impl IntoIterator<Item = PathBuf>) -> Option<P
     })
 }
 
+/// Windows PowerShell running `script`, exiting with the last native command's failure status.
+fn powershell_command(script: &str) -> Result<std::process::Command, String> {
+    let system_root = std::env::var_os("SystemRoot").ok_or("SystemRoot is unavailable")?;
+    let powershell = Path::new(&system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let command = format!(
+        "$global:LASTEXITCODE = 0; {script}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}"
+    );
+    let mut spawn = std::process::Command::new(powershell);
+    spawn
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(command);
+    Ok(spawn)
+}
+
+/// A command that runs a user-written script outside the `bash` tool, such as `/loop --while`
+/// conditions and ratchet flow commands: `sh -c` on Unix. Windows has no `sh`, so it uses Git for
+/// Windows' bash when installed and otherwise Windows PowerShell, the `bash` tool's `auto` order
+/// without the built-in shell. Environment, stdio and process ownership belong to the caller.
+pub fn host_script_command(script: &str) -> Result<std::process::Command, String> {
+    if !cfg!(windows) {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", script]);
+        return Ok(command);
+    }
+    match find_system_bash() {
+        Some(bash) => {
+            let mut command = std::process::Command::new(bash);
+            command.args(["-c", script]);
+            Ok(command)
+        }
+        None => powershell_command(script),
+    }
+}
+
 /// Writes `script` for the built-in shell and returns the host program and its arguments.
 fn embedded_invocation(
     scratch: &Path,
@@ -1569,23 +1731,7 @@ fn shell_command_with_state(
                 spawn.args(args);
                 spawn
             }
-            Runner::PowerShell => {
-                let system_root =
-                    std::env::var_os("SystemRoot").ok_or("SystemRoot is unavailable")?;
-                let powershell = Path::new(&system_root)
-                    .join("System32")
-                    .join("WindowsPowerShell")
-                    .join("v1.0")
-                    .join("powershell.exe");
-                let command = format!(
-                    "$global:LASTEXITCODE = 0; {script}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}"
-                );
-                let mut spawn = std::process::Command::new(powershell);
-                spawn
-                    .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-                    .arg(command);
-                spawn
-            }
+            Runner::PowerShell => powershell_command(script)?,
         };
         let mut spawn = if ws.unsandboxed {
             spawn.env_clear();

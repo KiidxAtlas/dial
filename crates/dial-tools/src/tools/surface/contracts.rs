@@ -25,7 +25,7 @@ pub struct HistoricalCall {
 const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("bash", &["session", "pty", "check", "check_paths", "trace"]),
     ("bg", &["persist", "lifetime", "call"]),
-    ("monitor", &["run"]),
+    ("monitor", &["run", "after_secs", "on_exit", "note"]),
     ("grep", &["output", "preview", "ast", "lang"]),
     ("glob", &["preview"]),
     ("edit", &["allow_syntax_errors", "verify"]),
@@ -495,10 +495,13 @@ const REMOVED_ALIASES: &[(&str, &str, &str)] = &[("bash", "async", "background")
 fn has_legacy_names(tool: &str) -> bool {
     RENAMED_PROPERTIES.iter().any(|(t, ..)| *t == tool)
         || REMOVED_ALIASES.iter().any(|(t, ..)| *t == tool)
+        || matches!(tool, "grep" | "glob")
 }
 
-/// The schema as recorded before the renames: current names moved back, removed aliases restored.
+/// The schema as recorded before the renames: current names moved back, removed aliases restored,
+/// and `grep`/`glob` paging as `skip` plus a structured cursor ([`paged_cursor_schema`]).
 fn legacy_schema(schema: &mut Value) {
+    paged_cursor_schema(schema);
     let Some(name) = schema
         .pointer("/function/name")
         .and_then(Value::as_str)
@@ -556,6 +559,87 @@ pub fn legacy_arguments(tool: &str, parameters: &Value, arguments: &mut Value) {
         {
             object.insert((*canonical).into(), value);
         }
+    }
+    legacy_paging_arguments(tool, properties, object);
+}
+
+/// `grep`/`glob` paging before the single string `cursor`: an integer `skip` plus a structured
+/// `{path, match}` cursor (`match` was always 0 for glob). Other schemas are left unchanged.
+fn paged_cursor_schema(schema: &mut Value) {
+    let name = schema["function"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    if !matches!(name.as_str(), "grep" | "glob") {
+        return;
+    }
+    let Some(properties) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if properties
+        .get("cursor")
+        .and_then(|cursor| cursor.get("type"))
+        != Some(&json!("string"))
+    {
+        return;
+    }
+    let mut matched = json!({"type": "integer", "minimum": 0});
+    if name == "glob" {
+        matched["maximum"] = json!(0);
+    }
+    properties.insert(
+        "cursor".into(),
+        json!({"type": "object", "properties": {"path": {"type": "string"}, "match": matched},
+            "required": ["path", "match"], "additionalProperties": false}),
+    );
+    properties.insert("skip".into(), json!({"type": "integer", "minimum": 0}));
+}
+
+/// A habitual pre-single-cursor `grep`/`glob` call: a structured `{path, match}` cursor and/or
+/// integer `skip` become the one string cursor (`"consumed:skip:path"` or `"skip"`). Anything
+/// else is left for ordinary validation to refuse.
+fn legacy_paging_arguments(
+    tool: &str,
+    properties: &serde_json::Map<String, Value>,
+    object: &mut serde_json::Map<String, Value>,
+) {
+    if !matches!(tool, "grep" | "glob")
+        || properties.contains_key("skip")
+        || properties
+            .get("cursor")
+            .and_then(|cursor| cursor.get("type"))
+            != Some(&json!("string"))
+    {
+        return;
+    }
+    let skip = match object.get("skip") {
+        None | Some(Value::Null) => 0,
+        Some(value) => match value.as_u64() {
+            Some(skip) => skip,
+            None => return,
+        },
+    };
+    let cursor = match object.get("cursor") {
+        None | Some(Value::Null) => skip.to_string(),
+        Some(Value::Object(cursor)) => {
+            let (Some(path), Some(consumed)) = (
+                cursor.get("path").and_then(Value::as_str),
+                cursor.get("match").and_then(Value::as_u64),
+            ) else {
+                return;
+            };
+            format!("{consumed}:{skip}:{path}")
+        }
+        Some(_) => return,
+    };
+    object.remove("skip");
+    if cursor == "0" {
+        object.remove("cursor");
+    } else {
+        object.insert("cursor".into(), json!(cursor));
     }
 }
 
@@ -673,10 +757,18 @@ fn native_identities(name: &str, legacy: bool) -> Vec<Identity> {
     ]
     .into_iter()
     .filter_map(|mode| crate::tools::schema(name, mode))
-    .flat_map(|mut schema| {
-        if legacy {
-            legacy_schema(&mut schema);
+    .flat_map(|schema| {
+        if !legacy {
+            return vec![schema];
         }
+        // History before the single string cursor, with and without the older renames.
+        let mut paged = schema.clone();
+        paged_cursor_schema(&mut paged);
+        let mut renamed = schema;
+        legacy_schema(&mut renamed);
+        vec![renamed, paged]
+    })
+    .flat_map(|schema| {
         let mut before = schema.clone();
         if let Some(properties) = before
             .pointer_mut("/function/parameters/properties")
@@ -740,14 +832,29 @@ fn registry_additive_compatible(
     if old.revision != new.revision || crate::tools::BUILTIN.contains(&old.name.as_str()) {
         return false;
     }
-    let properties = ADDITIVE_PROPERTIES
+    // A consolidated successor's schema is the union of its members' schemas
+    // (`facade::GROUPS`), so a member's additions are additions to the successor too.
+    let owners: Vec<&str> = std::iter::once(old.name.as_str())
+        .chain(
+            crate::tools::surface::facade::GROUPS
+                .iter()
+                .filter(|group| group.successor == old.name)
+                .flat_map(|group| group.members.iter().map(|(member, _)| *member)),
+        )
+        .collect();
+    let additions: Vec<&[&str]> = owners
         .iter()
-        .find(|(name, _)| *name == old.name)
-        .map_or(&[][..], |(_, properties)| *properties);
+        .filter_map(|owner| {
+            ADDITIVE_PROPERTIES
+                .iter()
+                .find(|(name, _)| name == owner)
+                .map(|(_, properties)| *properties)
+        })
+        .collect();
     let has_enum_values = ADDITIVE_ENUM_VALUES
         .iter()
-        .any(|(tool, ..)| *tool == old.name);
-    if properties.is_empty() && !has_enum_values {
+        .any(|(tool, ..)| owners.contains(tool));
+    if additions.is_empty() && !has_enum_values {
         return false;
     }
     let Some(current) = schemas
@@ -756,25 +863,28 @@ fn registry_additive_compatible(
     else {
         return false;
     };
-    // Additions are appended in release order. Walking suffixes preserves every intermediate
-    // release without enumerating a browser-sized powerset. Properties and enum groups can
-    // land independently, so match their bounded cross product. Never change required fields,
-    // existing property types, strictness or semantic revisions.
-    let mut property_variant = current.clone();
-    for remaining in (0..=properties.len()).rev() {
-        if remaining < properties.len()
-            && let Some(map) = property_variant
-                .pointer_mut("/function/parameters/properties")
-                .and_then(Value::as_object_mut)
+    // Additions are appended in release order per owner. Walking suffixes preserves every
+    // intermediate release without enumerating a browser-sized powerset. Owners and enum groups
+    // can land independently, so match their bounded cross product. Never change required
+    // fields, existing property types, strictness or semantic revisions.
+    let mut kept: Vec<usize> = additions.iter().map(|list| list.len()).collect();
+    loop {
+        let mut candidate = current.clone();
+        if let Some(map) = candidate
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
         {
-            map.remove(properties[remaining]);
+            for (list, kept) in additions.iter().zip(&kept) {
+                for property in &list[*kept..] {
+                    map.remove(*property);
+                }
+            }
         }
-        let mut candidate = property_variant.clone();
         if identities(std::slice::from_ref(&candidate), registry).get(&old.name) == Some(old) {
             return true;
         }
         for (tool, property, values) in ADDITIVE_ENUM_VALUES.iter().rev() {
-            if *tool != old.name {
+            if !owners.contains(tool) {
                 continue;
             }
             if let Some(options) = candidate
@@ -790,8 +900,15 @@ fn registry_additive_compatible(
                 return true;
             }
         }
+        // Next combination: shorten the first owner's list that still has an addition.
+        let Some(index) = kept.iter().position(|kept| *kept > 0) else {
+            return false;
+        };
+        kept[index] -= 1;
+        for (earlier, list) in kept[..index].iter_mut().zip(&additions) {
+            *earlier = list.len();
+        }
     }
-    false
 }
 
 /// Recognize exact additive changes to controller-owned schemas. Historical calls remain inert,

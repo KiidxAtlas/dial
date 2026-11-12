@@ -116,7 +116,7 @@ impl Shell {
 
     /// `/skills`: install and update run as a background job; the rest is local file work.
     pub(super) fn skills_command(&mut self, app: &App, args: &str) {
-        let words = crate::runtime::arguments::split_words(args);
+        let words = crate::runtime::arguments::split_prose_words(args);
         if matches!(
             words.first().map(String::as_str),
             Some("install" | "update")

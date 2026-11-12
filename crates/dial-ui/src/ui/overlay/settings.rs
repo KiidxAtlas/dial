@@ -387,7 +387,7 @@ pub(super) fn tab_strip(
         1 + if start > 0 { mark_w + 1 } else { 0 }
             + span_w(start, active)
             + if active + 1 < names.len() {
-                gap + mark_w
+                gap + mark_w + 2
             } else {
                 0
             }
@@ -405,10 +405,20 @@ pub(super) fn tab_strip(
     }
     for (i, name) in names.iter().enumerate().skip(start) {
         let sep = if i > start { gap } else { 0 };
-        let reserve = if i + 1 < names.len() { gap + mark_w } else { 0 };
+        let hidden = names.len() - i;
+        let more_label = format!("{mark}{hidden}");
+        let reserve = if i + 1 < names.len() {
+            gap + text::width(&more_label)
+        } else {
+            0
+        };
         let need = sep + text::width(name);
         if i > active && used + need + reserve > w {
-            spans.push(Span::styled(format!("{}{mark}", " ".repeat(sep)), more));
+            // Say how many tabs are off the edge, not just that some are.
+            spans.push(Span::styled(
+                format!("{}{more_label}", " ".repeat(sep)),
+                more,
+            ));
             break;
         }
         spans.push(Span::raw(" ".repeat(sep)));
@@ -430,6 +440,8 @@ pub(super) mod testkit;
 
 /// Choices a picker shows at once; longer lists get a filter line.
 const PICK_ROWS: usize = 7;
+/// The most choices an open picker lists at once, however tall the panel.
+const MAX_PICK_ROWS: usize = 12;
 
 /// Indexes of the `choices` the filter keeps, in order. Each space-separated term must appear in
 /// the choice's label or raw value, ignoring case, so "auto" finds "Auto (let Dial decide)".
@@ -1226,8 +1238,7 @@ impl SettingsOverlay {
         if def.path == "improve.teach" {
             return true;
         }
-        let learning = Self::learning_setting(def);
-        !self.learning_only || learning
+        !self.learning_only || Self::learning_setting(def)
     }
     fn filter_tabs(&mut self) {
         self.tabs = crate::config::schema::tabs()
@@ -3078,9 +3089,10 @@ impl SettingsOverlay {
                             }
                         }
                     }
-                    // Show every match the panel has room for (beside the setting row, its
-                    // section header and the filter line); short panels keep the usual window.
-                    let pick_rows = body_rows.saturating_sub(3).max(PICK_ROWS);
+                    // Show a window of matches beside the setting row, its section header and the
+                    // filter line, capped so a long list (32 themes) never hides the rest of the
+                    // panel; typing filters, and the window follows the cursor.
+                    let pick_rows = body_rows.saturating_sub(3).clamp(PICK_ROWS, MAX_PICK_ROWS);
                     if choices.len() > PICK_ROWS || !filter.text.is_empty() {
                         items.push(Item::Filter {
                             editor: filter.clone(),

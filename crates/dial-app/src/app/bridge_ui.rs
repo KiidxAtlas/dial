@@ -21,7 +21,9 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Ignore result-only policy updates: only changed request controls warrant a transcript notice.
+/// Ignore result-only policy updates and first requests: the transcript names a change only when a
+/// control the user can adjust differs from the previous request to the same model. The status
+/// line always carries the current values, and `/policy` the full detail.
 fn request_settings_change(
     status: &mut crate::ui::status::StatusData,
     previous: &Value,
@@ -31,10 +33,11 @@ fn request_settings_change(
     let settings = &policy["selection"]["effective"];
     status.inference = crate::adaptive::render_request_settings(settings, true).unwrap_or_default();
     let old = &previous["adaptive_policy"];
-    if old["model"] == policy["model"] && old["selection"]["effective"] == *settings {
+    if old["model"].is_null() || old["model"] != policy["model"] {
         return None;
     }
-    crate::adaptive::render_request_settings(settings, false)
+    crate::adaptive::request_settings_diff(&old["selection"]["effective"], settings)
+        .map(|changes| format!("{changes} · /policy for details"))
 }
 
 struct ApprovalPrompt {
@@ -44,10 +47,10 @@ struct ApprovalPrompt {
     scope: Option<String>,
 }
 
-/// How to leave an approval: shown under the action so the difference is never a surprise.
+/// How to stop the turn as well: shown under the action; the panel footer names Esc as deny.
 fn deny_hint(keys: &crate::ui::keys::Keymap) -> String {
     format!(
-        "Esc or n denies · {} denies and stops the turn",
+        "n or Esc denies · {} denies and stops the turn",
         keys.label(Action::Interrupt)
     )
 }
@@ -65,13 +68,19 @@ fn approval_prompt(
     hint: &str,
 ) -> ApprovalPrompt {
     let mut body = summary.trim_end().to_owned();
+    // The coverage sentence already names /undo; a second `Undo:` label only stutters.
+    if !preview.undo.is_empty() {
+        body.push_str(&format!("\n\n{}", preview.undo));
+    }
     let scope = preview
         .session
         .as_deref()
         .or(preview.project.as_deref())
         .map(|scope| grant_matcher(scope).to_owned());
     if let Some(scope) = &scope {
-        body.push_str(&format!("\n\nA reusable approval would cover: {scope}"));
+        body.push_str(&format!(
+            "\n\nAllowing for the session or project covers: {scope}"
+        ));
     }
     if let Some(reason) = &preview.unavailable_reason {
         body.push_str(&format!("\n\nOne-time approval only: {reason}"));
@@ -154,6 +163,35 @@ fn policy_notice(
         PolicyReason::HookVeto => format!("{tool} was blocked by a pre-tool hook{scope}."),
         _ => return None,
     })
+}
+
+/// Decisions `/permissions why` keeps; older ones are dropped.
+const POLICY_LOG_ROWS: usize = 20;
+
+/// One `/permissions why` row: the deciding rule, then the control that would change it.
+fn policy_log_row(tool: &str, explanation: &agent::safety::approval::PolicyExplanation) -> String {
+    use agent::safety::approval::PolicyReason;
+    let change = match explanation.reason {
+        PolicyReason::DenyRule | PolicyReason::AllowRule => {
+            "remove the rule with /permissions remove <number>"
+        }
+        PolicyReason::ReadOnly => "leave read-only mode with /approval",
+        PolicyReason::PlanMode => "approve a plan, or leave plan mode with /plan",
+        PolicyReason::Cancelled => "nothing; the request was cancelled before it ran",
+        PolicyReason::AutomaticMode => "choose /approval ask or /approval write to be prompted",
+        PolicyReason::WorkspaceWrite => "choose /approval ask to be prompted for edits",
+        PolicyReason::SafeCall => "a deny rule (/permissions deny <tool>) is checked first",
+        PolicyReason::GeneratedCheck => "checks the harness generates run without a prompt",
+        PolicyReason::PromptRequired => {
+            "allow it for the session or project in the prompt, or add /permissions allow <tool>"
+        }
+        PolicyReason::OperatorAllow | PolicyReason::OperatorDeny => {
+            "your answer to the approval prompt"
+        }
+        PolicyReason::HookVeto => "edit or disable the pre-tool hook in /hooks",
+    };
+    let text = format!("{tool}: {explanation}. To change: {change}.");
+    crate::storage::redact::redact_text(&text).into_owned()
 }
 
 impl Bridge<'_> {
@@ -827,6 +865,12 @@ impl Ui for Bridge<'_> {
         tool: &str,
         explanation: &crate::agent::safety::approval::PolicyExplanation,
     ) {
+        if self.shell.policy_log.len() == POLICY_LOG_ROWS {
+            self.shell.policy_log.pop_front();
+        }
+        self.shell
+            .policy_log
+            .push_back(policy_log_row(tool, explanation));
         match policy_notice(tool, explanation) {
             Some(notice) => self.notice(&notice),
             None => self.diagnostic(&format!("{tool}: {explanation}")),

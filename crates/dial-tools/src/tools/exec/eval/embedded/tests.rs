@@ -242,6 +242,9 @@ fn embedded_missing_globals_do_not_recommend_unavailable_node_imports() {
     assert!(error.contains("Node modules are unavailable"), "{error}");
     assert!(error.contains("tool.read"), "{error}");
     assert!(!error.contains("await import('node:"), "{error}");
+    let result = cell("Buffer.from([1, 2])");
+    let error = result["error"].as_str().unwrap();
+    assert!(error.contains("Uint8Array and DataView"), "{error}");
 }
 
 #[test]

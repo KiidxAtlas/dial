@@ -11,6 +11,53 @@ fn directory_delta_reports_disappearing_and_shrinking_sources() {
     let note = created_entries_note(before.as_ref(), dir.path()).unwrap();
     assert!(note.contains("main.db-wal disappeared"), "{note}");
     assert!(note.contains("input shrank"), "{note}");
+    // Recovery must name a byte-exact path, not invite copying binary data through a reply,
+    // and must not promise a retained copy that preservation never made.
+    assert!(
+        note.contains("dial.writeBytes(path, dial.readBytes(artifact))"),
+        "{note}"
+    );
+    assert!(
+        note.contains("Otherwise the original bytes are gone"),
+        "{note}"
+    );
+    assert!(!note.contains("inspect retained input artifacts"), "{note}");
+}
+
+#[test]
+fn captured_output_is_cut_at_line_boundaries_and_names_the_omitted_lines() {
+    let mut capture = Capture::new();
+    let mut expected = String::new();
+    for line in 1..=4000 {
+        let text = format!("line {line} of the output\n");
+        capture.push(text.as_bytes());
+        expected.push_str(&text);
+    }
+    let text = capture.finish();
+    let (head, rest) = text.split_once("\n[... ").unwrap();
+    let (notice, tail) = rest.split_once(" ...]\n").unwrap();
+    let number = |line: &str| line.split(' ').nth(1).unwrap().parse::<usize>().unwrap();
+    let last_shown = number(head.lines().last().unwrap());
+    let first_resumed = number(tail.lines().next().unwrap());
+    // Both sides are whole lines of the original, and the notice names exactly the gap.
+    assert!(expected.starts_with(&format!("{head}\n")), "{head}");
+    assert!(expected.ends_with(tail), "{tail}");
+    assert!(
+        notice.ends_with(&format!("(lines {}-{})", last_shown + 1, first_resumed - 1)),
+        "{notice}"
+    );
+    let omitted: usize = notice.split(' ').next().unwrap().parse().unwrap();
+    assert_eq!(omitted, expected.len() - head.len() - 1 - tail.len());
+
+    // One line longer than the slack is still cut by bytes and reported as a single line.
+    let mut capture = Capture::new();
+    capture.push(&vec![b'x'; BASH_HEAD + 4 * BASH_TAIL]);
+    let text = capture.finish();
+    assert!(
+        text.contains("bytes of output omitted (line 1) ...]"),
+        "{}",
+        &text[BASH_HEAD..BASH_HEAD + 80]
+    );
 }
 #[cfg(target_os = "macos")]
 use crate::tools::execute;
@@ -1444,4 +1491,74 @@ fn interpreter_guidance_lists_available_and_missing_helper_languages() {
         empty.contains("Shell PATH languages: none; not found: python3"),
         "{empty}"
     );
+}
+
+/// A WAL database whose last transaction lives only in `main.db-wal`.
+fn wal_database(dir: &std::path::Path) -> Vec<u8> {
+    let db = rusqlite::Connection::open(dir.join("main.db")).unwrap();
+    db.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+         CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO items(name) VALUES ('a');
+         PRAGMA wal_checkpoint(TRUNCATE);
+         INSERT INTO items(name) VALUES ('b'),('c');",
+    )
+    .unwrap();
+    fs::copy(dir.join("main.db"), dir.join("db.keep")).unwrap();
+    let wal = fs::read(dir.join("main.db-wal")).unwrap();
+    drop(db);
+    let _ = fs::remove_file(dir.join("main.db-shm"));
+    fs::rename(dir.join("db.keep"), dir.join("main.db")).unwrap();
+    fs::write(dir.join("main.db-wal"), &wal).unwrap();
+    wal
+}
+
+#[test]
+fn a_writable_sqlite3_open_is_refused_before_it_can_destroy_a_damaged_wal() {
+    let (dir, ws) = workspace();
+    let original = wal_database(dir.path());
+    let scrambled: Vec<u8> = original.iter().map(|b| b ^ 0x42).collect();
+    fs::write(dir.path().join("main.db-wal"), &scrambled).unwrap();
+    let guard = |command: &str| sqlite_wal_guard(&ws, &json!({"command": command}), command);
+
+    for command in [
+        "sqlite3 main.db 'SELECT count(*) FROM items;'",
+        "cd . && sqlite3 -json main.db \"SELECT * FROM items\"; echo done",
+        "ls; LC_ALL=C /usr/bin/sqlite3 file:main.db .tables",
+    ] {
+        let message = guard(command).unwrap_or_else(|| panic!("not refused: {command}"));
+        assert!(message.contains("`main.db-wal`"), "{message}");
+        assert!(message.contains("header NOT valid"), "{message}");
+        assert!(message.contains("sqlite3 -readonly"), "{message}");
+    }
+    // Read-only opens, other programs and other databases run.
+    for command in [
+        "sqlite3 -readonly main.db 'SELECT 1'",
+        "sqlite3 'file:main.db?mode=ro' 'SELECT 1'",
+        "python3 -c 'import sqlite3'",
+        "sqlite3 other.db 'SELECT 1'",
+        "xxd main.db-wal",
+        // An earlier step replaces or backs up the WAL, so the open is deliberate.
+        "cp fixed.wal main.db-wal && sqlite3 main.db 'SELECT 1'",
+        "cp /tmp/x/main.db-wal keep.wal; sqlite3 /tmp/x/main.db 'SELECT 1'",
+    ] {
+        assert_eq!(guard(command), None, "{command}");
+    }
+    // Through the bash tool the command never runs, so the WAL keeps its bytes.
+    let out = crate::tools::execute(
+        &ws,
+        "bash",
+        &json!({"command": "sqlite3 main.db 'SELECT 1'; rm main.db-wal"}),
+        30,
+    );
+    assert!(
+        out.is_error && out.text.starts_with("Blocked before running"),
+        "{}",
+        out.text
+    );
+    assert_eq!(fs::read(dir.path().join("main.db-wal")).unwrap(), scrambled);
+
+    // A valid, fully committed WAL is applied by SQLite rather than discarded.
+    fs::write(dir.path().join("main.db-wal"), &original).unwrap();
+    assert_eq!(guard("sqlite3 main.db 'SELECT 1'"), None);
 }

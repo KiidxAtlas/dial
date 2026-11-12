@@ -561,7 +561,7 @@ impl Workspace {
         mut self,
         configured: &BTreeMap<String, crate::config::types::SshHostConfig>,
     ) -> Self {
-        self.ssh_hosts = Arc::new(match std::env::var_os("HOME").map(PathBuf::from) {
+        self.ssh_hosts = Arc::new(match crate::config::paths::home_dir() {
             Some(home) => integrations::ssh::host_targets(&home, configured),
             None => BTreeMap::new(),
         });
@@ -1297,13 +1297,14 @@ impl Workspace {
     }
 }
 
-const HASHLINE_READ_DESC: &str = "read: view a file or directory in any format (text, CSV, PDF, Office, \
-images, video, notebooks, archives). Ranges as a path suffix: `:50-100`, `:50+20`, `:50-`, `:-30`, \
-`:5-16,960-973`; `:outline` lists declarations, `:raw` is non-editable text; `paths` reads up to 16 targets at once. \
-Also `ssh://host/path`, `http(s)://`, `pr://N`, `issue://N`, `conflict://`, `artifact://H` (lines, `:info`, \
-`:annotations`, `:bytes=O+N`). Output is \
-a `[PATH#TAG]` header then `LINE:TEXT` rows; edit needs that TAG and may touch only shown lines. Stops at \
-48 KiB; the footer names the next range. Large or unfamiliar files: `grep` or `:outline` first, then read only the needed ranges, never page through. Excerpts already shown by glob/grep previews or earlier reads stay current: reuse them instead of rereading.";
+const HASHLINE_READ_DESC: &str = "read: view any file or directory without changing it; use it over shell viewers, once per file. Decodes text, \
+documents, data, databases (read-only), archives, media, executables; other binaries as hex. Suffixes: `:50-100`, \
+`:50+20`, `:50-`, `:-30`, `:bytes=O+N`, `:outline`, `:raw` (non-editable); format parts `:member`, `:table`, \
+`:sheet=N`. `paths` reads up to 16 targets. Also `ssh://host/path`, `http(s)://`, `pr://N`, `issue://N`, \
+`conflict://`, `artifact://H`. Output is a `[PATH#TAG]` header then `LINE:TEXT` rows; edit needs that TAG and may \
+touch only shown lines. Stops at 48 KiB; the footer names the next range. Large or unfamiliar files: `grep` or \
+`:outline` first, then read only the needed ranges, never page through. Excerpts already shown by glob/grep \
+previews or earlier reads stay current: reuse them instead of rereading.";
 
 const HASHLINE_WRITE_DESC: &str = "write: create a new file or replace one whose content changes almost entirely. Max 1 MiB; parent directories are created. Replacing an existing file requires reading all of it first; for changes to an existing file use edit (one call carries every operation) instead of regenerating it. Content must be complete, never a placeholder; do not also paste it into chat. Notebooks take literal JSON. Copied read prefixes are stripped; truncated projections are refused. Returns the fresh `[PATH#TAG]`.";
 
@@ -1321,11 +1322,11 @@ Move code: `CUT 3.=5 @tmp` then `PUT >9 @tmp` (across files too; `PUT N.=M @tmp`
 Example: `[src/main.rs#3FA9]` then `PUT 4.=4:` and `+    let total = a + b;` on separate lines.
 One section per file; put every planned change to every file in one call. Success returns the fresh [PATH#TAG] and changed lines. If the file changed since your read, edits re-anchor when their lines are unchanged; otherwise you get the current lines: after a stale-anchor failure, re-read the target range (or use those lines and their new TAG) before retrying."#;
 
-const REPLACE_READ_DESC: &str = "read: view a file or directory in any format (text, CSV, PDF, Office, \
-images, video, notebooks, archives). Ranges as a path suffix: `:50-100`, `:50+150`, `:50-`, `:-60`, \
-`:5-16,960-973`; `:outline` lists declarations; `paths` reads up to 16 targets. Also `artifact://H` (lines, \
-`:info`, `:annotations`, `:bytes=O+N`). Lines are numbered. Stops at \
-48 KiB; the footer names the next range. Large or unfamiliar files: `grep` or `:outline` first, then read only the needed ranges, never page through.";
+const REPLACE_READ_DESC: &str = "read: view any file or directory without changing it; use it over shell viewers, once per file. Decodes text, \
+documents, data, databases (read-only), archives, media, executables; other binaries as hex. Suffixes: `:50-100`, \
+`:50+150`, `:bytes=O+N`, `:outline`; format parts `:member`, `:table`, `:sheet=N`. `paths` reads up to 16 targets. \
+Also `artifact://H`. Lines are numbered. Stops at 48 KiB; the footer names the next range. Large or unfamiliar \
+files: `grep` or `:outline` first, then read only the needed ranges, never page through.";
 
 fn schema(name: &str, mode: EditMode) -> Option<Value> {
     let hashline = mode == EditMode::Hashline;
@@ -1387,8 +1388,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "gitignore": {"type": "boolean", "description": "Honor ignore rules and skip dependency/build directories (default true)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Paths per page (default 500)."},
                 "preview": {"type": "boolean", "description": "Excerpts of up to 3 code files among the first 16 paths (default false). Only returned rows are edit witnesses."},
-                "skip": {"type": "integer", "minimum": 0, "description": "Paths to skip; resume with remaining_skip."},
-                "cursor": {"type": "object", "properties": {"path": {"type": "string"}, "match": {"type": "integer", "minimum": 0, "maximum": 0}}, "required": ["path", "match"], "additionalProperties": false, "description": "next_cursor from the previous page, unchanged."},
+                "cursor": {"type": "string", "description": "next_cursor from the previous page, unchanged; or \"N\" to skip N paths."},
             }),
             &["pattern"],
         ),
@@ -1411,8 +1411,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "multiline": {"type": "boolean", "description": "Match across lines (automatic when the pattern has \\n); use (?s) for dot to match newline."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},
                 "gitignore": {"type": "boolean", "description": "Honor ignore rules and skip dependency/build directories (default true)."},
-                "skip": {"type": "integer", "minimum": 0, "description": "Matches to skip; resume with remaining_skip."},
-                "cursor": {"type": "object", "properties": {"path": {"type": "string"}, "match": {"type": "integer", "minimum": 0}}, "required": ["path", "match"], "additionalProperties": false, "description": "next_cursor from the previous page, unchanged."},
+                "cursor": {"type": "string", "description": "next_cursor from the previous page, unchanged; or \"N\" to skip N results."},
             }),
             &["pattern"],
         ),

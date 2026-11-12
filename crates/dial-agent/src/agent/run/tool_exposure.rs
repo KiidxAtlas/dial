@@ -808,11 +808,7 @@ impl<'a> Agent<'a> {
         // request; an explicit load, a pinned selection, hermetic runs and the selection lent to
         // children keep them offered. An unattended run also defers the long-session helpers,
         // unless the operator prefers delegation.
-        let unattended = |name: &str| {
-            self.modes.launch.unattended
-                && Self::UNATTENDED_DEFERRED.contains(&name)
-                && !(name == "task" && self.config.task.prefer_subagents)
-        };
+        let unattended = |name: &str| self.unattended_deferred(name);
         // Repository work should not spend a model request loading its native VCS tool.
         // Respect pinned/hermetic selections and small-context budgets.
         let repository_git = !pinned
@@ -988,13 +984,11 @@ impl<'a> Agent<'a> {
             if name == "ask" && !self.config.ask.enabled {
                 continue;
             }
-            // Delegation is a hosted-route default; an unattended run defers it unless the
-            // operator prefers subagents. Peer messaging joins with it (one budget decision).
+            // Delegation is a hosted-route default. An unattended run defers the long-session
+            // helpers here as in the discovery offer; a run that needs one loads it with
+            // `tool_search`. Peer messaging joins with `task` (one budget decision).
             let delegation = name == "task";
-            if delegation
-                && (!self.hosted_route()
-                    || (self.modes.launch.unattended && !self.config.task.prefer_subagents))
-            {
+            if (delegation && !self.hosted_route()) || self.unattended_deferred(name) {
                 continue;
             }
             let mut size = schema_size(name);
@@ -1018,6 +1012,14 @@ impl<'a> Agent<'a> {
         core.sort();
         core.dedup();
         core
+    }
+
+    /// An unattended launch defers [`Self::UNATTENDED_DEFERRED`] from the first offer unless the
+    /// operator prefers delegation (which keeps `task`).
+    fn unattended_deferred(&self, name: &str) -> bool {
+        self.modes.launch.unattended
+            && Self::UNATTENDED_DEFERRED.contains(&name)
+            && !(name == "task" && self.config.task.prefer_subagents)
     }
 
     /// The selected memory backend's `memory` tool when it is in the catalog: the runtime's, or

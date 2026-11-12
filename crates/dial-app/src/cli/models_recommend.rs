@@ -213,10 +213,12 @@ fn candidates(layout: &Layout, config: &Config) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = catalog::downloaded_local_models(&layout.user_dir)
         .into_iter()
         .filter(|entry| {
-            matches!(
-                detect(Path::new(&entry.selection.model)),
-                Some(LocalFormat::Mlx | LocalFormat::Gguf)
-            )
+            // Embedding, rerank, image and audio models are not chat models to recommend.
+            entry.supports_chat()
+                && matches!(
+                    detect(Path::new(&entry.selection.model)),
+                    Some(LocalFormat::Mlx | LocalFormat::Gguf)
+                )
         })
         .map(|entry| Candidate {
             label: entry.label,

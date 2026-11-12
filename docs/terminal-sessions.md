@@ -120,6 +120,11 @@ turn finishes. See [Session coordination](session-coordination.md) for delivery,
   format or journal schema is newer than this Dial, and never overwrites an existing file. The transfer is
   recorded, so reopening the original path after the session moved away forks a sibling instead of
   reattaching to it.
+- `dial sessions export`, `pack` and `unpack` resolve relative paths, and the default
+  `session-<id>.md`/`.html`/`.dialpack` file name, in the current directory (or `-C <dir>`), not the project root.
+  `dial sessions` hides sessions with no messages (left by launches that never sent a prompt) and says how
+  many it hid; their ids still resolve. `dial -c -p` with no earlier conversation fails instead of
+  silently starting a new one.
 - `/export` and `dial sessions export` (Markdown or HTML) and `/dump all` include the subagent transcripts
   that belong to the session, after the parent conversation and with the same redaction. `/dump anon`
   anonymizes them the same way it anonymizes the session.

@@ -7,6 +7,8 @@ Find actions through the goal-first palette, slash completion and command help.
 - **Action palette:** `Alt-K`, `F1` or `/palette` starts with a short list of goals: start or
   continue work, review changes, manage ongoing work, configure Dial, or browse all actions.
   Choose a goal to drill into relevant commands; return to the goal list before closing.
+  Search is fuzzy; a phrase of two or more words that matches nothing that way ("undo the last
+  changes") is matched by its words against command names and descriptions instead.
   Type at any point to search every registered action, including advanced commands and enabled
   skills, without replacing your chat draft. Command names and task-oriented labels both match.
   The selected action shows its exact slash command, description and, while busy, whether it
@@ -25,7 +27,7 @@ Find actions through the goal-first palette, slash completion and command help.
   that filters as you type. `Up`/`Down` move (wrapping, with a position counter for long lists), `Tab`/`Right`
   complete, `Esc` dismisses without losing the draft. Without navigating, `Enter` sends exactly what you
   typed, so a full command runs at once; after you move the highlight with `Up`/`Down`, `Enter` accepts and
-  runs the highlighted command. File mentions (`@path`) complete the highlighted file on `Enter`. Built-ins
+  runs the highlighted command. File mentions (`@path`) complete the highlighted file on `Enter`, also mid-draft while you type the mention; paths with spaces are inserted quoted (`@"My Notes.md"`). Built-ins
   win over a custom command with the same name. `/clear`, `/resume`, `/palette`, `/commands`, `/tree`,
   `/branch`, `/rollback` and `/review-file` still work but are hidden from menus in favor of `/new`,
   `/sessions`, `/help`, `/help commands`, `/sessions this|branch`, `/undo files` and `/review files`.
@@ -35,6 +37,24 @@ Find actions through the goal-first palette, slash completion and command help.
   cached state, so typing never probes the filesystem.
 - **CLI equivalents:** `/help <command>` (or any alias) explains the command and shows its matching
   `dial …` entry point, for example `/help rename` shows `also: dial sessions rename`.
+
+## File completion cache
+
+File mentions (`@path`) use an ignore-aware background scan of the project root, refreshed
+at most once every 30 seconds. Scans have a 10-second time budget, a 50,000-entry cap
+(files and directories), and an 8 MiB budget for cached path names, not file contents.
+They do not follow symlinks. These bounds keep traversal and memory use limited without
+running the scan on the input thread.
+
+A **File completion** notice identifies the actual cause: the time budget, entry cap,
+path-name budget, or unreadable paths. Each cause is reported only once for the current
+project root, even when files change or the condition goes away and recurs. Changing the
+root resets this warning history; new causes are still reported.
+
+For limits, start in a narrower project directory or exclude large generated/dependency
+directories through `.gitignore` or `.ignore`. For unreadable paths, check that the root
+exists and its directories are readable. A partial cache only limits suggestions: type
+a path explicitly to attach a file that was not indexed.
 
 ## Hubs and panels
 

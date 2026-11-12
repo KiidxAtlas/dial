@@ -52,7 +52,7 @@ class Capture {
     this.dropped += text.length - take;
   }
   value() {
-    return this.parts.join('') + (this.dropped ? `\n[truncated ${this.dropped} characters]` : '');
+    return this.parts.join('') + (this.dropped ? `\n[truncated ${this.dropped} characters; the start was kept. Keep large results in a variable and print slices or summaries]` : '');
   }
 }
 

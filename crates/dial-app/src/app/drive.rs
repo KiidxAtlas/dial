@@ -201,11 +201,18 @@ pub(super) fn onboarding_flow(outcome: &OverlayOutcome) -> OnboardingFlow {
     }
 }
 
-/// The default/escape result is cancellation, never an implicit local-model selection.
+/// First-run choices, most likely first; Cancel last. Order matches [`onboarding_destination`].
+const ONBOARDING_CHOICES: &[(&str, char)] = &[
+    ("Local model", 'l'),
+    ("Hosted provider", 'h'),
+    ("Quit setup", 'q'),
+];
+
+/// Escape or Quit is cancellation, never an implicit model selection.
 fn onboarding_destination(choice: Option<usize>) -> Option<Which> {
     match choice {
+        Some(0) => Some(Which::Models),
         Some(1) => Some(Which::Providers),
-        Some(2) => Some(Which::Models),
         _ => None,
     }
 }
@@ -248,25 +255,57 @@ impl LocalHint {
 /// a local model this Mac can hold, so the local path is obvious. This is a hint only: the user
 /// still chooses, and nothing is selected or downloaded for them.
 pub(super) fn onboarding_prompt(hint: &LocalHint) -> String {
-    let base = "Hosted: sign in or add an API key. Local: choose a running Ollama/LM Studio endpoint or a downloaded local model. Browsing never installs or downloads a model. Esc cancels; Esc in a panel returns here.";
+    let base = "Nothing is downloaded or installed until you confirm. Esc cancels.";
     if !hint.running.is_empty() {
         format!(
-            "Running on this machine: {}. Choose Local model to use it with no API key. {base}",
+            "Running on this machine: {}. Local model uses it with no API key.\n{base}",
             hint.running.join(", ")
         )
     } else if let Some(model) = hint.suggestion {
         format!(
-            "No local model server is running. This Mac has enough memory for {model}: choose Local model, then Get models, to download it (only after you confirm). {base}"
+            "This Mac has enough memory for {model}: Local model → Get models downloads it (only after you confirm). Hosted provider signs in or takes an API key.\n{base}"
         )
     } else {
-        base.to_owned()
+        format!(
+            "Local model uses Ollama, LM Studio or downloaded weights; Hosted provider signs in or takes an API key.\n{base}"
+        )
     }
 }
 
 /// The highlighted first-run choice: "Local model" when there is a local path to point at, else
-/// "Cancel". Enter still has to confirm it; Esc still cancels.
+/// "Hosted provider". Either only opens a panel; Enter still confirms and Esc still cancels.
 pub(super) fn onboarding_default(hint: &LocalHint) -> usize {
-    if hint.points_to_local() { 2 } else { 0 }
+    if hint.points_to_local() { 0 } else { 1 }
+}
+
+/// A first run that never chose an approval mode starts in `write` ("Edit freely"): edits and
+/// non-destructive commands run, destructive or out-of-project actions ask. It is saved once as
+/// the user's own choice, so headless runs, protocols, benchmarks and existing users (who already
+/// run with the `auto` default) keep their contracts. Returns the notice to show, if any.
+pub(super) fn adopt_first_run_approval(app: &mut App) -> Option<String> {
+    if app.config.setting_sources.get("approval") != Some(&"default") {
+        return None;
+    }
+    let change = crate::config::settings_store::Change::Insert {
+        path: "approval".into(),
+        value: "write".into(),
+    };
+    match crate::config::settings_store::save(
+        &app.layout,
+        crate::config::settings_store::Scope::Global,
+        &[change],
+    ) {
+        Ok(()) => {
+            app.config.approval = crate::config::types::Approval::Write;
+            app.config
+                .setting_sources
+                .insert("approval".into(), "global");
+            Some("Edit freely: edits and safe commands run without asking; destructive or out-of-project actions ask. Shift+Tab cycles ask, write and read-only; /approval auto removes all prompts.".into())
+        }
+        Err(error) => Some(format!(
+            "Could not save the starting approval mode ({error:#}); this session keeps the configured default."
+        )),
+    }
 }
 
 /// First run (or a provider that cannot be used): let the user pick a model before any agent exists.
@@ -280,6 +319,12 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
             None => make_backend(&app.config),
         };
         if backend.is_ok() && destination.is_none() {
+            // Only a real first run (the welcome prompt was shown) chooses a starting mode.
+            if local.is_some()
+                && let Some(notice) = adopt_first_run_approval(app)
+            {
+                shell.note("Approval", notice);
+            }
             return Ok(true);
         }
         if !app.config.model.trim().is_empty() {
@@ -297,13 +342,9 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
         } else {
             let local = local.get_or_insert_with(LocalHint::detect);
             match onboarding_destination(shell.ask_selected(
-                "Welcome to dial · choose a model path",
+                "Welcome to dial · where should the model run?",
                 &onboarding_prompt(local),
-                &[
-                    ("Cancel", 'c'),
-                    ("Hosted provider", 'h'),
-                    ("Local model", 'l'),
-                ],
+                ONBOARDING_CHOICES,
                 onboarding_default(local),
             )) {
                 Some(which) => which,

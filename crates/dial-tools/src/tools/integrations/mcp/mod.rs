@@ -36,6 +36,7 @@ mod inventory;
 mod names;
 mod npm;
 mod oauth;
+mod osv;
 pub mod registry;
 pub mod smithery;
 pub use oauth::{login, logout};

@@ -126,7 +126,8 @@ publishes them. Missing or mismatched values fail the release; no example or gen
 key is trusted by production code.
 
 Tags must be ancestors of `main`, with a completed successful **push-to-main** CI run for
-the exact tagged SHA; pull-request CI does not authorize publication. Releases are serialized.
+the exact tagged SHA; pull-request CI does not authorize publication. Preparation runs concurrently;
+`release-publish.yml` serializes publication, package metadata and container updates together.
 An older stable tag may publish versioned artifacts but cannot move GitHub, Homebrew or
 container `latest` backwards. Container builds request BuildKit provenance and an SBOM,
 then sign and verify the immutable image digest with pinned Cosign using GitHub OIDC.
@@ -139,9 +140,13 @@ To verify a published container, resolve its digest and use the exact release ta
 
 ```sh
 cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity 'https://github.com/KiidxAtlas/dial/.github/workflows/release.yml@refs/tags/vX.Y.Z' \
+  --certificate-identity 'https://github.com/KiidxAtlas/dial/.github/workflows/release-publish.yml@refs/tags/vX.Y.Z' \
   'ghcr.io/kiidxatlas/dial@sha256:…'
 ```
+
+This identity names the reusable publishing workflow (`job_workflow_ref` in the OIDC token),
+not its caller. Releases from before the publication-workflow split used `release.yml` instead;
+select the exact workflow in the tagged source rather than accepting an identity wildcard.
 
 An attestation or signature is not proof that the image is safe. Verify the expected repository,
 workflow, tag and digest; do not accept an arbitrary GitHub-issued certificate identity.
@@ -173,9 +178,77 @@ and assembles `Dockerfile.release` for `linux/amd64`. The binary retains the can
 source identity and embedded update key. The source-building `Dockerfile` remains available for
 local development and CI. Published images are smoke-tested, then signed by immutable digest.
 
+### Release speed and measurement
+
+Main CI builds all eight unsigned archives in parallel with its tests while the version is still
+untagged. A tag promotes those exact-commit archives after CI succeeds; absent, expired or
+public-key-mismatched candidates trigger a full rebuild. The tag gate reports which path it chose.
+The optional rebuild may be skipped without skipping publication after successful signing.
+Only publication and downstream `latest` updates share the release queue, so a slow candidate
+build no longer holds up another tag's validation or preparation. Signing protections, archive
+checks, native tests and version ordering remain required. Portable Unix installer tests run in
+main CI rather than once for each of the six Unix candidate targets; each archive still gets its
+own format/runtime smoke checks, and Windows retains its archive-backed installer checks.
+
+CI explicitly selects Nextest's `ci` reporting profile, independently of Cargo's `ci` build profile,
+and uploads `test-timings-<os>` artifacts containing `junit.xml` even when tests fail. Use the
+per-test durations to investigate the critical path before removing coverage. The inspected
+macOS CI run `42935891367` spent 646 seconds in Nextest; its settings tiny-terminal grid test
+took 86 seconds. Those historical measurements are not a promised speedup or current acceptance.
+Locally, `make test-nextest TEST_PROFILE=ci NEXTEST_PROFILE=ci` produces the same JUnit report
+under `target/nextest/ci/` (or the selected `CARGO_TARGET_DIR`).
+
+Profiling the unchanged 961-size settings grid found repeated linear scans of the original
+settings declarations. Original locations are now indexed once, and the normal settings view
+does not compute learning-only membership. Three local runs on the same Apple Silicon host
+reduced the grid's median from 7.65 to 2.21 seconds (3.46×); all dimensions and modes remain
+covered. Other activity on this shared host was not independently ruled out; these are indicative
+local test timings, not an isolated benchmark or a measured reduction in hosted CI duration.
+
+Optional repository variables `DIAL_MACOS_RUNNER` and `DIAL_WINDOWS_RUNNER` select faster
+GitHub-hosted runner labels for push builds/tests/lints on their corresponding platform.
+Leave them unset to retain the existing runners. The replacement must provide the same OS and
+architecture: Apple Silicon macOS for `macos-15`, x86-64 Windows for `windows-2025`.
+Windows ARM and Linux keep their existing runners; pull requests always use the default labels.
+Provisioning/billing and access to larger runners require repository-owner configuration; these
+variables do not provision runners. Larger runners are billed even for public repositories;
+confirm account eligibility and a budget before selecting one. Do not point them at persistent
+self-hosted machines
+without a separately reviewed isolation and cleanup policy. Compare queue time separately from
+job execution time, and do not assume that consolidating parallel targets on one cross-builder
+will reduce wall-clock time. Intel macOS already cross-compiles on Apple Silicon with Rosetta
+smoke coverage; cross-compilation does not replace native Linux/Windows runtime tests.
+
+The manual **Release optimization benchmark** workflow compares cold, full-featured thin-LTO
+and no-LTO builds on native macOS ARM and Linux x86-64 runners. It never signs or publishes.
+It records build seconds, binary bytes, binary SHA-256, compiler/source identity, seven warmed
+`--help` startup samples and their median, plus Cargo HTML timings, then runs artifact/recovery
+smoke tests. It deliberately restores no build cache. Repeat the workflow before drawing timing
+conclusions; startup measurements are not representative of all agent workloads. Shipping stays
+on thin LTO until representative parsing/image/runtime benchmarks and size results justify a change.
+
+A single native Apple Silicon/macOS cold-build comparison with Rust 1.99.0 and a dirty snapshot
+of `99ad369` measured 132.4 seconds with thin LTO and 136.4 seconds without it. Both binaries
+passed artifact and recovery smoke checks; their sizes were 147.7 MB and 145.3 MB respectively.
+Another session reported overlapping benchmark processes during both builds, so these are
+shared-host observations, not an isolated LTO comparison. The approximately 3% difference
+does not establish an improvement from disabling LTO. The shipping profile is unchanged.
+
+For a local measurement on a native host (set the matching target triple):
+
+```sh
+python3 scripts/benchmark-release.py --target aarch64-apple-darwin --lto thin --output target/benchmark-thin.json
+python3 scripts/benchmark-release.py --target aarch64-apple-darwin --lto off --output target/benchmark-off.json
+```
+
+Each variant has a separate target directory. Use a new `--target-dir` for each cold measurement;
+reusing it measures a cached build. Do not clear someone else's caches or benchmark during other
+builds. Local preflight already reuses a successful unchanged tree; its result does not replace
+the exact-commit hosted main-CI publication gate.
+
 ## Build from source
 
-Install the pinned Rust toolchain from `rust-toolchain.toml` and run `cargo build --release --locked -p dial` for shipping optimization. `make build` and `make update` default to the optimized `local` profile (incremental compilation, no LTO); pass `PROFILE=release` for shipping-equivalent builds (thin LTO). `make update` rebuilds from the checkout, backs up existing binaries, and retains only the three newest backups at each managed location. `make check`, `make test-lib`, and `make test-module MOD=module::path` provide narrower development checks; `make test` retains the full Rust suite. CI builds and tests with the `ci` profile (unoptimized, no debug info) and caches Rust dependencies separately for test, lint, and release jobs. Release jobs require a completed successful push-to-main CI run for the exact tagged commit before building, signing or publishing. Python tests run under pytest in CI; optional model/runtime dependencies are separate from the Rust executable.
+Install the pinned Rust toolchain from `rust-toolchain.toml` and run `cargo build --release --locked -p dial` for shipping optimization. `make build` and `make update` default to the optimized `local` profile (incremental compilation, no LTO); pass `PROFILE=release` for shipping-equivalent builds (thin LTO). `make update` rebuilds from the checkout, backs up existing binaries, and retains only the three newest backups at each managed location. `make check`, `make test-lib`, and `make test-module MOD=module::path` provide narrower development checks; `make test` retains the full Rust suite. CI builds and tests with the `ci` profile (unoptimized, no debug info) and caches Rust dependencies separately for test, lint, and release jobs. Main CI builds unsigned candidates alongside tests; the tag workflow requires a completed successful push-to-main CI run for the exact tagged commit before fallback builds, signing or publication. Python tests run under pytest in CI; optional model/runtime dependencies are separate from the Rust executable.
 
 `make test-python` and `make test-release-policy` check the selected `PYTHON` interpreter before
 starting their suites. Missing or broken `pytest`/`cryptography` imports fail with the interpreter
@@ -404,28 +477,43 @@ Use Python 3.12 with the pinned check dependencies, for example:
 uv run --no-project --python 3.12 --with-requirements scripts/requirements-ci.lock make release-check
 ```
 
-`--tag` requires clean `main`, matching `origin/main`, passing no-build checks and a completed
-successful **push-to-main CI run for that exact commit**, checked with `gh`. It does not bump,
-commit, compile or push main. `--tag --push` additionally pushes the tag; bare `--push` and the
-old `--no-check` bypass are refused. The workflow independently repeats exact-commit admission.
+`--tag` requires clean `main`, matching `origin/main`, passing no-build checks and completed
+successful CI for that exact source: either the **push-to-main CI run for the commit** or the CI
+run of the **merged pull request whose tested and built tree is identical** (see below), checked
+with `gh`. It does not bump, commit, compile or push main. `--tag --push` additionally pushes the
+tag; bare `--push` and the old `--no-check` bypass are refused. The workflow independently repeats
+admission.
 
 CI's shared no-build readiness/format job gates every compiling matrix and the container build.
-On main, while the workspace version has no tag, CI also calls `release-build.yml` to compile
-unsigned candidates for all eight release targets **in parallel with the test/lint jobs**. This
-does not run for PRs or after that version is tagged. Candidate jobs validate public keys, package
-and smoke-test every archive, and record the exact commit, version and embedded public key.
-They receive no private signing key or protected environment access. All candidate jobs must
-succeed for that main CI run to pass; this uses more concurrent runner capacity on release-bound
-main pushes, so queue time still depends on the account's concurrency allowance.
+While the workspace version has no tag, CI also calls `release-build.yml` to compile unsigned
+candidates for all eight release targets **in parallel with the test/lint jobs**, on main pushes
+and on pull requests from this repository (version-bump PRs in practice). A pull request records
+candidates only when the merge with main that CI tests has the same tree as the PR head that is
+built; a PR that is behind main gets none. Main skips the rebuild when a merged PR's CI already
+recorded candidates for the same tree. Candidate jobs validate public keys, package and smoke-test
+every archive, and record the built commit, its source tree, the version and the embedded public
+key. They receive no private signing key or protected environment access. All candidate jobs must
+succeed for that CI run to pass; this uses more concurrent runner capacity on release-bound
+pushes, so queue time still depends on the account's concurrency allowance.
 
-The tag workflow still requires successful push-to-main CI for the exact SHA. It promotes that
-CI run's complete, unexpired candidate artifact set rather than compiling again. PR artifacts,
-other commits, incomplete sets and identities with a changed public key cannot be promoted.
-Older CI runs, expired artifacts or a rotated public key use the same shared build workflow as a
-fallback. Authentication/API errors fail visibly rather than silently bypassing admission.
-The protected `release-signing` input check and final signing approval remain mandatory when
-configured. The final job rechecks candidate identity before signing; build jobs never receive
-the private key. Workflow source alone cannot establish hosted repository protections.
+The tag workflow first looks for a pull request from this repository, merged into main with a
+merge commit (its head is an ancestor of the tag), whose head has the tagged commit's tree and whose
+newest successful CI run recorded candidates for that tree and tag. When found, it reuses that run's
+tests and archives and does not wait for main CI;
+this is what makes "merge the release PR, then tag" fast. Otherwise it requires successful
+push-to-main CI for the exact SHA, as before, and promotes that run's candidates. Fork pull
+requests, other trees, incomplete or expired sets and identities with a changed public key cannot
+be promoted; those cases rebuild every platform with the same shared workflow. Released binaries
+built on a pull request report its head commit in `dial --version`; that commit is in main's
+history and has the tagged tree. Authentication/API errors fail visibly rather than silently
+bypassing admission. The protected `release-signing` input check and final signing approval
+remain mandatory when configured. The final job rechecks the candidate tree, tag and public key
+before signing; build jobs never receive the private key. Workflow source alone cannot establish
+hosted repository protections.
+
+Release in one path: either push the prepared commit to main and tag it after main CI passes, or
+open a release PR, merge it once its checks pass, and tag the merge commit right away. Doing both
+repeats CI on the same tree.
 
 Candidate Rust caches are saved from main, including after failure, so later main commits can
 restore them; tag-scoped fallback builds restore main caches without creating isolated tag caches.
@@ -433,33 +521,30 @@ PR container builds restore the main layer cache but do not export competing PR 
 The release container no longer needs a Rust compilation cache. Cache availability and speedups
 are not guaranteed; Docker cache mounts are not themselves persisted by the layer-cache exporter.
 
-Intel macOS test jobs also cache pip downloads and locally built wheels, keyed by Python and
-`scripts/requirements-ci.lock`, so successful jobs can reuse the otherwise source-built
-`cryptography` wheel. Installation still requires the locked hashes. Only main CI enables this
-cache; PRs, candidate packaging and tag fallback builds do not, avoiding extra branch-scoped
-cache entries. A cold or evicted cache still builds normally.
+Release candidate jobs also cache pip downloads and locally built wheels, keyed by Python and
+`scripts/requirements-ci.lock`, so the Intel macOS packaging job can reuse its source-built
+`cryptography` wheel. Installation still requires the locked hashes. Only main enables this
+cache; PRs and tag fallback builds do not, avoiding extra branch-scoped cache entries. A cold or
+evicted cache still builds normally.
 
 The `x86_64-apple-darwin` candidate is cross-compiled on an Apple Silicon `macos-15` runner
 instead of the Intel runner, whose release build took about 24 minutes and set the candidate
 critical path. Its packaged binary is format-checked and smoke-tested under Rosetta 2, which the
-job installs if missing. The full test suite still runs on native Intel hardware in CI.
+job installs if missing.
 
 #### Runner capacity and downstream failures
 
-Intel macOS remains fully tested in CI. To benchmark a faster **native Intel macOS** test runner,
-set the repository variable `DIAL_MACOS_INTEL_RUNNER` to an available runner label; CI tests use
-it, defaulting to `macos-15-intel`. Candidate packaging cross-compiles and does not use it. Provisioning a paid runner or increasing
-the repository cache quota requires an owner decision; this change does not spend money or alter
-hosted settings. Do not send untrusted PRs to a persistent privileged self-hosted runner.
+Intel macOS is still built, smoke-tested and published, but CI no longer runs the test suite on
+Intel hardware: that job took 30 to 60 minutes and held every release behind it. Intel-specific
+regressions that the Rosetta smoke test does not exercise can therefore reach a release.
+Provisioning a paid runner or increasing the repository cache quota requires an owner decision.
+Do not send untrusted PRs to a persistent privileged self-hosted runner.
 
 The publish job writes the binary release URL to its summary before downstream jobs start. If
-website refresh, package metadata or container publication fails, rerun only the failed jobs with
+package metadata or container publication fails, rerun only the failed jobs with
 `gh run rerun <release-run-id> --failed`; do not retag, rebuild or republish successful binaries.
-Those jobs retain visible failures. Website HTTP 404 means the refresh route is absent or its
-server-side token is unset: deploy the route and set `NUXT_RELEASE_REFRESH_TOKEN` on dial-web to
-the same value as Dial's `DIAL_WEB_REFRESH_TOKEN` secret. HTTP 401 means the values do not match.
-The endpoint intentionally returns 404 without its server-side token; changing the Dial workflow
-alone cannot configure the separately hosted website. No token value should appear in logs.
+Those jobs retain visible failures. The release workflow does not refresh dial.rootatlas.dev;
+the site picks up a new release when its cached copy of GitHub's latest release expires.
 
 #### Checking a commit locally before pushing
 
@@ -510,10 +595,15 @@ does it create a GitHub release with the archives, bundled MIT license and READM
 combined `SHA256SUMS` with its `SHA256SUMS.sig` and `SHA256SUMS.sshsig` signatures, and curated notes
 from the tag's exact version section in `CHANGELOG.md` (missing, duplicate or empty sections refuse publication).
 The container job pins Cosign installer v4.1.2 and Cosign v3.0.6; its OIDC signing and verification still
-require a successful hosted run. CI runs on both
-macOS and Ubuntu without weakening host security. CI builds the `dial` library and its unit-test
-build one after the other: each peaks near 5 GB in rustc, and together they would swap on the
-7 GB macOS arm64 runner. The native Windows Rust contract (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) runs in CI's `windows-rust` job, so the CI requirement above covers it; the release does not repeat it. The Windows release jobs (x86-64 and ARM64) build `dial.exe`, smoke-test the packaged archive (`--version`, `--help`), verify the binary format for the target, and run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.sshsig`.
+require a successful hosted run. CI runs the full portable test suite once, on Ubuntu, and a
+focused macOS contract (`scripts/macos-contract.txt`) on macOS: the modules with macOS-specific
+code (Seatbelt sandbox, APFS clones, power assertions, launchd schedules, pasteboard, keychain,
+desktop capture, browser discovery, self-update) plus sandboxed isolation, shell-session and
+terminal-lifecycle integration tests. Repeating the portable suite on macOS took about 11 of the
+job's 20 minutes in CI run `42935891367`. Locally, its 28 filters ran 3,196 tests in about 7
+minutes, including compilation, on Apple Silicon. Add a filter with any new macOS-specific code;
+`make preflight` on a macOS host still runs the full suite before pushing. Ubuntu builds the
+`dial` library and its unit-test build one after the other: each peaks near 5 GB in rustc. The native Windows Rust contract (`scripts/windows-contract.txt`, which lists its skipped tests with reasons) runs in CI's `windows-rust` job, so the CI requirement above covers it; the release does not repeat it. The Windows release jobs (x86-64 and ARM64) build `dial.exe`, smoke-test the packaged archive (`--version`, `--help`), verify the binary format for the target, and run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS`, `SHA256SUMS.sig`, and `SHA256SUMS.sshsig`.
 
 The Windows contract selects each library's owning package rather than compiling every
 workspace test harness for each filter. Its migrated-record privacy assertion checks native
@@ -525,27 +615,35 @@ The Unix CI smoke tier stages the executable already produced by the workspace b
 
 CI caches compiled dependencies per job with `Swatinem/rust-cache`. Caches are saved only from
 `main`, and also after a failing run, so one red test does not force the next run on that OS to
-rebuild from scratch. The repository's 10 GB cache quota evicts the least recently used entries
-first, so the Linux feature-powerset jobs share one cache per runner image, saved only by the
-all-features combination; per-combination caches crowded out the macOS test caches.
+rebuild from scratch. The repository's default 10 GB cache quota evicts the least recently used
+entries first, so the Linux feature jobs share one cache per runner image, saved only by the
+largest combination on that image. Ubuntu 22.04 Clippy restores that same dependency cache,
+without becoming a competing writer; macOS/Windows lint caches keep their separate keys.
+Per-combination caches previously crowded out the macOS test caches. Sharing compatible
+check artifacts reduces duplication but does not guarantee cache residency; inspect cache hits
+and repository usage before increasing the quota or deleting useful build artifacts.
 
-Push and pull-request CI run eight representative Linux feature selections: minimal, each
-of the five optional features alone, the default feature set, and all features. PipeWire
-already enables desktop, so its individual selection covers that pair without a duplicate job.
-`.github/workflows/linux-features.yml` owns the shared compile job and runs
-the exhaustive 32-combination powerset weekly (Monday 04:23 UTC). Maintainers can also
-dispatch **Linux feature coverage** manually, with exhaustive coverage enabled by default;
-run that tier before a release when full feature-interaction evidence is needed. It does
-not run the other platform suites again. Feature compilation is capped at four concurrent
-jobs per run to leave capacity for platform CI. PipeWire selections retain Ubuntu 24.04;
-other selections retain Ubuntu 22.04. Representative coverage does not prove every optional
-feature interaction; the exhaustive tier retains that coverage. This changes future runs,
-not workflows already queued from an older commit.
+Push and pull-request CI compile three Linux feature selections: minimal (no optional
+features), the default feature set, and all features. `.github/workflows/linux-features.yml`
+owns the shared compile job and runs the exhaustive 32-combination powerset weekly (Monday
+04:23 UTC). Maintainers can also dispatch **Linux feature coverage** manually, with exhaustive
+coverage enabled by default; run that tier before a release when a change touches feature
+gating. Per-push coverage does not prove that each optional feature compiles alone or with
+every other; a gating mistake can surface only in the weekly run. PipeWire selections use
+Ubuntu 24.04; other selections use Ubuntu 22.04.
 
-The Intel macOS CI job (`macos-15-intel`) runs format, build and the full test suite. The
-installed-binary smoke tests, real-terminal lifecycle scripts, slim build check and runtime
-overhead recording run on `macos-15` and Ubuntu only; release candidates cross-compile the
-`x86_64-apple-darwin` archive on `macos-15` and smoke-test it under Rosetta 2.
+CI runs format, build and the full test suite on `macos-15` and Ubuntu. The installed-binary
+smoke tests, real-terminal lifecycle scripts, slim build check and runtime overhead recording
+run on Ubuntu only; `make preflight` runs the smoke and real-terminal suites on a developer's
+macOS host. Release candidates cross-compile the `x86_64-apple-darwin` archive on `macos-15` and
+smoke-test it under Rosetta 2.
+
+The musl compile checks run on pull requests and on pushes that do not build release
+candidates; a main push that builds candidates compiles both musl targets there instead. The
+source container image (`.github/workflows/docker.yml`) builds only when the Dockerfiles,
+compose files, `Cargo.lock`, the toolchain pin or that workflow change. Source changes that break
+only the container build are caught by the release workflow, which builds and smoke-tests the
+published image.
 
 The workflow preserves repository visibility. Dial is MIT licensed; see `LICENSE` for
 permission to use, modify, and redistribute it.

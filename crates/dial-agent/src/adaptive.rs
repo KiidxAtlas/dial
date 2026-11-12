@@ -414,14 +414,26 @@ pub fn render_request_settings(settings: &Value, compact: bool) -> Option<String
         Some(false) => "off",
         None => "model default",
     };
+    if compact {
+        // The live label names only what this request decides: a value Dial sends, or one the
+        // server reported. Pure delegation ("provider", "model default") says nothing at a glance.
+        let mut parts = Vec::new();
+        for (label, key) in [("temp", "temperature"), ("out", "max_tokens")] {
+            let value = delegated(key, "");
+            if !value.is_empty() {
+                parts.push(format!("{label} {value}"));
+            }
+            if key == "temperature" && settings["thinking"].is_boolean() {
+                parts.push(format!("think {thinking}"));
+            }
+        }
+        return (!parts.is_empty()).then(|| parts.join(" · "));
+    }
     let short = format!(
         "temp {} · think {thinking} · out {}",
         delegated("temperature", "provider"),
         delegated("max_tokens", "provider")
     );
-    if compact {
-        return Some(short);
-    }
     Some(format!(
         "{short}\nTop-p {} · top-k {} · min-p {}\nSampling selection: {}; server enforcement unconfirmed\nReasoning effort {} · thinking budget {} · loop penalty {}\nReasoning guard: {} bytes · pre-action {}s (0 = unlimited)\nDial-side requested controls, not confirmed backend behavior. Unset fields may be provider defaults, not confirmed unsent. /policy shows the last request.",
         delegated("top_p", "unset"),
@@ -442,6 +454,36 @@ pub fn render_request_settings(settings: &Value, compact: bool) -> Option<String
         number("max_reasoning_bytes"),
         number("max_pre_action_secs"),
     ))
+}
+
+/// The user-adjustable request controls that differ between two requests, as one readable line
+/// (`thinking on → off · temp 0.6 → 0.2`). Derived budgets and provider reports are not controls.
+pub fn request_settings_diff(before: &Value, after: &Value) -> Option<String> {
+    const CONTROLS: &[(&str, &str)] = &[
+        ("temperature", "temp"),
+        ("top_p", "top-p"),
+        ("top_k", "top-k"),
+        ("min_p", "min-p"),
+        ("thinking", "thinking"),
+        ("reasoning_effort", "effort"),
+        ("thinking_budget", "thinking budget"),
+        ("max_tokens", "output limit"),
+        ("loop_penalty", "loop penalty"),
+        ("context_window", "context window"),
+    ];
+    let show = |value: &Value| match value {
+        Value::Null => "default".to_owned(),
+        Value::Bool(true) => "on".to_owned(),
+        Value::Bool(false) => "off".to_owned(),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let changes: Vec<_> = CONTROLS
+        .iter()
+        .filter(|(key, _)| before[*key] != after[*key])
+        .map(|(key, label)| format!("{label} {} → {}", show(&before[*key]), show(&after[*key])))
+        .collect();
+    (!changes.is_empty()).then(|| changes.join(" · "))
 }
 
 pub fn render(value: &Value) -> String {

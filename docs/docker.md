@@ -108,5 +108,7 @@ servers must listen on an address the container can reach, not only on the host'
 
 ## Checks
 
-CI builds the image, runs `dial --version` and `dial --help` from it, and validates the compose
-file (`docker` job in `.github/workflows/ci.yml`).
+The **Container image** workflow (`.github/workflows/docker.yml`) builds the image, runs
+`dial --version` and `dial --help` from it, and validates the compose file. It runs only when the
+Dockerfiles, compose files, `Cargo.lock`, the toolchain pin or that workflow change; the release
+workflow builds and smoke-tests the published image on every release.

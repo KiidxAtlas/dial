@@ -138,6 +138,19 @@ fn calls_are_validated_against_the_member_schema() {
     };
     let refused = facade.call(&ctx, &json!({"kind":"data","action":"analyze"}));
     assert!(refused.is_error, "{}", refused.text);
+    assert!(
+        refused
+            .text
+            .contains("action=analyze belongs to kind=audio; resend with that selector"),
+        "{}",
+        refused.text
+    );
+    let invalid = facade.call(&ctx, &json!({"kind":"data","action":"profile","own":"x"}));
+    assert!(
+        invalid.is_error && !invalid.text.contains("belongs to"),
+        "{}",
+        invalid.text
+    );
     let ok = facade.call(&ctx, &json!({"kind":"data","action":"profile","path":"x"}));
     assert!(!ok.is_error, "{}", ok.text);
     assert_eq!(ok.text, r#"data {"action":"profile","path":"x"}"#);

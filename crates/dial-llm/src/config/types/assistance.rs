@@ -317,7 +317,8 @@ pub const MAX_BATCH_RESULT_PERCENT: u32 = 80;
 #[serde(default, deny_unknown_fields)]
 pub struct EfficiencyConfig {
     pub enabled: bool,
-    /// Bounded initial source preservation in unattended task sessions.
+    /// Bounded initial source preservation in unattended task sessions. The copies are taken
+    /// silently; the model hears of one only when its original disappears or shrinks.
     pub preserve_task_inputs: bool,
     /// Unattended work rounds without new independent evidence before a blocked stop; 0 off.
     pub evidence_stall_rounds: u32,

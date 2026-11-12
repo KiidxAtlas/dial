@@ -1,0 +1,53 @@
+# Focused macOS Rust contract, run by `scripts/windows-contract.py --contract` on the macOS runner.
+#
+# The full portable suite runs on Linux. macOS runs the modules whose behavior differs on macOS:
+# each filter below owns code under `cfg(target_os = "macos")` or a macOS-specific backend
+# (Seatbelt sandbox, APFS clones, power assertions, launchd scheduling, pasteboard, keychain and
+# browser discovery). Add a filter when adding macOS-specific code; remove one only with its code.
+# `make preflight` on a macOS host still runs the full suite before pushing.
+#
+#   test-lib <package> <libtest-filter>              explicit package library (substring match)
+#   test-bin <package> <binary> <filter>             explicit binary target (substring match)
+#   test-integration <package> <target> <filter>     explicit integration-test target
+#   skip <test-path> # <reason>                      excluded via libtest `--skip`
+
+# Clone/rename, power assertions, process info, terminal and wake handling.
+test-lib dial-core platform::
+# Seatbelt sandbox, shells, kernels, eval and background jobs on macOS process semantics.
+test-lib dial-tools tools::exec::
+# Browser discovery, system views, executable documents, SSH paths, tool catalog and gh helpers.
+test-lib dial-tools tools::net::browser::
+test-lib dial-tools tools::fs::system::
+test-lib dial-tools tools::fs::documents::executable::
+test-lib dial-tools tools::integrations::ssh::
+test-lib dial-tools tools::surface::catalog::
+test-lib dial-tools tools::vcs::
+test-lib dial-tools tools::edit::
+# Dependency setup, vision models and voice (macOS speech and audio backends).
+test-lib dial-tools setup::
+test-lib dial-tools voice::
+# Approval, worker isolation/development copies and process learning.
+test-lib dial-agent agent::safety::approval::
+test-lib dial-agent agent::workers::
+test-lib dial-agent learn::processes::
+# launchd schedules, maintenance launch, settings overlay and shell lifecycle.
+test-lib dial-app schedule::
+test-lib dial-app app::commands::maintenance::
+test-lib dial-app app::overlay::settings::
+test-lib dial-app app::shell::
+# Desktop capture and input RPC.
+test-lib dial-computer computer::
+# Provider OAuth/keychain, downloads, local fit and macOS config paths.
+test-lib dial-llm llm::
+test-lib dial-llm config::paths::
+# Pasteboard, composer and macOS key handling.
+test-lib dial-ui ui::clipboard
+test-lib dial-ui ui::composer::
+test-lib dial-ui ui::keys::
+# Self-update activation on macOS.
+test-bin dial dial cmd::update::tests::
+# Sandboxed isolation, shell sessions and terminal lifecycle end to end. The native idle-sleep test
+# (`agent::idle_sleep`) is `#[ignore]`d and run by hand, so the full suite never ran it either.
+test-integration dial integration isolation::
+test-integration dial integration shell_sessions::
+test-integration dial integration terminal_lifecycle::

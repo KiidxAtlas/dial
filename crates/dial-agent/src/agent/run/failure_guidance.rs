@@ -276,6 +276,17 @@ pub(in crate::agent) fn report(
     )
 }
 
+/// A failed turn's error as shown to a person: the diagnostic chain without the recovery
+/// guidance that is addressed to the model (`PROVIDER_RECOVERY`).
+pub fn user_failure_text(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .filter(|cause| cause != PROVIDER_RECOVERY)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 pub(in crate::agent) fn provider_failure(error: &anyhow::Error) -> String {
     format!("{error:#}\n{PROVIDER_RECOVERY}")
 }

@@ -394,7 +394,13 @@ impl ProviderOverlay {
                         url.trim_end_matches('/') != spec.base_url.trim_end_matches('/')
                     })
             });
-            let (state, detail) = if spec.is_some_and(|spec| !spec.enabled) {
+            let reset = spec.is_some_and(ProviderSpec::is_reset);
+            let (state, detail) = if reset {
+                (
+                    "not-set-up",
+                    "Removed from Dial; set up this provider to connect again",
+                )
+            } else if spec.is_some_and(|spec| !spec.enabled) {
                 ("disabled", "Disabled in configuration")
             } else if endpoint_changed {
                 ("unknown", "Endpoint changed since the last metadata scan")
@@ -412,15 +418,25 @@ impl ProviderOverlay {
                     .or_else(|| p.base_url.clone()),
                 state: state.to_owned(),
                 detail: detail.to_owned(),
-                models: if endpoint_changed { 0 } else { p.models },
-                spec: spec.cloned(),
+                models: if endpoint_changed || reset {
+                    0
+                } else {
+                    p.models
+                },
+                spec: spec.filter(|spec| !spec.is_reset()).cloned(),
             });
         }
         for (id, spec) in &self.configured {
             if out.iter().any(|e| &e.id == id) {
                 continue;
             }
-            let state = if !spec.enabled { "disabled" } else { "unknown" };
+            let state = if spec.is_reset() {
+                "not-set-up"
+            } else if !spec.enabled {
+                "disabled"
+            } else {
+                "unknown"
+            };
             out.push(Entry {
                 id: id.clone(),
                 label: if spec.label.is_empty() {
@@ -436,7 +452,7 @@ impl ProviderOverlay {
                     "Waiting for the first scan".to_owned()
                 },
                 models: 0,
-                spec: Some(spec.clone()),
+                spec: (!spec.is_reset()).then(|| spec.clone()),
             });
         }
         // Metadata evidence (observed or cached) first, then configured routes; none of these
@@ -567,6 +583,22 @@ impl ProviderOverlay {
             self.mode = Mode::Wizard(Wizard::new());
             return;
         };
+        if entry.state == "not-set-up" {
+            let mut items = Vec::new();
+            if matches!(entry.id.as_str(), "mlx" | "apple") || entry.base_url.is_some() {
+                items.push((ProviderAction::Toggle, "Set up provider".into()));
+            }
+            items.push((
+                ProviderAction::EditConfiguration,
+                "Edit configuration / endpoint → Settings providers".into(),
+            ));
+            self.mode = Mode::Menu(Menu {
+                entry,
+                items,
+                cursor: 0,
+            });
+            return;
+        }
         let saved = self.key_saved(&entry);
         let mut items = vec![(ProviderAction::ChooseModel, "Choose a model".to_owned())];
         if entry.id != crate::llm::chatgpt::PROVIDER && entry.base_url.is_some() {
@@ -727,9 +759,7 @@ impl ProviderOverlay {
             ProviderAction::VerifyCodingModel,
             "Check selected chat model coding/tool compatibility…".into(),
         ));
-        if entry.spec.is_some() {
-            items.push((ProviderAction::Remove, "Remove provider".to_owned()));
-        }
+        items.push((ProviderAction::Remove, "Remove provider".to_owned()));
         self.mode = Mode::Menu(Menu {
             entry,
             items,
@@ -738,6 +768,13 @@ impl ProviderOverlay {
     }
 
     fn begin_key(&mut self) {
+        if self
+            .selected()
+            .is_some_and(|entry| entry.state == "not-set-up")
+        {
+            self.open_menu();
+            return;
+        }
         match self.selected() {
             Some(entry) if entry.id == crate::llm::chatgpt::PROVIDER => {
                 self.message = Some((
@@ -766,20 +803,8 @@ impl ProviderOverlay {
     }
 
     fn begin_remove(&mut self) -> OverlayEvent {
-        match self.selected() {
-            Some(entry) if entry.spec.is_some() => {
-                self.mode = Mode::Confirm(entry, Removal::Provider)
-            }
-            Some(entry) => {
-                self.message = Some((
-                    format!(
-                        "{} is built in and is not in your config; disable it instead",
-                        text::one_line(&entry.label)
-                    ),
-                    false,
-                ))
-            }
-            None => {}
+        if let Some(entry) = self.selected() {
+            self.mode = Mode::Confirm(entry, Removal::Provider);
         }
         OverlayEvent::None
     }
@@ -967,7 +992,7 @@ impl ProviderOverlay {
             base_url: action.base_url.clone().unwrap_or_default(),
             ..ProviderSpec::default()
         });
-        spec.enabled = action.state == "disabled";
+        spec.enabled = matches!(action.state.as_str(), "disabled" | "not-set-up");
         OverlayEvent::AddProvider {
             id: action.id,
             spec,
@@ -1137,12 +1162,12 @@ impl ProviderOverlay {
         let (main, note) = match removal {
             Removal::Provider => (
                 format!(
-                    "  Remove provider {} ({}) from the {} config?",
+                    "  Reset provider {} ({}) to not set up in the {} config?",
                     label,
                     text::one_line(&entry.id),
                     scope_name(self.scope)
                 ),
-                "  Its saved API key, if any, is kept until you remove it.".to_owned(),
+                "  Removes saved URL-scoped keys and sign-ins (shared across projects). Global also clears this project's override. Environment, servers and model files stay unchanged.".to_owned(),
             ),
             Removal::SavedKey => (
                 format!("  Remove the saved API key for {label}?"),
@@ -1357,7 +1382,9 @@ impl ProviderOverlay {
             "reachable" => Status::Ready,
             "cached" | "unknown" => Status::Missing,
             // Not configured yet is a neutral state, not a warning.
-            "auth-required" => return chrome::status_chip(theme, Status::Missing, "not set up"),
+            "auth-required" | "not-set-up" => {
+                return chrome::status_chip(theme, Status::Missing, "not set up");
+            }
             "disabled" => Status::Missing,
             _ => Status::Error,
         };

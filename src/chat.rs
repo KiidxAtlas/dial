@@ -18,9 +18,6 @@ pub(crate) fn chat(
 ) -> Result<()> {
     let tty = std::io::stdin().is_terminal();
     let interactive_capable = tty && std::io::stdout().is_terminal();
-    if cli.print || !interactive_capable {
-        config.require_model()?;
-    }
     let config = config.for_coding();
     let notices: Vec<String> = Vec::new();
 
@@ -47,6 +44,12 @@ pub(crate) fn chat(
             let latest =
                 dial::storage::session::latest_conversation(&catalogue).map(|s| s.path.clone());
             if latest.is_none() {
+                // A one-shot run that asked to continue must not silently lose its context.
+                if cli.print {
+                    bail!(
+                        "no earlier conversation in this project to continue; drop -c to start a new one"
+                    );
+                }
                 eprintln!("No earlier conversation in this project; starting a new session.");
             }
             latest
@@ -116,6 +119,11 @@ pub(crate) fn chat(
     };
     if (output_schema.is_some() || cli.output_last_message.is_some()) && !cli.print {
         bail!("--output-schema and -o/--output-last-message need print mode (-p)");
+    }
+    // After the session and arguments are checked, so a wrong `-r` id or a missing prompt is
+    // reported as such rather than hidden behind the model requirement.
+    if !interactive {
+        config.require_model()?;
     }
     let options = Options {
         session,

@@ -34,7 +34,7 @@ impl Agent<'_> {
         }
         if !notices.is_empty() {
             self.session.set_control_state(state)?;
-            output.text.push_str(&format!("\n<dial-notice kind=\"input_evidence_changed\">\nOriginal task inputs changed: {}. Retained artifacts contain the actual original bytes; inspect them before reconstruction and restore only through admitted tools. Source access and destination writes still need their normal permissions. If evidence cannot be recovered, report that limitation rather than fabricate data.\n</dial-notice>", json!(notices)));
+            output.text.push_str(&format!("\n<dial-notice kind=\"input_evidence_changed\">\nOriginal task inputs changed: {}. Retained artifacts contain the actual original bytes; inspect them before reconstruction and restore only through admitted tools. To restore exact bytes without copying them through your reply, run one eval cell: `await dial.writeBytes(path, await dial.readBytes(original))` (Python: `dial.writeBytes(path, dial.readBytes(original))`); writeBytes only creates, so move a damaged file aside first, and work on a copy if a tool may consume the original again. Source access and destination writes still need their normal permissions. If evidence cannot be recovered, report that limitation rather than fabricate data.\n</dial-notice>", json!(notices)));
         }
         Ok(())
     }

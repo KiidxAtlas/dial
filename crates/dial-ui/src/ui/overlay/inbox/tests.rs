@@ -151,3 +151,34 @@ fn enter_reads_directly_unread_is_a_mark_and_mark_all_read_clears_every_notice()
         "nothing left to mark"
     );
 }
+
+#[test]
+fn return_digest_lists_only_notices_that_arrived_during_a_real_focus_loss() {
+    let mut inbox = Inbox::default();
+    inbox.push("Workers", "before any focus report");
+    // Unknown focus reads as unfocused; that is not an absence.
+    assert_eq!(inbox.returned(false), None);
+    assert_eq!(inbox.returned(true), None);
+
+    assert_eq!(inbox.returned(false), None);
+    inbox.push("Workers", "review finished\nsecond line");
+    // Repeated unfocused observations keep the original mark.
+    assert_eq!(inbox.returned(false), None);
+    inbox.push("Background", "build failed");
+    assert_eq!(
+        inbox.returned(true).as_deref(),
+        Some("Background: build failed\nWorkers: review finished")
+    );
+    // The digest is shown once, and a quiet absence shows nothing.
+    assert_eq!(inbox.returned(true), None);
+    assert_eq!(inbox.returned(false), None);
+    assert_eq!(inbox.returned(true), None);
+
+    assert_eq!(inbox.returned(false), None);
+    for i in 0..5 {
+        inbox.push("Background", &format!("job {i}"));
+    }
+    let digest = inbox.returned(true).unwrap();
+    assert!(digest.starts_with("Background: job 4\nBackground: job 3\nBackground: job 2\n"));
+    assert!(digest.ends_with("+2 more; /inbox lists them"), "{digest}");
+}

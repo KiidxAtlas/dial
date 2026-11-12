@@ -95,7 +95,7 @@ fn segments(command: &str) -> Vec<(String, bool)> {
 #[test]
 fn default_rules_all_compile_and_match_count() {
     let rules = default_rules();
-    assert_eq!(rules.len(), 11);
+    assert_eq!(rules.len(), 13);
     for r in &rules {
         assert!(
             compile_rule(r).is_some(),
@@ -150,6 +150,33 @@ fn read_rule() {
     // Writing through `cat` is not a read.
     assert_eq!(blocked_tool("cat > notes.md"), None);
     assert_eq!(blocked_tool("cat >> notes.md"), None);
+}
+
+/// Read-like sqlite3 opens and hex dumps point at `read`; writes and `-readonly` opens do not.
+#[test]
+fn database_and_hex_viewers_are_read() {
+    for c in [
+        "sqlite3 main.db",
+        "sqlite3 main.db .tables",
+        "sqlite3 main.db '.schema items'",
+        "sqlite3 -header main.db \"SELECT * FROM items\"",
+        "sqlite3 main.db 'pragma journal_mode'",
+        "xxd main.db-wal",
+        "hexdump -C data.bin",
+        "od -An -tx1 data.bin",
+    ] {
+        assert_eq!(hinted_tool(c).as_deref(), Some("read"), "{c}");
+    }
+    for c in [
+        "sqlite3 -readonly main.db 'SELECT 1'",
+        "sqlite3 main.db 'INSERT INTO t VALUES (1)'",
+        "sqlite3 main.db 'PRAGMA wal_checkpoint' && cp main.db out.db",
+        "sqlite3 --version",
+        "xxd -r dump.hex out.bin",
+        "odd x",
+    ] {
+        assert_eq!(check(&hint_mode(), TOOLS, c), None, "{c}");
+    }
 }
 
 #[test]

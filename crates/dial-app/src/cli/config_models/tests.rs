@@ -179,3 +179,43 @@ fn config_display_uses_runtime_defaults_overlay_and_hook_merging() {
     let runtime = settings_store::load_config(&layout, &overlay).unwrap();
     assert_eq!(table, toml::Table::try_from(runtime).unwrap());
 }
+
+#[test]
+fn unknown_keys_suggest_the_closest_setting() {
+    let known = words(&["ui.motion", "ui.history_limit", "model"]);
+    assert_eq!(closest_key("UI.Motion", &known), Some("ui.motion"));
+    assert_eq!(closest_key("motion", &known), Some("ui.motion"));
+    assert_eq!(
+        closest_key("ui.histroy_limit", &known),
+        Some("ui.history_limit")
+    );
+    assert_eq!(closest_key("nonexistent.key", &known), None);
+    assert_eq!(edit_distance("kitten", "sitting"), 3);
+}
+
+#[test]
+fn set_accepts_switch_words_and_negative_values() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        action: ConfigAction,
+    }
+    let parsed = Cli::try_parse_from(["dial", "set", "ui.history_limit", "-1"]).unwrap();
+    assert!(matches!(parsed.action, ConfigAction::Set { value, .. } if value == "-1"));
+    let table = toml::Table::new();
+    let off = crate::config::schema::coerce_value(&table, "ui.motion", parse_value("off"));
+    assert_eq!(off, toml::Value::Boolean(false));
+    let yes = crate::config::schema::coerce_value(&table, "ui.motion", parse_value("Yes"));
+    assert_eq!(yes, toml::Value::Boolean(true));
+    // Text settings keep the word.
+    let text = crate::config::schema::coerce_value(&table, "model", parse_value("off"));
+    assert_eq!(text, toml::Value::String("off".into()));
+    let error =
+        crate::config::schema::check_value_for(&table, "ui.history_limit", &parse_value("20000"))
+            .unwrap_err();
+    assert!(error.contains("an integer from 0 to 10000"), "{error}");
+    let error = crate::config::schema::check_value_for(&table, "ui.motion", &parse_value("maybe"))
+        .unwrap_err();
+    assert!(error.contains("true or false"), "{error}");
+}

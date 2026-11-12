@@ -145,7 +145,12 @@ impl Totals {
         self.tokens_per_second = ratio(self.output as f64, self.duration_ms as f64 / 1000.0);
         self.cache_rate = ratio(self.cache_read as f64 * 100.0, self.input as f64);
         self.error_rate = ratio(self.errors as f64 * 100.0, self.requests as f64);
-        self.avg_latency_ms = ratio(self.duration_ms as f64, self.requests as f64);
+        // Failed requests add no model time (see `Db::record_request`), so latency averages
+        // the requests that answered.
+        self.avg_latency_ms = ratio(
+            self.duration_ms as f64,
+            self.requests.saturating_sub(self.errors) as f64,
+        );
         self
     }
 }
@@ -546,7 +551,9 @@ impl Db {
                subscription = subscription + excluded.subscription",
             params![r.ts_ms.div_euclid(HOUR_MS), r.project, r.model, r.error as i64, r.reported as i64,
                 sql_u64(r.input), sql_u64(r.output), sql_u64(r.cache_read), sql_u64(r.cache_write),
-                sql_u64(r.reasoning), cost.unwrap_or(0.0), cost.is_some() as i64, sql_u64(r.duration_ms),
+                sql_u64(r.reasoning), cost.unwrap_or(0.0), cost.is_some() as i64,
+                // A failed attempt (refused connection, retries) is not model time.
+                if r.error { 0 } else { sql_u64(r.duration_ms) },
                 subscription as i64],
         )?;
         tx.commit()?;
@@ -898,7 +905,9 @@ impl Db {
 
     /// Project directory name -> working directory recorded in its session headers (`~` for home).
     fn project_labels(&self) -> Result<HashMap<String, String>> {
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::config::paths::home_dir()
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut stmt = self
             .conn
             .prepare("SELECT project, MAX(cwd) FROM sessions WHERE cwd != '' GROUP BY project")?;
@@ -907,7 +916,10 @@ impl Db {
         for row in rows {
             let (project, cwd) = row?;
             let cwd = match cwd.strip_prefix(&home) {
-                Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+                Some(rest)
+                    if !home.is_empty()
+                        && (rest.is_empty() || rest.starts_with(std::path::is_separator)) =>
+                {
                     format!("~{rest}")
                 }
                 _ => cwd,
@@ -1053,7 +1065,9 @@ impl Db {
             totals.cache_read += request.cache_read;
             totals.cache_write += request.cache_write;
             totals.reasoning += request.reasoning;
-            totals.duration_ms += request.duration_ms;
+            if !request.error {
+                totals.duration_ms += request.duration_ms;
+            }
             if let Some(cost) = request.cost_usd {
                 totals.cost_usd += cost;
                 totals.priced_requests += 1;
@@ -1428,8 +1442,8 @@ pub fn render_text(report: &Report) -> String {
     ));
     let s = &report.sessions;
     out.push_str(&format!(
-        "Sessions {} in {} projects · {} user / {} assistant messages · {} tool calls · active {} (avg {})\n",
-        s.sessions, s.projects, s.user_messages, s.assistant_messages, s.tool_calls,
+        "Sessions {} in {} project{} · {} user / {} assistant messages · {} tool calls · active {} (avg {})\n",
+        s.sessions, s.projects, if s.projects == 1 { "" } else { "s" }, s.user_messages, s.assistant_messages, s.tool_calls,
         duration_text(s.active_ms), s.avg_session_ms.map_or("-".into(), |ms| duration_text(ms as u64)),
     ));
     let t = &report.turns;
@@ -1440,16 +1454,22 @@ pub fn render_text(report: &Report) -> String {
                 .collect::<Vec<_>>()
                 .join(" · ")
         };
-        out.push_str(&format!(
-            "Turns {} · settled {} · {} · interrupted {} · undone {} · rated {} good / {} bad\n",
-            t.turns,
-            percent(t.settled_rate),
-            list(&t.outcomes),
-            t.interrupted,
-            t.undone_turns,
-            t.rated_good,
-            t.rated_bad,
-        ));
+        let mut parts = vec![
+            format!("Turns {}", t.turns),
+            format!("settled {}", percent(t.settled_rate)),
+        ];
+        let outcomes = list(&t.outcomes);
+        if !outcomes.is_empty() {
+            parts.push(outcomes);
+        }
+        // The outcome list already counts interrupted turns when it names them.
+        if !t.outcomes.iter().any(|row| row.name == "interrupted") {
+            parts.push(format!("{} interrupted", t.interrupted));
+        }
+        parts.push(format!("{} undone", t.undone_turns));
+        parts.push(format!("rated {} good / {} bad", t.rated_good, t.rated_bad));
+        out.push_str(&parts.join(" · "));
+        out.push('\n');
         out.push_str(&format!(
             "Turn time p50 {} · p90 {} · median steps {} · {} changed files\n",
             t.duration_p50_ms.map_or("-".into(), duration_text),

@@ -118,6 +118,29 @@ fn slot_reuse_does_not_revive_a_disappeared_generation() {
     assert!(Reader::attach(&layout, "old").is_err());
 }
 
+/// Windows forbids reading a file another handle has locked, so readers identify the live
+/// generation from the unlocked companion file, never the held lock file.
+#[cfg(unix)]
+#[test]
+fn readers_identify_a_live_generation_without_reading_the_held_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout(&dir);
+    let capture = Capture::start(&layout, "web").unwrap();
+    let runs = layout.state_dir.join("runs");
+    let lock = runs.join(format!("slot-{}.lock", capture.snapshot.slot));
+    // Advisory locks let this test blank the held file, as a mandatory lock makes it unreadable.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&lock)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let mut reader = Reader::attach(&layout, "web").unwrap();
+    assert_eq!(reader.poll(100).unwrap(), (Vec::new(), false));
+    fs::remove_file(generation_path(&runs, capture.snapshot.slot)).unwrap();
+    assert!(Reader::attach(&layout, "web").is_err());
+}
+
 #[test]
 fn live_run_capacity_and_publication_failure_are_explicit() {
     let dir = tempfile::tempdir().unwrap();

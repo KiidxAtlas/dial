@@ -95,8 +95,9 @@ head="$(git rev-parse HEAD)"
 runs="$(mktemp "${TMPDIR:-/tmp}/dial-release-ci.XXXXXX")"
 trap 'rm -f "$runs"' EXIT
 gh run list --workflow ci.yml --commit "$head" --event push --branch main --json status,conclusion,event,headBranch,headSha > "$runs"
-if ! python3 scripts/release-policy.py ci "$head" "$runs"; then
-  echo "no successful main push CI for $head; no tag created" >&2
+if ! python3 scripts/release-policy.py ci "$head" "$runs" &&
+   ! RELEASE_TAG="$tag" scripts/release-candidate-run.sh "$head" >/dev/null; then
+  echo "no successful main push CI, or same-tree merged pull request CI, for $head; no tag created" >&2
   id="$(gh run list --workflow ci.yml --commit "$head" --event push --branch main --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
   if [[ -n "$id" ]]; then
     gh run view "$id" --json jobs --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | "  failed: \(.name) (\(.conclusion)) \(.url)"' >&2 || true

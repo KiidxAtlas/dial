@@ -40,7 +40,8 @@ const SCRIPT: &str = r#"on run argv
 end run"#;
 
 /// Terminals that `/watch` can split, for the message shown when none is detected.
-pub(super) const SUPPORTED: &str = "tmux, Zellij, iTerm2, WezTerm or kitty with remote control";
+pub(super) const SUPPORTED: &str =
+    "tmux, Zellij, iTerm2, WezTerm, kitty with remote control or Windows Terminal";
 
 /// The terminal or multiplexer that will open the side pane, with its validated target.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +64,8 @@ pub(super) enum Launcher {
     ITerm2 {
         session: String,
     },
+    /// Native Windows inside Windows Terminal (`WT_SESSION`); `wt -w 0` targets this window.
+    WindowsTerminal,
 }
 
 impl Launcher {
@@ -73,6 +76,7 @@ impl Launcher {
             Self::WezTerm { .. } => "WezTerm",
             Self::Kitty { .. } => "kitty",
             Self::ITerm2 { .. } => "iTerm2",
+            Self::WindowsTerminal => "Windows Terminal",
         }
     }
 
@@ -83,6 +87,9 @@ impl Launcher {
                 "kitty needs `allow_remote_control socket-only` (or `yes`) and `listen_on` in kitty.conf. "
             }
             Self::Tmux { .. } => "Splitting with a command needs tmux 3.0 or newer. ",
+            Self::WindowsTerminal => {
+                "Enable the `wt.exe` app execution alias (Settings > Apps > Advanced app settings > App execution aliases). "
+            }
             Self::Zellij | Self::WezTerm { .. } => "",
         }
     }
@@ -93,11 +100,17 @@ pub(super) fn target() -> Result<Option<Launcher>> {
     if cfg!(test) {
         return Ok(None);
     }
-    detect(cfg!(target_os = "macos"), |key| std::env::var(key).ok())
+    detect(cfg!(target_os = "macos"), cfg!(windows), |key| {
+        std::env::var(key).ok()
+    })
 }
 
 /// Chooses the launcher from the environment alone. Empty variables count as unset.
-fn detect(macos: bool, env: impl Fn(&str) -> Option<String>) -> Result<Option<Launcher>> {
+fn detect(
+    macos: bool,
+    windows: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Launcher>> {
     let var = |key: &str| env(key).filter(|value| !value.is_empty());
     if var("TMUX").is_some() {
         let pane = var("TMUX_PANE")
@@ -134,6 +147,11 @@ fn detect(macos: bool, env: impl Fn(&str) -> Option<String>) -> Result<Option<La
             "kitty remote control is not listening on a socket (set `allow_remote_control socket-only` and `listen_on unix:/tmp/kitty` in kitty.conf); Dial will not send remote-control escapes through the terminal it is drawing",
         )?;
         return Ok(Some(Launcher::Kitty { socket, window }));
+    }
+    // Only native Windows: WSL inherits `WT_SESSION` through `WSLENV`, but `wt.exe` would then
+    // receive a Linux path it cannot run.
+    if windows && var("WT_SESSION").is_some() {
+        return Ok(Some(Launcher::WindowsTerminal));
     }
     Ok(None)
 }
@@ -205,10 +223,53 @@ fn invocation(launcher: &Launcher, argv: &[String]) -> Result<(&'static str, Vec
                 format!("--next-to=id:{window}"),
             ],
         ),
+        // `wt` splits its argument list on `;` itself, so literal semicolons are escaped.
+        Launcher::WindowsTerminal => {
+            let mut args = owned(&["-w", "0", "split-pane", "-V", "--"]);
+            args.extend(argv.iter().map(|word| word.replace(';', "\\;")));
+            return Ok(("wt", args));
+        }
     };
     args.push("--".to_owned());
     args.extend(argv.iter().cloned());
     Ok((program, args))
+}
+
+/// The watch command for a person to paste into another terminal. Windows terminals default to
+/// PowerShell, where a POSIX-quoted `'C:\…\dial.exe' -C …` is a string expression followed by a
+/// parse error, so the program is invoked with `&` and every word uses PowerShell quoting.
+pub(super) fn display_command(argv: &[String], windows: bool) -> Result<String> {
+    if !windows {
+        return shlex::try_join(argv.iter().map(String::as_str))
+            .context("quoting the watch command");
+    }
+    let words: Vec<String> = argv
+        .iter()
+        .enumerate()
+        .map(|(index, word)| powershell_word(word, index == 0))
+        .collect();
+    Ok(format!("& {}", words.join(" ")))
+}
+
+/// A word PowerShell passes through unchanged stays bare; anything else is single-quoted.
+fn powershell_word(word: &str, always: bool) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '\\' | ':'));
+    if plain && !always {
+        return word.to_owned();
+    }
+    // PowerShell also treats typographic single quotes as quote characters.
+    let mut quoted = String::from("'");
+    for c in word.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    quoted.push('\'');
+    quoted
 }
 
 pub(super) fn launch(launcher: &Launcher, argv: &[String], cancel: &AtomicBool) -> Result<()> {

@@ -520,7 +520,14 @@ impl RunMetrics {
             _ => None,
         };
         if let Some(key) = counter {
-            return self.efficiency.as_ref()?.get(key)?.as_u64();
+            let efficiency = self.efficiency.as_ref()?;
+            if let Some(turns) = efficiency.get("turns") {
+                let turns = turns.as_array().filter(|turns| !turns.is_empty())?;
+                return turns.iter().try_fold(0u64, |total, turn| {
+                    total.checked_add(turn["report"]["projection_bytes"][key].as_u64()?)
+                });
+            }
+            return efficiency.get(key)?.as_u64();
         }
         Some(match metric {
             ObservedMetric::ToolCalls => self.tool_calls,

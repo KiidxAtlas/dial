@@ -116,7 +116,7 @@ fn watch(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
         "watch".to_owned(),
         shell.session_id.clone(),
     ];
-    let command = shlex::try_join(argv.iter().map(String::as_str))?;
+    let command = watch_launch::display_command(&argv, cfg!(windows))?;
     match watch_launch::target() {
         Ok(Some(launcher)) => {
             // Keep the manual command visible even if the split fails or the job slot is busy.

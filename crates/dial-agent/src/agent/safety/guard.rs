@@ -107,6 +107,11 @@ fn executed_result(
 
 /// Summarized text of the tool result that answers `id`, or empty when none is in `messages`.
 fn result_text_for(messages: &[serde_json::Value], id: &str) -> String {
+    summarize_text(&result_content_for(messages, id), 200)
+}
+
+/// Full text of the tool result that answers `id`, or empty when none is in `messages`.
+fn result_content_for(messages: &[serde_json::Value], id: &str) -> String {
     messages
         .iter()
         .rev()
@@ -114,9 +119,9 @@ fn result_text_for(messages: &[serde_json::Value], id: &str) -> String {
             message["role"].as_str() == Some("tool") && message["tool_call_id"].as_str() == Some(id)
         })
         .map(|message| match &message["content"] {
-            serde_json::Value::String(text) => summarize_text(text, 200),
+            serde_json::Value::String(text) => text.clone(),
             serde_json::Value::Null => String::new(),
-            other => summarize_text(&other.to_string(), 200),
+            other => other.to_string(),
         })
         .unwrap_or_default()
 }
@@ -350,6 +355,120 @@ impl CallCycle {
             self.turns,
             self.period,
             self.tools.join(" → ")
+        )
+    }
+}
+
+/// One identical call returning an identical result, recurring among otherwise varied turns
+/// (A, B, A, C, A, D, ...). [`RepeatedToolCall`] sees only consecutive repeats and [`CallCycle`]
+/// only strict short periods, so an irregular revisit escapes both. The full result is part of
+/// the identity: rerunning a check whose output changed after an edit is progress, not a loop.
+/// Advisory only: nothing is refused.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::agent) struct RecurringCall {
+    pub tool_name: String,
+    pub count: usize,
+    pub turns: usize,
+    pub arguments_summary: String,
+}
+
+impl RecurringCall {
+    /// Newest call-bearing turns examined.
+    const WINDOW: usize = 10;
+    /// Occurrences within the window that make a recurrence.
+    const MIN_REPEATS: usize = 6;
+
+    /// Walks assistant turns from the newest backwards, as [`RepeatedToolCall::detect`] does: a
+    /// turn with no calls, or with only exempt calls, ends the window. A call counts once per turn.
+    pub(in crate::agent) fn detect(
+        messages: &[serde_json::Value],
+        exempt: &[&str],
+    ) -> Option<Self> {
+        let mut turns = 0;
+        // Borrow result bodies: do not copy large outputs or rescan history for every call.
+        let mut results = std::collections::HashMap::new();
+        let mut counts: Vec<(String, &serde_json::Value, String, serde_json::Value, usize)> =
+            Vec::new();
+        for message in messages.iter().rev() {
+            if turns == Self::WINDOW {
+                break;
+            }
+            if message["role"] == "user" && message["dial_transient"] != true {
+                break;
+            }
+            if message["role"] == "tool" {
+                if let (Some(id), Some(content)) =
+                    (message["tool_call_id"].as_str(), message.get("content"))
+                    && !content.is_null()
+                    && !content.as_str().is_some_and(is_unexecuted_reference)
+                {
+                    results.entry(id).or_insert(content);
+                }
+                continue;
+            }
+            if message["role"].as_str() != Some("assistant") {
+                continue;
+            }
+            let Some(calls) = message["tool_calls"]
+                .as_array()
+                .filter(|calls| !calls.is_empty())
+            else {
+                break;
+            };
+            let parsed = parsed_calls(calls);
+            if parsed
+                .iter()
+                .all(|(_, name, _)| exempt.contains(&name.as_str()))
+            {
+                break;
+            }
+            turns += 1;
+            let mut seen: Vec<String> = Vec::new();
+            for (id, name, args) in &parsed {
+                if exempt.contains(&name.as_str()) {
+                    continue;
+                }
+                let Some(&result) = results.get(id.as_str()) else {
+                    continue;
+                };
+                let arguments = identity_arguments(name, args);
+                let key = serde_json::json!([name, arguments]).to_string();
+                if seen.contains(&key) {
+                    continue;
+                }
+                match counts
+                    .iter_mut()
+                    .find(|entry| entry.0 == key && entry.1 == result)
+                {
+                    Some(entry) => entry.4 += 1,
+                    None => counts.push((key.clone(), result, name.clone(), arguments, 1)),
+                }
+                seen.push(key);
+            }
+        }
+        counts
+            .into_iter()
+            .filter(|entry| entry.4 >= Self::MIN_REPEATS)
+            .max_by_key(|entry| entry.4)
+            .map(|(_, _, tool_name, arguments, count)| Self {
+                tool_name,
+                count,
+                turns,
+                arguments_summary: summarize_text(&arguments.to_string(), 400),
+            })
+    }
+
+    pub(in crate::agent) fn guidance(&self) -> String {
+        format!(
+            "<dial-notice kind=\"recurring_tool_call\">\n`{}` with the same arguments ({}) returned the same result {} times in your last {} tool rounds. Running it again will not produce new information: use the result you already have, change the approach, or answer with what is known and what remains unresolved.\n</dial-notice>",
+            self.tool_name, self.arguments_summary, self.count, self.turns
+        )
+    }
+
+    pub(in crate::agent) fn event(&self) -> String {
+        format!(
+            "Tool call `{}` recurred {}x with the same result; redirecting the model",
+            self.tool_name, self.count
         )
     }
 }

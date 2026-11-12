@@ -74,6 +74,20 @@ pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
     })]
 }
 
+/// An already-installed Chromium for offline page rendering: the configured executable, else a
+/// cached Playwright build or a system Chrome/Chromium/Edge. Inspects files only; never installs.
+pub(crate) fn installed_chromium(config: &BrowserConfig) -> Option<PathBuf> {
+    let browsers = runtime::cached()
+        .map(|runtime| runtime.browsers)
+        .unwrap_or_default();
+    config
+        .chromium_executable
+        .as_ref()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_file())
+        .or_else(|| discover::installed_chromium(&discover::playwright_roots(&browsers)))
+}
+
 /// Cache-only benchmark preflight. A successful result establishes installed files, not a working
 /// browser/service connection; actual runtime failures remain failures, never mocked successes.
 pub fn prerequisites(config: &BrowserConfig, workspace: &Path) -> Result<(), String> {
@@ -967,6 +981,7 @@ fn start(
     let mut command = driver_command(ctx, &node, &reads, &state_path, cdp.is_some())?;
     command
         .env_clear()
+        .envs(crate::tools::exec::sandbox::windows_system_env())
         .envs(env)
         .current_dir(ctx.workspace.root());
     let process = JsonProcess::start(command, pid.clone())?;
@@ -1034,6 +1049,7 @@ fn probe(
     command
         .args(["-e", PREFLIGHT])
         .env_clear()
+        .envs(crate::tools::exec::sandbox::windows_system_env())
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("DIAL_PLAYWRIGHT", module)
         .current_dir(ctx.workspace.root());

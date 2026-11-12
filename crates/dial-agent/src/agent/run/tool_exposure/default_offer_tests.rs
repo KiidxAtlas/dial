@@ -694,6 +694,12 @@ fn memory_guidance_follows_the_tools_the_backend_offers() {
     with_agent("[assistance]\nlean_local=false", |agent| {
         assert!(system_text(agent).contains("action recall searches facts"));
     });
+    // Unattended runs defer `memory`, so its guidance is not sent until the tool is loaded.
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        agent.modes.launch.unattended = true;
+        agent.rebuild_system();
+        assert!(!system_text(agent).contains("action recall searches facts"));
+    });
     with_agent("[memory]\nbackend='semantic'", |agent| {
         assert!(system_text(agent).contains("Action retain saves a durable fact"));
     });

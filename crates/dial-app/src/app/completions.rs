@@ -91,7 +91,7 @@ pub(super) fn command_argument_completions(
         ("skills install", &["--user"]),
         ("approval", Approval::NAMES),
         ("plan", &["on", "off"]),
-        ("permissions", &["allow", "deny", "remove"]),
+        ("permissions", &["allow", "deny", "remove", "why"]),
         ("permissions allow", &["--persist"]),
         ("permissions deny", &["--persist"]),
         (

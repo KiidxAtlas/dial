@@ -897,7 +897,7 @@ fn failed_check_blocks_completion_until_rerun_when_no_automatic_pass_will_rechec
     assert!(!config.verification.automatic_checks);
     let mut agent = hermetic_agent(&config, root.path());
     let failing = verify::verification::FocusedCheck {
-        name: "acceptance: correctness".into(),
+        name: "acceptance: \"correctness\"".into(),
         command: "grep -q fixed state || { echo assertion failed; exit 1; }".into(),
         timeout_secs: 5,
     };
@@ -914,11 +914,46 @@ fn failed_check_blocks_completion_until_rerun_when_no_automatic_pass_will_rechec
     agent.hermetic = false;
     let refusal = agent.completion_blockers().unwrap_err();
     assert!(refusal.contains("focused checks failed"), "{refusal}");
-    assert!(refusal.contains("acceptance: correctness"), "{refusal}");
+    assert!(refusal.contains(&failing.name), "{refusal}");
+    let recovery = refusal
+        .lines()
+        .find_map(|line| line.strip_prefix("Recovery call: verify "))
+        .expect("completion refusal must provide an executable recovery call");
+    let args: Value = serde_json::from_str(recovery).unwrap();
+    assert_eq!(args, json!({"targets": [failing.name]}));
     std::fs::write(root.path().join("state"), "fixed").unwrap();
-    agent.run_checks(std::slice::from_ref(&failing), &mut NullUi);
+    let output = agent.verify_tool(&args, &mut NullUi);
+    assert!(!output.is_error, "{}", output.text);
     assert!(agent.step_checks.failed_checks.is_empty());
     assert!(agent.completion_blockers().is_ok());
+}
+
+#[test]
+fn completion_recovery_targets_respect_the_verify_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    let limit = crate::tools::edit::editing::MAX_VERIFY_TARGETS;
+    agent.step_checks.failed_checks = (0..=limit)
+        .map(|index| verify::verification::FocusedCheck {
+            name: format!("check {index}"),
+            command: format!("echo {index}; exit 1"),
+            timeout_secs: 5,
+        })
+        .collect();
+    agent.step_checks.failed = true;
+    agent.hermetic = false;
+    let refusal = agent.completion_blockers().unwrap_err();
+    let recovery = refusal
+        .lines()
+        .find_map(|line| line.strip_prefix("Recovery call: verify "))
+        .unwrap();
+    let args: Value = serde_json::from_str(recovery).unwrap();
+    assert_eq!(args["targets"].as_array().unwrap().len(), limit);
+    assert_eq!(args["targets"][0], "check 0");
+    assert_eq!(args["targets"][limit - 1], format!("check {}", limit - 1));
+    assert_eq!(agent.step_checks.failed_checks.len(), limit + 1);
+    assert!(refusal.contains("additional failures may remain"));
 }
 
 #[test]
@@ -1020,6 +1055,55 @@ fn background_check_overlaps_reads_and_settles_stale_inputs_without_credit() {
         !agent.reuse_check(&check),
         "stale run must not satisfy completion"
     );
+}
+
+#[test]
+fn background_check_slots_run_configured_checks_side_by_side() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("input"), "before").unwrap();
+    // Each check only finishes once the other has started, so a serial run would time out.
+    let first = "touch a; i=0; while test ! -f b; do i=$((i+1)); test $i -gt 500 && exit 1; sleep 0.01; done; exit 0";
+    let second = "touch b; i=0; while test ! -f a; do i=$((i+1)); test $i -gt 500 && exit 1; sleep 0.01; done; exit 0";
+    let (mut config, _) = input_contract_config(first);
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "contract2".into(),
+            command: second.into(),
+            file_extensions: vec![],
+            timeout_secs: 15,
+        });
+    let inputs = config.verification.inputs["contract"].clone();
+    config
+        .verification
+        .inputs
+        .insert("contract2".into(), inputs);
+    config.experimental.background_checks = true;
+    config.experimental.background_check_slots = 2;
+    config.verification.automatic_checks = true;
+    config.experimental.fault_witness = false;
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    agent.approval = crate::config::types::Approval::Auto;
+    agent.start_background_check(&mut NullUi);
+    assert_eq!(
+        agent
+            .pending_check
+            .as_ref()
+            .map(|pending| pending.runs.len()),
+        Some(2),
+        "both configured checks start together"
+    );
+    agent.drain_background_check(&mut NullUi, true);
+    assert!(agent.pending_check.is_none());
+    for command in [first, second] {
+        assert_eq!(
+            agent.step_checks.evidence.latest_status(command),
+            Some(verify::verification::CheckStatus::Passed),
+            "{command}"
+        );
+    }
 }
 
 #[test]

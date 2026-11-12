@@ -40,7 +40,7 @@ fn artifact_selectors_choose_lines_info_annotations_or_bytes() {
             true,
             ArtifactView::Bytes {
                 offset: 0,
-                count: 8192
+                count: u64::MAX
             }
         ))
     );

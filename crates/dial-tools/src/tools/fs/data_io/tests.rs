@@ -78,11 +78,60 @@ fn data_reads_enforce_size_scope_and_representation() {
     for args in [
         json!({"path":"big","format":"base64"}),
         json!({"path":"../outside","format":"text"}),
-        json!({"path":"big","format":"text","offset":1}),
+        json!({"path":"big","format":"base64","offset":1}),
+        json!({"path":"big","format":"text","offset":1,"retain":true}),
+        json!({"path":"big","format":"text","offset":0}),
+        json!({"path":"../outside","format":"text","offset":1}),
         json!({"path":"big","format":"json"}),
     ] {
         assert!(read(&ws, &args).is_err(), "{args}");
     }
+    let whole = read(&ws, &json!({"path":"big","format":"text"})).unwrap_err();
+    assert!(whole.contains("offset/limit"), "{whole}");
+}
+
+#[test]
+fn line_pages_cover_files_beyond_the_exact_read_limit() {
+    let (dir, ws) = testkit::workspace();
+    let line = format!("{}\r\n", "x".repeat(1023));
+    let lines = 1500;
+    std::fs::write(dir.path().join("big.jsonl"), line.repeat(lines)).unwrap();
+    let page = |offset: u64, limit: Option<u64>| {
+        let mut args = json!({"path":"big.jsonl","format":"text","offset":offset});
+        if let Some(limit) = limit {
+            args["limit"] = json!(limit);
+        }
+        read(&ws, &args).unwrap().data.unwrap()
+    };
+    let (mut offset, mut seen, mut joined) = (1, 0, String::new());
+    loop {
+        let data = page(offset, None);
+        let content = data["content"].as_str().unwrap();
+        assert!(content.len() <= MAX_BYTES);
+        seen += data["lines"].as_u64().unwrap();
+        joined.push_str(content);
+        match data["next_offset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(seen, lines as u64);
+    assert_eq!(joined, line.repeat(lines));
+    let two = page(1499, Some(5));
+    assert_eq!(
+        (two["lines"].as_u64(), two["next_offset"].is_null()),
+        (Some(2), true)
+    );
+    let one = page(2, Some(1));
+    assert_eq!(
+        (one["content"].as_str(), one["next_offset"].as_u64()),
+        (Some(line.as_str()), Some(3))
+    );
+    let past = page(5000, None);
+    assert_eq!(
+        (past["lines"].as_u64(), past["content"].as_str()),
+        (Some(0), Some(""))
+    );
 }
 
 #[test]
@@ -156,4 +205,38 @@ fn retained_sources_survive_removal_of_the_original() {
     );
     assert!(!result.is_error, "{}", result.text);
     assert!(result.text.contains("AP8q"), "{}", result.text);
+}
+
+#[test]
+fn artifact_byte_reads_return_whole_inputs_and_page_losslessly_within_the_budget() {
+    let (dir, ws) = testkit::workspace();
+    let ws = ws.with_artifacts(
+        crate::storage::artifact::ArtifactStore::new(&dir.path().join("artifacts")).unwrap(),
+    );
+    // The size of a real retained WAL that a fixed 16 KiB page could not return in one read.
+    let bytes: Vec<u8> = (0..16_512u32).map(|n| (n * 7 % 256) as u8).collect();
+    let uri = ws.artifacts().unwrap().retain_exact_bytes(&bytes).unwrap();
+    let page = |selector: String, budget| {
+        let result = crate::tools::read_tool_streaming(
+            &ws,
+            &json!({ "path": selector }),
+            &AtomicBool::new(false),
+            budget,
+        );
+        assert!(!result.is_error, "{}", result.text);
+        assert!(result.text.len() <= budget, "{}", result.text.len());
+        let value: Value = serde_json::from_str(&result.text).unwrap();
+        let data = STANDARD.decode(value["data"].as_str().unwrap()).unwrap();
+        (data, value["next_offset"].as_u64().unwrap())
+    };
+    let (whole, next) = page(format!("{uri}:bytes=0"), 48 * 1024);
+    assert_eq!((whole.as_slice(), next), (bytes.as_slice(), 16_512));
+    let mut rebuilt = Vec::new();
+    while (rebuilt.len() as u64) < 16_512 {
+        let (data, next) = page(format!("{uri}:bytes={}+20000", rebuilt.len()), 4096);
+        assert!(!data.is_empty() && data.len() < 4096);
+        rebuilt.extend(data);
+        assert_eq!(next, rebuilt.len() as u64);
+    }
+    assert_eq!(rebuilt, bytes);
 }

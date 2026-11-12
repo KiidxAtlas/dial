@@ -21,7 +21,7 @@ use std::{
 
 use crate::agent::base::helpers::byte_prefix;
 use crate::config::paths::Layout;
-use crate::runtime::arguments::split_words;
+use crate::runtime::arguments::split_prose_words;
 
 mod attachments;
 mod imports;
@@ -78,9 +78,10 @@ fn read_text(path: &Path, cap: usize) -> Option<(String, bool)> {
     Some((text, truncated))
 }
 
+/// Native Windows rarely sets `HOME`; the shared lookup falls back to `USERPROFILE`, so the
+/// instruction-file walk still stops at the home directory there.
 pub(in crate::agent) fn home_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
-    fs::canonicalize(home).ok()
+    fs::canonicalize(crate::config::paths::home_dir()?).ok()
 }
 
 /// Directories whose instruction files apply to `root`, nearest first. The walk climbs to the nearest
@@ -785,17 +786,82 @@ fn reference_tokens(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Byte ranges of Markdown code in `text`: fenced blocks (```` ``` ```` or `~~~`, an unclosed
+/// fence runs to the end) and inline backtick spans. `@` inside code is pasted source, such as
+/// a decorator or a scoped package, never a reference.
+fn code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    let mut fence: Option<(usize, &str)> = None;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let marker = ["```", "~~~"]
+            .into_iter()
+            .find(|marker| trimmed.starts_with(marker));
+        match (fence, marker) {
+            (Some((start, open)), Some(close)) if open == close => {
+                out.push(start..offset + line.len());
+                fence = None;
+            }
+            (None, Some(open)) => fence = Some((offset, open)),
+            (None, None) => inline_code(line, offset, &mut out),
+            _ => {}
+        }
+        offset += line.len();
+    }
+    if let Some((start, _)) = fence {
+        out.push(start..text.len());
+    }
+    out
+}
+
+/// Inline code spans of one line: a run of N backticks closed by the next run of exactly N.
+fn inline_code(line: &str, offset: usize, out: &mut Vec<std::ops::Range<usize>>) {
+    let bytes = line.as_bytes();
+    let run_at = |at: usize| bytes[at..].iter().take_while(|b| **b == b'`').count();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let open = run_at(i);
+        let mut j = i + open;
+        let mut closed = None;
+        while j < bytes.len() {
+            if bytes[j] == b'`' {
+                let run = run_at(j);
+                if run == open {
+                    closed = Some(j + run);
+                    break;
+                }
+                j += run;
+            } else {
+                j += 1;
+            }
+        }
+        match closed {
+            Some(end) => {
+                out.push(offset + i..offset + end);
+                i = end;
+            }
+            None => i += open,
+        }
+    }
+}
+
 fn reference_spans(text: &str) -> Vec<AttachmentToken<'_>> {
     let mut out = Vec::new();
     let mut consumed_until = 0;
+    let code = code_ranges(text);
     for (i, _) in text.match_indices('@') {
-        if i < consumed_until {
+        if i < consumed_until || code.iter().any(|range| range.contains(&i)) {
             continue;
         }
         let starts_word = text[..i]
             .chars()
             .next_back()
-            .is_none_or(|c| c.is_whitespace() || "([{\"'`,;:".contains(c));
+            .is_none_or(|c| c.is_whitespace() || "([{\"',;:".contains(c));
         if !starts_word {
             continue;
         }
@@ -830,6 +896,28 @@ fn reference_spans(text: &str) -> Vec<AttachmentToken<'_>> {
 
 fn looks_like_path(token: &str) -> bool {
     token.contains('/') || token.contains('.') || token.starts_with('~')
+}
+
+/// Whether an unresolved path-like reference was probably meant as a project file, so its absence
+/// deserves a warning: its first directory exists, or its name has a short conventional extension
+/// (`notes.md`, `missing/file.rs`). Scoped packages (`@angular/core`), decorators
+/// (`@pytest.fixture`, `@app.route("/")`) and similar text pass silently.
+fn likely_missing_file(root: &Path, token: &str) -> bool {
+    if token.contains(['(', ')', '=', '<', '>', ',', '[', ']']) {
+        return false;
+    }
+    let mut components = Path::new(token).components();
+    let Some(first) = components.next() else {
+        return false;
+    };
+    let nested = components.next().is_some() || token.ends_with('/');
+    let file_like = Path::new(token)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            (1..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+    file_like || (nested && root.join(first.as_os_str()).exists())
 }
 
 /// Attribute-safe text for the `<file>`, `<dir>`, `<context>` and `<mcp-server>` wrappers: control
@@ -870,7 +958,7 @@ fn path_block(
         return None;
     }
     let Ok(real) = fs::canonicalize(root.join(rel)) else {
-        if path_like {
+        if path_like && likely_missing_file(root, token) {
             skipped(format!("@{token} not found"));
         }
         return None;
@@ -1257,10 +1345,11 @@ fn split_frontmatter(raw: &str) -> (Option<String>, String) {
 
 /// Substitutes `$ARGUMENTS` / `$@` (the raw argument string) and `$1`..`$9` (shell-style words;
 /// missing ones become empty) in one pass, so arguments containing `$1` are not re-expanded. A
-/// template with no placeholder gets the arguments appended.
+/// digit that starts a longer number (`$10`, `$5.00`, `$1,000`) is literal text, not a placeholder.
+/// A template with no placeholder gets the arguments appended.
 pub fn expand_command(def: &CommandDef, args: &str) -> String {
     let args = args.trim();
-    let words = split_words(args);
+    let words = split_prose_words(args);
     let mut out = String::with_capacity(def.template.len() + args.len());
     let mut used = false;
     let mut rest = def.template.as_str();
@@ -1274,13 +1363,8 @@ pub fn expand_command(def: &CommandDef, args: &str) -> String {
             out.push_str(args);
             used = true;
             rest = r;
-        } else if let Some(d) = after
-            .chars()
-            .next()
-            .and_then(|c| c.to_digit(10))
-            .filter(|d| *d >= 1)
-        {
-            out.push_str(words.get(d as usize - 1).map(String::as_str).unwrap_or(""));
+        } else if let Some(d) = positional(after) {
+            out.push_str(words.get(d - 1).map(String::as_str).unwrap_or(""));
             used = true;
             rest = &after[1..];
         } else {
@@ -1294,6 +1378,20 @@ pub fn expand_command(def: &CommandDef, args: &str) -> String {
         out.push_str(args);
     }
     out
+}
+
+/// The positional index of a `$N` placeholder whose `$` precedes `after`: one digit 1–9 that is not
+/// the start of a longer number such as a price.
+fn positional(after: &str) -> Option<usize> {
+    let mut chars = after.chars();
+    let digit = chars.next()?.to_digit(10).filter(|d| *d >= 1)?;
+    let mut next = chars.clone();
+    let number_continues = match next.next() {
+        Some(c) if c.is_ascii_digit() => true,
+        Some('.' | ',') => next.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    };
+    (!number_continues).then_some(digit as usize)
 }
 #[cfg(test)]
 mod tests;

@@ -83,7 +83,7 @@ fn custom_thinking_segment_is_not_hidden_when_inference_is_not_requested() {
         status_right: vec![],
         ..cfg_with(StatusPreset::Custom)
     };
-    assert!(plain(&render(&cfg, &status, 80)).contains("THINK HIGH"));
+    assert!(plain(&render(&cfg, &status, 80)).contains("think high"));
 }
 
 #[test]
@@ -211,15 +211,12 @@ fn thinking_is_visible_in_presets_and_fits_narrow_terminals() {
                 thinking: level.into(),
                 ..data()
             };
-            assert!(
-                plain(&render(&cfg, &data, 200))
-                    .contains(&format!("THINK {}", level.to_uppercase()))
-            );
+            assert!(plain(&render(&cfg, &data, 200)).contains(&format!("think {level}")));
             for width in 1..100 {
                 assert_eq!(render(&cfg, &data, width).width(), width as usize);
             }
         }
-        assert!(!plain(&render(&cfg, &data(), 200)).contains("THINK "));
+        assert!(!plain(&render(&cfg, &data(), 200)).contains("think "));
     }
 }
 
@@ -1271,6 +1268,48 @@ fn the_default_layout_shows_the_thinking_level_at_every_width() {
     };
     for width in [70, 100, 160] {
         let line = plain(&render(&UiConfig::default(), &data, width));
-        assert!(line.contains("THINK HIGH"), "{width}: {line}");
+        assert!(line.contains("think high"), "{width}: {line}");
+    }
+}
+
+#[test]
+fn controls_row_names_only_what_differs_from_a_fresh_session() {
+    let keys = crate::ui::keys::Keymap::defaults();
+    let theme = Theme::dark();
+    let mut status = StatusData {
+        planning: Some(false),
+        assistance: Some(false),
+        ..data()
+    };
+    let quiet = plain(&controls_row(&status, &keys, &theme, 200));
+    assert!(quiet.ends_with("controls"), "{quiet}");
+    for noise in ["Planning off", "Assistance off", "provider default"] {
+        assert!(!quiet.contains(noise), "{quiet}");
+    }
+    status.planning = Some(true);
+    status.assistance = Some(true);
+    status.controls_pending = true;
+    let busy = plain(&controls_row(&status, &keys, &theme, 200));
+    for fact in [
+        "planning on",
+        "assistance on",
+        "saved changes apply after this turn",
+    ] {
+        assert!(busy.contains(fact), "{busy}");
+    }
+}
+
+#[test]
+fn approval_mode_outlasts_path_git_and_cost_at_narrow_widths() {
+    let status = StatusData {
+        approval: "auto".into(),
+        thinking: "on".into(),
+        provider: "anthropic".into(),
+        model: "claude-opus-5-5".into(),
+        ..data()
+    };
+    for width in [50u16, 60, 80, 100] {
+        let line = plain(&render(&cfg_with(StatusPreset::Default), &status, width));
+        assert!(line.contains("Full auto"), "{width}: {line}");
     }
 }

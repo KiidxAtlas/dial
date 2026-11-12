@@ -65,7 +65,7 @@ fn interrupted_turn_names_effects_outside_undo() {
     assert_eq!(line(&text, "Open tasks:"), "Open tasks: 2");
     assert_eq!(
         line(&text, "Outside /undo:"),
-        "Outside /undo: 1 shell command and 0 extension calls may have changed files"
+        "Outside /undo: 1 shell command may have changed files"
     );
     assert_eq!(
         line(&text, "Summary:"),
@@ -500,4 +500,53 @@ fn task_notes_are_not_blockers_without_a_blocked_status() {
             "{report}"
         );
     }
+}
+
+#[test]
+fn observed_cost_joins_a_detailed_report_above_next_and_never_a_plain_answer() {
+    use crate::llm::usage::{CostCoverage, Counts};
+    let priced = Counts {
+        observed_cost_usd: Some(0.0125),
+        cost_coverage: CostCoverage::ObservedPriced,
+        ..Counts::default()
+    };
+    let edited = json!({"outcome": "completed", "changed_files": ["src/a.rs"], "recorded_checks": [], "open_tasks": 0});
+    let outcome = super::with_cost(super::outcome(&edited, &no_timing()), &priced);
+    let cost = outcome
+        .handoff
+        .iter()
+        .position(|line| line == "Cost: $0.012500 USD observed API cost")
+        .unwrap_or_else(|| panic!("{:?}", outcome.handoff));
+    assert!(outcome.handoff[cost + 1].starts_with("Next:"));
+    // Unpriced or local usage adds nothing, and a plain answer keeps its empty footer.
+    let unpriced = super::with_cost(super::outcome(&edited, &no_timing()), &Counts::default());
+    assert!(
+        !unpriced
+            .handoff
+            .iter()
+            .any(|line| line.starts_with("Cost:"))
+    );
+    let plain =
+        json!({"outcome": "answered", "changed_files": [], "recorded_checks": [], "open_tasks": 0});
+    assert!(
+        super::with_cost(super::outcome(&plain, &no_timing()), &priced)
+            .handoff
+            .is_empty()
+    );
+}
+
+#[test]
+fn shell_checks_are_reported_as_checks() {
+    let summary = json!({
+        "outcome": "completed",
+        "changed_files": ["src/main.rs"],
+        "recorded_checks": [{"name": "rustc main.rs && ./main", "status": "passed", "kind": "shell"}],
+        "checks_current": true,
+        "uncheckpointed_shell_commands": 0,
+        "uncheckpointed_extension_calls": 0,
+    });
+    let text = render(&summary, &Value::Null).unwrap();
+    assert!(!text.contains("none recorded"), "{text}");
+    assert!(text.contains("rustc main.rs && ./main passed"), "{text}");
+    assert!(text.contains("checks passed (current)"), "{text}");
 }

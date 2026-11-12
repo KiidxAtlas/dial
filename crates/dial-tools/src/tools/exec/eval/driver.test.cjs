@@ -95,6 +95,28 @@ for (const python of [false, true]) {
     assert.match(results[3].value, python ? /True/ : /true/);
     assert.equal(frames.filter(frame => frame.callback).length, 0);
   });
+
+  test(`portable lines page through large files exactly (${python ? 'Python' : 'Node'})`, () => {
+    const install = fs.readFileSync(path.join(__dirname, python ? 'portable.py' : 'portable.js'), 'utf8');
+    const code = python ? "list(dial.lines('big.jsonl'))" : "const out = []; for await (const line of dial.lines('big.jsonl')) out.push(line); out";
+    const frames = run([cell(0, install), cell(1, code),
+      reply(1, 1, {content:'a\nb\r\n', lines:2, next_offset:3}),
+      reply(2, 1, {content:'c\u2028d', lines:1, next_offset:null})], python);
+    const calls = frames.filter(frame => frame.callback);
+    assert.deepEqual(calls.map(call => call.arguments.offset), [1, 3]);
+    assert.ok(calls.every(call => call.arguments.format === 'text' && call.arguments.path === 'big.jsonl'));
+    const result = frames.filter(frame => frame.result).at(-1).result;
+    assert.equal(result.error, null);
+    assert.match(result.value, python ? /\['a', 'b', 'c\\u2028d'\]/ : /\[\s*'a',\s*'b',\s*'c\u2028d'\s*\]/);
+  });
+
+  if (python) test('Python names the dial. form of a bare portable helper', () => {
+    const install = fs.readFileSync(path.join(__dirname, 'portable.py'), 'utf8');
+    const frames = run([cell(0, install), cell(1, "readText('x')"), cell(2, 'undefined_name')], true);
+    const results = frames.filter(frame => frame.result).map(frame => frame.result);
+    assert.match(results[1].error, /use dial\.readText\(\.\.\.\)/);
+    assert.doesNotMatch(results[2].error, /\[dial\]/);
+  });
 }
 
 test('Python shorthand preserves dictionary/keyword calls, validation and controller denial', () => {

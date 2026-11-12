@@ -6,6 +6,23 @@ use tempfile::TempDir;
 const KEY_ENV: &str = "DIAL_BACKEND_AUTH_TEST_UNUSED_KEY";
 const OPENAI_URL: &str = "https://api.openai.com/v1";
 
+#[test]
+fn reset_provider_cannot_reconnect_from_an_old_explicit_endpoint() {
+    for id in ["docker-model-runner", "mlx-serve"] {
+        let mut fixture = Fixture::new(id, "http://127.0.0.1:1/v1");
+        fixture.config.providers.insert(
+            id.into(),
+            llm::model_config::ProviderSpec {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let error = make_backend(&fixture.config)
+            .err()
+            .expect("reset provider must require setup before backend construction");
+        assert!(error.to_string().contains("not set up"), "{error}");
+    }
+}
 struct Fixture {
     _root: TempDir,
     config: Config,

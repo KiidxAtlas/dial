@@ -389,6 +389,14 @@ pub(in crate::agent) fn chat_attempt_with_ui(
     ui.provider_retry_control(Some(backend.retry_control()));
     ui.request_phase(RequestPhase::Waiting);
     ui.model_wait(Duration::ZERO);
+    // Starting the request publishes its body first. If that (or any earlier) publication
+    // failed, the reply could never be shown or recorded: stop before contacting the provider
+    // instead of racing the worker's send against the cancellation below.
+    if let Some(error) = ui.execution_error() {
+        ui.provider_retry_control(None);
+        ui.request_finished(false);
+        return Err(anyhow::Error::msg(error));
+    }
     // Model family picks the detectors; `None` means the kill switch is set.
     let loop_policy = llm::thinking_loop::policy_for(backend.model_label());
     let result = thread::scope(|scope| {

@@ -14,6 +14,30 @@ fn lifecycle_counters_are_unknown_for_legacy_reports_and_the_live_slice_parses()
     assert_eq!(suite.cases.len(), 3);
 }
 
+#[test]
+fn lifecycle_counters_sum_observed_turns_not_recovery_snapshots() {
+    let mut metrics = RunMetrics {
+        efficiency: Some(serde_json::json!({"turns":[
+            {"send":1,"report":{"projection_bytes":{"completion_nudges":2}}},
+            {"send":2,"report":{"projection_bytes":{"completion_nudges":3}}}
+        ],"recovery_observation":{"projection_bytes":{"completion_nudges":99}}})),
+        ..Default::default()
+    };
+    assert_eq!(metrics.observed(ObservedMetric::CompletionNudges), Some(5));
+    assert_eq!(metrics.observed(ObservedMetric::FullBuilds), None);
+    for turns in [
+        serde_json::json!([]),
+        serde_json::json!([{"report":{}}]),
+        serde_json::json!([
+            {"report":{"projection_bytes":{"completion_nudges":u64::MAX}}},
+            {"report":{"projection_bytes":{"completion_nudges":1}}}
+        ]),
+    ] {
+        metrics.efficiency = Some(serde_json::json!({"turns":turns}));
+        assert_eq!(metrics.observed(ObservedMetric::CompletionNudges), None);
+    }
+}
+
 fn case(passed: bool, outcome_checks: usize, tokens: u64) -> CaseResult {
     CaseResult {
         id: "case".into(),

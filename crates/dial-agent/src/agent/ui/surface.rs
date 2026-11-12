@@ -169,6 +169,9 @@ pub trait Ui {
         cancel: Option<&AtomicBool>,
     ) -> Decision {
         let mut summary = format!("{summary}\nOnce: {}", preview.once);
+        if !preview.undo.is_empty() {
+            summary.push_str(&format!("\nUndo: {}", preview.undo));
+        }
         if let Some(scope) = &preview.session {
             summary.push_str(&format!("\nSession: {scope}"));
         }

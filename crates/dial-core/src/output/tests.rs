@@ -148,3 +148,16 @@ fn disconnect_is_per_connection_and_not_a_pipe_failure() {
     assert!(second.text(b"y\n").is_ok());
     assert!(!second.failed());
 }
+
+#[test]
+fn only_a_closed_reader_counts_as_a_closed_stdout_panic() {
+    assert!(is_closed_stdout_panic(
+        "failed printing to stdout: Broken pipe (os error 32)"
+    ));
+    assert!(!is_closed_stdout_panic(
+        "failed printing to stdout: No space left on device (os error 28)"
+    ));
+    assert!(!is_closed_stdout_panic(
+        "Broken pipe while talking to a child"
+    ));
+}

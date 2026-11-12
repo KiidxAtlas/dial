@@ -9,17 +9,15 @@ permissions:
   # The build jobs read CI's result for the tagged commit instead of re-running its tests.
   actions: read
 
-concurrency:
-  # Serialize tags so an older release cannot race a newer release's latest pointer.
-  group: release-publish
-  # Retain up to 100 waiting releases instead of replacing the one pending run.
-  queue: max
-  cancel-in-progress: false
-
 jobs:
   gate:
     name: Require tested main commit
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
+      # Find the merged pull request whose CI already tested this exact tree.
+      pull-requests: read
     outputs:
       epoch: ${{ steps.identity.outputs.epoch }}
       candidates: ${{ steps.candidates.outputs.run }}
@@ -51,8 +49,20 @@ jobs:
           git fetch origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           echo "epoch=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+      - name: Reuse same-tree pull request CI
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if run="$(scripts/release-candidate-run.sh "$GITHUB_SHA")"; then
+            echo "run=$run" >> "$GITHUB_OUTPUT"
+            echo "Pull request CI run $run tested and built this exact source tree; not waiting for main CI." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Require successful push CI on main
         id: ci
+        if: steps.pr.outputs.run == ''
         env:
           GH_TOKEN: ${{ github.token }}
         timeout-minutes: 90
@@ -82,7 +92,7 @@ jobs:
         id: candidates
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_RUN: ${{ steps.ci.outputs.run }}
+          CI_RUN: ${{ steps.pr.outputs.run || steps.ci.outputs.run }}
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
@@ -90,7 +100,7 @@ jobs:
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN/artifacts?per_page=100" > "$RUNNER_TEMP/artifacts.json"
           if python3 scripts/release-policy.py artifacts "$GITHUB_SHA" "$RUNNER_TEMP/artifacts.json"; then
             gh run download "$CI_RUN" -R "$GITHUB_REPOSITORY" -n release-assets-identity -D "$RUNNER_TEMP/candidate-identity"
-            if python3 scripts/release-policy.py identity "$GITHUB_SHA" "$RUNNER_TEMP/candidate-identity/candidate.json"; then
+            if python3 scripts/release-policy.py identity "$(git rev-parse 'HEAD^{tree}')" "$RUNNER_TEMP/candidate-identity/candidate.json"; then
               echo "run=$CI_RUN" >> "$GITHUB_OUTPUT"
               echo "Reusing all eight tested platform archives from CI run $CI_RUN." >> "$GITHUB_STEP_SUMMARY"
               exit 0
@@ -128,6 +138,7 @@ jobs:
     uses: ./.github/workflows/release-build.yml
     with:
       tag: ${{ github.ref_name }}
+      ref: ${{ github.sha }}
       epoch: ${{ needs.gate.outputs.epoch }}
 
   sign:
@@ -161,13 +172,13 @@ jobs:
           pattern: release-assets-*
           merge-multiple: true
           path: dist
-      - name: Recheck candidate commit, version and embedded public key
+      - name: Recheck candidate source tree, version and embedded public key
         env:
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          python3 scripts/release-policy.py identity "$GITHUB_SHA" dist/candidate.json
+          python3 scripts/release-policy.py identity "$(git rev-parse 'HEAD^{tree}')" dist/candidate.json
           rm dist/candidate.json
       - name: Prepare installers and manifest (no private key)
         env:
@@ -226,229 +237,15 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish signed release
+    name: Publish prepared release
     needs: sign
-    runs-on: ubuntu-22.04
+    # Override implicit success(): the optional candidate build is deliberately skipped
+    # on promotion, and that skip must not propagate past a successful signing job.
+    if: ${{ !cancelled() && needs.sign.result == 'success' }}
+    uses: ./.github/workflows/release-publish.yml
     permissions:
       contents: write
-    outputs:
-      latest: ${{ steps.latest.outputs.latest }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: signed-release-assets
-          path: dist
-      - name: Verify signed manifest
-        # Fail closed unless every file handed over by `sign` matches SHA256SUMS and the
-        # signature verifies against the public key.
-        env:
-          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
-        run: |
-          set -euo pipefail
-          (cd dist && sha256sum --strict --check SHA256SUMS)
-          printf '%s\n' "$DIAL_RELEASE_PUBLIC_KEY_PEM" > "$RUNNER_TEMP/release-public.pem"
-          base64 -d dist/SHA256SUMS.sig > "$RUNNER_TEMP/SHA256SUMS.sig"
-          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/release-public.pem" -rawin \
-            -in dist/SHA256SUMS -sigfile "$RUNNER_TEMP/SHA256SUMS.sig"
-      - name: Decide whether this is the newest stable release
-        id: latest
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' > "$RUNNER_TEMP/release-tags"
-          python3 scripts/release-policy.py latest "$RELEASE_TAG" "$RUNNER_TEMP/release-tags" >> "$GITHUB_OUTPUT"
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
-          IS_LATEST: ${{ steps.latest.outputs.latest }}
-        run: |
-          set -euo pipefail
-          python3 scripts/release-policy.py notes "$RELEASE_TAG" CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
-          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/SHA256SUMS.sig dist/SHA256SUMS.sshsig dist/install.sh dist/install.ps1 \
-            --verify-tag --notes-file "$RUNNER_TEMP/release-notes.md" --latest="$IS_LATEST" --title "Dial $RELEASE_TAG"
-          {
-            echo "## Binary release published"
-            echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
-            echo "Downstream website, package metadata and container jobs can be retried independently; do not rebuild published binaries."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  website:
-    name: Show the new release on dial.rootatlas.dev
-    needs: publish
-    if: needs.publish.outputs.latest == 'true'
-    runs-on: ubuntu-22.04
-    permissions: {}
-    steps:
-      - name: Refresh the site's cached release
-        # dial-web caches GitHub's latest release for an hour; this replaces it at once.
-        # The token matches NUXT_RELEASE_REFRESH_TOKEN on the dial-web Railway service.
-        env:
-          DIAL_WEB_REFRESH_TOKEN: ${{ secrets.DIAL_WEB_REFRESH_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [ -z "$DIAL_WEB_REFRESH_TOKEN" ]; then
-            echo "::error title=Website refresh not configured::Set DIAL_WEB_REFRESH_TOKEN here and the same NUXT_RELEASE_REFRESH_TOKEN on the dial-web service. Binaries are already published."
-            exit 1
-          fi
-          status="$(curl --silent --show-error --retry 3 --retry-connrefused --max-time 30 \
-            --output "$RUNNER_TEMP/release.json" --write-out '%{http_code}' \
-            -X POST -H "Authorization: Bearer $DIAL_WEB_REFRESH_TOKEN" \
-            https://dial.rootatlas.dev/release/refresh)"
-          if [ "$status" != 200 ]; then
-            echo "::error title=Website refresh HTTP $status::Binaries are already published. For 404, configure NUXT_RELEASE_REFRESH_TOKEN on dial-web and deploy the refresh route; for 401, match it to DIAL_WEB_REFRESH_TOKEN. Rerun this failed job only."
-            exit 1
-          fi
-          version="$(jq -r .version "$RUNNER_TEMP/release.json")"
-          if [ "$version" != "$RELEASE_TAG" ]; then
-            echo "::error title=Website stale::Website did not return the published release. Rerun this job only."
-            exit 1
-          fi
-          echo "Website now shows $RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
-
-  packaging:
-    name: Propose package metadata update
-    needs: publish
-    if: needs.publish.outputs.latest == 'true'
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
+      actions: read
       pull-requests: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: signed-release-assets
-          path: dist
-      - name: Verify signed manifest
-        # The formula and AUR checksums are merged without review, so re-check the signature here.
-        env:
-          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
-        run: |
-          set -euo pipefail
-          printf '%s\n' "$DIAL_RELEASE_PUBLIC_KEY_PEM" > "$RUNNER_TEMP/release-public.pem"
-          base64 -d dist/SHA256SUMS.sig > "$RUNNER_TEMP/SHA256SUMS.sig"
-          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/release-public.pem" -rawin \
-            -in dist/SHA256SUMS -sigfile "$RUNNER_TEMP/SHA256SUMS.sig"
-      - name: Update and merge Homebrew formula and AUR metadata
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          version="${RELEASE_TAG#v}"
-          branch="release-packaging/$RELEASE_TAG"
-          git fetch origin main
-          git checkout -B "$branch" origin/main
-          python3 scripts/update-formula.py --version "$version" --sums dist/SHA256SUMS \
-            --formula Formula/dial.rb --aur packaging/aur/dial-bin
-          python3 scripts/check-packaging.py
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add Formula/dial.rb packaging/aur/dial-bin
-          if git diff --cached --quiet; then
-            echo "Package metadata already matches $RELEASE_TAG; no pull request needed"
-            exit 0
-          fi
-          git commit -m "release: update package metadata for $version"
-          git push --force origin "HEAD:refs/heads/$branch"
-          if gh pr view "$branch" --json number >/dev/null 2>&1; then
-            echo "Pull request for $branch already exists"
-          else
-            gh pr create --base main --head "$branch" \
-              --title "release: Dial $RELEASE_TAG package metadata" \
-              --body "Automated Homebrew formula and AUR metadata update for $RELEASE_TAG, generated from the signed SHA256SUMS of the published release."
-          fi
-          # The release is already published (this job needs publish) and the checksums come from
-          # its verified manifest, so merge now; an unmerged PR leaves Homebrew users on the old version.
-          # Publishing to the AUR itself still needs the maintainer's AUR key (packaging/README.md).
-          gh pr merge "$branch" --merge --delete-branch
-
-  container:
-    name: Publish signed container with build provenance and SBOM
-    needs: [publish, gate]
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
       packages: write
       id-token: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: '3.12'
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: signed-release-assets
-          path: dist
-      - name: Verify and stage the published Linux binary
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
-        run: python3 scripts/stage-container.py dist container-context
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - name: Resolve container tags
-        id: docker-meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ghcr.io/${{ github.repository }}
-          flavor: latest=false
-          tags: |
-            type=ref,event=tag
-            type=raw,value=latest,enable=${{ needs.publish.outputs.latest == 'true' }}
-      - name: Publish container
-        id: container-build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: container-context
-          file: Dockerfile.release
-          platforms: linux/amd64
-          provenance: mode=max
-          sbom: true
-          push: true
-          tags: ${{ steps.docker-meta.outputs.tags }}
-          labels: ${{ steps.docker-meta.outputs.labels }}
-          cache-from: type=gha,scope=docker-release
-          cache-to: type=gha,scope=docker-release,mode=max
-      - name: Smoke-test published container
-        env:
-          IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
-          IMAGE_DIGEST: ${{ steps.container-build.outputs.digest }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          image="${IMAGE_REPOSITORY,,}@$IMAGE_DIGEST"
-          docker run --rm "$image" --version | awk 'NR==1 {print $1, $2}' | grep -Fx "dial ${RELEASE_TAG#v}"
-          docker run --rm "$image" --help >/dev/null
-      - name: Install pinned Cosign
-        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.2; verifies pinned bootstrap checksum
-        with:
-          cosign-release: v3.0.6
-      - name: Sign immutable container digest with GitHub OIDC
-        env:
-          IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
-          IMAGE_DIGEST: ${{ steps.container-build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          image="${IMAGE_REPOSITORY,,}@$IMAGE_DIGEST"
-          cosign sign --yes "$image"
-          cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF" \
-            "$image"

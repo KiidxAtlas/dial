@@ -7,6 +7,7 @@ not by crate ownership. In the terminal, `/help <topic>` prints a focused docume
 
 - [Quickstart](quickstart.md) — Install, pick a model, get a fix reviewed and undo it, in five minutes.
 - [Release and installation](release-and-install.md) — Install Dial, build from source and check or publish releases.
+- [Design philosophy](design-philosophy.md) — What Dial aims to be, its principles and how to decide when they conflict.
 - [How Dial compares](comparison.md) — Dial's defaults and capabilities next to another open-source terminal agent.
 
 ## Everyday

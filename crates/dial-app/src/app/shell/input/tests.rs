@@ -82,3 +82,16 @@ fn tool_startup_edits_draft_until_an_action_is_held() {
     assert_eq!(shell.composer.draft(), "hellp");
     assert!(shell.held.is_empty());
 }
+
+#[test]
+fn a_windows_editor_path_with_spaces_is_quoted_but_a_command_line_is_not() {
+    assert_eq!(
+        editor_invocation(r"C:\Program Files\Notepad++\notepad++.exe", true),
+        r"& 'C:\Program Files\Notepad++\notepad++.exe'"
+    );
+    assert_eq!(
+        editor_invocation(r"C:\it's\ed.exe", true),
+        r"& 'C:\it''s\ed.exe'"
+    );
+    assert_eq!(editor_invocation("code --wait", false), "& code --wait");
+}

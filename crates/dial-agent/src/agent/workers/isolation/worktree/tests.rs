@@ -45,13 +45,13 @@ fn probe_rejects_a_repository_without_commits_and_a_subdirectory() {
 }
 
 #[test]
-fn populate_matches_the_project_and_excludes_secrets() {
+fn populate_matches_the_project_and_excludes_secrets_and_ignored_files() {
     let repo = repository();
     let project = repo.path();
     fs::write(project.join("kept.txt"), "edited uncommitted").unwrap();
     fs::remove_file(project.join("removed.txt")).unwrap();
     fs::write(project.join("new.txt"), "untracked").unwrap();
-    fs::write(project.join("ignored.log"), "ignored but not excluded").unwrap();
+    fs::write(project.join("ignored.log"), "gitignored local data").unwrap();
     fs::create_dir(project.join("cache")).unwrap();
     fs::write(project.join("cache/entry.bin"), "cached").unwrap();
     fs::write(project.join(".gitignore"), "*.log\ncache/\n").unwrap();
@@ -72,13 +72,13 @@ fn populate_matches_the_project_and_excludes_secrets() {
         fs::read_to_string(dest.join("new.txt")).unwrap(),
         "untracked"
     );
-    assert_eq!(
-        fs::read_to_string(dest.join("ignored.log")).unwrap(),
-        "ignored but not excluded"
+    assert!(
+        !dest.join("ignored.log").exists(),
+        "gitignored untracked files stay out of the copy"
     );
-    assert_eq!(
-        fs::read_to_string(dest.join("cache/entry.bin")).unwrap(),
-        "cached"
+    assert!(
+        !dest.join("cache").exists(),
+        "gitignored untracked directories stay out of the copy"
     );
     assert!(
         !dest.join(".env").exists(),

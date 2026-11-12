@@ -29,8 +29,12 @@ this feature does not claim every edit previously needed approval.
 With `experimental.background_checks` and `verification.automatic_checks` enabled, a committed
 parent edit can start one configured focused command without waiting for another model request.
 The command must have an existing complete `verification.inputs` contract. Commands without a
-complete, capturable input contract continue through synchronous final verification. Only one
-check process is owned at a time; the normal final gate handles the remaining selected commands.
+complete, capturable input contract continue through synchronous final verification. By default
+one check is started at a time; `experimental.background_check_slots` (1–4) starts up to that many
+eligible configured checks together, each authorized separately. They run in parallel with each
+other but hold one shared workspace serial-operation boundary, so they must tolerate running side
+by side (separate outputs, build-tool locks). The normal final gate handles the remaining selected
+commands.
 
 Configured commands retain ordinary shell authorization, explicit denies and sandbox policy.
 Denied commands start no process. The controller owns the process until its actual outcome is
@@ -55,8 +59,15 @@ operations run together, bounded by `task.max_concurrency` (at most 32). Multi-p
 `write`, `edit`, bounded applying `ast_edit`, and directory-scoped `grep`/`glob` participate.
 Directory reads cover membership and descendants, including absent matches; they conflict with
 any writer in that scope. Read/read overlap is safe. A conflict closes the prefix; calls never
-jump over a conflicting or unknown operation. Git inspection actions use ordinary read groups;
-Git mutations remain exclusive.
+jump over a conflicting or unknown operation. Git mutations remain exclusive.
+
+Read-only shell commands (the parallel-read form: no `session`, `pty` or `background`),
+`dep_source`, and `git status`/`diff` without `path` read every workspace root, so they join
+waves with reads, external reads and bookkeeping but never run beside a write. `git
+status`/`diff`/`blame` with `path` read only that path. `git log`/`reflog`/`show`/`branches`
+(object-database reads) and the `pr_view`/`pr_checks`/`issue_view` actions, `github` read ops and
+`glab_mr` read ops touch no source file and are effect-free external reads (below). In a jj
+repository every jj-backed read snapshots the working copy and reads every root.
 
 Parent `todo` steps and working-state views/ordinary progress patches can appear inside a group. They
 settle on the controller in original order after native work drains. Deliverable-scope changes
@@ -83,7 +94,8 @@ read batching remains available with that setting.
 
 File handles that cannot be expanded, selectors, aliases, symlinks, hardlinks, version-control
 and Dial metadata directories (`.git`, `.hg`, `.svn`, `.jj`, `.dial`), host-shaped leading
-segments (`user@host/...`), missing parent directories, shell commands, hooks and unknown effects
+segments (`user@host/...`), missing parent directories, shell commands other than read-only
+ones, hooks and unknown effects
 remain barriers. Ordinary dotfile directories such as `.github/` and `.cargo/`, and scoped package
 directories such as `node_modules/@scope/`, are schedulable paths.
 Existing-file resource admission currently requires Unix hardlink metadata; other platforms

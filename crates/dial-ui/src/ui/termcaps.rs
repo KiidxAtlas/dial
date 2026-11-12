@@ -5,6 +5,71 @@
 //! Detection checks the terminal's capabilities; multiplexers (tmux, Zellij, GNU
 //! screen) are accounted for.
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Terminal focus from focus reports: 0 unknown, 1 focused, 2 unfocused.
+static FOCUS: AtomicU8 = AtomicU8::new(0);
+
+/// Records a focus report (`None` when reporting stops and the state is unknown again).
+pub fn set_focus(focused: Option<bool>) {
+    let value = match focused {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    FOCUS.store(value, Ordering::SeqCst);
+}
+
+/// The terminal reported that it has focus. Unknown (no report yet, or a terminal without focus
+/// reporting) counts as unfocused so notifications are never lost.
+pub fn terminal_focused() -> bool {
+    FOCUS.load(Ordering::SeqCst) == 1
+}
+
+/// Background brightness from an OSC 11 reply (`ESC ] 11 ; rgb:RRRR/GGGG/BBBB` ended by BEL or
+/// `ESC \`) anywhere in `bytes`: `Some(true)` for a dark background. Components may have 1–4 hex
+/// digits each, as XParseColor allows.
+pub fn background_dark_from_reply(bytes: &[u8]) -> Option<bool> {
+    let text = String::from_utf8_lossy(bytes);
+    let start = text.find("]11;")? + 4;
+    let rest = &text[start..];
+    let end = rest.find(['\x07', '\x1b']).unwrap_or(rest.len());
+    let spec = rest[..end]
+        .strip_prefix("rgb:")
+        .or_else(|| rest[..end].strip_prefix("rgba:"))?;
+    let mut channels = spec.split('/').map(|hex| {
+        let digits = hex.len();
+        let value = u32::from_str_radix(hex, 16).ok()?;
+        ((1..=4).contains(&digits))
+            .then(|| f64::from(value) / f64::from((1u32 << (4 * digits)) - 1))
+    });
+    let (r, g, b) = (channels.next()??, channels.next()??, channels.next()??);
+    // Relative luminance (Rec. 709 weights) on the reported values.
+    Some(0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5)
+}
+
+/// Background reported by the terminal at startup: 0 unknown, 1 dark, 2 light.
+static BACKGROUND: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_reported_background(dark: Option<bool>) {
+    BACKGROUND.store(
+        match dark {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        },
+        Ordering::SeqCst,
+    );
+}
+
+/// The terminal's answer to the startup background query (`None` when it did not answer).
+pub fn reported_background_dark() -> Option<bool> {
+    match BACKGROUND.load(Ordering::SeqCst) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalId {
@@ -365,9 +430,13 @@ pub fn notification_sequence(
     }
 }
 
-/// Raise a notification on the controlling terminal unless `DIAL_NOTIFICATIONS=off|0|false`.
+/// Raise a notification on the controlling terminal unless `DIAL_NOTIFICATIONS=off|0|false` or
+/// the terminal reports that it has focus (the user is already looking at Dial).
 /// Serialized through the active terminal owner so it cannot split an asynchronous paint.
 pub fn notify(kind: NotifyKind, title: &str, body: &str, session: &str) {
+    if terminal_focused() {
+        return;
+    }
     let env = |name: &str| std::env::var(name).ok();
     if env("DIAL_NOTIFICATIONS")
         .is_some_and(|value| matches!(value.as_str(), "off" | "0" | "false"))
@@ -392,7 +461,8 @@ pub struct TurnEndNotice {
 /// - `NeedsInput` → question, subject to `notify`: the agent is waiting for the user.
 /// - `Failed`, `Blocked`, `Incomplete` → error, subject to `notify` and `notify_errors`. Blocked
 ///   and incomplete work did not finish, so they count as failures for this policy.
-/// - `Answered`, `Interrupted` and `Running` → silent; reply delivery is not work completion.
+/// - `Answered` → completion ("Reply ready"), subject to `notify`: the reply the user waited for.
+/// - `Interrupted` and `Running` → silent.
 pub fn turn_end_notice(
     outcome: crate::runtime::Phase,
     notify: bool,
@@ -401,11 +471,12 @@ pub fn turn_end_notice(
     use crate::runtime::Phase;
     let (kind, body, failure) = match outcome {
         Phase::Completed => (NotifyKind::Completion, "Turn finished", false),
+        Phase::Answered => (NotifyKind::Completion, "Reply ready", false),
         Phase::NeedsInput => (NotifyKind::Question, "Turn needs your input", false),
         Phase::Failed => (NotifyKind::Error, "Turn failed", true),
         Phase::Blocked => (NotifyKind::Error, "Turn blocked", true),
         Phase::Incomplete => (NotifyKind::Error, "Turn incomplete", true),
-        Phase::Running | Phase::Interrupted | Phase::Answered => return None,
+        Phase::Running | Phase::Interrupted => return None,
     };
     (notify && (!failure || notify_errors)).then_some(TurnEndNotice { kind, body })
 }

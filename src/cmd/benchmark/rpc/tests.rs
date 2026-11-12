@@ -290,3 +290,44 @@ fn shared_auth_requires_opt_in_and_does_not_replace_isolated_home() {
         configure_subscription_auth(&mut command, Some(&shared.path().join("missing"))).is_err()
     );
 }
+
+#[test]
+fn benchmark_accepts_answered_turns_without_claiming_work_completion() {
+    for previous in [0, 1, 3] {
+        let answer = json!({"outcome":"answered","metrics":{"turns_completed":previous}});
+        assert_eq!(completed_turns(&answer, previous).unwrap(), previous);
+        let completed = json!({"outcome":"completed","metrics":{"turns_completed":previous+1}});
+        assert_eq!(completed_turns(&completed, previous).unwrap(), previous + 1);
+    }
+    for outcome in [
+        "blocked",
+        "incomplete",
+        "failed",
+        "needs_input",
+        "interrupted",
+        "unknown",
+    ] {
+        assert!(
+            completed_turns(
+                &json!({"outcome":outcome,"metrics":{"turns_completed":1}}),
+                0
+            )
+            .is_err()
+        );
+    }
+    assert!(completed_turns(&json!({"outcome":"answered"}), 0).is_err());
+    assert!(
+        completed_turns(
+            &json!({"outcome":"completed","metrics":{"turns_completed":0}}),
+            0
+        )
+        .is_err()
+    );
+    assert!(
+        completed_turns(
+            &json!({"outcome":"answered","metrics":{"turns_completed":1}}),
+            0
+        )
+        .is_err()
+    );
+}

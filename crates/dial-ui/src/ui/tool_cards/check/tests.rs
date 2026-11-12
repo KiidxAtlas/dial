@@ -1,5 +1,6 @@
 use super::*;
 use crate::llm::model_config::UiConfig;
+use crate::ui::theme::Sym;
 use crate::ui::theme::{Glyphs, Theme};
 use ratatui::text::Line;
 
@@ -85,21 +86,37 @@ fn a_passing_test_run_is_one_row_with_its_counts() {
 }
 
 #[test]
-fn failing_tests_are_listed_and_the_log_stays_behind_expand() {
+fn failing_tests_are_a_red_card_and_the_log_stays_behind_expand() {
     let output = "running 3 tests\ntest ok_one ... ok\ntest ui::a ... FAILED\ntest ui::b ... FAILED\n\nfailures:\n---- ui::a stdout ----\npanicked\n\ntest result: FAILED. 1 passed; 2 failed; 0 ignored\n\n[exit code: 101]";
     let t = run("cargo test", output, true);
     ctx_with(false, |ctx| {
-        let rows = rendered(&check_card(&t, 90, ctx).unwrap());
+        let card = check_card(&t, 90, ctx).unwrap();
+        let rows = rendered(&card);
+        assert!(rows.iter().all(|r| text::width(r) == 90), "{rows:?}");
         assert!(
-            rows[0].contains("1 passed") && rows[0].contains("2 failed"),
+            rows[0].starts_with(ctx.theme.sym(Sym::BoxTl))
+                && rows[0].contains("Test")
+                && rows[0].contains("cargo test"),
             "{rows:?}"
         );
         assert!(
-            rows[1].ends_with("ui::a") && rows[2].ends_with("ui::b"),
+            rows[1].contains("ui::a") && rows[2].contains("ui::b"),
             "{rows:?}"
         );
-        assert!(rows.last().unwrap().contains("ctrl+o expands"), "{rows:?}");
+        let foot = rows.last().unwrap();
+        assert!(
+            foot.contains("1 passed") && foot.contains("2 failed"),
+            "{foot}"
+        );
+        assert!(foot.contains("ctrl+o expands"), "{foot}");
         assert!(!rows.iter().any(|r| r.contains("panicked")), "{rows:?}");
+        assert_eq!(card[0].spans[0].style.fg, ctx.theme.fg(Tok::Error).fg);
+
+        // Too narrow for a frame: the same content as indented rows under the header.
+        let rows = rendered(&check_card(&t, CARD_MIN - 1, ctx).unwrap());
+        assert!(rows[0].contains("Test"), "{rows:?}");
+        assert!(rows[1].contains("ui::a"), "{rows:?}");
+        assert!(rows.last().unwrap().contains("more lines"), "{rows:?}");
     });
     ctx_with(true, |ctx| assert!(check_card(&t, 90, ctx).is_none()));
 }
@@ -109,10 +126,10 @@ fn build_errors_show_their_location_and_warnings_are_counted() {
     let output = "    Checking dial-ui v0.3.0\nwarning: unused variable: `x`\n --> src/a.rs:3:9\nerror[E0425]: cannot find value `y` in this scope\n --> src/b.rs:7:5\n  |\nerror: could not compile `dial-ui` (lib) due to 1 previous error\n[exit code: 101]";
     ctx_with(false, |ctx| {
         let rows = rendered(&check_card(&run("cargo check", output, true), 90, ctx).unwrap());
+        assert!(rows[0].contains("Build"), "{rows:?}");
+        let foot = rows.last().unwrap();
         assert!(
-            rows[0].contains("Build")
-                && rows[0].contains("1 error")
-                && rows[0].contains("1 warning"),
+            foot.contains("1 error") && foot.contains("1 warning"),
             "{rows:?}"
         );
         assert!(rows[1].contains("error[E0425]"), "{rows:?}");
@@ -122,6 +139,35 @@ fn build_errors_show_their_location_and_warnings_are_counted() {
             "{rows:?}"
         );
     });
+}
+
+#[test]
+fn a_verdict_sums_up_settled_checks_only() {
+    let failing = "test result: FAILED. 1 passed; 2 failed; 0 ignored\n[exit code: 101]";
+    assert_eq!(
+        verdict(&run("cargo test", PASSING, false)),
+        Some(Verdict {
+            ok: true,
+            what: "tests",
+            summary: "2 passed".into()
+        })
+    );
+    assert_eq!(
+        verdict(&run("cargo test", failing, true)),
+        Some(Verdict {
+            ok: false,
+            what: "tests",
+            summary: "2 failed".into()
+        })
+    );
+    let clean = "    Finished `dev` profile target(s) in 3.2s\n[exit code: 0]";
+    assert_eq!(
+        verdict(&run("cargo clippy", clean, false)).map(|v| (v.ok, v.what, v.summary)),
+        Some((true, "build", "clean".to_owned()))
+    );
+    let moved = "command is running as background job bg1 (after 15s): cargo test";
+    assert_eq!(verdict(&run("cargo test", moved, false)), None);
+    assert_eq!(verdict(&run("git status", PASSING, false)), None);
 }
 
 #[test]

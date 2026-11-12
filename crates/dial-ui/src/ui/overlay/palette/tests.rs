@@ -411,6 +411,30 @@ fn task_labels_are_searchable_without_changing_command_dispatch() {
 }
 
 #[test]
+fn a_plain_phrase_finds_commands_by_their_words() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    // No entry contains this phrase as a subsequence; its words name `/undo`.
+    palette.handle(&Event::Paste("undo the last changes".into()), &keys);
+    // Both words name `/undo`; `/settings` shares only "change" and ranks after it.
+    assert_eq!(names(&palette), ["undo", "settings"]);
+    assert!(matches!(palette.handle(&plain(KeyCode::Enter), &keys),
+        OverlayEvent::Action(action) if action == "command:/undo"));
+
+    assert_eq!(
+        phrase_score("browse my conversations", "sessions Browse conversations"),
+        Some(20)
+    );
+    // Filler alone, a single word, or under half the words matching is no match.
+    assert_eq!(phrase_score("what was that", "undo Restore changes"), None);
+    assert_eq!(phrase_score("undo", "undo Restore changes"), None);
+    assert_eq!(
+        phrase_score("deploy kubernetes cluster changes", "undo Restore changes"),
+        None
+    );
+}
+
+#[test]
 fn manage_goal_lists_todo_and_watch_alongside_work_commands() {
     let keys = Keymap::defaults();
     let mut source = entries();

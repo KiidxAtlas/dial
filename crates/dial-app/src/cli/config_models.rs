@@ -29,10 +29,16 @@ pub enum ConfigAction {
     /// List effective settings; credential values are redacted (default).
     List,
     /// Print one setting by dotted key.
-    Get { key: String },
+    Get {
+        /// Dotted setting key, e.g. `ui.theme`, or a table such as `ui`.
+        key: String,
+    },
     /// Set a setting. The value is parsed as TOML; anything that does not parse is a string.
     Set {
+        /// Dotted setting key, e.g. `ui.theme`.
         key: String,
+        /// Negative numbers are accepted as values (`config set key -1`).
+        #[arg(allow_hyphen_values = true)]
         value: String,
         /// Write the project file instead of the global file.
         #[arg(long)]
@@ -40,7 +46,9 @@ pub enum ConfigAction {
     },
     /// Remove a setting from the global file (or the project file with `--project`).
     Reset {
+        /// Dotted setting key, e.g. `ui.theme`.
         key: String,
+        /// Remove it from the project file instead of the global file.
         #[arg(long)]
         project: bool,
     },
@@ -52,7 +60,7 @@ pub enum ConfigAction {
 
 #[derive(Args, Debug, Clone)]
 pub struct ModelsArgs {
-    /// `ls` (default), `list`, `find <pattern>`, `refresh`, `recommend` (RAM-aware fit of
+    /// `ls` (default), `list`, `find <pattern>`, `recommend` (RAM-aware fit of
     /// downloaded local MLX models), or `status` (per-model speed, fit, adapter and gate; `--json`).
     /// Any other first word is a provider/substring filter for `ls`.
     pub words: Vec<String>,
@@ -228,6 +236,17 @@ fn display_value(key: &str, value: &toml::Value) -> String {
     }
 }
 
+/// Checks that need more than the value's type: the theme a theme setting names must load, and a
+/// status-line list may name only known segments. Only writes are checked; loading stays lenient.
+pub(crate) fn check_written_value(user_dir: &Path, key: &str, value: &toml::Value) -> Result<()> {
+    crate::config::schema::check_status_segments(key, value).map_err(anyhow::Error::msg)?;
+    if let ("ui.theme" | "ui.theme_dark" | "ui.theme_light", Some(name)) = (key, value.as_str()) {
+        crate::ui::theme::ThemeManager::check_name(user_dir, name, key == "ui.theme")
+            .map_err(|error| anyhow::anyhow!("{key}: {error}"))?;
+    }
+    Ok(())
+}
+
 /// Runs `dial config` (list when no action is given).
 pub fn run_config(cwd: &Path, args: &ConfigArgs) -> Result<i32> {
     run_config_with_overlay(cwd, args, None)
@@ -300,6 +319,12 @@ pub fn run_config_with_overlay(
                         &serde_json::json!({ "key": key, "value": shown })
                     )?
                 );
+            } else if let toml::Value::Table(table) = value {
+                // A whole table prints one `key = value` line per setting, like `config` does.
+                for (name, value) in flatten(table) {
+                    let name = format!("{key}.{name}");
+                    println!("{name} = {}", display_value(&name, &value));
+                }
             } else {
                 println!("{}", display_value(&key, value));
             }
@@ -310,9 +335,11 @@ pub fn run_config_with_overlay(
             project,
         } => {
             let scope = scope(project);
-            let value = parse_value(&value);
-            crate::config::schema::check_value_for(&merged(&layout, &overlay)?, &key, &value)
+            let current = merged(&layout, &overlay)?;
+            let value = crate::config::schema::coerce_value(&current, &key, parse_value(&value));
+            crate::config::schema::check_value_for(&current, &key, &value)
                 .map_err(anyhow::Error::msg)?;
+            check_written_value(&layout.user_dir, &key, &value)?;
             settings_store::save_config(
                 &layout,
                 scope,
@@ -320,11 +347,19 @@ pub fn run_config_with_overlay(
                     path: key.clone(),
                     value,
                 }],
-            )?;
+            )
+            .map_err(|error| unknown_key_error(error, &key, &current))?;
             println!("set {key} in {}", scope_name(scope));
         }
         ConfigAction::Reset { key, project } => {
             let scope = scope(project);
+            if lookup(&settings_store::load_layer(&layout, scope)?, &key).is_none() {
+                println!(
+                    "{key} is not set in {}; nothing to reset",
+                    scope_name(scope)
+                );
+                return Ok(0);
+            }
             settings_store::save_config(&layout, scope, &[Change::Remove { path: key.clone() }])?;
             println!("reset {key} in {}", scope_name(scope));
         }
@@ -338,6 +373,70 @@ pub fn run_config_with_overlay(
         ConfigAction::Reference => unreachable!("reference does not load operator configuration"),
     }
     Ok(0)
+}
+
+/// Replaces the configuration loader's "unknown field" error (which lists every field of the
+/// table) with a short message naming the key and the closest known setting.
+fn unknown_key_error(error: anyhow::Error, key: &str, current: &toml::Table) -> anyhow::Error {
+    // Only an unknown field named by this key: an unrelated defect elsewhere keeps its own error.
+    let text = format!("{error:#}");
+    if !key
+        .split('.')
+        .any(|part| text.contains(&format!("unknown field `{part}`")))
+    {
+        return error;
+    }
+    let known: Vec<String> = crate::config::schema::registry()
+        .iter()
+        .map(|def| def.path.to_owned())
+        .chain(flatten(current).into_iter().map(|(name, _)| name))
+        .collect();
+    match closest_key(key, &known) {
+        Some(near) => anyhow::anyhow!(
+            "unknown setting {key:?}; did you mean {near:?}? `dial config` lists every setting"
+        ),
+        None => anyhow::anyhow!("unknown setting {key:?}; `dial config` lists every setting"),
+    }
+}
+
+/// The known key nearest to `key`: an exact case-insensitive match, a key ending in `.key`, or
+/// the smallest edit distance within a quarter of the key's length (at least 2).
+fn closest_key<'a>(key: &str, known: &'a [String]) -> Option<&'a str> {
+    let lower = key.to_ascii_lowercase();
+    if let Some(exact) = known.iter().find(|name| name.to_ascii_lowercase() == lower) {
+        return Some(exact);
+    }
+    let suffix = format!(".{lower}");
+    if let Some(tail) = known
+        .iter()
+        .find(|name| name.to_ascii_lowercase().ends_with(&suffix))
+    {
+        return Some(tail);
+    }
+    let limit = (lower.chars().count() / 4).max(2);
+    known
+        .iter()
+        .map(|name| (edit_distance(&lower, &name.to_ascii_lowercase()), name))
+        .filter(|(distance, _)| *distance <= limit)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, name)| name.as_str())
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(ca != *cb));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
 }
 
 fn scope_name(scope: Scope) -> &'static str {
@@ -374,6 +473,18 @@ fn tri(value: Option<bool>) -> String {
     }
 }
 
+/// The name to show for a model: a downloaded local model's path becomes its short label
+/// (`mlx-community/Qwen2.5-7B-Instruct-4bit`), which `--model` resolves back to the same weights.
+/// `--json` keeps the full path.
+fn shown_model(entry: &ModelEntry) -> String {
+    let model = &entry.selection.model;
+    if Path::new(model).is_absolute() && !entry.label.trim().is_empty() {
+        entry.label.clone()
+    } else {
+        model.clone()
+    }
+}
+
 /// Column-aligned table; cells are not truncated.
 pub fn format_table(entries: &[ModelEntry]) -> String {
     const HEADER: [&str; 8] = [
@@ -391,7 +502,7 @@ pub fn format_table(entries: &[ModelEntry]) -> String {
         .map(|e| {
             [
                 e.selection.provider.clone(),
-                e.selection.model.clone(),
+                shown_model(e),
                 e.metadata.kind.label().to_owned(),
                 tri(Some(e.available)),
                 tri(e.metadata.vision),
@@ -411,7 +522,9 @@ pub fn run_models(cwd: &Path, args: &ModelsArgs, overlay: Option<toml::Table>) -
     let route = route(&args.words)?;
     let needle = match route {
         ModelsRoute::Refresh => {
-            bail!("models refresh is not supported: Dial's model catalog is local discovery only")
+            bail!(
+                "there is nothing to refresh: `dial models` discovers models each time it runs; run it again for the current list"
+            )
         }
         ModelsRoute::Status => {
             return crate::stats::local_models::run_status(cwd, args.json, overlay);

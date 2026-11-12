@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod audio;
+pub(in crate::tools) mod binary;
 pub(in crate::tools) mod conflicts;
 pub(in crate::tools) mod data_io;
 pub mod documents;

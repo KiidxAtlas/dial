@@ -492,6 +492,7 @@ impl<'a> Agent<'a> {
             request_prefix: Default::default(),
             workflow_metrics: Default::default(),
             efficiency_metrics: Default::default(),
+            prefix_resets: Default::default(),
             workflow_started: Instant::now(),
             request_phase: crate::adaptive::State::begin(
                 crate::learn::task_policy::Kind::General,
@@ -616,6 +617,7 @@ impl<'a> Agent<'a> {
             version,
             workflow_metrics: Default::default(),
             efficiency_metrics: Default::default(),
+            prefix_resets: Default::default(),
             workflow_started: Instant::now(),
             request_phase: crate::adaptive::State::begin(
                 crate::learn::task_policy::Kind::General,
@@ -769,7 +771,16 @@ impl<'a> Agent<'a> {
                 } else {
                     with_skill_loader(&self.parts.skills, &policy_tools)
                 },
-                memory: self.parts.memory.clone(),
+                // Unattended runs defer `memory`; its guidance waits until the tool is loaded.
+                memory: if self.modes.launch.unattended
+                    && !offered
+                        .iter()
+                        .any(|tool| tool == crate::storage::memory_backend::TOOL_NAME)
+                {
+                    String::new()
+                } else {
+                    self.parts.memory.clone()
+                },
                 tools: &policy_tools,
                 discoverable: &discoverable,
                 template: self.parts.system_template.as_ref(),

@@ -169,7 +169,13 @@ pub(super) fn panel_rows_window(
     if let Some(details) = &details {
         hints.push(("PgUp/PgDn", details.as_str()));
     }
-    hints.push(("Esc", "cancel"));
+    // A prompt with a Deny choice is left by denying; say so rather than a vaguer "cancel".
+    let leave = if options.iter().any(|(label, _)| label.starts_with("Deny")) {
+        "deny"
+    } else {
+        "cancel"
+    };
+    hints.push(("Esc", leave));
     rows.push(pad_row(
         crate::ui::chrome::hint_line(theme, &hints, inner).spans,
     ));
@@ -230,10 +236,11 @@ pub(super) fn panel_body_lines(
 }
 
 /// Body rows a modal panel shows for `options` choices within `height` rows: the same budget the renderer and
-/// the page keys use, so paging never jumps past rows the user has not seen.
+/// the page keys use, so paging never jumps past rows the user has not seen. A tall terminal shows a
+/// long body whole instead of paging it a few rows at a time.
 pub(super) fn panel_body_limit(options: usize, height: usize) -> usize {
     let option_limit = options.min(height.saturating_sub(5).max(1));
-    height.saturating_sub(option_limit + 3).clamp(1, 8)
+    height.saturating_sub(option_limit + 3).clamp(1, 24)
 }
 
 /// The next body offset for a page key: one visible page minus a row of overlap, never past the last page.

@@ -685,6 +685,32 @@ fn emails_handles_and_unresolved_refs() {
 }
 
 #[test]
+fn code_packages_and_decorators_are_not_missing_references() {
+    let (_t, base) = project();
+    let root = base.join("proj");
+    write(root.join("src/a.rs"), "A");
+    for text in [
+        "upgrade @angular/core and @types/node",
+        "use @pytest.fixture here",
+        "@app.route(\"/x\") handler",
+        "```py\n@missing.txt\n```",
+        "inline `@missing.txt` code",
+        "``x ` @missing.txt``",
+    ] {
+        let (out, w) = expand_references(&root, text, &AtomicBool::new(false));
+        assert_eq!((out.as_str(), w.len()), (text, 0), "{text}: {w:?}");
+    }
+    // Plausible files still warn: a known first directory or a conventional extension.
+    for text in ["@src/mian.rs", "@src/nothing", "@notes.md"] {
+        let (_, w) = expand_references(&root, text, &AtomicBool::new(false));
+        assert_eq!(w.len(), 1, "{text}");
+    }
+    // A reference after an unclosed backtick still attaches.
+    let (out, _) = expand_references(&root, "a ` b @src/a.rs", &AtomicBool::new(false));
+    assert!(out.contains("<file "), "{out}");
+}
+
+#[test]
 fn reference_count_and_total_are_bounded() {
     let (_t, base) = project();
     let root = base.join("proj");
@@ -857,9 +883,14 @@ fn command_expansion() {
         expand_command(&def("[$1] [$ARGUMENTS]"), "$2 $ARGUMENTS"),
         "[$2] [$2 $ARGUMENTS]"
     );
+    // Prices and longer numbers stay literal; `$N` before ordinary punctuation still expands.
     assert_eq!(
         expand_command(&def("cost is $5.00 or $x or $"), ""),
-        "cost is .00 or $x or $"
+        "cost is $5.00 or $x or $"
+    );
+    assert_eq!(
+        expand_command(&def("$10, $1,000 and $2.5k; fix $1. then $2, done"), "a b"),
+        "$10, $1,000 and $2.5k; fix a. then b, done"
     );
     // No placeholder: arguments are appended rather than lost.
     assert_eq!(

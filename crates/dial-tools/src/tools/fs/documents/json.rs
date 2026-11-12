@@ -61,11 +61,26 @@ struct Options {
     raw: bool,
 }
 
-pub(super) fn is_json(path: &str) -> bool {
+/// Paths `?q=` queries: JSON, JSONL/NDJSON, YAML and TOML, optionally gzip/zstd/xz/bzip2
+/// compressed (`data.jsonl.gz`).
+pub(super) fn is_queryable(path: &str) -> bool {
+    source_format(path).is_some()
+}
+
+/// The source format of a queryable path, by its extension under any compression suffix.
+fn source_format(path: &str) -> Option<&'static str> {
     let lower = path.to_ascii_lowercase();
-    [".json", ".jsonl", ".ndjson"]
-        .iter()
-        .any(|ext| lower.ends_with(ext))
+    let base = super::without_compression(&lower);
+    [
+        (".json", "JSON"),
+        (".jsonl", "JSONL"),
+        (".ndjson", "NDJSON"),
+        (".yaml", "YAML"),
+        (".yml", "YAML"),
+        (".toml", "TOML"),
+    ]
+    .iter()
+    .find_map(|(suffix, format)| base.ends_with(suffix).then_some(*format))
 }
 fn decode(input: &str) -> Result<String, String> {
     let bytes = input.as_bytes();
@@ -315,18 +330,18 @@ fn evaluate(
         visits: 0,
         clipped: false,
     };
-    let lower = label.to_ascii_lowercase();
-    let source_format = if lower.ends_with(".json") {
-        "JSON"
-    } else if lower.ends_with(".ndjson") {
-        "NDJSON"
-    } else {
-        "JSONL"
-    };
-    let jsonl = source_format != "JSON";
+    let source_format = source_format(label).unwrap_or("JSON");
     let file = File::open(path).map_err(|e| format!("opening JSON: {e}"))?;
-    if jsonl {
-        let mut reader = BufReader::new(file);
+    let compressed = super::without_compression(&label.to_ascii_lowercase()).len() != label.len();
+    if matches!(source_format, "JSONL" | "NDJSON") {
+        let mut reader: Box<dyn BufRead> = if compressed {
+            let bytes = bounded(file)?;
+            Box::new(std::io::Cursor::new(
+                super::archives::decompressed(&bytes)?.into_owned(),
+            ))
+        } else {
+            Box::new(BufReader::new(file))
+        };
         let mut line = Vec::new();
         let mut source_line = 0;
         let mut total_bytes = 0u64;
@@ -355,10 +370,13 @@ fn evaluate(
             feed(&filter, value, Some(source_line), &mut page, cancel)?;
         }
     } else {
-        let bytes = bounded(file)?;
-        let value =
-            jaq_json::read::parse_single(&bytes).map_err(|e| format!("malformed JSON: {e}"))?;
-        feed(&filter, value, None, &mut page, cancel)?;
+        let raw = bounded(file)?;
+        let bytes = super::archives::decompressed(&raw)?;
+        for document in documents(source_format, &bytes)? {
+            let value = jaq_json::read::parse_single(&document)
+                .map_err(|e| format!("malformed {source_format}: {e}"))?;
+            feed(&filter, value, None, &mut page, cancel)?;
+        }
     }
     let next = options.offset.saturating_add(page.shown);
     let remaining = page.total.saturating_sub(next);
@@ -379,4 +397,85 @@ fn evaluate(
         return Err("JSON page including labels exceeds 20 KiB; reduce query/limit".into());
     }
     Ok(out)
+}
+
+/// The JSON text of each document in `bytes`: the document itself for JSON, the converted table
+/// for TOML (datetimes become strings), and one value per `---` document for YAML (non-string
+/// keys are stringified, tags dropped).
+fn documents(format: &str, bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    match format {
+        "JSON" => Ok(vec![bytes.to_vec()]),
+        "TOML" => {
+            let text = std::str::from_utf8(bytes).map_err(|_| "TOML is not UTF-8")?;
+            let table: toml::Table =
+                toml::from_str(text).map_err(|e| format!("malformed TOML: {e}"))?;
+            Ok(vec![
+                from_toml(toml::Value::Table(table))
+                    .to_string()
+                    .into_bytes(),
+            ])
+        }
+        _ => {
+            use serde::Deserialize as _;
+            let text = std::str::from_utf8(bytes).map_err(|_| "YAML is not UTF-8")?;
+            let mut out = Vec::new();
+            for document in serde_norway::Deserializer::from_str(text) {
+                let value = serde_norway::Value::deserialize(document)
+                    .map_err(|e| format!("malformed YAML: {e}"))?;
+                out.push(from_yaml(value).to_string().into_bytes());
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn from_toml(value: toml::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match value {
+        toml::Value::String(s) => J::String(s),
+        toml::Value::Integer(n) => J::from(n),
+        toml::Value::Float(f) => serde_json::Number::from_f64(f).map_or(J::Null, J::Number),
+        toml::Value::Boolean(b) => J::Bool(b),
+        toml::Value::Datetime(d) => J::String(d.to_string()),
+        toml::Value::Array(items) => J::Array(items.into_iter().map(from_toml).collect()),
+        toml::Value::Table(table) => J::Object(
+            table
+                .into_iter()
+                .map(|(key, value)| (key, from_toml(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn from_yaml(value: serde_norway::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    use serde_norway::Value as Y;
+    match value {
+        Y::Null => J::Null,
+        Y::Bool(b) => J::Bool(b),
+        Y::Number(n) => n
+            .as_i64()
+            .map(J::from)
+            .or_else(|| n.as_u64().map(J::from))
+            .or_else(|| {
+                n.as_f64()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(J::Number)
+            })
+            .unwrap_or(J::Null),
+        Y::String(s) => J::String(s),
+        Y::Sequence(items) => J::Array(items.into_iter().map(from_yaml).collect()),
+        Y::Mapping(map) => J::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let key = match key {
+                        Y::String(s) => s,
+                        other => from_yaml(other).to_string(),
+                    };
+                    (key, from_yaml(value))
+                })
+                .collect(),
+        ),
+        Y::Tagged(tagged) => from_yaml(tagged.value),
+    }
 }

@@ -107,10 +107,9 @@ fn dispatch(
                 .get("tags")
                 .context("split needs --tags <file.json>")?;
             let tags_file = match tags_path.strip_prefix("~/") {
-                Some(relative) => std::path::PathBuf::from(
-                    std::env::var_os("HOME").context("--tags ~/ needs HOME to be set")?,
-                )
-                .join(relative),
+                Some(relative) => crate::config::paths::home_dir()
+                    .context("--tags ~/ needs a home directory (HOME, or USERPROFILE on Windows)")?
+                    .join(relative),
                 None => root.join(tags_path),
             };
             let bytes = std::fs::read(&tags_file)

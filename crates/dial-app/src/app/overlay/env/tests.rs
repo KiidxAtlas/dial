@@ -287,6 +287,7 @@ fn bulk_event_requires_frozen_review_and_settles_only_successful_save() {
             todo: &Default::default(),
             model_downloads: None,
             compute_monitor: None,
+            first_run: false,
             live_tasks: None,
             verify_lora: None,
             auth_job: &mut auth_job,
@@ -422,6 +423,7 @@ fn history_panel_actions_close_and_reach_the_shell_controller() {
         todo: &Default::default(),
         model_downloads: None,
         compute_monitor: None,
+        first_run: false,
         live_tasks: None,
         verify_lora: None,
         auth_job: &mut auth_job,
@@ -474,5 +476,215 @@ fn history_panel_actions_close_and_reach_the_shell_controller() {
         files(&app),
         before,
         "forwarding navigation never changes settings"
+    );
+}
+
+#[test]
+fn first_run_closes_the_model_panel_once_a_main_model_is_assigned() {
+    use crate::ui::overlay::OverlayEvent;
+    let (_home, _project, app) = app();
+    let selection = crate::llm::model_config::ModelSelection {
+        provider: "openai".into(),
+        model: "gpt-4.1".into(),
+        ..Default::default()
+    };
+    for first_run in [false, true] {
+        let mut keys = Keymap::defaults();
+        let mut themes = ThemeManager::new(&app.layout.user_dir, &app.config.ui, None);
+        let mut catalog = Catalog::new();
+        let runtime = crate::runtime::Tree::default();
+        let status = StatusData::default();
+        let mut history = Vec::new();
+        let mut auth_job = None;
+        let mut extensions_pending = None;
+        let mut extensions_job = None;
+        let mut scope = Scope::Global;
+        let mut env = OverlayEnv {
+            history: &mut history,
+            runtime: &runtime,
+            todo: &Default::default(),
+            model_downloads: None,
+            compute_monitor: None,
+            first_run,
+            live_tasks: None,
+            verify_lora: None,
+            auth_job: &mut auth_job,
+            last_setup_failure: &mut None,
+            extensions_pending: &mut extensions_pending,
+            extensions_job: &mut extensions_job,
+            background_control: None,
+            pty_approval: Approval::Write,
+            app: &app,
+            themes: &mut themes,
+            keys: &mut keys,
+            status: &status,
+            catalog: &mut catalog,
+            scope: &mut scope,
+            dark: None,
+            latest: None,
+            next: None,
+            seen_generation: 0,
+            release_compute: None,
+            peer_source: None,
+        };
+        let mut overlay = ActiveOverlay::Models(Box::new(
+            crate::ui::overlay::models::ModelOverlay::new(None, Vec::new(), Scope::Global),
+        ));
+        let closed = env.apply(
+            OverlayEvent::AssignModel {
+                role: "main".into(),
+                selection: selection.clone(),
+                scope: Scope::Global,
+            },
+            &mut overlay,
+        );
+        assert!(env.latest.is_some(), "the assignment saved");
+        assert_eq!(
+            closed, first_run,
+            "only first-run setup closes after the pick"
+        );
+    }
+}
+
+#[test]
+fn stop_key_leaves_every_panel_while_escape_steps_back_one() {
+    use crate::app::overlay::run::overlay_input;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let (_home, _project, app) = app();
+    let models = || {
+        ActiveOverlay::Models(Box::new(crate::ui::overlay::models::ModelOverlay::new(
+            None,
+            Vec::new(),
+            Scope::Global,
+        )))
+    };
+    let mut keys = Keymap::defaults();
+    let mut themes = ThemeManager::new(&app.layout.user_dir, &app.config.ui, None);
+    let mut catalog = Catalog::new();
+    let runtime = crate::runtime::Tree::default();
+    let status = StatusData::default();
+    let mut history = vec![models()];
+    let mut auth_job = None;
+    let mut extensions_pending = None;
+    let mut extensions_job = None;
+    let mut scope = Scope::Global;
+    let mut env = OverlayEnv {
+        history: &mut history,
+        runtime: &runtime,
+        todo: &Default::default(),
+        model_downloads: None,
+        compute_monitor: None,
+        first_run: false,
+        live_tasks: None,
+        verify_lora: None,
+        auth_job: &mut auth_job,
+        last_setup_failure: &mut None,
+        extensions_pending: &mut extensions_pending,
+        extensions_job: &mut extensions_job,
+        background_control: None,
+        pty_approval: Approval::Write,
+        app: &app,
+        themes: &mut themes,
+        keys: &mut keys,
+        status: &status,
+        catalog: &mut catalog,
+        scope: &mut scope,
+        dark: None,
+        latest: None,
+        next: None,
+        seen_generation: 0,
+        release_compute: None,
+        peer_source: None,
+    };
+    let mut guard = crate::ui::input::PasteGuard::default();
+    let mut overlay = models();
+    let typed = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert!(!overlay_input(&mut env, &mut overlay, &mut guard, typed));
+    let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        !overlay_input(&mut env, &mut overlay, &mut guard, esc),
+        "Esc first clears the search"
+    );
+    assert_eq!(env.history.len(), 1);
+    let stop = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(overlay_input(&mut env, &mut overlay, &mut guard, stop));
+    assert!(env.next.is_none());
+    assert!(
+        env.history.is_empty(),
+        "Ctrl+C leaves the panels, not one level"
+    );
+}
+
+#[test]
+fn removing_builtin_provider_refreshes_config_and_clears_saved_key() {
+    use crate::ui::overlay::OverlayEvent;
+    let (_home, _project, app) = app();
+    let url = "http://127.0.0.1:11234/v1";
+    crate::llm::catalog::save_credential(&app.layout.user_dir, url, "fixture-key").unwrap();
+    let mut keys = Keymap::defaults();
+    let mut themes = ThemeManager::new(&app.layout.user_dir, &app.config.ui, None);
+    let mut catalog = Catalog::new();
+    let runtime = crate::runtime::Tree::default();
+    let status = StatusData::default();
+    let mut history = Vec::new();
+    let mut auth_job = None;
+    let mut extensions_pending = None;
+    let mut extensions_job = None;
+    let mut scope = Scope::Global;
+    let mut env = OverlayEnv {
+        history: &mut history,
+        runtime: &runtime,
+        todo: &Default::default(),
+        model_downloads: None,
+        compute_monitor: None,
+        first_run: false,
+        live_tasks: None,
+        verify_lora: None,
+        auth_job: &mut auth_job,
+        last_setup_failure: &mut None,
+        extensions_pending: &mut extensions_pending,
+        extensions_job: &mut extensions_job,
+        background_control: None,
+        pty_approval: Approval::Write,
+        app: &app,
+        themes: &mut themes,
+        keys: &mut keys,
+        status: &status,
+        catalog: &mut catalog,
+        scope: &mut scope,
+        dark: None,
+        latest: None,
+        next: None,
+        seen_generation: 0,
+        release_compute: None,
+        peer_source: None,
+    };
+    let mut overlay =
+        ActiveOverlay::Providers(crate::ui::overlay::providers::ProviderOverlay::new(
+            None,
+            BTreeMap::new(),
+            Box::new(|_| true),
+            Scope::Global,
+        ));
+    for id in ["mlx-serve", "docker-model-runner"] {
+        assert!(!env.apply(
+            OverlayEvent::RemoveProvider {
+                id: id.into(),
+                scope: Scope::Global
+            },
+            &mut overlay
+        ));
+        assert!(env.latest.as_ref().unwrap().providers[id].is_reset());
+        assert!(
+            settings_store::load_config(&app.layout, &toml::Table::new())
+                .unwrap()
+                .providers[id]
+                .is_reset()
+        );
+    }
+    assert!(
+        crate::llm::catalog::credential_token(&app.layout.user_dir, url)
+            .unwrap()
+            .is_none()
     );
 }

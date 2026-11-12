@@ -93,6 +93,24 @@ grant. Choose a method explicitly to stop sign-in state from affecting routing. 
 alone does not change this legacy choice. **Remove API key** removes only the saved key;
 subscription/OAuth sign-out removes only that sign-in. Environment keys remain independently set.
 
+### Reset a provider
+
+In `/providers`, **X** or **Delete**, then **Enter** to confirm, resets the selected
+provider to **not set up**, including built-in local servers such as Docker Model Runner
+and MLX-Serve. The selected scope retains an empty disabled provider record so discovery
+cannot reconnect it from a running server, an environment key, or an old model selection.
+A Global reset also clears this project's override; a Project reset masks the inherited
+Global connection without deleting its definition.
+
+Reset also removes Dial's saved URL-scoped API keys for the connection and its provider
+sign-ins; these credentials are shared across projects (and a URL-scoped key may be used
+by another provider at that URL). Pending sign-in for that provider is cancelled. A failure
+to clear credentials is reported, not presented as a successful complete reset. Resetting
+ChatGPT forgets local account registrations/tokens; it does not claim remote revocation.
+Environment variables, external server processes, installed software, downloaded weights,
+and session history are not deleted. The provider remains available for **Set up provider**.
+For a custom endpoint with no setup URL, use **Edit configuration / endpoint** to enter one.
+
 ### Anthropic subscription sign-in
 
 Open `/providers`, select **Anthropic**, choose **Sign in with Claude subscription**, and complete
@@ -341,6 +359,12 @@ you to paste one. Dial checks that key against OpenRouter's protected `/api/v1/a
 before saving. The option appears only for OpenRouter's official endpoint, so a generated key is never
 forwarded to a custom gateway.
 
+`/providers` lists every bundled hosted provider, such as OpenCode Zen and Go, Cerebras, Together or
+Fireworks, not only the ones probed by default. A provider without a credential shows as **not set
+up** and makes no network request; choose **Set API key** or set its environment variable (the row
+names it), and the next scan lists its models. Sign-in providers, templated endpoints (Snowflake,
+Cloudflare AI Gateway) and agent protocols keep their own setup.
+
 When entering OpenAI or Anthropic API keys, Dial checks them against each provider's model-list
 endpoint before saving; this is metadata, not an inference call. OpenAI uses bearer authentication;
 Anthropic API keys use `x-api-key` and `anthropic-version`. Other custom endpoint keys are saved
@@ -470,5 +494,12 @@ A model's `m` (`reasoning_effort_wire`) map sends a declared effort under a prov
 `/cost` separates main and worker usage, logical requests and actual transport/retry attempts, with
 per-model and usage-report coverage. Observed priced spend includes accepted maintenance/helper replies,
 including discarded results; unknown prices or missing usage stay explicit rather than becoming free.
+Each role and model also shows a cache hit rate: prompt tokens read from the provider's prompt cache
+as a share of all prompt tokens. A provider that sent no cache fields shows "not reported", never 0%;
+when only some responses reported them the rate is a lower bound and says so. When a main-agent
+request's prompt did not extend the previous one, `/cost` also lists these prompt cache restarts by
+cause: model switched, instructions changed, tool list changed, or earlier messages rewritten
+(compaction or pruning). This is Dial's own comparison of consecutive requests, not a provider
+measurement.
 Subscription counters are observed activity, not an invoice or quota forecast. Reasoning may overlap
 output and must not be added twice. The live ledger is not a reconstructed cross-process billing total.

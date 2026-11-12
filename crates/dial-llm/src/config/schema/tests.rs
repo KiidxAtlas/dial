@@ -8,9 +8,8 @@ fn execution_gap_experiments_have_explicit_defaults_and_validate_bounds() {
             && defaults.eval.auto_offer
             && defaults.eval.parallel_batches
     );
-    assert!(
-        defaults.efficiency.preserve_task_inputs && defaults.verification.auto_registered_checks
-    );
+    assert!(defaults.verification.auto_registered_checks);
+    assert!(defaults.efficiency.preserve_task_inputs);
     assert!(!defaults.experimental.adaptive_output_effort);
     assert_eq!(defaults.compaction.argument_projection_tokens, 0);
     let configured: crate::config::types::Config = toml::from_str("[eval]\nportable_helpers=false\nauto_offer=false\nparallel_batches=false\n[efficiency]\npreserve_task_inputs=false\nevidence_stall_rounds=0\nsmall_case_guard=false\n[verification]\nauto_registered_checks=false\n").unwrap();
@@ -20,6 +19,7 @@ fn execution_gap_experiments_have_explicit_defaults_and_validate_bounds() {
             && !configured.eval.parallel_batches
     );
     assert!(!configured.verification.auto_registered_checks);
+    assert!(!configured.efficiency.preserve_task_inputs);
     let mut invalid = defaults;
     invalid.efficiency.evidence_stall_rounds = 257;
     assert!(invalid.validate().is_err());
@@ -550,6 +550,15 @@ fn experimental_options_are_registered_in_their_tab_with_their_defaults() {
     let mut out_of_range = Config::default();
     out_of_range.experimental.mutation_runs = 17;
     assert!(out_of_range.validate().is_err());
+    let slots = setting("experimental.background_check_slots");
+    assert_eq!(slots.tab, "Experimental");
+    assert_eq!(slots.default_value(), Some(Value::Integer(1)));
+    assert_eq!(unset.experimental.background_check_slots, 1);
+    for invalid in [0, 5] {
+        let mut out_of_range = Config::default();
+        out_of_range.experimental.background_check_slots = invalid;
+        assert!(out_of_range.validate().is_err(), "{invalid}");
+    }
 }
 
 #[test]
@@ -788,6 +797,21 @@ fn tabs_follow_the_layout_table_not_declaration_order() {
             "{path}"
         );
     }
+}
+
+#[test]
+fn search_location_uses_the_declaration_or_falls_back_to_the_supplied_metadata() {
+    let mut definition = registry()[0];
+    let original = definition.search_location();
+    definition.tab = "custom tab";
+    definition.section = "custom section";
+    assert_eq!(definition.search_location(), original);
+
+    definition.path = "unregistered.setting";
+    assert_eq!(
+        definition.search_location(),
+        ("custom tab", "custom section")
+    );
 }
 
 #[test]
@@ -1048,4 +1072,15 @@ fn setting_pairs_are_symmetric_and_both_paths_are_declared() {
     }
     assert_eq!(pair_partner("memory.semantic.embedding_api_key_env"), None);
     assert_eq!(pair_partner("ui.theme"), None);
+}
+
+#[test]
+fn status_lists_written_by_a_command_name_only_known_segments() {
+    let list = |names: &[&str]| Value::Array(names.iter().map(|n| Value::from(*n)).collect());
+    check_status_segments("ui.status_left", &list(&["model", "reasoning", "git"])).unwrap();
+    let error = check_status_segments("ui.status_right", &list(&["model", "nope"])).unwrap_err();
+    assert!(error.contains("unknown status segment nope;"), "{error}");
+    // Other lists and the lenient load-time check are unaffected.
+    check_status_segments("integrations", &list(&["nope"])).unwrap();
+    check_value("ui.status_left", &list(&["nope"])).unwrap();
 }

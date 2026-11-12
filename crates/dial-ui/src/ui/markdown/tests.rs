@@ -591,3 +591,36 @@ fn other_fences_keep_their_language_label_with_extra_info() {
     let bar = theme().sym(Sym::CodeBar).to_owned();
     assert_eq!(text[0], format!("{bar} RUST"));
 }
+
+#[test]
+fn table_columns_keep_whole_words_and_break_after_hyphens() {
+    let src = "| Aspect | Rust | Go |\n|---|---|---|\n| Memory | ownership and borrowing, no GC | Garbage-collected, low pause times |\n| Tooling | cargo, clippy, rust-analyzer | go build, go fmt |\n";
+    let rows = md(src, 50);
+    assert_fits(&rows, 50);
+    let text = plain(&rows).join("\n");
+    for word in ["ownership", "borrowing,", "rust-analyzer", "clippy,"] {
+        assert!(text.contains(word), "{word} split:\n{text}");
+    }
+    assert!(text.contains("Garbage-"), "{text}");
+    assert!(
+        !text.contains("Garbage-coll\n") && !text.contains("Garbage-c "),
+        "{text}"
+    );
+}
+
+#[test]
+fn wrapped_code_breaks_at_spaces_and_marks_continuations() {
+    let rows = md(
+        "```bash\nrustc main.rs -o /tmp/demo && grep -rn println . | sort | uniq -c\n```",
+        40,
+    );
+    assert_fits(&rows, 40);
+    let text = plain(&rows);
+    let joined = text.join("\n");
+    assert!(joined.contains("println"), "{joined}");
+    assert!(
+        text.iter().skip(2).all(|l| l.contains('\u{21aa}')),
+        "{text:?}"
+    );
+    assert!(!text[1].contains('\u{21aa}'), "{text:?}");
+}

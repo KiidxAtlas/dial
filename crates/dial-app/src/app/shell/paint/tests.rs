@@ -65,6 +65,31 @@ fn model_change_updates_status_and_home_without_resetting_navigation() {
 }
 
 #[test]
+fn a_local_gguf_model_shows_gguf_not_mlx_in_the_status_and_home() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("qwen3-8b-Q4_K_M.gguf");
+    std::fs::write(&file, b"GGUF\x03\0\0\0").unwrap();
+    let config = Config {
+        model: file.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    assert_eq!(config.selection().provider, "mlx");
+    let mut status = StatusData::default();
+    let mut home = Some(Home::new(WelcomeInfo::default(), Vec::new(), false));
+    update_model_status(&mut status, &mut home, &config);
+    assert_eq!(status.provider, "gguf");
+    assert_eq!(status.model, "qwen3-8b-Q4_K_M.gguf");
+    assert_eq!(home.as_ref().unwrap().info.provider, "gguf");
+
+    status.inference = "last request controls".into();
+    update_model_status(&mut status, &mut home, &config);
+    assert_eq!(
+        status.inference, "last request controls",
+        "an unchanged GGUF model is not treated as a switch"
+    );
+}
+
+#[test]
 fn a_command_report_on_the_home_screen_ends_the_home_so_it_is_visible() {
     let (_home, _project, _app, mut shell) = super::super::testkit::shell();
     shell.home = Some(Home::new(WelcomeInfo::default(), Vec::new(), false));
@@ -232,6 +257,53 @@ fn bottom_chrome_leaves_the_transcript_most_of_an_80x24_terminal() {
     shell.paint(None).unwrap();
 }
 
+#[test]
+fn plan_is_live_only_and_evidence_and_mode_remain_available() {
+    use crate::ui::work_panel::Tab;
+
+    for (cols, rows) in [(50, 24), (80, 24), (120, 40)] {
+        for tab in Tab::ALL {
+            let (_home, _project, _app, mut shell) = super::super::testkit::shell();
+            let capture = Capture::default();
+            shell.term = crate::ui::term::with_writer(Box::new(capture.clone()), (cols, rows));
+            shell.home = None;
+            shell.work_tab = tab;
+            shell.status.sandbox = "workspace".into();
+            shell.status.approval = "ask".into();
+            shell.todo.call(&serde_json::json!({"op": "set", "tasks": [
+                {"content": "Unique plan step"},
+                {"content": "Second step"}
+            ]}));
+            for _ in 0..3 {
+                shell.paint(None).unwrap();
+            }
+            let mut parser = vt100::Parser::new(rows, cols, 100);
+            parser.process(&capture.0.lock().unwrap());
+            let shown = parser.screen().contents();
+            let expected = usize::from(tab == Tab::Plan || cols < 90);
+            assert_eq!(
+                shown.matches("Unique plan step").count(),
+                expected,
+                "{cols}x{rows} {tab:?}: {shown}"
+            );
+            if cols == 120 && tab == Tab::Plan {
+                assert!(
+                    shown.contains("Plan ▱▱▱▱▱▱▱▱ 0/2 done")
+                        || shown.contains("Plan -------- 0/2 done"),
+                    "{shown}"
+                );
+            }
+            if cols == 120 {
+                match tab {
+                    Tab::Evidence => assert!(shown.contains("no evidence recorded yet"), "{shown}"),
+                    Tab::Mode => assert!(shown.contains("sandbox"), "{shown}"),
+                    Tab::Plan => {}
+                }
+            }
+        }
+    }
+}
+
 /// Shared capture of everything the inline terminal writes, replayed into a screen emulator.
 #[derive(Clone, Default)]
 struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -325,4 +397,17 @@ fn the_full_main_screen_at_80x24_keeps_the_transcript_and_whole_rows() {
             assert!(rows.iter().all(|r| r.is_ascii()), "{rows:#?}");
         }
     }
+}
+
+#[test]
+fn shift_tab_never_cycles_into_full_auto() {
+    let mut mode = Approval::Ask;
+    for _ in 0..6 {
+        mode = next_cycled_approval(mode);
+        assert_ne!(mode, Approval::Auto);
+    }
+    assert_eq!(next_cycled_approval(Approval::Ask), Approval::Write);
+    assert_eq!(next_cycled_approval(Approval::Write), Approval::Readonly);
+    assert_eq!(next_cycled_approval(Approval::Readonly), Approval::Ask);
+    assert_eq!(next_cycled_approval(Approval::Auto), Approval::Ask);
 }

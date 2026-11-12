@@ -31,3 +31,29 @@ fn python_voice_health_uses_supported_help_and_propagates_failure() {
         );
     }
 }
+
+#[test]
+fn summary_counts_missing_capabilities_on_one_line_and_the_full_list_names_each() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Env {
+        path: Vec::new(),
+        user_dir: tmp.path().join("dial"),
+    };
+    let full = list_text(&env, "dial doctor --fix");
+    let missing = full.lines().filter(|line| line.starts_with("  · ")).count();
+    assert!(missing > 0, "{full}");
+    assert!(full.contains("dial doctor --fix bun"), "{full}");
+    let summary = summary_text(&env, "dial doctor --all");
+    assert!(
+        summary.contains(&format!("Not installed: {missing} optional capabilit")),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("`dial doctor --all` lists them"),
+        "{summary}"
+    );
+    assert!(
+        !summary.lines().any(|line| line.starts_with("  · ")),
+        "{summary}"
+    );
+}

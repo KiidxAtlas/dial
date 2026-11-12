@@ -57,6 +57,75 @@ fn copies_omit_credentials_but_keep_templates() {
 }
 
 #[test]
+fn ignored_paths_cover_their_subtrees_and_an_ignored_root_ignores_nothing() {
+    let ignored = IgnoredPaths::parse(b"benchmarks/run/\0notes.log\0");
+    assert!(ignored.covers(Path::new("benchmarks/run")));
+    assert!(ignored.covers(Path::new("benchmarks/run/a/b.bin")));
+    assert!(ignored.covers(Path::new("notes.log")));
+    assert!(!ignored.covers(Path::new("benchmarks/README.md")));
+    assert!(!ignored.covers(Path::new("benchmarks/runner.rs")));
+    assert!(IgnoredPaths::parse(b"./\0a\0").is_empty());
+    assert!(!IgnoredPaths::default().covers(Path::new("anything")));
+}
+
+#[test]
+fn worker_copies_leave_out_ignored_paths_and_plain_copies_keep_them() {
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir_all(source.path().join("data/run")).unwrap();
+    fs::write(source.path().join("data/run/big.bin"), "data").unwrap();
+    fs::write(source.path().join("data/README.md"), "kept").unwrap();
+    fs::write(source.path().join("main.rs"), "fn main() {}").unwrap();
+    let ignored = IgnoredPaths::parse(b"data/run/\0");
+    for copied in [
+        clone_project_except(source.path(), &ignored).unwrap(),
+        copy_project_plain_except(source.path(), &ignored).unwrap(),
+    ] {
+        assert!(!copied.path().join("data/run").exists());
+        assert!(copied.path().join("data/README.md").is_file());
+        assert!(copied.path().join("main.rs").is_file());
+    }
+    assert!(
+        clone_project(source.path())
+            .unwrap()
+            .path()
+            .join("data/run/big.bin")
+            .is_file()
+    );
+}
+
+#[test]
+fn ignored_paths_come_from_git_and_exclude_tracked_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    fs::create_dir_all(root.join("data/run")).unwrap();
+    fs::write(root.join("data/tracked.txt"), "t").unwrap();
+    git(&["add", "data/tracked.txt"]);
+    fs::write(root.join(".gitignore"), "/data/\n").unwrap();
+    fs::write(root.join("data/run/big.bin"), "b").unwrap();
+    let ignored = IgnoredPaths::of(root);
+    assert!(ignored.covers(Path::new("data/run/big.bin")));
+    assert!(
+        !ignored.covers(Path::new("data/tracked.txt")),
+        "tracked files stay source"
+    );
+    assert!(!ignored.covers(Path::new(".gitignore")));
+    assert!(IgnoredPaths::of(tempfile::tempdir().unwrap().path()).is_empty());
+}
+
+#[test]
 fn plain_copy_applies_the_same_exclusions_as_clone() {
     let source = tempfile::tempdir().unwrap();
     fs::write(source.path().join("main.rs"), "fn main() {}").unwrap();

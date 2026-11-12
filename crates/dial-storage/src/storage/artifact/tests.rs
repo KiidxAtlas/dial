@@ -27,6 +27,23 @@ fn ranged_and_immutable() {
     assert!(store.retrieve(&uri, 2, 1).unwrap().contains("2:b\n"));
     assert!(store.retrieve("artifact://../x", 1, 1).is_err());
 }
+
+#[test]
+fn byte_pages_have_no_store_cap_and_stop_at_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::new(dir.path()).unwrap();
+    let bytes: Vec<u8> = (0..40_000u32).map(|n| (n % 251) as u8).collect();
+    let uri = store.retain_exact_bytes(&bytes).unwrap();
+    let page: serde_json::Value =
+        serde_json::from_str(&store.retrieve_bytes(&uri, 0, usize::MAX).unwrap()).unwrap();
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(page["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(data, bytes);
+    assert_eq!(page["next_offset"], 40_000);
+    assert!(store.retrieve_bytes(&uri, 0, 0).is_err());
+}
 fn capped(max: u64, head: u64) -> (tempfile::TempDir, ArtifactStore) {
     let dir = tempfile::tempdir().unwrap();
     let store = ArtifactStore::new(dir.path())

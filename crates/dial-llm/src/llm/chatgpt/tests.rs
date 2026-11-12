@@ -2,6 +2,16 @@ use super::*;
 use crate::llm::{catalog::model_context_window, model_config::ModelSelection};
 use ring::signature::KeyPair;
 use serde_json::json;
+
+#[test]
+fn reset_provider_forgets_chatgpt_account_registrations_and_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    test_account(dir.path(), false);
+    assert!(!accounts(dir.path()).unwrap().is_empty());
+    crate::llm::catalog::remove_provider_credentials(dir.path(), "chatgpt", &[]).unwrap();
+    assert!(accounts(dir.path()).unwrap().is_empty());
+    assert!(resolve_account(dir.path(), None).is_err());
+}
 fn attempt() -> Attempt {
     Attempt {
         state: "pending-state".into(),

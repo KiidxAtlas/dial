@@ -54,7 +54,8 @@ failures (including checkpoint failures) are not reset by this recovery.
   separate worker and falls back to an after-turn follow-up if it cannot start). The footer states
   what Enter will do. In `/settings` → Input, **Enter while working** explicitly saves `ui.busy_send`:
   `choose` (default), `redirect`, `after_turn`, `independent`, or `auto`. Choices other than `choose`
-  send directly on Enter; selecting a chooser action never changes this preference. Empty Enter
+  send directly on Enter; selecting a chooser action never changes this preference, but the next
+  chooser in the same session opens on the action picked last (Enter still confirms). Empty Enter
   with queued work still asks before stopping, regardless of preference. Automatic routing defaults
   to steering without an extra model call; `[message_routing] route = "classify"` opts into a routing
   judge, and a failed decision steers. `Ctrl+Enter` redirects directly when the terminal supports the
@@ -90,13 +91,15 @@ failures (including checkpoint failures) are not reset by this recovery.
   `/help` opens the action palette while idle or busy; `/help text` and `/help all` list commands and their scheduling policies,
   also used by dispatch and palette notes. `/model` and `/models` share the same policy, including
   `settings` (`setting`), `defaults`, `local` and `memory`: these panels open immediately, even during
-  a turn. The model shortcut (`Ctrl+K` on macOS, `Alt+M` elsewhere) opens the same picker.
+  a turn. The model shortcut (`F2` on macOS, `Alt+M` elsewhere) opens the same picker.
   Saved choices apply after the current turn without canceling it; display settings apply immediately.
   Closing the picker without selecting changes nothing. A selection changes only this session and the
   saved default for new sessions; other running Dial sessions keep their models.
   Other commands wait for the turn to finish, with a notice, except commands
   that replace or alter the active session/work: `/exit` (`/quit`, `/q`), `/new`, `/clear`, `/resume`, `/sessions`,
   `/tree`, `/fork`, `/undo`, `/rollback`, `/compact` and `/plan` stop it first.
+  While a turn runs, the command menu labels these commands "stops the current turn first" in place of
+  their usual description, so a typed command never stops work by surprise.
   `/queue` inspection and queue edits also leave the current turn running. `/model restart` (also
   `/models restart`) is refused
   while busy without cancelling inference. Live informational notices do not settle or replay the
@@ -182,6 +185,11 @@ failures (including checkpoint failures) are not reset by this recovery.
   before enabling edits. `/permissions` lists scoped rules; for example,
   `/permissions allow --persist bash cargo test` persists a project rule outside the workspace.
   Deny rules take precedence, including in automatic approval mode.
+  `/permissions why` lists the 20 most recent approval-policy decisions of this session, newest
+  first: the rule that decided each call (mode, saved rule, hook, your answer) and the control
+  that would change it. It covers approval policy only, not model routing or completion checks.
+  Approval prompts also say what `/undo` covers: `write`, `edit` and `ast_edit` are checkpointed,
+  shell commands only when `shell.undo_snapshot` is on, and other tools have no checkpoint.
   Approval prompts lead with the action and show the exact policy-derived reusable matcher and
   lifetime before consent. Answer keys are ignored for about 350 ms after a prompt appears. `Esc`
   or `n` denies; `Ctrl+C` denies and stops the turn. Choosing the project scope asks for

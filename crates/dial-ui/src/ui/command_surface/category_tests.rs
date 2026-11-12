@@ -64,3 +64,40 @@ fn availability_uses_known_context_and_preserves_deferred_commands() {
     assert_eq!(unavailable_reason("model", "", missing), None);
     assert_eq!(unavailable_reason("compact", "", missing), None);
 }
+
+#[test]
+fn every_command_has_a_lowercase_description_and_stop_commands_say_so_while_busy() {
+    use super::{AvailabilityContext, COMMANDS, DuringTurn, busy_effect};
+    for spec in COMMANDS {
+        assert!(
+            !spec.description.is_empty(),
+            "/{} has no description",
+            spec.name
+        );
+        let first = spec.description.chars().next().unwrap();
+        let acronym = spec
+            .description
+            .chars()
+            .nth(1)
+            .is_some_and(char::is_uppercase);
+        assert!(
+            !first.is_uppercase() || acronym,
+            "/{}: {}",
+            spec.name,
+            spec.description
+        );
+    }
+    let busy = AvailabilityContext {
+        busy: true,
+        ..Default::default()
+    };
+    let idle = AvailabilityContext::default();
+    let stop = COMMANDS
+        .iter()
+        .find(|spec| spec.during_turn == DuringTurn::Stop)
+        .unwrap();
+    assert!(busy_effect(stop.name, busy).is_some());
+    assert!(busy_effect(stop.name, idle).is_none());
+    assert!(busy_effect("help", busy).is_none());
+    assert_eq!(category("seance"), Category::Session);
+}

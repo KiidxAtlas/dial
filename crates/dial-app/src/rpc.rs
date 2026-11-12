@@ -170,6 +170,17 @@ impl std::fmt::Display for RequestError {
     }
 }
 impl std::error::Error for RequestError {}
+/// A plain RPC method listed in [`METHODS`].
+fn known_method(method: &str) -> bool {
+    METHODS.iter().any(|(name, _)| *name == method)
+}
+/// The error for a method this endpoint does not serve; the actor returns the same one.
+pub(super) fn unknown_method() -> anyhow::Error {
+    anyhow::Error::new(RequestError {
+        code: "unknown_method",
+        message: "unknown RPC method".to_owned(),
+    })
+}
 /// Highest served protocol version the client can speak. A client that asks for a version older
 /// than every served one gets a coded error listing what this build serves.
 fn negotiated_version(requested: u64) -> Result<u32> {
@@ -1435,6 +1446,13 @@ fn run_control(
                     out.result(&id, Ok(json!({"live":false,"stopped":stopped})));
                 }
                 _ => {
+                    // An unknown method is refused here, before it takes the busy slot: queued
+                    // behind the agent it would make `state` report busy and refuse the next
+                    // request. ACP methods are translated and checked in `acp.rs` first.
+                    if !acp && !known_method(request["method"].as_str().unwrap_or("")) {
+                        out.result(&id, Err(unknown_method()));
+                        continue;
+                    }
                     if acp
                         && request["method"] == "close_session"
                         && request["params"]["_active"] == true

@@ -31,6 +31,29 @@ fn oversized_grep_context_is_capped_at_runtime_not_rejected() {
     );
 }
 #[test]
+fn malformed_arguments_quote_the_received_text_and_parse_error() {
+    let call = |arguments| crate::llm::ToolCall {
+        id: "1".into(),
+        name: "verify".into(),
+        arguments,
+        malformed_arguments: true,
+    };
+    let (kind, why) =
+        validate_offered_call(&call(json!(r#"{"targets": ["#)), &[], &["verify".into()]).unwrap();
+    assert_eq!(kind, "malformed_arguments");
+    assert!(
+        why.starts_with("tool arguments were not a valid JSON object ("),
+        "{why}"
+    );
+    assert!(why.contains(r#"\"targets\": ["#), "{why}");
+    assert!(why.contains("13 bytes"), "{why}");
+    let long = format!("{{\"command\": \"{}", "x".repeat(1000));
+    let (_, why) = validate_offered_call(&call(json!(long)), &[], &["verify".into()]).unwrap();
+    assert!(why.contains(" … ") && why.len() < 700, "{why}");
+    let (_, why) = validate_offered_call(&call(json!(null)), &[], &["verify".into()]).unwrap();
+    assert_eq!(why, "tool arguments were not a valid JSON object");
+}
+#[test]
 fn integration_defaults_and_legacy_registration_share_metadata() {
     let config = crate::config::types::Config::default();
     assert_eq!(config.integrations, default_integrations());

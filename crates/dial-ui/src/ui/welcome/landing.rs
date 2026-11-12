@@ -1,7 +1,16 @@
 //! The live landing composition. The input stays near the window's midpoint; artwork yields
-//! before actions or safety context when the terminal is short. Scrollback uses the banner API.
+//! before actions or safety context when the terminal is short. Below the input, the context
+//! stands in rounded cards drawn with the transcript's card frame, so the launch screen and the
+//! conversation share one visual language: warnings in a warning-outlined card, the recent
+//! sessions or starters in a bordered list, first-run steps in an accent card. Each card falls
+//! back to plain centered rows when the window cannot spare its two edge rows. Scrollback uses
+//! the banner API.
 use super::*;
 use crate::ui::composer::ComposerView;
+use crate::ui::tool_cards::frame::{CHROME_W, Frame};
+
+/// Narrowest content width that draws its context as cards.
+const CARD_MIN: usize = 24;
 
 /// A readable measure, with breathing room on either side of the launch composer. Even a tiny
 /// terminal keeps a one-cell margin, so the input card never sits flush against the window edge.
@@ -27,10 +36,81 @@ fn centered(spans: Vec<Span<'static>>, width: usize, theme: &Theme) -> Line<'sta
     Line::from(out)
 }
 
-fn hero(width: usize, budget: usize, theme: &Theme, sweep: f32, idle: u64) -> Rows {
+/// A rounded card exactly `width` cells wide, or `None` when the width cannot hold one.
+fn card(
+    theme: &Theme,
+    head: Vec<Span<'static>>,
+    body: Vec<Vec<Span<'static>>>,
+    foot: Option<Vec<Span<'static>>>,
+    border: Tok,
+    width: usize,
+) -> Option<Rows> {
+    if width < CARD_MIN {
+        return None;
+    }
+    let mut frame = Frame::new(head, theme.fg(border));
+    frame.sections.push((
+        None,
+        body.into_iter()
+            .map(|row| Line::from(trim_lead(row)))
+            .collect(),
+    ));
+    if let Some(foot) = foot {
+        frame.foot = trim_lead(foot);
+    }
+    Some(frame.rows(theme, width))
+}
+
+/// Spans without the blank padding spans that lead them (a card edge brings its own spacing).
+fn trim_lead(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .skip_while(|s| s.content.trim().is_empty())
+        .collect()
+}
+
+/// `v0.4.2 · Your coding agent, wired into this project.`, typed in while the mark powers up.
+/// The row keeps its full width at every frame, so the centered text never shifts.
+fn tagline(info: &WelcomeInfo, theme: &Theme, sweep: f32) -> Vec<Span<'static>> {
+    let version = text::one_line(info.version.trim());
+    let mut parts: Vec<(String, Style)> = Vec::new();
+    if !version.is_empty() {
+        let version = if version.starts_with(|c: char| c.is_ascii_digit()) {
+            format!("v{version}")
+        } else {
+            version
+        };
+        parts.push((version, theme.fg(Tok::Dim)));
+        parts.push((format!(" {} ", theme.sym(Sym::Dot)), theme.fg(Tok::Dim)));
+    }
+    parts.push((TAGLINE.to_owned(), theme.fg(Tok::Muted)));
+    let total: usize = parts.iter().map(|(s, _)| s.chars().count()).sum();
+    let mut visible = if (0.0..1.0).contains(&sweep) {
+        ((sweep * 1.6).min(1.0) * total as f32).round() as usize
+    } else {
+        total
+    };
+    let mut spans = Vec::new();
+    for (part, style) in parts {
+        let n = part.chars().count();
+        let shown: String = part.chars().take(visible).collect();
+        let hidden = n.saturating_sub(visible);
+        visible = visible.saturating_sub(n);
+        if !shown.is_empty() {
+            spans.push(Span::styled(shown, style));
+        }
+        if hidden > 0 {
+            spans.push(Span::raw(" ".repeat(hidden)));
+        }
+    }
+    spans
+}
+
+fn hero(info: &WelcomeInfo, width: usize, budget: usize, theme: &Theme, view: &View) -> Rows {
     if budget < 2 {
         return Vec::new();
     }
+    let (sweep, idle) = (view.sweep, view.idle);
     let art = if theme.ascii() {
         None
     } else if budget > mark::LOCKUP.1 && width >= mark::LOCKUP.0 {
@@ -54,6 +134,12 @@ fn hero(width: usize, budget: usize, theme: &Theme, sweep: f32, idle: u64) -> Ro
             theme,
         )],
     };
+    // The tagline sits under the mark when the window can spare the row and its whole width.
+    let line = tagline(info, theme, sweep);
+    let line_w: usize = line.iter().map(|s| text::width(&s.content)).sum();
+    if budget >= rows.len() + 2 && line_w <= width {
+        rows.push(centered(line, width, theme));
+    }
     rows.push(Line::default());
     rows
 }
@@ -101,13 +187,18 @@ pub fn frame(
         )]);
     }
     let place = place(info, theme, inner);
-    let reserve =
-        (usize::from(!place.is_empty()) + notices.len() + 2 + usize::from(view.selected.is_some()))
-            .min(remaining);
+    // Warnings keep room for their card's two edges, so a tall window never trades them away.
+    let chrome = if notices.is_empty() { 0 } else { 2 };
+    let reserve = (usize::from(!place.is_empty())
+        + notices.len()
+        + chrome
+        + 2
+        + usize::from(view.selected.is_some()))
+    .min(remaining);
     let above = (height / 2)
         .saturating_sub(composer.cursor.0 as usize)
         .min(remaining.saturating_sub(reserve));
-    let hero = hero(inner, above, theme, view.sweep, view.idle);
+    let hero = hero(info, inner, above, theme, &view);
     let mut rows = vec![Line::default(); above.saturating_sub(hero.len())];
     let indent = |mut line: Line<'static>| {
         line.spans.insert(0, Span::raw(" ".repeat(inset)));
@@ -128,19 +219,64 @@ pub fn frame(
     if budget > context.len() {
         context.push(Line::default());
     }
-    for spans in notices
-        .into_iter()
-        .take(budget.saturating_sub(context.len()))
-    {
-        context.push(centered(spans, inner, theme));
+
+    // Warnings: one card outlined in the warning color, else plain rows.
+    let left = budget.saturating_sub(context.len());
+    let warned = !notices.is_empty();
+    if warned {
+        let head = vec![Span::styled(
+            format!("{} heads up", theme.sym(Sym::Warn)),
+            theme.fg(Tok::Warning).add_modifier(Modifier::BOLD),
+        )];
+        match (left >= notices.len() + 2)
+            .then(|| card(theme, head, notices.clone(), None, Tok::Warning, inner))
+            .flatten()
+        {
+            Some(card) => context.extend(card),
+            None => context.extend(
+                notices
+                    .into_iter()
+                    .take(left)
+                    .map(|spans| centered(spans, inner, theme)),
+            ),
+        }
     }
-    let limit = budget.saturating_sub(context.len());
-    if view.selected.is_some() || (!info.recent.is_empty() && limit >= 4) {
-        context.extend(
-            list_lines(info, theme, &view, inner, limit)
-                .into_iter()
-                .map(|spans| centered(spans, inner, theme)),
-        );
+
+    // The recent sessions or starters: a bordered list card whose edges carry its heading and hint.
+    let mut limit = budget.saturating_sub(context.len());
+    let wants_list = view.selected.is_some() || (!info.recent.is_empty() && limit >= 4);
+    if wants_list && warned && limit >= 6 {
+        context.push(Line::default());
+        limit -= 1;
+    }
+    if wants_list {
+        let framed = (limit >= 3)
+            .then(|| {
+                let parts = list_parts(
+                    info,
+                    theme,
+                    &view,
+                    inner.saturating_sub(CHROME_W),
+                    limit - 2,
+                );
+                card(
+                    theme,
+                    parts.heading,
+                    parts.rows,
+                    parts.hint,
+                    Tok::Border,
+                    inner,
+                )
+            })
+            .flatten();
+        match framed {
+            Some(card) => context.extend(card),
+            None => context.extend(
+                list_lines(info, theme, &view, inner, limit)
+                    .into_iter()
+                    .map(|spans| centered(spans, inner, theme)),
+            ),
+        }
     } else if limit > 0 {
         let browse = if items(info) > 0 {
             if theme.ascii() {
@@ -160,20 +296,57 @@ pub fn frame(
             theme,
         ));
     }
-    if info.tour && view.selected.is_none() && budget.saturating_sub(context.len()) >= 4 {
-        for hint in [
-            "1  Type a request in your own words",
-            "2  Enter sends · F1 opens actions",
-            "3  /models picks a model · Esc dismisses",
-        ] {
-            context.push(centered(
-                vec![Span::styled(
-                    hint.replace('·', theme.sym(Sym::Dot)),
-                    theme.fg(Tok::Muted),
-                )],
-                inner,
-                theme,
-            ));
+    let left = budget.saturating_sub(context.len());
+    if info.tour && view.selected.is_none() && left >= 4 {
+        let hints = [
+            ("1", "Type a request in your own words"),
+            ("2", "Enter sends · F1 opens actions"),
+            ("3", "/models picks a model · Esc dismisses"),
+        ]
+        .map(|(n, hint)| (n, hint.replace('·', theme.sym(Sym::Dot))));
+        let steps: Vec<Vec<Span<'static>>> = hints
+            .iter()
+            .map(|(n, hint)| {
+                vec![
+                    Span::styled(
+                        format!("{n}  "),
+                        theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(hint.clone(), theme.fg(Tok::Text)),
+                ]
+            })
+            .collect();
+        let head = vec![Span::styled(
+            "first steps",
+            theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+        )];
+        let framed = (left >= hints.len() + 3)
+            .then(|| card(theme, head, steps, None, Tok::BorderAccent, inner))
+            .flatten();
+        match framed {
+            Some(card) => {
+                context.push(Line::default());
+                context.extend(card);
+            }
+            None => {
+                // One left-aligned block centered as a whole, so the step numbers form a column.
+                let lines: Vec<String> = hints
+                    .iter()
+                    .map(|(n, hint)| format!("{n}  {hint}"))
+                    .collect();
+                let block = lines.iter().map(|l| text::width(l)).max().unwrap_or(0);
+                for line in lines {
+                    let pad = block.saturating_sub(text::width(&line));
+                    context.push(centered(
+                        vec![Span::styled(
+                            format!("{line}{}", " ".repeat(pad)),
+                            theme.fg(Tok::Muted),
+                        )],
+                        inner,
+                        theme,
+                    ));
+                }
+            }
         }
     }
     rows.extend(context.into_iter().map(indent));

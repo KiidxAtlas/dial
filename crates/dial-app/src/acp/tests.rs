@@ -396,3 +396,24 @@ fn cancel_drops_pending_fs_requests() {
         adapter.receive(json!({"jsonrpc":"2.0","id":read[0]["id"],"result":{"content":"late"}}));
     assert!(relay.is_none());
 }
+
+#[test]
+fn unknown_methods_are_method_not_found_with_or_without_params() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+    let mut adapter = Adapter::new(layout);
+    adapter.receive(
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
+    );
+    for wire in [
+        json!({"jsonrpc":"2.0","id":2,"method":"bogus"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"bogus","params":{}}),
+    ] {
+        let (request, replies) = adapter.receive(wire);
+        assert!(request.is_none());
+        assert_eq!(replies[0]["error"]["code"], -32601, "{replies:?}");
+    }
+    let (_, replies) = adapter.receive(json!({"jsonrpc":"2.0","id":4,"method":"session/new"}));
+    assert_eq!(replies[0]["error"]["code"], -32602, "{replies:?}");
+}

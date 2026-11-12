@@ -60,21 +60,18 @@ pub(super) fn update_model_status(
     config: &crate::config::types::Config,
 ) {
     let selection = config.selection();
-    status.assistance = Some(config.assistance.enabled);
-    if status.provider != selection.provider
-        || status.model.trim_end_matches(" [plan]")
-            != selection
-                .display_name()
-                .trim_start_matches(&format!("{}/", selection.provider))
-    {
-        status.inference.clear();
-        status.main_model_explanation = None;
-    }
-    status.provider = selection.provider.clone();
-    status.model = selection
+    let provider = selection.display_provider().to_owned();
+    let model = selection
         .display_name()
         .trim_start_matches(&format!("{}/", selection.provider))
         .to_owned();
+    status.assistance = Some(config.assistance.enabled);
+    if status.provider != provider || status.model.trim_end_matches(" [plan]") != model {
+        status.inference.clear();
+        status.main_model_explanation = None;
+    }
+    status.provider = provider;
+    status.model = model;
     // `auto` keeps no profile level: each user turn's effort is judged from its prompt.
     status.thinking = if config.thinking_auto {
         "auto".to_owned()
@@ -209,6 +206,29 @@ impl Shell {
     pub(in crate::app) fn paint(&mut self, panel: Option<Rows>) -> Result<()> {
         self.status.controls_pending = self.pending_config.is_some();
         self.composer.set_command_context(self.command_context());
+        if self.term.reflow_due() {
+            // The width changed and settled: reprint the blocks still on screen at the new width.
+            // Scrollback keeps its rows; only the visible tail is rendered again.
+            let (cols, _) = self.term.size();
+            let expand_key = self.keys.label(Action::ToolsExpand);
+            let Shell {
+                term,
+                themes,
+                transcript,
+                ui,
+                status,
+                tools_expanded,
+                ..
+            } = self;
+            let ctx = TranscriptCtx {
+                theme: themes.current(),
+                ui,
+                tick: status.tick,
+                tools_expanded: *tools_expanded,
+                expand_key: &expand_key,
+            };
+            term.reflow(|seam| transcript.committed_rows_from(Some(seam), cols, &ctx));
+        }
         if panel.is_some() && self.busy_overlay.is_some() {
             // Approvals and questions paint inline, even when a turn has a menu open. Yield the
             // alternate screen without discarding the menu; its next step reopens and redraws it.
@@ -286,6 +306,7 @@ impl Shell {
         let retire = Retire::frame(Instant::now());
         let (settled, images) = transcript.retire_settled(cols, &tctx, retire);
         if !settled.is_empty() {
+            term.mark_blocks(transcript.take_block_starts());
             if let Some(protocol) = term.image_protocol() {
                 term.commit_with_images(settled, images, protocol);
             } else {
@@ -418,6 +439,8 @@ impl Shell {
         let room = (rows as usize).saturating_sub(bottom.len()).max(1);
         let (spilled, mut live) = transcript.live(cols, &tctx, room);
         if !spilled.is_empty() {
+            // The streaming block's head: transcript rows, though no whole block starts here.
+            term.mark_blocks(Vec::new());
             term.commit(spilled);
         }
         let above = live.len() as u16;
@@ -477,6 +500,10 @@ impl Shell {
     }
 
     pub(super) fn refresh_status(&mut self, app: &App, agent: &Agent<'_>) {
+        if let Some(digest) = self.inbox.returned(crate::ui::termcaps::terminal_focused()) {
+            // Not an inbox title: the digest must not file itself as a new notice.
+            self.note("While you were away", digest);
+        }
         self.status.inbox_unread = self.inbox.unread();
         self.refresh_workers(app);
         self.adapter_monitor = agent.adapter_monitor();
@@ -532,16 +559,21 @@ impl Shell {
         }
     }
 
-    /// Shift+Tab: cycles write → auto → readonly → ask → write and reports the new mode.
+    /// Shift+Tab: cycles ask → write → readonly → ask and reports the new mode. Full auto is never
+    /// one stray keypress away: it is chosen explicitly (`/approval`), and the cycle leaves it for ask.
     pub(super) fn cycle_approval(&mut self, agent: &mut Agent<'_>) {
-        let next = match agent.approval() {
-            Approval::Write => Approval::Auto,
-            Approval::Auto => Approval::Readonly,
-            Approval::Readonly => Approval::Ask,
-            Approval::Ask => Approval::Write,
-        };
+        let next = next_cycled_approval(agent.approval());
         agent.set_approval(next);
         self.note("Approval", format!("{next:?}").to_lowercase());
+    }
+}
+
+/// The approval mode Shift+Tab moves to; never `Auto`.
+pub(super) fn next_cycled_approval(current: Approval) -> Approval {
+    match current {
+        Approval::Ask => Approval::Write,
+        Approval::Write => Approval::Readonly,
+        Approval::Readonly | Approval::Auto => Approval::Ask,
     }
 }
 

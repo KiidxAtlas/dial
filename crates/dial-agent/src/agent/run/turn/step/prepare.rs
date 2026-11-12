@@ -192,48 +192,19 @@ impl Agent<'_> {
             crate::agent::safety::stream_guards::TOOL_CALL_LOOP_THRESHOLD,
             crate::agent::safety::stream_guards::TOOL_CALL_LOOP_EXEMPT_TOOLS,
         );
-        if let Some(repeat) = &repeat_streak {
+        if let Some((event, guidance)) =
+            crate::agent::safety::stream_guards::repetition_guidance_with_streak(
+                &messages,
+                repeat_streak.as_ref(),
+            )
+        {
             ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                 crate::agent::ui::ui_event::EventKind::Recovery,
-                format!(
-                    "Repeated tool call {}x; redirecting the model",
-                    repeat.count
-                ),
+                event,
             ));
-            let guidance =
-                if repeat.count > crate::agent::safety::stream_guards::TOOL_CALL_LOOP_THRESHOLD {
-                    crate::agent::safety::stream_guards::render_tool_call_loop_escalation(
-                        &repeat.tool_name,
-                        repeat.count,
-                        &repeat.arguments_summary,
-                        &repeat.result_summary,
-                    )
-                } else {
-                    crate::agent::safety::stream_guards::render_tool_call_loop_redirect(
-                        &repeat.tool_name,
-                        repeat.count,
-                        &repeat.arguments_summary,
-                        &repeat.result_summary,
-                    )
-                };
             messages.push(crate::agent::run::guidance::note(
                 crate::agent::run::guidance::Priority::Repetition,
                 guidance,
-            ));
-        } else if let Some(cycle) = crate::agent::safety::guard::CallCycle::detect(
-            &messages,
-            crate::agent::safety::stream_guards::TOOL_CALL_LOOP_EXEMPT_TOOLS,
-        ) {
-            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
-                crate::agent::ui::ui_event::EventKind::Recovery,
-                format!(
-                    "Tool calls cycling with period {}; redirecting the model",
-                    cycle.period
-                ),
-            ));
-            messages.push(crate::agent::run::guidance::note(
-                crate::agent::run::guidance::Priority::Repetition,
-                cycle.guidance(),
             ));
         }
         // Only lean local routes get the forced tool-free checkpoint; elsewhere a long

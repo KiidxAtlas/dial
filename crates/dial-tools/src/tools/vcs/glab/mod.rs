@@ -118,6 +118,15 @@ impl Tool for GlabMr {
         }
     }
 
+    /// Read operations query GitLab and the checkout's Git metadata, never source files.
+    fn resources(
+        &self,
+        _workspace: &Workspace,
+        args: &Value,
+    ) -> Option<crate::tools::surface::resources::Access> {
+        is_read_op(args).then(Default::default)
+    }
+
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         self.call_streaming(ctx, args, &|_| {}, &AtomicBool::new(false))
     }

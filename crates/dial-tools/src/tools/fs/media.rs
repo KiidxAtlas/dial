@@ -29,6 +29,12 @@ const FFMPEG_HINT: &str =
 /// Smallest longest edge for a rasterized SVG, so icons stay legible.
 const MIN_SVG_EDGE: f32 = 1024.0;
 const PREVIEW_FRAMES: u32 = 9;
+/// Rendered page viewport; content below it is not captured.
+const PAGE_VIEWPORT: (u32, u32) = (1280, 1600);
+const MAX_PAGE_SOURCE: usize = 4 * 1024 * 1024;
+/// Prepended to every rendered page. Meta policies only add restrictions, so a page's own policy
+/// cannot loosen it: no file, network or frame loads; inline styles, scripts and data: URLs only.
+const PAGE_POLICY: &str = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; media-src data:; font-src data:; style-src 'unsafe-inline' data:; script-src 'unsafe-inline'\">\n";
 
 /// Conservative approval classifier; execution expands handles before media detection.
 pub(in crate::tools) fn needs_approval(path: &str) -> bool {
@@ -41,6 +47,7 @@ pub(in crate::tools) fn needs_approval(path: &str) -> bool {
     VIDEO_EXTENSIONS.contains(&ext.as_str())
         || matches!(ext.as_str(), "heic" | "heif")
         || (ext == "pdf" && pdf_page(selector).is_some())
+        || (is_page(&ext) && selector == "img")
 }
 
 /// Intercepts media targets before the generic file reader. `None` means the target is not a
@@ -75,6 +82,7 @@ pub(crate) fn read(
         "heic" | "heif" => true,
         ext if VIDEO_EXTENSIONS.contains(&ext) => true,
         "svg" if selector == "img" => false,
+        ext if is_page(ext) && selector == "img" => true,
         _ => return None,
     };
     let result = (|| {
@@ -91,6 +99,9 @@ pub(crate) fn read(
             !cancel.load(std::sync::atomic::Ordering::Acquire),
             "media read cancelled"
         );
+        if is_page(&ext) {
+            return render_page(ws, file, &ext, &context.config.browser, cancel);
+        }
         if ext == "pdf" {
             return render_pdf_page(
                 ws,
@@ -383,6 +394,91 @@ fn render_pdf_page(
     with_snapshot(output, snapshot)
 }
 
+fn is_page(ext: &str) -> bool {
+    matches!(ext, "html" | "htm" | "md" | "markdown")
+}
+
+/// Screenshot an HTML or Markdown file with installed headless Chromium, sealed offline: the copy
+/// is rendered from a private directory under [`PAGE_POLICY`] with DNS resolution disabled.
+fn render_page(
+    ws: &Workspace,
+    file: &str,
+    ext: &str,
+    browser: &crate::config::tools::browser::BrowserConfig,
+    cancel: &AtomicBool,
+) -> Result<ToolOutput> {
+    let bytes = source::read(ws, file)?;
+    ensure!(
+        bytes.len() <= MAX_PAGE_SOURCE,
+        "pages larger than {} MiB are not rendered",
+        MAX_PAGE_SOURCE >> 20
+    );
+    let snapshot = source::snapshot(&bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let markdown = matches!(ext, "md" | "markdown");
+    let page = if markdown {
+        markdown::document(&text)
+    } else {
+        text.into_owned()
+    };
+    let chromium = crate::tools::net::browser::installed_chromium(browser).context(
+        "page rendering needs an installed Chrome or Chromium; install Chrome or set browser.chromium_executable",
+    )?;
+    let dir = tempfile::tempdir().context("creating page render directory")?;
+    let input = dir.path().join("page.html");
+    fs::write(&input, format!("{PAGE_POLICY}{page}"))?;
+    let out = dir.path().join("page.png");
+    let (width, height) = PAGE_VIEWPORT;
+    let mut spec = CommandSpec::new(chromium);
+    for arg in [
+        "--headless",
+        "--disable-gpu",
+        "--hide-scrollbars",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-sync",
+        "--mute-audio",
+        "--host-resolver-rules=MAP * ~NOTFOUND",
+        "--virtual-time-budget=3000",
+    ] {
+        spec = spec.arg(arg);
+    }
+    let page_url = url::Url::from_file_path(&input)
+        .map_err(|()| anyhow!("page render path is not absolute"))?;
+    let spec = spec
+        .arg(format!(
+            "--user-data-dir={}",
+            dir.path().join("profile").display()
+        ))
+        .arg(format!("--window-size={width},{height}"))
+        .arg(format!("--screenshot={}", out.display()))
+        .arg(page_url.as_str());
+    run(&spec, None, cancel, COMMAND_TIMEOUT).context("rendering page with Chromium")?;
+    let png = bounded_output(&out).context("Chromium produced no bounded screenshot")?;
+    let kind = if markdown { "Markdown" } else { "HTML" };
+    let output = derived(
+        format!(
+            "Image: {file} rendered from {kind} in a {width}x{height} viewport; attached to the next model request when vision is available"
+        ),
+        &png,
+        Origin {
+            source: file,
+            location: Location::Whole,
+            method: Method::Render,
+            producer: "chromium",
+            limitations: &[
+                "Only the first viewport was captured; content below it is not shown.",
+                "Rendered offline: network, file and frame loads are blocked, so linked stylesheets, scripts, fonts and images other than inline or data: URLs are missing.",
+                "Markdown uses Dial's minimal CommonMark/GFM writer, not a specific site's renderer.",
+            ],
+        },
+    )?;
+    with_snapshot(output, snapshot)
+}
+
 struct Probe {
     duration: Option<f64>,
     fps: Option<f64>,
@@ -631,5 +727,6 @@ fn parse_units(text: &str) -> Option<f64> {
     (number.is_empty() && units > 0).then_some(total)
 }
 
+mod markdown;
 #[cfg(test)]
 mod tests;

@@ -187,7 +187,15 @@ fn read_prints_tag_header_and_anchored_rows_with_selectors() {
     fs::write(dir.path().join("empty"), "").unwrap();
     assert!(read(&ws, "empty").text.contains("(empty file)"));
     fs::write(dir.path().join("bin"), b"a\0b").unwrap();
-    assert!(read(&ws, "bin").is_error);
+    // A binary file reads as a read-only hex view: no tag header, so it cannot anchor an edit.
+    let binary = read(&ws, "bin");
+    assert!(!binary.is_error, "{}", binary.text);
+    assert!(
+        binary.text.contains("read-only hex view"),
+        "{}",
+        binary.text
+    );
+    assert!(!binary.text.contains("[bin#"), "{}", binary.text);
     let listing = read(&ws, ".");
     assert!(listing.text.contains("f.txt") && listing.text.contains("directory"));
 }

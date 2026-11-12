@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn bundled_providers_are_listed_without_a_key_and_probed_with_one() {
+    let none = BTreeSet::new();
+    let known = |id: &str| KNOWN.iter().any(|row| row.0 == id);
+    let (probes, listed) = bundled_endpoints(known, &none, |_| false);
+    assert!(probes.is_empty(), "nothing is probed without a credential");
+    let zen = listed
+        .iter()
+        .find(|s| s.id == "opencode-zen")
+        .expect("OpenCode Zen listed");
+    assert_eq!(zen.label, "OpenCode Zen");
+    assert_eq!(zen.state, "auth-required");
+    assert_eq!(zen.base_url.as_deref(), Some("https://opencode.ai/zen/v1"));
+    assert!(zen.detail.contains("OPENCODE_API_KEY"), "{}", zen.detail);
+    assert!(listed.iter().any(|s| s.id == "opencode-go"));
+    for skipped in ["openai", "snowflake", "copilot", "devin"] {
+        assert!(!listed.iter().any(|s| s.id == skipped), "{skipped}");
+    }
+
+    let (probes, listed) = bundled_endpoints(known, &none, |key| key == "OPENCODE_API_KEY");
+    let ids: Vec<&str> = probes.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["opencode-go", "opencode-zen"]);
+    assert!(probes.iter().all(|(_, spec)| {
+        spec.api_key_env.as_deref() == Some("OPENCODE_API_KEY")
+            && spec.protocol == Some(ApiProtocol::ChatCompletions)
+    }));
+    assert!(!listed.iter().any(|s| s.id.starts_with("opencode")));
+
+    let saved = BTreeSet::from(["https://api.cerebras.ai/v1".to_owned()]);
+    let (probes, _) = bundled_endpoints(|id| id == "together", &saved, |_| false);
+    let cerebras = probes
+        .iter()
+        .find(|(id, _)| id == "cerebras")
+        .expect("saved key probes");
+    assert_eq!(cerebras.1.api_key_env.as_deref(), Some("CEREBRAS_API_KEY"));
+    let (_, listed) = bundled_endpoints(|id| id == "together", &none, |_| false);
+    assert!(
+        !listed.iter().any(|s| s.id == "together"),
+        "configured ids are not duplicated"
+    );
+}
+#[test]
 fn token_pricing_splits_cache_writes_by_ttl() {
     let pricing = TokenPricing {
         prompt: 1e-6,
@@ -2595,4 +2636,88 @@ fn unbundled_claude_models_take_thinking_controls_from_the_live_listing() {
         crate::llm::profiles::default_anthropic_thinking("claude-no-thinking"),
         None
     );
+}
+
+#[test]
+fn model_card_front_matter_declares_a_purpose_exactly() {
+    let card = "---\nlibrary_name: transformers\npipeline_tag: feature-extraction\n---\n# Model\n";
+    assert_eq!(model_card_kind_in(card), ModelKind::Embedding);
+    assert_eq!(
+        model_card_kind_in("---\npipeline_tag: \"text-generation\"\n---\n"),
+        ModelKind::Chat
+    );
+    // Only front matter counts, and unfamiliar tags stay unknown.
+    assert_eq!(
+        model_card_kind_in("# Model\npipeline_tag: feature-extraction\n"),
+        ModelKind::Unknown
+    );
+    assert_eq!(
+        model_card_kind_in("---\ntitle: x\n---\npipeline_tag: feature-extraction\n"),
+        ModelKind::Unknown
+    );
+    assert_eq!(
+        model_card_kind_in("---\npipeline_tag: magic\n---\n"),
+        ModelKind::Unknown
+    );
+}
+
+#[test]
+fn reset_provider_credentials_remove_canonical_and_custom_keys_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let custom = "https://custom.example.test/v1";
+    let canonical = "http://127.0.0.1:11234/v1";
+    for url in [custom, canonical, "https://keep.example.test/v1"] {
+        save_credential(dir.path(), url, "fixture-key").unwrap();
+    }
+    remove_provider_credentials(dir.path(), "mlx-serve", &[format!("{custom}/")]).unwrap();
+    assert!(credential_token(dir.path(), custom).unwrap().is_none());
+    assert!(credential_token(dir.path(), canonical).unwrap().is_none());
+    assert!(
+        credential_token(dir.path(), "https://keep.example.test/v1")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn reset_provider_stays_unconfigured_despite_saved_selections() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let configured: BTreeMap<_, _> = LOCAL_SERVERS
+        .iter()
+        .map(|&(id, ..)| id)
+        .chain(KNOWN.iter().map(|row| row.0))
+        .chain(["chatgpt", "mlx", "apple"])
+        .map(|id| {
+            (
+                id.to_owned(),
+                ProviderSpec {
+                    enabled: false,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    let selections: Vec<_> = ["docker-model-runner", "mlx-serve"]
+        .into_iter()
+        .map(|id| ModelSelection {
+            provider: id.into(),
+            model: "old-model".into(),
+            base_url: Some("http://127.0.0.1:1/v1".into()),
+            ..Default::default()
+        })
+        .collect();
+    let found = discover(&layout, &configured, &selections);
+    for id in ["docker-model-runner", "mlx-serve", "mlx"] {
+        let status = found.providers.iter().find(|p| p.id == id).unwrap();
+        assert_eq!(status.state, "not-set-up", "{id}");
+        assert_eq!(status.models, 0, "{id}");
+        assert!(
+            !found
+                .models
+                .iter()
+                .any(|entry| entry.selection.provider == id)
+        );
+    }
 }

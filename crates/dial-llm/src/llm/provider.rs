@@ -3299,10 +3299,9 @@ pub(super) fn anthropic_reply(value: &serde_json::Value) -> Result<Reply> {
             "tool_use" => tool_calls.push(crate::llm::ToolCall {
                 id: block["id"].as_str().unwrap_or_default().to_owned(),
                 name: block["name"].as_str().unwrap_or_default().to_owned(),
-                arguments: if block["input"].is_object() {
-                    block["input"].clone()
-                } else {
-                    Value::Null
+                arguments: match &block["input"] {
+                    input @ (Value::Object(_) | Value::String(_)) => input.clone(),
+                    _ => Value::Null,
                 },
                 malformed_arguments: !block["input"].is_object(),
             }),

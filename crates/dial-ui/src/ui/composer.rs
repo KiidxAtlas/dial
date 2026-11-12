@@ -35,6 +35,18 @@ const MAX_INPUT_ROWS: usize = 10;
 /// Under this many cells the composer degrades to a bare input row.
 const MIN_BOX_WIDTH: usize = 8;
 const MAX_NAME_COLUMN: usize = 24;
+/// The selected command's description word-wrapped to exactly `lines` rows; only the last row is
+/// shortened with an ellipsis.
+fn detail_description(description: &str, room: usize, ascii: bool, lines: usize) -> Vec<String> {
+    let lines = lines.max(1);
+    let mut wrapped = text::wrap_words(description, room.max(1));
+    if wrapped.len() > lines {
+        let rest = wrapped.split_off(lines - 1).join(" ");
+        wrapped.push(text::ellipsize(&rest, room, ascii));
+    }
+    wrapped.resize(lines, String::new());
+    wrapped
+}
 /// App-level shortcuts the composer reports instead of handling (owned by the keymap, so the
 /// shortcut editor can flag editing chords they shadow).
 const APP_ACTIONS: [Action; 20] = Action::COMPOSER_APP;
@@ -355,8 +367,16 @@ pub struct Composer {
     editing_queue: Option<QueuedEdit>,
     /// The busy chooser open above the box, if any.
     choice: Option<Choice>,
+    /// The draft route last picked in the busy chooser this session; the next chooser opens on it.
+    /// Enter still confirms, so remembering never sends anything by itself.
+    last_draft_choice: Option<BusyChoice>,
     queue_notice: Option<String>,
     exit_armed: bool,
+    /// Ctrl+D was pressed once on an empty idle draft; a second press exits.
+    eof_armed: bool,
+    /// The last key edited the draft (or only stepped an open menu), so an `@file` word ending at
+    /// a mid-draft cursor is being typed rather than passed over by cursor movement.
+    mention_edit: bool,
     /// Payloads referenced by the draft, saved draft, undo/redo or bounded kill rings.
     pastes: Vec<(String, String)>,
     paste_count: usize,
@@ -405,6 +425,8 @@ impl Composer {
             busy_send: BusySend::Choose,
             recording: None,
             exit_armed: false,
+            eof_armed: false,
+            mention_edit: false,
             pastes: Vec::new(),
             clipboard_read: None,
             paste_count: 0,
@@ -415,6 +437,7 @@ impl Composer {
             explicit: Vec::new(),
             editing_queue: None,
             choice: None,
+            last_draft_choice: None,
             queue_notice: None,
             files: std::sync::Arc::new(Vec::new()),
             argument_completions: Vec::new(),
@@ -529,6 +552,8 @@ impl Composer {
         self.history_index = None;
         self.saved_draft = None;
         self.exit_armed = false;
+        self.eof_armed = false;
+        self.mention_edit = false;
         self.dismissed = None;
         self.prune_pastes();
         self.choice = None;
@@ -1014,6 +1039,8 @@ impl Composer {
     pub fn handle_paste(&mut self, pasted: &str) {
         let clean = text::sanitize(&pasted.replace("\r\n", "\n").replace('\r', "\n"));
         self.exit_armed = false;
+        self.eof_armed = false;
+        self.mention_edit = false;
         self.choice = None;
         if let Some(search) = &mut self.search {
             search.query.insert(&clean.replace('\n', " "));
@@ -1085,11 +1112,14 @@ impl Composer {
             return ComposerEvent::None;
         }
         self.editor.cancel_jump();
+        let (length, cursor) = (self.editor.text.len(), self.editor.cursor);
         let event = if self.search.is_some() {
             self.search_key(key, ctx)
         } else {
             self.edit_key(key, ctx)
         };
+        self.mention_edit =
+            self.editor.text.len() != length || (self.mention_edit && self.editor.cursor == cursor);
         self.refresh();
         event
     }
@@ -1098,6 +1128,7 @@ impl Composer {
         let keys = ctx.keys;
         let rows = list_rows(ctx.ui);
         let armed = std::mem::take(&mut self.exit_armed);
+        let eof_armed = std::mem::take(&mut self.eof_armed);
         if let Some(event) = self.choice_key(key, ctx) {
             return event;
         }
@@ -1147,7 +1178,16 @@ impl Composer {
             return ComposerEvent::Action(action);
         }
         if keys.matches(Action::HistorySearch, &key) {
-            let entries = self.history.iter().rev().take(500).cloned().collect();
+            // Search every remembered prompt, as `ui.history_limit` promises (0 = unlimited).
+            // Newest first, each prompt once: a repeated `/cost` keeps only its latest place.
+            let mut seen = std::collections::HashSet::new();
+            let entries = self
+                .history
+                .iter()
+                .rev()
+                .filter(|entry| seen.insert(entry.trim().to_owned()))
+                .cloned()
+                .collect();
             self.search = Some(Search {
                 query: Editor::default(),
                 entries,
@@ -1181,11 +1221,15 @@ impl Composer {
         }
         if keys.matches(Action::Exit, &key) {
             if self.editor.text.is_empty() {
-                return if self.busy {
-                    ComposerEvent::None
-                } else {
-                    ComposerEvent::Exit
-                };
+                // Like Ctrl+C, exiting takes a second press so a stray key cannot end the session.
+                if self.busy {
+                    return ComposerEvent::None;
+                }
+                if eof_armed {
+                    return ComposerEvent::Exit;
+                }
+                self.eof_armed = true;
+                return ComposerEvent::None;
             }
             // Like readline: Ctrl-D in a draft deletes the character under the cursor.
             if !self.delete_chip(true) {
@@ -1304,16 +1348,24 @@ impl Composer {
     }
 
     fn submit(&mut self) -> ComposerEvent {
-        // File mentions complete the draft. Commands only accept a suggestion after navigation;
-        // otherwise Enter executes exactly the command the user typed.
+        // File mentions complete the draft unless the typed path already names the highlighted
+        // file exactly. Commands only accept a suggestion after navigation; otherwise Enter
+        // executes exactly the command the user typed.
         let file_menu = self
             .menu
             .as_ref()
             .is_some_and(|menu| menu.file_start.is_some());
+        let typed_exactly = self.menu.as_ref().is_some_and(|menu| {
+            !menu.navigated
+                && menu.file_start.is_some()
+                && menu.matches.get(menu.selected).is_some_and(|matched| {
+                    self.menu_entries(menu)[matched.index].name == menu.query
+                })
+        });
         let accept = self
             .menu
             .as_ref()
-            .is_some_and(|menu| file_menu || menu.navigated);
+            .is_some_and(|menu| (file_menu && !typed_exactly) || menu.navigated);
         if accept && self.complete_menu() {
             if file_menu {
                 return ComposerEvent::None;
@@ -1404,11 +1456,17 @@ impl Composer {
         ComposerEvent::None
     }
 
-    /// Opens the busy chooser with its safe default highlighted. The draft is left as it is.
+    /// Opens the busy chooser. The draft chooser highlights the route picked last time this session
+    /// (else automatic routing); the queue chooser always opens on its safe default, since stopping
+    /// the turn is never preselected. The draft is left as it is.
     fn open_choice(&mut self, options: &'static [BusyChoice]) {
+        let remembered = (options == DRAFT_CHOICES)
+            .then_some(self.last_draft_choice)
+            .flatten()
+            .and_then(|last| options.iter().position(|option| *option == last));
         self.choice = Some(Choice {
             options,
-            selected: 0,
+            selected: remembered.unwrap_or(0),
         });
         self.exit_armed = false;
     }
@@ -1455,7 +1513,11 @@ impl Composer {
         }
         if direct.is_some() || keys.matches(Action::Submit, &key) {
             self.choice = None;
-            let event = match options[direct.unwrap_or(selected)] {
+            let picked = options[direct.unwrap_or(selected)];
+            if options == DRAFT_CHOICES {
+                self.last_draft_choice = Some(picked);
+            }
+            let event = match picked {
                 BusyChoice::Auto => self.submit_queued(false),
                 BusyChoice::Redirect => self.send_explicit(SteerKind::Steer),
                 BusyChoice::Independent => self.send_explicit(SteerKind::Independent),
@@ -1492,7 +1554,22 @@ impl Composer {
         let entry = &self.menu_entries(menu)[menu.matches[menu.selected].index];
         let arguments = menu.arguments.is_some();
         let completed = if let Some(start) = menu.file_start {
-            format!("{}@{} ", &self.editor.text[..start], entry.name)
+            let text = &self.editor.text;
+            let cursor = self.editor.cursor;
+            let mention = format!("@{}", quote_mention(&entry.name));
+            if cursor == text.len() {
+                format!("{}{mention} ", &text[..start])
+            } else {
+                // Mid-draft: replace the word before the cursor and step past the separator that
+                // already follows it, so the menu closes as it does at the end of the draft.
+                let after = &text[cursor..];
+                let gap = after.chars().next().map_or(0, char::len_utf8);
+                let completed = format!("{}{mention}{after}", &text[..start]);
+                self.editor.set(&completed);
+                self.editor.cursor = start + mention.len() + gap;
+                self.dismissed = None;
+                return true;
+            }
         } else {
             // Slash commands are not shell words. Preserve the command and its arguments,
             // including any quoting supplied by the suggestion itself.
@@ -1735,7 +1812,9 @@ impl Composer {
             return None;
         }
         let text = self.editor.text.as_str();
-        if self.editor.cursor != text.len() || self.dismissed.as_deref() == Some(text) {
+        let cursor = self.editor.cursor;
+        let at_end = cursor == text.len();
+        if (!at_end && !self.mention_edit) || self.dismissed.as_deref() == Some(text) {
             return None;
         }
         // An unedited history entry is being browsed, not typed: Up/Down keep walking history
@@ -1746,11 +1825,23 @@ impl Composer {
         {
             return None;
         }
-        let start = text
+        // A mention completes the word that ends at the cursor, also in the middle of a draft.
+        if !text[cursor..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+        {
+            return None;
+        }
+        let before = &text[..cursor];
+        let start = before
             .rfind(char::is_whitespace)
-            .map_or(0, |i| i + text[i..].chars().next().unwrap().len_utf8());
-        if let Some(query) = text[start..].strip_prefix('@') {
+            .map_or(0, |i| i + before[i..].chars().next().unwrap().len_utf8());
+        if let Some(query) = before[start..].strip_prefix('@') {
             return (!self.files.is_empty()).then_some((query, Some(start)));
+        }
+        if !at_end {
+            return None;
         }
         if self.commands.is_empty() {
             return None;
@@ -2213,6 +2304,16 @@ impl Composer {
             };
             hints.insert(0, Hint { key: None, what });
         }
+        if !landing
+            && ctx.ui.hints
+            && ctx.status.planning.is_some()
+            && statusline::controls_facts(ctx.ui, ctx.status, usize::from(width)).is_empty()
+        {
+            hints.push(Hint {
+                key: Some(ctx.keys.label(Action::StatusFocus)),
+                what: "controls".to_owned(),
+            });
+        }
         if banded {
             // The card closes on a padded row; the status line and hints sit quietly beneath it.
             rows.push(band(vec![edge()]));
@@ -2253,16 +2354,27 @@ impl Composer {
             ));
         }
 
-        if !landing && ctx.status.planning.is_some() {
+        // The controls key alone is one more footer hint; only real facts earn their own row.
+        if !landing
+            && ctx.status.planning.is_some()
+            && !statusline::controls_facts(ctx.ui, ctx.status, usize::from(width)).is_empty()
+        {
             rows.push(statusline::controls_row_with(
                 ctx.ui, ctx.status, ctx.keys, theme, width,
             ));
         }
         let mut cursor = cursor;
         if let Some(search) = &self.search {
+            // Like the command menu, history search opens upward, above the input, with its
+            // query row next to the box, so it never lands below the footer.
             let (list, col) = self.search_rows(search, w, ctx);
-            cursor = (rows.len() as u16, col as u16);
-            rows.extend(list);
+            let mut list = list.into_iter();
+            let head = list.next();
+            let mut above: Rows = list.collect();
+            above.extend(head);
+            cursor = ((above.len() - 1) as u16, col as u16);
+            above.append(&mut rows);
+            rows = above;
         } else if let Some(menu) = &self.menu {
             // The menu opens upward, into the space above the input, so the input never moves
             // down and the closest rows to the cursor are the selected command's details.
@@ -2667,6 +2779,8 @@ impl Composer {
                 pieces.push(keyed("Esc", "cancel edit"));
             } else if self.exit_armed {
                 pieces.push(hint(Action::ClearDraft, "again to exit"));
+            } else if self.eof_armed {
+                pieces.push(hint(Action::Exit, "again to exit"));
             } else if self.menu_open() {
                 pieces.extend([
                     hint(
@@ -2781,7 +2895,8 @@ impl Composer {
             .min(if menu.file_start.is_some() || menu.arguments.is_some() {
                 w.saturating_sub(6)
             } else {
-                MAX_NAME_COLUMN
+                // A long skill name gives way before the descriptions do.
+                MAX_NAME_COLUMN.min((w / 3).max(8))
             });
         let pointer = theme.sym(Sym::Pointer);
         let blank_pointer = " ".repeat(text::width(pointer));
@@ -2831,6 +2946,13 @@ impl Composer {
                         )
                     })
                     .flatten();
+                // While busy, a command that stops the turn says so in place of its description.
+                let busy_effect = (command.kind == CommandKind::Builtin && unavailable.is_none())
+                    .then(|| {
+                        crate::ui::command_surface::busy_effect(&command.name, self.command_context)
+                    })
+                    .flatten()
+                    .map(|effect| format!("{effect} · {}", command.description));
                 spans.extend(highlighted(
                     &name,
                     &found.name_hits,
@@ -2858,6 +2980,18 @@ impl Composer {
                 } else {
                     ""
                 };
+                let full_description = unavailable
+                    .or(busy_effect.as_deref())
+                    .unwrap_or(&command.description);
+                // A group tag only goes where it costs no description text: a narrow list keeps
+                // the words and leaves the grouping to the order.
+                let group = if text::width(full_description) + text::width(group) + 2
+                    > budget.saturating_sub(used)
+                {
+                    ""
+                } else {
+                    group
+                };
                 let group_w = if group.is_empty() {
                     0
                 } else {
@@ -2865,11 +2999,7 @@ impl Composer {
                 };
                 let room = budget.saturating_sub(used + group_w);
                 if room > 0 {
-                    let description = text::ellipsize(
-                        unavailable.unwrap_or(&command.description),
-                        room,
-                        theme.ascii(),
-                    );
+                    let description = text::ellipsize(full_description, room, theme.ascii());
                     let description_w = text::width(&description);
                     spans.extend(highlighted(
                         &description,
@@ -2899,8 +3029,25 @@ impl Composer {
                 )
             {
                 detail.description = reason.to_owned();
+            } else if command.kind == CommandKind::Builtin
+                && let Some(effect) =
+                    crate::ui::command_surface::busy_effect(&command.name, self.command_context)
+            {
+                detail.description = format!("{effect} · {}", command.description);
             }
-            rows.extend(Self::command_detail_rows(&detail, w, theme));
+            // Two description rows when any listed command needs them, so the menu's height
+            // stays put while the selection moves.
+            let room = w.saturating_sub(2);
+            let lines = if menu
+                .matches
+                .iter()
+                .any(|m| text::width(&entries[m.index].description) > room)
+            {
+                2
+            } else {
+                1
+            };
+            rows.extend(Self::command_detail_rows(&detail, w, theme, lines));
         }
         if panel {
             // On the band layout the menu is an inset panel: its kind and position as a title.
@@ -2936,31 +3083,31 @@ impl Composer {
 
     /// Usage and the full description of the selected command, drawn under the menu. Both rows are
     /// ellipsized to the width, so the detail never wraps into the composer.
-    fn command_detail_rows(command: &CommandEntry, w: usize, theme: &Theme) -> Rows {
+    /// Usage, then the description on `lines` rows (see [`detail_description`]).
+    fn command_detail_rows(command: &CommandEntry, w: usize, theme: &Theme, lines: usize) -> Rows {
         let usage = match command.args_hint.as_deref() {
             Some(hint) if !hint.is_empty() => format!("/{} {hint}", command.name),
             _ => format!("/{}", command.name),
         };
         let room = w.saturating_sub(2);
-        vec![
-            finish_row(
-                vec![Span::styled(
-                    format!(" {}", text::ellipsize(&usage, room, theme.ascii())),
-                    theme.fg(Tok::Accent),
-                )],
-                w,
-            ),
-            finish_row(
-                vec![Span::styled(
-                    format!(
-                        " {}",
-                        text::ellipsize(&command.description, room, theme.ascii())
-                    ),
-                    theme.fg(Tok::Muted),
-                )],
-                w,
-            ),
-        ]
+        let mut rows = vec![finish_row(
+            vec![Span::styled(
+                format!(" {}", text::ellipsize(&usage, room, theme.ascii())),
+                theme.fg(Tok::Accent),
+            )],
+            w,
+        )];
+        rows.extend(
+            detail_description(&command.description, room, theme.ascii(), lines)
+                .into_iter()
+                .map(|line| {
+                    finish_row(
+                        vec![Span::styled(format!(" {line}"), theme.fg(Tok::Muted))],
+                        w,
+                    )
+                }),
+        );
+        rows
     }
 
     /// The search prompt row, then the matching history entries (newest first). Returns the cursor
@@ -3361,6 +3508,20 @@ fn substring_hits(value: &str, query_lower: &str) -> Vec<usize> {
     (first..first + query_lower.chars().count()).collect()
 }
 
+/// A file path as an `@` mention the reference parser reads back whole: paths containing
+/// whitespace are quoted (with `'` when the path itself contains `"`).
+fn quote_mention(path: &str) -> String {
+    if !path.contains(char::is_whitespace) {
+        path.to_owned()
+    } else if !path.contains('"') {
+        format!("\"{path}\"")
+    } else if !path.contains('\'') {
+        format!("'{path}'")
+    } else {
+        path.to_owned()
+    }
+}
+
 /// Candidate count above which file ranking moves to a worker thread. Measured in release builds:
 /// about 15 ms for 50k paths and under 1 ms for 2k, so anything at or below this rank inline.
 const SYNC_RANK_LIMIT: usize = 2_000;
@@ -3457,8 +3618,27 @@ fn rank_until(
                 stopped.set(true);
                 return None;
             }
-            let name = text::fuzzy(query, &command.name);
-            let desc = text::fuzzy(query, &command.description);
+            // A scattered subsequence (`settings` in `skill:file-structure-cleanup`) is noise for
+            // commands: their names must match tightly or at a word start, their descriptions as
+            // a word piece. File paths keep plain fuzzy matching (`mrs` finds `src/main.rs`).
+            let name = text::fuzzy(query, &command.name).filter(|(_, hits)| {
+                command.kind == CommandKind::File
+                    || tier(&command.name) > 0
+                    || hits.first().zip(hits.last()).is_none_or(|(first, last)| {
+                        let span = last - first + 1;
+                        let n = query.chars().count();
+                        n < 3 || span <= n + n / 2 + 1
+                    })
+            });
+            // A file's description is the same for every file, so matching it would offer every
+            // file for any query that happens to fit "project file".
+            let desc = if command.kind == CommandKind::File
+                || !command.description.to_lowercase().contains(&lower)
+            {
+                None
+            } else {
+                text::fuzzy(query, &command.description)
+            };
             if name.is_none() && desc.is_none() {
                 return None;
             }

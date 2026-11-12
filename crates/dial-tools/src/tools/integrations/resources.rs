@@ -122,7 +122,8 @@ pub fn scheme(input: &str) -> Result<Scheme, String> {
 
 /// What `read` returns for an `artifact://` target, chosen by a path suffix: lines (`:A-B`, `:A+C`,
 /// `:A-`, `:A`; default from line 1), `:info` (retention and availability), `:annotations` (human
-/// feedback bound to the artifact) or `:bytes=O[+N]` (exact base64 bytes from offset O).
+/// feedback bound to the artifact) or `:bytes=O[+N]` (exact base64 bytes from offset O; without
+/// N, through the end of the artifact as far as one reply allows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactView {
     Lines { start: u64, count: Option<u64> },
@@ -157,7 +158,7 @@ pub fn artifact_target(input: &str) -> Result<(String, ArtifactView), String> {
             if let Some(bytes) = selector.strip_prefix("bytes=") {
                 let (offset, count) = match bytes.split_once('+') {
                     Some((offset, count)) => (number(offset)?, number(count)?),
-                    None => (number(bytes)?, 8192),
+                    None => (number(bytes)?, u64::MAX),
                 };
                 ArtifactView::Bytes { offset, count }
             } else {

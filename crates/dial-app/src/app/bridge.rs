@@ -218,19 +218,9 @@ impl Bridge<'_> {
                 continue;
             }
             if self.shell.busy_overlay.is_some() {
-                // The first stop key in an open panel only closes the panel; the turn keeps
-                // running. A second press (with no panel open) stops the turn.
-                let close = matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release
-                    && self.shell.keys.matches(Action::Interrupt, key)
-                    && !self.shell.keys.matches(Action::SelectCancel, key));
-                let result = if close {
-                    if let Some(state) = &mut self.shell.busy_overlay {
-                        state.next = None;
-                    }
-                    self.shell.finish_busy_overlay(self.app)
-                } else {
-                    self.shell.step_busy_overlay(self.app, Some(event))
-                };
+                // The stop key in an open panel only closes the panels; the turn keeps running.
+                // A second press (with no panel open) stops the turn. See `stop_key_leaves_panels`.
+                let result = self.shell.step_busy_overlay(self.app, Some(event));
                 match result {
                     Ok(true) => {
                         self.stop_from_pump(Some("then runs the panel's choice"));

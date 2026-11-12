@@ -68,6 +68,30 @@ fn edit_results_with_new_language_server_errors_show_the_count_as_a_fact() {
 }
 
 #[test]
+fn search_results_count_their_matches() {
+    let args = serde_json::json!({"pattern":"println"});
+    let view = render_result(
+        "grep",
+        &args,
+        &ToolOutput::ok(
+            "src/main.rs:3:    println!(\"hi\");\nsrc/main.rs-4-}\nsrc/lib.rs:10:println!()\n"
+                .into(),
+        ),
+    );
+    assert!(
+        view.facts.contains(&"2 matches".to_owned()),
+        "{:?}",
+        view.facts
+    );
+    let none = render_result("grep", &args, &ToolOutput::ok("no matches\n".into()));
+    assert!(
+        none.facts.contains(&"no matches".to_owned()),
+        "{:?}",
+        none.facts
+    );
+}
+
+#[test]
 fn skill_reference_reads_are_distinct_from_loading_the_core_skill() {
     for (file, target) in [
         (None, "rust-best-practices"),

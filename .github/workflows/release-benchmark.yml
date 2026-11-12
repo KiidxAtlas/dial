@@ -1,0 +1,60 @@
+name: Release optimization benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: ${{ matrix.target }} LTO=${{ matrix.lto }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+            lto: thin
+          - target: aarch64-apple-darwin
+            os: macos-15
+            lto: 'off'
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            lto: thin
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            lto: 'off'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install Linux sandbox for artifact smoke tests
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
+      # Deliberately no cache: compare cold builds, not two different cache hit rates.
+      - name: Measure build, size and help startup
+        env:
+          BENCH_TARGET: ${{ matrix.target }}
+          BENCH_LTO: ${{ matrix.lto }}
+        run: python3 scripts/benchmark-release.py --target "$BENCH_TARGET" --lto "$BENCH_LTO" --output benchmark.json
+      - name: Test benchmark binary
+        env:
+          BENCH_TARGET: ${{ matrix.target }}
+          BENCH_LTO: ${{ matrix.lto }}
+        run: make test-smoke DIAL="target/release-benchmark/$BENCH_LTO/$BENCH_TARGET/release/dial"
+      - name: Preserve benchmark and Cargo timings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-benchmark-${{ matrix.target }}-${{ matrix.lto }}
+          path: |
+            benchmark.json
+            target/release-benchmark/*/cargo-timings/
+          if-no-files-found: warn

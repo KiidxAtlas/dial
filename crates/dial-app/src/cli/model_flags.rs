@@ -126,12 +126,10 @@ pub fn parse_models(value: &str) -> std::result::Result<ModelPatterns, String> {
     for entry in value.split(',') {
         let entry = entry.trim();
         if entry.is_empty() {
-            return Err(format!(
-                "Invalid --models value: {value:?}. Every comma-separated model pattern must be non-empty."
-            ));
+            return Err("every comma-separated model pattern must be non-empty".to_owned());
         }
         if entry.chars().any(char::is_control) {
-            return Err("Invalid --models value: control characters are not allowed.".into());
+            return Err("control characters are not allowed".into());
         }
         patterns.push(entry.to_owned());
     }
@@ -147,19 +145,14 @@ pub fn parse_provider(value: &str) -> std::result::Result<String, String> {
     if valid {
         Ok(value.to_owned())
     } else {
-        Err(format!(
-            "Invalid --provider value: {value:?}. Expected a provider id of letters, digits, '.', '_' or '-'."
-        ))
+        Err("expected a provider id of letters, digits, '.', '_' or '-'".to_owned())
     }
 }
 
 /// Parses `--api-key`: a non-empty secret without whitespace or control characters.
 pub fn parse_api_key(value: &str) -> std::result::Result<ApiKey, String> {
     if value.is_empty() || value.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(
-            "Invalid --api-key value: expected a non-empty key without whitespace or control characters."
-                .into(),
-        );
+        return Err("expected a non-empty key without whitespace or control characters".into());
     }
     Ok(ApiKey(value.to_owned()))
 }
@@ -169,11 +162,11 @@ pub fn parse_role_model(value: &str) -> std::result::Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.len() > MAX_MODEL_BYTES {
         return Err(format!(
-            "Invalid model value: {value:?}. Expected a non-empty model of at most {MAX_MODEL_BYTES} bytes."
+            "expected a non-empty model of at most {MAX_MODEL_BYTES} bytes"
         ));
     }
     if trimmed.chars().any(char::is_control) {
-        return Err("Invalid model value: control characters are not allowed.".into());
+        return Err("control characters are not allowed".into());
     }
     Ok(trimmed.to_owned())
 }
@@ -186,7 +179,7 @@ pub fn parse_service_tier(value: &str) -> std::result::Result<ServiceTier, Strin
         .map(|(_, tier)| *tier)
         .ok_or_else(|| {
             format!(
-                "Invalid --service-tier value: {value:?}. Expected one of: {}.",
+                "expected one of: {}",
                 SERVICE_TIER_VALUES
                     .iter()
                     .map(|(name, _)| *name)
@@ -200,11 +193,8 @@ pub fn parse_service_tier(value: &str) -> std::result::Result<ServiceTier, Strin
 /// (suffix form requires digits with an optional fraction, as in `^(\d+(\.\d+)?)([smh])$`).
 pub fn parse_max_time(value: &str) -> std::result::Result<f64, String> {
     let trimmed = value.trim();
-    let invalid = || {
-        format!(
-            "Invalid --max-time value: {value:?}. Expected a positive number of seconds or duration like \"5s\", \"10m\", \"1h\"."
-        )
-    };
+    let invalid =
+        || "expected a positive number of seconds or a duration like 5s, 10m or 1h".to_owned();
     let seconds = match trimmed.chars().last() {
         Some(unit @ ('s' | 'm' | 'h')) => {
             let number = &trimmed[..trimmed.len() - 1];

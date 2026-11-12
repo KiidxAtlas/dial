@@ -540,9 +540,7 @@ fn env_dir(key: &str) -> Option<PathBuf> {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
+    crate::config::paths::home_dir().unwrap_or_default()
 }
 
 /// `CLAUDE_CONFIG_DIR`, or `~/.claude`.

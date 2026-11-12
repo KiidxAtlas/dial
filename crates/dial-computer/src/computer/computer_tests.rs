@@ -363,8 +363,9 @@ mod worker {
         list_windows: impl Fn(usize) -> Value,
         read_only: bool,
     ) -> (Value, Vec<Value>) {
+        let script = supervisor::worker_script().expect("worker script");
         let mut child = Command::new("node")
-            .args(["--input-type=module", "-e", include_str!("js/worker.mjs")])
+            .arg(&*script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

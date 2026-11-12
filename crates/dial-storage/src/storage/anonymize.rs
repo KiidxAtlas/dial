@@ -99,7 +99,9 @@ impl Identity {
     /// Reads `HOME`, `USER`/`USERNAME`, and `HOSTNAME`, falling back to the
     /// `hostname` command for the host.
     pub fn detect() -> Self {
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::config::paths::home_dir()
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let user = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_default();
@@ -504,7 +506,10 @@ impl Anonymizer {
             if working == home {
                 return "~".to_string();
             }
-            if let Some(rest) = working.strip_prefix(&format!("{home}/")) {
+            if let Some(rest) = working
+                .strip_prefix(&format!("{home}/"))
+                .or_else(|| working.strip_prefix(&format!("{home}\\")))
+            {
                 prefix.push_str("~/");
                 working = rest;
             }

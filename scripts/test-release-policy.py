@@ -11,7 +11,6 @@ import subprocess
 import sys
 import tempfile
 import tarfile
-import textwrap
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -143,7 +142,7 @@ class ReleaseReadinessTests(unittest.TestCase):
     def release(self, *args, env_updates=None):
         scripts = self.root / "scripts"
         scripts.mkdir(exist_ok=True)
-        for name in ("release.sh", "release-policy.py", "check-packaging.py"):
+        for name in ("release.sh", "release-policy.py", "check-packaging.py", "release-candidate-run.sh"):
             shutil.copy2(SCRIPT.with_name(name), scripts / name)
         tools = self.root / "bin"
         tools.mkdir(exist_ok=True)
@@ -303,6 +302,92 @@ class WindowsReleaseTests(unittest.TestCase):
         self.assertIn("dist/SHA256SUMS", manifest)
 
 
+class PullRequestCandidateRunTests(unittest.TestCase):
+    """Runs scripts/release-candidate-run.sh against a real Git history and a fake `gh`."""
+
+    FAKE_GH = '''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+state = Path(os.environ["FAKE_GH_STATE"])
+with open(state / "calls", "a") as calls:
+    calls.write(" ".join(args) + "\\n")
+if args[:1] == ["api"]:
+    print((state / "pulls.json").read_text())
+elif args[:2] == ["run", "list"]:
+    print((state / "runs.json").read_text())
+elif args[:2] == ["run", "download"]:
+    target = Path(args[args.index("-D") + 1])
+    target.mkdir(parents=True)
+    (target / "candidate.json").write_text((state / "candidate.json").read_text())
+else:
+    sys.exit(2)
+'''
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+        self.repo = self.base / "repo"
+        (self.repo / "scripts").mkdir(parents=True)
+        for name in ("release-policy.py", "release-candidate-run.sh"):
+            shutil.copy2(SCRIPT.with_name(name), self.repo / "scripts" / name)
+        self.bin = self.base / "bin"
+        self.bin.mkdir()
+        (self.bin / "gh").write_text(self.FAKE_GH)
+        (self.bin / "gh").chmod(0o755)
+        self.git("init", "-q", "-b", "main")
+        (self.repo / "file").write_text("one\n")
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "base")
+        self.git("switch", "-q", "-c", "release")
+        (self.repo / "file").write_text("two\n")
+        self.git("commit", "-q", "-am", "release")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "merge release", "release")
+        self.merge = self.git("rev-parse", "HEAD")
+        self.tree = self.git("rev-parse", "HEAD^{tree}")
+
+    def git(self, *args):
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+        return subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=self.repo, env=env,
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def find(self, commit, head=None, repo="KiidxAtlas/dial", conclusion="success", tree=None):
+        head = head or self.head
+        (self.base / "pulls.json").write_text(json.dumps([dict(
+            merged_at="2026-11-11T00:00:00Z", base=dict(ref="main"),
+            head=dict(sha=head, repo=dict(full_name=repo)))]))
+        (self.base / "runs.json").write_text(json.dumps([dict(
+            event="pull_request", headSha=head, status="completed", conclusion=conclusion, databaseId=42)]))
+        (self.base / "candidate.json").write_text(json.dumps(dict(
+            revision=head, tree=tree or self.tree, tag="v0.3.5", public_key="key")))
+        return subprocess.run(["bash", "scripts/release-candidate-run.sh", commit], cwd=self.repo,
+                              env=dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+                                       FAKE_GH_STATE=str(self.base), GITHUB_REPOSITORY="KiidxAtlas/dial",
+                                       RELEASE_TAG="v0.3.5", DIAL_RELEASE_PUBLIC_KEY="other"),
+                              capture_output=True, text=True)
+
+    def test_merged_same_tree_pull_request_run_is_reused(self):
+        result = self.find(self.merge)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "42"), result.stderr)
+        self.assertIn(f"api repos/KiidxAtlas/dial/commits/{self.merge}/pulls",
+                      (self.base / "calls").read_text())
+
+    def test_other_trees_forks_failures_and_non_ancestor_heads_are_refused(self):
+        squashed = self.git("commit-tree", f"{self.head}^{{tree}}", "-p", f"{self.merge}~1", "-m", "squash")
+        main_moved = self.git("commit-tree", f"{self.merge}~1^{{tree}}", "-p", self.merge, "-m", "revert")
+        for name, kwargs in (("fork", dict(repo="fork/dial")), ("failed run", dict(conclusion="failure")),
+                             ("identity for another tree", dict(tree="f" * 40)),
+                             ("tag tree differs from head tree", dict(commit=main_moved)),
+                             ("squash merge: head not in history", dict(commit=squashed))):
+            with self.subTest(name):
+                result = self.find(kwargs.pop("commit", self.merge), **kwargs)
+                self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)
+
+
 class CandidatePromotionTests(unittest.TestCase):
     def test_ci_run_selection_never_promotes_pr_failed_or_other_commit(self):
         good = dict(event="push", headBranch="main", headSha="abc", status="completed",
@@ -324,16 +409,62 @@ class CandidatePromotionTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 self.assertFalse(policy.complete_candidate_artifacts([{"artifacts": invalid}]))
 
-    def test_identity_cli_refuses_commit_version_and_public_key_changes(self):
+    def test_identity_cli_refuses_tree_version_and_public_key_changes(self):
+        tree, revision = "a" * 40, "b" * 40
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "candidate.json"
-            expected = dict(revision="abc", tag="v0.3.0", public_key="public-fixture")
-            for changes in ({}, {"revision": "other"}, {"tag": "v0.3.1"}, {"public_key": "changed"}):
+            expected = dict(revision=revision, tree=tree, tag="v0.3.0", public_key="public-fixture")
+            for changes in ({}, {"tree": "c" * 40}, {"tag": "v0.3.1"}, {"public_key": "changed"},
+                            {"revision": "abc"}, {"revision": None}, {"extra": 1}):
                 path.write_text(json.dumps({**expected, **changes}))
-                result = subprocess.run([sys.executable, str(SCRIPT), "identity", "abc", str(path)],
+                result = subprocess.run([sys.executable, str(SCRIPT), "identity", tree, str(path)],
                                         env=dict(os.environ, RELEASE_TAG="v0.3.0", DIAL_RELEASE_PUBLIC_KEY="public-fixture"),
                                         capture_output=True, text=True)
-                self.assertEqual(result.returncode == 0, not changes, result.stderr)
+                self.assertEqual(result.returncode == 0, not changes, (changes, result.stderr))
+            # The tree-only check used to find pull-request candidates ignores the public key,
+            # which the release workflow rechecks, but nothing else.
+            for changes, accepted in (({"public_key": "changed"}, True), ({"tree": "c" * 40}, False),
+                                      ({"tag": "v0.3.1"}, False)):
+                path.write_text(json.dumps({**expected, **changes}))
+                result = subprocess.run([sys.executable, str(SCRIPT), "candidate-tree", tree, str(path)],
+                                        env=dict(os.environ, RELEASE_TAG="v0.3.0", DIAL_RELEASE_PUBLIC_KEY="public-fixture"),
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, accepted, (changes, result.stderr))
+
+    def test_only_same_repository_merged_main_pull_requests_and_their_successful_runs_qualify(self):
+        head = "d" * 40
+        good = dict(merged_at="2026-11-11T00:00:00Z", base=dict(ref="main"),
+                    head=dict(sha=head, repo=dict(full_name="KiidxAtlas/dial")))
+        self.assertEqual(policy.merged_pull_request_heads([good], "KiidxAtlas/dial"), [head])
+        for changes in ({"merged_at": None}, {"base": dict(ref="release")},
+                        {"head": dict(sha=head, repo=dict(full_name="fork/dial"))},
+                        {"head": dict(sha=head, repo=None)}, {"head": dict(sha="short", repo=dict(full_name="KiidxAtlas/dial"))}):
+            with self.subTest(changes=changes):
+                self.assertEqual(policy.merged_pull_request_heads([{**good, **changes}], "KiidxAtlas/dial"), [])
+        run = dict(event="pull_request", headSha=head, status="completed", conclusion="success", databaseId=7)
+        self.assertEqual(policy.successful_pull_request_ci_run_id([run], head), 7)
+        for changes in ({"event": "push"}, {"headSha": "e" * 40}, {"status": "in_progress"},
+                        {"conclusion": "failure"}, {"databaseId": "7"}, {"databaseId": True}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                policy.successful_pull_request_ci_run_id([{**run, **changes}], head)
+
+    def test_release_reuses_same_tree_pull_request_ci_or_waits_for_main(self):
+        root = SCRIPT.parent.parent
+        ci = (root / ".github/workflows/ci.yml").read_text()
+        release = (root / ".github/workflows/release.yml").read_text()
+        helper = (root / "scripts/release-candidate-run.sh").read_text()
+        validate = ci.split("\n  validate:\n", 1)[1].split("\n  release-candidates:\n", 1)[0]
+        self.assertIn("fetch-depth: 0", validate)
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", validate)
+        # Pull requests record candidates only when the tested merge tree is the built head tree.
+        self.assertIn('"$(git rev-parse \'HEAD^{tree}\')" != "$(git rev-parse "$HEAD_SHA^{tree}")"', validate)
+        self.assertIn("ref: ${{ needs.validate.outputs.candidate-ref }}", ci)
+        self.assertIn('git merge-base --is-ancestor "$head" "$commit"', helper)
+        self.assertIn("--event pull_request", helper)
+        self.assertIn('candidate-tree "$tree"', helper)
+        self.assertIn("if: steps.pr.outputs.run == ''", release)
+        self.assertIn("CI_RUN: ${{ steps.pr.outputs.run || steps.ci.outputs.run }}", release)
+        self.assertIn("ref: ${{ github.sha }}", release.split("\n  build:\n", 1)[1])
 
     def test_main_only_candidates_keep_private_keys_out_and_allow_safe_fallback(self):
         root = SCRIPT.parent.parent
@@ -350,21 +481,55 @@ class CandidatePromotionTests(unittest.TestCase):
             self.assertIn(f"target: {target}", candidates)
         self.assertIn("if: needs.gate.outputs.candidates == ''", release)
         self.assertIn("run-id: ${{ needs.gate.outputs.candidates }}", release)
-        self.assertIn('identity "$GITHUB_SHA" dist/candidate.json', release)
-        self.assertIn("file: Dockerfile.release", release)
-        self.assertIn("Smoke-test published container", release)
+        self.assertIn('identity "$(git rev-parse \'HEAD^{tree}\')" dist/candidate.json', release)
+        publication = (root / '.github/workflows/release-publish.yml').read_text()
+        self.assertIn('uses: ./.github/workflows/release-publish.yml', release)
+        self.assertIn('file: Dockerfile.release', publication)
+        self.assertIn('Smoke-test published container', publication)
 
-    def test_intel_pip_cache_is_lock_keyed_main_only_and_keeps_hash_checks(self):
-        root = SCRIPT.parent.parent
-        for filename, job in (("ci.yml", "test"), ("release-build.yml", "build")):
-            with self.subTest(workflow=filename):
-                source = (root / ".github/workflows" / filename).read_text()
-                block = source.split(f"\n  {job}:\n", 1)[1].split("\n\n  ", 1)[0]
-                setup = block.split("uses: actions/setup-python@", 1)[1].split("\n      - ", 1)[0]
-                self.assertIn("python-version: '3.12'", setup)
-                self.assertIn("cache: ${{ github.ref == 'refs/heads/main' && runner.os == 'macOS' && runner.arch == 'X64' && 'pip' || '' }}", setup)
-                self.assertIn("cache-dependency-path: scripts/requirements-ci.lock", setup)
-                self.assertIn("--require-hashes -r scripts/requirements-ci.lock", block)
+    def test_preparation_is_parallel_but_all_latest_writers_are_serialized(self):
+        root = SCRIPT.parent.parent / '.github/workflows'
+        release = (root / 'release.yml').read_text()
+        publication = (root / 'release-publish.yml').read_text()
+        self.assertNotIn('\nconcurrency:', release)
+        self.assertIn('group: release-publish', publication)
+        self.assertIn('queue: max', publication)
+        self.assertIn('cancel-in-progress: false', publication)
+        for job in ('publish', 'packaging', 'container'):
+            self.assertIn(f'\n  {job}:\n', publication)
+        self.assertNotIn('needs: sign', publication)
+        self.assertNotIn('needs: [publish, gate]', publication)
+        self.assertNotIn('DIAL_RELEASE_SIGNING_KEY', publication)
+        self.assertIn('release-publish.yml@$GITHUB_REF', publication)
+        self.assertNotIn('release.yml@$GITHUB_REF', publication)
+
+    def test_successful_promotion_does_not_skip_publication(self):
+        release = (SCRIPT.parent.parent / '.github/workflows/release.yml').read_text()
+        publish = release.split('\n  publish:\n', 1)[1]
+        self.assertIn('needs: sign', publish)
+        self.assertIn("if: ${{ !cancelled() && needs.sign.result == 'success' }}", publish)
+        self.assertIn('uses: ./.github/workflows/release-publish.yml', publish)
+
+    def test_candidates_keep_artifact_checks_without_repeating_portable_installer_suite(self):
+        root = SCRIPT.parent.parent / '.github/workflows'
+        candidates = (root / 'release-build.yml').read_text()
+        ci = (root / 'ci.yml').read_text()
+        self.assertNotIn('bash scripts/test-install.sh', candidates)
+        self.assertNotIn('requirements-ci.lock', candidates.split('\n  windows-build:', 1)[0].split('\n  build:', 1)[1])
+        self.assertIn('run: make test-install', ci)
+        self.assertIn('python3 scripts/check-artifact.py', candidates)
+        self.assertIn('Test installer under Windows PowerShell 5.1', candidates)
+        self.assertIn('Test installer under PowerShell 7', candidates)
+
+    def test_linux_lint_reuses_feature_dependencies_without_competing_cache_writers(self):
+        workflows = SCRIPT.parent.parent / '.github/workflows'
+        ci = (workflows / 'ci.yml').read_text().split('\n  lint:\n', 1)[1].split('\n  musl:\n', 1)[0]
+        features = (workflows / 'linux-features.yml').read_text()
+        self.assertIn("shared-key: ${{ matrix.os == 'ubuntu-22.04' && 'features-ubuntu-22.04' || '' }}", ci)
+        self.assertIn("key: ${{ matrix.os != 'ubuntu-22.04' && format('lint-{0}', matrix.os) || '' }}", ci)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' && matrix.os != 'ubuntu-22.04' }}", ci)
+        self.assertIn('shared-key: features-${{ matrix.os }}', features)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' && matrix['save-cache'] }}", features)
 
 
 class ContainerStagingTests(unittest.TestCase):
@@ -450,31 +615,6 @@ class ContainerStagingTests(unittest.TestCase):
             "crates/dial-agent/src/agent/compact/snapcompact/fonts/", "")
         self.assertEqual(release, expected)
         self.assertNotIn("cargo", release)
-
-
-class WebsiteRefreshTests(unittest.TestCase):
-    def test_refresh_diagnoses_missing_endpoint_auth_and_stale_version_without_hiding_failures(self):
-        workflow = (SCRIPT.parent.parent / ".github/workflows/release.yml").read_text()
-        job = workflow.split("\n  website:\n", 1)[1].split("\n  packaging:\n", 1)[0]
-        script = textwrap.dedent(job.split("        run: |\n", 1)[1])
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            curl = root / "curl"
-            curl.write_text('#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\nif [ "$1" = --output ]; then shift; out="$1"; fi\nshift\ndone\nprintf \'{"version":"%s"}\' "$SITE_VERSION" > "$out"\nprintf "%s" "$HTTP_STATUS"\n')
-            curl.chmod(0o755)
-            for status, version, token, success in (("200", "v0.3.0", "fixture-token", True),
-                    ("404", "v0.3.0", "fixture-token", False), ("401", "v0.3.0", "fixture-token", False),
-                    ("200", "v0.2.9", "fixture-token", False), ("200", "v0.3.0", "", False)):
-                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                    env=dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
-                        RUNNER_TEMP=str(root), GITHUB_STEP_SUMMARY=str(root / "summary"),
-                        RELEASE_TAG="v0.3.0", SITE_VERSION=version, HTTP_STATUS=status, DIAL_WEB_REFRESH_TOKEN=token))
-                with self.subTest(status=status, version=version, configured=bool(token)):
-                    self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
-                    self.assertNotIn("fixture-token", result.stdout + result.stderr)
-                    if status == "404":
-                        self.assertIn("NUXT_RELEASE_REFRESH_TOKEN", result.stdout)
-                        self.assertIn("Rerun this failed job only", result.stdout)
 
 
 if __name__ == "__main__":

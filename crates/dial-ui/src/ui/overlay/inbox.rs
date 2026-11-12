@@ -26,7 +26,14 @@ impl Category {
 pub struct Inbox {
     next_id: u64,
     entries: Vec<Notice>,
+    /// A focus report has said the terminal is focused; before that the state is unknown.
+    seen_focus: bool,
+    /// The newest notice id when the terminal lost focus.
+    away_since: Option<u64>,
 }
+
+/// Notices one return digest names before it summarizes the rest.
+const DIGEST_ROWS: usize = 3;
 
 pub struct Notice {
     pub id: u64,
@@ -43,6 +50,10 @@ impl Inbox {
     }
 
     pub fn push_category(&mut self, title: &str, text: &str, category: Category) {
+        // A busy turn does not poll `returned`, so the absence is also marked on arrival.
+        if !crate::ui::termcaps::terminal_focused() {
+            self.mark_away();
+        }
         if text.trim().is_empty()
             || self
                 .entries
@@ -62,6 +73,48 @@ impl Inbox {
             unread: true,
             category,
         });
+    }
+
+    fn mark_away(&mut self) {
+        if self.seen_focus && self.away_since.is_none() {
+            self.away_since = Some(self.next_id);
+        }
+    }
+
+    /// Tracks terminal focus. On the return from a real focus loss, lists the notices that
+    /// arrived meanwhile, newest first; `None` when nothing arrived. An unknown focus state
+    /// reads as unfocused, so absence only counts after one focused report.
+    pub fn returned(&mut self, focused: bool) -> Option<String> {
+        if !focused {
+            self.mark_away();
+            return None;
+        }
+        self.seen_focus = true;
+        let since = self.away_since.take()?;
+        let arrived: Vec<&Notice> = self
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| entry.id > since)
+            .collect();
+        if arrived.is_empty() {
+            return None;
+        }
+        let mut lines: Vec<String> = arrived
+            .iter()
+            .take(DIGEST_ROWS)
+            .map(|entry| {
+                let first = entry.text.lines().next().unwrap_or_default();
+                format!("{}: {}", entry.title, crate::ui::text::one_line(first))
+            })
+            .collect();
+        if arrived.len() > DIGEST_ROWS {
+            lines.push(format!(
+                "+{} more; /inbox lists them",
+                arrived.len() - DIGEST_ROWS
+            ));
+        }
+        Some(lines.join("\n"))
     }
 
     pub fn unread(&self) -> usize {

@@ -633,6 +633,7 @@ impl Shell {
         history: &mut Vec<ActiveOverlay>,
     ) -> Result<OverlayOutcome> {
         let compute = matches!(overlay.content_mut(), ActiveOverlay::Compute(_));
+        let first_run = agent.is_none();
         let peers = matches!(overlay.content_mut(), ActiveOverlay::Peers(_));
         self.term.set_overlay_mouse(self.ui.mouse);
         let Shell {
@@ -693,6 +694,7 @@ impl Shell {
             } else {
                 None
             },
+            first_run,
         };
         env.seen_generation = env.catalog.generation;
         crate::app::overlay::env::refresh_navigation(
@@ -763,6 +765,7 @@ impl Shell {
         } = self;
         let mut env = OverlayEnv {
             compute_monitor: state.compute_monitor.take(),
+            first_run: false,
             verify_lora: state.verify_lora.take(),
             latest: state.latest.take(),
             next: state.next.take(),

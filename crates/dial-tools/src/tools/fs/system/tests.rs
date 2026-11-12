@@ -193,7 +193,8 @@ fn compact_inventory_shortens_versions_and_names_missing_tools() {
 }
 
 /// Lookup without running anything: a non-executable file is skipped, and on Windows the
-/// `PATHEXT` suffix is supplied (`tool` finds `tool.exe`).
+/// `PATHEXT` suffix is supplied (`tool` finds `tool.exe`). `PATHEXT` is conventionally upper
+/// case (`.EXE`) and Windows paths are case-insensitive, so the match ignores case there.
 #[test]
 fn path_lookup_finds_executables_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -209,7 +210,15 @@ fn path_lookup_finds_executables_only() {
         std::fs::set_permissions(plain.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let path = std::env::join_paths([empty.path(), plain.as_path()]).unwrap();
-    assert_eq!(find_on_path("tool", &path), Some(plain.join(name)));
+    let found = find_on_path("tool", &path).expect("the executable is found");
+    if cfg!(windows) {
+        assert!(
+            found.as_os_str().eq_ignore_ascii_case(plain.join(name)),
+            "{found:?}"
+        );
+    } else {
+        assert_eq!(found, plain.join(name));
+    }
     assert_eq!(find_on_path("data", &path), None);
     assert_eq!(find_on_path("absent", &path), None);
 }

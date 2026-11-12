@@ -69,6 +69,28 @@ fn response(id: &Value, result: Value) -> Value {
 fn error(id: &Value, code: i32, message: impl std::fmt::Display) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message.to_string()}})
 }
+/// ACP session methods `Adapter::prepare` translates; anything else is "method not found".
+const SESSION_METHODS: &[&str] = &[
+    "session/new",
+    "session/load",
+    "session/resume",
+    "session/fork",
+    "session/list",
+    "session/prompt",
+    "session/cancel",
+    "session/close",
+    "session/set_mode",
+    "session/set_config_option",
+];
+fn unsupported_method(id: &Value, method: &str) -> Value {
+    error(
+        id,
+        -32601,
+        format!(
+            "unsupported ACP method {method}; client terminal/auth/MCP bridges are not implemented"
+        ),
+    )
+}
 fn text_content(text: &Value) -> Value {
     json!({"type":"text","text":text})
 }
@@ -316,6 +338,10 @@ impl Adapter {
             );
             return Ok((None, vec![response(id, json!({}))]));
         }
+        // An unknown method is "method not found", whatever its params look like.
+        if !SESSION_METHODS.contains(&method) {
+            return Ok((None, vec![unsupported_method(id, method)]));
+        }
         ensure!(params.is_object(), "params must be an object");
         let mut actor_params = json!({"_acp":true});
         let session = params["sessionId"].as_str().map(str::to_owned);
@@ -421,18 +447,7 @@ impl Adapter {
                 actor_params["enabled"] = json!(mode == "plan");
                 "plan"
             }
-            _ => {
-                return Ok((
-                    None,
-                    vec![error(
-                        id,
-                        -32601,
-                        format!(
-                            "unsupported ACP method {method}; client terminal/auth/MCP bridges are not implemented"
-                        ),
-                    )],
-                ));
-            }
+            _ => return Ok((None, vec![unsupported_method(id, method)])),
         };
         if actor_method != "new_session" && actor_method != "list_sessions" {
             let session = session.as_deref().context("sessionId is required")?;

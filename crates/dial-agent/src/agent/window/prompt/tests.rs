@@ -236,6 +236,10 @@ fn generated_artifact_policy_reaches_all_builtin_message_profiles() {
         assert_eq!(policy.matches(marker).count(), 1, "{policy}");
         assert!(policy.contains("Read a file before editing it"), "{policy}");
         assert!(
+            policy.contains("Inspect task inputs with `read`"),
+            "{policy}"
+        );
+        assert!(
             policy.contains("none of this guidance widens your permissions"),
             "{policy}"
         );
@@ -471,7 +475,7 @@ fn one_call_guidance_replaces_batching() {
         );
         assert!(batching.contains(LEAN_BATCHING));
         assert!(batching.contains("independent reads and searches as parallel tool calls"));
-        assert!(batching.contains("sequence dependent steps"));
+        assert!(batching.contains("`&&`-chain dependent commands"));
         assert!(!batching.contains(LEAN_ONE_CALL));
     }
     // One-call operation always uses the lean sections, which carry the same safety contracts.

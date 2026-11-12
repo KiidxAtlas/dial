@@ -86,3 +86,39 @@ fn guidance_expands_the_review_template_for_the_frozen_target() {
     assert!(text.contains("Review base main"), "{text}");
     assert!(text.ends_with("Additional review focus: focus on error handling"));
 }
+
+#[test]
+fn unknown_base_or_commit_fails_before_the_review_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "first"]);
+    let layout = Layout::with_user_dir(dir.path(), dir.path().join("dial")).unwrap();
+    let error = parse(&["--base", "no-such-branch"])
+        .unwrap()
+        .run(&layout)
+        .expect_err("unknown base is refused");
+    assert!(
+        error.to_string().contains("no such branch or commit"),
+        "{error}"
+    );
+    assert!(parse(&["--commit", "nope"]).unwrap().run(&layout).is_err());
+    assert!(parse(&["--base", "HEAD"]).unwrap().run(&layout).is_ok());
+}

@@ -291,3 +291,85 @@ fn recorded_changes_touch_footprints_by_lexical_containment() {
     assert!(!file.touches(base, &[]));
     assert!(!Footprint::default().touches(base, &[PathBuf::from("src/a.rs")]));
 }
+
+#[test]
+fn workspace_reads_conflict_with_every_write_but_no_read() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/a.rs"), "a").unwrap();
+    let ws = Workspace::new(root.path()).unwrap();
+    let registry = Registry::new();
+    let get = |name, args: Value| resolve(&ws, EditMode::default(), &registry, name, &args);
+    let all = workspace_read(&ws).unwrap();
+    assert!(!all.is_empty() && !all.writes());
+    assert!(all.conflicts(&get("write", json!({"path":"src/a.rs"})).unwrap()));
+    assert!(all.conflicts(&get("write", json!({"path":"new"})).unwrap()));
+    assert!(!all.conflicts(&get("read", json!({"path":"src/a.rs"})).unwrap()));
+    assert!(!all.conflicts(&all));
+}
+
+#[test]
+fn vcs_and_dependency_reads_declare_footprints_and_mutations_stay_unknown() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/a.rs"), "a").unwrap();
+    std::fs::write(root.path().join("b.rs"), "b").unwrap();
+    let ws = Workspace::new(root.path()).unwrap();
+    let config = crate::config::types::Config::default();
+    let mut registry = Registry::new();
+    for tool in crate::tools::vcs::git::tools(&config)
+        .into_iter()
+        .chain(crate::tools::vcs::gh::tools(&config))
+        .chain(crate::tools::vcs::glab::tools(&config))
+        .chain(crate::tools::knowledge::deps::tools(&config))
+    {
+        registry.try_register(tool).unwrap();
+    }
+    let get = |name, args: Value| resolve(&ws, EditMode::default(), &registry, name, &args);
+    let write_a = get("write", json!({"path":"src/a.rs"})).unwrap();
+    let write_b = get("write", json!({"path":"b.rs"})).unwrap();
+
+    for (name, args) in [
+        ("git", json!({"action":"log"})),
+        ("git", json!({"action":"show","rev":"HEAD"})),
+        ("git", json!({"action":"branches"})),
+        ("git", json!({"action":"pr_view","number":1})),
+        ("github", json!({"op":"pr_diff","pr":"1"})),
+        ("github", json!({"op":"search_code","query":"x"})),
+        ("glab_mr", json!({"op":"mr_view","mr":"1"})),
+    ] {
+        let footprint = get(name, args.clone()).expect("external read");
+        assert!(footprint.is_empty(), "{name}: {args}");
+    }
+    let scoped = get("git", json!({"action":"diff","path":"src/a.rs"})).unwrap();
+    assert!(scoped.conflicts(&write_a) && !scoped.conflicts(&write_b));
+    for (name, args) in [
+        ("git", json!({"action":"status"})),
+        ("git", json!({"action":"diff"})),
+        ("dep_source", json!({"name":"serde"})),
+    ] {
+        let footprint = get(name, args.clone()).expect("workspace read");
+        assert!(
+            footprint.conflicts(&write_a) && footprint.conflicts(&write_b) && !footprint.writes(),
+            "{name}: {args}"
+        );
+    }
+    for (name, args) in [
+        ("git", json!({"action":"commit","message":"m"})),
+        ("git", json!({"action":"push"})),
+        ("git", json!({"action":"log","vcs":"svn"})),
+        ("git", json!({})),
+        ("github", json!({"op":"pr_checkout","pr":"1"})),
+        ("github", json!({"op":"pr_create"})),
+        ("glab_mr", json!({"op":"mr_merge","mr":"1"})),
+    ] {
+        assert!(get(name, args.clone()).is_none(), "{name}: {args}");
+    }
+
+    // jj snapshots the whole working copy before any command, including `log`.
+    std::fs::create_dir(root.path().join(".jj")).unwrap();
+    let jj = get("git", json!({"action":"log"})).unwrap();
+    assert!(jj.conflicts(&write_b));
+    let forced = get("git", json!({"action":"log","vcs":"git"})).unwrap();
+    assert!(forced.is_empty());
+}

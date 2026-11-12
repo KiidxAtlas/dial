@@ -1010,7 +1010,13 @@ impl Session {
             }
         }
         let mut cleanup = SocketCleanup(cleanup_dir);
-        let mut command = Command::new(&config.program);
+        // `Command` only tries `.exe` for a bare Windows name; `which` also finds `.cmd` adapters.
+        let program = if cfg!(windows) {
+            select::which(&config.program, root).unwrap_or_else(|| config.program.clone())
+        } else {
+            config.program.clone()
+        };
+        let mut command = Command::new(program);
         let piped = config.transport == DapTransport::Stdio;
         command
             .args(&args)

@@ -253,6 +253,11 @@ fn is_executable(path: &Path) -> bool {
     crate::platform::fs::is_executable(path)
 }
 
+/// `path`, or on Windows `path` with its `PATHEXT` suffix (`node_modules/.bin/x` → `x.cmd`).
+fn executable(path: &Path) -> Option<PathBuf> {
+    crate::platform::fs::executable_candidate(path)
+}
+
 /// `*` matches any run of characters, `?` one; used for root markers such as `*.cabal`.
 fn wildcard(pattern: &str, name: &str) -> bool {
     let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
@@ -335,7 +340,7 @@ fn find_program(
         } else {
             program.to_owned()
         };
-        return is_executable(&path).then_some(path);
+        return executable(&path);
     }
     let mut seen: Vec<&Path> = Vec::new();
     for root in roots {
@@ -344,18 +349,16 @@ fn find_program(
         }
         seen.push(root);
         for (markers, bin) in LOCAL_BINS {
-            if has_markers(root, markers) {
-                let candidate = root.join(bin).join(program);
-                if is_executable(&candidate) {
-                    return Some(candidate);
-                }
+            if has_markers(root, markers)
+                && let Some(candidate) = executable(&root.join(bin).join(program))
+            {
+                return Some(candidate);
             }
         }
     }
     let root = roots.first().copied().unwrap_or(ws_root);
     dirs.iter()
-        .map(|dir| dir.join(program))
-        .filter(|candidate| is_executable(candidate))
+        .filter_map(|dir| executable(&dir.join(program)))
         .find_map(|candidate| match pyenv_shim(&candidate, dirs) {
             Some(pyenv) => command_path(&pyenv, &["which", &program.to_string_lossy()], root),
             None => Some(candidate),
@@ -401,8 +404,7 @@ fn toolchain_program(program: &Path, root: &Path, dirs: &[PathBuf]) -> Option<Pa
     }
     let rustup = dirs
         .iter()
-        .map(|dir| dir.join("rustup"))
-        .find(|candidate| is_executable(candidate))?;
+        .find_map(|dir| executable(&dir.join("rustup")))?;
     command_path(&rustup, &["which", "rust-analyzer"], root)
 }
 

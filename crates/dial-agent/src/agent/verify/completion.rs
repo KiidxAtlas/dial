@@ -530,8 +530,9 @@ pub(in crate::agent) fn eval_checks(
         .filter_map(|check| check["passed"].as_bool())
 }
 
-/// Preserve a candidate as unaccepted work alongside the controller's exact missing prerequisite.
-/// This is a terminal report for the user, never feedback injected into another model request.
+/// Preserve a candidate as unaccepted work alongside the controller's missing prerequisite.
+/// This is a terminal report for the user, never feedback injected into another model request,
+/// so it states the status first and keeps only the user-relevant part of the reason.
 pub(in crate::agent) fn rejected_report(
     candidate: &str,
     reason: &str,
@@ -542,9 +543,76 @@ pub(in crate::agent) fn rejected_report(
     } else {
         "Incomplete"
     };
-    format!(
-        "{label}: completion requirements were not met. No completion was recorded.\n\nCandidate summary (not accepted as completed):\n{candidate}\n\nUnmet prerequisite:\n{reason}"
-    )
+    format!("{label}: {}\n\n{}", user_reason(reason), candidate.trim())
+}
+
+/// Most characters of the reason a rejected report shows.
+const USER_REASON_CHARS: usize = 600;
+
+/// The controller reason without its model-directed recovery instructions: the first sentence of
+/// each statement, blocking check names and the first compiler/test error with its location.
+/// Repeated reminders and full diagnostics stay in the session record.
+fn user_reason(reason: &str) -> String {
+    let main = reason
+        .split("\nEarlier completion reminder:")
+        .next()
+        .unwrap_or(reason);
+    let mut parts: Vec<String> = Vec::new();
+    for line in main.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with("Recovery call:") || is_diagnostic(line) {
+            continue;
+        }
+        let line = line.strip_prefix("Cannot complete: ").unwrap_or(line);
+        let sentence = first_sentence(line);
+        if !parts.iter().any(|part| part == sentence) {
+            parts.push(sentence.to_owned());
+        }
+    }
+    let lines: Vec<&str> = reason.lines().map(str::trim).collect();
+    let compiler = lines
+        .iter()
+        .position(|line| line.starts_with("error[") || line.starts_with("error:"));
+    // Without a compiler error, the first line a failed check printed after its command.
+    let output = || {
+        let command = lines.iter().position(|line| line.starts_with("Command:"))?;
+        lines[command + 1..]
+            .iter()
+            .position(|line| !line.is_empty() && !line.starts_with('['))
+            .map(|offset| command + 1 + offset)
+    };
+    if let Some(at) = compiler.or_else(output) {
+        let location = lines[at + 1..]
+            .iter()
+            .take(2)
+            .find_map(|line| line.strip_prefix("--> "));
+        parts.push(match location {
+            Some(location) => format!("First error: {} ({location})", lines[at]),
+            None => format!("First error: {}", lines[at]),
+        });
+    }
+    let text = parts.join(" ");
+    if text.chars().count() <= USER_REASON_CHARS {
+        return text;
+    }
+    let cut: String = text.chars().take(USER_REASON_CHARS).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// Compiler and test output lines, which the first-error summary represents.
+fn is_diagnostic(line: &str) -> bool {
+    line.starts_with("error")
+        || line.starts_with("warning")
+        || line.starts_with("-->")
+        || line.starts_with('|')
+        || line.starts_with('[')
+        || line.starts_with("Command:")
+        || line.starts_with("For more information")
+        || line.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Text up to and including the first `. ` sentence break, or the whole line.
+fn first_sentence(line: &str) -> &str {
+    line.find(". ").map_or(line, |end| &line[..=end])
 }
 
 #[cfg(test)]

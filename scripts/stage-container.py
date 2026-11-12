@@ -14,13 +14,29 @@ import tempfile
 FILES = {"dial", "LICENSE", "README.md", "THIRD_PARTY_NOTICES", "Silver.LICENSE", "Unscii.LICENSE"}
 
 
-def stage(dist, destination, tag, public_key):
-    if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
-        raise ValueError("expected a stable release tag")
-    if destination.exists():
-        raise ValueError("container context must not already exist")
-    manifest = (dist / "SHA256SUMS").read_bytes()
-    signature = base64.b64decode((dist / "SHA256SUMS.sig").read_bytes(), validate=True)
+def signature_verifies(public_key, signature, manifest):
+    """Verify an Ed25519 signature, preferring Python cryptography over the openssl CLI.
+
+    Some platforms' `openssl` (LibreSSL, older OpenSSL) cannot verify raw Ed25519 input.
+    """
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError:
+        pass
+    else:
+        try:
+            key = serialization.load_pem_public_key(public_key.encode("utf-8"))
+        except ValueError:
+            return False
+        if not isinstance(key, Ed25519PublicKey):
+            return False
+        try:
+            key.verify(signature, manifest)
+        except InvalidSignature:
+            return False
+        return True
     with tempfile.TemporaryDirectory(prefix="dial-manifest-") as temporary:
         temporary = Path(temporary)
         (temporary / "public.pem").write_text(public_key, encoding="utf-8")
@@ -31,8 +47,18 @@ def stage(dist, destination, tag, public_key):
             "-inkey", str(temporary / "public.pem"), "-rawin",
             "-in", str(temporary / "manifest"), "-sigfile", str(temporary / "signature"),
         ], capture_output=True)
-        if result.returncode:
-            raise ValueError("release manifest signature did not verify")
+    return result.returncode == 0
+
+
+def stage(dist, destination, tag, public_key):
+    if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
+        raise ValueError("expected a stable release tag")
+    if destination.exists():
+        raise ValueError("container context must not already exist")
+    manifest = (dist / "SHA256SUMS").read_bytes()
+    signature = base64.b64decode((dist / "SHA256SUMS.sig").read_bytes(), validate=True)
+    if not signature_verifies(public_key, signature, manifest):
+        raise ValueError("release manifest signature did not verify")
     package = f"dial-{tag}-x86_64-unknown-linux-gnu"
     archive = f"{package}.tar.gz"
     entries = []

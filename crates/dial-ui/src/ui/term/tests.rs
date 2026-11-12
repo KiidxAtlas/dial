@@ -551,6 +551,108 @@ fn clear_screen_resets_the_display_and_restarts_tracking() {
 }
 
 #[test]
+fn a_settled_width_change_asks_for_one_reflow_of_printed_rows() {
+    let mut rig = Rig::new(20, 4);
+    // Nothing printed yet: a resize has nothing to reflow.
+    rig.term.set_size_for_test((30, 4));
+    rig.term.on_resize();
+    assert!(!rig.term.needs_repaint() && !rig.term.reflow_due());
+
+    commit_numbered(&mut rig, 3);
+    rig.paint(&["input"], Some((0, 0)));
+    // A height-only change keeps the rows' wrapping.
+    rig.term.set_size_for_test((30, 10));
+    rig.term.on_resize();
+    assert!(!rig.term.needs_repaint());
+
+    rig.term.set_size_for_test((24, 10));
+    rig.term.on_resize();
+    assert!(
+        rig.term.needs_repaint(),
+        "the loop keeps ticking until it settles"
+    );
+    assert!(!rig.term.reflow_due(), "not while the drag may continue");
+    std::thread::sleep(REFLOW_SETTLE);
+    assert!(rig.term.reflow_due());
+    assert!(!rig.term.reflow_due(), "once per settled change");
+    rig.term.clear_screen().unwrap();
+    rig.term.set_size_for_test((40, 10));
+    rig.term.on_resize();
+    assert!(!rig.term.needs_repaint(), "nothing printed since the reset");
+
+    // Returning to the printed width before it settles cancels the reflow.
+    commit_numbered(&mut rig, 2);
+    rig.paint(&["input"], Some((0, 0)));
+    rig.term.set_size_for_test((50, 10));
+    rig.term.on_resize();
+    rig.term.set_size_for_test((40, 10));
+    rig.term.on_resize();
+    assert!(!rig.term.needs_repaint() && !rig.term.reflow_due());
+}
+
+#[test]
+fn reflow_reprints_only_whole_blocks_on_screen_and_keeps_scrollback() {
+    use crate::ui::transcript::BlockStart;
+    let start = |row, block| BlockStart {
+        row,
+        block,
+        gap: false,
+    };
+    let mut rig = Rig::new(30, 10);
+    // Block 0 (a0..a5) begins above the screen once the rest is printed; blocks 1 and 2 are
+    // wholly on screen.
+    rig.term
+        .mark_blocks(vec![start(0, 0), start(6, 1), start(8, 2)]);
+    rig.commit(&["a0", "a1", "a2", "a3", "a4", "a5", "b0", "b1", "c0", "c1"]);
+    rig.paint(&["input"], Some((0, 0)));
+    assert_eq!(rig.history, ["a0"]);
+
+    rig.resize(40, 10);
+    std::thread::sleep(REFLOW_SETTLE);
+    assert!(rig.term.reflow_due());
+    let mut seam = None;
+    assert!(rig.term.reflow(|from| {
+        seam = Some(*from);
+        (
+            lines(&["B0 and B1 joined at the new width", "C0 and C1 joined"]),
+            vec![start(0, 1), start(1, 2)],
+        )
+    }));
+    assert_eq!(seam, Some(start(6, 1)), "the first block wholly on screen");
+    rig.paint(&["input"], Some((0, 0)));
+    assert_eq!(
+        rig.history,
+        ["a0"],
+        "scrollback is untouched, nothing repeated"
+    );
+    assert_eq!(
+        rig.screen(),
+        [
+            "a1",
+            "a2",
+            "a3",
+            "a4",
+            "a5",
+            "B0 and B1 joined at the new width",
+            "C0 and C1 joined",
+            "input",
+            "",
+            ""
+        ],
+        "the cut block keeps its rows; the rest is reprinted below it"
+    );
+    assert!(
+        !String::from_utf8_lossy(&rig.raw).contains("\x1b[3J"),
+        "scrollback is never erased"
+    );
+
+    // The reprinted rows are tracked like any others: later rows follow without gaps.
+    rig.commit(&["d0"]);
+    rig.paint(&["input"], Some((0, 0)));
+    assert_eq!(rig.screen()[7..9], ["d0", "input"]);
+}
+
+#[test]
 fn overlay_round_trip_restores_the_inline_view() {
     let mut rig = Rig::new(30, 8);
     commit_numbered(&mut rig, 4);
@@ -1007,4 +1109,70 @@ fn a_transcript_replay_larger_than_one_frame_is_painted_in_slices() {
         assert!(paints < 100, "scrollback drains");
     }
     assert!(paints > 1, "the replay was split across frames");
+}
+
+#[test]
+fn input_setup_requests_shift_enter_without_a_successful_capability_probe() {
+    let setup = terminal_input_setup();
+    assert!(
+        setup.contains("\x1b[>7u"),
+        "request disambiguated keys and releases"
+    );
+    assert!(setup.contains("\x1b[?2004h"), "enable bracketed paste");
+    assert!(setup.contains("\x1b[?1004h"), "enable focus reports");
+}
+
+#[test]
+fn requested_keyboard_protocol_is_balanced_across_suspend() {
+    let mut rig = Rig::new(20, 8);
+    // A request was sent, independently of whether detection reported key-release support.
+    rig.term.keyboard_flags = true;
+    let bytes = rig.bytes.clone();
+    rig.term
+        .suspend(|| {
+            let before = String::from_utf8(bytes.0.lock().clone()).unwrap();
+            assert!(
+                before.contains("\x1b[<1u"),
+                "restore keyboard before external editor"
+            );
+            assert!(
+                !before.contains("\x1b[>7u"),
+                "do not rearm before editor exits"
+            );
+        })
+        .unwrap();
+    rig.sync();
+    let all = String::from_utf8(rig.raw.clone()).unwrap();
+    assert!(all.rfind("\x1b[<1u").unwrap() < all.rfind("\x1b[>7u").unwrap());
+}
+
+#[test]
+fn reflow_never_reprints_across_rows_from_outside_the_transcript() {
+    use crate::ui::transcript::BlockStart;
+    let start = |row, block| BlockStart {
+        row,
+        block,
+        gap: false,
+    };
+    let mut rig = Rig::new(30, 10);
+    rig.term.mark_blocks(vec![start(0, 0)]);
+    rig.commit(&["a0", "a1"]);
+    rig.commit(&["launch summary"]);
+    rig.term.mark_blocks(vec![start(0, 1)]);
+    rig.commit(&["b0", "b1"]);
+    rig.paint(&["input"], Some((0, 0)));
+    rig.resize(40, 10);
+    std::thread::sleep(REFLOW_SETTLE);
+    assert!(rig.term.reflow_due());
+    let mut seam = None;
+    assert!(rig.term.reflow(|from| {
+        seam = Some(*from);
+        (lines(&["B"]), vec![start(0, 1)])
+    }));
+    assert_eq!(seam, Some(start(3, 1)), "block 0 lies before the summary");
+    rig.paint(&["input"], Some((0, 0)));
+    assert_eq!(
+        rig.screen()[..5],
+        ["a0", "a1", "launch summary", "B", "input"]
+    );
 }

@@ -1,7 +1,9 @@
 //! Isolated working copies for `task` workers (`isolation = "copy"`).
 //!
 //! The worker runs against a private copy of the project (the same copier benchmarks use, so dirty
-//! and untracked files are included and secrets, `.git`, `.dial` and build caches are not). When it
+//! and untracked files are included and secrets, `.git`, `.dial` and build caches are not).
+//! Gitignored, untracked paths are left out of the copy, its size limits and its merge: they are
+//! local data, not source, and a large ignored directory must not block every worker. When it
 //! finishes, its complete patch is preflighted before any project file is installed. A conflict
 //! blocks the entire patch; an installation failure rolls back earlier writes without replacing
 //! concurrent user edits. Recovery retains the worker copy and any unrestored preimages. Merges
@@ -10,6 +12,7 @@
 //! lifecycle metadata reports applied files, parent conflicts, I/O errors and recovery locations
 //! independently of the worker's schema-validated answer.
 use crate::agent::workflow::solve::{FileState, confined_destination, install, read_state};
+use crate::workspace_copy::IgnoredPaths;
 use crate::{platform::fs as platform_fs, tools::Workspace};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -86,6 +89,8 @@ pub struct Isolated {
     label: String,
     before: Snapshot,
     limits: crate::config::task::TaskConfig,
+    /// Gitignored, untracked paths of the project, left out of the copy and its change set.
+    ignored: IgnoredPaths,
     workspace: Workspace,
 }
 
@@ -187,17 +192,21 @@ impl Merge {
 
 /// A shared metadata walk keeps preflight and hashed snapshots on the same exclusion and
 /// size policies. Preflight retains only names: copied inodes cannot reuse source hashes.
+/// `ignored` paths are skipped entirely, so they count against no limit.
 fn scan<T, P>(
     root: &Path,
     preserved: Option<&BTreeMap<PathBuf, P>>,
+    ignored: &IgnoredPaths,
     limits: &crate::config::task::TaskConfig,
     mut visit: impl FnMut(&Path, &Path, Identity) -> Result<T>,
 ) -> Result<BTreeMap<PathBuf, T>> {
+    #[allow(clippy::too_many_arguments)]
     fn walk<T, P>(
         root: &Path,
         dir: &Path,
         out: &mut BTreeMap<PathBuf, T>,
         preserved: Option<&BTreeMap<PathBuf, P>>,
+        ignored: &IgnoredPaths,
         remaining: &mut usize,
         limits: &crate::config::task::TaskConfig,
         visit: &mut impl FnMut(&Path, &Path, Identity) -> Result<T>,
@@ -217,13 +226,18 @@ fn scan<T, P>(
                 || path
                     .file_name()
                     .is_some_and(|n| n == crate::workspace_copy::SCRATCH_DIR)
+                || path
+                    .strip_prefix(root)
+                    .is_ok_and(|relative| ignored.covers(relative))
             {
                 continue;
             }
             let meta = fs::symlink_metadata(&path)
                 .with_context(|| format!("reading metadata for {}", path.display()))?;
             if meta.is_dir() {
-                walk(root, &path, out, preserved, remaining, limits, visit)?;
+                walk(
+                    root, &path, out, preserved, ignored, remaining, limits, visit,
+                )?;
             } else if meta.is_file() {
                 let relative = path.strip_prefix(root)?.to_path_buf();
                 ensure!(
@@ -261,6 +275,7 @@ fn scan<T, P>(
         root,
         &mut out,
         preserved,
+        ignored,
         &mut remaining,
         limits,
         &mut visit,
@@ -271,38 +286,47 @@ fn scan<T, P>(
 /// Metadata-only preflight bounds the source before a backend copies or mounts it.
 fn preflight(
     root: &Path,
+    ignored: &IgnoredPaths,
     limits: &crate::config::task::TaskConfig,
 ) -> Result<BTreeMap<PathBuf, ()>> {
-    scan::<_, ()>(root, None, limits, |_, _, _| Ok(()))
+    scan::<_, ()>(root, None, ignored, limits, |_, _, _| Ok(()))
 }
 
 /// Identity and streamed hashes, not two complete in-memory copies of project contents.
 fn snapshot(
     root: &Path,
     baseline: Option<&Snapshot>,
+    ignored: &IgnoredPaths,
     limits: &crate::config::task::TaskConfig,
 ) -> Result<Snapshot> {
-    snapshot_preserving(root, baseline, baseline, limits)
+    snapshot_preserving(root, baseline, baseline, ignored, limits)
 }
 
 fn snapshot_preserving<P>(
     root: &Path,
     baseline: Option<&Snapshot>,
     preserved: Option<&BTreeMap<PathBuf, P>>,
+    ignored: &IgnoredPaths,
     limits: &crate::config::task::TaskConfig,
 ) -> Result<Snapshot> {
-    scan(root, preserved, limits, |path, relative, identity| {
-        let value = match baseline.and_then(|tree| tree.get(relative)) {
-            Some(previous) if previous.identity == identity => previous.clone(),
-            _ => stamp(path)?.context("snapshot file disappeared")?,
-        };
-        ensure!(
-            value.identity == identity,
-            "file changed while snapshotting {}",
-            path.display()
-        );
-        Ok(value)
-    })
+    scan(
+        root,
+        preserved,
+        ignored,
+        limits,
+        |path, relative, identity| {
+            let value = match baseline.and_then(|tree| tree.get(relative)) {
+                Some(previous) if previous.identity == identity => previous.clone(),
+                _ => stamp(path)?.context("snapshot file disappeared")?,
+            };
+            ensure!(
+                value.identity == identity,
+                "file changed while snapshotting {}",
+                path.display()
+            );
+            Ok(value)
+        },
+    )
 }
 
 fn stamp(path: &Path) -> Result<Option<FileStamp>> {
@@ -431,6 +455,7 @@ struct Materialized {
 fn set_up_backend(
     project: &Workspace,
     config: &crate::config::task::TaskConfig,
+    ignored: &IgnoredPaths,
     kind: Backend,
 ) -> Result<Materialized> {
     // Declaration order is drop order for the locals below: the overlay is unmounted and the
@@ -442,11 +467,11 @@ fn set_up_backend(
     let mut projection = None;
     match kind {
         Backend::Clone => {
-            dir = crate::workspace_copy::clone_project(project.root())?;
+            dir = crate::workspace_copy::clone_project_except(project.root(), ignored)?;
             root = dir.path().canonicalize()?;
         }
         Backend::Copy => {
-            dir = crate::workspace_copy::copy_project_plain(project.root())?;
+            dir = crate::workspace_copy::copy_project_plain_except(project.root(), ignored)?;
             root = dir.path().canonicalize()?;
         }
         Backend::Worktree => {
@@ -503,8 +528,9 @@ impl Isolated {
         config: &crate::config::task::TaskConfig,
         preference: Preference,
     ) -> Result<Self> {
+        let ignored = IgnoredPaths::of(project.root());
         // Bound source scanning before copying any tree; a failure here leaves nothing copied.
-        let source_paths = preflight(project.root(), config).context(
+        let source_paths = preflight(project.root(), &ignored, config).context(
             "isolation preflight failed before any copy was made; no files were copied and the project is unchanged",
         )?;
         // `auto` takes the first backend that both probes and sets up: a probe cannot prove a
@@ -521,7 +547,7 @@ impl Isolated {
                 backend::probe(candidate, project.root(), config.isolation_source_files)
             })
             .map_err(anyhow::Error::msg)?;
-            match set_up_backend(project, config, selection.backend) {
+            match set_up_backend(project, config, &ignored, selection.backend) {
                 Ok(parts) => {
                     selection
                         .skipped
@@ -548,8 +574,8 @@ impl Isolated {
         // its instance would hydrate every placeholder. Overlay still hashes its mounted view
         // so concurrent source changes cannot silently reuse stale preflight content.
         let before = match kind {
-            Backend::ProjFs => snapshot(project.root(), None, config)?,
-            _ => snapshot_preserving(&root, None, Some(&source_paths), config)?,
+            Backend::ProjFs => snapshot(project.root(), None, &ignored, config)?,
+            _ => snapshot_preserving(&root, None, Some(&source_paths), &ignored, config)?,
         };
         // The overlay's lower layer already provides dependencies. The worktree checkout holds only
         // tracked files (its sync skips `node_modules`, `.venv`, `vendor` and other dependency
@@ -581,19 +607,23 @@ impl Isolated {
             label,
             before,
             limits: config.clone(),
+            ignored,
             workspace,
         })
     }
 
-    /// The worker's changes as a snapshot comparable with `before`.
+    /// The worker's changes as a snapshot comparable with `before`. Ignored paths are dropped for
+    /// every backend, including overlay and ProjFS views that still show them to the worker.
     fn current(&self) -> Result<Snapshot> {
-        match (&self._mount, &self._projection) {
+        let mut after = match (&self._mount, &self._projection) {
             (Some(mount), _) => {
-                overlay::changed_snapshot(mount.upper(), &self.before, &self.limits)
+                overlay::changed_snapshot(mount.upper(), &self.before, &self.limits)?
             }
-            (None, Some(projection)) => projection.changed_snapshot(&self.before, &self.limits),
-            (None, None) => snapshot(&self.root, Some(&self.before), &self.limits),
-        }
+            (None, Some(projection)) => projection.changed_snapshot(&self.before, &self.limits)?,
+            (None, None) => snapshot(&self.root, Some(&self.before), &self.ignored, &self.limits)?,
+        };
+        after.retain(|path, _| !self.ignored.covers(path));
+        Ok(after)
     }
 
     /// Directory whose files hold the worker's current content, as `current` describes them.

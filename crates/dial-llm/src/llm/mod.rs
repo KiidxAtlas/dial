@@ -265,7 +265,9 @@ pub struct ToolCall {
     pub id: String,
     /// Empty when the server omitted the function name.
     pub name: String,
-    /// A JSON object, or `Value::Null` when `malformed_arguments` is set.
+    /// A JSON object when well formed. When `malformed_arguments` is set: the raw argument text as
+    /// a `Value::String` if the provider sent text that does not parse to an object (kept so the
+    /// refusal can quote it), otherwise `Value::Null`. Replay always sends malformed calls as `{}`.
     pub arguments: Value,
     /// The model produced arguments that are not a JSON object. The engine
     /// should report this back to the model instead of aborting.
@@ -1240,6 +1242,10 @@ fn transport_error(error: ureq::Error, url: &str, auth: Option<&str>) -> anyhow:
             "no response before the silence limit (the server may be overloaded or the connection was lost)"
                 .to_owned()
         }
+        // The usual cause is a local server that is not running; say so instead of only the OS text.
+        ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => format!(
+            "{error} (nothing is listening there: start the model server, or check the endpoint with `dial config get endpoint`)"
+        ),
         error => error.to_string(),
     };
     let message = redact(
@@ -1602,7 +1608,7 @@ fn normalize_arguments(raw: Option<&Value>) -> (Value, bool) {
         // not an object at all, and is reported as malformed rather than guessed.
         Some(Value::String(text)) => match json_repair::parse_arguments(text) {
             Some(value) => (value, false),
-            None => (Value::Null, true),
+            None => (Value::String(text.clone()), true),
         },
         Some(_) => (Value::Null, true),
     }

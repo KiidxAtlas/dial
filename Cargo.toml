@@ -11,7 +11,7 @@ members = [".", "crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 license = "MIT"
 
@@ -88,6 +88,17 @@ ruzstd = "0.9"
 sevenz-rust2 = { version = "0.25.0", default-features = false }
 cab = "0.6"
 rars = { version = "0.12", default-features = false }
+# Rich `read` projections: certificates, executables, columnar data, legacy office, plists and mail.
+x509-parser = { version = "0.18", features = ["verify"] }
+object = { version = "0.41", default-features = false, features = ["read", "std"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap", "lz4", "zstd", "brotli", "flate2", "flate2-rust_backend"] }
+arrow-ipc = { version = "60", default-features = false }
+arrow-array = { version = "60", default-features = false }
+arrow-schema = { version = "60", default-features = false }
+arrow-cast = { version = "60", default-features = false }
+calamine = "0.38"
+plist = { version = "1.10", default-features = false }
+mail-parser = { version = "1", features = ["full_encoding"] }
 parking_lot = "0.13"
 similar = { version = "2.7", default-features = false, features = ["text"] }
 shlex = "2"

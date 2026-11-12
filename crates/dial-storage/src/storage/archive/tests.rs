@@ -374,3 +374,64 @@ fn iso_formats_known_instants() {
     assert_eq!(iso(0), "1970-01-01T00:00:00Z");
     assert_eq!(iso(951_782_401), "2000-02-29T00:00:01Z");
 }
+
+#[test]
+fn session_failures_pair_errors_with_their_calls_and_strip_notices() {
+    let call = |id: &str, name: &str, args: &str| {
+        serde_json::json!({"type":"message","ts":"2026-01-02T03:04:10.000Z","message":{"role":"assistant","content":"",
+            "tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args}}]}})
+    };
+    let result = |id: &str, text: &str, error: bool| {
+        serde_json::json!({"type":"message","ts":"2026-01-02T03:04:11.000Z","message":{"role":"tool",
+            "tool_call_id":id,"content":text,"is_error":error}})
+    };
+    let turn = |outcome: &str, error: Option<&str>| {
+        serde_json::json!({"type":"runtime","ts":"2026-01-02T03:05:00.000Z","node":{"kind":"completion",
+            "result":{"data":{"error":error,"error_class":"harness","evidence":{"execution_outcome":outcome}}}}})
+    };
+    let lines = [
+        call("c1", "read", r#"{"path":"a.rs"}"#),
+        result("c1", "ok", false),
+        call("c2", "edit", r#"{"input":"[a.rs#AB]"}"#),
+        result(
+            "c2",
+            "lines 7 have not been shown by a read\n<dial-notice kind=\"x\">noise\nmore</dial-notice>\nRetry barrier: withheld",
+            true,
+        ),
+        turn("completed", None),
+        turn("failed", Some("tool bg contract changed")),
+        result("orphan", "refused", true),
+    ]
+    .map(|v| v.to_string())
+    .join("\n");
+    let (all, total) = scan_failures(lines.as_bytes(), 10).unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(
+        all[0],
+        ArchiveFailure {
+            at: "2026-01-02T03:04:11.000Z".into(),
+            kind: "tool",
+            name: "edit".into(),
+            arguments: Some(r#"{"input":"[a.rs#AB]"}"#.into()),
+            text: "lines 7 have not been shown by a read".into(),
+        }
+    );
+    assert_eq!((all[1].kind, all[1].name.as_str()), ("turn", "failed"));
+    assert_eq!(all[1].text, "harness: tool bg contract changed");
+    assert_eq!((all[2].name.as_str(), &all[2].arguments), ("tool", &None));
+
+    // Only the newest `limit` are kept, oldest first, with the total still counted.
+    let (newest, total) = scan_failures(lines.as_bytes(), 1).unwrap();
+    assert_eq!((newest.len(), total), (1, 3));
+    assert_eq!(newest[0].text, "refused");
+    let text = failure_lines(&newest, total).join("\n");
+    assert!(
+        text.starts_with(
+            "Failures (latest 1 of 3), oldest first:\n- 03:04:11 tool tool -> refused"
+        )
+    );
+    assert_eq!(
+        failure_lines(&[], 0),
+        ["No failed tool calls or failed turns recorded."]
+    );
+}

@@ -376,7 +376,7 @@ pub(crate) fn user_home() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::config::paths::home_dir()
 }
 
 fn discover_all_with_home(layout: &Layout, home: Option<&Path>) -> Vec<Skill> {

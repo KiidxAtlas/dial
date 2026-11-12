@@ -171,6 +171,7 @@ fn set(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) 
         return Ok(Step::Done);
     }
     let value = setting_value(key, raw)?;
+    crate::cli::config_models::check_written_value(&app.layout.user_dir, key, &value)?;
     let step = shell.save(app, agent, &[set_value(key, value)], scope)?;
     shell.note(
         "Setting",
@@ -807,7 +808,7 @@ fn ssh(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) 
 }
 
 fn ssh_list(config: &Config) -> String {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::config::paths::home_dir() else {
         return configured_only_list(config);
     };
     let hosts = crate::tools::integrations::ssh::resolve_hosts(&home, &config.ssh_hosts);
