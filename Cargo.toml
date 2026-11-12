@@ -85,7 +85,7 @@ flate2 = "1"
 lzma-rs = "0.3"
 bzip2-rs = "0.1"
 ruzstd = "0.9"
-sevenz-rust2 = { version = "0.24.1", default-features = false }
+sevenz-rust2 = { version = "0.25.0", default-features = false }
 cab = "0.6"
 rars = { version = "0.12", default-features = false }
 # Rich `read` projections: certificates, executables, columnar data, legacy office, plists and mail.
