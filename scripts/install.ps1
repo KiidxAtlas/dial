@@ -190,7 +190,8 @@ public static class DialInstallerEd25519V1
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($lines -join "`n"); Started = $true }
     }
 
-    # Explains a failed launch of the downloaded dial.exe when Windows application control is the likely cause.
+    # Explains a failed launch of the downloaded dial.exe. Smart App Control is named only when Windows output
+    # shows an application control block, or as a possible cause. Being enabled with an unsigned file is not evidence.
     function Get-DialAppControlHint {
         param([string] $Path, [string] $Output)
         $sacState = $null
@@ -199,14 +200,34 @@ public static class DialInstallerEd25519V1
         } catch { }
         $authenticode = $null
         try { $authenticode = [string](Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop).Status } catch { }
+        $unsigned = [bool]$authenticode -and ($authenticode -ne 'Valid')
+        $sacOnUnsigned = ($sacState -eq 1) -and $unsigned
         $policyBlock = $Output -match 'Application Control|blocked this file|0x800711C7'
-        if ($sacState -eq 1 -and $authenticode -ne 'Valid') {
-            return " Windows Smart App Control is on and blocked dial.exe because Dial releases are not Authenticode-signed (signature status: $authenticode). The download passed Dial's signed-manifest and checksum verification; nothing was installed. Use the Linux build of Dial in WSL2 instead. Turning Smart App Control off is a system-wide security change that Dial does not require. See docs/windows.md#smart-app-control."
-        }
         if ($policyBlock) {
-            return ' A Windows application control policy blocked dial.exe; nothing was installed. See docs/windows.md#smart-app-control.'
+            $cause = ' A Windows application control policy blocked dial.exe.'
+            if ($sacOnUnsigned) {
+                $cause = " Windows application control blocked dial.exe. Smart App Control is on and dial.exe is not Authenticode-signed (signature status: $authenticode), which is a likely cause."
+            }
+            return "$cause See docs/windows.md#smart-app-control."
+        }
+        if ($sacOnUnsigned) {
+            return " Smart App Control is on and dial.exe is not Authenticode-signed (signature status: $authenticode). This output does not show that a block happened, so it may be unrelated. See docs/windows.md#smart-app-control."
         }
         return ''
+    }
+
+    # Windows reports loader failures as NTSTATUS codes, which PowerShell exposes as negative signed integers.
+    # Format the status as unsigned hex and name the known loader failures.
+    function Get-DialExitStatusText {
+        param($ExitCode)
+        $unsigned = [long]$ExitCode -band 0xFFFFFFFFL
+        $hex = '0x{0:X8}' -f $unsigned
+        switch ($unsigned) {
+            0xC0000142L { return "$hex (STATUS_DLL_INIT_FAILED: a DLL that dial.exe loads failed to initialize)" }
+            0xC0000135L { return "$hex (STATUS_DLL_NOT_FOUND: a DLL that dial.exe needs is missing)" }
+            0xC000007BL { return "$hex (STATUS_INVALID_IMAGE_FORMAT: dial.exe or a DLL it loads has an invalid image format, such as a 32-bit/64-bit mismatch or a damaged file)" }
+        }
+        return "$hex (exit code $unsigned)"
     }
 
     function Get-DialStatusCode {
@@ -363,11 +384,14 @@ public static class DialInstallerEd25519V1
         }
         $run = Invoke-DialNative $binary @('--version')
         if (-not $run.Started) {
-            throw "Downloaded dial.exe could not start: $($run.Output)$(Get-DialAppControlHint $binary $run.Output)"
+            throw "Downloaded dial.exe could not start: $($run.Output). Nothing was installed.$(Get-DialAppControlHint $binary $run.Output)"
+        }
+        if ($run.ExitCode -ne 0) {
+            throw "Downloaded dial.exe exited with status $(Get-DialExitStatusText $run.ExitCode) when run with --version. Nothing was installed.$(Get-DialAppControlHint $binary $run.Output)"
         }
         $firstLine = ($run.Output -split "`n")[0].Trim()
-        if ($run.ExitCode -ne 0 -or $firstLine -notmatch ('^dial ' + [regex]::Escape($versionNumber) + '( |$)')) {
-            throw "Downloaded binary version check failed (expected dial $versionNumber): $firstLine$(Get-DialAppControlHint $binary $run.Output)"
+        if ($firstLine -notmatch ('^dial ' + [regex]::Escape($versionNumber) + '( |$)')) {
+            throw "Downloaded binary version check failed (expected dial $versionNumber): $firstLine. Nothing was installed."
         }
 
         $null = New-Item -ItemType Directory -Force -Path $destination
@@ -401,11 +425,13 @@ public static class DialInstallerEd25519V1
         Write-Host "$destination is on your user PATH and in this session's PATH."
         Write-Host ''
         Write-Host 'Next steps:'
-        Write-Host '  1. Run dial from inside a project directory.'
-        Write-Host '  2. Shell, PDF and Python-kernel tools stay disabled on Windows until you opt in:'
-        Write-Host '       dial config set sandbox.mode off'
-        Write-Host '     That runs commands with your normal Windows privileges and no filesystem or network confinement.'
-        Write-Host '     Only do this for trusted workspaces. See docs/windows.md.'
+        Write-Host '  1. Run dial from inside a project directory, from a normal (non-Administrator) shell.'
+        Write-Host '  2. On first run, choose a model: Local model (for example LM Studio) or Hosted provider.'
+        Write-Host '     Run /doctor inside Dial to check model setup.'
+        Write-Host '  3. Shell commands are confined by sandbox.mode in your Dial config. "off" (the default) runs them'
+        Write-Host '     without confinement; "dev" runs them at Windows Low integrity; "strict" uses an AppContainer.'
+        Write-Host '     On first use of a sandboxed command, Dial self-tests the sandbox and refuses sandboxed commands'
+        Write-Host '     if a check fails. See docs/windows.md#security.'
         if (-not $env:HOME -and -not $env:USERPROFILE -and -not $env:DIAL_HOME) {
             Write-Host '  Note: HOME and USERPROFILE are not set, so Dial cannot find its config. Set $env:DIAL_HOME to a directory before running Dial.'
         }

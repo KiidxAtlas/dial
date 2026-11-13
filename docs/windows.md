@@ -6,6 +6,11 @@ Dial ships native Windows releases for `x86_64-pc-windows-msvc` and `aarch64-pc-
 
 Works in Windows PowerShell 5.1 and PowerShell 7. No OpenSSL or other prerequisite is needed. The installer verifies an Ed25519-signed checksum manifest before it installs anything. It installs to `$HOME\.local\bin` (override with `DIAL_INSTALL_DIR`) and adds that directory to your user PATH and to the current session.
 
+Windows release builds statically link the C runtime, so the release executable does not require
+the Visual C++ Redistributable or Visual Studio. Release checks inspect both normal and
+delay-loaded imports for C-runtime DLL dependencies. Windows system DLLs are still required;
+this does not bypass Windows application-control policies.
+
 Open PowerShell (no admin needed) and run:
 
     irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 | iex
@@ -51,9 +56,10 @@ Do not disable Defender/SmartScreen or install an untrusted root certificate to 
 Smart App Control (Windows 11) blocks any executable that is neither signed by a trusted
 publisher nor already known to Microsoft's cloud service. Release builds of `dial.exe` are not
 Authenticode-signed, so Smart App Control blocks them. It has no per-app allow list, and
-`Unblock-File` does not help. In that case the installer stops before installing anything. It
-reports `Downloaded dial.exe could not start` and says that Smart App Control is on. To check
-the state, open Windows Security > App & browser control > Smart App Control settings.
+`Unblock-File` does not help. The installer tests the downloaded executable before replacing an
+existing installation. If startup fails, it reports the native exit code when available; an
+enabled Smart App Control policy is a possible cause, not proof of the cause of every failure.
+To check the state, open Windows Security > App & browser control > Smart App Control settings.
 
 Options:
 
@@ -64,6 +70,20 @@ Options:
 
 Building from source does not avoid the block: a locally built unsigned `dial.exe` is also unknown
 to Smart App Control.
+
+### Application startup errors
+
+A Windows dialog such as **0xc0000142** means a DLL failed to initialize before Dial could start;
+it does not identify which DLL failed. It is not the same as an invalid model configuration or a
+confirmed Smart App Control block. **0xc0000135** means a required DLL was not found, and
+**0xc000007b** means an invalid executable/DLL image (which can include an architecture mismatch).
+
+The installer reports these loader failures separately from a release version mismatch and
+leaves an existing installation untouched when the downloaded executable fails its startup check.
+If a current release still fails, report the Dial release version, Windows version, machine
+architecture, and exact error code. A maintainer may need the faulting DLL from Windows Event
+Viewer's Application log to identify the cause; omit private paths and unrelated log contents.
+Do not download replacement DLLs from third-party sites or disable Windows security controls.
 
 ## First run and LM Studio
 

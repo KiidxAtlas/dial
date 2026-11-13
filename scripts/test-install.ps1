@@ -148,16 +148,22 @@ function Set-ManifestSignature {
 }
 
 function New-FixtureBinary {
-    param([string] $Path, [string] $Version)
+    param([string] $Path, [string] $Version, [int] $ExitCode = 0, [string] $Stdout = "dial $Version")
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    # The default prints the version; an explicit '' prints nothing (like a loader failure).
     if ($script:IsWindowsHost) {
         $source = [IO.Path]::ChangeExtension($Path, '.cs')
-        [IO.File]::WriteAllText($source, 'public static class Program { public static void Main() { System.Console.WriteLine("dial ' + $Version + '"); } }')
+        $print = ''
+        if ($Stdout) { $print = 'System.Console.WriteLine("' + $Stdout + '"); ' }
+        $code = 'public static class Program { public static int Main() { ' + $print + 'return ' + $ExitCode.ToString([Globalization.CultureInfo]::InvariantCulture) + '; } }'
+        [IO.File]::WriteAllText($source, $code)
         $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
         & $csc /nologo "/out:$Path" $source | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'csc failed to build the fixture binary' }
     } else {
-        [IO.File]::WriteAllText($Path, "#!/bin/sh`necho 'dial $Version'`n")
+        $echo = ''
+        if ($Stdout) { $echo = "echo '$Stdout'`n" }
+        [IO.File]::WriteAllText($Path, "#!/bin/sh`n$echo" + "exit $($ExitCode -band 255)`n")
         & chmod +x $Path
     }
 }
@@ -177,7 +183,7 @@ function New-ZipFromFile {
 
 # Builds <serve>/<Scenario>/ with the archive, SHA256SUMS, and SHA256SUMS.sig for $Tag.
 function New-Release {
-    param([string] $Scenario, [string] $Tag, [string] $ReportedVersion, [string] $KeyPath, [string] $ArchiveName, [string] $Target = 'x86_64-pc-windows-msvc', [switch] $Unlaunchable)
+    param([string] $Scenario, [string] $Tag, [string] $ReportedVersion, [string] $KeyPath, [string] $ArchiveName, [string] $Target = 'x86_64-pc-windows-msvc', [switch] $Unlaunchable, [int] $ExitCode = 0, [string] $Stdout = "dial $ReportedVersion")
     $dir = Join-Path $script:Serve $Scenario
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $pkg = "dial-$Tag-$Target"
@@ -188,7 +194,7 @@ function New-Release {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $binary) | Out-Null
         [IO.File]::WriteAllBytes($binary, [byte[]](0x00, 0x01, 0x02, 0x03))
     } else {
-        New-FixtureBinary -Path $binary -Version $ReportedVersion
+        New-FixtureBinary -Path $binary -Version $ReportedVersion -ExitCode $ExitCode -Stdout $Stdout
     }
     $archive = Join-Path $dir $ArchiveName
     New-ZipFromFile -ZipPath $archive -EntryName "$pkg/dial.exe" -SourceFile $binary
@@ -393,7 +399,9 @@ try {
         Assert-Equal 0 $run.Code "installer exit code. Output: $($run.Output)"
         Assert-True (Test-Path -LiteralPath (Join-Path $pathBin 'dial.exe')) 'dial.exe was not installed'
         Assert-Contains $run.Output 'Installed Dial 0.1.0'
-        Assert-Contains $run.Output 'dial config set sandbox.mode off'
+        Assert-Contains $run.Output 'Next steps:'
+        Assert-Contains $run.Output 'Run dial from inside a project directory'
+        Assert-True (-not $run.Output.Contains('sandbox.mode off')) 'output still tells the user to disable the sandbox'
         Assert-True (-not ($run.Output -match 'Add .* to PATH')) 'output still tells the user to add to PATH'
     }
 
@@ -468,6 +476,47 @@ try {
         Assert-True ($run.Code -ne 0) 'unlaunchable binary was installed'
         Assert-Contains $run.Output 'could not start'
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $dir 'dial.exe'))) 'dial.exe written although it could not start'
+    }
+
+    Test-Case 'formats a nonzero --version exit as hex and never as a version mismatch' {
+        $rows = @(
+            [pscustomobject]@{ Scenario = 'exit-dll-init';    ExitCode = -1073741502; Hex = '0xC0000142'; Meaning = 'STATUS_DLL_INIT_FAILED' },
+            [pscustomobject]@{ Scenario = 'exit-dll-missing'; ExitCode = -1073741515; Hex = '0xC0000135'; Meaning = 'STATUS_DLL_NOT_FOUND' },
+            [pscustomobject]@{ Scenario = 'exit-bad-image';   ExitCode = -1073741701; Hex = '0xC000007B'; Meaning = 'STATUS_INVALID_IMAGE_FORMAT' },
+            [pscustomobject]@{ Scenario = 'exit-plain';       ExitCode = 3;            Hex = '0x00000003'; Meaning = 'exit code 3' }
+        )
+        foreach ($row in $rows) {
+            $label = $row.Scenario
+            # Silent (-Stdout ''): a loader failure prints nothing before the process exits.
+            New-Release -Scenario $label -Tag 'v0.1.0' -ReportedVersion '0.1.0' -KeyPath $keyA.Private -ExitCode $row.ExitCode -Stdout '' | Out-Null
+            $envMap = Get-BaseEnvironment (Get-ScenarioUrl $label)
+            $envMap['DIAL_RELEASE_PUBLIC_KEY_PEM'] = $keyA.PublicPem
+            $dir = Join-Path $script:WorkRoot "bin-$label"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            [IO.File]::WriteAllText((Join-Path $dir 'dial.exe'), 'previous-install')
+            $run = Invoke-Installer @('-Version', 'v0.1.0', '-InstallDir', $dir) $envMap
+            Assert-True ($run.Code -ne 0) "$label`: nonzero exit was installed"
+            Assert-Contains $run.Output $row.Hex
+            Assert-Contains $run.Output $row.Meaning
+            Assert-Contains $run.Output 'when run with --version'
+            Assert-Contains $run.Output 'Nothing was installed'
+            Assert-True (-not $run.Output.Contains('version check failed')) "$label`: exit status reported as a version mismatch"
+            Assert-True (-not $run.Output.Contains('blocked dial.exe')) "$label`: loader failure reported as a policy block"
+            Assert-Equal 'previous-install' ([IO.File]::ReadAllText((Join-Path $dir 'dial.exe'))) "$label`: previous dial.exe changed"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $dir 'dial.exe.bak'))) "$label`: backup created before verification"
+        }
+    }
+
+    Test-Case 'reports explicit application control output as a policy block' {
+        New-Release -Scenario 'policy-block' -Tag 'v0.1.0' -ReportedVersion '0.1.0' -KeyPath $keyA.Private -ExitCode 1 -Stdout 'Application Control policy blocked this file.' | Out-Null
+        $envMap = Get-BaseEnvironment (Get-ScenarioUrl 'policy-block')
+        $envMap['DIAL_RELEASE_PUBLIC_KEY_PEM'] = $keyA.PublicPem
+        $dir = Join-Path $script:WorkRoot 'bin-policy-block'
+        $run = Invoke-Installer @('-Version', 'v0.1.0', '-InstallDir', $dir) $envMap
+        Assert-True ($run.Code -ne 0) 'policy-blocked binary was installed'
+        Assert-Contains $run.Output 'A Windows application control policy blocked dial.exe'
+        Assert-Contains $run.Output 'docs/windows.md#smart-app-control'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $dir 'dial.exe'))) 'dial.exe written despite policy block'
     }
 
     Test-Case 'reports a missing release as not found' {

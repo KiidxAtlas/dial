@@ -178,6 +178,8 @@ jobs:
       - name: Build release binary
         env:
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+          # Ship the C runtime inside dial.exe: users should not need the VC++ redist.
+          RUSTFLAGS: '-C target-feature=+crt-static'
         run: cargo build --release --locked -p dial --target "${{ matrix.target }}"
       - name: Package and smoke-test outside the checkout
         shell: pwsh
@@ -193,12 +195,19 @@ jobs:
           $expected = "$env:RELEASE_TAG".Substring(1)
           # Capture all output first: piping into `Select-Object -First 1` stops the native
           # command early and leaves $LASTEXITCODE unset, which failed this check.
-          $output = & "dist/$package/dial.exe" --version
-          $code = $LASTEXITCODE
-          $version = @($output)[0]
-          if ($code -ne 0 -or $version -notmatch ("^dial " + [regex]::Escape($expected) + "( |$)")) { throw "Packaged version check failed (exit $code): $version" }
-          & "dist/$package/dial.exe" --help
-          if ($LASTEXITCODE -ne 0) { throw "Packaged help check failed" }
+          $smoke = Join-Path $env:RUNNER_TEMP ('dial-smoke-' + [Guid]::NewGuid().ToString('N'))
+          try {
+            Expand-Archive -LiteralPath "dist/$package.zip" -DestinationPath $smoke
+            Push-Location (Join-Path $smoke $package)
+            try {
+              $output = & ./dial.exe --version
+              $code = $LASTEXITCODE
+              $version = @($output)[0]
+              if ($code -ne 0 -or $version -notmatch ("^dial " + [regex]::Escape($expected) + "( |$)")) { throw "Packaged version check failed (exit $code): $version" }
+              & ./dial.exe --help
+              if ($LASTEXITCODE -ne 0) { throw 'Packaged help check failed' }
+            } finally { Pop-Location }
+          } finally { Remove-Item -LiteralPath $smoke -Recurse -Force }
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'

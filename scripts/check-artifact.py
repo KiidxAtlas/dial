@@ -13,6 +13,14 @@ ELF_MACHINES = {"x86_64": 0x3E, "aarch64": 0xB7}
 MACH_O_CPU_TYPES = {"x86_64": 0x01000007, "aarch64": 0x0100000C}
 PE_MACHINES = {"x86_64": 0x8664, "aarch64": 0xAA64}
 PT_INTERP = 3
+PE32_PLUS_MAGIC = 0x20B
+PE_IMPORT_DIRECTORY = 1
+PE_DELAY_IMPORT_DIRECTORY = 13
+# Visual C++ runtime redistributable DLLs (and the UCRT they sit on). OS API sets stay allowed.
+VC_RUNTIME_DLL_PREFIXES = ("vcruntime", "msvcp", "concrt", "ucrtbase", "api-ms-win-crt-")
+MAX_PE_IMPORT_TABLE_ENTRIES = 512
+MAX_PE_DLL_NAME_BYTES = 256
+PE_MAX_DIRECTORIES = 16
 
 
 def elf_interpreter(data):
@@ -29,6 +37,102 @@ def elf_interpreter(data):
     return None
 
 
+def pe_bytes(data, offset, size):
+    """Returns exactly size bytes at offset, failing closed when the range leaves the file."""
+    if offset < 0 or size < 0 or offset + size > len(data):
+        raise RuntimeError(f"PE table at file offset {offset:#x} lies outside the file")
+    return data[offset:offset + size]
+
+
+def pe_section_window(sections, rva):
+    """Returns (file offset, bytes left in that section's raw data) for an RVA inside a section."""
+    for virtual_address, raw_size, raw_pointer in sections:
+        if virtual_address <= rva < virtual_address + raw_size:
+            return raw_pointer + rva - virtual_address, virtual_address + raw_size - rva
+    raise RuntimeError(f"PE RVA {rva:#x} lies outside every section's raw data")
+
+
+def pe_section_entry(data, sections, rva, size):
+    """Reads one fixed-size table entry that must lie wholly inside a single section's raw data."""
+    offset, left = pe_section_window(sections, rva)
+    if size > left:
+        raise RuntimeError(f"PE table entry at RVA {rva:#x} crosses its section's raw data")
+    return pe_bytes(data, offset, size)
+
+
+def pe_dll_name(data, sections, rva):
+    offset, left = pe_section_window(sections, rva)
+    window = pe_bytes(data, offset, min(MAX_PE_DLL_NAME_BYTES, left))
+    end = window.find(b"\0")
+    if end <= 0:
+        raise RuntimeError(f"PE import DLL name at RVA {rva:#x} is unterminated or empty within its section")
+    try:
+        return window[:end].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise RuntimeError(f"PE import DLL name at RVA {rva:#x} is not ASCII") from error
+
+
+def pe_imported_dlls(data, pe):
+    """Returns (normal, delay) DLL names imported by a PE32+ image whose PE signature is at pe."""
+    coff = pe + 4
+    section_count = int.from_bytes(pe_bytes(data, coff + 2, 2), "little")
+    optional_size = int.from_bytes(pe_bytes(data, coff + 16, 2), "little")
+    optional = pe + 24
+    directory_count = int.from_bytes(pe_bytes(data, optional + 108, 4), "little")
+    if directory_count > PE_MAX_DIRECTORIES:
+        raise RuntimeError(f"PE declares {directory_count} data directories; the format allows {PE_MAX_DIRECTORIES}")
+    if optional_size < 112 + 8 * directory_count:
+        raise RuntimeError("PE optional header is too small to hold its declared data directories")
+    section_table = optional + optional_size
+    sections = []
+    for index in range(section_count):
+        header = pe_bytes(data, section_table + 40 * index, 40)
+        virtual_address = int.from_bytes(header[12:16], "little")
+        raw_size = int.from_bytes(header[16:20], "little")
+        raw_pointer = int.from_bytes(header[20:24], "little")
+        sections.append((virtual_address, raw_size, raw_pointer))
+
+    def directory(index):
+        if index >= directory_count:
+            return 0, 0
+        entry = pe_bytes(data, optional + 112 + 8 * index, 8)
+        rva, size = int.from_bytes(entry[:4], "little"), int.from_bytes(entry[4:], "little")
+        if bool(rva) != bool(size):
+            raise RuntimeError(f"PE data directory {index} is inconsistent (RVA {rva:#x}, size {size})")
+        return rva, size
+
+    def walk(rva, size, entry_size, name_at, check_entry):
+        """Walks descriptors until an all-zero terminator, which must fit inside the declared size."""
+        names = []
+        for index in range(MAX_PE_IMPORT_TABLE_ENTRIES):
+            if (index + 1) * entry_size > size:
+                raise RuntimeError("PE import table does not terminate within its declared size")
+            entry = pe_section_entry(data, sections, rva + index * entry_size, entry_size)
+            if not any(entry):
+                return names
+            check_entry(entry)
+            names.append(pe_dll_name(data, sections, int.from_bytes(entry[name_at:name_at + 4], "little")))
+        raise RuntimeError(f"PE import table does not terminate within {MAX_PE_IMPORT_TABLE_ENTRIES} entries")
+
+    def check_delay(entry):
+        if not int.from_bytes(entry[:4], "little") & 1:
+            raise RuntimeError("PE delay-load descriptor uses absolute addresses (unsupported)")
+
+    normal_rva, normal_size = directory(PE_IMPORT_DIRECTORY)
+    delay_rva, delay_size = directory(PE_DELAY_IMPORT_DIRECTORY)
+    normal = walk(normal_rva, normal_size, 20, 12, lambda entry: None) if normal_rva else []
+    delayed = walk(delay_rva, delay_size, 32, 4, check_delay) if delay_rva else []
+    return normal, delayed
+
+
+def check_pe_runtime_imports(executable, data, pe):
+    normal, delayed = pe_imported_dlls(data, pe)
+    for dll in (*normal, *delayed):
+        if dll.lower().startswith(VC_RUNTIME_DLL_PREFIXES):
+            raise RuntimeError(f"{executable.name} imports the Visual C++ runtime DLL {dll}; "
+                               "link the C runtime statically")
+
+
 def check_target_format(executable, target):
     """Fails unless the binary header matches the release target's OS, CPU, and C library."""
     arch = target.partition("-")[0]
@@ -40,8 +144,10 @@ def check_target_format(executable, target):
     elif "windows" in target:
         pe = int.from_bytes(data[0x3C:0x40], "little") if data[:2] == b"MZ" else None
         if pe is None or data[pe:pe + 4] != b"PE\0\0" or arch not in PE_MACHINES \
-                or int.from_bytes(data[pe + 4:pe + 6], "little") != PE_MACHINES[arch]:
-            raise RuntimeError(f"{executable.name} is not a PE {arch} binary")
+                or int.from_bytes(data[pe + 4:pe + 6], "little") != PE_MACHINES[arch] \
+                or int.from_bytes(data[pe + 24:pe + 26], "little") != PE32_PLUS_MAGIC:
+            raise RuntimeError(f"{executable.name} is not a PE32+ {arch} binary")
+        check_pe_runtime_imports(executable, data, pe)
     elif "linux" in target:
         if data[:6] != b"\x7fELF\x02\x01" or arch not in ELF_MACHINES \
                 or int.from_bytes(data[18:20], "little") != ELF_MACHINES[arch]:

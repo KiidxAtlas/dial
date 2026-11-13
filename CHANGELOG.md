@@ -17,6 +17,10 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows release builds statically link the C runtime and reject normal or delay-loaded Visual C++ runtime imports during artifact checks, avoiding a separate redistributable prerequisite. Windows smoke tests run the extracted archive outside the checkout. The installer distinguishes native loader failures (including `0xc0000142`) from version mismatches without assuming Smart App Control is responsible, and no longer tells users to disable the sandbox as a first-run step. Native Windows validation is required; these changes do not establish the cause of an individual startup failure.
+
 ## [0.3.7] - 2026-11-12
 
 ### Added

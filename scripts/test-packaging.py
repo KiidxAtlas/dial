@@ -291,6 +291,48 @@ class SourceIgnoreTests(unittest.TestCase):
         self.assertEqual(set(result.stdout.splitlines()), set(outputs))
 
 
+class ReleaseWorkflowRuntimeTests(unittest.TestCase):
+    WORKFLOW = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "release-build.yml"
+
+    @classmethod
+    def build_steps(cls):
+        """Maps each job id to its steps' text blocks, using only the workflow's indentation."""
+        jobs, job, step = {}, None, None
+        for line in cls.WORKFLOW.read_text(encoding="utf-8").splitlines():
+            top = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+            if top:
+                job, step = top.group(1), None
+                jobs[job] = []
+                continue
+            if job is None:
+                continue
+            if re.match(r"^      - ", line):
+                step = [line]
+                jobs[job].append(step)
+            elif step is not None and (line.startswith("      ") or not line.strip()):
+                step.append(line)
+            elif line.strip() and not line.startswith(" "):
+                job, step = None, None
+        return {name: ["\n".join(block) for block in blocks] for name, blocks in jobs.items()}
+
+    def build_step(self, job):
+        matches = [block for block in self.build_steps().get(job, []) if "name: Build release binary" in block]
+        self.assertEqual(len(matches), 1, f"{job} must have exactly one build step")
+        return matches[0]
+
+    def test_windows_release_binary_links_the_static_c_runtime(self):
+        step = self.build_step("windows-build")
+        self.assertIn("RUSTFLAGS: '-C target-feature=+crt-static'", step)
+        self.assertIn("cargo build --release --locked -p dial", step)
+
+    def test_static_c_runtime_flag_is_scoped_to_the_windows_build(self):
+        for job in self.build_steps():
+            if job == "windows-build":
+                continue
+            with self.subTest(job=job):
+                self.assertNotIn("crt-static", "\n".join(self.build_steps()[job]))
+
+
 class ArtifactFormatTests(unittest.TestCase):
     @staticmethod
     def elf(machine=0x3E, elf_class=2, endian=1, interpreter=b"/lib64/ld-linux-x86-64.so.2\0"):
@@ -333,6 +375,183 @@ class ArtifactFormatTests(unittest.TestCase):
     def test_glibc_target_must_link_ld_linux(self):
         with self.assertRaisesRegex(RuntimeError, "does not link ld-linux"):
             self.check(self.elf(interpreter=b"/lib/ld-musl-x86_64.so.1\0"), "x86_64-unknown-linux-gnu")
+
+
+
+class WindowsPortableRuntimeTests(unittest.TestCase):
+    """Synthetic PE32+ fixtures: the release .exe must not import the VC++ runtime (normal or delay)."""
+    X64 = "x86_64-pc-windows-msvc"
+    ARM64 = "aarch64-pc-windows-msvc"
+    RUNTIME_DLLS = ("VCRUNTIME140.dll", "vcruntime140_1.dll", "MSVCP140.dll", "concrt140.dll",
+                    "ucrtbase.dll", "api-ms-win-crt-runtime-l1-1-0.dll")
+    OS_REGULAR = ("KERNEL32.dll", "api-ms-win-core-synch-l1-2-0.dll", "bcrypt.dll", "ntdll.dll")
+    OS_DELAYED = ("ws2_32.dll", "api-ms-win-core-path-l1-1-0.dll")
+    # Layout: PE header at 0x80, one section ".idata" mapped at RVA 0x1000 from file offset 0x400.
+    PE_OFFSET = 0x80
+    OPTIONAL = PE_OFFSET + 24
+    SECTION_TABLE = OPTIONAL + 240
+    BLOB = 0x400
+    REGULAR_TABLE = BLOB                # RVA 0x1000
+    DELAY_TABLE = BLOB + 0x200          # RVA 0x1200
+    NAMES = BLOB + 0x400                # RVA 0x1400
+
+    @classmethod
+    def pe(cls, machine=0x8664, magic=0x20B, regular=(), delayed=(), delay_attributes=1):
+        data = bytearray(cls.BLOB + 0x800)
+        data[0:2] = b"MZ"
+        data[0x3C:0x40] = cls.PE_OFFSET.to_bytes(4, "little")
+        data[cls.PE_OFFSET:cls.PE_OFFSET + 4] = b"PE\0\0"
+        coff = cls.PE_OFFSET + 4
+        data[coff:coff + 2] = machine.to_bytes(2, "little")
+        data[coff + 2:coff + 4] = (1).to_bytes(2, "little")         # NumberOfSections
+        data[coff + 16:coff + 18] = (240).to_bytes(2, "little")     # SizeOfOptionalHeader (PE32+)
+        data[cls.OPTIONAL:cls.OPTIONAL + 2] = magic.to_bytes(2, "little")
+        data[cls.OPTIONAL + 108:cls.OPTIONAL + 112] = (16).to_bytes(4, "little")
+        section = cls.SECTION_TABLE
+        data[section:section + 8] = b".idata\0\0"
+        data[section + 8:section + 12] = (0x800).to_bytes(4, "little")    # VirtualSize
+        data[section + 12:section + 16] = (0x1000).to_bytes(4, "little")  # VirtualAddress
+        data[section + 16:section + 20] = (0x800).to_bytes(4, "little")   # SizeOfRawData
+        data[section + 20:section + 24] = (cls.BLOB).to_bytes(4, "little")  # PointerToRawData
+        names = cls.NAMES
+
+        def name(text):
+            nonlocal names
+            encoded = text.encode("ascii") + b"\0"
+            data[names:names + len(encoded)] = encoded
+            rva = 0x1000 + (names - cls.BLOB)
+            names += len(encoded)
+            return rva.to_bytes(4, "little")
+
+        for index, dll in enumerate(regular):
+            entry = cls.REGULAR_TABLE + 20 * index
+            data[entry + 12:entry + 16] = name(dll)
+        if regular:
+            directory = cls.OPTIONAL + 112 + 8 * 1
+            data[directory:directory + 4] = (0x1000).to_bytes(4, "little")
+            data[directory + 4:directory + 8] = (20 * (len(regular) + 1)).to_bytes(4, "little")
+        for index, dll in enumerate(delayed):
+            entry = cls.DELAY_TABLE + 32 * index
+            data[entry:entry + 4] = delay_attributes.to_bytes(4, "little")
+            data[entry + 4:entry + 8] = name(dll)
+        if delayed:
+            directory = cls.OPTIONAL + 112 + 8 * 13
+            data[directory:directory + 4] = (0x1200).to_bytes(4, "little")
+            data[directory + 4:directory + 8] = (32 * (len(delayed) + 1)).to_bytes(4, "little")
+        return bytes(data)
+
+    def check_pe(self, data, target):
+        ArtifactFormatTests.check(self, data, target)
+
+    def test_os_api_set_imports_are_accepted_for_both_windows_architectures(self):
+        for machine, target in ((0x8664, self.X64), (0xAA64, self.ARM64)):
+            with self.subTest(target=target):
+                self.check_pe(self.pe(machine, regular=self.OS_REGULAR, delayed=self.OS_DELAYED), target)
+        self.check_pe(self.pe(), self.X64)
+
+    def test_vc_runtime_imports_are_rejected_in_normal_and_delay_tables(self):
+        for dll in self.RUNTIME_DLLS:
+            for kind in ("regular", "delayed"):
+                for machine, target in ((0x8664, self.X64), (0xAA64, self.ARM64)):
+                    with self.subTest(dll=dll, kind=kind, target=target):
+                        imports = {kind: (dll,)}
+                        with self.assertRaisesRegex(RuntimeError, "Visual C\\+\\+ runtime"):
+                            self.check_pe(self.pe(machine, **imports), target)
+
+    def test_architecture_and_pe_flavour_are_retained(self):
+        with self.assertRaisesRegex(RuntimeError, "is not a PE32\\+ aarch64 binary"):
+            self.check_pe(self.pe(0x8664), self.ARM64)
+        with self.assertRaisesRegex(RuntimeError, "is not a PE32\\+ x86_64 binary"):
+            self.check_pe(self.pe(0xAA64), self.X64)
+        with self.assertRaisesRegex(RuntimeError, "is not a PE32\\+ x86_64 binary"):
+            self.check_pe(self.pe(magic=0x10B), self.X64)
+
+    def test_malformed_pe_import_tables_fail_closed(self):
+        def patched(data, offset, value):
+            mutated = bytearray(data)
+            mutated[offset:offset + 4] = value.to_bytes(4, "little")
+            return bytes(mutated)
+
+        base = self.pe(regular=("KERNEL32.dll",), delayed=("ws2_32.dll",))
+        cases = {
+            "absolute delay-load descriptor": (self.pe(delayed=("ws2_32.dll",), delay_attributes=0),
+                                               "delay-load"),
+            "normal import table outside sections": (patched(base, self.OPTIONAL + 112 + 8, 0x9000),
+                                                     "outside"),
+            "dll name outside sections": (patched(base, self.REGULAR_TABLE + 12, 0x9000 + 0), "outside"),
+            "section table missing": (base[:self.SECTION_TABLE], "outside"),
+            "truncated file": (base[:0x100], "outside"),
+            "zero sections": (base[:self.PE_OFFSET + 6] + (0).to_bytes(2, "little") + base[self.PE_OFFSET + 8:],
+                              "outside"),
+            "unterminated dll name": (base[:self.NAMES] + b"A" * (len(base) - self.NAMES), "terminated|unterminated"),
+        }
+        for label, (data, pattern) in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(RuntimeError, pattern):
+                    self.check_pe(data, self.X64)
+
+    def test_unterminated_import_descriptor_table_is_bounded(self):
+        from unittest import mock
+        data = self.pe(regular=("KERNEL32.dll", "bcrypt.dll", "ntdll.dll"))
+        with mock.patch.object(artifact, "MAX_PE_IMPORT_TABLE_ENTRIES", 2):
+            with self.assertRaisesRegex(RuntimeError, "terminated|bounded|entries"):
+                self.check_pe(data, self.X64)
+
+
+    @staticmethod
+    def patch(data, offset, value, size=4):
+        mutated = bytearray(data)
+        mutated[offset:offset + size] = value.to_bytes(size, "little")
+        return bytes(mutated)
+
+    def test_directory_rva_and_size_must_agree(self):
+        base = self.pe(regular=("KERNEL32.dll",))
+        directory = self.OPTIONAL + 112 + 8 * 1
+        cases = {
+            "rva without size": self.patch(base, directory + 4, 0),
+            "size without rva": self.patch(base, directory, 0),
+        }
+        for label, data in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(RuntimeError, "inconsistent"):
+                    self.check_pe(data, self.X64)
+
+    def test_optional_header_must_hold_the_declared_data_directories(self):
+        base = self.pe(regular=("KERNEL32.dll",))
+        cases = {
+            "optional header smaller than its directories": (self.patch(base, self.PE_OFFSET + 20, 112, 2),
+                                                             "optional header"),
+            "more directories than the PE format allows": (self.patch(base, self.OPTIONAL + 108, 17),
+                                                           "data directories"),
+        }
+        for label, (data, pattern) in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(RuntimeError, pattern):
+                    self.check_pe(data, self.X64)
+
+    def test_import_terminator_must_fit_inside_the_declared_directory_size(self):
+        regular = self.pe(regular=("KERNEL32.dll", "bcrypt.dll"))
+        delayed = self.pe(delayed=("ws2_32.dll",))
+        cases = {
+            "normal table without room for its terminator": self.patch(regular, self.OPTIONAL + 112 + 8 + 4, 40),
+            "delay table without room for its terminator": self.patch(delayed, self.OPTIONAL + 112 + 8 * 13 + 4, 32),
+        }
+        for label, data in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(RuntimeError, "declared size"):
+                    self.check_pe(data, self.X64)
+
+    def test_descriptors_and_names_stay_inside_their_raw_section(self):
+        cases = {
+            "descriptor straddles the raw section end": (self.patch(
+                self.pe(regular=("KERNEL32.dll",)), self.SECTION_TABLE + 16, 0x10), "crosses"),
+            "dll name lies beyond the raw section": (self.patch(
+                self.pe(regular=("KERNEL32.dll",)), self.SECTION_TABLE + 16, 0x210), "raw data"),
+        }
+        for label, (data, pattern) in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(RuntimeError, pattern):
+                    self.check_pe(data, self.X64)
 
 
 if __name__ == "__main__":
