@@ -1098,6 +1098,27 @@ Usage: `dial benchmark examples/benchmarks/local-tasks.toml --profiles examples/
 (or the hosted file). These files only select configurations; nothing runs until you invoke
 `dial benchmark`, and no inference was run for this change.
 
+### Headline score
+
+`local-tasks` is Dial's headline task score: one fixed, outcome-graded suite tracked across
+releases. Record correctness first, then tokens and wall time for matched successful cases.
+
+```sh
+make bench-headline DIAL=target/local/dial                      # writes target/benchmarks/headline-<time>.json
+make bench-headline DIAL=target/local/dial BASELINE=target/benchmarks/headline-<earlier>.json
+```
+
+`HEADLINE_PROFILES` selects the profile file (default `local-tasks-profiles.toml`, whose model
+placeholder must be replaced first). Reports and their progress journals go under the Cargo
+target directory rather than `$TMPDIR`, so an interrupted run keeps its evidence. With `BASELINE`,
+`compare.py` reports correctness regressions before speed. A score is a measurement only for the
+recorded model, machine and build (`execution_build`); compare runs with the same profile.
+
+When a case misses its whole-case deadline, the failure detail names the elapsed time of every
+completed RPC phase (`ready`, `seed_context#N`, `compact#N`, `send#N`) and how long the pending
+request had been waiting, for example
+`case elapsed 180.0 s; completed: ready 3.0 s, send#1 40.0 s, compact#2 57.0 s; pending for 80.0 s`.
+
 Offline checks: `cd examples/benchmarks && python3 -m unittest test_local_tasks` verifies that each
 starting state fails, each reference fix passes, mutable-test weakening cannot hide the original
 `calc`/snake defects, partial snake/harness repairs and input mutation fail, and swapped or merged

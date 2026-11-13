@@ -1,6 +1,6 @@
 # Shell tool
 
-The `bash` tool runs a command with the shell chosen by `shell.backend` (default `auto`): `/bin/bash -c` on Unix when it exists, Git for Windows' `bash.exe` on Windows when it is installed, otherwise Dial's built-in shell (on Windows without the built-in shell, PowerShell). The tool runs from the workspace root. Supply `cwd` to select an existing directory inside the workspace. A simple leading `cd PATH &&` is extracted into the working directory only when PATH resolves to a directory inside the workspace; shell expansions and compound commands are left to the shell. Any other `cd` is not extracted and runs inside the shell, where the sandbox (if enabled) still applies.
+The `bash` tool runs a command with the shell chosen by `shell.backend` (default `auto`): Dial's embedded Bash-compatible engine on macOS, Linux and Windows. Bundled utilities resolve before the machine's `PATH`, so installing Git Bash or changing GNU/BSD utilities does not change the default command implementation. Builds without `embedded-shell` fall back to system Bash (`/bin/bash` on Unix, Git Bash on Windows), then PowerShell on Windows. The tool runs from the workspace root. Supply `cwd` to select an existing directory inside the workspace. A simple leading `cd PATH &&` is extracted into the working directory only when PATH resolves to a directory inside the workspace; shell expansions and compound commands are left to the shell. Any other `cd` is not extracted and runs inside the shell, where the sandbox (if enabled) still applies.
 
 By default, commands run with stdin at EOF and stdout/stderr captured, without allocating an interactive terminal. Native foreground, named-session and managed shell routes report controller-owned launch context in `execution.shell_launch`, mirrored in `shell_launch` result data and a short factual note. This identifies stdin (`eof`, `pipe` or `terminal`), captured output, terminal allocation and the managed job name when known. Job observations retain the launch context; pre-start refusals and non-shell eval cells do not invent it. These facts describe Dial's launch, not redirections or terminals a descendant may create, and do not establish that the host lacks interactive capabilities. A zero exit code is process status, not proof that the requested application behavior worked; an application can print an error or skip its work and still exit zero.
 
@@ -47,7 +47,7 @@ Tool allowlists, `shell.no_pty`, sandbox policy, platform support and approvals 
 
 Set `shell.backend` in Settings (Tools tab) or in `config.toml`:
 
-- `auto` (default): bash when one is found (`/bin/bash` on Unix; on Windows, Git for Windows' `bash.exe` from `%ProgramFiles%\Git\bin`, `%ProgramFiles(x86)%\Git\bin`, `%LOCALAPPDATA%\Programs\Git\bin`, or PATH). A Git installation is recognized by its `cmd\git.exe` beside `bin\bash.exe`, so WSL's `bash.exe` launcher is never used. Without bash: the built-in shell. On Windows without the built-in shell (a build without `embedded-shell`): PowerShell.
+- `auto` (default): Dial's built-in shell on every OS, regardless of installed system shells. Without the `embedded-shell` build feature, it falls back to system Bash, then PowerShell on Windows. System Bash discovery uses `/bin/bash` on Unix; on Windows, Git for Windows' `bash.exe` from `%ProgramFiles%\Git\bin`, `%ProgramFiles(x86)%\Git\bin`, `%LOCALAPPDATA%\Programs\Git\bin`, or PATH. A Git installation is recognized by its `cmd\git.exe` beside `bin\bash.exe`, so WSL's `bash.exe` launcher is never used.
 - `system`: bash only. On Windows this means Git Bash; it fails with an actionable message when no bash is found.
 - `embedded`: Dial's built-in shell. It needs no system bash, so it works on minimal systems and containers.
 - `inprocess`: the same built-in shell, run on a thread inside the Dial process instead of a child process. It is allowed **only when `sandbox.mode = "off"`**: with `dev` or `strict` (or any other mode) the `bash` tool refuses with an error and runs nothing; it never falls back to another shell. A build without `embedded-shell` reports a clear error. See "In-process shell" below.
@@ -59,17 +59,24 @@ The built-in shell runs as a child process of `dial` itself (no extra install). 
 
 The built-in shell provides the POSIX shell language (pipelines, redirections, `&&`/`||`, variables, `$(( ))`, globs, functions, `case`/`if`/`for`/`while`) with the standard shell builtins (`cd`, `echo`, `printf`, `test`/`[`, `export`, `read`, and so on). Dial also ships these commands so scripts run without GNU or BSD coreutils:
 
-- files: `basename`, `cat`, `cp`, `dirname`, `find`, `head`, `ls`, `mkdir`, `mv`, `rm`, `tail`, `touch`, `wc`
-- text: `cut`, `env`, `grep`, `sed`, `sort`, `tr`, `uniq`, `xargs`
+- files: `basename`, `cat`, `cp`, `dirname`, `find`, `head`, `ls`, `mkdir`, `mktemp`, `mv`, `realpath`, `rm`, `tail`, `touch`, `wc`
+- text and streams: `cut`, `env`, `grep`, `sed`, `seq`, `sort`, `tee`, `tr`, `uniq`, `xargs`
+- processes: `kill`, `wait` and `which` on every OS, and `sleep` on Windows only (Windows has no system `sleep`; Unix keeps the system one)
 
-Any other command is looked up on `PATH`. Run `<command> --help` for the supported options of a built-in utility.
+Bundled utilities resolve before `PATH`; installing GNU/BSD coreutils does not replace them for the options they support. When a bundled utility is given an option or argument outside its subset (for example `grep -P`, `sed -i` or `find -newer`), it runs nothing itself and the program of the same name on `PATH` runs instead with the same arguments, input and redirections; only when `PATH` has none does the command fail with a usage error (exit 2). So the same script behaves identically everywhere within the bundled subset, and beyond it depends on the host's utilities. Other commands (for example, `git`, `node` and `python`) still need to be installed and are looked up on `PATH`. Run `<command> --help` for a bundled utility's supported options. Select `shell.backend = "system"` when a script requires the host's shell and utilities.
+
+`xargs` and `find -exec` dispatch argument vectors through the shell engine, so they can call shell functions and bundled utilities as well as external programs. Arguments are passed as values, not reparsed as shell source. Each invocation gets a copy of the shell state; changing its directory or variables does not change the calling shell. `xargs` commands read from the null device, while `find -exec` inherits stdin. `find -print0 | xargs -0 ...` preserves spaces and newlines in filenames.
 
 Limits of the built-in shell:
 
-- `sed` supports only the `s/RE/REPLACEMENT/[g]` substitution, with `-n` and `-e`. Other sed commands need the system shell.
+- Utilities implement documented subsets, not every GNU/BSD option; see above for what happens outside them. `grep` supports `-E`, `-F`, repeated `-e`, `-q`, `-h`/`-H`, `-o`, `-x`, `-w` and `-s` alongside its basic matching options. `head -c N` supports byte-limited output, and `tail -n +N` prints from line N. `cp` and `rm` accept `-R` as well as `-r`, and `cp`/`mv` accept `-f`.
+- `sed` supports `p`, `d`, and `s/RE/REPLACEMENT/` with `g`, `p`, `i` and numeric occurrence flags; `-n`, repeated `-e`, numeric/`$`/regex addresses and address ranges are supported. Hold space, labels, in-place editing and other sed commands run the system `sed` from `PATH` when there is one.
+- `kill` defaults to `TERM`, as Bash does. On Unix it sends the real signal to the named PID, or to the process group for `kill -- -PGID`; it does not signal a PID's children. Windows has no signals: any signal other than 0 terminates the named process and its descendants (so `npx.cmd` takes its `node.exe` with it), and the job's status is 128 plus the signal number. `kill %N` and `kill $!` signal every external process the job started and end the job itself, including a loop of builtins. `kill -0` checks that a process exists. `which` searches `PATH` (with `PATHEXT` on Windows) and does not report bundled utilities. `mktemp` supports `-d` and `-p DIR`; `realpath` supports `-e` and `-m`; `seq` supports `-w` and `-s`; other options are handed to the `PATH` program as described above.
 - Patterns in `grep` and `sed` use Rust regular-expression syntax, not the full POSIX basic/extended grammar.
-- `xargs` runs external programs only. A name that exists only as a shell builtin is not found and exits 127.
-- On Windows, shell commands support `sandbox.mode = "dev"` through Low integrity or run unconfined with `"off"` (the default). General reads and network access cannot be confined; `"strict"` is refused. See [Windows security](windows.md#security).
+- `find` supports one root, `-name`, `-type f/d`, `-maxdepth`, `-print`, `-print0`, and `-exec ... \;` / `-exec ... {} +`; it does not implement Boolean expressions. `xargs` supports `-0`, `-r`, `-n` and `-I`, not parallel execution.
+- `find` tests must precede actions, and repeated tests are rejected rather than silently overwritten. `xargs` collects its input before dispatch, so use finite input lists. Command arguments use UTF-8 strings; this is not a byte-transparent replacement for every Unix utility.
+- `$!` after `cmd &` is never empty. It names the job's external process (for a pipeline, its last external member; for a subshell, its first external child), waiting up to one second for that process to start. A job that starts no external process (a builtin loop, or `sleep N &` on Windows, where `sleep` is in-process) gets a virtual PID in `0x40000000..=0x7FFFFFFF`, which no real process uses; `kill` and `wait` accept it, but `ps` and other programs do not know it. `wait PID` and `wait %N` return that job's exit status (127 for an unknown PID or job); `wait` with no operands waits for every job and returns 0; `wait -n` returns the status of the next job to finish (127 with no jobs); `wait -p VAR` stores the PID waited for; `-f` is accepted. `/dev/tcp/HOST/PORT` and `/dev/udp/HOST/PORT` redirections work as in Bash (no connect timeout, numeric ports only). On Windows, sockets are relayed through pipes for external commands: bytes a child does not read may be lost, and UDP datagram boundaries are not kept.
+- On Windows, `sandbox.mode = "dev"` uses Low integrity; `strict` or disabled network uses an AppContainer. `off` (the default) is unconfined. These policies also apply to the embedded host and commands it starts; selecting embedded execution does not bypass confinement. See [Windows security](windows.md#security).
 
 ## Per-session Cargo build output
 
@@ -94,7 +101,7 @@ Differences and limits:
 
 ## Named embedded sessions
 
-With `shell.backend = "embedded"`, a `bash` call may supply `session` to retain its
+With the embedded backend (including the default `auto` in standard builds), a `bash` call may supply `session` to retain its
 working directory and exported string variables for later calls in this Dial workspace. Named
 sessions reject overlapping commands, including while a command is owned by a background job.
 Explicit and automatic background handoff retain the session claim until the job settles.

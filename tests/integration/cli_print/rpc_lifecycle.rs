@@ -404,6 +404,68 @@ fn native_session_model_and_settings_methods_answer_during_a_turn() {
 }
 
 #[test]
+fn apply_settings_rebuilds_around_the_same_session_and_gui_reads_answer_during_a_turn() {
+    let env = Env::new();
+    // The scripted server answers one connection at a time, and the interrupt-waiting reply holds
+    // it until the fixture drops, so it comes last.
+    let server = Server::new(vec![
+        text("first answer"),
+        text("after rebuild"),
+        json!({"wait_for_interrupt":true}),
+    ]);
+    let mut rpc = RpcChild::start(&env, &server);
+    rpc.send(1, "send", json!({"text":"first prompt"}));
+    rpc.result(1);
+    rpc.send(2, "state", json!({}));
+    let session = rpc.result(2)["session_id"].as_str().unwrap().to_owned();
+
+    // Nothing saved differs from the launch configuration: applied in place.
+    rpc.send(3, "apply_settings", json!({}));
+    let live = rpc.result(3);
+    assert_eq!(live["applied"], "live", "{live}");
+    assert_eq!(live["rebuilt"], false);
+
+    rpc.send(
+        4,
+        "set_setting",
+        json!({"key":"harness.max_steps","value":7}),
+    );
+    assert_eq!(rpc.result(4)["restart_required"], true);
+    rpc.send(5, "apply_settings", json!({}));
+    let rebuilt = rpc.result(5);
+    assert_eq!(rebuilt["applied"], "rebuild", "{rebuilt}");
+    assert!(rebuilt["tools"].is_array(), "{rebuilt}");
+    rpc.send(6, "state", json!({}));
+    let state = rpc.result(6);
+    assert_eq!(state["session_id"], session.as_str(), "{state}");
+    rpc.send(7, "messages", json!({}));
+    assert_eq!(rpc.result(7)["messages"].as_array().unwrap().len(), 2);
+
+    // The rebuilt agent runs turns in the same session.
+    rpc.send(8, "send", json!({"text":"again"}));
+    assert_eq!(rpc.result(8)["text"], "after rebuild");
+    rpc.send(9, "state", json!({}));
+    assert_eq!(rpc.result(9)["session_id"], session.as_str());
+
+    rpc.send(10, "send", json!({"text":"wait"}));
+    for _ in 0..3 {
+        server.wait_for_request(SETTLE).unwrap();
+    }
+    // Controller reads a GUI polls while the turn holds the actor.
+    rpc.send(11, "list_jobs", json!({}));
+    assert!(rpc.result(11)["jobs"].is_array());
+    rpc.send(12, "list_dirs", json!({}));
+    assert!(rpc.result(12)["dirs"].is_array());
+    rpc.send(13, "get_schema", json!({}));
+    assert!(rpc.result(13)["$defs"]["request"]["oneOf"].is_array());
+    rpc.send(14, "abort", json!({}));
+    rpc.result(14);
+    assert_eq!(rpc.result(10)["interrupted"], true);
+    rpc.send(1000, "shutdown", json!({}));
+    rpc.result(1000);
+}
+
+#[test]
 fn acp_sessions_expose_and_switch_the_model_config_option() {
     let env = Env::new();
     let server = Server::new(vec![]);
@@ -449,4 +511,106 @@ fn acp_sessions_expose_and_switch_the_model_config_option() {
         json!({"sessionId":session,"configId":"model","value":"nope/unknown-model"}),
     );
     error_response(&rpc, 4);
+}
+
+#[test]
+fn extension_actions_save_through_the_overlay_owner_and_mcp_sign_in_names_the_server() {
+    let env = Env::new();
+    let config = env.home.path().join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("[mcp.local]\nprogram = \"true\"\nenabled = false\n");
+    std::fs::write(&config, text).unwrap();
+    let server = Server::new(vec![]);
+    let mut rpc = RpcChild::start(&env, &server);
+    rpc.send(1, "hello", json!({"protocol_version":2}));
+    rpc.result(1);
+
+    // Enabling runs at once, as in the overlay; the change is saved for `apply_settings`.
+    rpc.send(
+        2,
+        "extension_action",
+        json!({"intent":{"op":"toggle_mcp","id":"local","enable":true}}),
+    );
+    let enabled = rpc.result(2);
+    assert_eq!(enabled["ok"], true, "{enabled}");
+    assert_eq!(enabled["saved_scope"], "global");
+    assert_eq!(enabled["apply_settings"], true);
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("enabled = true")
+    );
+
+    // Disabling needs the overlay's confirm step.
+    rpc.send(
+        3,
+        "extension_action",
+        json!({"intent":{"op":"toggle_mcp","id":"local","enable":false}}),
+    );
+    assert_eq!(error_response(&rpc, 3)["error"]["code"], "invalid_params");
+    rpc.send(4, "extension_action", json!({"intent":{"op":"no_such_op"}}));
+    assert_eq!(error_response(&rpc, 4)["error"]["code"], "invalid_params");
+
+    rpc.send(5, "list_extensions", json!({}));
+    let listed = rpc.result(5);
+    assert!(
+        listed["mcp"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == "local"),
+        "{listed}"
+    );
+
+    rpc.send(6, "mcp_login", json!({"server":"missing"}));
+    assert_eq!(error_response(&rpc, 6)["error"]["code"], "not_found");
+    // A local program has no OAuth sign-in; the owner says so.
+    rpc.send(7, "mcp_login", json!({"server":"local"}));
+    let local = error_response(&rpc, 7);
+    assert!(
+        local["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("local program"),
+        "{local}"
+    );
+    rpc.send(8, "mcp_logout", json!({"server":"local"}));
+    assert_eq!(rpc.result(8), json!({"server":"local","removed":false}));
+    rpc.send(1000, "shutdown", json!({}));
+    rpc.result(1000);
+}
+
+#[test]
+fn providers_that_needed_a_terminal_sign_in_through_masked_prompts() {
+    let env = Env::new();
+    let server = Server::new(vec![]);
+    let mut rpc = RpcChild::start(&env, &server);
+    rpc.send(1, "hello", json!({"protocol_version":2}));
+    rpc.result(1);
+    rpc.send(2, "login", json!({"provider":"cloudflare-ai-gateway"}));
+    let prompt = loop {
+        let event = rpc.next();
+        assert!(event.get("error").is_none(), "{event}");
+        if event["event"] == "auth_prompt" {
+            break event;
+        }
+    };
+    assert_eq!(prompt["provider"], "cloudflare-ai-gateway");
+    assert_eq!(prompt["secret"], true, "{prompt}");
+    rpc.send(
+        3,
+        "auth_cancel",
+        json!({"provider":"cloudflare-ai-gateway"}),
+    );
+    rpc.result(3);
+    let ended = error_response(&rpc, 2);
+    assert!(
+        ended["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cancel"),
+        "{ended}"
+    );
+    rpc.send(1000, "shutdown", json!({}));
+    rpc.result(1000);
 }

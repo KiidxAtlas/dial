@@ -258,7 +258,7 @@ fn bottom_chrome_leaves_the_transcript_most_of_an_80x24_terminal() {
 }
 
 #[test]
-fn plan_is_live_only_and_evidence_and_mode_remain_available() {
+fn plan_is_live_only_and_mode_remains_available() {
     use crate::ui::work_panel::Tab;
 
     for (cols, rows) in [(50, 24), (80, 24), (120, 40)] {
@@ -293,12 +293,8 @@ fn plan_is_live_only_and_evidence_and_mode_remain_available() {
                     "{shown}"
                 );
             }
-            if cols == 120 {
-                match tab {
-                    Tab::Evidence => assert!(shown.contains("no evidence recorded yet"), "{shown}"),
-                    Tab::Mode => assert!(shown.contains("sandbox"), "{shown}"),
-                    Tab::Plan => {}
-                }
+            if cols == 120 && tab == Tab::Mode {
+                assert!(shown.contains("sandbox"), "{shown}");
             }
         }
     }

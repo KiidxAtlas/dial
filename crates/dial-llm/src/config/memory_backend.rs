@@ -306,8 +306,9 @@ pub fn active_backend(config: &crate::config::types::MemoryConfig) -> MemoryBack
 /// Whether the enabled backend calls a chat model through a memory role: `memory` for local
 /// extraction/consolidation and sharpshooter work (`decision` is not used by these backends).
 /// Hindsight runs server-side and Provenance is deterministic, so neither needs a role. Semantic
-/// calls the memory role only for automatic fact saving, which pauses (never falls back to the main
-/// model) while the role is unassigned; see [`auto_retain_uses_memory_role`].
+/// calls a model only for automatic fact saving, on the `memory` role or else the `small` role,
+/// and pauses (never falls back to the main model) while neither is assigned; see
+/// [`auto_retain_uses_memory_role`].
 pub fn calls_model(config: &crate::config::types::MemoryConfig) -> bool {
     config.enabled
         && matches!(
@@ -334,8 +335,9 @@ pub fn requires_memory_role(config: &crate::config::types::MemoryConfig) -> bool
         }
 }
 
-/// Semantic memory saves facts automatically with the `memory` role when `auto_retain` is on. The
-/// role is optional: without it automatic saving pauses while recall and the retain tool still work.
+/// Semantic memory saves facts automatically with the `memory` role (else the `small` role) when
+/// `auto_retain` is on. The role is optional: without either, automatic saving pauses while recall
+/// and the retain tool still work.
 pub fn auto_retain_uses_memory_role(config: &crate::config::types::MemoryConfig) -> bool {
     config.enabled && config.backend == MemoryBackendId::Semantic && config.semantic.auto_retain
 }

@@ -128,65 +128,68 @@ cat > "$test_root/bin/libressl" <<'SH'
 echo 'usage: pkeyutl [-verify] [-sign] [-inkey file]' >&2
 exit 1
 SH
-chmod +x "$test_root/bin/uname" "$test_root/bin/ldd" "$test_root/bin/curl" "$test_root/bin/gh" "$test_root/bin/libressl"
+cat > "$test_root/bin/ls" <<'SH'
+#!/bin/sh
+# Emulates a musl loader left behind on a glibc host without writing to /lib.
+if [ "${FAKE_MUSL_LOADER:-0}" = 1 ] && [ "$#" = 1 ] && [ "$1" = '/lib/ld-musl-*.so.1' ]; then exit 0; fi
+exec /bin/ls "$@"
+SH
+chmod +x "$test_root/bin/uname" "$test_root/bin/ldd" "$test_root/bin/curl" "$test_root/bin/gh" "$test_root/bin/libressl" "$test_root/bin/ls"
+# The installer is POSIX sh; run it under dash when present so bashisms fail here.
+install_sh=$(command -v dash || echo sh)
+if command -v shellcheck >/dev/null 2>&1; then shellcheck -s sh "$root/scripts/install.sh"; fi
 # The installer edits shell profiles; keep HOME inside the fixture.
 export PATH="$test_root/bin:$PATH" FIXTURES="$test_root/releases" TMPDIR="$test_root/temp" \
     HOME="$test_root/home" SHELL=/bin/zsh
 mkdir -p "$HOME"
 export FAKE_OS=Darwin FAKE_ARCH=arm64 DIAL_INSTALL_DIR="$test_root/mac/bin"
-bash "$root/scripts/install.sh" v0.1.0 > "$test_root/mac.log" 2>&1
+"$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/mac.log" 2>&1
 [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0 aarch64-apple-darwin' ]
 mac_path_line="export PATH=\"$DIAL_INSTALL_DIR:\$PATH\""
 [ "$(grep -Fxc "$mac_path_line" "$HOME/.zshrc")" = 1 ] || { echo 'PATH was not added to ~/.zshrc' >&2; exit 1; }
-bash "$root/scripts/install.sh" v0.1.0 > "$test_root/mac-again.log" 2>&1
+"$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/mac-again.log" 2>&1
 [ "$(grep -Fxc "$mac_path_line" "$HOME/.zshrc")" = 1 ] || { echo 'Reinstall duplicated the PATH line' >&2; exit 1; }
 export FAKE_OS=Darwin FAKE_ARCH=x86_64 DIAL_INSTALL_DIR="$test_root/intel/bin"
-bash "$root/scripts/install.sh" latest > "$test_root/intel.log" 2>&1
+"$install_sh" "$root/scripts/install.sh" latest > "$test_root/intel.log" 2>&1
 [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0 x86_64-apple-darwin' ]
 export FAKE_OS=Linux FAKE_ARCH=x86_64 FAKE_LIBC=glibc DIAL_INSTALL_DIR="$test_root/linux/bin"
-bash "$root/scripts/install.sh" latest > "$test_root/linux.log" 2>&1
+"$install_sh" "$root/scripts/install.sh" latest > "$test_root/linux.log" 2>&1
 [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0 x86_64-unknown-linux-gnu' ]
 # Installing musl-tools on a glibc host leaves a musl loader behind. Its presence
-# must not override ldd's active glibc result; emulate it without writing to /lib.
-compgen() {
-    if [ "${1:-}" = -G ] && [ "${2:-}" = '/lib/ld-musl-*.so.1' ]; then return 0; fi
-    builtin compgen "$@"
-}
-export -f compgen
-DIAL_INSTALL_DIR="$test_root/glibc-with-musl/bin" bash "$root/scripts/install.sh" v0.1.0 > "$test_root/glibc-with-musl.log" 2>&1
+# must not override ldd's active glibc result.
+FAKE_MUSL_LOADER=1 DIAL_INSTALL_DIR="$test_root/glibc-with-musl/bin" "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/glibc-with-musl.log" 2>&1
 [ "$("$test_root/glibc-with-musl/bin/dial" --version)" = 'dial 0.1.0 x86_64-unknown-linux-gnu' ]
-unset -f compgen
 export FAKE_OS=Linux FAKE_ARCH=aarch64 FAKE_LIBC=glibc DIAL_INSTALL_DIR="$test_root/linux-arm/bin"
-bash "$root/scripts/install.sh" v0.1.0 > "$test_root/linux-arm.log" 2>&1
+"$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/linux-arm.log" 2>&1
 [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0 aarch64-unknown-linux-gnu' ]
 export FAKE_OS=Linux FAKE_ARCH=x86_64 FAKE_LIBC=musl DIAL_INSTALL_DIR="$test_root/musl/bin"
-bash "$root/scripts/install.sh" v0.1.0 > "$test_root/musl.log" 2>&1
+"$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/musl.log" 2>&1
 [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0 x86_64-unknown-linux-musl' ]
 export FAKE_OS=Linux FAKE_ARCH=aarch64 FAKE_LIBC=musl DIAL_INSTALL_DIR="$test_root/musl-arm/bin"
-bash "$root/scripts/install.sh" v0.1.0 > "$test_root/musl-arm.log" 2>&1
+"$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/musl-arm.log" 2>&1
 [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0 aarch64-unknown-linux-musl' ]
 [ ! -e "$HOME/.bashrc" ] && [ ! -e "$HOME/.profile" ] || { echo 'A zsh install edited another profile' >&2; exit 1; }
 SHELL=/bin/bash DIAL_NO_MODIFY_PATH=1 DIAL_INSTALL_DIR="$test_root/unlisted/bin" \
-    bash "$root/scripts/install.sh" v0.1.0 > "$test_root/no-path.log" 2>&1
+    "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/no-path.log" 2>&1
 [ ! -e "$HOME/.bashrc" ] || { echo 'DIAL_NO_MODIFY_PATH=1 edited ~/.bashrc' >&2; exit 1; }
 grep -Fq "Add $test_root/unlisted/bin to your PATH" "$test_root/no-path.log"
 
-# Signature verifier chain. OpenSSL 3 is the default; the others are forced by hiding OpenSSL.
+# Signature verifier chain. ssh-keygen is the default; the others are forced by hiding it.
 export FAKE_OS=Darwin FAKE_ARCH=arm64
-DIAL_INSTALL_DIR="$test_root/openssl/bin" bash "$root/scripts/install.sh" v0.1.0 > "$test_root/openssl.log" 2>&1
-grep -q 'Verifying release signature with openssl' "$test_root/openssl.log"
-DIAL_OPENSSL="$test_root/bin/libressl" DIAL_PYTHON=python3 DIAL_INSTALL_DIR="$test_root/python/bin" \
-    bash "$root/scripts/install.sh" v0.1.0 > "$test_root/python.log" 2>&1
-grep -q 'Verifying release signature with python' "$test_root/python.log"
-[ "$("$test_root/python/bin/dial" --version)" = 'dial 0.1.0 aarch64-apple-darwin' ]
-DIAL_OPENSSL="$test_root/bin/libressl" DIAL_PYTHON="$test_root/no-python" DIAL_INSTALL_DIR="$test_root/sshkeygen/bin" \
-    bash "$root/scripts/install.sh" v0.1.0 > "$test_root/sshkeygen.log" 2>&1
+DIAL_INSTALL_DIR="$test_root/sshkeygen/bin" "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/sshkeygen.log" 2>&1
 grep -q 'Verifying release signature with ssh-keygen' "$test_root/sshkeygen.log"
 [ "$("$test_root/sshkeygen/bin/dial" --version)" = 'dial 0.1.0 aarch64-apple-darwin' ]
+DIAL_SSH_KEYGEN="$test_root/no-ssh-keygen" DIAL_INSTALL_DIR="$test_root/openssl/bin" \
+    "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/openssl.log" 2>&1
+grep -q 'Verifying release signature with openssl' "$test_root/openssl.log"
+DIAL_SSH_KEYGEN="$test_root/no-ssh-keygen" DIAL_OPENSSL="$test_root/bin/libressl" DIAL_PYTHON=python3 DIAL_INSTALL_DIR="$test_root/python/bin" \
+    "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/python.log" 2>&1
+grep -q 'Verifying release signature with python' "$test_root/python.log"
+[ "$("$test_root/python/bin/dial" --version)" = 'dial 0.1.0 aarch64-apple-darwin' ]
 
 # Fail closed: with no verifier at all, nothing is installed and no checksum-only fallback happens.
 if DIAL_OPENSSL="$test_root/bin/libressl" DIAL_PYTHON="$test_root/no-python" DIAL_SSH_KEYGEN="$test_root/no-ssh-keygen" \
-    DIAL_INSTALL_DIR="$test_root/failclosed/bin" bash "$root/scripts/install.sh" v0.1.0 > "$test_root/failclosed.log" 2>&1; then
+    DIAL_INSTALL_DIR="$test_root/failclosed/bin" "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/failclosed.log" 2>&1; then
     echo 'Installed without any signature verifier' >&2; exit 1
 fi
 grep -q 'No release signature verifier found' "$test_root/failclosed.log"
@@ -194,74 +197,82 @@ grep -q 'No release signature verifier found' "$test_root/failclosed.log"
 # Opt-out: explicit and loud, still checksum-verified.
 DIAL_OPENSSL="$test_root/bin/libressl" DIAL_PYTHON="$test_root/no-python" DIAL_SSH_KEYGEN="$test_root/no-ssh-keygen" \
     DIAL_ALLOW_UNSIGNED_INSTALL=1 DIAL_INSTALL_DIR="$test_root/unsigned/bin" \
-    bash "$root/scripts/install.sh" v0.1.0 > "$test_root/unsigned.log" 2>&1
+    "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/unsigned.log" 2>&1
 grep -q 'release signature is NOT' "$test_root/unsigned.log"
 [ "$("$test_root/unsigned/bin/dial" --version)" = 'dial 0.1.0 aarch64-apple-darwin' ]
 if DIAL_OPENSSL="$test_root/bin/libressl" DIAL_PYTHON="$test_root/no-python" DIAL_SSH_KEYGEN="$test_root/no-ssh-keygen" \
     DIAL_ALLOW_UNSIGNED_INSTALL=1 TAMPER=1 DIAL_INSTALL_DIR="$test_root/unsigned-tamper/bin" \
-    bash "$root/scripts/install.sh" v0.1.0 > "$test_root/unsigned-tamper.log" 2>&1; then
+    "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/unsigned-tamper.log" 2>&1; then
     echo 'Tampered archive was accepted by the opt-out path' >&2; exit 1
 fi
 [ ! -e "$test_root/unsigned-tamper/bin/dial" ]
 
 # Bad signatures fail closed on each verifier, and nothing is installed.
-if BAD_SIGNATURE=1 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/bad-openssl.log" 2>&1; then
+if BAD_SIGNATURE=1 DIAL_SSH_KEYGEN="$test_root/no-ssh-keygen" "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/bad-openssl.log" 2>&1; then
     echo 'Invalid OpenSSL signature was accepted' >&2; exit 1
 fi
 grep -q 'Release signature verification failed' "$test_root/bad-openssl.log"
-if BAD_SIGNATURE=1 DIAL_OPENSSL="$test_root/bin/libressl" DIAL_PYTHON=python3 DIAL_INSTALL_DIR="$test_root/bad-python/bin" \
-    bash "$root/scripts/install.sh" v0.1.0 > "$test_root/bad-python.log" 2>&1; then
+if BAD_SIGNATURE=1 DIAL_SSH_KEYGEN="$test_root/no-ssh-keygen" DIAL_OPENSSL="$test_root/bin/libressl" DIAL_PYTHON=python3 DIAL_INSTALL_DIR="$test_root/bad-python/bin" \
+    "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/bad-python.log" 2>&1; then
     echo 'Invalid Python signature was accepted' >&2; exit 1
 fi
 grep -q 'Release signature verification failed' "$test_root/bad-python.log"
 [ ! -e "$test_root/bad-python/bin/dial" ]
-if BAD_SSHSIG=1 DIAL_OPENSSL="$test_root/bin/libressl" DIAL_PYTHON="$test_root/no-python" \
-    DIAL_INSTALL_DIR="$test_root/bad-sshkeygen/bin" bash "$root/scripts/install.sh" v0.1.0 > "$test_root/bad-sshkeygen.log" 2>&1; then
+# A bad OpenSSH signature must not fall back to the other verifiers.
+if BAD_SSHSIG=1 DIAL_INSTALL_DIR="$test_root/bad-sshkeygen/bin" "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/bad-sshkeygen.log" 2>&1; then
     echo 'Invalid SSH signature was accepted' >&2; exit 1
 fi
 grep -q 'Release signature verification failed' "$test_root/bad-sshkeygen.log"
 [ ! -e "$test_root/bad-sshkeygen/bin/dial" ]
-# A checksum-only release (no SHA256SUMS.sshsig) still installs through OpenSSL or Python.
+# A release without SHA256SUMS.sshsig still installs through OpenSSL or Python, and is refused
+# when ssh-keygen is the only verifier.
 rm -f "$FIXTURES/SHA256SUMS.sshsig"
-DIAL_INSTALL_DIR="$test_root/no-sshsig/bin" bash "$root/scripts/install.sh" v0.1.0 > "$test_root/no-sshsig.log" 2>&1
+DIAL_INSTALL_DIR="$test_root/no-sshsig/bin" "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/no-sshsig.log" 2>&1
+grep -q 'Verifying release signature with openssl' "$test_root/no-sshsig.log"
 [ "$("$test_root/no-sshsig/bin/dial" --version)" = 'dial 0.1.0 aarch64-apple-darwin' ]
+if DIAL_OPENSSL="$test_root/bin/libressl" DIAL_PYTHON="$test_root/no-python" DIAL_INSTALL_DIR="$test_root/no-sshsig-only/bin" \
+    "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/no-sshsig-only.log" 2>&1; then
+    echo 'Installed a release without SHA256SUMS.sshsig using only ssh-keygen' >&2; exit 1
+fi
+grep -q 'has no SHA256SUMS.sshsig' "$test_root/no-sshsig-only.log"
+[ ! -e "$test_root/no-sshsig-only/bin/dial" ]
 python3 "$root/scripts/make-sshsig.py" --openssl "$openssl" --key "$test_root/release-private.pem" \
     --input "$test_root/releases/SHA256SUMS" --output "$test_root/releases/SHA256SUMS.sshsig"
 
 # Tampered archive is rejected, and the existing binary is left untouched.
 export DIAL_INSTALL_DIR="$test_root/nosig/bin"
-DIAL_INSTALL_DIR="$test_root/nosig/bin" bash "$root/scripts/install.sh" v0.1.0 > "$test_root/nosig.log" 2>&1
+DIAL_INSTALL_DIR="$test_root/nosig/bin" "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/nosig.log" 2>&1
 cp "$DIAL_INSTALL_DIR/dial" "$test_root/nosig-original"
-if TAMPER=1 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/nosig-tamper.log" 2>&1; then
+if TAMPER=1 "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/nosig-tamper.log" 2>&1; then
     echo 'Tampered archive was accepted' >&2; exit 1
 fi
 cmp "$DIAL_INSTALL_DIR/dial" "$test_root/nosig-original"
 
 export FAKE_OS=Linux FAKE_ARCH=x86_64 FAKE_LIBC=glibc
 export FAKE_GH_AUTH=1 PRIVATE_REPO=1 DIAL_INSTALL_DIR="$test_root/private/bin"
-bash "$root/scripts/install.sh" latest > "$test_root/private.log" 2>&1
+"$install_sh" "$root/scripts/install.sh" latest > "$test_root/private.log" 2>&1
 [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0 x86_64-unknown-linux-gnu' ]
 cp "$DIAL_INSTALL_DIR/dial" "$test_root/private-original"
-if FAKE_GH_DENIED=1 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/denied.log" 2>&1; then
+if FAKE_GH_DENIED=1 "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/denied.log" 2>&1; then
     echo 'Denied private release access was accepted' >&2; exit 1
 fi
 cmp "$DIAL_INSTALL_DIR/dial" "$test_root/private-original"
 export FAKE_GH_AUTH=0 PRIVATE_REPO=0 DIAL_INSTALL_DIR="$test_root/linux/bin"
 cp "$DIAL_INSTALL_DIR/dial" "$test_root/original"
-if TAMPER=1 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/tamper.log" 2>&1; then
+if TAMPER=1 "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/tamper.log" 2>&1; then
     echo 'Tampered archive was accepted' >&2; exit 1
 fi
 cmp "$DIAL_INSTALL_DIR/dial" "$test_root/original"
 export DIAL_INSTALL_DIR="$test_root/not-installed/bin"
-if BAD_MANIFEST=1 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/manifest.log" 2>&1; then
+if BAD_MANIFEST=1 "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/manifest.log" 2>&1; then
     echo 'Invalid manifest was accepted' >&2; exit 1
 fi
-if bash "$root/scripts/install.sh" 'v0.1.0/../../other' > "$test_root/version.log" 2>&1; then
+if "$install_sh" "$root/scripts/install.sh" 'v0.1.0/../../other' > "$test_root/version.log" 2>&1; then
     echo 'Unsafe version was accepted' >&2; exit 1
 fi
 export FAKE_OS=Windows_NT FAKE_ARCH=x86_64
-if bash "$root/scripts/install.sh" v0.1.0 > "$test_root/platform.log" 2>&1; then
+if "$install_sh" "$root/scripts/install.sh" v0.1.0 > "$test_root/platform.log" 2>&1; then
     echo 'Unsupported native Windows was accepted' >&2; exit 1
 fi
 [ ! -e "$DIAL_INSTALL_DIR/dial" ]
-echo 'Installer tests passed: macOS and Linux (glibc/musl, x86-64/arm64) target selection, latest version, authenticated private downloads and access denial, OpenSSL/Python/ssh-keygen signature verifiers, fail-closed refusal and explicit opt-out, bad-signature and tamper rejection, checksum-only releases, shell profile PATH setup (idempotent, opt-out), no overwrite on failure, unsafe manifest/version/platform rejection.'
+echo "Installer tests passed under $install_sh: macOS and Linux (glibc/musl, x86-64/arm64) target selection, latest version, authenticated private downloads and access denial, ssh-keygen/OpenSSL/Python signature verifiers, fail-closed refusal and explicit opt-out, bad-signature and tamper rejection, releases without SHA256SUMS.sshsig, shell profile PATH setup (idempotent, opt-out), no overwrite on failure, unsafe manifest/version/platform rejection."

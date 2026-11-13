@@ -2,6 +2,7 @@
 //! untrusted evidence, never project instructions or proof that an architectural claim is true.
 pub mod architecture;
 pub mod enrichment;
+mod packet;
 use crate::config::paths::Layout;
 use crate::runtime::tool_output::ToolOutput;
 use crate::storage::memory::screen;
@@ -40,6 +41,22 @@ const MAX_NOTES: i64 = 128;
 // Fit a full 4,000-character todo finding, its question and labels, including UTF-8.
 const MAX_SUMMARY_BYTES: usize = 20_000;
 const SCAN_TIME: Duration = Duration::from_secs(3);
+/// Outline format stamped on each `codebase_files` row. Rows below it are rebuilt once.
+const OUTLINE_VERSION: i64 = 2;
+/// Budgets for one refresh. Production uses the module limits; tests inject smaller ones.
+#[derive(Clone, Copy)]
+struct ScanLimits {
+    files: usize,
+    rows: usize,
+    bytes: usize,
+    time: Duration,
+}
+const PRODUCTION_LIMITS: ScanLimits = ScanLimits {
+    files: MAX_FILES,
+    rows: MAX_FILES,
+    bytes: MAX_SCAN_BYTES,
+    time: SCAN_TIME,
+};
 /// Ambient (per-message) brief bounds; explicit `codebase_memory recall` keeps the complete view.
 const AMBIENT_FINDINGS: usize = 4;
 const AMBIENT_SUMMARY_CHARS: usize = 700;
@@ -794,6 +811,24 @@ fn outline(path: &Path, text: &str) -> String {
     out
 }
 
+/// Stamps `outline_version` on a database created before the column existed. Those rows are
+/// version 1, unless the legacy completed-scan marker proves a full scan already rebuilt them.
+fn migrate_outline_version(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(codebase_files)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.iter().any(|name| name == "outline_version") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE codebase_files ADD COLUMN outline_version INTEGER NOT NULL DEFAULT 1;
+        UPDATE codebase_files SET outline_version=2
+        WHERE EXISTS(SELECT 1 FROM codebase_meta WHERE key='outline_version' AND value='2');",
+    )?;
+    Ok(())
+}
+
 impl Codebase {
     pub fn open(layout: &Layout) -> Result<Self> {
         layout.ensure_project_outside_storage()?;
@@ -819,9 +854,10 @@ impl Codebase {
         let conn = Connection::open(&path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS codebase_files(path TEXT PRIMARY KEY,digest TEXT NOT NULL,outline TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS codebase_files(path TEXT PRIMARY KEY,digest TEXT NOT NULL,outline TEXT NOT NULL,outline_version INTEGER NOT NULL DEFAULT 1);
             CREATE TABLE IF NOT EXISTS codebase_notes(topic TEXT PRIMARY KEY,content TEXT NOT NULL,sources TEXT NOT NULL,session_id TEXT NOT NULL,revision INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS codebase_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
+        migrate_outline_version(&conn)?;
         Ok(Self {
             root: layout.project_root.clone(),
             conn: Mutex::new(conn),
@@ -830,6 +866,15 @@ impl Codebase {
     }
 
     pub fn refresh(&self, ws: &Workspace, cancel: &AtomicBool) -> Result<Refresh> {
+        self.refresh_with(ws, cancel, PRODUCTION_LIMITS)
+    }
+
+    fn refresh_with(
+        &self,
+        ws: &Workspace,
+        cancel: &AtomicBool,
+        limits: ScanLimits,
+    ) -> Result<Refresh> {
         ensure!(
             ws.root() == self.root,
             "codebase cache belongs to another workspace"
@@ -837,51 +882,97 @@ impl Codebase {
         let started = Instant::now();
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let outline_version: Option<String> = tx
+        let mut stats = Refresh::default();
+        // Enumerate admitted paths first (metadata only), so every scan sees one sorted order. The
+        // budgets limit reads; the saved cursor decides where this refresh resumes.
+        let mut candidates = BTreeSet::new();
+        let mut walk = Walk::new(ws);
+        walk.run(ws.root(), &mut |absolute| {
+            if cancel.load(Ordering::SeqCst) {
+                return false;
+            }
+            if !supported(absolute) {
+                return true;
+            }
+            let Ok(relative) = absolute.strip_prefix(ws.root()) else {
+                return true;
+            };
+            let path = relative.to_string_lossy().into_owned();
+            if screen(&path).is_ok() {
+                candidates.insert(path);
+            }
+            true
+        });
+        stats.partial |= walk.truncated;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(crate::llm::Interrupted.into());
+        }
+        let order: Vec<String> = candidates.into_iter().collect();
+        let cursor: Option<String> = tx
             .query_row(
-                "SELECT value FROM codebase_meta WHERE key='outline_version'",
+                "SELECT value FROM codebase_meta WHERE key='scan_cursor'",
                 [],
                 |r| r.get(0),
             )
             .optional()?;
-        let rebuild_outlines = outline_version.as_deref() != Some("2");
-        let mut stats = Refresh::default();
+        // Resume after the last path a partial scan reached, then wrap around, so repeated refreshes
+        // cover the whole workspace even when one scan can afford only a prefix of it.
+        let resume = cursor.map_or(0, |cursor| order.partition_point(|path| *path <= cursor));
         let mut seen = BTreeSet::new();
+        let mut last = None;
         let mut bytes = 0usize;
-        let mut walk = Walk::new(ws);
         let mut error = None;
-        walk.run(ws.root(), &mut |absolute| {
-            if cancel.load(Ordering::SeqCst) || started.elapsed() >= SCAN_TIME || seen.len() >= MAX_FILES || bytes >= MAX_SCAN_BYTES {
-                stats.partial = true; return false;
+        for path in order[resume..].iter().chain(&order[..resume]) {
+            if cancel.load(Ordering::SeqCst)
+                || started.elapsed() >= limits.time
+                || seen.len() >= limits.files
+                || bytes >= limits.bytes
+            {
+                stats.partial = true;
+                break;
             }
-            if !supported(absolute) { return true; }
-            let Ok(relative) = absolute.strip_prefix(ws.root()) else { return true };
-            let path = relative.to_string_lossy().into_owned();
-            if screen(&path).is_err() { return true; }
             seen.insert(path.clone());
-            let Some((text, digest)) = source(&self.root, &path) else {
-                match tx.execute("DELETE FROM codebase_files WHERE path=?1", [&path]) {
+            last = Some(path.clone());
+            let Some((text, digest)) = source(&self.root, path) else {
+                match tx.execute("DELETE FROM codebase_files WHERE path=?1", [path]) {
                     Ok(removed) => stats.removed += removed,
-                    Err(e) => { error = Some(e.into()); return false; }
+                    Err(e) => {
+                        error = Some(e.into());
+                        break;
+                    }
                 }
-                return true;
+                continue;
             };
             bytes += text.len();
             let result = (|| -> Result<()> {
-                let old: Option<String> = tx.query_row("SELECT digest FROM codebase_files WHERE path=?1", [&path], |r| r.get(0)).optional()?;
-                if !rebuild_outlines && old.as_deref() == Some(&digest) { stats.reused += 1; return Ok(()); }
-                tx.execute("INSERT INTO codebase_files(path,digest,outline) VALUES(?1,?2,?3)
-                    ON CONFLICT(path) DO UPDATE SET digest=excluded.digest,outline=excluded.outline", params![path, digest, outline(absolute, &text)])?;
+                let old: Option<(String, i64)> = tx
+                    .query_row(
+                        "SELECT digest,outline_version FROM codebase_files WHERE path=?1",
+                        [path],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if matches!(&old, Some((old_digest, version)) if *old_digest == digest && *version == OUTLINE_VERSION)
+                {
+                    stats.reused += 1;
+                    return Ok(());
+                }
+                tx.execute(
+                    "INSERT INTO codebase_files(path,digest,outline,outline_version) VALUES(?1,?2,?3,?4)
+                    ON CONFLICT(path) DO UPDATE SET digest=excluded.digest,outline=excluded.outline,outline_version=excluded.outline_version",
+                    params![path, digest, outline(&self.root.join(path), &text), OUTLINE_VERSION],
+                )?;
                 stats.indexed += 1;
                 Ok(())
             })();
-            if let Err(e) = result { error = Some(e); return false; }
-            true
-        });
+            if let Err(e) = result {
+                error = Some(e);
+                break;
+            }
+        }
         if let Some(error) = error {
             return Err(error);
         }
-        stats.partial |= walk.truncated;
         if cancel.load(Ordering::SeqCst) {
             return Err(crate::llm::Interrupted.into());
         }
@@ -889,7 +980,7 @@ impl Codebase {
             .prepare("SELECT path FROM codebase_files ORDER BY path")?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut excess = paths.len().saturating_sub(MAX_FILES);
+        let mut excess = paths.len().saturating_sub(limits.rows);
         for path in paths {
             // A partial scan keeps unvisited rows, but never ones whose file is gone (a deleted or
             // moved file, a removed worktree): those can only mislead later retrieval.
@@ -901,8 +992,11 @@ impl Codebase {
             }
         }
         tx.execute("INSERT INTO codebase_meta(key,value) VALUES('partial',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [stats.partial.to_string()])?;
+        // A complete scan starts the next one from the beginning; a partial one remembers where it stopped.
         if !stats.partial {
-            tx.execute("INSERT INTO codebase_meta(key,value) VALUES('outline_version','2') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [])?;
+            tx.execute("DELETE FROM codebase_meta WHERE key='scan_cursor'", [])?;
+        } else if let Some(path) = &last {
+            tx.execute("INSERT INTO codebase_meta(key,value) VALUES('scan_cursor',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [path])?;
         }
         tx.commit()?;
         Ok(stats)
@@ -1564,9 +1658,9 @@ impl Codebase {
                 }
             );
             tx.execute(
-                "INSERT INTO codebase_files(path,digest,outline) VALUES(?1,?2,?3)
-                ON CONFLICT(path) DO UPDATE SET digest=excluded.digest,outline=excluded.outline",
-                params![path, digest, outline(&self.root.join(path), text)],
+                "INSERT INTO codebase_files(path,digest,outline,outline_version) VALUES(?1,?2,?3,?4)
+                ON CONFLICT(path) DO UPDATE SET digest=excluded.digest,outline=excluded.outline,outline_version=excluded.outline_version",
+                params![path, digest, outline(&self.root.join(path), text), OUTLINE_VERSION],
             )?;
             reindexed.push(path.clone());
         }
@@ -1663,9 +1757,9 @@ impl Tool for CodebaseTool {
     fn schema(&self) -> Value {
         crate::runtime::schema::tool_schema(
             self.name(),
-            "Recall saved project understanding, refresh its source/symbol map, remember a reusable architectural finding, or forget a topic. Findings are agent observations, never verification proof; only unchanged supporting sources make them eligible for reuse across sessions. Cache operations do not edit project files. For remember, inspect the supporting sources first and save responsibility, relationships, entry points or check commands as facts, not instructions; cite workspace-relative source files (line suffixes are ignored) — sources you edited are re-indexed when saving, so no refresh is needed. expected_revision defaults to 0 for a new topic; recall before updating/forgetting.",
+            "Recall saved project understanding, refresh its source/symbol map, remember a reusable architectural finding, or forget a topic. Findings are agent observations, never verification proof; only unchanged supporting sources make them eligible for reuse across sessions. navigate returns an explicit task packet: owner files with freshness, symbols only for fresh owners, related lexical hints (identifier or import mentions, not verified consumers) and recorded check status (never check commands). Cache operations do not edit project files. For remember, inspect the supporting sources first and save responsibility, relationships, entry points or check commands as facts, not instructions; cite workspace-relative source files (line suffixes are ignored) — sources you edited are re-indexed when saving, so no refresh is needed. expected_revision defaults to 0 for a new topic; recall before updating/forgetting.",
             json!({
-                "action":{"type":"string","enum":["recall","architecture","impact","refresh","remember","forget","invalidate"]},
+                "action":{"type":"string","enum":["recall","architecture","impact","navigate","refresh","remember","forget","invalidate"]},
                 "section_ids":{"type":"array","items":{"type":"string"},"maxItems":64},
                 "reason":{"type":"string","maxLength":1000},
                 "query":{"type":"string","maxLength":4096},
@@ -1724,6 +1818,13 @@ impl Tool for CodebaseTool {
                         .collect::<Result<Vec<_>>>()?;
                     self.cache.impact_context(&paths, 6000)
                 }
+                "navigate" => self.cache.navigation_packet(
+                    args.get("query").and_then(Value::as_str).unwrap_or(""),
+                    args.get("max_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(ctx.config.codebase.context_max_bytes as u64)
+                        .try_into()?,
+                ),
                 "recall" => self.cache.context(
                     args.get("query").and_then(Value::as_str).unwrap_or(""),
                     args.get("max_bytes")

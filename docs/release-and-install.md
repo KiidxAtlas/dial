@@ -24,6 +24,35 @@
   use the transitive, hashed `scripts/requirements-ci.lock`. The Nix input is pinned to an immutable
   revision, but still needs a genuine resolver-generated `flake.lock` and native Nix acceptance.
 
+### Bundled execution runtime and installed-feature gate
+
+Release binaries embed a compressed, target-specific Node runtime alongside the existing
+embedded shell and utilities. The executable remains the installation/update unit: no sibling
+runtime directory needs to survive an installer or self-update. Default `eval.node` and
+`browser.node` (`node`), and the computer worker, prefer this payload. Explicit executable
+overrides remain operator-owned; Python, browser packages/Chromium and project toolchains are
+not bundled by this change. A bundled runtime is extracted into Dial's private cache and its
+length and SHA-256 are checked before reuse. Corruption is an error, not a PATH fallback.
+
+`runtimes/node/manifest.json` pins Node's version, target archive and SHA-256. Release builds
+run `scripts/prepare-node.py --target <triple> --output <directory>` and set
+`DIAL_BUNDLED_NODE_DIR` to that directory before Cargo runs. Archive bytes are verified before
+extracting only the executable and its license. Source builds without this input keep the
+existing host-Node/embedded-JavaScript fallback; builds do not download a runtime implicitly.
+To refresh the pin, review upstream checksum inputs and license, update every target together,
+then rerun payload tests and native installed-artifact checks. ARM64 musl uses the explicitly
+pinned Node unofficial-builds artifact; other targets use nodejs.org artifacts. Musl Node needs
+the system `libstdc++` and `libgcc` packages, which the Alpine release gate installs explicitly.
+
+The internal `dial __installed-smoke --require-bundled-node` probe verifies the runtime version,
+starts the real computer worker, exchanges ping/pong messages and requires a bounded close
+acknowledgement. It needs no model, network, desktop permissions or desktop input. Release
+artifact checks run it with an empty PATH, poisoned Node injection variables and fresh Dial
+state, then repeat against the same cache. Musl probes run in Alpine, not against a glibc host.
+Passing this gate proves worker loading and transport, not actual desktop capture/input,
+browser downloads or live-provider behavior. Native-platform execution is still required;
+cross-compilation and workflow definitions alone do not establish a successful release.
+
 ### Known platform limits
 
 Portable Unix process-group signalling remains best-effort against PID reuse. General storage
@@ -57,11 +86,16 @@ cannot establish the current hosted settings. See [Release signing inputs](#rele
 
 ## Install a release
 
-The supported release installer is the asset `install.sh` on macOS and Linux:
+The supported release installer is the asset `install.sh` on macOS and Linux. `dial.rootatlas.dev/install`
+sends terminal clients (curl, wget) straight to the latest release's asset, so the short command and the
+GitHub URL run the same script:
 
 ```sh
-curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | bash
+curl -fsSL https://dial.rootatlas.dev/install | sh
+# same script: curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | sh
 ```
+
+`install.sh` is POSIX `sh` (dash, busybox ash, bash and zsh all run it); bash is not required.
 
 Published targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`. The Windows archives are `dial-<tag>-<target>.zip` containing `dial.exe`; install with the release's `install.ps1` in Windows PowerShell 5.1 or PowerShell 7 (one-line commands in [windows.md](windows.md)).
 
@@ -71,16 +105,18 @@ only when `ldd` is unavailable.
 
 The published installers (`install.sh` and `install.ps1`) embed the release's Ed25519 public key,
 select the host target, and check the archive digest against `SHA256SUMS` before extraction.
-Both verify the signed manifest. `install.sh` tries OpenSSL 3 (on `PATH`, Homebrew's `openssl@3`,
-or `DIAL_OPENSSL`), Python with `cryptography` (`DIAL_PYTHON`), then OpenSSH `ssh-keygen`
-(`DIAL_SSH_KEYGEN`). If none is available, it refuses installation unless
+Both verify the signed manifest. `install.sh` tries OpenSSH `ssh-keygen` 8.1+ first
+(`DIAL_SSH_KEYGEN`; it ships with macOS and most Linux distributions, so usually nothing extra is
+needed), then OpenSSL 3 (on `PATH`, Homebrew's `openssl@3`, or `DIAL_OPENSSL`), then Python with
+`cryptography` (`DIAL_PYTHON`). OpenSSL and Python also cover older releases published without
+`SHA256SUMS.sshsig`. If none can verify, it refuses installation unless
 `DIAL_ALLOW_UNSIGNED_INSTALL=1` explicitly opts into checksum-only verification.
 `install.sh` installs into `~/.local/bin` (override with `DIAL_INSTALL_DIR`), validates the binary
 version before and after activation, and restores the previous executable if activation fails.
 When the directory is not on `PATH`, it appends one `export PATH=…` line (`fish_add_path` for fish)
 to the login shell's profile (`~/.zshrc`, `~/.bash_profile` on macOS bash, `~/.bashrc` on Linux bash,
 otherwise `~/.profile`), once; `DIAL_NO_MODIFY_PATH=1` prints the line instead. For a pinned
-version, download `install.sh` and pass a tag such as `v0.2.2` to it. Release archives include
+version, pass a tag such as `v0.2.2`: `curl -fsSL https://dial.rootatlas.dev/install | sh -s -- v0.2.2`. Release archives include
 `LICENSE`, `THIRD_PARTY_NOTICES`, and the Silver/Unscii font notices.
 
 `dial update` (or `/update` inside the interactive terminal, followed by `/restart`) updates Dial the way it was installed. For installer copies it checks the GitHub latest release (or `dial update --version 0.1.1`, `/update 0.1.1`). If you already run that release it says so and stops; an explicit `--version` always installs, so it can also reinstall or downgrade. It verifies the same signed manifest and asset digest, stages the candidate on the install filesystem, and checks its `--version`. On Unix it holds a lock file (`.dial-update.lock`) in the install directory so concurrent updates cannot interleave, preserves a digest-verified copy of the current binary as the rollback point, renames the candidate over the active name (never removing that name first, so an interruption leaves a complete old or new executable), fsyncs the directory, and re-checks `--version`. If the post-install check fails, the rollback copy is renamed back; if that also fails, the error reports both failures and the rollback copy is kept at `<name>.dial.bak` for manual recovery. Windows uses a deferred PowerShell swap after the running process exits, with its own rollback.
@@ -283,15 +319,15 @@ and the release's `SHA256SUMS` and `SHA256SUMS.sig` files from
 For the terminal installer:
 
 ```sh
-curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | bash
+curl -fsSL https://dial.rootatlas.dev/install | sh
 dial
 ```
 
 When GitHub CLI is installed and signed in, the installer downloads through it; otherwise it uses
 plain HTTPS. Complete the platform prerequisites below before installing.
 
-The installer verifies the Ed25519 signature on `SHA256SUMS` against the embedded release public key, using OpenSSL 3, Python `cryptography`, or OpenSSH, then verifies the archive's SHA-256. It refuses to proceed without verification unless `DIAL_ALLOW_UNSIGNED_INSTALL=1` explicitly requests checksum-only installation. `install.ps1` verifies the signed manifest with its embedded key too.
-Run `bash install.sh v0.1.1` to select a specific release. On Windows, run the release's `install.ps1` in PowerShell for the native `dial.exe` (commands in [windows.md](windows.md)), or run the Linux commands in your WSL2 Ubuntu terminal; the PowerShell command in the WSL2 section below installs WSL2 first.
+The installer verifies the Ed25519 signature on `SHA256SUMS` against the embedded release public key, using OpenSSH `ssh-keygen`, OpenSSL 3, or Python `cryptography`, then verifies the archive's SHA-256. It refuses to proceed without verification unless `DIAL_ALLOW_UNSIGNED_INSTALL=1` explicitly requests checksum-only installation. `install.ps1` verifies the signed manifest with its embedded key too.
+Run `sh install.sh v0.1.1` (or `… | sh -s -- v0.1.1`) to select a specific release. On Windows, run the release's `install.ps1` in PowerShell for the native `dial.exe` (commands in [windows.md](windows.md)), or run the Linux commands in your WSL2 Ubuntu terminal; the PowerShell command in the WSL2 section below installs WSL2 first.
 
 ### macOS (Apple Silicon or Intel)
 
@@ -409,6 +445,12 @@ process/API fixtures; `make test` still runs the full Rust suite. Tests use the
 usual dev profile, so these commands share its build cache. `make build` uses the
 optimized `local` profile; its first build creates a separate cache in
 `target/local`, with subsequent edits benefiting from incremental compilation.
+
+The Rust test targets build a matching `dial` executable and set `DIAL_EMBEDDED_SHELL_HOST`
+for the test process, because the default embedded shell re-executes Dial, not the Rust test
+harness. Keep that override when invoking Cargo tests directly; use a freshly built host with
+the same features. The native macOS/Windows contract runner prepares the host in the same way.
+This does not install or replace your running Dial binary.
 
 ### Faster builds and optional integrations
 

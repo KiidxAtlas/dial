@@ -72,3 +72,24 @@ fn concurrent_group_and_ordinary_spawns_do_not_share_stdio_pipes() {
         );
     }
 }
+
+/// `signal_group` signals the group `spawn_group` created as a whole: its leader `sh` ends on the
+/// signal (the background `sleep` shares the group and receives it too). Group 0 would name the
+/// caller's own group, so it is refused.
+#[cfg(unix)]
+#[test]
+fn signal_group_terminates_every_member_of_the_group() {
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "sleep 30 & wait"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut leader = spawn_group(&mut command).unwrap();
+    let group = leader.id();
+    signal_group(group, libc::SIGTERM).unwrap();
+    let status = leader.wait().unwrap();
+    assert_eq!(exit_signal(&status), Some(libc::SIGTERM));
+    let refused = signal_group(0, libc::SIGTERM).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+}

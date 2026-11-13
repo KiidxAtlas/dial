@@ -84,6 +84,26 @@ fn tool_startup_edits_draft_until_an_action_is_held() {
 }
 
 #[test]
+fn a_held_paste_line_break_stays_in_the_draft_while_more_held_input_follows() {
+    // Keys queued while tools connected are replayed one by one; the pump queue is empty then, so
+    // the rest of the paste is only visible in `held`. Its Enter must not submit the first line.
+    let (_home, _project, _app, mut shell) = shell();
+    shell.composer.set_draft("first line");
+    shell
+        .held
+        .extend([key(KeyCode::Char('s')), key(KeyCode::Char('e'))]);
+    let event = shell.composer_key(crossterm::event::KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    ));
+    assert!(
+        matches!(event, ComposerEvent::None),
+        "a pasted line break submitted the draft"
+    );
+    assert_eq!(shell.composer.draft(), "first line\n");
+}
+
+#[test]
 fn a_windows_editor_path_with_spaces_is_quoted_but_a_command_line_is_not() {
     assert_eq!(
         editor_invocation(r"C:\Program Files\Notepad++\notepad++.exe", true),

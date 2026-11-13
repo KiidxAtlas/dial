@@ -71,6 +71,115 @@ fn activity_tabs_cycle_in_both_directions_and_preserve_inner_tabs() {
 }
 
 #[test]
+fn arrow_keys_cycle_activity_tabs_without_leaving_for_the_models_panel() {
+    let keys = Keymap::defaults();
+    let mut tab = ActivityTab::Workers;
+    // Every Right press stays on an Activity tab and returns to Workers after a full lap.
+    for _ in 0..ActivityTab::ALL.len() {
+        let mut panel = ActivityOverlay::new(
+            tab,
+            ActiveOverlay::Palette(PaletteOverlay::choice(queue_choices(&[]))),
+        );
+        let event = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let OverlayEvent::Action(action) = panel.handle(&event, &keys) else {
+            panic!("Right must switch the Activity tab");
+        };
+        let next = action
+            .strip_prefix("open:activity:")
+            .and_then(ActivityTab::parse)
+            .expect("an activity tab");
+        assert_ne!(next, ActivityTab::Downloads);
+        assert!(!matches!(
+            crate::app::overlay::overlay_destination(&action),
+            Some(Which::ModelDownloads | Which::Models)
+        ));
+        tab = next;
+    }
+    assert_eq!(tab, ActivityTab::Workers);
+}
+
+#[test]
+fn title_row_is_one_surface_row_with_the_active_tab_styled_at_every_width() {
+    let theme = crate::ui::theme::Theme::dark();
+    let keys = Keymap::defaults();
+    for width in [12, 30, 60, 80, 120, 200] {
+        let line = title_row(&theme, &keys, ActivityTab::Workers, width);
+        let plain: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(crate::ui::text::width(&plain), width, "{width}: {plain:?}");
+        assert!(!plain.contains('['), "{width}: no bracket tabs: {plain:?}");
+        let active = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Workers"))
+            .unwrap_or_else(|| panic!("{width}: active tab named: {plain:?}"));
+        assert_eq!(
+            active.style.fg,
+            crate::ui::chrome::tab_style(&theme, true).fg,
+            "{width}"
+        );
+        if width >= 120 {
+            assert!(
+                plain.contains("Processes") && plain.contains("tabs"),
+                "{plain:?}"
+            );
+            assert!(!plain.contains("Downloads"), "{plain:?}");
+        }
+    }
+}
+
+#[test]
+fn activity_over_the_worker_hub_draws_one_styled_title_row() {
+    let theme = crate::ui::theme::Theme::dark();
+    let keys = Keymap::defaults();
+    let status = crate::ui::status::StatusData::default();
+    let ctx = DrawCtx {
+        theme: &theme,
+        keys: &keys,
+        status: &status,
+        preview_status: &|_, _| Line::default(),
+    };
+    let mut panel = ActivityOverlay::new(
+        ActivityTab::Workers,
+        ActiveOverlay::Subagents(Box::new(crate::ui::subagent_hub::SubagentHub::new(
+            "session".into(),
+        ))),
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+    terminal.draw(|frame| panel.draw(frame, &ctx)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        })
+        .collect();
+    if std::env::var_os("DIAL_PRINT_ACTIVITY").is_some() {
+        eprintln!("{}", rows.join("\n"));
+    }
+    assert!(
+        rows[0].starts_with(" Activity   Attention  Workers"),
+        "{rows:#?}"
+    );
+    assert!(rows[0].trim_end().ends_with("tabs"), "{rows:#?}");
+    assert!(
+        !rows.iter().any(|row| row.contains("[workers]")),
+        "{rows:#?}"
+    );
+    // The active tab carries the shared tab style; inactive tabs stay muted.
+    let active_x = rows[0].find("Workers").unwrap() as u16;
+    assert!(
+        buffer[(active_x, 0)]
+            .modifier
+            .contains(ratatui::style::Modifier::UNDERLINED)
+    );
+}
+
+#[test]
 fn queued_message_picker_reuses_edit_and_remove_commands() {
     let keys = Keymap::defaults();
     for (code, expected) in [

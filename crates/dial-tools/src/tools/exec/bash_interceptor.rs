@@ -1,8 +1,9 @@
 //! Bash intent interceptor: points shell commands that duplicate a dedicated tool at that tool.
 //!
-//! In the default `hint` mode the command runs and its result gains one line naming the tool;
-//! only a command that is nothing but the duplicate (optionally trimmed by `head`/`tail`) is
-//! hinted, so batched compound commands, which save model round trips, pass untouched. `block`
+//! In the default `hint` mode the command runs and its result gains one line naming the tool.
+//! A command that is nothing but the duplicate (optionally trimmed by `head`/`tail`) gets a hint
+//! naming that tool; a compound command whose every segment is a lookup that `read`/`grep`/`glob`
+//! covers gets one line suggesting parallel calls instead. Mixed batches pass untouched. `block`
 //! mode refuses any command with a matching segment instead. [`ci_poll_hint`] separately steers
 //! repeated `gh run` status checks toward one blocking wait.
 //!
@@ -47,7 +48,8 @@ pub fn exit_masking_hint(command: &str) -> Option<&'static str> {
 /// `block` checks the trimmed command, each flat segment not fed by a pipe, and that segment
 /// without leading `NAME=value` assignments. `hint` checks only a command that is a single
 /// duplicate: one segment, optionally after a leading `cd DIR` and before `| head`/`| tail`
-/// stages. Rules run in order; the first match wins.
+/// stages; or a batch of two or more lookups that `read`/`grep`/`glob` all cover (see
+/// [`check_in`]). Rules run in order; the first match wins.
 pub fn check(
     config: &BashInterceptorConfig,
     available_tools: &[&str],
@@ -71,13 +73,6 @@ pub fn check_in(
     if !config.enabled {
         return None;
     }
-    let candidates = match config.mode {
-        InterceptMode::Block => interception_candidates(command),
-        InterceptMode::Hint => hint_candidates(command),
-    };
-    if candidates.is_empty() {
-        return None;
-    }
     let custom: Vec<Compiled>;
     let rules: &[Compiled] = match &config.patterns {
         None => DEFAULT_COMPILED.as_slice(),
@@ -86,6 +81,20 @@ pub fn check_in(
             &custom
         }
     };
+    if config.mode == InterceptMode::Hint && lookup_batch(rules, available_tools, command) {
+        // Same refusal as a single duplicate: the workspace tools would refuse the path.
+        if absolute_operands(command).any(|path| !in_workspace(path)) {
+            return None;
+        }
+        return Some(Verdict::Hint(LOOKUP_BATCH_HINT.to_owned()));
+    }
+    let candidates = match config.mode {
+        InterceptMode::Block => interception_candidates(command),
+        InterceptMode::Hint => hint_candidates(command),
+    };
+    if candidates.is_empty() {
+        return None;
+    }
     for compiled in rules {
         if !available_tools.contains(&compiled.tool.as_str()) {
             continue;
@@ -109,6 +118,48 @@ pub fn check_in(
         }
     }
     None
+}
+
+/// The hint for a batch of lookups; `read` takes several paths and parallel calls cover the rest.
+const LOOKUP_BATCH_HINT: &str = "[hint] Every command here is a lookup that `read`/`grep`/`glob` cover; send them as parallel tool calls in one response (`read` takes `paths` for several files).";
+
+/// Hint-mode batch: a compound command of two or more lookups, each covered by a workspace file
+/// tool that is offered. A leading `cd DIR` and bare `echo`/`printf` separator lines do not
+/// count. Any piped stage, writing segment or uncovered segment makes the batch mixed: no hint.
+fn lookup_batch(rules: &[Compiled], available_tools: &[&str], command: &str) -> bool {
+    let mut segments = extract_flat_shell_command_segments(command);
+    if segments.len() > 1 && !segments[1].piped_stdin && is_cd(&segments[0].text) {
+        segments.remove(0);
+    }
+    segments.retain(|segment| !is_printing_line(&segment.text));
+    segments.len() > 1
+        && segments.iter().all(|segment| {
+            !segment.piped_stdin && is_covered_lookup(rules, available_tools, &segment.text)
+        })
+}
+
+/// `echo`/`printf` of literal text with no redirection or expansion: it runs nothing.
+fn is_printing_line(segment: &str) -> bool {
+    matches!(segment.split_whitespace().next(), Some("echo" | "printf"))
+        && !segment.contains(['>', '<', '$', '`'])
+}
+
+/// Whether the first offered rule matching `segment` names a workspace file tool, and the
+/// segment does not write (`>`, ignoring `2>&1`).
+fn is_covered_lookup(rules: &[Compiled], available_tools: &[&str], segment: &str) -> bool {
+    if segment.replace(" 2>&1", "").contains('>') {
+        return false;
+    }
+    let stripped = without_leading_environment_assignments(segment);
+    std::iter::once(segment)
+        .chain(stripped.as_deref())
+        .any(|candidate| {
+            rules
+                .iter()
+                .filter(|rule| available_tools.contains(&rule.tool.as_str()))
+                .find(|rule| rule.matches(candidate))
+                .is_some_and(|rule| WORKSPACE_FILE_TOOLS.contains(&rule.tool.as_str()))
+        })
 }
 
 /// Words of `command` that are absolute paths, with surrounding quotes removed.

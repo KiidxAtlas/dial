@@ -452,6 +452,28 @@ fn verify_history_before_repro_preserves_saved_calls_and_callback_catalogs() {
     }
 }
 
+#[test]
+fn verify_plan_is_additive_without_reinterpreting_recorded_calls() {
+    let registry = Registry::new();
+    let before = verify_schema_with_repro();
+    let old = identities(std::slice::from_ref(&before), &registry)["verify"].clone();
+    let history = vec![
+        json!({"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"verify","arguments":"{\"targets\":[\"failed\"]}"}}],"dial_tool_contracts":{"c1":old}}),
+        json!({"role":"tool","tool_call_id":"c1","content":"recorded result"}),
+    ];
+    let original = history.clone();
+    let mut current = before;
+    current["function"]["parameters"]["properties"]["plan"] = json!({"type":"boolean"});
+    assert!(
+        project_history(&history, std::slice::from_ref(&current), &registry)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(history, original);
+    current["function"]["parameters"]["properties"]["targets"]["items"]["type"] = json!("number");
+    assert!(validate_history(&history, &[current], &registry).is_err());
+}
+
 fn task_schema(actions: &[&str], pool_fields: bool) -> Value {
     let mut properties = json!({
         "action": {"type": "string", "enum": actions},
@@ -1771,4 +1793,33 @@ fn write_artifact_batch_contract_accepts_the_exact_legacy_required_shape() {
     let identity = identities(&[old], &registry)["write"].clone();
     let history = vec![json!({"role":"assistant","dial_tool_contracts":{"call":identity}})];
     assert!(validate_history(&history, &[current], &registry).is_err());
+}
+
+#[test]
+fn codebase_navigate_action_resumes_pre_navigate_memory_contracts() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let layout =
+        crate::config::paths::Layout::with_user_dir(project.path(), home.path().join("dial"))
+            .unwrap();
+    let cache =
+        std::sync::Arc::new(crate::tools::knowledge::codebase::Codebase::open(&layout).unwrap());
+    let tool = crate::tools::knowledge::codebase::tool(cache, "session".into());
+    let current = tool.schema();
+    let mut before = current.clone();
+    let actions = before["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array_mut()
+        .unwrap();
+    let count = actions.len();
+    actions.retain(|value| value != "navigate");
+    assert_eq!(actions.len() + 1, count);
+    let mut registry = Registry::new();
+    registry.register(tool);
+    let identity = identities(&[before], &registry)["codebase_memory"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"call":identity}})];
+    assert!(
+        project_history(&history, &[current], &registry)
+            .unwrap()
+            .is_none()
+    );
 }

@@ -64,7 +64,7 @@ fn sign_in(
     cancel: &Arc<AtomicBool>,
     bases_for: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<Credentials> {
-    let input = ui.prompt(
+    let input = ui.prompt_secret(
         "Paste your Xiaomi API key (sk-... or token-plan tp-...)",
         Some("sk-... or tp-..."),
         false,

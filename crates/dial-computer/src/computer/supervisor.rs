@@ -558,7 +558,15 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> Comput
     // A Node install that cannot load (a broken or wrong-architecture node.exe or DLL) would
     // otherwise stop at a Windows popup; this turns it into an exit status reported below.
     crate::platform::process::quiet_error_dialogs();
-    let mut command = Command::new("node");
+    let node = dial_tools::setup::deps::bundled_node::resolve(cwd, "node", "computer.node")
+        .map_err(|reason| {
+            if reason.starts_with("cannot find computer.node") {
+                ComputerError::tool(format!("{reason}. {NODE_HINT}"))
+            } else {
+                ComputerError::tool(reason)
+            }
+        })?;
+    let mut command = Command::new(&node);
     command
         .arg(&*script)
         .env_clear()
@@ -656,12 +664,23 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> Comput
 
 const NODE_HINT: &str = "Computer use runs on Node.js: check that `node --version` works in a new terminal, and if it does not, install the current Node.js LTS for this computer's CPU from https://nodejs.org, then restart Dial.";
 
+fn node_hint() -> &'static str {
+    if dial_tools::setup::deps::bundled_node::available() {
+        "Computer use uses the Node.js runtime bundled with Dial; repair or reinstall Dial if the bundled runtime cannot start. Installing another Node on PATH does not replace this runtime."
+    } else {
+        NODE_HINT
+    }
+}
+
 /// Why `node` could not be launched at all.
 fn launch_failure(error: &std::io::Error) -> String {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        format!("Failed to start computer worker: `node` was not found on PATH. {NODE_HINT}")
+    let hint = node_hint();
+    if error.kind() == std::io::ErrorKind::NotFound
+        && !dial_tools::setup::deps::bundled_node::available()
+    {
+        format!("Failed to start computer worker: `node` was not found on PATH. {hint}")
     } else {
-        format!("Failed to start computer worker: {error}. {NODE_HINT}")
+        format!("Failed to start computer worker: {error}. {hint}")
     }
 }
 
@@ -685,8 +704,9 @@ fn start_failure(code: Option<i32>, stderr: &str) -> String {
         }
     });
     let mut message = format!(
-        "{WORKER_EXITED} before ready{}. {NODE_HINT}",
-        status.unwrap_or_default()
+        "{WORKER_EXITED} before ready{}. {}",
+        status.unwrap_or_default(),
+        node_hint()
     );
     if !stderr.is_empty() {
         message.push_str(" Worker output: ");
@@ -840,6 +860,7 @@ fn handle_message(inner: &Arc<Inner>, generation: u64, message: Value) {
             };
             resolve_pending(inner, generation, &message, result);
         }
+        Some("pong") => resolve_pending(inner, generation, &message, Ok(Value::Null)),
         Some("result") => resolve_run(inner, &message, ok),
         Some("tool-call") => spawn_tool_call(inner, generation, &message),
         Some("control-request") => spawn_control_request(inner, generation, &message),
@@ -1324,6 +1345,70 @@ fn terminate_inner(inner: &Arc<Inner>, error: ComputerError, only_gen: Option<u6
 
 fn kill_child(child: Child) {
     drop(crate::runtime::process::ProcessGroup::new(child));
+}
+
+const SMOKE_PING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Installed-feature probe for the real worker transport: start it, round-trip `ping`/`pong`,
+/// and require its `closed` acknowledgement. It never builds a DesktopSession or sends native
+/// work, so it needs no display or desktop permissions. The worker is reaped on every path.
+pub fn smoke_test(cwd: &Path) -> ComputerResult<()> {
+    let supervisor = ComputerSupervisor::new();
+    let signal = AbortSignal::new();
+    let inner = &supervisor.inner;
+    let result = ensure_worker(inner, cwd, &signal)
+        .and_then(|()| ping_worker(inner, SMOKE_PING_TIMEOUT))
+        .and_then(|()| close_worker_strictly(inner));
+    let worker = {
+        let mut st = inner.state.lock();
+        st.status = Status::Closed;
+        st.worker.take()
+    };
+    if let Some(worker) = worker {
+        worker.stop();
+    }
+    result
+}
+
+/// Sends one `ping` and waits for its matching `pong`. A timeout terminates the worker.
+fn ping_worker(inner: &Arc<Inner>, timeout: Duration) -> ComputerResult<()> {
+    let (id, rx) = register_pending(inner)?;
+    let deadline = Instant::now() + timeout;
+    if let Err(error) = send_guarded(inner, &json!({"type": "ping", "id": id}), deadline, None) {
+        forget_pending(inner, id);
+        return Err(error);
+    }
+    await_reply(
+        inner,
+        Some(id),
+        rx,
+        deadline,
+        None,
+        "Timed out waiting for computer worker ping",
+    )
+    .map(|_| ())
+}
+
+/// Unlike ordinary `close`, which tolerates a failed or lost handshake, the probe requires the
+/// worker's `closed` acknowledgement before it reports success.
+fn close_worker_strictly(inner: &Arc<Inner>) -> ComputerResult<()> {
+    let (closed_tx, closed_rx) = flume::bounded(1);
+    {
+        let mut st = inner.state.lock();
+        let worker = st.worker.as_mut().ok_or_else(not_running)?;
+        worker.closed = Some(closed_tx);
+    }
+    let deadline = Instant::now() + CLOSE_TIMEOUT;
+    send_guarded(inner, &json!({"type": "close"}), deadline, None)?;
+    await_reply(
+        inner,
+        None,
+        closed_rx,
+        deadline,
+        None,
+        "Timed out closing computer worker",
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]

@@ -1437,8 +1437,8 @@ enum Runner {
     InProcess,
 }
 
-/// Maps `shell.backend` to a runner. `auto` prefers bash, then the built-in shell, then PowerShell
-/// on Windows when the built-in shell is not in this build.
+/// Maps `shell.backend` to a runner. `auto` uses the built-in shell on every OS when compiled in;
+/// slim builds fall back to system bash, then PowerShell on Windows.
 fn resolve_runner(
     backend: ShellBackend,
     system_bash: Option<PathBuf>,
@@ -1446,9 +1446,9 @@ fn resolve_runner(
     windows: bool,
 ) -> Result<Runner, String> {
     match backend {
+        ShellBackend::Auto if embedded_built => Ok(Runner::Embedded),
         ShellBackend::Auto => match system_bash {
             Some(bash) => Ok(Runner::Bash(bash)),
-            None if embedded_built => Ok(Runner::Embedded),
             None if windows => Ok(Runner::PowerShell),
             None => Err("no bash was found and the built-in shell is not in this build".into()),
         },
@@ -1689,6 +1689,14 @@ pub(in crate::tools) fn shell_command_mode(
     owned_terminal: Option<i32>,
 ) -> Result<std::process::Command, String> {
     shell_command_with_state(ws, script, cwd, owned_terminal, None, false)
+}
+
+/// Command that runs `script` in `ws`'s root through the workspace's configured shell backend (the
+/// embedded engine by default) and sandbox. It serves callers outside a tool turn, such as learning
+/// verifiers and autoresearch benchmarks. The caller owns stdio, capture and the exit-status verdict;
+/// an `Err` means the command could not be built, not that the script failed.
+pub fn verifier_command(ws: &Workspace, script: &str) -> Result<std::process::Command, String> {
+    shell_command_mode(ws, script, ws.root(), None)
 }
 fn shell_command_with_state(
     ws: &Workspace,

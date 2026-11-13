@@ -10,7 +10,6 @@ anyhow.workspace = true
 ast-grep-core.workspace = true
 ast-grep-language.workspace = true
 ignore.workspace = true
-libc.workspace = true
 parking_lot.workspace = true
 regex.workspace = true
 rustls.workspace = true
@@ -19,11 +18,13 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows.workspace = true
 windows-sys.workspace = true
 
 [features]

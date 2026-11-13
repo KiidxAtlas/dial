@@ -117,10 +117,19 @@ jobs:
           key: release-${{ matrix.target }}${{ matrix.cache-suffix }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Prepare pinned Node payload
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          payload="$GITHUB_WORKSPACE/target/node-payload/$RELEASE_TARGET"
+          rm -rf "$payload"
+          python3 scripts/prepare-node.py --target "$RELEASE_TARGET" --output "$payload"
       - name: Build release binary
         env:
           MACOSX_DEPLOYMENT_TARGET: '13.0'
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+          DIAL_BUNDLED_NODE_DIR: ${{ github.workspace }}/target/node-payload/${{ matrix.target }}
         run: cargo build --release --locked -p dial --target "${{ matrix.target }}"
       - name: Package and smoke-test outside the checkout
         env:
@@ -131,14 +140,43 @@ jobs:
           mkdir -p "dist/$package"
           install -m 755 "target/$RELEASE_TARGET/release/dial" "dist/$package/dial"
           cp LICENSE README.md THIRD_PARTY_NOTICES crates/dial-agent/src/agent/compact/snapcompact/fonts/Silver.LICENSE crates/dial-agent/src/agent/compact/snapcompact/fonts/Unscii.LICENSE "dist/$package/"
+          cp "target/node-payload/$RELEASE_TARGET/LICENSE.node" "dist/$package/"
           tar -czf "dist/$package.tar.gz" -C dist "$package"
           smoke="$(mktemp -d "${RUNNER_TEMP:-$PWD/dist}/dial-smoke.XXXXXX")"
           trap 'rm -rf "$smoke"' EXIT
           tar -xzf "dist/$package.tar.gz" -C "$smoke"
-          python3 scripts/check-artifact.py --dial "$smoke/$package/dial" --target "$RELEASE_TARGET"
+          if [[ "$RELEASE_TARGET" == *-musl ]]; then
+            # The musl Node payload cannot run on this glibc runner; the Alpine step below proves it.
+            python3 scripts/check-artifact.py --dial "$smoke/$package/dial" --target "$RELEASE_TARGET"
+          else
+            python3 scripts/check-artifact.py --dial "$smoke/$package/dial" --target "$RELEASE_TARGET" --require-bundled-node
+          fi
           cd "$smoke/$package"
           ./dial --version | awk 'NR==1 {print $1, $2}' | grep -Fx "dial ${RELEASE_TAG#v}"
           ./dial --help
+      - name: Verify bundled runtime on native Alpine (musl)
+        if: runner.os == 'Linux' && contains(matrix.target, '-musl')
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          package="dial-${RELEASE_TAG}-${RELEASE_TARGET}"
+          extract="$(mktemp -d "${RUNNER_TEMP:-$PWD/dist}/dial-alpine.XXXXXX")"
+          trap 'rm -rf "$extract"' EXIT
+          tar -xzf "dist/$package.tar.gz" -C "$extract"
+          # Runs on the runner's own CPU architecture. Only the disclosed system libraries below are
+          # added; the checker itself strips PATH and Node variables for the bundled probe.
+          docker run --rm \
+            -e RELEASE_TARGET \
+            -v "$extract/$package:/artifact:ro" \
+            -v "$GITHUB_WORKSPACE/scripts:/checks/scripts:ro" \
+            -v "$GITHUB_WORKSPACE/runtimes:/checks/runtimes:ro" \
+            alpine:3.22 sh -c '
+              set -eu
+              apk add --no-cache python3 libstdc++ libgcc
+              echo "Disclosed system libraries for the bundled musl Node: libstdc++ libgcc"
+              python3 /checks/scripts/check-artifact.py --dial /artifact/dial --target "$RELEASE_TARGET" --require-bundled-node
+            '
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets-${{ matrix.target }}
@@ -166,6 +204,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
       - name: Install pinned Rust
         run: |
           rustup show active-toolchain
@@ -175,9 +216,21 @@ jobs:
           key: release-${{ matrix.target }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Prepare pinned Node payload
+        shell: pwsh
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          $payload = Join-Path $env:GITHUB_WORKSPACE "target/node-payload/$env:RELEASE_TARGET"
+          Remove-Item -LiteralPath $payload -Recurse -Force -ErrorAction SilentlyContinue
+          python scripts/prepare-node.py --target $env:RELEASE_TARGET --output $payload
+          if ($LASTEXITCODE -ne 0) { throw 'Node payload preparation failed' }
       - name: Build release binary
         env:
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+          DIAL_BUNDLED_NODE_DIR: ${{ github.workspace }}/target/node-payload/${{ matrix.target }}
+          # Ship the C runtime inside dial.exe: users should not need the VC++ redist.
+          RUSTFLAGS: '-C target-feature=+crt-static'
         run: cargo build --release --locked -p dial --target "${{ matrix.target }}"
       - name: Package and smoke-test outside the checkout
         shell: pwsh
@@ -189,19 +242,27 @@ jobs:
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item "target/$env:RELEASE_TARGET/release/dial.exe" "$dir/dial.exe"
           Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES, crates/dial-agent/src/agent/compact/snapcompact/fonts/Silver.LICENSE, crates/dial-agent/src/agent/compact/snapcompact/fonts/Unscii.LICENSE $dir
+          Copy-Item "target/node-payload/$env:RELEASE_TARGET/LICENSE.node" $dir
           Compress-Archive -Path $dir -DestinationPath "dist/$package.zip"
           $expected = "$env:RELEASE_TAG".Substring(1)
           # Capture all output first: piping into `Select-Object -First 1` stops the native
           # command early and leaves $LASTEXITCODE unset, which failed this check.
-          $output = & "dist/$package/dial.exe" --version
-          $code = $LASTEXITCODE
-          $version = @($output)[0]
-          if ($code -ne 0 -or $version -notmatch ("^dial " + [regex]::Escape($expected) + "( |$)")) { throw "Packaged version check failed (exit $code): $version" }
-          & "dist/$package/dial.exe" --help
-          if ($LASTEXITCODE -ne 0) { throw "Packaged help check failed" }
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: '3.12'
+          $smoke = Join-Path $env:RUNNER_TEMP ('dial-smoke-' + [Guid]::NewGuid().ToString('N'))
+          try {
+            Expand-Archive -LiteralPath "dist/$package.zip" -DestinationPath $smoke
+            Push-Location (Join-Path $smoke $package)
+            try {
+              $output = & ./dial.exe --version
+              $code = $LASTEXITCODE
+              $version = @($output)[0]
+              if ($code -ne 0 -or $version -notmatch ("^dial " + [regex]::Escape($expected) + "( |$)")) { throw "Packaged version check failed (exit $code): $version" }
+              & ./dial.exe --help
+              if ($LASTEXITCODE -ne 0) { throw 'Packaged help check failed' }
+              $checker = Join-Path $env:GITHUB_WORKSPACE 'scripts/check-artifact.py'
+              & python $checker --dial (Join-Path (Get-Location) 'dial.exe') --target $env:RELEASE_TARGET --require-bundled-node
+              if ($LASTEXITCODE -ne 0) { throw 'Installed checks with the bundled Node runtime failed' }
+            } finally { Pop-Location }
+          } finally { Remove-Item -LiteralPath $smoke -Recurse -Force }
       - name: Verify packaged binary format
         shell: pwsh
         env:

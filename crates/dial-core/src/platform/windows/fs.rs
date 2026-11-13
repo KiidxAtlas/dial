@@ -13,7 +13,7 @@ use std::{
 use windows_sys::{
     Wdk::{Foundation::OBJECT_ATTRIBUTES, Storage::FileSystem::NtCreateFile},
     Win32::{
-        Foundation::{HANDLE, LocalFree, UNICODE_STRING},
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE, LocalFree, UNICODE_STRING},
         Security::{Authorization::*, *},
         Storage::FileSystem::*,
         System::{
@@ -972,7 +972,29 @@ pub(in crate::platform) fn set_owner_only_file(file: &File) -> io::Result<()> {
             "owner-only handle must be a file or directory",
         ));
     }
-    install_private_acl(file)
+    match install_private_acl(file) {
+        // Callers often check a file through a read-only handle, which cannot change its DACL.
+        // Reopen the same object (not its path, which could have been swapped) with WRITE_DAC.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // SAFETY: file keeps its handle live for the call; the share mode admits the handle
+            // the caller already holds, and the result is checked before it is owned.
+            let handle = unsafe {
+                ReOpenFile(
+                    file.as_raw_handle() as HANDLE,
+                    READ_CONTROL | WRITE_DAC,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(error);
+            }
+            // SAFETY: ReOpenFile returned a new handle that nothing else owns.
+            let control = unsafe { File::from_raw_handle(handle as _) };
+            install_private_acl(&control)
+        }
+        result => result,
+    }
 }
 pub(in crate::platform) fn set_owner_only(path: &Path) -> io::Result<()> {
     let file = OpenOptions::new()

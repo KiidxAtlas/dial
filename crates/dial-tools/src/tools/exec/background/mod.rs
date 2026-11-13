@@ -125,6 +125,19 @@ const MAX_MATCH_LINE: usize = 300;
 const MAX_LISTED_COMMAND: usize = 80;
 const DEFAULT_WAIT_SECS: u64 = 5;
 const MAX_WAIT_SECS: u64 = 300;
+
+/// The next step after a wait that used the whole bounded cap and the job still runs. Long jobs
+/// (CI watchers, benchmarks) were re-waited at the 300s cap up to 17 times in a row, one model
+/// request each; one unlimited wait costs a single request and stays interruptible.
+fn capped_wait_hint(name: &str, secs: u64, startup: bool, condition: bool) -> Option<String> {
+    (!startup && secs >= MAX_WAIT_SECS).then(|| {
+        format!(
+            "[hint] {name} outlasted the longest bounded wait. To keep waiting, call wait once with `timeout: 0`: it returns when {name} {} (a new user message or an interrupt still stops the wait), instead of repeating bounded waits.",
+            if condition { "is ready or exits" } else { "exits" }
+        )
+    })
+}
+
 /// Observe a terminal's initial state without turning launch into an unbounded foreground run.
 const PTY_STARTUP: Duration = Duration::from_secs(1);
 
@@ -246,7 +259,7 @@ impl Background {
         // the caller asked for and says so, instead of failing and stranding the waits after it.
         if present(args, "lifetime") {
             if req_str(args, "action")? != "start" {
-                return Err("lifetime requires explicit persist=true".into());
+                return Err("lifetime is accepted only by start; with start, persist=true makes a durable job that stops after lifetime".into());
             }
             opt_u64(args, "lifetime")?;
             let mut output = self.start(ws, args, on_event, cancel)?;
@@ -672,25 +685,28 @@ impl Background {
                 ));
             }
             if deadline.is_some_and(|end| Instant::now() >= end) {
+                let mut text =
+                    format!("not ready: timed out after {secs}s; {name} is still running");
+                if let Some(hint) =
+                    capped_wait_hint(name, secs, startup, until.is_some() || port.is_some())
+                {
+                    text.push('\n');
+                    text.push_str(&hint);
+                }
                 if lock(&snap.ring).tool_job {
-                    return Ok(ToolOutput::ok(format!(
-                        "not ready: timed out after {secs}s; {name} is still running"
-                    ))
-                    .with_observation(ObservationKind::Wait, false));
+                    return Ok(ToolOutput::ok(text).with_observation(ObservationKind::Wait, false));
                 }
                 return Ok(snap.with_launch(
-                    ToolOutput::ok(format!(
-                        "not ready: timed out after {secs}s; {name} is still running"
-                    ))
-                    .with_observation(
-                        if conditions {
-                            ObservationKind::Readiness
-                        } else {
-                            ObservationKind::Wait
-                        },
-                        false,
-                    )
-                    .with_process(process_outcome(&snap)),
+                    ToolOutput::ok(text)
+                        .with_observation(
+                            if conditions {
+                                ObservationKind::Readiness
+                            } else {
+                                ObservationKind::Wait
+                            },
+                            false,
+                        )
+                        .with_process(process_outcome(&snap)),
                 ));
             }
             let mut wake_at = deadline;
@@ -1364,6 +1380,19 @@ impl Tool for Background {
     }
 
     fn awaited_work(&self) -> Vec<String> {
+        // A job that exited a moment ago queues its completion only once its reader closes. Let
+        // it settle first, so a caller that sees no awaited work also finds the completion queued.
+        let settling = {
+            let mut table = self.table();
+            table.refresh();
+            table.settling()
+        };
+        for name in settling {
+            let snap = self.table().snapshot(&name);
+            if let Ok(snap) = snap {
+                snap.settle();
+            }
+        }
         let mut table = self.table();
         table.refresh();
         table.awaited()

@@ -83,7 +83,7 @@ fn login_frames_carry_the_url_and_prompt_id_and_the_callback_completes_the_sign_
     let state = Arc::new(AuthState::default());
     let (frames_tx, frames_rx) = mpsc::channel::<Value>();
     let ui = RpcInteraction {
-        provider: "copilot",
+        provider: "copilot".into(),
         state: state.clone(),
         emit: move |frame| frames_tx.send(frame).is_ok(),
         gone: || false,
@@ -111,6 +111,7 @@ fn login_frames_carry_the_url_and_prompt_id_and_the_callback_completes_the_sign_
     let prompt = next("auth_prompt");
     assert_eq!(prompt["event"], "auth_prompt");
     assert_eq!(prompt["placeholder"], "code");
+    assert_eq!(prompt["secret"], false);
     let prompt_id = prompt["prompt_id"].as_str().unwrap().to_owned();
     let reply = submit_code(
         &state,
@@ -123,4 +124,40 @@ fn login_frames_carry_the_url_and_prompt_id_and_the_callback_completes_the_sign_
     for frame in [&auth_url, &progress, &prompt] {
         assert!(!frame.to_string().contains("callback-secret-42"));
     }
+}
+
+#[test]
+fn credential_prompts_are_marked_secret_and_the_answer_is_not_echoed() {
+    let state = Arc::new(AuthState::default());
+    let (frames_tx, frames_rx) = mpsc::channel::<Value>();
+    let ui = RpcInteraction {
+        provider: "xiaomi".into(),
+        state: state.clone(),
+        emit: move |frame| frames_tx.send(frame).is_ok(),
+        gone: || false,
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+    let worker = std::thread::spawn(move || ui.prompt_secret("Paste your API key", None, false));
+    let prompt = frames_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(prompt["secret"], true);
+    assert_eq!(prompt["provider"], "xiaomi");
+    let prompt_id = prompt["prompt_id"].as_str().unwrap().to_owned();
+    submit_code(&state, &json!({"prompt_id": prompt_id, "code": "sk-abc"})).unwrap();
+    assert_eq!(worker.join().unwrap().unwrap(), "sk-abc");
+    assert!(
+        frames_rx
+            .try_iter()
+            .all(|frame| !frame.to_string().contains("sk-abc"))
+    );
+}
+
+#[test]
+fn mcp_logout_needs_a_server_and_reports_whether_a_grant_was_removed() {
+    let state = AuthState::default();
+    let home = tempfile::tempdir().unwrap();
+    assert!(mcp_logout(&state, home.path(), &json!({})).is_err());
+    assert_eq!(
+        mcp_logout(&state, home.path(), &json!({"server":"docs"})).unwrap(),
+        json!({"server":"docs","removed":false})
+    );
 }

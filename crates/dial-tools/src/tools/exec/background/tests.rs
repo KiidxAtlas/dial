@@ -489,6 +489,23 @@ fn wait_reports_timeout_and_early_exit_as_not_ready() {
         "{}",
         timed.text
     );
+    // A short bounded wait gives no hint; only a wait that used the whole cap points at timeout 0.
+    assert!(!timed.text.contains("timeout: 0"), "{}", timed.text);
+    assert_eq!(
+        capped_wait_hint("ci", MAX_WAIT_SECS - 1, false, false),
+        None
+    );
+    assert_eq!(capped_wait_hint("ci", MAX_WAIT_SECS, true, false), None);
+    let exits = capped_wait_hint("ci", MAX_WAIT_SECS, false, false).expect("capped wait hint");
+    assert!(
+        exits.contains("`timeout: 0`") && exits.contains("returns when ci exits"),
+        "{exits}"
+    );
+    let ready = capped_wait_hint("web", MAX_WAIT_SECS, false, true).expect("capped wait hint");
+    assert!(
+        ready.contains("returns when web is ready or exits"),
+        "{ready}"
+    );
 
     start(&tool, &ws, "dies", "echo nothing useful; exit 3");
     let early = bg(
@@ -693,7 +710,12 @@ fn readiness_scan_reports_ring_loss_and_its_own_observation_limit() {
 fn kill_takes_down_the_whole_process_group() {
     let (_dir, ws) = open_workspace();
     let tool = tool();
-    start(&tool, &ws, "tree", "sleep 300 & echo child $!; wait");
+    start(
+        &tool,
+        &ws,
+        "tree",
+        "sh -c 'echo child $$; exec sleep 300' & wait",
+    );
     let wait = bg(
         &tool,
         &ws,
@@ -711,7 +733,12 @@ fn dropping_the_tool_kills_every_process_and_its_children() {
     let tool = tool();
     let mut pids = Vec::new();
     for name in ["one", "two"] {
-        start(&tool, &ws, name, "sleep 300 & echo child $!; wait");
+        start(
+            &tool,
+            &ws,
+            name,
+            "sh -c 'echo child $$; exec sleep 300' & wait",
+        );
         let wait = bg(
             &tool,
             &ws,
@@ -731,7 +758,14 @@ fn dropping_the_tool_kills_every_process_and_its_children() {
 fn a_finished_leader_takes_its_stragglers_with_it() {
     let (_dir, ws) = open_workspace();
     let tool = tool();
-    start(&tool, &ws, "leaky", "sleep 300 & echo child $!");
+    start(
+        &tool,
+        &ws,
+        "leaky",
+        // Ensure the child has started and reported its real PID before the leader exits.
+        // Brush schedules asynchronous lists as tasks rather than exposing a synchronous $!.
+        "sh -c 'echo child $$; echo ready > child.started; exec sleep 300' & until [ -s child.started ]; do sleep 0.01; done",
+    );
     let wait = bg(
         &tool,
         &ws,
@@ -1858,10 +1892,7 @@ fn a_session_start_naming_lifetime_starts_the_job_and_says_the_lifetime_is_ignor
     // Only a start is lenient: the argument still means nothing on other session actions.
     let listed = bg(&tool, &ws, json!({"action":"list", "lifetime": 60}));
     assert!(
-        listed.is_error
-            && listed
-                .text
-                .contains("lifetime requires explicit persist=true"),
+        listed.is_error && listed.text.contains("lifetime is accepted only by start"),
         "{}",
         listed.text
     );

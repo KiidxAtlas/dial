@@ -6,7 +6,7 @@ Five minutes from install to a reviewed, undoable fix. For the full loop afterwa
 ## 1. Install
 
 ```sh
-curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | bash
+curl -fsSL https://dial.rootatlas.dev/install | sh
 ```
 
 On Windows use PowerShell: `irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 | iex`

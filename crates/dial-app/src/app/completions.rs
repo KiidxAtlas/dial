@@ -16,15 +16,18 @@ fn memory_argument_completions(config: &Config) -> Vec<String> {
     let (words, nested): (&[&str], &[(&str, &[&str])]) = match backend {
         MemoryBackendId::Off => (&["status", "help"], &[]),
         MemoryBackendId::Provenance => (
-            &["status", "search", "clear", "help"],
-            &[("clear", &["project", "global"])],
+            &["status", "view", "search", "clear", "help"],
+            &[
+                ("clear", &["project", "global"]),
+                ("view", &["project", "global"]),
+            ],
         ),
         MemoryBackendId::Semantic => (
             &[
-                "status", "search", "save", "forget", "update", "history", "rebuild", "clear",
-                "help",
+                "status", "view", "search", "save", "forget", "update", "history", "rebuild",
+                "clear", "help",
             ],
-            &[("clear", &["user"])],
+            &[("clear", &["user"]), ("view", &["project", "user"])],
         ),
         MemoryBackendId::Hindsight => (
             &[

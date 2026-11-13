@@ -98,7 +98,7 @@ fn sign_in(
     };
 
     open(auth_url, Some(instructions));
-    let answer = ui.prompt(
+    let answer = ui.prompt_secret(
         "Paste your QwenCloud Token Plan API key",
         Some("sk-sp-..."),
         false,
@@ -140,7 +140,7 @@ fn prompt_cookie(
     } else {
         (INTERNATIONAL_COOKIE_PROMPT, INTERNATIONAL_COOKIE_HOST)
     };
-    let answer = ui.prompt(message, Some("name=value; name=value; ..."), true)?;
+    let answer = ui.prompt_secret(message, Some("name=value; name=value; ..."), true)?;
     check_cancelled(cancel)?;
     let cookie = normalize_cookie(&answer);
     ensure!(

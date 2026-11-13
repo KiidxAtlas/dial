@@ -4,6 +4,7 @@
 //! settings to save once the install succeeds and the health check passes. Detection and
 //! planning are pure over an [`Env`], so tests can fake the package managers on `PATH`.
 
+pub mod bundled_node;
 pub mod plan;
 pub mod prebuilt;
 pub mod run;
@@ -448,17 +449,14 @@ pub fn is_executable(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    if !meta.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
-        true
+        meta.is_file()
     }
 }
 

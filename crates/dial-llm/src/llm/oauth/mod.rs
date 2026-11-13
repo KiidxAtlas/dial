@@ -154,6 +154,16 @@ pub trait Interaction: Send + Sync {
     /// and an error explaining how to sign in from a terminal otherwise.
     fn prompt(&self, message: &str, placeholder: Option<&str>, allow_empty: bool)
     -> Result<String>;
+    /// [`Interaction::prompt`] for a credential (an API key, a pasted code or cookie): a
+    /// graphical host masks the field. Terminal implementations need not differ.
+    fn prompt_secret(
+        &self,
+        message: &str,
+        placeholder: Option<&str>,
+        allow_empty: bool,
+    ) -> Result<String> {
+        self.prompt(message, placeholder, allow_empty)
+    }
 }
 
 /// Inputs to a login flow.

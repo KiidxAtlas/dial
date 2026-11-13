@@ -45,3 +45,12 @@ terminfo 0.9.0 (transitive dependency of brush-core)
    TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
 
   0. You just DO WHAT THE FUCK YOU WANT TO.
+
+Node.js runtime in release binaries
+==================================
+
+Release binaries embed the target-specific Node.js runtime pinned in
+`runtimes/node/manifest.json`. Node.js and its bundled dependencies retain their
+upstream licenses and notices; the complete LICENSE extracted from the verified
+runtime archive accompanies each release as `LICENSE.node`. Unbundled source
+builds do not contain that runtime.

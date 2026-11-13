@@ -10,9 +10,10 @@ use windows_sys::Win32::{
         DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA,
         ERROR_PIPE_NOT_CONNECTED, HANDLE,
     },
+    Storage::FileSystem::{FILE_TYPE_PIPE, FILE_TYPE_UNKNOWN, GetFileType},
     System::{
         Console::{GetStdHandle, STD_OUTPUT_HANDLE},
-        Pipes::{GetNamedPipeInfo, PeekNamedPipe},
+        Pipes::PeekNamedPipe,
         Threading::GetCurrentProcess,
     },
 };
@@ -70,21 +71,29 @@ fn available(pipe: &impl crate::platform::io::Pipe) -> io::Result<Option<usize>>
 pub(in crate::platform) fn set_nonblocking(
     pipe: &impl crate::platform::io::Pipe,
 ) -> io::Result<()> {
+    validate_pipe(pipe)?;
     // We do not change a shared handle's mode; read_nonblocking performs the bounded peek.
-    // SAFETY: pipe lends a live handle; all optional query outputs are null, which is supported.
-    if unsafe {
-        GetNamedPipeInfo(
-            pipe.as_handle().as_raw_handle() as HANDLE,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
     Ok(())
+}
+
+fn validate_pipe(pipe: &impl crate::platform::io::Pipe) -> io::Result<()> {
+    // GetNamedPipeInfo requires FILE_READ_ATTRIBUTES on a write-only pipe. ChildStdin need
+    // not grant that access, so inspect the handle type without querying pipe attributes.
+    // SAFETY: pipe lends a live handle; GetFileType inspects it without taking ownership.
+    match unsafe { GetFileType(pipe.as_handle().as_raw_handle() as HANDLE) } {
+        FILE_TYPE_PIPE => return Ok(()),
+        FILE_TYPE_UNKNOWN => {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(0) {
+                return Err(error);
+            }
+        }
+        _ => {}
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "expected a Windows pipe handle",
+    ))
 }
 pub(in crate::platform) fn read_nonblocking<R: Read + crate::platform::io::Pipe>(
     reader: &mut R,
@@ -120,20 +129,7 @@ pub(in crate::platform) fn wait_readable(
 }
 pub(in crate::platform) fn set_blocking(pipe: &impl crate::platform::io::Pipe) -> io::Result<()> {
     // Windows pipe handles have no shared per-handle blocking flag to toggle.
-    // SAFETY: pipe lends a live handle and GetNamedPipeInfo accepts null for each unused output.
-    if unsafe {
-        GetNamedPipeInfo(
-            pipe.as_handle().as_raw_handle() as HANDLE,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    validate_pipe(pipe)
 }
 pub(in crate::platform) fn wait_writable(
     _pipe: &impl crate::platform::io::Pipe,

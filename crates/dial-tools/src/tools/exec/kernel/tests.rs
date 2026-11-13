@@ -375,6 +375,23 @@ fn workspace_python_launcher_is_rejected_before_execution() {
 }
 
 #[test]
+fn bundled_node_supports_a_workspace_containing_private_state_but_not_explicit_overrides() {
+    let Some(node) = bundled_node::provision().unwrap() else {
+        return; // Source builds do not embed a runtime.
+    };
+    let workspace = node.parent().unwrap();
+    for label in ["eval.node", "browser.node", "computer.node"] {
+        assert_eq!(
+            resolve_operator_executable(workspace, "node", label).unwrap(),
+            node
+        );
+        let error =
+            resolve_operator_executable(workspace, node.to_str().unwrap(), label).unwrap_err();
+        assert!(error.contains("outside the editable workspace"), "{error}");
+    }
+}
+
+#[test]
 fn persistent_reply_observation_and_retention_do_not_invent_child_success() {
     use crate::runtime::execution::Completeness;
     let out = code_output(Ok(json!({"stdout":"abc", "error":null,

@@ -81,12 +81,11 @@ Write, paste and edit drafts without losing your place; understand the launch sc
   plan calls are hidden from the transcript; failures remain visible and session history retains the calls.
   While a plan has open steps on a terminal at least 90 columns wide, one compact rounded card
   shows a `Plan` header with a progress bar and completed/total count. It is as tall as its content
-  and at most 100 columns wide. Its tab strip shows `plan`, `evidence` and `mode`, switched with `Ctrl+X` (or `Alt+W` or
+  and at most 100 columns wide. Its tab strip shows `plan` and `mode`, switched with `Ctrl+X` (or `Alt+W` or
   `F12`; rebind `app.work.tab`). The plan tab lists the steps with status dots (a green check for
   done, an orange dot for the step in progress, a hollow ring for pending) and the focused step's
   recorded reason or finding; when the card is short it keeps the focused step and drops reason
-  lines first. Evidence lists references recorded so far, newest and focused first with a `+N more`
-  count for the rest, labelled as agent observations, not verification. Mode shows the approval mode
+  lines first. Mode shows the approval mode
   and sandbox. At 60–89 columns a collapsed plan-only
   card shows the current and next step; narrower terminals keep the one-line focus summary. The panel
   only reads the plan; it never changes it.
@@ -148,7 +147,9 @@ Write, paste and edit drafts without losing your place; understand the launch sc
 - The newline hint shows `Shift+Enter` only when the terminal speaks the kitty keyboard protocol;
   otherwise Shift+Enter arrives as plain Enter, so the hint shows `Ctrl+J`.
 - Pasted text stays in the draft. Buffered unbracketed paste preserves line breaks, and an immediate
-  trailing Enter after bracketed paste is ignored. Press Enter after the paste settles to send it.
+  trailing Enter after bracketed paste is ignored. A plain Enter with no input queued waits 25 ms for
+  the rest of a paste before it submits, and keys typed while tools were still connecting are
+  replayed with the same protection. Press Enter after the paste settles to send it.
   A large paste collapses into a placeholder that Backspace or Delete removes as one unit.
 - **Clipboard images:** the paste-image key (`app.clipboard.pasteImage`; `Ctrl+V`, `Alt+V` on Windows)
   attaches the clipboard image as an `[Image #n]` chip in the draft. Sources by platform: macOS reads the pasteboard (PNG, TIFF,

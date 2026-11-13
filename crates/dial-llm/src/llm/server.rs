@@ -568,7 +568,7 @@ fn spawn_spec(command: &Command) -> anyhow::Result<crate::platform::process_reco
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect(),
         cwd,
-        env_allow: ENV_ALLOW.iter().map(|name| (*name).to_owned()).collect(),
+        env_allow: crate::platform::env::cleared_child_allow_list(&ENV_ALLOW, cfg!(windows)),
         env,
     })
 }

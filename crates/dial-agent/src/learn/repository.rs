@@ -348,11 +348,11 @@ pub fn register_repair(
             fs::create_dir_all(target.parent().context("source path has no parent")?)?;
             fs::write(target, content)?;
         }
-        Ok(verify(
+        verify(
             workspace.path(),
             &snapshot.verification,
             &snapshot.spec.command,
-        ))
+        )
     };
     ensure!(
         !replay(&snapshot.files)?,
@@ -367,8 +367,8 @@ pub fn register_repair(
 }
 
 /// Restore sealed tests only after the agent finishes. A solver-written test cannot replace them.
-pub fn verify(root: &Path, files: &BTreeMap<String, String>, command: &str) -> bool {
-    let run = || -> Result<bool> {
+pub fn verify(root: &Path, files: &BTreeMap<String, String>, command: &str) -> Result<bool> {
+    let restore = || -> Result<()> {
         // Validates `root` before any verification bytes are written.
         Workspace::new(root)?;
         for (path, content) in files {
@@ -387,14 +387,19 @@ pub fn verify(root: &Path, files: &BTreeMap<String, String>, command: &str) -> b
             }
             fs::write(probe, content)?;
         }
-        Ok(Check::Command {
-            command: command.into(),
-            expect_stdout: None,
-            expect_exit: 0,
-        }
-        .verify(root, ""))
+        Ok(())
     };
-    run().unwrap_or(false)
+    // Unrestorable verification files fail the check, as before: a solver can make them unwritable.
+    // Only a command that cannot be launched is an error, so callers can tell it from a failure.
+    if restore().is_err() {
+        return Ok(false);
+    }
+    Check::Command {
+        command: command.into(),
+        expect_stdout: None,
+        expect_exit: 0,
+    }
+    .try_verify(root, "")
 }
 
 #[cfg(test)]

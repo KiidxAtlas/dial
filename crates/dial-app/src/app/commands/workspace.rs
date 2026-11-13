@@ -59,13 +59,11 @@ fn add_dir(shell: &mut Shell, agent: &mut Agent<'_>, args: &str) -> Result<Step>
         shell.note("Add dir", "Usage: /add-dir <dir>");
         return Ok(Step::Done);
     }
-    let dir = resolve_dir(agent.workspace().root(), args);
-    let added = agent.workspace_mut().add_root(&dir)?;
-    agent.persist_workspace_roots()?;
+    let (added, dir) = add_workspace_dir(agent, args)?;
     let text = if added {
-        format!("Added {}.", canonical(&dir).display())
+        format!("Added {}.", dir.display())
     } else {
-        format!("Already in the workspace: {}", canonical(&dir).display())
+        format!("Already in the workspace: {}", dir.display())
     };
     shell.note("Add dir", text);
     Ok(Step::Done)
@@ -76,16 +74,33 @@ fn remove_dir(shell: &mut Shell, agent: &mut Agent<'_>, args: &str) -> Result<St
         shell.note("Remove dir", "Usage: /remove-dir <dir>");
         return Ok(Step::Done);
     }
-    let dir = resolve_dir(agent.workspace().root(), args);
-    let removed = agent.workspace_mut().remove_root(&dir)?;
-    agent.persist_workspace_roots()?;
+    let (removed, dir) = remove_workspace_dir(agent, args)?;
     let text = if removed {
-        format!("Removed {}.", canonical(&dir).display())
+        format!("Removed {}.", dir.display())
     } else {
         format!("Not a workspace directory: {}", dir.display())
     };
     shell.note("Remove dir", text);
     Ok(Step::Done)
+}
+
+/// Add `arg` (`~`, absolute, or relative to the primary root) to the workspace and persist the
+/// roots. The owner of `/add-dir` and the RPC `add_dir` method. Returns whether the directory
+/// was new, and its canonical path.
+pub(crate) fn add_workspace_dir(agent: &mut Agent<'_>, arg: &str) -> Result<(bool, PathBuf)> {
+    let dir = resolve_dir(agent.workspace().root(), arg);
+    let added = agent.workspace_mut().add_root(&dir)?;
+    agent.persist_workspace_roots()?;
+    Ok((added, canonical(&dir)))
+}
+
+/// Remove an added directory and persist the roots (`/remove-dir`, RPC `remove_dir`). Returns
+/// whether it was a workspace directory, and its path (canonical when it was removed).
+pub(crate) fn remove_workspace_dir(agent: &mut Agent<'_>, arg: &str) -> Result<(bool, PathBuf)> {
+    let dir = resolve_dir(agent.workspace().root(), arg);
+    let removed = agent.workspace_mut().remove_root(&dir)?;
+    agent.persist_workspace_roots()?;
+    Ok((removed, if removed { canonical(&dir) } else { dir }))
 }
 
 fn dirs(shell: &mut Shell, agent: &Agent<'_>) -> Result<Step> {

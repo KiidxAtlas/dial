@@ -7,7 +7,7 @@ use crate::app::command_registry::{canonical_command, command_panel, turn_count}
 use crate::app::core::App;
 use crate::app::display::short;
 use crate::app::drive::Step;
-use crate::app::notices::memory_status_text;
+use crate::app::notices::{memory_status_text, memory_view_text};
 use crate::app::overlay::Which;
 use crate::app::selection::{PendingFavorite, cycle_set, next_favorite};
 use crate::app::shell::{PAINT_EVERY, Shell};
@@ -1260,6 +1260,8 @@ impl Shell {
                         .or_else(|| value.as_str())
                     {
                         Ok(help.to_owned())
+                    } else if value.get("view").is_some() && value.get("backend").is_some() {
+                        Ok(memory_view_text(&value))
                     } else if matches!(args.trim(), "" | "status") && value.get("backend").is_some()
                     {
                         Ok(memory_status_text(&value))

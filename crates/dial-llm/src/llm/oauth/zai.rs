@@ -37,7 +37,7 @@ fn login(login: &Login<'_>) -> Result<Credentials> {
     );
     let input = login
         .ui
-        .prompt("Authorization code or redirect URL", None, false)?;
+        .prompt_secret("Authorization code or redirect URL", None, false)?;
     let (code, received_state) = util::parse_pasted_code(&input)?;
     if let Some(s) = received_state {
         ensure!(s == state, "Z.AI OAuth state mismatch");

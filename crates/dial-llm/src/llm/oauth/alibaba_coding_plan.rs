@@ -94,7 +94,7 @@ fn sign_in(
     };
 
     open(auth_url, Some(instructions));
-    let answer = ui.prompt(
+    let answer = ui.prompt_secret(
         "Paste your Alibaba Coding Plan API key",
         Some("sk-..."),
         false,

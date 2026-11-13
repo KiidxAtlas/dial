@@ -106,7 +106,7 @@ pub(super) struct Snapshot {
     files: BTreeMap<String, String>,
     inventory: String,
     environment: String,
-    complete: bool,
+    pub(super) complete: bool,
     outlines: BTreeMap<String, String>,
 }
 
@@ -237,7 +237,7 @@ impl Codebase {
 
     /// The cited source is gone from the workspace (deleted, moved, or an excluded nested
     /// worktree that disappeared). Checked directly so partial snapshots still notice it.
-    fn source_missing(&self, path: &str) -> bool {
+    pub(super) fn source_missing(&self, path: &str) -> bool {
         !self.root.join(path).is_file()
     }
     pub(super) fn freshness_snapshot(&self) -> Result<Snapshot> {
@@ -1023,14 +1023,9 @@ impl Codebase {
         Ok(record.sections.len())
     }
 
-    pub fn architecture_report(&self) -> Result<Value> {
-        let Some(saved) = self.architecture_saved()? else {
-            return Ok(
-                json!({"status":"missing","sections":[],"unknowns":["No architecture synthesis has completed yet."]}),
-            );
-        };
-        let snapshot = self.freshness_snapshot()?;
-        let statuses = self.section_statuses_at(&saved.sections, &snapshot)?;
+    /// Last recorded check outcome, re-keyed to the current sources. It stores only a command
+    /// digest, so no command text is ever reported from it.
+    pub(super) fn behavior_report(&self, snapshot: &Snapshot) -> Result<Value> {
         let raw: Option<String> = self
             .conn
             .lock()
@@ -1058,6 +1053,18 @@ impl Codebase {
                 "failed_requires_review"
             });
         }
+        Ok(behavior)
+    }
+
+    pub fn architecture_report(&self) -> Result<Value> {
+        let Some(saved) = self.architecture_saved()? else {
+            return Ok(
+                json!({"status":"missing","sections":[],"unknowns":["No architecture synthesis has completed yet."]}),
+            );
+        };
+        let snapshot = self.freshness_snapshot()?;
+        let statuses = self.section_statuses_at(&saved.sections, &snapshot)?;
+        let behavior = self.behavior_report(&snapshot)?;
         let mut invalidation_reasons = Vec::with_capacity(saved.sections.len());
         for s in &saved.sections {
             invalidation_reasons.push(
@@ -1250,10 +1257,39 @@ impl Codebase {
         max_bytes: usize,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<enrichment::Hints> {
+        let found = self.related_sources(paths, MAX_SCOPE_NEIGHBOURS, cancelled)?;
+        const REVIEW: &str = "\nRelated-source hints (not a resolved dependency graph; inspect current sources before relying on them):\n";
+        let mut hints = String::new();
+        let mut sources = Vec::new();
+        for (reason, path, digest) in found {
+            let row = format!("{reason}: {path}\n");
+            if REVIEW.len() + hints.len() + row.len() <= max_bytes {
+                hints.push_str(&row);
+                sources.push((path, digest));
+            }
+        }
+        let text = if hints.is_empty() {
+            String::new()
+        } else {
+            format!("{REVIEW}{hints}")
+        };
+        ensure!(!cancelled(), "impact hints cancelled");
+        Ok(enrichment::Hints { text, sources })
+    }
+
+    /// Lexically ranked files that mention a path's stem (import/module lines rank first), verified
+    /// against current source digests and visibility before return, as `(reason, path, digest)`;
+    /// at most `limit` candidates are checked. These are mentions, not a resolved dependency graph.
+    pub(super) fn related_sources(
+        &self,
+        paths: &[String],
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<(&'static str, String, String)>> {
         ensure!(!cancelled(), "impact hints cancelled");
         let stems = impact_stems(paths);
         if stems.is_empty() {
-            return Ok(enrichment::Hints::default());
+            return Ok(Vec::new());
         }
         let rows = self
             .conn
@@ -1292,13 +1328,11 @@ impl Codebase {
                 .then_with(|| b.1.cmp(&a.1))
                 .then_with(|| a.2.cmp(&b.2))
         });
-        const REVIEW: &str = "\nRelated-source hints (not a resolved dependency graph; inspect current sources before relying on them):\n";
-        let mut hints = String::new();
-        let mut sources = Vec::new();
-        // Bound filesystem validation as well as output. Reuse the index's normal visibility and
-        // digest rules, including ignores, linked worktrees, symlinks and missing/changed files.
-        for (rank, _, path, digest) in ranked.into_iter().take(MAX_SCOPE_NEIGHBOURS) {
+        let mut verified = Vec::new();
+        for (rank, _, path, digest) in ranked.into_iter().take(limit) {
             ensure!(!cancelled(), "impact hints cancelled");
+            // Bound filesystem validation as well as output. Reuse the index's normal visibility and
+            // digest rules, including ignores, linked worktrees, symlinks and missing/changed files.
             let Ok((_, current)) = self.current_source(&path) else {
                 continue;
             };
@@ -1310,19 +1344,10 @@ impl Codebase {
             } else {
                 "Lexical identifier match"
             };
-            let row = format!("{reason}: {path}\n");
-            if REVIEW.len() + hints.len() + row.len() <= max_bytes {
-                hints.push_str(&row);
-                sources.push((path, digest));
-            }
+            verified.push((reason, path, digest));
         }
-        let text = if hints.is_empty() {
-            String::new()
-        } else {
-            format!("{REVIEW}{hints}")
-        };
         ensure!(!cancelled(), "impact hints cancelled");
-        Ok(enrichment::Hints { text, sources })
+        Ok(verified)
     }
 }
 

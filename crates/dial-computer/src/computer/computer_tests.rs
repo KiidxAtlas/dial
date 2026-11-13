@@ -286,8 +286,8 @@ fn computer_function_runs_use_async_bodies_and_keep_session_usable() {
 }
 
 #[test]
-fn computer_run_code_that_only_defines_a_function_fails_instead_of_echoing_it() {
-    // A local model sent function source as `code`; the run returned the source text, not a result.
+fn computer_run_code_that_is_a_function_is_called_with_the_fn_scope() {
+    // A local model sent function source as `code`; it now runs as `fn` would, and the run says so.
     let dir = tempfile::tempdir().unwrap();
     let session = ComputerSession::new(dir.path().display().to_string());
     let action = parse_action(&json!({
@@ -295,18 +295,19 @@ fn computer_run_code_that_only_defines_a_function_fails_instead_of_echoing_it() 
         "code": "async ({ desktop }) => {\n  return 42;\n}"
     }))
     .unwrap();
-    let Err(error) = session.execute(
-        action,
-        dir.path().to_str().unwrap(),
-        false,
-        None,
-        None,
-        &AbortSignal::new(),
-    ) else {
-        panic!("function source sent as `code` must not succeed");
-    };
-    let error = error.to_string();
-    assert!(error.contains("pass it as `fn`"), "{error}");
+    let result = session
+        .execute(
+            action,
+            dir.path().to_str().unwrap(),
+            false,
+            None,
+            None,
+            &AbortSignal::new(),
+        )
+        .unwrap();
+    assert_eq!(result.value["returnValue"], 42, "the function was called");
+    let displays = result.value["displays"].to_string();
+    assert!(displays.contains("instead of `code`"), "{displays}");
     let action = parse_action(&json!({
         "action": "run", "read_only": true, "code": "return 42;"
     }))
@@ -612,6 +613,39 @@ mod worker {
         assert_eq!(one["payload"]["returnValue"], "Message", "{one}");
         let result = run_worker("throw new TypeError('unrelated failure');", brave);
         assert_eq!(result["error"]["message"], "unrelated failure");
+    }
+
+    #[test]
+    fn computer_function_code_is_called_with_the_fn_scope() {
+        let result = run_worker(
+            "async ({ desktop, wait, assert }) => [typeof desktop.windows, typeof wait, typeof assert]",
+            brave,
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(
+            result["payload"]["returnValue"],
+            json!(["function", "function", "function"]),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn computer_handle_guesses_name_the_real_methods() {
+        // Models guessed method names on window handles; the TypeError lists each handle type's methods.
+        for code in [
+            "const win = await desktop.window('12086'); await win.actions();",
+            "const win = await desktop.window('12086'); await win.click2();",
+        ] {
+            let result = run_worker(code, brave);
+            assert_eq!(result["ok"], false, "{result}");
+            let message = result["error"]["message"].as_str().unwrap();
+            assert!(message.contains("if `win` is a Dial handle"), "{message}");
+            for kind in ["desktop: ", "window: ", "element: ", "display: "] {
+                assert!(message.contains(kind), "{message}");
+            }
+            assert!(message.contains("screenshot"), "{message}");
+            assert!(message.contains("focus"), "{message}");
+        }
     }
 
     #[test]

@@ -785,7 +785,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": "todo",
-            "description": "todo: optional plan for long work with several distinct steps; skip it for short tasks. done closes the active item and starts the next; never resend set to mark progress. Indices are 1-based. Send each update in the same response as the next real tool call when several calls are allowed. An accepted finish(completed) closes the steps still open, so no closing todo call is needed. state_* ops keep deliverables across compaction. Example: {\"op\":\"set\",\"tasks\":[{\"content\":\"Fix parser\"},{\"content\":\"Add test\"}]}, later {\"op\":\"done\"}.",
+            "description": "todo: optional plan for long work with several distinct steps; skip it for short tasks. set the list once ({\"op\":\"set\",\"tasks\":[{\"content\":\"...\"}]}); done closes the active item and starts the next. Indices are 1-based. Send updates alongside the next real tool call. An accepted finish(completed) closes open steps. state_* ops keep deliverables across compaction.",
             "parameters": {
                 "type": "object",
                 "properties": {

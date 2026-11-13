@@ -82,6 +82,36 @@ or form rejections, not as the absence of an offer.
 
 Reports from builds without this field keep `tool_trace` absent. Absent traces are always `unknown`.
 
+### Parent and worker execution accounting
+
+New benchmark reports also retain `metrics.worker_execution` and a derived
+`metrics.whole_execution` view. Parent dispatches come from the complete main-agent trace;
+worker dispatch starts come from worker runtime nodes in the final state tree. The derived view
+sums these disjoint counts once. They measure admission/start, not successful effects or useful
+work. Missing counters and nonterminal workers leave complete totals unknown rather than zero.
+The combined view also requires worker model-step counts to agree with the runtime ledger's
+worker request count. Missing nodes, retries or internal requests can make these differ; the
+conservative result is an unknown worker dispatch/time total, not a fabricated complete tree.
+
+Backend request counts use the complete runtime ledger's `main` and `workers` groups. Its `all`
+group already includes both and must never be added to them. Purpose groups (including internal
+work) are another view of the same ledger, not extra usage. Worker elapsed time overlaps parent
+wall time and is reported separately, never added to it. Extension and compaction-internal tool
+calls remain outside the dispatch counts; unavailable timing stays unknown.
+
+For a descriptive offline summary of these fields:
+
+```sh
+python3 examples/benchmarks/whole_execution.py tool-effectiveness-raw.json
+python3 -m unittest discover -s examples/benchmarks -p 'test_whole_execution.py'
+```
+
+The summary includes known-case counts per field and counts reports without the view, so legacy
+or partial reports cannot look like zero-work trials. It is work accounting, not an outcome
+validator or a paired effectiveness comparison: use the checked-outcome analysis above to judge
+correctness and regressions. No live-provider performance improvement is established by these
+instrumentation or offline tests.
+
 ## Tool expectations sidecar (opt-in)
 
 Suite cases cannot declare tool expectations, so they live in a separate TOML file keyed by case ID.

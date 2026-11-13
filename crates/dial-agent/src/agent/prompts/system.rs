@@ -50,16 +50,16 @@ pub(crate) const CHANGE_RULES: &str = "
 - Update owners, callers, configuration, serialized contracts and docs together so the change stays coherent.
 - Run the narrowest useful check first (a type check or one focused test of the changed module), reuse passing evidence until its inputs change, and broaden once for affected interfaces, real uncertainty or required gates.";
 pub(crate) const TESTING_DECISIONS: &str = "
-- Prove new algorithms/formats on tiny known-answer/round-trip cases; keep tests meaningful and temporary outputs out of deliverables.
-- If a new helper check disagrees with passing code, shrink both to a minimal case before rewriting the code.
+- Prove tricky algorithms/formats on tiny known-answer/round-trip cases; keep tests meaningful and temporary outputs out of deliverables.
+- If a new helper check disagrees with passing code, shrink both to a minimal case before rewriting code.
 - Test doubles and unavailable runtimes do not establish live behavior.";
 pub(crate) const ARTIFACT_CHECK_RULE: &str = "For standalone artifacts without a test suite, send `verify` acceptance {name, command} with the write: one focused check that fails on violations, never empty, never replacing task or operator checks.";
 pub(crate) const DELIVERY: &str = "
 
 # Delivery
 - Follow the user's requested response format while still disclosing blockers, unverified checks and safety-relevant gaps.
-- Write one-line notes between tool calls, not prose; the final report is what the user reads.
-- Finish with a short report: the outcome, the evidence (cite code as path:line) and what remains.
+- Write one-line notes between tool calls, not prose; the user reads the final report.
+- End with a brief report, few lines if routine: outcome, evidence (code as path:line), what remains.
 - A read-only investigation delivers findings; implementation delivers working changes. A real blocker keeps the unfinished work and names the needed decision or prerequisite.";
 pub(crate) const VISUAL_VERIFICATION: &str = "
 

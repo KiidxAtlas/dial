@@ -1298,14 +1298,13 @@ impl Workspace {
     }
 }
 
-const HASHLINE_READ_DESC: &str = "read: view any file or directory without changing it; use it over shell viewers, once per file. Decodes text, \
+const HASHLINE_READ_DESC: &str = "read: view any file or directory without changing it; prefer it to shell viewers. Decodes text, \
 documents, data, databases (read-only), archives, media, executables; other binaries as hex. Suffixes: `:50-100`, \
-`:50+20`, `:-30`, `:80~10` (context), `:sym=NAME`, `:outline` (file or dir), `:bytes=O+N`, `:raw` (non-editable); \
+`:50+20`, `:-30`, `:80~10` (context), `:sym=NAME`, `:outline`, `:bytes=O+N`, `:raw` (non-editable); \
 format parts `:member`, `:table`, `:sheet=N`. `paths` reads up to 16 targets. Also `ssh://host/path`, `http(s)://`, \
-`pr://N`, `issue://N`, `conflict://`, `artifact://H`. Output is a `[PATH#TAG]` header then `LINE:TEXT` rows; edit needs \
-that TAG and may touch only shown lines. Stops at 48 KiB; the footer names the next range. Large or unfamiliar files: \
-`grep`, `:outline` or `:sym=` first, never page through. Rows still visible are not resent; a changed file returns \
-its changed lines.";
+`pr://N`, `issue://N`, `conflict://`, `artifact://H`. Output: a `[PATH#TAG]` header, then `LINE:TEXT` rows; edit needs \
+that TAG and may touch only shown lines. Stops at 48 KiB; the footer names the next range. Large files: `grep`, \
+`:outline` or `:sym=` first, never page through. Rows still visible are not resent; a changed file returns its changed lines.";
 
 const HASHLINE_WRITE_DESC: &str = "write: create files or near-total replacements; use edit for local changes. Read existing files in full first. Supply path plus content OR source (artifact://SHA256 and matching sha256), or files. Max 1 MiB/file, 8 MiB/batch; creates parents. Notebooks need literal JSON. Inline read prefixes stripped; incomplete projections refused. Artifact bytes stay exact. Returns fresh [PATH#TAG] headers and receipts. SSH accepts only path/content.";
 
@@ -1408,9 +1407,9 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         "bash" => tool_schema(
             "bash",
             if cfg!(windows) {
-                "bash: run a shell command. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. Uses Git for Windows bash when installed, otherwise Dial's built-in bash-compatible shell (PowerShell only with `shell.backend = \"powershell\"`). On Windows `sandbox.mode = \"dev\"` runs commands at Low integrity (writes confined to the project); `strict` or `allow_network = false` runs them in an AppContainer (reads also confined; no network) and `off` runs them with the user's privileges. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
+                "bash: run a shell command with Dial's embedded Bash-compatible shell (default); bundled utilities precede PATH. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. On Windows `sandbox.mode = \"dev\"` runs commands at Low integrity (writes confined to the project); `strict` or `allow_network = false` runs them in an AppContainer (reads also confined; no network) and `off` runs them with the user's privileges. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
             } else {
-                "bash: run a shell command with `/bin/bash -c`. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. May be sandboxed: writes confined to the project, network possibly blocked, temp files in `$TMPDIR`. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
+                "bash: run a shell command with Dial's embedded Bash-compatible shell (default); bundled utilities precede PATH. Set `cwd` instead of prefixing `cd`; `background` starts a job now, `pty` a terminal job. May be sandboxed: writes confined to the project, network possibly blocked, temp files in `$TMPDIR`. Output merges stdout/stderr and keeps its start and end. Foreground commands return their result when they finish or reach `timeout`; use `background` only for servers, watchers or long jobs you will work beside. Save a script you will rerun to a file once instead of resending it inline."
             },
             json!({
                 "command": {"type": "string", "description": "Shell command to run."},

@@ -20,8 +20,6 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-unicode-segmentation.workspace = true
-xxhash-rust.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = { workspace = true, optional = true }
@@ -31,6 +29,10 @@ reis = { workspace = true, optional = true }
 x11rb = { workspace = true, optional = true }
 xkeysym = { workspace = true, optional = true }
 zbus = { workspace = true, optional = true }
+xxhash-rust = { workspace = true, optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+unicode-segmentation = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 xcap = { workspace = true, optional = true }
@@ -61,6 +63,7 @@ desktop = [
     "dep:block2", "dep:core-graphics", "dep:foreign-types", "dep:objc2", "dep:objc2-app-kit",
     "dep:objc2-application-services", "dep:objc2-core-foundation", "dep:objc2-core-graphics",
     "dep:objc2-foundation", "dep:windows", "dep:enigo", "dep:uiautomation",
+    "dep:unicode-segmentation", "dep:xxhash-rust",
 ]
 # Linux Wayland screencast (PipeWire); off by default.
 wayland-pipewire = ["desktop", "dep:pipewire"]

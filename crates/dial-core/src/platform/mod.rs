@@ -41,6 +41,8 @@ pub mod fs;
 pub mod process;
 
 pub mod atomic;
+/// Environment variables a child needs when it starts with a cleared environment.
+pub mod env;
 pub mod interrupt;
 pub mod power;
 pub mod process_record;

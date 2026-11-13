@@ -110,6 +110,26 @@ pub(in crate::platform) fn terminate_group(leader: u32) -> io::Result<()> {
     check(unsafe { libc::killpg(pid(leader)?, libc::SIGTERM) })
 }
 
+/// `kill(2)` / `killpg(2)` failures: a missing process or group is `NotFound`, everything else is
+/// passed through.
+fn map_missing(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        io::Error::new(io::ErrorKind::NotFound, "no such process")
+    } else {
+        error
+    }
+}
+
+pub(in crate::platform) fn signal_pid(target: u32, signal: i32) -> io::Result<()> {
+    // SAFETY: kill only signals; the caller names the process and signal.
+    check(unsafe { libc::kill(pid(target)?, signal) }).map_err(map_missing)
+}
+
+pub(in crate::platform) fn signal_group(leader: u32, signal: i32) -> io::Result<()> {
+    // SAFETY: killpg only signals; the caller names the group and signal.
+    check(unsafe { libc::killpg(pid(leader)?, signal) }).map_err(map_missing)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(in crate::platform) fn alive(target: u32) -> bool {
     // SAFETY: signal 0 only checks existence and permission.

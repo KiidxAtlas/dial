@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EvalConfig {
-    /// Operator-installed Node executable, never a workspace-owned program.
+    /// `node` prefers the release-bundled runtime; explicit overrides must be operator-owned.
     pub node: String,
     /// Whole-operation cap; zero disables the cap, not cancellation or containment.
     pub timeout_secs: u64,

@@ -489,3 +489,77 @@ fn fetch_read_keeps_the_network_gate_and_refuses_incompatible_modes() {
         output.text
     );
 }
+
+#[test]
+fn consolidated_memory_codebase_store_routes_navigate_and_resumes_prior_identity() {
+    use crate::tools::integrations::ext::Registry;
+    use crate::tools::surface::contracts::{identities, project_history};
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("src/router.rs"),
+        "pub fn route_request() {}\n",
+    )
+    .unwrap();
+    let workspace = crate::tools::Workspace::new(project.path()).unwrap();
+    let layout =
+        crate::config::paths::Layout::with_user_dir(workspace.root(), home.path().join("dial"))
+            .unwrap();
+    let cache = Arc::new(crate::tools::knowledge::codebase::Codebase::open(&layout).unwrap());
+    cache.refresh(&workspace, &AtomicBool::new(false)).unwrap();
+    let codebase = crate::tools::knowledge::codebase::tool(cache, "session".into());
+    let facade = build(
+        group_of("memory").unwrap(),
+        Some(fake("memory", &["recall", "retain"], false)),
+        &[("codebase_memory", codebase)],
+    )
+    .unwrap();
+    let current = facade.schema();
+    let actions = current["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(actions.contains(&json!("navigate")));
+    assert!(
+        group_of("memory")
+            .unwrap()
+            .selector_note
+            .contains("navigate")
+    );
+    // store=codebase routes navigate to the owner with its own action; the owner answers from the index.
+    let args = json!({"store":"codebase","action":"navigate","query":"route_request"});
+    let (owner, own) = facade.resolve(&args).unwrap();
+    assert_eq!(owner.name(), "codebase_memory");
+    assert_eq!(own, json!({"action":"navigate","query":"route_request"}));
+    let config = crate::config::types::Config::default();
+    let ctx = ToolContext {
+        workspace: &workspace,
+        config: &config,
+        mutation_authorizer: None,
+        confirm: None,
+    };
+    let out = owner.call(&ctx, &own);
+    assert!(!out.is_error, "{}", out.text);
+    assert!(
+        out.text.contains("Navigation packet") && out.text.contains(r#""path":"src/router.rs""#),
+        "{}",
+        out.text
+    );
+    // The pre-navigate successor is the same schema without the new enum value; it must still resume.
+    let mut before = current.clone();
+    let enum_values = before["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array_mut()
+        .unwrap();
+    let count = enum_values.len();
+    enum_values.retain(|value| value != "navigate");
+    assert_eq!(enum_values.len() + 1, count);
+    let mut registry = Registry::new();
+    registry.register(Arc::new(facade));
+    let identity = identities(&[before], &registry)["memory"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"call":identity}})];
+    assert!(
+        project_history(&history, &[current], &registry)
+            .unwrap()
+            .is_none()
+    );
+}

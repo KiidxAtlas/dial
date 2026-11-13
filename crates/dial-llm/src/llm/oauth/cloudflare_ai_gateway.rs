@@ -33,18 +33,21 @@ fn login(l: &Login<'_>) -> Result<Credentials> {
         "Paste your Cloudflare AI Gateway token/API key",
         "cfut_...",
         "Cloudflare AI Gateway token is required",
+        true,
     )?;
     let account = prompt_required(
         l,
         "Enter your Cloudflare account ID",
         "32-character account ID",
         "Cloudflare account ID is required",
+        false,
     )?;
     let gateway = prompt_required(
         l,
         "Enter your Cloudflare AI Gateway ID",
         "default",
         "Cloudflare AI Gateway ID is required",
+        false,
     )?;
     let mut extra = serde_json::Map::new();
     extra.insert(ACCOUNT_KEY.into(), Value::String(account));
@@ -62,8 +65,13 @@ fn prompt_required(
     message: &str,
     placeholder: &str,
     missing: &str,
+    secret: bool,
 ) -> Result<String> {
-    let value = l.ui.prompt(message, Some(placeholder), true)?;
+    let value = if secret {
+        l.ui.prompt_secret(message, Some(placeholder), true)?
+    } else {
+        l.ui.prompt(message, Some(placeholder), true)?
+    };
     ensure!(!l.cancel.load(Ordering::SeqCst), "sign-in cancelled");
     let value = value.trim();
     ensure!(!value.is_empty(), "{missing}");

@@ -116,12 +116,16 @@ pub fn prepare_containment() -> Result<(), String> {
     require_fork_containment("eval")
 }
 
+fn embedded_fallback_available(node: &str) -> bool {
+    embedded_js_available() && (node != "node" || !crate::setup::deps::bundled_node::available())
+}
+
 /// Languages backed by a resolved operator launcher or the compiled JavaScript engine. Only
 /// paths/build facts are inspected; version and containment preflight runs at cell launch.
 pub fn installed_languages(workspace: &std::path::Path, config: &Config) -> Vec<&'static str> {
     let mut languages = Vec::new();
     if resolve_operator_executable(workspace, &config.eval.node, "eval.node").is_ok()
-        || embedded_js_available()
+        || embedded_fallback_available(&config.eval.node)
     {
         languages.push("js");
     }
@@ -313,7 +317,7 @@ impl JsRuntime {
                         ) {
                             Ok(node) => (Some(node), "Node kernel (install/configure eval.node)"),
                             Err(node_error) => {
-                                if !embedded_js_available() {
+                                if !embedded_fallback_available(&self.config.node) {
                                     return Err(node_error);
                                 }
                                 (None, "embedded JavaScript engine")
@@ -364,7 +368,7 @@ impl Tool for EvalTool {
             "eval",
             &crate::tools::surface::catalog::execution_description(
                 "eval",
-                "Persistent JavaScript (default) or Python 3.8+; separate namespaces, persistent top-level bindings (prefer var in JS). Embedded JS has no Node modules; OS containment required; subprocesses/native addons denied. Portable dial helpers are `dial` methods (JS await, Python synchronous): read/readText/readJson/readBytes, readLines(path, offset, limit)/lines(path) (page any-size text by line), writeText/writeJson/writeBytes (creates only), run, batch (raises with error.results unless collect:true), check (local, not task-wide verification), snapshot/fresh/restore (source bytes, not atomic live-database backup), hex/pack/unpack; whole-file exact I/O cap: 1 MiB/call. Call tool.<name>(args) or tool.call(name,args) (JS await; Python returns dictionaries synchronously, also await-compatible without replay). tool.batch([{name,args},...]) returns ordered {is_error,text,data}; eligible reads run together: filter/aggregate lookups in one cell. Normal approval applies; denied/malformed callbacks raise ToolError. Generate data in one foreground cell (background:false): read inputs programmatically, compute, serialize, write, then assert saved bytes, unchanged inputs, shape and independently expected results; prove a tiny known-answer case first; never transcribe source rows or printed values. Keep large values in the namespace; print short summaries. Stdout alone is not check evidence. Failed cells can leave effects: inspect receipts before retrying.",
+                "Persistent JavaScript (default) or Python 3.8+; separate namespaces keep top-level bindings (var in JS): patch earlier definitions, don't resend whole scripts. Embedded JS has no Node modules; OS containment required; subprocesses/native addons denied. Portable dial helpers are dial.* methods (JS await, Python sync): read/readText/readJson/readBytes(path), readLines/lines, writeText/writeJson/writeBytes (create only), run, batch (raises unless collect:true), check (local only), snapshot/fresh/restore, hex/pack/unpack; 1 MiB/whole-file call. tool.<name>({...}) and tool.batch([{name,args},...]) take objects; denials raise ToolError. Generated files: in one cell read inputs, compute, write, assert; prove tricky logic on a tiny known-answer case; never print then transcribe. Print short summaries; stdout isn't check evidence. Failed cells can leave effects.",
             ),
             json!({
                 "language":{"type":"string","enum":["js","py"],"description":"Runtime for this cell; defaults to js. Windows Python requires explicit unsandboxed opt-in."},
@@ -379,10 +383,10 @@ impl Tool for EvalTool {
         if !self.js.config.portable_helpers
             && let Some(description) = schema["function"]["description"].as_str()
             && let Some((start, remaining)) = description.split_once("Portable dial helpers")
-            && let Some((_, rest)) = remaining.split_once("Call tool.<name>")
+            && let Some((_, rest)) = remaining.split_once("tool.<name>")
         {
             schema["function"]["description"] = json!(format!(
-                "{start}Portable helpers are disabled. Call tool.<name>{rest}"
+                "{start}Portable helpers are disabled. tool.<name>{rest}"
             ));
         }
         schema

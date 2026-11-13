@@ -2536,8 +2536,11 @@ impl<'a> Agent<'a> {
 
     /// Keep unfinished bash work visible without blocking the controller or user steering.
     pub(in crate::agent) fn await_background_jobs(&mut self, ui: &mut dyn Ui) -> bool {
-        self.pump_subagents(ui);
+        // Running jobs are listed before notifications are drained. In the other order a job that
+        // exits between the drain and the listing is in neither: its completion stays queued and
+        // the turn ends without reporting it. Here such a job is at worst both listed and reported.
         let jobs = self.awaited_background_jobs();
+        self.pump_subagents(ui);
         let questions = self.side_questions.running_ids();
         if !questions.is_empty() && !self.interrupt.load(Ordering::Relaxed) {
             self.background_notices.push(format!("[Side questions still running]\n{}\nContinue independent work or use a bounded `task` action=question_wait; do not claim their answers are available yet.", questions.join("\n")));

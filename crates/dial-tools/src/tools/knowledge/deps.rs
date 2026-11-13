@@ -451,9 +451,12 @@ fn cargo(
     wanted: Option<&str>,
     caches: &Caches,
 ) -> Result<Package, String> {
-    let text = fs::read_to_string(root.join("Cargo.lock")).map_err(|_| {
-        "no Cargo.lock in the workspace root (`cargo generate-lockfile --offline` creates one)"
-            .to_owned()
+    let text = fs::read_to_string(root.join("Cargo.lock")).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            "no Cargo.lock in the workspace root (`cargo generate-lockfile --offline` creates one)"
+                .to_owned()
+        }
+        _ => format!("cannot read Cargo.lock: {error}"),
     })?;
     let lock: toml::Value =
         toml::from_str(&text).map_err(|error| format!("Cargo.lock does not parse: {error}"))?;
@@ -591,9 +594,13 @@ fn git_checkout(base: &Path, revision: &str, package: &str) -> Option<PathBuf> {
 fn npm(root: &Path, name: &str, wanted: Option<&str>) -> Result<Package, String> {
     let base = root.join("node_modules");
     let dir = base.join(name);
-    let manifest = fs::read_to_string(dir.join("package.json")).map_err(|_| {
-        format!("{name} is not installed in node_modules (install it with the project's package manager; nothing is fetched here)")
-    })?;
+    let manifest =
+        fs::read_to_string(dir.join("package.json")).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => format!(
+                "{name} is not installed in node_modules (install it with the project's package manager; nothing is fetched here)"
+            ),
+            _ => format!("cannot read node_modules/{name}/package.json: {error}"),
+        })?;
     let manifest: Value = serde_json::from_str(&manifest)
         .map_err(|error| format!("node_modules/{name}/package.json does not parse: {error}"))?;
     let version = manifest["version"].as_str().unwrap_or("unknown").to_owned();

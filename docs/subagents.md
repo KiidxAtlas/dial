@@ -8,6 +8,17 @@ Delegation briefs avoid repeating automatic parent goals when the exact text alr
 
 For efficient handoffs, supply the outcome, owned files or subsystem, shared interfaces, relevant evidence references, and checks with an owner. Cite `file:line` evidence rather than telling a worker to read whole skills or architecture documents. Give each worker one complete assignment and collect it with `wait`; message a running worker only when a requirement changes, not for readiness signals, holds or status checks. Workers carry out their scoped change without stopping to ask for confirmation. Keep shared builds with one integration owner and wait for relevant edits to settle. Worker findings are evidence to use, not a reason to repeat the investigation; failed checks still need diagnosis, repair and rechecking.
 
+Work-packet handoffs keep the existing `scope`, `interface` and `acceptance` fields; put relevant
+source references and check ownership in that assignment rather than sending a second repository
+tour. Unless a custom output schema says otherwise, worker result guidance also requests exact
+`checks_run` and explicit `gaps`. The parent projection retains bounded copies as untrusted report
+claims, not native process evidence or controller acceptance. Custom output schemas remain
+authoritative. Prompt/envelope checks establish these transport rules, not better live delegation.
+For these new fields, an absent or malformed value is `null` with `<key>_reported:false`;
+an explicitly reported empty array means none were reported. Non-string rows are counted in
+`<key>_dropped`; an array containing only invalid rows remains `null`, not an empty-list claim.
+The compact view retains the reported flag even when empty/null values are omitted.
+
 Untargeted task status/wait and pool polling retain lifecycle state and report artifacts but do not
 repeat a successful narrative already delivered for that exact execution. New results, failures,
 blockers, acceptance/audit details and isolation/merge warnings remain visible. Targeted
@@ -404,7 +415,7 @@ The `task` tool runs typed subagents (`scout`, `reviewer`, `planner`, `worker`, 
 
 On hosted routes `task` is in the default core offer (with `message`); on lean and local routes, and for `skill`, load them with `tool_load` or `tool_search` `load: true`. A user message that shares words with a skill's name or description gets a one-line hint to load that skill.
 
-Open the worker hub with Alt+A or F6 (`app.subagents.hub`), Left twice on an empty composer, or `/workers` (`/agents` opens it too; `/jobs` and `/hub` are hidden aliases). `/bg` and `/processes` open the background process panel instead. The `subagent-hub:activity` action opens the hub directly on its Activity tab. Each child's conversation is saved as JSONL under the state directory (`subagents/<session>/<job>-<millis>.jsonl`), outside the workspace.
+Open the worker hub with Alt+A or F6 (`app.subagents.hub`), Left twice on an empty composer, or `/workers` (`/agents` opens it too; `/jobs` and `/hub` are hidden aliases). It opens as the Workers tab of Activity, whose title row lists Attention, Workers, Processes, Compute, Schedule and Queue; Left/Right (or Tab/Shift+Tab) switch those tabs and never leave Activity. `/bg` and `/processes` open the background process panel instead. The `subagent-hub:activity` action opens the hub directly on its Events view. Before any worker exists the hub shows how to start one (`/worker <task>`, asking Dial to delegate, `r` for worker models) instead of an empty roster. Each child's conversation is saved as JSONL under the state directory (`subagents/<session>/<job>-<millis>.jsonl`), outside the workspace.
 
 Agents tab: Up/Down or `j`/`k` select a worker; Enter opens its transcript at the selected entry; `t` toggles flat and tree views; `/` filters by name, task or id; `m` messages a worker (steers a running one, resumes a finished one); `x` pressed twice within 2 seconds stops a running worker; `r` opens model roles; PageUp/PageDown scroll the inspector; F1 or `?` shows the keys. The inspector shows each worker's result. Unread messages show as `✉ N msgs`. Existing roster positions stay stable while the hub is open; workers waiting for input or reporting failure can rise for attention rather than continuously reordering by recent activity. A worker that finished needing input or blocked counts as finished but needing attention: it stays pinned above the composer until you open it, and its transcript view can resume it. Worker notices that arrive while the hub or a worker view is open are kept, and `Alt+Shift+A` opens the worker named by the newest notice.
 
@@ -413,7 +424,7 @@ draft, cursor and undo state when reopened; `/back` exits the view. Ctrl+C stops
 worker, after a confirming second press. Ordinary letters, including `x`, are text there, not hub stop shortcuts. A submitted
 message clears only after delivery/start acknowledgement; a failed submission keeps the draft.
 
-Activity tab (`2`, or Tab on a wide layout): `f` cycles the kind filter (all, errors, responses, tools, messages); `s` cycles the scope (all, selected worker, selected subtree); Space toggles follow; `/` searches; Enter opens the entry in its transcript.
+Events view (`2`; `1` returns to the workers): `f` cycles the kind filter (all, errors, responses, tools, messages); `s` cycles the scope (all, selected worker, selected subtree); Space toggles follow; `/` searches; Enter opens the entry in its transcript.
 
 Refreshes follow complete appended transcript records instead of reparsing the full history. Each
 view retains at most 300 activity events for each of the 12 newest transcripts, reading at most one

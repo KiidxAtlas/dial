@@ -1,6 +1,7 @@
 //! Listen-only physical Escape monitoring for operation and durable task
 //! ownership.
 use std::{
+    cell::Cell,
     ffi::c_void,
     ptr,
     thread::{self, JoinHandle},
@@ -64,7 +65,9 @@ unsafe extern "C" {
 
 struct TapContext {
     stop: EmergencyStop,
-    tap: Ref,
+    // Set after the tap exists, through the same shared borrow the callback uses,
+    // so the raw pointer registered with Quartz is never invalidated by a unique write.
+    tap: Cell<Ref>,
 }
 
 const fn physical_escape(kind: u32, key: i64, pid: i64, tag: i64) -> bool {
@@ -83,7 +86,7 @@ unsafe extern "C" fn observe(_proxy: Ref, kind: u32, event: Ref, user: Ref) -> R
         context.stop.cancel();
         // SAFETY: the event tap remains alive until this callback returns.
         unsafe {
-            CGEventTapEnable(context.tap, true);
+            CGEventTapEnable(context.tap.get(), true);
         }
         return event;
     }
@@ -129,9 +132,9 @@ impl EscapeMonitor {
         let worker = thread::Builder::new()
             .name("desktop-escape".into())
             .spawn(move || {
-                let mut context = TapContext {
+                let context = TapContext {
                     stop: emergency,
-                    tap: ptr::null_mut(),
+                    tap: Cell::new(ptr::null_mut()),
                 };
                 // SAFETY: listen-only CGEventTapCreate uses the declared C ABI.
                 // `context` stays at this stack address until the source is
@@ -143,14 +146,14 @@ impl EscapeMonitor {
                         1,
                         (1 << KEY_DOWN) | (1 << 1) | (1 << 3) | (1 << 25) | (1 << 12),
                         observe,
-                        ptr::from_mut(&mut context).cast(),
+                        ptr::from_ref(&context).cast_mut().cast(),
                     )
                 };
                 if tap.is_null() {
                     let _ = ready.send(None);
                     return;
                 }
-                context.tap = tap;
+                context.tap.set(tap);
                 let mut stop_context = SourceContext {
                     version: 0,
                     info: ptr::null_mut(),

@@ -90,6 +90,26 @@ fn request_failures_identify_the_pending_operation_without_logging_params() {
     assert!(!detail.contains("not-for-diagnostics"));
     assert!(input.is_empty(), "expired request must not emit bytes");
 }
+
+#[test]
+fn deadline_failures_attribute_time_to_completed_and_pending_phases() {
+    let started = Instant::now();
+    let mut phases = Phases::default();
+    assert_eq!(
+        phases.summary(started, started + Duration::from_millis(2_500)),
+        "case elapsed 2.5 s; completed: none; pending for 2.5 s"
+    );
+    phases.start(started);
+    phases.done("ready", started + Duration::from_secs(3));
+    phases.done("send#1", started + Duration::from_secs(43));
+    phases.done("compact#2", started + Duration::from_secs(100));
+    assert_eq!(
+        phases.summary(started, started + Duration::from_secs(180)),
+        "case elapsed 180.0 s; completed: ready 3.0 s, send#1 40.0 s, compact#2 57.0 s; \
+         pending for 80.0 s"
+    );
+}
+
 #[test]
 fn runtime_ledger_replaces_main_agent_events_across_turns() {
     let mut metrics = RunMetrics::default();
@@ -330,4 +350,83 @@ fn benchmark_accepts_answered_turns_without_claiming_work_completion() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn worker_counters_sum_only_when_every_worker_reports_them() {
+    let node = |kind: &str, phase: &str, data: Value| json!({"kind": kind, "result": {"phase": phase, "data": data}});
+    let tree = |nodes: Vec<Value>| json!({"tree": nodes});
+    let cases = [
+        (
+            "terminal workers with every counter",
+            tree(vec![
+                node(
+                    "worker",
+                    "completed",
+                    json!({"tools": 2, "steps": 3, "elapsed_ms": 40}),
+                ),
+                node(
+                    "worker",
+                    "failed",
+                    json!({"tools": 1, "steps": 1, "elapsed_ms": 10}),
+                ),
+                node("task", "completed", json!({"tools": 99, "steps": 99})),
+            ]),
+            Some((2, 0, Some(3), Some(4), Some(50))),
+        ),
+        (
+            "running worker keeps the partial snapshot incomplete",
+            tree(vec![node(
+                "worker",
+                "running",
+                json!({"tools": 2, "steps": 1}),
+            )]),
+            Some((1, 1, Some(2), Some(1), None)),
+        ),
+        (
+            "terminal worker without elapsed time",
+            tree(vec![node(
+                "worker",
+                "completed",
+                json!({"tools": 2, "steps": 1}),
+            )]),
+            Some((1, 0, Some(2), Some(1), None)),
+        ),
+        (
+            "unknown or corrupt phase is never terminal",
+            tree(vec![node(
+                "worker",
+                "paused",
+                json!({"tools": 1, "steps": 1, "elapsed_ms": 5}),
+            )]),
+            Some((1, 1, Some(1), Some(1), None)),
+        ),
+        (
+            "worker without a tool counter",
+            tree(vec![node(
+                "worker",
+                "completed",
+                json!({"steps": 1, "elapsed_ms": 5}),
+            )]),
+            Some((1, 0, None, Some(1), Some(5))),
+        ),
+        (
+            "no workers in a present tree is a known zero",
+            tree(vec![node("session", "completed", json!({}))]),
+            Some((0, 0, Some(0), Some(0), Some(0))),
+        ),
+        ("missing tree stays unknown", json!({}), None),
+    ];
+    for (name, state, expected) in cases {
+        let actual = read_worker_execution(&state).map(|w| {
+            (
+                w.workers,
+                w.running,
+                w.tool_starts,
+                w.model_steps,
+                w.elapsed_ms,
+            )
+        });
+        assert_eq!(actual, expected, "{name}");
+    }
 }

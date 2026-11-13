@@ -20,11 +20,11 @@ pub struct ToolConfig {
     pub parameters: Option<serde_json::Value>,
 }
 
-/// Which shell runs `bash` commands. `auto` uses bash when one is installed: `/bin/bash` on Unix, and
-/// Git for Windows' `bash.exe` on Windows (WSL's launcher does not count). Without bash it uses the
-/// built-in shell (`embedded`), and on Windows without an embedded build it uses PowerShell.
-/// `system` requires bash. `inprocess` runs the built-in shell inside Dial itself and is refused unless
-/// `sandbox.mode` is `off`. `powershell` runs PowerShell on Windows only.
+/// Which shell runs `bash` commands. `auto` uses Dial's built-in Bash-compatible shell on every OS.
+/// Builds without `embedded-shell` fall back to system bash (Git for Windows, never WSL's launcher),
+/// then PowerShell on Windows. `system` explicitly requires bash. `inprocess` runs the built-in
+/// shell inside Dial itself and is refused unless `sandbox.mode` is `off`.
+/// `powershell` runs PowerShell on Windows only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellBackend {

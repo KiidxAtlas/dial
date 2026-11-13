@@ -85,6 +85,17 @@ fn main() {
             ));
         }
     }
+    // Release probes bypass configuration/onboarding and never need model credentials.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "__installed-smoke")
+    {
+        if let Err(error) = cmd::installed_smoke::run(std::env::args_os().skip(2)) {
+            eprintln!("installed smoke failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     dial::exit_quietly_on_closed_stdout();
     let cli = args::parse();
     if let Some(suggestion) = args::mistyped_subcommand(&cli, std::env::args_os()) {

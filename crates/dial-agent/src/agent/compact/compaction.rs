@@ -810,15 +810,19 @@ pub(in crate::agent) fn compact_history_with_execution(
                             backend,
                             &request.messages,
                             keep,
-                            policy,
-                            &context,
-                            method,
-                            &focus,
-                            &interrupt,
+                            summary::SummaryOptions {
+                                policy,
+                                context: &context,
+                                method,
+                                focus: &focus,
+                                interrupt: &interrupt,
+                            },
                             ui,
                             complete,
-                            &mut remote_observer,
-                            &mut execution.parallel,
+                            summary::SummaryRoute {
+                                remote_observer: &mut remote_observer,
+                                worker: &mut execution.parallel,
+                            },
                         )?,
                     };
                     let mut prefix = vec![Session::compaction_message(&summary)];
@@ -867,11 +871,13 @@ pub(in crate::agent) fn compact_history_with_execution(
                                 backend,
                                 &increment,
                                 increment.len(),
-                                policy,
-                                &context,
-                                method,
-                                &focus,
-                                &interrupt,
+                                summary::SummaryOptions {
+                                    policy,
+                                    context: &context,
+                                    method,
+                                    focus: &focus,
+                                    interrupt: &interrupt,
+                                },
                                 ui,
                                 &mut |backend, request, ui| {
                                     complete(backend, request, ui, interrupt.clone())

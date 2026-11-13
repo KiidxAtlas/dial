@@ -147,6 +147,14 @@ pub fn run_host_with_state(script_path: &Path, state_path: Option<&Path>) -> i32
                 return 2;
             }
         };
+        // CoreFoundation may add this process-local bookkeeping entry while the linked Dial
+        // executable starts, after the launcher has cleared and allowlisted its environment.
+        // It is not part of the portable command environment; keep the scrub boundary intact.
+        #[cfg(target_os = "macos")]
+        if let Err(error) = shell.env_mut().unset("__CF_USER_TEXT_ENCODING") {
+            eprintln!("dial: scrubbing embedded shell environment: {error}");
+            return 2;
+        }
         if let Some(seed) = &seed {
             for (name, value) in &seed.exported {
                 let mut variable = brush_core::variables::ShellVariable::new(value.clone());

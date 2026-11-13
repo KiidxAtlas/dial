@@ -226,12 +226,13 @@ pub fn run(root: &Path, state: &Path) -> Result<Run> {
         root,
         "a benchmark run needs a clean working tree so the recorded commit is what was measured",
     )?;
-    let workspace = fs::canonicalize(root)?;
-    let sandbox = crate::tools::exec::sandbox::Sandbox::detect();
-    let mut command = sandbox
-        .command(&workspace, false, "/bin/sh", &["-lc", &e.benchmark])
-        .map_err(anyhow::Error::msg)?;
-    command.current_dir(&workspace);
+    // Workspace::new applies the tool-call admission boundary (canonical directory, not the
+    // filesystem root) and the default strict sandbox, shared with the bash tool.
+    let ws = crate::tools::Workspace::new(root)?;
+    let workspace = ws.root();
+    let mut command = crate::tools::exec::shell::verifier_command(&ws, &e.benchmark)
+        .map_err(anyhow::Error::msg)
+        .context("building sandboxed benchmark command")?;
     let output = command.output().context("running sandboxed benchmark")?;
     let text = format!(
         "{}{}",
@@ -244,7 +245,7 @@ pub fn run(root: &Path, state: &Path) -> Result<Run> {
     let metric = parse_metric(&text, &e.metric).context(
         "benchmark did not emit requested metric; use `metric=value` or ASI metric=value",
     )?;
-    let commit = run_checked(&workspace, &["rev-parse", "HEAD"], false)
+    let commit = run_checked(workspace, &["rev-parse", "HEAD"], false)
         .map_err(|error| anyhow::anyhow!("reading Git HEAD failed: {error}"))?;
     let commit = commit.trim().to_owned();
     let mut c = db(state)?;
@@ -264,7 +265,7 @@ pub fn run(root: &Path, state: &Path) -> Result<Run> {
     if is_best {
         // Move the Git ref first: if it fails, the run stays unmarked and DB and Git agree.
         run_checked(
-            &workspace,
+            workspace,
             &["branch", "-f", best_ref(&e.name).as_str(), commit.as_str()],
             true,
         )

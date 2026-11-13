@@ -23,10 +23,16 @@ TEST_PROFILE ?= dev
 NEXTEST_PROFILE ?= default
 DIAL ?= $(BUILD_DIR)/dial
 
+# Tests that run the embedded shell need a freshly built `dial` host (the test binary cannot act as
+# one). HOST_RUN builds it with the same profile and features as the test command, smoke-checks it,
+# and exports DIAL_EMBEDDED_SHELL_HOST for that command only; see scripts/embedded-host.py.
+# Callers append `-- <cargo command>` after their feature flags.
+HOST_RUN = $(PYTHON) scripts/embedded-host.py --cargo "$(CARGO)"
+
 
 .DEFAULT_GOAL := help
-.PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline test-smoke test-mlx preflight preflight-quick hooks
-.PHONY: test-install test-build test-windows-contract test-packaging test-release-policy preflight-worktree
+.PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline bench-headline test-smoke test-mlx preflight preflight-quick hooks
+.PHONY: test-install test-build test-windows-contract test-embedded-host test-packaging test-release-policy preflight-worktree
 .PHONY: release-check lint-deps clean test-clean
 
 help:
@@ -47,12 +53,14 @@ help:
 		'make test-drivers  Run browser, JavaScript eval and Python kernel transport contracts (Node 22+, Python 3)' \
 		'make test-python  Run Python contracts; report unavailable optional MLX checks' \
 		'make test-bench-offline  Run benchmark grader/reporting tests, no model or binary needed' \
+		'make bench-headline DIAL=target/local/dial [BASELINE=old.json]  Run the headline local-tasks score (needs a loaded model in HEADLINE_PROFILES)' \
 		'make test-packaging  Check distribution metadata and packaging contracts' \
 		'make test-release-policy  Check publication authorization and version ordering' \
 		'make release-check  No-build source, packaging, shell and tooling checks (RELEASE_TAG=v0.3.0 optional)' \
 		'make test-build  Test local build/install commands without replacing your installed binary' \
 		'make test-install  Test the Unix release installer (Python cryptography required)' \
 		'make test-windows-contract  Test the focused Windows contract runner' \
+		'make test-embedded-host  Test embedded shell host preparation (mocked Cargo; no build)' \
 		'make test-smoke DIAL=target/local/dial  Check an already-built binary and scripted recovery' \
 		'make test-mlx  Run optional local MLX checks; explicitly skip unsupported hosts, never download' \
 		'make preflight  Run every CI check locally on a clean snapshot of HEAD (REV=<commit> for another)' \
@@ -95,25 +103,25 @@ test: test-rust
 
 test-rust:
 	$(PYTHON) scripts/test-prerequisites.py
-	$(CARGO) test --locked --workspace --no-fail-fast --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked --workspace --no-fail-fast --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 
 test-lib:
-	$(CARGO) test --locked --workspace --lib $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked --workspace --lib $(CARGO_FEATURE_FLAGS)
 
 test-integration:
-	$(CARGO) test --locked -p dial --test integration $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked -p dial --test integration $(CARGO_FEATURE_FLAGS)
 
 # Fast loop for one lib module: make test-module MOD=llm::provider (searches every workspace crate).
 # CRATE=dial-llm builds only that crate's test binary instead of every crate's.
 test-module:
 	@test -n "$(MOD)" || { printf '%s\n' 'Usage: make test-module MOD=llm::provider [CRATE=dial-llm]' >&2; exit 2; }
-	$(CARGO) test --locked $(if $(strip $(CRATE)),-p $(CRATE),--workspace) --lib $(CARGO_FEATURE_FLAGS) $(MOD)
+	$(HOST_RUN) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked $(if $(strip $(CRATE)),-p $(CRATE),--workspace) --lib $(CARGO_FEATURE_FLAGS) $(MOD)
 
 test-nextest:
 	$(PYTHON) scripts/test-prerequisites.py
 	@command -v cargo-nextest >/dev/null 2>&1 || { printf '%s\n' 'cargo-nextest is not installed: https://nexte.st (or use make test-rust)' >&2; exit 2; }
-	$(CARGO) nextest run --locked --workspace --no-fail-fast --cargo-profile $(TEST_PROFILE) --profile $(NEXTEST_PROFILE) $(CARGO_FEATURE_FLAGS)
-	$(CARGO) test --locked --workspace --doc --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS) -- $(CARGO) nextest run --locked --workspace --no-fail-fast --cargo-profile $(TEST_PROFILE) --profile $(NEXTEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked --workspace --doc --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 
 lint:
 	$(CARGO) clippy --locked --workspace --all-targets $(CARGO_FEATURE_FLAGS) -- -D warnings
@@ -134,6 +142,20 @@ test-python:
 test-bench-offline:
 	$(PYTHON) -m unittest discover -s examples/benchmarks -p 'test_*.py'
 
+# Headline task score: the fixed local-tasks suite, run against an already-loaded model. Reports
+# go to a durable path under the target dir, never $TMPDIR, so an interrupted run keeps its
+# progress journal. BASELINE compares against an earlier headline report (correctness first).
+HEADLINE_PROFILES ?= examples/benchmarks/local-tasks-profiles.toml
+HEADLINE_REPORT := $(CARGO_TARGET_DIR)/benchmarks/headline-$(shell date +%Y%m%d-%H%M%S).json
+BASELINE ?=
+bench-headline:
+	@status=0; \
+	"$(DIAL)" benchmark examples/benchmarks/local-tasks.toml --profiles "$(HEADLINE_PROFILES)" --report "$(HEADLINE_REPORT)" || status=$$?; \
+	if [ -n "$(BASELINE)" ] && [ -f "$(HEADLINE_REPORT)" ]; then \
+		$(PYTHON) examples/benchmarks/compare.py "$(BASELINE)" "$(HEADLINE_REPORT)" || status=1; \
+	fi; \
+	exit $$status
+
 test-install:
 	bash scripts/test-install.sh
 
@@ -142,6 +164,9 @@ test-build:
 
 test-windows-contract:
 	$(PYTHON) scripts/test-windows-contract.py
+
+test-embedded-host:
+	$(PYTHON) scripts/test-embedded-host.py
 
 test-packaging:
 	$(PYTHON) scripts/test-packaging.py

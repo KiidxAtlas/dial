@@ -1,4 +1,24 @@
+use super::cache::selection_cache_key;
+use super::credentials::env_token;
+use super::local_models::{
+    lmstudio_gguf_models, lmstudio_gguf_models_where, lmstudio_mlx_models,
+    lmstudio_mlx_models_where, local_models, local_models_where, model_card_kind_in,
+    resolve_local_model_in,
+};
+use super::local_servers::{
+    annotate_lmstudio, declared_kind, kind_from_declared, ollama_show, parse_lmstudio,
+};
+use super::metadata::metadata;
+use super::probe::{apply_anthropic_oauth_access, parse_models, verify_and_save_credential_at};
 use super::*;
+use crate::config::settings_store::write_private;
+use crate::llm::local_format::LocalFormat;
+use serde_json::Value;
+use std::collections::BTreeSet;
+use std::fs;
+use std::io::Read;
+use std::sync::Arc;
+use std::time::Instant;
 
 #[test]
 fn bundled_providers_are_listed_without_a_key_and_probed_with_one() {

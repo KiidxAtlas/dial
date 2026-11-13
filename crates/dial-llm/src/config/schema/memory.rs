@@ -827,7 +827,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         LE,
         "Semantic memory",
         "Retain facts automatically",
-        "After substantive turns, extract durable facts with the memory role (Alt+M) and store them in the background. Pauses while the memory role is unassigned; it never falls back to the main model. Each turn is extracted once. Turn text is redacted and treated as untrusted.",
+        "After substantive turns, extract durable facts with the memory role (Alt+M), or the small role when the memory role is unassigned, and store them in the background. Pauses while neither role is assigned; it never falls back to the main model. Each turn is extracted once. Turn text is redacted and treated as untrusted.",
         Kind::Bool,
         false
     ),

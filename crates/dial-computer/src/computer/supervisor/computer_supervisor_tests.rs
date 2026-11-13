@@ -473,7 +473,7 @@ fn worker_start_failures_name_windows_loader_errors_and_how_to_fix_node() {
         ),
         "{message}"
     );
-    assert!(message.contains("`node --version`"), "{message}");
+    assert!(message.contains(node_hint()), "{message}");
     assert!(!message.contains("Worker output"), "{message}");
     let wrong_arch = start_failure(Some(0xC000_007B_u32 as i32), "");
     assert!(
@@ -490,11 +490,16 @@ fn worker_start_failures_name_windows_loader_errors_and_how_to_fix_node() {
 #[test]
 fn a_missing_node_says_so_instead_of_an_os_error() {
     let missing = launch_failure(&std::io::Error::from(std::io::ErrorKind::NotFound));
-    assert!(
-        missing.contains("`node` was not found on PATH"),
-        "{missing}"
-    );
-    assert!(missing.contains("https://nodejs.org"), "{missing}");
+    if dial_tools::setup::deps::bundled_node::available() {
+        assert!(missing.contains("repair or reinstall Dial"), "{missing}");
+        assert!(!missing.contains("was not found on PATH"), "{missing}");
+    } else {
+        assert!(
+            missing.contains("`node` was not found on PATH"),
+            "{missing}"
+        );
+        assert!(missing.contains("https://nodejs.org"), "{missing}");
+    }
     let denied = launch_failure(&std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     assert!(
         denied.starts_with("Failed to start computer worker: permission denied"),
@@ -514,4 +519,52 @@ fn a_worker_that_exits_at_startup_reports_its_exit_code() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(supervisor.inner.state.lock().last_exit, Some(7));
+}
+
+/// Answers `ping` with `pong` and `close` with `closed`, as the real worker does.
+#[cfg(unix)]
+const ACKING_WORKER: &str = "import json,sys\nfor line in sys.stdin:\n    m = json.loads(line)\n    if m['type'] == 'ping': print(json.dumps({'type': 'pong', 'id': m['id']}), flush=True)\n    elif m['type'] == 'close': print(json.dumps({'type': 'closed'}), flush=True); break\n";
+
+#[cfg(unix)]
+#[test]
+fn smoke_probe_resolves_the_matching_pong_and_requires_closed_ack() {
+    let supervisor = fake_worker(ACKING_WORKER);
+    ping_worker(&supervisor.inner, Duration::from_secs(5)).unwrap();
+    close_worker_strictly(&supervisor.inner).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn smoke_probe_ping_timeout_is_bounded_and_reaps_the_worker() {
+    let supervisor = fake_worker("import time; time.sleep(30)");
+    let started = Instant::now();
+    let error = ping_worker(&supervisor.inner, Duration::from_millis(200)).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("Timed out waiting for computer worker ping"),
+        "{error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(supervisor.inner.state.lock().worker.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn smoke_probe_close_without_closed_ack_is_an_error() {
+    // Reads the close request and exits without acknowledging it.
+    let supervisor = fake_worker("import sys\nfor line in sys.stdin:\n    break\n");
+    assert!(close_worker_strictly(&supervisor.inner).is_err());
+    assert!(supervisor.inner.state.lock().worker.is_none());
+}
+
+/// Starts the real worker through Node. Reported as skipped, not passed, when no Node runtime exists.
+#[test]
+fn smoke_test_round_trips_the_real_worker_over_node() {
+    if !matches!(Command::new("node").arg("--version").output(), Ok(out) if out.status.success()) {
+        eprintln!("skipped: node is not available; the real worker smoke test did not run");
+        return;
+    }
+    let cwd = tempfile::tempdir().unwrap();
+    smoke_test(cwd.path()).unwrap();
 }

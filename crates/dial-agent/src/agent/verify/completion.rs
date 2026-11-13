@@ -98,7 +98,7 @@ impl Finish {
 pub fn schema() -> Value {
     json!({"type":"function","function":{
         "name":"finish",
-        "description":"End the request with an explicit outcome; a plain final reply works the same way. completed: the requested work is done; first finish or block planned steps and deliverables, wait for running jobs, and get required checks passing. answered: you are delivering information, not claiming changes are done. blocked or needs_input: put the concrete missing prerequisite or question in reason, after checking what the workspace can tell you; needs_input may offer up to 8 options. Call it last in a batch.",
+        "description":"End the request with an explicit outcome (a plain final reply works the same). completed: work done, planned steps closed, jobs finished, required checks passing. answered: information, no change claims. blocked/needs_input: put the missing prerequisite or question in reason after checking the workspace; needs_input may offer up to 8 options. Call it last in a batch.",
         "parameters":{"type":"object","properties":{
             "outcome":{"type":"string","enum":["completed","answered","blocked","needs_input"]},
             "summary":{"type":"string","minLength":1,"maxLength":8192},

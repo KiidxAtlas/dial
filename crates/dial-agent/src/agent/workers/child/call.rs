@@ -1177,10 +1177,12 @@ fn execute_child_call(
             let authority = context.children.observe_memory()?;
             let mut runner = ChildMemoryRunner::new(
                 env,
-                context.backend,
-                context.adapter,
-                context.steps,
-                context.budget,
+                ChildMemoryTarget {
+                    backend: context.backend,
+                    adapter: context.adapter,
+                    steps: context.steps,
+                    budget: context.budget,
+                },
                 approver,
                 context.children,
                 Some(call),

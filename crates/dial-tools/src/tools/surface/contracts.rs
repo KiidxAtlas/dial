@@ -77,7 +77,7 @@ const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
     ("dap", &["filters", "filterOptions", "exceptionOptions"]),
     ("tool_search", &["load", "names", "unload"]),
     ("eval", &["background", "title"]),
-    ("verify", &["acceptance"]),
+    ("verify", &["acceptance", "plan"]),
     ("web_search", &["domains", "exclude_domains", "fetch_top"]),
     (
         "session_search",
@@ -216,6 +216,7 @@ const ADDITIVE_ENUM_VALUES: &[(&str, &str, &[&str])] = &[
     ("find", "ranking", &["embedding"]),
     ("monitor", "action", &["saved", "restore", "forget"]),
     ("bg", "action", &["saved", "restore", "forget"]),
+    ("codebase_memory", "action", &["navigate"]),
     ("task", "action", &["verify"]),
     ("lsp", "action", &["request"]),
     (

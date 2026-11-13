@@ -1,14 +1,18 @@
-//! Provider sign-in over RPC (protocol 2): `login`, `auth_code`, `auth_cancel`, `logout` and
-//! `auth_providers`. The flows and grant storage are the same owners `/login` uses.
+//! Sign-in over RPC (protocol 2): provider `login`, `auth_code`, `auth_cancel`, `logout` and
+//! `auth_providers`, and MCP server `mcp_login`/`mcp_logout`. The flows and grant storage are the
+//! same owners `/login` and `/mcp login` use.
 //!
-//! `login` runs the owner flow on a worker thread and replies to the request when it finishes.
+//! A login runs the owner flow on a worker thread and replies to the request when it finishes.
 //! While it runs, the flow emits `auth_url` (open this URL, optionally with a device code),
 //! `auth_progress`, and `auth_prompt` (the host answers with `auth_code`). Typed answers are never
 //! emitted or logged, and events carry no tokens. The reply carries only the owner's status line.
+//! An MCP sign-in is named `mcp:<server>` in its events and in `auth_cancel`.
 
-use super::Sender;
+use super::{Sender, coded};
+use crate::config::types::Config;
 use crate::llm::oauth::{self, Interaction};
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use dial_protocol::ErrorCode;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,7 +27,7 @@ const POLL: Duration = Duration::from_millis(50);
 const MIN_PROTOCOL: u32 = 2;
 
 struct Job {
-    provider: &'static str,
+    provider: String,
     cancel: Arc<AtomicBool>,
 }
 
@@ -110,7 +114,7 @@ fn wait_for_answer(
 
 /// The owner-facing interaction. It forwards flow events to the host without typed secrets.
 struct RpcInteraction<E, G> {
-    provider: &'static str,
+    provider: String,
     state: Arc<AuthState>,
     /// Sends one frame to the host; `false` when the frame could not be delivered.
     emit: E,
@@ -147,6 +151,32 @@ where
         placeholder: Option<&str>,
         allow_empty: bool,
     ) -> Result<String> {
+        self.ask(message, placeholder, allow_empty, false)
+    }
+
+    fn prompt_secret(
+        &self,
+        message: &str,
+        placeholder: Option<&str>,
+        allow_empty: bool,
+    ) -> Result<String> {
+        self.ask(message, placeholder, allow_empty, true)
+    }
+}
+
+impl<E, G> RpcInteraction<E, G>
+where
+    E: Fn(Value) -> bool + Send + Sync,
+    G: Fn() -> bool + Send + Sync,
+{
+    /// `secret`: the answer is a credential; the host masks the field.
+    fn ask(
+        &self,
+        message: &str,
+        placeholder: Option<&str>,
+        allow_empty: bool,
+        secret: bool,
+    ) -> Result<String> {
         self.state.ask(
             |prompt_id| {
                 (self.emit)(json!({
@@ -156,6 +186,7 @@ where
                     "message": message,
                     "placeholder": placeholder,
                     "allow_empty": allow_empty,
+                    "secret": secret,
                 }))
             },
             &self.cancel,
@@ -177,7 +208,8 @@ pub(super) fn ensure_v2(out: &Sender) -> Result<()> {
     Ok(())
 }
 
-/// Starts `login`. The request is answered by the worker thread when the flow finishes.
+/// Starts `login`. The request is answered by the worker thread when the flow finishes. Flows
+/// that need typed input (`needs_terminal` in `auth_providers`) ask through `auth_prompt`.
 pub(super) fn start_login(
     state: &Arc<AuthState>,
     out: &Sender,
@@ -188,37 +220,89 @@ pub(super) fn start_login(
     let provider = params["provider"].as_str().context("provider required")?;
     let flow = oauth::flow(provider)
         .with_context(|| format!("unknown provider {provider:?}; call auth_providers"))?;
-    ensure!(
-        !flow.needs_terminal,
-        "{} sign-in needs a terminal; run `dial login {}`",
-        flow.name,
-        flow.id
-    );
+    let user_dir = user_dir.to_path_buf();
+    spawn_flow(state, out, id, flow.id.to_owned(), move |ui, cancel| {
+        oauth::login(&user_dir, flow.id, ui, cancel)
+            .map(|message| json!({"provider": flow.id, "message": message}))
+    })
+}
+
+/// Starts `mcp_login` for the configured remote server `params.server`, as `/mcp login` does.
+/// The grant applies when the server next connects: `apply_settings {reconnect: true}`.
+pub(super) fn start_mcp_login(
+    state: &Arc<AuthState>,
+    out: &Sender,
+    config: &Config,
+    id: &Value,
+    params: &Value,
+) -> Result<()> {
+    let name = mcp_server(params)?;
+    let server = config.mcp.get(name).cloned().ok_or_else(|| {
+        coded(
+            ErrorCode::NotFound,
+            format!("MCP server `{name}` is not configured"),
+        )
+    })?;
+    let user_dir = config.user_dir.clone();
+    let name = name.to_owned();
+    spawn_flow(state, out, id, format!("mcp:{name}"), move |ui, cancel| {
+        crate::tools::integrations::mcp::login(&user_dir, &name, &server, ui, cancel)
+            .map(|message| json!({"server": name, "message": message}))
+    })
+}
+
+/// `mcp_logout`: removes the stored sign-in for `params.server`, cancelling a running one.
+pub(super) fn mcp_logout(state: &AuthState, user_dir: &Path, params: &Value) -> Result<Value> {
+    let name = mcp_server(params)?;
+    let job = format!("mcp:{name}");
+    if let Some(running) = locked(&state.job)
+        .as_ref()
+        .filter(|running| running.provider == job)
+    {
+        running.cancel.store(true, Ordering::SeqCst);
+    }
+    let removed = crate::tools::integrations::mcp::logout(user_dir, name)?;
+    Ok(json!({"server": name, "removed": removed}))
+}
+
+fn mcp_server(params: &Value) -> Result<&str> {
+    params["server"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| coded(ErrorCode::InvalidParams, "server required"))
+}
+
+/// Runs one sign-in on a worker thread, answering `id` when it ends. One runs at a time.
+fn spawn_flow(
+    state: &Arc<AuthState>,
+    out: &Sender,
+    id: &Value,
+    provider: String,
+    flow: impl FnOnce(&dyn Interaction, Arc<AtomicBool>) -> Result<Value> + Send + 'static,
+) -> Result<()> {
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut job = locked(&state.job);
         ensure!(job.is_none(), "an authentication action is already running");
         *job = Some(Job {
-            provider: flow.id,
+            provider: provider.clone(),
             cancel: cancel.clone(),
         });
     }
     let state = state.clone();
     let out = out.clone();
-    let user_dir = user_dir.to_path_buf();
     let id = id.clone();
     std::thread::spawn(move || {
         let emit_out = out.clone();
         let gone_out = out.clone();
         let ui = RpcInteraction {
-            provider: flow.id,
+            provider,
             state: state.clone(),
             emit: move |frame| emit_out.emit(frame),
             gone: move || gone_out.unavailable(),
             cancel: cancel.clone(),
         };
-        let result = oauth::login(&user_dir, flow.id, &ui, cancel)
-            .map(|message| json!({"provider": flow.id, "message": message}));
+        let result = flow(&ui, cancel);
         *locked(&state.job) = None;
         out.result(&id, result);
     });

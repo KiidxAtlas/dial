@@ -147,10 +147,12 @@ The environment prompt reports whether the configured JavaScript and Python eval
 resolve before the model generates a helper. Discovery reports a missing prerequisite when
 neither resolves. These are executable-path observations: interpreter version, containment and
 actual execution still need validation. Loading `eval` installs no interpreter; its status,
-reset and cancel actions remain loadable without one. JavaScript runs on operator-installed
-Node 22+ when `eval.node` resolves; otherwise on Dial's embedded QuickJS engine (built with
-the default `embedded-js` feature on all platforms), which needs no installed interpreter. Python 3.8+ still needs
-the existing [dependency setup](setup.md), including in benchmark containers.
+reset and cancel actions remain loadable without one. Release binaries prefer their pinned,
+embedded Node runtime for the default `eval.node = "node"`; explicit Node 22+ executable
+overrides remain supported outside the editable workspace. Unbundled source builds use host
+Node when it resolves, otherwise Dial's embedded QuickJS engine (the default `embedded-js`
+feature). Python 3.8+ still needs the existing [dependency setup](setup.md), including in
+benchmark containers.
 Do not assume a configured absolute eval launcher is also available by name in the shell.
 
 Whenever `bash` is offered, the environment prompt also lists which helper languages the shell
@@ -265,8 +267,9 @@ Windows cannot enforce `"strict"` or network isolation; see [Windows security](w
 Discovery and `status` report platform support, not approval or interpreter availability.
 Reset, cancel and status remain usable on unsupported platforms.
 
-JavaScript eval uses operator-installed Node 22 or newer when `eval.node` resolves. Otherwise it
-uses the embedded QuickJS engine, which runs as a re-exec of `dial` (hidden worker argument) under
+JavaScript eval uses the bundled Node runtime by default in release binaries, or the configured
+operator-installed Node 22+ executable. Unbundled builds without a resolving Node use the
+embedded QuickJS engine, which runs as a re-exec of `dial` (hidden worker argument) under
 the same containment and fd-3 JSON protocol. Node uses its persistent REPL evaluator for lexical
 declarations and top-level `await`; the embedded engine keeps lexical bindings across cells,
 supports top-level `await` and ES built-ins including BigInt, and has no `require`, `process`,

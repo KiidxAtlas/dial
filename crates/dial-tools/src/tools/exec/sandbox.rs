@@ -1106,45 +1106,9 @@ const RUNTIME_VARIABLES: &[&str] = &[
     "CURL_CA_BUNDLE",
 ];
 
-/// Windows system variables a process with a cleared environment still needs: without
-/// `SystemRoot` Winsock cannot load its providers (WSAEPROVIDERFAILUREINIT), so Node, Chromium
-/// and other networked children fail, and `ComSpec`/`PATHEXT` are needed to start `.cmd` shims.
-/// It holds no profile, credential or cache location. Empty on other platforms.
-pub fn windows_system_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    if !cfg!(windows) {
-        return Vec::new();
-    }
-    windows_system_env_from(std::env::vars_os())
-}
-
-const WINDOWS_SYSTEM_VARIABLES: &[&str] = &[
-    "SystemRoot",
-    "windir",
-    "SystemDrive",
-    "ComSpec",
-    "PATHEXT",
-    "OS",
-    "NUMBER_OF_PROCESSORS",
-    "PROCESSOR_ARCHITECTURE",
-    "ProgramData",
-    "ProgramFiles",
-    "ProgramFiles(x86)",
-    "ProgramW6432",
-    "CommonProgramFiles",
-];
-
-fn windows_system_env_from(
-    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    vars.into_iter()
-        .filter(|(name, _)| {
-            let name = name.to_string_lossy();
-            WINDOWS_SYSTEM_VARIABLES
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(&name))
-        })
-        .collect()
-}
+/// Windows system variables a cleared child needs (owned by `dial-core`'s platform env module, so
+/// the managed-process restart and tool children share one list).
+pub use dial_core::platform::env::windows_system_env;
 
 /// Windows variable names are case-insensitive and a default profile stores `Path` and `windir`,
 /// so an exact-case match there silently dropped `PATH` from every tool child.

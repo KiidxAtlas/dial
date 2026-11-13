@@ -10,7 +10,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 use windows_sys::Win32::{
-    Foundation::{HANDLE, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{ERROR_INVALID_PARAMETER, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::{
         Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent},
         JobObjects::*,
@@ -248,6 +248,109 @@ pub(in crate::platform) fn in_group(leader: u32, pid: u32) -> bool {
     };
     checked != 0 && member != 0
 }
+/// Opens `pid` with `access`. A PID that names no process is `NotFound`.
+fn open_pid(pid: u32, access: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: OpenProcess takes only scalar access, inheritance and ID arguments.
+    let raw = unsafe { OpenProcess(access, 0, pid) };
+    if raw.is_null() {
+        let error = io::Error::last_os_error();
+        return Err(
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                io::Error::new(io::ErrorKind::NotFound, "no such process")
+            } else {
+                error
+            },
+        );
+    }
+    // SAFETY: raw is a fresh non-null process handle, adopted exactly once.
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw.cast()) })
+}
+pub(in crate::platform) fn process_exists(pid: u32) -> io::Result<bool> {
+    // The wait below needs SYNCHRONIZE: without it WaitForSingleObject fails (WAIT_FAILED) and a
+    // running process would read as exited.
+    let process = match open_pid(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE) {
+        Ok(process) => process,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    // SAFETY: process keeps the handle live for this zero-time wait; a signalled process exited.
+    match unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 0) } {
+        WAIT_TIMEOUT => Ok(true),
+        WAIT_OBJECT_0 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+pub(in crate::platform) fn terminate_pid(pid: u32, exit_code: u32) -> io::Result<()> {
+    let process = open_pid(pid, PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let raw = process.as_raw_handle() as HANDLE;
+    // SAFETY: process keeps the handle live for this zero-time wait.
+    if unsafe { WaitForSingleObject(raw, 0) } == WAIT_OBJECT_0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "process has already exited",
+        ));
+    }
+    // SAFETY: process pins the exact process this call names; TerminateProcess takes scalars only.
+    if unsafe { TerminateProcess(raw, exit_code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Terminates `pid` and every descendant with `exit_code`, so a `.cmd` shim's child (`cmd.exe` ->
+/// `node.exe`) does not outlive it. Descendants come from one Toolhelp snapshot; a process counts
+/// as a child only when its parent PID names a process that started no later than it, so a reused
+/// PID is never taken for one. Each process is opened and identity-checked before the first
+/// termination, and the named root must still be running (`NotFound` otherwise).
+pub(in crate::platform) fn terminate_tree(pid: u32, exit_code: u32) -> io::Result<()> {
+    let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    let root = open_pid(pid, access)?;
+    let root_created = match crate::platform::procinfo::win::times(&root) {
+        Some((created, false)) => created,
+        Some((_, true)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process has already exited",
+            ));
+        }
+        None => return Err(io::Error::last_os_error()),
+    };
+    let entries = crate::platform::processes::snapshot()?;
+    // (pid, creation time, handle) for the root and each descendant found so far, breadth first.
+    let mut members: Vec<(u32, u64, OwnedHandle)> = vec![(pid, root_created, root)];
+    let mut next = 0;
+    while next < members.len() {
+        let (parent, parent_created) = (members[next].0, members[next].1);
+        next += 1;
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.parent == parent && entry.pid != parent)
+        {
+            if members.iter().any(|(known, _, _)| *known == entry.pid) {
+                continue;
+            }
+            let Ok(handle) = open_pid(entry.pid, access) else {
+                continue;
+            };
+            if let Some((created, false)) = crate::platform::procinfo::win::times(&handle)
+                && created >= parent_created
+            {
+                members.push((entry.pid, created, handle));
+            }
+        }
+    }
+    // Deepest first, so a parent cannot spawn a replacement child while the sweep runs.
+    let mut status = Ok(());
+    for (index, (_, _, handle)) in members.iter().enumerate().rev() {
+        // SAFETY: handle pins the exact process whose identity was checked when it was opened.
+        let terminated = unsafe { TerminateProcess(handle.as_raw_handle() as HANDLE, exit_code) };
+        if index == 0 && terminated == 0 {
+            status = Err(io::Error::last_os_error());
+        }
+    }
+    status
+}
+
 pub(in crate::platform) fn exited(child: &Child) -> io::Result<bool> {
     // SAFETY: child owns the live process handle for the entire zero-time query.
     match unsafe { WaitForSingleObject(child.as_raw_handle() as HANDLE, 0) } {

@@ -1692,6 +1692,21 @@ impl Job {
             None => block_end(&self.base, line, &self.ext),
         }
     }
+    /// Pure insertions name a gap, not a line: the gap is witnessed when either side of it was
+    /// shown. `line` is the anchor line (the strict rule's target); `neighbour` is the line on
+    /// the other side of the gap, if any. Refusal for an unwitnessed gap names `line`, as before.
+    fn check_gap(&mut self, line: usize, neighbour: Option<usize>) -> Result<(), String> {
+        if !self.enforce_seen {
+            return Ok(());
+        }
+        for candidate in std::iter::once(line).chain(neighbour) {
+            if self.seen.first_unseen(candidate, candidate).is_none() {
+                self.required.push((candidate, candidate));
+                return Ok(());
+            }
+        }
+        self.check_seen(line, line)
+    }
     fn check_seen(&mut self, a: usize, b: usize) -> Result<(), String> {
         if !self.enforce_seen {
             return Ok(());
@@ -1927,14 +1942,15 @@ fn resolve_anchor(job: &mut Job, anchor: &Anchor) -> Result<Resolved, String> {
             if n > len {
                 return Err(out_of_range(job, n));
             }
-            job.check_seen(n, n)?;
+            let neighbour = (n > 1).then(|| n - 1);
+            job.check_gap(n, neighbour)?;
             Resolved::Insert(n - 1)
         }
         Anchor::After(n) => {
             if n > len {
                 return Err(out_of_range(job, n));
             }
-            job.check_seen(n, n)?;
+            job.check_gap(n, (n < len).then_some(n + 1))?;
             Resolved::Insert(n)
         }
         Anchor::AfterBlock(n) => {

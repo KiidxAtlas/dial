@@ -270,3 +270,25 @@ fn command_check_runs_in_the_sandbox() {
         .verify(dir.path(), "")
     );
 }
+
+#[test]
+fn a_command_that_cannot_be_launched_has_no_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    // Admission fails before any shell starts, so the command never ran: an error, not a failed check.
+    let not_a_directory = dir.path().join("file");
+    fs::write(&not_a_directory, "").unwrap();
+    let check = Check::Command {
+        command: "true".into(),
+        expect_stdout: None,
+        expect_exit: 0,
+    };
+    assert!(check.try_verify(&not_a_directory, "").is_err());
+    assert!(!check.verify(&not_a_directory, ""));
+    assert!(
+        Check::All {
+            checks: vec![check]
+        }
+        .try_verify(&not_a_directory, "")
+        .is_err()
+    );
+}

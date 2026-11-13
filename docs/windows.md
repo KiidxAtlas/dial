@@ -6,6 +6,11 @@ Dial ships native Windows releases for `x86_64-pc-windows-msvc` and `aarch64-pc-
 
 Works in Windows PowerShell 5.1 and PowerShell 7. No OpenSSL or other prerequisite is needed. The installer verifies an Ed25519-signed checksum manifest before it installs anything. It installs to `$HOME\.local\bin` (override with `DIAL_INSTALL_DIR`) and adds that directory to your user PATH and to the current session.
 
+Windows release builds statically link the C runtime, so the release executable does not require
+the Visual C++ Redistributable or Visual Studio. Release checks inspect both normal and
+delay-loaded imports for C-runtime DLL dependencies. Windows system DLLs are still required;
+this does not bypass Windows application-control policies.
+
 Open PowerShell (no admin needed) and run:
 
     irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 | iex
@@ -51,9 +56,10 @@ Do not disable Defender/SmartScreen or install an untrusted root certificate to 
 Smart App Control (Windows 11) blocks any executable that is neither signed by a trusted
 publisher nor already known to Microsoft's cloud service. Release builds of `dial.exe` are not
 Authenticode-signed, so Smart App Control blocks them. It has no per-app allow list, and
-`Unblock-File` does not help. In that case the installer stops before installing anything. It
-reports `Downloaded dial.exe could not start` and says that Smart App Control is on. To check
-the state, open Windows Security > App & browser control > Smart App Control settings.
+`Unblock-File` does not help. The installer tests the downloaded executable before replacing an
+existing installation. If startup fails, it reports the native exit code when available; an
+enabled Smart App Control policy is a possible cause, not proof of the cause of every failure.
+To check the state, open Windows Security > App & browser control > Smart App Control settings.
 
 Options:
 
@@ -64,6 +70,20 @@ Options:
 
 Building from source does not avoid the block: a locally built unsigned `dial.exe` is also unknown
 to Smart App Control.
+
+### Application startup errors
+
+A Windows dialog such as **0xc0000142** means a DLL failed to initialize before Dial could start;
+it does not identify which DLL failed. It is not the same as an invalid model configuration or a
+confirmed Smart App Control block. **0xc0000135** means a required DLL was not found, and
+**0xc000007b** means an invalid executable/DLL image (which can include an architecture mismatch).
+
+The installer reports these loader failures separately from a release version mismatch and
+leaves an existing installation untouched when the downloaded executable fails its startup check.
+If a current release still fails, report the Dial release version, Windows version, machine
+architecture, and exact error code. A maintainer may need the faulting DLL from Windows Event
+Viewer's Application log to identify the cause; omit private paths and unrelated log contents.
+Do not download replacement DLLs from third-party sites or disable Windows security controls.
 
 ## First run and LM Studio
 
@@ -116,7 +136,7 @@ WSL Windows interop and failed enforcement probes; WSL2 alone is not proof of co
 Do not work around a native Windows policy refusal by switching to `off` or enabling network
 access when the task requires it blocked.
 
-Windows shell commands are PowerShell source executed by Windows PowerShell; POSIX shell scripts are not translated. Process groups use Windows Job Objects, and background PTY jobs use ConPTY, sandboxed like other commands. Durable background jobs are supported; see [background services](background-services.md).
+Windows shell commands use Dial's embedded Bash-compatible engine by default, with bundled utilities resolved before PATH, just like macOS and Linux. `shell.backend = "system"` selects Git Bash; `"powershell"` explicitly selects Windows PowerShell source (POSIX scripts are not translated). Builds without `embedded-shell` fall back to Git Bash, then PowerShell. Process groups use Windows Job Objects, and background PTY jobs use ConPTY, sandboxed like other commands. Durable background jobs are supported; see [background services](background-services.md).
 
 Python environment discovery uses Windows layouts: virtualenv packages come from `<venv>/Lib/site-packages`, while the trusted base interpreter comes from an absolute `executable`/`base-executable` or `home` in `pyvenv.cfg`, not the `Scripts/python.exe` redirector. Conda uses `<prefix>/python.exe`. Base interpreters and conda installations must still resolve outside the workspace and pass the normal interpreter preflight; environment discovery does not relax those checks.
 
@@ -143,13 +163,22 @@ socket on the port must belong to a process inside the job's Job Object. Program
 to Notepad when neither `VISUAL` nor `EDITOR` is set, and copying an answer uses PowerShell's
 `Set-Clipboard`.
 
-**Computer use** (`/computer on`) runs its worker with Node.js (`node` on `PATH`). The worker gets
-the same Windows system variables (`SystemRoot`, `SystemDrive`, `ProgramFiles`, ...) as the browser.
-Dial turns off Windows' modal error dialogs for the processes it starts, so a `node.exe` that cannot
-load no longer stops at "The application was unable to start correctly". Instead `/computer on`
-fails with the reason, for example `exit 0xC0000142: a DLL failed to initialize while Node
-started` or `0xC000007B` for a damaged or wrong-architecture install. If `node --version` also
-fails in a new terminal, reinstall the Node.js LTS for your CPU from nodejs.org.
+**Computer use** (`/computer on`) uses the pinned Node runtime embedded in release binaries;
+installing Node or changing `PATH` is not required. Dial verifies and extracts that runtime into
+its private cache on first use, without a download. Source builds without a bundled payload
+still use an operator-installed `node` outside the editable workspace. The worker gets the same
+Windows system variables (`SystemRoot`, `SystemDrive`, `ProgramFiles`, ...) as the browser.
+Dial suppresses modal Windows loader dialogs and reports startup failures as errors. A corrupt
+bundled runtime fails closed instead of silently switching to a different Node installation;
+repair/reinstall the Dial release. For an unbundled source build, verify `node --version` in a
+new terminal and install the current Node.js LTS for your CPU if necessary.
+
+`Computer pipe setup failed: Access is denied. (os error 5)` after Node starts can be a Dial
+pipe-validation bug, not a Node installation or desktop permission problem. Affected builds
+query the write-only worker stdin with `GetNamedPipeInfo`, which requires extra read-attribute
+access. The fixed implementation validates both pipe ends without that requirement. Update to
+a release containing this fix or rebuild from the fixed source; running as Administrator,
+disabling the sandbox, or reinstalling Node is not the remedy for this pipe-check failure.
 
 ## File edits and checkpoints
 
@@ -169,4 +198,4 @@ the original file is not changed without undo coverage.
 - The Windows `dev` sandbox with network allowed (Low integrity) confines writes but not reads or network. `strict` and `allow_network = false` use an AppContainer, which also confines reads and network but blocks loopback and programs installed under your user profile. Neither is identical to the macOS and Linux sandboxes. Never run untrusted input with `sandbox.mode = "off"`.
 - Atomically published private files flush staged file contents before replacement. Windows does not document an unprivileged parent-directory flush or write-through rename equivalent to POSIX `fsync` on a directory, so a successful replacement is atomic for concurrent readers but its directory entry is not guaranteed to survive sudden power loss.
 - Dial replaces and deletes its own files with POSIX semantics on NTFS/ReFS, so a file another process has open (with delete sharing) can still be replaced, and a deleted name is freed at once. When a program opens a file without delete sharing (some editors, backup and sync tools), Dial retries for about 0.3 s and then reports Windows error 32, "being used by another process". Close that program, or move the project out of a synced folder such as OneDrive.
-- `/autoresearch run` and `dial learn` command verification run `/bin/bash` in the strict offline sandbox. That path is not supported on native Windows.
+- `/autoresearch run` benchmarks and `dial learn` command verification run through the same shell as the `bash` tool (the embedded engine by default, or Git Bash with `shell.backend = "system"`) in the strict offline sandbox, with the same Windows sandbox limits as above. A verification command that cannot start is reported as an error, not as a failed check.

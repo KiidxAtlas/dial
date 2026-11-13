@@ -1,10 +1,10 @@
 //! The work panel: one compact rounded card above the composer. Its first row is the tab strip
-//! (`plan`, `evidence`, `mode`); the rows below it come from the active tab. The plan tab
-//! lists as many steps as the card has rows for, always including the focused step, then the
-//! focused step's recorded reason or finding. The card is as tall as its content, at most
-//! [`MAX_WIDTH`] columns wide, and it yields to the focus summary of [`super::tasks::rows`] below
-//! [`MIN_WIDTH`] columns or without the rows for it. Every value comes from the todo list and
-//! status the shell already holds; the panel never changes task state.
+//! (`plan`, `mode`); the rows below it come from the active tab. The plan tab lists as many
+//! steps as the card has rows for, always including the focused step, then the focused step's
+//! recorded reason or finding. The card is as tall as its content, at most [`MAX_WIDTH`] columns
+//! wide, and it yields to the focus summary of [`super::tasks::rows`] below [`MIN_WIDTH`] columns
+//! or without the rows for it. Every value comes from the todo list and status the shell already
+//! holds; the panel never changes task state.
 use super::{
     Rows, chrome,
     markdown::truncate_spans,
@@ -36,18 +36,16 @@ const PROGRESS_CELLS: usize = 8;
 pub enum Tab {
     #[default]
     Plan,
-    Evidence,
     /// The approval mode and sandbox. Pending approvals ask inline, never here.
     Mode,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Plan, Tab::Evidence, Tab::Mode];
+    pub const ALL: [Tab; 2] = [Tab::Plan, Tab::Mode];
 
     pub fn next(self) -> Tab {
         match self {
-            Tab::Plan => Tab::Evidence,
-            Tab::Evidence => Tab::Mode,
+            Tab::Plan => Tab::Mode,
             Tab::Mode => Tab::Plan,
         }
     }
@@ -55,7 +53,6 @@ impl Tab {
     pub fn label(self) -> &'static str {
         match self {
             Tab::Plan => "plan",
-            Tab::Evidence => "evidence",
             Tab::Mode => "mode",
         }
     }
@@ -217,58 +214,6 @@ fn detail(
                     .take(reason_rows)
                     .map(|reason| line(reason, Tok::Text)),
             );
-            out
-        }
-        Tab::Evidence => {
-            // The focused step's references first, then the newest steps', so the cut at the card
-            // height drops the oldest and says how much it dropped.
-            let tasks = todo.tasks();
-            let focus = focus_index(tasks);
-            let mut order: Vec<usize> = focus.into_iter().collect();
-            order.extend((0..tasks.len()).rev().filter(|i| Some(*i) != focus));
-            let mut entries: Vec<(Vec<Span<'static>>, bool)> = Vec::new();
-            for task in order
-                .into_iter()
-                .map(|i| &tasks[i])
-                .filter(|t| !t.evidence.is_empty())
-            {
-                entries.push((
-                    vec![
-                        Span::styled(format!("{} ", theme.sym(Sym::Bullet)), theme.fg(Tok::Muted)),
-                        Span::styled(text::one_line(&task.content), theme.fg(Tok::Text)),
-                    ],
-                    false,
-                ));
-                for reference in &task.evidence {
-                    entries.push((
-                        vec![
-                            Span::raw("  "),
-                            Span::styled(text::one_line(reference), theme.fg(Tok::Muted)),
-                        ],
-                        true,
-                    ));
-                }
-            }
-            if entries.is_empty() {
-                return vec![line("no evidence recorded yet".into(), Tok::Muted)];
-            }
-            // Recorded references are the agent's observations, not a verification result.
-            let mut out = vec![line("agent observations, not verified".into(), Tok::Muted)];
-            let room = avail.saturating_sub(1);
-            if entries.len() <= room {
-                out.extend(entries.into_iter().map(|(spans, _)| spans));
-            } else {
-                let keep = room.saturating_sub(1);
-                let hidden = entries[keep..].iter().filter(|(_, r)| *r).count();
-                out.extend(entries.into_iter().take(keep).map(|(spans, _)| spans));
-                out.push(line(
-                    format!(
-                        "+{hidden} more reference{}",
-                        if hidden == 1 { "" } else { "s" }
-                    ),
-                    Tok::Dim,
-                ));
-            }
             out
         }
         Tab::Mode => {

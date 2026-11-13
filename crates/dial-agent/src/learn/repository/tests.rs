@@ -127,10 +127,10 @@ fn solver_cannot_replace_sealed_tests_or_follow_symlinks() {
     )]);
     fs::write(root.path().join("source.py"), "answer=41").unwrap();
     fs::write(root.path().join("test.py"), "pass").unwrap();
-    assert!(!verify(root.path(), &checks, "python3 -B test.py"));
+    assert!(!verify(root.path(), &checks, "python3 -B test.py").unwrap());
     fs::write(root.path().join("source.py"), "answer=42").unwrap();
-    assert!(verify(root.path(), &checks, "python3 -B test.py"));
+    assert!(verify(root.path(), &checks, "python3 -B test.py").unwrap());
     fs::remove_file(root.path().join("test.py")).unwrap();
     std::os::unix::fs::symlink("source.py", root.path().join("test.py")).unwrap();
-    assert!(!verify(root.path(), &checks, "python3 -B test.py"));
+    assert!(!verify(root.path(), &checks, "python3 -B test.py").unwrap());
 }

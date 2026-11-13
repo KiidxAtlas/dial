@@ -39,16 +39,19 @@ pub(crate) fn scope() -> BankScope {
     }
 }
 
-/// A model runner that answers every completion with `reply` and records each system prompt.
+/// A model runner that answers every completion with `reply` and records each system prompt
+/// and the role it was sent to.
 pub(crate) struct FakeRunner {
     pub reply: String,
     pub systems: Vec<String>,
+    pub roles: Vec<String>,
 }
 impl FakeRunner {
     pub(crate) fn new(reply: &str) -> Self {
         Self {
             reply: reply.into(),
             systems: Vec::new(),
+            roles: Vec::new(),
         }
     }
 }
@@ -69,6 +72,7 @@ impl MemoryModelRunner for FakeRunner {
     }
     fn complete(&mut self, request: MemoryModelRequest) -> Result<String> {
         self.systems.push(request.system);
+        self.roles.push(request.role);
         Ok(self.reply.clone())
     }
     fn authorize_external(&mut self, _: &Operation, _: &str) -> Result<u64> {

@@ -22,9 +22,12 @@ mod actor;
 mod auth;
 mod checkpoints;
 mod client_fs;
+mod extensions;
 mod host_tools;
 mod host_uris;
+mod jobs;
 mod models;
+mod parity;
 mod sessions;
 mod settings;
 /// Wire vocabulary shared with clients: versions, the method table and error codes.
@@ -49,8 +52,9 @@ fn request_limit(acp: bool) -> usize {
 }
 
 /// Capabilities a transport lacks: ACP has no custom question input, no live voice, no host tool or
-/// host URI bridge, no provider sign-in, and no session administration, settings or checkpoint methods
-/// (these are native `dial rpc` capabilities).
+/// host URI bridge, no provider sign-in, and no session administration, settings, checkpoint,
+/// workspace-directory, background-job, session-control or schema methods (these are native
+/// `dial rpc` capabilities).
 fn capability_available(capability: &str, acp: bool) -> bool {
     !(acp
         && matches!(
@@ -64,6 +68,10 @@ fn capability_available(capability: &str, acp: bool) -> bool {
                 | "settings"
                 | "checkpoints"
                 | "extensions"
+                | "workspace"
+                | "jobs"
+                | "session_control"
+                | "schema"
         ))
 }
 
@@ -125,6 +133,9 @@ struct Output {
     acp: Option<crate::acp::Adapter>,
     /// Negotiated protocol version; `DEFAULT_PROTOCOL_VERSION` until the client sends `hello`.
     protocol: u32,
+    /// Set by `hello {interactive:true}`: a person answers approvals and questions, so the engine
+    /// may ask (directory grants, recovery choices, draft review). Off by default for scripts.
+    interactive: bool,
     /// Envelope fields stamped on every plain-RPC event (ACP frames are mapped, not stamped).
     envelope: Envelope,
 }
@@ -310,8 +321,10 @@ impl Sender {
         self.mapping()
             .map_or(DEFAULT_PROTOCOL_VERSION, |output| output.protocol)
     }
-    fn negotiate(&self, version: u32) -> Result<()> {
-        self.mapping()?.protocol = version;
+    fn negotiate(&self, version: u32, interactive: bool) -> Result<()> {
+        let mut output = self.mapping()?;
+        output.protocol = version;
+        output.interactive = interactive;
         Ok(())
     }
     /// Attribute later events to `session_id` and to the request in flight (null when idle).
@@ -447,6 +460,12 @@ fn node_metadata(node: &crate::runtime::Node) -> Value {
     })
 }
 impl Ui for RpcUi {
+    /// Plain RPC clients opt in through `hello`; ACP never collects free input this way.
+    fn interactive_input(&self) -> bool {
+        self.out
+            .mapping()
+            .is_ok_and(|output| output.acp.is_none() && output.interactive)
+    }
     fn runtime(&mut self, tree: &crate::runtime::Tree) {
         if self.tree.as_ref().is_none_or(|old| !old.same(tree)) {
             self.node_cursors.clear();
@@ -825,21 +844,32 @@ impl Default for QueryProjection {
 /// The single `state` projection, used by the worker's `state` arm and by the cached reader reply.
 fn state_projection(agent: &Agent<'_>) -> Value {
     let (usage_total, usage_turn) = agent.usage();
+    let workspace = agent.workspace();
     json!({"session_id":agent.session().id(),"title":agent.session().title(),"tools":agent.tool_names(),
-        "plan_mode":agent.plan_mode(),"cost":agent.session_cost(),
+        "plan_mode":agent.plan_mode(),"approval":agent.approval(),"cost":agent.session_cost(),
         "cost_note":"observed priced session spend, not an invoice total; usage has explicit unknown-cost coverage",
         "observed_cost":usage_total.all.observed_cost_usd,"usage":{"total":usage_total,"turn":usage_turn},
         "metrics":agent.metrics(),"efficiency":agent.efficiency_report(),"speculation":agent.speculation_stats(),"tree":agent.session().execution_tree(),
+        "workspace":{"root":workspace.root(),"dirs":workspace.additional_roots()},
         "current_model":models::current(agent.effective_config())})
 }
 
+/// The schema clients generate bindings from: `docs/rpc-schema.json` as built into this engine.
+const SCHEMA_JSON: &str = include_str!("../../../docs/rpc-schema.json");
+
+fn schema_document() -> Result<Value> {
+    serde_json::from_str(SCHEMA_JSON).context("embedded RPC schema is invalid")
+}
+
 /// Native controller methods that never touch the agent: session administration, the offline
-/// model listing and settings. Reads run off the controller thread; writes run on it, so a later
-/// request observes an earlier write. `current` is the active session and model from the
-/// worker's cached projection.
+/// model listing, settings and the protocol schema. Reads run off the controller thread; writes
+/// run on it, so a later request observes an earlier write. `current` is the active session and
+/// model from the worker's cached projection. `config` is replaced when `apply_settings` rebuilds.
 struct Admin {
     layout: Layout,
-    config: Config,
+    config: Arc<std::sync::RwLock<Config>>,
+    /// Command-line settings, kept when a method reads the saved configuration again.
+    overlay: toml::Table,
 }
 
 impl Admin {
@@ -858,6 +888,13 @@ impl Admin {
         )
     }
 
+    /// The configuration as saved now (with this launch's command-line settings), so a change
+    /// saved by an earlier request is visible before `apply_settings`.
+    fn saved_config(&self) -> Result<Config> {
+        crate::config::settings_store::load_config(&self.layout, &self.overlay)
+            .map_err(|error| coded(ErrorCode::InvalidParams, error))
+    }
+
     /// Whether `method` only reads, so it may run on its own thread.
     fn reads(method: &str) -> bool {
         matches!(
@@ -867,6 +904,7 @@ impl Admin {
                 | "settings_schema"
                 | "get_settings"
                 | "list_extensions"
+                | "get_schema"
         )
     }
 
@@ -877,6 +915,7 @@ impl Admin {
         current: (Option<String>, crate::llm::model_config::ModelSelection),
     ) -> Result<Value> {
         let (session, model) = current;
+        let config = self.config.read().unwrap_or_else(|p| p.into_inner());
         match method {
             "list_sessions" => sessions::list(&self.layout, session.as_deref(), params),
             "delete_session" => sessions::delete(&self.layout, session.as_deref(), params),
@@ -893,13 +932,13 @@ impl Admin {
                 };
                 let models = if model.provider.is_empty() {
                     models::list(
-                        &self.config,
-                        &self.config.selection(),
+                        &config,
+                        &config.selection(),
                         &self.layout.user_dir,
                         provider,
                     )
                 } else {
-                    models::list(&self.config, &model, &self.layout.user_dir, provider)
+                    models::list(&config, &model, &self.layout.user_dir, provider)
                 };
                 Ok(json!({"models":models}))
             }
@@ -907,31 +946,14 @@ impl Admin {
             "get_settings" => settings::get(&self.layout, params),
             "set_setting" => settings::set(&self.layout, params),
             "reset_setting" => settings::reset(&self.layout, params),
-            "list_extensions" => Ok(extensions(&self.layout, &self.config)),
+            "list_extensions" => {
+                drop(config);
+                Ok(extensions::list(&self.layout, &self.saved_config()?))
+            }
+            "get_schema" => schema_document(),
             _ => Err(unknown_method()),
         }
     }
-}
-
-/// `list_extensions`: the rows `/extensions` shows, from disk and the launch configuration.
-/// Installing, enabling and signing in remain terminal flows.
-fn extensions(layout: &Layout, config: &Config) -> Value {
-    let row = |row: &crate::ui::overlay::extensions::model::Row| {
-        json!({
-            "id": row.id,
-            "title": row.title,
-            "summary": row.summary,
-            "tags": row.tags,
-            "origin": row.origin,
-            "state": row.state,
-            "details": row.details,
-        })
-    };
-    let snapshot = crate::app::extensions_snapshot(layout, config);
-    json!({
-        "mcp": snapshot.mcp.iter().map(row).collect::<Vec<_>>(),
-        "skills": snapshot.skills.iter().map(row).collect::<Vec<_>>(),
-    })
 }
 
 fn query_snapshot(agent: &Agent<'_>, projection: &mut QueryProjection) {
@@ -1060,20 +1082,31 @@ pub fn run_with_launch(
     config: Config,
     launch: crate::agent::modes::Launch,
 ) -> Result<()> {
-    run_control(layout, config, false, launch)
+    run_with_overlay(layout, config, launch, toml::Table::new())
+}
+/// [`run_with_launch`] keeping the command-line settings `overlay`, so `apply_settings` reloads
+/// the saved settings with the same flags the process was launched with.
+pub fn run_with_overlay(
+    layout: Layout,
+    config: Config,
+    launch: crate::agent::modes::Launch,
+    overlay: toml::Table,
+) -> Result<()> {
+    run_control(layout, config, false, launch, overlay)
 }
 pub(crate) fn run_acp(
     layout: Layout,
     config: Config,
     launch: crate::agent::modes::Launch,
 ) -> Result<()> {
-    run_control(layout, config, true, launch)
+    run_control(layout, config, true, launch, toml::Table::new())
 }
 fn run_control(
     layout: Layout,
     config: Config,
     acp: bool,
     launch: crate::agent::modes::Launch,
+    overlay: toml::Table,
 ) -> Result<()> {
     config.require_model()?;
     layout.ensure_project_outside_storage()?;
@@ -1085,6 +1118,7 @@ fn run_control(
         output: Arc::new(Mutex::new(Output {
             acp: acp.then(|| crate::acp::Adapter::new(layout.clone())),
             protocol: DEFAULT_PROTOCOL_VERSION,
+            interactive: false,
             envelope: Envelope::default(),
         })),
         writer,
@@ -1124,14 +1158,18 @@ fn run_control(
     let active = busy.clone();
     let worker_closing = closing.clone();
     let worker_prompt_queued = prompt_queued.clone();
+    let admin_config = Arc::new(std::sync::RwLock::new(config.clone()));
     let admin = Arc::new(Admin {
         layout: layout.clone(),
-        config: config.clone(),
+        config: admin_config.clone(),
+        overlay: overlay.clone(),
     });
+    let extension_jobs = Arc::new(extensions::ExtensionJobs::default());
     let queue = steering.clone();
     let actor = actor::Actor {
         layout,
         config,
+        overlay,
         acp,
         launch,
         rx,
@@ -1151,10 +1189,11 @@ fn run_control(
         worker_query_cache,
         worker_live,
         queue,
+        admin_config,
         worker_fs,
     };
     let worker = thread::spawn(move || actor.run());
-    let (task_control, maintenance_control) = match control_rx.recv() {
+    let (mut task_control, mut maintenance_control, mut background) = match control_rx.recv() {
         Ok(controls) => controls,
         Err(_) => {
             // The actor may fail before publishing its controls. Preserve that cause instead
@@ -1206,6 +1245,10 @@ fn run_control(
             if out.unavailable() || worker.is_finished() {
                 break;
             }
+            // `apply_settings` rebuilds the agent and publishes its controls before it replies.
+            while let Ok((tasks, maintenance, jobs)) = control_rx.try_recv() {
+                (task_control, maintenance_control, background) = (tasks, maintenance, jobs);
+            }
             if let Some(started) = cancelling {
                 if !busy.load(Ordering::SeqCst)
                     && !task_control.list().iter().any(|(_, running)| *running)
@@ -1246,12 +1289,13 @@ fn run_control(
             };
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             match request["method"].as_str().unwrap_or("") {
-                "state" | "messages" | "messages_page" => {
+                "state" | "messages" | "messages_page" | "list_dirs" => {
                     let result = (|| -> Result<Value> {
                         let projection = query_cache.lock().unwrap_or_else(|p| p.into_inner());
                         match request["method"].as_str().unwrap_or("") {
                             "state" => state_reply(&projection, busy.load(Ordering::SeqCst)),
                             "messages" => Ok(json!({"messages":projection.messages.clone()})),
+                            "list_dirs" => Ok(projection.state["workspace"].clone()),
                             _ => messages_page(
                                 projection
                                     .messages
@@ -1529,10 +1573,20 @@ fn run_control(
                                 .ok_or_else(|| {
                                     coded(ErrorCode::InvalidParams, "protocol_version required")
                                 })?;
+                        let interactive = match request["params"].get("interactive") {
+                            None | Some(Value::Null) => false,
+                            Some(Value::Bool(flag)) => *flag,
+                            Some(_) => {
+                                return Err(coded(
+                                    ErrorCode::InvalidParams,
+                                    "interactive must be a boolean",
+                                ));
+                            }
+                        };
                         let version = negotiated_version(requested)?;
-                        out.negotiate(version)?;
+                        out.negotiate(version, interactive && !acp)?;
                         Ok(
-                            json!({"protocol_version":version,"supported_protocol_versions":SUPPORTED_PROTOCOL_VERSIONS}),
+                            json!({"protocol_version":version,"supported_protocol_versions":SUPPORTED_PROTOCOL_VERSIONS,"interactive":interactive && !acp}),
                         )
                     })();
                     out.result(&id, result);
@@ -1618,12 +1672,56 @@ fn run_control(
                     drop(state);
                     out.result(&id, Ok(json!({"live":false,"stopped":stopped})));
                 }
-                "list_sessions" | "delete_session" | "pin_session" | "list_models"
-                | "settings_schema" | "get_settings" | "set_setting" | "reset_setting"
-                | "list_extensions"
+                "extension_action" if !acp => {
+                    let result = admin.saved_config().and_then(|config| {
+                        extensions::start(
+                            &extension_jobs,
+                            &out,
+                            &admin.layout,
+                            config,
+                            &id,
+                            &request["params"],
+                        )
+                    });
+                    if let Err(error) = result {
+                        out.result(&id, Err(error));
+                    }
+                }
+                "mcp_login" if !acp => {
+                    let result = auth::ensure_v2(&out)
+                        .and_then(|()| admin.saved_config())
+                        .and_then(|config| {
+                            auth::start_mcp_login(
+                                &auth_state,
+                                &out,
+                                &config,
+                                &id,
+                                &request["params"],
+                            )
+                        });
+                    if let Err(error) = result {
+                        out.result(&id, Err(error));
+                    }
+                }
+                "mcp_logout" if !acp => {
+                    let result = auth::ensure_v2(&out).and_then(|()| {
+                        auth::mcp_logout(&auth_state, &auth_dir, &request["params"])
+                    });
+                    out.result(&id, result);
+                }
+                "list_jobs" | "stop_job" | "list_sessions" | "delete_session" | "pin_session"
+                | "list_models" | "settings_schema" | "get_settings" | "set_setting"
+                | "reset_setting" | "list_extensions" | "get_schema"
                     if !acp =>
                 {
                     let method = request["method"].as_str().unwrap_or_default().to_owned();
+                    if matches!(method.as_str(), "list_jobs" | "stop_job") {
+                        out.result(
+                            &id,
+                            jobs::handle(background.as_ref(), &method, &request["params"]),
+                        );
+                        continue;
+                    }
                     let current =
                         Admin::current(&query_cache.lock().unwrap_or_else(|p| p.into_inner()));
                     if Admin::reads(&method) {
@@ -1688,7 +1786,7 @@ fn run_control(
                         );
                         continue;
                     }
-                    if request["method"] == "send" {
+                    if matches!(request["method"].as_str(), Some("send" | "retry")) {
                         prompt_queued.store(true, Ordering::SeqCst);
                         maintenance_control.note_input();
                     } else if matches!(

@@ -758,7 +758,7 @@ impl Approver for Bridge {
                 .and_then(|d| d["steps"].as_u64())
                 .unwrap_or(0) as u32
         });
-        self.body.progress(&format!("tool: {name}"), steps);
+        self.body.tool_started(name, steps);
         if let Some(tool) = registry.get(name) {
             self.active_tool
                 .lock()
@@ -1200,7 +1200,7 @@ impl LiveTasks {
             }
             let resume_contract = json!({"version":1,"workspace":workspace_identity,"task":task,"original_task":original_task,"model":role.selection().display_name(),"definition":config.agents.get(job.kind)});
             let started_ms = epoch_ms();
-            let status = json!({"id":id,"runtime_node":body.read(|node| node.id.clone()),"status":"running","name":job.label,"agent":job.kind,"model":role.selection().display_name(),"role":job.role,"model_source":job.model_routes[0].source,"model_explanation":job.model_routes[0].explanation,"phase":"starting","steps":0,"started_ms":started_ms,
+            let status = json!({"id":id,"runtime_node":body.read(|node| node.id.clone()),"status":"running","name":job.label,"agent":job.kind,"model":role.selection().display_name(),"role":job.role,"model_source":job.model_routes[0].source,"model_explanation":job.model_routes[0].explanation,"phase":"starting","steps":0,"tools":0,"started_ms":started_ms,
                 "assignment":assignment, "task":original_task, "instruction":job.prompt});
             body.settle(
                 String::new(),
@@ -1474,12 +1474,14 @@ impl LiveTasks {
                         }
                     }
                 }
+                let finished_ms = epoch_ms();
+                value["finished_ms"] = json!(finished_ms);
+                value["elapsed_ms"] = json!(finished_ms.saturating_sub(started_ms));
                 if let Some(sink) = &transcript {
-                    let finished_ms = epoch_ms();
                     let artifacts = value["artifact"]
                         .as_str()
                         .map_or_else(|| json!([]), |uri| json!([["result", uri]]));
-                    if let Err(error) = sink.finish(json!({"status":value["status"],"steps":outcome.steps,"finished":agent_timestamp(),"finished_ms":finished_ms,"elapsed_ms":finished_ms.saturating_sub(started_ms),"artifacts":artifacts,"isolation":value.get("isolation_label").cloned(),"role":value["role"],"model":value["model"],"model_source":value["model_source"],"model_explanation":value["model_explanation"]})) {
+                    if let Err(error) = sink.finish(json!({"status":value["status"],"steps":outcome.steps,"finished":agent_timestamp(),"finished_ms":finished_ms,"elapsed_ms":value["elapsed_ms"],"artifacts":artifacts,"isolation":value.get("isolation_label").cloned(),"role":value["role"],"model":value["model"],"model_source":value["model_source"],"model_explanation":value["model_explanation"]})) {
                             value["status"] = json!("failed");
                             value["transcript_error"] = json!(format!("{error:#}"));
                         }
@@ -2147,7 +2149,7 @@ pub(in crate::agent) fn route(team: &Team, from: &str, args: &Value) -> Result<V
 pub(in crate::agent) fn message_schema(peers: bool) -> Value {
     let (sessions, to) = if peers {
         (
-            " A 32-hex peer id (listed when `to` is omitted, or by `peers`) delivers to that independent Dial session in this checkout, like `peers` send; `all` never reaches other sessions.",
+            " A 32-hex peer id (see `peers`) reaches that Dial session in this checkout; `all` never does.",
             "Recipient: a live task id, a unique live label, `parent`, `all` (this session's workers), or a peer id of another Dial session. Omit to list recipients and live peers.",
         )
     } else {
@@ -2156,7 +2158,7 @@ pub(in crate::agent) fn message_schema(peers: bool) -> Value {
             "Recipient: a live task id, a unique live label, `parent`, or `all`. Omit to list recipients.",
         )
     };
-    json!({"type":"function","function":{"name":"message","description":format!("Send text to a live task id/unique label, `parent`, or `all` (other workers); omit `to` to list recipients.{sessions} Receipts: queued (read next step), refused (reason), finished (no delivery; collect via task). Unknown recipient errors. Text only: no authority, work starts or permission changes. Delivered next step in send order."),"parameters":{"type":"object","properties":{"to":{"type":"string","description":to},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
+    json!({"type":"function","function":{"name":"message","description":format!("Send text to a live task id/label, `parent`, or `all` (other workers); omit `to` to list recipients.{sessions} Receipts: queued, refused (reason), or finished (collect via task). Text only; grants no authority. Delivered next step, in order."),"parameters":{"type":"object","properties":{"to":{"type":"string","description":to},"text":{"type":"string","description":"Message body, at most 32768 bytes."}},"additionalProperties":false}}})
 }
 
 pub mod control;

@@ -1,6 +1,7 @@
 use super::*;
 
 mod incremental;
+mod plan;
 mod post_edit;
 mod scope;
 
@@ -416,7 +417,8 @@ fn a_registered_reproduction_earns_behavioral_credit_only_after_fail_then_fix() 
     let mut agent = hermetic_agent(&config, root.path());
     // Registration runs it at once, even before any change: this is the pre-fix observation.
     let first = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
-    assert!(first.is_error, "{}", first.text);
+    assert!(!first.is_error, "{}", first.text);
+    assert!(first.text.contains("failed as expected"), "{}", first.text);
     assert!(
         first.text.contains("code_failed: repro: bug"),
         "{}",
@@ -470,6 +472,77 @@ fn a_registered_reproduction_earns_behavioral_credit_only_after_fail_then_fix() 
     assert_eq!(
         agent.completion_evidence(TurnOutcome::Completed)["checks"]["reproductions"][0]["state"],
         "stale"
+    );
+}
+
+#[test]
+fn a_fresh_reproduction_failing_as_expected_is_not_an_error_but_stays_an_obligation() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    let out = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("failed as expected"), "{}", out.text);
+    assert!(out.text.contains("code_failed: repro: bug"), "{}", out.text);
+    let result = &out.data.as_ref().unwrap()["results"][0];
+    assert_eq!(result["status"], "code_failed");
+    assert_eq!(result["registration"], "failed_as_expected");
+    // Gate semantics are unchanged: the failure is retained and the reproduction stays selected.
+    assert!(agent.step_checks.failed);
+    assert!(agent.step_checks.reproduced);
+    assert!(
+        agent
+            .current_focused_checks()
+            .iter()
+            .any(|check| check.name == "repro: bug")
+    );
+}
+
+#[test]
+fn failures_other_than_a_fresh_reproductions_first_failure_keep_the_error_status() {
+    // A configured check failing in the same call is a real failure.
+    let root = tempfile::tempdir().unwrap();
+    let config = config();
+    let mut agent = hermetic_agent(&config, root.path());
+    let mut args = repro_args("bug", REPRO);
+    args["targets"] = json!(["lint"]);
+    let out = agent.verify_tool(&args, &mut NullUi);
+    assert!(out.is_error, "{}", out.text);
+    assert!(out.text.contains("code_failed: lint"), "{}", out.text);
+    assert!(!out.text.contains("failed as expected"), "{}", out.text);
+
+    // A reproduction registered after a change is not a pre-fix observation.
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.step_checks.mutations = 1;
+    let out = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
+    assert!(out.is_error, "{}", out.text);
+    assert!(!out.text.contains("failed as expected"), "{}", out.text);
+
+    // Rerunning a registered reproduction that still fails is an error.
+    let root = tempfile::tempdir().unwrap();
+    let mut agent = hermetic_agent(&config, root.path());
+    let first = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
+    assert!(!first.is_error, "{}", first.text);
+    let rerun = agent.verify_tool(&json!({"targets":["repro: bug"]}), &mut NullUi);
+    assert!(rerun.is_error, "{}", rerun.text);
+    assert!(!rerun.text.contains("failed as expected"), "{}", rerun.text);
+
+    // A reproduction that passed after a fix and now fails again is a regression.
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("fixed"), "").unwrap();
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.step_checks.mutations = 1;
+    let passed = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
+    assert!(!passed.is_error, "{}", passed.text);
+    std::fs::remove_file(root.path().join("fixed")).unwrap();
+    let regressed = agent.verify_tool(&json!({"targets":["repro: bug"]}), &mut NullUi);
+    assert!(regressed.is_error, "{}", regressed.text);
+    assert!(
+        !regressed.text.contains("failed as expected"),
+        "{}",
+        regressed.text
     );
 }
 
@@ -545,7 +618,7 @@ fn invalid_reproduction_selection_preserves_registration_and_failed_evidence() {
         let mut agent = hermetic_agent(&config, root.path());
         if replace_existing {
             let first = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
-            assert!(first.is_error, "{}", first.text);
+            assert!(!first.is_error, "{}", first.text);
             assert!(agent.step_checks.failed);
         }
         let before = agent
@@ -588,7 +661,7 @@ fn failed_only_reproduction_registration_is_refused_without_changing_evidence() 
         let mut agent = hermetic_agent(&config, root.path());
         if replace_existing {
             let first = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
-            assert!(first.is_error, "{}", first.text);
+            assert!(!first.is_error, "{}", first.text);
         }
         let before = agent
             .step_checks
@@ -623,7 +696,7 @@ fn explicit_selection_runs_a_replacement_and_other_named_checks() {
         .retain(|check| check.name == "unit");
     let mut agent = hermetic_agent(&config, root.path());
     let first = agent.verify_tool(&repro_args("bug", REPRO), &mut NullUi);
-    assert!(first.is_error, "{}", first.text);
+    assert!(!first.is_error, "{}", first.text);
     let replacement = "echo 'replacement.rs:1: error: bug remains'; exit 1";
     let mut args = repro_args("bug", replacement);
     args["targets"] = json!(["unit", "repro: bug"]);
@@ -847,7 +920,7 @@ fn unsafe_reproduction_rerun_cannot_earn_its_own_fix_credit() {
     let mut agent = hermetic_agent(&config, root.path());
     let command = "if test -f ran; then exit 0; else touch ran; echo 'AssertionError: first run fails'; exit 1; fi";
     let first = agent.verify_tool(&repro_args("stateful", command), &mut NullUi);
-    assert!(first.is_error, "{}", first.text);
+    assert!(!first.is_error, "{}", first.text);
     assert_eq!(
         first.data.as_ref().unwrap()["results"][0]["reproduction"],
         "not_passing"

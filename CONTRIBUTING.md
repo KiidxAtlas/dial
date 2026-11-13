@@ -81,6 +81,14 @@ behaviour until a measurement justifies a different default. Passing assembly or
 does not establish a live-model improvement. The `[Unreleased]` CHANGELOG entry names the
 measurement or says the effect is unmeasured.
 
+### New integrations and tools are paused
+
+Until the headline task score (`make bench-headline`, [docs/benchmarks.md](docs/benchmarks.md#headline-score))
+has a recorded baseline, new opt-in integrations and new built-in tools are not accepted. Fixes,
+reliability work and removals for existing ones are welcome. A proposal to lift the pause for one
+addition needs a before/after headline comparison on the same model and profile showing it helps,
+and must keep the hosted core tool offer inside its schema budget (25 KiB) without removing `task`.
+
 ## Releases
 
 Maintainers prepare release metadata with `scripts/release.sh <version>`; tagging and publication

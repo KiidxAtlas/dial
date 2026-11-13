@@ -170,6 +170,14 @@ pub struct RunMetrics {
     /// reports, where tool offers and use stay unknown rather than zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_trace: Option<ToolTrace>,
+    /// Worker runtime nodes from the child's final state, read once after the last turn. Absent in
+    /// legacy or uninstrumented reports, where worker activity is unknown rather than zero. Worker
+    /// counters never enter `tool_trace`, which covers the main agent only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_execution: Option<WorkerExecution>,
+    /// Whole-tree view derived from this case's facts when the run ends. Absent in legacy reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_execution: Option<WholeExecution>,
     /// Exact runtime ledger groups: `all`, `main`, `workers`, `by_purpose`, and coverage.
     /// Purpose and ownership are orthogonal views, never additional usage to sum together.
     /// Absent fields in older runtimes remain absent (unknown), not fabricated zeros.
@@ -229,10 +237,115 @@ impl ToolTrace {
     }
 }
 
+/// Worker runtime nodes in the child's final state tree. Each node's counters cover only that
+/// worker's own dispatches and model requests; the main agent's calls are in `tool_trace`.
+/// A counter missing from any node leaves its total unknown (`None`), never zero.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerExecution {
+    /// Worker nodes observed in the snapshot.
+    pub workers: u64,
+    /// Nodes whose phase is not a known terminal phase; their counters may still change.
+    pub running: u64,
+    /// Tool dispatches each worker began (its `tools` counter), summed over workers.
+    pub tool_starts: Option<u64>,
+    /// Model requests made by workers (the worker's own `steps`).
+    pub model_steps: Option<u64>,
+    /// Inclusive worker time. It overlaps the parent's wall time and is never added to it.
+    /// Known only when every terminal worker recorded elapsed time.
+    pub elapsed_ms: Option<u64>,
+}
+
+impl WorkerExecution {
+    /// True when no worker is still running and every counter was observed on every worker.
+    pub fn complete(&self) -> bool {
+        self.running == 0 && self.tool_starts.is_some() && self.model_steps.is_some()
+    }
+}
+
+/// Whole-tree view derived from existing facts. Dispatch counts mean admitted to execution (main
+/// admissions plus worker tool starts); they are not successful effects, and a worker start may
+/// later fail. Each field is `None` when its source is unknown; no field is zero-filled.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WholeExecution {
+    /// Main-agent admitted dispatches, when the main trace is complete.
+    pub parent_tool_dispatches: Option<u64>,
+    /// Worker tool dispatch starts, when the worker snapshot is complete.
+    pub worker_tool_dispatches: Option<u64>,
+    /// Parent plus worker dispatches. Disjoint sources, so summed once; only when both are known.
+    pub tool_dispatches: Option<u64>,
+    /// Main-agent backend requests (ledger group `main`), only when the ledger is complete. A
+    /// partial ledger gives a lower bound, which is not reported as a total.
+    pub parent_requests: Option<u64>,
+    /// Worker backend requests (ledger group `workers`), only when the ledger is complete.
+    pub worker_requests: Option<u64>,
+    /// Inclusive worker elapsed time; overlaps parent wall time and must not be added to it.
+    pub worker_elapsed_ms: Option<u64>,
+    /// True when dispatch totals and both request groups are known.
+    pub complete: bool,
+}
+
+impl RunMetrics {
+    /// Derives the whole-tree view from stored facts. Ledger groups are used only when the ledger
+    /// is complete; `all` is never added to `main` or `workers`.
+    pub fn derive_whole_execution(&self) -> WholeExecution {
+        let parent_tool_dispatches =
+            self.tool_trace
+                .as_ref()
+                .filter(|trace| trace.complete)
+                .map(|trace| {
+                    trace
+                        .invoked
+                        .values()
+                        .fold(0u64, |sum, count| sum.saturating_add(*count))
+                });
+        let ledger_complete = !self.token_usage_incomplete;
+        let group_requests = |group: &str| {
+            ledger_complete
+                .then_some(self.runtime_usage.as_ref())
+                .flatten()
+                .and_then(|usage| usage.pointer(&format!("/{group}/requests")))
+                .and_then(serde_json::Value::as_u64)
+        };
+        let parent_requests = group_requests("main");
+        let worker_requests = group_requests("workers");
+        // Absent worker nodes are not evidence of zero: retired, rebound or legacy trees omit them.
+        // Require step/request agreement as a conservative coverage check. Missing nodes, retries,
+        // or internal requests can make these disagree; in that case dispatch totals stay unknown.
+        let workers = self
+            .worker_execution
+            .as_ref()
+            .filter(|w| w.complete())
+            .filter(|w| match (w.workers, worker_requests) {
+                (0, Some(0)) => true,
+                (nodes, Some(requests)) => {
+                    nodes > 0 && requests > 0 && w.model_steps == Some(requests)
+                }
+                (_, None) => false,
+            });
+        let worker_tool_dispatches = workers.and_then(|w| w.tool_starts);
+        let tool_dispatches = parent_tool_dispatches
+            .zip(worker_tool_dispatches)
+            .map(|(parent, worker)| parent.saturating_add(worker));
+        WholeExecution {
+            parent_tool_dispatches,
+            worker_tool_dispatches,
+            tool_dispatches,
+            parent_requests,
+            worker_requests,
+            worker_elapsed_ms: workers.and_then(|w| w.elapsed_ms),
+            complete: tool_dispatches.is_some()
+                && parent_requests.is_some()
+                && worker_requests.is_some(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod efficiency_tests;
 #[cfg(test)]
 mod tool_trace_tests;
+#[cfg(test)]
+mod whole_execution_tests;
 
 /// Verification metadata, not prompt contents or a model's claim of success.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

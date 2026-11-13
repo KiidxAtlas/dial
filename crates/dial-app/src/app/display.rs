@@ -29,7 +29,7 @@ pub(super) fn session_age(started: &str) -> String {
 }
 
 /// An effective snapshot includes private policy and resolved limits omitted from persisted TOML.
-pub(super) fn config_key(config: &Config) -> String {
+pub(crate) fn config_key(config: &Config) -> String {
     let mut table = toml::Table::try_from(config).expect("validated config serializes");
     table.insert(
         "effective_context_window".into(),

@@ -924,26 +924,3 @@ fn windows_runtime_variables_match_any_letter_case() {
     assert!(!runtime_variable("Path", false), "Unix names stay exact");
     assert!(!runtime_variable("node_options", true));
 }
-
-#[test]
-fn windows_system_env_keeps_only_system_variables_in_any_case() {
-    let vars = [
-        ("SYSTEMROOT", r"C:\Windows"),
-        ("windir", r"C:\Windows"),
-        ("ComSpec", r"C:\Windows\system32\cmd.exe"),
-        ("PATHEXT", ".COM;.EXE;.CMD"),
-        ("USERPROFILE", r"C:\Users\a"),
-        ("APPDATA", r"C:\Users\a\AppData\Roaming"),
-        ("OPENAI_API_KEY", "sk-secret"),
-        ("Path", r"C:\bin"),
-    ]
-    .map(|(name, value)| (name.into(), value.into()));
-    let names: Vec<String> = windows_system_env_from(vars)
-        .into_iter()
-        .map(|(name, _)| name.to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(names, ["SYSTEMROOT", "windir", "ComSpec", "PATHEXT"]);
-    if !cfg!(windows) {
-        assert!(windows_system_env().is_empty());
-    }
-}

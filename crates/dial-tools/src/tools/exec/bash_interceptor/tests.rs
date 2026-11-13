@@ -544,12 +544,9 @@ fn hint_mode_hints_a_lone_duplicate() {
 
 #[test]
 fn hint_mode_leaves_batched_and_scripted_commands_alone() {
-    // Commands taken from session transcripts: batching several reads into one call saves
-    // model round trips, and piping into another program is shell work a tool cannot do.
+    // Commands taken from session transcripts: piping into another program is shell work a
+    // tool cannot do, and a batch with a non-lookup segment is mixed shell work too.
     for c in [
-        "sed -n 30,60p src/ui/overlay/settings.rs; sed -n 285,345p src/ui/overlay/settings.rs",
-        "grep -n \"set_title_fields\" src/ui/main_page.py; grep -n \"def title_fields\" src/ui/settings.py",
-        "grep '^version' pyproject.toml && grep '__version__' src/simple_stipple/__init__.py",
         "grep -ohE \"page\\.[a-z_]+\" tests/test_shipping_ui.py | sort | uniq -c | sort -rn",
         "cat file | wc -l",
         "find . -name '*.rs' | xargs wc -l",
@@ -569,6 +566,90 @@ fn hint_mode_leaves_batched_and_scripted_commands_alone() {
         check(&on(), TOOLS, "cargo build; grep -rn foo src"),
         Some(Verdict::Block(_))
     ));
+}
+
+#[test]
+fn hint_mode_hints_a_batch_of_covered_lookups() {
+    // Batches taken from session transcripts whose every segment `read`/`grep`/`glob` covers.
+    // A leading `cd`, bare `echo` separators and a leading `NAME=value` do not change that.
+    for c in [
+        "sed -n 30,60p src/ui/overlay/settings.rs; sed -n 285,345p src/ui/overlay/settings.rs",
+        "grep -n \"set_title_fields\" src/ui/main_page.py; grep -n \"def title_fields\" src/ui/settings.py",
+        "grep '^version' pyproject.toml && grep '__version__' src/simple_stipple/__init__.py",
+        "cd crates/core && cat a.rs; grep -n foo b.rs",
+        "echo '== a =='; cat a.toml\necho '== b =='; head -5 b.toml",
+        "RUST_LOG=debug cat x; find . -name '*.rs' -type f",
+    ] {
+        assert_eq!(
+            check(&hint_mode(), TOOLS, c),
+            Some(Verdict::Hint(LOOKUP_BATCH_HINT.to_owned())),
+            "{c}"
+        );
+    }
+    // A lone duplicate keeps its own rule's hint, and block mode never gets the batch line.
+    assert_eq!(
+        check(&hint_mode(), TOOLS, "cat a.rs"),
+        Some(Verdict::Hint(
+            "[hint] Use the `read` tool instead of cat/head/tail. It provides better context and handles binary files.".to_owned()
+        ))
+    );
+    assert_eq!(
+        check(&hint_mode(), TOOLS, "cd crates/core && grep -rn foo src").map(|v| match v {
+            Verdict::Hint(line) => line,
+            Verdict::Block(_) => panic!("hint mode must not block"),
+        }),
+        Some("[hint] Use the `grep` tool instead of grep/rg. It respects .gitignore and provides structured output.".to_owned())
+    );
+    let message = blocked(&on(), "cat a.rs; grep -n foo b.rs").expect("block mode");
+    assert!(!message.contains(LOOKUP_BATCH_HINT), "{message}");
+}
+
+#[test]
+fn lookup_batch_stays_untouched_when_any_segment_is_not_a_covered_lookup() {
+    for c in [
+        "grep -n foo a.rs; npm test",
+        "cat a.rs; sed -i 's/a/b/' b.rs",
+        "cat a.rs; cargo test",
+        "cat a.rs; grep -n foo b.rs | wc -l",
+        "cat a.rs > out.txt; cat b.rs",
+        "cat a.rs; cat b.rs 2>&1 >/dev/null; ls",
+        "cat a.rs; echo done > status.txt",
+        "cat a.rs; cat b.rs; echo $(date)",
+    ] {
+        assert_eq!(check(&hint_mode(), TOOLS, c), None, "{c}");
+    }
+    // A segment whose covering tool is not offered is uncovered: no `grep` here, no batch.
+    for tools in [&["read", "bash"][..], &["grep", "glob", "bash"][..]] {
+        assert_eq!(
+            check(&hint_mode(), tools, "cat a.rs; grep -n foo b.rs"),
+            None,
+            "{tools:?}"
+        );
+    }
+    assert_eq!(
+        check(
+            &hint_mode(),
+            &["read", "grep", "bash"],
+            "cat a.rs; grep -n foo b.rs"
+        ),
+        Some(Verdict::Hint(LOOKUP_BATCH_HINT.to_owned()))
+    );
+}
+
+#[test]
+fn lookup_batch_withheld_for_paths_outside_the_workspace() {
+    let inside = |path: &str| path.starts_with("/app");
+    let hint = |c: &str| check_in(&hint_mode(), TOOLS, c, &inside);
+    for c in [
+        "cat a.rs; grep -n main /usr/include/stdio.h",
+        "cat /app/a.txt; cat /etc/hosts",
+    ] {
+        assert_eq!(hint(c), None, "{c}");
+    }
+    assert_eq!(
+        hint("cat /app/a.txt; sed -n 1,5p /app/b.txt"),
+        Some(Verdict::Hint(LOOKUP_BATCH_HINT.to_owned()))
+    );
 }
 
 #[test]

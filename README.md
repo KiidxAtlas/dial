@@ -14,7 +14,7 @@ commands to an OS sandbox. It works with your own models or anyone else's.**
 </div>
 
 ```sh
-curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | bash
+curl -fsSL https://dial.rootatlas.dev/install | sh
 cd your-project && dial
 ```
 
@@ -52,10 +52,11 @@ On first launch Dial asks which model to use. Then you tell it what you want.
 
 | Platform                              | Command                                                                                     |
 | ------------------------------------- | ------------------------------------------------------------------------------------------- |
-| macOS 13+, Linux (x86-64/arm64), WSL2 | `curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh \| bash` |
+| macOS 13+, Linux (x86-64/arm64), WSL2 | `curl -fsSL https://dial.rootatlas.dev/install \| sh`                                       |
 | Windows (PowerShell)                  | `irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 \| iex`        |
 
-You don't need Rust. The installer checks release signatures. Homebrew, Nix, Docker and source
+You don't need Rust or bash: the installer is plain `sh` and checks release signatures with the
+`ssh-keygen` already on your machine. Homebrew, Nix, Docker and source
 builds are also supported. To update, run `dial update`. On Linux the optional sandbox needs `bubblewrap`.
 For all options and requirements, see [docs/release-and-install.md](docs/release-and-install.md).
 

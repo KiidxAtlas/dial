@@ -310,7 +310,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
     if matches!(cli.command, Some(Command::Rpc)) || route == Some(dial::cli::cli_modes::Route::Rpc)
     {
         mode.validate_protocol("RPC")?;
-        return dial::rpc::run_with_launch(layout, config.for_coding(), launch);
+        return dial::rpc::run_with_overlay(layout, config.for_coding(), launch, table);
     }
     if matches!(cli.command, Some(Command::Acp)) || route == Some(dial::cli::cli_modes::Route::Acp)
     {

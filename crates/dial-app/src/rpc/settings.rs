@@ -11,7 +11,7 @@ use anyhow::Result;
 use dial_protocol::ErrorCode;
 use serde_json::{Value, json};
 
-fn scope(params: &Value) -> Result<Scope> {
+pub(super) fn scope(params: &Value) -> Result<Scope> {
     match params.get("scope").filter(|value| !value.is_null()) {
         None => Ok(Scope::Global),
         Some(value) => match value.as_str() {
@@ -25,7 +25,7 @@ fn scope(params: &Value) -> Result<Scope> {
     }
 }
 
-fn scope_name(scope: Scope) -> &'static str {
+pub(super) fn scope_name(scope: Scope) -> &'static str {
     match scope {
         Scope::Global => "global",
         Scope::Project => "project",

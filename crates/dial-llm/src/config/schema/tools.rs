@@ -67,7 +67,7 @@ pub(super) static SANDBOX_AND_EDITING: &[SettingDef] = &[
         TO,
         "Shell",
         "Bash backend",
-        "Which shell runs bash commands. Auto: Git Bash or /bin/bash when found, otherwise the built-in shell (on Windows without it: PowerShell). System: bash only (Git for Windows on Windows). Embedded: Dial's built-in shell. In-process: the built-in shell inside Dial itself; refused unless sandbox.mode is off. PowerShell: Windows only.",
+        "Which shell runs bash commands. Auto: Dial's built-in Bash-compatible shell on every OS; builds without it fall back to system bash, then PowerShell on Windows. System: bash only (Git for Windows on Windows). Embedded: require the built-in shell. In-process: the built-in shell inside Dial itself; refused unless sandbox.mode is off. PowerShell: Windows only.",
         Kind::Enum(SHELL_BACKEND),
         true
     ),
@@ -371,7 +371,7 @@ pub(super) static EXECUTION: &[SettingDef] = &[
         TO,
         "JavaScript code mode",
         "Node executable",
-        "Operator-installed Node 22+ executable outside the editable workspace. New sessions require macOS sandbox-exec process-fork containment; never a browser-page alias.",
+        "Node 22+ executable outside the editable workspace. The default node uses the release-bundled runtime when present, otherwise PATH. Explicit overrides remain operator-owned; eval containment is unchanged.",
         Kind::Text,
     ),
     field!(

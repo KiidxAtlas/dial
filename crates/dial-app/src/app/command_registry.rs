@@ -16,6 +16,7 @@ pub(super) fn canonical_command(name: &str) -> &str {
     command_spec(name).map_or(name, |spec| spec.name)
 }
 
+#[cfg(test)]
 /// Historical RPC rows, projected once from the shared metadata (not a second declaration).
 pub(super) static BUILTIN_COMMANDS: std::sync::LazyLock<Vec<(&str, &str, &str)>> =
     std::sync::LazyLock::new(|| {
@@ -307,9 +308,26 @@ pub(super) fn palette_sessions(
         .collect())
 }
 
-/// The built-in slash commands as `(name, usage, description)` rows, for RPC clients.
+#[cfg(test)]
+/// The built-in rows of the historical `get_available_commands` contract, kept for its tests.
 pub(crate) fn builtin_commands() -> &'static [(&'static str, &'static str, &'static str)] {
     &BUILTIN_COMMANDS
+}
+
+/// Every slash command a user can discover (built-in rows first, then group commands), as
+/// `(name, usage, description)` rows. `get_available_commands` pairs each with its RPC surface.
+pub(crate) fn discoverable_commands()
+-> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
+    let order = |surface: Surface| COMMANDS.iter().filter(move |spec| spec.surface == surface);
+    order(Surface::Builtin)
+        .chain(order(Surface::Group))
+        .map(|spec| (spec.name, spec.usage, spec.description))
+}
+
+#[cfg(test)]
+/// Canonical names of every declared slash command, discoverable or not.
+pub(crate) fn command_names() -> impl Iterator<Item = &'static str> {
+    COMMANDS.iter().map(|spec| spec.name)
 }
 
 /// The prompt a `/skill:<name> [task]` line sends: the same text the terminal sends.

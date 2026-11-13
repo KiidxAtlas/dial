@@ -291,13 +291,20 @@ fn backend_missing_separates_blocking_and_optional_steps() {
     assert!(
         optional
             .iter()
-            .any(|line| line.contains("memory role (Alt+M)"))
+            .any(|line| line.contains("memory role (or the small role) in Alt+M"))
     );
     with_role(&mut config, "embedding");
     with_role(&mut config, "memory");
     assert_eq!(
         backend_missing(&config, MemoryBackendId::Semantic),
         (Vec::new(), Vec::new())
+    );
+    let mut small_only = Config::default();
+    with_role(&mut small_only, "small");
+    let (_, optional) = backend_missing(&small_only, MemoryBackendId::Semantic);
+    assert!(
+        !optional.iter().any(|line| line.contains("save facts")),
+        "the small role runs auto-retain: {optional:?}"
     );
     assert!(
         backend_missing(&config, MemoryBackendId::Local)

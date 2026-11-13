@@ -6,7 +6,7 @@ use super::*;
 
 fn semantic_runtime(
     dir: &std::path::Path,
-    memory_role: bool,
+    retain_role: Option<&'static str>,
 ) -> (Arc<MemoryRuntime>, MemoryAuthority) {
     let project = dir.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -25,7 +25,7 @@ fn semantic_runtime(
         scope,
         None,
         Ok(None),
-        memory_role,
+        retain_role,
     )
     .unwrap();
     assert!(runtime.open_error().is_none(), "{:?}", runtime.open_error());
@@ -42,7 +42,7 @@ fn pair(prompt: &str, answer: &str) -> [Value; 2] {
 #[test]
 fn idle_memory_has_no_maintenance_work_after_observations_are_drained() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, auth) = semantic_runtime(dir.path(), false);
+    let (runtime, auth) = semantic_runtime(dir.path(), None);
     let mut runner = FakeRunner::new("{}");
     assert!(!runtime.maintenance_due(&auth).unwrap());
     runtime
@@ -82,7 +82,7 @@ fn fact_refs_parse_both_banks_and_reject_garbage() {
 #[test]
 fn every_user_message_recalls_only_facts_not_already_shown() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let (runtime, auth) = semantic_runtime(dir.path(), Some("memory"));
     let mut runner = FakeRunner::new("{}");
     runtime
         .command(
@@ -144,7 +144,7 @@ fn every_user_message_recalls_only_facts_not_already_shown() {
 #[test]
 fn clear_resets_shown_facts_and_keeps_the_user_bank() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let (runtime, auth) = semantic_runtime(dir.path(), Some("memory"));
     let mut runner = FakeRunner::new("{}");
     let saved = runtime
         .execute_tool(
@@ -204,7 +204,7 @@ fn clear_resets_shown_facts_and_keeps_the_user_bank() {
 #[test]
 fn bank_qualified_refs_target_the_right_bank() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let (runtime, auth) = semantic_runtime(dir.path(), Some("memory"));
     let mut runner = FakeRunner::new("{}");
     runtime
         .execute_tool(
@@ -273,7 +273,7 @@ fn bank_qualified_refs_target_the_right_bank() {
 #[test]
 fn auto_retain_pauses_without_a_memory_role_but_recall_and_retain_work() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, auth) = semantic_runtime(dir.path(), false);
+    let (runtime, auth) = semantic_runtime(dir.path(), None);
     let mut runner = FakeRunner::new(r#"{"facts":[{"content":"never stored","scope":"project"}]}"#);
     let messages: Vec<Value> = pair(
         "please remember that our staging database is called orchid",
@@ -291,7 +291,7 @@ fn auto_retain_pauses_without_a_memory_role_but_recall_and_retain_work() {
     assert!(
         status["notes"]
             .to_string()
-            .contains("assign the memory role (Alt+M) to save facts automatically"),
+            .contains("assign the memory role (or the small role) in Alt+M"),
         "{status}"
     );
     runtime
@@ -312,9 +312,106 @@ fn auto_retain_pauses_without_a_memory_role_but_recall_and_retain_work() {
 }
 
 #[test]
+fn auto_retain_uses_the_small_role_when_the_memory_role_is_unassigned() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, auth) = semantic_runtime(dir.path(), Some("small"));
+    let mut runner = FakeRunner::new(
+        r#"{"facts":[{"content":"staging database is called orchid","scope":"project"}]}"#,
+    );
+    let messages: Vec<Value> = pair(
+        "please remember that our staging database is called orchid",
+        "Noted: staging is orchid.",
+    )
+    .into();
+    runtime.observe_owned(&auth, messages).unwrap();
+    runtime.maintain(&auth, &mut runner).unwrap();
+    assert_eq!(runner.roles, ["small"], "extraction runs on the small role");
+    let status = runtime.command(&auth, "status", &mut runner).unwrap();
+    assert_eq!(status["autoRetain"], "on");
+    assert!(
+        status["notes"].to_string().contains("with the small role"),
+        "{status}"
+    );
+    let recalled = runtime
+        .execute_tool(
+            &auth,
+            &json!({"action":"recall","query":"staging orchid"}),
+            &mut runner,
+        )
+        .unwrap();
+    assert_eq!(recalled["items"].as_array().unwrap().len(), 1, "{recalled}");
+}
+
+#[test]
+fn configured_auto_retain_role_prefers_memory_then_small_never_main() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let path = layout.config_files()[0].clone();
+    let base = "model='local'\nprovider='mlx'\n[memory]\nbackend='semantic'\n";
+    let small = "[model_roles.small]\nprovider='mlx'\nmodel='s'\n";
+    let memory = "[model_roles.memory]\nprovider='mlx'\nmodel='m'\n";
+    for (settings, expected) in [
+        (base.to_owned(), None),
+        (format!("{base}{small}"), Some("small")),
+        (format!("{base}{small}{memory}"), Some("memory")),
+    ] {
+        fs::write(&path, &settings).unwrap();
+        let config = Config::load(&layout, None).unwrap();
+        assert_eq!(config.auto_retain_role(), expected, "{settings}");
+    }
+}
+
+#[test]
+fn view_lists_every_fact_per_bank_with_refs_and_revisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, auth) = semantic_runtime(dir.path(), None);
+    let mut runner = FakeRunner::new("{}");
+    runtime
+        .execute_tool(
+            &auth,
+            &json!({"action":"retain","items":[
+                {"content":"staging database is orchid"},
+                {"content":"the user prefers terse answers","scope":"global"}
+            ]}),
+            &mut runner,
+        )
+        .unwrap();
+    let view = runtime.command(&auth, "view", &mut runner).unwrap();
+    let banks = view["view"]["banks"].as_array().unwrap();
+    assert_eq!(banks.len(), 2, "{view}");
+    assert_eq!(banks[0]["scope"], "project");
+    assert_eq!(banks[0]["total"], 1);
+    assert_eq!(banks[0]["truncated"], false);
+    assert_eq!(
+        banks[0]["facts"][0]["content"],
+        "staging database is orchid"
+    );
+    assert_eq!(banks[0]["facts"][0]["revision"], 1);
+    assert_eq!(banks[1]["scope"], "global");
+    assert!(
+        banks[1]["facts"][0]["ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("user:"),
+        "{view}"
+    );
+    assert_eq!(view["view"]["autoRetain"]["state"], "paused");
+    assert_eq!(view["view"]["autoRetain"]["pendingTurns"], 0);
+    let user_only = runtime.command(&auth, "view user", &mut runner).unwrap();
+    let banks = user_only["view"]["banks"].as_array().unwrap();
+    assert_eq!(banks.len(), 1);
+    assert_eq!(banks[0]["scope"], "global");
+    let error = runtime
+        .command(&auth, "view everything", &mut runner)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("usage: /memory view [project|user]"));
+}
+
+#[test]
 fn backlog_keeps_every_turn_across_turns_and_sessions() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let (runtime, auth) = semantic_runtime(dir.path(), Some("memory"));
     let mut runner = FakeRunner::new(r#"{"facts":[]}"#);
     let mut first: Vec<Value> = pair(
         "the first long question about the release checklist",
@@ -393,7 +490,7 @@ fn turn(role: &str, text: &str) -> Value {
 #[test]
 fn identical_raw_prompt_requeries_only_when_its_effective_context_changes() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let (runtime, auth) = semantic_runtime(dir.path(), Some("memory"));
     let mut runner = FakeRunner::new("{}");
     runtime
         .command(
@@ -446,7 +543,7 @@ fn identical_raw_prompt_requeries_only_when_its_effective_context_changes() {
 #[test]
 fn compaction_rebinds_the_history_generation_and_reattaches_compacted_away_facts() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let (runtime, auth) = semantic_runtime(dir.path(), Some("memory"));
     let mut runner = FakeRunner::new("{}");
     runtime
         .command(
@@ -493,7 +590,7 @@ fn compaction_rebinds_the_history_generation_and_reattaches_compacted_away_facts
 #[test]
 fn rewind_rebinds_the_history_generation_and_reattaches_removed_facts() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let (runtime, auth) = semantic_runtime(dir.path(), Some("memory"));
     let mut runner = FakeRunner::new("{}");
     runtime
         .command(
@@ -540,7 +637,7 @@ fn rewind_rebinds_the_history_generation_and_reattaches_removed_facts() {
 #[test]
 fn automatic_recall_filters_incidental_words_and_old_assistant_subjects() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let (runtime, auth) = semantic_runtime(dir.path(), Some("memory"));
     let mut runner = FakeRunner::new("{}");
     runtime
         .command(
@@ -637,7 +734,7 @@ fn semantic_setup_failure_reports_keyword_fallback_once_and_off_stays_quiet() {
         bank_scope(&layout, &config),
         None,
         Err("embedding endpoint refused connection".into()),
-        false,
+        None,
     )
     .unwrap();
     let notice = runtime.take_reachability_notice().unwrap();
@@ -646,6 +743,6 @@ fn semantic_setup_failure_reports_keyword_fallback_once_and_off_stays_quiet() {
         "{notice}"
     );
     assert!(runtime.take_reachability_notice().is_none());
-    let (disabled, _) = semantic_runtime(dir.path(), false);
+    let (disabled, _) = semantic_runtime(dir.path(), None);
     assert!(disabled.take_reachability_notice().is_none());
 }

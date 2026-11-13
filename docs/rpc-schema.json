@@ -39,6 +39,22 @@
               "properties": {
                 "text": {
                   "type": "string"
+                },
+                "images": {
+                  "type": "array",
+                  "description": "Image files to attach (native dial rpc only): absolute, `~`, or relative to the workspace root. The active model must accept image input (ready.image_input).",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "inline_images": {
+                  "type": "array",
+                  "description": "Base64 image bytes to attach (native dial rpc only), e.g. pasted screenshots.",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
                 }
               },
               "additionalProperties": false,
@@ -730,7 +746,7 @@
             "method": {"const": "hello"},
             "params": {
               "type": "object",
-              "properties": {"protocol_version": {"type": "integer", "minimum": 1}},
+              "properties": {"protocol_version": {"type": "integer", "minimum": 1}, "interactive": {"type": "boolean", "default": false, "description": "A person answers this client (native dial rpc only): the engine may then ask interactive questions such as directory-access grants. Scripts leave it false."}},
               "required": ["protocol_version"],
               "additionalProperties": false
             }
@@ -1107,13 +1123,389 @@
         },
         {
           "type": "object",
-          "description": "Extension rows shown by /extensions: configured and curated MCP servers and skill packages. Result: {mcp:[row],skills:[row]} where row is {id,title,summary,tags,origin,state,details}. Read-only; installs and sign-in remain terminal flows.",
+          "description": "Extension rows shown by /extensions: configured and curated MCP servers and skill packages, read from the saved configuration. Result: {mcp:[row],skills:[row]} where row is {id,title,summary,tags,origin,state,details}.",
           "properties": {
             "id": {"$ref": "#/$defs/id"},
             "method": {"const": "list_extensions"},
             "params": {"type": "object", "properties": {}, "additionalProperties": false}
           },
           "required": ["method"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Run one /extensions action through the overlay's owner: install, import, enable, disable, remove or test an MCP server, Smithery steps, catalog browsing, or installing/removing a skill package. Answered when it finishes; progress arrives as extension_progress events. Actions that change files, run a downloaded command, or remove or disable something need confirm:true. Saved config changes apply on apply_settings. Result: {ok, message, action, saved_scope:'global'|'project'|null, apply_settings, form?, catalog?}; form is {submit, target, title, note, error, fields:[{key,label,hint,required,secret}]} and is answered by sending the intent named by submit. One action runs at a time (busy).",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "extension_action"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "intent": {
+                  "type": "object",
+                  "description": "An /extensions intent, tagged by op: install_curated_mcp{id}, install_mcp{id,values?}, toggle_mcp{id,enable}, remove_mcp{id}, test_mcp{id}, remove_skill{id}, import_mcp{id}, smithery_install{name}, smithery_key{name,key}, smithery_deploy{name,values}, catalog_browse{tab:'Mcp'|'Skills'|'Tools'|'Hooks',query,page}, install_skill{source}.",
+                  "properties": {
+                    "op": {
+                      "enum": [
+                        "install_curated_mcp",
+                        "install_mcp",
+                        "toggle_mcp",
+                        "remove_mcp",
+                        "test_mcp",
+                        "remove_skill",
+                        "import_mcp",
+                        "smithery_install",
+                        "smithery_key",
+                        "smithery_deploy",
+                        "catalog_browse",
+                        "install_skill"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "op"
+                  ]
+                },
+                "scope": {
+                  "enum": [
+                    "global",
+                    "project",
+                    null
+                  ]
+                },
+                "confirm": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "intent"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Sign in to the configured remote MCP server, as /mcp login does (protocol 2). Emits auth_url/auth_progress/auth_prompt with provider 'mcp:<server>'; cancel with auth_cancel {provider:'mcp:<server>'}. Answered when the flow ends with {server, message}. The grant applies when the server reconnects: apply_settings {reconnect:true}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "mcp_login"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "server": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "server"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Remove the stored sign-in for an MCP server, cancelling a running one (protocol 2). Result: {server, removed}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "mcp_logout"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "server": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "server"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "This protocol's JSON Schema (the document in docs/rpc-schema.json), for client code generation. Result: the schema object. Answered by the controller, also during a turn.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "get_schema"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Set the session's approval mode, as /approval does. Result: {approval, description}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "set_approval"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "ask",
+                    "write",
+                    "auto",
+                    "readonly"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "mode"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "The workspace roots, as /dirs shows them. Result: {root, dirs:[path]}. Answered from the published projection, also during a turn.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "list_dirs"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Add a directory to the workspace and persist it, as /add-dir does. `~`, absolute, or relative to the primary root. Result: {changed, path, dirs}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "add_dir"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Remove an added workspace directory, as /remove-dir does. Result: {changed, path, dirs}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "remove_dir"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Rewind the unanswered last prompt and send it again, as /retry does. Result: the same shape as send. Refused (invalid_params) when the last message is not an unanswered prompt.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "retry"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Unload this session's Dial-managed local model; it reloads on the next request. External endpoints are refused. Result: {restarted:true}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "restart_model"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "The session's background (`bg`) jobs. Result: {jobs:[{name, command, status, running, stop_requested, terminal}]}. Answered by the controller, also during a turn.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "list_jobs"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Stop one background job by name. Result: {name, stopped}.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "stop_job"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "name"
+              ]
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Reload saved settings (with this process's command-line flags) and apply them to the running session, as the terminal does after a settings change. Approval applies in place; any other change rebuilds the agent around the same session, keeping its conversation, todo, plan mode, cost, model choice, resident model and background processes. Host tools are dropped on a rebuild and must be declared again, parked sessions must be resumed again. Result: {applied:'live'|'rebuild', rebuilt, approval?, host_tools_reset?, reconnected?, tools?, model?, image_input?}. Refused (busy) while workers run.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "method": {
+              "const": "apply_settings"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "reconnect": {
+                  "type": "boolean",
+                  "description": "Rebuild even when nothing changed and reconnect MCP servers instead of keeping their connections, as /mcp reconnect does (after mcp_login). The result adds reconnected."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method"
+          ],
           "additionalProperties": false
         }
       ]
@@ -1228,7 +1620,7 @@
         },
         {
           "type": "object",
-          "description": "Asks the host for a typed sign-in value; answer with auth_code using the same prompt_id. The answer is never echoed.",
+          "description": "Asks the host for a typed sign-in value; answer with auth_code using the same prompt_id. The answer is never echoed. provider is 'mcp:<server>' for an MCP sign-in.",
           "properties": {
             "event": {"const": "auth_prompt"},
             "seq": {"type": "integer", "minimum": 1, "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."},
@@ -1238,9 +1630,52 @@
             "prompt_id": {"type": "string"},
             "message": {"type": "string"},
             "placeholder": {"type": ["string", "null"]},
-            "allow_empty": {"type": "boolean"}
+            "allow_empty": {"type": "boolean"},
+            "secret": {
+              "type": "boolean",
+              "description": "The answer is a credential (API key, pasted code or cookie); mask the field."
+            }
           },
           "required": ["event", "provider", "prompt_id", "message", "placeholder", "allow_empty"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "A progress line from the running extension_action.",
+          "properties": {
+            "event": {
+              "const": "extension_progress"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Per-connection event sequence; increases by one per plain-RPC event in stdout order."
+            },
+            "session_id": {
+              "type": "string",
+              "description": "Session the engine was serving when the event was produced."
+            },
+            "request_id": {
+              "description": "Id of the request whose processing produced the event; null for background work between requests.",
+              "type": [
+                "string",
+                "integer",
+                "null"
+              ]
+            },
+            "action": {
+              "type": "string",
+              "description": "The running action, as in its result."
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "action",
+            "message"
+          ],
           "additionalProperties": false
         },
         {
