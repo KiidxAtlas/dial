@@ -113,9 +113,17 @@ impl EscapeMonitor {
 
 impl Drop for EscapeMonitor {
     fn drop(&mut self) {
-        // SAFETY: this id is the dedicated monitor thread; it retains no input.
-        unsafe {
-            PostThreadMessageW(self.id, WM_QUIT, 0, 0);
+        // A thread that already left its message loop (GetMessageW failure) must not be
+        // posted to: Windows may have reused its id for an unrelated thread.
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            // SAFETY: this id is the live dedicated monitor thread; it retains no input.
+            unsafe {
+                PostThreadMessageW(self.id, WM_QUIT, 0, 0);
+            }
         }
         if let Some(worker) = self.thread.take()
             && worker.thread().id() != thread::current().id()

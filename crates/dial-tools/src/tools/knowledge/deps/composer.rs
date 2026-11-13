@@ -7,9 +7,12 @@ pub(super) fn resolve(root: &Path, name: &str, wanted: Option<&str>) -> Result<P
             "Composer packages are named vendor/package, not {name:?}"
         ));
     }
-    let text = fs::read_to_string(root.join("composer.lock")).map_err(|_| {
-        "no composer.lock in the workspace root (`composer install` creates it and vendor/; nothing is fetched here)"
-            .to_owned()
+    let text = fs::read_to_string(root.join("composer.lock")).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            "no composer.lock in the workspace root (`composer install` creates it and vendor/; nothing is fetched here)"
+                .to_owned()
+        }
+        _ => format!("cannot read composer.lock: {error}"),
     })?;
     let lock: Value = serde_json::from_str(&text)
         .map_err(|error| format!("composer.lock does not parse: {error}"))?;

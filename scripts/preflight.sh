@@ -215,12 +215,13 @@ main() {
   # Collect cheap blockers together, but never begin expensive work after they fail.
   ((${#failed[@]} == 0)) || finish
 
-  # CI's lint job runs on Linux, where cfg(target_os = "linux") code is linted too.
+  # CI's lint job runs on Linux and Windows, where cfg(target_os = "linux") and cfg(windows) code
+  # is linted too; a plain Windows `check` misses Windows-only Clippy failures.
   cross x86_64-unknown-linux-gnu clippy-linux clippy --locked --workspace --all-targets -- -D warnings
   step clippy-host cargo clippy --locked --workspace --all-targets -- -D warnings
   cross x86_64-unknown-linux-musl musl-x86_64 check --locked --profile ci -p dial
   cross aarch64-unknown-linux-musl musl-aarch64 check --locked --profile ci -p dial
-  cross x86_64-pc-windows-gnu windows-check check --locked --profile ci --workspace --all-targets
+  cross x86_64-pc-windows-gnu clippy-windows clippy --locked --profile ci --workspace --all-targets -- -D warnings
   step slim-check cargo check --locked --profile ci --no-default-features -p dial --bin dial
   if command -v cargo-deny >/dev/null 2>&1; then
     step cargo-deny cargo deny check advisories licenses bans sources

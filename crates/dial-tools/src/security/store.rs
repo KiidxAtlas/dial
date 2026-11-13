@@ -165,9 +165,8 @@ impl Store {
             }
             Err(error) => return Err(error.into()),
         };
-        let index: Index = serde_json::from_slice(&bytes).map_err(|_| {
-            anyhow::anyhow!("Unsupported security store index at {}", path.display())
-        })?;
+        let index: Index = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Invalid security store index at {}", path.display()))?;
         ensure!(
             index.schema_version == 1,
             "Unsupported security store index at {}",
@@ -220,7 +219,15 @@ impl Store {
             "Invalid security plan id: {id}"
         );
         let path = self.dir.join("plans").join(format!("{id}.json"));
-        let bytes = fs::read(&path).map_err(|_| anyhow::anyhow!("Unknown security plan: {id}"))?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!("Unknown security plan: {id}")
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot read security plan {id}"));
+            }
+        };
         let plan: Plan = serde_json::from_slice(&bytes)
             .with_context(|| format!("Invalid security plan document: {id}"))?;
         ensure!(
@@ -310,8 +317,15 @@ impl Store {
 
     pub fn load_scan(&self, id: &str) -> Result<Scan> {
         let dir = self.scan_dir(id)?;
-        let bytes = fs::read(dir.join(SCAN_FILE))
-            .map_err(|_| anyhow::anyhow!("Unknown security scan: {id}"))?;
+        let bytes = match fs::read(dir.join(SCAN_FILE)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!("Unknown security scan: {id}")
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot read security scan {id}"));
+            }
+        };
         let scan: Scan = serde_json::from_slice(&bytes)
             .with_context(|| format!("Invalid security scan document: {id}"))?;
         ensure!(

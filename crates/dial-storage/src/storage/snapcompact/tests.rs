@@ -333,7 +333,7 @@ fn record_selector_returns_exact_json_of_the_selected_record() {
     let messages = fixture();
     let all = layers(&messages).unwrap();
     let id = all[0].id.clone();
-    for index in 0..all[0].messages.len() {
+    for (index, expected) in all[0].messages.iter().enumerate() {
         let out = run(
             &messages,
             json!({"view": "layers", "query": "", "layer": id, "record": index}),
@@ -342,7 +342,6 @@ fn record_selector_returns_exact_json_of_the_selected_record() {
         assert_eq!(data["items_total"], 1);
         assert_eq!(data["items"][0]["record"], index);
         assert_eq!(data["items"][0]["ref"], format!("{id}#{index}"));
-        let expected = &all[0].messages[index];
         let body = record_body(&out.text);
         assert_eq!(body, serde_json::to_string(expected).unwrap());
         assert_eq!(serde_json::from_str::<Value>(body).unwrap(), *expected);

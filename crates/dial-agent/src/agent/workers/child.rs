@@ -876,6 +876,14 @@ fn child_role_chat(
     )
 }
 
+/// The child loop state a memory runner acts on: its backend, optional adapter, step counter and budget.
+struct ChildMemoryTarget<'b> {
+    backend: &'b mut Backend,
+    adapter: Option<&'b Path>,
+    steps: &'b mut u32,
+    budget: u32,
+}
+
 struct ChildMemoryRunner<'a, 'b, 'c, 'd> {
     env: Env<'a>,
     backend: &'b mut Backend,
@@ -892,19 +900,21 @@ struct ChildMemoryRunner<'a, 'b, 'c, 'd> {
 }
 
 impl<'a, 'b, 'c, 'd> ChildMemoryRunner<'a, 'b, 'c, 'd> {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         env: Env<'a>,
-        backend: &'b mut Backend,
-        adapter: Option<&'b Path>,
-        steps: &'b mut u32,
-        budget: u32,
+        target: ChildMemoryTarget<'b>,
         observer: &'b std::cell::RefCell<&'c mut (dyn Approver + 'd)>,
         children: &'b ChildBackends,
         call: Option<&'b llm::ToolCall>,
         mutates: bool,
         capture: bool,
     ) -> Self {
+        let ChildMemoryTarget {
+            backend,
+            adapter,
+            steps,
+            budget,
+        } = target;
         Self {
             env,
             backend,
@@ -1260,10 +1270,12 @@ fn child_compaction_memory(
     let observer = std::cell::RefCell::new(&mut *approver);
     let mut runner = ChildMemoryRunner::new(
         env,
-        backend,
-        adapter,
-        steps,
-        budget,
+        ChildMemoryTarget {
+            backend,
+            adapter,
+            steps,
+            budget,
+        },
         &observer,
         children,
         None,
@@ -2259,10 +2271,12 @@ fn capture_child_memory(
         let observer = std::cell::RefCell::new(&mut *approver);
         let mut runner = ChildMemoryRunner::new(
             env,
-            context.backend,
-            context.adapter,
-            context.steps,
-            context.budget,
+            ChildMemoryTarget {
+                backend: context.backend,
+                adapter: context.adapter,
+                steps: context.steps,
+                budget: context.budget,
+            },
             &observer,
             context.children,
             Some(&origin),

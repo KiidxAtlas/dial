@@ -412,7 +412,7 @@ fn empty_memory_view_says_how_facts_arrive() {
 
 #[test]
 fn provenance_memory_view_has_no_auto_retain_line_and_marks_a_full_page() {
-    let facts: Vec<Value> = (1..=3)
+    let facts: Vec<serde_json::Value> = (1..=3)
         .map(|id| json!({"ref": id.to_string(), "id": id, "revision": 1, "content": format!("fact {id}"), "source": "agent", "updated": 0}))
         .collect();
     let value = json!({

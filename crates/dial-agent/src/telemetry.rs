@@ -1138,17 +1138,17 @@ impl Exporter {
                             if r.error { json!("chat") } else { Value::Null },
                         ),
                     ]);
-                    self.spans.push(span_json(
+                    self.spans.push(span_json(SpanRecord {
                         trace,
                         span,
-                        Some(parent),
-                        &format!("chat {}", r.model),
-                        3,
+                        parent: Some(parent),
+                        name: &format!("chat {}", r.model),
+                        kind: 3,
                         start_ns,
                         end_ns,
-                        attrs,
-                        r.error,
-                    ));
+                        attributes: attrs,
+                        error: r.error,
+                    }));
                 }
                 if r.error && self.settings.logs_url.is_some() {
                     self.logs.push(log_json(
@@ -1237,17 +1237,17 @@ impl Exporter {
                     ));
                     pairs.push(("dial.output.omitted_bytes", json!(t.facts.omitted_bytes)));
                     let attrs = attributes(&pairs);
-                    self.spans.push(span_json(
+                    self.spans.push(span_json(SpanRecord {
                         trace,
-                        nonzero_u64(),
-                        Some(parent),
-                        &format!("execute_tool {}", t.tool),
-                        1,
+                        span: nonzero_u64(),
+                        parent: Some(parent),
+                        name: &format!("execute_tool {}", t.tool),
+                        kind: 1,
                         start_ns,
                         end_ns,
-                        attrs,
-                        t.error,
-                    ));
+                        attributes: attrs,
+                        error: t.error,
+                    }));
                 }
             }
             Event::Turn(t) => {
@@ -1278,17 +1278,17 @@ impl Exporter {
                     ("session.id", json!(t.session)),
                 ];
                 if self.settings.traces_url.is_some() {
-                    self.spans.push(span_json(
+                    self.spans.push(span_json(SpanRecord {
                         trace,
                         span,
-                        None,
-                        "invoke_agent dial",
-                        1,
-                        opened.min(start_ns),
+                        parent: None,
+                        name: "invoke_agent dial",
+                        kind: 1,
+                        start_ns: opened.min(start_ns),
                         end_ns,
-                        attributes(&pairs),
-                        failed,
-                    ));
+                        attributes: attributes(&pairs),
+                        error: failed,
+                    }));
                 }
                 if self.settings.logs_url.is_some() {
                     let (severity, text) = if failed { (17, "ERROR") } else { (9, "INFO") };
@@ -1496,18 +1496,31 @@ fn hex(value: u128, bytes: usize) -> String {
     format!("{value:0width$x}", width = bytes * 2)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn span_json(
+/// One OTLP span as recorded: identifiers, the operation, its time range and its outcome.
+struct SpanRecord<'a> {
     trace: u128,
     span: u64,
     parent: Option<u64>,
-    name: &str,
+    name: &'a str,
     kind: u8,
     start_ns: u64,
     end_ns: u64,
     attributes: Value,
     error: bool,
-) -> Value {
+}
+
+fn span_json(record: SpanRecord<'_>) -> Value {
+    let SpanRecord {
+        trace,
+        span,
+        parent,
+        name,
+        kind,
+        start_ns,
+        end_ns,
+        attributes,
+        error,
+    } = record;
     json!({
         "traceId": hex(trace, 16),
         "spanId": hex(span as u128, 8),

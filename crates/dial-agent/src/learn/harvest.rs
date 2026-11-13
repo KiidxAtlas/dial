@@ -92,6 +92,10 @@ struct Candidate {
 pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Result<Report> {
     let t = &config.training;
     let max_tokens = t.max_seq_length as usize;
+    let limits = ScreenLimits {
+        held_out,
+        max_tokens,
+    };
     ensure!(
         t.train_data != t.valid_data
             && !matches!((t.train_data.canonicalize(), t.valid_data.canonicalize()), (Ok(a), Ok(b)) if a == b),
@@ -183,8 +187,7 @@ pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Re
             &domain,
             &source,
             &payload,
-            held_out,
-            max_tokens,
+            limits,
             &mut report,
             None,
         ) {
@@ -217,8 +220,7 @@ pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Re
             "session-teaching",
             "user:session",
             &example.payload,
-            held_out,
-            max_tokens,
+            limits,
             &mut report,
             Some(&origin),
         ) {
@@ -240,8 +242,7 @@ pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Re
             config,
             &origin,
             &sibling,
-            held_out,
-            max_tokens,
+            limits,
             &mut report,
             &mut links,
             true,
@@ -267,8 +268,7 @@ pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Re
                     config,
                     &origin,
                     &teacher,
-                    held_out,
-                    max_tokens,
+                    limits,
                     &mut report,
                     &mut links,
                     false,
@@ -416,6 +416,13 @@ enum Verdict {
     Invalid,
     Overlap,
     Oversize,
+}
+
+/// The held-out prompts and sequence ceiling every candidate is screened against.
+#[derive(Clone, Copy)]
+struct ScreenLimits<'a> {
+    held_out: &'a HashSet<String>,
+    max_tokens: usize,
 }
 
 /// Incrementally judges a message prefix whose last message carries the training loss.
@@ -590,17 +597,19 @@ fn siblings(config: &Config, report: &mut Report) -> Vec<(String, Store)> {
 /// Verified repairs and successes from one sibling database, screened like local data. Targets lose
 /// their reasoning, and no preference pairs carry over: they were verified against the sibling's own
 /// model, not this one.
-#[allow(clippy::too_many_arguments)]
 fn sibling_candidates(
     config: &Config,
     origin: &str,
     sibling: &Store,
-    held_out: &HashSet<String>,
-    max_tokens: usize,
+    limits: ScreenLimits<'_>,
     report: &mut Report,
     links: &mut BTreeMap<String, HashSet<String>>,
     repairs: bool,
 ) -> Result<Vec<Candidate>> {
+    let ScreenLimits {
+        held_out,
+        max_tokens,
+    } = limits;
     let mut found = Vec::new();
     let repair_rows = if repairs {
         sibling.tool_recoveries()?
@@ -657,8 +666,7 @@ fn sibling_candidates(
             &domain,
             &source,
             &payload,
-            held_out,
-            max_tokens,
+            limits,
             report,
             Some(origin),
         ) {
@@ -1006,17 +1014,19 @@ fn sample(keep: &[usize], cap: usize) -> Vec<usize> {
     picked
 }
 
-#[allow(clippy::too_many_arguments)]
 fn success_candidates(
     trajectory: i64,
     domain: &str,
     source: &str,
     payload: &Value,
-    held_out: &HashSet<String>,
-    max_tokens: usize,
+    limits: ScreenLimits<'_>,
     report: &mut Report,
     origin: Option<&str>,
 ) -> Vec<Candidate> {
+    let ScreenLimits {
+        held_out,
+        max_tokens,
+    } = limits;
     // Sibling records keep their origin in the source so provenance and trajectory ids stay distinct.
     let provenance = |inner: &str| match origin {
         Some(origin) => format!("dial:learned:{origin}:{trajectory}:{inner}"),

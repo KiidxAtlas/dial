@@ -472,10 +472,12 @@ impl<'a> ChildTurn<'a> {
                     let observer = std::cell::RefCell::new(&mut *approver);
                     let mut runner = ChildMemoryRunner::new(
                         env,
-                        backend,
-                        adapter,
-                        &mut self.steps,
-                        self.budget,
+                        ChildMemoryTarget {
+                            backend,
+                            adapter,
+                            steps: &mut self.steps,
+                            budget: self.budget,
+                        },
                         &observer,
                         children,
                         None,
@@ -2674,10 +2676,12 @@ impl<'a> ChildTurn<'a> {
                 let observer = std::cell::RefCell::new(&mut *approver);
                 let mut runner = ChildMemoryRunner::new(
                     env,
-                    backend,
-                    adapter,
-                    &mut self.steps,
-                    self.budget,
+                    ChildMemoryTarget {
+                        backend,
+                        adapter,
+                        steps: &mut self.steps,
+                        budget: self.budget,
+                    },
                     &observer,
                     children,
                     Some(origin),

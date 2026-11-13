@@ -520,19 +520,40 @@ impl FileOps {
     }
 }
 
+/// Settings shared by every summarizer pass of one compaction. `interrupt` is copied per pass when a
+/// pass runs under its own cancellation flag.
+#[derive(Clone, Copy)]
+pub(super) struct SummaryOptions<'a, 'c> {
+    pub(super) policy: &'a CompactionConfig,
+    pub(super) context: &'a CompactionContext<'c>,
+    pub(super) method: CompactionMethod,
+    pub(super) focus: &'a str,
+    pub(super) interrupt: &'a Arc<AtomicBool>,
+}
+
+/// One fold's input: the text windows to summarize, the summary it updates, and the framing prompt.
+#[derive(Clone, Copy)]
+struct FoldInput<'p> {
+    parts: &'p [String],
+    previous: Option<&'p str>,
+    prompt: Prompt,
+}
+
+/// Where a prefix summary's remote work goes: the remote observer and the optional independent
+/// worker that folds the turn prefix in parallel.
+pub(super) struct SummaryRoute<'r, 'o, 'w> {
+    pub(super) remote_observer: &'r mut Option<&'o mut RemoteCompactionObserver<'w>>,
+    pub(super) worker: &'r mut Option<SummaryWorker>,
+}
+
 /// Summarize `messages[..keep]` for a portable replacement prefix. A leading committed summary is
 /// updated (never re-summarized from its own JSON), and a cut inside a turn gets a separate
 /// turn-prefix summary so the turn's original request survives verbatim intent.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn summarize_prefix(
     backend: &mut Backend,
     messages: &[Value],
     keep: usize,
-    policy: &CompactionConfig,
-    context: &CompactionContext<'_>,
-    method: CompactionMethod,
-    focus: &str,
-    interrupt: &Arc<AtomicBool>,
+    options: SummaryOptions<'_, '_>,
     ui: &mut dyn Ui,
     complete: &mut dyn FnMut(&mut Backend, &Chat, &mut dyn Ui) -> Result<String>,
     remote_observer: &mut Option<&mut RemoteCompactionObserver<'_>>,
@@ -541,15 +562,13 @@ pub(super) fn summarize_prefix(
         backend,
         messages,
         keep,
-        policy,
-        context,
-        method,
-        focus,
-        interrupt,
+        options,
         ui,
         &mut |backend, request, ui, _| complete(backend, request, ui),
-        remote_observer,
-        &mut None,
+        SummaryRoute {
+            remote_observer,
+            worker: &mut None,
+        },
     )
 }
 
@@ -584,21 +603,25 @@ pub(super) fn finish_handoff(messages: &[Value], summary: &str) -> String {
 
 /// Summarize with an optional independently owned cloud route for the independent turn-prefix fold.
 /// Incremental folds stay sequential, and both results settle before the prepared summary is used.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn summarize_prefix_with_worker(
     backend: &mut Backend,
     messages: &[Value],
     keep: usize,
-    policy: &CompactionConfig,
-    context: &CompactionContext<'_>,
-    method: CompactionMethod,
-    focus: &str,
-    interrupt: &Arc<AtomicBool>,
+    options: SummaryOptions<'_, '_>,
     ui: &mut dyn Ui,
     complete: &mut RequestCompletion<'_>,
-    remote_observer: &mut Option<&mut RemoteCompactionObserver<'_>>,
-    worker: &mut Option<SummaryWorker>,
+    route: SummaryRoute<'_, '_, '_>,
 ) -> Result<String> {
+    let SummaryOptions {
+        context,
+        method,
+        interrupt,
+        ..
+    } = options;
+    let SummaryRoute {
+        remote_observer,
+        worker,
+    } = route;
     let keep = keep.min(messages.len());
     let mut ops = FileOps::default();
     let mut previous: Option<&str> = None;
@@ -695,14 +718,15 @@ pub(super) fn summarize_prefix_with_worker(
                                     std::panic::AssertUnwindSafe(|| {
                                         fold(
                                             &mut backend,
-                                            &prefix,
-                                            None,
-                                            Prompt::TurnPrefix,
-                                            policy,
-                                            context,
-                                            method,
-                                            focus,
-                                            &child_cancel,
+                                            FoldInput {
+                                                parts: &prefix,
+                                                previous: None,
+                                                prompt: Prompt::TurnPrefix,
+                                            },
+                                            SummaryOptions {
+                                                interrupt: &child_cancel,
+                                                ..options
+                                            },
                                             &mut worker_ui,
                                             &mut |backend, request, ui| {
                                                 complete(backend, request, ui, child_cancel.clone())
@@ -723,14 +747,15 @@ pub(super) fn summarize_prefix_with_worker(
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 fold(
                                     backend,
-                                    &history,
-                                    previous,
-                                    Prompt::Main,
-                                    policy,
-                                    context,
-                                    method,
-                                    focus,
-                                    &cancel,
+                                    FoldInput {
+                                        parts: &history,
+                                        previous,
+                                        prompt: Prompt::Main,
+                                    },
+                                    SummaryOptions {
+                                        interrupt: &cancel,
+                                        ..options
+                                    },
                                     ui,
                                     &mut |backend, request, ui| {
                                         complete(backend, request, ui, cancel.clone())
@@ -780,14 +805,12 @@ pub(super) fn summarize_prefix_with_worker(
             } else {
                 fold(
                     backend,
-                    &history,
-                    previous,
-                    Prompt::Main,
-                    policy,
-                    context,
-                    method,
-                    focus,
-                    interrupt,
+                    FoldInput {
+                        parts: &history,
+                        previous,
+                        prompt: Prompt::Main,
+                    },
+                    options,
                     ui,
                     &mut |backend, request, ui| complete(backend, request, ui, interrupt.clone()),
                     remote_observer,
@@ -795,14 +818,12 @@ pub(super) fn summarize_prefix_with_worker(
             };
             let turn = fold(
                 backend,
-                &prefix,
-                None,
-                Prompt::TurnPrefix,
-                policy,
-                context,
-                method,
-                focus,
-                interrupt,
+                FoldInput {
+                    parts: &prefix,
+                    previous: None,
+                    prompt: Prompt::TurnPrefix,
+                },
+                options,
                 ui,
                 &mut |backend, request, ui| complete(backend, request, ui, interrupt.clone()),
                 remote_observer,
@@ -813,14 +834,12 @@ pub(super) fn summarize_prefix_with_worker(
     } else {
         fold(
             backend,
-            &parts(&source)?,
-            previous,
-            Prompt::Main,
-            policy,
-            context,
-            method,
-            focus,
-            interrupt,
+            FoldInput {
+                parts: &parts(&source)?,
+                previous,
+                prompt: Prompt::Main,
+            },
+            options,
             ui,
             &mut |backend, request, ui| complete(backend, request, ui, interrupt.clone()),
             remote_observer,
@@ -900,14 +919,18 @@ pub fn summarize_branch(
         .collect::<Result<Vec<_>>>()?;
     let summary = fold(
         backend,
-        &parts,
-        None,
-        Prompt::Branch,
-        policy,
-        context,
-        CompactionMethod::Soft,
-        focus,
-        interrupt,
+        FoldInput {
+            parts: &parts,
+            previous: None,
+            prompt: Prompt::Branch,
+        },
+        SummaryOptions {
+            policy,
+            context,
+            method: CompactionMethod::Soft,
+            focus,
+            interrupt,
+        },
         ui,
         complete,
         &mut None,
@@ -928,21 +951,26 @@ pub fn summarize_branch(
 /// Summarize `parts` as a fold: each window updates the summary carried out of the previous one.
 /// Oversized texts are fragmented, never truncated; a provider rejection re-plans at a learned
 /// ceiling; the call and fragment counts are bounded so an oversized transcript fails explicitly.
-#[allow(clippy::too_many_arguments)]
 fn fold(
     backend: &mut Backend,
-    parts: &[String],
-    previous: Option<&str>,
-    prompt: Prompt,
-    policy: &CompactionConfig,
-    context: &CompactionContext<'_>,
-    method: CompactionMethod,
-    focus: &str,
-    interrupt: &Arc<AtomicBool>,
+    input: FoldInput<'_>,
+    options: SummaryOptions<'_, '_>,
     ui: &mut dyn Ui,
     complete: &mut dyn FnMut(&mut Backend, &Chat, &mut dyn Ui) -> Result<String>,
     remote_observer: &mut Option<&mut RemoteCompactionObserver<'_>>,
 ) -> Result<String> {
+    let FoldInput {
+        parts,
+        previous,
+        prompt,
+    } = input;
+    let SummaryOptions {
+        policy,
+        context,
+        method,
+        focus,
+        interrupt,
+    } = options;
     ensure!(!parts.is_empty(), "nothing to summarize");
     let output = summary_output(policy, context);
     let window = if context.summary_window > 0 {
