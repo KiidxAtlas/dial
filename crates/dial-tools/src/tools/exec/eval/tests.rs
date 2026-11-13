@@ -16,6 +16,48 @@ fn settled(outcome: CellOutcome) -> Value {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn bundled_node_eval_runs_with_private_dial_storage_protected() {
+    if !crate::setup::deps::bundled_node::available()
+        || !crate::tools::exec::sandbox::require_for_test()
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let user = crate::config::paths::user_dir().unwrap();
+    let workspace = Workspace::new(dir.path())
+        .unwrap()
+        .with_protected_paths(&[user]);
+    let config = Config::default();
+    let tool = EvalTool::new(config.eval.clone(), config.kernel.clone());
+    let ctx = context(&workspace, &config);
+    let result = settled(
+        run_cell(
+            &tool,
+            &ctx,
+            json!({"language":"js", "code":"40 + 2", "background":false}),
+            &|_| Err("no background".into()),
+        )
+        .unwrap(),
+    );
+    assert!(result["error"].is_null(), "{result}");
+    assert_eq!(result["value"], "42");
+}
+
+#[test]
+fn bundled_default_node_failure_never_silently_changes_eval_engine() {
+    assert_eq!(
+        embedded_fallback_available("node"),
+        embedded_js_available() && !crate::setup::deps::bundled_node::available()
+    );
+    // Keep the pre-existing fallback policy for explicit operator overrides.
+    assert_eq!(
+        embedded_fallback_available("/missing/custom-node"),
+        embedded_js_available()
+    );
+}
+
 /// JavaScript resolves through the embedded engine on unix builds, so these checks observe Python only.
 #[cfg(unix)]
 fn python_languages(workspace: &std::path::Path, config: &Config) -> Vec<&'static str> {

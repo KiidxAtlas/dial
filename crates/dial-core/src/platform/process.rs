@@ -51,6 +51,29 @@ pub fn kill_checked(process: std::os::windows::io::BorrowedHandle<'_>) -> io::Re
     super::imp::process::kill_checked(process)
 }
 
+/// Whether a process with `pid` is running and this user may open it (`kill -0`). A PID that names
+/// no process, or one that has exited, is `Ok(false)`. Windows only.
+#[cfg(windows)]
+pub fn process_exists(pid: u32) -> io::Result<bool> {
+    super::imp::process::process_exists(pid)
+}
+
+/// Terminates the process `pid` with `exit_code` (`TerminateProcess`). Only that process is
+/// terminated; its children are not. Fails with `NotFound` when no such process is running and
+/// `PermissionDenied` when this user may not terminate it. Windows only.
+#[cfg(windows)]
+pub fn terminate_pid(pid: u32, exit_code: u32) -> io::Result<()> {
+    super::imp::process::terminate_pid(pid, exit_code)
+}
+
+/// Sends `signal` to the process `pid` (`kill(2)`); signal 0 only checks that it exists. Fails
+/// with `NotFound` when no such process exists and `PermissionDenied` when this user may not
+/// signal it. Unix only.
+#[cfg(unix)]
+pub fn signal_pid(pid: u32, signal: i32) -> io::Result<()> {
+    super::imp::process::signal_pid(pid, signal)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 /// Whether `pid` names a live process this user may signal (Unix: `kill(pid, 0) == 0`).
 pub fn alive(pid: u32) -> bool {
@@ -90,6 +113,21 @@ pub fn exit_signal(status: &ExitStatus) -> Option<i32> {
 /// Release bookkeeping for a reaped group leader (Windows: the Job Object handle).
 pub fn forget_group(leader: u32) {
     super::imp::process::forget_group(leader)
+}
+
+/// Sends `signal` to every member of the process group `leader` (`killpg(2)`); signal 0 only checks
+/// that the group exists. Fails with `NotFound` when no such group exists. Unix only.
+#[cfg(unix)]
+pub fn signal_group(leader: u32, signal: i32) -> io::Result<()> {
+    super::imp::process::signal_group(leader, signal)
+}
+
+/// Terminates the process `pid` and every descendant of it with `exit_code`, the Windows meaning
+/// of a signal to a process group (`cmd.exe` launching `node.exe` leaves no orphan). Fails with
+/// `NotFound` when `pid` names no running process. Windows only.
+#[cfg(windows)]
+pub fn terminate_tree(pid: u32, exit_code: u32) -> io::Result<()> {
+    super::imp::process::terminate_tree(pid, exit_code)
 }
 
 #[cfg(all(test, unix))]

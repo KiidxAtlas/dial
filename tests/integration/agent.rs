@@ -7205,7 +7205,9 @@ fn explicit_browser_and_process_tools_load_without_starting_a_service() {
         ),
         Reply::Call(
             "bg",
-            json!({"action":"wait","name":"preview","until":"^READY$","timeout":2}),
+            // The wait returns as soon as READY appears; the budget covers macOS's one-time
+            // first-exec check of a freshly built embedded-shell host (seconds for a debug build).
+            json!({"action":"wait","name":"preview","until":"^READY$","timeout":30}),
         ),
         Reply::Call("bg", json!({"action":"kill","name":"preview"})),
         Reply::Text("Temporary preview process stopped."),
@@ -7485,7 +7487,8 @@ fn automatic_verification_prerequisite_failures_do_not_request_code_repairs() {
             name: name.into(),
             command: command.into(),
             file_extensions: vec![],
-            timeout_secs: 5,
+            // Covers the embedded-shell host's cold first start on macOS; the command is instant.
+            timeout_secs: 30,
         });
         let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
         let report = agent
@@ -11170,7 +11173,8 @@ fn completion_evidence_repaired_shell_effects_replace_failing_baseline() {
         name: "value_behavior".into(),
         command: command.into(),
         file_extensions: vec!["txt".into()],
-        timeout_secs: 5,
+        // Covers the embedded-shell host's cold first start on macOS; the command is instant.
+        timeout_secs: 30,
     });
     e.config
         .verification

@@ -6,8 +6,12 @@ selects a package integration-test target. Every `skip` line is passed to libtes
 printed with its reason. Successful Cargo exits with no executed tests are rejected, including
 ignored-only selections. `--print` shows the commands without running them (it does not verify
 selection).
+
+The embedded shell is the default backend, so the contract first builds the matching `dial` host
+binary and exports its path as DIAL_EMBEDDED_SHELL_HOST to every filter (scripts/embedded-host.py).
 """
 import argparse
+import importlib.util
 import re
 import subprocess
 import sys
@@ -15,6 +19,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = ROOT / "scripts" / "windows-contract.txt"
+
+_host_spec = importlib.util.spec_from_file_location(
+    "embedded_host", Path(__file__).with_name("embedded-host.py"))
+embedded_host = importlib.util.module_from_spec(_host_spec)
+_host_spec.loader.exec_module(embedded_host)
 
 
 def parse(path):
@@ -61,10 +70,12 @@ def parse(path):
     return tests, skips
 
 
-def run_contract(tests, skips, profile, dry_run=False, label="Windows"):
+def run_contract(tests, skips, profile, dry_run=False, label="Windows", host=None):
+    """Run each filter. `host` is the verified embedded host path, or None for no host variable."""
     for name, reason in skips:
         print(f"SKIPPED {name}: {reason}", flush=True)
 
+    env = embedded_host.environment(host)
     skip_args = [arg for name, _ in skips for arg in ("--skip", name)]
     # Every filter runs even after one fails, so a single CI run reports all Windows failures;
     # the first failure's exit status is preserved.
@@ -77,7 +88,7 @@ def run_contract(tests, skips, profile, dry_run=False, label="Windows"):
         if dry_run:
             continue
         result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
+                                stderr=subprocess.STDOUT, text=True, env=env)
         print(result.stdout, end="", flush=True)
         if result.returncode != 0:
             print(f"{label} contract failed in filter `{filter_name}`", file=sys.stderr)
@@ -112,7 +123,9 @@ def main():
     args = parser.parse_args()
 
     tests, skips = parse(args.contract)
-    return run_contract(tests, skips, args.profile, args.dry_run, args.label)
+    # The contract uses default features, so the host is the default-feature dial binary.
+    host = embedded_host.prepare("cargo", args.profile, dry_run=args.dry_run)
+    return run_contract(tests, skips, args.profile, args.dry_run, args.label, host)
 
 
 if __name__ == "__main__":

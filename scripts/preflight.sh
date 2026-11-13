@@ -198,6 +198,9 @@ main() {
       step test-install pyrun make test-install
       step test-build pyrun make test-build PYTHON=python3
       step test-windows-contract pyrun make test-windows-contract PYTHON=python3
+      if [[ -f "$dir/scripts/embedded-host.py" ]]; then
+        step test-embedded-host pyrun make test-embedded-host PYTHON=python3
+      fi
       step packaging pyrun make test-packaging PYTHON=python3
       step release-policy pyrun make test-release-policy PYTHON=python3
     else

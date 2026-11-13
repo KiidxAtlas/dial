@@ -4,6 +4,7 @@
 //! settings to save once the install succeeds and the health check passes. Detection and
 //! planning are pure over an [`Env`], so tests can fake the package managers on `PATH`.
 
+pub mod bundled_node;
 pub mod plan;
 pub mod prebuilt;
 pub mod run;

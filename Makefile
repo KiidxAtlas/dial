@@ -23,10 +23,16 @@ TEST_PROFILE ?= dev
 NEXTEST_PROFILE ?= default
 DIAL ?= $(BUILD_DIR)/dial
 
+# Tests that run the embedded shell need a freshly built `dial` host (the test binary cannot act as
+# one). HOST_RUN builds it with the same profile and features as the test command, smoke-checks it,
+# and exports DIAL_EMBEDDED_SHELL_HOST for that command only; see scripts/embedded-host.py.
+# Callers append `-- <cargo command>` after their feature flags.
+HOST_RUN = $(PYTHON) scripts/embedded-host.py --cargo "$(CARGO)"
+
 
 .DEFAULT_GOAL := help
 .PHONY: help update install build check test test-lib test-integration test-module test-nextest lint test-rust test-drivers test-python test-bench-offline bench-headline test-smoke test-mlx preflight preflight-quick hooks
-.PHONY: test-install test-build test-windows-contract test-packaging test-release-policy preflight-worktree
+.PHONY: test-install test-build test-windows-contract test-embedded-host test-packaging test-release-policy preflight-worktree
 .PHONY: release-check lint-deps clean test-clean
 
 help:
@@ -54,6 +60,7 @@ help:
 		'make test-build  Test local build/install commands without replacing your installed binary' \
 		'make test-install  Test the Unix release installer (Python cryptography required)' \
 		'make test-windows-contract  Test the focused Windows contract runner' \
+		'make test-embedded-host  Test embedded shell host preparation (mocked Cargo; no build)' \
 		'make test-smoke DIAL=target/local/dial  Check an already-built binary and scripted recovery' \
 		'make test-mlx  Run optional local MLX checks; explicitly skip unsupported hosts, never download' \
 		'make preflight  Run every CI check locally on a clean snapshot of HEAD (REV=<commit> for another)' \
@@ -96,25 +103,25 @@ test: test-rust
 
 test-rust:
 	$(PYTHON) scripts/test-prerequisites.py
-	$(CARGO) test --locked --workspace --no-fail-fast --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked --workspace --no-fail-fast --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 
 test-lib:
-	$(CARGO) test --locked --workspace --lib $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked --workspace --lib $(CARGO_FEATURE_FLAGS)
 
 test-integration:
-	$(CARGO) test --locked -p dial --test integration $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked -p dial --test integration $(CARGO_FEATURE_FLAGS)
 
 # Fast loop for one lib module: make test-module MOD=llm::provider (searches every workspace crate).
 # CRATE=dial-llm builds only that crate's test binary instead of every crate's.
 test-module:
 	@test -n "$(MOD)" || { printf '%s\n' 'Usage: make test-module MOD=llm::provider [CRATE=dial-llm]' >&2; exit 2; }
-	$(CARGO) test --locked $(if $(strip $(CRATE)),-p $(CRATE),--workspace) --lib $(CARGO_FEATURE_FLAGS) $(MOD)
+	$(HOST_RUN) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked $(if $(strip $(CRATE)),-p $(CRATE),--workspace) --lib $(CARGO_FEATURE_FLAGS) $(MOD)
 
 test-nextest:
 	$(PYTHON) scripts/test-prerequisites.py
 	@command -v cargo-nextest >/dev/null 2>&1 || { printf '%s\n' 'cargo-nextest is not installed: https://nexte.st (or use make test-rust)' >&2; exit 2; }
-	$(CARGO) nextest run --locked --workspace --no-fail-fast --cargo-profile $(TEST_PROFILE) --profile $(NEXTEST_PROFILE) $(CARGO_FEATURE_FLAGS)
-	$(CARGO) test --locked --workspace --doc --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS) -- $(CARGO) nextest run --locked --workspace --no-fail-fast --cargo-profile $(TEST_PROFILE) --profile $(NEXTEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(HOST_RUN) --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS) -- $(CARGO) test --locked --workspace --doc --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 
 lint:
 	$(CARGO) clippy --locked --workspace --all-targets $(CARGO_FEATURE_FLAGS) -- -D warnings
@@ -157,6 +164,9 @@ test-build:
 
 test-windows-contract:
 	$(PYTHON) scripts/test-windows-contract.py
+
+test-embedded-host:
+	$(PYTHON) scripts/test-embedded-host.py
 
 test-packaging:
 	$(PYTHON) scripts/test-packaging.py

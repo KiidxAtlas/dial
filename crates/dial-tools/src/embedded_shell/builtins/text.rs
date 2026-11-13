@@ -1,12 +1,11 @@
-//! Text-processing commands for the built-in shell: `cut`, `env`, `grep`, `sed` (substitution
-//! only), `sort`, `tr`, `uniq` and `xargs`.
-//!
-//! `xargs` runs external programs only. It cannot run shell builtins or functions: a name that
-//! exists only as a builtin is looked up on the filesystem, fails, and exits 127.
+//! Text-processing commands for the built-in shell: `cut`, `env`, `grep`, `sed`, `sort`, `tr`
+//! and `uniq`. They run in-process and never spawn a program. `xargs` and `find` run other
+//! programs and are not implemented in this module.
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::str::Chars;
 
 use regex::{Regex, RegexBuilder};
 
@@ -82,12 +81,6 @@ fn parse_opts(
     Ok(opts)
 }
 
-/// Reports a bad option or argument, then the usage line. Returns exit code 2.
-fn usage_error(io: &mut Io<'_>, message: &str) -> i32 {
-    let _ = writeln!(io.stderr, "{}: {message}", io.name);
-    io.usage()
-}
-
 /// Operand list where no operands means standard input.
 fn inputs(operands: &[String]) -> Vec<&str> {
     if operands.is_empty() {
@@ -141,7 +134,7 @@ fn split_lines(text: &str) -> Vec<&str> {
 pub(super) fn cut(io: &mut Io<'_>, args: &[String]) -> i32 {
     let opts = match parse_opts(args, "", "df", false) {
         Ok(opts) => opts,
-        Err(message) => return usage_error(io, &message),
+        Err(message) => return io.decline(message),
     };
     let Some(list) = opts.values('f').last().copied() else {
         return io.usage();
@@ -245,17 +238,29 @@ pub(super) fn env(io: &mut Io<'_>, args: &[String]) -> i32 {
 // ---------------------------------------------------------------------------------------------
 
 pub(super) fn grep(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let opts = match parse_opts(args, "ivnclr", "", false) {
+    let opts = match parse_opts(args, "ivnclrEFqhHoxws", "e", false) {
         Ok(opts) => opts,
-        Err(message) => return usage_error(io, &message),
+        Err(message) => return io.decline(message),
     };
-    let Some((pattern, files)) = opts.operands.split_first() else {
-        return io.usage();
+    // `-e` supplies every pattern, so all operands are files; otherwise the first operand is the
+    // pattern.
+    let explicit = opts.values('e');
+    let (patterns, files): (Vec<&str>, &[String]) = if explicit.is_empty() {
+        match opts.operands.split_first() {
+            Some((pattern, files)) => (vec![pattern.as_str()], files),
+            None => return io.usage(),
+        }
+    } else {
+        (explicit, opts.operands.as_slice())
     };
-    let re = match RegexBuilder::new(pattern)
-        .case_insensitive(opts.has('i'))
-        .build()
-    {
+    let whole = if opts.has('x') {
+        Whole::Line
+    } else if opts.has('w') {
+        Whole::Word
+    } else {
+        Whole::Any
+    };
+    let re = match grep_regex(&patterns, opts.has('F'), opts.has('i'), whole) {
         Ok(re) => re,
         Err(error) => {
             let _ = writeln!(io.stderr, "{}: {error}", io.name);
@@ -266,7 +271,11 @@ pub(super) fn grep(io: &mut Io<'_>, args: &[String]) -> i32 {
     let line_numbers = opts.has('n');
     let count_only = opts.has('c');
     let list_only = opts.has('l');
+    let quiet = opts.has('q');
+    let only_matching = opts.has('o');
     let recursive = opts.has('r');
+    // -s drops messages about missing or unreadable files; the exit status still reports them.
+    let silent = opts.has('s');
 
     let default_target = if recursive { "." } else { "-" };
     let targets: Vec<&str> = if files.is_empty() {
@@ -274,7 +283,8 @@ pub(super) fn grep(io: &mut Io<'_>, args: &[String]) -> i32 {
     } else {
         files.iter().map(String::as_str).collect()
     };
-    let with_name = targets.len() > 1 || recursive;
+    // Several inputs (or -r) prefix each line with its name; -H forces the prefix, -h drops it.
+    let with_name = opts.has('H') || (!opts.has('h') && (targets.len() > 1 || recursive));
 
     let mut had_error = false;
     let mut inputs: Vec<(String, Option<PathBuf>)> = Vec::new();
@@ -293,51 +303,73 @@ pub(super) fn grep(io: &mut Io<'_>, args: &[String]) -> i32 {
         );
         for error in errors {
             had_error = true;
-            let _ = writeln!(io.stderr, "{}: {error}", io.name);
+            if !silent {
+                let _ = writeln!(io.stderr, "{}: {error}", io.name);
+            }
         }
     }
 
     let mut total = 0;
     for (label, path) in &inputs {
-        let bytes = match path {
-            Some(path) => std::fs::read(path).map_err(|e| os_message(&e)),
-            None => {
-                let mut buf = Vec::new();
-                io.stdin
-                    .read_to_end(&mut buf)
-                    .map(|_| buf)
-                    .map_err(|e| os_message(&e))
-            }
+        // Lines are read one at a time, so -q returns at the first selected line without reading the
+        // rest of standard input.
+        let mut reader: Box<dyn BufRead + '_> = match path {
+            Some(path) => match std::fs::File::open(path) {
+                Ok(file) => Box::new(BufReader::new(file)),
+                Err(error) => {
+                    had_error = true;
+                    if !silent {
+                        let _ = writeln!(io.stderr, "{}: {label}: {}", io.name, os_message(&error));
+                    }
+                    continue;
+                }
+            },
+            None => Box::new(BufReader::new(&mut *io.stdin)),
         };
-        let bytes = match bytes {
-            Ok(bytes) => bytes,
-            Err(message) => {
-                had_error = true;
-                let _ = writeln!(io.stderr, "{}: {label}: {message}", io.name);
-                continue;
-            }
-        };
-        let text = String::from_utf8_lossy(&bytes);
         let mut matched = 0;
-        for (index, line) in split_lines(&text).into_iter().enumerate() {
-            if re.is_match(line) == invert {
+        let mut buf = Vec::new();
+        let mut number = 0;
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => {
+                    had_error = true;
+                    let _ = writeln!(io.stderr, "{}: {label}: {}", io.name, os_message(&error));
+                    break;
+                }
+            }
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+            }
+            number += 1;
+            let line = String::from_utf8_lossy(&buf);
+            if grep_matches(&re, whole, &line).is_empty() != invert {
                 continue;
             }
             matched += 1;
+            if quiet {
+                // GNU grep -q exits as soon as a line is selected, even after an unreadable file.
+                return 0;
+            }
             if list_only || count_only {
                 continue;
             }
-            let name = if with_name {
-                format!("{label}:")
-            } else {
-                String::new()
-            };
-            let number = if line_numbers {
-                format!("{}:", index + 1)
-            } else {
-                String::new()
-            };
-            let _ = writeln!(io.stdout, "{name}{number}{line}");
+            let line_number = line_numbers.then_some(number);
+            if !only_matching {
+                let prefix = line_prefix(label, with_name, line_number);
+                let _ = writeln!(io.stdout, "{prefix}{line}");
+            } else if !invert {
+                // -o prints each non-empty match on its own line; a -v selection has none.
+                for found in grep_matches(&re, whole, &line)
+                    .into_iter()
+                    .filter(|found| !found.is_empty())
+                {
+                    let prefix = line_prefix(label, with_name, line_number);
+                    let _ = writeln!(io.stdout, "{prefix}{}", found.as_str());
+                }
+            }
         }
         if list_only {
             if matched > 0 {
@@ -361,6 +393,93 @@ pub(super) fn grep(io: &mut Io<'_>, args: &[String]) -> i32 {
     } else {
         1
     }
+}
+
+/// What a grep match must span: anywhere in the line, a whole word (`-w`), or the whole line (`-x`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Whole {
+    Any,
+    Word,
+    Line,
+}
+
+/// Compiles the patterns into one regex that matches when any of them does. Each pattern is
+/// compiled on its own first, so that one cannot close a group opened by another. With `-w` a
+/// match must not touch a word character (letter, digit or `_`) on either side; with `-x` it must
+/// be the whole line.
+fn grep_regex(
+    patterns: &[&str],
+    fixed: bool,
+    ignore_case: bool,
+    whole: Whole,
+) -> Result<Regex, regex::Error> {
+    let mut alternatives = Vec::new();
+    for pattern in patterns.iter().flat_map(|pattern| pattern.split('\n')) {
+        let source = if fixed {
+            regex::escape(pattern)
+        } else {
+            pattern.to_owned()
+        };
+        RegexBuilder::new(&source)
+            .case_insensitive(ignore_case)
+            .build()?;
+        alternatives.push(format!("(?:{source})"));
+    }
+    let any = alternatives.join("|");
+    let source = match whole {
+        // Word boundaries are checked per match by `grep_matches`: a boundary consumed by the
+        // regex would show up in `-o` output, and the regex crate has no lookaround.
+        Whole::Any | Whole::Word => any,
+        Whole::Line => format!("^(?:{any})$"),
+    };
+    RegexBuilder::new(&source)
+        .case_insensitive(ignore_case)
+        .build()
+}
+
+/// The `name:` and `number:` prefix of a grep output line.
+fn line_prefix(label: &str, with_name: bool, number: Option<usize>) -> String {
+    let name = if with_name {
+        format!("{label}:")
+    } else {
+        String::new()
+    };
+    let number = number.map_or_else(String::new, |n| format!("{n}:"));
+    format!("{name}{number}")
+}
+
+/// The non-overlapping matches grep selects in `line`. Under `-w` a candidate is kept only when no
+/// word character (letter, digit or `_`) touches it on either side; otherwise the search resumes
+/// one character after the candidate's start, so a later word-bounded match is still found.
+fn grep_matches<'h>(re: &Regex, whole: Whole, line: &'h str) -> Vec<regex::Match<'h>> {
+    if whole != Whole::Word {
+        return re.find_iter(line).collect();
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let next_len = |at: usize| line[at..].chars().next().map_or(1, char::len_utf8);
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at <= line.len() {
+        let Some(candidate) = re.find_at(line, at) else {
+            break;
+        };
+        let touches_before = line[..candidate.start()]
+            .chars()
+            .next_back()
+            .is_some_and(is_word);
+        let touches_after = line[candidate.end()..].chars().next().is_some_and(is_word);
+        at = if touches_before || touches_after {
+            candidate.start() + next_len(candidate.start())
+        } else {
+            found.push(candidate);
+            if candidate.is_empty() {
+                candidate.end() + next_len(candidate.end())
+            } else {
+                candidate.end()
+            }
+        };
+    }
+    found
 }
 
 /// Appends every file under `path` to `inputs` in sorted order. Directories are an error unless
@@ -411,7 +530,7 @@ fn expand(
 }
 
 // ---------------------------------------------------------------------------------------------
-// sed (substitution only)
+// sed (`s`, `p` and `d`, with line, `$` and regex addresses)
 // ---------------------------------------------------------------------------------------------
 
 /// One piece of a replacement: literal text or a capture group (`0` is the whole match).
@@ -420,39 +539,276 @@ enum Part {
     Group(usize),
 }
 
+/// `s/RE/REPL/FLAGS`. Replacement starts at match number `occurrence` (1 unless the `N` flag says
+/// otherwise); `global` (`g`) replaces every match from there on.
 struct Subst {
-    pattern: String,
+    regex: Regex,
     parts: Vec<Part>,
+    occurrence: usize,
     global: bool,
     print: bool,
+}
+
+enum Action {
+    Subst(Subst),
+    Print,
+    Delete,
+}
+
+/// A line number, the last line, or every line matching a regex.
+enum Address {
+    Line(usize),
+    Last,
+    Match(Regex),
+}
+
+impl Address {
+    /// Whether this address selects the line.
+    fn matches(&self, number: usize, last: bool, pattern: &str) -> bool {
+        match self {
+            Address::Line(n) => *n == number,
+            Address::Last => last,
+            Address::Match(re) => re.is_match(pattern),
+        }
+    }
+}
+
+/// Which lines a command applies to. A range runs from its first address to its second, inclusive.
+enum Selector {
+    All,
+    Single(Address),
+    Range(Address, Address),
+}
+
+struct Command {
+    selector: Selector,
+    action: Action,
+}
+
+/// Why a script was refused. `Unsupported` covers every construct outside the supported subset.
+enum ScriptError {
+    Unsupported,
+    Regex(regex::Error),
+    Reference(usize),
 }
 
 pub(super) fn sed(io: &mut Io<'_>, args: &[String]) -> i32 {
     let opts = match parse_opts(args, "n", "e", false) {
         Ok(opts) => opts,
-        Err(message) => return usage_error(io, &message),
+        Err(message) => return io.decline(message),
     };
+    // `-e` scripts are joined with newlines; without `-e` the first operand is the script.
     let scripts = opts.values('e');
-    let (script, files) = match scripts.as_slice() {
-        [] => match opts.operands.split_first() {
-            Some((script, rest)) => (script.as_str(), rest),
+    let (script, files): (String, &[String]) = if scripts.is_empty() {
+        match opts.operands.split_first() {
+            Some((script, rest)) => (script.clone(), rest),
             None => return io.usage(),
-        },
-        [one] => (*one, opts.operands.as_slice()),
-        _ => return unsupported_sed(io),
+        }
+    } else {
+        (scripts.join("\n"), opts.operands.as_slice())
     };
-    let Some(parsed) = parse_subst(script) else {
-        return unsupported_sed(io);
-    };
-    let re = match Regex::new(&parsed.pattern) {
-        Ok(re) => re,
-        Err(error) => {
+    let commands = match parse_script(&script) {
+        Ok(commands) => commands,
+        Err(ScriptError::Unsupported) => return io.decline("unsupported sed script"),
+        Err(ScriptError::Regex(error)) => {
             let _ = writeln!(io.stderr, "{}: {error}", io.name);
             return 2;
         }
+        Err(ScriptError::Reference(group)) => {
+            return io.fail(format!("invalid reference \\{group} on `s' command's RHS"));
+        }
     };
-    let max_ref = parsed
-        .parts
+
+    // Every input is read before any output, because `$` is the last line of the combined input.
+    let mut lines: Vec<String> = Vec::new();
+    let mut status = 0;
+    for input in inputs(files) {
+        match read_text(io, input) {
+            Ok(text) => lines.extend(split_lines(&text).into_iter().map(str::to_owned)),
+            Err(message) => status = io.fail(message),
+        }
+    }
+
+    let quiet = opts.has('n');
+    let total = lines.len();
+    // Per command: whether a range is open after the previous line.
+    let mut open = vec![false; commands.len()];
+    for (index, line) in lines.iter().enumerate() {
+        let number = index + 1;
+        let last = number == total;
+        let mut pattern = line.clone();
+        let mut deleted = false;
+        for (command, range_open) in commands.iter().zip(open.iter_mut()) {
+            if !selects(&command.selector, range_open, number, last, &pattern) {
+                continue;
+            }
+            match &command.action {
+                Action::Print => {
+                    let _ = writeln!(io.stdout, "{pattern}");
+                }
+                Action::Delete => {
+                    deleted = true;
+                    break;
+                }
+                Action::Subst(subst) => {
+                    if let Some(replaced) = substitute(subst, &pattern) {
+                        pattern = replaced;
+                        if subst.print {
+                            let _ = writeln!(io.stdout, "{pattern}");
+                        }
+                    }
+                }
+            }
+        }
+        if !deleted && !quiet {
+            let _ = writeln!(io.stdout, "{pattern}");
+        }
+    }
+    status
+}
+
+/// Whether a command's selector picks the current line. `range_open` records a range that began
+/// on an earlier line and has not closed yet; it is updated here.
+fn selects(
+    selector: &Selector,
+    range_open: &mut bool,
+    number: usize,
+    last: bool,
+    pattern: &str,
+) -> bool {
+    match selector {
+        Selector::All => true,
+        Selector::Single(address) => address.matches(number, last, pattern),
+        Selector::Range(start, end) => {
+            if *range_open {
+                return match end {
+                    // A line-number end closes the range on that line; a later line is outside it.
+                    Address::Line(n) => {
+                        *range_open = number < *n;
+                        number <= *n
+                    }
+                    _ => {
+                        *range_open = !end.matches(number, last, pattern);
+                        true
+                    }
+                };
+            }
+            if !start.matches(number, last, pattern) {
+                return false;
+            }
+            // A line-number end at or before the start selects only this line, and a regex end
+            // is first tested on the following line.
+            *range_open = match end {
+                Address::Line(n) => *n > number,
+                Address::Last => !last,
+                Address::Match(_) => true,
+            };
+            true
+        }
+    }
+}
+
+/// Parses a script of commands separated by `;` or newlines. Each command is `s/RE/REPL/FLAGS`,
+/// `p` or `d`, optionally preceded by an address: `N`, `$` or `/RE/`, or a pair `A,B` of them.
+fn parse_script(script: &str) -> Result<Vec<Command>, ScriptError> {
+    let mut chars = script.chars();
+    let mut commands = Vec::new();
+    loop {
+        take_while(&mut chars, |c| c == ';' || c == '\n' || c.is_whitespace());
+        if peek(&chars).is_none() {
+            return Ok(commands);
+        }
+        let selector = parse_selector(&mut chars)?;
+        take_while(&mut chars, is_blank);
+        let action = match chars.next() {
+            Some('p') => Action::Print,
+            Some('d') => Action::Delete,
+            Some('s') => parse_subst(&mut chars)?,
+            _ => return Err(ScriptError::Unsupported),
+        };
+        take_while(&mut chars, is_blank);
+        if !matches!(peek(&chars), None | Some(';' | '\n')) {
+            return Err(ScriptError::Unsupported);
+        }
+        commands.push(Command { selector, action });
+    }
+}
+
+fn parse_selector(chars: &mut Chars<'_>) -> Result<Selector, ScriptError> {
+    let Some(start) = parse_address(chars)? else {
+        return Ok(Selector::All);
+    };
+    if peek(chars) != Some(',') {
+        return Ok(Selector::Single(start));
+    }
+    chars.next();
+    let end = parse_address(chars)?.ok_or(ScriptError::Unsupported)?;
+    Ok(Selector::Range(start, end))
+}
+
+/// Parses one address if the next character starts one. Line numbers start at 1.
+fn parse_address(chars: &mut Chars<'_>) -> Result<Option<Address>, ScriptError> {
+    match peek(chars) {
+        Some('$') => {
+            chars.next();
+            Ok(Some(Address::Last))
+        }
+        Some('/') => {
+            chars.next();
+            let source = scan_part(chars).ok_or(ScriptError::Unsupported)?;
+            // An empty regex means "reuse the last regex", which this subset does not track.
+            if source.is_empty() {
+                return Err(ScriptError::Unsupported);
+            }
+            let re = RegexBuilder::new(&source)
+                .build()
+                .map_err(ScriptError::Regex)?;
+            Ok(Some(Address::Match(re)))
+        }
+        Some('0'..='9') => match take_while(chars, |c| c.is_ascii_digit()).parse::<usize>() {
+            Ok(n) if n > 0 => Ok(Some(Address::Line(n))),
+            _ => Err(ScriptError::Unsupported),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// Parses the rest of an `s` command after its letter: `/RE/REPL/` and the flags `g`, `p`, `i` or
+/// `I` (ignore case) and `N` (first match to replace). `\/` is a literal slash in both parts.
+fn parse_subst(chars: &mut Chars<'_>) -> Result<Action, ScriptError> {
+    if chars.next() != Some('/') {
+        return Err(ScriptError::Unsupported);
+    }
+    let pattern = scan_part(chars).ok_or(ScriptError::Unsupported)?;
+    // An empty pattern would reuse the last regex, which this subset does not track.
+    if pattern.is_empty() {
+        return Err(ScriptError::Unsupported);
+    }
+    let replacement = scan_part(chars).ok_or(ScriptError::Unsupported)?;
+    let (mut global, mut print, mut ignore_case) = (false, false, false);
+    let mut occurrence: usize = 1;
+    loop {
+        match peek(chars) {
+            Some('g') => global = true,
+            Some('p') => print = true,
+            Some('i' | 'I') => ignore_case = true,
+            Some('1'..='9') => {
+                occurrence = take_while(chars, |c| c.is_ascii_digit())
+                    .parse::<usize>()
+                    .map_err(|_| ScriptError::Unsupported)?;
+                continue;
+            }
+            None | Some(' ' | '\t' | ';' | '\n') => break,
+            Some(_) => return Err(ScriptError::Unsupported),
+        }
+        chars.next();
+    }
+    let regex = RegexBuilder::new(&pattern)
+        .case_insensitive(ignore_case)
+        .build()
+        .map_err(ScriptError::Regex)?;
+    let parts = parse_replacement(&replacement);
+    let max_ref = parts
         .iter()
         .filter_map(|part| match part {
             Part::Group(index) => Some(*index),
@@ -460,64 +816,73 @@ pub(super) fn sed(io: &mut Io<'_>, args: &[String]) -> i32 {
         })
         .max()
         .unwrap_or(0);
-    if max_ref >= re.captures_len() {
-        return io.fail(format!(
-            "invalid reference \\{max_ref} on `s' command's RHS"
-        ));
+    if max_ref >= regex.captures_len() {
+        return Err(ScriptError::Reference(max_ref));
     }
-
-    let quiet = opts.has('n');
-    let mut status = 0;
-    for input in inputs(files) {
-        let text = match read_text(io, input) {
-            Ok(text) => text,
-            Err(message) => {
-                status = io.fail(message);
-                continue;
-            }
-        };
-        for line in split_lines(&text) {
-            let (out, substituted) = match substitute(&re, &parsed.parts, parsed.global, line) {
-                Some(replaced) => (replaced, true),
-                None => (line.to_owned(), false),
-            };
-            if substituted && parsed.print {
-                let _ = writeln!(io.stdout, "{out}");
-            }
-            if !quiet {
-                let _ = writeln!(io.stdout, "{out}");
-            }
-        }
-    }
-    status
-}
-
-fn unsupported_sed(io: &mut Io<'_>) -> i32 {
-    let _ = writeln!(io.stderr, "{}: unsupported sed script", io.name);
-    2
-}
-
-/// Parses `s/RE/REPL/[gp]`. `\/` stands for a literal slash in both parts; other backslash
-/// pairs are kept for the regex or the replacement parser.
-fn parse_subst(script: &str) -> Option<Subst> {
-    let rest = script.strip_prefix("s/")?;
-    let mut chars = rest.chars();
-    let pattern = scan_part(&mut chars)?;
-    let replacement = scan_part(&mut chars)?;
-    let (mut global, mut print) = (false, false);
-    for flag in chars {
-        match flag {
-            'g' => global = true,
-            'p' => print = true,
-            _ => return None,
-        }
-    }
-    Some(Subst {
-        pattern,
-        parts: parse_replacement(&replacement),
+    Ok(Action::Subst(Subst {
+        regex,
+        parts,
+        occurrence,
         global,
         print,
-    })
+    }))
+}
+
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
+/// The next character without consuming it.
+fn peek(chars: &Chars<'_>) -> Option<char> {
+    chars.clone().next()
+}
+
+/// Consumes characters while `keep` holds and returns them.
+fn take_while(chars: &mut Chars<'_>, keep: impl Fn(char) -> bool) -> String {
+    let mut taken = String::new();
+    while let Some(c) = peek(chars).filter(|c| keep(*c)) {
+        taken.push(c);
+        chars.next();
+    }
+    taken
+}
+
+/// Applies the substitution to one line. `None` when it replaces nothing.
+fn substitute(subst: &Subst, line: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut replaced = false;
+    let mut seen = 0;
+    for caps in subst.regex.captures_iter(line) {
+        let Some(whole) = caps.get(0) else {
+            continue;
+        };
+        seen += 1;
+        if seen < subst.occurrence {
+            continue;
+        }
+        if seen > subst.occurrence && !subst.global {
+            break;
+        }
+        out.push_str(&line[copied..whole.start()]);
+        for part in &subst.parts {
+            match part {
+                Part::Text(text) => out.push_str(text),
+                Part::Group(index) => {
+                    if let Some(group) = caps.get(*index) {
+                        out.push_str(group.as_str());
+                    }
+                }
+            }
+        }
+        copied = whole.end();
+        replaced = true;
+    }
+    if !replaced {
+        return None;
+    }
+    out.push_str(&line[copied..]);
+    Some(out)
 }
 
 /// Reads up to the next unescaped `/`, which is consumed. `None` if the delimiter is missing.
@@ -573,37 +938,6 @@ fn parse_replacement(raw: &str) -> Vec<Part> {
     parts
 }
 
-/// Applies the substitution to one line. `None` when nothing matched.
-fn substitute(re: &Regex, parts: &[Part], global: bool, line: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut copied = 0;
-    let mut found = false;
-    for caps in re.captures_iter(line) {
-        let whole = caps.get(0)?;
-        found = true;
-        out.push_str(&line[copied..whole.start()]);
-        for part in parts {
-            match part {
-                Part::Text(text) => out.push_str(text),
-                Part::Group(index) => {
-                    if let Some(group) = caps.get(*index) {
-                        out.push_str(group.as_str());
-                    }
-                }
-            }
-        }
-        copied = whole.end();
-        if !global {
-            break;
-        }
-    }
-    if !found {
-        return None;
-    }
-    out.push_str(&line[copied..]);
-    Some(out)
-}
-
 // ---------------------------------------------------------------------------------------------
 // sort
 // ---------------------------------------------------------------------------------------------
@@ -611,7 +945,7 @@ fn substitute(re: &Regex, parts: &[Part], global: bool, line: &str) -> Option<St
 pub(super) fn sort(io: &mut Io<'_>, args: &[String]) -> i32 {
     let opts = match parse_opts(args, "rnu", "", false) {
         Ok(opts) => opts,
-        Err(message) => return usage_error(io, &message),
+        Err(message) => return io.decline(message),
     };
     let numeric = opts.has('n');
     let mut lines: Vec<(f64, String)> = Vec::new();
@@ -684,7 +1018,7 @@ fn numeric_key(line: &str) -> f64 {
 pub(super) fn tr(io: &mut Io<'_>, args: &[String]) -> i32 {
     let opts = match parse_opts(args, "d", "", false) {
         Ok(opts) => opts,
-        Err(message) => return usage_error(io, &message),
+        Err(message) => return io.decline(message),
     };
     let delete = opts.has('d');
     let (set1, set2) = match opts.operands.as_slice() {
@@ -774,7 +1108,7 @@ fn expand_set(spec: &str) -> Result<Vec<char>, String> {
 pub(super) fn uniq(io: &mut Io<'_>, args: &[String]) -> i32 {
     let opts = match parse_opts(args, "cdu", "", false) {
         Ok(opts) => opts,
-        Err(message) => return usage_error(io, &message),
+        Err(message) => return io.decline(message),
     };
     if opts.operands.len() > 1 {
         return io.usage();
@@ -808,109 +1142,6 @@ pub(super) fn uniq(io: &mut Io<'_>, args: &[String]) -> i32 {
         }
     }
     0
-}
-
-// ---------------------------------------------------------------------------------------------
-// xargs
-// ---------------------------------------------------------------------------------------------
-
-pub(super) fn xargs(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let opts = match parse_opts(args, "", "nI", true) {
-        Ok(opts) => opts,
-        Err(message) => return usage_error(io, &message),
-    };
-    let per_call = match opts.values('n').last().copied() {
-        None => usize::MAX,
-        Some(text) => match text.parse::<usize>() {
-            Ok(count) if count > 0 => count,
-            _ => return usage_error(io, &format!("invalid number of arguments '{text}'")),
-        },
-    };
-    let replace = opts.values('I').last().copied();
-    if replace == Some("") {
-        return usage_error(io, "replacement string must not be empty");
-    }
-    // The command and its fixed arguments; with no operands, GNU xargs defaults to echo.
-    let template: Vec<String> = if opts.operands.is_empty() {
-        vec!["echo".to_owned()]
-    } else {
-        opts.operands.clone()
-    };
-
-    let mut input = Vec::new();
-    if let Err(error) = io.stdin.read_to_end(&mut input) {
-        return io.fail(format!("standard input: {}", os_message(&error)));
-    }
-    let text = String::from_utf8_lossy(&input);
-    let invocations = match replace {
-        Some(repl) => replace_args(&template, repl, &text),
-        None => {
-            let words: Vec<&str> = text.split_whitespace().collect();
-            batch_args(&template, &words, per_call)
-        }
-    };
-
-    let mut status = 0;
-    for argv in &invocations {
-        let output = match Command::new(&argv[0])
-            .args(&argv[1..])
-            .current_dir(io.cwd)
-            .env_clear()
-            .envs(io.env.iter().cloned())
-            .output()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                let reason = if error.kind() == std::io::ErrorKind::NotFound {
-                    "not found".to_owned()
-                } else {
-                    os_message(&error)
-                };
-                let _ = writeln!(io.stderr, "xargs: {}: {reason}", argv[0]);
-                return 127;
-            }
-        };
-        let _ = io.stdout.write_all(&output.stdout);
-        let _ = io.stderr.write_all(&output.stderr);
-        if !output.status.success() {
-            status = 123;
-        }
-    }
-    status
-}
-
-/// Builds the argument vectors (command first) for the default mode: the input words appended to
-/// `template`, at most `per_call` words per invocation. With no words, one invocation runs with
-/// just `template`, as GNU xargs does.
-fn batch_args(template: &[String], words: &[&str], per_call: usize) -> Vec<Vec<String>> {
-    if words.is_empty() {
-        return vec![template.to_vec()];
-    }
-    words
-        .chunks(per_call)
-        .map(|chunk| {
-            template
-                .iter()
-                .cloned()
-                .chain(chunk.iter().map(|word| (*word).to_owned()))
-                .collect()
-        })
-        .collect()
-}
-
-/// Builds the argument vectors for `-I` mode: one invocation per non-empty input line, with every
-/// `repl` occurrence in each template word replaced by that line.
-fn replace_args(template: &[String], repl: &str, input: &str) -> Vec<Vec<String>> {
-    input
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            template
-                .iter()
-                .map(|word| word.replace(repl, line))
-                .collect::<Vec<String>>()
-        })
-        .collect()
 }
 
 #[cfg(test)]

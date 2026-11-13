@@ -19,7 +19,27 @@ Release attribution uses local release-tag trees from `v0.1.4` through `v0.2.6`;
 
 ### Fixed
 
+- Background jobs in the embedded shell behave as in Bash: `$!` names the job's process (the last external member of a pipeline; a virtual PID for a job that runs only builtins), `kill $!`/`kill %N` stop the job, including a busy loop of builtins, `wait PID`/`wait %N`/`wait -n`/`wait -p VAR` return the job's status, and `kill` defaults to `TERM` (brush's `kill` sent `KILL`). Bash's `/dev/tcp` and `/dev/udp` redirections are supported. On Windows `kill` terminates the process tree.
+- In-process shell runs no longer report `external-command cleanup could not be established` when Dial leads many process groups: the run's marker check covers every candidate in one `ps` call instead of one call per group.
+
+### Changed
+
+- Shell execution now defaults to Dial's embedded Bash-compatible engine on macOS, Linux and Windows, with bundled utilities resolved before PATH. Explicit system Bash and PowerShell backends remain available; builds without the embedded engine retain system fallbacks. Bundled `xargs` and `find -exec` dispatch through the shell engine rather than bypassing its builtins and functions; common `grep` and `sed` operations are supported without host utilities. The embedded host retains existing sandbox and process-lifecycle boundaries ([shell](docs/shell.md)).
+- Release binaries now embed a SHA-256-pinned, target-specific Node runtime for the computer worker and default JavaScript eval/browser launchers, eliminating a separate Node installation for those launch paths. Explicit runtime overrides and unbundled source-build fallbacks remain available. Installed-artifact gates exercise the real computer worker's startup, ping/pong and acknowledged shutdown with no host Node on PATH; musl checks run in Alpine with its documented system libraries ([release runtime](docs/release-and-install.md#bundled-execution-runtime-and-installed-feature-gate)).
+
+### Fixed
+
+- `/autoresearch run` benchmarks and `dial learn` command verification no longer hard-code `/bin/sh` or `/bin/bash`; they use the configured shell backend and sandbox, so they run on Windows. A verification command that cannot start is now an error instead of a failed check.
+- The embedded shell on Windows runs the file it found through `PATHEXT`: `npx`, `npm` and other `.cmd`/`.bat` shims (and `./tool` resolving to `tool.cmd`) no longer launch as `npx.exe` or the extensionless POSIX shim beside them. Dial now carries a patched brush-core 0.5.0 (`vendor/brush-core/DIAL.md`).
+- Restarted managed processes (`llama-server`) on Windows keep `SystemRoot`, `ComSpec`, `PATHEXT`, `TEMP` and the other system and profile variables a cleared environment needs.
+- Bundled `head` and `tail` accept the historic `-N` shorthand (`head -1`).
+- Bundled embedded-shell utilities no longer break scripts that use options outside their subset: such a call runs the same-named program from `PATH` (for example `grep -P`, `sed -i`, `cp -p`), and reports a usage error only when there is none. `grep` adds `-x`, `-w` and `-s`; `tail -n +N` prints from line N (it previously printed the last N lines); `cp`/`mv` accept `-f` and `cp`/`rm` accept `-R`.
 - Windows release builds statically link the C runtime and reject normal or delay-loaded Visual C++ runtime imports during artifact checks, avoiding a separate redistributable prerequisite. Windows smoke tests run the extracted archive outside the checkout. The installer distinguishes native loader failures (including `0xc0000142`) from version mismatches without assuming Smart App Control is responsible, and no longer tells users to disable the sandbox as a first-run step. Native Windows validation is required; these changes do not establish the cause of an individual startup failure.
+- Windows computer-worker startup no longer queries pipe attributes on the write-only stdin handle, which could refuse `/computer on` with `Computer pipe setup failed: Access is denied. (os error 5)`. Shared pipe validation now accepts either pipe direction without extra attribute access and still rejects non-pipe handles; read polling and queued writes are unchanged.
+
+### Added
+
+- Embedded shell on Windows gains the commands Unix hosts already had: `kill` (`-s`/`-n`/`-SIG`, `-l`, `%job`), `sleep` (cancelled with the run), and bundled `which`, `tee`, `seq`, `mktemp` and `realpath`. Bundled `kill`, `wait` and the new utilities run on every OS and resolve before PATH; Unix keeps the system `sleep` ([shell](docs/shell.md)).
 
 ## [0.3.7] - 2026-11-12
 

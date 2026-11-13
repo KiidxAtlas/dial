@@ -65,7 +65,8 @@ pub fn check_case_measured(
     let metrics = std::mem::take(agent.workflow_metrics.get_mut());
     let passed = match result {
         Ok(report) => {
-            report.outcome == TurnOutcome::Completed && check.verify(workspace.path(), &report.text)
+            report.outcome == TurnOutcome::Completed
+                && check.try_verify(workspace.path(), &report.text)?
         }
         Err(error) if format!("{error:#}").contains(BUDGET_MSG) => false,
         Err(error) => return Err(error),
@@ -113,7 +114,7 @@ pub fn selfplay_run(
                 }
                 Err(error) => return Err(error),
             };
-            let passed = completed && check.verify(workspace.path(), &text);
+            let passed = completed && check.try_verify(workspace.path(), &text)?;
             if let Some(id) = trajectory {
                 store.outcome(&crate::config::types::Outcome {
                     trajectory: id,

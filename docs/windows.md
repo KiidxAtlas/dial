@@ -136,7 +136,7 @@ WSL Windows interop and failed enforcement probes; WSL2 alone is not proof of co
 Do not work around a native Windows policy refusal by switching to `off` or enabling network
 access when the task requires it blocked.
 
-Windows shell commands are PowerShell source executed by Windows PowerShell; POSIX shell scripts are not translated. Process groups use Windows Job Objects, and background PTY jobs use ConPTY, sandboxed like other commands. Durable background jobs are supported; see [background services](background-services.md).
+Windows shell commands use Dial's embedded Bash-compatible engine by default, with bundled utilities resolved before PATH, just like macOS and Linux. `shell.backend = "system"` selects Git Bash; `"powershell"` explicitly selects Windows PowerShell source (POSIX scripts are not translated). Builds without `embedded-shell` fall back to Git Bash, then PowerShell. Process groups use Windows Job Objects, and background PTY jobs use ConPTY, sandboxed like other commands. Durable background jobs are supported; see [background services](background-services.md).
 
 Python environment discovery uses Windows layouts: virtualenv packages come from `<venv>/Lib/site-packages`, while the trusted base interpreter comes from an absolute `executable`/`base-executable` or `home` in `pyvenv.cfg`, not the `Scripts/python.exe` redirector. Conda uses `<prefix>/python.exe`. Base interpreters and conda installations must still resolve outside the workspace and pass the normal interpreter preflight; environment discovery does not relax those checks.
 
@@ -163,13 +163,22 @@ socket on the port must belong to a process inside the job's Job Object. Program
 to Notepad when neither `VISUAL` nor `EDITOR` is set, and copying an answer uses PowerShell's
 `Set-Clipboard`.
 
-**Computer use** (`/computer on`) runs its worker with Node.js (`node` on `PATH`). The worker gets
-the same Windows system variables (`SystemRoot`, `SystemDrive`, `ProgramFiles`, ...) as the browser.
-Dial turns off Windows' modal error dialogs for the processes it starts, so a `node.exe` that cannot
-load no longer stops at "The application was unable to start correctly". Instead `/computer on`
-fails with the reason, for example `exit 0xC0000142: a DLL failed to initialize while Node
-started` or `0xC000007B` for a damaged or wrong-architecture install. If `node --version` also
-fails in a new terminal, reinstall the Node.js LTS for your CPU from nodejs.org.
+**Computer use** (`/computer on`) uses the pinned Node runtime embedded in release binaries;
+installing Node or changing `PATH` is not required. Dial verifies and extracts that runtime into
+its private cache on first use, without a download. Source builds without a bundled payload
+still use an operator-installed `node` outside the editable workspace. The worker gets the same
+Windows system variables (`SystemRoot`, `SystemDrive`, `ProgramFiles`, ...) as the browser.
+Dial suppresses modal Windows loader dialogs and reports startup failures as errors. A corrupt
+bundled runtime fails closed instead of silently switching to a different Node installation;
+repair/reinstall the Dial release. For an unbundled source build, verify `node --version` in a
+new terminal and install the current Node.js LTS for your CPU if necessary.
+
+`Computer pipe setup failed: Access is denied. (os error 5)` after Node starts can be a Dial
+pipe-validation bug, not a Node installation or desktop permission problem. Affected builds
+query the write-only worker stdin with `GetNamedPipeInfo`, which requires extra read-attribute
+access. The fixed implementation validates both pipe ends without that requirement. Update to
+a release containing this fix or rebuild from the fixed source; running as Administrator,
+disabling the sandbox, or reinstalling Node is not the remedy for this pipe-check failure.
 
 ## File edits and checkpoints
 
@@ -189,4 +198,4 @@ the original file is not changed without undo coverage.
 - The Windows `dev` sandbox with network allowed (Low integrity) confines writes but not reads or network. `strict` and `allow_network = false` use an AppContainer, which also confines reads and network but blocks loopback and programs installed under your user profile. Neither is identical to the macOS and Linux sandboxes. Never run untrusted input with `sandbox.mode = "off"`.
 - Atomically published private files flush staged file contents before replacement. Windows does not document an unprivileged parent-directory flush or write-through rename equivalent to POSIX `fsync` on a directory, so a successful replacement is atomic for concurrent readers but its directory entry is not guaranteed to survive sudden power loss.
 - Dial replaces and deletes its own files with POSIX semantics on NTFS/ReFS, so a file another process has open (with delete sharing) can still be replaced, and a deleted name is freed at once. When a program opens a file without delete sharing (some editors, backup and sync tools), Dial retries for about 0.3 s and then reports Windows error 32, "being used by another process". Close that program, or move the project out of a synced folder such as OneDrive.
-- `/autoresearch run` and `dial learn` command verification run `/bin/bash` in the strict offline sandbox. That path is not supported on native Windows.
+- `/autoresearch run` benchmarks and `dial learn` command verification run through the same shell as the `bash` tool (the embedded engine by default, or Git Bash with `shell.backend = "system"`) in the strict offline sandbox, with the same Windows sandbox limits as above. A verification command that cannot start is reported as an error, not as a failed check.

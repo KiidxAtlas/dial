@@ -1253,8 +1253,6 @@ dependencies = [
 [[package]]
 name = "brush-core"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "967a82f3b1bf090db686d5fb86424b19725073828532a42f960d5a13bff14ecb"
 dependencies = [
  "async-recursion",
  "async-trait",

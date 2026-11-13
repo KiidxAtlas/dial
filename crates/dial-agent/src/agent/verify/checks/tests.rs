@@ -317,8 +317,12 @@ fn configured_missing_program_uses_shared_environment_verdict_without_repair() {
         timeout_secs: 30,
     };
     let run = agent.run_checks(&[check], &mut NullUi);
-    assert_eq!(run.failures.len(), 1);
-    assert!(run.failures[0].contains("Configured verification runner unavailable"));
+    assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
+    assert!(
+        run.failures[0].contains("Configured verification runner unavailable"),
+        "{:?}",
+        run.failures
+    );
     assert!(run.actionable.is_empty());
     assert_eq!(
         agent.step_checks.evidence.latest_status(program),
@@ -1446,7 +1450,8 @@ fn non_code_failures_are_disclosed_unless_the_check_passed_before_the_first_effe
         timeout_secs: 30,
     };
     let mut agent = hermetic_agent(&config, root.path());
-    agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    let run = agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
     assert_eq!(
         agent.disclosed_failure(&check, false),
         Some("verification environment unavailable")

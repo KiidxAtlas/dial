@@ -41,27 +41,35 @@ fn powershell_is_windows_only() {
 }
 
 #[test]
-fn auto_prefers_bash_then_embedded() {
+fn auto_prefers_embedded_even_when_system_bash_is_installed() {
     assert_eq!(
         resolve_runner(ShellBackend::Auto, Some(bash()), true, false),
-        Ok(Runner::Bash(bash()))
+        Ok(Runner::Embedded)
     );
     assert_eq!(
         resolve_runner(ShellBackend::Auto, None, true, false),
         Ok(Runner::Embedded)
     );
+    assert_eq!(
+        resolve_runner(ShellBackend::Auto, Some(bash()), false, false),
+        Ok(Runner::Bash(bash()))
+    );
 }
 
 #[test]
-fn auto_on_windows_prefers_git_bash_then_embedded_then_powershell() {
+fn auto_on_windows_uses_embedded_with_system_fallbacks_only_in_slim_builds() {
     let git = PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
     assert_eq!(
         resolve_runner(ShellBackend::Auto, Some(git.clone()), true, true),
-        Ok(Runner::Bash(git))
+        Ok(Runner::Embedded)
     );
     assert_eq!(
         resolve_runner(ShellBackend::Auto, None, true, true),
         Ok(Runner::Embedded)
+    );
+    assert_eq!(
+        resolve_runner(ShellBackend::Auto, Some(git.clone()), false, true),
+        Ok(Runner::Bash(git))
     );
     assert_eq!(
         resolve_runner(ShellBackend::Auto, None, false, true),

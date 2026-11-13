@@ -16,6 +16,7 @@ fn run(f: RunFn, cwd: &Path, args: &[&str], stdin: &str) -> (i32, String, String
             stdin: &mut input,
             stdout: &mut out,
             stderr: &mut err,
+            declined: None,
         },
         &args,
     );
@@ -144,25 +145,79 @@ fn glob_supports_star_question_and_classes() {
 }
 
 #[test]
-fn find_matches_names_with_glob_depth_first() {
+fn head_bytes_keeps_leading_bytes_across_forms() {
     let dir = tempdir().unwrap();
     let d = dir.path();
-    fs::create_dir_all(d.join("root/sub")).unwrap();
-    write(&d.join("root/a.rs"), "");
-    write(&d.join("root/sub/b.rs"), "");
-    write(&d.join("root/sub/c.txt"), "");
-    assert_eq!(
-        run(find, d, &["root", "-name", "*.rs"], "").1,
-        "root/a.rs\nroot/sub/b.rs\n"
+    write(&d.join("t.txt"), "abcdef\nghi\n");
+    assert_eq!(run(head, d, &["-c", "4", "t.txt"], "").1, "abcd");
+    assert_eq!(run(head, d, &["-c3"], "xyz123").1, "xyz");
+    assert_eq!(run(head, d, &["-c", "99"], "short").1, "short");
+    assert_eq!(run(head, d, &["-c", "0"], "abc").1, "");
+}
+
+#[test]
+fn head_and_tail_accept_the_dash_number_shorthand() {
+    let dir = tempdir().unwrap();
+    let d = dir.path();
+    assert_eq!(run(head, d, &["-1"], "a\nb\nc\n").1, "a\n");
+    assert_eq!(run(head, d, &["-2", "-"], "a\nb\nc\n").1, "a\nb\n");
+    assert_eq!(run(tail, d, &["-1"], "a\nb\nc\n").1, "c\n");
+    assert_eq!(run(head, d, &["-x"], "a\n").0, 2);
+    assert_eq!(run(head, d, &["-+1"], "a\n").0, 2);
+}
+
+#[test]
+fn head_bytes_stops_reading_an_endless_input() {
+    struct Endless;
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            buf.fill(b'y');
+            Ok(buf.len())
+        }
+    }
+    let dir = tempdir().unwrap();
+    let mut input = Endless;
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let code = head(
+        &mut Io {
+            name: "head",
+            cwd: dir.path(),
+            env: &[],
+            synopsis: "",
+            stdin: &mut input,
+            stdout: &mut out,
+            stderr: &mut err,
+            declined: None,
+        },
+        &["-c".to_owned(), "1000000".to_owned()],
     );
-    assert_eq!(
-        run(find, d, &["root/", "-type", "d"], "").1,
-        "root/\nroot/sub\n"
+    assert_eq!(code, 0);
+    assert_eq!(out.len(), 1_000_000);
+}
+
+#[test]
+fn head_bytes_leaves_the_rest_of_stdin_unread() {
+    let dir = tempdir().unwrap();
+    let mut input: &[u8] = b"abcdefgh";
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let code = head(
+        &mut Io {
+            name: "head",
+            cwd: dir.path(),
+            env: &[],
+            synopsis: "",
+            stdin: &mut input,
+            stdout: &mut out,
+            stderr: &mut err,
+            declined: None,
+        },
+        &["-c".to_owned(), "2".to_owned()],
     );
-    assert_eq!(
-        run(find, d, &["root", "-maxdepth", "1"], "").1,
-        "root\nroot/a.rs\nroot/sub\n"
-    );
+    assert_eq!(code, 0);
+    assert_eq!(out, b"ab");
+    assert_eq!(input, &b"cdefgh"[..]);
 }
 
 #[test]

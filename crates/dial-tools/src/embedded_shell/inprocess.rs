@@ -203,7 +203,7 @@ fn kill_marked_groups(token: &str, deadline: Instant) -> Result<(), String> {
         deadline,
         &mut budget,
         group_leaders,
-        carries_token,
+        marked_leaders,
         crate::platform::process::kill_group,
     )
 }
@@ -214,20 +214,23 @@ fn cleanup_groups(
     deadline: Instant,
     budget: &mut usize,
     mut discover: impl FnMut(Instant, &mut usize) -> Result<Vec<u32>, String>,
-    mut marked: impl FnMut(u32, &str, Instant, &mut usize) -> Result<bool, String>,
+    mut marked: impl FnMut(&[u32], &str, Instant, &mut usize) -> Result<Vec<u32>, String>,
     mut kill: impl FnMut(u32) -> std::io::Result<()>,
 ) -> Result<(), String> {
     for _ in 0..3 {
         remaining(deadline)?;
-        let mut found = false;
-        for leader in discover(deadline, budget)? {
-            remaining(deadline)?;
-            if marked(leader, token, deadline, budget)? {
-                found = true;
-                kill(leader).map_err(|e| format!("killing marked process group: {e}"))?;
-            }
+        let leaders = discover(deadline, budget)?;
+        if leaders.is_empty() {
+            return Ok(());
         }
-        if !found {
+        remaining(deadline)?;
+        // One environment check for the whole batch: Dial may lead many unrelated groups
+        // (background jobs, concurrent runs), and a per-leader `ps` would exhaust the deadline.
+        let found = marked(&leaders, token, deadline, budget)?;
+        for leader in &found {
+            kill(*leader).map_err(|e| format!("killing marked process group: {e}"))?;
+        }
+        if found.is_empty() {
             return Ok(());
         }
     }
@@ -333,47 +336,53 @@ pub(crate) fn parse_leaders(ps: &str, parent: u32) -> Vec<u32> {
         .collect()
 }
 
-/// Whether the environment holds the run token; failures are not evidence of absence.
+/// The `leaders` whose environment holds the run token; failures are not evidence of absence.
 #[cfg(unix)]
-fn carries_token(
-    pid: u32,
+fn marked_leaders(
+    leaders: &[u32],
     token: &str,
     deadline: Instant,
     budget: &mut usize,
-) -> Result<bool, String> {
+) -> Result<Vec<u32>, String> {
     let needle = format!("{TOKEN_ENV}={token}");
     if cfg!(target_os = "linux") {
         use std::io::Read;
-        remaining(deadline)?;
-        let file = match std::fs::File::open(format!("/proc/{pid}/environ")) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(format!("reading process environment: {e}")),
-        };
-        let mut bytes = Vec::new();
-        file.take(budget.saturating_add(1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("reading process environment: {e}"))?;
-        if bytes.len() > *budget {
-            return Err("external-command discovery output budget exhausted".into());
+        let mut marked = Vec::new();
+        for &pid in leaders {
+            remaining(deadline)?;
+            let file = match std::fs::File::open(format!("/proc/{pid}/environ")) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("reading process environment: {e}")),
+            };
+            let mut bytes = Vec::new();
+            file.take(budget.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("reading process environment: {e}"))?;
+            if bytes.len() > *budget {
+                return Err("external-command discovery output budget exhausted".into());
+            }
+            *budget -= bytes.len();
+            if bytes.split(|b| *b == 0).any(|var| var == needle.as_bytes()) {
+                marked.push(pid);
+            }
         }
-        *budget -= bytes.len();
         remaining(deadline)?;
-        return Ok(bytes.split(|b| *b == 0).any(|var| var == needle.as_bytes()));
+        return Ok(marked);
     }
+    let mut pids: Vec<String> = leaders.iter().map(u32::to_string).collect();
+    // Include Dial so `ps` succeeds even when every candidate disappeared since discovery.
+    // A missing row is evidence of exit, not a ps failure.
+    pids.push(std::process::id().to_string());
     let mut command = std::process::Command::new("ps");
-    // Include Dial so `ps` succeeds even when the candidate disappeared since discovery.
-    // Only inspect the candidate's row; a missing row is evidence of exit, not a ps failure.
-    command.args([
-        "-E",
-        "-ww",
-        "-o",
-        "pid=,command=",
-        "-p",
-        &format!("{pid},{}", std::process::id()),
-    ]);
+    command.args(["-E", "-ww", "-o", "pid=,command=", "-p", &pids.join(",")]);
     let output = discovery_output(command, deadline, budget)?;
-    Ok(token_in_ps(&String::from_utf8_lossy(&output), pid, &needle))
+    let output = String::from_utf8_lossy(&output);
+    Ok(leaders
+        .iter()
+        .copied()
+        .filter(|&pid| token_in_ps(&output, pid, &needle))
+        .collect())
 }
 
 #[cfg(unix)]

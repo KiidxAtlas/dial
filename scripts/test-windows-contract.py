@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Focused runner regressions; no Cargo build or Windows host required."""
 import contextlib
+import os
+import sys
 import importlib.util
 import io
 import subprocess
@@ -28,14 +30,14 @@ class WindowsContractTests(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
             return contract.parse(path)
 
-    def run_fixture(self, output, code=0, tests=None, skips=None, dry_run=False):
+    def run_fixture(self, output, code=0, tests=None, skips=None, dry_run=False, host=None):
         if tests is None:
             tests = [(["--workspace", "--lib"], "platform::")]
         stdout, stderr = io.StringIO(), io.StringIO()
         with patch.object(contract.subprocess, "run", return_value=subprocess.CompletedProcess(
                 [], code, stdout=output)) as run:
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                result = contract.run_contract(tests, skips or [], "ci", dry_run)
+                result = contract.run_contract(tests, skips or [], "ci", dry_run, host=host)
         return result, run, stdout.getvalue(), stderr.getvalue()
 
     def test_repository_update_filter_selects_the_binary_module(self):
@@ -66,6 +68,39 @@ class WindowsContractTests(unittest.TestCase):
             with self.subTest(filter=name):
                 self.assertNotIn("--workspace", target)
                 self.assertEqual(target[0], "--package")
+
+    def test_every_filter_gets_the_verified_host_and_never_a_stale_one(self):
+        tests = [(["--workspace", "--lib"], "platform::"), (["--package", "dial", "--bin", "dial"], "cmd::")]
+        for host, expected in (("C:\\target\\ci\\dial.exe", "C:\\target\\ci\\dial.exe"), (None, None)):
+            with self.subTest(host=host), patch.dict(os.environ, {"DIAL_EMBEDDED_SHELL_HOST": "C:\\stale.exe"}):
+                result, run, _, _ = self.run_fixture(summary(1), tests=tests, host=host)
+                self.assertEqual(result, 0)
+                self.assertEqual(run.call_count, 2)
+                for call in run.call_args_list:
+                    self.assertEqual(call.kwargs["env"].get("DIAL_EMBEDDED_SHELL_HOST"), expected)
+
+    def test_main_builds_the_host_once_before_filters_and_passes_it_on(self):
+        with tempfile.TemporaryDirectory() as directory:
+            contract_path = Path(directory) / "contract.txt"
+            contract_path.write_text("test-lib dial-core platform::\n", encoding="utf-8")
+            stdout = io.StringIO()
+            with patch.object(contract.embedded_host, "prepare", return_value="/built/dial") as prepare, \
+                    patch.object(contract.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [], 0, stdout=summary(1))) as run, \
+                    patch.object(sys, "argv", ["windows-contract.py", "--contract", str(contract_path)]), \
+                    contextlib.redirect_stdout(stdout):
+                self.assertEqual(contract.main(), 0)
+        prepare.assert_called_once_with("cargo", "ci", dry_run=False)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.kwargs["env"]["DIAL_EMBEDDED_SHELL_HOST"], "/built/dial")
+
+    def test_print_shows_host_preparation_without_building(self):
+        with patch.object(contract.embedded_host.subprocess, "run") as host_run, \
+                patch.object(sys, "argv", ["windows-contract.py", "--print"]), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(contract.main(), 0)
+        host_run.assert_not_called()
+        self.assertIn("+ cargo build --locked -p dial --bin dial", stdout.getvalue())
 
     def test_skips_are_reported_and_applied_before_counting(self):
         tests, skips = self.parse("test platform::\nskip platform::unix # POSIX only\n")

@@ -710,7 +710,12 @@ fn readiness_scan_reports_ring_loss_and_its_own_observation_limit() {
 fn kill_takes_down_the_whole_process_group() {
     let (_dir, ws) = open_workspace();
     let tool = tool();
-    start(&tool, &ws, "tree", "sleep 300 & echo child $!; wait");
+    start(
+        &tool,
+        &ws,
+        "tree",
+        "sh -c 'echo child $$; exec sleep 300' & wait",
+    );
     let wait = bg(
         &tool,
         &ws,
@@ -728,7 +733,12 @@ fn dropping_the_tool_kills_every_process_and_its_children() {
     let tool = tool();
     let mut pids = Vec::new();
     for name in ["one", "two"] {
-        start(&tool, &ws, name, "sleep 300 & echo child $!; wait");
+        start(
+            &tool,
+            &ws,
+            name,
+            "sh -c 'echo child $$; exec sleep 300' & wait",
+        );
         let wait = bg(
             &tool,
             &ws,
@@ -748,7 +758,14 @@ fn dropping_the_tool_kills_every_process_and_its_children() {
 fn a_finished_leader_takes_its_stragglers_with_it() {
     let (_dir, ws) = open_workspace();
     let tool = tool();
-    start(&tool, &ws, "leaky", "sleep 300 & echo child $!");
+    start(
+        &tool,
+        &ws,
+        "leaky",
+        // Ensure the child has started and reported its real PID before the leader exits.
+        // Brush schedules asynchronous lists as tasks rather than exposing a synchronous $!.
+        "sh -c 'echo child $$; echo ready > child.started; exec sleep 300' & until [ -s child.started ]; do sleep 0.01; done",
+    );
     let wait = bg(
         &tool,
         &ws,

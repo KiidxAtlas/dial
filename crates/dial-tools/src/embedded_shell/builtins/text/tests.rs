@@ -1,14 +1,28 @@
 use super::super::RunFn;
 use super::*;
+use std::io::Read;
 use std::path::Path;
 
 fn run(f: RunFn, cwd: &Path, args: &[&str], stdin: &str) -> (i32, String, String) {
+    run_with(
+        f,
+        cwd,
+        args,
+        &mut std::io::Cursor::new(stdin.as_bytes().to_vec()),
+    )
+}
+
+fn run_with(
+    f: RunFn,
+    cwd: &Path,
+    args: &[&str],
+    stdin: &mut (dyn Read + Send),
+) -> (i32, String, String) {
     let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
     let env = vec![
         ("ZED".to_owned(), "1".to_owned()),
         ("ALPHA".to_owned(), "2".to_owned()),
     ];
-    let mut input = std::io::Cursor::new(stdin.as_bytes().to_vec());
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     let code = {
@@ -17,21 +31,23 @@ fn run(f: RunFn, cwd: &Path, args: &[&str], stdin: &str) -> (i32, String, String
             cwd,
             env: &env,
             synopsis: "test",
-            stdin: &mut input,
+            stdin,
             stdout: &mut out,
             stderr: &mut err,
+            declined: None,
         };
-        f(&mut io, &args)
+        let code = f(&mut io, &args);
+        // As the dispatcher reports a declined command when `PATH` has no program of its name.
+        if let Some(message) = io.declined.take() {
+            let _ = writeln!(io.stderr, "{}: {message}", io.name);
+        }
+        code
     };
     (
         code,
         String::from_utf8(out).unwrap(),
         String::from_utf8(err).unwrap(),
     )
-}
-
-fn s(items: &[&str]) -> Vec<String> {
-    items.iter().map(|item| (*item).to_owned()).collect()
 }
 
 #[test]
@@ -122,6 +138,81 @@ fn grep_recurses_in_sorted_order() {
 }
 
 #[test]
+fn grep_matches_extended_fixed_and_repeated_patterns() {
+    let cwd = Path::new(".");
+    let input = "abc\nxyz\nqq a.c\n";
+    let cases: &[(&[&str], &str)] = &[
+        (&["-E", "b|x"], "abc\nxyz\n"),
+        (&["-F", "a.c"], "qq a.c\n"),
+        (&["-F", "-i", "A.C"], "qq a.c\n"),
+        (&["-e", "b", "-e", "q"], "abc\nqq a.c\n"),
+        (&["-e", "x\nq"], "xyz\nqq a.c\n"),
+        (&["-E", "-e", "z"], "xyz\n"),
+    ];
+    for &(args, expected) in cases {
+        assert_eq!(run(grep, cwd, args, input).1, expected, "grep {args:?}");
+    }
+    assert_eq!(run(grep, cwd, &["-F", "("], "f(x\nfx\n").1, "f(x\n");
+    assert_eq!(run(grep, cwd, &["-F", "-e", "("], input).0, 1);
+}
+
+#[test]
+fn grep_rejects_invalid_options_and_patterns() {
+    let cwd = Path::new(".");
+    let (code, _, err) = run(grep, cwd, &["-P", "a"], "a\n");
+    assert_eq!(code, 2);
+    assert!(err.contains("invalid option -- 'P'"));
+    let (code, _, err) = run(grep, cwd, &["-e"], "a\n");
+    assert_eq!(code, 2);
+    assert!(err.contains("option requires an argument -- 'e'"));
+    assert_eq!(run(grep, cwd, &["-E", "("], "a\n").0, 2);
+    assert_eq!(run(grep, cwd, &["-e", "a", "-e", "("], "a\n").0, 2);
+    assert_eq!(run(grep, cwd, &[], "a\n").0, 2);
+}
+
+#[test]
+fn grep_quiet_only_sets_status() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hit\n").unwrap();
+    let cwd = dir.path();
+    assert_eq!(
+        run(grep, cwd, &["-q", "hit", "a.txt"], ""),
+        (0, String::new(), String::new())
+    );
+    assert_eq!(run(grep, cwd, &["-q", "miss", "a.txt"], "").0, 1);
+    // A selected line gives status 0 even after an unreadable file, as in GNU grep.
+    assert_eq!(run(grep, cwd, &["-q", "hit", "gone.txt", "a.txt"], "").0, 0);
+}
+
+#[test]
+fn grep_only_matching_and_file_name_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "abcab\nxyz\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "ab\n").unwrap();
+    let cwd = dir.path();
+    assert_eq!(run(grep, cwd, &["-o", "b", "a.txt"], "").1, "b\nb\n");
+    assert_eq!(
+        run(grep, cwd, &["-on", "ab", "a.txt"], "").1,
+        "1:ab\n1:ab\n"
+    );
+    // Empty matches print nothing, though the line still counts as selected.
+    assert_eq!(
+        run(grep, cwd, &["-o", "q*", "a.txt"], ""),
+        (0, String::new(), String::new())
+    );
+    assert_eq!(run(grep, cwd, &["-o", "-v", "b", "a.txt"], "").1, "");
+    assert_eq!(
+        run(grep, cwd, &["-h", "ab", "a.txt", "b.txt"], "").1,
+        "abcab\nab\n"
+    );
+    assert_eq!(
+        run(grep, cwd, &["-H", "ab", "a.txt"], "").1,
+        "a.txt:abcab\n"
+    );
+    assert_eq!(run(grep, cwd, &["-Hc", "ab", "a.txt"], "").1, "a.txt:1\n");
+}
+
+#[test]
 fn sed_substitutes_with_groups_and_escapes() {
     let cwd = Path::new(".");
     assert_eq!(run(sed, cwd, &["s/a/X/"], "aaa\n").1, "Xaa\n");
@@ -139,12 +230,89 @@ fn sed_substitutes_with_groups_and_escapes() {
 }
 
 #[test]
+fn sed_prints_and_deletes_by_address() {
+    let cwd = Path::new(".");
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&["-n", "2p"], "a\nb\nc\n", "b\n"),
+        (&["2d"], "a\nb\nc\n", "a\nc\n"),
+        (&["-n", "$p"], "a\nb\nc\n", "c\n"),
+        (&["$d"], "a\nb\nc\n", "a\nb\n"),
+        (&["2,$d"], "a\nb\nc\n", "a\n"),
+        (&["-n", "2,1p"], "a\nb\nc\n", "b\n"),
+        (&["-n", "3,10p"], "a\nb\nc\n", "c\n"),
+        (&["-n", "5p"], "a\nb\nc\n", ""),
+        (&["/b/d"], "a\nb\nc\n", "a\nc\n"),
+        (&["-n", "/a/,/b/p"], "a\nb\nc\n", "a\nb\n"),
+        (&["-n", "/b/,$p"], "a\nb\nc\n", "b\nc\n"),
+        (&["/b/,/c/d"], "a\nb\nx\nc\nd\n", "a\nd\n"),
+        (&["1d;$d"], "a\nb\nc\n", "b\n"),
+        (&["/x/d;1,2p"], "a\nx\nb\n", "a\na\nb\n"),
+        (&["-n", "p"], "a\nb\n", "a\nb\n"),
+        (&["p"], "a\nb\n", "a\na\nb\nb\n"),
+    ];
+    for &(args, input, expected) in cases {
+        assert_eq!(run(sed, cwd, args, input).1, expected, "sed {args:?}");
+    }
+    let numbers: String = (1..=25).map(|n| format!("{n}\n")).collect();
+    let first_twenty: String = (1..=20).map(|n| format!("{n}\n")).collect();
+    assert_eq!(run(sed, cwd, &["-n", "1,20p"], &numbers).1, first_twenty);
+}
+
+#[test]
+fn sed_numbers_lines_across_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a1\na2\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b1\nb2\n").unwrap();
+    let cwd = dir.path();
+    assert_eq!(run(sed, cwd, &["-n", "3p", "a.txt", "b.txt"], "").1, "b1\n");
+    assert_eq!(run(sed, cwd, &["-n", "$p", "a.txt", "b.txt"], "").1, "b2\n");
+    let (code, out, err) = run(sed, cwd, &["-n", "$p", "gone.txt", "b.txt"], "");
+    assert_eq!((code, out.as_str()), (1, "b2\n"));
+    assert!(err.contains("gone.txt: No such file or directory"));
+}
+
+#[test]
+fn sed_substitution_flags_and_script_separators() {
+    let cwd = Path::new(".");
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&["s/a/X/2"], "aaa\n", "aXa\n"),
+        (&["s/a/X/2g"], "aaaa\n", "aXXX\n"),
+        (&["s/A/x/i"], "Abc\n", "xbc\n"),
+        (&["-n", "s/a/X/gp"], "aa\nb\n", "XX\n"),
+        (&["s/q/X/"], "a\n", "a\n"),
+        (&["s/b/X/;s/a/Y/"], "ab\n", "YX\n"),
+        (&["-e", "1d", "-e", "s/b/X/"], "a\nb\n", "X\n"),
+    ];
+    for &(args, input, expected) in cases {
+        assert_eq!(run(sed, cwd, args, input).1, expected, "sed {args:?}");
+    }
+}
+
+#[test]
 fn sed_rejects_unsupported_scripts() {
     let cwd = Path::new(".");
-    let (code, _, err) = run(sed, cwd, &["d"], "a\n");
-    assert_eq!(code, 2);
-    assert!(err.contains("unsupported sed script"));
+    for script in [
+        "y/a/b/",
+        "s/a/b/w out",
+        "1,p",
+        "0p",
+        "$!d",
+        "/x",
+        "a foo",
+        "s//X/",
+        "//d",
+    ] {
+        let (code, _, err) = run(sed, cwd, &[script], "a\n");
+        assert_eq!(
+            (code, err.as_str()),
+            (2, "test: unsupported sed script\n"),
+            "{script:?}"
+        );
+    }
+    assert_eq!(run(sed, cwd, &["/(/d"], "a\n").0, 2);
+    assert_eq!(run(sed, cwd, &["s/(/x/"], "a\n").0, 2);
     assert_eq!(run(sed, cwd, &["s/a/\\1/"], "a\n").0, 1);
+    assert_eq!(run(sed, cwd, &[], "a\n").0, 2);
 }
 
 #[test]
@@ -213,26 +381,27 @@ fn env_prints_sorted_assignments() {
     assert_eq!(run(env, Path::new("."), &[], "").1, "ALPHA=2\nZED=1\n");
 }
 
-#[test]
-fn xargs_batches_words_by_count() {
-    let base = s(&["echo", "pre"]);
-    assert_eq!(
-        batch_args(&base, &["a", "b", "c"], 2),
-        vec![s(&["echo", "pre", "a", "b"]), s(&["echo", "pre", "c"])]
-    );
-    assert_eq!(
-        batch_args(&base, &["a", "b", "c"], usize::MAX),
-        vec![s(&["echo", "pre", "a", "b", "c"])]
-    );
-    assert_eq!(batch_args(&base, &[], 2), vec![s(&["echo", "pre"])]);
+/// A reader that yields one matching line and then fails, so any read past that line is an error.
+struct OneLineThenFail {
+    sent: bool,
+}
+
+impl Read for OneLineThenFail {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.sent {
+            return Err(std::io::Error::other("read past the matching line"));
+        }
+        self.sent = true;
+        let line = b"hit\n";
+        let n = line.len().min(buf.len());
+        buf[..n].copy_from_slice(&line[..n]);
+        Ok(n)
+    }
 }
 
 #[test]
-fn xargs_replaces_each_input_line() {
-    let template = s(&["echo", "[{}]", "{}"]);
-    assert_eq!(
-        replace_args(&template, "{}", "a b\n\nc\n"),
-        vec![s(&["echo", "[a b]", "a b"]), s(&["echo", "[c]", "c"])]
-    );
-    assert!(replace_args(&template, "{}", "").is_empty());
+fn grep_quiet_stops_reading_at_first_match() {
+    let mut stdin = OneLineThenFail { sent: false };
+    let (code, out, err) = run_with(grep, Path::new("."), &["-q", "hit"], &mut stdin);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
 }

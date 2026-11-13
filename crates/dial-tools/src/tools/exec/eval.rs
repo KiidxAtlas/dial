@@ -116,12 +116,16 @@ pub fn prepare_containment() -> Result<(), String> {
     require_fork_containment("eval")
 }
 
+fn embedded_fallback_available(node: &str) -> bool {
+    embedded_js_available() && (node != "node" || !crate::setup::deps::bundled_node::available())
+}
+
 /// Languages backed by a resolved operator launcher or the compiled JavaScript engine. Only
 /// paths/build facts are inspected; version and containment preflight runs at cell launch.
 pub fn installed_languages(workspace: &std::path::Path, config: &Config) -> Vec<&'static str> {
     let mut languages = Vec::new();
     if resolve_operator_executable(workspace, &config.eval.node, "eval.node").is_ok()
-        || embedded_js_available()
+        || embedded_fallback_available(&config.eval.node)
     {
         languages.push("js");
     }
@@ -313,7 +317,7 @@ impl JsRuntime {
                         ) {
                             Ok(node) => (Some(node), "Node kernel (install/configure eval.node)"),
                             Err(node_error) => {
-                                if !embedded_js_available() {
+                                if !embedded_fallback_available(&self.config.node) {
                                     return Err(node_error);
                                 }
                                 (None, "embedded JavaScript engine")

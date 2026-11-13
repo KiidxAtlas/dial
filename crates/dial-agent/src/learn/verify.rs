@@ -2,9 +2,10 @@
 //! agent's final answer and returns pass/fail: no model is involved, which is what makes outcomes
 //! produced with it externally grounded (for gate cases, self-play and training data alike).
 use crate::runtime::{execution::ProcessOutcome, process};
-use crate::tools::exec::sandbox::Sandbox;
+use crate::tools::Workspace;
 #[cfg(test)]
-use crate::tools::{self, Workspace, exec::sandbox::Policy};
+use crate::tools::{self, exec::sandbox::Policy};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
@@ -69,10 +70,18 @@ pub enum Check {
 }
 
 impl Check {
+    /// Verdict for callers that cannot act on a launch failure: a command that could not run counts
+    /// as failed. Callers that must tell the two apart use [`Check::try_verify`].
     pub fn verify(&self, workspace: &Path, answer: &str) -> bool {
-        match self {
+        self.try_verify(workspace, answer).unwrap_or(false)
+    }
+
+    /// `Ok(verdict)` once the checks have run. `Err` means a command check could not be launched, so
+    /// there is no verdict; a command that runs and fails is `Ok(false)`.
+    pub fn try_verify(&self, workspace: &Path, answer: &str) -> Result<bool> {
+        Ok(match self {
             Check::Repository { files, command } => {
-                super::repository::verify(workspace, files, command)
+                super::repository::verify(workspace, files, command)?
             }
             Check::AnswerExact { expected } => answer.trim() == expected.trim(),
             Check::AnswerContains { needle } => answer.contains(needle.as_str()),
@@ -104,11 +113,19 @@ impl Check {
                 command,
                 expect_stdout,
                 expect_exit,
-            } => run_command(workspace, command, expect_stdout.as_deref(), *expect_exit),
+            } => run_command(workspace, command, expect_stdout.as_deref(), *expect_exit)?,
             Check::All { checks } => {
-                !checks.is_empty() && checks.iter().all(|c| c.verify(workspace, answer))
+                if checks.is_empty() {
+                    return Ok(false);
+                }
+                for check in checks {
+                    if !check.try_verify(workspace, answer)? {
+                        return Ok(false);
+                    }
+                }
+                true
             }
-        }
+        })
     }
 }
 
@@ -151,44 +168,29 @@ fn run_command(
     command: &str,
     expect_stdout: Option<&str>,
     expect_exit: i32,
-) -> bool {
-    let Ok(root) = workspace.canonicalize() else {
-        return false;
-    };
-    // Preserve Workspace's admission boundary even though verification needs raw process streams.
-    if !root.is_dir() || root.parent().is_none() {
-        return false;
-    }
-    // Keep the strict offline sandbox, but capture raw streams separately. Shell tool text merges
-    // stderr and adds status/artifact diagnostics; none of that is command stdout or authority.
-    let Ok(mut child) = Sandbox::detect().command(
-        &root,
-        false,
-        "/bin/bash",
-        &["--noprofile", "--norc", "-c", command],
-    ) else {
-        return false;
-    };
-    let scratch = root.join(crate::workspace_copy::SCRATCH_DIR);
-    if fs::create_dir_all(&scratch).is_err() {
-        return false;
-    }
-    child
-        .current_dir(&root)
-        .env_clear()
-        .envs(std::env::vars().filter(|(key, value)| {
-            !crate::tools::exec::sandbox::is_secret_env(key, value)
-                && !matches!(key.as_str(), "BASH_ENV" | "ENV" | "SHELLOPTS" | "BASHOPTS")
-        }))
-        .env("TMPDIR", &scratch);
+) -> Result<bool> {
+    // Workspace::new applies the tool-call admission boundary: a canonical directory, not the
+    // filesystem root. Its error means verification never ran.
+    let ws = Workspace::new(workspace).context("verification workspace is unavailable")?;
+    // The shell owner chooses the configured backend (embedded by default) and the strict sandbox,
+    // and owns the child environment and scratch directory. Raw streams are read here, not the
+    // tool's merged text with status and artifact diagnostics.
+    let child = crate::tools::exec::shell::verifier_command(&ws, command)
+        .map_err(anyhow::Error::msg)
+        .context("verification command could not be built")?;
     let mut policy = process::Policy::bounded(Duration::from_secs(30), 4 * 1024 * 1024);
     policy.fail_on_output_limit = true;
-    let Ok(out) =
+    // A spawn failure is an Err from the process runner; a command that ran and failed is a verdict.
+    let out =
         process::run_with_policy(child, None, policy, &AtomicBool::new(false), &mut |_, _| {})
-    else {
-        return false;
-    };
-    command_matches(&out.outcome(), &out.stdout, expect_stdout, expect_exit)
+            .map_err(anyhow::Error::msg)
+            .context("verification command could not be launched")?;
+    Ok(command_matches(
+        &out.outcome(),
+        &out.stdout,
+        expect_stdout,
+        expect_exit,
+    ))
 }
 
 fn command_matches(

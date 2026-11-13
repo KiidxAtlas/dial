@@ -14,6 +14,11 @@ MACH_O_CPU_TYPES = {"x86_64": 0x01000007, "aarch64": 0x0100000C}
 PE_MACHINES = {"x86_64": 0x8664, "aarch64": 0xAA64}
 PT_INTERP = 3
 PE32_PLUS_MAGIC = 0x20B
+NODE_MANIFEST = Path(__file__).resolve().parent.parent / "runtimes" / "node" / "manifest.json"
+SMOKE_REQUIRED_CHECKS = ("bundled-node", "node-version", "computer-worker")
+# Poison values: a probe that consults the host's Node through these must fail, not borrow it.
+POISON_NODE_OPTIONS = "--dial-poison-node-options-must-not-be-read"
+POISON_NODE_PATH = "/dial-poison-node-path-must-not-be-read"
 PE_IMPORT_DIRECTORY = 1
 PE_DELAY_IMPORT_DIRECTORY = 13
 # Visual C++ runtime redistributable DLLs (and the UCRT they sit on). OS API sets stay allowed.
@@ -163,13 +168,68 @@ def check_target_format(executable, target):
 
 
 
+def expected_node_version():
+    """Returns the exact Node version pinned in runtimes/node/manifest.json, v-prefixed as the probe reports it."""
+    version = json.loads(NODE_MANIFEST.read_text(encoding="utf-8")).get("version")
+    if not isinstance(version, str) or not version:
+        raise RuntimeError(f"{NODE_MANIFEST} needs a non-empty string 'version'")
+    return f"v{version}"
+
+
+def check_installed_smoke_report(text, expected_version):
+    """Returns the probe report only when it proves the bundled payload and the computer worker; fails closed otherwise."""
+    try:
+        report = json.loads(text)
+    except ValueError as error:
+        raise RuntimeError(f"__installed-smoke printed no JSON report: {error}") from error
+    if not isinstance(report, dict) or report.get("schema_version") != 1:
+        raise RuntimeError(f"__installed-smoke report has an unexpected schema: {report!r}")
+    if report.get("bundled") is not True:
+        raise RuntimeError(f"packaged Node payload is not bundled (bundled={report.get('bundled')!r})")
+    if report.get("node_version") != expected_version:
+        raise RuntimeError(f"bundled Node is {report.get('node_version')!r}; the manifest pins {expected_version!r}")
+    checks = report.get("checks")
+    missing = [name for name in SMOKE_REQUIRED_CHECKS if not isinstance(checks, list) or name not in checks]
+    if missing:
+        raise RuntimeError(f"__installed-smoke did not prove {', '.join(missing)}")
+    return report
+
+
+def installed_smoke(executable, root, expected_version):
+    """Runs the packaged probe twice under one DIAL_HOME: a fresh run, then a run reusing its cache.
+
+    Both runs get an empty PATH and poisoned Node variables, so only the bundled payload can satisfy them.
+    """
+    home = root / "bundled-home"
+    # The probe's workspace is a sibling of DIAL_HOME, never an ancestor: the runtime home must not sit inside the cwd.
+    workspace = root / "bundled-workspace"
+    workspace.mkdir()
+    reports = []
+    for _ in range(2):
+        env = os.environ.copy()
+        env.update(PATH="", NODE_OPTIONS=POISON_NODE_OPTIONS, NODE_PATH=POISON_NODE_PATH, DIAL_HOME=str(home))
+        env.pop("DIAL_EMBEDDED_SHELL_HOST", None)
+        result = subprocess.run([str(executable), "__installed-smoke", "--require-bundled-node"],
+                                cwd=workspace, env=env, capture_output=True, text=True, timeout=180)
+        if result.returncode:
+            raise RuntimeError(f"__installed-smoke failed (exit {result.returncode}): {result.stderr[-2048:]}")
+        reports.append(check_installed_smoke_report(result.stdout, expected_version))
+    if reports[0] != reports[1]:
+        raise RuntimeError("__installed-smoke changed between the fresh run and the cached run")
+    return reports[-1]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dial", type=Path, required=True)
     parser.add_argument("--target", help="release target triple; verifies the binary format for it")
     parser.add_argument("--format-only", action="store_true",
                         help="verify only the --target binary format without executing the artifact")
+    parser.add_argument("--require-bundled-node", action="store_true",
+                        help="also run __installed-smoke; fail unless the packaged Node payload and computer worker are proven")
     args = parser.parse_args()
+    if args.format_only and args.require_bundled_node:
+        parser.error("--require-bundled-node cannot be combined with --format-only")
     executable = args.dial.resolve(strict=True)
     checks = []
     if args.target:
@@ -244,9 +304,14 @@ def main():
         notes = json.loads(run("annotate", uri, "--list"))
         assert len(notes["annotations"]) == 1 and notes["annotations"][0]["origin"] == "human_cli"
         assert artifact.read_bytes() == source
+        report = None
+        if args.require_bundled_node:
+            report = installed_smoke(executable, root, expected_node_version())
+            checks.append("installed-smoke")
         print(json.dumps({"schema_version": 1, "executable": str(executable),
                           "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
-                          "checks": [*checks, "entry", "metadata", "completions", "shell-host", "shell-state", "annotation"]}))
+                          "checks": [*checks, "entry", "metadata", "completions", "shell-host", "shell-state", "annotation"],
+                          **({"installed_smoke": report} if report else {})}))
 
 
 if __name__ == "__main__":

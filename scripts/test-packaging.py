@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Regression tests for scripts/check-packaging.py (run in CI; no Nix or network needed)."""
 import importlib.util
+import json
 import os
+import sys
 import re
 import subprocess
 import tempfile
@@ -331,6 +333,117 @@ class ReleaseWorkflowRuntimeTests(unittest.TestCase):
                 continue
             with self.subTest(job=job):
                 self.assertNotIn("crt-static", "\n".join(self.build_steps()[job]))
+
+    def package_step(self, job):
+        matches = [block for block in self.build_steps().get(job, []) if "Package and smoke-test" in block]
+        self.assertEqual(len(matches), 1, f"{job} must have exactly one package step")
+        return matches[0]
+
+    def test_both_build_jobs_prepare_the_pinned_node_payload_before_cargo(self):
+        for job in ("build", "windows-build"):
+            with self.subTest(job=job):
+                blocks = self.build_steps()[job]
+                setup = [i for i, block in enumerate(blocks) if "actions/setup-python@" in block]
+                prepare = [i for i, block in enumerate(blocks) if "scripts/prepare-node.py --target" in block]
+                build = [i for i, block in enumerate(blocks) if "name: Build release binary" in block]
+                self.assertEqual((len(setup), len(prepare), len(build)), (1, 1, 1), job)
+                self.assertLess(setup[0], prepare[0])
+                self.assertLess(prepare[0], build[0])
+                self.assertIn("DIAL_BUNDLED_NODE_DIR: ${{ github.workspace }}/target/node-payload/${{ matrix.target }}",
+                              self.build_step(job))
+
+    def test_packaged_archives_ship_the_node_license(self):
+        for job in ("build", "windows-build"):
+            with self.subTest(job=job):
+                self.assertIn("LICENSE.node", self.package_step(job))
+
+    def test_installed_probe_is_required_except_on_musl_hosts_that_cannot_run_it(self):
+        self.assertIn("--require-bundled-node", self.package_step("windows-build"))
+        bash = self.package_step("build")
+        self.assertIn('if [[ "$RELEASE_TARGET" == *-musl ]]; then', bash)
+        self.assertEqual(bash.count("--require-bundled-node"), 1)
+        self.assertIn('--target "$RELEASE_TARGET" --require-bundled-node', bash)
+
+    def test_musl_bundled_runtime_is_verified_on_native_alpine_with_disclosed_libraries(self):
+        steps = [block for block in self.build_steps()["build"] if "alpine:" in block]
+        self.assertEqual(len(steps), 1)
+        for fragment in ("runner.os == 'Linux'", "contains(matrix.target, '-musl')",
+                         "apk add --no-cache python3 libstdc++ libgcc", "/checks/scripts:ro",
+                         "/checks/runtimes:ro", "/artifact:ro",
+                         "python3 /checks/scripts/check-artifact.py --dial /artifact/dial", "--require-bundled-node"):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, steps[0])
+        self.assertNotIn("alpine:", "\n".join(self.build_steps()["windows-build"]))
+
+
+class InstalledSmokeTests(unittest.TestCase):
+    ROOT = Path(__file__).resolve().parent.parent
+    PINNED = json.loads((ROOT / "runtimes" / "node" / "manifest.json").read_text(encoding="utf-8"))["version"]
+    EXPECTED = f"v{PINNED}"
+    REPORT = {"schema_version": 1, "checks": ["bundled-node", "node-version", "computer-worker"],
+              "node_version": EXPECTED, "bundled": True}
+    # Stands in for dial: asserts the probe's environment contract, then prints the scripted report.
+    FAKE = """#!PYTHON
+import json, os, sys
+from pathlib import Path
+behavior = json.loads(Path(__file__).with_name("behavior.json").read_text(encoding="utf-8"))
+if os.environ.get("PATH") != "" or os.environ.get("NODE_OPTIONS") != behavior["node_options"] \\
+        or os.environ.get("NODE_PATH") != behavior["node_path"]:
+    sys.exit(3)
+if sys.argv[1:] != ["__installed-smoke", "--require-bundled-node"]:
+    sys.exit(4)
+home = Path(os.environ["DIAL_HOME"]).resolve()
+if home.is_relative_to(Path.cwd().resolve()):
+    sys.exit(6)
+runs = home.parent / "runs"
+count = int(runs.read_text()) + 1 if runs.exists() else 1
+runs.write_text(str(count))
+cache = home / "payload-cache"
+if (count == 1) == cache.exists():
+    sys.exit(5)
+cache.mkdir(parents=True, exist_ok=True)
+print(behavior["stdout"])
+sys.exit(behavior["exit"])
+"""
+
+    def test_report_must_prove_the_pinned_bundled_payload_and_computer_worker(self):
+        cases = {
+            "not bundled": ({"bundled": False}, "not bundled"),
+            "system node": ({"node_version": "v22.0.0"}, "manifest pins"),
+            "no computer worker": ({"checks": ["bundled-node", "node-version"]}, "computer-worker"),
+            "checks not a list": ({"checks": "bundled-node computer-worker node-version"}, "did not prove"),
+            "unknown schema": ({"schema_version": 2}, "schema"),
+        }
+        for label, (change, pattern) in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(RuntimeError, pattern):
+                    artifact.check_installed_smoke_report(json.dumps({**self.REPORT, **change}), self.EXPECTED)
+        with self.assertRaisesRegex(RuntimeError, "no JSON"):
+            artifact.check_installed_smoke_report("probe crashed", self.EXPECTED)
+        self.assertEqual(artifact.check_installed_smoke_report(json.dumps(self.REPORT), self.EXPECTED), self.REPORT)
+        self.assertEqual(artifact.expected_node_version(), self.EXPECTED)
+
+    @unittest.skipIf(os.name == "nt", "the fake probe is a POSIX shebang script")
+    def test_probe_runs_twice_with_empty_path_poison_and_one_home_and_fails_closed(self):
+        cases = {
+            "fresh run then cached run pass": (json.dumps(self.REPORT), 0, None),
+            "missing payload exits nonzero": ("", 1, "failed"),
+            "payload not bundled": (json.dumps({**self.REPORT, "bundled": False}), 0, "not bundled"),
+        }
+        for label, (stdout, exit_code, pattern) in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory(prefix="installed-smoke-test-") as directory:
+                root = Path(directory)
+                executable = root / "dial"
+                executable.write_text(self.FAKE.replace("#!PYTHON", "#!" + sys.executable), encoding="utf-8")
+                executable.chmod(0o755)
+                (root / "behavior.json").write_text(json.dumps({
+                    "node_options": artifact.POISON_NODE_OPTIONS, "node_path": artifact.POISON_NODE_PATH,
+                    "stdout": stdout, "exit": exit_code}), encoding="utf-8")
+                if pattern is None:
+                    self.assertEqual(artifact.installed_smoke(executable, root, self.EXPECTED), self.REPORT)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, pattern):
+                        artifact.installed_smoke(executable, root, self.EXPECTED)
 
 
 class ArtifactFormatTests(unittest.TestCase):

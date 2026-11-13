@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::platform::env as platform_env;
 use crate::platform::process_record::{self as process_record, Log, Record};
 use crate::platform::procinfo::ProcId;
 
@@ -519,11 +520,9 @@ pub fn restart(user: &Path, pid: i32, identity: &str) -> Result<String> {
     let (stdout, stderr) = log.stdio()?;
     let mut command = Command::new(&spec.program);
     command.args(&spec.args).current_dir(&spec.cwd).env_clear();
-    for name in &spec.env_allow {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
+    // Only the names recorded at spawn time are re-read; Windows matches them case-insensitively.
+    let inherited = platform_env::allowed_from(&spec.env_allow, std::env::vars_os(), cfg!(windows));
+    command.envs(inherited);
     command
         .envs(spec.env.iter().map(|(name, value)| (name, value)))
         .env("DIAL_PARENT_PID", std::process::id().to_string())

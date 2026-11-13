@@ -5,6 +5,7 @@ pub mod benchmark;
 pub(crate) mod doctor;
 pub mod improve;
 pub(crate) mod inspection;
+pub(crate) mod installed_smoke;
 pub(crate) mod laya;
 pub(crate) mod schedule;
 pub(crate) mod sessions;

@@ -561,35 +561,266 @@ fn bash_network_is_blocked_unless_allowed() {
     }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo CONNECTED");
-    // Control: the same command outside the sandbox does connect.
-    let control = std::process::Command::new("/bin/bash")
-        .args(["-c", &probe])
-        .output()
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&control.stdout).contains("CONNECTED"),
-        "control failed"
-    );
+    // Each probe is one loopback connect through a different shell path, all under the same
+    // sandbox. `/dev/tcp` is bash syntax that the System, embedded and default backends all
+    // implement; the `nc` probe runs the ordinary binary from the default backend.
+    let tcp_probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo CONNECTED");
+    let probes = [
+        ("system /dev/tcp", ShellBackend::System, tcp_probe.clone()),
+        (
+            "embedded /dev/tcp",
+            ShellBackend::Embedded,
+            tcp_probe.clone(),
+        ),
+        ("default /dev/tcp", ShellBackend::Auto, tcp_probe),
+        (
+            "default nc",
+            ShellBackend::Auto,
+            format!("/usr/bin/nc -z -w 1 127.0.0.1 {port} && echo CONNECTED"),
+        ),
+    ];
+    for (label, backend, probe) in probes {
+        // Control: the same command outside the sandbox does connect.
+        let control = std::process::Command::new("/bin/bash")
+            .args(["-c", &probe])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&control.stdout).contains("CONNECTED"),
+            "{label}: control failed"
+        );
 
-    let (_dir, ws) = workspace();
-    let blocked = bash(&ws, &probe);
-    assert!(
-        blocked.is_error && !blocked.text.contains("CONNECTED"),
-        "{}",
-        blocked.text
-    );
+        let (_dir, ws) = workspace();
+        let blocked = bash(&ws.with_shell_backend(backend), &probe);
+        assert!(
+            blocked.is_error && !blocked.text.contains("CONNECTED"),
+            "{label}: {}",
+            blocked.text
+        );
+
+        let (_dir2, open) = workspace();
+        let open = open.with_network(true).with_shell_backend(backend);
+        let allowed = bash(&open, &probe);
+        assert!(
+            allowed.text.contains("CONNECTED"),
+            "{label}: {}",
+            allowed.text
+        );
+    }
+    let (_dir3, ws) = workspace();
     let curl = bash(&ws, "/usr/bin/curl --max-time 3 -sS https://example.com");
     assert!(
         curl.is_error && !curl.text.contains("Example Domain"),
         "{}",
         curl.text
     );
+}
 
-    let (_dir2, open) = workspace();
-    let open = open.with_network(true);
-    let allowed = bash(&open, &probe);
-    assert!(allowed.text.contains("CONNECTED"), "{}", allowed.text);
+/// Runs `command` through `backend` with the sandbox off, for the Unix network redirection tests.
+#[cfg(unix)]
+fn bash_unsandboxed_on(backend: ShellBackend, command: &str) -> ToolOutput {
+    let (_dir, ws) = workspace();
+    bash(&ws.without_sandbox().with_shell_backend(backend), command)
+}
+
+/// Every shell backend that reaches `/dev/tcp` and `/dev/udp` without a sandbox.
+#[cfg(unix)]
+fn network_redirect_backends() -> Vec<(&'static str, ShellBackend)> {
+    let mut backends = vec![
+        ("system", ShellBackend::System),
+        ("embedded", ShellBackend::Embedded),
+    ];
+    if cfg!(feature = "embedded-shell") {
+        backends.push(("inprocess", ShellBackend::InProcess));
+    }
+    backends
+}
+
+/// Accepts one TCP connection on `listener` in the background and runs `serve` on it.
+#[cfg(unix)]
+fn serve_tcp<T: Send + 'static>(
+    listener: std::net::TcpListener,
+    serve: impl FnOnce(std::net::TcpStream) -> T + Send + 'static,
+) -> std::thread::JoinHandle<T> {
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve(stream)
+    })
+}
+
+/// Reads the request up to and including `terminator`, answers `reply`, and returns the request.
+#[cfg(unix)]
+fn reply_after(
+    mut stream: std::net::TcpStream,
+    terminator: &'static [u8],
+    reply: &'static [u8],
+) -> Vec<u8> {
+    use std::io::{Read as _, Write as _};
+    let mut request = Vec::new();
+    let mut byte = [0u8; 1];
+    while !request.ends_with(terminator) {
+        if stream.read(&mut byte).unwrap() == 0 {
+            break;
+        }
+        request.push(byte[0]);
+    }
+    stream.write_all(reply).unwrap();
+    request
+}
+
+/// A loopback port that nothing listens on: bind, learn the port, release it.
+#[cfg(unix)]
+fn closed_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_tcp_redirections_write_read_and_feed_external_children() {
+    for (name, backend) in network_redirect_backends() {
+        // Builtin write: the shell closes the socket when the redirection ends, so the server
+        // sees EOF after the payload.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = serve_tcp(listener, |mut stream| {
+            use std::io::Read as _;
+            let mut got = Vec::new();
+            stream.read_to_end(&mut got).unwrap();
+            got
+        });
+        let out = bash_unsandboxed_on(backend, &format!("echo hi > /dev/tcp/127.0.0.1/{port}"));
+        assert!(!out.is_error, "{name} builtin write: {}", out.text);
+        assert_eq!(server.join().unwrap(), b"hi\n", "{name} builtin write");
+
+        // External write: the child's stdout is the socket itself.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = serve_tcp(listener, |mut stream| {
+            use std::io::Read as _;
+            let mut got = Vec::new();
+            stream.read_to_end(&mut got).unwrap();
+            got
+        });
+        let out = bash_unsandboxed_on(
+            backend,
+            &format!("/bin/echo external > /dev/tcp/127.0.0.1/{port}"),
+        );
+        assert!(!out.is_error, "{name} external write: {}", out.text);
+        assert_eq!(
+            server.join().unwrap(),
+            b"external\n",
+            "{name} external write"
+        );
+
+        // Read-write HTTP exchange on fd 3: a builtin writes the request, a builtin reads the
+        // response.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = serve_tcp(listener, |stream| {
+            reply_after(stream, b"\r\n\r\n", b"HTTP/1.0 200 OK\r\n\r\npong")
+        });
+        let out = bash_unsandboxed_on(
+            backend,
+            &format!(
+                "exec 3<>/dev/tcp/127.0.0.1/{port}; printf 'GET / HTTP/1.0\r\n\r\n' >&3; cat <&3"
+            ),
+        );
+        assert!(
+            out.text.contains("pong"),
+            "{name} http builtin: {}",
+            out.text
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            b"GET / HTTP/1.0\r\n\r\n",
+            "{name} http builtin request"
+        );
+
+        // Read-write exchange where the response is read by an external child on fd 3.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = serve_tcp(listener, |stream| reply_after(stream, b"\n", b"pong\n"));
+        let out = bash_unsandboxed_on(
+            backend,
+            &format!("exec 3<>/dev/tcp/127.0.0.1/{port}; echo ping >&3; /bin/cat <&3"),
+        );
+        assert!(
+            out.text.contains("pong"),
+            "{name} external read: {}",
+            out.text
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            b"ping\n",
+            "{name} external read request"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_tcp_probe_reports_closed_and_open_ports_without_error() {
+    for (name, backend) in network_redirect_backends() {
+        let closed = closed_loopback_port();
+        let probe = |port: u16| {
+            format!("(echo > /dev/tcp/127.0.0.1/{port}) 2>/dev/null && echo open || echo closed")
+        };
+
+        let out = bash_unsandboxed_on(backend, &probe(closed));
+        assert!(
+            out.text.contains("closed") && !out.text.contains("open"),
+            "{name}: {}",
+            out.text
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = serve_tcp(listener, |_stream| ());
+        let out = bash_unsandboxed_on(backend, &probe(port));
+        assert!(out.text.contains("open"), "{name}: {}", out.text);
+        server.join().unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_tcp_refused_connection_is_a_redirection_error() {
+    for (name, backend) in network_redirect_backends() {
+        let closed = closed_loopback_port();
+        let out = bash_unsandboxed_on(backend, &format!("echo hi > /dev/tcp/127.0.0.1/{closed}"));
+        assert!(
+            out.is_error && out.text.contains("Connection refused"),
+            "{name}: {}",
+            out.text
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_udp_redirections_send_datagrams_and_exchange_replies() {
+    for (name, backend) in network_redirect_backends() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (n, peer) = socket.recv_from(&mut buf).unwrap();
+            let got = buf[..n].to_vec();
+            socket.send_to(b"pong\n", peer).unwrap();
+            got
+        });
+        // A builtin writes one datagram; `head` reads the reply as one datagram from fd 3.
+        let out = bash_unsandboxed_on(
+            backend,
+            &format!("exec 3<>/dev/udp/127.0.0.1/{port}; echo ping >&3; head -n 1 <&3"),
+        );
+        assert!(out.text.contains("pong"), "{name} udp: {}", out.text);
+        assert_eq!(server.join().unwrap(), b"ping\n", "{name} udp request");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -748,7 +979,7 @@ fn bash_timeout_kills_process_group_without_orphans() {
     let out = run(
         &ws,
         "bash",
-        json!({"command": "sleep 30 & echo $! > bg.pid; echo $$ > sh.pid; echo partial; sleep 30", "timeout": 1}),
+        json!({"command": "sh -c 'echo $$ > bg.pid; exec sleep 30' & echo $$ > sh.pid; echo partial; until [ -s bg.pid ]; do sleep 0.01; done; sleep 30", "timeout": 1}),
     );
     assert!(
         started.elapsed() < Duration::from_secs(10),
@@ -785,7 +1016,10 @@ fn bash_kills_background_jobs_when_command_returns() {
     }
     let (dir, ws) = workspace();
     let started = Instant::now();
-    let out = bash(&ws, "sleep 30 & echo $! > bg.pid; echo done");
+    let out = bash(
+        &ws,
+        "sh -c 'echo $$ > bg.pid; exec sleep 30' & until [ -s bg.pid ]; do sleep 0.01; done; echo done",
+    );
     assert!(!out.is_error && out.text.contains("done"), "{}", out.text);
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -931,7 +1165,7 @@ fn sigint_shell_helper() {
     let output = bash_tool_streaming(
         &ws,
         &json!({
-            "command": "sleep 30 & echo $! > bg.pid; echo $$ > sh.pid; echo READY; wait"
+            "command": "sh -c 'echo $$ > bg.pid; exec sleep 30' & until [ -s bg.pid ]; do sleep 0.01; done; echo $$ > sh.pid; echo READY; wait"
         }),
         30,
         &|bytes| {

@@ -24,6 +24,35 @@
   use the transitive, hashed `scripts/requirements-ci.lock`. The Nix input is pinned to an immutable
   revision, but still needs a genuine resolver-generated `flake.lock` and native Nix acceptance.
 
+### Bundled execution runtime and installed-feature gate
+
+Release binaries embed a compressed, target-specific Node runtime alongside the existing
+embedded shell and utilities. The executable remains the installation/update unit: no sibling
+runtime directory needs to survive an installer or self-update. Default `eval.node` and
+`browser.node` (`node`), and the computer worker, prefer this payload. Explicit executable
+overrides remain operator-owned; Python, browser packages/Chromium and project toolchains are
+not bundled by this change. A bundled runtime is extracted into Dial's private cache and its
+length and SHA-256 are checked before reuse. Corruption is an error, not a PATH fallback.
+
+`runtimes/node/manifest.json` pins Node's version, target archive and SHA-256. Release builds
+run `scripts/prepare-node.py --target <triple> --output <directory>` and set
+`DIAL_BUNDLED_NODE_DIR` to that directory before Cargo runs. Archive bytes are verified before
+extracting only the executable and its license. Source builds without this input keep the
+existing host-Node/embedded-JavaScript fallback; builds do not download a runtime implicitly.
+To refresh the pin, review upstream checksum inputs and license, update every target together,
+then rerun payload tests and native installed-artifact checks. ARM64 musl uses the explicitly
+pinned Node unofficial-builds artifact; other targets use nodejs.org artifacts. Musl Node needs
+the system `libstdc++` and `libgcc` packages, which the Alpine release gate installs explicitly.
+
+The internal `dial __installed-smoke --require-bundled-node` probe verifies the runtime version,
+starts the real computer worker, exchanges ping/pong messages and requires a bounded close
+acknowledgement. It needs no model, network, desktop permissions or desktop input. Release
+artifact checks run it with an empty PATH, poisoned Node injection variables and fresh Dial
+state, then repeat against the same cache. Musl probes run in Alpine, not against a glibc host.
+Passing this gate proves worker loading and transport, not actual desktop capture/input,
+browser downloads or live-provider behavior. Native-platform execution is still required;
+cross-compilation and workflow definitions alone do not establish a successful release.
+
 ### Known platform limits
 
 Portable Unix process-group signalling remains best-effort against PID reuse. General storage
@@ -416,6 +445,12 @@ process/API fixtures; `make test` still runs the full Rust suite. Tests use the
 usual dev profile, so these commands share its build cache. `make build` uses the
 optimized `local` profile; its first build creates a separate cache in
 `target/local`, with subsequent edits benefiting from incremental compilation.
+
+The Rust test targets build a matching `dial` executable and set `DIAL_EMBEDDED_SHELL_HOST`
+for the test process, because the default embedded shell re-executes Dial, not the Rust test
+harness. Keep that override when invoking Cargo tests directly; use a freshly built host with
+the same features. The native macOS/Windows contract runner prepares the host in the same way.
+This does not install or replace your running Dial binary.
 
 ### Faster builds and optional integrations
 

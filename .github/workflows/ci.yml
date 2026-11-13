@@ -141,6 +141,10 @@ jobs:
         run: make test-build
       - name: Test focused Windows contract runner
         run: make test-windows-contract
+      - name: Test embedded host preparation
+        # The embedded shell host is built and smoke-checked by scripts/embedded-host.py; this checks its
+        # command and environment contract with mocked Cargo. The live path runs in the Rust test steps.
+        run: make test-embedded-host
       - name: Check packaging and release policy
         run: make test-packaging test-release-policy
       - name: Verify Linux sandbox enforcement
@@ -148,11 +152,11 @@ jobs:
         timeout-minutes: 10
         run: cargo test --locked --profile ci --workspace linux_sandbox_enforces_filesystem_and_both_network_modes
       - name: Build
-        # The full workspace build and test suite run on Linux. macOS runs the focused contract below,
-        # which builds only the test targets it selects. On Linux the `dial` library and its
-        # unit-test build each peak near 5 GB in rustc and are still built one at a time, and
-        # workspace crates one lib target at a time. The `ci` profile drops debug info, which cuts
-        # rustc memory, link time and cache size.
+        # The full workspace build and test suite run on Linux. macOS runs a focused contract,
+        # plus the real dial binary needed to host its embedded shell. On Linux the `dial`
+        # library and its unit-test build each peak near 5 GB in rustc and are built one at a
+        # time, and workspace crates one lib target at a time. The `ci` profile drops debug
+        # info, which cuts rustc memory, link time and cache size.
         if: runner.os == 'Linux'
         run: |
           cargo build --locked --profile ci --workspace --lib

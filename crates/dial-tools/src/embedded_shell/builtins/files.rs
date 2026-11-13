@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use super::Io;
 
 /// Text of an I/O error without Rust's ` (os error N)` suffix, matching coreutils messages.
-fn err_text(e: &io::Error) -> String {
+pub(super) fn err_text(e: &io::Error) -> String {
     let text = e.to_string();
     match text.find(" (os error") {
         Some(i) => text[..i].to_string(),
@@ -24,9 +24,12 @@ fn report(io: &mut Io<'_>, name: &str, e: &io::Error) -> i32 {
     io.fail(format!("{name}: {}", err_text(e)))
 }
 
-/// Splits arguments into the single-letter flags drawn from `allowed` and the operands.
-/// Returns `None` on an unknown flag. `-` and everything after `--` are operands.
-fn parse_flags<'a>(args: &'a [String], allowed: &str) -> Option<(String, Vec<&'a str>)> {
+/// Splits arguments into the single-letter flags drawn from `allowed` and the operands. An unknown
+/// flag is an `invalid option` error. `-` and everything after `--` are operands.
+pub(super) fn parse_flags<'a>(
+    args: &'a [String],
+    allowed: &str,
+) -> Result<(String, Vec<&'a str>), String> {
     let mut flags = String::new();
     let mut operands = Vec::new();
     let mut literal = false;
@@ -39,18 +42,36 @@ fn parse_flags<'a>(args: &'a [String], allowed: &str) -> Option<(String, Vec<&'a
         } else {
             for c in arg[1..].chars() {
                 if !allowed.contains(c) {
-                    return None;
+                    return Err(format!("invalid option -- '{c}'"));
                 }
                 flags.push(c);
             }
         }
     }
-    Some((flags, operands))
+    Ok((flags, operands))
 }
 
-/// Parses `[-n N] [FILE]...` for head and tail. `N` defaults to 10.
-fn line_count_args(args: &[String]) -> Option<(usize, Vec<&str>)> {
-    let mut count: usize = 10;
+/// How much of each input `head` and `tail` keep: whole lines, or leading bytes (`head -c`).
+#[derive(Clone, Copy)]
+enum Limit {
+    Lines(usize),
+    Bytes(usize),
+    /// `tail -n +N`: every line from line `N` (1-based) on.
+    From(usize),
+}
+
+/// Parses `[-n N] [-c N] [-N] [FILE]...` for head and tail. The default is 10 lines; `-N` is the
+/// historic shorthand for `-n N` (`head -1`). `-c` is only accepted when `bytes_ok` (head);
+/// `-n +N` (output from line `N`) only when it is not (tail).
+fn count_args(args: &[String], bytes_ok: bool) -> Option<(Limit, Vec<&str>)> {
+    let lines = |value: &str| -> Option<Limit> {
+        match value.strip_prefix('+') {
+            Some(from) if !bytes_ok => Some(Limit::From(digits(from)?)),
+            Some(_) => None,
+            None => Some(Limit::Lines(digits(value)?)),
+        }
+    };
+    let mut limit = Limit::Lines(10);
     let mut operands = Vec::new();
     let mut literal = false;
     let mut iter = args.iter();
@@ -61,17 +82,38 @@ fn line_count_args(args: &[String]) -> Option<(usize, Vec<&str>)> {
         } else if arg == "--" {
             literal = true;
         } else if arg == "-n" {
-            count = iter.next()?.parse().ok()?;
+            limit = lines(iter.next()?)?;
+        } else if bytes_ok && arg == "-c" {
+            limit = Limit::Bytes(digits(iter.next()?)?);
+        } else if let Some(value) = arg.strip_prefix("-n") {
+            limit = lines(value)?;
+        } else if let Some(value) = arg.strip_prefix("-c").filter(|_| bytes_ok) {
+            limit = Limit::Bytes(digits(value)?);
         } else {
-            let value = arg.strip_prefix("-n")?;
-            count = value.parse().ok()?;
+            limit = Limit::Lines(digits(arg.strip_prefix('-')?)?);
         }
     }
-    Some((count, operands))
+    Some((limit, operands))
+}
+
+/// A count made only of ASCII digits (no sign: `-n -5` and `-c 1K` are not supported).
+fn digits(text: &str) -> Option<usize> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Line selection for `tail`, which does not support `-c`.
+fn line_count_args(args: &[String]) -> Option<(Limit, Vec<&str>)> {
+    match count_args(args, false)? {
+        (Limit::Bytes(_), _) => None,
+        parsed => Some(parsed),
+    }
 }
 
 /// Last component of `path`, ignoring trailing slashes. `/` and `//` yield `/`.
-fn base_name(path: &str) -> &str {
+pub(super) fn base_name(path: &str) -> &str {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         if path.is_empty() { "" } else { "/" }
@@ -194,8 +236,9 @@ fn cat_lines(
 }
 
 pub(super) fn cat(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let Some((flags, operands)) = parse_flags(args, "n") else {
-        return io.usage();
+    let (flags, operands) = match parse_flags(args, "n") {
+        Ok(parsed) => parsed,
+        Err(message) => return io.decline(message),
     };
     let number = flags.contains('n');
     let mut line_no = 0;
@@ -246,13 +289,15 @@ fn target_for(dest: &Path, dest_is_dir: bool, source: &str) -> PathBuf {
 }
 
 pub(super) fn cp(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let Some((flags, operands)) = parse_flags(args, "r") else {
-        return io.usage();
+    // `-f` changes nothing here: an existing destination file is always replaced.
+    let (flags, operands) = match parse_flags(args, "rRf") {
+        Ok(parsed) => parsed,
+        Err(message) => return io.decline(message),
     };
     let Some((dest, sources)) = operands.split_last().filter(|(_, rest)| !rest.is_empty()) else {
         return io.usage();
     };
-    let recursive = flags.contains('r');
+    let recursive = flags.contains('r') || flags.contains('R');
     let dest_path = io.path(dest);
     let dest_is_dir = dest_path.is_dir();
     if sources.len() > 1 && !dest_is_dir {
@@ -296,7 +341,12 @@ fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 pub(super) fn mv(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let Some((dest, sources)) = args.split_last().filter(|(_, rest)| !rest.is_empty()) else {
+    // `-f` changes nothing here: mv never prompts, and an existing destination is replaced.
+    let operands = match parse_flags(args, "f") {
+        Ok((_, operands)) => operands,
+        Err(message) => return io.decline(message),
+    };
+    let Some((dest, sources)) = operands.split_last().filter(|(_, rest)| !rest.is_empty()) else {
         return io.usage();
     };
     let dest_path = io.path(dest);
@@ -315,8 +365,9 @@ pub(super) fn mv(io: &mut Io<'_>, args: &[String]) -> i32 {
 }
 
 pub(super) fn mkdir(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let Some((flags, operands)) = parse_flags(args, "p") else {
-        return io.usage();
+    let (flags, operands) = match parse_flags(args, "p") {
+        Ok(parsed) => parsed,
+        Err(message) => return io.decline(message),
     };
     if operands.is_empty() {
         return io.usage();
@@ -338,10 +389,11 @@ pub(super) fn mkdir(io: &mut Io<'_>, args: &[String]) -> i32 {
 }
 
 pub(super) fn rm(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let Some((flags, operands)) = parse_flags(args, "rf") else {
-        return io.usage();
+    let (flags, operands) = match parse_flags(args, "rRf") {
+        Ok(parsed) => parsed,
+        Err(message) => return io.decline(message),
     };
-    let recursive = flags.contains('r');
+    let recursive = flags.contains('r') || flags.contains('R');
     let force = flags.contains('f');
     if operands.is_empty() {
         return if force { 0 } else { io.usage() };
@@ -389,31 +441,94 @@ pub(super) fn touch(io: &mut Io<'_>, args: &[String]) -> i32 {
 }
 
 pub(super) fn head(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let Some((count, operands)) = line_count_args(args) else {
-        return io.usage();
+    let Some((limit, operands)) = count_args(args, true) else {
+        return io.decline("unsupported arguments");
     };
-    for_each_input(io, &operands, true, |input, out| {
-        let mut line = Vec::new();
-        for _ in 0..count {
-            line.clear();
-            if input.read_until(b'\n', &mut line)? == 0 {
-                break;
+    match limit {
+        Limit::Bytes(bytes) => head_bytes(io, &operands, bytes),
+        // count_args only yields `From` for tail.
+        Limit::From(count) => io.fail(format!("invalid number of lines: '+{count}'")),
+        Limit::Lines(count) => for_each_input(io, &operands, true, |input, out| {
+            let mut line = Vec::new();
+            for _ in 0..count {
+                line.clear();
+                if input.read_until(b'\n', &mut line)? == 0 {
+                    break;
+                }
+                out.write_all(&line)?;
             }
-            out.write_all(&line)?;
+            Ok(())
+        }),
+    }
+}
+
+/// `head -c N`: copies the first `bytes` bytes of each input. Inputs are read without a buffer, so
+/// a shared stdin keeps the bytes past the count for the next reader (`{ head -c2; cat; }`).
+fn head_bytes(io: &mut Io<'_>, operands: &[&str], bytes: usize) -> i32 {
+    let names: Vec<&str> = if operands.is_empty() {
+        vec!["-"]
+    } else {
+        operands.to_vec()
+    };
+    let multi = names.len() > 1;
+    let mut status = 0;
+    let mut printed = false;
+    for name in names {
+        let label = if name == "-" { "standard input" } else { name };
+        let outcome = if name == "-" {
+            header(&mut *io.stdout, multi, &mut printed, label);
+            copy_prefix(&mut *io.stdin, &mut *io.stdout, bytes)
+        } else {
+            match File::open(io.path(name)) {
+                Ok(mut file) => {
+                    header(&mut *io.stdout, multi, &mut printed, label);
+                    copy_prefix(&mut file, &mut *io.stdout, bytes)
+                }
+                Err(e) => {
+                    status = report(io, name, &e);
+                    continue;
+                }
+            }
+        };
+        if let Err(e) = outcome {
+            status = report(io, name, &e);
         }
-        Ok(())
-    })
+    }
+    status
+}
+
+/// Copies at most `bytes` bytes. `Take` caps each read to the bytes still wanted, so nothing past
+/// them is consumed from `input`.
+fn copy_prefix(input: &mut dyn Read, out: &mut dyn Write, bytes: usize) -> io::Result<()> {
+    io::copy(&mut input.take(bytes as u64), out).map(|_| ())
 }
 
 pub(super) fn tail(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let Some((count, operands)) = line_count_args(args) else {
-        return io.usage();
+    let Some((limit, operands)) = line_count_args(args) else {
+        return io.decline("unsupported arguments");
     };
     for_each_input(io, &operands, true, |input, out| {
+        // Lines are kept verbatim, so a final line without a newline is written back without one.
+        let mut line = Vec::new();
+        if let Limit::From(first) = limit {
+            let mut number = 0usize;
+            loop {
+                line.clear();
+                if input.read_until(b'\n', &mut line)? == 0 {
+                    return Ok(());
+                }
+                number += 1;
+                if number >= first {
+                    out.write_all(&line)?;
+                }
+            }
+        }
+        let Limit::Lines(count) = limit else {
+            return Ok(());
+        };
         if count == 0 {
             return Ok(());
         }
-        // Lines are kept verbatim, so a final line without a newline is written back without one.
         let mut kept: VecDeque<Vec<u8>> = VecDeque::new();
         loop {
             let mut line = Vec::new();
@@ -473,8 +588,9 @@ fn list_dir(out: &mut dyn Write, dir: &Path, all: bool, long: bool) -> io::Resul
 }
 
 pub(super) fn ls(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let Some((flags, mut operands)) = parse_flags(args, "al") else {
-        return io.usage();
+    let (flags, mut operands) = match parse_flags(args, "al") {
+        Ok(parsed) => parsed,
+        Err(message) => return io.decline(message),
     };
     let all = flags.contains('a');
     let long = flags.contains('l');
@@ -510,108 +626,9 @@ pub(super) fn ls(io: &mut Io<'_>, args: &[String]) -> i32 {
     status
 }
 
-/// Expression state for one `find` run, plus the program name used in error messages.
-struct Find<'a> {
-    prog: &'a str,
-    name: Option<&'a str>,
-    kind: Option<char>,
-    max_depth: Option<usize>,
-}
-
-/// Joins a displayed parent path and a child name with a single `/`.
-fn join_display(parent: &str, child: &str) -> String {
-    if parent.ends_with('/') {
-        format!("{parent}{child}")
-    } else {
-        format!("{parent}/{child}")
-    }
-}
-
-impl Find<'_> {
-    /// Prints `shown` if it matches, then descends into directories (never through symlinks).
-    fn visit(
-        &self,
-        out: &mut dyn Write,
-        err: &mut dyn Write,
-        path: &Path,
-        shown: &str,
-        depth: usize,
-    ) -> i32 {
-        let meta = match fs::symlink_metadata(path) {
-            Ok(meta) => meta,
-            Err(e) => {
-                let _ = writeln!(err, "{}: '{shown}': {}", self.prog, err_text(&e));
-                return 1;
-            }
-        };
-        let kind_ok = match self.kind {
-            Some('f') => meta.is_file(),
-            Some(_) => meta.is_dir(),
-            None => true,
-        };
-        let name_ok = self
-            .name
-            .is_none_or(|glob| glob_match(glob, base_name(shown)));
-        if kind_ok && name_ok {
-            let _ = writeln!(out, "{shown}");
-        }
-        let mut status = 0;
-        if meta.is_dir() && self.max_depth.is_none_or(|max| depth < max) {
-            match fs::read_dir(path) {
-                Ok(entries) => {
-                    let mut names: Vec<OsString> = entries
-                        .filter_map(Result::ok)
-                        .map(|e| e.file_name())
-                        .collect();
-                    names.sort();
-                    for child in names {
-                        let child_name = child.to_string_lossy();
-                        let child_shown = join_display(shown, &child_name);
-                        status |= self.visit(out, err, &path.join(&child), &child_shown, depth + 1);
-                    }
-                }
-                Err(e) => {
-                    let _ = writeln!(err, "{}: '{shown}': {}", self.prog, err_text(&e));
-                    status = 1;
-                }
-            }
-        }
-        status
-    }
-}
-
-pub(super) fn find(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let (root, rest) = match args.first() {
-        Some(first) if !first.starts_with('-') => (first.as_str(), &args[1..]),
-        _ => (".", args),
-    };
-    let mut walk = Find {
-        prog: io.name,
-        name: None,
-        kind: None,
-        max_depth: None,
-    };
-    let mut i = 0;
-    while i < rest.len() {
-        let value = rest.get(i + 1).map(String::as_str);
-        match (rest[i].as_str(), value) {
-            ("-name", Some(glob)) => walk.name = Some(glob),
-            ("-type", Some(t @ ("f" | "d"))) => walk.kind = t.chars().next(),
-            ("-maxdepth", Some(n)) => match n.parse::<usize>() {
-                Ok(depth) => walk.max_depth = Some(depth),
-                Err(_) => return io.usage(),
-            },
-            _ => return io.usage(),
-        }
-        i += 2;
-    }
-    let root_path = io.path(root);
-    walk.visit(&mut *io.stdout, &mut *io.stderr, &root_path, root, 0)
-}
-
 /// Shell-style glob over one file name: `*`, `?`, `[...]` (with `!`/`^` negation and ranges),
 /// and `\` escapes.
-fn glob_match(pattern: &str, name: &str) -> bool {
+pub(super) fn glob_match(pattern: &str, name: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = name.chars().collect();
     glob_at(&pat, &text)
@@ -712,8 +729,9 @@ fn wc_fields(counts: Counts, show: [bool; 3]) -> String {
 }
 
 pub(super) fn wc(io: &mut Io<'_>, args: &[String]) -> i32 {
-    let Some((flags, operands)) = parse_flags(args, "lwc") else {
-        return io.usage();
+    let (flags, operands) = match parse_flags(args, "lwc") {
+        Ok(parsed) => parsed,
+        Err(message) => return io.decline(message),
     };
     let mut show = [
         flags.contains('l'),

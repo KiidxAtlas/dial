@@ -6,6 +6,7 @@
 use crate::config::tools::kernel::KernelConfig;
 
 use super::background::{AdoptedJob, CellJob};
+use crate::setup::deps::bundled_node;
 use crate::tools::integrations::ext::{ToolCallback, ToolContext};
 use crate::tools::{ToolOutput, Workspace, exec::preludes};
 use parking_lot::Mutex;
@@ -281,6 +282,12 @@ pub(crate) fn resolve_operator_executable(
     let workspace = workspace
         .canonicalize()
         .map_err(|e| format!("cannot resolve editable workspace: {e}"))?;
+    // Only Dial's default `node` may use the verified release payload. Its private state
+    // directory is excluded from agent edits even when the workspace contains DIAL_HOME.
+    // Operator overrides still go through the outside-workspace identity check below.
+    if let Some(bundled) = bundled_default_node(program, label)? {
+        return Ok(bundled);
+    }
     let path = Path::new(program);
     let candidate = if path.is_absolute() || path.components().count() > 1 {
         let candidate = if path.is_absolute() {
@@ -306,6 +313,15 @@ pub(crate) fn resolve_operator_executable(
         ));
     }
     Ok(resolved)
+}
+
+/// The release-bundled Node.js for Dial's default `node` program, when this build carries one.
+/// Source builds and every other program return `None` and keep the PATH lookup.
+fn bundled_default_node(program: &str, label: &str) -> Result<Option<PathBuf>, String> {
+    if program != "node" || !matches!(label, "eval.node" | "browser.node" | "computer.node") {
+        return Ok(None);
+    }
+    bundled_node::provision()
 }
 
 /// Side-effect-free counterpart of Python startup's environment selection. Do not launch a
